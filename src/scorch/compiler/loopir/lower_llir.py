@@ -3794,7 +3794,6 @@ class _ResultTileTextValidator(LLIRWalker):
             )
         )
         self.protected_names = protected_names
-        self.known_names: Set[str] = set()
         self.declared_names: Dict[str, str] = {}
         self.policies: List[Tuple[object, str]] = []
 
@@ -3833,14 +3832,13 @@ class _ResultTileTextValidator(LLIRWalker):
             checker(self, node)
 
     def _check_var(self, node: llir.Node) -> None:
-        name = self._identifier(getattr(node, "name", None), "Var.name")
+        self._identifier(getattr(node, "name", None), "Var.name")
         if type(getattr(node, "type", None)) is not llir.DataType:
             raise ValueError("Var.type must be a DataType")
         if type(getattr(node, "is_ptr", None)) is not bool:
             raise ValueError("Var.is_ptr must be a bool")
         if type(getattr(node, "is_restrict", None)) is not bool:
             raise ValueError("Var.is_restrict must be a bool")
-        self.known_names.add(name)
 
     def _check_unary_op(self, node: llir.Node) -> None:
         operator = getattr(node, "op", None)
