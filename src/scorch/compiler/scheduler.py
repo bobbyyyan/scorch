@@ -3298,10 +3298,20 @@ class Scheduler:
     ) -> CIN:
         """Apply selected auto decisions on a CIN owned by the scheduler."""
 
-        if not isinstance(cin, ForAll):
-            return cin
         if type(require_complete_plan) is not bool:
             raise TypeError("require_complete_plan must be an exact bool")
+        if require_complete_plan and (
+            type(plan_tiles) is not list
+            or type(plan_workspace) is not list
+            or plan_tiles
+            or plan_workspace
+        ):
+            raise TypeError(
+                "require_complete_plan needs empty exact plan tile and "
+                "workspace sinks"
+            )
+        if not isinstance(cin, ForAll):
+            return cin
         if scheduler_policy is None:
             scheduler_policy = compile_options.scheduler
 
