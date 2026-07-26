@@ -450,7 +450,7 @@ def test_scheduled_stage_sequence_and_failure_ownership():
 
     failing = Schedule(
         loop_order=("i", "j", "k"),
-        parallel_loop="i",
+        tiles=(TileSpec("k", 4, placement="outermost", parallel=True, unroll=False),),
     )
     failing_options = scheduled_options(failing)
     failing_context = CompilationContext(failing_options)
@@ -478,18 +478,35 @@ def test_scheduled_stage_sequence_and_failure_ownership():
     "schedule, code",
     [
         # Stack accumulation left this list in the Phase-6 workspace slice,
-        # sparse panel tiling left it in the panel slice, and heap result
-        # tiles left it in the heap slice: all are now migrated families
-        # with their own positive parity locks.
+        # sparse panel tiling in the panel slice, heap result tiles in the
+        # heap slice, and explicit parallel_loop plans in the abstract
+        # parallel-selection slice (their positive twins live in the anchor
+        # parity grid).  Parallel tile selection is the remaining
+        # unmigrated explicit-parallel spelling.
         (
-            Schedule(loop_order=("i", "j", "k"), parallel_loop="i"),
+            Schedule(
+                loop_order=("i", "j", "k"),
+                tiles=(
+                    TileSpec(
+                        "k", 4, placement="outermost", parallel=True, unroll=False
+                    ),
+                ),
+            ),
             "unsupported_schedule_parallel",
         ),
         (
             Schedule(
                 loop_order=("i", "j", "k"),
-                tiles=(tile("k", 4, unroll=False),),
-                parallel_loop="i",
+                tiles=(
+                    TileSpec(
+                        "k",
+                        4,
+                        placement="outermost",
+                        accum="stack",
+                        parallel=True,
+                        unroll=False,
+                    ),
+                ),
             ),
             "unsupported_schedule_parallel",
         ),
