@@ -29,6 +29,11 @@ the legacy lowering of the verified ``ScheduledCIN``):
   assembly).
 """
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -2335,37 +2340,117 @@ def ttm_stensor(tensor, name):
     return STensor(name=name, storage=storage)
 
 
+def _assert_ttm_multi_prefix_heap_shadow(
+    *,
+    width,
+    batch,
+    rows,
+    inner,
+    cols,
+    dtype_name,
+    seed,
+):
+    """Run one native rank-3 differential in an isolated process.
+
+    The helper is module-level so the pytest parent can execute each new
+    JIT-heavy case in a short-lived child.  Scorch's pre-existing macOS
+    full-suite process already approaches libomp's pthread-key ceiling; keeping
+    these additional extensions out of that long-lived process makes the
+    canonical, unpartitioned suite a meaningful gate instead of moving the
+    failure threshold.
+    """
+
+    dtype = {"float32": F32, "float64": F64}[dtype_name]
+    torch.manual_seed(seed)
+    core = torch.randn(batch, rows, inner, dtype=dtype)
+    if core.numel():
+        core[core.abs() < 0.6] = 0.0
+    if batch > 1 and rows > 2:
+        core[1, 2, :] = 0.0
+    factor = torch.randn(inner, cols, dtype=dtype)
+    tolerance = 1e-9 if dtype is F64 else 1e-3
+    assert_scheduled_shadow(
+        build_ttm(dtype=dtype),
+        ttm_heap_schedule(f"h-ttm-shadow-{width}", strip=width),
+        (batch, rows, cols),
+        (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
+        torch.einsum("abc,cd->abd", core, factor),
+        atol=tolerance,
+        rtol=tolerance,
+    )
+
+
+def _run_ttm_multi_prefix_heap_shadow_in_subprocess(**kwargs):
+    """Keep each added native rank-3 case below macOS's process-local limit."""
+
+    invocation = (
+        "from tests.test_scorch.test_loopir_scheduled_slice import "
+        "_assert_ttm_multi_prefix_heap_shadow as run\n"
+        f"run(**{kwargs!r})\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", invocation],
+        cwd=Path(__file__).resolve().parents[2],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        "isolated rank-3 heap differential failed\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+
+
 @pytest.mark.parametrize("width", [1, 3, 4, 64])
 def test_ttm_multi_prefix_heap_shadow_execution(width):
     """The rank-3 compact tile agrees bitwise with legacy and with Torch."""
 
-    torch.manual_seed(2941 + width)
-    core = torch.randn(3, 4, 5)
-    core[core.abs() < 0.6] = 0.0
-    core[1, 2, :] = 0.0  # an empty stored segment
-    factor = torch.randn(5, 6)
-    assert_scheduled_shadow(
-        build_ttm(),
-        ttm_heap_schedule(f"h-ttm-shadow-{width}", strip=width),
-        (3, 4, 6),
-        (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
-        torch.einsum("abc,cd->abd", core, factor),
+    _run_ttm_multi_prefix_heap_shadow_in_subprocess(
+        width=width,
+        batch=3,
+        rows=4,
+        inner=5,
+        cols=6,
+        dtype_name="float32",
+        seed=2941 + width,
     )
 
 
 def test_ttm_multi_prefix_heap_float64_shadow_execution():
-    torch.manual_seed(2949)
-    core = torch.randn(3, 4, 5, dtype=F64)
-    core[core.abs() < 0.6] = 0.0
-    factor = torch.randn(5, 6, dtype=F64)
-    assert_scheduled_shadow(
-        build_ttm(dtype=F64),
-        ttm_heap_schedule("h-ttm-shadow-f64", strip=4),
-        (3, 4, 6),
-        (ttm_stensor(core, "Core"), dense_stensor(factor, "Factor")),
-        torch.einsum("abc,cd->abd", core, factor),
-        atol=1e-9,
-        rtol=1e-9,
+    _run_ttm_multi_prefix_heap_shadow_in_subprocess(
+        width=4,
+        batch=3,
+        rows=4,
+        inner=5,
+        cols=6,
+        dtype_name="float64",
+        seed=2949,
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch", "rows", "inner", "cols"),
+    [
+        (0, 4, 5, 6),
+        (3, 0, 5, 6),
+        (3, 4, 0, 6),
+        (3, 4, 5, 0),
+    ],
+    ids=("zero-outer-prefix", "zero-inner-prefix", "zero-reduction", "zero-free"),
+)
+def test_ttm_multi_prefix_heap_zero_extent_shadow_execution(batch, rows, inner, cols):
+    """Every rank-3 zero-extent position executes through both native routes."""
+
+    _run_ttm_multi_prefix_heap_shadow_in_subprocess(
+        width=3,
+        batch=batch,
+        rows=rows,
+        inner=inner,
+        cols=cols,
+        dtype_name="float32",
+        seed=2951 + batch + rows + inner + cols,
     )
 
 

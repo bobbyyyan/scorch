@@ -3066,6 +3066,107 @@ def test_multi_prefix_heap_oracle_differential_is_exact():
         assert scheduled_result[lowering.result_symbol] == reference
 
 
+@pytest.mark.parametrize(
+    ("batch", "rows", "inner", "cols"),
+    [
+        (0, 3, 4, 5),
+        (2, 0, 4, 5),
+        (2, 3, 0, 5),
+        (2, 3, 4, 0),
+    ],
+    ids=("zero-outer-prefix", "zero-inner-prefix", "zero-reduction", "zero-free"),
+)
+def test_multi_prefix_heap_oracle_covers_zero_extents(batch, rows, inner, cols):
+    """Every zero-extent position preserves fresh-zero/copy-out semantics."""
+
+    lowering, _ids, _plan, artifact = scheduled_multi_prefix_heap(width=3)
+    core_dense = [
+        [float((parent + red) % 5 - 2) for red in range(inner)]
+        for parent in range(batch * rows)
+    ]
+    factor = [
+        [float((red * 3 + col) % 7 - 3) for col in range(cols)] for red in range(inner)
+    ]
+    bindings = {
+        lowering.input_symbols[0]: dds_storage(
+            core_dense,
+            batch,
+            rows,
+            inner,
+        ),
+        lowering.input_symbols[1]: factor,
+    }
+    shapes = {lowering.result_symbol: (batch, rows, cols)}
+    scheduled_result = run_program(artifact.program, bindings, shapes)
+    erased_result = run_program(erase_schedule(artifact.program), bindings, shapes)
+    assert scheduled_result == erased_result
+    reference = [
+        [
+            [
+                sum(
+                    core_dense[index * rows + row][red] * factor[red][col]
+                    for red in range(inner)
+                )
+                for col in range(cols)
+            ]
+            for row in range(rows)
+        ]
+        for index in range(batch)
+    ]
+    assert scheduled_result[lowering.result_symbol] == reference
+
+
+def test_multi_prefix_heap_keeps_physical_and_logical_orders_distinct():
+    """The pass maps a physical prefix through the result's logical modes."""
+
+    from scorch.compiler.loop_plan import ResultTile
+    from scorch.compiler.loopir.nodes import LevelKind, ResultTileRegion
+    from tests.test_scorch.test_loopir_verifier import forge
+
+    cin, (a, b, c, d) = build_ttm_abcd()
+    lowering = lower(cin)
+    result_decl = next(
+        decl
+        for decl in lowering.program.tensors
+        if decl.symbol == lowering.result_symbol
+    )
+    builder = LoopIRBuilder.resuming(lowering.program)
+    forge(
+        result_decl,
+        levels=(
+            builder.level(LevelKind.DENSE, 1),
+            builder.level(LevelKind.DENSE, 0),
+            builder.level(LevelKind.DENSE, 2),
+        ),
+    )
+    result_tile = ResultTile(
+        result_id=lowering.result_symbol,
+        tile_loop=LoopRef(d.index_id),
+        result_level=2,
+        # A (1, 0, 2) physical mode order stores b then a before d.
+        result_prefix=(b.index_id, a.index_id),
+        # Tensor accesses remain in logical a, b, d order.
+        access_indices=(a.index_id, b.index_id, d.index_id),
+    )
+    plan = LoopPlan(
+        loop_order=(b.index_id, a.index_id, c.index_id, d.index_id),
+        tiles=(affine_tile(d.index_id, 3, accum="heap"),),
+        result_tile=result_tile,
+        parallel_loop=LoopRef(b.index_id),
+        provenance="explicit",
+        tag="heap-physical-prefix",
+    )
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    pack = artifact.program.body.statements[0]
+    region = pack.body.statements[0]
+    assert type(region) is ResultTileRegion
+    physical_b = region.body.statements[0]
+    physical_a = physical_b.body.statements[0]
+    assert type(physical_b) is DenseFor and physical_b.index == b.index_id
+    assert type(physical_a) is DenseFor and physical_a.index == a.index_id
+
+
 def test_multi_prefix_heap_rejects_an_inner_prefix_parallel_anchor():
     """Target lowering realizes the outermost prefix; anything else fails."""
 

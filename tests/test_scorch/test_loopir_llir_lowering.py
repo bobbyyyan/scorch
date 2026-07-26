@@ -2095,6 +2095,15 @@ def test_heap_completion_owns_malformed_write_state(monkeypatch, mutation):
         "unary_operator_subclass",
         "opaque_binary_operator",
         "binary_operator_subclass",
+        "duplicate_tile_width_declaration",
+        "duplicate_result_stack_declaration",
+        "undeclared_variable",
+        "use_before_declaration",
+        "branch_local_variable_escape",
+        "nested_function",
+        "hidden_pre_parallel_declaration",
+        "residual_structured_hoist",
+        "policy_declaration_after_loop",
         "opaque_parallel_policy",
         "unknown_parallel_policy_macro",
         "parallel_schedule_subclass",
@@ -2157,6 +2166,15 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
             "unary_operator_subclass",
             "opaque_binary_operator",
             "binary_operator_subclass",
+            "duplicate_tile_width_declaration",
+            "duplicate_result_stack_declaration",
+            "undeclared_variable",
+            "use_before_declaration",
+            "branch_local_variable_escape",
+            "nested_function",
+            "hidden_pre_parallel_declaration",
+            "residual_structured_hoist",
+            "policy_declaration_after_loop",
             "opaque_parallel_policy",
             "unknown_parallel_policy_macro",
             "parallel_schedule_subclass",
@@ -2324,6 +2342,123 @@ def test_heap_completion_owns_the_write_effect_and_function_state(
                 function.body.insert(
                     final_assembly,
                     llir.VarInit(llir.Var("decoy", llir.DataType.INT), spoofed),
+                )
+            elif mutation == "duplicate_tile_width_declaration":
+                tile_width = next(
+                    stmt
+                    for stmt in function.body
+                    if type(stmt) is llir.VarInit
+                    and type(stmt.var) is llir.Var
+                    and stmt.var.name.startswith("kTile_")
+                )
+                pack_origin = next(
+                    stmt for stmt in function.body if type(stmt) is llir.ForLoop
+                )
+                pack_origin.body.insert(
+                    0,
+                    llir.VarInit(
+                        llir.Var(tile_width.var.name, tile_width.var.type),
+                        llir.Literal(1),
+                    ),
+                )
+            elif mutation == "duplicate_result_stack_declaration":
+                pack_origin = next(
+                    stmt for stmt in function.body if type(stmt) is llir.ForLoop
+                )
+                pack_origin.body.insert(
+                    0,
+                    llir.FixedStackArrayDecl(
+                        name="C_values",
+                        element_type=llir.DataType.FLOAT32,
+                        extent=llir.Literal(1),
+                        initializer=llir.Array((), llir.DataType.FLOAT32),
+                    ),
+                )
+            elif mutation == "undeclared_variable":
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("review_sink", llir.DataType.INT),
+                        llir.Var("review_ghost", llir.DataType.INT),
+                    ),
+                )
+            elif mutation == "use_before_declaration":
+                function.body[final_assembly:final_assembly] = [
+                    llir.VarInit(
+                        llir.Var("review_sink", llir.DataType.INT),
+                        llir.Var("review_later", llir.DataType.INT),
+                    ),
+                    llir.VarInit(
+                        llir.Var("review_later", llir.DataType.INT),
+                        llir.Literal(1),
+                    ),
+                ]
+            elif mutation == "branch_local_variable_escape":
+                function.body[final_assembly:final_assembly] = [
+                    llir.IfThenElse(
+                        cond=llir.Literal(True),
+                        then_body=[
+                            llir.VarInit(
+                                llir.Var("review_branch", llir.DataType.INT),
+                                llir.Literal(1),
+                            )
+                        ],
+                    ),
+                    llir.VarInit(
+                        llir.Var("review_sink", llir.DataType.INT),
+                        llir.Var("review_branch", llir.DataType.INT),
+                    ),
+                ]
+            elif mutation == "nested_function":
+                function.body.insert(
+                    final_assembly,
+                    llir.Function(
+                        llir.DataType.VOID,
+                        "review_nested",
+                        (),
+                        [],
+                    ),
+                )
+            elif mutation == "hidden_pre_parallel_declaration":
+                loop = next(
+                    stmt
+                    for stmt in relayout_llir_nodes(function.body)
+                    if type(stmt) is llir.ForLoop
+                    and not stmt.omp_parallel_for
+                    and not getattr(stmt, "_use_atomic_scheduling", False)
+                )
+                loop.pre_parallel_body = [
+                    llir.VarInit(
+                        llir.Var("review_hidden", llir.DataType.INT),
+                        llir.Literal(1),
+                    )
+                ]
+            elif mutation == "residual_structured_hoist":
+                loop = next(
+                    stmt
+                    for stmt in relayout_llir_nodes(function.body)
+                    if type(stmt) is llir.ForLoop
+                )
+                loop._hoisted_ptr_decls = [
+                    llir.VarInit(
+                        llir.Var("review_hoist", llir.DataType.INT),
+                        llir.Literal(1),
+                    )
+                ]
+            elif mutation == "policy_declaration_after_loop":
+                loop = next(
+                    stmt
+                    for stmt in relayout_llir_nodes(function.body)
+                    if type(stmt) is llir.ForLoop
+                )
+                loop.omp_parallel_for = True
+                loop.omp_num_threads = "scorch_nthreads(review_later_policy, A0_size)"
+                function.body.insert(
+                    final_assembly,
+                    llir.VarInit(
+                        llir.Var("review_later_policy", llir.DataType.INT),
+                        llir.Literal(1),
+                    ),
                 )
             elif mutation == "malformed_conditional_flag":
                 conditional = next(
@@ -2502,7 +2637,7 @@ def test_multi_prefix_heap_target_emits_the_legacy_compact_source():
 
 
 def test_multi_prefix_heap_target_rejects_a_permuted_prefix_chain():
-    """The prefix loops must appear in the result's logical mode order."""
+    """The prefix loops must appear in the result's physical storage order."""
 
     from tests.test_scorch.test_loopir_verifier import forge
 
