@@ -357,7 +357,7 @@ def _compile_normalized_cin_via_loopir(
     # normalized CIN, the verified plan (or the unscheduled marker), the
     # result shape, and the runtime bindings — inside the stages already
     # recorded above; no new stage and no cache participate.
-    from ..loop_plan_identity import loopir_request_dump
+    from .plan_identity import loopir_request_dump
 
     request_dump = loopir_request_dump(
         normalized,

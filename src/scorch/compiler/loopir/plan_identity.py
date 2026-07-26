@@ -49,7 +49,7 @@ import hashlib
 import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .cin import (
+from ..cin import (
     BinaryOp,
     ForAll,
     IndexExpr,
@@ -59,9 +59,9 @@ from .cin import (
     UnaryOp,
     Where,
 )
-from .diagnostics import VerificationError
-from .identity import IndexId, SymbolId
-from .loop_plan import (
+from ..diagnostics import VerificationError
+from ..identity import IndexId, SymbolId
+from ..loop_plan import (
     LoopPlacement,
     LoopPlan,
     LoopRef,
@@ -304,7 +304,7 @@ def loopir_request_dump(
     the requests.
     """
 
-    from .cin_analysis import canonical_cin_dump
+    from ..cin_analysis import canonical_cin_dump
 
     if not isinstance(cin, IndexStmt):
         raise VerificationError("loopir_request_dump expects an IndexStmt")

@@ -18,7 +18,7 @@ from scorch.compiler.cin import (
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.loop_plan import LoopRef, WorkspaceInsertion
-from scorch.compiler.loop_plan_identity import (
+from scorch.compiler.loopir.plan_identity import (
     CANONICAL_PLAN_SCHEMA,
     CANONICAL_REQUEST_SCHEMA,
     canonical_plan_dump,
