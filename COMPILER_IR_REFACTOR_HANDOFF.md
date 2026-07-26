@@ -26726,3 +26726,213 @@ update the Phase-6 review and handoff with exact receipts and honest
 limitations, push nothing, and finish the largest fully verified
 coherent result without overclaiming.
 ```
+
+## Phase-6 automatic routing, canonical identity, and exit audit (2026-07-26, supersedes the §22 routing prompt)
+
+This section and its prompt are chronologically latest.  They supersede
+the earlier broad prompt while preserving §22 and every prior section as
+historical evidence.  The full report is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §23; this is the routing
+summary.
+
+### What happened
+
+1. **The §22 correction commits were independently reviewed and held.**
+   All focused §22 gates reproduced exactly (534-test contract battery,
+   185-test compiled slice, byte-identical 86-case audit re-run), and
+   four fresh adversarial probes beyond the committed locks all failed
+   closed as required (in-place rows-value mutation, equal-copy
+   selection replacement, and both declaration orders of a three-input
+   cross-driver parity case outside the audit matrix).  No fix commit
+   was needed.
+
+2. **Automatic scheduling decisions are now explicit LoopPlan facts.**
+   `c745e6b` adds ``WorkspaceInsertion`` to ``LoopPlan``: the automatic
+   scheduler's standalone workspace insertion is recorded at scheduling
+   time, proved equal to the legality boundary's independent
+   re-derivation (stored-equals-derived, the §22 pattern), and consumed
+   by legacy auto replay instead of re-running
+   ``should_insert_workspace`` against scheduler policy.
+   ``Scheduler.auto_schedule_plan`` originates one verified
+   ``provenance="auto"`` plan at the plan-free F4 production boundary
+   (both regblock arms measured; replay reproduces the plan-free
+   scheduler exactly on every non-root case).  Release dispatch is
+   unchanged.  Two legacy observations are recorded: the dense
+   root-reduction surgery inserts a pure-overhead root workspace that
+   the established replay contract omits (the recorded fact follows the
+   replay contract, keeping both behaviors byte-stable), and the tiled
+   automatic family strip-mines reduction variables — a shape the
+   explicit legacy route itself rejects, so it has no explicit
+   comparand.
+
+3. **The tile-free automatic family is migrated through LoopIR.**
+   `2fd563a`/`76205af`: the strangler gate admits automatic plans with a
+   cost-model order and nothing else; a seven-case parity grid is
+   byte-identical to legacy, the artifact carries the verified auto plan
+   with full stage records and erasure equivalence, and two compiled
+   shadows (auto SpMM, auto dense add) are bitwise-equal to legacy and
+   numerically equal to Torch.  The tiled automatic family fails closed
+   with the stable ``unsupported_schedule_auto_family`` code; foreign
+   provenances keep ``unsupported_schedule_provenance``.
+
+4. **Canonical plan and request identity own the strangler boundary.**
+   `ea2ec02`/`42b817a`/`f218c2e`: ``scorch.loopplan.canonical.v1`` serializes a
+   verified plan from semantic content only through artifact-local
+   canonical numbering (fresh builders serialize byte-identically; every
+   semantic decision changes the bytes; ``tag`` is excluded as
+   presentation-only).  ``plan_schedule_digest`` is the separate
+   provenance-free layer; the request identity
+   (``scorch.loopir.request.v1``, canonical CIN + canonical plan or
+   unscheduled marker + result shape + bindings, SHA-256 over the
+   retained dump) includes provenance — the explicit cross-provenance
+   rule — and is computed and retained on every strangler artifact at
+   the compile/shadow boundary.  No new stage, no artifact cache, and
+   the release source-derived cache is untouched.
+
+5. **The Phase-6 exit audit ran criterion by criterion (§23.5).**
+   Criteria 1 (decisions only on LoopIR), 2 (no name/regex discovery in
+   the typed passes), 3 (canonical identity owns the strangler request
+   boundary), and 5 (tile-j / direct tile-ijk / rank-2 heap / rank-3
+   multi-prefix heap readiness) are met with evidence.  Criterion 4
+   (explicit and automatic differentials) is met for the explicit
+   families and the tile-free automatic family and is **open for the
+   tiled automatic family**, whose typed emission twin (strip-mined
+   reduction loops over the recorded workspace with a reduce-out
+   consumer, plus the ``CHILD_OF`` regblock arm) does not exist yet.
+
+**Phase 6 therefore remains open on exactly that one boundary.**  No
+Phase-7 work was started (no genuine GO), and production dispatch,
+selector parity, cutover, cache behavior, and legacy deletion are
+untouched.
+
+### Final verification
+
+- focused nine-file contract battery at clean detached `f218c2e`:
+  **691 passed**;
+- compiled scheduled/pipeline/generality focus at the same clean
+  detached worktree: **269 passed in 970.97 s** (log SHA-256
+  `250a25c2f3defa81451da32441d61a92b58f89017c58a1ad2560ea750750a4c0`,
+  JUnit SHA-256
+  `8b6ba2b57604f3c774191bd5f91f9c17faee662e2a3604afe1c733e6718b4d06`);
+- fresh 86-case schedule audit at `f218c2e`: **46 admitted and 46
+  byte-identical**, 40 stable fail-closed outcomes; two runs
+  byte-identical and every per-case record equal to the retained
+  `b03c705` results;
+- fresh source gates at `f218c2e`: **95/95** corpus/grid/heap/anchor
+  captures byte-identical to the retained
+  `phase6-parallel-review-b03c705` finals, **10/10** explicit-anchor and
+  **11/11** heap LoopIR/legacy comparisons byte-identical;
+- statics at the clean detached tip: full-source Black at the one
+  inherited `prebuilt_kernels.py` finding, full-source Flake8 at the
+  nine inherited findings, full-source mypy at **146 findings in 12
+  files** over 61 source files with every normalized error line
+  byte-identical to the retained baseline; changed files
+  Black/Flake8-clean, `loopir/plan_identity.py` focused-mypy-clean;
+- paired same-session latency, exact base `ef49d50` versus candidate
+  `f218c2e`, 5 warmups / 30 samples, identical per-case
+  generated-source hashes: `small_dense` **0.982/0.987**, `reduction`
+  **1.001/1.040**, `csr_intersection` **0.997/0.982**, `sparse_union`
+  **0.964/0.941** (p50/p95 candidate/base); worst **1.040**, no 1.10
+  crossing;
+- literal unpartitioned clean detached-worktree non-performance suite at
+  `f218c2e` with isolated caches and asserted import provenance:
+  **4,166 passed, 14 skipped, 3 performance tests
+  deselected, one known sparse-invariant warning, and zero failures**
+  in **2,701.32 s** (wall **45:01**); log SHA-256
+  `c393ea197aff538996462d6a32946da55563c6465ca7129825c94b6ff79927f4`,
+  JUnit SHA-256
+  `26d55eaa6ea31405820e7f94f92032a98005be71fc4239d2f0134719877e4e78`;
+  the literal run crossed the historical late-abort region without a
+  libomp/resource event, so no partition substitute or base control was
+  needed;
+- `git diff --check` clean, live origin still `58e8565`, all five
+  protected tracked files at their recorded hashes, and no unrelated
+  tracked or untracked material staged.
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-exit-f218c2e/` (captures,
+verification incl. the two identical 86-case audit runs, latency, and
+the full-suite ledger).
+
+### Updated copy-paste prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip. Do
+not push, switch branches, amend, squash, or reorder commits.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Phases 6-7 and the
+Phase-6 exit criteria), the Phase-4/5 reviews, all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through the chronologically latest
+§23, and the latest tail of COMPILER_IR_REFACTOR_HANDOFF.md. Section 23
+and this prompt supersede every older routing prompt where they
+conflict.
+
+First independently review, rather than trust, the six commits
+c745e6b, 2fd563a, 76205af, ea2ec02, 42b817a, and f218c2e plus the
+documentation commit above them. Inspect the diffs in full and reproduce the §23
+focused gates. Probe the actual invariants: the stored-equals-derived
+automatic workspace fact and its replay consumption; the root-reduction
+replay contract and its locked surgery divergence; auto_schedule_plan
+parity across both regblock arms; the tile-free automatic gate boundary
+and its parity grid and compiled shadows; fresh-builder canonical-dump
+equality and the per-decision inequality grid; the cross-provenance
+request rule, tag exclusion, and digest-of-retained-dump contract; and
+the unchanged stage-record sequence. Fix and commit any concrete defect
+before new work. Preserve scorch.loopir.canonical.v8,
+scorch.loopplan.canonical.v1, and scorch.loopir.request.v1 unless a
+serialized representation genuinely changes.
+
+Then close the one remaining Phase-6 boundary: the typed emission twin
+for the tiled automatic family. The recorded plan already carries every
+decision (cost-model order, WorkspaceInsertion fact, heuristic direct
+tiles including strip-mined reduction loops and the CHILD_OF regblock
+arm). Implement the typed LoopIR passes that consume it: the workspace
+region materialized from the recorded fact, direct strip-mines over
+reduction variables above the region with the reduce-out consumer, and
+the OUTERMOST/CHILD_OF placements the heuristics emit. Measure the
+legacy auto emission first (the §23.2 observations are the starting
+envelope: the reduce-out consumer C_values[p] += wksp[k_in] appears
+whenever a reduction tile origin sits above the region). Require byte
+parity against the legacy auto route across a format/dtype/order grid,
+verifier and erasure/oracle coverage for the new scheduled shapes,
+adversarial locks on every new boundary, and compiled numerical
+differentials. Widen the unsupported_schedule_auto_family gate only as
+each measured sub-family lands, and keep the root-reduction replay
+contract exactly as locked.
+
+Then re-run the §23.5 exit audit. If criterion 4 closes with evidence,
+declare the Phase-6 GO, and only then start Phase 7 with a read-only
+ownership/dependency audit of parallel and target lowering, followed by
+the largest coherent structured parallel/target-lowering slice that fits
+the remaining verification budget. Do not start production cutover,
+selector parity, legacy deletion, or Phase 8.
+
+Preserve every established contract: frozen tuple ownership; exact
+stored-field/type/enum validation; forged/missing/extra/hostile/cyclic/
+shared/depth adversaries; stable stage-owned diagnostics;
+artifact-local deterministic identities; no C++ spelling in LoopIR; no
+rendered-name/regex/tag discovery; structural activation never waived;
+byte identity wherever legacy is the comparand; independent oracle and
+erasure proofs; explicit and automatic compiled differentials; and no
+ordinary release-JIT double compilation.
+
+Run focused memberships after each coherent commit, then the compiled
+schedule/legacy generality gates, fresh corpus/grid/heap/anchor
+captures, the 86-case audit, paired same-session latency, Black,
+Flake8, focused and full-source mypy baseline comparisons, git diff
+--check, and one literal clean detached-worktree non-performance suite
+with isolated caches and asserted import provenance. Avoid overlapping
+native/JIT lanes on macOS; if the unpartitioned suite hits the known
+libomp resource ceiling, attribute it against the base and run a
+complete non-overlapping partition rather than hiding the failure.
+
+Before editing and before every commit, inspect git status, live
+origin, and the five protected-file hashes. Preserve all unrelated
+dirty and untracked GPU/CUDA, benchmark, packaging, scheduler,
+research, scratchpad, and tooling material. Stage explicit pathspecs
+only, use focused commits with descriptive bodies, retain evidence
+outside Git, update the Phase-6 review and handoff with exact receipts
+and honest limitations, push nothing, and finish the largest fully
+verified coherent result without overclaiming.
+```

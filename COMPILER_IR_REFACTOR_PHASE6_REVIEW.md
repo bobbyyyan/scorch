@@ -3122,3 +3122,262 @@ routing, canonical `LoopPlan` schedule identity, and the
 criterion-by-criterion exit audit are still required.  No automatic route,
 release dispatch, cache, production cutover, or legacy deletion changed in
 this review.
+
+## 23. Automatic routing, canonical identity, and the Phase-6 exit audit (2026-07-26)
+
+This session first independently re-reviewed the §22 correction commits
+(`d7f0970`, `b03c705`, `ef49d50`) without trusting their report, found no
+concrete defect, and then implemented the two remaining Phase-6
+milestones and the criterion-by-criterion exit audit.  Six focused
+commits, nothing pushed, amended, squashed, or reordered:
+
+- `c745e6b` — `feat(compiler): record automatic scheduling decisions in LoopPlan`
+- `2fd563a` — `feat(compiler): admit tile-free automatic plans at the LoopIR gate`
+- `76205af` — `test(compiler): lock automatic routing parity and boundaries`
+- `ea2ec02` — `feat(compiler): own canonical plan and request identity at the strangler boundary`
+- `42b817a` — `test(compiler): lock canonical plan and request identity`
+- `f218c2e` — `fix(compiler): keep the request identity inside the strangler package`
+  (the release-neutrality battery scans production modules outside
+  ``compiler/loopir`` for the strangler package's name; the identity
+  module moved into the package unchanged, which is also the more
+  faithful placement for a strangler-only boundary)
+
+### 23.1 Independent review of the §22 corrections
+
+The inherited three-commit correction range was inspected diff-by-diff
+and its focused gates reproduced exactly: the five-file contract battery
+(**534 passed**), the compiled scheduled-slice file (**185 passed**),
+and the 86-case schedule audit re-run from the retained harness in a
+clean detached worktree at `b03c705` — results JSON byte-identical to
+the retained run (SHA-256
+`d6c075663f9d8df4a1a0ade293a174be99ab346c96f7a91c3674f45d0b60433a`).
+Four fresh adversarial probes beyond the committed locks all held:
+in-place mutation of the selection's ``rows`` DimensionId integer after
+lowering init and wholesale replacement of ``program.parallel`` with a
+structurally equal deep copy both fail closed as
+``parallel_completion_lost`` (the primitive-signature and object-identity
+pins), and a three-input cross-driver case outside the audit matrix
+(``Y[i,m]``/``X[i,k]`` dense with ``A[i,j]`` sparse, both declaration
+orders) reproduced legacy byte parity with the correct
+``scorch_nthreads(-1, X0_size)`` versus
+``scorch_nthreads(A1_pos[A0_size], A0_size)`` policies.  The sole-mark
+census was verified identity-pinned (LLIR ``ForLoop`` has no structural
+equality), the panel prologue offset was verified against the exact
+three-statement panel prepend with result-tile completion ordered before
+relayout completion, and canonical serialization was confirmed at
+``scorch.loopir.canonical.v8`` with the ``row_only`` label confined to
+the human printer.  No fix commit was needed.
+
+### 23.2 Recorded automatic plans (Milestone: automatic routing, part 1)
+
+The Milestone-2 inventory was re-verified against the live tree (F1
+scalar, F2 identity, F3 explicit, F4 plan-free production
+auto-scheduling; only ``"explicit"`` and ``"auto"`` provenances exist).
+`c745e6b` makes the automatic scheduler's standalone workspace insertion
+an explicit plan fact — the exact class of hidden replay state the
+milestone existed to eliminate:
+
+- ``WorkspaceInsertion(reduction_loop, axis_loops, dense)`` is stored on
+  ``LoopPlan.workspace``; the legality boundary re-derives the decision
+  from the analyzed CIN, the plan order, and the recorded tiles and
+  requires the stored fact (including ``None``) to equal that derivation
+  exactly (``auto_workspace_decision``) — the §22 stored-equals-derived
+  pattern applied at the plan boundary.  Explicit plans reject the fact
+  (``workspace_provenance``).
+- the F2 identity path records the fact while scheduling, and
+  ``_replay_auto_plan_owned`` now consumes it — cross-checked against
+  the replayed nest — instead of re-running
+  ``should_insert_workspace`` against scheduler policy at replay time;
+- ``Scheduler.auto_schedule_plan`` originates one verified
+  ``provenance="auto"`` plan at the plan-free F4 boundary, covering both
+  regblock arms (the ``CHILD_OF`` regblock tile family included); its
+  replay reproduces ``auto_schedule``/``_auto_schedule_regblock_arm``
+  output exactly on every measured non-root case.  Release dispatch does
+  not consume it yet.
+
+Two legacy observations were recorded by this work.  First, for a dense
+root-scope reduction the plan-free surgery inserts a pure-overhead root
+workspace whose candidate tiles never materialize (the ``Where`` root
+makes the tiling heuristics bail), while the established
+``ScheduledCIN`` replay contract omits it; the recorded fact follows the
+replay contract (``None``), keeping both existing behaviors
+byte-compatible while making the divergence visible and locked.  Second,
+the tiled automatic family strip-mines reduction variables with a
+reduce-out consumer — a shape the legacy *explicit* route itself rejects
+("Affine reduction tiling requires an accumulator spanning outer
+tiles"), so it exists only through the auto heuristics and has no
+explicit comparand.
+
+### 23.3 Tile-free automatic routing through LoopIR (Milestone: automatic routing, part 2)
+
+`2fd563a` widens the strangler provenance gate to exactly the recorded
+tile-free automatic family: a cost-model loop order with no tiles, no
+workspace fact, and no explicit-only facts, flowing through the same
+verified reorder pass, stage records, and erasure/oracle machinery as
+explicit reorder-only plans.  The tiled automatic family fails closed
+with the stable ``unsupported_schedule_auto_family`` code, and every
+foreign provenance keeps ``unsupported_schedule_provenance``.
+
+`76205af` locks the family: a seven-case auto parity grid (SpMM,
+two-reduction, broadcast row, sparse union add to dense, dense add
+2d/3d, vector add) is byte-identical to legacy; the strangler artifact
+carries the verified auto plan with the full seven-stage record sequence
+and erasure equivalence; and two compiled shadows (automatic SpMM,
+automatic dense add) execute bitwise-equal to legacy and numerically
+equal to Torch.  F1 remains fail-closed at the base-family boundary with
+the stable ``unsupported_statement`` code — the legacy generated-kernel
+route itself dies on loop-free CIN with an unowned ``IndexError``, so F1
+has no measured comparand at this boundary.
+
+### 23.4 Canonical plan and request identity (Milestone complete)
+
+`ea2ec02` defines ``scorch.loopplan.canonical.v1`` — the versioned
+canonical serialization of one verified plan from semantic content only
+(order, tiles and placements, accumulation, unroll, panel bounds,
+relayout, result tile, parallel selection, workspace insertion,
+provenance).  Plan-referenced identities are rewritten through an
+artifact-local canonical numbering derived from the normalized CIN
+(indices by outer-to-inner nest binding order, symbols by first
+appearance in a deterministic assignment walk), so equivalent plans from
+fresh builders serialize byte-identically while process-global
+allocation order, Python ``hash()``, display names, rendered C++,
+mutable scheduler state, and insertion history never enter the bytes.
+``plan.tag`` is a presentation-only annotation and is deliberately
+outside the identity.
+
+``plan_schedule_digest`` is the separate provenance-free layer for
+comparing schedule content across provenances; the request identity
+(``scorch.loopir.request.v1``) includes provenance because provenance
+selects the gate and replay contract — the explicit cross-provenance
+rule.  The strangler compile/shadow request boundary now computes the
+canonical request dump and its SHA-256 content key (canonical normalized
+CIN + canonical plan or the explicit unscheduled marker + result shape +
+runtime bindings) and retains both on the compiled artifact.  No new
+compiler stage is added, no artifact cache consumes the identity, and
+the release source-derived cache is untouched.  Collisions are handled
+by retaining the authoritative dumps beside the content-addressed
+digest.
+
+`42b817a` locks: fresh-builder equality (the probe asserts the two
+builds allocated different global identities), repeated-dump and
+repeated-compilation determinism, inequality for every semantic decision
+(order, width, accumulation, unroll, placement, tile presence, panel
+bound, explicit parallel selection, workspace fact), the
+cross-provenance rule with the digest-layer agreement, the tag
+exclusion, malformed/hostile state, shape/dtype/plan-presence coverage,
+the digest-of-retained-dump contract, and the unchanged stage-record
+sequence.
+
+### 23.5 Phase-6 exit audit
+
+Route trace.  Public explicit scheduling:
+``Schedule`` → ``Scheduler.apply_schedule`` (shared validation,
+surgery discarded) → verified ``LoopPlan`` → normalized CIN →
+verified LoopIR → pure typed passes (``apply_schedule_plan``) →
+oracle/erasure proofs → structured LLIR → C++ → compiled execution,
+with stage records at every boundary.  Migrated automatic routing:
+``Schedule()``/``auto_schedule_plan`` → verified ``provenance="auto"``
+LoopPlan (order, workspace fact, tiles recorded) → the same typed path
+for the tile-free family; the tiled family fails closed at the gate.
+
+Criterion-by-criterion:
+
+1. **Schedule decisions applied only to LoopIR for migrated
+   operations — met.**  Every migrated route consumes one verified plan
+   through pure typed passes on verified LoopIR; the legacy tree surgery
+   is discarded at ``apply_schedule`` and replayed only inside the
+   legacy adapter for the legacy comparand.
+2. **No name/regex/rendered-text discovery in panel/relayout/result-tile
+   passes — met.**  ``schedule_passes.py`` contains no regex, no name
+   matching, and no text traversal (verified by direct audit this
+   session); the only regexes in the target lowering are the §20-audited
+   *rejection* validators (`_CPP_IDENTIFIER`,
+   ``_RESULT_TILE_POLICY_TOKEN``, ``_RESULT_TILE_NUMERIC_LITERAL``),
+   which forbid C++ spellings rather than discover targets.
+3. **Canonical plan identity owns the strangler request boundary —
+   met.**  The canonical request identity (§23.4) is computed and
+   retained at the compile/shadow boundary for every strangler request;
+   there is deliberately no LoopIR or plan artifact cache, and the
+   release source-derived kernel cache stays untouched until the
+   cutover phase, exactly as scoped.
+4. **Explicit and automatic structural/numerical differentials —
+   met for the explicit families and the tile-free automatic family;
+   open for the tiled automatic family.**  Explicit: the retained §21/§22
+   grids, shadows, and captures plus this session's re-runs.  Automatic:
+   the seven-case parity grid and two compiled shadows above.  The tiled
+   automatic family (heuristic strip-mines composed with the recorded
+   workspace insertion, including reduction-loop strip-mining with a
+   reduce-out consumer) has no typed emission twin and fails closed; its
+   decisions are now fully recorded and replayable, but its differential
+   obligation is unmet by construction.
+5. **Representative tile-j, direct tile-ijk, rank-2 heap tile-ijk, and
+   rank-3 multi-prefix heap readiness — met** (§21.5/§22 receipts,
+   reconfirmed by this session's byte-identical capture and audit
+   re-runs).
+
+**Verdict: Phase 6 remains open on exactly one boundary** — the typed
+emission twin for the tiled automatic family (criterion 4's automatic
+residue).  Everything else holds with evidence.  Because there is no
+genuine Phase-6 GO, the Phase-7 stretch was not started; production
+dispatch, selector integration, cutover, and legacy deletion stay out of
+scope.
+
+### 23.6 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-exit-f218c2e/` (captures,
+verification, latency, full-suite ledgers).
+
+- exact nine-file contract focus at clean detached `f218c2e`:
+  **691 passed** (verifier, printer, schedule passes, LLIR lowering,
+  loop plan, plan identity, schedule API, and both neutrality
+  batteries);
+- compiled scheduled/pipeline/generality focus at the same detached
+  worktree: **269 passed** in
+  **970.97 s** across the scheduled slice, pipeline execution, and
+  legacy schedule-generality files (log SHA-256
+  `250a25c2f3defa81451da32441d61a92b58f89017c58a1ad2560ea750750a4c0`,
+  JUnit SHA-256
+  `8b6ba2b57604f3c774191bd5f91f9c17faee662e2a3604afe1c733e6718b4d06`);
+- fresh 86-case schedule audit at `f218c2e`: **46 admitted and 46
+  byte-identical**, 40 stable fail-closed outcomes; two runs
+  byte-identical, and every per-case record equals the retained
+  `b03c705` results (only the embedded commit id differs);
+- fresh captures byte-identical to the retained
+  `phase6-parallel-review-b03c705` finals: 20-source corpus, 42-cell
+  grid, 11 heap goldens, and the 22-cell anchor survey — **95/95**;
+  plus **10/10** explicit-anchor and **11/11** heap LoopIR/legacy
+  source comparisons, all byte-identical;
+- static comparison at the detached tip: full-source Black reproduces
+  only the inherited `prebuilt_kernels.py` finding, full-source Flake8
+  is byte-identical at the nine inherited findings, and full-source
+  mypy is **146 findings in 12 files** over 61 source files with every
+  normalized error line byte-identical to the retained baseline; the
+  changed files are Black/Flake8-clean and ``loopir/plan_identity.py``
+  is focused-mypy-clean;
+- paired same-session compiler latency (5 warmups / 30 samples, clean
+  detached `ef49d50` base versus `f218c2e` candidate):
+  with identical per-case generated-source hashes: `small_dense`
+  **0.982/0.987**, `reduction` **1.001/1.040**, `csr_intersection`
+  **0.997/0.982**, and `sparse_union` **0.964/0.941** (p50/p95
+  candidate/base; worst **1.040**, no 1.10 crossing and no attribution
+  rerun required); base JSON SHA-256
+  `d9b04b28b2080bd09c38c6550db15099a5757e7c63538254a7ffe139200c3566`,
+  candidate JSON SHA-256
+  `8fedb6a435677d8d20fb941904ee168fdb5de60f2cb33b8be15aed7aeff9d308`,
+  comparison-log SHA-256
+  `cd450535f38716102e3f4183053b7df7e35cefed820c1c658872f889dd164327`;
+- literal unpartitioned clean detached-worktree non-performance suite at
+  `f218c2e` with isolated caches and asserted import provenance:
+  **4,166 passed, 14 skipped, 3 performance tests
+  deselected, one known sparse-invariant warning, and zero failures**
+  in **2,701.32 s** (wall **45:01**); log SHA-256
+  `c393ea197aff538996462d6a32946da55563c6465ca7129825c94b6ff79927f4`,
+  JUnit SHA-256
+  `26d55eaa6ea31405820e7f94f92032a98005be71fc4239d2f0134719877e4e78`;
+  the literal run crossed the historical late-abort region without a
+  libomp/resource event, so no partition substitute or base control was
+  needed;
+- `git diff --check` clean; live origin still `58e8565`; all five
+  protected tracked files at their recorded hashes; no unrelated
+  tracked or untracked material staged.
