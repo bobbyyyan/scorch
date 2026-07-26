@@ -83,7 +83,9 @@ from ..parallel_marking_pass import (
     _CPP_KEYWORDS,
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
     apply_parallel_policy,
+    extract_loop_bound,
     find_sparse_pos_array,
+    has_sparse_inner_loop,
     mark_first_for_loop_parallel,
 )
 from ..schedule_lowerer import (
@@ -131,6 +133,8 @@ from .nodes import (
     PanelOuterFor,
     ParallelDiscipline,
     ParallelPart,
+    ParallelSelection,
+    ParallelWork,
     RelayoutDecl,
     RelayoutScope,
     RelayoutStage,
@@ -140,6 +144,7 @@ from .nodes import (
     ScalarType,
     SparseCursorDecl,
     SparseFor,
+    SparseWorkSource,
     SparseWindowFor,
     StagedRead,
     Stmt,
@@ -153,7 +158,7 @@ from .nodes import (
     WorkspaceReduce,
     WorkspaceRegion,
 )
-from .verifier import verify_program
+from .verifier import LoopIRVerificationError, verify_program
 
 _SCALAR_TO_TORCH: Dict[ScalarType, torch.dtype] = {
     ScalarType.FLOAT32: torch.float32,
@@ -296,15 +301,18 @@ class _TargetLowering:
         self._panel_completion: Optional[
             Tuple[llir.ForLoop, llir.ForLoop, llir.ForLoop, llir.ForLoop]
         ] = None
+        self._panel_parallel_snapshot: Optional[llir.ForLoop] = None
         # Abstract parallel-selection state; populated by
         # _validate_parallel_selection when the program carries the fact.
         # Direct and stack routes suppress the emission-time auto gate and
         # mark the selected loop on the assembled function — exactly the
-        # legacy explicit-parallel order — while panel, relayout, and heap
-        # routes keep their completion-owned marking and only prove the
-        # selection agrees with it.
+        # legacy explicit-parallel order.  Panel (including relayout) and heap
+        # completions own the corresponding mark; every route independently
+        # checks the legacy marker state and then realizes the selection's
+        # revalidated work fact.
         self.parallel = program.parallel
         self.parallel_position = -1
+        self._parallel_signature: Optional[Tuple[object, ...]] = None
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -1165,9 +1173,11 @@ class _TargetLowering:
         one reduction loop (or the panel window pair), and the pack point
         loop, with the compute leaf accumulating through exactly one
         TiledReduce of the region.  A multi-prefix result contributes one
-        dense loop per prefix axis at a derived chain position; the sparse
-        panel composition stays at its audited single-prefix shape.  The
-        leaf was recorded as a synthetic direct StoreReduce view by the
+        dense loop per prefix axis at a derived chain position; a sparse
+        panel may window the reduction below that derived prefix.  The
+        relayout composition remains its separately audited
+        single-prefix/rank-2 operand-staging subfamily.  The leaf was
+        recorded as a synthetic direct StoreReduce view by the
         nest walk; the compact redirection happens in
         :meth:`complete_result_tile` on the assembled function, exactly
         where the legacy schedule lowering performs it.
@@ -1283,10 +1293,11 @@ class _TargetLowering:
         exactly one chain loop, restate that loop's trip-count dimension,
         and agree with the route that owns the marking: the heap
         completion adopts the selected prefix loop as its parallel row,
-        the panel and relayout completions require the selection to name
-        the row they already mark, and the direct/stack routes mark the
-        selected loop on the assembled function through
-        :meth:`complete_parallel`.
+        the panel (including relayout) and heap completions require the
+        selection to name the row they mark, and the direct/stack routes
+        mark the selected loop on the assembled function through
+        :meth:`complete_parallel`.  Completion revalidates the immutable
+        fact before realizing its exact work policy.
         """
 
         selection = self.parallel
@@ -1370,6 +1381,185 @@ class _TargetLowering:
                 "a direct-accumulation program partitions its dense result; "
                 "the compact discipline does not apply",
             )
+        self._parallel_signature = self._parallel_selection_signature(selection)
+
+    @staticmethod
+    def _parallel_selection_signature(selection: object) -> Tuple[object, ...]:
+        """Snapshot the exact primitive state target realization depends on."""
+
+        if type(selection) is not ParallelSelection:
+            raise TypeError("parallel selection must remain exact")
+        work = selection.work
+        if type(work) is not ParallelWork:
+            raise TypeError("parallel work must remain exact")
+
+        def identity_value(value: object, expected: type, owner: str) -> int:
+            if type(value) is not expected:
+                raise TypeError(f"{owner} must remain an exact {expected.__name__}")
+            stored = object.__getattribute__(value, "__dict__")
+            if (
+                type(stored) is not dict
+                or tuple(stored) != ("value",)
+                or type(stored["value"]) is not int
+            ):
+                raise TypeError(f"{owner} must retain one exact integer value")
+            return stored["value"]
+
+        source = work.nnz
+        source_signature: Optional[Tuple[int, int, int]]
+        if source is None:
+            source_signature = None
+        else:
+            if type(source) is not SparseWorkSource:
+                raise TypeError("parallel sparse work source must remain exact")
+            source_signature = (
+                identity_value(
+                    source.node_id,
+                    LoopIRNodeId,
+                    "SparseWorkSource.node_id",
+                ),
+                identity_value(source.tensor, SymbolId, "SparseWorkSource.tensor"),
+                source.level,
+            )
+            if type(source.level) is not int:
+                raise TypeError("SparseWorkSource.level must remain an exact int")
+        return (
+            identity_value(
+                selection.node_id,
+                LoopIRNodeId,
+                "ParallelSelection.node_id",
+            ),
+            identity_value(selection.index, IndexId, "ParallelSelection.index"),
+            selection.part,
+            selection.discipline,
+            identity_value(work.node_id, LoopIRNodeId, "ParallelWork.node_id"),
+            identity_value(work.rows, DimensionId, "ParallelWork.rows"),
+            source_signature,
+            selection.intent,
+        )
+
+    def _parallel_work_policy_spec(
+        self,
+        error_code: str,
+    ) -> Optional[str]:
+        """Revalidate and resolve the selected work fact to owned C++ names."""
+
+        try:
+            verify_program(self.program)
+            if self.program.parallel is not self.parallel:
+                raise TypeError("the program's parallel selection was replaced")
+            signature = self._parallel_selection_signature(self.parallel)
+            if signature != self._parallel_signature:
+                raise TypeError(
+                    "the program's parallel selection changed after lowering"
+                )
+            assert self.parallel is not None
+            source = self.parallel.work.nnz
+            if source is None:
+                return None
+            decl = self.decls.get(source.tensor)
+            if (
+                decl is None
+                or source.level < 1
+                or source.level >= len(decl.levels)
+                or decl.levels[source.level].kind is not LevelKind.COMPRESSED
+                or decl.levels[source.level - 1].kind is not LevelKind.DENSE
+            ):
+                raise TypeError(
+                    "the parallel sparse work source is not a dense-parented "
+                    "compressed level"
+                )
+            return f"{decl.name}{source.level}_pos"
+        except (
+            AssertionError,
+            AttributeError,
+            KeyError,
+            LoopIRVerificationError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(error_code, str(error))
+
+    def _apply_selected_parallel_policy(
+        self,
+        loop: llir.ForLoop,
+        policy_spec: Optional[str],
+        error_code: str,
+        *,
+        invoke_marker: bool = True,
+    ) -> None:
+        """Apply one exact selected policy, honoring row-only work explicitly."""
+
+        try:
+            if policy_spec is not None:
+                actual_position_array = find_sparse_pos_array(loop.body)
+                if actual_position_array != policy_spec:
+                    raise ValueError(
+                        "the selected loop's structural work source disagrees "
+                        "with the canonical parallel work fact"
+                    )
+                loop_bound = extract_loop_bound(loop)
+                if loop_bound is None:
+                    raise ValueError(
+                        "the selected loop no longer has a canonical target bound"
+                    )
+            if invoke_marker:
+                mark_first_for_loop_parallel(
+                    [loop],
+                    EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+                )
+            else:
+                # Construct the independent expected snapshot without
+                # trusting the marker whose output it checks.
+                loop.omp_parallel_for = True
+                if has_sparse_inner_loop(loop.body):
+                    loop.omp_schedule = "dynamic, 64"
+            if policy_spec is None:
+                # ``None`` is the canonical row-only estimate, including the
+                # established merged-nest behavior.  Override any discovery
+                # the target's more explicit LLIR happens to expose.
+                apply_parallel_policy(loop, body=())
+            else:
+                apply_parallel_policy(
+                    loop,
+                    work_expr=f"{policy_spec}[{loop_bound}]",
+                )
+        except (
+            AttributeError,
+            LLIRTraversalError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(error_code, str(error))
+
+    @staticmethod
+    def _apply_expected_parallel_marker(loop: llir.ForLoop) -> None:
+        """Construct the EMPTY-cluster marker's expected state independently."""
+
+        loop.omp_parallel_for = True
+        if has_sparse_inner_loop(loop.body):
+            loop.omp_schedule = "dynamic, 64"
+        apply_parallel_policy(loop)
+
+    def _require_retained_panel_parallel_policy(self, error_code: str) -> None:
+        """Revalidate the policy handed from panel to a later completion."""
+
+        state = self._panel_completion
+        expected = self._panel_parallel_snapshot
+        if (
+            state is None
+            or expected is None
+            or not self._panel_loop_header_matches(state[2], expected)
+        ):
+            _fail(
+                error_code,
+                "the panel-owned row policy changed before the next "
+                "completion boundary",
+            )
+        if self.parallel is not None:
+            self._parallel_work_policy_spec(error_code)
 
     def _reserve_panel_names(self) -> None:
         """Reserve the derived loop, bound, and search names panels generate."""
@@ -3483,16 +3673,48 @@ class _TargetLowering:
                 "panel_completion_lost",
                 "the panel row-loop policy snapshot did not remain a ForLoop",
             )
-        expected_marked.omp_parallel_for = True
-        expected_marked.omp_schedule = "dynamic, 64"
-        apply_parallel_policy(expected_marked)
-        mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+        if self.parallel is None:
+            expected_marked.omp_parallel_for = True
+            expected_marked.omp_schedule = "dynamic, 64"
+            apply_parallel_policy(expected_marked)
+            mark_first_for_loop_parallel(
+                [row_loop],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+        else:
+            policy_spec = self._parallel_work_policy_spec(
+                "panel_completion_lost",
+            )
+            self._apply_expected_parallel_marker(expected_marked)
+            mark_first_for_loop_parallel(
+                [row_loop],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+            if not self._panel_loop_header_matches(row_loop, expected_marked):
+                _fail(
+                    "panel_completion_lost",
+                    "the panel's selected row loop did not acquire the "
+                    "unmodified legacy parallel marker state",
+                )
+            self._apply_selected_parallel_policy(
+                expected_marked,
+                policy_spec,
+                "panel_completion_lost",
+                invoke_marker=False,
+            )
+            self._apply_selected_parallel_policy(
+                row_loop,
+                policy_spec,
+                "panel_completion_lost",
+                invoke_marker=False,
+            )
         if not self._panel_loop_header_matches(row_loop, expected_marked):
             _fail(
                 "panel_completion_lost",
                 "the panel's selected row loop did not acquire the required "
                 "sparse parallel policy",
             )
+        self._panel_parallel_snapshot = expected_marked
 
         # 2. Window the compressed loop: capture the row end, derive the
         # search-based panel begin/end, and start the loop at the window.
@@ -3640,15 +3862,14 @@ class _TargetLowering:
 
         Runs first among the completions — exactly where the legacy route
         applies ``CINLowerer._apply_explicit_parallel_schedule`` before its
-        schedule lowering — and only for the direct and stack routes: the
-        panel, relayout, and heap completions own their marking, and
-        :meth:`_validate_parallel_selection` already proved the selection
-        agrees with them.  The selected loop is re-identified against the
-        detached pre-pass headers, its structural policy source is
-        cross-checked against the selection's declared work estimate, and
-        the shared legacy marker is applied under a detached
-        snapshot-comparison; any disagreement is the stage-owned
-        ``parallel_completion_lost``.
+        schedule lowering — for direct and stack routes.  Panel (including
+        relayout) and heap completions own their corresponding marking after
+        assembly.  The complete selected-loop ancestor chain is
+        re-identified against detached pre-pass headers, the program and
+        primitive selection snapshot are revalidated, and the shared legacy
+        marker is checked independently before the exact owned work policy is
+        realized.  Exactly one final marking may survive; any disagreement is
+        the stage-owned ``parallel_completion_lost``.
         """
 
         if (
@@ -3657,65 +3878,53 @@ class _TargetLowering:
             or self.result_tile is not None
         ):
             return function
-        snapshot = self._emitted_loop_headers.get(self.parallel_position)
-        if snapshot is None:
-            _fail(
-                _PARALLEL_LOST,
-                "the selected loop's emitted header was never recorded",
-            )
+        policy_spec = self._parallel_work_policy_spec(_PARALLEL_LOST)
         try:
             found = self._for_loops_with_owners(function.body)
         except LoopIRTargetError as error:
             _fail(_PARALLEL_LOST, error.defect.message)
-        # The stack route's workspace region emits loops outside the direct
-        # chain, so the selection is re-identified alone: exactly one
-        # emitted loop may match the detached pre-pass header (chain loop
-        # variables are validated unique, and the selectable parts exclude
-        # the ragged point twins).
-        matches = [
-            loop
+        if any(
+            loop.omp_parallel_for or getattr(loop, "_use_atomic_scheduling", False)
             for loop, _owner in found
-            if self._panel_loop_header_matches(loop, snapshot)
-        ]
-        if len(matches) != 1:
-            _fail(
-                _PARALLEL_LOST,
-                "the assembled function does not carry exactly the selected "
-                "loop's detached pre-pass header",
-            )
-        selected = matches[0]
-        expected_nnz = self.parallel.work.nnz
-        try:
-            actual_pos = find_sparse_pos_array(selected.body)
-        except (
-            LLIRTraversalError,
-            AttributeError,
-            RecursionError,
-            TypeError,
-            ValueError,
-        ) as error:
-            _fail(_PARALLEL_LOST, str(error))
-        if expected_nnz is None:
-            expected_pos = None
-        else:
-            source_decl = self.decls[expected_nnz.tensor]
-            expected_pos = f"{source_decl.name}{expected_nnz.level}_pos"
-        if actual_pos != expected_pos:
-            _fail(
-                _PARALLEL_LOST,
-                "the selected loop's structural work source disagrees with "
-                "the selection's declared estimate",
-            )
-        if selected.omp_parallel_for or getattr(
-            selected, "_use_atomic_scheduling", False
         ):
-            # The legacy explicit route never re-marks an already parallel
-            # loop; with the auto gate suppressed this cannot happen, so a
-            # marked loop here means the assembled function was mutated.
             _fail(
                 _PARALLEL_LOST,
-                "the selected loop acquired a parallel marking before the "
-                "selection completion ran",
+                "an assembled loop acquired a parallel marking before the "
+                "explicit selection completion ran",
+            )
+
+        # Re-identify the complete ancestor prefix, not merely a matching
+        # header anywhere in the function.  Direct chains own every prefix
+        # loop; stack chains branch only below the selected race-free prefix.
+        # Each header must be unique and each loop must be owned by its
+        # immediate predecessor, so relocating the selected loop cannot
+        # preserve a superficially matching header.
+        prior: Optional[llir.ForLoop] = None
+        selected: Optional[llir.ForLoop] = None
+        for position in range(self.parallel_position + 1):
+            snapshot = self._emitted_loop_headers.get(position)
+            if snapshot is None:
+                _fail(
+                    _PARALLEL_LOST,
+                    "a selected-loop ancestor header was never recorded",
+                )
+            matches = [
+                (loop, owner)
+                for loop, owner in found
+                if self._panel_loop_header_matches(loop, snapshot)
+            ]
+            if len(matches) != 1 or matches[0][1] is not prior:
+                _fail(
+                    _PARALLEL_LOST,
+                    "the assembled function does not retain the selected "
+                    "loop's exact detached ancestor chain",
+                )
+            selected = matches[0][0]
+            prior = selected
+        if selected is None:
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop could not be re-identified",
             )
         try:
             expected_marked = LLIRRewriter(
@@ -3729,11 +3938,29 @@ class _TargetLowering:
                     _PARALLEL_LOST,
                     "the selection policy snapshot did not remain a ForLoop",
                 )
+            self._apply_expected_parallel_marker(expected_marked)
             mark_first_for_loop_parallel(
-                [expected_marked],
+                [selected],
                 EMPTY_PARALLEL_WORKSPACE_CLUSTER,
             )
-            mark_first_for_loop_parallel([selected], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+            if not self._panel_loop_header_matches(selected, expected_marked):
+                _fail(
+                    _PARALLEL_LOST,
+                    "the selected loop did not acquire the unmodified "
+                    "legacy parallel marker state",
+                )
+            self._apply_selected_parallel_policy(
+                expected_marked,
+                policy_spec,
+                _PARALLEL_LOST,
+                invoke_marker=False,
+            )
+            self._apply_selected_parallel_policy(
+                selected,
+                policy_spec,
+                _PARALLEL_LOST,
+                invoke_marker=False,
+            )
         except (
             LLIRTraversalError,
             AttributeError,
@@ -3746,6 +3973,17 @@ class _TargetLowering:
             _fail(
                 _PARALLEL_LOST,
                 "the selected loop did not acquire the required parallel " "policy",
+            )
+        marked = [
+            loop
+            for loop, _owner in found
+            if loop.omp_parallel_for or getattr(loop, "_use_atomic_scheduling", False)
+        ]
+        if marked != [selected]:
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop must own the assembled function's only "
+                "parallel marking",
             )
         return function
 
@@ -3886,36 +4124,48 @@ def _dense_zero_candidates(function: llir.Function) -> List[llir.FunctionCallStm
 def _require_canonical_result_shape_validation(
     lowering: "_TargetLowering", function: llir.Function
 ) -> None:
-    """Pin the ABI result-shape validation to its one canonical occurrence.
+    """Pin the complete ABI validation block to its canonical prologue.
 
-    The binding validator's protected-argument allowlist admits the ABI's
-    result-shape validation by name; a forged or duplicated validation over
-    the protected ``result_shape`` argument would otherwise ride that
-    allowlist into non-compiling or behavior-changing C++ (the
-    ``scorch_zero_dense`` precedent).
+    Heap completion must not merely census the result-shape call by name:
+    moving the exact call after allocation or compute would let invalid
+    runtime shape state drive writes before validation.  Function assembly
+    owns the complete validation block at offset zero; panel completion is
+    the sole predecessor that prepends statements, and owns exactly its
+    comment/width/blank prefix at offset three.  The whole freshly
+    reconstructed block is compared structurally before any heap mutation.
     """
 
-    expected_validation = lowering.kernel_abi().emit_validation()[0]
+    expected_validations = lowering.kernel_abi().emit_validation()
+    offset = 3 if lowering.panel is not None else 0
+    if (
+        type(function.body) is not list
+        or len(function.body) < offset + len(expected_validations)
+        or any(
+            not lowering._exact_panel_state_matches(actual, expected)
+            for actual, expected in zip(
+                function.body[offset : offset + len(expected_validations)],
+                expected_validations,
+            )
+        )
+    ):
+        _fail(
+            _RESULT_TILE_LOST,
+            "heap accumulation requires the complete canonical ABI "
+            "validation block before allocation and compute",
+        )
     validation_candidates = _named_call_candidates(
         function,
         "scorch_native::validate_jit_result_shape",
     )
-    if len(validation_candidates) != 1 or not lowering._exact_panel_state_matches(
-        validation_candidates[0], expected_validation
+    if (
+        not expected_validations
+        or len(validation_candidates) != 1
+        or validation_candidates[0] is not function.body[offset]
     ):
         _fail(
             _RESULT_TILE_LOST,
             "heap accumulation requires exactly one canonical ABI "
             "result-shape validation",
-        )
-    located_validation = lowering._locate_statement(
-        function.body,
-        validation_candidates[0],
-    )
-    if located_validation is None or located_validation[0] is not function.body:
-        _fail(
-            _RESULT_TILE_LOST,
-            "the canonical ABI result-shape validation moved out of function scope",
         )
 
 
@@ -4110,6 +4360,35 @@ def _result_tile_protected_uses(
     else:
         collector.walk(cast(Any, value))
     return collector.names
+
+
+def _protected_torch_empty_candidates(
+    function: llir.Function,
+    protected_names: Set[str],
+) -> List[llir.FunctionCall]:
+    """Collect every ``torch::empty`` expression fed protected result state."""
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_result_tile_torch_allocations",
+                )
+            )
+            self.matches: List[llir.FunctionCall] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if (
+                type(node) is llir.FunctionCall
+                and node.name == "torch::empty"
+                and _result_tile_protected_uses(node.args, protected_names)
+            ):
+                self.matches.append(cast(llir.FunctionCall, node))
+
+    collector = _Collector()
+    collector.walk(function)
+    return collector.matches
 
 
 class _ResultTileTextValidator(LLIRWalker):
@@ -4982,6 +5261,98 @@ def _count_direct_prefetches(statements: List[llir.Stmt], array_name: str) -> in
     return collector.count
 
 
+def _complete_result_tile_chain(
+    lowering: "_TargetLowering",
+    function: llir.Function,
+) -> llir.ForLoop:
+    """Re-identify the heap chain and own its completion-time row policy."""
+
+    if lowering.panel is not None:
+        state = lowering._panel_completion
+        if state is None:
+            _fail(
+                _RESULT_TILE_LOST,
+                "the panel completion did not retain the heap chain's loops",
+            )
+        # Panel completion already realized the policy on the shared row,
+        # but heap completion is a distinct mutation boundary and must not
+        # trust either the header or the owned selection in between.
+        lowering._require_retained_panel_parallel_policy(_RESULT_TILE_LOST)
+        return state[0]
+    try:
+        completed = lowering._completed_panel_chain(function)
+    except LoopIRTargetError as error:
+        _fail(_RESULT_TILE_LOST, error.defect.message)
+    tile_loop = completed[0]
+    row_loop = completed[lowering.result_tile_row_position]
+    try:
+        expected_marked = LLIRRewriter(
+            LLIRTraversalContext(
+                stage="LoopIR target lowering",
+                pass_name="snapshot_result_tile_parallel_policy",
+            )
+        ).rewrite(row_loop)
+        if type(expected_marked) is not llir.ForLoop:
+            _fail(
+                _RESULT_TILE_LOST,
+                "the heap row-loop policy snapshot did not remain a ForLoop",
+            )
+        if lowering.parallel is None:
+            mark_first_for_loop_parallel(
+                [expected_marked],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+            mark_first_for_loop_parallel(
+                [row_loop],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+        else:
+            policy_spec = lowering._parallel_work_policy_spec(
+                _RESULT_TILE_LOST,
+            )
+            lowering._apply_expected_parallel_marker(expected_marked)
+            mark_first_for_loop_parallel(
+                [row_loop],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+            if not lowering._panel_loop_header_matches(
+                row_loop,
+                expected_marked,
+            ):
+                _fail(
+                    _RESULT_TILE_LOST,
+                    "the heap row loop did not acquire the unmodified "
+                    "legacy parallel marker state",
+                )
+            lowering._apply_selected_parallel_policy(
+                expected_marked,
+                policy_spec,
+                _RESULT_TILE_LOST,
+                invoke_marker=False,
+            )
+            lowering._apply_selected_parallel_policy(
+                row_loop,
+                policy_spec,
+                _RESULT_TILE_LOST,
+                invoke_marker=False,
+            )
+    except (
+        LLIRTraversalError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_RESULT_TILE_LOST, str(error))
+    if not lowering._panel_loop_header_matches(row_loop, expected_marked):
+        _fail(
+            _RESULT_TILE_LOST,
+            "the heap chain's selected row loop did not acquire the "
+            "required parallel policy",
+        )
+    return tile_loop
+
+
 def _complete_result_tile_impl(
     lowering: "_TargetLowering", function: llir.Function
 ) -> llir.Function:
@@ -5046,58 +5417,14 @@ def _complete_result_tile_impl(
         ValueError,
     ) as error:
         _fail(_RESULT_TILE_LOST, str(error))
+    _require_canonical_result_shape_validation(lowering, function)
 
     # 1. Re-identify the chain.  A panel chain hands over the loops its
     # completion already re-identified (retained object identity); the bare
     # heap chain re-identifies its direct loops against the detached
     # pre-pass headers and marks the parallel row exactly as the legacy
     # explicit-parallel schedule does before its heap transformation.
-    if lowering.panel is not None:
-        state = lowering._panel_completion
-        if state is None:
-            _fail(
-                _RESULT_TILE_LOST,
-                "the panel completion did not retain the heap chain's loops",
-            )
-        tile_loop = state[0]
-    else:
-        try:
-            completed = lowering._completed_panel_chain(function)
-        except LoopIRTargetError as error:
-            _fail(_RESULT_TILE_LOST, error.defect.message)
-        tile_loop = completed[0]
-        row_loop = completed[lowering.result_tile_row_position]
-        try:
-            expected_marked = LLIRRewriter(
-                LLIRTraversalContext(
-                    stage="LoopIR target lowering",
-                    pass_name="snapshot_result_tile_parallel_policy",
-                )
-            ).rewrite(row_loop)
-            if type(expected_marked) is not llir.ForLoop:
-                _fail(
-                    _RESULT_TILE_LOST,
-                    "the heap row-loop policy snapshot did not remain a " "ForLoop",
-                )
-            mark_first_for_loop_parallel(
-                [expected_marked],
-                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
-            )
-            mark_first_for_loop_parallel([row_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
-        except (
-            LLIRTraversalError,
-            AttributeError,
-            RecursionError,
-            TypeError,
-            ValueError,
-        ) as error:
-            _fail(_RESULT_TILE_LOST, str(error))
-        if not lowering._panel_loop_header_matches(row_loop, expected_marked):
-            _fail(
-                _RESULT_TILE_LOST,
-                "the heap chain's selected row loop did not acquire the "
-                "required parallel policy",
-            )
+    tile_loop = _complete_result_tile_chain(lowering, function)
 
     # 2. The target's own spellings for the compact family.
     result_name = lowering.result_decl.name
@@ -5328,6 +5655,21 @@ def _complete_result_tile_impl(
                 "heap accumulation requires exactly one canonical generated "
                 "dense-result Torch allocation",
             )
+        canonical_allocation = result_tensor_inits[0].value
+        protected_allocations = _protected_torch_empty_candidates(
+            function,
+            protected_names,
+        )
+        if (
+            type(canonical_allocation) is not llir.FunctionCall
+            or len(protected_allocations) != 1
+            or protected_allocations[0] is not canonical_allocation
+        ):
+            _fail(
+                _RESULT_TILE_LOST,
+                "protected result shape state may reach only the one "
+                "canonical dense-result Torch allocation",
+            )
         result_pointer_inits = [
             stmt
             for stmt in function.body
@@ -5373,7 +5715,6 @@ def _complete_result_tile_impl(
                 "an unowned use of the dense result's Torch storage "
                 "survived heap completion",
             )
-        _require_canonical_result_shape_validation(lowering, function)
         zero_candidates = _dense_zero_candidates(function)
         if len(zero_candidates) != 1 or not lowering._exact_panel_state_matches(
             zero_candidates[0], expected_zero
@@ -5513,6 +5854,7 @@ def _complete_relayout_impl(
             "the relayout's emitted statements were never recorded",
         )
     pack_loop, panel_loop, row_loop, window_loop = state
+    lowering._require_retained_panel_parallel_policy(_RELAYOUT_LOST)
     operand_decl = lowering.decls[decl.operand]
     operand_name = operand_decl.name
     panel_dim_name = lowering.dimension_names[lowering.panel.dimension]

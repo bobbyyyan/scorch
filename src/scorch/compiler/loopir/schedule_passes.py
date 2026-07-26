@@ -116,7 +116,7 @@ from typing import (
 )
 
 from ..diagnostics import VerificationError
-from ..identity import IndexId, SymbolId
+from ..identity import IndexId
 from ..loop_plan import (
     MAX_AFFINE_TILE_WIDTH,
     LoopPart,
@@ -170,7 +170,7 @@ from .nodes import (
     WorkspaceReduce,
     WorkspaceRegion,
 )
-from .verifier import verify_program
+from .verifier import _canonical_parallel_work_source, verify_program
 
 _LoopNode = Union[
     DenseFor,
@@ -1550,6 +1550,7 @@ def apply_relayout(program: LoopProgram, relayout: OperandRelayout) -> LoopProgr
         program.inputs,
         program.outputs,
         body,
+        program.parallel,
     )
     if _collect_operand_loads(rebuilt.body, relayout.operand_id):
         _fail(
@@ -1614,12 +1615,13 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
     identities only, for the migrated rank>=2 trailing-axis shape.  The
     scheduled chain must be one of the admitted forms — the outermost
     affine pack origin over the result's dense prefix loops, one reduction
-    loop, and the pack point loop (heap alone), or the packed tile-ijk
-    five-loop chain on a single-prefix result with an optional relayout
-    stage already applied (the pass runs after :func:`apply_relayout`) —
-    with a direct dense-result reduction leaf.  A multi-prefix result
-    contributes one dense loop per prefix axis at a derived chain position;
-    no spelling of any particular kernel is special-cased.
+    loop, and the pack point loop (heap alone), or that rank-derived prefix
+    chain composed with one sparse panel.  The audited relayout composition
+    remains the packed tile-ijk five-loop/single-prefix subfamily and is
+    already staged when this pass runs.  Every form has a direct
+    dense-result reduction leaf.  A multi-prefix result contributes one
+    dense loop per prefix axis at a derived chain position; no spelling of
+    any particular kernel is special-cased.
 
     Every result-tile fact is consumed exactly once: ``tile_loop``
     selects the pack schedule pair, ``access_indices`` select the
@@ -1641,9 +1643,16 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
     widens).
     """
 
-    verify_program(program)
     if type(result_tile) is not ResultTile:
         raise TypeError("apply_result_tile expects a ResultTile")
+    verify_program(program)
+    if program.parallel is not None:
+        _fail(
+            "invalid_schedule_result_tile",
+            "parallel selection must run after result-tile construction; "
+            "introducing compact storage cannot silently discard or "
+            "reinterpret an existing result-partition discipline",
+        )
     try:
         _validate_loop_plan_structure(LoopPlan(loop_order=(), result_tile=result_tile))
     except (VerificationError, AttributeError, TypeError, ValueError) as error:
@@ -1693,7 +1702,7 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
             "heap accumulation requires the audited chain: the pack origin "
             "over the dense result-prefix loops, one reduction loop, and the "
             "pack point loop, optionally windowed by one sparse panel on the "
-            "single-prefix result",
+            "reduction axis",
         )
     if len(relayout_stages) > 1 or (relayout_stages and not heap_panel):
         _fail(
@@ -1915,6 +1924,12 @@ def select_parallel_loop(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
     checked = _validate_plan_for_pass(plan)
     fact = checked.parallel_loop
     if fact is None:
+        if program.parallel is not None:
+            _fail(
+                "invalid_schedule_parallel",
+                "a program already carrying a parallel selection cannot be "
+                "paired with a plan that has no parallel-loop fact",
+            )
         return program
     if program.parallel is not None:
         _fail(
@@ -1970,17 +1985,9 @@ def select_parallel_loop(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
             "explicit parallel selection is migrated for dense logical "
             "loops and affine origin loops only",
         )
-    rows = cast(DenseFor, target).dimension
-    nnz_source: Optional[Tuple[SymbolId, int]] = None
-    for node in _ordered_schema_nodes(target):
-        if type(node) in (SparseFor, SparseWindowFor):
-            cursor = cast(SparseFor, node).cursor
-            nnz_source = (cursor.tensor, cursor.level)
-            break
-        if type(node) is MergedSparseFor:
-            cursor = node.cursors[0]
-            nnz_source = (cursor.tensor, cursor.level)
-            break
+    typed_target = cast(Stmt, target)
+    rows = cast(DenseFor, typed_target).dimension
+    nnz_source = _canonical_parallel_work_source(program, typed_target, index)
     discipline = (
         ParallelDiscipline.COMPACT_PARTITION
         if checked.result_tile is not None
@@ -2020,11 +2027,10 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
     The heap family admits exactly the audited legacy shape: one serial
     outermost heap-accumulation affine tile targeting the plan's innermost
     logical loop, paired one-to-one with the plan's ``result_tile`` fact
-    compacting a rank-2 dense result on its trailing storage level, at most
-    one composed sparse panel tile, and the mandatory parallel dense
-    result-prefix loop (the race-legality proof: any prefix loop partitions
-    compact rows, and with one prefix level the selection has no degrees of
-    freedom).
+    compacting a rank>=2 dense result on its trailing storage level, at most
+    one composed sparse panel tile, and one mandatory parallel dense
+    result-prefix loop.  Any prefix loop partitions compact cells; the
+    panel composition further fixes the selection to its dense-parent row.
     """
 
     heap_tiles = [
@@ -2133,10 +2139,10 @@ def _check_plan_families(plan: LoopPlan) -> None:
     The sparse-panel family admits exactly the legacy plan shape: at most
     one panel tile, listed after every affine tile, with direct serial
     accumulation, exactly one corresponding ``PanelBound``, and the
-    mandatory parallel row loop.  ``parallel_loop`` remains an unmigrated
-    family on every plan without a panel tile or heap result tile — the
-    panel and heap forms are the shapes whose row selection has no degrees
-    of freedom.
+    mandatory parallel row loop.  Outside panel and heap plans, an explicit
+    ``parallel_loop`` is admitted only when the final typed selection pass
+    can prove a supported dense logical or affine-origin anchor and its race
+    and work contracts.
     """
 
     if plan.provenance != "explicit":
@@ -2438,10 +2444,11 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
     chain exactly as the legacy lowering sequences it.  Each plan fact is
     consumed exactly once: the order by the reorder pass, each tile by its
     pass, the ``PanelBound`` by materialization into the panel node, the
-    panel-mandated ``parallel_loop`` by exact validation against the
-    window's dense-parent row loop (the fact has no other legal value),
-    and the relayout fact — last, on the fully scheduled chain, exactly
-    where the legacy lowering completes it — by :func:`apply_relayout`.
+    relayout fact on the fully scheduled chain by :func:`apply_relayout`,
+    the result-tile fact by :func:`apply_result_tile`, and finally the
+    explicit ``parallel_loop`` by :func:`select_parallel_loop`.  The latter
+    validates panel/heap anchor restrictions and materializes one verified
+    program-level selection after every structural transform.
     """
 
     checked = _validate_plan_for_pass(plan)

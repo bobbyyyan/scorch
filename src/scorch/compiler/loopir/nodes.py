@@ -23,11 +23,14 @@ current window.  The operand-relayout slice adds the staging region: one
 :class:`RelayoutStage` owning a :class:`RelayoutDecl` that stages a dense
 operand's current pack strip (panel-window rows or the whole panel axis)
 at region entry, with :class:`StagedRead` — the staged twin of
-:class:`Load` — reading the operand through the region.  Concepts the
-migrated families do not exercise are deliberately *not* declared: there
-are no accumulators, integer constants, physical position loads (dense
-value-bearing leaves below sparse levels), dimension-extent or sparse
-(hashed) workspaces, or parallel nodes yet.
+:class:`Load` — reading the operand through the region.  The abstract
+parallel-selection slice adds one optional program-level fact naming a dense
+logical or affine-origin loop, its canonical structural work estimate, and
+its verifier-proved race discipline; it deliberately carries no OpenMP or
+target-policy spelling.  Concepts the migrated families do not exercise are
+still not declared: there are no accumulators, integer constants, physical
+position loads (dense value-bearing leaves below sparse levels),
+dimension-extent or sparse (hashed) workspaces.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -949,11 +952,14 @@ class SparseWorkSource(LoopIRNode):
     """A target-independent per-iteration work measure: one stored level.
 
     ``tensor``/``level`` name a compressed physical level of a declared
-    tensor iterated inside the selected loop's subtree; the count of its
-    stored entries is the work the selection distributes.  No position
-    array name, C++ spelling, or policy text appears here — how a target
-    turns stored-entry counts into thread policy is target lowering's
-    exclusive concern.
+    tensor reached by the first sparse cursor in a selected subtree that
+    contains no merged loop.  That cursor must be immediately parented by the
+    selected dense coordinate, and that parent tensor/level must be the exact
+    physical input driver that supplies the target loop bound.  The count of
+    its stored entries is the work the selection distributes.  No
+    position-array name, C++ spelling, or policy text appears here — target
+    lowering revalidates the fact and combines it with the selected loop's
+    concrete bound.
     """
 
     node_id: LoopIRNodeId
@@ -968,10 +974,12 @@ class ParallelWork(LoopIRNode):
     ``rows`` is the selected loop's trip-count source — the declared
     dimension the loop iterates (an ``OUTER`` selection still names the
     split dimension; the origin count is derived from it and the width).
-    ``nnz`` optionally names the sparse work measure dominating one
-    iteration; ``None`` states the estimate is uniform per row.  Both are
-    facts about the program, re-derivable and verified structurally —
-    never trusted spelling.
+    ``nnz`` optionally names the canonical sparse work measure dominating
+    one iteration; ``None`` states that the target must use the row-count-only
+    policy.  It does not claim that row costs are uniform (merged sparse
+    nests deliberately use the row-only legacy policy).  Both fields are
+    facts about the program, re-derivable and verified structurally — never
+    trusted spelling.
     """
 
     node_id: LoopIRNodeId
@@ -989,8 +997,9 @@ class ParallelSelection(LoopIRNode):
     parallelization: a work estimate, the race-freedom discipline the
     verifier re-proves, and the scheduling intent.  OpenMP spelling,
     thread counts, chunking, and scheduling policy are deliberately
-    absent; target lowering derives them from the selected loop's
-    structure exactly as the legacy explicit-parallel route does.
+    absent; target lowering revalidates and realizes the owned work fact
+    against the selected loop exactly as the legacy explicit-parallel route
+    does.
     """
 
     node_id: LoopIRNodeId

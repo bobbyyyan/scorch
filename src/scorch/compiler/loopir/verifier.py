@@ -2071,15 +2071,103 @@ def _walk_declared_schema(root: object) -> List[object]:
             continue
         seen.add(id(node))
         collected.append(node)
+        children: List[LoopIRNode] = []
         for field in fields(type(node)):  # type: ignore[arg-type]
             value = getattr(node, field.name, None)
             if isinstance(value, LoopIRNode):
-                pending.append(value)
+                children.append(value)
             elif type(value) is tuple:
-                pending.extend(
+                children.extend(
                     child for child in value if isinstance(child, LoopIRNode)
                 )
+        # The stack is LIFO: reverse once so fields and tuple members are
+        # visited in their declared/source order.  Parallel work ownership
+        # intentionally follows the first sparse initializer the LLIR target
+        # emits and ``find_sparse_pos_array`` discovers.
+        pending.extend(reversed(children))
     return collected
+
+
+def _parallel_dense_bound_driver(
+    program: LoopProgram,
+    nodes: List[object],
+    index: IndexId,
+) -> Optional[Tuple[SymbolId, int]]:
+    """Reproduce the exact first dense input bound the target will spell."""
+
+    decls = {decl.symbol: decl for decl in program.tensors}
+    for symbol in program.inputs:
+        decl = decls[symbol]
+        for level, level_decl in enumerate(decl.levels):
+            if level_decl.kind is not LevelKind.DENSE:
+                continue
+            logical_mode = level_decl.mode
+            for node in nodes:
+                if type(node) is Load and node.tensor == symbol:
+                    coordinate = node.indices[logical_mode]
+                    if type(coordinate) is IndexValue and coordinate.index == index:
+                        return symbol, level
+                if (
+                    type(node) is DensePosition
+                    and node.tensor == symbol
+                    and node.level == level
+                    and type(node.coord) is IndexValue
+                    and node.coord.index == index
+                ):
+                    return symbol, level
+    return None
+
+
+def _canonical_parallel_work_source(
+    program: LoopProgram,
+    target: Stmt,
+    index: IndexId,
+) -> Optional[Tuple[SymbolId, int]]:
+    """Derive the one canonical sparse work source for a selected loop.
+
+    The legacy-compatible work policy can use a compressed position total
+    only when the first visible sparse cursor is immediately parented by the
+    selected coordinate *and* that dense parent is the exact input
+    tensor/level whose extent the target uses to spell the selected loop
+    bound.  Equal logical extents are insufficient for compatibility:
+    legacy sparse-position discovery is tied to that physical driver and
+    falls back to its row-count-only policy otherwise.  A merged loop
+    likewise forces the row-count-only legacy policy because established
+    merged-nest lowering hides its iterator initialization from discovery.
+    Returning one value (or ``None``) makes ``ParallelWork`` re-derived
+    program state rather than an unchecked policy choice.
+    """
+
+    subtree = _walk_declared_schema(target)
+    if any(type(node) is MergedSparseFor for node in subtree):
+        return None
+    cursor: Optional[SparseCursorDecl] = None
+    for node in subtree:
+        if type(node) in (SparseFor, SparseWindowFor):
+            cursor = cast(SparseFor, node).cursor
+            break
+    if cursor is None or cursor.level < 1:
+        return None
+    parent = cursor.parent
+    if (
+        type(parent) is not DensePosition
+        or parent.tensor != cursor.tensor
+        or parent.level != cursor.level - 1
+        or type(parent.coord) is not IndexValue
+        or parent.coord.index != index
+    ):
+        return None
+    decls = {decl.symbol: decl for decl in program.tensors}
+    decl = decls[cursor.tensor]
+    if decl.levels[parent.level].kind is not LevelKind.DENSE:
+        return None
+    all_nodes = _walk_declared_schema(program.body)
+    if _parallel_dense_bound_driver(program, all_nodes, index) != (
+        cursor.tensor,
+        parent.level,
+    ):
+        return None
+    return cursor.tensor, cursor.level
 
 
 def _parallel_target_matches(node: object, index: IndexId, part: ParallelPart) -> bool:
@@ -2237,6 +2325,14 @@ def _check_parallel_selection(ctx: _Context, program: LoopProgram) -> None:
             loop_dimension = ctx.level_dimension(
                 first_cursor.tensor, first_cursor.level
             )
+        if type(target) in (SparseFor, MergedSparseFor):
+            _fail(
+                "parallel_work_mismatch",
+                path,
+                "sparse position loops do not have the declared dimension "
+                "as their trip count; this work model selects dense logical "
+                "loops or affine origin loops only",
+            )
         if work.rows != loop_dimension:
             _fail(
                 "parallel_work_mismatch",
@@ -2246,29 +2342,15 @@ def _check_parallel_selection(ctx: _Context, program: LoopProgram) -> None:
             )
 
         subtree = _walk_declared_schema(target)
-        if work.nnz is not None:
-            source = work.nnz
-
-            def _iterates_source(node: object) -> bool:
-                if type(node) in (SparseFor, SparseWindowFor):
-                    cursor = cast(SparseFor, node).cursor
-                    return (
-                        cursor.tensor == source.tensor and cursor.level == source.level
-                    )
-                if type(node) is MergedSparseFor:
-                    return any(
-                        cursor.tensor == source.tensor and cursor.level == source.level
-                        for cursor in cast(MergedSparseFor, node).cursors
-                    )
-                return False
-
-            if not any(_iterates_source(node) for node in subtree):
-                _fail(
-                    "parallel_work_mismatch",
-                    f"{path}.work.nnz",
-                    "the sparse work source is not iterated inside the "
-                    "selected loop",
-                )
+        expected_source = _canonical_parallel_work_source(program, target, index)
+        actual_source = None if work.nnz is None else (work.nnz.tensor, work.nnz.level)
+        if actual_source != expected_source:
+            _fail(
+                "parallel_work_mismatch",
+                f"{path}.work.nnz",
+                "the sparse work source must be the selected loop's one "
+                "canonical, directly parented structural work source",
+            )
 
         regions = [
             node

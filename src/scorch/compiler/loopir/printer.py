@@ -772,7 +772,7 @@ def print_program(program: LoopProgram) -> str:
         selection = program.parallel
         nnz = selection.work.nnz
         nnz_text = (
-            "uniform" if nnz is None else f"nnz(t{ids.symbol(nnz.tensor)}@{nnz.level})"
+            "row_only" if nnz is None else f"nnz(t{ids.symbol(nnz.tensor)}@{nnz.level})"
         )
         lines.append(
             f"  parallel x{ids.index(selection.index)}"
