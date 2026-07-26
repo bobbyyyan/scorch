@@ -38,6 +38,7 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     PanelOuterFor,
+    ParallelSelection,
     PositionId,
     PositionValue,
     RelayoutId,
@@ -64,7 +65,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v7"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v8"
 
 
 class _CanonicalIds:
@@ -484,6 +485,26 @@ def _serialize_tensor(decl: TensorDecl, ids: _CanonicalIds) -> Dict[str, object]
     }
 
 
+def _serialize_parallel(
+    selection: ParallelSelection, ids: _CanonicalIds
+) -> Dict[str, object]:
+    nnz = selection.work.nnz
+    return {
+        "index": ids.index(selection.index),
+        "part": selection.part.value,
+        "discipline": selection.discipline.value,
+        "work": {
+            "rows": ids.dimension(selection.work.rows),
+            "nnz": (
+                None
+                if nnz is None
+                else {"tensor": ids.symbol(nnz.tensor), "level": nnz.level}
+            ),
+        },
+        "intent": selection.intent.value,
+    }
+
+
 def canonical_program_dump(program: LoopProgram) -> str:
     """Serialize one verified program canonically, independent of ID history."""
 
@@ -502,6 +523,11 @@ def canonical_program_dump(program: LoopProgram) -> str:
         "inputs": [ids.symbol(symbol) for symbol in program.inputs],
         "outputs": [ids.symbol(symbol) for symbol in program.outputs],
         "body": _serialize_stmt(program.body, ids),
+        "parallel": (
+            None
+            if program.parallel is None
+            else _serialize_parallel(program.parallel, ids)
+        ),
     }
     return json.dumps(
         payload,
@@ -742,6 +768,19 @@ def print_program(program: LoopProgram) -> str:
     outputs = ", ".join(f"t{ids.symbol(symbol)}" for symbol in program.outputs)
     lines.append(f"  inputs({inputs})")
     lines.append(f"  outputs({outputs})")
+    if program.parallel is not None:
+        selection = program.parallel
+        nnz = selection.work.nnz
+        nnz_text = (
+            "uniform" if nnz is None else f"nnz(t{ids.symbol(nnz.tensor)}@{nnz.level})"
+        )
+        lines.append(
+            f"  parallel x{ids.index(selection.index)}"
+            f" part={selection.part.value}"
+            f" discipline={selection.discipline.value}"
+            f" work(d{ids.dimension(selection.work.rows)}, {nnz_text})"
+            f" intent={selection.intent.value}"
+        )
     lines.append("  body {")
     _render_stmt(program.body, ids, {}, 2, lines)
     lines.append("  }")

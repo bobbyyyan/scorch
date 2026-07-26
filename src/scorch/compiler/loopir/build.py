@@ -19,7 +19,7 @@ adversarial tests can build malformed programs through the same API surface.
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from ..identity import IndexId, SymbolId, new_index_id, new_symbol_id
 from .nodes import (
@@ -45,6 +45,11 @@ from .nodes import (
     MergedSparseFor,
     MergeMode,
     PanelOuterFor,
+    ParallelDiscipline,
+    ParallelIntent,
+    ParallelPart,
+    ParallelSelection,
+    ParallelWork,
     PositionId,
     PositionValue,
     ReduceOp,
@@ -60,6 +65,7 @@ from .nodes import (
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    SparseWorkSource,
     StagedRead,
     Stmt,
     Store,
@@ -473,6 +479,33 @@ class LoopIRBuilder:
     ) -> StoreReduce:
         return StoreReduce(self._node_id(), tensor, tuple(indices), op, value)
 
+    def sparse_work_source(self, tensor: SymbolId, level: int) -> SparseWorkSource:
+        return SparseWorkSource(self._node_id(), tensor, level)
+
+    def parallel_work(
+        self,
+        rows: DimensionId,
+        nnz: Optional[SparseWorkSource] = None,
+    ) -> ParallelWork:
+        return ParallelWork(self._node_id(), rows, nnz)
+
+    def parallel_selection(
+        self,
+        index: IndexId,
+        part: ParallelPart,
+        discipline: ParallelDiscipline,
+        work: ParallelWork,
+        intent: ParallelIntent,
+    ) -> ParallelSelection:
+        return ParallelSelection(
+            self._node_id(),
+            index,
+            part,
+            discipline,
+            work,
+            intent,
+        )
+
     def program(
         self,
         dimensions: Sequence[DimensionDecl],
@@ -480,6 +513,7 @@ class LoopIRBuilder:
         inputs: Sequence[SymbolId],
         outputs: Sequence[SymbolId],
         body: Block,
+        parallel: Optional[ParallelSelection] = None,
     ) -> LoopProgram:
         return LoopProgram(
             self._node_id(),
@@ -488,4 +522,5 @@ class LoopIRBuilder:
             tuple(inputs),
             tuple(outputs),
             body,
+            parallel,
         )

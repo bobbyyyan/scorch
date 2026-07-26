@@ -420,8 +420,16 @@ def _rebuild_program(
     builder: LoopIRBuilder,
     loops: Sequence[_LoopNode],
     leaf: _ChainEnd,
+    *,
+    keep_parallel: bool = True,
 ) -> LoopProgram:
-    """Reassemble the chain with fresh loop/block nodes and shared subtrees."""
+    """Reassemble the chain with fresh loop/block nodes and shared subtrees.
+
+    ``keep_parallel`` carries the program's abstract parallel selection
+    through structural rebuilds; erasure passes ``False`` because the
+    selection is schedule state and the erased program must be the
+    unscheduled base.
+    """
 
     body = _wrap_loops(builder, loops, builder.block((leaf,)))
     rebuilt = builder.program(
@@ -430,6 +438,7 @@ def _rebuild_program(
         program.inputs,
         program.outputs,
         body,
+        program.parallel if keep_parallel else None,
     )
     verify_program(rebuilt)
     return rebuilt
@@ -2383,6 +2392,7 @@ def _verify_scheduled_loopir(
     if (
         base_relayouts
         or base_result_tiles
+        or base_program.parallel is not None
         or type(base_leaf) is WorkspaceRegion
         or type(base_leaf) is TiledReduce
         or any(
@@ -2393,8 +2403,8 @@ def _verify_scheduled_loopir(
         _fail(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
-            "loops, panels, workspace regions, staging regions, or "
-            "result-tile regions",
+            "loops, panels, workspace regions, staging regions, "
+            "result-tile regions, or a parallel selection",
         )
 
     replayed = (
@@ -2501,7 +2511,19 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
         )
     ):
-        return program
+        if program.parallel is None:
+            return program
+        # An abstract parallel selection is schedule state: erasing a
+        # program that carries only the selection still returns the
+        # unscheduled base.
+        stripped_builder = LoopIRBuilder.resuming(program)
+        return _rebuild_program(
+            program,
+            stripped_builder,
+            loops,
+            leaf=leaf,
+            keep_parallel=False,
+        )
     builder = LoopIRBuilder.resuming(program)
     region_loops: List[_LoopNode] = []
     erased_leaf: _ChainEnd = leaf
@@ -2593,4 +2615,10 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             )
         else:
             erased.append(node)
-    return _rebuild_program(program, builder, erased, leaf=erased_leaf)
+    return _rebuild_program(
+        program,
+        builder,
+        erased,
+        leaf=erased_leaf,
+        keep_parallel=False,
+    )

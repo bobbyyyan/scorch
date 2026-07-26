@@ -214,6 +214,50 @@ class RelayoutScope(Enum):
 
 
 @unique
+class ParallelPart(Enum):
+    """Which derived part of a logical loop a parallel selection names.
+
+    ``LOGICAL`` selects the unsplit binding loop of the index; ``OUTER``
+    selects the origin loop of the index's affine split.  A split's point
+    loop is deliberately unrepresentable: its ragged-tail clamp makes it a
+    non-canonical work partition, matching the legacy scheduler's
+    rejection of ``*_in`` parallel anchors.
+    """
+
+    LOGICAL = "logical"
+    OUTER = "outer"
+
+
+@unique
+class ParallelDiscipline(Enum):
+    """The race-freedom argument class of one parallel selection.
+
+    ``RESULT_PARTITION``: distinct iterations of the selected loop write
+    disjoint cells of the declared dense result (the selected coordinate
+    participates in every enclosed result write), and any accumulation
+    state lives strictly inside one iteration.  ``COMPACT_PARTITION``: the
+    program accumulates through a heap result-tile region and distinct
+    iterations of the selected dense prefix loop address disjoint compact
+    cells (the linearized prefix position partitions the tile).
+    """
+
+    RESULT_PARTITION = "result_partition"
+    COMPACT_PARTITION = "compact_partition"
+
+
+@unique
+class ParallelIntent(Enum):
+    """Why the selection exists — schedule provenance, never target policy.
+
+    ``EXPLICIT`` records a plan-carried explicit ``parallel_loop`` fact.
+    Automatic selection intents arrive only with the automatic-plan
+    migration; the member set is deliberately closed until then.
+    """
+
+    EXPLICIT = "explicit"
+
+
+@unique
 class BinaryOp(Enum):
     """Value-typed binary operators; coordinates never flow through these."""
 
@@ -901,8 +945,72 @@ class TensorDecl(LoopIRNode):
 
 
 @dataclass(frozen=True)
+class SparseWorkSource(LoopIRNode):
+    """A target-independent per-iteration work measure: one stored level.
+
+    ``tensor``/``level`` name a compressed physical level of a declared
+    tensor iterated inside the selected loop's subtree; the count of its
+    stored entries is the work the selection distributes.  No position
+    array name, C++ spelling, or policy text appears here — how a target
+    turns stored-entry counts into thread policy is target lowering's
+    exclusive concern.
+    """
+
+    node_id: LoopIRNodeId
+    tensor: SymbolId
+    level: int
+
+
+@dataclass(frozen=True)
+class ParallelWork(LoopIRNode):
+    """The target-independent work estimate of one parallel selection.
+
+    ``rows`` is the selected loop's trip-count source — the declared
+    dimension the loop iterates (an ``OUTER`` selection still names the
+    split dimension; the origin count is derived from it and the width).
+    ``nnz`` optionally names the sparse work measure dominating one
+    iteration; ``None`` states the estimate is uniform per row.  Both are
+    facts about the program, re-derivable and verified structurally —
+    never trusted spelling.
+    """
+
+    node_id: LoopIRNodeId
+    rows: DimensionId
+    nnz: Optional[SparseWorkSource]
+
+
+@dataclass(frozen=True)
+class ParallelSelection(LoopIRNode):
+    """One abstract parallel-loop selection over a stable loop identity.
+
+    Names the selected loop by ``(index, part)`` — the same identity
+    scheme the schedule passes already use — and carries the
+    target-independent facts the design assigns to abstract
+    parallelization: a work estimate, the race-freedom discipline the
+    verifier re-proves, and the scheduling intent.  OpenMP spelling,
+    thread counts, chunking, and scheduling policy are deliberately
+    absent; target lowering derives them from the selected loop's
+    structure exactly as the legacy explicit-parallel route does.
+    """
+
+    node_id: LoopIRNodeId
+    index: IndexId
+    part: ParallelPart
+    discipline: ParallelDiscipline
+    work: ParallelWork
+    intent: ParallelIntent
+
+
+@dataclass(frozen=True)
 class LoopProgram(LoopIRNode):
-    """One executable LoopIR program: declarations plus a top-level block."""
+    """One executable LoopIR program: declarations plus a top-level block.
+
+    ``parallel`` optionally carries the program's abstract parallel-loop
+    selection.  ``None`` means no explicit selection exists and target
+    lowering keeps its legacy structural derivation; the field is part of
+    program semantics (canonically serialized, verified, erased with the
+    schedule), never a target annotation.
+    """
 
     node_id: LoopIRNodeId
     dimensions: Tuple[DimensionDecl, ...]
@@ -910,3 +1018,4 @@ class LoopProgram(LoopIRNode):
     inputs: Tuple[SymbolId, ...]
     outputs: Tuple[SymbolId, ...]
     body: Block
+    parallel: Optional[ParallelSelection] = None

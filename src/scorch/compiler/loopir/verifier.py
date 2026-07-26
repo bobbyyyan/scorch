@@ -121,7 +121,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple, cast
 
 from ..identity import IndexId, SymbolId
 from .nodes import (
@@ -141,12 +141,18 @@ from .nodes import (
     LevelDecl,
     LevelKind,
     Load,
+    LoopIRNode,
     LoopIRNodeId,
     LoopProgram,
     MergedSparseFor,
     MergeMode,
     PanelOuterFor,
     PositionId,
+    ParallelDiscipline,
+    ParallelIntent,
+    ParallelPart,
+    ParallelSelection,
+    ParallelWork,
     PositionValue,
     ReduceOp,
     RelayoutDecl,
@@ -161,6 +167,7 @@ from .nodes import (
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    SparseWorkSource,
     StagedRead,
     Stmt,
     Store,
@@ -2046,6 +2053,302 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
         _leave(ctx, decl)
 
 
+def _walk_declared_schema(root: object) -> List[object]:
+    """Every schema node reachable through declared fields, root included.
+
+    The walked structure was already admitted by the ordinary traversal, so
+    aliasing, cycles, and depth are bounded; this is the shared read-only
+    walk the parallel-selection legality analysis performs over verified
+    statements.
+    """
+
+    collected: List[object] = []
+    seen: Set[int] = set()
+    pending: List[object] = [root]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        collected.append(node)
+        for field in fields(type(node)):  # type: ignore[arg-type]
+            value = getattr(node, field.name, None)
+            if isinstance(value, LoopIRNode):
+                pending.append(value)
+            elif type(value) is tuple:
+                pending.extend(
+                    child for child in value if isinstance(child, LoopIRNode)
+                )
+    return collected
+
+
+def _parallel_target_matches(node: object, index: IndexId, part: ParallelPart) -> bool:
+    """Whether one statement binds the selected ``(index, part)`` identity."""
+
+    if part is ParallelPart.LOGICAL:
+        if type(node) is DenseFor:
+            return node.index == index
+        if type(node) is SparseFor:
+            return node.coord_index == index
+        if type(node) is MergedSparseFor:
+            return node.coord_index == index
+        return False
+    if type(node) is TileOuterFor:
+        return node.index == index
+    if type(node) is PanelOuterFor:
+        return node.index == index
+    return False
+
+
+def _selected_coordinate_addresses(indices: object, index: IndexId) -> bool:
+    """Whether one write's index tuple carries the selected coordinate."""
+
+    if type(indices) is not tuple:
+        return False
+    return any(type(entry) is IndexValue and entry.index == index for entry in indices)
+
+
+def _check_parallel_selection(ctx: _Context, program: LoopProgram) -> None:
+    """Validate the program's abstract parallel selection fail-closed.
+
+    The selection is program semantics: its stored fields are exact, its
+    loop must resolve uniquely by ``(index, part)`` identity, its work
+    estimate must restate the resolved loop's structure, and its declared
+    race discipline must be re-proved from the program — never trusted.
+    """
+
+    selection = program.parallel
+    path = "program.parallel"
+    if type(selection) is not ParallelSelection:
+        _fail(
+            "invalid_parallel_selection",
+            path,
+            f"expected a ParallelSelection, got {type(selection).__name__}",
+        )
+    _enter(ctx, selection, path, 1)
+    try:
+        index = _check_index_id(selection.index, path, "ParallelSelection.index")
+        if type(selection.part) is not ParallelPart or not any(
+            selection.part is member for member in ParallelPart
+        ):
+            _fail(
+                "invalid_parallel_selection",
+                f"{path}.part",
+                "part must be a canonical ParallelPart member",
+            )
+        if type(selection.discipline) is not ParallelDiscipline or not any(
+            selection.discipline is member for member in ParallelDiscipline
+        ):
+            _fail(
+                "invalid_parallel_selection",
+                f"{path}.discipline",
+                "discipline must be a canonical ParallelDiscipline member",
+            )
+        if type(selection.intent) is not ParallelIntent or not any(
+            selection.intent is member for member in ParallelIntent
+        ):
+            _fail(
+                "invalid_parallel_selection",
+                f"{path}.intent",
+                "intent must be a canonical ParallelIntent member",
+            )
+        work = selection.work
+        if type(work) is not ParallelWork:
+            _fail(
+                "invalid_parallel_selection",
+                f"{path}.work",
+                f"expected a ParallelWork, got {type(work).__name__}",
+            )
+        _enter(ctx, work, f"{path}.work", 2)
+        try:
+            rows = _check_dimension_id(
+                work.rows, f"{path}.work.rows", "the work rows source"
+            )
+            if rows not in ctx.dimensions:
+                _fail(
+                    "invalid_parallel_selection",
+                    f"{path}.work.rows",
+                    "work rows must name a declared dimension",
+                )
+            nnz = work.nnz
+            if nnz is not None:
+                if type(nnz) is not SparseWorkSource:
+                    _fail(
+                        "invalid_parallel_selection",
+                        f"{path}.work.nnz",
+                        f"expected a SparseWorkSource, got {type(nnz).__name__}",
+                    )
+                _enter(ctx, nnz, f"{path}.work.nnz", 3)
+                try:
+                    tensor = _check_symbol_id(
+                        nnz.tensor, f"{path}.work.nnz", "the work tensor"
+                    )
+                    decl = ctx.tensors.get(tensor)
+                    if decl is None:
+                        _fail(
+                            "invalid_parallel_selection",
+                            f"{path}.work.nnz",
+                            "work source must name a declared tensor",
+                        )
+                    if (
+                        type(nnz.level) is not int
+                        or isinstance(nnz.level, bool)
+                        or not 0 <= nnz.level < len(decl.levels)
+                        or decl.levels[nnz.level].kind is not LevelKind.COMPRESSED
+                    ):
+                        _fail(
+                            "invalid_parallel_selection",
+                            f"{path}.work.nnz",
+                            "work source must name a compressed level of its " "tensor",
+                        )
+                finally:
+                    _leave(ctx, nnz)
+        finally:
+            _leave(ctx, work)
+
+        matches = [
+            node
+            for node in _walk_declared_schema(program.body)
+            if isinstance(node, Stmt)
+            and _parallel_target_matches(node, index, selection.part)
+        ]
+        if not matches:
+            _fail(
+                "parallel_target_missing",
+                path,
+                "no loop in the program binds the selected (index, part) " "identity",
+            )
+        # The ordinary binding discipline makes the identity unique on a
+        # verified program: ``duplicate_index_binding`` rejects any second
+        # LOGICAL binding of one index anywhere in the program, and the
+        # split-ownership rules give every OUTER origin a unique owner.
+        target = matches[0]
+
+        if type(target) is DenseFor or type(target) is TileOuterFor:
+            loop_dimension = target.dimension
+        elif type(target) is PanelOuterFor:
+            loop_dimension = target.dimension
+        elif type(target) is SparseFor:
+            loop_dimension = ctx.level_dimension(
+                target.cursor.tensor, target.cursor.level
+            )
+        else:
+            first_cursor = cast(MergedSparseFor, target).cursors[0]
+            loop_dimension = ctx.level_dimension(
+                first_cursor.tensor, first_cursor.level
+            )
+        if work.rows != loop_dimension:
+            _fail(
+                "parallel_work_mismatch",
+                f"{path}.work.rows",
+                "the work rows source must be the selected loop's declared "
+                "dimension",
+            )
+
+        subtree = _walk_declared_schema(target)
+        if work.nnz is not None:
+            source = work.nnz
+
+            def _iterates_source(node: object) -> bool:
+                if type(node) in (SparseFor, SparseWindowFor):
+                    cursor = cast(SparseFor, node).cursor
+                    return (
+                        cursor.tensor == source.tensor and cursor.level == source.level
+                    )
+                if type(node) is MergedSparseFor:
+                    return any(
+                        cursor.tensor == source.tensor and cursor.level == source.level
+                        for cursor in cast(MergedSparseFor, node).cursors
+                    )
+                return False
+
+            if not any(_iterates_source(node) for node in subtree):
+                _fail(
+                    "parallel_work_mismatch",
+                    f"{path}.work.nnz",
+                    "the sparse work source is not iterated inside the "
+                    "selected loop",
+                )
+
+        regions = [
+            node
+            for node in _walk_declared_schema(program.body)
+            if type(node) is ResultTileRegion
+        ]
+        if selection.discipline is ParallelDiscipline.RESULT_PARTITION:
+            if regions:
+                _fail(
+                    "parallel_race",
+                    path,
+                    "a heap result-tile program partitions compact cells; "
+                    "the result-partition discipline does not apply",
+                )
+        else:
+            if len(regions) != 1:
+                _fail(
+                    "parallel_race",
+                    path,
+                    "the compact-partition discipline requires exactly one "
+                    "heap result-tile region",
+                )
+            region = regions[0]
+            region_nodes = _walk_declared_schema(region.body)
+            if not any(node is target for node in region_nodes):
+                _fail(
+                    "parallel_race",
+                    path,
+                    "the selected loop must execute inside the heap region; "
+                    "loops outside it share the reusable compact storage",
+                )
+            reduces = [
+                node
+                for node in region_nodes
+                if type(node) is TiledReduce
+                and node.result_tile == region.decl.result_tile
+            ]
+            if not reduces or not all(
+                _selected_coordinate_addresses(node.indices, index) for node in reduces
+            ):
+                _fail(
+                    "parallel_race",
+                    path,
+                    "the selected coordinate must address every compact "
+                    "accumulation of the heap region",
+                )
+
+        workspaces_inside = {
+            node.workspace.workspace
+            for node in subtree
+            if type(node) is WorkspaceRegion
+        }
+        for node in subtree:
+            if type(node) is AppendEntry:
+                _fail(
+                    "parallel_race",
+                    path,
+                    "ordered sparse assembly cannot be partitioned by a "
+                    "parallel selection",
+                )
+            if type(node) in (Store, StoreReduce):
+                if not _selected_coordinate_addresses(cast(Store, node).indices, index):
+                    _fail(
+                        "parallel_race",
+                        path,
+                        "a write inside the selected loop is not addressed "
+                        "by the selected coordinate",
+                    )
+            if type(node) in (WorkspaceRead, WorkspaceReduce):
+                if cast(WorkspaceRead, node).workspace not in workspaces_inside:
+                    _fail(
+                        "parallel_race",
+                        path,
+                        "a workspace shared across selected iterations is "
+                        "not race free",
+                    )
+    finally:
+        _leave(ctx, selection)
+
+
 def verify_program(program: object) -> None:
     """Fail closed unless ``program`` is a structurally valid LoopIR program."""
 
@@ -2134,5 +2437,7 @@ def verify_program(program: object) -> None:
                 "program.outputs",
                 "an output is never stored to",
             )
+        if program.parallel is not None:
+            _check_parallel_selection(ctx, program)
     finally:
         _leave(ctx, program)
