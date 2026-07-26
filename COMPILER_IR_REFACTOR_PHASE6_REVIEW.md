@@ -2998,3 +2998,127 @@ dispatch, selector integration, cutover, and legacy deletion stay out of
 scope.  The admission envelope deliberately excludes compressed, merged,
 and panel-origin anchors (no measured legacy comparand) and parallel
 tiles; widening either requires fresh legacy measurement first.
+
+## 22. Independent review corrections to abstract parallel selection
+
+This section is chronologically later than §21 and supersedes §21.3,
+§21.4, and §21.7 wherever their completeness claims conflict.  The
+eleven-commit inherited range was reviewed claim by claim and with fresh
+adversarial programs before the next milestone began.  That review found
+that Milestone 1 was not complete at `e68c060`: its broad anchor parity
+grid was green, but several stored-work, transformation, and post-assembly
+ownership boundaries were not yet exact.
+
+### 22.1 Findings
+
+1. **`ParallelWork` was not a verified program fact.**  The selection pass
+   stamped the first sparse cursor below a dense anchor without reproducing
+   the legacy policy's actual discovery boundary.  It therefore assigned
+   sparse work to merged nests (whose established emission is row-count
+   only), to a cursor whose dense parent was a different coordinate, and
+   to a cursor whose parent tensor/level was not the exact first dense
+   input driver that spells the selected loop bound.  The verifier accepted
+   all three.  A supported `X[i,k] * A[i,j]` case with `X` declared first
+   demonstrated the consequence: the legacy route emitted
+   `scorch_nthreads(-1, X0_size)`, while the typed route emitted
+   `A1_pos[X0_size]`.  Directly constructed/forged schema states selecting
+   sparse or merged coordinate loops also passed verifier work checks while
+   storing a logical dimension as `rows`, even though their physical
+   position trip count is not represented by that dimension.  The
+   production selection pass had already rejected those anchor kinds since
+   `6242da8`; this was a verifier truthfulness/totality defect, not a newly
+   admitted public schedule.
+2. **Source order and transformation ownership were incomplete.**
+   `_walk_declared_schema` traversed sibling statements in reverse despite
+   the work contract depending on the first emitted sparse initializer.
+   `apply_relayout` silently discarded an existing selection, while
+   `apply_result_tile` could reinterpret and discard one.  A plan with no
+   `parallel_loop` fact could also accept a program already carrying a
+   selection.
+3. **Target completion trusted mutable state too far.**  Completion did not
+   reverify the program and the primitive selection payload at the point of
+   use.  `complete_parallel` matched one detached header anywhere in the
+   function rather than the complete owner chain, and it did not reject a
+   different loop that arrived pre-marked or atomic.  Panel and heap
+   completion re-derived policy instead of realizing the exact owned work
+   fact.  The panel-to-heap and panel-to-relayout handoffs then trusted a
+   syntactically valid but mutated row policy, and composed heap+panel
+   completion did not revalidate a work fact changed after panel completion.
+4. **Two heap effects were census-pinned but not position/identity-pinned.**
+   Moving the exact result-shape validation after compute passed the
+   name/shape census, and other ABI validation calls were not required to
+   remain in the prologue.  A second `torch::empty` fed by protected result
+   shape state was admitted because the allowlist recognized the callee name
+   rather than the one canonical allocation object.
+
+### 22.2 Corrections
+
+`d7f0970` closes those boundaries without a schema-version change.
+The verifier and selection pass now share one structural derivation:
+
+- statement traversal is declared/source ordered;
+- any merged subtree uses the row-count-only policy;
+- a sparse work source is permitted only for the first sparse cursor,
+  immediately parented by the selected dense coordinate, when that
+  tensor/level is also the exact first dense input driver of the target
+  loop bound;
+- dense logical and affine-origin loops are the only representable target
+  kinds, and the verifier requires the stored source (including `None`) to
+  equal the re-derived source exactly.
+
+`None` is consequently rendered as `row_only`, not `uniform`: merged rows
+can be highly nonuniform even though compatibility requires the row-only
+legacy estimate.
+
+Structural passes now preserve selection deliberately, or reject a
+preselected input before a transform that changes its race discipline.
+Fact-free plans reject carried selections.  At target completion, a
+primitive snapshot of the exact selection/work identities, enums, level,
+and intent is compared after a fresh `verify_program`.  The resolved sparse
+source is combined with the selected loop's actual target bound.  Direct
+and stack completion require the unique complete ancestor prefix, reject
+every pre-existing ordinary or atomic mark, independently compare the
+legacy marker result, apply the exact owned policy, and require the selected
+loop to be the sole final mark.
+
+Panel and heap completions use the same work-fact realization.  Panel keeps
+an independently detached snapshot of the exact row header it produced;
+both heap and relayout recheck that snapshot at their own entry, and heap
+also rechecks the selection after the panel boundary.  Heap completion now
+requires the complete freshly reconstructed ABI validation block at the
+canonical prologue offset before any allocation or compute, and requires
+the only protected `torch::empty` expression to be the canonical generated
+result allocation by object identity.
+
+`b03c705` locks the corrections with source-order, cross-driver,
+merged-row-only, transform-ordering, malformed post-init state,
+ancestor-relocation, ordinary/atomic stray-mark, panel/heap/relayout
+handoff, full validation-prologue, and protected-allocation adversaries.
+The package and node documentation were corrected to the actual rank>=2
+heap and row-only work contracts; canonical serialization remains
+`scorch.loopir.canonical.v8` because no serialized field or representation
+changed (the human-readable label and contract wording were corrected).
+
+### 22.3 Verification and verdict
+
+The focused contract before detached final gates is **534 passed** across
+the verifier, printer, schedule-pass, and LLIR-lowering files.  A fresh
+86-case format/operand/order/anchor audit admitted 46 programs and produced
+byte-identical legacy/LoopIR sources for all 46; the other 40 retained
+stable fail-closed boundaries.  Two independent source-only audit runs are
+byte-identical and retained under
+`phase6-parallel-review-b03c705/verification/schedule-audit/` (results
+SHA-256 `d6c075663f9d8df4a1a0ade293a174be99ab346c96f7a91c3674f45d0b60433a`;
+manifest SHA-256
+`b49b7f0f53484396a195d375a16e5bc47a80ef359209fa1184f2aa53fa4a5769`).
+Focused Black, Flake8, and production mypy are clean, and
+`git diff --check` is clean.  The final scheduled-runtime, capture/static,
+latency, and clean detached full-suite receipts are recorded in the
+chronologically latest handoff section.
+
+With these corrections, **abstract parallel selection is complete for the
+measured explicit family**, but Phase 6 remains open.  Automatic-plan
+routing, canonical `LoopPlan` schedule identity, and the
+criterion-by-criterion exit audit are still required.  No automatic route,
+release dispatch, cache, production cutover, or legacy deletion changed in
+this review.

@@ -26496,3 +26496,233 @@ before editing.  Exactly two provenance values exist in the tree:
   provenance; `legacy_cin_adapter.py:93` branches on it beforehand.
   `CINLowerer` applies no independent scheduling (`loop_plan` only ever
   set from a `ScheduledCIN`, `cin_lowerer.py:2035`).
+
+## Phase-6 abstract-selection rigorous review correction (2026-07-26, supersedes §21 handoff)
+
+This section and its prompt are chronologically latest.  They supersede
+the prior claim that the abstract parallel-selection milestone was
+complete at `533de08`, while preserving §21 as historical evidence.
+
+### Review outcome and commits
+
+The inherited eleven-commit range through `e68c060` was inspected
+claim-by-claim and probed adversarially before any remaining Phase-6
+milestone began.  Four concrete defect families were found:
+
+- `ParallelWork.nnz` was an unchecked choice rather than an exactly
+  re-derived fact.  Merged nests, parent-coordinate mismatches, and a
+  different physical dense bound driver could receive the wrong policy;
+  directly constructed/forged sparse position-loop selections also passed
+  verifier checks with an unrepresented logical trip count (the production
+  selection pass already rejected those anchor kinds).  The supported
+  `X[i,k] * A[i,j]` counterexample produced non-identical source before
+  the correction.
+- the shared schema walk reversed sibling source order; relayout and
+  result-tile transforms could discard/reinterpret an existing
+  selection; a fact-free plan could silently retain one;
+- completion trusted mutable post-construction state: one relocated
+  matching loop was enough, other ordinary/atomic marks were not
+  censused, panel/heap policy was re-derived instead of owned, and the
+  panel-to-heap/relayout handoff accepted post-panel work/policy
+  mutation;
+- heap completion pinned result-shape validation and `torch::empty` by
+  callee/shape rather than the complete validation prologue and the one
+  canonical allocation identity.
+
+The fixes are committed locally, with nothing pushed:
+
+- `d7f0970` — `fix(compiler): close parallel completion boundaries`
+- `b03c705` — `test(compiler): lock parallel review corrections`
+
+The exact corrected contract is recorded in
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §22.  In brief: work ownership is
+lexical, merged-aware, parent-linked, and tied to the exact legacy dense
+bound driver; `None` means `row_only`, never uniform; transforms preserve
+or reject existing selection deliberately; completion reverifies the
+program plus a primitive selection snapshot; direct/stack marking owns
+the exact ancestor prefix and sole final mark; panel hands an independent
+policy snapshot to heap/relayout; and heap owns the complete ABI
+validation prologue plus the unique protected Torch allocation.
+
+No new node, enum, field, or verifier code was needed.  Canonical JSON
+stays `scorch.loopir.canonical.v8`; only the human work label changed
+from the inaccurate `uniform` to `row_only`.
+
+### Final verification
+
+- verifier + printer + schedule-pass + LLIR-lowering contract:
+  **534 passed**;
+- compiled scheduled-slice file: **185 passed in 580.53 s**;
+- independent 86-case schedule audit: **46 admitted and 46
+  byte-identical**, with 40 stable fail-closed outcomes; two independent
+  source-only runs are byte-identical, with results SHA-256
+  `d6c075663f9d8df4a1a0ade293a174be99ab346c96f7a91c3674f45d0b60433a`
+  and manifest SHA-256
+  `b49b7f0f53484396a195d375a16e5bc47a80ef359209fa1184f2aa53fa4a5769`;
+- fresh source gates at clean detached `b03c705`: **73/73**
+  corpus/grid/heap captures byte-identical to `a24c0c1`, **11/11** heap
+  LoopIR/legacy comparisons, **10/10** explicit-anchor comparisons, and
+  **22/22** retained anchor outcomes; import neutrality **4 passed**;
+- changed-file Black/Flake8 and focused production mypy clean;
+  full-source baselines byte-identical at one inherited Black finding,
+  nine inherited Flake8 findings, and **146 mypy findings in 12 files**;
+- literal unpartitioned clean detached-worktree non-performance suite at
+  `b03c705`: **4,129 passed, 14 skipped, 3 performance tests deselected,
+  one known sparse-invariant warning, and zero failures** in **2,797.86
+  s** (wall **2,799 s / 46:39**); log SHA-256
+  `91d0a4f40d623bd72f5872ad78d49436aeadfe3f4fd610fc0d66a692f5614901`,
+  JUnit SHA-256
+  `58f3c6bc4ec68b5aa40bab2561c09175ef88850f6210a3620cd337f24263d1f7`;
+  the literal run crossed the historical late-abort region without a
+  libomp/resource event, so no partition substitute or base control was
+  needed;
+- clean detached same-session sequential latency, exact base `e68c060`
+  versus candidate `b03c705`, 5 warmups / 30 samples, with identical
+  per-case generated-source hashes: `small_dense` **1.001/1.001**,
+  `reduction` **1.003/0.986**, `csr_intersection` **1.019/1.027**, and
+  `sparse_union` **1.009/1.010** (p50/p95 candidate/base); worst
+  **1.027**, no 1.10 crossing and no attribution rerun required;
+- `git diff --check`, import provenance, protected-file hashes, clean
+  evidence worktrees, and live-origin checks all green.
+
+Static/source evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-parallel-review-b03c705/verification/`
+(summary SHA-256
+`23d77d5110cc15b4dd496c717b545e885aabcf47f6a8e21ca957348dbdb5b0fe`).
+The reproducible 86-case harness, two identical raw runs, results JSON,
+and manifests are in its `schedule-audit/` subdirectory.
+The clean full-suite ledger is
+`/Users/bobby/.cache/scorch-codex/phase6-exit-b03c705/`, with its
+`full-suite-SHA256SUMS` manifest.  Paired latency is retained under
+`phase6-parallel-review-b03c705/latency/`: base JSON SHA-256
+`4370f07b003e1b41708534b97e810bdfee03b429eec021f780aa233ce56c3c91`,
+candidate JSON SHA-256
+`b8186e8ec9e4849e795ab3d191f36840f5cd2d33f21c94e37a9a7accec3e6682`,
+and comparison-log SHA-256
+`ca6351f91680488ec53a20c9ab872c313082c88dfa7d3c1266924b7bf04e1f64`.
+
+### Current verdict
+
+The measured explicit abstract-selection family is now complete under
+the corrected contract.  **Phase 6 remains open**: intended
+automatic-plan routing, canonical `LoopPlan` schedule identity, and the
+criterion-by-criterion exit audit are still owed.  No automatic route,
+release dispatch, cache behavior, production cutover, or legacy
+implementation changed in this review.
+
+## Updated broad copy-paste prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip. Do
+not push, switch branches, amend, squash, or reorder commits.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (especially Phases 6-7
+and the Phase-6 exit criteria), the Phase-4/5 reviews, all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through the chronologically latest
+§22, and the latest tail of COMPILER_IR_REFACTOR_HANDOFF.md. Section 22
+and this prompt supersede §21 and every older routing prompt wherever
+they conflict.
+
+First independently review, rather than trust, the latest correction
+commits d7f0970 and b03c705 plus the documentation commit above them.
+Inspect the diffs in full and reproduce the focused §22 gates. Probe the
+actual invariants: exact lexical sparse-source derivation; merged
+row-only behavior; exact physical dense bound-driver matching;
+SparseFor/MergedSparseFor trip-count rejection; selection preservation
+and transform ordering; post-init forged work state; exact
+ancestor-chain/sole-mark ownership; panel-to-heap and
+panel-to-relayout policy handoff; complete ABI-validation prologue
+placement; and canonical protected torch::empty identity. Fix and commit
+any concrete defect before starting new work. Preserve canonical v8
+unless the serialized schema truly changes.
+
+Then complete the remaining Phase 6 in one ambitious session if the
+evidence stays green. Treat the following as coherent milestones, not
+artificial session boundaries; continue through all of them rather than
+stopping after the easiest family:
+
+1. Automatic schedule routing. Re-audit the latest “Milestone-2 input”
+   inventory instead of assuming it is complete. Migrate F1 scalar and
+   F2 identity/heuristic auto LoopPlans through the verified LoopIR
+   schedule path, then address the real F4 plan-free production
+   auto-scheduler boundary by making every required automatic decision
+   explicit in LoopPlan (including workspace insertion) rather than
+   re-deriving hidden state during replay. Inventory and fail closed at
+   the LoopIR strangler gate on every fallback/tuned/prebuilt route that
+   is not a compiler schedule.
+   Add the correct automatic ParallelIntent/provenance representation
+   if automatic plans carry parallel selection. Keep release/default
+   dispatch unchanged until a later cutover phase, but ensure every
+   declared migrated automatic route consumes one verified plan through
+   pure typed passes, stage records, erasure/oracle checks, generated
+   source parity, and compiled numerical differentials.
+
+2. Canonical LoopPlan schedule identity. Define one versioned,
+   deterministic canonical representation from semantic plan content
+   only—never object/global IDs, display names that are not semantic,
+   Python hash(), rendered C++, mutable scheduler state, or insertion
+   history. The current strangler does not cache a LoopIR or plan
+   artifact, so first create a strangler-only canonical request identity
+   at the compile/shadow request boundary; it need not introduce an
+   artifact cache. Keep the release source-derived cache untouched.
+   Prove equality across fresh builders and same-provenance equivalent
+   plans, and inequality for every semantic decision (order, each tile
+   and placement, accumulation, unroll, panel bound, relayout, result
+   tile, parallel selection, and any policy version represented in the
+   request). Explicitly decide the cross-provenance rule: if provenance
+   selects a different gate or replay contract, request identities must
+   differ; if a separate provenance-free schedule-semantic digest is
+   useful, define and test it as a distinct layer rather than conflating
+   the two. Cover malformed/hostile state, deterministic serialization,
+   collision handling, stage timing, and repeated compilation.
+
+3. Phase-6 exit audit. Trace public explicit and every intended automatic
+   route end to end: Schedule/automatic decision -> verified LoopPlan ->
+   normalized CIN -> verified LoopIR -> pure schedule passes -> oracle
+   erasure -> structured LLIR -> C++ -> compiled execution. Audit each
+   design exit criterion explicitly: schedule decisions applied only to
+   LoopIR for migrated operations; no name/regex discovery in
+   panel/relayout/result-tile passes; canonical plan identity owns the
+   strangler request identity (whether or not artifacts are cached);
+   explicit and automatic structural/numerical differentials;
+   representative tile-j, direct tile-ijk, rank-2 heap tile-ijk, and
+   rank-3 multi-prefix heap readiness. Close Phase 6 only if every
+   criterion has evidence; otherwise name the exact remaining boundary
+   and leave it open.
+
+4. Stretch only after a genuine Phase-6 GO: begin Phase 7 with a
+   read-only ownership/dependency audit, then implement the largest
+   coherent first structured parallel/target-lowering slice that fits
+   the remaining evidence budget. Do not start production cutover,
+   selector parity, legacy deletion, or Phase 8.
+
+Preserve every established contract: frozen tuple ownership; exact
+stored-field/type/enum validation; forged/missing/extra/hostile/cyclic/
+shared/depth adversaries; stable stage-owned diagnostics;
+artifact-local deterministic identities; no C++ spelling in LoopIR; no
+rendered-name/regex/tag discovery; structural activation never waived;
+byte identity wherever legacy is the comparand; independent oracle and
+erasure proofs; explicit and automatic compiled differentials; and no
+ordinary release-JIT double compilation.
+
+Use capable parallel read-only audits where useful, but keep edits
+coordinated. Run focused memberships after each coherent commit, then
+the compiled schedule/legacy generality gates, fresh corpus/grid/heap/
+anchor captures, paired same-session latency, Black, Flake8, focused and
+full-source mypy baseline comparisons, git diff --check, and one literal
+clean detached-worktree non-performance suite with isolated caches and
+asserted import provenance. Avoid overlapping native/JIT lanes on macOS;
+if the unpartitioned suite hits the known libomp resource ceiling,
+attribute it against the base and run a complete non-overlapping
+partition rather than hiding the failure.
+
+Before editing and before every commit, inspect git status, live origin,
+and the five protected-file hashes. Preserve all unrelated dirty and
+untracked GPU/CUDA, benchmark, packaging, scheduler, research,
+scratchpad, and tooling material. Stage explicit pathspecs only, use
+focused commits with descriptive bodies, retain evidence outside Git,
+update the Phase-6 review and handoff with exact receipts and honest
+limitations, push nothing, and finish the largest fully verified
+coherent result without overclaiming.
+```
