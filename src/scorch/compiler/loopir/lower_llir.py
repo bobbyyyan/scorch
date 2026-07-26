@@ -83,6 +83,7 @@ from ..parallel_marking_pass import (
     _CPP_KEYWORDS,
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
     apply_parallel_policy,
+    find_sparse_pos_array,
     mark_first_for_loop_parallel,
 )
 from ..schedule_lowerer import (
@@ -128,6 +129,8 @@ from .nodes import (
     MergedSparseFor,
     MergeMode,
     PanelOuterFor,
+    ParallelDiscipline,
+    ParallelPart,
     RelayoutDecl,
     RelayoutScope,
     RelayoutStage,
@@ -293,6 +296,15 @@ class _TargetLowering:
         self._panel_completion: Optional[
             Tuple[llir.ForLoop, llir.ForLoop, llir.ForLoop, llir.ForLoop]
         ] = None
+        # Abstract parallel-selection state; populated by
+        # _validate_parallel_selection when the program carries the fact.
+        # Direct and stack routes suppress the emission-time auto gate and
+        # mark the selected loop on the assembled function — exactly the
+        # legacy explicit-parallel order — while panel, relayout, and heap
+        # routes keep their completion-owned marking and only prove the
+        # selection agrees with it.
+        self.parallel = program.parallel
+        self.parallel_position = -1
         self._validate_display_names()
         self._validate_layouts()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
@@ -305,6 +317,7 @@ class _TargetLowering:
         self._validate_panel_shape()
         self._validate_relayout_shape()
         self._validate_result_tile_shape()
+        self._validate_parallel_selection()
         self.cursor_loops: Dict[CursorId, int] = {}
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
@@ -1181,20 +1194,22 @@ class _TargetLowering:
             and kinds[rank] in (_DENSE, _SPARSE)
             and kinds[-1] == _TILE_INNER
         )
-        heap_panel = rank == 2 and kinds == [
-            _TILE_OUTER,
-            _PANEL_OUTER,
-            _DENSE,
-            _SPARSE_WINDOW,
-            _TILE_INNER,
-        ]
+        heap_panel = (
+            rank >= 2
+            and len(kinds) == rank + 3
+            and kinds[0] == _TILE_OUTER
+            and kinds[1] == _PANEL_OUTER
+            and all(kind == _DENSE for kind in kinds[2 : rank + 1])
+            and kinds[rank + 1] == _SPARSE_WINDOW
+            and kinds[-1] == _TILE_INNER
+        )
         if not heap_alone and not heap_panel:
             _fail(
                 "unsupported_program_shape",
                 "heap accumulation supports exactly the audited chains: "
                 "the pack origin over the result's dense prefix loops, one "
-                "reduction loop or the single-prefix panel window pair, and "
-                "the pack point loop",
+                "reduction loop or the panel window pair, and the pack "
+                "point loop",
             )
         if self.result_tile_depth != 1:
             _fail(
@@ -1208,9 +1223,15 @@ class _TargetLowering:
                 "unsupported_program_shape",
                 "the result-tile region must name the chain's pack split " "pair",
             )
-        row_position = 2 if heap_panel else 1
+        prefix_start = 2 if heap_panel else 1
+        # The composed default anchor is the window's dense parent — the
+        # innermost prefix loop and the only anchor legacy admits for the
+        # composition; the bare chain defaults to the outermost prefix.
+        # An abstract parallel selection may adopt any admissible prefix
+        # anchor afterwards (_validate_parallel_selection).
+        row_position = prefix_start + prefix_rank - 1 if heap_panel else 1
         prefix_nodes = [
-            self.loops[row_position + offset].node for offset in range(prefix_rank)
+            self.loops[prefix_start + offset].node for offset in range(prefix_rank)
         ]
         prefix_levels = result_decl.levels[:prefix_rank]
         pack_level = result_decl.levels[prefix_rank]
@@ -1251,6 +1272,98 @@ class _TargetLowering:
                 "and the pack point coordinate",
             )
         self.result_tile_row_position = row_position
+
+    def _validate_parallel_selection(self) -> None:
+        """Resolve the program's abstract parallel selection on the chain.
+
+        A missing selection preserves every existing derivation: the
+        generic auto gate, the panel row, and the heap's outermost-prefix
+        default all stay byte-identical — bare verified programs keep
+        direct structural activation.  A present selection must resolve to
+        exactly one chain loop, restate that loop's trip-count dimension,
+        and agree with the route that owns the marking: the heap
+        completion adopts the selected prefix loop as its parallel row,
+        the panel and relayout completions require the selection to name
+        the row they already mark, and the direct/stack routes mark the
+        selected loop on the assembled function through
+        :meth:`complete_parallel`.
+        """
+
+        selection = self.parallel
+        if selection is None:
+            return
+        position = -1
+        for candidate, loop in enumerate(self.loops):
+            node = loop.node
+            if selection.part is ParallelPart.LOGICAL:
+                matched = (
+                    type(node) is DenseFor
+                    and node.index == selection.index
+                    or type(node) in (SparseFor, MergedSparseFor)
+                    and node.coord_index == selection.index
+                )
+            else:
+                matched = (
+                    type(node) in (TileOuterFor, PanelOuterFor)
+                    and node.index == selection.index
+                )
+            if matched:
+                position = candidate
+                break
+        if position < 0:
+            _fail(
+                "unsupported_parallel_selection",
+                "the program's parallel selection does not name a chain "
+                "loop this target emits",
+            )
+        self.parallel_position = position
+        selected = self.loops[position]
+        if type(selected.node) in (DenseFor, TileOuterFor, PanelOuterFor):
+            loop_dimension = selected.node.dimension
+        else:
+            cursor = selected.cursors[0]
+            loop_dimension = self._level_dimension(cursor.tensor, cursor.level)
+        if selection.work.rows != loop_dimension:
+            _fail(
+                "unsupported_parallel_selection",
+                "the parallel selection's work estimate does not restate "
+                "the selected loop's dimension",
+            )
+        if self.result_tile is not None:
+            prefix_rank = len(self.result_decl.levels) - 1
+            prefix_start = 2 if self.panel is not None else 1
+            if (
+                selection.discipline is not ParallelDiscipline.COMPACT_PARTITION
+                or not prefix_start <= position < prefix_start + prefix_rank
+            ):
+                _fail(
+                    "unsupported_parallel_selection",
+                    "a heap program's parallel selection must partition the "
+                    "compact tile through one dense prefix loop",
+                )
+            if self.panel is not None and position != self.panel_row_position:
+                _fail(
+                    "unsupported_parallel_selection",
+                    "a composed heap-panel selection must name the window's "
+                    "dense-parent row loop the panel completion marks",
+                )
+            self.result_tile_row_position = position
+        elif self.panel is not None:
+            if (
+                selection.discipline is not ParallelDiscipline.RESULT_PARTITION
+                or position != self.panel_row_position
+            ):
+                _fail(
+                    "unsupported_parallel_selection",
+                    "a panel program's parallel selection must name the "
+                    "window's dense-parent row loop the completion marks",
+                )
+        elif selection.discipline is not ParallelDiscipline.RESULT_PARTITION:
+            _fail(
+                "unsupported_parallel_selection",
+                "a direct-accumulation program partitions its dense result; "
+                "the compact discipline does not apply",
+            )
 
     def _reserve_panel_names(self) -> None:
         """Reserve the derived loop, bound, and search names panels generate."""
@@ -2767,6 +2880,11 @@ class _TargetLowering:
         stmts: List[llir.Stmt] = [llir.BlankLine(), outer_loop]
         if self.panel is not None or self.result_tile is not None:
             return stmts
+        if self.parallel is not None:
+            # The legacy explicit-parallel route suppresses the
+            # emission-time auto gate and marks the selected loop on the
+            # assembled function; complete_parallel owns that marking.
+            return stmts
         leaf_indices = self._leaf_indices()
         outer_index = self._loop_logical_index(first)
         outer_in_result = any(
@@ -2860,7 +2978,7 @@ class _TargetLowering:
     def _record_emitted_loop(self, position: int, loop: llir.ForLoop) -> None:
         """Snapshot one chain-loop header before managed passes can touch it."""
 
-        if self.panel is None and self.result_tile is None:
+        if self.panel is None and self.result_tile is None and self.parallel is None:
             return
         header = llir.ForLoop(
             init=loop.init,
@@ -3511,9 +3629,124 @@ class _TargetLowering:
             return function
         return _complete_result_tile_impl(self, function)
 
+    def complete_parallel(self, function: llir.Function) -> llir.Function:
+        """Mark the abstract parallel selection on the assembled function.
+
+        Runs first among the completions — exactly where the legacy route
+        applies ``CINLowerer._apply_explicit_parallel_schedule`` before its
+        schedule lowering — and only for the direct and stack routes: the
+        panel, relayout, and heap completions own their marking, and
+        :meth:`_validate_parallel_selection` already proved the selection
+        agrees with them.  The selected loop is re-identified against the
+        detached pre-pass headers, its structural policy source is
+        cross-checked against the selection's declared work estimate, and
+        the shared legacy marker is applied under a detached
+        snapshot-comparison; any disagreement is the stage-owned
+        ``parallel_completion_lost``.
+        """
+
+        if (
+            self.parallel is None
+            or self.panel is not None
+            or self.result_tile is not None
+        ):
+            return function
+        snapshot = self._emitted_loop_headers.get(self.parallel_position)
+        if snapshot is None:
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop's emitted header was never recorded",
+            )
+        try:
+            found = self._for_loops_with_owners(function.body)
+        except LoopIRTargetError as error:
+            _fail(_PARALLEL_LOST, error.defect.message)
+        # The stack route's workspace region emits loops outside the direct
+        # chain, so the selection is re-identified alone: exactly one
+        # emitted loop may match the detached pre-pass header (chain loop
+        # variables are validated unique, and the selectable parts exclude
+        # the ragged point twins).
+        matches = [
+            loop
+            for loop, _owner in found
+            if self._panel_loop_header_matches(loop, snapshot)
+        ]
+        if len(matches) != 1:
+            _fail(
+                _PARALLEL_LOST,
+                "the assembled function does not carry exactly the selected "
+                "loop's detached pre-pass header",
+            )
+        selected = matches[0]
+        expected_nnz = self.parallel.work.nnz
+        try:
+            actual_pos = find_sparse_pos_array(selected.body)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_PARALLEL_LOST, str(error))
+        if expected_nnz is None:
+            expected_pos = None
+        else:
+            source_decl = self.decls[expected_nnz.tensor]
+            expected_pos = f"{source_decl.name}{expected_nnz.level}_pos"
+        if actual_pos != expected_pos:
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop's structural work source disagrees with "
+                "the selection's declared estimate",
+            )
+        if selected.omp_parallel_for or getattr(
+            selected, "_use_atomic_scheduling", False
+        ):
+            # The legacy explicit route never re-marks an already parallel
+            # loop; with the auto gate suppressed this cannot happen, so a
+            # marked loop here means the assembled function was mutated.
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop acquired a parallel marking before the "
+                "selection completion ran",
+            )
+        try:
+            expected_marked = LLIRRewriter(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="snapshot_parallel_selection_policy",
+                )
+            ).rewrite(selected)
+            if type(expected_marked) is not llir.ForLoop:
+                _fail(
+                    _PARALLEL_LOST,
+                    "the selection policy snapshot did not remain a ForLoop",
+                )
+            mark_first_for_loop_parallel(
+                [expected_marked],
+                EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+            )
+            mark_first_for_loop_parallel([selected], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_PARALLEL_LOST, str(error))
+        if not self._panel_loop_header_matches(selected, expected_marked):
+            _fail(
+                _PARALLEL_LOST,
+                "the selected loop did not acquire the required parallel " "policy",
+            )
+        return function
+
 
 _RELAYOUT_LOST = "relayout_completion_lost"
 _RESULT_TILE_LOST = "result_tile_completion_lost"
+_PARALLEL_LOST = "parallel_completion_lost"
 
 
 def _relayout_access_candidates(
@@ -5604,7 +5837,9 @@ def _lower_loopir_to_llir_owned(
         )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
     return lowering.complete_relayout(
-        lowering.complete_result_tile(lowering.complete_panel(assembled))
+        lowering.complete_result_tile(
+            lowering.complete_panel(lowering.complete_parallel(assembled))
+        )
     )
 
 

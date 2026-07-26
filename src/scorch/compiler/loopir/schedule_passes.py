@@ -116,7 +116,7 @@ from typing import (
 )
 
 from ..diagnostics import VerificationError
-from ..identity import IndexId
+from ..identity import IndexId, SymbolId
 from ..loop_plan import (
     MAX_AFFINE_TILE_WIDTH,
     LoopPart,
@@ -146,6 +146,9 @@ from .nodes import (
     LoopProgram,
     MergedSparseFor,
     PanelOuterFor,
+    ParallelDiscipline,
+    ParallelIntent,
+    ParallelPart,
     PositionId,
     PositionValue,
     ReduceOp,
@@ -1675,12 +1678,14 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
         and kinds[prefix_rank + 1] in (DenseFor, SparseFor)
         and kinds[-1] is TileInnerFor
     )
-    heap_panel = prefix_rank == 1 and kinds == (
-        TileOuterFor,
-        PanelOuterFor,
-        DenseFor,
-        SparseWindowFor,
-        TileInnerFor,
+    heap_panel = (
+        prefix_rank >= 1
+        and len(kinds) == prefix_rank + 4
+        and kinds[0] is TileOuterFor
+        and kinds[1] is PanelOuterFor
+        and all(kind is DenseFor for kind in kinds[2 : prefix_rank + 2])
+        and kinds[prefix_rank + 2] is SparseWindowFor
+        and kinds[-1] is TileInnerFor
     )
     if not heap_alone and not heap_panel:
         _fail(
@@ -1715,7 +1720,7 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
         )
     if heap_panel:
         panel_origin = loops[1]
-        window = loops[3]
+        window = loops[prefix_rank + 2]
         assert type(panel_origin) is PanelOuterFor
         assert type(window) is SparseWindowFor
         if panel_origin.tile != window.tile:
@@ -1841,6 +1846,174 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
     return rebuilt
 
 
+def _ordered_schema_nodes(root: LoopIRNode) -> List[LoopIRNode]:
+    """Every schema node under ``root`` in document order, root included.
+
+    Declared dataclass fields are visited in declaration order and tuple
+    children in sequence, so "first" below means first in the program's
+    lexical statement order — the same order the target's own structural
+    policy derivation encounters emitted statements.
+    """
+
+    collected: List[LoopIRNode] = []
+    seen: Set[int] = set()
+    stack: List[LoopIRNode] = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        collected.append(node)
+        children: List[LoopIRNode] = []
+        for field in fields(type(node)):  # type: ignore[arg-type]
+            value = getattr(node, field.name, None)
+            if isinstance(value, LoopIRNode):
+                children.append(value)
+            elif type(value) is tuple:
+                children.extend(
+                    child for child in value if isinstance(child, LoopIRNode)
+                )
+        stack.extend(reversed(children))
+    return collected
+
+
+def _selection_target_matches(
+    node: LoopIRNode, index: IndexId, part: ParallelPart
+) -> bool:
+    if part is ParallelPart.LOGICAL:
+        if type(node) is DenseFor:
+            return node.index == index
+        if type(node) is SparseFor or type(node) is MergedSparseFor:
+            return node.coord_index == index
+        return False
+    if type(node) is TileOuterFor or type(node) is PanelOuterFor:
+        return node.index == index
+    return False
+
+
+def select_parallel_loop(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Consume the plan's explicit ``parallel_loop`` fact exactly once.
+
+    Runs last in :func:`apply_schedule_plan`, on the fully scheduled
+    program, and materializes the fact as the program's abstract
+    :class:`ParallelSelection` — the typed twin of the legacy explicit
+    route (``CINLowerer._apply_explicit_parallel_schedule``), which marks
+    the named loop on the assembled function after every structural
+    schedule transformation.
+
+    Legacy anchor semantics are reproduced on identities: a LOGICAL
+    anchor naming an affine-split variable selects the split's origin
+    loop (legacy's ``{var}_out`` redirect), a point loop is never
+    selectable (the ragged-tail clamp), and explicit selection requires
+    an all-dense result.  The race, work, and reduction legality proofs
+    are the verifier's ``parallel_race`` / ``parallel_work_mismatch``
+    obligations, re-proved on the stamped program before it is returned —
+    the pass derives facts, the verifier re-derives them.
+    """
+
+    verify_program(program)
+    checked = _validate_plan_for_pass(plan)
+    fact = checked.parallel_loop
+    if fact is None:
+        return program
+    if program.parallel is not None:
+        _fail(
+            "invalid_schedule_parallel",
+            "the scheduled program already carries a parallel selection; "
+            "the plan fact would not be consumed exactly once",
+        )
+    if fact.part is LoopPart.INNER:
+        _fail(
+            "invalid_schedule_parallel",
+            "a split's point loop contains the ragged-tail clamp and "
+            "cannot be selected for parallel execution",
+        )
+    index = fact.index_id
+    part = fact.part
+    if part is LoopPart.LOGICAL and any(
+        tile.kind == "affine" and tile.loop.index_id == index for tile in checked.tiles
+    ):
+        # Legacy redirects a logical anchor naming an affine-split
+        # variable to the split's origin loop.
+        part = LoopPart.OUTER
+    parallel_part = (
+        ParallelPart.LOGICAL if part is LoopPart.LOGICAL else ParallelPart.OUTER
+    )
+    decls = {decl.symbol: decl for decl in program.tensors}
+    if any(
+        level.kind is not LevelKind.DENSE
+        for output in program.outputs
+        for level in decls[output].levels
+    ):
+        _fail(
+            "invalid_schedule_parallel",
+            "explicit parallel-loop selection requires a dense result " "tensor",
+        )
+    ordered = _ordered_schema_nodes(program.body)
+    matches = [
+        node
+        for node in ordered
+        if _selection_target_matches(node, index, parallel_part)
+    ]
+    if len(matches) != 1:
+        _fail(
+            "invalid_schedule_parallel",
+            "the plan's parallel loop must resolve to exactly one " "scheduled loop",
+        )
+    target = matches[0]
+    if type(target) in (DenseFor, TileOuterFor, PanelOuterFor):
+        rows = cast(DenseFor, target).dimension
+    elif type(target) is SparseFor:
+        cursor = target.cursor
+        decl = decls[cursor.tensor]
+        rows = decl.dimensions[decl.levels[cursor.level].mode]
+    else:
+        cursor = cast(MergedSparseFor, target).cursors[0]
+        decl = decls[cursor.tensor]
+        rows = decl.dimensions[decl.levels[cursor.level].mode]
+    nnz_source: Optional[Tuple[SymbolId, int]] = None
+    for node in _ordered_schema_nodes(target):
+        if type(node) in (SparseFor, SparseWindowFor):
+            cursor = cast(SparseFor, node).cursor
+            nnz_source = (cursor.tensor, cursor.level)
+            break
+        if type(node) is MergedSparseFor:
+            cursor = node.cursors[0]
+            nnz_source = (cursor.tensor, cursor.level)
+            break
+    discipline = (
+        ParallelDiscipline.COMPACT_PARTITION
+        if checked.result_tile is not None
+        else ParallelDiscipline.RESULT_PARTITION
+    )
+    builder = LoopIRBuilder.resuming(program)
+    work = builder.parallel_work(
+        rows,
+        (
+            None
+            if nnz_source is None
+            else builder.sparse_work_source(nnz_source[0], nnz_source[1])
+        ),
+    )
+    selection = builder.parallel_selection(
+        index,
+        parallel_part,
+        discipline,
+        work,
+        ParallelIntent.EXPLICIT,
+    )
+    stamped = builder.program(
+        program.dimensions,
+        program.tensors,
+        program.inputs,
+        program.outputs,
+        program.body,
+        selection,
+    )
+    verify_program(stamped)
+    return stamped
+
+
 def _check_heap_plan_family(plan: LoopPlan) -> None:
     """Exact pre-replay admission of the heap result-tile plan family.
 
@@ -1907,14 +2080,8 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
         )
     if other_tiles:
         panel_tile = other_tiles[0]
-        if prefix_rank != 1:
-            _fail(
-                "invalid_schedule_result_tile",
-                "the migrated heap family composes a sparse panel only with "
-                "the audited single-prefix result",
-            )
         expected_order = (
-            result_tile.result_prefix[0],
+            *result_tile.result_prefix,
             panel_tile.loop.index_id,
             result_tile.tile_loop.index_id,
         )
@@ -1945,20 +2112,18 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
     # Race legality: every compact cell is addressed by the linearized dense
     # prefix position and the pack point, so distinct iterations of any
     # prefix loop write disjoint cells and the reduction loop is enclosed by
-    # all of them.  Target lowering realizes the parallel policy structurally
-    # on the outermost prefix loop, so the plan's selection is pinned there
-    # until abstract parallel-loop selection carries an inner-prefix anchor
-    # into LoopIR; a non-outermost anchor fails closed rather than silently
-    # parallelizing a different loop than the plan names.
+    # all of them.  The abstract selection carries the chosen anchor into
+    # LoopIR, so any dense prefix loop is admissible — exactly the legacy
+    # envelope — while the shared origin loop stays serial.
     if plan.parallel_loop is None or (
         plan.parallel_loop.part is not LoopPart.LOGICAL
-        or plan.parallel_loop.index_id != result_tile.result_prefix[0]
+        or plan.parallel_loop.index_id not in result_tile.result_prefix
     ):
         _fail(
             "invalid_schedule_result_tile",
-            "heap accumulation requires the outermost dense result-prefix "
-            "loop as the explicit parallel loop so the shared origin loop "
-            "stays serial",
+            "heap accumulation requires one dense result-prefix loop as "
+            "the explicit parallel loop so the shared origin loop stays "
+            "serial",
         )
 
 
@@ -2146,11 +2311,6 @@ def _check_plan_families(plan: LoopPlan) -> None:
                     "a child_of panel placement must name the origin loop of "
                     "an outermost-placed affine tile of the same plan",
                 )
-    elif plan.parallel_loop is not None and plan.result_tile is None:
-        _fail(
-            "unsupported_schedule_parallel",
-            "explicit parallel-loop selection is not a migrated schedule " "family",
-        )
     for tile in plan.tiles:
         if tile.kind == "panel":
             continue
@@ -2302,6 +2462,7 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
         scheduled = apply_relayout(scheduled, checked.relayout)
     if checked.result_tile is not None:
         scheduled = apply_result_tile(scheduled, checked.result_tile)
+    scheduled = select_parallel_loop(scheduled, checked)
     return scheduled
 
 
