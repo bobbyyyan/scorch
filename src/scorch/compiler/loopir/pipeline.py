@@ -78,9 +78,9 @@ class LoopIRCompiledKernel:
     ``request_identity`` are the canonical strangler request serialization
     and its SHA-256 content key, computed at the compile/shadow request
     boundary from the canonical normalized CIN, the canonical verified plan
-    (or the explicit unscheduled marker), the result shape, and the runtime
-    input bindings; no cache consumes them yet, and the release
-    source-derived cache is untouched.
+    (or the explicit unscheduled marker), the result shape, runtime input
+    bindings, and exact canonical CompileOptions state; no cache consumes
+    them yet, and the release source-derived cache is untouched.
     """
 
     lowering: LoopIRLoweringResult
@@ -88,9 +88,25 @@ class LoopIRCompiledKernel:
     program_dump: str
     llir_function: llir.Function
     cpp_source: str
-    schedule: Optional[ScheduledLoopIR] = None
-    request_dump: str = ""
-    request_identity: str = ""
+    schedule: Optional[ScheduledLoopIR]
+    request_dump: str
+    request_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.request_dump) is not str or not self.request_dump:
+            raise TypeError("request_dump must be a non-empty canonical string")
+        if (
+            type(self.request_identity) is not str
+            or len(self.request_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.request_identity
+            )
+        ):
+            raise TypeError("request_identity must be a lowercase SHA-256 digest")
+        expected = hashlib.sha256(self.request_dump.encode("utf-8")).hexdigest()
+        if self.request_identity != expected:
+            raise TypeError("request_identity must hash the retained request_dump")
 
 
 @dataclass(frozen=True)
@@ -318,6 +334,19 @@ def _compile_normalized_cin_via_loopir(
             tuple(result_shape),
             input_formats,
         )
+        # Request identity belongs to the validated request boundary.  Keep
+        # malformed shape/dtype/CIN/options failures owned by this stage rather
+        # than running serialization between two completed stage records.
+        from .plan_identity import loopir_request_dump
+
+        request_dump = loopir_request_dump(
+            normalized,
+            plan,
+            tuple(result_shape),
+            tuple(input_bindings),
+            compile_options=options,
+        )
+        request_identity = hashlib.sha256(request_dump.encode("utf-8")).hexdigest()
     except Exception:
         context.fail_stage(binding_token)
         raise
@@ -351,21 +380,6 @@ def _compile_normalized_cin_via_loopir(
             raise
         context.complete_stage(schedule_token)
         program = schedule.program
-
-    # The canonical strangler request identity, owned at this compile/shadow
-    # request boundary.  Derived only from canonical semantic content — the
-    # normalized CIN, the verified plan (or the unscheduled marker), the
-    # result shape, and the runtime bindings — inside the stages already
-    # recorded above; no new stage and no cache participate.
-    from .plan_identity import loopir_request_dump
-
-    request_dump = loopir_request_dump(
-        normalized,
-        plan,
-        tuple(result_shape),
-        tuple(input_bindings),
-    )
-    request_identity = hashlib.sha256(request_dump.encode("utf-8")).hexdigest()
 
     program_text = print_program(program)
     program_dump = canonical_program_dump(program)
