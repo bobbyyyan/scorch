@@ -49,8 +49,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
-from typing import Dict, List, Optional, Sequence, Tuple, cast
+from dataclasses import fields, replace
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 
@@ -59,15 +59,25 @@ from ..cin import (
     ForAll,
     IndexExpr,
     IndexStmt,
+    IndexVar,
+    IndexVarAdd,
     TensorAccess,
     TensorAssign,
     UnaryOp,
     Where,
 )
 from ..cin_analysis import canonical_cin_dump, verify_cin
-from ..compile_options import CompileOptions
+from ..compile_options import (
+    CompileOptions,
+    DarwinToolchainOptions,
+    KernelBuildOptions,
+    SchedulerCostModel,
+    SchedulerPolicy,
+    VerificationPolicy,
+)
 from ..diagnostics import VerificationError
 from ..identity import IndexId, SymbolId
+from ..llir_pass_manager import LLIRPassOptions
 from ..loop_plan import (
     LoopPlacement,
     LoopPlan,
@@ -119,6 +129,7 @@ def _verify_identity_cin(cin: object) -> IndexStmt:
         active.add(node_key)
         try:
             if isinstance(node, ForAll):
+                visit(node.index_var, f"{path}.index_var", depth + 1)
                 visit(node.stmt, f"{path}.stmt", depth + 1)
             elif isinstance(node, Where):
                 visit(node.producer, f"{path}.producer", depth + 1)
@@ -131,6 +142,26 @@ def _verify_identity_cin(cin: object) -> IndexStmt:
                 visit(node.right, f"{path}.right", depth + 1)
             elif isinstance(node, UnaryOp):
                 visit(node.expr, f"{path}.expr", depth + 1)
+            elif isinstance(node, TensorAccess):
+                indices = node.indices
+                if not isinstance(indices, (tuple, list)):
+                    raise VerificationError(
+                        f"loopir request identity received malformed indices at {path}"
+                    )
+                for axis, index_var in enumerate(indices):
+                    visit(index_var, f"{path}.indices[{axis}]", depth + 1)
+            elif isinstance(node, IndexVar):
+                index_expr = node._expr
+                if index_expr is not None:
+                    if type(index_expr) is not IndexVarAdd:
+                        raise VerificationError(
+                            "loopir request identity received an unsupported "
+                            f"index expression at {path}.expr"
+                        )
+                    visit(index_expr, f"{path}.expr", depth + 1)
+            elif isinstance(node, IndexVarAdd):
+                visit(node.lhs, f"{path}.lhs", depth + 1)
+                visit(node.rhs, f"{path}.rhs", depth + 1)
         finally:
             active.remove(node_key)
 
@@ -181,12 +212,86 @@ def _compile_options_payload(options: object) -> object:
     and build option stays authoritative in the retained request dump.
     """
 
+    def require_exact_carrier(
+        value: object,
+        expected_type: Any,
+        owner: str,
+    ) -> None:
+        if type(value) is not expected_type:
+            raise VerificationError(
+                f"loopir request identity requires an exact {owner} snapshot"
+            )
+        expected_fields = {field.name for field in fields(cast(Any, expected_type))}
+        if set(vars(value)) != expected_fields:
+            raise VerificationError(
+                f"loopir request identity {owner} has unexpected stored fields"
+            )
+
     if type(options) is not CompileOptions:
         raise VerificationError(
             "loopir request identity requires an exact CompileOptions snapshot"
         )
     typed_options = cast(CompileOptions, options)
-    return replace(typed_options, requested_schedule=None).cache_key
+    require_exact_carrier(typed_options, CompileOptions, "CompileOptions")
+    require_exact_carrier(
+        typed_options.scheduler,
+        SchedulerPolicy,
+        "SchedulerPolicy",
+    )
+    require_exact_carrier(
+        typed_options.scheduler.cost_model,
+        SchedulerCostModel,
+        "SchedulerCostModel",
+    )
+    require_exact_carrier(
+        typed_options.verification,
+        VerificationPolicy,
+        "VerificationPolicy",
+    )
+    require_exact_carrier(
+        typed_options.verification.llir_pass_options,
+        LLIRPassOptions,
+        "LLIRPassOptions",
+    )
+    require_exact_carrier(
+        typed_options.build,
+        KernelBuildOptions,
+        "KernelBuildOptions",
+    )
+    if typed_options.build.darwin_toolchain is not None:
+        require_exact_carrier(
+            typed_options.build.darwin_toolchain,
+            DarwinToolchainOptions,
+            "DarwinToolchainOptions",
+        )
+
+    # Frozen dataclasses can still be forged through ``object.__setattr__``.
+    # Rebuild every carrier from its exact stored fields so each existing
+    # constructor remains the one authority for primitive and cross-field
+    # invariants instead of trusting a previously validated outer shell.
+    cost_model = replace(typed_options.scheduler.cost_model)
+    scheduler = replace(typed_options.scheduler, cost_model=cost_model)
+    pass_options = replace(typed_options.verification.llir_pass_options)
+    verification = replace(
+        typed_options.verification,
+        llir_pass_options=pass_options,
+    )
+    darwin_toolchain = (
+        None
+        if typed_options.build.darwin_toolchain is None
+        else replace(typed_options.build.darwin_toolchain)
+    )
+    build = replace(
+        typed_options.build,
+        darwin_toolchain=darwin_toolchain,
+    )
+    return replace(
+        typed_options,
+        requested_schedule=None,
+        scheduler=scheduler,
+        verification=verification,
+        build=build,
+    ).cache_key
 
 
 def _entity_maps(
@@ -385,7 +490,12 @@ def _plan_payload(
 
 
 def _dump(payload: object) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def canonical_plan_dump(cin: IndexStmt, plan: LoopPlan) -> str:
