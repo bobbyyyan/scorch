@@ -545,17 +545,33 @@ def test_unsupported_schedule_families_fail_closed(schedule, code):
     assert error.value.defect.code == code, error.value.defect
 
 
-def test_empty_schedule_tiled_auto_family_fails_closed():
-    """The heuristic tile/workspace automatic family stays on the legacy path."""
+def test_empty_schedule_tiled_auto_family_replays_reduce_out():
+    """The dense tiled automatic family now byte-replays through LoopIR.
 
-    with pytest.raises(SchedulePassError) as error:
-        compile_cin_via_loopir(
-            build_matmul(),
-            (4, 6),
-            MATMUL_BINDINGS,
-            compile_options=scheduled_options(Schedule()),
-        )
-    assert error.value.defect.code == "unsupported_schedule_auto_family"
+    The empty-Schedule route carries the recorded reduce-out plan (dense
+    workspace at the last reduction plus the arm's candidate tiles) end to
+    end; the generated source must equal the legacy automatic surgery.
+    The sparse-workspace automatic family remains fail-closed and is
+    locked by the boundary census in the pipeline-execution battery.
+    """
+
+    kernel = compile_cin_via_loopir(
+        build_matmul(),
+        (4, 6),
+        MATMUL_BINDINGS,
+        compile_options=scheduled_options(Schedule()),
+    )
+    plan = kernel.schedule.plan
+    assert plan.provenance == "auto"
+    assert plan.workspace is not None and plan.workspace.dense
+    assert any(tile.loop == plan.workspace.reduction_loop for tile in plan.tiles)
+    comparison = compare_generated_sources(
+        build_matmul(),
+        (4, 6),
+        MATMUL_BINDINGS,
+        compile_options=scheduled_options(Schedule()),
+    )
+    assert comparison.identical
 
 
 def test_unscheduled_pipeline_is_unchanged_by_the_strangler_entry():
