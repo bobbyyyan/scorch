@@ -4231,3 +4231,170 @@ Evidence is retained under
   dirty/untracked GPU/CUDA, benchmark, packaging, scheduler, research,
   scratchpad, and tooling material remained untouched, and nothing was
   pushed.
+
+## 28. Independent review corrections to the Phase-6 closure milestone (2026-07-27)
+
+This section supersedes §27's closure verdict and evidence claims where
+they conflict.  The implementation commits `7e5f2ba`, `a1b6887`, and
+`9c45266` remain sound under independent review; the review found no
+wrong-result or emission regression in their logical-order automatic
+derivation, implicit-reduction normalization, or fused reduce-out pass.
+It did find one adjacent compiler trust-boundary defect and several
+material gaps in the claimed census and retained evidence.  They are
+corrected in:
+
+- `a920e10` — `fix(compiler): reject malformed CIN structure`; and
+- `8fb4902` — `test(compiler): close Phase-6 review gaps`.
+
+No serialized schema changed.  `scorch.autopolicy.v1`,
+`scorch.loopplan.canonical.v1`, `scorch.loopir.request.v2`, and
+`scorch.loopir.canonical.v8` remain current.
+
+### 28.1 Analyzed and LoopIR-owned malformed CIN now fails closed
+
+Fresh adversarial probes found that a forged `ForAll.stmt` self-cycle
+hung `_collect_loop_nest`, expression cycles escaped as
+`RecursionError`, and missing `ForAll.parallel`, `ForAll.stmt`, or
+`TensorAssign.op` fields escaped as raw `AttributeError`.  These are
+pre-existing defects, but they sit directly on the newly exercised
+CIN→LoopIR boundary.
+
+`a920e10` adds one iterative stored-forward-structure preflight with an
+active/complete DFS and a 256-edge depth bound.  It returns stable
+`missing_cin_field`, `invalid_cin_field`,
+`cyclic_cin_structure`, or `cin_structure_depth_exceeded`
+diagnostics before recursive ownership analysis, nest collection,
+metadata binding, or kernel preparation.  Direct lowering and the
+compile, execute, and shadow entries share the boundary; the latter
+preflight before the LoopIR pipeline invokes requested scheduling.
+Completed shared subgraphs are not mislabeled as cycles: they continue
+to the existing ownership analysis, which retains authority for
+`duplicate_node_reference` and `duplicate_access_reference`.
+
+This correction does not claim a repository-wide CIN walker boundary.
+Plan-free `normalize_cin` does not call the structural preflight in
+normal release mode, so a forged missing field can still escape as
+`AttributeError`.  Direct `Scheduler.apply_schedule` has a stronger
+gap: its display-name validation runs before normalization and can
+leak the same error even when full debug verification is enabled.
+Moving the preflight to those shared production boundaries requires
+its own latency-gated compatibility decision.
+
+### 28.2 The reduce-out implementation is sound; its oracle receipt was missing
+
+Independent source comparisons extended the fused reduce-out pass to
+34 additional programs with two through six tiles in both automatic
+arms; placement, target lowering, deterministic identities, and source
+parity held.  The §27 claim that the oracle covered all twelve
+extent/arm cells was nevertheless not backed by committed tests.
+
+`8fb4902` adds the missing executable oracle/erasure lock: zero
+reduction, zero output axis, unit, exact, ragged, and oversized extents
+in both arms, plus a rank-three output with two reductions and four
+tiles.  Each cell compares scheduled, base, and erased execution with
+an independent contraction reference and requires canonical erasure
+to recover the exact base program.
+
+One wider dense family is deliberately not admitted.  The legacy
+automatic order `a,b,d,c,e,f` for a rank-six contraction emits `pA3 =
+pA2 * ...` before declaring `pA2`; the same explicit family was already
+invalid before `9c45266`.  LoopIR's `unsupported_loop_order` is the
+correct boundary.  Byte parity is not evidence when the comparand is
+non-compiling C++.
+
+### 28.3 The dual census was representative, not complete
+
+The literal §27 statement that `476bf94` locked the complete production
+dual domain is withdrawn.  Additional identity-layout batched and
+four-operand families do reconstruct byte-for-byte from their actual
+LoopIR arms and are now locked.  A batched sparse-operand family stays
+at `unsupported_schedule_auto_family`.
+
+More importantly, the public-aligned `einsum("ij,kj->ik", ds, dd)`
+family reaches the dual helper with the dense operand represented as
+logical `B[k,j]` over physical `mode_order=[1,0]`.  Both LoopIR arms
+fail closed at `unsupported_loop_order`: the current target does not
+own general non-identity dense position-chain lowering.  That is a
+real Phase-6 boundary, not part of the sparse-result/workspace
+representation.  The committed census is now explicitly described as
+a representative identity-layout census instead of a complete
+production census.
+
+### 28.4 The sparse audit and retained-evidence statement are corrected
+
+The boundary matrix now separately locks:
+
+- dense-domain and sparse-row writes to CSR at
+  `unsupported_sparse_output_domain`;
+- merged explicit updates at `unsupported_merged_update`;
+- mixed compressed-parent/dense-leaf elementwise and reduction forms
+  at `unsupported_format`; and
+- the existing sparse-output reduction, merged-reduction, and root
+  boundaries.
+
+The retained `ws3-boundary` directory contains one generated mixed-`sd`
+source file.  That source proves the unsized values-vector and missing
+coordinate/position assembly defects by inspection, and its header
+records an observed wrapping error.  It does **not** contain a
+standalone reproducer or crash transcript for the separately asserted
+generic `ds`-output SpMSpM SIGSEGV.  §27's statement that SIGSEGV
+evidence was retained is therefore withdrawn; that observation must be
+reproduced before it is used as a gate premise.
+
+Finally, §27 listed five code commits but omitted the later
+`28f3424` scheduled-replay test commit.  The historical milestone has
+six code/test commits before its documentation commit.
+
+### 28.5 Corrected Phase-6 disposition
+
+**Phase 6 still has no GO, and it is not open on exactly one
+boundary.**  At minimum, two independent representation/target
+families remain:
+
+1. sparse result/workspace ownership: mixed-level result assembly and
+   true sparse `coo_workspace` allocation/reset/insertion/assembly; and
+2. general logical-coordinate to physical-position lowering for
+   non-identity dense layouts, including the transposed dense dual
+   constituent.
+
+The high-rank legacy use-before-declaration case is a separate
+correctness boundary until a valid target order is proven; it must not
+be "migrated" by reproducing invalid C++.  The runtime dual stitch
+cannot be assigned wholesale to Phase 7 until a genuinely complete,
+format/layout-aware constituent census is closed or explicitly
+dispositioned.
+
+No Phase-7 work, production cutover, selector parity, cache cutover,
+legacy deletion, Phase 8, or Phase 8.5 is claimed here.
+
+### 28.6 Verification
+
+The review gates are recorded at the final documentation commit:
+
+- broad pure CIN/LoopPlan/LoopIR/schedule-API membership: **918
+  passed**;
+- the complete compiled scheduled-slice, pipeline-execution,
+  schedule-generality, and dual-path battery: **331 passed in
+  1,057.39 s (17:37)**;
+- changed production and tests: Black, Flake8, focused mypy, and
+  `git diff --check` clean; clean detached full-source base/candidate
+  comparison retained the exact inherited baselines (**one** Black
+  file, **nine** Flake8 findings, and **140 mypy errors in 11 files**)
+  with byte-identical line-normalized Flake8 and mypy output;
+- clean detached non-performance collection proved a complete
+  non-overlapping union of **4,306 selected tests** (zero missing,
+  extra, or duplicate node IDs): sequential fresh processes passed
+  **4,292**, skipped **14**, deselected **3** performance tests, and
+  failed **zero** in 3,012.31 pytest-seconds; no rerun or libomp
+  resource event occurred;
+- paired same-session compiler latency versus `fc94ec1` stayed inside
+  1.10 with identical source hashes in every case: `small_dense`
+  **1.003/0.980**, reduction **1.003/0.637**,
+  `csr_intersection` **0.973/0.963**, and `sparse_union`
+  **1.009/1.042** (p50/p95); a standalone clean-worktree execution of
+  public `einsum("ij,kj->ik", ds, dd)` also matched PyTorch; evidence
+  is retained under
+  `/Users/bobby/.cache/scorch-codex/phase7-infra-8fb4902-full.sWQ9jZ/`;
+  and
+- local and live origin remained `58e8565`; protected hashes and all
+  unrelated material remained unchanged; nothing was pushed.

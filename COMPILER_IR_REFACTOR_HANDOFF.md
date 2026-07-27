@@ -27726,3 +27726,179 @@ evidence outside Git, update §27 and the handoff with exact receipts
 and honest limitations, push nothing, and finish as much of the
 remaining boundary as the evidence supports.
 ```
+
+## Phase-6 closure review corrections (2026-07-27, supersedes the §27 prompt)
+
+The chronologically latest review is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §28.  Independent review found
+the inherited automatic derivation, implicit bridge, and reduce-out
+implementation sound, then committed two corrections:
+
+- `a920e10` makes malformed mutable CIN fail closed iteratively for
+  analysis and LoopIR-owned entry points before recursive analysis,
+  nest collection, requested scheduling inside the LoopIR pipeline,
+  metadata binding, or build work; and
+- `8fb4902` adds the missing reduce-out oracle/erasure tests and
+  corrects the dual and sparse boundary census.
+
+The prior "exactly one boundary" verdict is withdrawn.  Phase 6 has no
+GO and remains open on at least two independent families:
+
+1. sparse result/workspace representation and assembly; and
+2. general non-identity dense layout/physical-position lowering.
+
+The second boundary is production-relevant: the public-aligned
+`einsum("ij,kj->ik", ds, dd)` dual constituent carries the dense
+operand as logical `B[k,j]` over physical `mode_order=[1,0]`, and both
+typed arms currently fail at `unsupported_loop_order`.  The prior dual
+census covered representative identity-layout families, not the whole
+production domain.  A high-rank dense automatic plan also remains
+fail-closed because the legacy emitter itself uses one position before
+declaration; do not reproduce invalid C++ for byte parity.
+
+The sparse audit now includes
+`unsupported_sparse_output_domain`, `unsupported_merged_update`, and
+separate mixed-level elementwise/reduction cases.  The retained
+mixed-`sd` source demonstrates several assembly defects, but no
+standalone reproducer or crash transcript was retained for the
+separately asserted generic `ds` SpMSpM SIGSEGV.  Reproduce that claim
+before treating it as evidence.
+
+### Updated broad prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip. Do
+not push, switch branches, amend, squash, or reorder commits.
+
+Read AGENTS.md; COMPILER_IR_REFACTOR_DESIGN.md (Phases 6-7 and every
+Phase-6 exit criterion); the Phase-4 and Phase-5 reviews; all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through the chronologically
+latest §28; and the latest tail of COMPILER_IR_REFACTOR_HANDOFF.md.
+Section 28 and this prompt supersede §27 and all older routing prompts
+where they conflict.
+
+First independently review the inherited §27 commits and the review
+corrections a920e10 and 8fb4902 plus the §28 documentation commit. Do
+not trust the handoff. Reproduce the focused gates and inspect every
+diff. Adversarially verify:
+
+- logical-order automatic tile derivation against permuted physical
+  mode orders on both F2/F4 routes;
+- implicit op=None reduction normalization exactly once, with no
+  manufactured elementwise update;
+- reduce-out placement, target lowering, deterministic identities,
+  byte parity, oracle execution, and exact erasure across both arms,
+  zero/unit/exact/ragged/oversized extents, multiple reductions, and
+  at least two through six tiles;
+- malformed CIN cycles, excessive depth, missing/invalid fields,
+  shared DAGs, and failure before the LoopIR pipeline invokes its
+  scheduler or build boundary;
+- all sparse boundary codes now locked in §28; and
+- the dual helper across identity and non-identity layouts, batched and
+  multi-operand expressions, and both arms.
+
+Fix and commit any concrete review defect before new work. Preserve
+scorch.autopolicy.v1, scorch.loopplan.canonical.v1,
+scorch.loopir.request.v2, and scorch.loopir.canonical.v8 unless a real
+serialized representation change requires a version bump.
+
+Then pursue a broad Phase-6 closure milestone with parallel read-only
+audits and, where representations do not conflict, parallel
+implementation work. Do not stop after one tiny seam if the evidence
+supports completing both major families.
+
+Workstream A — general level/layout position lowering:
+
+1. First decide whether to move the iterative stored-forward-structure
+   preflight into the shared direct Scheduler/normalize boundary.
+   Today release-mode normalize_cin can still leak AttributeError for
+   a forged missing CIN field, and direct Scheduler.apply_schedule can
+   leak during its earlier display-name validation even with debug
+   verification enabled. Make that change only with exact
+   error-ordering tests and paired compiler-latency evidence; otherwise
+   retain and document the narrow LoopIR-owned boundary.
+2. Inventory the full release-reachable dual and automatic domain by
+   semantic format, rank, operand count, logical access order, and
+   physical mode_order. Generate the census from production
+   qualification rules where practical rather than claiming a small
+   hand-written table is exhaustive.
+3. Extend CIN→LoopIR and target lowering so logical coordinates map to
+   physical dense positions for non-identity layouts without rendered
+   names, regexes, or C++ spelling in the IR. The primary activating
+   case is public einsum("ij,kj->ik", ds, dd), whose dense B[k,j]
+   access currently fails unsupported_loop_order. Cover batched,
+   rank-3+, and multi-operand variants in both automatic arms.
+4. Separate valid legacy comparands from invalid legacy emission. For
+   valid transposed/permuted families, require byte-identical source
+   and bitwise/tolerance differentials. For the high-rank case whose
+   legacy source uses pA2 before declaration, prove a valid semantic
+   order against the LoopIR oracle/PyTorch or keep the exact boundary;
+   never emit invalid C++ merely to satisfy parity.
+
+Workstream B — sparse result/workspace representation:
+
+1. Represent true sparse coo_workspace allocation, reset, insertion,
+   and ordered assembly for row-scope SpMSpM and sparse-output roots,
+   including exact no_tile_list behavior and parent-linked positions.
+2. Represent mixed compressed-parent/dense-leaf result assembly with a
+   dense trailing workspace axis in the general level-based model; do
+   not introduce a CSR-only shortcut into the schema or interpreter.
+3. Cover dense-domain→CSR, sparse-row→CSR, merged updates/reductions,
+   empty/disjoint/overlapping/cancellation structures, zero extents,
+   f32/f64, nested compressed parents, and both policy arms. Use byte
+   parity only where legacy compiles and executes. Where legacy is
+   defective, retain the source, reproduce the defect rather than
+   citing prose, and use independent LoopIR oracle, PyTorch, and public
+   route differentials as the correctness gate.
+
+Workstream C — complete dual disposition and Phase-6 exit:
+
+1. Re-run the production-derived constituent census after A/B. Build
+   every admitted arm through actual LoopIR; comparing legacy helpers
+   to themselves is not evidence. Keep target-level runtime stitching
+   assigned to Phase 7 only after every constituent is migrated or
+   explicitly dispositioned.
+2. Repeat every Phase-6 criterion line by line. Declare GO only if
+   schedule decisions are typed, the valid explicit/automatic
+   differentials hold across format/layout families, canonical request
+   identity remains semantic, and the representative tile-j/tile-ijk
+   compositions remain ready. If any criterion remains open, record
+   exact codes and do not claim Phase 6 complete.
+3. If and only if Phase 6 genuinely reaches GO, use remaining session
+   capacity for one coherent Phase-7 stretch: the target-owned runtime
+   dual stitch plus its structured work-estimate/OpenMP policy. Do not
+   start production cutover, selector/cache cutover, legacy deletion,
+   Phase 8, or Phase 8.5.
+
+Preserve frozen tuple ownership; exact stored-field/type/enum
+validation; forged/missing/extra/hostile/cyclic/shared/depth
+adversaries; deterministic artifact-local identities; stage-owned
+failure; no rendered-name/tag/regex discovery in typed passes;
+structural activation never waived; erasure and independent semantic
+oracles; and no ordinary release-JIT double compilation.
+
+Run focused memberships after each coherent commit. Final gates must
+include: broad CIN/LoopPlan/LoopIR contract and options/identity
+memberships; the complete compiled scheduled-slice,
+pipeline-execution, schedule-generality, and dual-path battery; an
+expanded production-derived automatic/dual census; fresh
+corpus/grid/heap/anchor and activating-family captures; the 86-case
+audit plus every new format/layout cell; automatic root/tiled/dual
+source grids; paired same-session compiler latency; Black, Flake8,
+focused mypy, and same-methodology full-source mypy comparison
+(reviewed baseline 140 errors in 11 files); git diff --check; and a
+complete clean detached-worktree non-performance suite. Partition the
+full suite into complete non-overlapping fresh processes if needed to
+avoid the documented macOS libomp pthread-key ceiling, and report that
+method exactly.
+
+Before editing and before every commit, inspect git status, local and
+live origin, and the five protected-file hashes. Preserve every
+unrelated dirty/untracked GPU/CUDA, benchmark, packaging, scheduler,
+research, scratchpad, and tooling path. Stage explicit pathspecs only,
+use focused commits with descriptive bodies, retain evidence outside
+Git, update §28 and this handoff with exact receipts and candid
+limitations, push nothing, and complete as much of this broad coherent
+milestone as the evidence honestly supports.
+```
