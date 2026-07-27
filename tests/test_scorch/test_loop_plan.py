@@ -2418,6 +2418,127 @@ def test_auto_arm_mislabeling_fails_closed() -> None:
     )
 
 
+def test_auto_origin_derives_workspace_storage_from_the_workspace_axis() -> None:
+    """A sparse result may still use a dense trailing workspace."""
+
+    k, i, j = IndexVar("k"), IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="sd")
+    source = TensorVar("A", fmt="ddd")
+    cin = ForAll(
+        k,
+        ForAll(
+            i,
+            ForAll(
+                j,
+                TensorAssign(result[k, j], source[k, i, j], op=Operation.ADD),
+            ),
+        ),
+    )
+
+    scheduled = Scheduler.auto_schedule_plan(cin, regblock_enabled=False)
+    plan = scheduled.verified_loop_plan
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    assert plan.workspace == WorkspaceInsertion(
+        reduction_loop=LoopRef(ids["i"]),
+        axis_loops=(LoopRef(ids["j"]),),
+        dense=True,
+    )
+    assert tuple(tile.loop.index_id for tile in plan.tiles) == (ids["j"],)
+    replay = Scheduler.apply_schedule(cin, Schedule())
+    assert replay.verified_loop_plan == plan
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_auto_origin_replays_sparse_workspace_no_tile(
+    regblock_enabled: bool,
+) -> None:
+    """Sparse workspace insertion excludes its producer reduction from tiling."""
+
+    k, i, j = IndexVar("k"), IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="s")
+    left = TensorVar("A", fmt="ddd")
+    right = TensorVar("B", fmt="dd")
+    cin = ForAll(
+        k,
+        ForAll(
+            i,
+            ForAll(
+                j,
+                TensorAssign(
+                    result[j],
+                    left[k, i, j] * right[k, i],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+
+    scheduled = Scheduler.auto_schedule_plan(
+        cin,
+        regblock_enabled=regblock_enabled,
+    )
+    plan = scheduled.verified_loop_plan
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    assert plan.workspace == WorkspaceInsertion(
+        reduction_loop=LoopRef(ids["i"]),
+        axis_loops=(LoopRef(ids["j"]),),
+        dense=False,
+    )
+    assert plan.tiles == ()
+    options = CompileOptions.from_environment(
+        environ={},
+        requested_schedule=Schedule(),
+        regblock_override=regblock_enabled,
+    )
+    replay = Scheduler.apply_schedule(cin, Schedule(), compile_options=options)
+    assert replay.verified_loop_plan == plan
+
+
+def test_auto_origin_replays_post_workspace_retraversal_scope() -> None:
+    """Only the common pre-Where prefix participates in the legacy filter."""
+
+    j, k, ell, i = (
+        IndexVar("j"),
+        IndexVar("k"),
+        IndexVar("ell"),
+        IndexVar("i"),
+    )
+    result = TensorVar("C", fmt="dd")
+    source = TensorVar("A", fmt="sdsd")
+    cin = ForAll(
+        j,
+        ForAll(
+            k,
+            ForAll(
+                ell,
+                ForAll(
+                    i,
+                    TensorAssign(
+                        result[k, i],
+                        source[j, k, ell, i],
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    scheduled = Scheduler.auto_schedule_plan(cin, regblock_enabled=False)
+    plan = scheduled.verified_loop_plan
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    assert plan.workspace == WorkspaceInsertion(
+        reduction_loop=LoopRef(ids["ell"]),
+        axis_loops=(LoopRef(ids["i"]),),
+        dense=True,
+    )
+    assert tuple(tile.loop.index_id for tile in plan.tiles) == (
+        ids["k"],
+        ids["i"],
+    )
+    replay = Scheduler.apply_schedule(cin, Schedule())
+    assert replay.verified_loop_plan == plan
+
+
 def test_workspace_fact_is_an_automatic_decision_only() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_dense_matmul(), Schedule(loop_order=("i", "j", "k"))
