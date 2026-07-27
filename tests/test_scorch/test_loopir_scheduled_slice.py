@@ -3190,6 +3190,49 @@ def test_spmm_auto_stack_form_shadow_execution():
     )
 
 
+def build_root_reduction(dtype=F32):
+    ivs = {name: IndexVar(name) for name in ("j", "k")}
+    c = TensorVar("C", fmt="d", dtype=dtype)
+    a = TensorVar("A", fmt="dd", dtype=dtype)
+    stmt = TensorAssign(c[ivs["k"]], a[ivs["j"], ivs["k"]], op=Operation.ADD)
+    for name in reversed(("j", "k")):
+        stmt = ForAll(ivs[name], stmt)
+    return stmt
+
+
+def test_root_reduction_auto_source_is_byte_identical_to_legacy():
+    """The aligned dense root-scope family flows tile-free through LoopIR."""
+
+    comparison = compare_generated_sources(
+        build_root_reduction(),
+        (4,),
+        (((3, 4), F32),),
+        compile_options=scheduled_options(Schedule()),
+    )
+    assert comparison.identical
+
+
+def test_root_reduction_auto_shadow_execution():
+    """The compiled aligned root family matches legacy bitwise and Torch."""
+
+    torch.manual_seed(2613)
+    a = torch.randn(3, 4)
+    loopir_result, legacy_result, comparison = execute_shadow(
+        build_root_reduction(),
+        (4,),
+        dense_stensor(a, "A"),
+        compile_options=scheduled_options(Schedule()),
+    )
+    assert comparison.identical
+    assert torch.equal(loopir_result.values, legacy_result.values)
+    assert torch.allclose(
+        loopir_result.values.reshape(4),
+        a.sum(dim=0),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
 def test_auto_stack_form_ss_family_fails_closed_at_target_lowering():
     """The doubly-compressed operand stays outside the migrated families."""
 

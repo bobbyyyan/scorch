@@ -2092,13 +2092,13 @@ def test_auto_workspace_replay_consumes_the_recorded_fact() -> None:
 
 
 def test_root_workspace_auto_plan_records_the_replay_contract() -> None:
-    """A dense root-scope insertion whose tiles never materialize records None.
+    """The dense root-scope reduction elides its workspace on every route.
 
-    The private surgery inserts a pure-overhead root workspace (the Where
-    root makes the tiling heuristics bail, so no tiles are recorded); the
-    replayable plan contract deliberately omits it, exactly as the
-    established ScheduledCIN replay behavior does.  The surgery-versus-
-    replay divergence is a documented legacy observation, not new state.
+    The abandoned materialized form emitted the dense and sparse workspace
+    APIs over one undeclared symbol and never compiled (retained
+    einsum('jk->k') clang evidence), so the plan-free production surgery now
+    elides the root insertion exactly as the empty-Schedule replay contract
+    always has; the recorded plan and both nests agree.
     """
 
     scheduled, plan = _auto_plan(_build_root_reduction())
@@ -2111,18 +2111,28 @@ def test_root_workspace_auto_plan_records_the_replay_contract() -> None:
         copy.deepcopy(scheduled.normalized_cin),
         CompileOptions.from_environment(),
     )
-    assert surgery.inserted_workspace
-    assert str(replayed) != str(surgery)
+    assert not surgery.inserted_workspace
+    assert str(replayed) == str(surgery)
 
 
-def test_plan_free_root_workspace_origin_fails_closed() -> None:
-    """F4 must not return a plan that silently drops a real workspace decision."""
+def test_plan_free_root_workspace_origin_records_the_elision() -> None:
+    """F4 records the honest elided decision for the dense root family."""
 
-    with pytest.raises(
-        UnsupportedFeature,
-        match="dense root-workspace materialization is not represented",
-    ):
-        Scheduler.auto_schedule_plan(_build_root_reduction())
+    scheduled = Scheduler.auto_schedule_plan(_build_root_reduction())
+    plan = scheduled.verified_loop_plan
+    assert plan.provenance == "auto"
+    assert plan.workspace is None
+    assert plan.tiles == ()
+    assert plan.auto_policy is not None
+    replayed = legacy_cin_working_copy(scheduled.normalized_cin, plan)
+    assert not replayed.inserted_workspace
+
+    # A sparse-output root insertion still materializes and is recorded:
+    # elision is exactly the dense-output root family, nothing wider.
+    sparse_root = Scheduler.auto_schedule_plan(_build_sparse_output_reduction())
+    sparse_plan = sparse_root.verified_loop_plan
+    assert sparse_plan.workspace is not None
+    assert sparse_plan.workspace.dense is False
 
 
 def test_release_auto_schedule_does_not_depend_on_plan_recording() -> None:

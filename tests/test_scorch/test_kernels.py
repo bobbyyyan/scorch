@@ -1902,3 +1902,20 @@ def test_sddmm_csr():
     )
 
     assert torch_result.values().allclose(scorch_result.values)
+
+
+def test_einsum_dense_root_reduction():
+    """einsum('jk->k') compiles and matches torch for a dense operand.
+
+    Regression lock: the automatic scheduler used to materialize a
+    root-scope workspace for this family whose generated kernel mixed the
+    dense and sparse workspace APIs over one undeclared symbol and failed
+    to compile.  The scheduler now elides that insertion exactly as the
+    empty-Schedule replay contract does.
+    """
+
+    torch.manual_seed(2612)
+    dense = torch.randn(5, 7)
+    dense_stensor = STensor.from_torch(dense, "A").to_dense()
+    result = einsum("jk->k", dense_stensor)
+    assert torch.allclose(result.values, dense.sum(dim=0), atol=1e-3, rtol=1e-3)
