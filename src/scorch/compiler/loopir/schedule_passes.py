@@ -2153,11 +2153,12 @@ def _check_plan_families(plan: LoopPlan) -> None:
     ``provenance="auto"`` identifies those replay contracts; the verified
     ``auto_policy`` origin fact ties every recorded tile and workspace
     decision to its re-derivation, but the cost-model order itself remains
-    attested rather than re-proved.  The plan-free root-workspace family
-    (whose legacy production emission is internally inconsistent), the
-    reduce-out strip-mine family, and the sparse-workspace family have no
-    typed emission twin yet and stay fail-closed.  Every other provenance
-    fails closed.
+    attested rather than re-proved.  The dense root-scope reduction family
+    records the elided decision and flows through the tile-free contract
+    (its abandoned materialized form never compiled).  The reduce-out
+    strip-mine family and the sparse-workspace family have no typed
+    emission twin yet and stay fail-closed.  Every other provenance fails
+    closed.
     """
 
     if plan.provenance == "auto":
@@ -2195,9 +2196,9 @@ def _check_plan_families(plan: LoopPlan) -> None:
             _fail(
                 "unsupported_schedule_auto_family",
                 "automatic plans are migrated for the tile-free and "
-                "regblock stack-form replay contracts only; root-workspace, "
-                "reduce-out strip-mine, and sparse-workspace families stay "
-                "on the legacy path",
+                "regblock stack-form replay contracts only; reduce-out "
+                "strip-mine and sparse-workspace families stay on the "
+                "legacy path",
             )
         return
     if plan.provenance != "explicit":

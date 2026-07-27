@@ -362,11 +362,10 @@ def _derive_auto_decisions(
     candidates on the post-insertion nest — expressed over the immutable
     analysis instead of mutable CIN.  Candidate order follows the
     post-insertion access traversal (producer reads, then the consumer
-    result); a root-scope insertion demotes the nest root to a region, so
-    its candidate tiles never materialize.  The recorded replay contract
-    keeps ``workspace=None`` for a dense-output insertion whose tiles all
-    bailed; the plan-free origin API fails closed on that divergence
-    instead of recording it.
+    result); a dense-output root-scope insertion is elided by both the
+    plan-free production surgery and the empty-Schedule replay (the
+    abandoned materialized form never compiled), so the derived facts for
+    that family are no tiles and no workspace.
     """
 
     workspace_domain = _workspace_domain(facts, plan)

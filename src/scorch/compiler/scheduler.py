@@ -3354,7 +3354,26 @@ class Scheduler:
             will_tile = (
                 len(Scheduler._select_index_vars_to_tile(cin, scheduler_policy)) > 0
             )
-            if not dense_output or will_tile:
+            insert = not dense_output or will_tile
+            if insert and dense_output:
+                # A dense-output insertion at the nest root demotes the root
+                # to a Where, so the candidate tiles that justified the
+                # workspace can never materialize — and the legacy emission of
+                # that composition mixes the dense and sparse workspace APIs
+                # over one undeclared symbol, so it has never compiled
+                # (retained einsum('jk->k') clang evidence).  Elide exactly as
+                # the established empty-Schedule replay contract does, keeping
+                # the plan-free production route and replay in agreement.
+                root_getter = CINIndexVariablesGetter()
+                root_getter.visit(cin)
+                reductions_in_order = [
+                    var
+                    for var in root_getter.get_reduction_vars()
+                    if var in cin.loop_order
+                ]
+                if reductions_in_order and cin.index_var == reductions_in_order[-1]:
+                    insert = False
+            if insert:
                 # Recording is a plan-construction concern.  Ordinary release
                 # auto-scheduling owns only the legacy mutation and must not
                 # depend on this helper when no recording sink was requested.
@@ -3385,28 +3404,21 @@ class Scheduler:
                 plan_tiles=plan_tiles,
             )
         if plan_workspace is not None and recorded is not None:
-            # The recorded fact is the plan's replay contract, not a diary of
-            # the private surgery: a dense-output workspace whose candidate
-            # tiles never materialized (a root-scope insertion demotes the
-            # nest root to a Where, so the tiling heuristics bail) is pure
-            # overhead that replay deliberately omits.  Recording ``None``
-            # keeps replay byte-compatible with the established
-            # ``ScheduledCIN`` behavior; the surgery-versus-replay divergence
-            # it papers over is documented as a legacy observation.
+            # The root-scope dense elision above makes production surgery and
+            # the ``ScheduledCIN`` replay contract agree by construction: any
+            # materialized dense-output workspace now has candidate tiles that
+            # actually materialize.  The guard below is defense in depth — if
+            # a future heuristic change reintroduces a materialized dense
+            # workspace whose tiles bailed, recording ``None`` would falsely
+            # claim a complete recording, so complete-plan mode fails closed
+            # instead.
             if not dense_output or (plan_tiles is not None and plan_tiles):
                 plan_workspace.append(recorded)
             elif require_complete_plan:
-                # A dense root reduction is the one established legacy
-                # divergence: plan-free auto inserts a pure-overhead workspace,
-                # while Schedule()/ScheduledCIN replay intentionally elides it.
-                # Returning workspace=None here would falsely claim that the
-                # plan is a complete recording of production auto decisions.
-                # Fail closed until that materialize-vs-elide decision has its
-                # own typed representation and measured LoopIR lowering.
                 raise UnsupportedFeature(
-                    "stage=auto plan recording: dense root-workspace "
-                    "materialization is not represented by the current "
-                    "automatic LoopPlan replay contract"
+                    "stage=auto plan recording: a materialized dense "
+                    "workspace without derived tiles is not represented by "
+                    "the automatic LoopPlan replay contract"
                 )
         return cin
 
@@ -3547,10 +3559,11 @@ class Scheduler:
         ``provenance="auto"`` LoopPlan instead of surviving only as private
         tree surgery.  The mutable surgery result is discarded exactly as
         :meth:`apply_schedule` discards it; release dispatch does not consume
-        this entry yet.  The established dense root-workspace insertion cannot
-        yet be represented without changing the empty-Schedule replay contract,
-        so this entry fails closed on that family rather than returning an
-        incomplete plan.
+        this entry yet.  The dense root-scope reduction family records the
+        elided decision (``workspace=None``): plan-free production surgery
+        now elides that insertion exactly as the empty-Schedule replay
+        contract always has, because the abandoned materialized form never
+        produced compilable C++ (retained einsum('jk->k') clang evidence).
         """
 
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)

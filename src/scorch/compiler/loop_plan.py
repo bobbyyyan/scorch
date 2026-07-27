@@ -123,12 +123,13 @@ class WorkspaceInsertion:
     loop the region wraps, the trailing free axis loops whose cells the
     workspace stores (in loop order), and whether the materialized workspace
     is the 1-D dense accumulator or the sparse fallback representation.  It
-    records a workspace that replay must materialize; ``None`` in the legacy
-    empty-Schedule replay contract may still represent its established
-    root-workspace elision.  The plan-free origin API fails closed on that
-    divergent root case instead of pretending the production insertion did
-    not happen.  This is an automatic-provenance decision only; explicit
-    schedules express workspace lifetime through tile accumulation instead.
+    records a workspace that replay must materialize; ``None`` records the
+    elision contract, including the dense root-scope reduction family where
+    both the plan-free production surgery and the empty-Schedule replay now
+    elide the insertion (the abandoned materialized form emitted both
+    workspace APIs over one undeclared symbol and never compiled).  This is
+    an automatic-provenance decision only; explicit schedules express
+    workspace lifetime through tile accumulation instead.
     """
 
     reduction_loop: LoopRef
