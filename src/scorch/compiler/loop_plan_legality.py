@@ -346,6 +346,29 @@ def _workspace_domain(
     return free_after
 
 
+def _workspace_uses_dense_storage(
+    facts: LoopPlanLegalityFacts,
+    workspace_domain: Tuple[IndexId, ...],
+) -> bool:
+    """Mirror the legacy workspace representation decision exactly.
+
+    Workspace storage depends on the levels addressed by the workspace, not
+    on whether every level of the result tensor is dense.  The current
+    lowering supports a dense workspace only for one trailing result level;
+    every other domain uses the sparse fallback representation.
+    """
+
+    if len(workspace_domain) != 1 or not facts.result_accesses:
+        return False
+    result = facts.result_accesses[0]
+    workspace_index = workspace_domain[0]
+    try:
+        storage_position = result.storage_index_ids.index(workspace_index)
+    except ValueError:
+        return False
+    return result.level_types[storage_position] == LevelType.DENSE
+
+
 def _assignment_is_additive(assignment: AssignmentInfo) -> bool:
     return assignment.update_op in (None, Operation.ADD)
 
@@ -388,29 +411,66 @@ def _derive_auto_decisions(
     if plan.loop_order:
         first_loop = plan.loop_order[0]
         candidates = [index_id for index_id in candidates if index_id != first_loop]
-    if not policy.regblock_enabled:
+
+    def filter_sparse_retraversal(
+        candidate_ids: List[IndexId],
+        *,
+        surviving_prefix_end: Optional[int] = None,
+    ) -> List[IndexId]:
+        if policy.regblock_enabled:
+            return candidate_ids
 
         def causes_sparse_retraversal(index_id: IndexId) -> bool:
             position = facts.loop_positions.get(index_id)
             if position is None:
                 return False
+            if surviving_prefix_end is not None and position >= surviving_prefix_end:
+                # After workspace insertion the replaced reduction subtree is
+                # represented by a Where.  Legacy ``cin.loop_order`` retains
+                # only the common prefix as direct IndexVar entries; loops in
+                # or below the region therefore do not trigger the
+                # re-traversal filter.
+                return False
             return any(
                 plan.loop_order[inner] in sparse_ids for inner in range(1, position)
             )
 
-        candidates = [
+        return [
             index_id
-            for index_id in candidates
+            for index_id in candidate_ids
             if not causes_sparse_retraversal(index_id)
         ]
 
+    # The first selection runs before workspace insertion and decides whether
+    # a dense-result workspace is worth materializing.  At that point the loop
+    # order is still the original flat plan order.
+    pre_insertion_candidates = filter_sparse_retraversal(list(candidates))
     should_insert = bool(workspace_domain)
-    will_tile = bool(candidates)
+    will_tile = bool(pre_insertion_candidates)
     materialize = should_insert and (not dense_output or will_tile)
     if not materialize:
         return (), None
     last_reduction_position = max(
         facts.loop_positions[index_id] for index_id in facts.reduction_index_ids
+    )
+    last_reduction_id = plan.loop_order[last_reduction_position]
+    workspace_dense = _workspace_uses_dense_storage(facts, workspace_domain)
+
+    # The second selection runs on the post-insertion tree.  Sparse workspace
+    # insertion adds the producer's reduction loop to ``no_tile_list``.
+    # Moreover, the Where branches are nested list entries in legacy
+    # ``cin.loop_order``, so sparse re-traversal is checked only for candidate
+    # loops in the surviving common prefix.
+    post_insertion_candidates = list(candidates)
+    if not workspace_dense:
+        post_insertion_candidates = [
+            index_id
+            for index_id in post_insertion_candidates
+            if index_id != last_reduction_id
+        ]
+    post_insertion_candidates = filter_sparse_retraversal(
+        post_insertion_candidates,
+        surviving_prefix_end=last_reduction_position,
     )
     root_scope = last_reduction_position == 0
     if root_scope:
@@ -434,7 +494,7 @@ def _derive_auto_decisions(
                 accumulation="direct",
                 unroll=True,
             )
-            for index_id in candidates
+            for index_id in post_insertion_candidates
         )
     record_workspace = not dense_output or bool(derived_tiles)
     if not record_workspace:
@@ -442,7 +502,7 @@ def _derive_auto_decisions(
     derived_workspace = WorkspaceInsertion(
         reduction_loop=LoopRef(plan.loop_order[last_reduction_position]),
         axis_loops=tuple(LoopRef(index_id) for index_id in workspace_domain),
-        dense=dense_output,
+        dense=workspace_dense,
     )
     return derived_tiles, derived_workspace
 
