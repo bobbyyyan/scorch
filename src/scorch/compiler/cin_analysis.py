@@ -264,8 +264,7 @@ def _preflight_cin_structure(  # noqa: C901
         if live is not value:
             diagnose(
                 "invalid_cin_field",
-                f"{type(node).__name__}.{field_name} diverges from its "
-                "stored value",
+                f"{type(node).__name__}.{field_name} diverges from its stored value",
                 path + (field_name,),
             )
             return _MISSING_CIN_FIELD
