@@ -3381,3 +3381,168 @@ verification, latency, full-suite ledgers).
 - `git diff --check` clean; live origin still `58e8565`; all five
   protected tracked files at their recorded hashes; no unrelated
   tracked or untracked material staged.
+
+## 24. Review corrections to automatic routing and request identity (2026-07-26)
+
+This section supersedes §23's current-state claims.  Section 23 remains
+historical evidence for the inherited implementation at `f218c2e`; its
+statement that Phase 6 had exactly one remaining boundary is not the
+verdict after adversarial review.
+
+The review inspected the inherited automatic-plan and canonical-identity
+range through `0c4c6cd`, reproduced its focused and compiled gates, and
+then tested the claimed boundaries independently.  Fourteen focused
+correction commits were added without amending, reordering, or pushing:
+
+- `6a2a5e0` / `fd91be0` — make the request identity complete and lock
+  its first trust boundaries;
+- `6702f43` / `3d8f30a` — expose the automatic root-workspace boundary
+  and remove recording-only work from release scheduling;
+- `dd4d73a` / `21cac4d` — close nested request-state and
+  index-expression validation gaps;
+- `369cf03` / `3c964bf` and `4a82112` / `befa198` — require distinct,
+  fresh, exactly typed auto-plan ownership sinks;
+- `a2cc209` / `7afbc1e` — make request validation side-effect-free and
+  cover unary RHS binding counts and hostile containers; and
+- `25715bf` / `c7e3702` — reject hostile option values before invoking
+  equality or hashing protocols.
+
+### 24.1 Canonical request boundary: corrected
+
+The inherited `scorch.loopir.request.v1` key omitted `CompileOptions`,
+serialized dtypes through arbitrary `str()`, admitted unbounded Python
+integers until JSON conversion, and computed between owned compiler
+stages.  Consequently different generated C++ could share an identity,
+hostile dtype objects could execute code or collide, and malformed
+requests could fail while the compilation context recorded no failed
+stage.
+
+The corrected schema is **`scorch.loopir.request.v2`**.  It includes the
+exact canonical `CompileOptions` state with the public `Schedule`
+spelling replaced by the separately verified plan, closed float32/64
+dtype tokens, nonnegative int64 extents, exact runtime containers, and
+the existing canonical CIN/plan/binding content.  Construction now
+belongs to
+`FRONTEND_VALIDATED_OPERATION_CONSTRUCTION`; the compiled artifact
+requires a nonempty retained dump and its full lowercase SHA-256.
+`scorch.loopplan.canonical.v1` and
+`scorch.loopir.canonical.v8` are unchanged.
+
+The second adversarial pass found subtler fail-open behavior and closed
+it:
+
+- the cycle/depth preflight now traverses `ForAll.index_var`,
+  `TensorAccess.indices`, and `IndexVarAdd` edges;
+- every nested options carrier has exact stored fields and pure
+  stored-state validation, while constructor-normalized fields must
+  already be exact tuples;
+- forged one-shot iterators are rejected without consumption and an
+  immutable Darwin snapshot is not revalidated through new host
+  filesystem probes;
+- ABI RHS occurrences are counted by a cycle-safe structural walk
+  rather than the legacy visitor that recurses forever on `UnaryOp`;
+- list subclasses cannot invoke hostile `__iter__`/`__len__`; non-finite
+  JSON is rejected; and
+- LLIR-pass entries and compiler-wrapper names are type-checked before
+  tuple equality or set membership can invoke caller protocols.
+
+The canonical request remains a strangler-only retained identity.  No
+release cache consumes it and the source-derived JIT cache is unchanged.
+
+### 24.2 Automatic workspace ownership: corrected and honestly bounded
+
+The inherited report described `auto_schedule_plan` as a complete F4
+recording, but the dense root reduction `C[k] += A[j,k]` disproved that
+claim: plan-free production auto-scheduling materializes a root
+workspace and emits its zero/copy work, whereas the historical
+`Schedule()` replay contract deliberately elides that pure-overhead
+workspace.  Returning `workspace=None` from F4 silently identified two
+different programs as the same recorded decision.
+
+The correction keeps both established emission paths byte-stable but no
+longer claims equivalence:
+
+- plan-free `auto_schedule_plan` fails closed when it reaches that
+  materialize-versus-elide boundary;
+- ordinary release auto-scheduling calls no recording-only helper;
+- the admitted LoopIR family is described as the measured **tile-free
+  auto-replay contract**, not as authenticated cost-model origin; and
+- complete-plan helper mode validates its exact bool before loop-free
+  return and requires distinct, empty, exact tile/workspace sinks.
+
+The root behavior is not "fixed" by hiding it.  It is now an explicit
+remaining representation decision.
+
+### 24.3 Corrected Phase-6 exit disposition
+
+Criterion-by-criterion after the review:
+
+1. **Schedule decisions applied only to LoopIR:** met for the migrated
+   explicit families and the measured tile-free auto-replay family; not
+   claimed for the remaining plan-free automatic families.
+2. **No name/regex discovery in typed panel/relayout/result-tile
+   passes:** unchanged and met.
+3. **Canonical identity owns the strangler request:** met by request v2
+   with the fail-closed boundary above.
+4. **Explicit and automatic differentials:** explicit and tile-free
+   replay evidence holds; open for both (a) dense root-workspace
+   materialization versus replay elision and (b) heuristic
+   tiled/workspace auto, including `OUTERMOST`, `CHILD_OF`, reduction
+   strip-mines, and reduce-out consumers.
+5. **Representative tile-j/tile-ijk readiness:** unchanged and met.
+
+The default `regblock_dual` production path also stitches two automatic
+arms behind a runtime target branch.  Before exit, Phase 6 must either
+include that composition in its production-auto differential evidence
+or explicitly assign the target stitch to Phase 7 after proving both
+constituent schedules independently.
+
+**Verdict: Phase 6 remains open on two automatic-origin families, with
+the `regblock_dual` ownership decision still required.**  There is no
+Phase-6 GO and no Phase-7 work, production cutover, selector migration,
+cache cutover, or legacy deletion in this review.
+
+### 24.4 Verification
+
+Final evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-review-c7e3702/`.
+
+- the final ten-file contract membership passed **759 tests** at
+  `c7e3702`; the dedicated options/identity membership passed **81**,
+  including all adversarial probes;
+- the inherited compiled schedule/pipeline/generality gate plus the
+  review corrections passed **269 tests** before the final
+  identity-only hardening; the exact final-tip full-suite receipt below
+  contains those tests again;
+- paired same-session compiler latency at clean detached `0c4c6cd`
+  versus `c7e3702` (5 warmups / 30 samples, native work intercepted)
+  remained inside the 1.10 target with identical sources and complete
+  build summaries: `small_dense` **0.999/0.993**, reduction
+  **1.003/1.069**, `csr_intersection` **1.004/1.023**, and
+  `sparse_union` **1.009/0.992** (p50/p95); the canonical-endpoint
+  worst case was **1.070**;
+- changed files are Black/Flake8-clean except the inherited scheduler
+  C901; full-source Black, Flake8, and mypy are exactly at the retained
+  baselines (one formatting finding, nine lint findings, and 146 mypy
+  findings in 12 files, respectively);
+- the clean detached source-only gate reproduced **95/95**
+  corpus/grid/heap/anchor captures byte-identically, the 86-case audit
+  as **46 admitted / 40 rejected / zero divergent** with every
+  environment-independent record equal to the retained result, plus
+  **10/10** explicit-anchor and **11/11** heap LoopIR/legacy
+  byte-identical comparisons (ledger manifest
+  `a869e6e3860ce20ad916ddebce8953538d6f0b490751061b8e7c9e55f342010c`);
+- the literal unpartitioned clean detached-worktree non-performance
+  suite at exact `c7e3702`, with isolated caches and asserted import
+  provenance, passed **4,191 tests, 14 skipped, 3 performance tests
+  deselected, one known sparse-invariant warning, and zero
+  failures/errors** in **2,852.35 s (47:32)**; it crossed the historical
+  late-process region with no libomp/resource event (log SHA-256
+  `be5a80306ffb4269b6e93b2328c70b7b0701e27b188f1bee8993c8eece99f8d3`,
+  JUnit SHA-256
+  `b0687cfaf32d64e713f8dca07f824bc3697d678460248ee128dad1af1c111293`,
+  evidence-manifest SHA-256
+  `f56d0e1cfaf9509ce9ae27f71ad7961a9c7c0b43244b5c68beb37123cac32266`);
+  and
+- `git diff --check` is clean, local and live origin remain at
+  `58e8565`, and all five protected files retain their recorded hashes.
