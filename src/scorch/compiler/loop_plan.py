@@ -146,6 +146,35 @@ class WorkspaceInsertion:
         )
 
 
+AUTO_ORIGIN_POLICY_SCHEMA = "scorch.autopolicy.v1"
+
+
+@dataclass(frozen=True)
+class AutoOriginPolicy:
+    """The typed automatic-scheduling policy inputs one recorded plan claims.
+
+    ``provenance="auto"`` alone never attests cost-model origin: an arbitrary
+    plan can carry the string.  This versioned fact records the exact policy
+    inputs the originating scheduler consumed — which regblock arm ran and
+    the tile width that arm's heuristic uses — so the legality boundary can
+    re-derive every heuristic tile and workspace decision from the analyzed
+    CIN, the plan order, and this policy, and require the stored facts to
+    equal that derivation exactly.  The cost-model loop order itself remains
+    an attested decision (verified complete and legal, not re-derived); the
+    admitted automatic families are still replay contracts, not proofs that
+    the current cost model chose the order.
+
+    The policy is verification state, not schedule content: two verified
+    plans with identical decisions produce identical canonical serializations
+    and request identities regardless of the recorded policy, exactly as the
+    presentation-only ``tag`` stays outside the identity.
+    """
+
+    schema: str
+    regblock_enabled: bool
+    tile_width: int
+
+
 @dataclass(frozen=True)
 class ResultTile:
     result_id: SymbolId
@@ -184,6 +213,7 @@ class LoopPlan:
     result_tile: Optional[ResultTile] = None
     parallel_loop: Optional[LoopRef] = None
     workspace: Optional[WorkspaceInsertion] = None
+    auto_policy: Optional[AutoOriginPolicy] = None
     provenance: str = "explicit"
     tag: str = ""
 
@@ -410,6 +440,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "result_tile",
             "parallel_loop",
             "workspace",
+            "auto_policy",
             "provenance",
             "tag",
         ),
@@ -561,11 +592,42 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError(
                 "LoopPlan dense workspace insertion stores exactly one axis"
             )
+    if typed_plan.auto_policy is not None:
+        _validate_auto_policy_structure(typed_plan.auto_policy)
     if type(typed_plan.provenance) is not str or not typed_plan.provenance:
         raise VerificationError("LoopPlan.provenance must be a non-empty string")
     if type(typed_plan.tag) is not str:
         raise VerificationError("LoopPlan.tag must be a string")
     return typed_plan
+
+
+def _validate_auto_policy_structure(auto_policy: object) -> None:
+    """Reject a malformed stored automatic origin policy exactly."""
+
+    if type(auto_policy) is not AutoOriginPolicy:
+        raise VerificationError(
+            "LoopPlan.auto_policy must be an AutoOriginPolicy or None"
+        )
+    _validate_stored_fields(
+        auto_policy,
+        "auto_policy",
+        ("schema", "regblock_enabled", "tile_width"),
+    )
+    if (
+        type(auto_policy.schema) is not str
+        or auto_policy.schema != AUTO_ORIGIN_POLICY_SCHEMA
+    ):
+        raise VerificationError(
+            "LoopPlan auto_policy.schema must be the exact "
+            f"{AUTO_ORIGIN_POLICY_SCHEMA!r} version token"
+        )
+    if type(auto_policy.regblock_enabled) is not bool:
+        raise VerificationError("LoopPlan auto_policy.regblock_enabled must be a bool")
+    if not _is_non_bool_int(auto_policy.tile_width):
+        raise VerificationError("LoopPlan auto_policy.tile_width must be an integer")
+    if auto_policy.tile_width <= 0:
+        raise VerificationError("LoopPlan auto_policy.tile_width must be positive")
+    _verify_cpp_int_width(auto_policy.tile_width, "auto_policy.tile_width")
 
 
 def _verify_empty_loop_plan(plan: LoopPlan) -> None:

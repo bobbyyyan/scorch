@@ -9,7 +9,7 @@ lifetime facts are local values; none are attached to CIN or enter cache identit
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .cin import Operation
 from .cin_analysis import (
@@ -22,10 +22,12 @@ from .cin_analysis import (
 from .diagnostics import InvalidSchedule, UnsupportedFeature, VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .loop_plan import (
+    AutoOriginPolicy,
     LoopPart,
     LoopPlan,
     LoopPlacement,
     LoopRef,
+    LoopTile,
     OperandRelayout,
     PlacementKind,
     WorkspaceInsertion,
@@ -348,6 +350,104 @@ def _assignment_is_additive(assignment: AssignmentInfo) -> bool:
     return assignment.update_op in (None, Operation.ADD)
 
 
+def _derive_auto_decisions(
+    facts: LoopPlanLegalityFacts,
+    plan: LoopPlan,
+    policy: AutoOriginPolicy,
+) -> Tuple[Tuple[LoopTile, ...], Optional[WorkspaceInsertion]]:
+    """Re-derive the heuristic tile and workspace facts from the policy.
+
+    This mirrors the legacy automatic surgery exactly — workspace insertion
+    at the last in-order reduction, then per-arm tiling of the dense free
+    candidates on the post-insertion nest — expressed over the immutable
+    analysis instead of mutable CIN.  Candidate order follows the
+    post-insertion access traversal (producer reads, then the consumer
+    result); a root-scope insertion demotes the nest root to a region, so
+    its candidate tiles never materialize.  The recorded replay contract
+    keeps ``workspace=None`` for a dense-output insertion whose tiles all
+    bailed; the plan-free origin API fails closed on that divergence
+    instead of recording it.
+    """
+
+    workspace_domain = _workspace_domain(facts, plan)
+    dense_output = _all_dense_results(facts)
+
+    all_bound = set(facts.bound_index_ids)
+    sparse_ids = set()
+    ordered_layouts = facts.read_accesses + facts.result_accesses
+    for layout in ordered_layouts:
+        for index_id, level in zip(layout.storage_index_ids, layout.level_types):
+            if level != LevelType.DENSE:
+                sparse_ids.add(index_id)
+    candidates: List[IndexId] = []
+    for layout in ordered_layouts:
+        if set(layout.storage_index_ids) == all_bound:
+            continue
+        for index_id in layout.storage_index_ids:
+            if index_id not in sparse_ids and index_id not in candidates:
+                candidates.append(index_id)
+    if plan.loop_order:
+        first_loop = plan.loop_order[0]
+        candidates = [index_id for index_id in candidates if index_id != first_loop]
+    if not policy.regblock_enabled:
+
+        def causes_sparse_retraversal(index_id: IndexId) -> bool:
+            position = facts.loop_positions.get(index_id)
+            if position is None:
+                return False
+            return any(
+                plan.loop_order[inner] in sparse_ids for inner in range(1, position)
+            )
+
+        candidates = [
+            index_id
+            for index_id in candidates
+            if not causes_sparse_retraversal(index_id)
+        ]
+
+    should_insert = bool(workspace_domain)
+    will_tile = bool(candidates)
+    materialize = should_insert and (not dense_output or will_tile)
+    if not materialize:
+        return (), None
+    last_reduction_position = max(
+        facts.loop_positions[index_id] for index_id in facts.reduction_index_ids
+    )
+    root_scope = last_reduction_position == 0
+    if root_scope:
+        derived_tiles: Tuple[LoopTile, ...] = ()
+    else:
+        placement = (
+            LoopPlacement(
+                PlacementKind.CHILD_OF,
+                parent=LoopRef(plan.loop_order[0]),
+            )
+            if policy.regblock_enabled
+            else LoopPlacement(PlacementKind.OUTERMOST)
+        )
+        derived_tiles = tuple(
+            LoopTile(
+                loop=LoopRef(index_id),
+                width=policy.tile_width,
+                placement=placement,
+                parallel=False,
+                kind="affine",
+                accumulation="direct",
+                unroll=True,
+            )
+            for index_id in candidates
+        )
+    record_workspace = not dense_output or bool(derived_tiles)
+    if not record_workspace:
+        return derived_tiles, None
+    derived_workspace = WorkspaceInsertion(
+        reduction_loop=LoopRef(plan.loop_order[last_reduction_position]),
+        axis_loops=tuple(LoopRef(index_id) for index_id in workspace_domain),
+        dense=dense_output,
+    )
+    return derived_tiles, derived_workspace
+
+
 def _verify_auto_workspace_decision(
     facts: LoopPlanLegalityFacts,
     plan: LoopPlan,
@@ -431,6 +531,15 @@ def _verify_tiling_capabilities(
                 "auto LoopPlans cannot contain explicit-only scheduling decisions",
                 ("provenance",),
             )
+        if plan.auto_policy is None:
+            _invalid(
+                "auto_origin_policy",
+                "recorded automatic plans must carry the versioned origin "
+                "policy fact",
+                ("auto_policy",),
+            )
+        origin_policy = plan.auto_policy
+        assert origin_policy is not None
         for position, tile in enumerate(affine_tiles):
             if tile.accumulation != "direct" or tile.parallel:
                 _invalid(
@@ -440,8 +549,21 @@ def _verify_tiling_capabilities(
                     index_id=tile.loop.index_id,
                 )
         if not affine_tiles and not sparse_workspace:
-            _verify_auto_workspace_decision(facts, plan, None)
-            return False
+            derived_tiles: Tuple[LoopTile, ...] = ()
+            derived_workspace: Optional[WorkspaceInsertion] = None
+            if not source_has_workspace:
+                derived_tiles, derived_workspace = _derive_auto_decisions(
+                    facts, plan, origin_policy
+                )
+            if plan.tiles != derived_tiles:
+                _invalid(
+                    "auto_tile_decision",
+                    "the recorded automatic tiles must equal the "
+                    "policy-derived heuristic decisions exactly",
+                    ("tiles",),
+                )
+            _verify_auto_workspace_decision(facts, plan, derived_workspace)
+            return derived_workspace is not None
         if not workspace_domain:
             _invalid(
                 "auto_accumulator_lifetime",
@@ -462,22 +584,21 @@ def _verify_tiling_capabilities(
                 "auto workspace tiling supports additive reductions only",
                 ("analysis", "assignments"),
             )
-        derived_workspace: Optional[WorkspaceInsertion] = None
+        derived_tiles = ()
+        derived_workspace = None
         if not source_has_workspace:
-            derived_workspace = WorkspaceInsertion(
-                reduction_loop=LoopRef(
-                    plan.loop_order[
-                        max(
-                            facts.loop_positions[index_id]
-                            for index_id in facts.reduction_index_ids
-                        )
-                    ]
-                ),
-                axis_loops=tuple(LoopRef(index_id) for index_id in workspace_domain),
-                dense=_all_dense_results(facts),
+            derived_tiles, derived_workspace = _derive_auto_decisions(
+                facts, plan, origin_policy
+            )
+        if plan.tiles != derived_tiles:
+            _invalid(
+                "auto_tile_decision",
+                "the recorded automatic tiles must equal the policy-derived "
+                "heuristic decisions exactly",
+                ("tiles",),
             )
         _verify_auto_workspace_decision(facts, plan, derived_workspace)
-        return True
+        return derived_workspace is not None
 
     if plan.workspace is not None:
         _invalid(
@@ -486,6 +607,13 @@ def _verify_tiling_capabilities(
             "explicit schedules express accumulator lifetime through tile "
             "accumulation",
             ("workspace",),
+        )
+    if plan.auto_policy is not None:
+        _invalid(
+            "auto_policy_provenance",
+            "the automatic origin policy is recorded only on automatic "
+            "plans; explicit schedules carry no scheduler-policy claim",
+            ("auto_policy",),
         )
 
     if affine_tiles and not _all_dense_results(facts):

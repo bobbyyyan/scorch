@@ -39,7 +39,9 @@ from .diagnostics import (
 )
 from .legacy_cin_adapter import validate_legacy_cin_display_names
 from .loop_plan import (
+    AUTO_ORIGIN_POLICY_SCHEMA,
     MAX_AFFINE_TILE_WIDTH,
+    AutoOriginPolicy,
     LoopPart,
     LoopPlacement,
     LoopPlan,
@@ -2777,7 +2779,12 @@ class Scheduler:
                 )
             plan = verify_loop_plan(
                 source_cin,
-                LoopPlan(loop_order=(), provenance="auto", tag=schedule.tag),
+                LoopPlan(
+                    loop_order=(),
+                    auto_policy=Scheduler._auto_origin_policy(options.scheduler),
+                    provenance="auto",
+                    tag=schedule.tag,
+                ),
             )
             return ScheduledCIN(cin, plan)
         is_identity = Scheduler._validate_legacy_replay_scope(cin, schedule, costs)
@@ -2988,6 +2995,7 @@ class Scheduler:
                     loop_order=tuple(index_var.index_id for index_var in logical_order),
                     tiles=tuple(auto_tiles),
                     workspace=auto_workspace[0] if auto_workspace else None,
+                    auto_policy=Scheduler._auto_origin_policy(options.scheduler),
                     provenance="auto",
                     tag=schedule.tag,
                 ),
@@ -3287,6 +3295,25 @@ class Scheduler:
         return cin
 
     @staticmethod
+    def _auto_origin_policy(scheduler_policy: SchedulerPolicy) -> AutoOriginPolicy:
+        """The typed origin fact for one automatic-scheduling arm.
+
+        Records exactly the policy inputs the heuristics consume so plan
+        verification can re-derive every tile and workspace decision:
+        which regblock arm ran and the tile width that arm applies.
+        """
+
+        return AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=scheduler_policy.regblock_enabled,
+            tile_width=(
+                scheduler_policy.regblock_tile_width
+                if scheduler_policy.regblock_enabled
+                else scheduler_policy.auto_tile_width
+            ),
+        )
+
+    @staticmethod
     def _apply_auto_order_owned(
         cin: CIN,
         loop_order: List[IndexVar],
@@ -3561,7 +3588,11 @@ class Scheduler:
             if not isinstance(working, ForAll):
                 plan = verify_loop_plan(
                     normalized,
-                    LoopPlan(loop_order=(), provenance="auto"),
+                    LoopPlan(
+                        loop_order=(),
+                        auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                        provenance="auto",
+                    ),
                 )
             else:
                 logical_order = Scheduler.select_loop_order(working, costs=costs)
@@ -3584,6 +3615,7 @@ class Scheduler:
                         ),
                         tiles=tuple(auto_tiles),
                         workspace=auto_workspace[0] if auto_workspace else None,
+                        auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
                         provenance="auto",
                     ),
                 )

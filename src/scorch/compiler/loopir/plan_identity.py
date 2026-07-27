@@ -17,6 +17,10 @@ serialize byte-identically, and every semantic decision changes the bytes.
 ``plan.tag`` is a presentation-only annotation (the public ``Schedule.tag``
 label): it selects no gate, no pass, and no emission, so it is deliberately
 outside the canonical form and outside the request identity.
+``plan.auto_policy`` is likewise excluded: it is verification state that the
+legality boundary consumes to re-derive the recorded automatic decisions,
+never an emission input, so two verified plans with identical decisions
+serialize byte-identically regardless of the recorded policy arm.
 
 Layering:
 

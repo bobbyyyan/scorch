@@ -101,7 +101,7 @@ Legality model of this subset:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import (
     Any,
     Dict,
@@ -2144,30 +2144,60 @@ def _check_plan_families(plan: LoopPlan) -> None:
     can prove a supported dense logical or affine-origin anchor and its race
     and work contracts.
 
-    Automatic plans are admitted for the tile-free auto-replay contract: one
-    already verified logical order and no other decision.  ``provenance="auto"``
-    identifies that replay contract; it is not an attestation that an arbitrary
-    directly constructed plan was originated by the current cost model.  The
-    plan-free root-workspace and tiled automatic families have no typed
-    emission twin yet and stay fail-closed until scheduler origin/policy and
-    every workspace/tile decision are represented and re-derived.  Every other
-    provenance fails closed.
+    Automatic plans are admitted for two measured auto-replay contracts: the
+    tile-free family (one already verified logical order and no other
+    decision) and the regblock-arm stack form (one dense workspace over a
+    single trailing free axis plus exactly one direct serial ``CHILD_OF``
+    tile of that axis under the row loop, which the legacy surgery emits
+    byte-identically to the migrated explicit stack tile).
+    ``provenance="auto"`` identifies those replay contracts; the verified
+    ``auto_policy`` origin fact ties every recorded tile and workspace
+    decision to its re-derivation, but the cost-model order itself remains
+    attested rather than re-proved.  The plan-free root-workspace family
+    (whose legacy production emission is internally inconsistent), the
+    reduce-out strip-mine family, and the sparse-workspace family have no
+    typed emission twin yet and stay fail-closed.  Every other provenance
+    fails closed.
     """
 
     if plan.provenance == "auto":
         if (
-            plan.tiles
-            or plan.workspace is not None
-            or plan.panel_bounds
+            plan.panel_bounds
             or plan.relayout is not None
             or plan.result_tile is not None
             or plan.parallel_loop is not None
         ):
             _fail(
                 "unsupported_schedule_auto_family",
-                "automatic plans are migrated for the tile-free replay "
-                "contract only; root-workspace and heuristic tile/workspace "
-                "families stay on the legacy path",
+                "automatic plans are migrated for the tile-free and "
+                "regblock stack-form replay contracts only",
+            )
+        if not plan.tiles and plan.workspace is None:
+            return
+        stack_form = (
+            plan.auto_policy is not None
+            and plan.auto_policy.regblock_enabled
+            and len(plan.tiles) == 1
+            and plan.workspace is not None
+            and plan.workspace.dense
+            and plan.workspace.axis_loops == (plan.tiles[0].loop,)
+            and plan.tiles[0].kind == "affine"
+            and plan.tiles[0].accumulation == "direct"
+            and not plan.tiles[0].parallel
+            and plan.tiles[0].unroll
+            and plan.tiles[0].width == plan.auto_policy.tile_width
+            and plan.tiles[0].placement.kind is PlacementKind.CHILD_OF
+            and plan.tiles[0].placement.parent is not None
+            and bool(plan.loop_order)
+            and plan.tiles[0].placement.parent == LoopRef(plan.loop_order[0])
+        )
+        if not stack_form:
+            _fail(
+                "unsupported_schedule_auto_family",
+                "automatic plans are migrated for the tile-free and "
+                "regblock stack-form replay contracts only; root-workspace, "
+                "reduce-out strip-mine, and sparse-workspace families stay "
+                "on the legacy path",
             )
         return
     if plan.provenance != "explicit":
@@ -2479,6 +2509,16 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
     checked = _validate_plan_for_pass(plan)
     scheduled = reorder_loops(program, checked.loop_order)
     for tile in checked.tiles:
+        # The admitted automatic tile family records the legacy surgery's
+        # decisions verbatim: a standalone workspace fact plus one direct
+        # serial tile of the workspace axis.  That composition is measured
+        # byte-identical to the explicit stack tile, so it lowers through
+        # the same verified pass; the plan facts themselves stay untouched.
+        stack_equivalent = (
+            checked.provenance == "auto"
+            and checked.workspace is not None
+            and tile.kind == "affine"
+        )
         if tile.kind == "panel":
             scheduled = apply_panel_tile(
                 scheduled,
@@ -2486,8 +2526,15 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
                 checked.panel_bounds[0],
                 checked.parallel_loop,
             )
-        elif tile.accumulation == "stack":
-            scheduled = apply_stack_tile(scheduled, tile)
+        elif tile.accumulation == "stack" or stack_equivalent:
+            scheduled = apply_stack_tile(
+                scheduled,
+                (
+                    tile
+                    if tile.accumulation == "stack"
+                    else replace(tile, accumulation="stack")
+                ),
+            )
         else:
             scheduled = apply_affine_tile(scheduled, tile)
     if checked.relayout is not None:
