@@ -988,6 +988,155 @@ def test_regblock_stack_form_shape_is_exact():
     rejected(workspace=None)
 
 
+def _reduce_out_auto_plan(lowering, i, k, j, *, regblock_enabled, **overrides):
+    """The admitted dense reduce-out automatic plan for matmul_ikj."""
+
+    width = 8 if regblock_enabled else 32
+    placement = (
+        LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(i.index_id))
+        if regblock_enabled
+        else LoopPlacement(PlacementKind.OUTERMOST)
+    )
+
+    def tile(loop):
+        return LoopTile(
+            loop=LoopRef(loop.index_id),
+            width=width,
+            placement=placement,
+            parallel=False,
+            kind="affine",
+            accumulation="direct",
+            unroll=True,
+        )
+
+    fields = dict(
+        loop_order=lowering.loop_index_ids,
+        tiles=(tile(k), tile(j)),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(k.index_id),
+            axis_loops=(LoopRef(j.index_id),),
+            dense=True,
+        ),
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=regblock_enabled,
+            tile_width=width,
+        ),
+        provenance="auto",
+    )
+    fields.update(overrides)
+    return LoopPlan(**fields)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_apply_schedule_plan_admits_the_reduce_out_form(regblock_enabled):
+    """The strip-mined reduction plus copy-out region is a migrated family."""
+
+    from scorch.compiler.loopir.nodes import (
+        TileInnerFor,
+        TileOuterFor,
+        WorkspaceRegion,
+    )
+    from scorch.compiler.loopir.printer import canonical_program_dump
+    from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = _reduce_out_auto_plan(lowering, i, k, j, regblock_enabled=regblock_enabled)
+    schedule = apply_schedule_plan(lowering.program, plan)
+    assert schedule.plan is plan
+    verify_program(schedule.program)
+
+    # Chain shape: the axis origin stacks LIFO above the reduction origin
+    # (legacy add_tile order), around the arm placement anchor.
+    chain = []
+    node = schedule.program.body.statements[0]
+    while type(node) in (DenseFor, TileOuterFor):
+        chain.append(node)
+        node = node.body.statements[0]
+    kinds = [type(entry).__name__ for entry in chain]
+    if regblock_enabled:
+        assert kinds == ["DenseFor", "TileOuterFor", "TileOuterFor"]
+        assert chain[1].index == j.index_id
+        assert chain[2].index == k.index_id
+    else:
+        assert kinds == ["TileOuterFor", "TileOuterFor", "DenseFor"]
+        assert chain[0].index == j.index_id
+        assert chain[1].index == k.index_id
+    region = node
+    assert type(region) is WorkspaceRegion
+    producer_top = region.producer.statements[0]
+    assert type(producer_top) is TileInnerFor
+    assert producer_top.index == k.index_id
+    producer_point = producer_top.body.statements[0]
+    assert type(producer_point) is TileInnerFor
+    assert producer_point.index == j.index_id
+    consumer_point = region.consumer.statements[0]
+    assert type(consumer_point) is TileInnerFor
+    assert consumer_point.index == j.index_id
+
+    assert canonical_program_dump(
+        erase_schedule(schedule.program)
+    ) == canonical_program_dump(schedule.base_program)
+
+
+def test_reduce_out_form_shape_is_exact():
+    """Every deviation from the reduce-out form stays fail-closed."""
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    base = _reduce_out_auto_plan(lowering, i, k, j, regblock_enabled=False)
+
+    def rejected(code="unsupported_schedule_auto_family", **overrides):
+        expect_code(
+            code,
+            apply_schedule_plan,
+            lowering.program,
+            _reduce_out_auto_plan(
+                lowering, i, k, j, regblock_enabled=False, **overrides
+            ),
+        )
+
+    # A mixed-placement plan is not a policy arm.
+    rejected(
+        tiles=(
+            base.tiles[0],
+            replace(
+                base.tiles[1],
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)
+                ),
+            ),
+        )
+    )
+    # A width outside the recorded policy is not the automatic decision.
+    rejected(tiles=(replace(base.tiles[0], width=16), base.tiles[1]))
+    rejected(tiles=(replace(base.tiles[0], unroll=False), base.tiles[1]))
+    # Dropping the reduction or axis tile leaves an unmigrated shape.
+    rejected(tiles=(base.tiles[1],))
+    rejected(tiles=(base.tiles[0],))
+    # The sparse-workspace family stays fail-closed.
+    rejected(workspace=replace(base.workspace, dense=False))
+    rejected(workspace=None)
+    # The workspace fact must name the chain facts the pass consumes.
+    rejected(
+        code="reduce_out_shape_invalid",
+        workspace=replace(base.workspace, reduction_loop=LoopRef(i.index_id)),
+        tiles=(
+            replace(base.tiles[0], loop=LoopRef(i.index_id)),
+            base.tiles[1],
+        ),
+    )
+    expect_code(
+        "auto_origin_policy",
+        apply_schedule_plan,
+        lowering.program,
+        _reduce_out_auto_plan(
+            lowering, i, k, j, regblock_enabled=False, auto_policy=None
+        ),
+    )
+
+
 def test_apply_schedule_plan_rejects_unmigrated_families():
     from scorch.compiler.loop_plan import (
         OperandRelayout,

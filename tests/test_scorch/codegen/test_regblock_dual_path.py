@@ -32,7 +32,6 @@ from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
-from scorch.compiler.loopir.schedule_passes import SchedulePassError
 from scorch.compiler.scheduler import (
     Schedule,
     Scheduler,
@@ -221,28 +220,61 @@ def test_dual_path_composes_exactly_the_two_loopir_arm_lowerings(explicit_update
     assert _lower_to_cpp(reconstructed) == production_cpp
 
 
-@pytest.mark.parametrize(
-    ("left_format", "explicit_update", "error_type", "error_code"),
-    [
-        ("dd", False, SchedulePassError, "unsupported_schedule_auto_family"),
-        ("dd", True, SchedulePassError, "unsupported_schedule_auto_family"),
-        ("ss", False, LoopIRTargetError, "unsupported_program_shape"),
-        ("ss", True, LoopIRTargetError, "unsupported_program_shape"),
-    ],
-)
-def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
-    left_format,
+@pytest.mark.parametrize("explicit_update", [False, True])
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_dual_path_dense_arms_are_migrated_through_reduce_out(
     explicit_update,
-    error_type,
-    error_code,
+    regblock_enabled,
 ):
-    """The production dual helper reaches families Phase 6 has not migrated."""
+    """Both dense-matmul dual arms now lower through the reduce-out family."""
 
     options = CompileOptions.from_environment(environ={})
     assert (
         ops._build_regblock_dual_path(
             _build_spmm_cin(
-                sparse_format=left_format,
+                sparse_format="dd",
+                explicit_update=explicit_update,
+            ),
+            None,
+            compile_options=options,
+        )
+        is not None
+    )
+    arm_options = replace(
+        options.with_regblock_enabled(regblock_enabled),
+        requested_schedule=Schedule(),
+    )
+    kernel = compile_cin_via_loopir(
+        _build_spmm_cin(
+            sparse_format="dd",
+            explicit_update=explicit_update,
+        ),
+        (4, 6),
+        (
+            ((4, 5), torch.float32),
+            ((5, 6), torch.float32),
+        ),
+        compile_options=arm_options,
+    )
+    plan = kernel.schedule.plan
+    assert plan.workspace is not None and plan.workspace.dense
+    assert plan.auto_policy is not None
+    assert plan.auto_policy.regblock_enabled is regblock_enabled
+    assert {tile.loop for tile in plan.tiles} >= {
+        plan.workspace.reduction_loop,
+        plan.workspace.axis_loops[0],
+    }
+
+
+@pytest.mark.parametrize("explicit_update", [False, True])
+def test_dual_path_phase6_scope_keeps_hierarchical_ss_open(explicit_update):
+    """The hierarchical-compressed ss dual arm remains an open boundary."""
+
+    options = CompileOptions.from_environment(environ={})
+    assert (
+        ops._build_regblock_dual_path(
+            _build_spmm_cin(
+                sparse_format="ss",
                 explicit_update=explicit_update,
             ),
             None,
@@ -254,10 +286,10 @@ def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
         options.with_regblock_enabled(True),
         requested_schedule=Schedule(),
     )
-    with pytest.raises(error_type) as error:
+    with pytest.raises(LoopIRTargetError) as error:
         compile_cin_via_loopir(
             _build_spmm_cin(
-                sparse_format=left_format,
+                sparse_format="ss",
                 explicit_update=explicit_update,
             ),
             (4, 6),
@@ -267,4 +299,4 @@ def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
             ),
             compile_options=arm_options,
         )
-    assert error.value.defect.code == error_code
+    assert error.value.defect.code == "unsupported_program_shape"

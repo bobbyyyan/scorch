@@ -31,6 +31,7 @@ from scorch.compiler.compile_options import CompileOptions
 from scorch.exceptions import CompileSpecError
 from scorch.compiler.loopir.oracle import run_program
 from scorch.compiler.loopir.pipeline import (
+    compare_generated_sources,
     compile_cin_via_loopir,
     execute_cin_via_loopir,
     execute_shadow,
@@ -225,6 +226,128 @@ def test_matmul_float64_executes_and_matches_oracle():
     assert_close(result.to_torch(), a_t @ b_t)
     oracle = oracle_reference(kernel, (a_t, b_t), (4, 5))
     assert_close(result.to_torch(), oracle)
+
+
+def _reduce_out_options(regblock_enabled):
+    from scorch.compiler.scheduler import Schedule
+
+    return replace(
+        CompileOptions.from_environment().with_regblock_enabled(regblock_enabled),
+        requested_schedule=Schedule(),
+    )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_reduce_out_matmul_matches_legacy_bytes_and_execution(regblock_enabled):
+    """The automatic dense reduce-out family agrees with legacy end to end.
+
+    The empty-Schedule route carries the strip-mined reduction producer
+    plus accumulate copy-out consumer through LoopIR; the generated source
+    must be byte-identical to the legacy automatic surgery (including the
+    tile-count parallel work estimate on the off arm), and the compiled
+    kernel must execute bitwise-identically to the legacy production auto
+    route and match the PyTorch reference.
+    """
+
+    from scorch.ops import lower_and_exec_cin
+
+    torch.manual_seed(26)
+    options = _reduce_out_options(regblock_enabled)
+    cin = build_matmul_ikj()
+    comparison = compare_generated_sources(
+        copy.deepcopy(cin),
+        (4, 6),
+        (((4, 5), torch.float32), ((5, 6), torch.float32)),
+        compile_options=options,
+    )
+    assert comparison.identical
+    width = 8 if regblock_enabled else 32
+    assert f"constexpr int kTile_j = {width};" in comparison.loopir_cpp
+    assert f"constexpr int kTile_k = {width};" in comparison.loopir_cpp
+    assert "wksp[j_in] +=" in comparison.loopir_cpp
+    assert "+= wksp[j_in];" in comparison.loopir_cpp
+    if not regblock_enabled:
+        assert "(B1_size + kTile_j - 1) / kTile_j" in comparison.loopir_cpp
+
+    a_t, b_t = torch.rand(4, 5), torch.rand(5, 6)
+    loopir_result, _ = execute_cin_via_loopir(
+        copy.deepcopy(cin),
+        (4, 6),
+        dense_stensor(a_t, "A"),
+        dense_stensor(b_t, "B"),
+        compile_options=options,
+    )
+    legacy_result = lower_and_exec_cin(
+        copy.deepcopy(cin),
+        (4, 6),
+        dense_stensor(a_t, "A"),
+        dense_stensor(b_t, "B"),
+        _compile_options=CompileOptions.from_environment().with_regblock_enabled(
+            regblock_enabled
+        ),
+    )
+    assert torch.equal(loopir_result.to_torch(), legacy_result.to_torch())
+    assert_close(loopir_result.to_torch(), a_t @ b_t)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_reduce_out_family_byte_parity_across_shapes(regblock_enabled):
+    """Ragged, oversized, unit, zero, f64, implicit, and rank-3 cells."""
+
+    def build_ttm():
+        i, j, ell, k = (IndexVar(n) for n in ("i", "j", "ell", "k"))
+        a = TensorVar("A", fmt="ddd")
+        b = TensorVar("B", fmt="dd")
+        c = TensorVar("C", fmt="ddd")
+        assign = TensorAssign(
+            c[i, j, k],
+            CINBinaryOp(Operation.MUL, a[i, j, ell], b[ell, k]),
+            op=Operation.ADD,
+        )
+        return ForAll(i, ForAll(j, ForAll(ell, ForAll(k, assign))))
+
+    options = _reduce_out_options(regblock_enabled)
+    cells = [
+        (
+            build_matmul_ikj(),
+            (3, 13),
+            (((3, 9), torch.float32), ((9, 13), torch.float32)),
+        ),
+        (
+            build_matmul_ikj(),
+            (2, 5),
+            (((2, 3), torch.float32), ((3, 5), torch.float32)),
+        ),
+        (
+            build_matmul_ikj(),
+            (1, 1),
+            (((1, 1), torch.float32), ((1, 1), torch.float32)),
+        ),
+        (
+            build_matmul_ikj(),
+            (0, 6),
+            (((0, 5), torch.float32), ((5, 6), torch.float32)),
+        ),
+        (
+            build_matmul_ikj(torch.float64),
+            (4, 6),
+            (((4, 5), torch.float64), ((5, 6), torch.float64)),
+        ),
+        (
+            build_ttm(),
+            (3, 4, 6),
+            (((3, 4, 5), torch.float32), ((5, 6), torch.float32)),
+        ),
+    ]
+    for cin, result_shape, bindings in cells:
+        comparison = compare_generated_sources(
+            cin,
+            result_shape,
+            bindings,
+            compile_options=options,
+        )
+        assert comparison.identical, (result_shape, bindings)
 
 
 def test_loopir_stage_timing_is_recorded():

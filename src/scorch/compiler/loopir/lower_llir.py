@@ -873,11 +873,23 @@ class _TargetLowering:
                 continue
             if type(only) is TileInnerFor:
                 if only.tile != decl.tile:
-                    _fail(
-                        "unsupported_program_shape",
-                        "the workspace producer's point loop must belong to "
-                        "the owning split",
+                    # The reduce-out family strip-mines reduction loops
+                    # above the owning point loop; each such split's origin
+                    # must already be part of the outer chain.
+                    if not any(
+                        loop.kind is _TILE_OUTER and loop.node.tile == only.tile
+                        for loop in prefix
+                    ):
+                        _fail(
+                            "unsupported_program_shape",
+                            "a strip-mined workspace reduction loop needs "
+                            "its origin loop on the outer chain",
+                        )
+                    producer_loops.append(
+                        _Loop(_TILE_INNER, only.index, only.dimension, only, ())
                     )
+                    body = only.body
+                    continue
                 producer_loops.append(
                     _Loop(_TILE_INNER, only.index, only.dimension, only, ())
                 )
@@ -904,7 +916,8 @@ class _TargetLowering:
             _fail(
                 "unsupported_program_shape",
                 "workspace producers support dense loops, single-cursor "
-                "sparse loops, and the owning point loop only",
+                "sparse loops, strip-mined reduction point loops, and the "
+                "owning point loop only",
             )
         if len(producer_loops) < 2:
             _fail(
@@ -2771,11 +2784,15 @@ class _TargetLowering:
             stmts.extend([llir.BlankLine(), self._lower_dense(position + 1)])
         elif producer.kind is _SPARSE:
             stmts.extend(self._lower_sparse(position + 1))
+        elif producer.kind is _TILE_INNER:
+            # The reduce-out family opens its producer with the strip-mined
+            # reduction point loop; its origin loop is on the outer chain.
+            stmts.extend([llir.BlankLine(), self._lower_tile_inner(position + 1)])
         else:
             _fail(
                 "unsupported_program_shape",
-                "a workspace producer must open with a dense or "
-                "single-cursor sparse reduction loop",
+                "a workspace producer must open with a dense, single-cursor "
+                "sparse, or strip-mined reduction loop",
             )
         stmts.extend(self._lower_workspace_consumer())
         return stmts

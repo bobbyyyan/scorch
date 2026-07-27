@@ -128,6 +128,7 @@ from ..loop_plan import (
     PanelBound,
     PlacementKind,
     ResultTile,
+    WorkspaceInsertion,
     _validate_loop_plan_structure,
 )
 from .build import LoopIRBuilder
@@ -958,6 +959,321 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     )
     new_chain: List[_LoopNode] = list(prefix)
     new_chain.insert(depth, outer)
+    return _rebuild_program(program, builder, new_chain, region)
+
+
+def _validate_reduce_out_tile(tile: LoopTile) -> None:
+    """Validate one recorded reduce-out candidate tile fact."""
+
+    if type(tile.loop) is not LoopRef or tile.loop.part is not LoopPart.LOGICAL:
+        _fail(
+            "tile_target_not_logical",
+            "affine tiles must target one unsplit logical loop",
+        )
+    if tile.kind != "affine":
+        _fail(
+            "unsupported_schedule_panel",
+            "sparse coordinate panel tiling is not a migrated schedule " "family",
+        )
+    if tile.accumulation != "direct":
+        _fail(
+            "unsupported_schedule_accumulation",
+            "the reduce-out family records direct serial candidate "
+            f"tiles only, got {tile.accumulation!r}",
+        )
+    if tile.parallel:
+        _fail(
+            "unsupported_schedule_parallel",
+            "explicit parallel tile selection is not a migrated " "schedule family",
+        )
+    if (
+        type(tile.width) is not int
+        or tile.width < 1
+        or tile.width > MAX_AFFINE_TILE_WIDTH
+    ):
+        _fail(
+            "tile_invalid_width",
+            "affine tile widths must be positive ints representable by "
+            "the C++ constexpr int target",
+        )
+    if type(tile.placement) is not LoopPlacement:
+        _fail(
+            "tile_invalid_placement",
+            "affine tile placement must be an exact LoopPlacement",
+        )
+    _check_placement_shape(tile.placement)
+
+
+def apply_reduce_out_tiles(
+    program: LoopProgram,
+    tiles: Tuple[LoopTile, ...],
+    workspace: WorkspaceInsertion,
+) -> LoopProgram:
+    """Strip-mine the dense reduce-out automatic family in one fused rebuild.
+
+    Mirrors the legacy automatic composition exactly: ``insert_workspace``
+    materializes a one-cell-per-point dense workspace over the single
+    trailing free axis at the last reduction loop, then every recorded
+    candidate tile is applied in plan order with ``add_tile`` semantics —
+    each point loop splits in place and each origin loop inserts at the
+    arm placement, so later origins stack LIFO above earlier ones.  The
+    region's producer is the strip-mined reduction chain accumulating into
+    the workspace through the axis point loop; the consumer ADD-copies the
+    tile out to the result.  Exactly one tile must split the workspace
+    axis, exactly one must split the last reduction loop, and every other
+    tile splits a distinct dense prefix loop.
+    """
+
+    verify_program(program)
+    if type(tiles) is not tuple or not all(type(tile) is LoopTile for tile in tiles):
+        raise TypeError("apply_reduce_out_tiles expects a tuple of LoopTile")
+    if type(workspace) is not WorkspaceInsertion:
+        raise TypeError("apply_reduce_out_tiles expects a WorkspaceInsertion")
+    try:
+        _validate_loop_plan_structure(
+            LoopPlan(loop_order=(), tiles=tiles, workspace=workspace)
+        )
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_tile", str(error))
+    if len(tiles) < 2:
+        _fail(
+            "reduce_out_shape_invalid",
+            "the reduce-out family strip-mines at least the reduction loop "
+            "and the workspace axis",
+        )
+    if not workspace.dense or len(workspace.axis_loops) != 1:
+        _fail(
+            "reduce_out_shape_invalid",
+            "the reduce-out family materializes one dense workspace over a "
+            "single trailing axis",
+        )
+    for tile in tiles:
+        _validate_reduce_out_tile(tile)
+    targets = [tile.loop.index_id for tile in tiles]
+    if len(set(targets)) != len(targets):
+        _fail(
+            "tile_target_already_split",
+            "a reduce-out plan cannot split the same logical loop twice",
+        )
+
+    loops, leaf = _decompose_chain(program)
+    if any(type(node) in _PANEL_TYPES for node in loops):
+        _fail(
+            "unsupported_schedule_shape",
+            "reduce-out tiling over a panel-scheduled chain is not " "migrated",
+        )
+    if type(leaf) is WorkspaceRegion:
+        _fail(
+            "reduce_out_shape_invalid",
+            "the chain already carries a workspace region; at most one "
+            "workspace accumulation exists per program",
+        )
+    if type(leaf) is not StoreReduce:
+        _fail(
+            "reduce_out_shape_invalid",
+            "reduce-out accumulation requires a dense-output ADD reduction " "leaf",
+        )
+    for node in loops:
+        if _loop_key(node)[1] is not LoopPart.LOGICAL:
+            _fail(
+                "tile_target_already_split",
+                "reduce-out tiling operates on the unsplit logical chain",
+            )
+
+    leaf_index_ids: Set[IndexId] = set()
+    for index in leaf.indices:
+        if type(index) is not IndexValue:
+            _fail(
+                "reduce_out_shape_invalid",
+                "reduce-out accumulation requires directly bound result " "coordinates",
+            )
+        leaf_index_ids.add(index.index)
+    reduction_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node)[0] not in leaf_index_ids
+    ]
+    if not reduction_positions:
+        _fail(
+            "reduce_out_shape_invalid",
+            "reduce-out accumulation requires a reduction loop above the "
+            "trailing free axis",
+        )
+    last_reduction = max(reduction_positions)
+    axis_position = last_reduction + 1
+    if axis_position != len(loops) - 1:
+        _fail(
+            "reduce_out_shape_invalid",
+            "reduce-out accumulation is only supported for a single "
+            "trailing dense free dimension after the last reduction",
+        )
+    if last_reduction == 0:
+        _fail(
+            "reduce_out_root_scope",
+            "reduce-out tiling cannot wrap a workspace inserted at the " "root scope",
+        )
+    reduction_node = loops[last_reduction]
+    axis_node = loops[axis_position]
+    if type(reduction_node) is not DenseFor:
+        _fail(
+            "tile_target_not_dense",
+            "the reduce-out family strip-mines dense loops only; sparse "
+            "reductions belong to the stack family",
+        )
+    if type(axis_node) is not DenseFor:
+        _fail(
+            "tile_target_not_dense",
+            "the reduce-out family strip-mines dense loops only; sparse "
+            "reductions belong to the stack family",
+        )
+    reduction_index = _loop_key(reduction_node)[0]
+    axis_index = _loop_key(axis_node)[0]
+    if workspace.reduction_loop != LoopRef(reduction_index):
+        _fail(
+            "reduce_out_shape_invalid",
+            "the workspace fact must name the chain's last reduction loop",
+        )
+    if workspace.axis_loops != (LoopRef(axis_index),):
+        _fail(
+            "reduce_out_shape_invalid",
+            "the workspace fact must name the chain's trailing free axis",
+        )
+    reduction_tiles = [tile for tile in tiles if tile.loop.index_id == reduction_index]
+    axis_tiles = [tile for tile in tiles if tile.loop.index_id == axis_index]
+    if len(reduction_tiles) != 1 or len(axis_tiles) != 1:
+        _fail(
+            "reduce_out_shape_invalid",
+            "the reduce-out family strip-mines the last reduction loop and "
+            "the workspace axis exactly once each",
+        )
+    reduction_tile = reduction_tiles[0]
+    axis_tile = axis_tiles[0]
+    prefix_targets: Dict[IndexId, DenseFor] = {}
+    prefix_positions: Dict[IndexId, int] = {}
+    for position, node in enumerate(loops[:last_reduction]):
+        if type(node) is DenseFor:
+            prefix_targets[_loop_key(node)[0]] = node
+            prefix_positions[_loop_key(node)[0]] = position
+    for tile in tiles:
+        if tile is reduction_tile or tile is axis_tile:
+            continue
+        if tile.loop.index_id not in prefix_targets:
+            if any(
+                _loop_key(node)[0] == tile.loop.index_id
+                for node in loops[:last_reduction]
+            ):
+                _fail(
+                    "tile_target_not_dense",
+                    "affine tiling cannot split a sparse coordinate loop",
+                )
+            _fail(
+                "tile_target_missing",
+                "every reduce-out candidate tile must split a prefix loop, "
+                "the last reduction loop, or the workspace axis",
+            )
+
+    result_symbol = program.outputs[0]
+    result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
+
+    builder = LoopIRBuilder.resuming(program)
+    tile_ids = {id(tile): builder.new_tile_id() for tile in tiles}
+    workspace_id = builder.new_workspace_id()
+    workspace_decl = builder.workspace_decl(
+        workspace_id, "wksp", result_decl.dtype, tile_ids[id(axis_tile)]
+    )
+
+    reduce_leaf = builder.workspace_reduce(
+        workspace_id,
+        builder.index_value(axis_index),
+        ReduceOp.ADD,
+        leaf.value,
+    )
+    producer_axis_point = builder.tile_inner_for(
+        tile_ids[id(axis_tile)],
+        axis_index,
+        axis_node.dimension,
+        axis_tile.width,
+        axis_tile.unroll,
+        builder.block((reduce_leaf,)),
+    )
+    producer_reduction_point = builder.tile_inner_for(
+        tile_ids[id(reduction_tile)],
+        reduction_index,
+        reduction_node.dimension,
+        reduction_tile.width,
+        reduction_tile.unroll,
+        builder.block((producer_axis_point,)),
+    )
+    copy_out = builder.store_reduce(
+        leaf.tensor,
+        leaf.indices,
+        leaf.op,
+        builder.workspace_read(workspace_id, builder.index_value(axis_index)),
+    )
+    consumer_point = builder.tile_inner_for(
+        tile_ids[id(axis_tile)],
+        axis_index,
+        axis_node.dimension,
+        axis_tile.width,
+        axis_tile.unroll,
+        builder.block((copy_out,)),
+    )
+    region = builder.workspace_region(
+        workspace_decl,
+        builder.block((producer_reduction_point,)),
+        builder.block((consumer_point,)),
+    )
+
+    new_chain: List[_LoopNode] = list(loops[:last_reduction])
+    for tile in tiles:
+        if tile is reduction_tile or tile is axis_tile:
+            continue
+        prefix_node = prefix_targets[tile.loop.index_id]
+        new_chain[prefix_positions[tile.loop.index_id]] = builder.tile_inner_for(
+            tile_ids[id(tile)],
+            prefix_node.index,
+            prefix_node.dimension,
+            tile.width,
+            tile.unroll,
+            prefix_node.body,
+        )
+    # ``add_tile`` semantics: origins insert in plan order, each at its
+    # placement depth against the current chain, so later origins stack
+    # LIFO above earlier ones at the same anchor.
+    inner_of = {
+        id(tile): tile_ids[id(tile)]
+        for tile in tiles
+        if tile is not reduction_tile and tile is not axis_tile
+    }
+    for tile in tiles:
+        if tile is reduction_tile:
+            origin_dimension = reduction_node.dimension
+            origin_index = reduction_index
+            domination = len(new_chain)
+        elif tile is axis_tile:
+            origin_dimension = axis_node.dimension
+            origin_index = axis_index
+            domination = len(new_chain)
+        else:
+            origin_dimension = prefix_targets[tile.loop.index_id].dimension
+            origin_index = tile.loop.index_id
+            domination = next(
+                position
+                for position, node in enumerate(new_chain)
+                if type(node) is TileInnerFor and node.tile == inner_of[id(tile)]
+            )
+        depth = _placement_depth(new_chain, tile.placement, domination)
+        outer = builder.tile_outer_for(
+            tile_ids[id(tile)],
+            origin_index,
+            origin_dimension,
+            tile.width,
+            # The outer body is reassembled by _rebuild_program; this
+            # placeholder block is replaced there and never enters the
+            # rebuilt tree.
+            axis_node.body,
+        )
+        new_chain.insert(depth, outer)
     return _rebuild_program(program, builder, new_chain, region)
 
 
@@ -2133,6 +2449,79 @@ def _check_heap_plan_family(plan: LoopPlan) -> None:
         )
 
 
+def _check_auto_plan_family(plan: LoopPlan) -> None:
+    """Admit exactly the measured automatic replay contracts."""
+
+    if plan.auto_policy is None:
+        _fail(
+            "auto_origin_policy",
+            "automatic plans must carry the versioned origin policy "
+            "verified at the LoopPlan boundary",
+        )
+    if (
+        plan.panel_bounds
+        or plan.relayout is not None
+        or plan.result_tile is not None
+        or plan.parallel_loop is not None
+    ):
+        _fail(
+            "unsupported_schedule_auto_family",
+            "automatic plans are migrated for the tile-free and "
+            "regblock stack-form replay contracts only",
+        )
+    if not plan.tiles and plan.workspace is None:
+        return
+
+    def _auto_tile_shape(tile: LoopTile) -> bool:
+        if plan.auto_policy is None or not plan.loop_order:
+            return False
+        if plan.auto_policy.regblock_enabled:
+            placement_ok = (
+                tile.placement.kind is PlacementKind.CHILD_OF
+                and tile.placement.parent is not None
+                and tile.placement.parent == LoopRef(plan.loop_order[0])
+            )
+        else:
+            placement_ok = tile.placement.kind is PlacementKind.OUTERMOST
+        return (
+            tile.kind == "affine"
+            and tile.accumulation == "direct"
+            and not tile.parallel
+            and tile.unroll
+            and tile.width == plan.auto_policy.tile_width
+            and placement_ok
+        )
+
+    stack_form = (
+        plan.auto_policy is not None
+        and plan.auto_policy.regblock_enabled
+        and len(plan.tiles) == 1
+        and plan.workspace is not None
+        and plan.workspace.dense
+        and plan.workspace.axis_loops == (plan.tiles[0].loop,)
+        and _auto_tile_shape(plan.tiles[0])
+    )
+    reduce_out_form = (
+        plan.auto_policy is not None
+        and plan.workspace is not None
+        and plan.workspace.dense
+        and len(plan.workspace.axis_loops) == 1
+        and len(plan.tiles) >= 2
+        and all(_auto_tile_shape(tile) for tile in plan.tiles)
+        and len({tile.loop for tile in plan.tiles}) == len(plan.tiles)
+        and sum(tile.loop == plan.workspace.axis_loops[0] for tile in plan.tiles) == 1
+        and sum(tile.loop == plan.workspace.reduction_loop for tile in plan.tiles) == 1
+    )
+    if not stack_form and not reduce_out_form:
+        _fail(
+            "unsupported_schedule_auto_family",
+            "automatic plans are migrated for the tile-free, regblock "
+            "stack-form, and dense reduce-out replay contracts only; "
+            "the sparse-workspace family stays on the legacy path",
+        )
+    return
+
+
 def _check_plan_families(plan: LoopPlan) -> None:
     """Fail closed on every plan fact outside the migrated schedule families.
 
@@ -2144,68 +2533,25 @@ def _check_plan_families(plan: LoopPlan) -> None:
     can prove a supported dense logical or affine-origin anchor and its race
     and work contracts.
 
-    Automatic plans are admitted for two measured auto-replay contracts: the
-    tile-free family (one already verified logical order and no other
-    decision) and the regblock-arm stack form (one dense workspace over a
+    Automatic plans are admitted for three measured auto-replay contracts:
+    the tile-free family (one already verified logical order and no other
+    decision), the regblock-arm stack form (one dense workspace over a
     single trailing free axis plus exactly one direct serial ``CHILD_OF``
-    tile of that axis under the row loop, which the legacy surgery emits
-    byte-identically to the migrated explicit stack tile).
+    tile of that axis under the row loop), and the dense reduce-out form
+    (the same dense workspace plus arm-uniform candidate tiles that split
+    the last reduction loop and the workspace axis exactly once each).
     ``provenance="auto"`` identifies those replay contracts; the verified
     ``auto_policy`` origin fact ties every recorded tile and workspace
     decision to its re-derivation, but the cost-model order itself remains
     attested rather than re-proved.  The dense root-scope reduction family
     records the elided decision and flows through the tile-free contract
-    (its abandoned materialized form never compiled).  The reduce-out
-    strip-mine family and the sparse-workspace family have no typed
-    emission twin yet and stay fail-closed.  Every other provenance fails
-    closed.
+    (its abandoned materialized form never compiled).  The sparse-workspace
+    family has no typed emission twin yet and stays fail-closed.  Every
+    other provenance fails closed.
     """
 
     if plan.provenance == "auto":
-        if plan.auto_policy is None:
-            _fail(
-                "auto_origin_policy",
-                "automatic plans must carry the versioned origin policy "
-                "verified at the LoopPlan boundary",
-            )
-        if (
-            plan.panel_bounds
-            or plan.relayout is not None
-            or plan.result_tile is not None
-            or plan.parallel_loop is not None
-        ):
-            _fail(
-                "unsupported_schedule_auto_family",
-                "automatic plans are migrated for the tile-free and "
-                "regblock stack-form replay contracts only",
-            )
-        if not plan.tiles and plan.workspace is None:
-            return
-        stack_form = (
-            plan.auto_policy is not None
-            and plan.auto_policy.regblock_enabled
-            and len(plan.tiles) == 1
-            and plan.workspace is not None
-            and plan.workspace.dense
-            and plan.workspace.axis_loops == (plan.tiles[0].loop,)
-            and plan.tiles[0].kind == "affine"
-            and plan.tiles[0].accumulation == "direct"
-            and not plan.tiles[0].parallel
-            and plan.tiles[0].unroll
-            and plan.tiles[0].width == plan.auto_policy.tile_width
-            and plan.tiles[0].placement.kind is PlacementKind.CHILD_OF
-            and plan.tiles[0].placement.parent is not None
-            and bool(plan.loop_order)
-            and plan.tiles[0].placement.parent == LoopRef(plan.loop_order[0])
-        )
-        if not stack_form:
-            _fail(
-                "unsupported_schedule_auto_family",
-                "automatic plans are migrated for the tile-free and "
-                "regblock stack-form replay contracts only; reduce-out "
-                "strip-mine and sparse-workspace families stay on the "
-                "legacy path",
-            )
+        _check_auto_plan_family(plan)
         return
     if plan.auto_policy is not None:
         _fail(
@@ -2520,6 +2866,19 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
 
     checked = _validate_plan_for_pass(plan)
     scheduled = reorder_loops(program, checked.loop_order)
+    if (
+        checked.provenance == "auto"
+        and checked.workspace is not None
+        and any(tile.loop == checked.workspace.reduction_loop for tile in checked.tiles)
+    ):
+        # The reduce-out automatic family strip-mines the last reduction
+        # loop as well as the workspace axis (plus any recorded prefix
+        # candidates); the fused pass consumes the workspace fact and every
+        # tile at once with the legacy add_tile LIFO placement semantics.
+        return select_parallel_loop(
+            apply_reduce_out_tiles(scheduled, checked.tiles, checked.workspace),
+            checked,
+        )
     for tile in checked.tiles:
         # The admitted automatic tile family records the legacy surgery's
         # decisions verbatim: a standalone workspace fact plus one direct
