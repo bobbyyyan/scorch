@@ -2162,6 +2162,12 @@ def _check_plan_families(plan: LoopPlan) -> None:
     """
 
     if plan.provenance == "auto":
+        if plan.auto_policy is None:
+            _fail(
+                "auto_origin_policy",
+                "automatic plans must carry the versioned origin policy "
+                "verified at the LoopPlan boundary",
+            )
         if (
             plan.panel_bounds
             or plan.relayout is not None
@@ -2201,6 +2207,11 @@ def _check_plan_families(plan: LoopPlan) -> None:
                 "legacy path",
             )
         return
+    if plan.auto_policy is not None:
+        _fail(
+            "auto_policy_provenance",
+            "the automatic origin policy is valid only for automatic plans",
+        )
     if plan.provenance != "explicit":
         _fail(
             "unsupported_schedule_provenance",
