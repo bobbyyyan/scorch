@@ -18,15 +18,23 @@ therefore never perturb the direct-``auto_schedule`` schedule-shape tests, which
 assert the baseline nest.
 """
 
+import copy
+from dataclasses import replace
+
 import pytest
 import torch
 
 import scorch.ops as ops
 from scorch.ops import matmul
-from scorch.compiler.cin import ForAll, IndexVar, TensorVar
+from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.loopir.lower_llir import LoopIRTargetError
+from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
+from scorch.compiler.loopir.schedule_passes import SchedulePassError
 from scorch.compiler.scheduler import (
+    Schedule,
     Scheduler,
     regblock_force,
     _regblock_max_n,
@@ -34,7 +42,7 @@ from scorch.compiler.scheduler import (
 )
 
 
-def _build_spmm_cin():
+def _build_spmm_cin(*, sparse_format="ds", bind_shapes=False):
     """Unscheduled CIN for CSR(A: ds) @ dense(B: dd) -> dense(C: dd).
 
     Index layout matches the real ``einsum("ij,jk->ik")`` SpMM: contraction over
@@ -43,10 +51,18 @@ def _build_spmm_cin():
     """
     i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
     c = TensorVar("C", fmt="dd")  # [i, k]
-    a = TensorVar("A", fmt="ds")  # [i, j] (compressed cols -> CSR)
+    a = TensorVar("A", fmt=sparse_format)
     b = TensorVar("B", fmt="dd")  # [j, k]
-    c[i, k] = a[i, j] * b[j, k]
-    return ForAll(i, ForAll(j, ForAll(k, c._assignment)))
+    if bind_shapes:
+        c.shape, c.dtype = (4, 6), torch.float32
+        a.shape, a.dtype = (4, 5), torch.float32
+        b.shape, b.dtype = (5, 6), torch.float32
+    assignment = TensorAssign(
+        c[i, k],
+        a[i, j] * b[j, k],
+        op=Operation.ADD,
+    )
+    return ForAll(i, ForAll(j, ForAll(k, assignment)))
 
 
 def _lower_to_cpp(fn_or_cin) -> str:
@@ -149,26 +165,86 @@ def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
     belongs to Phase 7.
     """
 
-    from scorch.compiler.compile_options import CompileOptions
-
     options = CompileOptions.from_environment(environ={})
+    input_bindings = (
+        ((4, 5), torch.float32),
+        ((5, 6), torch.float32),
+    )
+    loopir_arms = []
+    for enabled in (False, True):
+        arm_options = replace(
+            options.with_regblock_enabled(enabled),
+            requested_schedule=Schedule(),
+        )
+        loopir_arms.append(
+            compile_cin_via_loopir(
+                _build_spmm_cin(),
+                (4, 6),
+                input_bindings,
+                compile_options=arm_options,
+            )
+        )
+
     built = ops._build_regblock_dual_path(
-        _build_spmm_cin(), None, compile_options=options
+        _build_spmm_cin(bind_shapes=True),
+        None,
+        compile_options=options,
     )
     assert built is not None
     production_fn, _ = built
     production_cpp = _lower_to_cpp(production_fn)
 
-    cin_base = Scheduler._auto_schedule_regblock_arm(
-        _build_spmm_cin(), enabled=False, compile_options=options
-    )
-    cin_rb = Scheduler._auto_schedule_regblock_arm(
-        _build_spmm_cin(), enabled=True, compile_options=options
-    )
-    fn_base = CINLowerer(compile_options=options)._lower_owned_IndexStmt(cin_base)
-    fn_rb = CINLowerer(compile_options=options)._lower_owned_IndexStmt(cin_rb)
+    base_arm, regblock_arm = loopir_arms
+    assert base_arm.schedule is not None
+    assert regblock_arm.schedule is not None
+    assert base_arm.schedule.plan.auto_policy is not None
+    assert regblock_arm.schedule.plan.auto_policy is not None
+    assert base_arm.schedule.plan.auto_policy.regblock_enabled is False
+    assert regblock_arm.schedule.plan.auto_policy.regblock_enabled is True
     reconstructed = ops._stitch_regblock_dual_path(
-        fn_rb, fn_base, options.scheduler.regblock_max_n
+        copy.deepcopy(regblock_arm.llir_function),
+        copy.deepcopy(base_arm.llir_function),
+        options.scheduler.regblock_max_n,
     )
     assert reconstructed is not None
     assert _lower_to_cpp(reconstructed) == production_cpp
+
+
+@pytest.mark.parametrize(
+    ("left_format", "error_type", "error_code"),
+    [
+        ("dd", SchedulePassError, "unsupported_schedule_auto_family"),
+        ("ss", LoopIRTargetError, "unsupported_program_shape"),
+    ],
+)
+def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
+    left_format,
+    error_type,
+    error_code,
+):
+    """The production dual helper reaches families Phase 6 has not migrated."""
+
+    options = CompileOptions.from_environment(environ={})
+    assert (
+        ops._build_regblock_dual_path(
+            _build_spmm_cin(sparse_format=left_format),
+            None,
+            compile_options=options,
+        )
+        is not None
+    )
+    arm_options = replace(
+        options.with_regblock_enabled(True),
+        requested_schedule=Schedule(),
+    )
+    with pytest.raises(error_type) as error:
+        compile_cin_via_loopir(
+            _build_spmm_cin(sparse_format=left_format),
+            (4, 6),
+            (
+                ((4, 5), torch.float32),
+                ((5, 6), torch.float32),
+            ),
+            compile_options=arm_options,
+        )
+    assert error.value.defect.code == error_code
