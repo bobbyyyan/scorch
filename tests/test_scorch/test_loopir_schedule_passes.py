@@ -35,6 +35,7 @@ from scorch.compiler.loop_plan import (
     LoopTile,
     PlacementKind,
     WorkspaceInsertion,
+    verify_loop_plan,
 )
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
@@ -751,7 +752,20 @@ def test_apply_schedule_plan_provenance_gate(provenance):
 def test_apply_schedule_plan_admits_the_tile_free_auto_replay_contract():
     """A verified tile-free auto-replay order is a migrated plan family."""
 
-    cin, (i, k, j) = build_matmul_ikj()
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    cin = ForAll(
+        i,
+        ForAll(
+            j,
+            TensorAssign(
+                c[i, j],
+                CINBinaryOp(Operation.MUL, a[i, j], b[i, j]),
+            ),
+        ),
+    )
     lowering = lower(cin)
     plan = LoopPlan(
         loop_order=lowering.loop_index_ids,
@@ -762,6 +776,7 @@ def test_apply_schedule_plan_admits_the_tile_free_auto_replay_contract():
         ),
         provenance="auto",
     )
+    assert verify_loop_plan(cin, plan) is plan
     schedule = apply_schedule_plan(lowering.program, plan)
     assert schedule.plan is plan
     verify_program(schedule.program)

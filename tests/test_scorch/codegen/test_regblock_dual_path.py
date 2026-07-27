@@ -30,6 +30,7 @@ from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, Tenso
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
 from scorch.compiler.loopir.schedule_passes import SchedulePassError
@@ -42,7 +43,12 @@ from scorch.compiler.scheduler import (
 )
 
 
-def _build_spmm_cin(*, sparse_format="ds", bind_shapes=False):
+def _build_spmm_cin(
+    *,
+    sparse_format="ds",
+    bind_shapes=False,
+    explicit_update=False,
+):
     """Unscheduled CIN for CSR(A: ds) @ dense(B: dd) -> dense(C: dd).
 
     Index layout matches the real ``einsum("ij,jk->ik")`` SpMM: contraction over
@@ -57,11 +63,15 @@ def _build_spmm_cin(*, sparse_format="ds", bind_shapes=False):
         c.shape, c.dtype = (4, 6), torch.float32
         a.shape, a.dtype = (4, 5), torch.float32
         b.shape, b.dtype = (5, 6), torch.float32
-    assignment = TensorAssign(
-        c[i, k],
-        a[i, j] * b[j, k],
-        op=Operation.ADD,
-    )
+    if explicit_update:
+        assignment = TensorAssign(
+            c[i, k],
+            a[i, j] * b[j, k],
+            op=Operation.ADD,
+        )
+    else:
+        c[i, k] = a[i, j] * b[j, k]
+        assignment = c._assignment
     return ForAll(i, ForAll(j, ForAll(k, assignment)))
 
 
@@ -151,18 +161,12 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
     assert torch.allclose(out.to(torch.float32), ref, atol=1e-3, rtol=1e-3)
 
 
-def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
-    """The production stitch is target-level composition, not a third lowering.
+def test_dual_path_composes_exactly_two_explicit_update_loopir_arms():
+    """An explicit-ADD surrogate contains no third schedule beyond its arms.
 
-    Phase-6 ownership decision: each regblock arm is an independently
-    verified automatic schedule (the tile-free contract and the stack-form
-    contract, both proven byte-identical through LoopIR), and the dual
-    kernel is exactly the register-block arm's lowering with its single
-    top-level compute loop replaced by a runtime free-dim branch over the
-    two arms' compute loops.  Reconstructing that stitch from the two arm
-    lowerings must reproduce the production builder byte-for-byte; the
-    runtime branch itself is target-lowering state and its migration
-    belongs to Phase 7.
+    This is a schema-level stitch proof, not proof that the public
+    implicit-update dual route has entered LoopIR; the next test locks that
+    remaining boundary.
     """
 
     options = CompileOptions.from_environment(environ={})
@@ -178,7 +182,7 @@ def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
         )
         loopir_arms.append(
             compile_cin_via_loopir(
-                _build_spmm_cin(),
+                _build_spmm_cin(explicit_update=True),
                 (4, 6),
                 input_bindings,
                 compile_options=arm_options,
@@ -186,7 +190,7 @@ def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
         )
 
     built = ops._build_regblock_dual_path(
-        _build_spmm_cin(bind_shapes=True),
+        _build_spmm_cin(bind_shapes=True, explicit_update=True),
         None,
         compile_options=options,
     )
@@ -211,14 +215,21 @@ def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
 
 
 @pytest.mark.parametrize(
-    ("left_format", "error_type", "error_code"),
+    ("left_format", "explicit_update", "error_type", "error_code"),
     [
-        ("dd", SchedulePassError, "unsupported_schedule_auto_family"),
-        ("ss", LoopIRTargetError, "unsupported_program_shape"),
+        (
+            "ds",
+            False,
+            LoopIRLoweringError,
+            "unsupported_reduction_without_update",
+        ),
+        ("dd", True, SchedulePassError, "unsupported_schedule_auto_family"),
+        ("ss", True, LoopIRTargetError, "unsupported_program_shape"),
     ],
 )
 def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
     left_format,
+    explicit_update,
     error_type,
     error_code,
 ):
@@ -227,7 +238,10 @@ def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
     options = CompileOptions.from_environment(environ={})
     assert (
         ops._build_regblock_dual_path(
-            _build_spmm_cin(sparse_format=left_format),
+            _build_spmm_cin(
+                sparse_format=left_format,
+                explicit_update=explicit_update,
+            ),
             None,
             compile_options=options,
         )
@@ -239,7 +253,10 @@ def test_dual_path_phase6_scope_keeps_unmigrated_arms_open(
     )
     with pytest.raises(error_type) as error:
         compile_cin_via_loopir(
-            _build_spmm_cin(sparse_format=left_format),
+            _build_spmm_cin(
+                sparse_format=left_format,
+                explicit_update=explicit_update,
+            ),
             (4, 6),
             (
                 ((4, 5), torch.float32),
