@@ -133,3 +133,42 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
         ops._einsum_dispatch_cache.clear()
 
     assert torch.allclose(out.to(torch.float32), ref, atol=1e-3, rtol=1e-3)
+
+
+def test_dual_path_composes_exactly_the_two_verified_arm_lowerings():
+    """The production stitch is target-level composition, not a third lowering.
+
+    Phase-6 ownership decision: each regblock arm is an independently
+    verified automatic schedule (the tile-free contract and the stack-form
+    contract, both proven byte-identical through LoopIR), and the dual
+    kernel is exactly the register-block arm's lowering with its single
+    top-level compute loop replaced by a runtime free-dim branch over the
+    two arms' compute loops.  Reconstructing that stitch from the two arm
+    lowerings must reproduce the production builder byte-for-byte; the
+    runtime branch itself is target-lowering state and its migration
+    belongs to Phase 7.
+    """
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(environ={})
+    built = ops._build_regblock_dual_path(
+        _build_spmm_cin(), None, compile_options=options
+    )
+    assert built is not None
+    production_fn, _ = built
+    production_cpp = _lower_to_cpp(production_fn)
+
+    cin_base = Scheduler._auto_schedule_regblock_arm(
+        _build_spmm_cin(), enabled=False, compile_options=options
+    )
+    cin_rb = Scheduler._auto_schedule_regblock_arm(
+        _build_spmm_cin(), enabled=True, compile_options=options
+    )
+    fn_base = CINLowerer(compile_options=options)._lower_owned_IndexStmt(cin_base)
+    fn_rb = CINLowerer(compile_options=options)._lower_owned_IndexStmt(cin_rb)
+    reconstructed = ops._stitch_regblock_dual_path(
+        fn_rb, fn_base, options.scheduler.regblock_max_n
+    )
+    assert reconstructed is not None
+    assert _lower_to_cpp(reconstructed) == production_cpp
