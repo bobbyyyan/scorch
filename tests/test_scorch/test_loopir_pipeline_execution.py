@@ -350,6 +350,127 @@ def test_reduce_out_family_byte_parity_across_shapes(regblock_enabled):
         assert comparison.identical, (result_shape, bindings)
 
 
+_SPARSE_WORKSPACE_DIMS = {"i": 4, "j": 5, "k": 6}
+
+
+def _build_boundary_cin(fmt_result, result_indices, operands, nest):
+    ivars = {name: IndexVar(name) for name in "ijk"}
+    result = TensorVar("C", fmt=fmt_result)
+    rhs = None
+    for position, (fmt, indices) in enumerate(operands):
+        operand = TensorVar("AB"[position], fmt=fmt)
+        access = operand[tuple(ivars[x] for x in indices)]
+        rhs = access if rhs is None else CINBinaryOp(Operation.MUL, rhs, access)
+    assignment = TensorAssign(
+        result[tuple(ivars[x] for x in result_indices)],
+        rhs,
+        op=Operation.ADD,
+    )
+    statement = assignment
+    for name in reversed(nest):
+        statement = ForAll(ivars[name], statement)
+    return statement
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("family", "spec", "expected"),
+    [
+        (
+            "spmspm_row_scope",
+            ("ds", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
+            "unsupported_sparse_output_reduction",
+        ),
+        (
+            "spmspm_csr_operands",
+            ("ds", "ik", (("ds", "ij"), ("ds", "jk")), "ijk"),
+            "unsupported_sparse_output_reduction",
+        ),
+        (
+            "reduce_to_csr",
+            ("ds", "ik", (("ds", "ij"), ("dd", "jk")), "ijk"),
+            "unsupported_sparse_output_reduction",
+        ),
+        (
+            "merged_reduction_dense_out",
+            ("dd", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
+            "unsupported_merged_reduction",
+        ),
+        (
+            "sparse_output_root",
+            ("s", "i", (("dd", "ji"), ("d", "j")), "ji"),
+            "unsupported_sparse_output",
+        ),
+        (
+            "mixed_level_dense_axis",
+            ("sd", "ij", (("dd", "ij"),), "ij"),
+            None,
+        ),
+    ],
+)
+def test_sparse_workspace_families_fail_closed_with_exact_codes(
+    regblock_enabled, family, spec, expected
+):
+    """The sparse-result/workspace boundary is exact in both policy arms.
+
+    Two representation seams remain open after the reduce-out migration.
+    Mixed-level results whose trailing workspace axis is dense record a
+    dense-workspace F2/F4 plan but the compressed-parent/dense-leaf result
+    itself is rejected at ``unsupported_format`` (its legacy comparand
+    generates C++ that writes an unsized values vector and never appends
+    row coordinates, and its execution fails at result wrapping, so no
+    byte-parity gate can be widened there).  True sparse ``coo_workspace``
+    families — row-scope SpMSpM, reduction-to-CSR, merged sparse
+    reductions, and sparse-output roots — fail closed at their own stable
+    codes, including the early ``unsupported_sparse_output`` boundary this
+    census audits explicitly.
+    """
+
+    from scorch.compiler.scheduler import Schedule
+
+    if family == "mixed_level_dense_axis":
+        # The rank-2 elementwise mixed result fails at the result format
+        # itself; the reduction shape with a dense trailing workspace is
+        # covered below with its recorded plan.
+        i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+        result = TensorVar("C", fmt="sd")
+        source = TensorVar("A", fmt="ddd")
+        cin = ForAll(
+            k,
+            ForAll(
+                i,
+                ForAll(
+                    j,
+                    TensorAssign(result[k, j], source[k, i, j], op=Operation.ADD),
+                ),
+            ),
+        )
+        bindings = (((6, 4, 5), torch.float32),)
+        out_shape = (6, 5)
+        expected = "unsupported_format"
+    else:
+        cin = _build_boundary_cin(*spec)
+        bindings = tuple(
+            (tuple(_SPARSE_WORKSPACE_DIMS[x] for x in indices), torch.float32)
+            for _, indices in spec[2]
+        )
+        out_shape = tuple(_SPARSE_WORKSPACE_DIMS[x] for x in spec[1])
+    options = replace(
+        CompileOptions.from_environment(environ={}).with_regblock_enabled(
+            regblock_enabled
+        ),
+        requested_schedule=Schedule(),
+    )
+    with pytest.raises(Exception) as error:
+        compile_cin_via_loopir(
+            cin,
+            out_shape,
+            bindings,
+            compile_options=options,
+        )
+    assert getattr(error.value, "defect").code == expected
+
+
 def test_loopir_stage_timing_is_recorded():
     options = CompileOptions.from_environment()
     context = CompilationContext(options)
