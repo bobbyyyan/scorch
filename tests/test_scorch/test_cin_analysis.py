@@ -5,14 +5,17 @@ from typing import Any
 import pytest
 
 import scorch.compiler.analysis_runner as analysis_runner_module  # type: ignore[import-untyped]
+import scorch.compiler.cin_analysis as cin_analysis_module  # type: ignore[import-untyped]
 from scorch.compiler.analysis_runner import (  # type: ignore[import-untyped]
     AnalysisRunner,
     COMMON_ANALYSIS_RUNNER,
 )
 from scorch.compiler.cin import (
+    BinaryOp,
     ForAll,
     IndexStmt,
     IndexVar,
+    IndexVarAdd,
     Operation,
     TensorAccess,
     TensorAssign,
@@ -586,7 +589,141 @@ def test_verifier_reports_duplicate_access_reference() -> None:
     with pytest.raises(VerificationError) as error:
         verify_cin(program)
 
-    assert "duplicate_access_reference" in _assert_structured_diagnostics(error)
+    codes = _assert_structured_diagnostics(error)
+    assert {"duplicate_node_reference", "duplicate_access_reference"} <= codes
+    assert "cyclic_cin_structure" not in codes
+
+
+@pytest.mark.parametrize(
+    "cycle_kind",
+    ("forall", "binary", "index_add"),
+)
+def test_structural_preflight_reports_cycles_without_recursing(
+    cycle_kind: str,
+) -> None:
+    i = IndexVar("i")
+    j = IndexVar("j")
+    result = TensorVar("C", fmt="d")
+    left = TensorVar("A", fmt="d")
+    right = TensorVar("B", fmt="d")
+
+    if cycle_kind == "forall":
+        program = ForAll(i, TensorAssign(result[i], left[i]))
+        program.stmt = program
+    elif cycle_kind == "binary":
+        expression = BinaryOp(Operation.ADD, left[i], right[i])
+        object.__setattr__(expression, "left", expression)
+        program = ForAll(i, TensorAssign(result[i], expression))
+    else:
+        i._expr = IndexVarAdd(i, j)
+        program = ForAll(i, TensorAssign(result[i], left[i]))
+
+    analysis = analyze_cin(program)
+
+    assert tuple(diagnostic.code for diagnostic in analysis.diagnostics) == (
+        "cyclic_cin_structure",
+    )
+    with pytest.raises(VerificationError) as error:
+        verify_cin(program)
+    assert _assert_structured_diagnostics(error) == {"cyclic_cin_structure"}
+
+
+def test_structural_preflight_reports_missing_forward_fields() -> None:
+    programs = []
+
+    i = IndexVar("i")
+    missing_parallel = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    del missing_parallel.parallel
+    programs.append((missing_parallel, ("root", "parallel")))
+
+    i = IndexVar("i")
+    missing_stmt = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    del missing_stmt.stmt
+    programs.append((missing_stmt, ("root", "stmt")))
+
+    i = IndexVar("i")
+    missing_assign_op = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    del missing_assign_op.stmt.op
+    programs.append((missing_assign_op, ("root", "stmt", "op")))
+
+    i = IndexVar("i")
+    expression = BinaryOp(
+        Operation.ADD,
+        TensorVar("A", fmt="d")[i],
+        TensorVar("B", fmt="d")[i],
+    )
+    object.__delattr__(expression, "op")
+    missing_binary_op = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], expression),
+    )
+    programs.append((missing_binary_op, ("root", "stmt", "rhs", "op")))
+
+    for program, path in programs:
+        analysis = analyze_cin(program)
+        assert analysis.diagnostics[0].code == "missing_cin_field"
+        assert analysis.diagnostics[0].path == path
+        with pytest.raises(VerificationError) as error:
+            verify_cin(program)
+        assert _assert_structured_diagnostics(error) == {"missing_cin_field"}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "path"),
+    [
+        (
+            lambda program: object.__setattr__(program, "parallel", 1),
+            ("root", "parallel"),
+        ),
+        (
+            lambda program: object.__setattr__(program.stmt, "rhs", object()),
+            ("root", "stmt", "rhs"),
+        ),
+    ],
+)
+def test_structural_preflight_reports_invalid_forward_fields(mutate, path) -> None:
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    mutate(program)
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert analysis.diagnostics[0].path == path
+    with pytest.raises(VerificationError) as error:
+        verify_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_reports_excessive_depth_iteratively() -> None:
+    i = IndexVar("i")
+    statement: IndexStmt = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    for depth in range(cin_analysis_module._MAX_CIN_STRUCTURE_DEPTH + 1):
+        statement = ForAll(IndexVar(f"deep_{depth}"), statement)
+
+    analysis = analyze_cin(statement)
+
+    assert tuple(diagnostic.code for diagnostic in analysis.diagnostics) == (
+        "cin_structure_depth_exceeded",
+    )
+    with pytest.raises(VerificationError) as error:
+        verify_cin(statement)
+    assert _assert_structured_diagnostics(error) == {"cin_structure_depth_exceeded"}
 
 
 @pytest.mark.parametrize(

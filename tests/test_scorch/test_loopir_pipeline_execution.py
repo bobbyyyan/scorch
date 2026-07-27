@@ -17,6 +17,7 @@ import torch
 from scorch.compiler.cin import (
     BinaryOp as CINBinaryOp,
     ForAll,
+    IndexStmt,
     IndexVar,
     Operation,
     TensorAssign,
@@ -350,6 +351,72 @@ def test_reduce_out_family_byte_parity_across_shapes(regblock_enabled):
         assert comparison.identical, (result_shape, bindings)
 
 
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_reduce_out_keeps_invalid_legacy_dense_position_order_fail_closed(
+    regblock_enabled,
+):
+    """A broader dense auto plan is not evidence for target compatibility.
+
+    Legacy scheduling can choose ``a,b,d,c,e,f`` for this rank-6
+    contraction and records a dense reduce-out workspace, but its emitted
+    position chain uses ``pA2`` before declaring it.  LoopIR must keep the
+    pre-existing ``unsupported_loop_order`` target boundary instead of
+    reproducing invalid C++ or letting the reduce-out family gate over-admit
+    the program.
+    """
+
+    from scorch.compiler.loopir.pipeline import legacy_generated_cpp
+    from scorch.compiler.scheduler import Schedule, Scheduler
+
+    a, b, c, d, e, f = (IndexVar(name) for name in "abcdef")
+    left = TensorVar("A", fmt="ddddd")
+    right = TensorVar("B", fmt="ddd")
+    result = TensorVar("C", fmt="dddd")
+    cin: IndexStmt = TensorAssign(
+        result[a, b, c, f],
+        CINBinaryOp(
+            Operation.MUL,
+            left[a, b, c, d, e],
+            right[d, e, f],
+        ),
+        op=Operation.ADD,
+    )
+    for index in reversed((a, b, c, d, e, f)):
+        cin = ForAll(index, cin)
+
+    plan = Scheduler.auto_schedule_plan(
+        cin, regblock_enabled=regblock_enabled
+    ).verified_loop_plan
+    assert plan.workspace is not None and plan.workspace.dense
+    assert len(plan.tiles) == 5
+
+    bindings = (
+        ((2, 3, 4, 5, 6), torch.float32),
+        ((5, 6, 7), torch.float32),
+    )
+    options = replace(
+        CompileOptions.from_environment(environ={}).with_regblock_enabled(
+            regblock_enabled
+        ),
+        requested_schedule=Schedule(),
+    )
+    legacy_cpp = legacy_generated_cpp(
+        cin,
+        (2, 3, 4, 7),
+        bindings,
+        compile_options=options,
+    )
+    assert legacy_cpp.index("int pA3 = pA2") < legacy_cpp.index("int pA2 =")
+    with pytest.raises(Exception) as error:
+        compile_cin_via_loopir(
+            cin,
+            (2, 3, 4, 7),
+            bindings,
+            compile_options=options,
+        )
+    assert getattr(error.value, "defect").code == "unsupported_loop_order"
+
+
 _SPARSE_WORKSPACE_DIMS = {"i": 4, "j": 5, "k": 6}
 
 
@@ -397,12 +464,32 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             "unsupported_merged_reduction",
         ),
         (
+            "merged_update_dense_out",
+            ("dd", "ij", (("ds", "ij"), ("ds", "ij")), "ij"),
+            "unsupported_merged_update",
+        ),
+        (
             "sparse_output_root",
             ("s", "i", (("dd", "ji"), ("d", "j")), "ji"),
             "unsupported_sparse_output",
         ),
         (
-            "mixed_level_dense_axis",
+            "dense_domain_to_csr",
+            ("ds", "ij", (("dd", "ij"),), "ij"),
+            "unsupported_sparse_output_domain",
+        ),
+        (
+            "sparse_row_to_csr",
+            ("ds", "ij", (("ss", "ij"),), "ij"),
+            "unsupported_sparse_output_domain",
+        ),
+        (
+            "mixed_level_dense_axis_reduction",
+            ("sd", "ij", (("dd", "ij"),), "ij"),
+            None,
+        ),
+        (
+            "mixed_level_dense_axis_elementwise",
             ("sd", "ij", (("dd", "ij"),), "ij"),
             None,
         ),
@@ -428,10 +515,7 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
 
     from scorch.compiler.scheduler import Schedule
 
-    if family == "mixed_level_dense_axis":
-        # The rank-2 elementwise mixed result fails at the result format
-        # itself; the reduction shape with a dense trailing workspace is
-        # covered below with its recorded plan.
+    if family == "mixed_level_dense_axis_reduction":
         i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
         result = TensorVar("C", fmt="sd")
         source = TensorVar("A", fmt="ddd")
@@ -448,6 +532,24 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         bindings = (((6, 4, 5), torch.float32),)
         out_shape = (6, 5)
         expected = "unsupported_format"
+    elif family == "mixed_level_dense_axis_elementwise":
+        i, j = IndexVar("i"), IndexVar("j")
+        result = TensorVar("C", fmt="sd")
+        source = TensorVar("A", fmt="dd")
+        cin = ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
+        bindings = (((4, 5), torch.float32),)
+        out_shape = (4, 5)
+        expected = "unsupported_format"
+    elif family in ("dense_domain_to_csr", "sparse_row_to_csr"):
+        i, j = IndexVar("i"), IndexVar("j")
+        result = TensorVar("C", fmt="ds")
+        source = TensorVar(
+            "A",
+            fmt="dd" if family == "dense_domain_to_csr" else "ss",
+        )
+        cin = ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
+        bindings = (((4, 5), torch.float32),)
+        out_shape = (4, 5)
     else:
         cin = _build_boundary_cin(*spec)
         bindings = tuple(

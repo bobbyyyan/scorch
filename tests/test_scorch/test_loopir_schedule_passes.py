@@ -1080,6 +1080,191 @@ def test_apply_schedule_plan_admits_the_reduce_out_form(regblock_enabled):
     ) == canonical_program_dump(schedule.base_program)
 
 
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize(
+    "extent_class",
+    [
+        "zero_reduction",
+        "zero_axis",
+        "unit",
+        "exact",
+        "ragged",
+        "oversized",
+    ],
+)
+def test_reduce_out_oracle_executes_every_extent_class(regblock_enabled, extent_class):
+    """Reset, producer, and copy-out semantics hold across tile boundaries."""
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = _reduce_out_auto_plan(lowering, i, k, j, regblock_enabled=regblock_enabled)
+    artifact = apply_schedule_plan(lowering.program, plan)
+    assert plan.auto_policy is not None
+    width = plan.auto_policy.tile_width
+    extents = {
+        "zero_reduction": (0, 5),
+        "zero_axis": (5, 0),
+        "unit": (1, 1),
+        "exact": (width, width),
+        "ragged": (width + 1, width + 3),
+        "oversized": (3, 5),
+    }
+    inner, cols = extents[extent_class]
+    rows = 2
+    a_values = [
+        [float((row * 3 + red) % 7 - 3) for red in range(inner)] for row in range(rows)
+    ]
+    b_values = [
+        [float((red * 5 + col) % 9 - 4) for col in range(cols)] for red in range(inner)
+    ]
+    bindings = {
+        lowering.input_symbols[0]: a_values,
+        lowering.input_symbols[1]: b_values,
+    }
+    shapes = {lowering.result_symbol: (rows, cols)}
+
+    scheduled = run_program(artifact.program, bindings, shapes)
+    base = run_program(artifact.base_program, bindings, shapes)
+    erased_program = erase_schedule(artifact.program)
+    erased = run_program(erased_program, bindings, shapes)
+    expected = [
+        [
+            float(sum(a_values[row][red] * b_values[red][col] for red in range(inner)))
+            for col in range(cols)
+        ]
+        for row in range(rows)
+    ]
+    assert scheduled == base == erased
+    assert scheduled[lowering.result_symbol] == expected
+    assert canonical_program_dump(erased_program) == canonical_program_dump(
+        artifact.base_program
+    )
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_reduce_out_oracle_covers_multiple_reductions_and_four_tiles(
+    regblock_enabled,
+):
+    """A rank-three output exercises prefix, two reductions, and axis tiles."""
+
+    a, b, d, e, c = (IndexVar(name) for name in ("a", "b", "d", "e", "c"))
+    left = TensorVar("A", fmt="dddd")
+    right = TensorVar("B", fmt="ddd")
+    result = TensorVar("C", fmt="ddd")
+    cin = ForAll(
+        a,
+        ForAll(
+            b,
+            ForAll(
+                d,
+                ForAll(
+                    e,
+                    ForAll(
+                        c,
+                        TensorAssign(
+                            result[a, b, c],
+                            CINBinaryOp(
+                                Operation.MUL,
+                                left[a, b, d, e],
+                                right[d, e, c],
+                            ),
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    lowering = lower(cin)
+    width = 8 if regblock_enabled else 32
+    placement = (
+        LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(a.index_id))
+        if regblock_enabled
+        else LoopPlacement(PlacementKind.OUTERMOST)
+    )
+
+    def tile(loop):
+        return LoopTile(
+            loop=LoopRef(loop.index_id),
+            width=width,
+            placement=placement,
+            parallel=False,
+            kind="affine",
+            accumulation="direct",
+            unroll=True,
+        )
+
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        tiles=tuple(tile(loop) for loop in (b, d, e, c)),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(e.index_id),
+            axis_loops=(LoopRef(c.index_id),),
+            dense=True,
+        ),
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=regblock_enabled,
+            tile_width=width,
+        ),
+        provenance="auto",
+    )
+    artifact = apply_schedule_plan(lowering.program, plan)
+    batch, rows, first_reduction, second_reduction, cols = (2, 3, 4, 5, 6)
+    left_values = [
+        [
+            [
+                [
+                    float((batch_pos + row + first + second) % 7 - 3)
+                    for second in range(second_reduction)
+                ]
+                for first in range(first_reduction)
+            ]
+            for row in range(rows)
+        ]
+        for batch_pos in range(batch)
+    ]
+    right_values = [
+        [
+            [float((first * 3 + second + col) % 9 - 4) for col in range(cols)]
+            for second in range(second_reduction)
+        ]
+        for first in range(first_reduction)
+    ]
+    bindings = {
+        lowering.input_symbols[0]: left_values,
+        lowering.input_symbols[1]: right_values,
+    }
+    shapes = {lowering.result_symbol: (batch, rows, cols)}
+
+    scheduled = run_program(artifact.program, bindings, shapes)
+    base = run_program(artifact.base_program, bindings, shapes)
+    erased_program = erase_schedule(artifact.program)
+    erased = run_program(erased_program, bindings, shapes)
+    expected = [
+        [
+            [
+                float(
+                    sum(
+                        left_values[batch_pos][row][first][second]
+                        * right_values[first][second][col]
+                        for first in range(first_reduction)
+                        for second in range(second_reduction)
+                    )
+                )
+                for col in range(cols)
+            ]
+            for row in range(rows)
+        ]
+        for batch_pos in range(batch)
+    ]
+    assert scheduled == base == erased
+    assert scheduled[lowering.result_symbol] == expected
+    assert canonical_program_dump(erased_program) == canonical_program_dump(
+        artifact.base_program
+    )
+
+
 def test_reduce_out_form_shape_is_exact():
     """Every deviation from the reduce-out form stays fail-closed."""
 

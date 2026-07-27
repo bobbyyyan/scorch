@@ -174,7 +174,7 @@ def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes
         result.dtype = torch.float32
     rhs = None
     for position, (fmt, indices) in enumerate(operands):
-        operand = TensorVar("ABD"[position], fmt=fmt)
+        operand = TensorVar("ABDE"[position], fmt=fmt)
         if bind_shapes:
             operand.shape = tuple(_CENSUS_DIMS[x] for x in indices)
             operand.dtype = torch.float32
@@ -192,7 +192,14 @@ def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes
 
 
 _DENSE_DUAL_CONSTITUENTS = {
+    "batched_dense": ("ddd", "lik", (("ddd", "lij"), ("ddd", "ljk")), "lijk"),
     "dense_matmul": ("dd", "ik", (("dd", "ij"), ("dd", "jk")), "ijk"),
+    "four_operand_ds": (
+        "dd",
+        "ik",
+        (("ds", "ij"), ("dd", "jk"), ("dd", "ik"), ("d", "k")),
+        "ijk",
+    ),
     "ttm_dense": ("ddd", "ijk", (("ddd", "ijl"), ("dd", "lk")), "ijlk"),
     "three_operand_ds": ("dd", "ik", (("ds", "ij"), ("dd", "jk"), ("dd", "ik")), "ijk"),
 }
@@ -200,14 +207,14 @@ _DENSE_DUAL_CONSTITUENTS = {
 
 @pytest.mark.parametrize("family", sorted(_DENSE_DUAL_CONSTITUENTS))
 def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
-    """Every admitted dense dual kernel reconstructs from its LoopIR arms.
+    """Representative identity-layout dual kernels reconstruct from LoopIR arms.
 
     The reduce-out migration closed the dense-matmul constituent of the
-    production dual domain: for each qualifying dense family, stitching the
-    two actual LoopIR-produced arm lowerings must reproduce the production
-    ``_build_regblock_dual_path`` kernel byte-for-byte.  Comparing the same
-    legacy helpers to themselves is not evidence; both arms here come from
-    ``compile_cin_via_loopir``.
+    production dual domain.  Cover rank-2, batched, rank-3, and three-/four-
+    operand qualifying families: stitching the two actual LoopIR-produced
+    arm lowerings must reproduce the production ``_build_regblock_dual_path``
+    kernel byte-for-byte.  Comparing the same legacy helpers to themselves
+    is not evidence; both arms here come from ``compile_cin_via_loopir``.
     """
 
     spec = _DENSE_DUAL_CONSTITUENTS[family]
@@ -273,13 +280,19 @@ def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
             ("ddd", "ijk", (("dds", "ijl"), ("dd", "lk")), "ijlk"),
             "unsupported_schedule_auto_family",
         ),
+        (
+            "batched_sparse_operand",
+            ("ddd", "lik", (("dds", "lij"), ("ddd", "ljk")), "lijk"),
+            "unsupported_schedule_auto_family",
+        ),
     ],
 )
 def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
     """Qualifying dual families outside the migrated arms fail closed.
 
-    The complete production dual census: hierarchical-compressed ``ss``
-    operands still fail target parent-position descent
+    This representative production census locks the known format-family
+    boundaries: hierarchical-compressed ``ss`` operands still fail target
+    parent-position descent
     (``unsupported_program_shape``); COO operands fail level lowering
     (``unsupported_format``); trailing-compressed operands derive
     sparse-workspace-adjacent automatic plans that the family gate keeps on
@@ -315,6 +328,54 @@ def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
                 compile_options=arm_options,
             )
         assert getattr(error.value, "defect").code == expected
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_dual_transposed_dense_operand_stays_an_explicit_boundary(
+    regblock_enabled,
+):
+    """A release-qualifying transposed operand is not an identity-layout arm.
+
+    Public ``einsum("ij,kj->ik", ds, dd)`` aligns the second operand with a
+    physical ``mode_order=[1, 0]`` while preserving the logical ``B[k, j]``
+    access.  The legacy dual builder admits that family, but the current
+    LoopIR target does not yet own general dense mode-order/position-chain
+    lowering.  Lock the exact fail-closed boundary so an identity-layout
+    census cannot be mistaken for complete production coverage.
+    """
+
+    i, j, k = (IndexVar(name) for name in "ijk")
+    result = TensorVar("C", fmt="dd")
+    sparse = TensorVar("A", fmt="ds")
+    transposed = TensorVar("B", fmt="dd", mode_order=[1, 0])
+    cin = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    result[i, k],
+                    sparse[i, j] * transposed[k, j],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(environ={})
+    assert ops._build_regblock_dual_path(cin, None, compile_options=options) is not None
+    arm_options = replace(
+        options.with_regblock_enabled(regblock_enabled),
+        requested_schedule=Schedule(),
+    )
+    with pytest.raises(Exception) as error:
+        compile_cin_via_loopir(
+            cin,
+            (4, 6),
+            (((4, 5), torch.float32), ((5, 6), torch.float32)),
+            compile_options=arm_options,
+        )
+    assert getattr(error.value, "defect").code == "unsupported_loop_order"
 
 
 def test_dual_domain_census_locks_non_qualifying_families():

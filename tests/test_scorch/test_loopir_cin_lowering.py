@@ -9,6 +9,7 @@ outside the families.
 import pytest
 import torch
 
+import scorch.compiler.loopir.pipeline as loopir_pipeline_module
 from scorch.compiler.cin import (
     BinaryOp as CINBinaryOp,
     ForAll,
@@ -21,6 +22,7 @@ from scorch.compiler.cin import (
     Workspace,
 )
 from scorch.compiler.cin_analysis import canonical_cin_dump, normalize_cin
+from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.diagnostics import VerificationError
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.lower_cin import (
@@ -37,7 +39,13 @@ from scorch.compiler.loopir.nodes import (
     StoreReduce,
 )
 from scorch.compiler.loopir.printer import canonical_program_dump
+from scorch.compiler.loopir.pipeline import (
+    compile_cin_via_loopir,
+    execute_cin_via_loopir,
+    execute_shadow,
+)
 from scorch.compiler.loopir.verifier import verify_program
+from scorch.compiler.scheduler import Schedule, Scheduler
 
 
 def build_elementwise_add():
@@ -448,6 +456,73 @@ def test_malformed_cin_fails_at_the_cin_verifier():
     # j is never bound by a ForAll: the full CIN verifier owns this failure.
     with pytest.raises(VerificationError):
         lower_normalized_cin_to_loopir(ForAll(i, assign))
+
+
+def _cyclic_forall_program():
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    program.stmt = program
+    return program
+
+
+def test_direct_lower_rejects_malformed_structure_before_nest_collection():
+    program = _cyclic_forall_program()
+
+    with pytest.raises(VerificationError) as error:
+        lower_normalized_cin_to_loopir(program)
+
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
+
+
+@pytest.mark.parametrize("entry", ("compile", "execute", "shadow"))
+def test_pipeline_entries_preflight_before_scheduler_metadata_and_build(
+    entry,
+    monkeypatch,
+):
+    program = _cyclic_forall_program()
+    options = CompileOptions.from_environment(
+        environ={},
+        requested_schedule=Schedule(),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("malformed CIN escaped structural preflight")
+
+    monkeypatch.setattr(Scheduler, "apply_schedule", forbidden)
+    monkeypatch.setattr(loopir_pipeline_module, "_bind_runtime_metadata", forbidden)
+    monkeypatch.setattr(
+        loopir_pipeline_module,
+        "_prepare_generated_kernel_build",
+        forbidden,
+        raising=False,
+    )
+
+    with pytest.raises(VerificationError) as error:
+        if entry == "compile":
+            compile_cin_via_loopir(
+                program,
+                (4,),
+                (((4,), torch.float32),),
+                compile_options=options,
+            )
+        else:
+            if entry == "execute":
+                execute_cin_via_loopir(
+                    program,
+                    (4,),
+                    compile_options=options,
+                )
+            else:
+                execute_shadow(
+                    program,
+                    (4,),
+                    compile_options=options,
+                )
+
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
 
 
 def test_non_index_stmt_rejected():
