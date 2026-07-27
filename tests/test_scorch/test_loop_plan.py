@@ -2555,6 +2555,79 @@ def test_auto_origin_replays_post_workspace_retraversal_scope() -> None:
     assert replay.verified_loop_plan == plan
 
 
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_auto_origin_candidate_order_ignores_physical_mode_permutation(
+    regblock_enabled: bool,
+) -> None:
+    """Tile candidates follow logical access order, not permuted storage order.
+
+    Legacy ``_select_index_vars_to_tile`` consumes each access's logical
+    index list, so a permuted physical ``mode_order`` must not reorder the
+    recorded heuristic tiles.  The derived twin previously walked
+    ``storage_index_ids`` and rejected this valid plan with
+    ``auto_tile_decision`` (stored ``m, j, k`` versus derived ``m, k, j``).
+    """
+
+    i, j, k, ell, m = (IndexVar(name) for name in ("i", "j", "k", "ell", "m"))
+    result = TensorVar("C", fmt="dsd")
+    left = TensorVar("A", fmt="d")
+    right = TensorVar("B", fmt="dddd", mode_order=[0, 3, 2, 1])
+    cin = ForAll(
+        j,
+        ForAll(
+            i,
+            ForAll(
+                k,
+                ForAll(
+                    ell,
+                    ForAll(
+                        m,
+                        TensorAssign(
+                            result[k, ell, m],
+                            left[m] * right[i, j, k, ell],
+                            op=Operation.ADD,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    scheduled = Scheduler.auto_schedule_plan(
+        cin,
+        regblock_enabled=regblock_enabled,
+    )
+    plan = scheduled.verified_loop_plan
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    assert plan.loop_order == (
+        ids["i"],
+        ids["k"],
+        ids["ell"],
+        ids["j"],
+        ids["m"],
+    )
+    assert plan.workspace == WorkspaceInsertion(
+        reduction_loop=LoopRef(ids["j"]),
+        axis_loops=(LoopRef(ids["m"]),),
+        dense=True,
+    )
+    assert tuple(tile.loop.index_id for tile in plan.tiles) == (
+        ids["m"],
+        ids["j"],
+        ids["k"],
+    )
+    replay = Scheduler.apply_schedule(
+        cin,
+        Schedule(),
+        compile_options=CompileOptions.from_environment(
+            environ={},
+            requested_schedule=Schedule(),
+            regblock_override=regblock_enabled,
+        ),
+    )
+    assert replay.verified_loop_plan == plan
+
+
 def test_workspace_fact_is_an_automatic_decision_only() -> None:
     scheduled = Scheduler.apply_schedule(
         _build_dense_matmul(), Schedule(loop_order=("i", "j", "k"))

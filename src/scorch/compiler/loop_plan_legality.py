@@ -403,9 +403,13 @@ def _derive_auto_decisions(
                 sparse_ids.add(index_id)
     candidates: List[IndexId] = []
     for layout in ordered_layouts:
-        if set(layout.storage_index_ids) == all_bound:
+        if set(layout.logical_index_ids) == all_bound:
             continue
-        for index_id in layout.storage_index_ids:
+        # Candidate enumeration follows the legacy access-index traversal,
+        # which is the access's logical index order.  A permuted physical
+        # ``mode_order`` reorders ``storage_index_ids`` but does not change
+        # the order in which legacy ``add_tile`` consumes candidates.
+        for index_id in layout.logical_index_ids:
             if index_id not in sparse_ids and index_id not in candidates:
                 candidates.append(index_id)
     if plan.loop_order:
