@@ -943,3 +943,59 @@ def test_release_mode_normalize_cin_fails_closed_on_forged_structure() -> None:
     with pytest.raises(VerificationError) as error:
         normalize_cin(deep, compile_options=release_options)
     assert _assert_structured_diagnostics(error) == {"cin_structure_depth_exceeded"}
+
+
+def test_structural_preflight_rejects_descriptor_divergence() -> None:
+    """A __class__-swapped property cannot split the stored/getattr graphs.
+
+    The preflight validates stored state while the recursive analyses walk
+    the getattr view; a hostile data descriptor returning a different object
+    (here: a self-cycle over a benign stored child) must fail closed instead
+    of validating one graph and handing the recursion another.
+    """
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+
+    class HostileForAll(ForAll):
+        @property
+        def stmt(self):  # type: ignore[override]
+            return self
+
+    program.__class__ = HostileForAll
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert analysis.diagnostics[0].path == ("root", "stmt")
+    with pytest.raises(VerificationError) as error:
+        verify_cin(program)
+    assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+
+
+def test_structural_preflight_rejects_raising_descriptor() -> None:
+    """A descriptor that raises on read is as hostile as a diverging one."""
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+
+    class ExplodingForAll(ForAll):
+        @property
+        def parallel(self):  # type: ignore[override]
+            raise RuntimeError("hostile descriptor")
+
+    program.__class__ = ExplodingForAll
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert analysis.diagnostics[0].path == ("root", "parallel")
+    with pytest.raises(VerificationError) as error:
+        verify_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}

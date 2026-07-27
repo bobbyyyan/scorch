@@ -207,6 +207,12 @@ def _preflight_cin_structure(  # noqa: C901
     them.  The ownership analysis retains authority for
     ``duplicate_node_reference`` and related identity diagnostics, while an
     object reached again before its exit frame is unambiguously a cycle.
+
+    Each stored field must also be the object the getattr view reports, so a
+    hostile class-level descriptor cannot show this preflight one graph and
+    the recursive analyses another.  Descriptors that execute arbitrary
+    non-terminating code remain outside the threat model, exactly as any
+    hostile ``__getattr__`` would be for every consumer.
     """
 
     diagnostics: List[CINDiagnostic] = []
@@ -237,7 +243,33 @@ def _preflight_cin_structure(  # noqa: C901
                 path + (field_name,),
             )
             return _MISSING_CIN_FIELD
-        return state[field_name]
+        value = state[field_name]
+        # Downstream consumers walk the getattr view of the graph while this
+        # preflight validates stored state, so a hostile class-level
+        # descriptor (for example a ``__class__``-swapped property) could
+        # otherwise validate one graph and hand the recursion another.  The
+        # two views must be the same object; a descriptor that raises is
+        # equally hostile.  Every structural field of the real CIN classes is
+        # a plain instance attribute, so legitimate programs always pass.
+        try:
+            live = getattr(node, field_name)
+        except Exception:
+            diagnose(
+                "invalid_cin_field",
+                f"{type(node).__name__}.{field_name} is shadowed by a "
+                "raising descriptor",
+                path + (field_name,),
+            )
+            return _MISSING_CIN_FIELD
+        if live is not value:
+            diagnose(
+                "invalid_cin_field",
+                f"{type(node).__name__}.{field_name} diverges from its "
+                "stored value",
+                path + (field_name,),
+            )
+            return _MISSING_CIN_FIELD
+        return value
 
     def typed_child(
         node: object,
