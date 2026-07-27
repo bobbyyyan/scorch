@@ -3546,3 +3546,225 @@ Final evidence is retained under
   and
 - `git diff --check` is clean, local and live origin remain at
   `58e8565`, and all five protected files retain their recorded hashes.
+
+## 25. Automatic origin, root-workspace resolution, and the dual boundary (2026-07-26)
+
+This section supersedes §24's current-state claims.  Section 24 remains
+historical evidence for the tree at `f3dee24`.
+
+The session first independently re-reviewed the fourteen §24 correction
+commits without trusting their report and found no concrete defect:
+every diff was inspected, the ten-file contract membership (**759
+passed**), the options/identity membership (**81 passed**), and the
+compiled schedule/pipeline/generality battery (**269 passed in
+993.27 s**) were reproduced exactly at `f3dee24`, and seven fresh
+adversarial probe families beyond the committed locks all held
+(identity side-effect freedom and idempotence, requested-schedule
+clearing, exact-int extents, non-consuming generator rejection,
+hostile-deep index chains under the depth bound, shared-node DAG
+rejection, and hostile forged plans).  Five focused commits were then
+added, nothing pushed, amended, squashed, or reordered:
+
+- `e1afa72` — `feat(compiler): type automatic origin and admit the regblock stack form`
+- `830fcd2` — `test(compiler): lock automatic origin policy and the stack-form family`
+- `1d7a6db` — `fix(compiler): elide the dense root-scope automatic workspace`
+- `36cbac4` — `test(compiler): lock the aligned dense root-workspace elision`
+- `dba2a22` — `test(compiler): lock the regblock_dual ownership boundary`
+
+### 25.1 Typed automatic origin (Milestone: origin honesty)
+
+`e1afa72` introduces the versioned `AutoOriginPolicy` fact
+(`scorch.autopolicy.v1`) on `LoopPlan`: which regblock arm originated
+the plan and the tile width that arm applies.  The legality boundary
+now re-derives the complete heuristic tile list and the workspace
+insertion from the analyzed CIN, the plan order, and that policy —
+mirroring the legacy surgery's post-insertion candidate selection,
+first-loop exclusion, sparse exclusion, retraversal guard, root-scope
+bailout, and per-arm placement and width — and requires the stored
+facts to equal the derivation exactly (`auto_tile_decision`,
+`auto_workspace_decision`).  A plan carrying the string ``"auto"`` can
+no longer justify tiles or a workspace the recorded policy would not
+derive, and arm mislabeling (a tile-free plan labeled as the regblock
+arm, or vice versa, or a forged policy width) fails closed.  The
+cost-model loop order remains an attested decision — admission is
+still a replay contract, not cost-model attestation.  The policy is
+required on every automatic plan, rejected on explicit plans
+(`auto_policy_provenance`), exact in type, schema token, stored
+fields, arm flag, and positive C++-representable width, and is
+verification state only: it stays outside
+`scorch.loopplan.canonical.v1` and the request identity, so the two
+arms of a decision-free program serialize byte-identically while the
+two arms of an SpMM still separate through their recorded decisions.
+`scorch.loopir.request.v2` and `scorch.loopir.canonical.v8` are
+unchanged.
+
+### 25.2 The regblock stack-form family (Milestone: heuristic tiled/workspace)
+
+The measured equivalence chain for the production-relevant automatic
+tiled subfamily — the regblock arm of the dual route — closed it onto
+already-verified machinery.  For `ds` and `ss` SpMM the legacy
+automatic regblock surgery (standalone dense workspace plus one direct
+serial `CHILD_OF` tile of the workspace axis) is byte-identical to the
+legacy *explicit* stack-tile schedule, and the migrated stack-tile
+pass already reproduces that explicit form byte-for-byte through
+LoopIR.  The strangler gate therefore admits exactly the recorded
+stack form — dense workspace over a single trailing free axis, one
+direct serial unrolled `CHILD_OF` tile of that axis under the row
+loop, width equal to the policy width, regblock arm recorded — and the
+typed driver lowers the recorded workspace+tile pair through the
+verified stack-tile pass without mutating the plan facts.  Locked
+evidence: byte-identical LoopIR-versus-legacy source for the automatic
+regblock arm, the artifact carrying the verified plan with the
+unchanged seven-stage record sequence, erasure returning the base
+program, a compiled shadow executing bitwise-equal to legacy and
+numerically equal to Torch, fail-closed coverage for every shape
+deviation (missing or wrong-arm policy, forged width, no-unroll,
+outermost or wrong-parent placement, sparse or missing or
+wrong-axis workspace), and the `ss` operand still failing closed at
+target lowering (hierarchical compressed descent).
+
+### 25.3 Dense root-workspace resolution (Milestone: materialize versus elide)
+
+The materialize-versus-elide divergence dissolved under evidence: the
+"materialize" disposition never produced an executable kernel.  The
+legacy plan-free emission for a dense root-scope reduction mixes the
+dense workspace API in the producer (`memset` plus indexed
+accumulation) with the sparse coordinate-map API in the consumer
+(`.sort()` plus iteration) over one never-declared symbol, and the
+public spelling `scorch.einsum("jk->k", dense)` died in release with
+clang `use of undeclared identifier 'wksp'` (broken kernel source and
+both clang transcripts retained, §25.6).  `1d7a6db` aligns plan-free
+production auto-scheduling with the only executable established
+semantics — the empty-Schedule replay contract's elision — scoped
+exactly to the broken family: dense output with the last in-order
+reduction at the nest root.  Sparse-output root insertions still
+materialize and record their fact.  After the alignment, production
+surgery and replay agree by construction, F4 records the honest
+elided decision instead of failing closed, the einsum spelling
+compiles and matches `torch.sum`, the root family flows tile-free
+through LoopIR byte-identical to legacy with a compiled bitwise
+shadow, and every previously-compiling emission is byte-unchanged
+(corpus, grid, and audit receipts below).  The complete-plan guard
+remains as fail-closed defense in depth.  One honest residue: with a
+plain `torch.Tensor` operand (rather than a dense `STensor`) the same
+einsum spelling now proceeds past compilation and fails later at a
+pre-existing result-wrapping gap ("Could not infer dtype of STensor"),
+which is unrelated to the compiler path and remains open.
+
+### 25.4 The regblock_dual ownership boundary (Milestone: dual disposition)
+
+Decision: the two constituent schedules are Phase-6 obligations and
+both are discharged — the regblock-off arm through the tile-free
+auto-replay contract and the regblock-on arm through the stack-form
+contract, each independently byte-identical through LoopIR — while the
+runtime free-dim branch that stitches the two lowered arms is
+target-level composition whose migration belongs to Phase 7's
+parallel/target-lowering work.  `dba2a22` locks the boundary with a
+composition differential: reconstructing the stitch from the two arm
+lowerings reproduces the production `_build_regblock_dual_path` kernel
+byte-for-byte, so the dual route contains no third semantic lowering.
+The existing branch-structure, cutoff-width, gate-off, and compiled
+both-sides-of-cutoff numerical tests (all green this session, now part
+of the compiled battery) cover the stitch's runtime behavior.
+
+### 25.5 Phase-6 exit disposition
+
+Criterion-by-criterion:
+
+1. **Schedule decisions applied only to LoopIR:** met for the migrated
+   explicit families, the tile-free auto-replay family (now including
+   the aligned dense root-scope reduction), and the regblock
+   stack-form family; not claimed for the remaining plan-free
+   automatic families.
+2. **No name/regex discovery in typed panel/relayout/result-tile
+   passes:** unchanged and met; the new admission logic consumes typed
+   plan facts only.
+3. **Canonical identity owns the strangler request:** met by request
+   v2, unchanged; the origin policy is deliberately outside the
+   identity.
+4. **Explicit and automatic differentials:** met for the explicit
+   families, the tile-free family (including the aligned root case),
+   the stack-form family, and the dual composition differential.
+   Open for (a) the reduce-out strip-mine family — heuristic
+   `OUTERMOST`/`CHILD_OF` tiles that strip-mine a dense reduction
+   variable with an accumulate copy-out consumer (dense-dense
+   matmul/SDDMM-shaped inputs; well-formed legacy C++ captured, no
+   typed emission twin) — and (b) the sparse-workspace family
+   (`coo_workspace` target API; SpMSpM-shaped and sparse-output root
+   cases).  Both stay fail-closed at the gate with the stable
+   `unsupported_schedule_auto_family` code.
+5. **Representative tile-j/tile-ijk readiness:** unchanged and met.
+
+**Verdict: Phase 6 remains open on the reduce-out strip-mine and
+sparse-workspace automatic families (criterion 4).  There is no
+Phase-6 GO**, and consequently no Phase-7 work, production cutover,
+selector migration, cache cutover, or legacy deletion was started.
+The §24 root-workspace and dual-route obligations are closed.
+
+### 25.6 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-auto-origin-f3dee24/`
+(capture, final, latency, full-suite, and root-workspace-evidence
+subtrees).
+
+- final ten-file contract membership at the code tip: **764 passed**;
+  dedicated options/identity membership: **82 passed**;
+- compiled schedule/pipeline/generality battery *plus the dual-path
+  file* at the code tip: **283 passed in 1,038.70 s** (log SHA-256
+  `dcada1e91cc636cf9690db4d0aaaae6e5b763e7c636af5a82b9fe03836c38565`,
+  JUnit SHA-256
+  `8ce75b46aa6a977a823611c9f2ddbc039a451bc8474fa9b54f19071b12aa615a`);
+- fresh 86-case schedule audit at the code tip: **46 admitted / 40
+  rejected / zero divergent**, two runs byte-identical, and the full
+  result equal to the retained `c7e3702` results after removing only
+  the embedded commit id (result SHA-256
+  `8946526e3bd64be1a24dc5fdb7eaef4e6d9cb65ea216bf387d825fd3a2862b91`);
+- fresh source captures byte-identical to the retained
+  `phase6-review-c7e3702` finals: 20-source corpus, 42-cell grid, 11
+  heap goldens, and the 22-cell anchor survey — **95/95**; plus
+  **10/10** explicit-anchor and **11/11** heap LoopIR/legacy
+  byte-identical comparisons re-run from patched copies of the
+  retained harnesses;
+- automatic root/tiled/dual source grids captured before and after the
+  alignment (five CIN families × both regblock arms × F2/F4 routes,
+  plus the three dual-path cases), including the broken root kernel,
+  both clang failure transcripts, and the post-fix einsum success log
+  under `root-workspace-evidence/`;
+- paired same-session compiler latency (5 warmups / 30 samples, clean
+  detached `f3dee24` base versus `dba2a22` candidate, identical
+  per-case source hashes): `small_dense` **0.979/1.020**, `reduction`
+  **1.006/1.048**, `csr_intersection` **0.994/1.018**, `sparse_union`
+  **1.004/0.973** (p50/p95 new/old) — every ratio inside the 1.10
+  target (base JSON SHA-256
+  `75b36524a887103a9d6287dc6062d784998974d8cb581e5483d45f340dcff0c0`,
+  candidate JSON SHA-256
+  `5a06db8d1790011bc26778093edeef944046e29918fb9f7fac6039fb8e4b5f34`,
+  comparison-log SHA-256
+  `47e74ee9e3bd4a821484c4c50cef1cee9adae86c6a6f4256881175f0fb7882dc`);
+- full-source Black reproduces only the inherited
+  `prebuilt_kernels.py` finding and full-source Flake8 is
+  byte-identical at the nine inherited findings; full-source mypy is
+  **140 errors in 11 files**, line-identical between a clean detached
+  worktree at base `f3dee24` and the candidate tree under the same
+  repository-root invocation (the previously recorded 146/12 figure
+  is reproducible only from the earlier session's different invocation
+  context, so the honest same-methodology baseline is 140/11 with a
+  zero-line delta from this session's commits); the four changed
+  compiler files are focused-mypy-clean at both base and candidate;
+  changed files are Black/Flake8-clean except the inherited scheduler
+  C901;
+- literal unpartitioned clean detached-worktree non-performance suite
+  at exact `dba2a22` with isolated caches and asserted import
+  provenance: **4,204 passed, 14 skipped, 3 performance tests
+  deselected, one known sparse-invariant warning, and zero
+  failures/errors** in **2,798.22 s (46:38)**; the run crossed the
+  historical late-process region with no libomp/resource event, so no
+  partition substitute or base control was needed (log SHA-256
+  `8e0aaefd1e87e25fc43f45ffb4b612c58f8af1d1ac4807a56592d1ec1d3db124`,
+  JUnit SHA-256
+  `eabe603cf408de99ef2fff26266b546c2636744e605410090d6158af4f1a0d42`); and
+- `git diff --check` is clean, local and live origin remain at
+  `58e8565`, and all five protected files retain their recorded
+  hashes; the only tracked files staged were the explicit compiler
+  and test pathspecs of the five commits.
