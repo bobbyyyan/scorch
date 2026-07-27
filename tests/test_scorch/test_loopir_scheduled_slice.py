@@ -51,7 +51,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.loop_plan import LoopPart
+from scorch.compiler.loop_plan import LoopPart, PlacementKind
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import (
     compare_generated_sources,
@@ -3095,3 +3095,120 @@ def test_dense_add_auto_shadow_execution():
         (dense_stensor(a, "A"), dense_stensor(b, "B")),
         a + b,
     )
+
+
+# ---------------------------------------------------------------------------
+# Automatic routing: the migrated regblock stack-form family
+# ---------------------------------------------------------------------------
+
+
+def regblock_auto_options():
+    return CompileOptions.from_environment(
+        requested_schedule=Schedule(),
+        regblock_override=True,
+    )
+
+
+def test_auto_stack_form_source_is_byte_identical_to_legacy():
+    """The regblock automatic arm reproduces legacy source byte-for-byte."""
+
+    comparison = compare_generated_sources(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=regblock_auto_options(),
+    )
+    assert comparison.identical
+
+
+def test_auto_stack_form_artifact_carries_the_verified_plan():
+    """The strangler artifact owns the recorded workspace+tile auto plan."""
+
+    options = regblock_auto_options()
+    context = CompilationContext(options)
+    kernel = compile_cin_via_loopir(
+        build_spmm(),
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=options,
+        compilation_context=context,
+    )
+    scheduled = kernel.schedule
+    assert scheduled is not None
+    plan = scheduled.plan
+    assert plan.provenance == "auto"
+    assert plan.auto_policy is not None
+    assert plan.auto_policy.regblock_enabled is True
+    assert plan.workspace is not None
+    assert plan.workspace.dense is True
+    assert len(plan.tiles) == 1
+    tile_fact = plan.tiles[0]
+    assert tile_fact.accumulation == "direct"
+    assert tile_fact.placement.kind is PlacementKind.CHILD_OF
+    assert tile_fact.width == plan.auto_policy.tile_width
+    assert any(entry.tile is not None for entry in scheduled.loops)
+    stages = [record.stage_id for record in context.stage_run_records]
+    assert stages == [
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+        CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+    ]
+    from scorch.compiler.loopir.printer import canonical_program_dump
+    from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+    assert canonical_program_dump(
+        erase_schedule(scheduled.program)
+    ) == canonical_program_dump(scheduled.base_program)
+
+
+def test_spmm_auto_stack_form_shadow_execution():
+    """The compiled regblock automatic arm matches legacy bitwise and Torch."""
+
+    torch.manual_seed(2611)
+    a = torch.randn(4, 5)
+    sparse_a = a.clone()
+    sparse_a[sparse_a.abs() < 0.6] = 0.0
+    b = torch.randn(5, 6)
+    loopir_result, legacy_result, comparison = execute_shadow(
+        build_spmm(),
+        (4, 6),
+        csr_stensor(sparse_a, "A"),
+        dense_stensor(b, "B"),
+        compile_options=regblock_auto_options(),
+    )
+    assert comparison.identical
+    assert torch.equal(loopir_result.values, legacy_result.values)
+    assert torch.allclose(
+        loopir_result.values.reshape(4, 6),
+        sparse_a @ b,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+def test_auto_stack_form_ss_family_fails_closed_at_target_lowering():
+    """The doubly-compressed operand stays outside the migrated families."""
+
+    ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
+    c = TensorVar("C", fmt="dd", dtype=F32)
+    a = TensorVar("A", fmt="ss", dtype=F32)
+    b = TensorVar("B", fmt="dd", dtype=F32)
+    stmt = TensorAssign(
+        c[ivs["i"], ivs["k"]],
+        CINBinaryOp(Operation.MUL, a[ivs["i"], ivs["j"]], b[ivs["j"], ivs["k"]]),
+        op=Operation.ADD,
+    )
+    for name in reversed(("i", "j", "k")):
+        stmt = ForAll(ivs[name], stmt)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            stmt,
+            (4, 6),
+            SPMM_BINDINGS,
+            compile_options=regblock_auto_options(),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"

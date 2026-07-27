@@ -25,7 +25,9 @@ from scorch.compiler.diagnostics import (
 )
 from scorch.compiler.identity import IndexId, SymbolId
 from scorch.compiler.loop_plan import (
+    AUTO_ORIGIN_POLICY_SCHEMA,
     MAX_AFFINE_TILE_WIDTH,
+    AutoOriginPolicy,
     LoopPart,
     LoopPlan,
     LoopPlacement,
@@ -243,6 +245,18 @@ def _affine_tile(
         kind="affine",
         accumulation=accumulation,
         unroll=False,
+    )
+
+
+def _auto_policy(
+    *,
+    regblock_enabled: bool = False,
+    tile_width: int = 32,
+) -> AutoOriginPolicy:
+    return AutoOriginPolicy(
+        schema=AUTO_ORIGIN_POLICY_SCHEMA,
+        regblock_enabled=regblock_enabled,
+        tile_width=tile_width,
     )
 
 
@@ -1157,6 +1171,7 @@ def test_reduction_tiles_and_accumulator_lifetimes_are_artifact_verified() -> No
                 LoopPlacement(PlacementKind.OUTERMOST),
             ),
         ),
+        auto_policy=_auto_policy(),
         provenance="auto",
     )
     _assert_plan_rejected(
@@ -1196,33 +1211,65 @@ def test_reduction_tiles_and_accumulator_lifetimes_are_artifact_verified() -> No
 
 
 def test_parallel_post_reduction_workspace_scope_is_rejected() -> None:
+    """Forged parallel selections over an auto workspace fail closed.
+
+    The policy-derived tile check now precedes the untiled post-reduction
+    scope probe, so a consistent forgery is rejected as an unrecordable
+    explicit parallel decision and an inconsistent one as a non-derived tile
+    set; ``parallel_workspace_scope`` stays as defense in depth behind them.
+    """
+
     scheduled = Scheduler.apply_schedule(
         _build_dense_matmul(), Schedule(loop_order=("i", "j", "k"))
     )
     cin = scheduled.normalized_cin
     ids = _index_ids_by_name(cin)
-    forged = replace(
+    derived_auto_tiles = tuple(
+        LoopTile(
+            loop=LoopRef(ids[name]),
+            width=32,
+            placement=LoopPlacement(PlacementKind.OUTERMOST),
+            parallel=False,
+            kind="affine",
+            accumulation="direct",
+            unroll=True,
+        )
+        for name in ("j", "k")
+    )
+    workspace_fact = WorkspaceInsertion(
+        reduction_loop=LoopRef(ids["j"]),
+        axis_loops=(LoopRef(ids["k"]),),
+        dense=True,
+    )
+    consistent_forgery = replace(
         scheduled.verified_loop_plan,
+        tiles=derived_auto_tiles,
+        parallel_loop=LoopRef(ids["k"]),
+        workspace=workspace_fact,
+        auto_policy=_auto_policy(),
+        provenance="auto",
+    )
+    _assert_plan_rejected(
+        cin,
+        consistent_forgery,
+        InvalidSchedule,
+        "auto_explicit_decision",
+    )
+
+    untiled_scope_forgery = replace(
+        consistent_forgery,
         tiles=(
             _affine_tile(
                 ids["i"],
                 LoopPlacement(PlacementKind.OUTERMOST),
             ),
         ),
-        parallel_loop=LoopRef(ids["k"]),
-        workspace=WorkspaceInsertion(
-            reduction_loop=LoopRef(ids["j"]),
-            axis_loops=(LoopRef(ids["k"]),),
-            dense=True,
-        ),
-        provenance="auto",
     )
-
     _assert_plan_rejected(
         cin,
-        forged,
+        untiled_scope_forgery,
         InvalidSchedule,
-        "parallel_workspace_scope",
+        "auto_tile_decision",
     )
 
 
@@ -1306,7 +1353,11 @@ def test_derived_sparse_workspace_rejects_nonadditive_reductions() -> None:
         UnsupportedFeature,
         "workspace_reduction_operator",
     )
-    forged_auto = replace(forged_explicit, provenance="auto")
+    forged_auto = replace(
+        forged_explicit,
+        auto_policy=_auto_policy(),
+        provenance="auto",
+    )
     _assert_plan_rejected(
         cin,
         forged_auto,
@@ -1483,13 +1534,17 @@ def test_root_workspace_scope_rejects_tiling_replay() -> None:
             axis_loops=(LoopRef(ids["k"]),),
             dense=True,
         ),
+        auto_policy=_auto_policy(),
         provenance="auto",
     )
+    # A root-scope insertion demotes the nest root, so its candidate tiles
+    # never materialize: the recorded tiles are not derivable and the origin
+    # check now fails ahead of the replay-shape probe.
     _assert_plan_rejected(
         cin,
         base,
-        UnsupportedFeature,
-        "root_workspace_tiling",
+        InvalidSchedule,
+        "auto_tile_decision",
     )
     _assert_plan_rejected(
         cin,
@@ -1497,6 +1552,7 @@ def test_root_workspace_scope_rejects_tiling_replay() -> None:
             base,
             tiles=(replace(base.tiles[0], accumulation="stack"),),
             workspace=None,
+            auto_policy=None,
             provenance="explicit",
         ),
         UnsupportedFeature,
@@ -2223,6 +2279,132 @@ def test_auto_workspace_fact_must_equal_the_derived_decision() -> None:
         ),
         InvalidSchedule,
         "auto_workspace_decision",
+    )
+
+
+def _regblock_auto_plan(cin: ForAll) -> Tuple[ScheduledCIN, LoopPlan]:
+    options = CompileOptions.from_environment(
+        environ={},
+        requested_schedule=Schedule(),
+        regblock_override=True,
+    )
+    scheduled = Scheduler.apply_schedule(cin, Schedule(), compile_options=options)
+    return scheduled, scheduled.verified_loop_plan
+
+
+def test_auto_origin_policy_is_required_and_exact() -> None:
+    """The versioned origin fact is mandatory, exact, and auto-only."""
+
+    scheduled, plan = _auto_plan(_build_spmm())
+    cin = scheduled.normalized_cin
+    assert plan.auto_policy == _auto_policy()
+
+    _assert_plan_rejected(
+        cin,
+        replace(plan, auto_policy=None),
+        InvalidSchedule,
+        "auto_origin_policy",
+    )
+    with pytest.raises(VerificationError, match="exact .* version token"):
+        verify_loop_plan(
+            cin,
+            replace(
+                plan,
+                auto_policy=replace(plan.auto_policy, schema="scorch.autopolicy.v0"),
+            ),
+        )
+    with pytest.raises(VerificationError, match="AutoOriginPolicy or None"):
+        verify_loop_plan(
+            cin,
+            replace(plan, auto_policy=cast(AutoOriginPolicy, object())),
+        )
+    with pytest.raises(VerificationError, match="regblock_enabled must be a bool"):
+        verify_loop_plan(
+            cin,
+            replace(
+                plan,
+                auto_policy=replace(plan.auto_policy, regblock_enabled=cast(bool, 1)),
+            ),
+        )
+    with pytest.raises(VerificationError, match="tile_width must be an integer"):
+        verify_loop_plan(
+            cin,
+            replace(
+                plan,
+                auto_policy=replace(plan.auto_policy, tile_width=cast(int, True)),
+            ),
+        )
+    with pytest.raises(VerificationError, match="tile_width must be positive"):
+        verify_loop_plan(
+            cin,
+            replace(plan, auto_policy=replace(plan.auto_policy, tile_width=0)),
+        )
+    with pytest.raises(VerificationError, match="constexpr int target"):
+        verify_loop_plan(
+            cin,
+            replace(plan, auto_policy=replace(plan.auto_policy, tile_width=2**31)),
+        )
+
+    ghost = replace(plan.auto_policy)
+    object.__setattr__(ghost, "ghost", True)
+    with pytest.raises(VerificationError, match="invalid stored fields"):
+        verify_loop_plan(cin, replace(plan, auto_policy=ghost))
+
+    explicit = Scheduler.apply_schedule(
+        _build_spmm(), Schedule(loop_order=("i", "j", "k"))
+    )
+    _assert_plan_rejected(
+        explicit.normalized_cin,
+        replace(explicit.verified_loop_plan, auto_policy=_auto_policy()),
+        InvalidSchedule,
+        "auto_policy_provenance",
+    )
+
+
+def test_auto_arm_mislabeling_fails_closed() -> None:
+    """A plan whose decisions the labeled policy cannot derive is rejected.
+
+    The tile-free SpMM plan belongs to the regblock-off arm and the
+    stack-form plan to the regblock-on arm; swapping the recorded policy —
+    or forging its width — makes the stored tiles non-derivable.
+    """
+
+    tile_free, tile_free_plan = _auto_plan(_build_spmm())
+    assert tile_free_plan.tiles == ()
+    _assert_plan_rejected(
+        tile_free.normalized_cin,
+        replace(
+            tile_free_plan,
+            auto_policy=_auto_policy(regblock_enabled=True, tile_width=8),
+        ),
+        InvalidSchedule,
+        "auto_tile_decision",
+    )
+
+    stack, stack_plan = _regblock_auto_plan(_build_spmm())
+    assert len(stack_plan.tiles) == 1
+    assert stack_plan.auto_policy == _auto_policy(regblock_enabled=True, tile_width=8)
+    _assert_plan_rejected(
+        stack.normalized_cin,
+        replace(stack_plan, auto_policy=_auto_policy()),
+        InvalidSchedule,
+        "auto_tile_decision",
+    )
+    _assert_plan_rejected(
+        stack.normalized_cin,
+        replace(
+            stack_plan,
+            auto_policy=_auto_policy(regblock_enabled=True, tile_width=16),
+        ),
+        InvalidSchedule,
+        "auto_tile_decision",
+    )
+    dropped_tile = replace(stack_plan, tiles=())
+    _assert_plan_rejected(
+        stack.normalized_cin,
+        dropped_tile,
+        InvalidSchedule,
+        "auto_tile_decision",
     )
 
 

@@ -300,14 +300,59 @@ def test_workspace_fact_changes_the_identity() -> None:
     assert payload["workspace"] is not None
     assert payload["workspace"]["dense"] is True
 
-    stripped = replace(
-        auto.verified_loop_plan,
-        tiles=(),
-        workspace=None,
-    )
+    # The two verified regblock arms of one SpMM differ exactly in the
+    # recorded workspace and tile facts, so their canonical bytes differ.
+    def spmm_arm(regblock):
+        options = CompileOptions.from_environment(
+            environ={},
+            requested_schedule=Schedule(),
+            regblock_override=regblock,
+        )
+        return Scheduler.apply_schedule(
+            build_spmm(), Schedule(), compile_options=options
+        )
+
+    tile_free_arm = spmm_arm(False)
+    stack_arm = spmm_arm(True)
+    assert tile_free_arm.verified_loop_plan.workspace is None
+    assert stack_arm.verified_loop_plan.workspace is not None
     assert canonical_plan_dump(
-        auto.normalized_cin, auto.verified_loop_plan
-    ) != canonical_plan_dump(auto.normalized_cin, stripped)
+        tile_free_arm.normalized_cin, tile_free_arm.verified_loop_plan
+    ) != canonical_plan_dump(stack_arm.normalized_cin, stack_arm.verified_loop_plan)
+
+
+def test_auto_policy_is_outside_the_canonical_identity() -> None:
+    """Identical decisions serialize identically regardless of the policy arm.
+
+    Both regblock arms derive the decision-free plan for an elementwise
+    program, so only the recorded ``auto_policy`` differs — and it must not
+    reach the canonical bytes or the request identity.
+    """
+
+    def elementwise_arm(regblock):
+        options = CompileOptions.from_environment(
+            environ={},
+            requested_schedule=Schedule(),
+            regblock_override=regblock,
+        )
+        return Scheduler.apply_schedule(
+            build_elementwise(), Schedule(), compile_options=options
+        )
+
+    off_arm = elementwise_arm(False)
+    on_arm = elementwise_arm(True)
+    assert off_arm.verified_loop_plan.auto_policy is not None
+    assert on_arm.verified_loop_plan.auto_policy is not None
+    assert (
+        off_arm.verified_loop_plan.auto_policy != on_arm.verified_loop_plan.auto_policy
+    )
+    assert off_arm.verified_loop_plan.tiles == on_arm.verified_loop_plan.tiles == ()
+    assert canonical_plan_dump(
+        off_arm.normalized_cin, off_arm.verified_loop_plan
+    ) == canonical_plan_dump(on_arm.normalized_cin, on_arm.verified_loop_plan)
+    assert request_identity(off_arm, (4, 5), ELEMENTWISE_BINDINGS) == request_identity(
+        on_arm, (4, 5), ELEMENTWISE_BINDINGS
+    )
 
 
 def test_cross_provenance_rule_and_schedule_digest_layer() -> None:

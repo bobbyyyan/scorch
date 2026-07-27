@@ -25,13 +25,16 @@ from scorch.compiler.cin import (
 from scorch.compiler.cin_analysis import normalize_cin
 from scorch.compiler.identity import IndexId
 from scorch.compiler.loop_plan import (
+    AUTO_ORIGIN_POLICY_SCHEMA,
     MAX_AFFINE_TILE_WIDTH,
+    AutoOriginPolicy,
     LoopPart,
     LoopPlacement,
     LoopPlan,
     LoopRef,
     LoopTile,
     PlacementKind,
+    WorkspaceInsertion,
 )
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
@@ -805,6 +808,118 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
         lowering.program,
         workspace_only,
     )
+
+
+def _stack_form_auto_plan(lowering, i, k, j, **overrides):
+    """The admitted regblock stack-form automatic plan for matmul_ikj."""
+
+    tile = LoopTile(
+        loop=LoopRef(j.index_id),
+        width=8,
+        placement=LoopPlacement(PlacementKind.CHILD_OF, parent=LoopRef(i.index_id)),
+        parallel=False,
+        kind="affine",
+        accumulation="direct",
+        unroll=True,
+    )
+    fields = dict(
+        loop_order=lowering.loop_index_ids,
+        tiles=(tile,),
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(k.index_id),
+            axis_loops=(LoopRef(j.index_id),),
+            dense=True,
+        ),
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=True,
+            tile_width=8,
+        ),
+        provenance="auto",
+    )
+    fields.update(overrides)
+    return LoopPlan(**fields)
+
+
+def test_apply_schedule_plan_admits_the_regblock_stack_form():
+    """The measured workspace+tile pair lowers through the stack-tile pass."""
+
+    from scorch.compiler.loopir.nodes import WorkspaceRegion
+    from scorch.compiler.loopir.printer import canonical_program_dump
+    from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    plan = _stack_form_auto_plan(lowering, i, k, j)
+    schedule = apply_schedule_plan(lowering.program, plan)
+    assert schedule.plan is plan
+    verify_program(schedule.program)
+    # The plan facts stay untouched: the recorded tile keeps its direct
+    # accumulation while the program carries the stack workspace region.
+    assert schedule.plan.tiles[0].accumulation == "direct"
+
+    def find_region(node):
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if type(current) is WorkspaceRegion:
+                return current
+            stack.extend(getattr(current, "statements", ()))
+            for attribute in ("body", "producer", "consumer"):
+                child = getattr(current, attribute, None)
+                if child is not None:
+                    stack.append(child)
+        return None
+
+    assert find_region(schedule.program.body) is not None
+    assert canonical_program_dump(
+        erase_schedule(schedule.program)
+    ) == canonical_program_dump(schedule.base_program)
+
+
+def test_regblock_stack_form_shape_is_exact():
+    """Every deviation from the measured stack form stays fail-closed."""
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    base = _stack_form_auto_plan(lowering, i, k, j)
+
+    def rejected(**overrides):
+        expect_code(
+            "unsupported_schedule_auto_family",
+            apply_schedule_plan,
+            lowering.program,
+            _stack_form_auto_plan(lowering, i, k, j, **overrides),
+        )
+
+    rejected(auto_policy=None)
+    rejected(
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=False,
+            tile_width=8,
+        )
+    )
+    rejected(tiles=(replace(base.tiles[0], width=16),))
+    rejected(tiles=(replace(base.tiles[0], unroll=False),))
+    rejected(
+        tiles=(
+            replace(base.tiles[0], placement=LoopPlacement(PlacementKind.OUTERMOST)),
+        )
+    )
+    rejected(
+        tiles=(
+            replace(
+                base.tiles[0],
+                placement=LoopPlacement(
+                    PlacementKind.CHILD_OF, parent=LoopRef(k.index_id)
+                ),
+            ),
+        )
+    )
+    rejected(workspace=replace(base.workspace, dense=False))
+    rejected(workspace=replace(base.workspace, axis_loops=(LoopRef(k.index_id),)))
+    rejected(workspace=None)
 
 
 def test_apply_schedule_plan_rejects_unmigrated_families():
