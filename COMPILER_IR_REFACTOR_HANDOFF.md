@@ -27517,3 +27517,212 @@ evidence outside Git, update §26 and the handoff with exact receipts
 and honest limitations, push nothing, and finish as much of the
 coherent closure milestone as the evidence supports.
 ```
+
+## Phase-6 closure milestone: implicit bridge, reduce-out, dual census, sparse boundary (2026-07-27, supersedes the §26 prompt)
+
+This section is chronologically latest.  The full milestone report is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §27; §26 remains the
+historical receipt for the automatic-origin review it documents.
+
+### Current state
+
+The independent review of the §26 commits reproduced every focused
+gate and found one concrete defect the report missed: the automatic
+stored-equals-derived verifier walked physical ``storage_index_ids``
+for tile-candidate enumeration while legacy walks the logical access
+index list, so a permuted physical ``mode_order`` falsely rejected
+valid F2/F4 plans with ``auto_tile_decision``.  Fixed and locked in
+`7e5f2ba`; randomized cross-route sweeps (ranks 2–5, permuted mode
+orders, both arms, three seeds) now report zero derivation and zero
+route mismatches.
+
+Five code commits stack above `78e70b2`:
+
+- `7e5f2ba` — logical-order tile-candidate derivation (review fix);
+- `a1b6887` — the public implicit-reduction bridge, owned once at the
+  CIN→LoopIR boundary; public op=None reductions lower exactly as
+  explicit ADD, byte-identical to legacy and to the explicit twin,
+  with compiled bitwise/PyTorch differentials; elementwise op=None
+  stays a plain store; unprovable shapes still fail closed;
+- `9c45266` — the dense reduce-out automatic family end to end:
+  fused ``apply_reduce_out_tiles`` (strip-mined reduction producer,
+  accumulate copy-out consumer, LIFO origin placement), widened
+  family gate, target-lowering producer acceptance; byte parity in
+  16/16 cells (matmul explicit/implicit/f64, rank-3 TTM,
+  three-operand, ragged/exact/unit/oversized/zero, both arms)
+  including the legacy tile-count parallel work estimate; erasure and
+  oracle green on all extent classes; compiled kernels bitwise-equal
+  to legacy production auto;
+- `476bf94` — the complete production dual census: dense
+  constituents (ds@dd both spellings, dense matmul, TTM, 3-operand)
+  reconstruct the production dual kernel byte-for-byte from actual
+  LoopIR arms; ss / COO / trailing-compressed boundaries locked at
+  their exact codes; non-qualifying families build no dual; release
+  behavior unchanged;
+- `7d75a45` — the sparse-result/workspace boundary audit: mixed-level
+  trailing-dense results fail at ``unsupported_format`` and their
+  legacy comparand is defective (unsized values vector, no coordinate
+  assembly, TensorIndexError at wrapping, SIGSEGV in the generic
+  ds-output SpMSpM configuration — evidence retained); true sparse
+  coo_workspace families fail closed at
+  ``unsupported_sparse_output_reduction`` /
+  ``unsupported_merged_reduction`` / early
+  ``unsupported_sparse_output``, both arms.
+
+No serialization changed: `scorch.autopolicy.v1`,
+`scorch.loopplan.canonical.v1`, `scorch.loopir.request.v2`, and
+`scorch.loopir.canonical.v8` remain current.
+
+**Phase 6 has no GO.**  It is open on exactly one boundary: the
+sparse-result/workspace representation — (a) mixed-level
+compressed-parent/dense-leaf result assembly with a dense trailing
+workspace axis (no executable legacy comparand; migrating it is a
+correctness feature, not a parity migration), and (b) true sparse
+``coo_workspace`` allocation/reset/assembly for row-scope SpMSpM and
+sparse-output roots with exact ``no_tile_list`` behavior (the public
+SpMSpM route works and is the honest comparand).  Phase 7, cutover,
+selector parity, cache cutover, legacy deletion, Phase 8, and
+Phase 8.5 are untouched.
+
+### Verification
+
+Evidence is under
+`/Users/bobby/.cache/scorch-codex/phase6-ws-closure-7e5f2ba/`
+(final, latency, full-suite, and ws3-boundary subtrees).
+
+- contract membership **774 passed**; options/identity **82 passed**;
+  hostile-environment replay **4 passed**;
+- expanded cross-route census: **1,900 randomized cases / zero
+  mismatches** (four seeds, both arms, F4 + F2 + direct-surgery
+  equality per case);
+- compiled schedule/pipeline/generality + dual battery at `28f3424`:
+  **316 passed in 17:32**, zero failures;
+- 86-case audit **46/40/0**, two byte-identical runs, equal to the
+  retained result modulo the embedded commit id;
+- captures byte-identical to retained: **20/20 corpus**, **42/42
+  grid**, **22/22 anchor**, **11/11 heap**, all 22 automatic-grid
+  legacy sources; explicit-anchor parity **10/10**, heap parity
+  **11/11**; the only auto-grid report delta is the worktree path
+  embedded in the build-key fingerprint;
+- changed files Black/Flake8/focused-mypy clean; full-source findings
+  at the inherited **1 / 9 / 140-in-11** baselines (line-normalized
+  identical); `git diff --check` clean;
+- paired latency inside 1.10 everywhere (worst **1.066** p95
+  `sparse_union`; identical per-case source hashes);
+- literal detached suite at `28f3424`: **4,250 passed / 2 failed /
+  14 skipped / 3 deselected** in **49:14** over 4,266 selected; both
+  failures are the known macOS libomp pthread-key ceiling in the JIT
+  build subprocess (OMP Error #179, EAGAIN), the environmental mode
+  retained at `3f17ec6`; the retained green `fe6bdb2` literal receipt
+  is the base control below the ceiling, `test_schedule_generality`
+  passed completely inside the same-tip compiled battery, and both
+  affected files rerun **81/81 green** in one fresh isolated process
+  at the same worktree, so every selected test passes in a clean
+  process;
+- origin still `58e8565`, protected hashes exact, unrelated material
+  untouched, nothing pushed.
+
+### Updated broad prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip. Do
+not push, switch branches, amend, squash, or reorder commits.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (Phases 6-7 and the
+Phase-6 exit criteria), the Phase-4 and Phase-5 reviews, all of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through the chronologically
+latest §27, and the latest tail of COMPILER_IR_REFACTOR_HANDOFF.md.
+Section 27 and this prompt supersede §26 and every older routing
+prompt where they conflict.
+
+First independently review the five closure commits 7e5f2ba, a1b6887,
+9c45266, 476bf94, and 7d75a45 plus the §27 docs commit. Do not trust
+the report. Reproduce §27's focused gates and inspect every diff.
+Adversarially verify: the logical-order candidate derivation against
+permuted physical mode orders on both routes; that the implicit
+bridge normalizes exactly once at the CIN→LoopIR boundary, cannot
+manufacture elementwise updates, and fails closed on unprovable
+reductions; that the reduce-out pass byte-reproduces legacy for
+matmul/TTM/three-operand cells across ragged/exact/unit/oversized/
+zero extents in both arms including the tile-count parallel estimate;
+that erasure returns the exact base program and the oracle agrees on
+every extent class; that each admitted dual constituent reconstructs
+the production kernel only from actual LoopIR-produced arms; and that
+every sparse-boundary code (unsupported_format,
+unsupported_sparse_output_reduction, unsupported_merged_reduction,
+early unsupported_sparse_output) still holds in both arms. Fix and
+commit any concrete defect before new work. Preserve
+scorch.autopolicy.v1, scorch.loopplan.canonical.v1,
+scorch.loopir.request.v2, and scorch.loopir.canonical.v8 unless a
+real serialized representation change requires a version bump.
+
+Then pursue the one remaining Phase-6 boundary: the
+sparse-result/workspace representation, in two separately gated
+seams.
+
+1. True sparse coo_workspace emission for row-scope SpMSpM and
+   sparse-output roots. Represent allocation, reset, insertion, and
+   assembly as typed LoopIR state with exact no_tile_list behavior
+   (the producer reduction is excluded from tiling). Cover empty,
+   disjoint, overlapping, and cancellation structures, both policy
+   arms, f32/f64, and every current early boundary. The public
+   SpMSpM route is the working comparand; the generic-path ds-output
+   configuration segfaults (retained evidence), so byte parity is
+   owed only where legacy compiles AND executes correctly; where it
+   does not, prove semantics against the oracle, PyTorch, and the
+   public route, and record the divergence explicitly.
+
+2. Mixed-level compressed-parent/dense-leaf result assembly with a
+   dense trailing workspace axis. The legacy comparand is defective
+   (retained evidence under phase6-ws-closure-7e5f2ba/ws3-boundary);
+   migrating this family is a correctness feature. Either implement
+   correct typed assembly with oracle/PyTorch differentials and an
+   explicit no-legacy-comparand disposition, or keep the exact
+   unsupported_format boundary with a documented criterion decision.
+
+Widen a gate only for a fully represented subfamily with structural
+activation, independent oracle and erasure proofs, byte parity where
+legacy compiles and executes, and compiled numerical differentials.
+
+After the workstreams, repeat every Phase-6 exit criterion. Declare
+GO only if the sparse-result/workspace families are genuinely closed
+or formally dispositioned by a recorded criterion revision. If and
+only if Phase 6 has a genuine GO, begin the widest coherent Phase-7
+target/parallel ownership slice (structured work estimates, OpenMP
+policy, target lowering, runtime dual stitch). Do not start
+production cutover, selector parity, cache cutover, legacy deletion,
+Phase 8, or Phase 8.5.
+
+Preserve all established contracts: frozen tuple ownership; exact
+stored-field/type/enum validation; forged/missing/extra/hostile/
+cyclic/shared/depth adversaries; side-effect-free diagnostics;
+stage-owned failure; artifact-local deterministic identities; no C++
+spelling in LoopIR; no rendered-name/regex/tag discovery; structural
+activation never waived; byte identity wherever legacy is a valid
+comparand; independent oracle and erasure proofs; explicit and
+automatic compiled differentials; and no ordinary release-JIT double
+compilation.
+
+Run focused memberships after every coherent commit. Final gates must
+include the ten-file contract and options/identity memberships; the
+complete compiled schedule/pipeline/generality and dual-path battery;
+an expanded cross-route automatic-plan equivalence census; fresh
+corpus/grid/heap/anchor captures; the 86-case audit plus the
+boundary-census cells; automatic root/tiled/dual source grids; paired
+same-session compiler latency; Black, Flake8, focused mypy, and
+same-methodology full-source mypy comparison (reviewed baseline: 140
+errors in 11 files); git diff --check; and one literal clean
+detached-worktree non-performance suite with isolated caches and
+asserted import provenance. Avoid overlapping native/JIT lanes on
+macOS.
+
+Before editing and before every commit, inspect git status, local and
+live origin, and the five protected-file hashes. Preserve all
+unrelated dirty and untracked GPU/CUDA, benchmark, packaging,
+scheduler, research, scratchpad, and tooling material. Stage explicit
+pathspecs only, use focused commits with descriptive bodies, retain
+evidence outside Git, update §27 and the handoff with exact receipts
+and honest limitations, push nothing, and finish as much of the
+remaining boundary as the evidence supports.
+```

@@ -3959,3 +3959,275 @@ Exact-tip evidence is retained under
 - local and live origin remained `58e8565`; all five protected files
   retained their recorded hashes, all unrelated dirty/untracked work
   remained untouched, and nothing was pushed.
+
+## 27. Phase-6 closure milestone: implicit bridge, reduce-out, dual census, and the sparse boundary (2026-07-26/27)
+
+This section records the broad closure milestone taken on top of §26's
+corrected disposition.  Five code commits stack above `78e70b2`:
+
+- `7e5f2ba` — `fix(compiler): derive tile candidates in logical access order`
+- `a1b6887` — `feat(compiler): normalize the public implicit reduction at the LoopIR boundary`
+- `9c45266` — `feat(compiler): migrate the dense reduce-out automatic family to LoopIR`
+- `476bf94` — `test(compiler): census and close the dense production dual domain`
+- `7d75a45` — `test(compiler): audit the sparse-result/workspace boundary exactly`
+
+### 27.1 Independent review of the §26 commits
+
+All eight inherited commits (`77a2cef` through `78e70b2`) were
+re-reviewed from the diffs, and §26's focused gates reproduced exactly
+(ten-file contract membership **769**, options/identity **82**, hostile
+`SCORCH_REGBLOCK=1` replay **2**).  An independent randomized
+cross-route sweep (ranks 2–5, mixed dense/sparse levels, permuted
+physical mode orders, one-to-three operands, both arms; F4 origination,
+F2 replay equality, and direct-legacy-surgery canonical equality per
+case) found **one concrete defect §26 missed**: the automatic
+stored-equals-derived verifier enumerated tile candidates from each
+access's physical ``storage_index_ids`` while legacy
+``_select_index_vars_to_tile`` walks the access's logical index list.
+A permuted ``mode_order`` that swaps two dense candidates therefore
+made the derived tile order diverge from the recorded surgery order
+(stored ``m, j, k`` versus derived ``m, k, j`` on a rank-5 ``dsd``
+result with a mode-order-permuted ``dddd`` operand), rejecting a valid
+F2/F4 plan with ``auto_tile_decision``.  Tile order is semantically
+meaningful because successive origin insertions stack LIFO.  Fixed in
+`7e5f2ba` by walking ``logical_index_ids``; level-type pairing keeps
+storage order, which is what ``level_type_of_index_var`` reports.
+After the fix, sweeps at three seeds (1,100 randomized cases plus the
+earlier structured matrices) report zero derivation mismatches and
+zero route mismatches.  Adversarial probes confirmed the rest of §26:
+semantic verification rejects arm/width flips wherever a decision is
+observable, hostile policy states fail closed at both the LoopPlan and
+consuming-pass boundaries, dense root elision and sparse root
+materialization are unchanged, and the sparse-workspace no-tile and
+retraversal-scope behaviors mirror legacy (the workspace access is
+excluded from legacy candidate selection because ``tensor_accesses``
+omits workspaces, which the sweep verified against production).
+
+### 27.2 Workstream 1: the public implicit-reduction bridge is closed
+
+The public einsum/matmul frontend deliberately builds
+``TensorAssign.op is None`` for reductions; legacy iteration analysis
+re-derives the additive update from the assignment's
+right-hand-side-only index variables (``iter_lattice.get_simplified_cin``
+discards the recorded op entirely) and emits the same C++ as an
+explicit ADD update — verified byte-identical for ``ds``, ``dd``, and
+``ss`` matmul in both regblock arms.  `a1b6887` owns that
+normalization exactly once at the CIN→LoopIR boundary: an op-``None``
+assignment whose reduction loops all appear in right-hand-side
+accesses lowers as the ADD update, and no later stage re-infers the
+fact.  ``verify_cin``'s ``unused_index_binding`` invariant guarantees
+every non-lhs loop variable has a right-hand-side use, and the
+boundary still fails closed on any unprovable shape.  Elementwise
+op-``None`` assignments keep plain overwrite stores (the bridge cannot
+manufacture updates), and repeated-operand rejection is unchanged.
+Agreement is proven among the public implicit spelling, the normalized
+explicit-ADD spelling, legacy C++, LoopIR C++, and compiled execution
+(bitwise vs legacy, tolerance vs PyTorch), covering multiple
+reductions, repeated operands (still rejected), empty extents,
+f32/f64, and non-reduction assignments.
+
+### 27.3 Workstream 2: the dense reduce-out automatic family is migrated
+
+`9c45266` represents the legacy automatic strip-mine composition as
+one fused typed pass.  ``apply_reduce_out_tiles`` builds the workspace
+region with a strip-mined reduction producer (the reduction point loop
+wrapping the axis point loop over one ``WorkspaceReduce``) and an
+accumulate copy-out consumer, then inserts each recorded origin loop
+at the arm placement with legacy ``add_tile`` LIFO semantics —
+OUTERMOST (regblock-off, width 32) stacks origins above the prefix;
+``CHILD_OF`` (regblock-on, width 8) stacks them under the row loop.
+Prefix candidates split in place, so the rank-3 three-tile family
+(TTM) is covered as well as two-tile dense matmul and the
+three-operand form.  The plan-family gate admits the dense reduce-out
+replay contract (arm-uniform affine/direct/serial/unroll tiles at the
+recorded policy width splitting the last reduction loop and the dense
+workspace axis exactly once each); the stack form and tile-free
+contracts are unchanged and the sparse-workspace family stays
+fail-closed.  Target lowering accepts strip-mined reduction point
+loops inside a workspace producer when their origin is on the outer
+chain; erasure and the oracle cover the new shape without
+modification.
+
+Evidence: generated source byte-identical to the legacy automatic
+surgery through the real empty-Schedule route for dense matmul
+(explicit, implicit, f64), TTM, three-operand matmul, and
+ragged/exact/unit/oversized/zero extents in both arms — sixteen of
+sixteen cells — including the legacy tile-count parallel work estimate
+``(B1_size + kTile_j - 1) / kTile_j`` on the off arm; erasure returns
+the exact base program and the oracle agrees with the erased program
+and the reference on all twelve extent-class cells; compiled kernels
+execute bitwise-identically to the legacy production auto route and
+match PyTorch on both arms.  Two honest limitations are recorded: the
+``execute_shadow`` utility freezes automatic plans into explicit legacy
+schedules and cannot express workspace facts, so the compiled
+differentials pair the LoopIR route with the legacy production auto
+route directly; and the legacy F2 validator itself crashes
+(``Affine reduction tiling requires an accumulator spanning outer
+tiles``) for shaped dense matmul whose cost ordering picks
+reduction-innermost — a pre-existing legacy limitation invisible in
+production because both-dense dispatch routes to ``torch.matmul``.
+
+### 27.4 Workstream 4: the production dual domain is censused and its dense constituents closed
+
+`476bf94` locks the complete ``_build_regblock_dual_path`` census.
+The admitted dense constituents — ``ds@dd`` SpMM (both public
+spellings), dense matmul, dense rank-3 TTM, and the three-operand
+``ds@dd`` form — each reconstruct the production dual kernel
+byte-for-byte by stitching the two actual LoopIR-produced arm
+lowerings, so no admitted dual kernel's evidence compares legacy
+helpers to themselves.  The open boundaries stay locked with their
+precise codes in both arms: hierarchical-compressed ``ss`` operands
+fail target parent-position descent at ``unsupported_program_shape``,
+COO operands fail level lowering at ``unsupported_format``, and
+trailing-compressed operands (``dd@ds``, ``dds`` TTM) derive
+sparse-workspace-adjacent automatic plans kept on the legacy path at
+``unsupported_schedule_auto_family``.  Non-qualifying families (SpMV,
+``ds@ds``, dense SDDMM) provably build no dual.  Release behavior is
+unchanged everywhere: production dispatch still builds the dual kernel
+from the legacy helpers and the strangler path is not live.  The
+runtime free-dim branch remains target-lowering state owned by
+Phase 7.
+
+### 27.5 Workstream 3: the sparse-result/workspace boundary is audited, not migrated
+
+`7d75a45` locks the two remaining representation seams with exact,
+arm-independent codes.  Mixed-level results whose trailing workspace
+axis is dense record their dense-workspace F2/F4 plans (closed by
+§26/`77a2cef`), but the compressed-parent/dense-leaf result
+representation fails at ``unsupported_format`` — and the family's
+legacy comparand is defective: its generated C++ reserves but never
+sizes the values vector it writes through, never appends row
+coordinates or advances the position cursor, its execution fails at
+result wrapping (``TensorIndexError``), and the generic-path
+``ds``-output SpMSpM configuration crashes with SIGSEGV.  Defect
+evidence is retained under
+`phase6-ws-closure-7e5f2ba/ws3-boundary/`.  No byte-parity gate can
+honestly be widened against a comparand that cannot execute, so the
+fail-closed boundary is the correct Phase-6 disposition for this seam.
+True sparse ``coo_workspace`` families fail closed at their own stable
+codes: row-scope SpMSpM and reduction-to-CSR at
+``unsupported_sparse_output_reduction``, merged sparse reductions with
+dense outputs at ``unsupported_merged_reduction``, and sparse-output
+roots at the early ``unsupported_sparse_output`` boundary the census
+audits explicitly.  The public SpMSpM route does not use the defective
+generic configuration and remains correct, so this seam is a genuine
+migration target for the next milestone.
+
+### 27.6 Corrected Phase-6 disposition
+
+Of §26's four linked obligations: (1) the public implicit-reduction
+bridge is **closed**; (2) the reduce-out automatic strip-mine family
+is **migrated**; (4) the production dual domain is **censused, its
+dense constituents closed from actual LoopIR arms**, and its remaining
+arms dispositioned as precise fail-closed boundaries with release
+behavior unchanged.  Obligation (3), the sparse-result/workspace
+boundary, remains **open**: its plan layer is closed and both
+representation seams are exactly audited, but neither seam has a typed
+emission twin (one of them has no executable legacy comparand at all).
+
+**Phase 6 therefore still has no GO.**  It is open on exactly one
+boundary: the sparse-result/workspace representation (mixed-level
+result assembly with a dense trailing axis, and true sparse
+``coo_workspace`` allocation/reset/assembly for row-scope SpMSpM and
+sparse-output roots).  No Phase-7 work, production cutover, selector
+parity, cache cutover, legacy deletion, Phase 8, or Phase 8.5 was
+started.
+
+### 27.7 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-ws-closure-7e5f2ba/`.
+
+- ten-file contract membership: **774 passed**; dedicated
+  options/identity membership: **82 passed**; hostile
+  `SCORCH_REGBLOCK=1` replay of the three environment-sensitive F2/F4
+  regressions: **4 passed**;
+- expanded cross-route automatic-plan census: 1,900 randomized cases
+  (ranks 2–5, mixed levels, permuted physical mode orders, one to
+  three operands, both arms) across five post-fix sweep runs at four
+  seeds, each case checking F4 origination, F2 replay plan equality,
+  and direct-legacy-surgery canonical equality: **zero derivation
+  mismatches and zero route mismatches** (only expected
+  `sparse_parent_dominance` / `result_storage_order` legality
+  rejections);
+- complete compiled schedule/pipeline/generality plus dual-path
+  battery at exact `28f3424`: **316 passed in 1,052.46 s (17:32)**,
+  zero failures (log SHA-256
+  `0d6ee88f0fa79627f2ef14e4b05b5a4325c7c8a78778414032f8cce30bd18d3c`,
+  JUnit SHA-256
+  `6c6fc0dfa6e43fb0c96e21893e6c5372b803249456eb95cfa26b222d203d732d`);
+  a first run at `7d75a45` passed 315/316, the single failure being
+  the stale scheduled-slice lock of the pre-migration tiled-auto
+  boundary, updated in `28f3424` to prove the reduce-out replay
+  instead;
+- source-only 86-case audit at the tip: **46 admitted / 40 rejected /
+  zero divergent**, two runs byte-identical (JSON SHA-256
+  `bdce0004d0a76681d31c1e9bc25f383fec98387a9a6f7e51bfcf6fb86d28854f`)
+  and equal to the retained `fe6bdb2` result after removing only the
+  embedded commit id;
+- fresh clean-detached captures at `7d75a45` (src byte-identical to
+  `28f3424`; the intervening commit touches tests only): corpus
+  **20/20**, grid **42/42**, anchor survey **22/22**, and heap goldens
+  **11/11** byte-identical to the retained baselines (manifest
+  SHA-256 values
+  `725bb5934bf57e04f37122789e8848dfa13ef8fd432d9554bf0d056c6adfa7c5`,
+  `08041990376fc87cbd4ddfb91baa8e71ff3ea9646366ebee03c61bc96e92ba7b`,
+  `c2a4b9873a8ab34f94bf02e27bc683b3f9c3f69e2275f24c04417a66de53ed8f`,
+  `b2a76cb3623a79129379adff9732456c35a984e686094a24d27fadc7c2f0c7d0`);
+  explicit-anchor LoopIR/legacy parity **10/10** and heap parity
+  **11/11**;
+- automatic root/tiled/dual source grids: all **22** legacy CIN/C++
+  and dual files byte-identical to the retained capture (manifest
+  SHA-256
+  `ac5f7f595cb668d93c5ec9395d29dbf353d534191a74d85e7882579fd7b34926`);
+  the only report delta is the dual `cache_key_suffix` window, which
+  embeds the capture worktree's `scorch_python_path` in the build
+  fingerprint — every other build-key component is byte-equal, so the
+  delta is the capture location, not a semantic change;
+- changed source/test files are Black- and Flake8-clean; focused mypy
+  reports no findings in the four changed production modules
+  (`loop_plan_legality.py`, `loopir/lower_cin.py`,
+  `loopir/schedule_passes.py`, `loopir/lower_llir.py`); full-source
+  static results remain at the inherited one-Black, nine-Flake8, and
+  **140-mypy-errors-in-11-files** baselines with every line-normalized
+  mypy error identical to the retained log; `git diff --check` is
+  clean;
+- paired same-session compiler latency, clean detached `78e70b2` base
+  versus `28f3424` candidate (5 warmups / 30 samples, native work
+  excluded, identical per-case source hashes): `small_dense`
+  **0.802/0.643**, reduction **0.980/0.884**, `csr_intersection`
+  **0.945/0.955**, and `sparse_union` **1.015/1.066** (p50/p95) — all
+  inside the 1.10 target (comparison SHA-256
+  `5e5f06c58da8369127cc6523000ea69bf494af425ec178270ba9b70777cba5a5`);
+- literal clean detached-worktree non-performance suite at exact
+  `28f3424` with isolated caches and asserted import provenance:
+  **4,250 passed, 2 failed, 14 skipped, 3 performance tests
+  deselected, one known warning in 2,954.77 s (49:14)** over 4,266
+  selected tests (log SHA-256
+  `4bf7a89d8a8fcb8bb8570bfe30c72f06abce57f44c8556a0b47c9fadca45c9f6`,
+  JUnit SHA-256
+  `357115f21b0cf6de7297bedec8abeaa45a42383aa0a3fe627584a48e98ead3f5`).
+  Both failures are the known macOS libomp resource ceiling — the JIT
+  build subprocess aborts with ``OMP Error #179: pthread_key_create
+  failed: Resource temporarily unavailable`` late in the 49-minute
+  JIT-heavy process
+  (`test_schedule_generality::test_spmv_and_dense_matmul_default_numerics_are_unchanged`
+  and
+  `test_value_object_boundaries::test_permuted_coo_sddmm_skips_canonical_native_shortcut`),
+  the same environmental mode retained at `3f17ec6`; this session's
+  added JIT tests grew the suite from 4,226 to 4,266 selected, and the
+  retained green `fe6bdb2` literal receipt is the base control below
+  the ceiling.  Attribution and closure: `test_schedule_generality`
+  passed completely inside the same-tip compiled battery, and both
+  affected files rerun **81/81 green in 203.81 s** in one fresh
+  isolated process at the same worktree (log SHA-256
+  `a136f89de19eabe31593d679fc5fddec40eeae8c07a8fb8b774d05a94f9c16f6`,
+  JUnit SHA-256
+  `16be3bdc0b331cbda2528f22bd818dac8dad617b924c3b3426e695a48acc3b1f`),
+  so every selected test passes in a clean process and no failure is
+  attributable to this session's code;
+- local and live origin remained `58e8565`; all five protected files
+  retained their recorded hashes before every commit, all unrelated
+  dirty/untracked GPU/CUDA, benchmark, packaging, scheduler, research,
+  scratchpad, and tooling material remained untouched, and nothing was
+  pushed.
