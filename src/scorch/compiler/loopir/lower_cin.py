@@ -61,7 +61,7 @@ from ..cin import (
     TensorVar,
     Where,
 )
-from ..cin_analysis import verify_cin
+from ..cin_analysis import verify_cin, verify_cin_structure
 from ..loop_plan import LoopPlan, verify_loop_plan
 from .build import LoopIRBuilder
 from .iterdomain import (
@@ -278,6 +278,7 @@ def lower_normalized_cin_to_loopir(
 
     if not isinstance(cin, IndexStmt):
         raise TypeError("lower_normalized_cin_to_loopir expects an IndexStmt")
+    verify_cin_structure(cin)
     # Classify the nest shape first so out-of-family statements (Where,
     # workspaces, missing loops) report the family's stable codes; the full
     # CIN verifier then owns reference/ownership validity for family-shaped

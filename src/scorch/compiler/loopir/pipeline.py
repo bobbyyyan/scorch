@@ -54,7 +54,7 @@ from ...exceptions import CompileSpecError
 from ...utils import parse_format
 from .. import llir
 from ..cin import IndexStmt
-from ..cin_analysis import normalize_cin
+from ..cin_analysis import normalize_cin, verify_cin_structure
 from ..cin_lowerer import CINLowerer
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..compile_options import CompileOptions
@@ -423,6 +423,7 @@ def compile_cin_via_loopir(
 ) -> LoopIRCompiledKernel:
     """Lower one supported-family CIN program to C++ through LoopIR."""
 
+    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options, compilation_context)
     context = compilation_context
     if context is None:
@@ -545,6 +546,7 @@ def execute_cin_via_loopir(
         _prepare_generated_kernel_build,
     )
 
+    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options, _compilation_context)
     context = _compilation_context
     if context is None:
@@ -762,6 +764,7 @@ def execute_shadow(
         lower_and_exec_cin,
     )
 
+    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options)
     shadow_plan: Optional[LoopPlan] = None
     downstream_options = options

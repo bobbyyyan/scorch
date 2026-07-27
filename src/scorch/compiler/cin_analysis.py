@@ -187,6 +187,238 @@ class CINDiagnostic:
     pass_name: str = "verify_cin"
 
 
+_MAX_CIN_STRUCTURE_DEPTH = 256
+_MISSING_CIN_FIELD = object()
+
+
+def _preflight_cin_structure(  # noqa: C901
+    cin: IndexStmt,
+) -> Tuple[CINDiagnostic, ...]:
+    """Validate stored forward structure without recursive Python calls.
+
+    CIN remains a mutable legacy object graph, so callers can forge missing
+    fields, cycles, and arbitrarily deep trees after construction.  The full
+    ownership analysis intentionally remains recursive while the CIN-to-LoopIR
+    strangler is in progress; this bounded iterative preflight makes that
+    recursion safe and gives every malformed structural boundary the same
+    structured diagnostic contract.
+
+    Completed objects are not rejected here when another parent references
+    them.  The ownership analysis retains authority for
+    ``duplicate_node_reference`` and related identity diagnostics, while an
+    object reached again before its exit frame is unambiguously a cycle.
+    """
+
+    diagnostics: List[CINDiagnostic] = []
+    active: set[int] = set()
+    complete: set[int] = set()
+    depth_reported = False
+    stack: List[Tuple[bool, object, Tuple[str, ...], int]] = [
+        (False, cin, ("root",), 0)
+    ]
+
+    def diagnose(
+        code: str,
+        message: str,
+        path: Tuple[str, ...],
+    ) -> None:
+        diagnostics.append(CINDiagnostic(code, message, path))
+
+    def stored_field(
+        node: object,
+        field_name: str,
+        path: Tuple[str, ...],
+    ) -> object:
+        state = object.__getattribute__(node, "__dict__")
+        if field_name not in state:
+            diagnose(
+                "missing_cin_field",
+                f"{type(node).__name__}.{field_name} is missing",
+                path + (field_name,),
+            )
+            return _MISSING_CIN_FIELD
+        return state[field_name]
+
+    def typed_child(
+        node: object,
+        field_name: str,
+        expected_type: type,
+        path: Tuple[str, ...],
+        children: List[Tuple[object, Tuple[str, ...]]],
+    ) -> None:
+        value = stored_field(node, field_name, path)
+        if value is _MISSING_CIN_FIELD:
+            return
+        child_path = path + (field_name,)
+        if not isinstance(value, expected_type):
+            diagnose(
+                "invalid_cin_field",
+                f"{type(node).__name__}.{field_name} must be a "
+                f"{expected_type.__name__}",
+                child_path,
+            )
+            return
+        children.append((value, child_path))
+
+    while stack:
+        exiting, node, path, depth = stack.pop()
+        object_id = id(node)
+        if exiting:
+            active.discard(object_id)
+            complete.add(object_id)
+            continue
+        if depth > _MAX_CIN_STRUCTURE_DEPTH:
+            if not depth_reported:
+                diagnose(
+                    "cin_structure_depth_exceeded",
+                    "CIN forward structure exceeds the supported depth "
+                    f"{_MAX_CIN_STRUCTURE_DEPTH}",
+                    path,
+                )
+                depth_reported = True
+            continue
+        if object_id in active:
+            diagnose(
+                "cyclic_cin_structure",
+                f"{type(node).__name__} is reachable from itself",
+                path,
+            )
+            continue
+        if object_id in complete:
+            continue
+
+        active.add(object_id)
+        stack.append((True, node, path, depth))
+        children: List[Tuple[object, Tuple[str, ...]]] = []
+
+        if isinstance(node, ForAll):
+            typed_child(node, "index_var", IndexVar, path, children)
+            typed_child(node, "stmt", IndexStmt, path, children)
+            parallel = stored_field(node, "parallel", path)
+            if parallel is not _MISSING_CIN_FIELD and parallel is not None:
+                if type(parallel) is not bool:
+                    diagnose(
+                        "invalid_cin_field",
+                        "ForAll.parallel must be an exact bool or None",
+                        path + ("parallel",),
+                    )
+        elif isinstance(node, Where):
+            typed_child(node, "producer", IndexStmt, path, children)
+            typed_child(node, "consumer", IndexStmt, path, children)
+        elif isinstance(node, TensorAssign):
+            typed_child(node, "lhs", TensorAccess, path, children)
+            typed_child(node, "rhs", IndexExpr, path, children)
+            op = stored_field(node, "op", path)
+            if op is not _MISSING_CIN_FIELD and op is not None:
+                if type(op) is not Operation:
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorAssign.op must be an exact Operation or None",
+                        path + ("op",),
+                    )
+        elif isinstance(node, BinaryOp):
+            typed_child(node, "left", IndexExpr, path, children)
+            typed_child(node, "right", IndexExpr, path, children)
+            op = stored_field(node, "op", path)
+            if op is not _MISSING_CIN_FIELD and type(op) is not Operation:
+                diagnose(
+                    "invalid_cin_field",
+                    "BinaryOp.op must be an exact Operation",
+                    path + ("op",),
+                )
+        elif isinstance(node, UnaryOp):
+            typed_child(node, "expr", IndexExpr, path, children)
+            op = stored_field(node, "op", path)
+            if op is not _MISSING_CIN_FIELD and type(op) is not Operation:
+                diagnose(
+                    "invalid_cin_field",
+                    "UnaryOp.op must be an exact Operation",
+                    path + ("op",),
+                )
+        elif isinstance(node, TensorAccess):
+            typed_child(node, "tensor", TensorVar, path, children)
+            indices = stored_field(node, "indices", path)
+            if indices is not _MISSING_CIN_FIELD:
+                if not isinstance(indices, (list, tuple)):
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorAccess.indices must be a list or tuple",
+                        path + ("indices",),
+                    )
+                else:
+                    for axis, index_var in enumerate(indices):
+                        index_path = path + (f"indices[{axis}]",)
+                        if not isinstance(index_var, IndexVar):
+                            diagnose(
+                                "invalid_cin_field",
+                                "TensorAccess.indices entries must be IndexVar "
+                                "objects",
+                                index_path,
+                            )
+                        else:
+                            children.append((index_var, index_path))
+            for field_name in ("access_id", "tensor_id", "index_ids"):
+                stored_field(node, field_name, path)
+        elif isinstance(node, IndexVarAdd):
+            typed_child(node, "lhs", IndexVar, path, children)
+            typed_child(node, "rhs", IndexVar, path, children)
+        elif isinstance(node, IndexVar):
+            expression = stored_field(node, "_expr", path)
+            if expression is not _MISSING_CIN_FIELD and expression is not None:
+                if not isinstance(expression, IndexVarAdd):
+                    diagnose(
+                        "invalid_cin_field",
+                        "IndexVar._expr must be an IndexVarAdd or None",
+                        path + ("_expr",),
+                    )
+                else:
+                    children.append((expression, path + ("_expr",)))
+            for field_name in ("node_id", "index_id", "_name"):
+                stored_field(node, field_name, path)
+        elif isinstance(node, TensorVar):
+            for field_name in (
+                "node_id",
+                "symbol_id",
+                "_name",
+                "_format",
+                "shape",
+                "dtype",
+                "mode_order",
+            ):
+                stored_field(node, field_name, path)
+            if isinstance(node, Workspace):
+                for field_name in ("dim", "dense"):
+                    stored_field(node, field_name, path)
+        elif isinstance(node, (IndexStmt, IndexExpr)):
+            # The full verifier owns stable unsupported-node diagnostics.  No
+            # unknown forward edge is authoritative here.
+            stored_field(node, "node_id", path)
+
+        for child, child_path in reversed(children):
+            stack.append((False, child, child_path, depth + 1))
+
+    return tuple(diagnostics)
+
+
+def _raise_cin_verification(diagnostics: Tuple[CINDiagnostic, ...]) -> None:
+    first = diagnostics[0]
+    raise VerificationError(
+        f"stage=normalized CIN: {first.code} at "
+        f"{'/'.join(first.path)}: {first.message}",
+        diagnostics=cast(Tuple[object, ...], diagnostics),
+    )
+
+
+def verify_cin_structure(cin: IndexStmt) -> None:
+    """Fail closed on malformed CIN forward structure before recursive work."""
+
+    if not isinstance(cin, IndexStmt):
+        raise TypeError("verify_cin_structure expects an IndexStmt")
+    diagnostics = _preflight_cin_structure(cin)
+    if diagnostics:
+        _raise_cin_verification(diagnostics)
+
+
 @dataclass(frozen=True)
 class CINAnalysis:
     root_id: NodeId
@@ -436,6 +668,12 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
 
     if not isinstance(cin, IndexStmt):
         raise TypeError("analyze_cin expects an IndexStmt")
+
+    structural_diagnostics = _preflight_cin_structure(cin)
+    if structural_diagnostics:
+        raw_root_id = getattr(cin, "node_id", None)
+        root_id = raw_root_id if isinstance(raw_root_id, NodeId) else NodeId(-1)
+        return _empty_analysis(root_id, structural_diagnostics)
 
     preflight = _IdPreflight()
     preflight.visit_stmt(cin, ("root",))
@@ -1159,12 +1397,7 @@ def verify_cin(cin: IndexStmt) -> CINAnalysis:
 
     analysis = analyze_cin(cin)
     if analysis.diagnostics:
-        first = analysis.diagnostics[0]
-        raise VerificationError(
-            f"stage=normalized CIN: {first.code} at "
-            f"{'/'.join(first.path)}: {first.message}",
-            diagnostics=cast(Tuple[object, ...], analysis.diagnostics),
-        )
+        _raise_cin_verification(analysis.diagnostics)
     return analysis
 
 
