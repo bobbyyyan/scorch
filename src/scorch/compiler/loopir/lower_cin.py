@@ -180,7 +180,9 @@ _LEVEL_TYPE_TO_KIND: Dict[LevelType, LevelKind] = {
 }
 
 
-def _check_tensor(tensor: TensorVar) -> Tuple[ScalarType, Tuple[LevelType, ...]]:
+def _check_tensor(
+    tensor: TensorVar,
+) -> Tuple[ScalarType, Tuple[LevelType, ...], Tuple[int, ...]]:
     if isinstance(tensor, cin_nodes.Workspace):
         _fail(
             "unsupported_workspace",
@@ -211,10 +213,31 @@ def _check_tensor(tensor: TensorVar) -> Tuple[ScalarType, Tuple[LevelType, ...]]
         )
     mode_order = tensor.mode_order
     rank = len(level_types)
-    if mode_order is not None and list(mode_order) != list(range(rank)):
+    if mode_order is None:
+        storage_modes = tuple(range(rank))
+    else:
+        entries = list(mode_order)
+        if (
+            len(entries) != rank
+            or any(type(entry) is not int for entry in entries)
+            or sorted(entries) != list(range(rank))
+        ):
+            _fail(
+                "unsupported_mode_order",
+                f"tensor {tensor.name!r} declares a mode order that is not "
+                f"a permutation of its rank-{rank} logical modes",
+            )
+        storage_modes = tuple(entries)
+    if storage_modes != tuple(range(rank)) and any(
+        level_type is not LevelType.DENSE for level_type in level_types
+    ):
+        # Permuted compressed structure changes the descent semantics, not
+        # only which loop drives each level; it stays fail-closed until a
+        # later slice represents it.
         _fail(
             "unsupported_mode_order",
-            f"tensor {tensor.name!r} uses a non-identity mode order",
+            f"tensor {tensor.name!r} permutes compressed structure, which "
+            "stays outside the migrated families",
         )
     scalar_type = _TORCH_TO_SCALAR.get(tensor.dtype)
     if scalar_type is None:
@@ -224,7 +247,7 @@ def _check_tensor(tensor: TensorVar) -> Tuple[ScalarType, Tuple[LevelType, ...]]
             "float32/float64",
         )
     assert scalar_type is not None
-    return scalar_type, level_types
+    return scalar_type, level_types, storage_modes
 
 
 def input_symbols_of(rhs_accesses: List[TensorAccess]) -> List[SymbolId]:
@@ -384,12 +407,39 @@ def lower_normalized_cin_to_loopir(
             )
         reduce_update = True
 
+    checked_tensors = {
+        access.tensor.symbol_id: _check_tensor(access.tensor) for access in all_accesses
+    }
+    scalar_types = {
+        symbol: scalar for symbol, (scalar, _, _) in checked_tensors.items()
+    }
+    level_types = {symbol: levels for symbol, (_, levels, _) in checked_tensors.items()}
+    storage_modes = {symbol: modes for symbol, (_, _, modes) in checked_tensors.items()}
+    if storage_modes[result_symbol] != tuple(range(len(level_types[result_symbol]))):
+        # Production alignment keeps results in loop-consistent identity
+        # layouts; a permuted result changes assembly, not only descent.
+        _fail(
+            "unsupported_mode_order",
+            f"result {lhs.tensor.name!r} uses a non-identity mode order, "
+            "which stays outside the migrated families",
+        )
+    if len(set(scalar_types.values())) > 1:
+        _fail(
+            "mixed_dtype",
+            "the migrated families require one uniform scalar type",
+        )
+
     # Every tensor's storage-order loop variables must appear in nest order
     # (the planned order on the scheduled path), the same dependency
-    # direction the legacy dense position chains use.
+    # direction the legacy dense position chains use.  Storage order is the
+    # access's logical index list viewed through the tensor's mode order, so
+    # a permuted dense layout is admitted exactly when its physical levels
+    # are nest-consistent.
     for access in all_accesses:
+        indices = list(access.indices)
         positions = [
-            order_positions[index_var.index_id] for index_var in access.indices
+            order_positions[indices[mode].index_id]
+            for mode in storage_modes[access.tensor.symbol_id]
         ]
         if positions != sorted(positions):
             _fail(
@@ -397,17 +447,6 @@ def lower_normalized_cin_to_loopir(
                 f"tensor {access.tensor.name!r} storage order conflicts with "
                 "the loop nest order",
             )
-
-    checked_tensors = {
-        access.tensor.symbol_id: _check_tensor(access.tensor) for access in all_accesses
-    }
-    scalar_types = {symbol: scalar for symbol, (scalar, _) in checked_tensors.items()}
-    level_types = {symbol: levels for symbol, (_, levels) in checked_tensors.items()}
-    if len(set(scalar_types.values())) > 1:
-        _fail(
-            "mixed_dtype",
-            "the migrated families require one uniform scalar type",
-        )
 
     if any(
         level_type is not LevelType.DENSE
@@ -425,6 +464,7 @@ def lower_normalized_cin_to_loopir(
             result_symbol,
             scalar_types,
             level_types,
+            storage_modes,
         )
 
     builder = LoopIRBuilder()
@@ -447,7 +487,9 @@ def lower_normalized_cin_to_loopir(
             access.tensor.name,
             scalar_types[symbol],
             tuple(dimension_ids[index_id] for index_id in access.index_ids),
-            builder.dense_levels(len(access.index_ids)),
+            tuple(
+                builder.level(LevelKind.DENSE, mode) for mode in storage_modes[symbol]
+            ),
         )
 
     for access in rhs_accesses:
@@ -525,6 +567,7 @@ def _lower_sparse_family(
     result_symbol: SymbolId,
     scalar_types: Dict[SymbolId, ScalarType],
     level_types: Dict[SymbolId, Tuple[LevelType, ...]],
+    storage_modes: Dict[SymbolId, Tuple[int, ...]],
 ) -> LoopIRLoweringResult:
     """Materialize the sparse level families from the pure domain analysis."""
 
@@ -613,7 +656,7 @@ def _lower_sparse_family(
             tuple(dimension_ids[index_id] for index_id in access.index_ids),
             tuple(
                 builder.level(_LEVEL_TYPE_TO_KIND[level_type], mode)
-                for mode, level_type in enumerate(level_types[symbol])
+                for mode, level_type in zip(storage_modes[symbol], level_types[symbol])
             ),
         )
 
@@ -644,7 +687,7 @@ def _lower_sparse_family(
             return builder.root_position()
         kind = _LEVEL_TYPE_TO_KIND[level_types[symbol][level]]
         if kind is LevelKind.DENSE:
-            driving = tensor_accesses[symbol].index_ids[level]
+            driving = tensor_accesses[symbol].index_ids[storage_modes[symbol][level]]
             return builder.dense_position(
                 symbol,
                 level,

@@ -282,12 +282,81 @@ def test_unsupported_format_dense_leaf_below_compressed():
     expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
 
 
-def test_unsupported_mode_order():
+def test_mode_order_boundaries():
+    """Dense layouts are level-mapped; the rest of the space fails closed.
+
+    A permuted all-dense operand is admitted exactly when its physical
+    levels are nest-consistent, so the elementwise copy below now reports
+    the loop-order conflict its physical storage actually has.  Permuted
+    compressed structure, permuted results, and non-permutation orders keep
+    their own stable code.
+    """
+
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="dd", mode_order=[1, 0])
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_loop_order", ForAll(i, ForAll(j, assign)))
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="ds", mode_order=[1, 0])
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], a[i, j])
     expect_code("unsupported_mode_order", ForAll(i, ForAll(j, assign)))
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    c = TensorVar("C", fmt="dd", mode_order=[1, 0])
+    assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_mode_order", ForAll(i, ForAll(j, assign)))
+
+    # A non-permutation order is owned by the full CIN verifier, which the
+    # lowering runs unconditionally; the lowering's own permutation guard
+    # stays as defense in depth behind it.
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd", mode_order=[0, 0])
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], a[i, j])
+    with pytest.raises(VerificationError) as error:
+        lower_normalized_cin_to_loopir(ForAll(i, ForAll(j, assign)))
+    assert "tensor_mode_order_mismatch" in str(error.value)
+
+
+def test_permuted_dense_operand_lowers_with_level_mapped_modes():
+    """The ds@dd transposed matmul lowers with physical level declarations.
+
+    The public einsum("ij,kj->ik", ds, dd) constituent carries its dense
+    operand as logical B[k, j] over physical mode_order=[1, 0]; the lowered
+    declaration must keep the levels in storage order with their logical
+    modes attached, and the base program must verify.
+    """
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    result = TensorVar("C", fmt="dd")
+    sparse = TensorVar("A", fmt="ds")
+    transposed = TensorVar("B", fmt="dd", mode_order=[1, 0])
+    cin = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    result[i, k],
+                    sparse[i, j] * transposed[k, j],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+
+    lowered = lower_normalized_cin_to_loopir(cin)
+    verify_program(lowered.program)
+
+    by_name = {decl.name: decl for decl in lowered.program.tensors}
+    assert tuple(level.mode for level in by_name["B"].levels) == (1, 0)
+    assert tuple(level.mode for level in by_name["A"].levels) == (0, 1)
+    assert tuple(level.mode for level in by_name["C"].levels) == (0, 1)
 
 
 def test_unsupported_dtype():
@@ -740,3 +809,41 @@ def test_analysis_codes_surface_through_the_lowering():
     dense_b = TensorVar("B2", fmt="dd")
     mixed = TensorAssign(c2[i, j], CINBinaryOp(Operation.ADD, a[i, j], dense_b[i, j]))
     expect_code("unsupported_union_with_dense", ForAll(i, ForAll(j, mixed)))
+
+
+def test_permuted_layout_canonical_identity_is_distinct():
+    """Permuted and identity layouts must never share a canonical identity.
+
+    The canonical program dump serializes each level's stored logical mode,
+    so the same logical program over different physical layouts is a
+    different artifact; collapsing them would poison schedule and kernel
+    caches.
+    """
+
+    def build(mode_order):
+        i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+        result = TensorVar("C", fmt="dd")
+        sparse = TensorVar("A", fmt="ds")
+        dense = TensorVar("B", fmt="dd")
+        if mode_order is not None:
+            dense.mode_order = list(mode_order)
+        access = dense[k, j] if mode_order is not None else dense[j, k]
+        return ForAll(
+            i,
+            ForAll(
+                j,
+                ForAll(
+                    k,
+                    TensorAssign(result[i, k], sparse[i, j] * access, op=Operation.ADD),
+                ),
+            ),
+        )
+
+    identity_dump = canonical_program_dump(
+        lower_normalized_cin_to_loopir(build(None)).program
+    )
+    permuted_dump = canonical_program_dump(
+        lower_normalized_cin_to_loopir(build((1, 0))).program
+    )
+    assert identity_dump != permuted_dump
+    assert '"mode":1' in permuted_dump.replace(" ", "")

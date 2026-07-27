@@ -1233,3 +1233,256 @@ def test_panel_scheduled_stage_timing_is_recorded():
         "hoist_loop_invariant_factors",
         "rewrite_dynamic_vector_accesses",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Non-identity dense layouts: general logical-coordinate -> physical-position
+# lowering.  The activation family is the public-aligned
+# einsum("ij,kj->ik", ds, dd) constituent (dense B[k, j] over physical
+# mode_order=[1, 0]); the census extends to batched, non-involutive,
+# multi-operand, matvec, f64, and zero-extent cells.  Legacy compiles and
+# executes every one of these, so byte parity is the gate, with compiled
+# and oracle differentials proving the shared semantics independently.
+
+_LAYOUT_DIMS = {"i": 4, "j": 6, "k": 5, "l": 3}
+
+
+def _build_layout_cin(result_spec, operand_specs, nest, *, op, dtype):
+    ivars = {name: IndexVar(name) for name in nest}
+    fmt_result, result_indices = result_spec
+    result = TensorVar("C", fmt=fmt_result, dtype=dtype)
+    rhs = None
+    names = ["A", "B", "D", "E"]
+    for position, (fmt, indices, mode_order) in enumerate(operand_specs):
+        operand = TensorVar(names[position], fmt=fmt, dtype=dtype)
+        if mode_order is not None:
+            operand.mode_order = list(mode_order)
+        access = operand[tuple(ivars[x] for x in indices)]
+        rhs = access if rhs is None else CINBinaryOp(Operation.MUL, rhs, access)
+    assignment = TensorAssign(
+        result[tuple(ivars[x] for x in result_indices)], rhs, op=op
+    )
+    statement = assignment
+    for name in reversed(nest):
+        statement = ForAll(ivars[name], statement)
+    return statement
+
+
+def _layout_physical_shape(indices, mode_order, dims):
+    logical = tuple(dims[x] for x in indices)
+    if mode_order is None:
+        return logical
+    return tuple(logical[mode] for mode in mode_order)
+
+
+_LAYOUT_FAMILIES = {
+    "transposed_spmm": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0))),
+        "ijk",
+        Operation.ADD,
+        torch.float32,
+        None,
+    ),
+    "transposed_spmm_f64": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0))),
+        "ijk",
+        Operation.ADD,
+        torch.float64,
+        None,
+    ),
+    "transposed_spmm_zero_rows": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0))),
+        "ijk",
+        Operation.ADD,
+        torch.float32,
+        {"i": 0},
+    ),
+    "transposed_spmm_zero_reduction": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0))),
+        "ijk",
+        Operation.ADD,
+        torch.float32,
+        {"j": 0},
+    ),
+    "transposed_spmm_zero_free": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0))),
+        "ijk",
+        Operation.ADD,
+        torch.float32,
+        {"k": 0},
+    ),
+    "batched_permuted": (
+        ("ddd", "lik"),
+        (("ddd", "lij", None), ("ddd", "lkj", (0, 2, 1))),
+        "lijk",
+        Operation.ADD,
+        torch.float32,
+        None,
+    ),
+    "noninvolutive_elementwise": (
+        ("ddd", "ijk"),
+        (("ddd", "ijk", None), ("ddd", "kij", (1, 2, 0))),
+        "ijk",
+        None,
+        torch.float32,
+        None,
+    ),
+    "multi_operand_transposed": (
+        ("dd", "ik"),
+        (("ds", "ij", None), ("dd", "kj", (1, 0)), ("dd", "ik", None)),
+        "ijk",
+        Operation.ADD,
+        torch.float32,
+        None,
+    ),
+    "matvec_transposed": (
+        ("d", "i"),
+        (("dd", "ji", (1, 0)), ("d", "j", None)),
+        "ij",
+        Operation.ADD,
+        torch.float32,
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize("family", sorted(_LAYOUT_FAMILIES))
+def test_permuted_dense_layout_byte_parity(family, regblock_enabled):
+    """Every admitted permuted-layout cell is byte-identical to legacy."""
+
+    from scorch.compiler.scheduler import Schedule
+
+    result_spec, operand_specs, nest, op, dtype, overrides = _LAYOUT_FAMILIES[family]
+    dims = dict(_LAYOUT_DIMS)
+    if overrides:
+        dims.update(overrides)
+    options = replace(
+        CompileOptions.from_environment(environ={}).with_regblock_enabled(
+            regblock_enabled
+        ),
+        requested_schedule=Schedule(),
+    )
+    result_shape = tuple(dims[x] for x in result_spec[1])
+    bindings = tuple(
+        (_layout_physical_shape(indices, mode_order, dims), dtype)
+        for _, indices, mode_order in operand_specs
+    )
+    comparison = compare_generated_sources(
+        _build_layout_cin(result_spec, operand_specs, nest, op=op, dtype=dtype),
+        result_shape,
+        bindings,
+        compile_options=options,
+    )
+    assert comparison.identical, family
+
+
+@torch.no_grad()
+def test_transposed_spmm_execution_matches_reference_both_marshalings():
+    """Compiled execution matches PyTorch for both runtime input layouts.
+
+    The runtime binding twin accepts the dense operand either as a logical
+    (identity) STensor, which it relayouts to the declared physical order,
+    or as an STensor already carrying mode_order=[1, 0]; both must execute
+    and match the reference, including every zero-extent class.
+    """
+
+    torch.manual_seed(20260727)
+    for dims in ((4, 6, 5), (0, 6, 5), (4, 0, 5), (4, 6, 0)):
+        rows, reduction, free = dims
+        a_t = (torch.rand(rows, reduction) * (torch.rand(rows, reduction) > 0.4)).to(
+            torch.float32
+        )
+        b_t = torch.rand(free, reduction)
+        reference = a_t @ b_t.T
+        sparse = STensor.from_torch(a_t.to_sparse_csr(), "A")
+        for variant_input in (
+            STensor.from_torch(b_t, "B"),
+            STensor.from_torch(b_t, "B", mode_order=[1, 0]).to_dense(),
+        ):
+            result, _ = execute_cin_via_loopir(
+                _build_layout_cin(
+                    ("dd", "ik"),
+                    (("ds", "ij", None), ("dd", "kj", (1, 0))),
+                    "ijk",
+                    op=Operation.ADD,
+                    dtype=torch.float32,
+                ),
+                (rows, free),
+                sparse,
+                variant_input,
+            )
+            assert_close(result.to_torch(), reference)
+
+
+@torch.no_grad()
+def test_permuted_layout_execution_and_oracle_agree():
+    """Batched and non-involutive permutations execute and match the oracle.
+
+    Byte parity alone could silently reproduce defective legacy output, so
+    the compiled kernels must independently match PyTorch, and the
+    production oracle (which consumes logical nested lists) must agree on
+    the transposed activation program.
+    """
+
+    from scorch.compiler.scheduler import Schedule
+
+    torch.manual_seed(20260728)
+    batch, rows, reduction, free = 3, 4, 6, 5
+
+    a_t = torch.rand(batch, rows, reduction)
+    b_t = torch.rand(batch, free, reduction)
+    result, _ = execute_cin_via_loopir(
+        _build_layout_cin(
+            ("ddd", "lik"),
+            (("ddd", "lij", None), ("ddd", "lkj", (0, 2, 1))),
+            "lijk",
+            op=Operation.ADD,
+            dtype=torch.float32,
+        ),
+        (batch, rows, free),
+        dense_stensor(a_t, "A"),
+        dense_stensor(b_t, "B"),
+    )
+    assert_close(result.to_torch(), torch.einsum("lij,lkj->lik", a_t, b_t))
+
+    a3_t = torch.rand(rows, reduction, free)
+    b3_t = torch.rand(free, rows, reduction)
+    result, _ = execute_cin_via_loopir(
+        _build_layout_cin(
+            ("ddd", "ijk"),
+            (("ddd", "ijk", None), ("ddd", "kij", (1, 2, 0))),
+            "ijk",
+            op=None,
+            dtype=torch.float32,
+        ),
+        (rows, reduction, free),
+        dense_stensor(a3_t, "A"),
+        dense_stensor(b3_t, "B"),
+    )
+    assert_close(result.to_torch(), a3_t * b3_t.permute(1, 2, 0))
+
+    a_dense = torch.rand(rows, reduction)
+    b_dense = torch.rand(free, reduction)
+    kernel = compile_cin_via_loopir(
+        _build_layout_cin(
+            ("dd", "ik"),
+            (("dd", "ij", None), ("dd", "kj", (1, 0))),
+            "ijk",
+            op=Operation.ADD,
+            dtype=torch.float32,
+        ),
+        (rows, free),
+        (((rows, reduction), torch.float32), ((reduction, free), torch.float32)),
+        compile_options=replace(
+            CompileOptions.from_environment(environ={}),
+            requested_schedule=Schedule(),
+        ),
+    )
+    oracle_result = oracle_reference(kernel, (a_dense, b_dense), (rows, free))
+    assert_close(oracle_result.to(torch.float32), a_dense @ b_dense.T)

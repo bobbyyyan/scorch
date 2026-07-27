@@ -373,16 +373,47 @@ def test_repeated_operand_loads_fail_at_target_boundary():
 
 
 def test_unsupported_mode_order_at_target_boundary():
+    """Permuted results and compressed structure stay target boundaries.
+
+    All-dense input permutations are level-mapped since the layout slice,
+    so the target check narrows to the two shapes it still refuses: a
+    permuted result declaration and permuted compressed structure.
+    """
+
     fixture = build_matmul()
-    decl = fixture.program.tensors[0]
-    forge(decl.levels[0], mode=1)
-    forge(decl.levels[1], mode=0)
+    result_decl = fixture.program.tensors[-1]
+    assert result_decl.name == "C"
+    forge(result_decl.levels[0], mode=1)
+    forge(result_decl.levels[1], mode=0)
     expect_target_code(
         "unsupported_mode_order",
         fixture.program,
         {fixture.a: (3, 5), fixture.b: (5, 4)},
         (3, 4),
     )
+
+    # A forged compressed-structure permutation cannot even reach the
+    # target: the verifier's dimension-domain rules reject the layout-
+    # inconsistent position chain first.  The target's compressed branch
+    # stays as defense in depth behind that boundary.
+    from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="ds")
+    c = TensorVar("C", fmt="dd")
+    cin = ForAll(i, ForAll(j, TensorAssign(c[i, j], a[i, j])))
+    lowered = lower_normalized_cin_to_loopir(cin)
+    sparse_decl = next(decl for decl in lowered.program.tensors if decl.name == "A")
+    forge(sparse_decl.levels[0], mode=1)
+    forge(sparse_decl.levels[1], mode=0)
+    a_symbol = lowered.program.inputs[0]
+    with pytest.raises(LoopIRVerificationError) as error:
+        lower_loopir_to_llir(
+            lowered.program,
+            input_shapes={a_symbol: (3, 4)},
+            result_shape=(3, 4),
+        )
+    assert error.value.defect.code == "domain_mismatch"
 
 
 def test_invalid_shape_binding_coverage_and_rank():

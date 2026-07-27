@@ -481,13 +481,23 @@ class _TargetLowering:
             )
         for decl in self.program.tensors:
             # verify_program already rejected COORDINATE/SINGLETON level
-            # kinds and non-CSR sparse outputs, so only the storage
-            # permutation needs a target-boundary check.
+            # kinds, non-CSR sparse outputs, and non-permutation level
+            # modes, so only the admitted storage-permutation scope needs a
+            # target-boundary check: all-dense inputs may permute; results
+            # and compressed structure may not.
             modes = tuple(level.mode for level in decl.levels)
-            if modes != tuple(range(len(decl.levels))):
+            if modes == tuple(range(len(decl.levels))):
+                continue
+            if decl.symbol == self.result_symbol:
                 _fail(
                     "unsupported_mode_order",
-                    f"tensor {decl.name!r} uses a non-identity storage order, "
+                    f"result {decl.name!r} uses a non-identity storage "
+                    "order, which the migrated families do not cover",
+                )
+            if any(level.kind is not LevelKind.DENSE for level in decl.levels):
+                _fail(
+                    "unsupported_mode_order",
+                    f"tensor {decl.name!r} permutes compressed structure, "
                     "which the migrated families do not cover",
                 )
         for symbol in self.program.inputs:
@@ -565,17 +575,21 @@ class _TargetLowering:
         extents: Dict[DimensionId, Tuple[int, str, int]] = {}
         for decl in self.program.tensors:
             shape = shapes[decl.symbol]
-            for mode, dimension in enumerate(decl.dimensions):
+            # Runtime shapes are physical level extents, so each level binds
+            # the dimension of the logical mode it stores.  Identity layouts
+            # keep the exact historical binding and messages.
+            for level, level_decl in enumerate(decl.levels):
+                dimension = decl.dimensions[level_decl.mode]
                 known = extents.get(dimension)
                 if known is None:
-                    extents[dimension] = (shape[mode], decl.name, mode)
-                elif known[0] != shape[mode]:
+                    extents[dimension] = (shape[level], decl.name, level)
+                elif known[0] != shape[level]:
                     _fail(
                         "dimension_extent_mismatch",
                         f"dimension "
                         f"{self.dimension_names[dimension]!r}: "
                         f"{known[1]}[{known[2]}] is {known[0]} but "
-                        f"{decl.name}[{mode}] is {shape[mode]}",
+                        f"{decl.name}[{level}] is {shape[level]}",
                     )
         return shapes
 
@@ -1744,10 +1758,12 @@ class _TargetLowering:
                 )
 
         for load in self.loads:
-            for level, index in enumerate(load.indices):
-                bound = self._index_of(
-                    index, f"access of {self.decls[load.tensor].name!r}"
-                )
+            # Load indices are logical mode order by contract; level
+            # ``level`` is driven by the logical coordinate it stores.
+            decl = self.decls[load.tensor]
+            for level, level_decl in enumerate(decl.levels):
+                index = load.indices[level_decl.mode]
+                bound = self._index_of(index, f"access of {decl.name!r}")
                 record(load.tensor, level, bound, "a coordinate load")
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
@@ -3134,7 +3150,7 @@ class _TargetLowering:
                         _LEVEL_KIND_TO_LEVEL_TYPE[level.kind]
                         for level in self.decls[symbol].levels
                     ),
-                    mode_order=tuple(range(len(self.decls[symbol].levels))),
+                    mode_order=tuple(level.mode for level in self.decls[symbol].levels),
                     shape=self.shapes[symbol],
                     dtype=_SCALAR_TO_TORCH[self.decls[symbol].dtype],
                 )

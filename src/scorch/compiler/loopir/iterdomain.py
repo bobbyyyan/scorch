@@ -235,15 +235,36 @@ def _access_domain(access: TensorAccess, index: IndexId) -> _OperandDomain:
             "unsupported_format",
             f"tensor {tensor.name!r} declares no format",
         )
+    level_types = tuple(tensor_format.get_level_types())
+    rank = len(level_types)
     mode_order = tensor.mode_order
-    rank = len(tensor_format.get_level_types())
-    if mode_order is not None and list(mode_order) != list(range(rank)):
+    if mode_order is None:
+        storage_modes = tuple(range(rank))
+    else:
+        entries = list(mode_order)
+        if (
+            len(entries) != rank
+            or any(type(entry) is not int for entry in entries)
+            or sorted(entries) != list(range(rank))
+        ):
+            _fail(
+                "unsupported_mode_order",
+                f"tensor {tensor.name!r} declares a mode order that is not "
+                f"a permutation of its rank-{rank} logical modes",
+            )
+        storage_modes = tuple(entries)
+    if storage_modes != tuple(range(rank)) and any(
+        level_type is not LevelType.DENSE for level_type in level_types
+    ):
         _fail(
             "unsupported_mode_order",
-            f"tensor {tensor.name!r} uses a non-identity mode order",
+            f"tensor {tensor.name!r} permutes compressed structure, which "
+            "stays outside the migrated families",
         )
-    level = occurrences[0]
-    level_type = tensor_format.get_level_types()[level]
+    # The occurrence is a logical axis; the level that stores it is the
+    # physical position of that axis under the tensor's mode order.
+    level = storage_modes.index(occurrences[0])
+    level_type = level_types[level]
     if level_type is LevelType.DENSE:
         return _DENSE
     if level_type is LevelType.COMPRESSED:

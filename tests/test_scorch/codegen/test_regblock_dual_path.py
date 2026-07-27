@@ -162,8 +162,25 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
 _CENSUS_DIMS = {"i": 4, "j": 5, "k": 6, "l": 3}
 
 
+def _census_operand(spec):
+    """Normalize a census operand spec to (fmt, indices, mode_order|None)."""
+
+    if len(spec) == 2:
+        return spec[0], spec[1], None
+    return spec
+
+
+def _census_physical_shape(indices, mode_order):
+    """Physical level extents: the logical extents viewed through the order."""
+
+    logical = tuple(_CENSUS_DIMS[x] for x in indices)
+    if mode_order is None:
+        return logical
+    return tuple(logical[mode] for mode in mode_order)
+
+
 def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes=False):
-    """One qualifying-domain census CIN with optional bound shapes."""
+    """One qualifying-domain census CIN with optional bound physical shapes."""
 
     from scorch.compiler.cin import BinaryOp as CINBinaryOp
 
@@ -173,10 +190,13 @@ def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes
         result.shape = tuple(_CENSUS_DIMS[x] for x in result_indices)
         result.dtype = torch.float32
     rhs = None
-    for position, (fmt, indices) in enumerate(operands):
+    for position, operand_spec in enumerate(operands):
+        fmt, indices, mode_order = _census_operand(operand_spec)
         operand = TensorVar("ABDE"[position], fmt=fmt)
+        if mode_order is not None:
+            operand.mode_order = list(mode_order)
         if bind_shapes:
-            operand.shape = tuple(_CENSUS_DIMS[x] for x in indices)
+            operand.shape = _census_physical_shape(indices, mode_order)
             operand.dtype = torch.float32
         access = operand[tuple(ivars[x] for x in indices)]
         rhs = access if rhs is None else CINBinaryOp(Operation.MUL, rhs, access)
@@ -193,11 +213,23 @@ def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes
 
 _DENSE_DUAL_CONSTITUENTS = {
     "batched_dense": ("ddd", "lik", (("ddd", "lij"), ("ddd", "ljk")), "lijk"),
+    "batched_transposed": (
+        "ddd",
+        "lik",
+        (("ddd", "lij"), ("ddd", "lkj", (0, 2, 1))),
+        "lijk",
+    ),
     "dense_matmul": ("dd", "ik", (("dd", "ij"), ("dd", "jk")), "ijk"),
     "four_operand_ds": (
         "dd",
         "ik",
         (("ds", "ij"), ("dd", "jk"), ("dd", "ik"), ("d", "k")),
+        "ijk",
+    ),
+    "transposed_spmm": (
+        "dd",
+        "ik",
+        (("ds", "ij"), ("dd", "kj", (1, 0))),
         "ijk",
     ),
     "ttm_dense": ("ddd", "ijk", (("ddd", "ijl"), ("dd", "lk")), "ijlk"),
@@ -234,8 +266,14 @@ def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
             requested_schedule=Schedule(),
         )
         bindings = tuple(
-            (tuple(_CENSUS_DIMS[x] for x in indices), torch.float32)
-            for _, indices in spec[2]
+            (
+                _census_physical_shape(
+                    _census_operand(operand_spec)[1],
+                    _census_operand(operand_spec)[2],
+                ),
+                torch.float32,
+            )
+            for operand_spec in spec[2]
         )
         arms.append(
             compile_cin_via_loopir(
@@ -285,6 +323,11 @@ def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
             ("ddd", "lik", (("dds", "lij"), ("ddd", "ljk")), "lijk"),
             "unsupported_schedule_auto_family",
         ),
+        (
+            "batched_transposed_sparse_operand",
+            ("ddd", "lik", (("dds", "lij"), ("ddd", "lkj", (0, 2, 1))), "lijk"),
+            "unsupported_schedule_auto_family",
+        ),
     ],
 )
 def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
@@ -317,8 +360,14 @@ def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
             requested_schedule=Schedule(),
         )
         bindings = tuple(
-            (tuple(_CENSUS_DIMS[x] for x in indices), torch.float32)
-            for _, indices in spec[2]
+            (
+                _census_physical_shape(
+                    _census_operand(operand_spec)[1],
+                    _census_operand(operand_spec)[2],
+                ),
+                torch.float32,
+            )
+            for operand_spec in spec[2]
         )
         with pytest.raises(Exception) as error:
             compile_cin_via_loopir(
@@ -330,52 +379,57 @@ def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
         assert getattr(error.value, "defect").code == expected
 
 
-@pytest.mark.parametrize("regblock_enabled", [False, True])
-def test_dual_transposed_dense_operand_stays_an_explicit_boundary(
-    regblock_enabled,
-):
-    """A release-qualifying transposed operand is not an identity-layout arm.
+def test_transposed_dual_constituent_matches_production_alignment():
+    """The census transposed entries are exactly the production alignment.
 
-    Public ``einsum("ij,kj->ik", ds, dd)`` aligns the second operand with a
-    physical ``mode_order=[1, 0]`` while preserving the logical ``B[k, j]``
-    access.  The legacy dual builder admits that family, but the current
-    LoopIR target does not yet own general dense mode-order/position-chain
-    lowering.  Lock the exact fail-closed boundary so an identity-layout
-    census cannot be mistaken for complete production coverage.
+    Public einsum alignment derives each operand's desired mode order from
+    the cost-selected loop order (``_bind_frontend_operand_mode_orders``):
+    the order of the operand's subscripts within the selected loop order,
+    spelled as logical-axis positions.  Deriving that decision from the
+    production formula for the census programs proves the transposed
+    families composed above are the real release-reachable layouts, not
+    hand-picked permutations.
     """
 
-    i, j, k = (IndexVar(name) for name in "ijk")
-    result = TensorVar("C", fmt="dd")
-    sparse = TensorVar("A", fmt="ds")
-    transposed = TensorVar("B", fmt="dd", mode_order=[1, 0])
-    cin = ForAll(
-        i,
-        ForAll(
-            j,
-            ForAll(
-                k,
-                TensorAssign(
-                    result[i, k],
-                    sparse[i, j] * transposed[k, j],
-                    op=Operation.ADD,
-                ),
-            ),
-        ),
-    )
-    options = CompileOptions.from_environment(environ={})
-    assert ops._build_regblock_dual_path(cin, None, compile_options=options) is not None
-    arm_options = replace(
-        options.with_regblock_enabled(regblock_enabled),
-        requested_schedule=Schedule(),
-    )
-    with pytest.raises(Exception) as error:
-        compile_cin_via_loopir(
-            cin,
-            (4, 6),
-            (((4, 5), torch.float32), ((5, 6), torch.float32)),
-            compile_options=arm_options,
+    from scorch.compiler.scheduler import Scheduler
+
+    # transposed_spmm follows the cost-selected branch; batched_transposed
+    # follows the requested-schedule branch (an explicit public loop order),
+    # exactly the two alignment branches production owns.
+    cases = {
+        "transposed_spmm": (("ij", "kj"), None),
+        "batched_transposed": (("lij", "lkj"), ("l", "i", "j", "k")),
+    }
+    for family, (input_index_strs, requested_order) in cases.items():
+        spec = _DENSE_DUAL_CONSTITUENTS[family]
+        identity_operands = tuple(
+            (fmt, indices)
+            for fmt, indices, _ in (
+                _census_operand(operand_spec) for operand_spec in spec[2]
+            )
         )
-    assert getattr(error.value, "defect").code == "unsupported_loop_order"
+        prealignment = _build_census_cin(
+            spec[0], spec[1], identity_operands, spec[3], bind_shapes=True
+        )
+        if requested_order is None:
+            selected = Scheduler.select_loop_order(
+                prealignment,
+                costs=CompileOptions.from_environment(environ={}).scheduler.cost_model,
+            )
+        else:
+            selected = Scheduler.resolve_loop_order(prealignment, requested_order)
+        selected_names = [index_var.name for index_var in selected]
+        for operand_spec, subscripts in zip(spec[2], input_index_strs):
+            _, _, census_order = _census_operand(operand_spec)
+            derived = [
+                subscripts.index(name) for name in selected_names if name in subscripts
+            ]
+            expected = (
+                list(census_order)
+                if census_order is not None
+                else list(range(len(subscripts)))
+            )
+            assert derived == expected, (family, subscripts, derived)
 
 
 def test_dual_domain_census_locks_non_qualifying_families():
