@@ -753,10 +753,46 @@ def test_apply_schedule_plan_admits_the_tile_free_auto_replay_contract():
 
     cin, (i, k, j) = build_matmul_ikj()
     lowering = lower(cin)
-    plan = LoopPlan(loop_order=lowering.loop_index_ids, provenance="auto")
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=False,
+            tile_width=32,
+        ),
+        provenance="auto",
+    )
     schedule = apply_schedule_plan(lowering.program, plan)
     assert schedule.plan is plan
     verify_program(schedule.program)
+
+
+def test_apply_schedule_plan_enforces_auto_policy_provenance():
+    """The consuming pass preserves the LoopPlan policy trust boundary."""
+
+    cin, (i, k, j) = build_matmul_ikj()
+    lowering = lower(cin)
+    policy = AutoOriginPolicy(
+        schema=AUTO_ORIGIN_POLICY_SCHEMA,
+        regblock_enabled=False,
+        tile_width=32,
+    )
+    expect_code(
+        "auto_origin_policy",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(loop_order=lowering.loop_index_ids, provenance="auto"),
+    )
+    expect_code(
+        "auto_policy_provenance",
+        apply_schedule_plan,
+        lowering.program,
+        LoopPlan(
+            loop_order=lowering.loop_index_ids,
+            auto_policy=policy,
+            provenance="explicit",
+        ),
+    )
 
 
 def test_apply_schedule_plan_rejects_the_tiled_auto_family():
@@ -785,6 +821,11 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
             axis_loops=(LoopRef(j.index_id),),
             dense=True,
         ),
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=False,
+            tile_width=32,
+        ),
         provenance="auto",
     )
     expect_code(
@@ -799,6 +840,11 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
             reduction_loop=LoopRef(k.index_id),
             axis_loops=(LoopRef(j.index_id),),
             dense=False,
+        ),
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=False,
+            tile_width=32,
         ),
         provenance="auto",
     )
@@ -892,7 +938,12 @@ def test_regblock_stack_form_shape_is_exact():
             _stack_form_auto_plan(lowering, i, k, j, **overrides),
         )
 
-    rejected(auto_policy=None)
+    expect_code(
+        "auto_origin_policy",
+        apply_schedule_plan,
+        lowering.program,
+        _stack_form_auto_plan(lowering, i, k, j, auto_policy=None),
+    )
     rejected(
         auto_policy=AutoOriginPolicy(
             schema=AUTO_ORIGIN_POLICY_SCHEMA,
