@@ -897,3 +897,49 @@ def test_legacy_adapter_materializes_backreferences_only_on_private_copy() -> No
     working_inner.parent = None
     assert nodes.i.tensor_accesses == []
     assert inner.parent is None
+
+
+def test_release_mode_normalize_cin_fails_closed_on_forged_structure() -> None:
+    """Direct plan-free normalization owns the structural boundary.
+
+    The clone walk recurses over stored forward edges, so release-mode
+    callers (verification disabled) must get the same stable structural
+    diagnostics as the analyzed and LoopIR-owned entries instead of raw
+    AttributeError, RecursionError, or a hang.
+    """
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    release_options = CompileOptions.from_environment(environ={})
+    assert release_options.verification.verify_cin is False
+
+    i = IndexVar("i")
+    missing = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    del missing.stmt
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(missing, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"missing_cin_field"}
+
+    j = IndexVar("j")
+    cyclic = ForAll(
+        j,
+        TensorAssign(TensorVar("C", fmt="d")[j], TensorVar("A", fmt="d")[j]),
+    )
+    cyclic.stmt = cyclic
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(cyclic, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"cyclic_cin_structure"}
+
+    k = IndexVar("k")
+    deep: IndexStmt = ForAll(
+        k,
+        TensorAssign(TensorVar("C", fmt="d")[k], TensorVar("A", fmt="d")[k]),
+    )
+    for depth in range(cin_analysis_module._MAX_CIN_STRUCTURE_DEPTH + 1):
+        deep = ForAll(IndexVar(f"deep_{depth}"), deep)
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(deep, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"cin_structure_depth_exceeded"}

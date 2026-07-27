@@ -3113,12 +3113,18 @@ class Scheduler:
         if compile_options is None and options.requested_schedule is None:
             options = replace(options, requested_schedule=schedule)
         _validate_requested_schedule(options, schedule, exact=True)
-        validate_legacy_cin_display_names(cin)
+        # Normalization owns the structural preflight, so it must run before
+        # the display-name walk: the legacy-name validator traverses stored
+        # forward edges recursively and would otherwise leak raw attribute
+        # or recursion failures on a forged graph.  The clone preserves every
+        # display name and stable ID, so validating the normalized graph is
+        # semantically identical.
         normalized_cin = normalize_cin(
             cin,
             compile_options=options,
             compilation_context=compilation_context,
         )
+        validate_legacy_cin_display_names(normalized_cin)
         stage_token = (
             compilation_context.begin_stage(
                 CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
@@ -3577,8 +3583,9 @@ class Scheduler:
                 regblock_enabled=regblock_enabled,
             )
             costs = scheduler_policy.cost_model
-        if isinstance(cin, IndexStmt):
-            validate_legacy_cin_display_names(cin)
+        # Normalization owns the structural preflight; validate display names
+        # on the normalized clone so a forged graph fails closed first (the
+        # clone preserves every display name and stable ID).
         normalized = (
             normalize_cin(
                 cin,
@@ -3588,6 +3595,8 @@ class Scheduler:
             if isinstance(cin, IndexStmt)
             else copy.deepcopy(cin)
         )
+        if isinstance(cin, IndexStmt):
+            validate_legacy_cin_display_names(normalized)
         stage_token = (
             compilation_context.begin_stage(
                 CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
@@ -3678,8 +3687,9 @@ class Scheduler:
     ) -> CIN:
         """Shared owned implementation after the public boundary is resolved."""
 
-        if isinstance(cin, IndexStmt):
-            validate_legacy_cin_display_names(cin)
+        # Normalization owns the structural preflight; validate display names
+        # on the normalized clone so a forged graph fails closed first (the
+        # clone preserves every display name and stable ID).
         working = (
             normalize_cin(
                 cin,
@@ -3689,6 +3699,8 @@ class Scheduler:
             if isinstance(cin, IndexStmt)
             else copy.deepcopy(cin)
         )
+        if isinstance(cin, IndexStmt):
+            validate_legacy_cin_display_names(working)
         stage_token = (
             compilation_context.begin_stage(
                 CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,

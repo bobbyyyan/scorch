@@ -1499,6 +1499,13 @@ def normalize_cin(
 def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
     """Normalize after the public boundary resolved one exact options snapshot."""
 
+    # Normalization owns the structural boundary for every caller, including
+    # direct release-mode ``normalize_cin``: the clone walk below recurses over
+    # stored forward edges, so forged fields, cycles, and unbounded depth must
+    # fail closed with stable diagnostics before any recursive work.  The
+    # bounded iterative preflight also caps the depth the recursive clone can
+    # observe.
+    verify_cin_structure(cin)
     verify_cin_if_enabled(cin, options.verification.verify_cin)
 
     index_memo: Dict[int, IndexVar] = {}

@@ -17,7 +17,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
-from scorch.compiler.diagnostics import CompileOptionsError
+from scorch.compiler.diagnostics import CompileOptionsError, VerificationError
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH, ScheduledCIN
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
@@ -1950,3 +1950,104 @@ def test_packed_relayout_rejects_non_additive_assignment():
                 operand="DenseInput",
             ),
         )
+
+
+def _build_conflicting_names_spmm() -> ForAll:
+    """One display name, two distinct SymbolId tensors: a legacy-name conflict."""
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("A", fmt="dd")
+    c[i, k] = a[i, j] * b[j, k]
+
+    stmt = c._assignment
+    for index_var in (k, j, i):
+        stmt = ForAll(index_var, stmt)
+    assert isinstance(stmt, ForAll)
+    return stmt
+
+
+def test_apply_schedule_rejects_malformed_structure_before_legacy_surgery(
+    monkeypatch,
+):
+    """A forged cycle fails closed before any legacy scheduling surgery runs."""
+
+    program = _build_spmm()
+    program.stmt = program
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("malformed CIN reached legacy schedule surgery")
+
+    monkeypatch.setattr(Scheduler, "_apply_schedule_legacy", forbidden)
+
+    with pytest.raises(VerificationError) as error:
+        Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
+
+
+def test_apply_schedule_structural_failure_precedes_display_name_conflicts():
+    """Normalization owns the structural boundary ahead of the name walk.
+
+    The display-name validator traverses stored forward edges recursively, so
+    it must only ever see a structurally verified graph; a program carrying
+    both defects reports the structural diagnostic.
+    """
+
+    program = _build_conflicting_names_spmm()
+    del program.parallel
+
+    with pytest.raises(VerificationError) as error:
+        Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "missing_cin_field"
+
+
+def test_apply_schedule_still_rejects_display_name_conflicts():
+    """The reordered boundary keeps the legacy display-name failure intact."""
+
+    with pytest.raises(VerificationError, match="display name"):
+        Scheduler.apply_schedule(_build_conflicting_names_spmm(), Schedule())
+
+
+def test_apply_schedule_option_mismatch_precedes_structural_preflight():
+    """The options boundary stays first: it never touches the CIN graph."""
+
+    program = _build_spmm()
+    program.stmt = program
+    options = CompileOptions.from_environment(
+        environ={},
+        requested_schedule=Schedule(tag="recorded"),
+    )
+
+    with pytest.raises(CompileOptionsError):
+        Scheduler.apply_schedule(
+            program,
+            Schedule(tag="conflicting"),
+            compile_options=options,
+        )
+
+
+def test_apply_schedule_debug_verification_reports_missing_fields():
+    """Full debug verification can no longer be preempted by a raw name walk."""
+
+    from scorch.compiler.cin_analysis import full_cin_verification
+
+    program = _build_spmm()
+    del program.stmt
+
+    with full_cin_verification():
+        with pytest.raises(VerificationError) as error:
+            Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "missing_cin_field"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_boundaries_reject_malformed_structure(entry):
+    """Both automatic entries fail closed on forged structure, like apply."""
+
+    program = _build_spmm()
+    program.stmt = program
+
+    with pytest.raises(VerificationError) as error:
+        getattr(Scheduler, entry)(program)
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
