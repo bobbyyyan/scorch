@@ -2444,7 +2444,15 @@ def test_auto_origin_derives_workspace_storage_from_the_workspace_axis() -> None
         dense=True,
     )
     assert tuple(tile.loop.index_id for tile in plan.tiles) == (ids["j"],)
-    replay = Scheduler.apply_schedule(cin, Schedule())
+    replay = Scheduler.apply_schedule(
+        cin,
+        Schedule(),
+        compile_options=CompileOptions.from_environment(
+            environ={},
+            requested_schedule=Schedule(),
+            regblock_override=False,
+        ),
+    )
     assert replay.verified_loop_plan == plan
 
 
@@ -2535,7 +2543,15 @@ def test_auto_origin_replays_post_workspace_retraversal_scope() -> None:
         ids["k"],
         ids["i"],
     )
-    replay = Scheduler.apply_schedule(cin, Schedule())
+    replay = Scheduler.apply_schedule(
+        cin,
+        Schedule(),
+        compile_options=CompileOptions.from_environment(
+            environ={},
+            requested_schedule=Schedule(),
+            regblock_override=False,
+        ),
+    )
     assert replay.verified_loop_plan == plan
 
 
