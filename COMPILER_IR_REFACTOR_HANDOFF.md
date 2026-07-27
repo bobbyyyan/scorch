@@ -27292,3 +27292,228 @@ outside Git, update §25/handoff with exact receipts and honest
 limitations, push nothing, and complete as much of this coherent
 closure milestone as the verification evidence supports.
 ```
+
+## Phase-6 automatic-origin review corrections (2026-07-26, supersedes the §25 prompt)
+
+This section is chronologically latest.  The full finding inventory
+and corrected disposition are in
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §26; §25 remains historical
+evidence only where §26 does not supersede it.
+
+### Current state
+
+The rigorous review found three production/evidence boundary defects
+and two test-quality defects:
+
+- automatic plan verification omitted workspace-axis density, sparse
+  workspace `no_tile_list`, and the post-`Where` common-prefix
+  retraversal scope;
+- direct `apply_schedule_plan` did not enforce missing/stray automatic
+  policy provenance;
+- two F2/F4 locks depended on ambient `SCORCH_REGBLOCK`;
+- `dba2a22`'s dual proof was a legacy self-comparison, and its first
+  replacement used an explicit-ADD surrogate rather than the public
+  frontend's implicit reduction;
+- the positive tile-free pass fixture was not semantically verified.
+
+Seven focused correction commits stack above `e4c5cb7`:
+
+- `77a2cef` / `bfd6692` — exact two-phase automatic workspace/tile
+  derivation plus mixed-result, sparse-workspace, and rank-four locks;
+- `5a4a932` / `b6be7dd` — policy provenance at the LoopIR pass
+  boundary plus a genuinely verified tile-free positive fixture;
+- `7c76b7b` — actual LoopIR-arm composition evidence for an
+  explicit-ADD `ds` surrogate;
+- `8b3b45d` — environment-independent F2/F4 arm selection; and
+- `fe6bdb2` — restoration of the production implicit-update fixture,
+  honest narrowing of the explicit-ADD proof, and direct locks for
+  the real `ds`, dense, and hierarchical-sparse open boundaries.
+
+No serialization changed, so `scorch.autopolicy.v1`,
+`scorch.loopplan.canonical.v1`, `scorch.loopir.request.v2`, and
+`scorch.loopir.canonical.v8` remain current.
+
+The root-workspace elision remains closed in its reviewed
+single-assignment scope.  Phase 6 remains open on four connected
+obligations:
+
+1. public implicit-reduction normalization/bridging into LoopIR;
+2. reduce-out automatic strip-mining;
+3. sparse workspace emission; and
+4. full production-dual domain ownership, including hierarchical
+   sparse target lowering or an explicit compatibility disposition.
+
+The explicit-ADD `ds` stack schedule and stitch are migrated
+schema-level cases; the public `ds` dual route is not yet migrated
+because it fails earlier at `unsupported_reduction_without_update`.
+After that same implicit-update bridge, dense dual arms additionally
+depend on reduce-out.  Hierarchical `ss` dual arms still fail target
+lowering.  The whole runtime stitch therefore cannot yet be assigned
+to Phase 7.
+
+### Verification
+
+Evidence is under
+`/Users/bobby/.cache/scorch-codex/phase6-auto-review-e4c5cb7/`.
+
+- contract membership **769 passed**; options/identity **82 passed**;
+  hostile-environment replay **2 passed**;
+- compiled battery **286 passed in 17:04**;
+- 86-case audit **46/40/0**, normalized byte-identical to retained;
+- source regeneration: **20/20 corpus**, **42/42 grid**, and
+  **22/22 anchor-survey** files byte-identical to retained; automatic
+  legacy C++ byte-identical to the post-root-fix capture;
+  explicit-anchor parity **10/10**, heap parity **11/11**;
+- changed files Black/Flake8/focused-mypy clean; full-source findings
+  remain at the inherited **1 / 9 / 140-in-11** baselines;
+  `git diff --check` clean;
+- paired latency inside 1.10 everywhere (worst **1.016**, identical
+  source hashes);
+- detached full suite **4,212 passed / 14 skipped / 3 deselected /
+  zero failures** in **48:20**; the retained outer-wrapper exit 1 was
+  solely a post-pytest assignment to zsh's read-only `status`
+  variable, while the complete log and JUnit record pytest success;
+- origin still `58e8565`, protected hashes exact, unrelated material
+  untouched, nothing pushed.
+
+### Updated broad prompt for the next session
+
+```text
+Work in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the current local tip. Do
+not push, switch branches, amend, squash, or reorder commits.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_DESIGN.md (especially Phases 6-7
+and the Phase-6 exit criteria), the Phase-4 and Phase-5 reviews, all
+of COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through the chronologically
+latest §26, and the chronologically latest tail of
+COMPILER_IR_REFACTOR_HANDOFF.md. Section 26 and this prompt supersede
+§25 and every older routing prompt where they conflict.
+
+First independently review the seven correction commits 77a2cef,
+bfd6692, 5a4a932, b6be7dd, 7c76b7b, 8b3b45d, and fe6bdb2. Do not
+trust the report. Inspect every diff and reproduce §26's exact gates.
+Adversarially verify:
+
+- F2, F4, and direct legacy scheduling agree for both regblock arms
+  across ranks 2-5, mixed dense/sparse result levels, sparse and dense
+  workspaces, multiple physical mode orders, root and row scopes, and
+  pre/post-workspace candidate selection;
+- workspace density comes from the exact workspace-axis result level,
+  sparse insertion excludes the producer reduction through
+  no_tile_list, and post-Where retraversal sees only the surviving
+  common direct prefix;
+- structural verification and consuming-pass boundaries reject
+  malformed, missing, stray, and wrong-schema AutoOriginPolicy state
+  without side effects; semantic verification rejects stored
+  decisions inconsistent with the recorded arm/width, and each
+  policy-dependent migrated family checks the arm/width it consumes
+  (do not duplicate the complete CIN semantic analysis inside a pure
+  pass);
+- canonical/request identity exclusion of the policy is used only
+  after semantic verification;
+- the root-elision scope remains dense-only and sparse roots remain
+  materialized;
+- the explicit-ADD ds composition test uses actual LoopIR arms, while
+  the production implicit-update ds case, dense reduce-out case, and
+  hierarchical ss case remain explicitly open.
+
+Fix and commit every concrete defect before new representation work.
+Preserve scorch.autopolicy.v1, scorch.loopplan.canonical.v1,
+scorch.loopir.request.v2, and scorch.loopir.canonical.v8 unless a
+real serialized representation change requires a version bump.
+
+Then take a broad Phase-6 closure milestone. Complete as many of these
+coherent workstreams as can be honestly gated in the session; do not
+stop after only an inventory if implementation is supportable:
+
+1. Close the public implicit-reduction bridge. Audit where the public
+   frontend intentionally leaves TensorAssign.op=None while the
+   iteration analysis proves an additive reduction. Normalize that
+   fact once at the typed CIN→LoopIR ownership boundary (do not infer
+   it independently in several targets), fail closed on ambiguous or
+   non-additive cases, and prove that public einsum/matmul CIN,
+   normalized explicit-ADD CIN, legacy C++, LoopIR C++, and execution
+   all agree. Include repeated operands, multiple reductions, empty
+   extents, f32/f64, and non-reduction assignments so the bridge
+   cannot manufacture updates.
+
+2. Migrate the reduce-out automatic strip-mine family end to end.
+Represent the workspace region with a strip-mined reduction producer
+and accumulate copy-out consumer, both OUTERMOST (regblock-off width
+32) and CHILD_OF (regblock-on width 8) placements, ragged/exact/unit/
+oversized/zero widths, and the legacy parallel work estimate over tile
+count. Cover dense matmul and SDDMM-shaped orders, both policy arms,
+erasure/oracle semantics, byte-identical legacy source, compiled
+shadows, and latency. This work should close the dense-matmul
+constituent of the production dual domain.
+
+3. Migrate the sparse-result/workspace boundary end to end, preserving
+   its two distinct representation seams. First cover mixed-level
+   results whose trailing workspace axis is dense: the plan is dense,
+   but LoopIR currently rejects the compressed-parent/dense-leaf result
+   representation at unsupported_format. Separately cover true sparse
+   coo_workspace allocation/reset/assembly for row-scope SpMSpM and
+   sparse-output roots, including exact no_tile_list behavior,
+   empty/disjoint/overlapping/cancellation cases, both policy arms, and
+   every current early boundary (including unsupported_sparse_output).
+   Widen a gate only for a fully represented subfamily with direct
+   structural activation, independent oracle and erasure proofs, byte
+   parity where legacy compiles, and compiled numerical differentials.
+
+4. Close or explicitly disposition the entire production
+_build_regblock_dual_path domain. Census every qualifying public
+format/order, not just ds SpMM. Keep the independent actual-LoopIR arm
+proof for ds after the implicit-update bridge; close dense arms
+through reduce-out; and either migrate parent-position descent and
+target lowering for hierarchical compressed ss operands or preserve a
+precise compatibility/fallback boundary with release-behavior and
+performance evidence. Reconstruct the final dual kernel only from
+actual LoopIR-produced arms for every admitted family. A comparison
+between the same legacy helpers is not evidence.
+
+After those workstreams, repeat every Phase-6 exit criterion.
+Declare GO only if the public implicit-update path, both automatic
+emission families, and the complete admitted dual domain are genuinely
+closed. If any remains open, record an exact fail-closed boundary and
+do not start Phase 7. If and only if Phase 6 has a genuine GO, begin
+the Phase-7 target/parallel ownership audit and migrate the widest
+coherent structured work-estimate/OpenMP policy plus runtime-dual
+stitch slice. Do not start production cutover, selector parity, cache
+cutover, legacy deletion, Phase 8, or Phase 8.5.
+
+Preserve all established contracts: frozen tuple ownership; exact
+stored-field/type/enum validation; forged/missing/extra/hostile/
+cyclic/shared/depth adversaries; side-effect-free diagnostics;
+stage-owned failure; artifact-local deterministic identities; no C++
+spelling in LoopIR; no rendered-name/regex/tag discovery; structural
+activation never waived; byte identity wherever legacy is the
+comparand; independent oracle and erasure proofs; explicit and
+automatic compiled differentials; and no ordinary release-JIT double
+compilation.
+
+Run focused memberships after each coherent commit. Final gates must
+include the ten-file contract and options/identity memberships; the
+compiled schedule/pipeline/generality battery plus the complete dual
+file; a larger cross-route automatic-plan equivalence census; fresh
+corpus/grid/heap/anchor captures; the 86-case audit plus new mixed-
+level/sparse-workspace/rank-4/public-dual cells; automatic
+root/tiled/dual source grids; paired same-session compiler latency;
+Black, Flake8, focused and same-methodology full-source mypy baseline
+comparison (140 errors in 11 files at the reviewed baseline);
+git diff --check; and one literal clean detached-worktree
+non-performance suite with isolated caches and asserted import
+provenance. Avoid overlapping native/JIT lanes on macOS. If the
+literal suite hits the known libomp resource ceiling, reproduce it at
+the base before using a complete non-overlapping partition, and state
+the attribution explicitly.
+
+Before editing and before every commit, inspect git status, local and
+live origin, and the five protected-file hashes. Preserve all
+unrelated dirty and untracked GPU/CUDA, benchmark, packaging,
+scheduler, research, scratchpad, and tooling material. Stage explicit
+pathspecs only, use focused commits with descriptive bodies, retain
+evidence outside Git, update §26 and the handoff with exact receipts
+and honest limitations, push nothing, and finish as much of the
+coherent closure milestone as the evidence supports.
+```

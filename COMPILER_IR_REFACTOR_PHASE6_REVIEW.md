@@ -3768,3 +3768,194 @@ subtrees).
   `58e8565`, and all five protected files retain their recorded
   hashes; the only tracked files staged were the explicit compiler
   and test pathspecs of the five commits.
+
+## 26. Automatic-origin review corrections and the real dual boundary (2026-07-26)
+
+This section supersedes §25's current-state and exit claims.  Section
+25 remains the historical receipt for `e1afa72..e4c5cb7`; its root
+workspace fix remains valid in the reviewed single-assignment scope,
+but its automatic-decision and dual-closure claims were too broad.
+
+The review inspected all six inherited commits and reproduced their
+focused gates before writing a fix.  It then used direct cross-route
+differentials, hostile environment controls, malformed direct-pass
+inputs, format/rank/mode-order matrices, and actual production dual
+fixtures rather than accepting the handoff's conclusions.
+
+### 26.1 Concrete findings
+
+Five issues were found.
+
+1. **The automatic stored-equals-derived verifier missed three legacy
+   decisions.**  Workspace storage was derived from whole-result
+   density rather than the workspace axis's result level; sparse
+   workspace insertion's addition of the producer reduction to
+   `no_tile_list` was not mirrored; and the post-`Where` sparse
+   retraversal test was incorrectly applied below the common direct
+   loop prefix.  Valid F2/F4 plans consequently failed with
+   `auto_workspace_decision` or `auto_tile_decision` for mixed-level
+   results, sparse workspaces, and rank-four post-insertion nests.
+
+2. **The policy trust boundary stopped at semantic verification.**
+   `verify_loop_plan` required `AutoOriginPolicy` on automatic plans
+   and rejected it on explicit plans, but direct
+   `apply_schedule_plan` accepted both missing-policy automatic plans
+   and explicit plans carrying the policy.  That pass has a verified
+   plan precondition and does not replace semantic verification, but
+   the enforceable provenance invariant still belongs at every
+   consuming boundary.  Excluding the policy from canonical/request
+   identity is sound only after semantic verification.
+
+3. **Two new F2/F4 regressions were environment-dependent.**  They
+   forced F4 to the regblock-off arm but allowed F2 to read ambient
+   `SCORCH_REGBLOCK`; `SCORCH_REGBLOCK=1` made correct production
+   behavior fail the tests.  Both routes now receive the same
+   environment-free `CompileOptions`.
+
+4. **The original dual differential was vacuous, and the first
+   correction still used a surrogate.**  `dba2a22` reconstructed the
+   production dual kernel from the same two legacy lowerings the
+   production helper used, so it passed even before either arm was
+   migrated.  `7c76b7b` improved this to actual LoopIR-produced arms,
+   but silently changed the fixture from the public frontend's
+   implicit reduction (`TensorAssign.op is None`) to an explicit
+   `Operation.ADD`.  The explicit-ADD `ds` schedule/stitch is a useful
+   schema-level proof; it is not evidence that the public dual route
+   enters LoopIR.  The real `ds` input still fails closed at
+   `unsupported_reduction_without_update`; once represented with
+   explicit ADD, dense matmul reaches the unmigrated reduce-out
+   schedule family and hierarchical `ss` reaches the unsupported
+   target shape.
+
+5. **One positive pass test used a semantically invalid plan.**  Its
+   hand-built tile-free dense-matmul plan was accepted by the pass
+   precondition but correctly rejected by `verify_loop_plan` because
+   the automatic policy derived tiles and a workspace.  The positive
+   fixture is now a genuinely tile-free dense elementwise plan and
+   explicitly proves semantic verification before pass consumption.
+
+### 26.2 Corrections
+
+Seven focused commits implement and lock the corrections:
+
+- `77a2cef` — `fix(compiler): mirror automatic workspace decisions`
+- `bfd6692` — `test(compiler): cover exact automatic workspace derivation`
+- `5a4a932` — `fix(compiler): preserve automatic policy at LoopIR passes`
+- `b6be7dd` — `test(compiler): lock automatic policy pass boundaries`
+- `7c76b7b` — `test(compiler): prove dual composition from LoopIR arms`
+- `8b3b45d` — `test(compiler): isolate automatic-origin arm selection`
+- `fe6bdb2` — `test(compiler): narrow automatic and dual evidence`
+
+The derivation now has the same two phases as legacy scheduling:
+pre-insertion candidates decide whether workspace materialization is
+useful; after insertion, workspace representation, sparse
+`no_tile_list`, the surviving common prefix, and final tile choices
+are re-derived from typed facts.  `apply_schedule_plan` now enforces
+the missing/stray policy provenance boundary before family dispatch.
+No schema token changed: `scorch.autopolicy.v1`,
+`scorch.loopplan.canonical.v1`, `scorch.loopir.request.v2`, and
+`scorch.loopir.canonical.v8` remain accurate because no serialized
+representation changed.
+
+Independent non-native generality checks found no remaining production
+derivation mismatch: a 1,376-case structured rank/layout/arm sweep had
+940 successful exact F2/F4 plans and only expected legality
+rejections; a separate ranks-two-through-five randomized sweep had
+896 successful F2/F4 plus replay/direct-surgery equalities; an
+exhaustive rank-three layout/mode-order matrix had 2,448 successful
+arm cases; and dense/sparse root matrices preserved dense elision and
+sparse materialization.  No sweep produced
+`auto_tile_decision`/`auto_workspace_decision` after the fix.
+
+### 26.3 Corrected Phase-6 disposition
+
+The dense root-workspace elision remains closed for the reviewed
+single-assignment family.  The typed automatic policy remains viable,
+and normalized explicit-ADD `ds` stack-form schedules are migrated.
+The explicit-ADD dual stitch is byte-identical when built from actual
+LoopIR arm lowerings, but it is only a schema-level target-composition
+proof.
+
+**Phase 6 has no GO.**  Its production closure now has four linked
+obligations rather than §25's two:
+
+1. normalize or otherwise faithfully bridge the public frontend's
+   implicit reduction into typed LoopIR, with a direct public-path
+   differential;
+2. migrate the reduce-out strip-mine automatic family, which also
+   blocks dense-matmul dual arms;
+3. migrate the sparse-result/workspace boundary in its two distinct
+   subfamilies: mixed-level result representation/assembly with a
+   dense trailing workspace (currently `unsupported_format`), and
+   true sparse `coo_workspace` allocation/reset/assembly with exact
+   sparse `no_tile_list` behavior (sparse output may currently fail
+   earlier at `unsupported_sparse_output`, not always at §25's claimed
+   schedule-family diagnostic); and
+4. disposition the full production dual-helper domain: keep the
+   actual-LoopIR, explicit-ADD `ds` arm proof, close dense arms through
+   reduce-out, and either migrate hierarchical-compressed `ss` target
+   lowering or retain an explicit compatibility/fallback boundary.
+   Only after every constituent arm is genuinely migrated can the
+   runtime stitch be assigned wholesale to Phase 7.
+
+Accordingly, §25's statements that the dual obligation is closed,
+that exactly two families remain, and that all remaining cases reach
+one stable `unsupported_schedule_auto_family` gate are withdrawn.
+
+### 26.4 Verification
+
+Exact-tip evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-auto-review-e4c5cb7/`.
+
+- ten-file contract membership: **769 passed**; dedicated
+  options/identity membership: **82 passed**; the hostile
+  `SCORCH_REGBLOCK=1` replay regression: **2 passed**;
+- the compiled schedule/pipeline/generality plus dual-path battery:
+  **286 passed in 1,024.28 s (17:04)** (log SHA-256
+  `b6940b5faeb6be02191c69b9b2021f6826b970cd421dd974d741f3be091f9918`,
+  JUnit SHA-256
+  `0450067680a9272f05f55962c8553afc9d15516a8d5e3e662b32c9817e3a2ed0`);
+- source-only 86-case audit: **46 admitted / 40 rejected / zero
+  divergent**, deterministic across repeat runs and byte-identical to
+  the retained result after removing the embedded commit id
+  (normalized SHA-256
+  `93b6737cef94f8bbb56ba9b339a2cba23bfc68bd2b059129d3a8ae95a5c2b788`);
+- clean detached source regeneration was byte-identical to the
+  retained captures for all **20 corpus files**, **42 grid cells**,
+  and **22 anchor-survey files** (manifest SHA-256 values
+  `7e4a9c436e5ed1005874e9ece56847ea4ef88dd6f5a04c4d657c3ca5b37cd6c4`,
+  `65e68ba19510ab240cf85574aa6be272dd6e5b0fdd7e799f7bcfe9db6d06c094`,
+  and
+  `44b39b55fbaea4bccbfac2aca6c217ca6b7ccd7135c8d50950efd96fd7f2dd13`);
+  exact automatic-family legacy C++ also remained byte-identical to
+  the post-root-fix retained capture; explicit-anchor LoopIR/legacy
+  parity remained **10/10**, and heap parity remained **11/11**;
+- changed source/test files are Black- and Flake8-clean; focused mypy
+  reports no findings in the two changed production modules;
+  full-source static results remain at the inherited one Black,
+  nine Flake8, and 140-mypy-errors-in-11-files baselines (mypy
+  category/content is line-normalized identical, with only the
+  inherited scheduler import shifted by two lines); `git diff --check`
+  is clean;
+- paired same-session compiler latency versus inherited tip `e4c5cb7`
+  stayed inside 1.10 with identical per-case source hashes:
+  `small_dense` **1.005/0.993**, reduction **0.995/0.973**,
+  `csr_intersection` **1.014/1.016**, and `sparse_union`
+  **0.997/0.987** (p50/p95; comparison SHA-256
+  `e736bd856c66f62661edaaccc06aa323135dc96a88d595cd67897c6dafbc479f`);
+- literal clean detached-worktree non-performance suite at exact
+  `fe6bdb2`: **4,212 passed, 14 skipped, 3 performance tests
+  deselected, one known warning, and zero failures/errors** in
+  **2,900.18 s (48:20)** (log SHA-256
+  `ba88f6692a02b8b75c9b62471918f341bbeec4a7aeec9b35d1df361be6a7809b`,
+  JUnit SHA-256
+  `6d1376b8433fff93f7197739d758ca840f74a676815f1b54bdbc28ed0823222e`);
+  JUnit records 4,226 selected tests and 14 skips.  The outer zsh
+  evidence wrapper exited 1 only after pytest completed because it
+  assigned the shell's read-only `status` variable; the complete
+  pytest summary and zero-failure/error XML establish pytest exit 0,
+  and the postprocessing error is retained rather than hidden or
+  papered over with a 48-minute rerun; and
+- local and live origin remained `58e8565`; all five protected files
+  retained their recorded hashes, all unrelated dirty/untracked work
+  remained untouched, and nothing was pushed.
