@@ -269,6 +269,11 @@ def lower_normalized_cin_to_loopir(
     a schedule that permutes the nest into a storage-consistent order is not
     rejected before the reorder pass can apply it.  The target lowering
     re-enforces the same boundary against the program it actually emits.
+
+    This boundary owns the implicit-reduction normalization: a public
+    ``TensorAssign.op is None`` statement whose reduction loops are all
+    proven additive by their right-hand-side uses lowers exactly as the
+    explicit ADD update, and no later stage re-infers that fact.
     """
 
     if not isinstance(cin, IndexStmt):
@@ -352,11 +357,31 @@ def lower_normalized_cin_to_loopir(
         index_id not in lhs_index_ids for index_id in loop_positions
     )
     if has_reduction_loops and not reduce_update:
-        _fail(
-            "unsupported_reduction_without_update",
-            "a loop variable outside the left-hand side requires the ADD "
-            "update operator",
-        )
+        # The public frontend deliberately leaves ``TensorAssign.op`` unset
+        # for reductions; legacy iteration analysis re-derives the additive
+        # update from the assignment's right-hand-side-only index variables
+        # (``iter_lattice.get_simplified_cin``) and emits the same C++ as an
+        # explicit ADD update.  Normalize that proven fact exactly once at
+        # this ownership boundary: every reduction loop variable must appear
+        # in a right-hand-side access, which ``verify_cin`` already
+        # guarantees for used bindings.  A loop variable outside both sides
+        # would make the implied accumulation unprovable, so it fails closed
+        # instead of manufacturing an update.
+        rhs_index_ids = {
+            index_id for access in rhs_accesses for index_id in access.index_ids
+        }
+        if any(
+            index_id not in rhs_index_ids
+            for index_id in loop_positions
+            if index_id not in lhs_index_ids
+        ):
+            _fail(
+                "unsupported_reduction_without_update",
+                "a loop variable outside the left-hand side requires the ADD "
+                "update operator or a right-hand-side use that proves the "
+                "additive reduction",
+            )
+        reduce_update = True
 
     # Every tensor's storage-order loop variables must appear in nest order
     # (the planned order on the scheduled path), the same dependency

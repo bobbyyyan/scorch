@@ -67,6 +67,22 @@ def expect_code(code, cin):
     return error.value.defect
 
 
+def _walk_statements(node):
+    """Yield every Stmt reachable from one statement tree node."""
+
+    from scorch.compiler.loopir.nodes import Block, Stmt
+
+    if isinstance(node, Block):
+        for statement in node.statements:
+            yield from _walk_statements(statement)
+        return
+    if isinstance(node, Stmt):
+        yield node
+        body = getattr(node, "body", None)
+        if body is not None:
+            yield from _walk_statements(body)
+
+
 def test_elementwise_structure_and_provenance():
     cin, (i, j), (a, b, c) = build_elementwise_add()
     result = lower_normalized_cin_to_loopir(normalize_cin(cin))
@@ -283,12 +299,105 @@ def test_mixed_dtype():
     expect_code("mixed_dtype", ForAll(i, assign))
 
 
-def test_reduction_without_update_fails_closed():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_public_implicit_reduction_bridges_to_the_explicit_update(dtype):
+    """The public op=None reduction lowers exactly as the explicit ADD twin.
+
+    The frontend deliberately leaves ``TensorAssign.op`` unset; legacy
+    iteration analysis re-derives the additive update from the
+    right-hand-side-only variables.  The CIN-to-LoopIR boundary owns that
+    normalization once, so both spellings must produce one canonical
+    program.
+    """
+
+    def build(op):
+        i, j = IndexVar("i"), IndexVar("j")
+        a = TensorVar("A", fmt="dd", dtype=dtype)
+        y = TensorVar("y", fmt="d", dtype=dtype)
+        return ForAll(i, ForAll(j, TensorAssign(y[i], a[i, j], op=op)))
+
+    implicit = lower_normalized_cin_to_loopir(normalize_cin(build(None)))
+    explicit = lower_normalized_cin_to_loopir(normalize_cin(build(Operation.ADD)))
+    assert canonical_program_dump(implicit.program) == canonical_program_dump(
+        explicit.program
+    )
+    stores = [
+        node
+        for node in _walk_statements(implicit.program.body)
+        if isinstance(node, (Store, StoreReduce))
+    ]
+    assert len(stores) == 1
+    assert isinstance(stores[0], StoreReduce)
+    assert stores[0].op is ReduceOp.ADD
+
+
+def test_implicit_multi_reduction_bridges_once_at_the_boundary():
+    """Several right-hand-side-only loops normalize to one ADD update."""
+
+    def build(op):
+        i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+        a = TensorVar("A", fmt="ddd")
+        y = TensorVar("y", fmt="d")
+        return ForAll(i, ForAll(j, ForAll(k, TensorAssign(y[i], a[i, j, k], op=op))))
+
+    implicit = lower_normalized_cin_to_loopir(normalize_cin(build(None)))
+    explicit = lower_normalized_cin_to_loopir(normalize_cin(build(Operation.ADD)))
+    assert canonical_program_dump(implicit.program) == canonical_program_dump(
+        explicit.program
+    )
+
+
+def test_implicit_bridge_cannot_manufacture_elementwise_updates():
+    """A non-reduction op=None assignment stays a plain overwrite store."""
+
+    def build(op):
+        i, j = IndexVar("i"), IndexVar("j")
+        a = TensorVar("A", fmt="dd")
+        b = TensorVar("B", fmt="dd")
+        c = TensorVar("C", fmt="dd")
+        assign = TensorAssign(
+            c[i, j], CINBinaryOp(Operation.MUL, a[i, j], b[i, j]), op=op
+        )
+        return ForAll(i, ForAll(j, assign))
+
+    implicit = lower_normalized_cin_to_loopir(normalize_cin(build(None)))
+    stores = [
+        node
+        for node in _walk_statements(implicit.program.body)
+        if isinstance(node, (Store, StoreReduce))
+    ]
+    assert len(stores) == 1
+    assert isinstance(stores[0], Store)
+    explicit = lower_normalized_cin_to_loopir(normalize_cin(build(Operation.ADD)))
+    assert canonical_program_dump(implicit.program) != canonical_program_dump(
+        explicit.program
+    )
+
+
+def test_implicit_bridge_boundary_rejects_unprovable_reductions():
+    """Loops the bridge cannot prove additive never reach normalization.
+
+    ``verify_cin`` owns the only ambiguous shape: a bound loop variable
+    used by no access.  Locking that failure proves the bridge sees only
+    reduction loops with right-hand-side uses.
+    """
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="d")
+    c = TensorVar("C", fmt="d")
+    with pytest.raises(VerificationError) as error:
+        lower_normalized_cin_to_loopir(
+            normalize_cin(ForAll(i, ForAll(j, TensorAssign(c[i], a[i]))))
+        )
+    assert "unused_index_binding" in str(error.value)
+
+
+def test_implicit_bridge_keeps_repeated_operand_rejection():
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="dd")
     y = TensorVar("y", fmt="d")
-    assign = TensorAssign(y[i], a[i, j])
-    expect_code("unsupported_reduction_without_update", ForAll(i, ForAll(j, assign)))
+    assign = TensorAssign(y[i], CINBinaryOp(Operation.MUL, a[i, j], a[i, j]))
+    expect_code("unsupported_repeated_operand", ForAll(i, ForAll(j, assign)))
 
 
 def test_unsupported_loop_order_kij():

@@ -30,7 +30,6 @@ from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, Tenso
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
 from scorch.compiler.loopir.schedule_passes import SchedulePassError
@@ -161,12 +160,20 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
     assert torch.allclose(out.to(torch.float32), ref, atol=1e-3, rtol=1e-3)
 
 
-def test_dual_path_composes_exactly_two_explicit_update_loopir_arms():
-    """An explicit-ADD surrogate contains no third schedule beyond its arms.
+@pytest.mark.parametrize(
+    "explicit_update",
+    [False, True],
+    ids=["public_implicit_update", "explicit_add"],
+)
+def test_dual_path_composes_exactly_the_two_loopir_arm_lowerings(explicit_update):
+    """The production dual stitch contains no third schedule beyond its arms.
 
-    This is a schema-level stitch proof, not proof that the public
-    implicit-update dual route has entered LoopIR; the next test locks that
-    remaining boundary.
+    Both spellings of the public ds SpMM dual route — the frontend's
+    implicit reduction (``TensorAssign.op is None``, normalized once at the
+    CIN-to-LoopIR ownership boundary) and its explicit-ADD twin — must
+    reconstruct the production dual kernel byte-for-byte from the two
+    actual LoopIR-produced arm lowerings.  The runtime free-dim branch
+    itself remains target-lowering state owned by Phase 7.
     """
 
     options = CompileOptions.from_environment(environ={})
@@ -182,7 +189,7 @@ def test_dual_path_composes_exactly_two_explicit_update_loopir_arms():
         )
         loopir_arms.append(
             compile_cin_via_loopir(
-                _build_spmm_cin(explicit_update=True),
+                _build_spmm_cin(explicit_update=explicit_update),
                 (4, 6),
                 input_bindings,
                 compile_options=arm_options,
@@ -190,7 +197,7 @@ def test_dual_path_composes_exactly_two_explicit_update_loopir_arms():
         )
 
     built = ops._build_regblock_dual_path(
-        _build_spmm_cin(bind_shapes=True, explicit_update=True),
+        _build_spmm_cin(bind_shapes=True, explicit_update=explicit_update),
         None,
         compile_options=options,
     )
@@ -217,13 +224,9 @@ def test_dual_path_composes_exactly_two_explicit_update_loopir_arms():
 @pytest.mark.parametrize(
     ("left_format", "explicit_update", "error_type", "error_code"),
     [
-        (
-            "ds",
-            False,
-            LoopIRLoweringError,
-            "unsupported_reduction_without_update",
-        ),
+        ("dd", False, SchedulePassError, "unsupported_schedule_auto_family"),
         ("dd", True, SchedulePassError, "unsupported_schedule_auto_family"),
+        ("ss", False, LoopIRTargetError, "unsupported_program_shape"),
         ("ss", True, LoopIRTargetError, "unsupported_program_shape"),
     ],
 )

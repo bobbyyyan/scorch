@@ -460,13 +460,13 @@ def build_spmv_csr(dtype=torch.float32):
     return ForAll(i, ForAll(j, assign))
 
 
-def build_spmm_csr_dense():
+def build_spmm_csr_dense(update_op=Operation.ADD, dtype=torch.float32):
     i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
-    c = TensorVar("C", fmt="dd")
-    a = TensorVar("A", fmt="ds")
-    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd", dtype=dtype)
+    a = TensorVar("A", fmt="ds", dtype=dtype)
+    b = TensorVar("B", fmt="dd", dtype=dtype)
     assign = TensorAssign(
-        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
+        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=update_op
     )
     return ForAll(i, ForAll(k, ForAll(j, assign)))
 
@@ -573,6 +573,70 @@ def test_spmm_csr_dense_shadow_execution_agrees_everywhere():
         loopir_result.to_torch(),
         torch.tensor(oracle[kernel.lowering.result_symbol]).to(torch.float32),
     )
+
+
+@torch.no_grad()
+def test_public_implicit_spmm_bridges_and_agrees_everywhere():
+    """The frontend's op=None SpMM matches its explicit-ADD twin end to end.
+
+    The public einsum/matmul frontend leaves ``TensorAssign.op`` unset for
+    reductions; the CIN-to-LoopIR ownership boundary normalizes the proven
+    additive update once.  The bridged program must be byte-identical to
+    the explicit spelling on both routes, execute identically, and match
+    the legacy shadow and the PyTorch reference.
+    """
+
+    torch.manual_seed(37)
+    implicit = build_spmm_csr_dense(update_op=None)
+    explicit = build_spmm_csr_dense()
+    bindings = [((6, 9), torch.float32), ((9, 4), torch.float32)]
+    implicit_kernel = compile_cin_via_loopir(copy.deepcopy(implicit), (6, 4), bindings)
+    explicit_kernel = compile_cin_via_loopir(copy.deepcopy(explicit), (6, 4), bindings)
+    assert implicit_kernel.cpp_source == explicit_kernel.cpp_source
+
+    a_t = masked_random(6, 9, 0.35, empty_rows=(0, 4))
+    b_t = torch.rand(9, 4)
+    loopir_result, legacy_result, comparison = execute_shadow(
+        implicit,
+        (6, 4),
+        sparse_stensor(a_t, "A"),
+        dense_stensor(b_t, "B"),
+    )
+    assert comparison.identical
+    assert torch.equal(loopir_result.to_torch(), legacy_result.to_torch())
+    assert_close(loopir_result.to_torch(), a_t @ b_t)
+
+
+@torch.no_grad()
+def test_public_implicit_spmm_bridges_for_float64_and_empty_extents():
+    implicit64 = build_spmm_csr_dense(update_op=None, dtype=torch.float64)
+    explicit64 = build_spmm_csr_dense(dtype=torch.float64)
+    bindings64 = [((5, 7), torch.float64), ((7, 3), torch.float64)]
+    implicit_kernel = compile_cin_via_loopir(
+        copy.deepcopy(implicit64), (5, 3), bindings64
+    )
+    explicit_kernel = compile_cin_via_loopir(
+        copy.deepcopy(explicit64), (5, 3), bindings64
+    )
+    assert implicit_kernel.cpp_source == explicit_kernel.cpp_source
+
+    kernel = compile_cin_via_loopir(
+        build_spmm_csr_dense(update_op=None),
+        (0, 4),
+        [((0, 9), torch.float32), ((9, 4), torch.float32)],
+    )
+    lowering = kernel.lowering
+    sparse_symbol, dense_symbol = lowering.rhs_access_symbols
+    dense = [[float(row + column) for column in range(4)] for row in range(9)]
+    result = run_program(
+        lowering.program,
+        {
+            sparse_symbol: CsrMatrix(0, 9, (0,), (), ()),
+            dense_symbol: dense,
+        },
+        {lowering.result_symbol: (0, 4)},
+    )
+    assert result[lowering.result_symbol] == []
 
 
 def test_spmm_oracle_preserves_hidden_extent_with_zero_rows():
