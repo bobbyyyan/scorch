@@ -159,6 +159,185 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
     assert torch.allclose(out.to(torch.float32), ref, atol=1e-3, rtol=1e-3)
 
 
+_CENSUS_DIMS = {"i": 4, "j": 5, "k": 6, "l": 3}
+
+
+def _build_census_cin(fmt_result, result_indices, operands, nest, *, bind_shapes=False):
+    """One qualifying-domain census CIN with optional bound shapes."""
+
+    from scorch.compiler.cin import BinaryOp as CINBinaryOp
+
+    ivars = {name: IndexVar(name) for name in "ijkl"}
+    result = TensorVar("C", fmt=fmt_result)
+    if bind_shapes:
+        result.shape = tuple(_CENSUS_DIMS[x] for x in result_indices)
+        result.dtype = torch.float32
+    rhs = None
+    for position, (fmt, indices) in enumerate(operands):
+        operand = TensorVar("ABD"[position], fmt=fmt)
+        if bind_shapes:
+            operand.shape = tuple(_CENSUS_DIMS[x] for x in indices)
+            operand.dtype = torch.float32
+        access = operand[tuple(ivars[x] for x in indices)]
+        rhs = access if rhs is None else CINBinaryOp(Operation.MUL, rhs, access)
+    assignment = TensorAssign(
+        result[tuple(ivars[x] for x in result_indices)],
+        rhs,
+        op=Operation.ADD,
+    )
+    statement = assignment
+    for name in reversed(nest):
+        statement = ForAll(ivars[name], statement)
+    return statement
+
+
+_DENSE_DUAL_CONSTITUENTS = {
+    "dense_matmul": ("dd", "ik", (("dd", "ij"), ("dd", "jk")), "ijk"),
+    "ttm_dense": ("ddd", "ijk", (("ddd", "ijl"), ("dd", "lk")), "ijlk"),
+    "three_operand_ds": ("dd", "ik", (("ds", "ij"), ("dd", "jk"), ("dd", "ik")), "ijk"),
+}
+
+
+@pytest.mark.parametrize("family", sorted(_DENSE_DUAL_CONSTITUENTS))
+def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
+    """Every admitted dense dual kernel reconstructs from its LoopIR arms.
+
+    The reduce-out migration closed the dense-matmul constituent of the
+    production dual domain: for each qualifying dense family, stitching the
+    two actual LoopIR-produced arm lowerings must reproduce the production
+    ``_build_regblock_dual_path`` kernel byte-for-byte.  Comparing the same
+    legacy helpers to themselves is not evidence; both arms here come from
+    ``compile_cin_via_loopir``.
+    """
+
+    spec = _DENSE_DUAL_CONSTITUENTS[family]
+    options = CompileOptions.from_environment(environ={})
+    built = ops._build_regblock_dual_path(
+        _build_census_cin(*spec, bind_shapes=True),
+        None,
+        compile_options=options,
+    )
+    assert built is not None
+    production_cpp = _lower_to_cpp(built[0])
+
+    arms = []
+    for enabled in (False, True):
+        arm_options = replace(
+            options.with_regblock_enabled(enabled),
+            requested_schedule=Schedule(),
+        )
+        bindings = tuple(
+            (tuple(_CENSUS_DIMS[x] for x in indices), torch.float32)
+            for _, indices in spec[2]
+        )
+        arms.append(
+            compile_cin_via_loopir(
+                _build_census_cin(*spec),
+                tuple(_CENSUS_DIMS[x] for x in spec[1]),
+                bindings,
+                compile_options=arm_options,
+            )
+        )
+    base_arm, regblock_arm = arms
+    assert base_arm.schedule.plan.auto_policy.regblock_enabled is False
+    assert regblock_arm.schedule.plan.auto_policy.regblock_enabled is True
+    reconstructed = ops._stitch_regblock_dual_path(
+        copy.deepcopy(regblock_arm.llir_function),
+        copy.deepcopy(base_arm.llir_function),
+        options.scheduler.regblock_max_n,
+    )
+    assert reconstructed is not None
+    assert _lower_to_cpp(reconstructed) == production_cpp
+
+
+@pytest.mark.parametrize(
+    ("family", "spec", "expected"),
+    [
+        (
+            "spmm_ss",
+            ("dd", "ik", (("ss", "ij"), ("dd", "jk")), "ijk"),
+            "unsupported_program_shape",
+        ),
+        (
+            "spmm_coo",
+            ("dd", "ik", (("oo", "ij"), ("dd", "jk")), "ijk"),
+            "unsupported_format",
+        ),
+        (
+            "dense_at_csr",
+            ("dd", "ik", (("dd", "ij"), ("ds", "jk")), "ijk"),
+            "unsupported_schedule_auto_family",
+        ),
+        (
+            "ttm_sparse_operand",
+            ("ddd", "ijk", (("dds", "ijl"), ("dd", "lk")), "ijlk"),
+            "unsupported_schedule_auto_family",
+        ),
+    ],
+)
+def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
+    """Qualifying dual families outside the migrated arms fail closed.
+
+    The complete production dual census: hierarchical-compressed ``ss``
+    operands still fail target parent-position descent
+    (``unsupported_program_shape``); COO operands fail level lowering
+    (``unsupported_format``); trailing-compressed operands derive
+    sparse-workspace-adjacent automatic plans that the family gate keeps on
+    the legacy path (``unsupported_schedule_auto_family``).  Production
+    release behavior is unchanged for every one of these: dispatch still
+    builds the dual kernel from the legacy helpers, and the strangler path
+    is not live.
+    """
+
+    options = CompileOptions.from_environment(environ={})
+    assert (
+        ops._build_regblock_dual_path(
+            _build_census_cin(*spec),
+            None,
+            compile_options=options,
+        )
+        is not None
+    )
+    for enabled in (False, True):
+        arm_options = replace(
+            options.with_regblock_enabled(enabled),
+            requested_schedule=Schedule(),
+        )
+        bindings = tuple(
+            (tuple(_CENSUS_DIMS[x] for x in indices), torch.float32)
+            for _, indices in spec[2]
+        )
+        with pytest.raises(Exception) as error:
+            compile_cin_via_loopir(
+                _build_census_cin(*spec),
+                tuple(_CENSUS_DIMS[x] for x in spec[1]),
+                bindings,
+                compile_options=arm_options,
+            )
+        assert getattr(error.value, "defect").code == expected
+
+
+def test_dual_domain_census_locks_non_qualifying_families():
+    """Families where the regblock arm changes nothing build no dual."""
+
+    options = CompileOptions.from_environment(environ={})
+    non_qualifying = [
+        ("d", "i", (("ds", "ij"), ("d", "j")), "ij"),
+        ("d", "i", (("dd", "ij"), ("d", "j")), "ij"),
+        ("dd", "ik", (("ds", "ij"), ("ds", "jk")), "ijk"),
+        ("dd", "ij", (("dd", "ij"), ("dd", "ik"), ("dd", "jk")), "ijk"),
+    ]
+    for spec in non_qualifying:
+        assert (
+            ops._build_regblock_dual_path(
+                _build_census_cin(*spec),
+                None,
+                compile_options=options,
+            )
+            is None
+        )
+
+
 @pytest.mark.parametrize(
     "explicit_update",
     [False, True],
