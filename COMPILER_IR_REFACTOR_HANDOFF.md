@@ -28038,3 +28038,227 @@ protected hashes before every commit, leave origin at 58e8565, update
 §29 (or add §30) and this handoff with honest receipts and
 limitations, and provide the next broad continuation prompt.
 ```
+
+## Phase-6 dense-layout rigorous review corrections (2026-07-28, supersedes §29 routing)
+
+The chronologically latest review is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §30.  Independent adversarial
+review found real gaps in the inherited dense-layout milestone and
+closed them in fourteen local commits:
+
+- `ce39b36` / `50fce1e` make CIN admission descriptor-free,
+  comprehensive, depth-bounded, and one-scan within a compiler-owned
+  call; complete logical-to-physical dense-layout ownership through
+  workspaces, relayout, results, ABI, and public wrapping; and lock the
+  runtime and adversarial boundaries;
+- `a356148` / `7a8621c` preserve only the exact legacy automatic
+  workspace alias receipt, refuse unverifiable caller-owned debug
+  lowering, replace recursive generic copying with a validated
+  forward-field copy, validate linked tile metadata, and lock every
+  raw-exception and compatibility boundary found by the review; and
+- `66a0817` / `c0cd7fe` restore the nonsemantic ownership of mutable
+  scheduler metadata exposed by the first clean compiled rerun:
+  normalization discards it, while the raw legacy adapter validates
+  every field its forward copier consumes; and
+- `2ebead9` / `e82603d` / `d14f87e` preserve canonical diagnostics for
+  the exact admitted legacy alias receipt, retain always-on structural
+  access-rank validation, and align the compatibility/relayout locks
+  after the first clean full-suite partition found those three
+  discrepancies;
+- `8612679` / `291f64e` close the latency gate discovered at exact
+  `d14f87e` by proving the compiler-built `einsum` root once across both
+  dual arms and the fallback while retaining stage-owned failure and
+  receipt cleanup; and
+- `42d484f` / `b946b58` close the final adversarial raw-`KeyError` escape
+  by requiring both copied optional fields on scheduler-detached tile
+  parents; and
+- `f13ba79` isolates the shared receipt/stage mechanics and restores the
+  exact inherited Flake8 complexity baseline without changing behavior.
+
+The §29 claim of at most two structural scans was wrong: probes counted
+seven scans on the ordinary automatic route and nine on the dual route.
+The first correction still left three scans around the production
+`einsum` dual/fallback block and crossed the latency policy; the final
+scoped receipt reduces that block to one scan without weakening direct
+entries.  The first and third base-to-candidate pairs pass every endpoint
+(worst 1.057 p95); the reverse-order run retains one isolated
+`small_dense` 1.290 p95 tail, reproduced at 1.260 between byte-identical
+candidate revisions while a fresh candidate A/A is green and the third
+pair returns to 1.035/1.047.  It is recorded as same-revision tail
+variance rather than averaged away.  The inherited layout change was
+also incomplete for
+non-identity results, workspace/relayout paths, runtime wrapping, and
+ABI metadata; those paths are now covered through rank three, f32/f64,
+and zero extents.
+
+One final read-only adversarial audit narrowed the raw compatibility
+claim: the legacy workspace validator proves exact alias topology and
+independent validity of non-aliased leaves, not semantic provenance from
+the pre-workspace source.  The producer RHS and consumer LHS have no
+retained twins after insertion.  Their canonical bytes and emitted
+program change if a caller supplies fresh valid leaves; production keeps
+the scheduler-to-lowerer handoff synchronous.  B1 must preserve source
+provenance structurally in the typed plan rather than trying to recover
+it from post-transformation raw CIN.
+
+Phase 6 remains **NO-GO on one production-relevant cluster only**:
+sparse result/workspace representation.  No schema version changed in
+the review.  The next session may take a broader milestone: independently
+review the §30 corrections, implement both B1 and B2 if the evidence
+supports them, repeat the complete Phase-6 exit audit, and—only after a
+genuine GO—start the smallest Phase-7 target-owned runtime-stitch slice.
+
+Exact `f13ba79` gates are sealed under
+`~/.cache/scorch-codex/phase6-layout-review-f13ba79/`: 682 focused
+tests, 414 compiled vertical-slice tests, the 46/40/0 automatic audit,
+all retained corpus/grid/anchor/heap/auto captures, and the
+production-derived 120-case/two-arm census are green.  The complete
+fresh-process non-performance union is **4,504 passed / 14 skipped /
+zero failures** across exactly 4,518 collected identities; full-source
+Black/Flake8/mypy exactly match the inherited one-file/nine-finding/
+140-error-in-11-files baselines after line normalization.  The bounded
+130-file final receipt manifest has SHA-256
+`240f03c6c0b23e38196245096f9465bf5399d97bc216c0806695dd9a1fed9470`.
+
+### Superseding broad copy-paste prompt
+
+```text
+Continue the compiler-IR migration in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call from the current local tip.
+Do not push, switch branches, amend, squash, or reorder existing
+commits. Preserve the five protected dirty files and every unrelated
+untracked GPU/CUDA, benchmark, scheduler, research, scratchpad,
+packaging, and tooling path. Stage explicit pathspecs only and give
+every non-trivial commit a descriptive body.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through §30, and
+the latest COMPILER_IR_REFACTOR_HANDOFF.md section completely before
+editing. First independently review the §30 correction commits
+ce39b36, 50fce1e, a356148, 7a8621c, 66a0817, c0cd7fe, 2ebead9,
+e82603d, d14f87e, 8612679, 291f64e, 42d484f, b946b58, f13ba79, and
+the following documentation commit. Do not trust the handoff. Reproduce
+the critical focused gates, 86-case audit, captures, and compiled
+public-workspace routes, then challenge the implementation with fresh
+adversaries:
+
+- descriptor-diverged and missing/extra stored CIN state at every raw
+  entry; cycles, deep chains, shared DAGs, and state mutation during a
+  compiler call;
+- false legacy-workspace receipts (extra accesses, cross-branch IDs,
+  changed assignment operations, tensor/index metadata, or binders),
+  direct debug-lowering attempts, and hostile discarded/backlink state.
+  Distinguish exact alias topology from source provenance: fresh
+  independently valid unmatched leaves legitimately change the raw
+  program, while the new typed B1 plan must retain its source receipt;
+- linked tile metadata mutations, multiple tiles, detached valid
+  scheduler parents, missing optional fields, and all malformed
+  relations that could otherwise leak a raw exception;
+- random non-identity dense input and result layouts through direct,
+  automatic, stack, heap, relayout, runtime wrapping, rank-three+,
+  f32/f64, and zero-extent paths. Keep permuted compressed levels and
+  unsupported sparse results fail-closed.
+
+Then complete the remaining Phase-6 cluster as two separately
+reviewable, separately gated slices. The session scope is intentionally
+broad enough to finish both when the evidence is green.
+
+Milestone B1 — serial sparse workspace and general ordered assembly:
+
+1. Implement typed serial coo_workspace allocation/reset, merging ADD
+   insertion, sorted drain, and ordered result assembly for the public
+   ss@ss->ss SpMSpM family in both automatic arms.
+2. Keep the representation genuinely level-based. Generalize the
+   existing AppendEntry stream to admitted outputs with DENSE and
+   COMPRESSED levels and lexicographically ordered coordinates; require
+   target assembly to derive parent-linked physical positions rather
+   than adding them as IR nodes. Cover complete leaf blocks,
+   empty-parent omission, empty output, and zero extents. Do not
+   introduce CSR-only schema or interpreter logic.
+3. Use the four-node intrinsic region design recorded in §29.5 unless
+   a fresh responsibility audit proves a smaller coherent model.
+   Adding node kinds requires scorch.loopir.canonical.v9; keep
+   scorch.loopir.request.v2, scorch.loopplan.canonical.v1, and
+   scorch.autopolicy.v1 unchanged.
+4. Widen only the verified tile-free sparse-workspace automatic family
+   (WorkspaceInsertion present, dense=False, exact no_tile_list
+   re-derivation). Require verifier, printer, canonical identity,
+   oracle, erasure, schedule-pass, target, completion, and stage-timing
+   ownership, including a structural source-to-workspace provenance
+   receipt for the producer expression and consumer destination. No
+   rendered-name/tag/regex discovery is allowed.
+5. Gate the executing legacy comparand with byte-identical C++, compiled
+   bitwise/PyTorch and public-route differentials, randomized
+   empty/disjoint/overlap/cancellation cases, explicit zeros, f32/f64,
+   both arms, and forged/missing/extra/cyclic/enum-lookalike/nesting
+   adversaries.
+
+Milestone B2 — mixed compressed-parent/dense-leaf correctness:
+
+1. Implement general mixed compressed-parent/dense-leaf result
+   assembly and the adjacent sd-operand load chain with the dense
+   trailing workspace axis represented structurally.
+2. Do not use legacy byte parity as a correctness claim: the retained
+   generic ss@ss->ds comparand writes through an unsized C_values
+   vector and SIGSEGVs. Preserve that source/transcript as defect
+   evidence, quarantine it from test-process execution, and gate B2 on
+   the independent LoopIR oracle, PyTorch, and public-route
+   differentials instead.
+3. Cover complete dense leaf blocks per materialized compressed parent,
+   empty parents/rows, explicit-zero cancellation, zero extents,
+   f32/f64, multiple compressed levels, rank-three+, and both automatic
+   arms. Return an honest sparse STensor with correct format,
+   mode_order, positions, coordinates, and values.
+4. Keep public ds@ds->ds two-pass OpenMP count/fill SpGEMM outside
+   Phase 6 with a stable structured code unless the representation
+   audit proves it inseparable. Its working public route is the
+   execution oracle; target-owned parallel/runtime stitching belongs
+   to Phase 7.
+
+After B1/B2, regenerate the production-derived automatic/dual census
+from qualification rules, not a hand-picked list. Build every admitted
+constituent through actual LoopIR. Repeat every Phase-6 exit criterion
+line by line: typed and verified decisions, valid explicit/automatic
+differentials across formats/layouts, semantic canonical request
+identity, erasure/oracle evidence, and tile-j/tile-ijk readiness.
+Declare GO only if every production-relevant Phase-6 family is migrated
+or explicitly and correctly assigned beyond Phase 6.
+
+If and only if the audit reaches genuine GO and the primary gates are
+sealed, use remaining session capacity for one coherent Phase-7
+stretch: represent and implement the target-owned runtime dual stitch
+with its structured work estimate/OpenMP policy, or the directly
+adjacent two-pass sparse count/fill stitch if the responsibility audit
+shows that is the smaller owner. Keep production dispatch unchanged;
+do not perform release cutover, selector/cache cutover, legacy deletion,
+Phase 8, or Phase 8.5.
+
+Preserve frozen tuple ownership; descriptor-free exact built-in
+class/type/enum and stored-field validation; deterministic
+artifact-local identities; stage-owned failure; forged/missing/extra/
+hostile/cyclic/shared/depth/descriptor adversaries; structural
+activation even when emission is byte-identical; erasure and
+independent semantic oracles; byte parity only when legacy compiles and
+executes; and no ordinary release-JIT double compilation.
+
+Run focused memberships after every coherent commit. Final gates must
+include the broad CIN/LoopPlan/LoopIR and options/identity memberships;
+the complete compiled scheduled-slice, pipeline-execution,
+schedule-generality, and dual-path battery; the expanded
+production-derived census; fresh corpus/grid/anchor/heap/auto and new
+activating-family captures; the 86-case audit plus new sparse cells;
+public compiled differentials; paired same-session compiler latency
+with warmups/samples and an A/A control; Black, Flake8, focused mypy,
+and same-methodology full-source mypy comparison (reviewed inherited
+baseline: one Black file, nine Flake8 findings, 140 errors in 11 files);
+git diff --check; and a complete clean-detached non-performance suite.
+Use complete non-overlapping fresh-process partitions if needed for the
+documented macOS libomp pthread-key ceiling, and prove the JUnit union
+equals direct collection exactly.
+
+Before editing and before every commit, inspect status, local/live
+origin, and the five protected hashes. Retain evidence outside Git,
+update the Phase-6 review and handoff with exact commands, hashes,
+limitations, and any legacy defect reproductions, push nothing, and
+finish as much of the broad coherent milestone as the evidence honestly
+supports.
+```

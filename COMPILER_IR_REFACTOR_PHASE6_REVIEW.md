@@ -4710,3 +4710,313 @@ Evidence is retained under
   dirty/untracked GPU/CUDA, benchmark, packaging, scheduler, research,
   scratchpad, and tooling material remained untouched; nothing was
   pushed, amended, squashed, or reordered.
+
+## 30. Rigorous review corrections to the dense-layout milestone (2026-07-28)
+
+This section supersedes the boundary and performance claims in §29 where
+they conflict.  The review read `56772e4`, `e8866b9`, `c69c839`,
+`4e63500`, and `a1d4851` in full, reproduced the focused gates, and then
+challenged the admitted boundaries with forged descriptors, stored-state
+mutation, non-identity result layouts, malformed runtime tensor metadata,
+legacy workspace schedules, linked tile metadata, and deep discarded
+compatibility state.  The inherited milestone had several concrete
+fail-open and correctness defects.  The exact compiled/full-suite/latency
+gates and a final independent adversarial pass then exposed six further
+boundary mistakes in the review corrections and adjacent locks.  Fourteen
+focused commits correct the complete set:
+
+- `ce39b36` — exact, descriptor-free CIN admission; one-scan
+  compiler-owned trust; complete dense-layout propagation; bounded ABI
+  and runtime metadata ownership;
+- `50fce1e` — adversarial and production-path coverage for that boundary;
+- `a356148` — exact legacy-workspace compatibility, safe forward copying,
+  and linked schedule-metadata validation;
+- `7a8621c` — the corresponding alias, detachment, and raw-exception
+  regression lock;
+- `66a0817` — keep discarded scheduler compatibility state nonsemantic
+  during normalization while validating it at raw legacy lowering; and
+- `c0cd7fe` — lock both sides of that ownership boundary;
+- `2ebead9` — preserve canonical diagnostics for the one exact admitted
+  legacy schedule alias receipt without weakening strict normalization;
+- `e82603d` — retain always-on access-rank structural validation; and
+- `d14f87e` — align the compatibility and relayout regression contracts
+  with those final boundaries;
+- `8612679` — prove the compiler-built `einsum` root once across the two
+  register-block arms and fallback scheduler, with stage-owned failure;
+- `291f64e` — lock one-scan ownership, receipt cleanup, and the unchanged
+  three-record normalization surface;
+- `42d484f` — require copied optional storage on scheduler-detached
+  logical tile parents; and
+- `b946b58` — prove valid detached parents still lower while both missing
+  fields fail with structured diagnostics; and
+- `f13ba79` — extract the shared receipt accounting so `_einsum_owned`
+  returns to its exact inherited Flake8 complexity baseline.
+
+No serialized contract changed:
+`scorch.loopir.canonical.v8`, `scorch.loopir.request.v2`,
+`scorch.loopplan.canonical.v1`, and `scorch.autopolicy.v1` remain
+current.
+
+### 30.1 CIN admission is now one exact structural boundary
+
+The inherited preflight mixed normal attribute access with stored-state
+inspection and did not cover every structural consumer.  That let hostile
+descriptors select a different graph after validation, let malformed
+graphs reach recursive consumers through direct analysis/lowering
+entries, and made the same compiler-owned root cross the bounded scan
+repeatedly.  The §29 statement that release paths perform at most two
+scans was not true: probes counted seven scans on the ordinary automatic
+path and nine on the dual path.
+
+The correction has one iterative, depth-bounded, descriptor-free
+preflight over exact stored fields.  Structural fields must be present,
+have the exact admitted built-in class/type/enum, and be read solely from
+the admitted object's stored state; compiler admission never invokes
+caller-defined descriptors.  Every raw-CIN entry passes through that same
+preflight, while scheduler and public normalization entries additionally
+normalize the verified graph.  A scoped `ContextVar` receipt lets
+synchronous compiler-owned descendants reuse exactly the already-verified
+root without weakening any caller-owned entry.  The receipt carries no
+authority outside the dynamic compiler call, and direct analyses,
+normalization, scheduling, request identity, and lowering remain strict.
+
+This also corrects §29's latency attribution.  The first receipt
+implementation removed repeated scans from the LoopIR path but missed
+the release `einsum` dual builder: both register-block arms and the
+fallback independently normalized the same freshly compiler-built root,
+so probes still counted three structural scans per call.  Exact
+`d14f87e` latency consequently crossed the 1.10 policy in two independent
+orders (worst **1.133 p50 / 1.130 p95**), with the normalization stage
+explaining 53-76% of the observed deltas.  `8612679` proves that root once
+and scopes its `ContextVar` receipt only across the synchronous internal
+scheduling block; all three historical normalization records remain, and
+a failed shared proof retires the `CompilationContext`.  The successful
+shared scan is included in end-to-end latency but deliberately excluded
+from the per-arm normalization durations because its provisional stage
+token is cancelled to preserve the published record sequence.  Error
+ordering, shared DAG handling, cycle detection, maximum depth, and
+receipt cleanup are locked independently.  The initial inline form also
+raised `_einsum_owned`'s inherited C901 score from 70 to 72; `f13ba79`
+extracts only the receipt/stage lifecycle, restoring 70 without changing
+the trust scope or published stage sequence.
+
+### 30.2 Dense layouts are complete across the whole vertical slice
+
+`c69c839` admitted permuted all-dense inputs but did not propagate the
+logical-to-physical contract through every owner.  Fresh differentials
+found incorrect or rejected behavior for non-identity result layouts,
+workspace addressing, relayout staging, scheduled result copies,
+runtime result wrapping, and several rank-three and zero-extent
+compositions.
+
+The correction makes physical level order the sole storage-order fact
+and maps logical coordinates through it at every input, workspace,
+relayout, result, oracle, target-lowering, and ABI boundary.  Runtime
+wrapping snapshots tensor storage, shapes, dtypes, and mode order before
+caller-visible mutation, validates exact input/result cardinality and
+rank, checks dimensions at signed-64-bit boundaries, and retires the
+compilation stage on every failure.  Permuted compressed levels,
+non-permutation orders, and unsupported permuted sparse results remain
+fail-closed; the schema remains level-based and no CSR-shaped shortcut
+was introduced.
+
+The regression matrix covers f32/f64, unary and multi-input expressions,
+rank two and three, direct and scheduled lowering, stack and heap
+workspaces, relayout, public result wrapping, and every zero-extent
+class.  The generated C++ remains byte-identical on all retained legacy
+capture surfaces.
+
+### 30.3 Legacy automatic workspace schedules use a narrow receipt
+
+The first correction exposed a release-reachable compatibility fact:
+legacy `Scheduler.auto_schedule` creates one producer/consumer workspace
+access pair whose compatibility identities intentionally alias across
+the two branches.  Strict normalized CIN must reject that graph, but the
+compiler-owned legacy lowerer must still consume it.  A broad
+identity-relaxation would have hidden real mutations, while the former
+generic `deepcopy` could recurse through arbitrary unowned instance state
+and leak `RecursionError`.
+
+The final boundary recognizes only the exact legacy alias topology:
+
+- one workspace access on the producer left-hand side and the paired
+  workspace access on the consumer right-hand side;
+- every reused identity at matching branch suffixes, with paired binder
+  identities and tensor-assignment operation, plus exact workspace
+  metadata; non-aliased child fields remain independently validated CIN;
+- no additional duplicate symbol, access, node, or index identities; and
+- only a compiler-owned synchronous ownership transfer after the
+  normalized source was already verified.
+
+That post-transformation graph cannot authenticate the semantic
+*provenance* of the intentionally unmatched producer RHS and consumer
+LHS: workspace insertion replaced and discarded their branch twins.  A
+caller can replace either leaf with fresh, independently valid CIN; the
+canonical bytes and generated program then change with it.  This is not
+an adapter-safety or cache-identity escape, and production `einsum`
+retains a synchronous scheduler-to-lowerer handoff.  Proving that those
+leaves came from a particular pre-workspace source requires a retained
+typed plan/source receipt, which B1 must own rather than infer from raw
+legacy syntax.
+
+Caller-owned debug lowering with verification enabled refuses such a
+derived graph with `unverifiable_legacy_schedule_aliases`; it never
+silently skips semantic verification.  The public `lower_IndexStmt`
+surface no longer exposes an ownership-transfer escape hatch.  The
+private `_lower_owned_IndexStmt` documents the synchronous handoff and
+does not return the transferred tree.
+
+The adapter now copies only validated forward and
+schedule-authoritative fields, then rebuilds reverse links.  Arbitrary
+extra or discarded attributes are neither copied nor traversed.  The
+finite known scheduler backlink surface is instead validated
+relationally before reverse links are rebuilt; that validation covers
+logical parent expressions, outer/inner tile flags, `TileSizeVar`
+endpoints and base, parent membership, `no_tile_list`, tensor-access
+backlinks, and missing optional fields.
+Malformed state fails with structured `VerificationError` rather than
+`KeyError`, `AssertionError`, `ValueError`, or `RecursionError`.  Exact
+untiled, workspace, regblock, and multiple-tile legacy schedules retain
+their historical emission.  Rank-zero scalar `TensorVar` values retain
+the established no-format contract; higher-rank tensors remain strict.
+
+The first exact compiled battery caught a real regression in this
+boundary:
+`test_source_comparison_ignores_nonsemantic_legacy_metadata` failed
+because the shared preflight rejected a hostile `no_tile_list` before
+normalization could discard it.  The fix distinguishes semantic forward
+state from mutable legacy schedule state.  Normalization ignores and
+resets workspace markers, `no_tile_list`, tile roles/backlinks, and
+reverse access lists; the raw legacy adapter validates those same fields
+because its forward copier consumes them.  Twelve focused adversaries
+cover both directions.  The failed run is retained rather than
+overwritten (one failure / 413 passes).
+
+The first clean-detached full-suite partition then caught three further
+problems rather than allowing a focused-only result to stand:
+
+- canonical dumping rejected the exact legacy alias receipt that the raw
+  compiler-owned adapter admits.  The compatibility fallback now applies
+  only when the strict defects are duplicate node/index identities and
+  the complete exact legacy receipt validates;
+- one intermediate correction accidentally made an access-rank mismatch
+  debug-policy-dependent.  Access arity is structural and is again
+  rejected at every entry; the debug-policy fixture now uses a genuinely
+  semantic dangling-index defect; and
+- an identity-layout relayout fixture expected the old blanket
+  `invalid_schedule_relayout` result, although the generalized dense
+  layout boundary correctly admits either logical access order.  With no
+  matching staged read, its stable failure is `relayout_target_missing`.
+
+The failing partition is retained.  Every final receipt below uses exact
+`f13ba79`, after all corrections.  A final independent adversarial pass
+also found that the detached logical parent admitted for successive
+legacy tiles treated missing `_parent` and `tile_size_var` storage as
+their valid `None` value.  The forward copier indexes both fields, so
+that gap leaked raw `KeyError`.  `42d484f` requires exact presence plus
+`None`; the two-case lock at `b946b58` retains valid detached lowering
+and structured rejection for either deletion.
+
+### 30.4 Exit disposition
+
+The corrections do not widen the Phase-6 claim.  Phase 6 remains
+**NO-GO on exactly one production-relevant cluster**: sparse
+result/workspace representation.  §29.5's sequencing remains sound:
+B1 is serial `coo_workspace` plus general multi-level ordered sparse
+assembly against the executing `ss@ss->ss` comparand; B2 is the mixed
+compressed-parent/dense-leaf correctness slice gated on the LoopIR
+oracle, PyTorch, and the public route because its legacy comparand is
+memory-unsafe.  The two-pass OpenMP count/fill form stays assigned to
+Phase 7.  No Phase-7 work, cutover, cache/selector change, or legacy
+deletion was started.
+
+### 30.5 Exact-revision verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-layout-review-f13ba79/`.
+Every command below imported Scorch from the clean detached
+`f13ba79` worktree unless explicitly identified as a base control.
+The bounded 130-file receipt manifest is
+`FINAL_RECEIPTS_SHA256SUMS`, SHA-256
+`240f03c6c0b23e38196245096f9465bf5399d97bc216c0806695dd9a1fed9470`;
+the earlier root `SHA256SUMS` remains the narrower
+audit/capture/census manifest.
+
+- focused review membership after the final corrections: **682 passed**
+  across CIN analysis, CIN lowering, schedule API, LoopPlan, compiler
+  stage timing, and the formerly failing compiled source-comparison
+  case;
+- 86-case automatic audit, twice: **46 admitted / 40 rejected / zero
+  divergent**; the JSON results are byte-identical (SHA-256
+  `f2d004b1f320489d43545346ed2eaf6a994db27f2165f31a17eb1405e390f7ac`);
+- fresh source captures: corpus **20/20**, grid **42/42**, anchors
+  **22/22**, and heap **11/11** are byte-identical to §29 and chain to
+  the sealed Phase-6 baselines.  All **22** auto source/CIN artifacts
+  are exact; its twenty-third report differs only in the same two
+  previously demonstrated process-dependent cache-key suffix
+  characters and is byte-identical after normalizing exactly those two
+  evidence-only fields.  Corpus/grid/anchor/heap manifest SHA-256 values
+  are `7e4a9c436e5ed1005874e9ece56847ea4ef88dd6f5a04c4d657c3ca5b37cd6c4`,
+  `65e68ba19510ab240cf85574aa6be272dd6e5b0fdd7e799f7bcfe9db6d06c094`,
+  `44b39b55fbaea4bccbfac2aca6c217ca6b7ccd7135c8d50950efd96fd7f2dd13`,
+  and `aa8be2229bea130833461d6dcf789722837f1a100f2da2a74de9cc4b2dcb4f72`;
+- full-source static parity: Black reports the one inherited
+  `prebuilt_kernels.py` file, Flake8 reports the same nine inherited
+  findings, and mypy reports the same **140 errors in 11 files**; the
+  normalized Black, Flake8, and mypy logs are byte-identical to the
+  inherited baseline (SHA-256
+  `0cba9cee6ea6e561b398ea9e56f9ba0ddeb040c6d836e6566adfd0b742c5c777`,
+  `8aa1212e0d42a9b8b90e2e0798fd3f2ce5085b389dd75205e0d942d98cfcc6b0`,
+  and
+  `bf34740270200e2521f2d5f287d788714a8bfd2733d932cfc4c735f1dc6d6681`);
+- non-performance collection selects **4,518 of 4,521** tests, with
+  exactly three performance tests deselected;
+- complete compiled scheduled-slice, pipeline-execution,
+  schedule-generality, and dual-path battery: **414 passed / zero
+  failures in 1,150.01 s** (log SHA-256
+  `3288c79598d02fb9121006f0e92f6a4b6d4a409b3757b60fcda5ab3907a054fb`,
+  JUnit SHA-256
+  `dafd617a42e97f606c18b5e9dfbbfbd9eb17ec2d664441d54c95d34c0c4795fe`);
+- production-derived layout/dual census, two seeds with 60 cases each:
+  **120 attempted**, **96 qualified / 24 skipped**, **192 arm
+  evaluations**, **82 admitted and byte-identical**, **108 expected
+  structured rejections**, and **zero mismatches**.  The only two raw
+  exceptions are both arms of the already documented, public-unreachable
+  broadcast-only result-axis case (`No lattice points generated`);
+  the combined census log remains byte-identical to `d14f87e`, SHA-256
+  `f9f81e072e8c361770462bd1df0de42da110dcfa5f3c15bb7ecb0705c9293b0a`;
+- paired same-session compiler latency, clean detached `a1d4851` base
+  versus `f13ba79` candidate, 5 warmups / 30 samples: the first and third
+  base-to-candidate pairs pass every endpoint (worst **1.057 p95**), while
+  the reverse-order run has one isolated `small_dense` p95 tail at
+  **1.290** with p50 1.063.  Comparing the two byte-identical candidate
+  runs reproduces that tail at **1.260 p95**; a fresh back-to-back
+  candidate A/A is fully green and the third paired run returns
+  `small_dense` to **1.035/1.047**.  The crossing is therefore retained
+  and attributed to same-revision tail variance rather than averaged
+  away.  All build tuples/source hashes are identical; attribution JSON
+  SHA-256
+  `a3cce293e0c1f690e03b1df050885bdda59693b11083b9d6dd9512e04b364007`;
+- partitioned complete non-performance suite, run sequentially in fresh
+  processes and isolated caches to avoid the documented macOS libomp
+  pthread-key ceiling: partition A passed **3,765** with **14 skipped**
+  and the one inherited PyTorch sparse-invariant warning in
+  **1,762.966 s**, and partition B passed **739** with the three
+  performance tests deselected in **1,233.772 s** — **4,504 passed, 14
+  skipped, zero failures**.  The JUnit union contains exactly all
+  **4,518** directly collected non-performance cases with zero missing,
+  extra, duplicate, or overlapping identities; the selected list,
+  pre-run partition union, and post-run JUnit union share SHA-256
+  `daaa4a72c8d4e8d100caab2598370253650504b9ea04dd8a7799eefd3bf6883d`.
+  The union summary JSON has SHA-256
+  `b65dd4f4700cfa79621c67bf08af81597324654696cc8e368d7c811b55330f0a`.
+  Partition log SHA-256 values are
+  `49abfce7321710e3fe694515c9d4e50fd7c6acec0e8bf187e81a113f5702d9be`
+  and
+  `cd21a86fb1e77f8f552ea4c6e5863efac752d7839d578f8efae49b1704bc5198`;
+- `git diff --check` is clean; the detached worktree remained clean;
+  local and live origin remained `58e8565`; the five protected files
+  retained their recorded hashes; all unrelated dirty/untracked
+  GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
+  tooling material remained untouched; nothing was pushed, amended,
+  squashed, or reordered.
