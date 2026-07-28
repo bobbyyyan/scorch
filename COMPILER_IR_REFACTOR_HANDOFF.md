@@ -28322,3 +28322,62 @@ result/workspace cluster; the §30 B1/B2 milestone definitions and the
 §29.5 four-node design remain the active plan.  B1 must preserve source
 provenance structurally in the typed plan (the raw adapter provably
 cannot recover it).  Work continues in this session toward B1.
+
+## Partial-B1 rigorous review checkpoint (2026-07-28; supersedes the §31 tail)
+
+The partial B1 stack (`28823db` through `f3f4545`) has now received a
+direct semantic, adversarial, replay, and integration review.  The review
+corrections are four local commits:
+
+- `deb71d4` — canonical level storage, sparse-region verifier/pass
+  boundaries, standalone CIN-analysis preflight, exact schedule inputs,
+  and restored LoopIR typing;
+- `c12b625` — direct oracle/erasure/canonical/lifetime/hostile-state tests
+  plus the explicit unfinished-target pipeline lock;
+- `121e4a9` — artifact-local deterministic drain binders, exact
+  one-reduction B1 admission, frozen-schedule use-boundary revalidation,
+  and total huge-int diagnostics;
+- `01de1b2` — replay/collision, extra-reduction, canonical rendering,
+  role-scope, hostile cache/compiler state, and diagnostic regressions.
+
+The important late review finds were real: a valid B1
+`ScheduledLoopIR` could not verify its own replay because the drain
+`IndexId` was process-global; an extra outer reduction caused repeated
+workspace resets/drains and duplicate sparse appends; and a frozen
+`Schedule` forged after construction could run caller hooks in scheduler
+or cache-key code.  These are fixed and locked.  The semantic B1 core
+remains level-based and oracle-correct.
+
+Verification at the code/test tip `01de1b2`: focused review **820
+passed**; broad CIN/LoopPlan/LoopIR adjacency **1,313 passed**; clean
+detached compiled scheduled-slice + pipeline + schedule-generality +
+dual-path battery **416 passed in 1,123.59 seconds** with candidate
+import provenance asserted; LoopIR mypy zero; full-source mypy restored
+from the partial B1 checkpoint's 149 findings in 13 files to the
+established 140 in 11; Black/Flake8 inherited sets unchanged; whitespace
+clean.  The literal clean-detached full run reached 4,549 passed / 14
+skipped / 3 performance-deselected before nine late JIT subprocesses hit
+the documented macOS libomp pthread-key ceiling (`OMP Error #179`).
+Fresh-process reruns covered every failed node (11 green
+schedule-generality selections, including adjacent parameters, plus the
+one value-object case).  The proven complete union is **4,558 passed / 14
+skipped / 3 deselected / zero code failures**.
+
+Phase 6 remains **NO-GO**.  Target integration is still absent by design:
+both public `ss@ss->ss` automatic arms build and verify the typed
+sparse-workspace program, then fail closed at
+`unsupported_program_shape` in the existing hierarchical-compressed
+target boundary.  No B1 source-parity, compiled sparse-output, B2, exit,
+or Phase-7 claim has been made.
+
+The active continuation is intentionally broad: independently review
+`deb71d4`, `c12b625`, `121e4a9`, and `01de1b2`; complete the narrowly
+gated B1 LLIR target and both-arm pipeline route with byte parity and
+direct sparse-output execution; then, if every B1 gate is green,
+continue into the independently-oracled B2 mixed-level slice, regenerate
+the automatic/dual census, and perform the criterion-by-criterion
+Phase-6 exit audit.  Only a genuine GO may open a small Phase-7 stretch.
+Preserve the §29.5/§31 constraints: no CSR-only schema, no global target
+weakening, no rendered-name discovery, no execution of the known
+memory-unsafe mixed-level legacy comparand, no release cutover, no push,
+and no protected/unrelated-file changes.

@@ -5109,7 +5109,7 @@ compiler-trusted scopes such as the scoped receipt window.
 
 ### 31.3 The corrections
 
-Four commits close the complete set:
+Five commits close the complete set:
 
 - `8f43cea` — completed-object revisits now diagnose
   `duplicate_node_reference` for every node kind except the
@@ -5196,3 +5196,145 @@ No serialized contract changed: `scorch.loopir.canonical.v8`,
 `scorch.autopolicy.v1` remain current.  Phase 6 remains **NO-GO on
 exactly the sparse result/workspace cluster** (B1/B2), unchanged by this
 review.
+
+## 32. Rigorous review of the partial B1 sparse-workspace milestone (2026-07-28)
+
+### 32.1 Scope and verdict
+
+The inherited B1 checkpoint (`28823db` through `f3f4545`) was reviewed as
+an intentionally incomplete vertical slice, not accepted from its session
+report.  Its semantic core is sound: the level-based program descends
+parent positions through a merged INTERSECTION, accumulates serially by
+coordinate, drains in coordinate order, preserves explicit-zero
+cancellation, and derives multi-level output storage from the ordered
+coordinate stream.  The representation is not CSR-specific.
+
+The checkpoint was nevertheless not ready to hand to target work.  It added
+roughly 1,250 production lines with only three small compatibility-test
+edits, had no direct B1 oracle/erasure/canonical/adversarial coverage, and
+contained concrete correctness and fail-closed defects.  Four local commits
+now close the review defects:
+
+- `deb71d4` — production boundary corrections;
+- `c12b625` — the first direct semantic/adversarial test lock;
+- `121e4a9` — deterministic replay and use-boundary corrections;
+- `01de1b2` — replay, hostile-state, and diagnostic regressions.
+
+The target path remains deliberately absent.  Both public automatic
+`ss@ss->ss` policy arms now reach verified sparse-workspace schedule
+application and then stop at the existing
+`unsupported_program_shape` hierarchical-compressed target boundary.  Phase
+6 therefore remains **NO-GO** on the same B1/B2 cluster; this review makes no
+target-parity or Phase-6 exit claim.
+
+### 32.2 Confirmed defects and corrections
+
+The review found and fixed these material issues:
+
+1. `LevelOutputBuilder.finish()` divided by zero for a zero-extent trailing
+   dense level and eagerly materialized the entire dense-suffix Cartesian
+   product even for an empty output.  Dense suffixes are now checked lazily,
+   zero suffixes are canonical empty outputs, unsupported level kinds and
+   excessive ranks fail closed, and `LevelTensor` validates its complete
+   DENSE/COMPRESSED storage contract.
+2. Sparse-workspace consumers could place drains under dynamically repeated
+   control flow, nest a second drain of the same workspace, or never consume
+   `SparseWorkspaceValue`.  The verifier now requires one direct ordered
+   drain and at least one in-scope consumption while preserving room for
+   dense-suffix work inside its body.
+3. A noncanonical all-`None` merge-position tuple serialized differently
+   from the equivalent empty tuple.  It is now rejected; continuation
+   builders also scan identity values stored in tuple fields.
+4. Loop reorder and scheduled-carrier admission omitted
+   `SparseWorkspaceRegion`, while sparse dependency analysis omitted
+   `MergedSparseFor.positions`.  Existing sparse regions can no longer be
+   reordered or passed off as an unscheduled base, and child cursor
+   dependencies retain their position-binder dominance.
+5. `apply_sparse_workspace` accepted malformed workspace facts, broader
+   output/loop roles than its B1 implementation, and an extra outer
+   reduction.  The latter reset and drained the region repeatedly, producing
+   duplicate/out-of-order appends.  Admission is now the exact
+   identity-ordered rank-2 C/C result with one final logical INTERSECTION
+   reduction and one trailing single-cursor result axis.
+6. The generated drain binder came from the process-global `IndexId`
+   allocator.  It could collide with an imported artifact and made the
+   public `verify_scheduled_loopir` replay differ structurally from the
+   artifact it was verifying.  Resumed builders now continue from every
+   stored artifact `IndexId`; both automatic policy arms replay exactly.
+7. Frozen `Schedule`, `TileSpec`, and `RelayoutSpec` instances were checked
+   only at construction.  Post-construction forged fields could execute
+   caller hooks in scheduling or cache-key construction.  Compiler and
+   cache-key boundaries now revalidate exact stored fields, descriptor
+   agreement, nested exact carriers, and canonical owned state before
+   comparison or rendering.
+8. A reused `CINLowerer` silently treated a second valid program as an
+   internal subtree; standalone iteration-domain analysis could recurse or
+   leak raw exceptions on hostile CIN.  Lowerers are explicitly single-use
+   after an outermost lowering begins, and the public analysis shares the
+   bounded structural preflight.
+9. Huge exact integer extents could leak CPython's decimal digit-limit
+   `ValueError` while formatting storage/oracle diagnostics.  Bounded
+   diagnostic rendering now preserves domain-specific errors without
+   coercing or accepting the value.
+10. The B1 files introduced nine mypy findings.  The typed fixes restore
+    zero findings under `src/scorch/compiler/loopir/` and return full-source
+    mypy from the inherited B1 checkpoint's 149 findings in 13 files to the
+    established 140 findings in 11 files.
+
+Fresh malformed-node sweeps over every field of a valid sparse-workspace
+graph produced only controlled verifier diagnostics.  The schedule tests
+also lock missing fields, descriptor/stored-state divergence, hostile scalar
+subclasses, unowned iterable containers, producer/output role separation,
+canonical name exclusion, erasure, empty inputs, cancellation, and
+independent carrier replay.
+
+### 32.3 Verification
+
+All commands used the `scorch` conda environment.  The broad pure membership
+(levels, oracle, printer, verifier, schedule passes, CIN lowering and
+analysis, neutrality, LoopPlan and identity, legacy lowering, schedule API,
+stage timing, and raw-string budget) passed **1,313 tests**.  The focused
+review selection passed **820 tests**.  A clean detached worktree at
+`01de1b2`, with `scorch.__file__` asserted inside that worktree, passed the
+complete scheduled-slice, pipeline-execution, schedule-generality, and
+dual-path compiled battery: **416 passed in 1,123.59 seconds**.
+
+Black and Flake8 have the same inherited file/finding sets as `f3f4545`
+(paths and affected line numbers aside); focused LoopIR mypy is clean.
+Full-source mypy improves from **149 errors in 13 files** at the partial B1
+checkpoint to the established inherited baseline of **140 errors in 11
+files**.  `git diff --check` is clean.  The clean-detached full
+non-performance run reached **4,549 passed / 14 skipped / 3 performance
+deselected** before nine late JIT subprocess creations hit the documented
+macOS libomp pthread-key ceiling (`OMP Error #179`, every failure the same
+`SIGABRT` at `pthread_key_create`).  A fresh process reran the complete
+failed schedule-generality selection plus adjacent parameter cells:
+**11 passed**; a second fresh process reran the one failed value-object case:
+**1 passed**.  The proven complete union is therefore **4,558 passed / 14
+skipped / 3 performance deselected / zero code failures**.  The independent
+compiled battery had already passed all eight affected
+schedule-generality cases before the exhausted full-suite process.
+
+The five protected tracked files retained their required SHA-256 values
+through every commit, only explicit paths were staged, all unrelated
+GPU/benchmark/scheduler/research/scratchpad material remains untouched,
+nothing was pushed, and local/live origin was not moved by this review.
+
+### 32.4 Next boundary
+
+The next coherent milestone is still B1 target completion, now on a much
+firmer contract.  Implement one narrowly recognized LLIR lowering for the
+verified outer sparse row → sparse-workspace region → merged reduction →
+child sparse axis → insert/drain/append shape.  Emit the retained serial
+`coo_workspace_1d` allocation, merged insertion, sorted drain, and
+two-compressed-level assembly byte-for-byte in both automatic arms.  Do not
+weaken the general target's existing hierarchical-compressed restrictions.
+Then add direct compiled sparse-output execution and PyTorch/oracle
+differentials (the dense-only shadow helper is not an honest sparse-output
+oracle), completion-loss adversaries, stage timing, and source parity.
+
+If those gates are green, continue in the same session into B2 as the
+independent-oracle correctness slice described in §29.5/§31: the legacy
+mixed-level comparand is memory-unsafe and must not be used as a parity
+oracle.  Regenerate the production-derived census and repeat the full Phase-6
+exit audit only after both slices.  Phase 7 may begin only on a genuine GO.
