@@ -1,7 +1,8 @@
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Iterator, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 from torch.fx import Proxy
@@ -1642,6 +1643,28 @@ def _build_regblock_dual_path(
     )
 
 
+@contextmanager
+def _trusted_compiler_built_cin(
+    cin_stmt: IndexStmt,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> Iterator[None]:
+    """Prove one compiler-built CIN root and scope its structural receipt."""
+
+    receipt_token = compilation_context.begin_stage(
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        compile_options=compile_options,
+    )
+    try:
+        verify_cin_structure(cin_stmt)
+    except Exception:
+        compilation_context.fail_stage(receipt_token)
+        raise
+    compilation_context.cancel_stage(receipt_token)
+    with _trusted_normalized_cin(cin_stmt):
+        yield
+
+
 def _einsum_owned(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
@@ -2254,17 +2277,11 @@ def _einsum_owned(
     # constructed CIN root.  Prove that root once, then carry the receipt only
     # across this synchronous compiler-owned scheduling block.  No caller code
     # can mutate the graph between the verification and these consumers.
-    receipt_token = compilation_context.begin_stage(
-        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
-        compile_options=compile_options,
-    )
-    try:
-        verify_cin_structure(cin_stmt)
-    except Exception:
-        compilation_context.fail_stage(receipt_token)
-        raise
-    compilation_context.cancel_stage(receipt_token)
-    with _trusted_normalized_cin(cin_stmt):
+    with _trusted_compiler_built_cin(
+        cin_stmt,
+        compile_options,
+        compilation_context,
+    ):
         _dual_llir: Optional[llir.Function] = None
         if (
             effective_schedule is None
