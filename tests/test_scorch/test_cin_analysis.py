@@ -982,6 +982,8 @@ def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
         "duplicate_index_id",
         "duplicate_node_id",
     }
+    scheduled_dump = canonical_cin_dump(scheduled)
+    assert '"kind":"where"' in scheduled_dump
 
     lowered = CINLowerer(compile_options=release_options).lower_IndexStmt(scheduled)
     debug_scheduled = Scheduler.auto_schedule(
@@ -1015,6 +1017,12 @@ def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
     with pytest.raises(VerificationError) as missing_marker_error:
         CINLowerer(compile_options=release_options).lower_IndexStmt(missing_marker)
     assert _assert_structured_diagnostics(missing_marker_error) == {
+        "duplicate_index_id",
+        "duplicate_node_id",
+    }
+    with pytest.raises(VerificationError) as missing_dump_marker_error:
+        canonical_cin_dump(missing_marker)
+    assert _assert_structured_diagnostics(missing_dump_marker_error) == {
         "duplicate_index_id",
         "duplicate_node_id",
     }

@@ -3339,10 +3339,11 @@ def test_relayout_plan_gate_requires_the_exact_family():
             provenance="explicit",
         ),
     )
-    # The rank-2 access and its physical levels are plan facts, so they
-    # must fail before any scheduling pass begins replay.
+    # Logical access order may differ from physical panel/pack order for a
+    # non-identity dense layout.  In this identity-layout fixture the swapped
+    # tuple is structurally admissible but selects no direct operand read.
     expect_code(
-        "invalid_schedule_relayout",
+        "relayout_target_missing",
         apply_schedule_plan,
         lowering.program,
         relayout_plan(

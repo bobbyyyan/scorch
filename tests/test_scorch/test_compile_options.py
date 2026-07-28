@@ -759,13 +759,14 @@ def test_production_and_debug_snapshots_preserve_verification_policy() -> None:
         llir_pass_options=DEBUG_LLIR_PASS_OPTIONS,
     )
     i = IndexVar("i")
+    j = IndexVar("j")
     invalid = ForAll(
         i,
-        TensorAssign(TensorVar("C", fmt="dd")[i], TensorVar("A", fmt="dd")[i]),
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[j]),
     )
 
     normalize_cin(invalid, compile_options=production)
-    with pytest.raises(VerificationError, match="tensor_access_rank_mismatch"):
+    with pytest.raises(VerificationError, match="dangling_index_reference"):
         normalize_cin(invalid, compile_options=debug)
 
     _, _, production_lowerer, production_cpp = _compile_spmm(
