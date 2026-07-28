@@ -30,7 +30,10 @@ its verifier-proved race discipline; it deliberately carries no OpenMP or
 target-policy spelling.  Concepts the migrated families do not exercise are
 still not declared: there are no accumulators, integer constants, physical
 position loads (dense value-bearing leaves below sparse levels),
-dimension-extent or sparse (hashed) workspaces.
+or dimension-extent expressions.  The serial sparse-result slice adds a
+target-neutral :class:`SparseWorkspaceRegion`: coordinate/value insertions
+merge under ADD and one ordered drain exposes the merged entries, while
+capacity, hashing, sorting, and the backing container remain target concerns.
 
 Discipline carried over from the spike and the binding design decisions:
 
@@ -708,8 +711,8 @@ class SparseWorkspaceInsert(Stmt):
     (``entry = entry op value``; an absent entry is created with the
     value).  Only ADD is admitted, and its identity is exactly the absent
     entry the owning region's empty-entry contract established.  ``coord``
-    must be value-typed over the workspace's drain dimension and is legal
-    only inside the owning region's producer.
+    must be coordinate-typed over the workspace's drain dimension and is
+    legal only inside the owning region's producer.
     """
 
     workspace: WorkspaceId
@@ -972,14 +975,16 @@ class Store(Stmt):
 
 @dataclass(frozen=True)
 class StoreReduce(Stmt):
-    """A coordinate-addressed read-modify-write into an all-dense output.
+    """A coordinate-addressed semantic read-modify-write.
 
     Combines the stored element with ``value`` using ``op``
-    (``target = target op value``).  Only ADD is admitted, and the contract
-    it depends on is explicit: every dense output this subset executes is
-    zero-initialized before the program body runs, which is exactly ADD's
-    identity.  This is how the dense reduction/matmul family reduces —
-    there is deliberately no scalar-accumulator node in this subset.
+    (``target = target op value``).  Only ADD is admitted.  On an all-dense
+    output, the target is zero-initialized before the body runs, exactly
+    matching ADD's identity.  On an identity-ordered DENSE/COMPRESSED
+    output, this is the target-neutral semantic accumulation form: the
+    oracle combines contributions by coordinate, while target lowering
+    requires a sparse-workspace pass to rewrite it into ordered assembly.
+    There is deliberately no scalar-accumulator node in this subset.
     """
 
     tensor: SymbolId

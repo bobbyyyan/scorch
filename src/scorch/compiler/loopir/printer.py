@@ -424,7 +424,7 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is MergedSparseFor:
-        serialized = {
+        serialized: Dict[str, object] = {
             "kind": "merged_sparse_for",
             "mode": stmt.mode.value,
             "cursors": [_serialize_cursor(cursor, ids) for cursor in stmt.cursors],
@@ -737,10 +737,11 @@ def _render_stmt(
         lines.append(f"{pad}}}")
         return
     if type(stmt) is WorkspaceRegion:
-        decl = stmt.workspace
+        workspace_decl = stmt.workspace
         lines.append(
-            f"{pad}workspace_region w{ids.workspace(decl.workspace)} "
-            f"{decl.name!r} {decl.dtype.value} over s{ids.tile(decl.tile)} {{"
+            f"{pad}workspace_region w{ids.workspace(workspace_decl.workspace)} "
+            f"{workspace_decl.name!r} {workspace_decl.dtype.value} "
+            f"over s{ids.tile(workspace_decl.tile)} {{"
         )
         lines.append(f"{pad}  producer {{")
         _render_stmt(stmt.producer, ids, names, indent + 2, lines)
@@ -759,11 +760,13 @@ def _render_stmt(
         )
         return
     if type(stmt) is SparseWorkspaceRegion:
-        decl = stmt.workspace
+        sparse_workspace_decl = stmt.workspace
         lines.append(
-            f"{pad}sparse_workspace_region w{ids.workspace(decl.workspace)} "
-            f"{decl.name!r} {decl.dtype.value} "
-            f"drain d{ids.dimension(decl.drain_dimension)} {{"
+            f"{pad}sparse_workspace_region "
+            f"w{ids.workspace(sparse_workspace_decl.workspace)} "
+            f"{sparse_workspace_decl.name!r} "
+            f"{sparse_workspace_decl.dtype.value} "
+            f"drain d{ids.dimension(sparse_workspace_decl.drain_dimension)} {{"
         )
         lines.append(f"{pad}  producer {{")
         _render_stmt(stmt.producer, ids, names, indent + 2, lines)

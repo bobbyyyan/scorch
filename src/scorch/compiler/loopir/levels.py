@@ -777,6 +777,115 @@ class LevelTensor:
     coordinates: Tuple[Any, ...]
     values: Tuple[float, ...]
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "shape",
+            "level_kinds",
+            "positions",
+            "coordinates",
+            "values",
+        ):
+            _stored_field(self, field_name, "LevelTensor")
+        if type(self.shape) is not tuple or not self.shape:
+            raise LevelStorageError("LevelTensor.shape must be a nonempty tuple")
+        if len(self.shape) > MAX_LEVEL_STORAGE_RANK:
+            raise LevelStorageError(
+                f"rank {len(self.shape)} exceeds the level-storage limit "
+                f"{MAX_LEVEL_STORAGE_RANK}"
+            )
+        for level, extent in enumerate(self.shape):
+            if _expect_exact_int(extent, f"shape[{level}]") < 0:
+                raise LevelStorageError("LevelTensor extents must be nonnegative")
+        rank = len(self.shape)
+        if (
+            type(self.level_kinds) is not tuple
+            or len(self.level_kinds) != rank
+            or any(
+                type(kind) is not LevelKind
+                or (kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED)
+                for kind in self.level_kinds
+            )
+        ):
+            raise LevelStorageError(
+                "LevelTensor needs one DENSE/COMPRESSED kind per level"
+            )
+        if (
+            type(self.positions) is not tuple
+            or type(self.coordinates) is not tuple
+            or len(self.positions) != rank
+            or len(self.coordinates) != rank
+        ):
+            raise LevelStorageError(
+                "LevelTensor position and coordinate streams must match its rank"
+            )
+
+        parent_count = 1
+        for level, kind in enumerate(self.level_kinds):
+            offsets = self.positions[level]
+            coords = self.coordinates[level]
+            if kind is LevelKind.DENSE:
+                if offsets is not None or coords is not None:
+                    raise LevelStorageError(
+                        f"dense level {level} must use implicit storage"
+                    )
+                parent_count *= self.shape[level]
+                continue
+            if type(offsets) is not tuple or type(coords) is not tuple:
+                raise LevelStorageError(
+                    f"compressed level {level} needs owned position and "
+                    "coordinate tuples"
+                )
+            if len(offsets) != parent_count + 1:
+                raise LevelStorageError(
+                    f"compressed level {level} has {len(offsets)} offsets for "
+                    f"{parent_count} parents"
+                )
+            previous = 0
+            for position, offset in enumerate(offsets):
+                _expect_exact_int(offset, f"positions[{level}][{position}]")
+                if position == 0 and offset != 0:
+                    raise LevelStorageError(
+                        f"compressed level {level} positions must start at zero"
+                    )
+                if offset < previous:
+                    raise LevelStorageError(
+                        f"compressed level {level} positions must be nondecreasing"
+                    )
+                previous = offset
+            if offsets[-1] != len(coords):
+                raise LevelStorageError(
+                    f"compressed level {level} positions must terminate at "
+                    "the coordinate count"
+                )
+            for parent in range(parent_count):
+                last = -1
+                for position in range(offsets[parent], offsets[parent + 1]):
+                    coord = _expect_exact_int(
+                        coords[position],
+                        f"coordinates[{level}][{position}]",
+                    )
+                    if not 0 <= coord < self.shape[level]:
+                        raise LevelStorageError(
+                            f"coordinate {coord} escapes level {level} extent "
+                            f"{self.shape[level]}"
+                        )
+                    if coord <= last:
+                        raise LevelStorageError(
+                            f"compressed level {level} coordinates must be "
+                            "strictly increasing per segment"
+                        )
+                    last = coord
+            parent_count = len(coords)
+        if type(self.values) is not tuple or len(self.values) != parent_count:
+            raise LevelStorageError(
+                "LevelTensor needs one owned value per leaf position"
+            )
+        for position, value in enumerate(self.values):
+            if type(value) is not float:
+                raise LevelStorageError(
+                    f"LevelTensor.values[{position}] must be an exact float"
+                )
+
 
 class LevelOutputBuilder:
     """Level-general ordered assembly: order-checked appends, level storage.
@@ -814,6 +923,13 @@ class LevelOutputBuilder:
         ):
             raise LevelStorageError(
                 "output level kinds must be one LevelKind per storage level"
+            )
+        if any(
+            kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED
+            for kind in level_kinds
+        ):
+            raise LevelStorageError(
+                "ordered assembly supports DENSE and COMPRESSED levels only"
             )
         if not any(kind is LevelKind.COMPRESSED for kind in level_kinds):
             raise LevelStorageError(
@@ -863,21 +979,32 @@ class LevelOutputBuilder:
         # The dense-suffix contract: entries group into complete, in-order
         # Cartesian blocks per materialized last-compressed position.
         if suffix_extents:
-            if len(self.entries) % suffix_cells != 0:
-                raise LevelStorageError(
-                    f"assembly of {self.name} left an incomplete trailing "
-                    "dense block"
-                )
-            expected_suffix: List[Tuple[int, ...]] = []
+            if suffix_cells == 0:
+                # No coordinate tuple can address a zero-extent dense suffix,
+                # so the canonical append stream is necessarily empty.  Keep
+                # the empty sparse structure representable without dividing
+                # or stepping by zero.
+                if self.entries:
+                    raise LevelStorageError(
+                        f"assembly of {self.name} contains entries beneath a "
+                        "zero-extent trailing dense level"
+                    )
+                suffix_extents = ()
+            else:
+                if len(self.entries) % suffix_cells != 0:
+                    raise LevelStorageError(
+                        f"assembly of {self.name} left an incomplete trailing "
+                        "dense block"
+                    )
 
-            def _extend(prefix: Tuple[int, ...], level: int) -> None:
-                if level == len(suffix_extents):
-                    expected_suffix.append(prefix)
-                    return
-                for coord in range(suffix_extents[level]):
-                    _extend(prefix + (coord,), level + 1)
+        if suffix_extents:
 
-            _extend((), 0)
+            def _expected_suffix(offset: int) -> Tuple[int, ...]:
+                coordinates = [0] * len(suffix_extents)
+                for level in range(len(suffix_extents) - 1, -1, -1):
+                    offset, coordinates[level] = divmod(offset, suffix_extents[level])
+                return tuple(coordinates)
+
             for block_start in range(0, len(self.entries), suffix_cells):
                 block = self.entries[block_start : block_start + suffix_cells]
                 head = block[0][0][: last_compressed + 1]
@@ -887,7 +1014,7 @@ class LevelOutputBuilder:
                             f"assembly of {self.name} split a dense block "
                             "across materialized parents"
                         )
-                    if coords[last_compressed + 1 :] != expected_suffix[offset]:
+                    if coords[last_compressed + 1 :] != _expected_suffix(offset):
                         raise LevelStorageError(
                             f"assembly of {self.name} skipped a trailing " "dense cell"
                         )

@@ -56,6 +56,8 @@ from ..cin import (
     TensorAssign,
     _is_index_stmt_instance,
 )
+from ..cin_analysis import verify_cin_structure
+from ..diagnostics import VerificationError
 from ..identity import IndexId, SymbolId
 from ..loop_plan import LoopPlan
 
@@ -282,9 +284,9 @@ def _access_domain(access: TensorAccess, index: IndexId) -> _OperandDomain:
 
 
 def _expr_domain(expr: object, index: IndexId) -> _OperandDomain:
-    if isinstance(expr, TensorAccess):
+    if type(expr) is TensorAccess:
         return _access_domain(expr, index)
-    if isinstance(expr, CINBinaryOp):
+    if type(expr) is CINBinaryOp:
         left = _expr_domain(expr.left, index)
         right = _expr_domain(expr.right, index)
         if expr.op is Operation.MUL:
@@ -322,10 +324,24 @@ def analyze_iteration_domains(cin: IndexStmt, plan: LoopPlan) -> IterationDomain
         raise TypeError("analyze_iteration_domains expects an IndexStmt")
     if type(plan) is not LoopPlan:
         raise TypeError("analyze_iteration_domains expects a LoopPlan")
+    try:
+        # This public analysis entry is callable independently of the normal
+        # CIN-to-LoopIR pipeline.  Bound its recursive expression walk with
+        # the same exact-type, cycle, alias, and depth preflight as every
+        # other normalized-CIN consumer.
+        verify_cin_structure(cin)
+    except VerificationError as error:
+        raise IterationDomainError(
+            IterationDomainDefect(
+                "malformed_cin",
+                "iteration-domain analysis requires structurally valid "
+                "normalized CIN",
+            )
+        ) from error
     loop_ids: List[IndexId] = []
     seen_nest_frames: set[int] = set()
     current: IndexStmt = cin
-    while isinstance(current, ForAll):
+    while type(current) is ForAll:
         if id(current) in seen_nest_frames:
             _fail(
                 "unsupported_statement",
@@ -334,7 +350,7 @@ def analyze_iteration_domains(cin: IndexStmt, plan: LoopPlan) -> IterationDomain
         seen_nest_frames.add(id(current))
         loop_ids.append(current.index_var.index_id)
         current = current.stmt
-    if not isinstance(current, TensorAssign):
+    if type(current) is not TensorAssign:
         _fail(
             "unsupported_statement",
             f"expected a TensorAssign at the nest leaf, got "

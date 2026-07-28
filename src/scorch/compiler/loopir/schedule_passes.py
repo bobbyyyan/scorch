@@ -151,6 +151,7 @@ from .nodes import (
     LoopIRNode,
     LoopProgram,
     MergedSparseFor,
+    MergeMode,
     PanelOuterFor,
     ParallelDiscipline,
     ParallelIntent,
@@ -186,6 +187,7 @@ _LoopNode = Union[
     TileInnerFor,
     PanelOuterFor,
     SparseWindowFor,
+    SparseWorkspaceDrainFor,
 ]
 _LeafNode = Union[Store, StoreReduce, AppendEntry]
 _ChainEnd = Union[
@@ -494,6 +496,10 @@ def _loop_dependencies(
     for chain_position, node in enumerate(loops):
         if type(node) is SparseFor:
             position_owner[node.position] = chain_position
+        elif type(node) is MergedSparseFor:
+            for position in node.positions:
+                if position is not None:
+                    position_owner[position] = chain_position
         index_owner[_loop_key(node)[0]] = chain_position
 
     dependencies: List[Set[int]] = []
@@ -534,11 +540,11 @@ def reorder_loops(program: LoopProgram, loop_order: Sequence[IndexId]) -> LoopPr
 
     verify_program(program)
     loops, leaf = _decompose_chain(program)
-    if type(leaf) is WorkspaceRegion:
+    if type(leaf) is WorkspaceRegion or type(leaf) is SparseWorkspaceRegion:
         _fail(
             "reorder_split_chain",
             "loop reorder operates on unsplit logical chains; the chain "
-            "already carries a workspace region",
+            "already carries a dense or sparse workspace region",
         )
     for node in loops:
         if type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES):
@@ -1015,11 +1021,24 @@ def apply_sparse_workspace(
     verify_program(program)
     if type(workspace) is not WorkspaceInsertion:
         raise TypeError("apply_sparse_workspace expects a WorkspaceInsertion")
+    try:
+        _validate_loop_plan_structure(LoopPlan(loop_order=(), workspace=workspace))
+    except (VerificationError, AttributeError, TypeError, ValueError) as error:
+        _fail("invalid_schedule_plan", str(error))
     if workspace.dense or len(workspace.axis_loops) != 1:
         _fail(
             "sparse_workspace_target_invalid",
             "the serial sparse workspace consumes exactly one sparse "
             "single-axis workspace fact",
+        )
+    if (
+        workspace.reduction_loop.part is not LoopPart.LOGICAL
+        or workspace.axis_loops[0].part is not LoopPart.LOGICAL
+    ):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the sparse workspace reduction and drain axis must name "
+            "unsplit logical loops",
         )
     loops, leaf = _decompose_chain(program)
     if type(leaf) is not StoreReduce or leaf.op is not ReduceOp.ADD:
@@ -1029,14 +1048,53 @@ def apply_sparse_workspace(
         )
     result_symbol = leaf.tensor
     result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
-    if all(level.kind is LevelKind.DENSE for level in result_decl.levels):
+    if (
+        len(result_decl.levels) != 2
+        or tuple(level.kind for level in result_decl.levels)
+        != (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+        or tuple(level.mode for level in result_decl.levels) != (0, 1)
+    ):
         _fail(
             "sparse_workspace_target_invalid",
-            "dense outputs accumulate through the stack and reduce-out "
-            "families, not the sparse workspace",
+            "the serial B1 sparse workspace requires an identity-ordered "
+            "rank-2 doubly-compressed result",
         )
     reduction_index = workspace.reduction_loop.index_id
     axis_index = workspace.axis_loops[0].index_id
+    if type(leaf.indices) is not tuple or not leaf.indices:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the reduction leaf must address the result by coordinates",
+        )
+    result_indices: List[IndexId] = []
+    for coord in leaf.indices:
+        if type(coord) is not IndexValue:
+            _fail(
+                "sparse_workspace_target_invalid",
+                "result coordinates must be plain bound coordinates",
+            )
+        result_indices.append(coord.index)
+    if axis_index != result_indices[-1] or reduction_index in result_indices:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the workspace fact must name the final reduction loop and the "
+            "trailing free result axis",
+        )
+    result_index_set = set(result_indices)
+    reduction_loops = [
+        node for node in loops if _loop_key(node)[0] not in result_index_set
+    ]
+    if (
+        not reduction_loops
+        or _loop_key(reduction_loops[-1]) != (reduction_index, LoopPart.LOGICAL)
+        or type(reduction_loops[-1]) is not MergedSparseFor
+        or reduction_loops[-1].mode is not MergeMode.INTERSECTION
+    ):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the sparse workspace must wrap the final logical "
+            "INTERSECTION reduction loop",
+        )
     reduction_positions = [
         position
         for position, node in enumerate(loops)
@@ -1060,10 +1118,12 @@ def apply_sparse_workspace(
             "the drained axis loop must appear exactly once below the "
             "reduction loop",
         )
-    if type(leaf.indices) is not tuple or not leaf.indices:
+    axis_position = loops.index(axis_nodes[0])
+    if axis_position <= reduction_position or type(axis_nodes[0]) is not SparseFor:
         _fail(
             "sparse_workspace_target_invalid",
-            "the reduction leaf must address the result by coordinates",
+            "the drained trailing result axis must be a single-cursor "
+            "logical sparse loop below the reduction",
         )
     trailing = leaf.indices[-1]
     if type(trailing) is not IndexValue or trailing.index != axis_index:
@@ -1072,11 +1132,7 @@ def apply_sparse_workspace(
             "the drained axis must address the trailing result coordinate",
         )
     for coord in leaf.indices[:-1]:
-        if type(coord) is not IndexValue:
-            _fail(
-                "sparse_workspace_target_invalid",
-                "result prefix coordinates must be plain bound coordinates",
-            )
+        coord = cast(IndexValue, coord)
         binder_positions = [
             position
             for position, node in enumerate(loops)
@@ -2680,9 +2736,9 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
     if not stack_form and not reduce_out_form:
         _fail(
             "unsupported_schedule_auto_family",
-            "automatic plans are migrated for the tile-free, regblock "
-            "stack-form, and dense reduce-out replay contracts only; "
-            "the sparse-workspace family stays on the legacy path",
+            "automatic plans are migrated for the tile-free, serial sparse "
+            "workspace, regblock stack-form, and dense reduce-out replay "
+            "contracts only",
         )
     return
 
@@ -3193,6 +3249,7 @@ def _verify_scheduled_loopir(
         or base_result_tiles
         or base_program.parallel is not None
         or type(base_leaf) is WorkspaceRegion
+        or type(base_leaf) is SparseWorkspaceRegion
         or type(base_leaf) is TiledReduce
         or any(
             type(loop) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES)
@@ -3202,7 +3259,7 @@ def _verify_scheduled_loopir(
         _fail(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
-            "loops, panels, workspace regions, staging regions, "
+            "loops, panels, dense or sparse workspace regions, staging regions, "
             "result-tile regions, or a parallel selection",
         )
 

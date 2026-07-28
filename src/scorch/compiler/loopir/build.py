@@ -103,6 +103,34 @@ def _max_identity_values(
     next_result_tile = 0
     seen: set = set()
     pending: list = [program]
+
+    def record_identity(value: object) -> bool:
+        nonlocal next_dimension
+        nonlocal next_cursor
+        nonlocal next_position
+        nonlocal next_tile
+        nonlocal next_workspace
+        nonlocal next_relayout
+        nonlocal next_result_tile
+
+        if type(value) is DimensionId and type(value.value) is int:
+            next_dimension = max(next_dimension, value.value + 1)
+        elif type(value) is CursorId and type(value.value) is int:
+            next_cursor = max(next_cursor, value.value + 1)
+        elif type(value) is PositionId and type(value.value) is int:
+            next_position = max(next_position, value.value + 1)
+        elif type(value) is TileId and type(value.value) is int:
+            next_tile = max(next_tile, value.value + 1)
+        elif type(value) is WorkspaceId and type(value.value) is int:
+            next_workspace = max(next_workspace, value.value + 1)
+        elif type(value) is RelayoutId and type(value.value) is int:
+            next_relayout = max(next_relayout, value.value + 1)
+        elif type(value) is ResultTileId and type(value.value) is int:
+            next_result_tile = max(next_result_tile, value.value + 1)
+        else:
+            return False
+        return True
+
     while pending:
         node = pending.pop()
         if id(node) in seen:
@@ -117,26 +145,14 @@ def _max_identity_values(
         # a continuation allocator.
         for field in fields(type(node)):
             value = getattr(node, field.name, None)
-            if type(value) is DimensionId and type(value.value) is int:
-                next_dimension = max(next_dimension, value.value + 1)
-            elif type(value) is CursorId and type(value.value) is int:
-                next_cursor = max(next_cursor, value.value + 1)
-            elif type(value) is PositionId and type(value.value) is int:
-                next_position = max(next_position, value.value + 1)
-            elif type(value) is TileId and type(value.value) is int:
-                next_tile = max(next_tile, value.value + 1)
-            elif type(value) is WorkspaceId and type(value.value) is int:
-                next_workspace = max(next_workspace, value.value + 1)
-            elif type(value) is RelayoutId and type(value.value) is int:
-                next_relayout = max(next_relayout, value.value + 1)
-            elif type(value) is ResultTileId and type(value.value) is int:
-                next_result_tile = max(next_result_tile, value.value + 1)
-            elif isinstance(value, LoopIRNode):
+            if record_identity(value):
+                continue
+            if isinstance(value, LoopIRNode):
                 pending.append(value)
             elif type(value) is tuple:
-                pending.extend(
-                    child for child in value if isinstance(child, LoopIRNode)
-                )
+                for child in value:
+                    if not record_identity(child) and isinstance(child, LoopIRNode):
+                        pending.append(child)
     return (
         next_node,
         next_dimension,

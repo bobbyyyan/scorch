@@ -527,7 +527,12 @@ class _Oracle:
                 builder.append(coords, entries[coords])
         for symbol in self.program.outputs:
             if symbol in self.builders:
-                results[symbol] = self.builders[symbol].finish()
+                try:
+                    results[symbol] = self.builders[symbol].finish()
+                except LevelStorageError as error:
+                    raise LoopIROracleError(
+                        f"output {self.decls[symbol].name} assembly failed: {error}"
+                    ) from error
             else:
                 results[symbol] = self.values[symbol]
         return results

@@ -208,6 +208,7 @@ class CINLowerer:
 
         self.seen_outermost_forall = False
         self.outermost_stmt: Optional[IndexStmt] = None
+        self._outermost_lowering_started: bool = False
         # Nonzero exactly while _lower_prepared_index_stmt is on the stack:
         # distinguishes compiler-internal recursive re-entry (which may bypass
         # the raw-entry boundary) from a stale reused instance or a hostile
@@ -2248,6 +2249,9 @@ class CINLowerer:
             compile_options=self.compile_options,
         )
         try:
+            self._reject_reused_outermost_entry(recurse)
+            if not recurse and self._active_lowerings == 0:
+                self._outermost_lowering_started = True
             self._active_lowerings += 1
             try:
                 lowered = self._lower_prepared_index_stmt(prepared_stmt, recurse)
@@ -2271,6 +2275,9 @@ class CINLowerer:
             recurse,
             ownership_transferred=_ownership_transferred,
         )
+        self._reject_reused_outermost_entry(recurse)
+        if not recurse and self._active_lowerings == 0:
+            self._outermost_lowering_started = True
         self._active_lowerings += 1
         try:
             lowered = self._lower_prepared_index_stmt(stmt, recurse)
@@ -2279,6 +2286,39 @@ class CINLowerer:
         if apply_schedule_lowering:
             return self._apply_schedule_lowering(lowered, stmt)
         return lowered
+
+    def _reject_reused_outermost_entry(self, recurse: bool) -> None:
+        """Keep the stateful legacy lowerer explicitly single-use.
+
+        A lowering owns dozens of per-program maps and compatibility flags.
+        Reusing an instance used to retain the first program as
+        ``outermost_stmt`` and silently treat the second program as an
+        internal recursive subtree, returning a list instead of a function
+        and consulting stale state.  Resetting only the root would leave the
+        rest of that state contaminated, so a second outermost entry fails
+        closed after its raw CIN has crossed the ordinary validation boundary.
+        """
+
+        if (
+            recurse
+            or self._active_lowerings > 0
+            or not self._outermost_lowering_started
+        ):
+            return
+        diagnostic = CINDiagnostic(
+            code="reused_lowerer",
+            message=(
+                "CINLowerer instances own one program's lowering state and "
+                "cannot lower a second outermost program"
+            ),
+            path=("root",),
+            stage="legacy_cin_lowering",
+            pass_name="prepare_stmt",
+        )
+        raise VerificationError(
+            "stage=legacy CIN lowering: CINLowerer instances are single-use",
+            diagnostics=(diagnostic,),
+        )
 
     def _lower_prepared_index_stmt(
         self,

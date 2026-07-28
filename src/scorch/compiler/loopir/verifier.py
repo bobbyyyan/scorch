@@ -37,7 +37,8 @@ The invariant families stated locally for this subset:
   whose identity matches the explicit dense-output zero-initialization
   contract), coordinate stores require all-dense outputs and appended
   assembly requires a compressed output (``layout_mismatch``), and sparse
-  outputs are canonical CSR only (``unsupported_sparse_output``).
+  outputs use identity-ordered DENSE/COMPRESSED levels only
+  (``unsupported_sparse_output``).
 - **Extent resolution.**  Every ``DenseFor`` dimension must be mapped by at
   least one declared tensor so its runtime extent has a source
   (``unresolved_dimension``); tile loops share the same rule.
@@ -288,7 +289,14 @@ class _WorkspaceState:
 class _SparseWorkspaceState:
     """One open sparse-workspace region's walk state."""
 
-    __slots__ = ("decl", "role", "inserted", "drained", "drain_depth")
+    __slots__ = (
+        "decl",
+        "role",
+        "inserted",
+        "drained",
+        "drain_depth",
+        "consumed",
+    )
 
     def __init__(self, decl: SparseWorkspaceDecl) -> None:
         self.decl = decl
@@ -296,6 +304,7 @@ class _SparseWorkspaceState:
         self.inserted = False
         self.drained = False
         self.drain_depth = 0
+        self.consumed = False
 
 
 class _RelayoutState:
@@ -805,6 +814,7 @@ def _check_sparse_workspace_value(
             "a drained value is readable only inside the owning "
             "workspace's drain loop",
         )
+    state.consumed = True
     return _VALUE
 
 
@@ -1512,7 +1522,35 @@ def _check_sparse_workspace_region(
         finally:
             ctx.producer_depth -= 1
         state.role = "consumer"
-        _check_body(ctx, stmt.consumer, f"{path}.consumer", depth + 1)
+        region_state = object.__getattribute__(stmt, "__dict__")
+        consumer = (
+            region_state.get("consumer", _MISSING)
+            if type(region_state) is dict
+            else _MISSING
+        )
+        consumer_state = (
+            object.__getattribute__(consumer, "__dict__")
+            if type(consumer) is Block
+            else None
+        )
+        consumer_statements = (
+            consumer_state.get("statements", _MISSING)
+            if type(consumer_state) is dict
+            else _MISSING
+        )
+        if (
+            type(consumer) is not Block
+            or type(consumer_statements) is not tuple
+            or len(consumer_statements) != 1
+            or type(consumer_statements[0]) is not SparseWorkspaceDrainFor
+        ):
+            _fail(
+                "workspace_read_scope",
+                f"{path}.consumer",
+                "a sparse workspace consumer must contain its one ordered "
+                "drain directly, outside any repeating control flow",
+            )
+        _check_body(ctx, consumer, f"{path}.consumer", depth + 1)
         if not state.inserted:
             _fail(
                 "workspace_dead_region",
@@ -1524,6 +1562,13 @@ def _check_sparse_workspace_region(
                 "workspace_dead_region",
                 path,
                 "a sparse region's consumer must drain its workspace",
+            )
+        if not state.consumed:
+            _fail(
+                "workspace_dead_region",
+                path,
+                "a sparse region's drain body must consume the current "
+                "merged workspace value",
             )
     finally:
         del ctx.open_sparse_workspaces[decl.workspace]
@@ -1897,7 +1942,7 @@ def _check_sparse_workspace_drain_for(
             path,
             "a sparse workspace drains only inside its region's consumer",
         )
-    if state.drained:
+    if state.drained or state.drain_depth != 0:
         _fail(
             "workspace_read_scope",
             path,
@@ -1940,6 +1985,13 @@ def _check_merged_sparse_for(
                 "malformed_state",
                 path,
                 "a position-binding merge names one entry per cursor",
+            )
+        if all(bound is None for bound in stmt.positions):
+            _fail(
+                "malformed_state",
+                path,
+                "a nonempty merge position tuple must bind at least one "
+                "position; use the canonical empty tuple otherwise",
             )
         if stmt.mode is not MergeMode.INTERSECTION:
             _fail(

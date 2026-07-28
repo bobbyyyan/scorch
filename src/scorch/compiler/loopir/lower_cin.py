@@ -68,6 +68,7 @@ from .build import LoopIRBuilder
 from .iterdomain import (
     DomainKind,
     IterationDomainError,
+    LoopIterationDomain,
     analyze_iteration_domains,
 )
 from .nodes import (
@@ -555,7 +556,7 @@ def _classify_sparse_output_family(
     result_levels: Tuple[LevelType, ...],
     lhs: TensorAccess,
     lhs_index_ids: Tuple[IndexId, ...],
-    domains: Dict[IndexId, object],
+    domains: Dict[IndexId, LoopIterationDomain],
 ) -> bool:
     """Gate the sparse-output families; True selects the semantic
     doubly-compressed reduction form."""

@@ -226,27 +226,27 @@ class TileSpec:
     unroll: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.index_var, str) or not self.index_var:
+        if type(self.index_var) is not str or not self.index_var:
             raise ValueError("TileSpec.index_var must be a non-empty string")
-        if isinstance(self.width, bool) or not isinstance(self.width, int):
+        if type(self.width) is not int:
             raise TypeError("TileSpec.width must be an integer")
         if self.width <= 0:
             raise ValueError("TileSpec.width must be greater than zero")
         if self.width > MAX_AFFINE_TILE_WIDTH:
             raise ValueError("TileSpec.width must fit the C++ constexpr int target")
-        if not isinstance(self.placement, str):
+        if type(self.placement) is not str:
             raise TypeError("TileSpec.placement must be a string")
-        if not isinstance(self.parallel, bool):
+        if type(self.parallel) is not bool:
             raise TypeError("TileSpec.parallel must be a bool")
-        if not isinstance(self.kind, str):
+        if type(self.kind) is not str:
             raise TypeError("TileSpec.kind must be a string")
         if self.kind not in ("affine", "panel"):
             raise ValueError("TileSpec.kind must be 'affine' or 'panel'")
-        if not isinstance(self.accum, str):
+        if type(self.accum) is not str:
             raise TypeError("TileSpec.accum must be a string")
         if self.accum not in ("stack", "direct", "heap"):
             raise ValueError("TileSpec.accum must be 'stack', 'direct', or 'heap'")
-        if not isinstance(self.unroll, bool):
+        if type(self.unroll) is not bool:
             raise TypeError("TileSpec.unroll must be a bool")
         if not (
             self.placement == "outermost"
@@ -299,11 +299,11 @@ class RelayoutSpec:
     scope_var: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.operand, str) or not isinstance(self.pack_var, str):
+        if type(self.operand) is not str or type(self.pack_var) is not str:
             raise TypeError("RelayoutSpec operand and pack_var must be strings")
         if not self.operand or not self.pack_var:
             raise ValueError("RelayoutSpec operand and pack_var must be non-empty")
-        if isinstance(self.strip_width, bool) or not isinstance(self.strip_width, int):
+        if type(self.strip_width) is not int:
             raise TypeError("RelayoutSpec.strip_width must be an integer")
         if self.strip_width <= 0:
             raise ValueError("RelayoutSpec.strip_width must be greater than zero")
@@ -312,7 +312,7 @@ class RelayoutSpec:
                 "RelayoutSpec.strip_width must fit the C++ constexpr int target"
             )
         if self.scope_var is not None:
-            if not isinstance(self.scope_var, str):
+            if type(self.scope_var) is not str:
                 raise TypeError("RelayoutSpec.scope_var must be a string or None")
             if not self.scope_var:
                 raise ValueError("RelayoutSpec.scope_var must be non-empty")
@@ -371,19 +371,22 @@ class Schedule:
 
     def __post_init__(self) -> None:
         if self.loop_order is not None:
-            if isinstance(self.loop_order, str):
+            if type(self.loop_order) is str:
                 raise TypeError("Schedule.loop_order must be a sequence of names")
-            if not isinstance(self.loop_order, tuple):
+            if type(self.loop_order) not in (list, tuple):
+                raise TypeError(
+                    "Schedule.loop_order must be an owned list or tuple of names"
+                )
+            if type(self.loop_order) is list:
                 object.__setattr__(self, "loop_order", tuple(self.loop_order))
-            if any(not isinstance(name, str) or not name for name in self.loop_order):
+            if any(type(name) is not str or not name for name in self.loop_order):
                 raise ValueError("Schedule.loop_order must contain non-empty strings")
             if len(self.loop_order) != len(set(self.loop_order)):
                 raise ValueError("Schedule.loop_order contains duplicate variables")
-        if not isinstance(self.tiles, tuple):
-            try:
-                object.__setattr__(self, "tiles", tuple(self.tiles))
-            except TypeError as exc:
-                raise TypeError("Schedule.tiles must be a sequence") from exc
+        if type(self.tiles) not in (list, tuple):
+            raise TypeError("Schedule.tiles must be an owned list or tuple")
+        if type(self.tiles) is list:
+            object.__setattr__(self, "tiles", tuple(self.tiles))
         if any(type(tile) is not TileSpec for tile in self.tiles):
             # Exact-type admission: a TileSpec subclass is caller code that
             # would otherwise execute inside compiler-trusted scopes.
@@ -408,11 +411,11 @@ class Schedule:
                 "Use either Schedule.parallel_loop or TileSpec.parallel, not both"
             )
         if self.parallel_loop is not None:
-            if not isinstance(self.parallel_loop, str):
+            if type(self.parallel_loop) is not str:
                 raise TypeError("Schedule.parallel_loop must be a string or None")
             if not self.parallel_loop:
                 raise ValueError("Schedule.parallel_loop must be a non-empty string")
-        if not isinstance(self.tag, str):
+        if type(self.tag) is not str:
             raise TypeError("Schedule.tag must be a string")
 
     @property
