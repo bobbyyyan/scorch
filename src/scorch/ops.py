@@ -19,7 +19,11 @@ from .compiler.cin import (
     IndexStmt,
 )
 from .compiler.cin_lowerer import CINLowerer
-from .compiler.cin_analysis import normalize_cin
+from .compiler.cin_analysis import (
+    _trusted_normalized_cin,
+    normalize_cin,
+    verify_cin_structure,
+)
 from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
 from .compiler.diagnostics import CompileOptionsDiagnostic, CompileOptionsError
@@ -2246,58 +2250,73 @@ def _einsum_owned(
     # (post M5+x86 validation); `SCORCH_REGBLOCK_DUAL=0` restores the single path.
     # When the pattern doesn't qualify, `_build_regblock_dual_path` returns None and
     # the else-branch below emits the byte-identical baseline (unchanged from before).
-    _dual_llir: Optional[llir.Function] = None
-    if (
-        effective_schedule is None
-        and _regblock_dual_active(compile_options)
-        and _post_ops is None
-    ):
-        _dual = _build_regblock_dual_path(
-            cin_stmt,
-            _post_ops,
-            compile_options=compile_options,
-            compilation_context=compilation_context,
-        )
-        if _dual is not None:
-            _dual_llir, _kernel_cache_key = _dual
-            _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
-
-    if _dual_llir is None:
-        if effective_schedule is not None:
-            lowering_stmt = Scheduler.apply_schedule(
+    # The two internal dual arms and the fallback all detach the same freshly
+    # constructed CIN root.  Prove that root once, then carry the receipt only
+    # across this synchronous compiler-owned scheduling block.  No caller code
+    # can mutate the graph between the verification and these consumers.
+    receipt_token = compilation_context.begin_stage(
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        compile_options=compile_options,
+    )
+    try:
+        verify_cin_structure(cin_stmt)
+    except Exception:
+        compilation_context.fail_stage(receipt_token)
+        raise
+    compilation_context.cancel_stage(receipt_token)
+    with _trusted_normalized_cin(cin_stmt):
+        _dual_llir: Optional[llir.Function] = None
+        if (
+            effective_schedule is None
+            and _regblock_dual_active(compile_options)
+            and _post_ops is None
+        ):
+            _dual = _build_regblock_dual_path(
                 cin_stmt,
-                effective_schedule,
+                _post_ops,
                 compile_options=compile_options,
                 compilation_context=compilation_context,
             )
-        # Default single path. When regblock is on but the dual-path wasn't
-        # applicable, force it OFF here so we never ship the wide-k-regressing
-        # single-path tiled kernel as a silent fallback.
-        elif compile_options.scheduler.regblock_enabled:
-            lowering_stmt = cast(
-                IndexStmt,
-                Scheduler._auto_schedule_regblock_arm(
+            if _dual is not None:
+                _dual_llir, _kernel_cache_key = _dual
+                _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
+
+        if _dual_llir is None:
+            if effective_schedule is not None:
+                lowering_stmt = Scheduler.apply_schedule(
                     cin_stmt,
-                    enabled=False,
+                    effective_schedule,
                     compile_options=compile_options,
                     compilation_context=compilation_context,
-                ),
+                )
+            # Default single path. When regblock is on but the dual-path wasn't
+            # applicable, force it OFF here so we never ship the wide-k-regressing
+            # single-path tiled kernel as a silent fallback.
+            elif compile_options.scheduler.regblock_enabled:
+                lowering_stmt = cast(
+                    IndexStmt,
+                    Scheduler._auto_schedule_regblock_arm(
+                        cin_stmt,
+                        enabled=False,
+                        compile_options=compile_options,
+                        compilation_context=compilation_context,
+                    ),
+                )
+            else:
+                lowering_stmt = cast(
+                    IndexStmt,
+                    Scheduler.auto_schedule(
+                        cin_stmt,
+                        compile_options=compile_options,
+                        compilation_context=compilation_context,
+                    ),
+                )
+            _kernel_cache_key = _codegen_kernel_cache_key(
+                lowering_stmt,
+                _post_ops,
+                effective_schedule,
+                compile_options=compile_options,
             )
-        else:
-            lowering_stmt = cast(
-                IndexStmt,
-                Scheduler.auto_schedule(
-                    cin_stmt,
-                    compile_options=compile_options,
-                    compilation_context=compilation_context,
-                ),
-            )
-        _kernel_cache_key = _codegen_kernel_cache_key(
-            lowering_stmt,
-            _post_ops,
-            effective_schedule,
-            compile_options=compile_options,
-        )
 
     # print("Auto-scheduled CIN:\n", lowering_stmt)
 
