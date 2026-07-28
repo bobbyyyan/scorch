@@ -32,13 +32,18 @@ from .diagnostics import (
     CompileOptionsError,
     CompilerInvariantError,
     UnsupportedFeature,
+    VerificationError,
 )
 from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
 from .legacy_cin_adapter import (
     claim_legacy_cin_working_tree,
     legacy_cin_working_copy,
 )
-from .cin_analysis import verify_cin_if_enabled, verify_cin_structure
+from .cin_analysis import (
+    CINDiagnostic,
+    _verify_legacy_cin_lowering_structure,
+    verify_cin_if_enabled,
+)
 from .compile_options import CompileOptions
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
@@ -2062,17 +2067,52 @@ class CINLowerer:
         else:
             prepared_stmt = cast(IndexStmt, stmt)
 
-        if plain_cin_input and not ownership_transferred:
+        legacy_schedule_aliases = False
+        if plain_cin_input and (
+            not ownership_transferred or self.compile_options.verification.verify_cin
+        ):
             # This method is also the direct/public legacy-lowering boundary.
-            # Production-owned paths arrive through normalize_cin and transfer
-            # ownership; raw callers must establish the same fail-closed
-            # structural contract before legacy copying or recursive visitors.
-            verify_cin_structure(prepared_stmt)
+            # Production-owned paths arrive through normalization and transfer
+            # ownership. Raw callers receive the same field/cycle/depth
+            # checks, with only the historical workspace scheduler's
+            # same-kind node clones and paired-node/same-name index aliases
+            # admitted for canonicalization by the private legacy adapter.
+            # Debug-owned paths classify aliases too: the normalized source
+            # was verified before scheduling, while the derived compatibility
+            # graph itself is intentionally not normalized CIN.
+            legacy_schedule_aliases = _verify_legacy_cin_lowering_structure(
+                prepared_stmt
+            )
         self._validate_index_stmt(prepared_stmt)
-        verify_cin_if_enabled(
-            prepared_stmt,
-            enabled=self.compile_options.verification.verify_cin,
-        )
+        verify_cin_enabled = self.compile_options.verification.verify_cin
+        if legacy_schedule_aliases and verify_cin_enabled and not ownership_transferred:
+            # A caller-owned legacy auto-schedule is a derived compatibility
+            # graph whose workspace branches intentionally reuse stable IDs.
+            # The normal semantic verifier cannot prove that mutable graph:
+            # silently skipping it would let post-schedule shape or scope
+            # mutations bypass a requested debug boundary. Compiler-owned
+            # scheduling verifies its normalized source before deriving this
+            # graph and transfers ownership without returning control.
+            diagnostic = CINDiagnostic(
+                code="unverifiable_legacy_schedule_aliases",
+                message=(
+                    "caller-owned workspace-scheduled CIN cannot satisfy full "
+                    "normalized-CIN verification; lower a verified ScheduledCIN"
+                ),
+                path=("root",),
+                stage="legacy_cin_lowering",
+                pass_name="prepare_stmt",
+            )
+            raise VerificationError(
+                "stage=legacy CIN lowering: caller-owned workspace aliases "
+                "cannot be semantically verified",
+                diagnostics=(diagnostic,),
+            )
+        if not legacy_schedule_aliases:
+            verify_cin_if_enabled(
+                prepared_stmt,
+                enabled=verify_cin_enabled,
+            )
         if ownership_transferred:
             return claim_legacy_cin_working_tree(
                 prepared_stmt,
@@ -2088,9 +2128,18 @@ class CINLowerer:
     def _lower_owned_IndexStmt(
         self, stmt: Union[IndexStmt, ScheduledCIN]
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
-        """Lower a detached compiler-local tree after transferring ownership."""
+        """Lower a detached compiler-local tree after transferring ownership.
 
-        return self.lower_IndexStmt(stmt, _ownership_transferred=True)
+        This is an internal compiler handoff, not a public validation bypass:
+        the caller must have obtained the tree synchronously from normalization
+        or scheduling and retained no externally visible alias.
+        """
+
+        return self._lower_index_stmt_entry(
+            stmt,
+            recurse=False,
+            ownership_transferred=True,
+        )
 
     def _lower_outer_body(self, stmt: IndexStmt) -> _LoweredOuterBody:
         """Lower the already-validated outer body and retain pass ownership data."""
@@ -2109,18 +2158,31 @@ class CINLowerer:
         self,
         stmt: Union[IndexStmt, ScheduledCIN],
         recurse=False,
-        _ownership_transferred: bool = False,
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
         Lower an IndexStmt to LLIR
         """
+
+        return self._lower_index_stmt_entry(
+            stmt,
+            recurse=recurse,
+            ownership_transferred=False,
+        )
+
+    def _lower_index_stmt_entry(
+        self,
+        stmt: Union[IndexStmt, ScheduledCIN],
+        recurse: bool,
+        ownership_transferred: bool,
+    ) -> Union[llir.Stmt, List[llir.Stmt]]:
+        """Route one public or explicitly compiler-owned lowering entry."""
 
         compilation_context = self._compilation_context
         if compilation_context is None or recurse or self.outermost_stmt is not None:
             return self._lower_index_stmt_untimed(
                 stmt,
                 recurse,
-                _ownership_transferred,
+                ownership_transferred,
             )
         adapter_token = compilation_context.begin_stage(
             CompilerStageId.LEGACY_CIN_ADAPTATION,
@@ -2130,7 +2192,7 @@ class CINLowerer:
             prepared_stmt = self._prepare_scheduled_cin(
                 stmt,
                 recurse,
-                ownership_transferred=_ownership_transferred,
+                ownership_transferred=ownership_transferred,
             )
         except Exception:
             compilation_context.fail_stage(adapter_token)
