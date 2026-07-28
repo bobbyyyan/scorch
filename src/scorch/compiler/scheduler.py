@@ -24,8 +24,13 @@ from scorch.compiler.cin import (
     Where,
     Workspace,
     WorkspaceAccess,
+    _is_index_stmt_instance,
 )
-from .cin_analysis import _compile_options_at_cin_boundary, normalize_cin
+from .cin_analysis import (
+    _compile_options_at_cin_boundary,
+    _trusted_normalized_cin,
+    normalize_cin,
+)
 from .compilation_context import CompilerStageId, CompilationContext
 from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
 from .identity import IndexId, SymbolId
@@ -913,8 +918,18 @@ class Scheduler:
                 continue
 
             logical_pos = tensor_access.get_index_vars().index(index_var)
-            if logical_pos < len(tensor_shape):
-                sizes.append(float(tensor_shape[logical_pos]))
+            mode_order = tensor_access.get_tensor().mode_order
+            physical_pos = logical_pos
+            if mode_order is not None:
+                try:
+                    physical_pos = mode_order.index(logical_pos)
+                except ValueError:
+                    # The normalized-CIN verifier owns the malformed
+                    # permutation diagnostic.  A cost heuristic must not
+                    # leak a raw lookup error before that boundary.
+                    continue
+            if physical_pos < len(tensor_shape):
+                sizes.append(float(tensor_shape[physical_pos]))
 
         if sizes:
             return max(max(sizes), 1.0)
@@ -3134,23 +3149,24 @@ class Scheduler:
             else None
         )
         try:
-            try:
-                legacy_scheduled = Scheduler._apply_schedule_legacy(
+            with _trusted_normalized_cin(normalized_cin):
+                try:
+                    legacy_scheduled = Scheduler._apply_schedule_legacy(
+                        normalized_cin,
+                        schedule,
+                        costs=costs,
+                        compile_options=options,
+                    )
+                except (InvalidSchedule, UnsupportedFeature, VerificationError):
+                    raise
+                except NotImplementedError as exc:
+                    raise UnsupportedFeature(str(exc)) from exc
+                except ValueError as exc:
+                    raise InvalidSchedule(str(exc)) from exc
+                scheduled = ScheduledCIN(
                     normalized_cin,
-                    schedule,
-                    costs=costs,
-                    compile_options=options,
+                    legacy_scheduled.verified_loop_plan,
                 )
-            except (InvalidSchedule, UnsupportedFeature, VerificationError):
-                raise
-            except NotImplementedError as exc:
-                raise UnsupportedFeature(str(exc)) from exc
-            except ValueError as exc:
-                raise InvalidSchedule(str(exc)) from exc
-            scheduled = ScheduledCIN(
-                normalized_cin,
-                legacy_scheduled.verified_loop_plan,
-            )
         except Exception:
             if stage_token is not None and compilation_context is not None:
                 compilation_context.fail_stage(stage_token)
@@ -3583,20 +3599,17 @@ class Scheduler:
                 regblock_enabled=regblock_enabled,
             )
             costs = scheduler_policy.cost_model
+        if not _is_index_stmt_instance(cin):
+            raise TypeError("auto_schedule_plan expects an IndexStmt")
         # Normalization owns the structural preflight; validate display names
         # on the normalized clone so a forged graph fails closed first (the
         # clone preserves every display name and stable ID).
-        normalized = (
-            normalize_cin(
-                cin,
-                compile_options=options,
-                compilation_context=compilation_context,
-            )
-            if isinstance(cin, IndexStmt)
-            else copy.deepcopy(cin)
+        normalized = normalize_cin(
+            cin,
+            compile_options=options,
+            compilation_context=compilation_context,
         )
-        if isinstance(cin, IndexStmt):
-            validate_legacy_cin_display_names(normalized)
+        validate_legacy_cin_display_names(normalized)
         stage_token = (
             compilation_context.begin_stage(
                 CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
@@ -3606,42 +3619,43 @@ class Scheduler:
             else None
         )
         try:
-            working = copy.deepcopy(normalized)
-            if not isinstance(working, ForAll):
-                plan = verify_loop_plan(
-                    normalized,
-                    LoopPlan(
-                        loop_order=(),
-                        auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
-                        provenance="auto",
-                    ),
-                )
-            else:
-                logical_order = Scheduler.select_loop_order(working, costs=costs)
-                auto_tiles: List[LoopTile] = []
-                auto_workspace: List[WorkspaceInsertion] = []
-                Scheduler._apply_auto_order_owned(
-                    working,
-                    logical_order,
-                    options,
-                    scheduler_policy=scheduler_policy,
-                    plan_tiles=auto_tiles,
-                    plan_workspace=auto_workspace,
-                    require_complete_plan=True,
-                )
-                plan = verify_loop_plan(
-                    normalized,
-                    LoopPlan(
-                        loop_order=tuple(
-                            index_var.index_id for index_var in logical_order
+            with _trusted_normalized_cin(normalized):
+                working = copy.deepcopy(normalized)
+                if not isinstance(working, ForAll):
+                    plan = verify_loop_plan(
+                        normalized,
+                        LoopPlan(
+                            loop_order=(),
+                            auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                            provenance="auto",
                         ),
-                        tiles=tuple(auto_tiles),
-                        workspace=auto_workspace[0] if auto_workspace else None,
-                        auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
-                        provenance="auto",
-                    ),
-                )
-            scheduled = ScheduledCIN(normalized, plan)
+                    )
+                else:
+                    logical_order = Scheduler.select_loop_order(working, costs=costs)
+                    auto_tiles: List[LoopTile] = []
+                    auto_workspace: List[WorkspaceInsertion] = []
+                    Scheduler._apply_auto_order_owned(
+                        working,
+                        logical_order,
+                        options,
+                        scheduler_policy=scheduler_policy,
+                        plan_tiles=auto_tiles,
+                        plan_workspace=auto_workspace,
+                        require_complete_plan=True,
+                    )
+                    plan = verify_loop_plan(
+                        normalized,
+                        LoopPlan(
+                            loop_order=tuple(
+                                index_var.index_id for index_var in logical_order
+                            ),
+                            tiles=tuple(auto_tiles),
+                            workspace=auto_workspace[0] if auto_workspace else None,
+                            auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                            provenance="auto",
+                        ),
+                    )
+                scheduled = ScheduledCIN(normalized, plan)
         except Exception:
             if stage_token is not None and compilation_context is not None:
                 compilation_context.fail_stage(stage_token)
@@ -3687,20 +3701,17 @@ class Scheduler:
     ) -> CIN:
         """Shared owned implementation after the public boundary is resolved."""
 
+        if not _is_index_stmt_instance(cin):
+            raise TypeError("auto_schedule expects an IndexStmt")
         # Normalization owns the structural preflight; validate display names
         # on the normalized clone so a forged graph fails closed first (the
         # clone preserves every display name and stable ID).
-        working = (
-            normalize_cin(
-                cin,
-                compile_options=options,
-                compilation_context=compilation_context,
-            )
-            if isinstance(cin, IndexStmt)
-            else copy.deepcopy(cin)
+        working = normalize_cin(
+            cin,
+            compile_options=options,
+            compilation_context=compilation_context,
         )
-        if isinstance(cin, IndexStmt):
-            validate_legacy_cin_display_names(working)
+        validate_legacy_cin_display_names(working)
         stage_token = (
             compilation_context.begin_stage(
                 CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
@@ -3710,14 +3721,15 @@ class Scheduler:
             else None
         )
         try:
-            scheduled = Scheduler._auto_schedule_owned(
-                working,
-                options,
-                costs=costs,
-                scheduler_policy=scheduler_policy,
-            )
-            if isinstance(scheduled, IndexStmt):
-                validate_legacy_cin_display_names(scheduled)
+            with _trusted_normalized_cin(working):
+                scheduled = Scheduler._auto_schedule_owned(
+                    working,
+                    options,
+                    costs=costs,
+                    scheduler_policy=scheduler_policy,
+                )
+                if isinstance(scheduled, IndexStmt):
+                    validate_legacy_cin_display_names(scheduled)
         except Exception:
             if stage_token is not None and compilation_context is not None:
                 compilation_context.fail_stage(stage_token)

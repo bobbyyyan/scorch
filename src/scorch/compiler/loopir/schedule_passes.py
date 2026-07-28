@@ -2589,18 +2589,20 @@ def _check_plan_families(plan: LoopPlan) -> None:
                 "pack loop order",
             )
         if (
-            relayout.access_indices
-            != (
+            type(relayout.access_indices) is not tuple
+            or len(relayout.access_indices) != 2
+            or set(relayout.access_indices)
+            != {
                 relayout.panel_loop.index_id,
                 relayout.pack_loop.index_id,
-            )
+            }
             or relayout.operand_panel_level != 0
             or relayout.operand_pack_level != 1
         ):
             _fail(
                 "invalid_schedule_relayout",
-                "packed relayout requires the rank-2 panel/pack access and "
-                "physical levels 0/1",
+                "packed relayout requires one rank-2 access containing the "
+                "panel and pack coordinates and physical levels 0/1",
             )
         for what, reference in (
             ("pack_loop", relayout.pack_loop),

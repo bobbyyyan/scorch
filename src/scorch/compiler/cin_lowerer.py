@@ -19,6 +19,8 @@ from .cin import (
     Workspace,
     PostOp,
     PostOps,
+    _is_index_expr_instance,
+    _is_index_stmt_instance,
 )
 from .iter_lattice import IterationLattice
 from .iterator import (
@@ -36,7 +38,7 @@ from .legacy_cin_adapter import (
     claim_legacy_cin_working_tree,
     legacy_cin_working_copy,
 )
-from .cin_analysis import verify_cin_if_enabled
+from .cin_analysis import verify_cin_if_enabled, verify_cin_structure
 from .compile_options import CompileOptions
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
@@ -451,13 +453,14 @@ class CINLowerer:
         )
 
     def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
-        if isinstance(index_expr, BinaryOp):
-            return self.lower_BinaryOp(index_expr)
-        elif isinstance(index_expr, TensorAccess):
-            return self.lower_TensorAccess(index_expr)
+        expression_type = type(index_expr)
+        if expression_type is BinaryOp:
+            return self.lower_BinaryOp(cast(BinaryOp, index_expr))
+        if expression_type is TensorAccess or expression_type is WorkspaceAccess:
+            return self.lower_TensorAccess(cast(TensorAccess, index_expr))
+        expression_name = type.__getattribute__(expression_type, "__qualname__")
         raise CompilerInvariantError(
-            "stage=CIN lowering: unknown IndexExpr node type "
-            f"'{type(index_expr).__qualname__}'"
+            "stage=CIN lowering: unknown IndexExpr node type " f"'{expression_name}'"
         )
 
     @staticmethod
@@ -476,11 +479,12 @@ class CINLowerer:
         )
 
     def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
-        if isinstance(cin, IndexStmt):
-            return self.lower_IndexStmt(cin)
-        elif isinstance(cin, IndexExpr):
-            return self.lower_IndexExpr(cin)
-        node_type = type(cin).__qualname__
+        if _is_index_stmt_instance(cin):
+            return self.lower_IndexStmt(cast(IndexStmt, cin))
+        cin_type = type(cin)
+        if _is_index_expr_instance(cin):
+            return self.lower_IndexExpr(cast(IndexExpr, cin))
+        node_type = type.__getattribute__(cin_type, "__qualname__")
         raise CompilerInvariantError(
             f"stage=CIN lowering: unknown CIN node type '{node_type}'"
         )
@@ -2020,22 +2024,28 @@ class CINLowerer:
         recurse: bool,
         ownership_transferred: bool,
     ) -> IndexStmt:
+        scheduled_input = type(stmt) is ScheduledCIN
+        if not scheduled_input and not _is_index_stmt_instance(stmt):
+            raise TypeError("CIN lowering expects an IndexStmt or exact ScheduledCIN")
+        plain_cin_input = not scheduled_input
         if recurse or self.outermost_stmt is not None:
-            if isinstance(stmt, ScheduledCIN):
+            if scheduled_input:
                 raise CompilerInvariantError(
                     "stage=CIN lowering: ScheduledCIN is valid only at the "
                     "outer scheduling boundary"
                 )
-            self._validate_index_stmt(stmt)
-            return stmt
+            plain_stmt = cast(IndexStmt, stmt)
+            self._validate_index_stmt(plain_stmt)
+            return plain_stmt
 
         plan = None
-        if isinstance(stmt, ScheduledCIN):
-            verify_scheduled_cin(stmt)
-            self.loop_plan = stmt.verified_loop_plan
-            plan = stmt.verified_loop_plan
-            stmt = stmt.normalized_cin
-            self.normalized_cin = stmt
+        if scheduled_input:
+            scheduled_stmt = cast(ScheduledCIN, stmt)
+            verify_scheduled_cin(scheduled_stmt)
+            self.loop_plan = scheduled_stmt.verified_loop_plan
+            plan = scheduled_stmt.verified_loop_plan
+            prepared_stmt = scheduled_stmt.normalized_cin
+            self.normalized_cin = prepared_stmt
         elif self.compile_options.requested_schedule is not None:
             raise CompileOptionsError(
                 (
@@ -2049,20 +2059,28 @@ class CINLowerer:
                     ),
                 )
             )
+        else:
+            prepared_stmt = cast(IndexStmt, stmt)
 
-        self._validate_index_stmt(stmt)
+        if plain_cin_input and not ownership_transferred:
+            # This method is also the direct/public legacy-lowering boundary.
+            # Production-owned paths arrive through normalize_cin and transfer
+            # ownership; raw callers must establish the same fail-closed
+            # structural contract before legacy copying or recursive visitors.
+            verify_cin_structure(prepared_stmt)
+        self._validate_index_stmt(prepared_stmt)
         verify_cin_if_enabled(
-            stmt,
+            prepared_stmt,
             enabled=self.compile_options.verification.verify_cin,
         )
         if ownership_transferred:
             return claim_legacy_cin_working_tree(
-                stmt,
+                prepared_stmt,
                 plan,
                 compile_options=self.compile_options,
             )
         return legacy_cin_working_copy(
-            stmt,
+            prepared_stmt,
             plan,
             compile_options=self.compile_options,
         )
@@ -2189,10 +2207,6 @@ class CINLowerer:
             )
 
         rhs_tensor_vars: List[TensorVar] = stmt.get_rhs_tensor_vars()
-        self._value_array_ctypes = {
-            f"{tensor.name}_val": dtype_to_c_datatype(tensor.dtype).value
-            for tensor in rhs_tensor_vars
-        }
         rhs_tensor_accesses: List[TensorAccess] = stmt.get_rhs_tensor_accesses()
         # rhs_tensor_vars_llir: List[llir.Expr] = [
         #     self.lower_TensorVar(tv) for tv in rhs_tensor_vars
@@ -2222,6 +2236,12 @@ class CINLowerer:
             rhs_tensor_vars,
             self.post_ops,
         )
+        # The ABI snapshot is the fail-closed dtype/rank boundary.  Do not
+        # index the raw dtype mapping before it has validated every input.
+        self._value_array_ctypes = {
+            f"{tensor.name}_val": dtype_to_c_datatype(tensor.dtype).value
+            for tensor in rhs_tensor_vars
+        }
 
         tensor_value_array_init_stmts: List[llir.Stmt] = []
         result_level_indices_init_stmts: List[llir.Stmt] = []

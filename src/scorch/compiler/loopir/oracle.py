@@ -1001,7 +1001,14 @@ def run_program(
     inputs: Mapping[SymbolId, object],
     output_shapes: Mapping[SymbolId, Tuple[int, ...]],
 ) -> Dict[SymbolId, TensorValue]:
-    """Verify then execute one LoopIR program over plain-Python containers."""
+    """Verify then execute one LoopIR program over logical Python values.
+
+    Dense input nesting and ``output_shapes`` are both expressed in logical
+    mode order.  Physical level order belongs to :class:`LevelDecl` and to
+    target/runtime bindings; callers crossing that boundary must map each
+    physical extent through ``level.mode`` before invoking the semantic
+    oracle.  Results remain logical nested containers regardless of layout.
+    """
 
     verify_program(program)
     return _Oracle(program, inputs, output_shapes).run()

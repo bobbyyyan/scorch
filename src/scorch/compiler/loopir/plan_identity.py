@@ -69,8 +69,9 @@ from ..cin import (
     TensorAssign,
     UnaryOp,
     Where,
+    _is_index_stmt_instance,
 )
-from ..cin_analysis import canonical_cin_dump, verify_cin
+from ..cin_analysis import canonical_cin_dump, verify_cin, verify_cin_structure
 from ..compile_options import (
     CompileOptions,
     DarwinToolchainOptions,
@@ -111,8 +112,10 @@ def _verify_identity_cin(cin: object) -> IndexStmt:
     ``AttributeError``, or a caller-defined exception from serialization.
     """
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise VerificationError("loopir request identity expects an IndexStmt")
+    typed_cin = cast(IndexStmt, cin)
+    verify_cin_structure(typed_cin)
 
     active: set[int] = set()
     visited: set[int] = set()
@@ -170,15 +173,15 @@ def _verify_identity_cin(cin: object) -> IndexStmt:
             active.remove(node_key)
 
     try:
-        visit(cin, "root", 0)
-        verify_cin(cin)
+        visit(typed_cin, "root", 0)
+        verify_cin(typed_cin)
     except VerificationError:
         raise
     except Exception as exc:
         raise VerificationError(
             "loopir request identity received malformed normalized CIN state"
         ) from exc
-    return cin
+    return typed_cin
 
 
 def _rhs_binding_count(cin: IndexStmt) -> int:

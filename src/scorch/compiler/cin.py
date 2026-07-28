@@ -226,7 +226,7 @@ class IndexStmt(CIN):
                 self.visit(node.producer)
 
         collector = RHSAccessCollector()
-        self.accept(collector)
+        collector.visit(self)
         return collector.get_rhs_tensor_accesses()
 
     def get_rhs_tensor_vars(self) -> List["TensorVar"]:
@@ -873,7 +873,12 @@ class TensorAccess(IndexExpr):
         if index_var:
             level = self.level_of_index_var(index_var)
         elif level is not None:
-            index_var = self.indices[level]
+            # ``level`` is a physical storage level.  Access indices are kept
+            # in logical mode order, so a permuted dense result must select
+            # the coordinate stored at this level before constructing its
+            # flattened position.  Identity layouts retain the historical
+            # spelling exactly.
+            index_var = self.get_sorted_index_vars()[level]
 
         level_type = self.level_type_of_index_var(index_var)
         tensor_name = self.tensor.name
@@ -1005,6 +1010,11 @@ class UnaryOp(OpExpr):
 
     def __repr__(self):
         return str(self)
+
+    def accept(self, visitor: "CINVisitor") -> None:
+        """Descend for visitors that do not specialize unary expressions."""
+
+        visitor.visit(self.expr)
 
 
 @dataclass(frozen=True)
@@ -1275,3 +1285,26 @@ def all_free_var_loops_before_reduction_loops(stmt: IndexStmt) -> bool:
     free_vars = loop_order_getter.free_vars
     free_var_loops = [var for var in index_vars_ordered if var in free_vars]
     return free_var_loops == index_vars_ordered[: len(free_var_loops)]
+
+
+def _is_exact_index_stmt(value: object) -> bool:
+    """Recognize the closed CIN statement family without invoking descriptors."""
+
+    value_type = type(value)
+    return value_type is ForAll or value_type is Where or value_type is TensorAssign
+
+
+def _is_index_stmt_instance(value: object) -> bool:
+    """Check the CIN statement ancestry without reading ``value.__class__``."""
+
+    value_type = type(value)
+    value_mro = type.__getattribute__(value_type, "__mro__")
+    return any(base is IndexStmt for base in value_mro)
+
+
+def _is_index_expr_instance(value: object) -> bool:
+    """Check the CIN expression ancestry without reading ``value.__class__``."""
+
+    value_type = type(value)
+    value_mro = type.__getattribute__(value_type, "__mro__")
+    return any(base is IndexExpr for base in value_mro)

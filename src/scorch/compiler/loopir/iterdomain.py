@@ -54,6 +54,7 @@ from ..cin import (
     Operation,
     TensorAccess,
     TensorAssign,
+    _is_index_stmt_instance,
 )
 from ..identity import IndexId, SymbolId
 from ..loop_plan import LoopPlan
@@ -317,7 +318,7 @@ def analyze_iteration_domains(cin: IndexStmt, plan: LoopPlan) -> IterationDomain
     by the result.
     """
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("analyze_iteration_domains expects an IndexStmt")
     if type(plan) is not LoopPlan:
         raise TypeError("analyze_iteration_domains expects a LoopPlan")

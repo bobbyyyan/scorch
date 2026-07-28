@@ -12,6 +12,29 @@ from ..utils import (
     get_pytorch_c_dtype_name,
 )
 
+_MAX_INT64 = (1 << 63) - 1
+_MAX_KERNEL_RANK = 64
+_SUPPORTED_KERNEL_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.int32,
+    torch.int64,
+    torch.int8,
+    torch.uint8,
+)
+
+
+def _validate_known_shape_range(shape: Tuple[int, ...], owner: str) -> None:
+    """Reject extents that cannot be represented or safely multiplied."""
+
+    product = 1
+    for extent in shape:
+        if extent > _MAX_INT64:
+            raise ValueError(f"known {owner} extents must fit signed int64")
+        if extent and product > _MAX_INT64 // extent:
+            raise ValueError(f"known {owner} element count must fit signed int64")
+        product *= extent
+
 
 def tensor_storage_member(tensor_name: str, *members: str) -> llir.MemberAccess:
     """Build a fresh nested member path rooted at one generated ``Tensor``."""
@@ -84,6 +107,8 @@ class KernelTensorABI:
             type(level_type) is not LevelType for level_type in self.level_types
         ):
             raise TypeError("kernel tensor levels must be an immutable LevelType tuple")
+        if len(self.level_types) > _MAX_KERNEL_RANK:
+            raise ValueError(f"kernel tensor rank must not exceed {_MAX_KERNEL_RANK}")
         supported_levels = (
             LevelType.DENSE,
             LevelType.COMPRESSED,
@@ -118,8 +143,11 @@ class KernelTensorABI:
             raise ValueError("known kernel tensor shape must match the level rank")
         if any(extent < 0 for extent in self.shape):
             raise ValueError("known kernel tensor extents must be non-negative")
-        if not isinstance(self.dtype, torch.dtype):
-            raise TypeError("kernel tensor dtype must be a torch.dtype")
+        _validate_known_shape_range(self.shape, "kernel tensor")
+        if type(self.dtype) is not torch.dtype:
+            raise TypeError("kernel tensor dtype must be an exact torch.dtype")
+        if self.dtype not in _SUPPORTED_KERNEL_DTYPES:
+            raise ValueError(f"unsupported kernel tensor dtype {self.dtype}")
 
     def _level_kind_codes(self) -> Tuple[int, ...]:
         self._validate()
@@ -268,11 +296,14 @@ class TorchCppKernelABI:
         ):
             raise TypeError("kernel result shape must be an immutable int tuple")
         if type(self.result_rank) is not int or self.result_rank < 0:
-            raise TypeError("kernel result rank must be a non-negative int")
+            raise TypeError("kernel result rank must be a non-negative exact int")
+        if self.result_rank > _MAX_KERNEL_RANK:
+            raise ValueError(f"kernel result rank must not exceed {_MAX_KERNEL_RANK}")
         if self.result_shape and len(self.result_shape) != self.result_rank:
             raise ValueError("known kernel result shape must match the result rank")
         if any(extent < 0 for extent in self.result_shape):
             raise ValueError("known kernel result extents must be non-negative")
+        _validate_known_shape_range(self.result_shape, "kernel result")
         if type(self.input_tensors) is not tuple or any(
             type(tensor) is not KernelTensorABI for tensor in self.input_tensors
         ):
@@ -287,8 +318,14 @@ class TorchCppKernelABI:
         ):
             raise TypeError("extra tensor names must be an immutable identifier tuple")
         if self.extra_tensor_names:
-            if not isinstance(self.extra_tensor_dtype, torch.dtype):
-                raise TypeError("extra tensor dtype must be a torch.dtype when present")
+            if type(self.extra_tensor_dtype) is not torch.dtype:
+                raise TypeError(
+                    "extra tensor dtype must be an exact torch.dtype when present"
+                )
+            if self.extra_tensor_dtype not in _SUPPORTED_KERNEL_DTYPES:
+                raise ValueError(
+                    f"unsupported extra tensor dtype {self.extra_tensor_dtype}"
+                )
         elif self.extra_tensor_dtype is not None:
             raise TypeError("extra tensor dtype must be None without extra tensors")
         argument_names = ["result_shape"]
@@ -517,8 +554,12 @@ class ResultTensorAssembler:
             type(level_type) is not LevelType for level_type in self.level_types
         ):
             raise TypeError("result level types must be an immutable LevelType tuple")
-        if not isinstance(self.dtype, torch.dtype):
-            raise TypeError("result dtype must be a torch.dtype")
+        if len(self.level_types) > _MAX_KERNEL_RANK:
+            raise ValueError(f"result rank must not exceed {_MAX_KERNEL_RANK}")
+        if type(self.dtype) is not torch.dtype:
+            raise TypeError("result dtype must be an exact torch.dtype")
+        if self.dtype not in _SUPPORTED_KERNEL_DTYPES:
+            raise ValueError(f"unsupported result dtype {self.dtype}")
         if self.known_nnz_var is not None and (
             type(self.known_nnz_var) is not str or not self.known_nnz_var.isidentifier()
         ):
@@ -1081,6 +1122,11 @@ class ResultTensorAssembler:
 
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "value array initialization requires an exact " "ResultTensorAssembler"
+            )
+        self.validate()
         stmts: List[llir.Stmt] = []
         if self.is_dense:
             # capacity = product of all dimension sizes
@@ -1246,6 +1292,11 @@ class ResultTensorAssembler:
 
     def emit_level_indices_init(self) -> List[llir.Stmt]:
         """Emit per-level index array initialization for COMPRESSED/COORDINATE levels."""
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "level-index initialization requires an exact " "ResultTensorAssembler"
+            )
+        self.validate()
         stmts: List[llir.Stmt] = []
         for i, level_type in enumerate(self.level_types):
             if level_type == LevelType.COMPRESSED:
@@ -1460,6 +1511,10 @@ class ResultTensorAssembler:
     def emit_result_declaration(self) -> llir.VarDecl:
         """Declare one fresh ABI result owner from this frozen snapshot."""
 
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "result declaration requires an exact ResultTensorAssembler"
+            )
         self.validate()
         return llir.VarDecl(
             var=llir.Var(
@@ -1471,6 +1526,8 @@ class ResultTensorAssembler:
     def emit_storage_epilogue(self) -> List[llir.Stmt]:
         """Assign result storage and return without moving dynamic buffers."""
 
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError("storage epilogue requires an exact ResultTensorAssembler")
         self.validate()
         return [
             llir.Assign(
@@ -1505,6 +1562,8 @@ class ResultTensorAssembler:
 
     def emit_final_assembly(self) -> List[llir.Stmt]:
         """Move dynamic buffers to Torch, assign indices/values, and return."""
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError("final assembly requires an exact ResultTensorAssembler")
         self.validate()
         stmts: List[llir.Stmt] = []
 

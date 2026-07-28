@@ -255,9 +255,9 @@ class ScheduledCIN:
     verified_loop_plan: LoopPlan
 
     def __post_init__(self) -> None:
-        from .cin import IndexStmt
+        from .cin import _is_exact_index_stmt
 
-        if not isinstance(self.normalized_cin, IndexStmt):
+        if not _is_exact_index_stmt(self.normalized_cin):
             raise TypeError("ScheduledCIN.normalized_cin must be an IndexStmt")
         if not isinstance(self.verified_loop_plan, LoopPlan):
             raise TypeError("ScheduledCIN.verified_loop_plan must be a LoopPlan")
@@ -267,11 +267,11 @@ class ScheduledCIN:
 
 
 def _collect_entities(cin: object) -> Tuple[Dict[IndexId, str], Dict[SymbolId, str]]:
-    from .cin import IndexStmt
+    from .cin import _is_index_stmt_instance
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise VerificationError("normalized CIN must be an IndexStmt")
-    analysis = analyze_cin(cin)
+    analysis = analyze_cin(cast("IndexStmt", cin))
     reference_errors = tuple(
         diagnostic
         for diagnostic in analysis.diagnostics
@@ -303,11 +303,11 @@ def _collect_entities(cin: object) -> Tuple[Dict[IndexId, str], Dict[SymbolId, s
 def _analyze_loop_plan_cin(cin: object) -> CINAnalysis:
     """Return trustworthy canonical facts for semantic plan verification."""
 
-    from .cin import IndexStmt
+    from .cin import _is_index_stmt_instance
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise VerificationError("normalized CIN must be an IndexStmt")
-    analysis = analyze_cin(cin)
+    analysis = analyze_cin(cast("IndexStmt", cin))
     if analysis.diagnostics:
         first = analysis.diagnostics[0]
         raise VerificationError(

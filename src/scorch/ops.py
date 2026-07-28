@@ -1,5 +1,6 @@
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
@@ -2441,6 +2442,299 @@ _ModeOrderAlignmentPlan = Tuple[
 ]
 
 
+@dataclass(frozen=True)
+class _RuntimeTensorSnapshot:
+    """One validated runtime tensor captured before compiler-side mutation."""
+
+    tensor: STensor
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    tensor_format: TensorFormat
+    mode_order: Tuple[int, ...]
+    has_index: bool
+    native_mode_indices: List[List[torch.Tensor]]
+    values: torch.Tensor
+
+
+def _checked_runtime_shape(shape: object, owner: str) -> Tuple[int, ...]:
+    """Snapshot one safe public shape with signed-int64 ABI bounds."""
+
+    if (
+        type(shape) is not tuple
+        and type(shape) is not list
+        and type(shape) is not torch.Size
+        and type(shape) is not range
+    ):
+        raise CompileSpecError(
+            f"{owner} must be a tuple, list, torch.Size, or range of exact ints"
+        )
+    try:
+        rank = len(shape)
+    except OverflowError as error:
+        raise CompileSpecError(f"{owner} rank exceeds the supported limit") from error
+    if rank > 64:
+        raise CompileSpecError(f"{owner} rank must not exceed 64")
+    max_int64 = (1 << 63) - 1
+    checked: List[int] = []
+    element_count = 1
+    for extent in shape:
+        if type(extent) is not int or extent < 0 or extent > max_int64:
+            raise CompileSpecError(
+                f"{owner} must contain nonnegative signed int64 extents"
+            )
+        if extent and element_count > max_int64 // extent:
+            raise CompileSpecError(f"{owner} element count exceeds signed int64")
+        element_count *= extent
+        checked.append(extent)
+    return tuple(checked)
+
+
+def _snapshot_runtime_tensors(
+    args: tuple,
+    *,
+    expected_count: Optional[int] = None,
+) -> Tuple[_RuntimeTensorSnapshot, ...]:
+    """Validate every runtime operand before reading any operand descriptor."""
+
+    if type(args) is not tuple:
+        raise CompileSpecError("runtime tensor arguments must be an exact tuple")
+    if expected_count is not None:
+        if type(expected_count) is not int or expected_count < 0:
+            raise TypeError("expected runtime tensor count must be a nonnegative int")
+        if len(args) != expected_count:
+            raise CompileSpecError(
+                f"CIN expects {expected_count} runtime tensors, got {len(args)}"
+            )
+    for position, arg in enumerate(args):
+        if type(arg) is not STensor:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} must be an exact STensor"
+            )
+
+    snapshots: List[_RuntimeTensorSnapshot] = []
+    for position, arg in enumerate(args):
+        # The all-argument exact-type pass above is deliberately separate:
+        # a hostile later object cannot make us execute a property, validation
+        # hook, or relayout on an earlier argument before the request fails.
+        try:
+            shape = _checked_runtime_shape(
+                STensor.shape.__get__(arg, STensor),
+                f"runtime tensor argument {position} shape",
+            )
+            dtype = STensor.dtype.__get__(arg, STensor)
+            tensor_format = STensor.format.__get__(arg, STensor)
+            mode_order = STensor.mode_order.__get__(arg, STensor)
+            has_index = STensor.has_index.__get__(arg, STensor)
+            values = STensor.values.__get__(arg, STensor)
+            native_mode_indices = STensor._native_mode_indices(arg)
+        except CompileSpecError:
+            raise
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid internal state"
+            ) from error
+        if type(dtype) is not torch.dtype:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} dtype must be an exact "
+                "torch.dtype"
+            )
+        if type(tensor_format) is not TensorFormat:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} format must be an exact "
+                "TensorFormat"
+            )
+        if type(mode_order) is not tuple or any(
+            type(mode) is not int for mode in mode_order
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} mode order must be an "
+                "exact tuple of ints"
+            )
+        rank = len(shape)
+        try:
+            format_rank = TensorFormat.get_order(tensor_format)
+            level_types = TensorFormat.get_level_types(tensor_format)
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid format state"
+            ) from error
+        if (
+            format_rank != rank
+            or len(mode_order) != rank
+            or sorted(mode_order) != list(range(rank))
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} format, shape, and mode "
+                "order ranks must agree"
+            )
+        if type(has_index) is not bool:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has_index must be an exact bool"
+            )
+        if not isinstance(values, torch.Tensor):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} values must be a torch.Tensor"
+            )
+        try:
+            invalid_values = (
+                values.dtype is not dtype
+                or values.layout is not torch.strided
+                or values.device.type != "cpu"
+                or values.dim() != 1
+                or not values.is_contiguous()
+                or values.is_neg()
+                or values.is_conj()
+            )
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid values state"
+            ) from error
+        if invalid_values:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} values violate the native "
+                "CPU storage contract"
+            )
+        if type(native_mode_indices) is not list or len(native_mode_indices) != rank:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices must be "
+                "rank-sized lists of tensors"
+            )
+        if (
+            any(type(arrays) is not list for arrays in native_mode_indices)
+            or type(level_types) is not list
+            or len(level_types) != rank
+            or any(type(level_type) is not LevelType for level_type in level_types)
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native index levels must "
+                "match its exact TensorFormat"
+            )
+        for level, (arrays, level_type) in enumerate(
+            zip(native_mode_indices, level_types)
+        ):
+            expected_arrays = (
+                0
+                if level_type is LevelType.DENSE
+                else (2 if level_type is LevelType.COMPRESSED else 1)
+            )
+            if len(arrays) != expected_arrays:
+                raise CompileSpecError(
+                    f"runtime tensor argument {position} level {level} requires "
+                    f"{expected_arrays} native index arrays"
+                )
+        if any(
+            not isinstance(index, torch.Tensor)
+            for arrays in native_mode_indices
+            for index in arrays
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices must be "
+                "rank-sized lists of tensors"
+            )
+        try:
+            invalid_index = any(
+                index.layout is not torch.strided
+                or index.device.type != "cpu"
+                or index.dtype not in (torch.int32, torch.int64)
+                or index.dim() != 1
+                or not index.is_contiguous()
+                for arrays in native_mode_indices
+                for index in arrays
+            )
+            index_dtypes = {
+                index.dtype for arrays in native_mode_indices for index in arrays
+            }
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid native index state"
+            ) from error
+        if invalid_index or len(index_dtypes) > 1:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices violate the "
+                "CPU index contract"
+            )
+        try:
+            stored_values = values.numel()
+            parent_positions = 1
+            for level, (extent, arrays, level_type) in enumerate(
+                zip(shape, native_mode_indices, level_types)
+            ):
+                if level_type is LevelType.DENSE:
+                    parent_positions *= extent
+                    continue
+                coordinates = arrays[-1]
+                coordinate_count = coordinates.numel()
+                if level_type in (LevelType.COORDINATE, LevelType.SINGLETON):
+                    if coordinate_count != stored_values:
+                        raise CompileSpecError(
+                            f"runtime tensor argument {position} coordinate level "
+                            f"{level} count must equal its stored value count"
+                        )
+                    parent_positions = coordinate_count
+                    continue
+                positions = arrays[0]
+                if (
+                    positions.numel() != parent_positions + 1
+                    or positions[0].item() != 0
+                    or positions[-1].item() != coordinate_count
+                ):
+                    raise CompileSpecError(
+                        f"runtime tensor argument {position} compressed level "
+                        f"{level} has an invalid positions/cardinality chain"
+                    )
+                parent_positions = coordinate_count
+            if parent_positions != stored_values:
+                raise CompileSpecError(
+                    f"runtime tensor argument {position} storage cardinality "
+                    "does not match its value count"
+                )
+        except CompileSpecError:
+            raise
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid storage "
+                "cardinality state"
+            ) from error
+        snapshots.append(
+            _RuntimeTensorSnapshot(
+                tensor=arg,
+                shape=shape,
+                dtype=dtype,
+                tensor_format=tensor_format,
+                mode_order=mode_order,
+                has_index=has_index,
+                native_mode_indices=native_mode_indices,
+                values=values,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _validate_direct_runtime_formats(
+    cin_stmt: IndexStmt,
+    snapshots: Tuple[_RuntimeTensorSnapshot, ...],
+) -> None:
+    """Check every direct-CIN operand before relayout or metadata mutation."""
+
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(snapshots):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
+            f"{len(snapshots)}"
+        )
+    mismatches = [
+        (tensor_var, snapshot.tensor_format)
+        for tensor_var, snapshot in zip(rhs_tensor_vars, snapshots)
+        if tensor_var.format != snapshot.tensor_format
+    ]
+    if mismatches:
+        tensor_var, actual_format = mismatches[0]
+        raise CompileSpecError(
+            f"CIN tensor {tensor_var.name!r} expects format "
+            f"{tensor_var.format}, got {actual_format}"
+        )
+
+
 def _plan_mode_orders_to_loop_order(
     cin_stmt: IndexStmt,
     args: tuple,
@@ -2484,23 +2778,57 @@ def _plan_mode_orders_to_loop_order(
 
 def _plan_direct_cin_runtime_binding(
     cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
     args: tuple,
     compile_options: CompileOptions,
     compilation_context: CompilationContext,
-) -> _ModeOrderAlignmentPlan:
-    """Time direct-CIN runtime-binding planning without executing relayouts."""
+) -> Tuple[
+    Tuple[int, ...],
+    Tuple[_RuntimeTensorSnapshot, ...],
+    _ModeOrderAlignmentPlan,
+]:
+    """Validate and plan direct-CIN binding without relayout or mutation."""
 
     planning_token = compilation_context.begin_stage(
         CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
         compile_options=compile_options,
     )
     try:
-        plan = _plan_mode_orders_to_loop_order(cin_stmt, args)
+        checked_result_shape = _checked_runtime_shape(result_shape, "result shape")
+        rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+        snapshots = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(rhs_tensor_vars),
+        )
+        _validate_direct_runtime_formats(cin_stmt, snapshots)
+        result_tensor_vars: List[TensorVar] = []
+        for tensor_var in cin_stmt.get_result_tensor_vars():
+            if isinstance(tensor_var, Workspace) or any(
+                tensor_var is retained for retained in result_tensor_vars
+            ):
+                continue
+            result_tensor_vars.append(tensor_var)
+        if len(result_tensor_vars) != 1:
+            raise CompileSpecError(
+                "direct CIN execution requires exactly one external result tensor"
+            )
+        result_tensor_var = result_tensor_vars[0]
+        result_format = result_tensor_var.format
+        if type(result_format) is not TensorFormat or result_format.get_order() != len(
+            checked_result_shape
+        ):
+            raise CompileSpecError(
+                "direct CIN result format rank must match the result shape rank"
+            )
+        plan = _plan_mode_orders_to_loop_order(
+            cin_stmt,
+            tuple(snapshot.tensor for snapshot in snapshots),
+        )
     except Exception:
         compilation_context.fail_stage(planning_token)
         raise
     compilation_context.complete_stage(planning_token)
-    return plan
+    return checked_result_shape, snapshots, plan
 
 
 def _relayout_mode_order_args(
@@ -2508,19 +2836,27 @@ def _relayout_mode_order_args(
     plan: _ModeOrderAlignmentPlan,
     compile_options: CompileOptions,
     compilation_context: Optional[CompilationContext],
+    *,
+    snapshots: Optional[Tuple[_RuntimeTensorSnapshot, ...]] = None,
 ) -> tuple:
     """Execute only runtime relayout prerequisites from a frozen alignment plan."""
 
+    if snapshots is None:
+        snapshots = _snapshot_runtime_tensors(args)
+    if len(args) != len(snapshots) or any(
+        arg is not snapshot.tensor for arg, snapshot in zip(args, snapshots)
+    ):
+        raise CompileSpecError("runtime tensor snapshots do not match relayout inputs")
     aligned_args = list(args)
-    for position, (stensor, desired_mode_order) in enumerate(zip(args, plan[0])):
+    for position, (snapshot, desired_mode_order) in enumerate(zip(snapshots, plan[0])):
         if (
             desired_mode_order is not None
-            and list(stensor.mode_order) != list(desired_mode_order)
-            and stensor.has_index
-            and stensor.shape is not None
+            and snapshot.mode_order != desired_mode_order
+            and snapshot.has_index
         ):
-            aligned = stensor.copy()
-            aligned.change_mode_order(
+            aligned = STensor.copy(snapshot.tensor)
+            STensor.change_mode_order(
+                aligned,
                 list(desired_mode_order),
                 _compile_options=compile_options,
                 _compilation_context=compilation_context,
@@ -2583,8 +2919,10 @@ def lower_and_exec_cin(
     ----------
     cin_stmt : IndexStmt
         CIN statement (index-notation AST) to lower.
-    result_shape : Sequence[int]
-        Shape of the result tensor.
+    result_shape : tuple[int, ...], list[int], torch.Size, or range
+        Physical shape of the result tensor. Extents must be exact,
+        nonnegative signed-64-bit integers and their product must fit in a
+        signed 64-bit integer.
     *args : STensor
         Input tensors, matched left-to-right against the RHS tensor accesses.
     **kwargs
@@ -2594,7 +2932,10 @@ def lower_and_exec_cin(
     Returns
     -------
     STensor
-        Output tensor. The output format is hard-coded to ``"dd"`` (dense).
+        Output tensor. Dense result rank and mode order are derived from the
+        compiler-owned result declaration. Sparse-result wrapping retains its
+        historical compatibility behavior until the sparse-result migration
+        owns its assembled indices.
     """
     compile_options = _compile_options_from_kwargs(kwargs)
     _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
@@ -2604,41 +2945,47 @@ def lower_and_exec_cin(
         compile_options=compile_options,
         compilation_context=compilation_context,
     )
-    alignment_plan = _plan_direct_cin_runtime_binding(
+    result_shape, runtime_args, alignment_plan = _plan_direct_cin_runtime_binding(
         cin_stmt,
+        result_shape,
         args,
         compile_options,
         compilation_context,
     )
-    args = _relayout_mode_order_args(
-        args,
-        alignment_plan,
-        compile_options,
-        compilation_context,
-    )
+    try:
+        args = _relayout_mode_order_args(
+            tuple(snapshot.tensor for snapshot in runtime_args),
+            alignment_plan,
+            compile_options,
+            compilation_context,
+            snapshots=runtime_args,
+        )
+    except Exception:
+        if compilation_context._failed_stage_id is None:
+            relayout_failure_token = compilation_context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=compile_options,
+            )
+            compilation_context.fail_stage(relayout_failure_token)
+        raise
 
     frontend_binding_token = compilation_context.begin_stage(
         CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
         compile_options=compile_options,
     )
     try:
+        runtime_args = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(runtime_args),
+        )
         _apply_mode_order_alignment(cin_stmt, alignment_plan)
         rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
-        if len(rhs_tensor_vars) != len(args):
-            raise CompileSpecError(
-                f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got {len(args)}"
-            )
-        for tensor_var, arg in zip(rhs_tensor_vars, args):
-            if tensor_var.format != arg.format:
-                raise CompileSpecError(
-                    f"CIN tensor {tensor_var.name!r} expects format "
-                    f"{tensor_var.format}, got {arg.format}"
-                )
-            tensor_var.shape = arg.shape
-            tensor_var.dtype = arg.dtype
-            tensor_var.mode_order = list(arg.mode_order)
+        for tensor_var, snapshot in zip(rhs_tensor_vars, runtime_args):
+            tensor_var.shape = snapshot.shape
+            tensor_var.dtype = snapshot.dtype
+            tensor_var.mode_order = list(snapshot.mode_order)
 
-        output_dtype = args[0].dtype if args else torch.float32
+        output_dtype = runtime_args[0].dtype if runtime_args else torch.float32
         for tensor_var in cin_stmt.get_result_tensor_vars():
             if not isinstance(tensor_var, Workspace):
                 tensor_var.shape = tuple(result_shape)
@@ -2672,10 +3019,10 @@ def lower_and_exec_cin(
 
     module_args: List[Any] = [result_shape]
 
-    for arg in args:
-        module_args.append(arg.shape)
-        module_args.append(arg._native_mode_indices())
-        module_args.append(arg.values)
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
 
     start_time = time.time()
     result_cpp = module.evaluate(*module_args)
@@ -2684,13 +3031,31 @@ def lower_and_exec_cin(
     if "time_dict" in kwargs:
         kwargs["time_dict"]["eval_time"] = eval_time
 
+    result_tensor_var = lowerer.final_result_tensor_var
+    dense_result = (
+        result_tensor_var
+        if result_tensor_var is not None
+        and result_tensor_var.format is not None
+        and result_tensor_var.format.is_dense()
+        else None
+    )
+    result_format = (
+        dense_result.get_format() if dense_result is not None else parse_format("dd")
+    )
+    result_mode_order = (
+        tuple(dense_result.mode_order)
+        if dense_result is not None and dense_result.mode_order is not None
+        else None
+    )
     result = STensor(
         shape=tuple(result_shape),
         index=TensorIndex(
             mode_indices=_finalize_generated_mode_indices(
-                parse_format("dd"), result_cpp.storage.index.mode_indices
+                result_format,
+                result_cpp.storage.index.mode_indices,
             ),
-            tensor_format="dd",
+            tensor_format=result_format,
+            mode_order=result_mode_order,
         ),
         value=result_cpp.storage.value,
     )

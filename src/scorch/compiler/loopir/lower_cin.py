@@ -60,6 +60,7 @@ from ..cin import (
     TensorAssign,
     TensorVar,
     Where,
+    _is_index_stmt_instance,
 )
 from ..cin_analysis import verify_cin, verify_cin_structure
 from ..loop_plan import LoopPlan, verify_loop_plan
@@ -299,7 +300,7 @@ def lower_normalized_cin_to_loopir(
     explicit ADD update, and no later stage re-infers that fact.
     """
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("lower_normalized_cin_to_loopir expects an IndexStmt")
     verify_cin_structure(cin)
     # Classify the nest shape first so out-of-family statements (Where,
@@ -415,14 +416,6 @@ def lower_normalized_cin_to_loopir(
     }
     level_types = {symbol: levels for symbol, (_, levels, _) in checked_tensors.items()}
     storage_modes = {symbol: modes for symbol, (_, _, modes) in checked_tensors.items()}
-    if storage_modes[result_symbol] != tuple(range(len(level_types[result_symbol]))):
-        # Production alignment keeps results in loop-consistent identity
-        # layouts; a permuted result changes assembly, not only descent.
-        _fail(
-            "unsupported_mode_order",
-            f"result {lhs.tensor.name!r} uses a non-identity mode order, "
-            "which stays outside the migrated families",
-        )
     if len(set(scalar_types.values())) > 1:
         _fail(
             "mixed_dtype",

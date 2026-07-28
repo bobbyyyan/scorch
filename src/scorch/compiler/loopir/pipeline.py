@@ -54,10 +54,15 @@ from ...exceptions import CompileSpecError
 from ...utils import parse_format
 from .. import llir
 from ..cin import IndexStmt
-from ..cin_analysis import normalize_cin, verify_cin_structure
+from ..cin_analysis import (
+    _trusted_normalized_cin,
+    normalize_cin,
+    verify_cin_structure,
+)
 from ..cin_lowerer import CINLowerer
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..compile_options import CompileOptions
+from ..diagnostics import VerificationError
 from ..identity import SymbolId
 from ..loop_plan import LoopPlan, ScheduledCIN
 from .lower_cin import LoopIRLoweringResult, lower_normalized_cin_to_loopir
@@ -205,8 +210,10 @@ def _execute_mode_order_alignment(
     alignment_plan,
     options: CompileOptions,
     context: Optional[CompilationContext],
+    *,
+    runtime_snapshots,
 ) -> tuple:
-    """Apply one alignment without leaking a parent schedule to prerequisites.
+    """Apply one alignment and return validated post-relayout snapshots.
 
     A storage relayout may compile an auxiliary kernel.  That prerequisite is
     not the scheduled operation, so it receives a schedule-free copy of the
@@ -214,7 +221,11 @@ def _execute_mode_order_alignment(
     Every other build and compiler option remains identical.
     """
 
-    from ...ops import _apply_mode_order_alignment, _relayout_mode_order_args
+    from ...ops import (
+        _apply_mode_order_alignment,
+        _relayout_mode_order_args,
+        _snapshot_runtime_tensors,
+    )
 
     relayout_options = options
     relayout_context = context
@@ -226,9 +237,14 @@ def _execute_mode_order_alignment(
         alignment_plan,
         relayout_options,
         relayout_context,
+        snapshots=runtime_snapshots,
+    )
+    aligned_snapshots = _snapshot_runtime_tensors(
+        aligned,
+        expected_count=len(runtime_snapshots),
     )
     _apply_mode_order_alignment(normalized, alignment_plan)
-    return aligned
+    return aligned_snapshots
 
 
 def _apply_requested_schedule(
@@ -249,61 +265,137 @@ def _apply_requested_schedule(
 
     schedule = options.requested_schedule
     assert schedule is not None
-    scheduled = Scheduler.apply_schedule(
-        cin_stmt,
-        schedule,
-        compile_options=options,
-        compilation_context=context,
-    )
+    # This public entry owns malformed-input ordering: no scheduler hook,
+    # metadata binder, or build preparation may observe a structurally invalid
+    # caller graph.  The narrow trust context lets the scheduler's immediately
+    # following normalization reuse this exact successful scan.
+    verify_cin_structure(cin_stmt)
+    with _trusted_normalized_cin(cin_stmt):
+        scheduled = Scheduler.apply_schedule(
+            cin_stmt,
+            schedule,
+            compile_options=options,
+            compilation_context=context,
+        )
     return scheduled.normalized_cin, scheduled.verified_loop_plan
 
 
 def _bind_runtime_metadata(
     cin_stmt: IndexStmt,
-    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
-    result_shape: Tuple[int, ...],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    result_shape: Sequence[int],
     input_formats: Optional[Sequence[object]] = None,
-) -> None:
-    """Bind shapes/dtypes exactly like the legacy public entry does."""
+) -> Tuple[
+    Tuple[Tuple[Tuple[int, ...], torch.dtype], ...],
+    Tuple[int, ...],
+]:
+    """Validate, snapshot, and bind public runtime metadata atomically."""
 
+    max_int64 = (1 << 63) - 1
+
+    def checked_shape(shape: object, owner: str) -> Tuple[int, ...]:
+        if (
+            type(shape) is not tuple
+            and type(shape) is not list
+            and type(shape) is not torch.Size
+            and type(shape) is not range
+        ):
+            raise VerificationError(
+                f"{owner} must be a tuple, list, torch.Size, or range of exact ints"
+            )
+        try:
+            rank = len(shape)
+        except OverflowError as error:
+            raise VerificationError(
+                f"{owner} rank exceeds the supported limit"
+            ) from error
+        if rank > 64:
+            raise VerificationError(f"{owner} rank must not exceed 64")
+        result: List[int] = []
+        product = 1
+        for extent in shape:
+            if type(extent) is not int or extent < 0 or extent > max_int64:
+                raise VerificationError(
+                    f"{owner} must contain nonnegative int64 extents"
+                )
+            if extent and product > max_int64 // extent:
+                raise VerificationError(f"{owner} element count exceeds signed int64")
+            product *= extent
+            result.append(extent)
+        return tuple(result)
+
+    if type(input_bindings) is not tuple and type(input_bindings) is not list:
+        raise VerificationError("runtime input bindings must be a tuple or list")
     rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
     if len(rhs_tensor_vars) != len(input_bindings):
         raise CompileSpecError(
             f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
             f"{len(input_bindings)}"
         )
-    if input_formats is not None and len(input_formats) != len(input_bindings):
-        raise CompileSpecError(
-            "runtime tensor formats must match the input binding count"
-        )
-    for position, (tensor_var, (shape, dtype)) in enumerate(
-        zip(rhs_tensor_vars, input_bindings)
-    ):
-        if input_formats is not None and tensor_var.format != input_formats[position]:
+    if input_formats is not None:
+        if type(input_formats) is not tuple and type(input_formats) is not list:
+            raise CompileSpecError("runtime tensor formats must be a tuple or list")
+        if len(input_formats) != len(input_bindings):
             raise CompileSpecError(
-                f"CIN tensor {tensor_var.name!r} expects format "
-                f"{tensor_var.format}, got {input_formats[position]}"
+                "runtime tensor formats must match the input binding count"
             )
-        tensor_var.shape = tuple(shape)
+    checked_bindings: List[Tuple[Tuple[int, ...], torch.dtype]] = []
+    for position, binding in enumerate(input_bindings):
+        if (type(binding) is not tuple and type(binding) is not list) or len(
+            binding
+        ) != 2:
+            raise VerificationError(
+                f"runtime input binding {position} must be a shape/dtype pair"
+            )
+        shape, dtype = binding
+        checked_input_shape = checked_shape(
+            shape,
+            f"runtime input binding {position} shape",
+        )
+        if type(dtype) is not torch.dtype:
+            raise VerificationError(
+                f"runtime input binding {position} dtype must be an exact "
+                "torch.dtype"
+            )
+        checked_bindings.append((checked_input_shape, dtype))
+
+    checked_result_shape = checked_shape(result_shape, "runtime result shape")
+    if input_formats is not None:
+        for position, (tensor_var, actual_format) in enumerate(
+            zip(rhs_tensor_vars, input_formats)
+        ):
+            if tensor_var.format != actual_format:
+                raise CompileSpecError(
+                    f"CIN tensor {tensor_var.name!r} expects format "
+                    f"{tensor_var.format}, got {input_formats[position]}"
+                )
+    for position, (tensor_var, (shape, dtype)) in enumerate(
+        zip(rhs_tensor_vars, checked_bindings)
+    ):
+        tensor_var.shape = shape
         tensor_var.dtype = dtype
         if tensor_var.mode_order is None:
             tensor_var.mode_order = list(range(len(shape)))
-    output_dtype = input_bindings[0][1] if input_bindings else torch.float32
+    output_dtype = checked_bindings[0][1] if checked_bindings else torch.float32
     for tensor_var in cin_stmt.get_result_tensor_vars():
-        tensor_var.shape = tuple(result_shape)
+        tensor_var.shape = checked_result_shape
         tensor_var.dtype = output_dtype
+    return tuple(checked_bindings), checked_result_shape
 
 
-def _validate_runtime_formats(cin_stmt: IndexStmt, args: Sequence[object]) -> None:
+def _validate_runtime_formats(
+    cin_stmt: IndexStmt,
+    input_formats: Sequence[object],
+) -> None:
     """Reject storage-format mismatches before any runtime relayout work."""
 
     rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
-    if len(rhs_tensor_vars) != len(args):
+    if len(rhs_tensor_vars) != len(input_formats):
         raise CompileSpecError(
-            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got {len(args)}"
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
+            f"{len(input_formats)}"
         )
-    for tensor_var, arg in zip(rhs_tensor_vars, args):
-        actual_format = getattr(arg, "format", None)
+    for tensor_var, actual_format in zip(rhs_tensor_vars, input_formats):
         if tensor_var.format != actual_format:
             raise CompileSpecError(
                 f"CIN tensor {tensor_var.name!r} expects format "
@@ -314,24 +406,48 @@ def _validate_runtime_formats(cin_stmt: IndexStmt, args: Sequence[object]) -> No
 def _compile_normalized_cin_via_loopir(
     normalized: IndexStmt,
     result_shape: Sequence[int],
-    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
     *,
     options: CompileOptions,
     context: CompilationContext,
     input_formats: Optional[Sequence[object]] = None,
     plan: Optional[LoopPlan] = None,
 ) -> LoopIRCompiledKernel:
-    """Lower one owned normalized CIN program through the LoopIR path."""
+    """Lower one privately owned normalized CIN root through LoopIR."""
+
+    with _trusted_normalized_cin(normalized):
+        return _compile_normalized_cin_via_loopir_owned(
+            normalized,
+            result_shape,
+            input_bindings,
+            options=options,
+            context=context,
+            input_formats=input_formats,
+            plan=plan,
+        )
+
+
+def _compile_normalized_cin_via_loopir_owned(
+    normalized: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    options: CompileOptions,
+    context: CompilationContext,
+    input_formats: Optional[Sequence[object]] = None,
+    plan: Optional[LoopPlan] = None,
+) -> LoopIRCompiledKernel:
+    """Implementation under the private normalized-CIN trust context."""
 
     binding_token = context.begin_stage(
         CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
         compile_options=options,
     )
     try:
-        _bind_runtime_metadata(
+        checked_input_bindings, checked_result_shape = _bind_runtime_metadata(
             normalized,
             input_bindings,
-            tuple(result_shape),
+            result_shape,
             input_formats,
         )
         # Request identity belongs to the validated request boundary.  Keep
@@ -342,8 +458,8 @@ def _compile_normalized_cin_via_loopir(
         request_dump = loopir_request_dump(
             normalized,
             plan,
-            tuple(result_shape),
-            tuple(input_bindings),
+            checked_result_shape,
+            checked_input_bindings,
             compile_options=options,
         )
         request_identity = hashlib.sha256(request_dump.encode("utf-8")).hexdigest()
@@ -393,7 +509,7 @@ def _compile_normalized_cin_via_loopir(
     llir_function = lower_loopir_to_llir(
         program,
         input_shapes=input_shapes,
-        result_shape=tuple(result_shape),
+        result_shape=checked_result_shape,
         compile_options=options,
         compilation_context=context,
     )
@@ -416,14 +532,13 @@ def _compile_normalized_cin_via_loopir(
 def compile_cin_via_loopir(
     cin_stmt: IndexStmt,
     result_shape: Sequence[int],
-    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
     *,
     compile_options: Optional[CompileOptions] = None,
     compilation_context: Optional[CompilationContext] = None,
 ) -> LoopIRCompiledKernel:
     """Lower one supported-family CIN program to C++ through LoopIR."""
 
-    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options, compilation_context)
     context = compilation_context
     if context is None:
@@ -450,7 +565,7 @@ def compile_cin_via_loopir(
 def legacy_generated_cpp(
     cin_stmt: IndexStmt,
     result_shape: Sequence[int],
-    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
     *,
     compile_options: Optional[CompileOptions] = None,
 ) -> str:
@@ -474,13 +589,11 @@ def legacy_generated_cpp(
             compile_options=options,
             compilation_context=context,
         )
-        _bind_runtime_metadata(
-            scheduled.normalized_cin, input_bindings, tuple(result_shape)
-        )
+        _bind_runtime_metadata(scheduled.normalized_cin, input_bindings, result_shape)
         lowering_stmt = scheduled
     else:
         normalized = normalize_cin(cin_stmt, compile_options=options)
-        _bind_runtime_metadata(normalized, input_bindings, tuple(result_shape))
+        _bind_runtime_metadata(normalized, input_bindings, result_shape)
         lowering_stmt = normalized
     lowerer = CINLowerer(compile_options=options, compilation_context=context)
     lowered = lowerer._lower_owned_IndexStmt(lowering_stmt)
@@ -493,7 +606,7 @@ def legacy_generated_cpp(
 def compare_generated_sources(
     cin_stmt: IndexStmt,
     result_shape: Sequence[int],
-    input_bindings: Sequence[Tuple[Tuple[int, ...], torch.dtype]],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
     *,
     compile_options: Optional[CompileOptions] = None,
 ) -> ShadowSourceComparison:
@@ -505,13 +618,13 @@ def compare_generated_sources(
 
     options = _resolve_options(compile_options)
     loopir_kernel = compile_cin_via_loopir(
-        copy.deepcopy(cin_stmt),
+        cin_stmt,
         result_shape,
         input_bindings,
         compile_options=options,
     )
     legacy_cpp = legacy_generated_cpp(
-        copy.deepcopy(cin_stmt),
+        cin_stmt,
         result_shape,
         input_bindings,
         compile_options=options,
@@ -540,13 +653,14 @@ def execute_cin_via_loopir(
     from ...stensor import STensor
     from ...storage import TensorIndex
     from ...ops import (
+        _checked_runtime_shape,
         _finalize_generated_mode_indices,
         _load_validated_prepared_kernel,
         _plan_mode_orders_to_loop_order,
         _prepare_generated_kernel_build,
+        _snapshot_runtime_tensors,
     )
 
-    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options, _compilation_context)
     context = _compilation_context
     if context is None:
@@ -565,23 +679,39 @@ def execute_cin_via_loopir(
         compile_options=options,
     )
     try:
-        _validate_runtime_formats(normalized, args)
+        result_shape = _checked_runtime_shape(result_shape, "result shape")
+        runtime_args = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(normalized.get_rhs_tensor_vars()),
+        )
+        _validate_runtime_formats(
+            normalized,
+            tuple(snapshot.tensor_format for snapshot in runtime_args),
+        )
         if plan is not None:
-            alignment_plan = _plan_mode_orders_to_planned_order(normalized, args, plan)
+            alignment_plan = _plan_mode_orders_to_planned_order(
+                normalized,
+                runtime_args,
+                plan,
+            )
             # A scheduled relayout executes with an independent schedule-free
             # context, but its success or failure still belongs to this
             # compilation's frontend binding stage.  Keep the parent token
             # active so elapsed time includes the prerequisite and a child
             # failure makes the caller-owned context terminal.
-            args = _execute_mode_order_alignment(
+            runtime_args = _execute_mode_order_alignment(
                 normalized,
-                args,
+                tuple(snapshot.tensor for snapshot in runtime_args),
                 alignment_plan,
                 options,
                 context,
+                runtime_snapshots=runtime_args,
             )
         else:
-            alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+            alignment_plan = _plan_mode_orders_to_loop_order(
+                normalized,
+                runtime_args,
+            )
     except Exception:
         context.fail_stage(planning_token)
         raise
@@ -589,21 +719,33 @@ def execute_cin_via_loopir(
     if plan is None:
         # The unscheduled route shares its context with nested relayout
         # compilation, so its root frontend stage must finish first.
-        args = _execute_mode_order_alignment(
-            normalized,
-            args,
-            alignment_plan,
-            options,
-            context,
-        )
-    input_bindings = tuple((tuple(arg.shape), arg.dtype) for arg in args)
+        try:
+            runtime_args = _execute_mode_order_alignment(
+                normalized,
+                tuple(snapshot.tensor for snapshot in runtime_args),
+                alignment_plan,
+                options,
+                context,
+                runtime_snapshots=runtime_args,
+            )
+        except Exception:
+            if context._failed_stage_id is None:
+                relayout_failure_token = context.begin_stage(
+                    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                    compile_options=options,
+                )
+                context.fail_stage(relayout_failure_token)
+            raise
+    input_bindings = tuple(
+        (snapshot.shape, snapshot.dtype) for snapshot in runtime_args
+    )
     kernel = _compile_normalized_cin_via_loopir(
         normalized,
         result_shape,
         input_bindings,
         options=options,
         context=context,
-        input_formats=tuple(arg.format for arg in args),
+        input_formats=tuple(snapshot.tensor_format for snapshot in runtime_args),
         plan=plan,
     )
     header_cpp_code = options.build.preamble_source
@@ -616,10 +758,10 @@ def execute_cin_via_loopir(
     module = _load_validated_prepared_kernel(prepared_build)
 
     module_args: List[object] = [result_shape]
-    for arg in args:
-        module_args.append(arg.shape)
-        module_args.append(arg._native_mode_indices())
-        module_args.append(arg.values)
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
 
     start_time = time.time()
     result_cpp = module.evaluate(*module_args)
@@ -636,6 +778,7 @@ def execute_cin_via_loopir(
         "d" if level.kind is LoopIRLevelKind.DENSE else "s"
         for level in result_decl.levels
     )
+    result_mode_order = tuple(level.mode for level in result_decl.levels)
     result = STensor(
         shape=tuple(result_shape),
         index=TensorIndex(
@@ -644,6 +787,7 @@ def execute_cin_via_loopir(
                 result_cpp.storage.index.mode_indices,
             ),
             tensor_format=result_format,
+            mode_order=result_mode_order,
         ),
         value=result_cpp.storage.value,
     )
@@ -669,10 +813,12 @@ def _execute_legacy_scheduled(
     from ...stensor import STensor
     from ...storage import TensorIndex
     from ...ops import (
+        _checked_runtime_shape,
         _finalize_generated_mode_indices,
         _load_validated_prepared_kernel,
         _lower_generated_llir,
         _prepare_generated_kernel_build,
+        _snapshot_runtime_tensors,
     )
     from ..scheduler import Scheduler
 
@@ -685,24 +831,33 @@ def _execute_legacy_scheduled(
         compile_options=options,
         compilation_context=context,
     )
-    _validate_runtime_formats(scheduled.normalized_cin, args)
+    result_shape = _checked_runtime_shape(result_shape, "result shape")
+    runtime_args = _snapshot_runtime_tensors(
+        args,
+        expected_count=len(scheduled.normalized_cin.get_rhs_tensor_vars()),
+    )
+    _validate_runtime_formats(
+        scheduled.normalized_cin,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
+    )
     alignment_plan = _plan_mode_orders_to_planned_order(
         scheduled.normalized_cin,
-        args,
+        runtime_args,
         scheduled.verified_loop_plan,
     )
-    args = _execute_mode_order_alignment(
+    runtime_args = _execute_mode_order_alignment(
         scheduled.normalized_cin,
-        args,
+        tuple(snapshot.tensor for snapshot in runtime_args),
         alignment_plan,
         options,
         context,
+        runtime_snapshots=runtime_args,
     )
     _bind_runtime_metadata(
         scheduled.normalized_cin,
-        tuple((tuple(arg.shape), arg.dtype) for arg in args),
-        tuple(result_shape),
-        tuple(arg.format for arg in args),
+        tuple((snapshot.shape, snapshot.dtype) for snapshot in runtime_args),
+        result_shape,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
     )
     lowerer = CINLowerer(compile_options=options, compilation_context=context)
     lowered = lowerer._lower_owned_IndexStmt(scheduled)
@@ -716,10 +871,10 @@ def _execute_legacy_scheduled(
     module = _load_validated_prepared_kernel(prepared_build)
 
     module_args: List[object] = [result_shape]
-    for arg in args:
-        module_args.append(arg.shape)
-        module_args.append(arg._native_mode_indices())
-        module_args.append(arg.values)
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
     result_cpp = module.evaluate(*module_args)
     result_vars = scheduled.normalized_cin.get_result_tensor_vars()
     if len(result_vars) != 1 or result_vars[0].format is None:
@@ -738,6 +893,11 @@ def _execute_legacy_scheduled(
                 result_format, result_cpp.storage.index.mode_indices
             ),
             tensor_format=result_format,
+            mode_order=(
+                None
+                if result_vars[0].mode_order is None
+                else tuple(result_vars[0].mode_order)
+            ),
         ),
         value=result_cpp.storage.value,
     )
@@ -760,11 +920,12 @@ def execute_shadow(
     """
 
     from ...ops import (
+        _checked_runtime_shape,
         _plan_mode_orders_to_loop_order,
+        _snapshot_runtime_tensors,
         lower_and_exec_cin,
     )
 
-    verify_cin_structure(cin_stmt)
     options = _resolve_options(compile_options)
     shadow_plan: Optional[LoopPlan] = None
     downstream_options = options
@@ -792,6 +953,11 @@ def execute_shadow(
             )
     else:
         normalized = normalize_cin(cin_stmt, compile_options=options)
+    result_shape = _checked_runtime_shape(result_shape, "result shape")
+    runtime_args = _snapshot_runtime_tensors(
+        args,
+        expected_count=len(normalized.get_rhs_tensor_vars()),
+    )
     if any(
         tensor_var.format is None or not tensor_var.format.is_dense()
         for tensor_var in normalized.get_result_tensor_vars()
@@ -800,50 +966,54 @@ def execute_shadow(
             "execute_shadow requires dense outputs because the legacy "
             "low-level result wrapper does not preserve sparse indices"
         )
-    _validate_runtime_formats(normalized, args)
+    _validate_runtime_formats(
+        normalized,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
+    )
     if shadow_plan is None:
-        alignment_plan = _plan_mode_orders_to_loop_order(normalized, args)
+        alignment_plan = _plan_mode_orders_to_loop_order(normalized, runtime_args)
     else:
         alignment_plan = _plan_mode_orders_to_planned_order(
             normalized,
-            args,
+            runtime_args,
             shadow_plan,
         )
     # Align once before source comparison so compile-only bindings describe
     # logical storage, then both execution routes independently observe the
     # same already-aligned inputs.
-    args = _execute_mode_order_alignment(
+    runtime_args = _execute_mode_order_alignment(
         normalized,
-        args,
+        tuple(snapshot.tensor for snapshot in runtime_args),
         alignment_plan,
         downstream_options,
         None,
+        runtime_snapshots=runtime_args,
     )
 
     comparison = compare_generated_sources(
         normalized,
         result_shape,
-        tuple((tuple(arg.shape), arg.dtype) for arg in args),
+        tuple((snapshot.shape, snapshot.dtype) for snapshot in runtime_args),
         compile_options=downstream_options,
     )
     loopir_result, _ = execute_cin_via_loopir(
         copy.deepcopy(normalized),
         result_shape,
-        *args,
+        *(snapshot.tensor for snapshot in runtime_args),
         compile_options=downstream_options,
     )
     if downstream_options.requested_schedule is not None:
         legacy_result = _execute_legacy_scheduled(
             copy.deepcopy(normalized),
             result_shape,
-            *args,
+            *(snapshot.tensor for snapshot in runtime_args),
             compile_options=downstream_options,
         )
     else:
         legacy_result = lower_and_exec_cin(
             copy.deepcopy(normalized),
             result_shape,
-            *args,
+            *(snapshot.tensor for snapshot in runtime_args),
             _compile_options=downstream_options,
         )
     return loopir_result, legacy_result, comparison

@@ -483,17 +483,11 @@ class _TargetLowering:
             # verify_program already rejected COORDINATE/SINGLETON level
             # kinds, non-CSR sparse outputs, and non-permutation level
             # modes, so only the admitted storage-permutation scope needs a
-            # target-boundary check: all-dense inputs may permute; results
-            # and compressed structure may not.
+            # target-boundary check: all-dense tensors may permute, while
+            # compressed structure may not.
             modes = tuple(level.mode for level in decl.levels)
             if modes == tuple(range(len(decl.levels))):
                 continue
-            if decl.symbol == self.result_symbol:
-                _fail(
-                    "unsupported_mode_order",
-                    f"result {decl.name!r} uses a non-identity storage "
-                    "order, which the migrated families do not cover",
-                )
             if any(level.kind is not LevelKind.DENSE for level in decl.levels):
                 _fail(
                     "unsupported_mode_order",
@@ -1174,17 +1168,25 @@ class _TargetLowering:
                 "region in the compute leaf",
             )
         staged = staged_reads[0]
+        panel_mode = operand_decl.levels[0].mode
+        pack_mode = operand_decl.levels[1].mode
         if (
             len(staged.indices) != 2
-            or self._index_of(staged.indices[0], "the staged row index")
+            or self._index_of(
+                staged.indices[panel_mode],
+                "the staged panel index",
+            )
             != panel_node.index
-            or self._index_of(staged.indices[1], "the staged column index")
+            or self._index_of(
+                staged.indices[pack_mode],
+                "the staged pack index",
+            )
             != point_node.index
         ):
             _fail(
                 "unsupported_program_shape",
-                "the staged read must be indexed by the panel window "
-                "coordinate and the pack point coordinate",
+                "the staged read's physical levels must be driven by the "
+                "panel window coordinate and the pack point coordinate",
             )
         self._staged_views[id(staged)] = Load(
             LoopIRNodeId(-1), decl.operand, staged.indices
@@ -1769,8 +1771,7 @@ class _TargetLowering:
             for cursor in loop.cursors:
                 record(cursor.tensor, cursor.level, loop.index, "a sparse loop")
                 record_parent_chain(cursor)
-        leaf_indices = self._leaf_indices()
-        for level, index in enumerate(leaf_indices):
+        for level, index in enumerate(self._result_storage_indices()):
             bound = self._index_of(index, f"access of {self.result_decl.name!r}")
             record(self.result_symbol, level, bound, "the result access")
         return drivers
@@ -1779,6 +1780,12 @@ class _TargetLowering:
         if type(self.leaf) is AppendEntry:
             return self.leaf.coords
         return self.leaf.indices  # type: ignore[attr-defined]
+
+    def _result_storage_indices(self) -> Tuple[Expr, ...]:
+        """Return the result access coordinates in physical level order."""
+
+        logical = self._leaf_indices()
+        return tuple(logical[level.mode] for level in self.result_decl.levels)
 
     def _validate_access_orders(self) -> None:
         for symbol, per_tensor in self.level_drivers.items():
@@ -1873,25 +1880,30 @@ class _TargetLowering:
         return known
 
     def _input_metadata(self, symbol: SymbolId) -> llir.TensorAccessMetadata:
+        decl = self.decls[symbol]
         per_tensor = self.level_drivers[symbol]
-        index_ids = tuple(
-            per_tensor[level] for level in range(len(self.decls[symbol].levels))
-        )
+        logical_indices: List[Optional[IndexId]] = [None] * len(decl.levels)
+        for level, level_decl in enumerate(decl.levels):
+            logical_indices[level_decl.mode] = cast(IndexId, per_tensor[level])
+        if any(index_id is None for index_id in logical_indices):
+            _fail(
+                "unsupported_program_shape",
+                f"tensor {decl.name!r} has incomplete logical access metadata",
+            )
         return llir.TensorAccessMetadata(
             access_id=self._access_id(symbol),
             tensor_id=symbol,
-            index_ids=index_ids,  # type: ignore[arg-type]
+            index_ids=cast(Tuple[IndexId, ...], tuple(logical_indices)),
             role=llir.TensorAccessRole.INPUT_READ,
         )
 
     def _result_metadata(self) -> llir.TensorAccessMetadata:
-        leaf_indices = self._leaf_indices()
         return llir.TensorAccessMetadata(
             access_id=self._access_id(self.result_symbol),
             tensor_id=self.result_symbol,
             index_ids=tuple(
                 self._index_of(index, "store index")  # type: ignore[misc]
-                for index in leaf_indices
+                for index in self._leaf_indices()
             ),
             role=llir.TensorAccessRole.RESULT_WRITE,
         )
@@ -1920,9 +1932,8 @@ class _TargetLowering:
         bound = self._input_bound_var(loop)
         if bound is not None:
             return bound
-        leaf_indices = self._leaf_indices()
         lookup = self._loop_logical_index(loop)
-        for level, index in enumerate(leaf_indices):
+        for level, index in enumerate(self._result_storage_indices()):
             if self._index_of(index, "store index") == lookup:
                 return llir.Var(
                     name=f"{self.result_decl.name}{level}_size",
@@ -2017,8 +2028,7 @@ class _TargetLowering:
             # synthesized consumer loop, never to the producer chain —
             # exactly where the legacy consumer lowering resolves them.
             return stmts
-        leaf_indices = self._leaf_indices()
-        for level, index in enumerate(leaf_indices):
+        for level, index in enumerate(self._result_storage_indices()):
             if self._index_of(index, "store index") != loop.index:
                 continue
             if self.result_decl.levels[level].kind is not LevelKind.DENSE:
@@ -2828,10 +2838,9 @@ class _TargetLowering:
         point = self.consumer_point
         name = self.dimension_names[point.dimension]
         result_name = self.result_decl.name
-        leaf_indices = self._leaf_indices()
         levels = [
             level
-            for level, index in enumerate(leaf_indices)
+            for level, index in enumerate(self._result_storage_indices())
             if self._index_of(index, "store index") == point.index
         ]
         if len(levels) != 1 or levels[0] == 0:

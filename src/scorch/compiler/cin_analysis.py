@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 
-from ..format import LevelType
+import torch
+
+from ..format import LevelFormat, LevelType, TensorFormat
 from .cin import (
     BinaryOp,
     ForAll,
@@ -32,6 +34,8 @@ from .cin import (
     Where,
     Workspace,
     WorkspaceAccess,
+    _is_exact_index_stmt,
+    _is_index_stmt_instance,
 )
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
@@ -188,7 +192,56 @@ class CINDiagnostic:
 
 
 _MAX_CIN_STRUCTURE_DEPTH = 256
+_MAX_CIN_TENSOR_RANK = 64
+_MAX_RUNTIME_EXTENT = (1 << 63) - 1
 _MISSING_CIN_FIELD = object()
+
+
+def _is_supported_cin_node_type(node_type: type) -> bool:
+    """Use identity comparisons without hashing/equality on a hostile type."""
+
+    return (
+        node_type is ForAll
+        or node_type is Where
+        or node_type is TensorAssign
+        or node_type is BinaryOp
+        or node_type is UnaryOp
+        or node_type is WorkspaceAccess
+        or node_type is TensorAccess
+        or node_type is IndexVarAdd
+        or node_type is IndexVar
+        or node_type is Workspace
+        or node_type is TensorVar
+    )
+
+
+def _is_exact_identity(value: object, identity_type: type) -> bool:
+    """Recognize one safe, hashable stable-ID wrapper without invoking hooks."""
+
+    if type(value) is not identity_type:
+        return False
+    state = object.__getattribute__(value, "__dict__")
+    if type(state) is not dict or len(state) != 1:
+        return False
+    key = next(iter(state), None)
+    return (
+        type(key) is str
+        and key == "value"
+        and type(state["value"]) is int
+        and 0 <= state["value"] <= _MAX_RUNTIME_EXTENT
+    )
+
+
+def _safe_exact_dict_value(value: object, field_name: str) -> object:
+    """Read one exact-string key without hashing forged stored-state keys."""
+
+    state = object.__getattribute__(value, "__dict__")
+    if type(state) is not dict:
+        return None
+    for key, stored in state.items():
+        if type(key) is str and key == field_name:
+            return stored
+    return None
 
 
 def _preflight_cin_structure(  # noqa: C901
@@ -208,17 +261,30 @@ def _preflight_cin_structure(  # noqa: C901
     ``duplicate_node_reference`` and related identity diagnostics, while an
     object reached again before its exit frame is unambiguously a cycle.
 
-    Each stored field must also be the object the getattr view reports, so a
-    hostile class-level descriptor cannot show this preflight one graph and
-    the recursive analyses another.  Descriptors that execute arbitrary
-    non-terminating code remain outside the threat model, exactly as any
-    hostile ``__getattr__`` would be for every consumer.
+    Only the exact built-in CIN node classes are admitted.  This is important
+    because downstream legacy consumers use properties and helper methods in
+    addition to the stored forward fields: accepting an arbitrary subclass
+    would let a stateful descriptor show the preflight one graph and a later
+    consumer another.  Exact-class admission makes the stored fields the sole
+    authoritative view without executing attacker-controlled descriptors.
     """
 
     diagnostics: List[CINDiagnostic] = []
     active: set[int] = set()
     complete: set[int] = set()
     depth_reported = False
+    identity_owners: Dict[type, Dict[int, Tuple[object, Tuple[str, ...]]]] = {
+        NodeId: {},
+        IndexId: {},
+        SymbolId: {},
+        AccessId: {},
+    }
+    identity_cache: Dict[
+        Tuple[int, type],
+        Tuple[object, Optional[int]],
+    ] = {}
+    tensor_ranks: Dict[int, int] = {}
+    pending_accesses: List[Tuple[TensorAccess, Tuple[str, ...]]] = []
     stack: List[Tuple[bool, object, Tuple[str, ...], int]] = [
         (False, cin, ("root",), 0)
     ]
@@ -230,12 +296,55 @@ def _preflight_cin_structure(  # noqa: C901
     ) -> None:
         diagnostics.append(CINDiagnostic(code, message, path))
 
+    def exact_identity_value(
+        value: object,
+        identity_type: type,
+    ) -> Optional[int]:
+        cache_key = (id(value), identity_type)
+        cached = identity_cache.get(cache_key)
+        if cached is not None and cached[0] is value:
+            return cached[1]
+        identity_value = (
+            cast(int, object.__getattribute__(value, "__dict__")["value"])
+            if _is_exact_identity(value, identity_type)
+            else None
+        )
+        identity_cache[cache_key] = (value, identity_value)
+        return identity_value
+
+    def record_identity(
+        value: object,
+        identity_type: type,
+        owner: object,
+        path: Tuple[str, ...],
+        duplicate_code: str,
+    ) -> None:
+        identity_value = exact_identity_value(value, identity_type)
+        if identity_value is None:
+            return
+        previous = identity_owners[identity_type].get(identity_value)
+        if previous is not None and previous[0] is not owner:
+            diagnose(
+                duplicate_code,
+                f"{identity_type.__name__} belongs to distinct CIN entities",
+                path,
+            )
+            return
+        identity_owners[identity_type][identity_value] = (owner, path)
+
     def stored_field(
         node: object,
         field_name: str,
         path: Tuple[str, ...],
     ) -> object:
         state = object.__getattribute__(node, "__dict__")
+        if type(state) is not dict:
+            diagnose(
+                "invalid_cin_field",
+                "CIN node stored state must be an exact dict",
+                path,
+            )
+            return _MISSING_CIN_FIELD
         if field_name not in state:
             diagnose(
                 "missing_cin_field",
@@ -243,32 +352,7 @@ def _preflight_cin_structure(  # noqa: C901
                 path + (field_name,),
             )
             return _MISSING_CIN_FIELD
-        value = state[field_name]
-        # Downstream consumers walk the getattr view of the graph while this
-        # preflight validates stored state, so a hostile class-level
-        # descriptor (for example a ``__class__``-swapped property) could
-        # otherwise validate one graph and hand the recursion another.  The
-        # two views must be the same object; a descriptor that raises is
-        # equally hostile.  Every structural field of the real CIN classes is
-        # a plain instance attribute, so legitimate programs always pass.
-        try:
-            live = getattr(node, field_name)
-        except Exception:
-            diagnose(
-                "invalid_cin_field",
-                f"{type(node).__name__}.{field_name} is shadowed by a "
-                "raising descriptor",
-                path + (field_name,),
-            )
-            return _MISSING_CIN_FIELD
-        if live is not value:
-            diagnose(
-                "invalid_cin_field",
-                f"{type(node).__name__}.{field_name} diverges from its stored value",
-                path + (field_name,),
-            )
-            return _MISSING_CIN_FIELD
-        return value
+        return state[field_name]
 
     def typed_child(
         node: object,
@@ -281,11 +365,57 @@ def _preflight_cin_structure(  # noqa: C901
         if value is _MISSING_CIN_FIELD:
             return
         child_path = path + (field_name,)
-        if not isinstance(value, expected_type):
+        value_type = type(value)
+        if expected_type is IndexStmt:
+            valid_type = (
+                value_type is ForAll
+                or value_type is Where
+                or value_type is TensorAssign
+            )
+        elif expected_type is TensorAccess:
+            valid_type = value_type is TensorAccess or value_type is WorkspaceAccess
+        else:
+            valid_type = value_type is expected_type
+        if not valid_type:
             diagnose(
                 "invalid_cin_field",
                 f"{type(node).__name__}.{field_name} must be a "
                 f"{expected_type.__name__}",
+                child_path,
+            )
+            return
+        children.append((value, child_path))
+
+    def expression_child(
+        node: object,
+        field_name: str,
+        path: Tuple[str, ...],
+        children: List[Tuple[object, Tuple[str, ...]]],
+    ) -> None:
+        """Admit only expressions the normalizer and analyses can execute."""
+
+        value = stored_field(node, field_name, path)
+        if value is _MISSING_CIN_FIELD:
+            return
+        child_path = path + (field_name,)
+        value_type = type(value)
+        if (
+            value_type is not TensorAccess
+            and value_type is not WorkspaceAccess
+            and value_type is not BinaryOp
+            and value_type is not UnaryOp
+        ):
+            code = (
+                "unsupported_expression"
+                if value_type is TensorVar
+                or value_type is IndexVar
+                or value_type is IndexVarAdd
+                else "invalid_cin_field"
+            )
+            diagnose(
+                code,
+                f"{type(node).__name__}.{field_name} must be an executable "
+                "CIN expression",
                 child_path,
             )
             return
@@ -311,18 +441,64 @@ def _preflight_cin_structure(  # noqa: C901
         if object_id in active:
             diagnose(
                 "cyclic_cin_structure",
-                f"{type(node).__name__} is reachable from itself",
+                "a CIN node is reachable from itself",
                 path,
             )
             continue
         if object_id in complete:
             continue
 
+        node_type = type(node)
+        if not _is_supported_cin_node_type(node_type):
+            diagnose(
+                "invalid_cin_field",
+                "CIN node must have an exact supported built-in node type",
+                path,
+            )
+            continue
+        node_state = object.__getattribute__(node, "__dict__")
+        if type(node_state) is not dict:
+            diagnose(
+                "invalid_cin_field",
+                "CIN node stored state must be an exact dict",
+                path,
+            )
+            continue
+        if any(type(key) is not str for key in node_state):
+            diagnose(
+                "invalid_cin_field",
+                "CIN node stored-state keys must be exact strings",
+                path,
+            )
+            continue
+
         active.add(object_id)
         stack.append((True, node, path, depth))
         children: List[Tuple[object, Tuple[str, ...]]] = []
 
-        if isinstance(node, ForAll):
+        # Stable-reference typing remains the full ownership verifier's
+        # authority.  Presence and non-shadowing are structural requirements
+        # because normalization reads this field even in release mode.
+        node_id = stored_field(node, "node_id", path)
+        if (
+            node_id is not _MISSING_CIN_FIELD
+            and exact_identity_value(node_id, NodeId) is None
+        ):
+            diagnose(
+                "invalid_node_id",
+                f"{node_type.__name__}.node_id must be an exact int-valued NodeId",
+                path + ("node_id",),
+            )
+        else:
+            record_identity(
+                node_id,
+                NodeId,
+                node,
+                path + ("node_id",),
+                "duplicate_node_id",
+            )
+
+        if type(node) is ForAll:
             typed_child(node, "index_var", IndexVar, path, children)
             typed_child(node, "stmt", IndexStmt, path, children)
             parallel = stored_field(node, "parallel", path)
@@ -333,12 +509,12 @@ def _preflight_cin_structure(  # noqa: C901
                         "ForAll.parallel must be an exact bool or None",
                         path + ("parallel",),
                     )
-        elif isinstance(node, Where):
+        elif type(node) is Where:
             typed_child(node, "producer", IndexStmt, path, children)
             typed_child(node, "consumer", IndexStmt, path, children)
-        elif isinstance(node, TensorAssign):
+        elif type(node) is TensorAssign:
             typed_child(node, "lhs", TensorAccess, path, children)
-            typed_child(node, "rhs", IndexExpr, path, children)
+            expression_child(node, "rhs", path, children)
             op = stored_field(node, "op", path)
             if op is not _MISSING_CIN_FIELD and op is not None:
                 if type(op) is not Operation:
@@ -347,9 +523,9 @@ def _preflight_cin_structure(  # noqa: C901
                         "TensorAssign.op must be an exact Operation or None",
                         path + ("op",),
                     )
-        elif isinstance(node, BinaryOp):
-            typed_child(node, "left", IndexExpr, path, children)
-            typed_child(node, "right", IndexExpr, path, children)
+        elif type(node) is BinaryOp:
+            expression_child(node, "left", path, children)
+            expression_child(node, "right", path, children)
             op = stored_field(node, "op", path)
             if op is not _MISSING_CIN_FIELD and type(op) is not Operation:
                 diagnose(
@@ -357,8 +533,8 @@ def _preflight_cin_structure(  # noqa: C901
                     "BinaryOp.op must be an exact Operation",
                     path + ("op",),
                 )
-        elif isinstance(node, UnaryOp):
-            typed_child(node, "expr", IndexExpr, path, children)
+        elif type(node) is UnaryOp:
+            expression_child(node, "expr", path, children)
             op = stored_field(node, "op", path)
             if op is not _MISSING_CIN_FIELD and type(op) is not Operation:
                 diagnose(
@@ -366,67 +542,507 @@ def _preflight_cin_structure(  # noqa: C901
                     "UnaryOp.op must be an exact Operation",
                     path + ("op",),
                 )
-        elif isinstance(node, TensorAccess):
-            typed_child(node, "tensor", TensorVar, path, children)
-            indices = stored_field(node, "indices", path)
-            if indices is not _MISSING_CIN_FIELD:
-                if not isinstance(indices, (list, tuple)):
+        elif type(node) is TensorAccess or type(node) is WorkspaceAccess:
+            tensor = stored_field(node, "tensor", path)
+            if tensor is not _MISSING_CIN_FIELD:
+                expected_tensor_type = (
+                    Workspace if type(node) is WorkspaceAccess else TensorVar
+                )
+                if type(tensor) is not expected_tensor_type:
                     diagnose(
                         "invalid_cin_field",
-                        "TensorAccess.indices must be a list or tuple",
+                        f"{type(node).__name__}.tensor must be an exact "
+                        f"{expected_tensor_type.__name__}",
+                        path + ("tensor",),
+                    )
+                else:
+                    children.append((tensor, path + ("tensor",)))
+            indices = stored_field(node, "indices", path)
+            if indices is not _MISSING_CIN_FIELD:
+                indices_type = type(indices)
+                if indices_type is not list and indices_type is not tuple:
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorAccess.indices must be an exact list or tuple",
                         path + ("indices",),
                     )
                 else:
-                    for axis, index_var in enumerate(indices):
-                        index_path = path + (f"indices[{axis}]",)
-                        if not isinstance(index_var, IndexVar):
+                    typed_indices = cast(
+                        Union[List[object], Tuple[object, ...]],
+                        indices,
+                    )
+                    if len(typed_indices) > _MAX_CIN_TENSOR_RANK:
+                        diagnose(
+                            "invalid_cin_field",
+                            "TensorAccess.indices exceeds the supported rank",
+                            path + ("indices",),
+                        )
+                    else:
+                        for axis, index_var in enumerate(typed_indices):
+                            index_path = path + (f"indices[{axis}]",)
+                            if type(index_var) is not IndexVar:
+                                diagnose(
+                                    "invalid_cin_field",
+                                    "TensorAccess.indices entries must be exact "
+                                    "IndexVar objects",
+                                    index_path,
+                                )
+                            else:
+                                children.append((index_var, index_path))
+            access_id = stored_field(node, "access_id", path)
+            if (
+                access_id is not _MISSING_CIN_FIELD
+                and exact_identity_value(access_id, AccessId) is None
+            ):
+                diagnose(
+                    "invalid_access_id",
+                    "TensorAccess.access_id must be an exact int-valued AccessId",
+                    path + ("access_id",),
+                )
+            else:
+                record_identity(
+                    access_id,
+                    AccessId,
+                    node,
+                    path + ("access_id",),
+                    "duplicate_access_id",
+                )
+            tensor_id = stored_field(node, "tensor_id", path)
+            if (
+                tensor_id is not _MISSING_CIN_FIELD
+                and exact_identity_value(tensor_id, SymbolId) is None
+            ):
+                diagnose(
+                    "invalid_symbol_reference",
+                    "TensorAccess.tensor_id must be an exact int-valued SymbolId",
+                    path + ("tensor_id",),
+                )
+            index_ids = stored_field(node, "index_ids", path)
+            if index_ids is not _MISSING_CIN_FIELD:
+                if type(index_ids) is not tuple:
+                    diagnose(
+                        "invalid_index_reference",
+                        "TensorAccess.index_ids must be an exact tuple",
+                        path + ("index_ids",),
+                    )
+                elif len(index_ids) > _MAX_CIN_TENSOR_RANK:
+                    diagnose(
+                        "invalid_index_reference",
+                        "TensorAccess.index_ids exceeds the supported rank",
+                        path + ("index_ids",),
+                    )
+                else:
+                    for axis, index_id in enumerate(index_ids):
+                        if exact_identity_value(index_id, IndexId) is None:
                             diagnose(
-                                "invalid_cin_field",
-                                "TensorAccess.indices entries must be IndexVar "
-                                "objects",
-                                index_path,
+                                "invalid_index_reference",
+                                "TensorAccess.index_ids entries must be exact "
+                                "int-valued IndexId values",
+                                path + ("index_ids", f"[{axis}]"),
                             )
-                        else:
-                            children.append((index_var, index_path))
-            for field_name in ("access_id", "tensor_id", "index_ids"):
-                stored_field(node, field_name, path)
-        elif isinstance(node, IndexVarAdd):
+            if type(node) is WorkspaceAccess:
+                workspace = stored_field(node, "wksp", path)
+                if workspace is not _MISSING_CIN_FIELD:
+                    if type(workspace) is not Workspace:
+                        diagnose(
+                            "invalid_cin_field",
+                            "WorkspaceAccess.wksp must be an exact Workspace",
+                            path + ("wksp",),
+                        )
+                    elif tensor is not _MISSING_CIN_FIELD and workspace is not tensor:
+                        diagnose(
+                            "invalid_cin_field",
+                            "WorkspaceAccess.wksp must be its tensor",
+                            path + ("wksp",),
+                        )
+            pending_accesses.append((cast(TensorAccess, node), path))
+        elif type(node) is IndexVarAdd:
             typed_child(node, "lhs", IndexVar, path, children)
             typed_child(node, "rhs", IndexVar, path, children)
-        elif isinstance(node, IndexVar):
+        elif type(node) is IndexVar:
             expression = stored_field(node, "_expr", path)
             if expression is not _MISSING_CIN_FIELD and expression is not None:
-                if not isinstance(expression, IndexVarAdd):
+                if type(expression) is not IndexVarAdd:
                     diagnose(
                         "invalid_cin_field",
-                        "IndexVar._expr must be an IndexVarAdd or None",
+                        "IndexVar._expr must be an exact IndexVarAdd or None",
                         path + ("_expr",),
                     )
                 else:
                     children.append((expression, path + ("_expr",)))
-            for field_name in ("node_id", "index_id", "_name"):
-                stored_field(node, field_name, path)
-        elif isinstance(node, TensorVar):
-            for field_name in (
-                "node_id",
-                "symbol_id",
-                "_name",
-                "_format",
-                "shape",
-                "dtype",
-                "mode_order",
+            index_id = stored_field(node, "index_id", path)
+            if (
+                index_id is not _MISSING_CIN_FIELD
+                and exact_identity_value(index_id, IndexId) is None
             ):
-                stored_field(node, field_name, path)
-            if isinstance(node, Workspace):
-                for field_name in ("dim", "dense"):
-                    stored_field(node, field_name, path)
-        elif isinstance(node, (IndexStmt, IndexExpr)):
-            # The full verifier owns stable unsupported-node diagnostics.  No
-            # unknown forward edge is authoritative here.
-            stored_field(node, "node_id", path)
+                diagnose(
+                    "invalid_index_id",
+                    "IndexVar.index_id must be an exact int-valued IndexId",
+                    path + ("index_id",),
+                )
+            else:
+                record_identity(
+                    index_id,
+                    IndexId,
+                    node,
+                    path + ("index_id",),
+                    "duplicate_index_id",
+                )
+            name = stored_field(node, "_name", path)
+            if name is not _MISSING_CIN_FIELD and type(name) is not str:
+                diagnose(
+                    "invalid_cin_field",
+                    "IndexVar._name must be an exact str",
+                    path + ("_name",),
+                )
+        elif type(node) is TensorVar or type(node) is Workspace:
+            symbol_id = stored_field(node, "symbol_id", path)
+            if (
+                symbol_id is not _MISSING_CIN_FIELD
+                and exact_identity_value(symbol_id, SymbolId) is None
+            ):
+                diagnose(
+                    "invalid_symbol_id",
+                    "TensorVar.symbol_id must be an exact int-valued SymbolId",
+                    path + ("symbol_id",),
+                )
+            else:
+                record_identity(
+                    symbol_id,
+                    SymbolId,
+                    node,
+                    path + ("symbol_id",),
+                    "duplicate_symbol_id",
+                )
+            name = stored_field(node, "_name", path)
+            if name is not _MISSING_CIN_FIELD and type(name) is not str:
+                diagnose(
+                    "invalid_cin_field",
+                    "TensorVar._name must be an exact str",
+                    path + ("_name",),
+                )
+            tensor_format = stored_field(node, "_format", path)
+            format_rank: Optional[int] = None
+            if tensor_format is not _MISSING_CIN_FIELD:
+                if (
+                    tensor_format is not None
+                    and type(tensor_format) is not TensorFormat
+                ):
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorVar._format must be an exact TensorFormat or None",
+                        path + ("_format",),
+                    )
+                elif type(tensor_format) is TensorFormat:
+                    format_state = object.__getattribute__(
+                        tensor_format,
+                        "__dict__",
+                    )
+                    if type(format_state) is not dict:
+                        diagnose(
+                            "invalid_cin_field",
+                            "TensorVar._format stored state must be an exact dict",
+                            path + ("_format",),
+                        )
+                    else:
+                        format_keys = tuple(format_state)
+                    if type(format_state) is dict and (
+                        len(format_keys) != 1
+                        or type(format_keys[0]) is not str
+                        or format_keys[0] != "_level_formats"
+                    ):
+                        diagnose(
+                            "invalid_cin_field",
+                            "TensorVar._format has malformed stored state",
+                            path + ("_format",),
+                        )
+                    elif type(format_state) is dict:
+                        level_formats = format_state["_level_formats"]
+                        if type(level_formats) is not tuple:
+                            diagnose(
+                                "invalid_cin_field",
+                                "TensorVar._format levels must be an exact tuple",
+                                path + ("_format", "_level_formats"),
+                            )
+                        else:
+                            format_rank = len(level_formats)
+                            if format_rank > _MAX_CIN_TENSOR_RANK:
+                                diagnose(
+                                    "invalid_cin_field",
+                                    "TensorVar._format exceeds the supported rank",
+                                    path + ("_format",),
+                                )
+                            for level, level_format in enumerate(
+                                level_formats[:_MAX_CIN_TENSOR_RANK],
+                            ):
+                                level_path = path + (
+                                    "_format",
+                                    f"_level_formats[{level}]",
+                                )
+                                if type(level_format) is not LevelFormat:
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "TensorFormat levels must be exact "
+                                        "LevelFormat values",
+                                        level_path,
+                                    )
+                                    continue
+                                level_state = object.__getattribute__(
+                                    level_format,
+                                    "__dict__",
+                                )
+                                if type(level_state) is not dict:
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "LevelFormat stored state must be an exact dict",
+                                        level_path,
+                                    )
+                                    continue
+                                level_keys = tuple(level_state)
+                                if (
+                                    len(level_keys) != 2
+                                    or any(type(key) is not str for key in level_keys)
+                                    or set(level_keys) != {"_mode", "_bit_width"}
+                                ):
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "LevelFormat has malformed stored state",
+                                        level_path,
+                                    )
+                                    continue
+                                mode = level_state["_mode"]
+                                bit_width = level_state["_bit_width"]
+                                if type(mode) is not LevelType:
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "LevelFormat._mode must be an exact LevelType",
+                                        level_path + ("_mode",),
+                                    )
+                                if bit_width is not None and (
+                                    type(bit_width) is not int
+                                    or bit_width <= 0
+                                    or bit_width > _MAX_RUNTIME_EXTENT
+                                ):
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "LevelFormat._bit_width must be a positive "
+                                        "signed-int64 exact int or None",
+                                        level_path + ("_bit_width",),
+                                    )
+            shape = stored_field(node, "shape", path)
+            shape_rank: Optional[int] = None
+            if shape is not _MISSING_CIN_FIELD and shape is not None:
+                invalid_shape = type(shape) is not tuple
+                if type(shape) is tuple:
+                    invalid_shape = len(shape) > _MAX_CIN_TENSOR_RANK
+                    product = 1
+                    for extent in shape[:_MAX_CIN_TENSOR_RANK]:
+                        if (
+                            type(extent) is not int
+                            or extent < 0
+                            or extent > _MAX_RUNTIME_EXTENT
+                            or (extent != 0 and product > _MAX_RUNTIME_EXTENT // extent)
+                        ):
+                            invalid_shape = True
+                            break
+                        product *= extent
+                if invalid_shape:
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorVar.shape must be an exact rank-bounded tuple whose "
+                        "extents are nonnegative int64 values and whose element "
+                        "count fits signed int64, or None",
+                        path + ("shape",),
+                    )
+                else:
+                    shape_rank = len(cast(Tuple[object, ...], shape))
+            dtype = stored_field(node, "dtype", path)
+            if dtype is not _MISSING_CIN_FIELD and type(dtype) is not torch.dtype:
+                diagnose(
+                    "invalid_cin_field",
+                    "TensorVar.dtype must be an exact torch.dtype",
+                    path + ("dtype",),
+                )
+            mode_order = stored_field(node, "mode_order", path)
+            mode_rank: Optional[int] = None
+            if mode_order is not _MISSING_CIN_FIELD and mode_order is not None:
+                mode_order_type = type(mode_order)
+                if mode_order_type is not list and mode_order_type is not tuple:
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorVar.mode_order must be an exact list or tuple of ints "
+                        "or None",
+                        path + ("mode_order",),
+                    )
+                else:
+                    typed_mode_order = cast(
+                        Union[List[object], Tuple[object, ...]],
+                        mode_order,
+                    )
+                    if len(typed_mode_order) > _MAX_CIN_TENSOR_RANK or any(
+                        type(mode) is not int for mode in typed_mode_order
+                    ):
+                        diagnose(
+                            "invalid_cin_field",
+                            "TensorVar.mode_order must be an exact list or tuple "
+                            "of ints or None",
+                            path + ("mode_order",),
+                        )
+                    else:
+                        mode_rank = len(typed_mode_order)
+                        expected_rank = (
+                            len(shape)
+                            if type(shape) is tuple
+                            else (
+                                format_rank
+                                if format_rank is not None
+                                else len(typed_mode_order)
+                            )
+                        )
+                        if len(typed_mode_order) != expected_rank or set(
+                            typed_mode_order
+                        ) != set(range(expected_rank)):
+                            diagnose(
+                                "invalid_cin_field",
+                                "TensorVar.mode_order must be an exact permutation "
+                                f"of range({expected_rank})",
+                                path + ("mode_order",),
+                            )
+            if type(node) is Workspace:
+                dim = stored_field(node, "dim", path)
+                valid_dim = dim is not _MISSING_CIN_FIELD and not (
+                    type(dim) is not int or dim < 0 or dim > _MAX_CIN_TENSOR_RANK
+                )
+                if dim is not _MISSING_CIN_FIELD and not valid_dim:
+                    diagnose(
+                        "invalid_cin_field",
+                        "Workspace.dim must be a supported nonnegative exact rank",
+                        path + ("dim",),
+                    )
+                dense = stored_field(node, "dense", path)
+                if dense is not _MISSING_CIN_FIELD and type(dense) is not bool:
+                    diagnose(
+                        "invalid_cin_field",
+                        "Workspace.dense must be an exact bool",
+                        path + ("dense",),
+                    )
+                rank_candidates = [
+                    rank
+                    for rank in (
+                        cast(int, dim) if valid_dim else None,
+                        mode_rank,
+                    )
+                    if rank is not None
+                ]
+            else:
+                rank_candidates = [
+                    rank
+                    for rank in (format_rank, shape_rank, mode_rank)
+                    if rank is not None
+                ]
+            if rank_candidates:
+                declared_rank = rank_candidates[0]
+                if any(rank != declared_rank for rank in rank_candidates[1:]):
+                    diagnose(
+                        "invalid_cin_field",
+                        "TensorVar format, shape, mode order, and workspace rank "
+                        "must agree",
+                        path,
+                    )
+                else:
+                    tensor_ranks[id(node)] = declared_rank
+                    if declared_rank > 0 and mode_order is None:
+                        diagnose(
+                            "invalid_cin_field",
+                            "rankful TensorVar.mode_order must declare its "
+                            "physical-to-logical permutation",
+                            path + ("mode_order",),
+                        )
 
         for child, child_path in reversed(children):
             stack.append((False, child, child_path, depth + 1))
+
+    for access, path in pending_accesses:
+        tensor = _safe_exact_dict_value(access, "tensor")
+        indices = _safe_exact_dict_value(access, "indices")
+        index_ids = _safe_exact_dict_value(access, "index_ids")
+        tensor_id = _safe_exact_dict_value(access, "tensor_id")
+        if type(tensor) is not TensorVar and type(tensor) is not Workspace:
+            continue
+        tensor_format = _safe_exact_dict_value(tensor, "_format")
+        if type(tensor) is TensorVar and tensor_format is None:
+            diagnose(
+                "invalid_cin_field",
+                "an accessed TensorVar must declare a TensorFormat",
+                path + ("tensor", "_format"),
+            )
+        if type(indices) is not list and type(indices) is not tuple:
+            continue
+        if type(index_ids) is not tuple:
+            continue
+        stored_rank = tensor_ranks.get(id(tensor))
+        if stored_rank is not None and len(indices) != stored_rank:
+            diagnose(
+                "tensor_access_rank_mismatch",
+                "TensorAccess index rank must match its tensor rank",
+                path + ("indices",),
+            )
+        if len(index_ids) != len(indices):
+            diagnose(
+                "index_reference_mismatch",
+                "TensorAccess.index_ids must mirror its indices",
+                path + ("index_ids",),
+            )
+        else:
+            for axis, (index, index_id) in enumerate(zip(indices, index_ids)):
+                stored_index_id = (
+                    _safe_exact_dict_value(index, "index_id")
+                    if type(index) is IndexVar
+                    else None
+                )
+                reference_value = exact_identity_value(index_id, IndexId)
+                stored_value = exact_identity_value(stored_index_id, IndexId)
+                if (
+                    reference_value is not None
+                    and stored_value is not None
+                    and reference_value != stored_value
+                ):
+                    diagnose(
+                        "index_reference_mismatch",
+                        "TensorAccess.index_ids must mirror its indices",
+                        path + ("index_ids", f"[{axis}]"),
+                    )
+                if (
+                    reference_value is not None
+                    and reference_value not in identity_owners[IndexId]
+                ):
+                    diagnose(
+                        "dangling_index_reference",
+                        "TensorAccess.index_ids references an undefined IndexId",
+                        path + ("index_ids", f"[{axis}]"),
+                    )
+        tensor_symbol_id = _safe_exact_dict_value(tensor, "symbol_id")
+        reference_symbol = exact_identity_value(tensor_id, SymbolId)
+        stored_symbol = exact_identity_value(tensor_symbol_id, SymbolId)
+        if (
+            reference_symbol is not None
+            and stored_symbol is not None
+            and reference_symbol != stored_symbol
+        ):
+            diagnose(
+                "symbol_reference_mismatch",
+                "TensorAccess.tensor_id must mirror its tensor",
+                path + ("tensor_id",),
+            )
+        if (
+            reference_symbol is not None
+            and reference_symbol not in identity_owners[SymbolId]
+        ):
+            diagnose(
+                "dangling_symbol_reference",
+                "TensorAccess.tensor_id references an undefined SymbolId",
+                path + ("tensor_id",),
+            )
 
     return tuple(diagnostics)
 
@@ -443,8 +1059,10 @@ def _raise_cin_verification(diagnostics: Tuple[CINDiagnostic, ...]) -> None:
 def verify_cin_structure(cin: IndexStmt) -> None:
     """Fail closed on malformed CIN forward structure before recursive work."""
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("verify_cin_structure expects an IndexStmt")
+    if id(cin) in _TRUSTED_CIN_ROOTS.get():
+        return
     diagnostics = _preflight_cin_structure(cin)
     if diagnostics:
         _raise_cin_verification(diagnostics)
@@ -491,14 +1109,15 @@ class _IdPreflight:
         self.diagnostics.append(CINDiagnostic(code, message, path, entity_id))
 
     def record_node(self, node: object, path: Tuple[str, ...]) -> None:
-        node_id = getattr(node, "node_id", None)
-        if not isinstance(node_id, NodeId):
+        node_id = object.__getattribute__(node, "__dict__").get("node_id")
+        if not _is_exact_identity(node_id, NodeId):
             self.diagnose(
                 "invalid_node_id",
-                f"{type(node).__name__}.node_id must be a NodeId",
+                f"{type(node).__name__}.node_id must be an exact int-valued NodeId",
                 path,
             )
             return
+        assert type(node_id) is NodeId
         previous = self.node_objects.get(node_id)
         if previous is not None and previous is not node:
             self.diagnose(
@@ -521,10 +1140,11 @@ class _IdPreflight:
             )
             return
         self.record_node(index_var, path)
-        if not isinstance(getattr(index_var, "index_id", None), IndexId):
+        index_id = object.__getattribute__(index_var, "__dict__").get("index_id")
+        if not _is_exact_identity(index_id, IndexId):
             self.diagnose(
                 "invalid_index_id",
-                "IndexVar.index_id must be an IndexId",
+                "IndexVar.index_id must be an exact int-valued IndexId",
                 path,
             )
         object_id = id(index_var)
@@ -545,30 +1165,32 @@ class _IdPreflight:
             )
             return
         self.record_node(tensor, path)
-        if not isinstance(getattr(tensor, "symbol_id", None), SymbolId):
+        symbol_id = object.__getattribute__(tensor, "__dict__").get("symbol_id")
+        if not _is_exact_identity(symbol_id, SymbolId):
             self.diagnose(
                 "invalid_symbol_id",
-                "TensorVar.symbol_id must be a SymbolId",
+                "TensorVar.symbol_id must be an exact int-valued SymbolId",
                 path,
             )
 
     def visit_access(self, access: TensorAccess, path: Tuple[str, ...]) -> None:
         self.record_node(access, path)
-        if not isinstance(getattr(access, "access_id", None), AccessId):
+        state = object.__getattribute__(access, "__dict__")
+        if not _is_exact_identity(state.get("access_id"), AccessId):
             self.diagnose(
                 "invalid_access_id",
-                "TensorAccess.access_id must be an AccessId",
+                "TensorAccess.access_id must be an exact int-valued AccessId",
                 path,
             )
-        if not isinstance(getattr(access, "tensor_id", None), SymbolId):
+        if not _is_exact_identity(state.get("tensor_id"), SymbolId):
             self.diagnose(
                 "invalid_symbol_reference",
-                "TensorAccess.tensor_id must be a SymbolId",
+                "TensorAccess.tensor_id must be an exact int-valued SymbolId",
                 path + ("tensor_ref",),
             )
-        self.visit_tensor(getattr(access, "tensor", None), path + ("tensor",))
+        self.visit_tensor(state.get("tensor"), path + ("tensor",))
 
-        indices = getattr(access, "indices", None)
+        indices = state.get("indices")
         if not isinstance(indices, (list, tuple)):
             self.diagnose(
                 "invalid_index_reference",
@@ -579,7 +1201,7 @@ class _IdPreflight:
         for axis, index_var in enumerate(indices):
             self.visit_index(index_var, path + (f"indices[{axis}]",))
 
-        index_ids = getattr(access, "index_ids", None)
+        index_ids = state.get("index_ids")
         if not isinstance(index_ids, tuple):
             self.diagnose(
                 "invalid_index_reference",
@@ -588,10 +1210,11 @@ class _IdPreflight:
             )
             return
         for axis, index_id in enumerate(index_ids):
-            if not isinstance(index_id, IndexId):
+            if not _is_exact_identity(index_id, IndexId):
                 self.diagnose(
                     "invalid_index_reference",
-                    "TensorAccess.index_ids entries must be IndexId values",
+                    "TensorAccess.index_ids entries must be exact int-valued "
+                    "IndexId values",
                     path + (f"index_refs[{axis}]",),
                 )
 
@@ -697,19 +1320,29 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
     # the shared typed CIN walker/rewriter. Keeping it explicit here avoids
     # prematurely coupling Phase 1 ownership analysis to pass infrastructure.
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("analyze_cin expects an IndexStmt")
 
-    structural_diagnostics = _preflight_cin_structure(cin)
+    structural_diagnostics = (
+        () if id(cin) in _TRUSTED_CIN_ROOTS.get() else _preflight_cin_structure(cin)
+    )
     if structural_diagnostics:
-        raw_root_id = getattr(cin, "node_id", None)
-        root_id = raw_root_id if isinstance(raw_root_id, NodeId) else NodeId(-1)
+        raw_root_id = _safe_exact_dict_value(cin, "node_id")
+        root_id = (
+            cast(NodeId, raw_root_id)
+            if _is_exact_identity(raw_root_id, NodeId)
+            else NodeId(-1)
+        )
         return _empty_analysis(root_id, structural_diagnostics)
 
     preflight = _IdPreflight()
     preflight.visit_stmt(cin, ("root",))
-    raw_root_id = getattr(cin, "node_id", None)
-    root_id = raw_root_id if isinstance(raw_root_id, NodeId) else NodeId(-1)
+    raw_root_id = _safe_exact_dict_value(cin, "node_id")
+    root_id = (
+        cast(NodeId, raw_root_id)
+        if _is_exact_identity(raw_root_id, NodeId)
+        else NodeId(-1)
+    )
     if preflight.diagnostics:
         return _empty_analysis(root_id, tuple(preflight.diagnostics))
     parent_relations: Dict[NodeId, ParentRelation] = {}
@@ -1436,6 +2069,31 @@ _VERIFY_CIN_CONTEXT: ContextVar[bool] = ContextVar(
     "scorch_verify_normalized_cin",
     default=False,
 )
+_TRUSTED_CIN_ROOTS: ContextVar[frozenset[int]] = ContextVar(
+    "scorch_trusted_normalized_cin_roots",
+    default=frozenset(),
+)
+
+
+@contextmanager
+def _trusted_normalized_cin(cin: IndexStmt) -> Iterator[None]:
+    """Avoid re-preflighting one already-verified root within a compiler call.
+
+    The caller must either have obtained ``cin`` from :func:`normalize_cin` or
+    have called :func:`verify_cin_structure` immediately before entering this
+    synchronous context.  No caller-controlled work may occur between those
+    operations.  The trust is held out-of-band rather than on the mutable
+    compatibility object, so forged caller metadata cannot opt into it.
+    """
+
+    if not _is_exact_index_stmt(cin):
+        raise TypeError("trusted normalized CIN must be an exact IndexStmt")
+    roots = _TRUSTED_CIN_ROOTS.get()
+    token = _TRUSTED_CIN_ROOTS.set(roots | {id(cin)})
+    try:
+        yield
+    finally:
+        _TRUSTED_CIN_ROOTS.reset(token)
 
 
 def get_full_cin_verification() -> bool:
@@ -1509,7 +2167,7 @@ def normalize_cin(
     and schedule metadata are deliberately absent.
     """
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("normalize_cin expects an IndexStmt")
     options = _compile_options_at_cin_boundary(compile_options)
     if compilation_context is None:
@@ -1686,8 +2344,9 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
 def canonical_cin_dump(cin: IndexStmt) -> str:
     """Serialize CIN with traversal-canonical IDs and no allocation-order data."""
 
-    if not isinstance(cin, IndexStmt):
+    if not _is_index_stmt_instance(cin):
         raise TypeError("canonical_cin_dump expects an IndexStmt")
+    verify_cin_structure(cin)
 
     node_ids: Dict[NodeId, int] = {}
     access_ids: Dict[AccessId, int] = {}
