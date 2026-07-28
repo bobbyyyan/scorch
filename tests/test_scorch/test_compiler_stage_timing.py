@@ -688,6 +688,84 @@ def test_regblock_dual_path_records_both_schedule_and_lowering_arms(
     ] * 2
 
 
+def test_regblock_dual_preflights_shared_compiler_root_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both dual arms and their fallback share one scoped structural receipt."""
+
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    original_preflight = cin_analysis._preflight_cin_structure
+    roots: list[int] = []
+
+    def counted_preflight(cin: IndexStmt):
+        roots.append(id(cin))
+        return original_preflight(cin)
+
+    monkeypatch.setattr(
+        cin_analysis,
+        "_preflight_cin_structure",
+        counted_preflight,
+    )
+    _isolate_compiler_caches(monkeypatch)
+    monkeypatch.setattr(
+        ops, "_load_validated_prepared_kernel", lambda prepared: object()
+    )
+
+    result = ops.einsum(
+        "ij,j->i",
+        TensorSpec("dd", (8, 16), name="A"),
+        TensorSpec("d", (16,), name="x"),
+        compile_only=True,
+        format="d",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+
+    assert isinstance(result, TensorSpec)
+    assert len(roots) == 1
+    assert cin_analysis._TRUSTED_CIN_ROOTS.get() == frozenset()
+    assert (
+        sum(
+            record.stage_id == CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION
+            for record in context.stage_run_records
+        )
+        == 3
+    )
+
+
+def test_regblock_shared_preflight_failure_retires_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared receipt boundary still owns a failed compiler stage."""
+
+    options = _default_options(regblock_dual=True)
+    context = CompilationContext(options)
+    error = VerificationError("injected shared structural failure")
+    monkeypatch.setattr(ops, "verify_cin_structure", _raise_same(error))
+    _isolate_compiler_caches(monkeypatch)
+
+    with pytest.raises(VerificationError) as failure:
+        ops.einsum(
+            "ij,j->i",
+            TensorSpec("dd", (8, 16), name="A"),
+            TensorSpec("d", (16,), name="x"),
+            compile_only=True,
+            format="d",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    assert cin_analysis._TRUSTED_CIN_ROOTS.get() == frozenset()
+    with pytest.raises(CompilationContextError) as suppressed:
+        context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=options,
+        )
+    assert suppressed.value.diagnostic.code == "failed_compilation"
+
+
 def test_regblock_dual_second_arm_failure_keeps_first_arm_and_suppresses_codegen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -725,6 +803,7 @@ def test_regblock_dual_second_arm_failure_keeps_first_arm_and_suppresses_codegen
         )
 
     assert failure.value is error
+    assert cin_analysis._TRUSTED_CIN_ROOTS.get() == frozenset()
     assert _stage_values(context) == [
         _FULL_STAGE_SEQUENCE[0],
         _FULL_STAGE_SEQUENCE[2],
