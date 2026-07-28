@@ -27902,3 +27902,139 @@ Git, update §28 and this handoff with exact receipts and candid
 limitations, push nothing, and complete as much of this broad coherent
 milestone as the evidence honestly supports.
 ```
+
+## Phase-6 layout closure and corrected disposition (2026-07-27, supersedes the §28 prompt)
+
+The chronologically latest review is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §29.  Independent review found
+the §28 corrections sound and reproduced their gates, then closed one
+of the two open §28 boundaries.  Four code commits stack above
+`80402b3`:
+
+- `56772e4` — the shared scheduler/normalize structural boundary:
+  `normalize_cin` owns the bounded structural preflight for every
+  caller, and the three raw-CIN scheduler entries normalize first and
+  validate display names on the normalized clone (10-15 microseconds
+  measured; error ordering locked; at most two bounded scans per path);
+- `e8866b9` — descriptor-diverged CIN structure fails closed: every
+  stored structural field must be the exact getattr object, and raising
+  descriptors are hostile (`invalid_cin_field`), closing a
+  `__class__`-swap forgery that split the preflighted graph from the
+  recursively walked one;
+- `c69c839` — general logical-to-physical dense layout lowering: the
+  public-aligned `einsum("ij,kj->ik", ds, dd)` constituent (dense
+  `B[k,j]` over `mode_order=[1,0]`) now lowers byte-identically to
+  legacy in both automatic arms, along with batched `[0,2,1]`,
+  non-involutive `[1,2,0]`, multi-operand, f64, transposed-matvec, and
+  every zero-extent cell; the transposed and batched-permuted dual
+  constituents reconstruct the production dual kernel byte-for-byte
+  from actual LoopIR arms, tied to the production alignment formula;
+  permuted compressed structure, permuted results, and non-permutation
+  orders stay fail-closed; no serialized schema changed; and
+- `4e63500` — a one-line Black-parity style fix.
+
+The asserted generic `ss@ss->ds` SIGSEGV is now REPRODUCED with
+retained evidence (exit 139, unsized `C_values` indexed write; nest
+`i,j,k` leaks `ValueError: ivar_k is not in list`), under
+`phase6-layout-56772e4/probes/probeA/`.  Byte parity against that
+family would reproduce memory corruption; its fail-closed boundary is
+confirmed correct.
+
+**Phase 6 still has no GO, and it is open on exactly one
+production-relevant family cluster: the sparse-result/workspace
+representation.**  The §28 dense-layout boundary is closed for the
+production dense domain.  §29.5 records the implementation-ready
+design: slice B1 (serial `coo_workspace` + multi-compressed-level
+append assembly, activated by public `ss@ss->ss`, whose comparand
+compiles AND executes; four new node kinds; `scorch.loopir.canonical.v9`
+bump by the v7-to-v8 precedent), slice B2 (mixed
+compressed-parent/dense-leaf assembly, a correctness feature gated on
+oracle/PyTorch/public-route differentials because the legacy comparand
+is defective and now provably crash-prone), and the explicit Phase-7
+disposition of the two-pass OpenMP count/fill SpGEMM form.
+
+### Updated broad prompt for the next session
+
+```text
+Continue the compiler-IR migration in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call from the current local tip.
+Do not push, switch branches, amend, squash, or reorder existing
+commits. Preserve the five protected dirty files and all unrelated
+untracked GPU, benchmark, scheduler, research, scratchpad, and tooling
+work. Stage only explicit paths.
+
+Read AGENTS.md, COMPILER_IR_REFACTOR_PHASE6_REVIEW.md through §29, and
+the latest COMPILER_IR_REFACTOR_HANDOFF.md section before editing.
+Independently review commits 56772e4, e8866b9, c69c839, and 4e63500
+and the inherited §28 work. Reproduce the focused gates (broad pure
+membership; compiled battery; 86-case audit 46/40/0; capture parity;
+paired latency) and challenge the claims with adversarial probes; do
+not trust the handoff as evidence. In particular: probe the layout
+lowering with fresh random mode orders on both arms (byte parity plus
+compiled/oracle differentials), verify permuted compressed structure
+and permuted results still fail closed, verify the preflight boundary
+ordering at all five entries, and re-run the descriptor-divergence
+adversaries.
+
+Then implement the remaining Phase-6 boundary as the §29.5 design
+records it, in two separately gated seams:
+
+1. Slice B1 — true sparse coo_workspace emission plus general
+   level-based ordered result assembly, activated by public
+   ss@ss->ss SpMSpM. Represent allocation/reset, merging ADD
+   insertion, sorted drain, ordered append with parent-linked
+   positions across multiple compressed levels, empty rows, and empty
+   output as typed intrinsic region state (four node kinds; result
+   assembly stays the AppendEntry stream generalized to level-general
+   admitted outputs). Bump scorch.loopir.canonical.v8 to v9 for the
+   new node kinds; scorch.loopir.request.v2, scorch.loopplan.
+   canonical.v1, and scorch.autopolicy.v1 must not change. Widen the
+   automatic family gate to the sparse-workspace tile-free contract
+   (workspace present, dense=False, no tiles) with exact no_tile_list
+   behavior. Gate on byte parity against the executing legacy
+   comparand, compiled bitwise/PyTorch differentials, oracle and
+   erasure ownership, verifier adversaries (forged/missing/cyclic/
+   enum-lookalike/region-nesting), zero extents, f32/f64, disjoint/
+   overlapping/cancellation structures, and the public kernels tests.
+2. Slice B2 — mixed compressed-parent/dense-leaf result assembly with
+   a dense trailing workspace axis, as a correctness feature: the
+   legacy comparand is defective (retained source and the reproduced
+   SIGSEGV), so use the LoopIR oracle, PyTorch, and the public route
+   as the gates and record the no-legacy-comparand disposition
+   explicitly. Cover complete leaf-block coverage per materialized
+   parent, explicit zeros, empty rows, zero extents, and both arms.
+   Keep the two-pass OpenMP count/fill SpGEMM form (public ds@ds->ds)
+   explicitly dispositioned to Phase 7 with a stable code and the
+   working public route as its execution oracle.
+
+After the slices, re-run the complete dual disposition and the exit
+audit line by line, and declare GO only if every production-relevant
+automatic family has a verified typed twin and every remaining
+compatibility boundary is explicitly outside Phase 6. If genuine GO is
+reached with time remaining, begin the smallest coherent Phase-7
+runtime-stitch/OpenMP slice; do not perform a release cutover or
+remove the legacy path.
+
+Preserve all established contracts: frozen tuple ownership; exact
+stored-field/type/enum validation with the stored-equals-getattr rule;
+forged/missing/extra/hostile/cyclic/shared/depth/descriptor
+adversaries; deterministic artifact-local identities; stage-owned
+failure; no rendered-name/tag/regex discovery in typed passes;
+structural activation never waived; erasure and independent semantic
+oracles; byte identity only where legacy compiles and executes; and no
+ordinary release-JIT double compilation.
+
+Before finishing, run the focused memberships, the complete compiled
+battery, a fresh clean-detached full non-performance suite with exact
+provenance (partition into complete non-overlapping fresh processes if
+needed for the macOS libomp pthread-key ceiling and report the method),
+Black/Flake8/mypy full-source base parity (inherited baselines: one
+Black file, nine Flake8 findings, 140 mypy errors in 11 files),
+git diff --check, capture/parity gates for every affected family
+(corpus/grid/anchor/heap/auto plus the 86-case audit), and paired
+compiler latency with warmups, enough samples, and an A/A control;
+investigate crossings instead of averaging them away. Verify the five
+protected hashes before every commit, leave origin at 58e8565, update
+§29 (or add §30) and this handoff with honest receipts and
+limitations, and provide the next broad continuation prompt.
+```

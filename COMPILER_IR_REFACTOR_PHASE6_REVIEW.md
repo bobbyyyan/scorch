@@ -4398,3 +4398,315 @@ The review gates are recorded at the final documentation commit:
   and
 - local and live origin remained `58e8565`; protected hashes and all
   unrelated material remained unchanged; nothing was pushed.
+
+## 29. General dense-layout lowering, the shared structural boundary, and the corrected exit disposition (2026-07-27)
+
+This section records the broad milestone taken on top of §28.  Four code
+commits stack above `80402b3`:
+
+- `56772e4` — `fix(compiler): own the structural preflight at the shared scheduler/normalize boundary`
+- `e8866b9` — `fix(compiler): reject descriptor-diverged CIN structure`
+- `c69c839` — `feat(compiler): lower logical coordinates onto permuted dense layouts`
+- `4e63500` — `style(compiler): keep the divergence diagnostic on one line`
+
+### 29.1 Independent review of the §28 commits
+
+The diffs of `a920e10`, `8fb4902`, and `80402b3` were re-reviewed without
+trusting the handoff, and the focused gates reproduced: the broad pure
+CIN/LoopPlan/LoopIR/schedule-API membership passes green (a 13-file set
+collects 919; the recorded 918 is a one-test set-definition difference,
+not a failure), and the complete compiled scheduled-slice,
+pipeline-execution, schedule-generality, and dual-path battery passed
+**331 in 1,116.22 s (18:36)** at the inherited tip.  Fresh adversarial
+probes beyond the committed locks all held: forged container types,
+enum-lookalike operations, `Where` cycles, workspace missing fields,
+shared diamonds (still `duplicate_node_reference`, never mislabeled
+cyclic), and the exact depth boundary (a 257-edge chain is allowed, a
+258-edge chain reports `cin_structure_depth_exceeded` once).
+
+Two findings were material:
+
+1. **The §27 SIGSEGV assertion is now reproduced with retained
+   evidence.**  The generic-path `ss@ss->ds` SpMSpM configuration through
+   legacy `lower_and_exec_cin` with nest order `i,k,j` exits with signal
+   11: the generated kernel declares `std::vector<float> C_values;`
+   without sizing it and writes through `C_values[pC1] +=`.  The same
+   configuration under nest `i,j,k` leaks
+   `ValueError: ivar_k is not in list` from `cin_lowerer.py`
+   `level_of_index_var`.  The kernel source and exit transcript are
+   retained under `phase6-layout-56772e4/probes/probeA/`
+   (`sigsegv-ss-ss-ds-ikj-main.cpp`).  §28.4's demand is satisfied; the
+   fail-closed LoopIR boundary for this family is confirmed correct, and
+   byte parity there would reproduce a memory-corrupting kernel.
+2. **One preflight divergence.**  The structural preflight validated
+   stored `__dict__` state while every recursive consumer walks the
+   getattr view, so a `__class__`-swapped subclass whose property returns
+   a different object (a self-cycle over a benign stored child) passed
+   the preflight and leaked `RecursionError` from the ownership analysis.
+   `e8866b9` requires every stored structural field to be the exact
+   object getattr reports and treats raising descriptors as hostile;
+   both now produce the stable `invalid_cin_field` diagnostic.  All
+   structural fields of the real CIN classes are plain instance
+   attributes, so legitimate programs are unaffected; descriptors that
+   execute non-terminating code remain outside the threat model, as they
+   are for every consumer.  Cost: about one microsecond per program.
+
+Reduce-out spot probes on three fresh programs outside the committed
+tests (rank-3 TTM f64 ragged, three-operand, and a two-reduction
+four-tile program) reproduced byte parity and exact erasure in both
+arms, 6/6.  One scoping observation is recorded: §27's "bitwise-identical
+to the legacy production auto route" generalizes only where the
+production cost-model schedule coincides with the empty-Schedule
+surgery; the committed source-level byte parity is the valid gate for
+the other cells.
+
+### 29.2 The shared scheduler/normalize structural boundary (`56772e4`)
+
+Both §28.1 gaps were first re-confirmed live: plan-free release-mode
+`normalize_cin` leaked raw `AttributeError` from the clone walk, and
+direct `Scheduler.apply_schedule` leaked from the display-name walk
+(`cin.py` `is_workspace`) before normalization even with full debug
+verification enabled.
+
+`_normalize_cin_owned` now runs the bounded iterative preflight first,
+so every normalization caller fails closed with the stable structural
+diagnostics before any recursive work, and the three raw-CIN scheduler
+entries (`apply_schedule`, `auto_schedule`, `auto_schedule_plan`)
+normalize first and validate legacy display names on the normalized
+clone, which preserves every display name and stable ID.  The options
+boundary stays first; the display-name failure itself is unchanged.  No
+path scans the graph more than twice (pipeline entry plus normalize),
+and the pipeline-entry preflights are retained because the committed
+monkeypatch contract requires entry-owned failure before
+`Scheduler.apply_schedule` is invoked at all.
+
+Measured cost of the added scan: 10.3/14.5 microseconds per normalize
+(3-loop SpMM / rank-5 contraction), 0.88%/0.70% of a scheduling-only
+`apply_schedule` call, and invisible against any JIT compile; the paired
+compiler-latency gate below re-proves end-to-end neutrality.  New
+error-ordering locks: structural failure before legacy surgery,
+structural failure before display-name conflicts, option mismatch before
+the CIN is touched, debug-mode missing-field reporting, and both
+automatic entries.
+
+### 29.3 General logical-to-physical dense layout lowering (`c69c839`)
+
+The production activation case is the §28.3 boundary: public
+`einsum("ij,kj->ik", ds, dd)` reaches the dual helper with the dense
+operand as logical `B[k,j]` over physical `mode_order=[1,0]`, and both
+typed arms failed at `unsupported_loop_order`.
+
+The representation was already level-based — `LevelDecl.mode` names the
+logical mode each physical level stores — so the change is confined to
+construction and validation, with no format-specific shortcut and no
+serialized representation change: tensor checking validates the stored
+order as an exact permutation and returns the storage modes;
+storage-order legality walks the access's logical indices through that
+order (reducing exactly to the historical check under identity); both
+declaration sites emit real level modes; dense position chains are
+driven by the logical coordinate each physical level stores in the CIN
+lowering, the iteration-domain analysis, and the target's level-driver
+collection; the dimension-extent table binds runtime physical shapes per
+level; and the kernel ABI embeds the tensor's real mode order.  The
+oracle needed no change: its dense values are logical nested lists and
+its position arithmetic was already level-mapped.  Admission is scoped
+to all-dense operands.  Permuted compressed structure and permuted
+results keep the stable `unsupported_mode_order` boundary, the full CIN
+verifier owns non-permutation orders (`tensor_mode_order_mismatch`), and
+a forged compressed permutation dies at the verifier's dimension-domain
+rules before the target; the target checks remain as defense in depth.
+`scorch.autopolicy.v1`, `scorch.loopplan.canonical.v1`,
+`scorch.loopir.request.v2`, and `scorch.loopir.canonical.v8` remain
+current — canonical program identity already serializes level modes and
+request identity already serializes `mode_order`, so permuted layouts
+already hash distinctly (now locked by test).
+
+Evidence: generated source byte-identical to legacy in both regblock
+arms for transposed SpMM (f32, f64, and zero row/reduction/free
+extents), batched `[0,2,1]`, non-involutive `[1,2,0]` elementwise,
+multi-operand, and transposed-matvec families — 18 committed cells plus
+12 probe cells; compiled execution matches PyTorch under both runtime
+marshalings (an identity-layout input relayouted by the binding twin,
+and an input already carrying `[1,0]` storage), including every
+zero-extent class; the production oracle agrees on the permuted dense
+reduce-out program; the public einsum route executes and matches; and
+the rank-6 use-before-declaration family stays rejected because the
+storage-driver check reduces to the historical check under identity.
+The full scheduled-slice byte-lock file passes unchanged (201 tests).
+
+### 29.4 The dual census re-run and the cross-route sweep
+
+`test_dense_dual_constituents_compose_from_actual_loopir_arms` now
+covers **seven** constituents: the five §28 identity-layout families
+plus `transposed_spmm` (`ds@dd`, B `[1,0]`) and `batched_transposed`
+(`ddd@ddd`, B `[0,2,1]`), each reconstructing the production
+`_build_regblock_dual_path` kernel byte-for-byte from the two actual
+LoopIR-produced arm lowerings.  A derivation test ties both census
+layouts to the production alignment formula
+(`_bind_frontend_operand_mode_orders`) through both production branches:
+the cost-selected branch derives `[1,0]` for `B("kj")` under the
+selected `i,j,k` order, and the requested-schedule branch derives
+`[0,2,1]` for `B("lkj")` under an explicit `l,i,j,k` order.  Two census
+observations are recorded honestly: the all-dense batched spelling
+`lij,lkj->lik` cost-selects `l,i,k,j` and therefore aligns to identity
+(the permuted batched dense family is release-reachable via the
+requested-schedule branch); and the cost-selected batched permuted
+family is `dds@ddd`, which is now layout-admitted but stays locked at
+`unsupported_schedule_auto_family` because its automatic plan is
+sparse-workspace-adjacent — added to the boundary census as
+`batched_transposed_sparse_operand`.
+
+A randomized two-seed cross-route census over ranks 1-3 results,
+one-to-three operands, sparse-leaf formats, and randomly permuted
+all-dense operands (120 attempted cases, both arms per case) reports
+**zero derivation and zero parity mismatches**; every rejection is an
+expected legality code (`InvalidSchedule`, `unsupported_loop_order`)
+except one pre-existing legacy limitation now recorded: a
+broadcast-only result axis (`C[i,j] += A[k]*B[i]*D[i]`) crashes legacy
+lowering with the raw assert `iter_lattice.py` "No lattice points
+generated" while LoopIR lowers it; public einsum cannot express an
+output subscript absent from every input, so the family is not
+production-reachable, and this session did not change legacy.
+
+### 29.5 The sparse-result/workspace boundary: designed and dispositioned, not implemented
+
+A full implementation-ready audit was produced for the remaining
+representation family; the honest scope decision is that its smallest
+coherent slice is a full session by itself, and rushing it would have
+violated the byte-parity/oracle/erasure/adversarial contract.  The audit
+result is recorded for the next session:
+
+- **Slice B1 (first, byte-parity-gated): serial `coo_workspace` plus
+  multi-compressed-level append assembly**, activated by the public
+  `ss@ss->ss` SpMSpM family.  The production comparand compiles and
+  executes; one kernel exhibits every element the representation needs
+  (per-row allocation/reset, merging insertion, sorted drain, ordered
+  append, parent-linked positions across two compressed levels,
+  empty-row parent omission, and empty-output finalize).  The proposed
+  typed surface is four node kinds — a sparse workspace declaration over
+  one drain dimension, an intrinsic producer/consumer region, a merging
+  ADD insertion, and an ordered drain loop with a drain-value
+  expression — with result assembly staying the single `AppendEntry`
+  stream generalized from canonical-CSR-only to level-general
+  (every level DENSE or COMPRESSED, lexicographically increasing
+  appends, complete leaf-block coverage under compressed parents).
+  Parent positions and coordinates remain derived target-assembly state,
+  never IR nodes.  By the v7-to-v8 precedent, adding node kinds requires
+  a `scorch.loopir.canonical.v9` bump; `scorch.loopir.request.v2` and
+  `scorch.loopplan.canonical.v1` are untouched.  The plan layer is
+  already closed (`WorkspaceInsertion.dense=False` with exact
+  `no_tile_list` re-derivation), so the work is one new schedule pass,
+  the family-gate widening to the sparse-workspace tile-free contract,
+  verifier/oracle/erasure ownership, and target emission byte-identical
+  to the retained comparand.
+- **Slice B2 (separable correctness feature): mixed
+  compressed-parent/dense-leaf assembly.**  The legacy comparand is
+  defective by inspection and now also by the retained SIGSEGV
+  reproduction, so this migration is gated on the LoopIR oracle,
+  PyTorch, and public-route differentials with an explicit
+  no-legacy-comparand disposition.  The `sd`-operand load chain is a
+  distinct adjacent gap.
+- **Explicitly outside Phase 6: the two-pass OpenMP count/fill form**
+  (public `ds@ds->ds` SpGEMM and `ds`-output requests).  Legacy emits a
+  statically parallel two-pass kernel with per-thread workspace pools;
+  a typed twin is inseparable from target-owned parallel/runtime-stitch
+  policy and belongs to the same Phase-7 bucket as the runtime dual
+  stitch, with the working public route as its execution oracle.
+
+### 29.6 Phase-6 exit audit
+
+Criterion by criterion: schedule decisions are typed and verified for
+every migrated family (stack, panel, relayout, heap, parallel selection,
+reduce-out, and now general dense layouts); the explicit/automatic
+differentials hold across format and layout families wherever legacy is
+a valid comparand; canonical request identity remains semantic and
+distinguishes physical layouts without a version change; the
+representative tile-j/tile-ijk compositions remain byte-ready; and
+release behavior is unchanged everywhere (production dispatch still
+builds the dual kernel from the legacy helpers; the strangler path is
+not live; the latency corpus emits byte-identical sources).
+
+**Phase 6 has no GO.**  After this session it is open on exactly one
+production-relevant family cluster: the sparse-result/workspace
+representation (slices B1 and B2 above).  The general dense-layout
+boundary that §28 added is **closed** for the production dense domain.
+The adjacent locked boundaries remain explicitly outside this cluster
+with their stable codes: hierarchical-compressed `ss` operands
+(`unsupported_program_shape`), COO operands (`unsupported_format`),
+trailing-compressed automatic families
+(`unsupported_schedule_auto_family`), permuted compressed structure and
+permuted results (`unsupported_mode_order`), and the rank-6 invalid
+legacy emission (`unsupported_loop_order`).  No Phase-7 work, production
+cutover, selector parity, cache cutover, legacy deletion, Phase 8, or
+Phase 8.5 was started.
+
+### 29.7 Verification
+
+Evidence is retained under
+`/Users/bobby/.cache/scorch-codex/phase6-layout-56772e4/`.
+
+- broad pure membership after the changes: **1,127 passed** (13-file
+  contract set plus scheduler/compile-options/neutrality/spike-verifier
+  files); the 13-file set alone passes 919 before and after with only
+  the committed re-scopes;
+- compiled battery at the inherited tip: **331 passed in 1,116.22 s**;
+  at the layout commit, scheduled-slice **201**, pipeline-execution
+  **77**, and dual-path **30** all pass in working-tree runs, and the
+  clean-detached battery receipt is recorded below;
+- 86-case audit at the tip: **46 admitted / 40 rejected / zero
+  divergent**, two runs byte-identical (JSON SHA-256
+  `f54528305f2190cbc801c55a9293f54ffb74a191e2d7a75c0775fe54371cc698`),
+  every case equal to the retained `phase6-ws-closure` baseline;
+- fresh clean-detached captures at `c69c839`: corpus **20/20**, grid
+  **42/42**, anchor survey **22/22**, heap goldens **11/11**, and
+  auto-grid **23/23** files byte-identical to the retained baselines
+  (auto-capture report equal modulo embedded worktree paths);
+  explicit-anchor parity **10/10** and heap parity **11/11**
+  byte-identical;
+- randomized cross-route census: two seeds, 120 attempted cases
+  including permuted layouts, both arms — **zero mismatches** (§29.4);
+- paired same-session compiler latency, clean detached `80402b3` base
+  versus `c69c839` candidate (5 warmups / 30 samples, native work
+  excluded, identical per-case source hashes in every run): run 1 —
+  `small_dense` **1.047/1.052**, reduction **1.047/1.033**,
+  `csr_intersection` **1.009/0.996**, `sparse_union` **0.988/1.096**
+  (p50/p95); a swapped-order run showed one `csr_intersection`
+  excursion (**1.137/1.223**) that was investigated rather than
+  averaged: the same-worktree A/A control swings 0.931-1.078 on this
+  machine, a third paired run returned every case to **≤1.053**, and
+  the mechanism bound (one 10-15 microsecond scan on a
+  2-millisecond path) caps the true added cost under 1%, so the
+  excursion is session noise, not a regression;
+- full-source static parity at the tip in a clean detached worktree:
+  Black **1 file** (the inherited `prebuilt_kernels.py` baseline),
+  Flake8 **9 findings**, mypy **140 errors in 11 files** — all equal to
+  the inherited baselines; mypy error lines are line-normalized
+  identical, with one informational `note:` line relocated from
+  `ops.py` to `scheduler.py` because the scheduler edit changed which
+  import-untyped occurrence carries it; `git diff --check` is clean;
+- clean-detached receipts at exact `c69c839` (detached worktree,
+  isolated `TORCH_EXTENSIONS_DIR`/`XDG_CACHE_HOME`, asserted import
+  provenance): the complete compiled scheduled-slice,
+  pipeline-execution, schedule-generality, and dual-path battery passed
+  **353 in 1,142.03 s (19:02)** with zero failures (log SHA-256
+  `cba0396aa21dcd040055f348701f364d8060fdddf92b92def777aeff25b98ae0`;
+  the growth from 331 is this session's added layout cells); the
+  partitioned full non-performance suite over the retained complete
+  non-overlapping file partition ran as two sequential fresh processes:
+  direct collection selected **4,340** tests, partition A passed
+  **3,933** with 14 skipped in 2,770.79 s (46:10), partition B passed
+  **393** with 3 performance tests deselected in 296.11 s (4:56) —
+  **4,326 passed, 14 skipped, zero failures in 3,066.90
+  pytest-seconds**, with the JUnit union proving exactly 4,340 case IDs
+  (zero missing, extra, or duplicate) and no libomp resource event
+  (log SHA-256 values
+  `bdcbe316b52efb22f20bf6670cd5fa05afee8ca16137635b78abccad22c4c24a`
+  and
+  `71e08f2441c4f446b55bbec3626cfbc16f961e4d6728a0d85c8dbd9ef6685627`);
+  the later `4e63500` style commit changes one diagnostic string
+  literal only, with the focused membership rerun green at that tip;
+- local and live origin remained `58e8565`; all five protected files
+  retained their recorded hashes before every commit; all unrelated
+  dirty/untracked GPU/CUDA, benchmark, packaging, scheduler, research,
+  scratchpad, and tooling material remained untouched; nothing was
+  pushed, amended, squashed, or reordered.
