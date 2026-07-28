@@ -30,10 +30,31 @@ from typing import Any, Dict, List, Sequence, Tuple, cast
 from .nodes import LevelKind
 
 MAX_LEVEL_STORAGE_RANK = 64
+_MAX_DIAGNOSTIC_INT_BITS = 2048
 
 
 class LevelStorageError(Exception):
     """A storage construction or access violated the canonical contract."""
+
+
+def _diagnostic_int(value: int) -> str:
+    """Render an exact integer without leaking CPython's digit-limit error."""
+
+    if value.bit_length() > _MAX_DIAGNOSTIC_INT_BITS:
+        return "<integer too large to render>"
+    try:
+        return str(value)
+    except ValueError:
+        return "<integer too large to render>"
+
+
+def _diagnostic_coords(coords: Tuple[int, ...]) -> str:
+    """Render one bounded-rank coordinate tuple through the safe int path."""
+
+    rendered = ", ".join(_diagnostic_int(coord) for coord in coords)
+    if len(coords) == 1:
+        rendered += ","
+    return f"({rendered})"
 
 
 def _stored_field(value: object, name: str, what: str) -> object:
@@ -112,7 +133,8 @@ class CsrMatrix:
                 column = expect_int(self.indices[position], f"indices[{position}]")
                 if not 0 <= column < n_cols:
                     raise CsrFormatError(
-                        f"column {column} outside [0, {n_cols}) in row {row}"
+                        f"column {_diagnostic_int(column)} outside [0, "
+                        f"{_diagnostic_int(n_cols)}) in row {_diagnostic_int(row)}"
                     )
                 if column <= last:
                     raise CsrFormatError(
@@ -294,8 +316,9 @@ class LevelTensorStorage:
                         )
                         if not 0 <= coord < extent:
                             raise LevelStorageError(
-                                f"levels[{number}] coordinate {coord} outside "
-                                f"[0, {extent})"
+                                f"levels[{number}] coordinate "
+                                f"{_diagnostic_int(coord)} outside [0, "
+                                f"{_diagnostic_int(extent)})"
                             )
                         if coord <= last:
                             raise LevelStorageError(
@@ -490,7 +513,8 @@ class LevelTensorStorage:
         extent = _expect_exact_int(shape[mode], f"shape[{mode}]")
         if not 0 <= coordinate < extent:
             raise LevelStorageError(
-                f"levels[{level}] coordinate {coordinate} outside [0, {extent})"
+                f"levels[{level}] coordinate {_diagnostic_int(coordinate)} "
+                f"outside [0, {_diagnostic_int(extent)})"
             )
         return coordinate
 
@@ -733,13 +757,15 @@ class CsrOutputBuilder:
         row, column = coords
         if not 0 <= row < self.n_rows or not 0 <= column < self.n_cols:
             raise LevelStorageError(
-                f"append to {self.name} at {coords} escapes shape "
+                f"append to {self.name} at {_diagnostic_coords(coords)} escapes shape "
                 f"({self.n_rows}, {self.n_cols})"
             )
         if self.rows and (row, column) <= (self.rows[-1], self.columns[-1]):
             raise LevelStorageError(
                 f"appends to {self.name} must be lexicographically increasing; "
-                f"got {coords} after ({self.rows[-1]}, {self.columns[-1]})"
+                f"got {_diagnostic_coords(coords)} after "
+                f"({_diagnostic_int(self.rows[-1])}, "
+                f"{_diagnostic_int(self.columns[-1])})"
             )
         self.rows.append(row)
         self.columns.append(column)
@@ -866,8 +892,9 @@ class LevelTensor:
                     )
                     if not 0 <= coord < self.shape[level]:
                         raise LevelStorageError(
-                            f"coordinate {coord} escapes level {level} extent "
-                            f"{self.shape[level]}"
+                            f"coordinate {_diagnostic_int(coord)} escapes level "
+                            f"{level} extent "
+                            f"{_diagnostic_int(self.shape[level])}"
                         )
                     if coord <= last:
                         raise LevelStorageError(
@@ -916,6 +943,11 @@ class LevelOutputBuilder:
             raise LevelStorageError(
                 "output shape must be a nonempty tuple of nonnegative exact ints"
             )
+        if len(shape) > MAX_LEVEL_STORAGE_RANK:
+            raise LevelStorageError(
+                f"output rank {len(shape)} exceeds the level-storage limit "
+                f"{MAX_LEVEL_STORAGE_RANK}"
+            )
         if (
             type(level_kinds) is not tuple
             or len(level_kinds) != len(shape)
@@ -954,13 +986,14 @@ class LevelOutputBuilder:
         for level, (coord, extent) in enumerate(zip(coords, self.shape)):
             if not 0 <= coord < extent:
                 raise LevelStorageError(
-                    f"append to {self.name} at {coords} escapes extent "
-                    f"{extent} at level {level}"
+                    f"append to {self.name} at {_diagnostic_coords(coords)} "
+                    f"escapes extent {_diagnostic_int(extent)} at level {level}"
                 )
         if self.entries and coords <= self.entries[-1][0]:
             raise LevelStorageError(
                 f"appends to {self.name} must be lexicographically "
-                f"increasing; got {coords} after {self.entries[-1][0]}"
+                f"increasing; got {_diagnostic_coords(coords)} after "
+                f"{_diagnostic_coords(self.entries[-1][0])}"
             )
         self.entries.append((coords, value))
 

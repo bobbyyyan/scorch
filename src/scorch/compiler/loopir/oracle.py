@@ -72,6 +72,7 @@ from .levels import (
     LevelStorageError,
     LevelTensorStorage,
     MAX_LEVEL_STORAGE_RANK,
+    _diagnostic_int,
     from_csr,
 )
 from .nodes import (
@@ -499,8 +500,8 @@ class _Oracle:
             name = self.dimension_names.get(dimension, f"<dimension {dimension.value}>")
             raise LoopIROracleError(
                 f"dimension extent mismatch for {name!r}: "
-                f"{known[1]}[{known[2]}] is {known[0]} but "
-                f"{tensor_name}[{mode}] is {extent}"
+                f"{known[1]}[{known[2]}] is {_diagnostic_int(known[0])} but "
+                f"{tensor_name}[{mode}] is {_diagnostic_int(extent)}"
             )
 
     def _dimension_extent(self, dimension: DimensionId) -> int:

@@ -1085,15 +1085,15 @@ def apply_sparse_workspace(
         node for node in loops if _loop_key(node)[0] not in result_index_set
     ]
     if (
-        not reduction_loops
+        len(reduction_loops) != 1
         or _loop_key(reduction_loops[-1]) != (reduction_index, LoopPart.LOGICAL)
         or type(reduction_loops[-1]) is not MergedSparseFor
         or reduction_loops[-1].mode is not MergeMode.INTERSECTION
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the sparse workspace must wrap the final logical "
-            "INTERSECTION reduction loop",
+            "the serial B1 sparse workspace requires exactly one reduction "
+            "loop: the recorded logical INTERSECTION merge",
         )
     reduction_positions = [
         position

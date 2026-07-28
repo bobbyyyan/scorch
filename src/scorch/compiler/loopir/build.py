@@ -90,10 +90,11 @@ from .nodes import (
 
 def _max_identity_values(
     program: LoopProgram,
-) -> Tuple[int, int, int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, int, int, int]:
     """Scan one program for the next free value of every builder identity."""
 
     next_node = 0
+    next_index = 0
     next_dimension = 0
     next_cursor = 0
     next_position = 0
@@ -106,6 +107,7 @@ def _max_identity_values(
 
     def record_identity(value: object) -> bool:
         nonlocal next_dimension
+        nonlocal next_index
         nonlocal next_cursor
         nonlocal next_position
         nonlocal next_tile
@@ -113,7 +115,9 @@ def _max_identity_values(
         nonlocal next_relayout
         nonlocal next_result_tile
 
-        if type(value) is DimensionId and type(value.value) is int:
+        if type(value) is IndexId and type(value.value) is int:
+            next_index = max(next_index, value.value + 1)
+        elif type(value) is DimensionId and type(value.value) is int:
             next_dimension = max(next_dimension, value.value + 1)
         elif type(value) is CursorId and type(value.value) is int:
             next_cursor = max(next_cursor, value.value + 1)
@@ -155,6 +159,7 @@ def _max_identity_values(
                         pending.append(child)
     return (
         next_node,
+        next_index,
         next_dimension,
         next_cursor,
         next_position,
@@ -170,6 +175,11 @@ class LoopIRBuilder:
 
     def __init__(self) -> None:
         self._next_node_id = 0
+        # Logical CIN indices normally come from the process-wide identity
+        # source.  A builder resumed for a pure schedule transform instead
+        # switches this to the next value owned by the input artifact so
+        # generated binders replay deterministically.
+        self._next_index_id: Optional[int] = None
         self._next_dimension_id = 0
         self._next_cursor_id = 0
         self._next_position_id = 0
@@ -191,6 +201,7 @@ class LoopIRBuilder:
         builder = cls()
         (
             builder._next_node_id,
+            builder._next_index_id,
             builder._next_dimension_id,
             builder._next_cursor_id,
             builder._next_position_id,
@@ -261,11 +272,20 @@ class LoopIRBuilder:
 
         return new_symbol_id()
 
-    @staticmethod
-    def new_index_id() -> IndexId:
-        """Allocate a fresh production loop index for a hand-built program."""
+    def new_index_id(self) -> IndexId:
+        """Allocate a fresh logical or artifact-continuation loop index.
 
-        return new_index_id()
+        A new hand-built artifact retains the production-wide identity source.
+        A resumed builder uses the deterministic continuation established from
+        every stored ``IndexId`` in its input, so a pure pass and its verifier
+        replay construct the same generated binder.
+        """
+
+        if self._next_index_id is None:
+            return new_index_id()
+        index = IndexId(self._next_index_id)
+        self._next_index_id += 1
+        return index
 
     def dimension(self, name: str) -> DimensionDecl:
         """Declare a dimension with an identity owned by this builder.

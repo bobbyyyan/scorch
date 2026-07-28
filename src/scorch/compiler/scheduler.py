@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -182,6 +182,10 @@ def _validate_requested_schedule(
     """Keep legacy schedule arguments consistent with the owned snapshot."""
 
     requested = options.requested_schedule
+    if schedule is not None:
+        _validate_schedule_structure(schedule)
+    if requested is not None and requested is not schedule:
+        _validate_schedule_structure(requested)
     if (exact and requested != schedule) or (
         not exact and requested is not None and requested != schedule
     ):
@@ -421,7 +425,117 @@ class Schedule:
     @property
     def cache_key(self) -> str:
         """Canonical cache discriminator containing every schedule field."""
-        return repr(self)
+        return repr(_validate_schedule_structure(self))
+
+
+def _stored_schedule_fields(
+    value: object,
+    expected_type: type,
+    expected_fields: Tuple[str, ...],
+    what: str,
+) -> Dict[str, Any]:
+    """Snapshot one exact frozen schedule carrier without invoking caller code."""
+
+    if type(value) is not expected_type:
+        raise InvalidSchedule(f"{what} must be an exact {expected_type.__name__}")
+    try:
+        state = object.__getattribute__(value, "__dict__")
+    except Exception as error:
+        raise InvalidSchedule(f"{what} has inaccessible stored state") from error
+    if (
+        type(state) is not dict
+        or any(type(key) is not str for key in state)
+        or set(state) != set(expected_fields)
+    ):
+        raise InvalidSchedule(f"{what} has invalid stored fields")
+    for field_name in expected_fields:
+        try:
+            observed = object.__getattribute__(value, field_name)
+        except Exception as error:
+            raise InvalidSchedule(
+                f"{what}.{field_name} is not safely readable"
+            ) from error
+        if observed is not state[field_name]:
+            raise InvalidSchedule(f"{what}.{field_name} diverges from its stored value")
+    return state
+
+
+def _validate_schedule_structure(schedule: object) -> Schedule:
+    """Revalidate a frozen public schedule at every compiler use boundary."""
+
+    state = _stored_schedule_fields(
+        schedule,
+        Schedule,
+        ("loop_order", "tiles", "relayout", "tag", "parallel_loop"),
+        "Schedule",
+    )
+    loop_order = state["loop_order"]
+    tiles = state["tiles"]
+    relayout = state["relayout"]
+    tag = state["tag"]
+    parallel_loop = state["parallel_loop"]
+    if loop_order is not None and type(loop_order) is not tuple:
+        raise InvalidSchedule("Schedule.loop_order must be an owned tuple or None")
+    if type(tiles) is not tuple:
+        raise InvalidSchedule("Schedule.tiles must be an owned tuple")
+    if relayout is not None and type(relayout) is not RelayoutSpec:
+        raise InvalidSchedule("Schedule.relayout must be an exact RelayoutSpec or None")
+    if type(tag) is not str:
+        raise InvalidSchedule("Schedule.tag must be an exact str")
+    if parallel_loop is not None and type(parallel_loop) is not str:
+        raise InvalidSchedule("Schedule.parallel_loop must be an exact str or None")
+
+    checked_tiles = []
+    for position, tile in enumerate(tiles):
+        tile_state = _stored_schedule_fields(
+            tile,
+            TileSpec,
+            (
+                "index_var",
+                "width",
+                "placement",
+                "parallel",
+                "kind",
+                "accum",
+                "unroll",
+            ),
+            f"Schedule.tiles[{position}]",
+        )
+        try:
+            checked_tiles.append(TileSpec(**tile_state))
+        except (TypeError, ValueError) as error:
+            raise InvalidSchedule(
+                f"Schedule.tiles[{position}] has invalid stored values"
+            ) from error
+
+    checked_relayout = None
+    if relayout is not None:
+        relayout_state = _stored_schedule_fields(
+            relayout,
+            RelayoutSpec,
+            ("operand", "pack_var", "strip_width", "scope_var"),
+            "Schedule.relayout",
+        )
+        try:
+            checked_relayout = RelayoutSpec(**relayout_state)
+        except (TypeError, ValueError) as error:
+            raise InvalidSchedule(
+                "Schedule.relayout has invalid stored values"
+            ) from error
+
+    try:
+        canonical = Schedule(
+            loop_order=loop_order,
+            tiles=tuple(checked_tiles),
+            relayout=checked_relayout,
+            tag=tag,
+            parallel_loop=parallel_loop,
+        )
+    except (TypeError, ValueError) as error:
+        raise InvalidSchedule("Schedule has invalid stored values") from error
+    if canonical != schedule:
+        raise InvalidSchedule("Schedule state is not in canonical owned form")
+    return schedule
 
 
 def _entity_ids_by_name(
@@ -3129,6 +3243,7 @@ class Scheduler:
         result is discarded here and replayed only inside the lowering adapter.
         """
 
+        _validate_schedule_structure(schedule)
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)
         if compile_options is None and options.requested_schedule is None:
             options = replace(options, requested_schedule=schedule)
