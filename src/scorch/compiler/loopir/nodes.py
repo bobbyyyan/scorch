@@ -652,6 +652,103 @@ class WorkspaceReduce(Stmt):
 
 
 @dataclass(frozen=True)
+class SparseWorkspaceDecl(LoopIRNode):
+    """One scoped serial sparse workspace over exactly one drain dimension.
+
+    The workspace buffers coordinate/value pairs of ``drain_dimension``:
+    insertions merge by coordinate under ADD, and the consumer observes the
+    merged entries in strictly increasing coordinate order.  ``name`` is
+    presentation only.  Capacity, hashing, and the backing container are
+    target concerns — no size or container spelling appears in the node.
+    There is deliberately no multi-dimensional drain form in this subset;
+    the one-dimension drain is exactly the serial ``coo_workspace`` the
+    automatic sparse-workspace family requires.
+    """
+
+    node_id: LoopIRNodeId
+    workspace: WorkspaceId
+    name: str
+    dtype: ScalarType
+    drain_dimension: DimensionId
+
+
+@dataclass(frozen=True)
+class SparseWorkspaceRegion(Stmt):
+    """Structured allocation, producer, and ordered consumer of one sparse
+    workspace.
+
+    Region semantics are intrinsic to the node (the oracle and any target
+    lowering must implement exactly this):
+
+    - on entry the workspace is empty — ADD's identity is the absent entry,
+      which is what makes :class:`SparseWorkspaceInsert` well-defined
+      without a separate initialization statement;
+    - ``producer`` runs first and owns all insertions:
+      :class:`SparseWorkspaceInsert` into this workspace is legal only
+      inside it, and it must not write declared outputs;
+    - ``consumer`` runs second and owns the one ordered drain:
+      :class:`SparseWorkspaceDrainFor` of this workspace is legal only
+      inside it and observes every merged entry exactly once in strictly
+      increasing drain-coordinate order;
+    - the workspace ceases to exist at region exit — its lifetime is
+      exactly the region, so an empty workspace is observed on every
+      execution of the region (once per iteration of the enclosing scope).
+    """
+
+    workspace: SparseWorkspaceDecl
+    producer: Block
+    consumer: Block
+
+
+@dataclass(frozen=True)
+class SparseWorkspaceInsert(Stmt):
+    """A merging insertion into one in-scope sparse workspace.
+
+    Combines the entry at ``coord`` with ``value`` using ``op``
+    (``entry = entry op value``; an absent entry is created with the
+    value).  Only ADD is admitted, and its identity is exactly the absent
+    entry the owning region's empty-entry contract established.  ``coord``
+    must be value-typed over the workspace's drain dimension and is legal
+    only inside the owning region's producer.
+    """
+
+    workspace: WorkspaceId
+    coord: Expr
+    op: ReduceOp
+    value: Expr
+
+
+@dataclass(frozen=True)
+class SparseWorkspaceDrainFor(Stmt):
+    """The ordered drain of one in-scope sparse workspace.
+
+    Visits every merged entry of the workspace exactly once in strictly
+    increasing drain-coordinate order, binding ``index`` to the entry's
+    coordinate for the body; the entry's merged value is read through
+    :class:`SparseWorkspaceValue`.  Legal only inside the owning region's
+    consumer, at most once per region.  How the ordering is realized (the
+    serial container sorts before iteration) is a target concern — no sort
+    spelling appears in the node.
+    """
+
+    workspace: WorkspaceId
+    index: IndexId
+    body: Block
+
+
+@dataclass(frozen=True)
+class SparseWorkspaceValue(Expr):
+    """The current drained entry's merged value (drain-loop scope only).
+
+    Value-typed with the owning workspace's scalar type.  Legal only inside
+    the body of the :class:`SparseWorkspaceDrainFor` naming the same
+    workspace.
+    """
+
+    workspace: WorkspaceId
+
+
+@dataclass(frozen=True)
 class RelayoutDecl(LoopIRNode):
     """One staged copy of a dense operand's current pack strip.
 

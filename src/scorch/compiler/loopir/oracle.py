@@ -115,6 +115,11 @@ from .nodes import (
     TileInnerFor,
     TileOuterFor,
     WorkspaceId,
+    SparseWorkspaceDecl,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     WorkspaceRead,
     WorkspaceReduce,
     WorkspaceRegion,
@@ -388,6 +393,10 @@ class _Oracle:
             else:
                 self.values[symbol] = _zeros(shape) if shape else []
         self.indices: Dict[IndexId, int] = {}
+        self.sparse_workspaces: Dict[
+            WorkspaceId, Tuple[SparseWorkspaceDecl, Dict[int, float]]
+        ] = {}
+        self.draining_values: Dict[WorkspaceId, float] = {}
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
         self.tile_origins: Dict[TileId, int] = {}
@@ -563,6 +572,12 @@ class _Oracle:
         if type(expr) is WorkspaceRead:
             cells, cell = self._workspace_cell(expr.workspace, expr.coord)
             return cells.get(cell, 0.0)
+        if type(expr) is SparseWorkspaceValue:
+            if expr.workspace not in self.draining_values:
+                raise LoopIROracleError(
+                    "drained value read outside its workspace's drain loop"
+                )
+            return self.draining_values[expr.workspace]
         if type(expr) is Load:
             current: Any = self.values[expr.tensor]
             for position, index_expr in enumerate(expr.indices):
@@ -722,6 +737,57 @@ class _Oracle:
             self._exec_stmt(stmt.consumer)
         finally:
             del self.workspaces[decl.workspace]
+
+    def _exec_sparse_workspace_region(self, stmt: SparseWorkspaceRegion) -> None:
+        decl = stmt.workspace
+        if decl.workspace in self.sparse_workspaces:
+            raise LoopIROracleError(
+                "sparse workspace region re-entered while already executing"
+            )
+        # Intrinsic region-entry semantics: an empty workspace (ADD's
+        # identity is the absent entry).
+        self.sparse_workspaces[decl.workspace] = (decl, {})
+        try:
+            self._exec_stmt(stmt.producer)
+            self._exec_stmt(stmt.consumer)
+        finally:
+            del self.sparse_workspaces[decl.workspace]
+
+    def _exec_sparse_workspace_insert(self, stmt: SparseWorkspaceInsert) -> None:
+        open_workspace = self.sparse_workspaces.get(stmt.workspace)
+        if open_workspace is None:
+            raise LoopIROracleError(
+                "sparse workspace insert outside an executing region"
+            )
+        decl, entries = open_workspace
+        extent = self._dimension_extent(decl.drain_dimension)
+        coordinate = self._eval_coord(stmt.coord)
+        if not 0 <= coordinate < extent:
+            raise LoopIROracleError(
+                f"sparse workspace coordinate {coordinate} outside [0, {extent})"
+            )
+        contribution = self._eval_value(stmt.value)
+        entries[coordinate] = entries.get(coordinate, 0.0) + contribution
+
+    def _exec_sparse_workspace_drain(self, stmt: SparseWorkspaceDrainFor) -> None:
+        open_workspace = self.sparse_workspaces.get(stmt.workspace)
+        if open_workspace is None:
+            raise LoopIROracleError(
+                "sparse workspace drain outside an executing region"
+            )
+        if stmt.workspace in self.draining_values:
+            raise LoopIROracleError(
+                "sparse workspace drain re-entered while already draining"
+            )
+        _, entries = open_workspace
+        try:
+            for coordinate in sorted(entries):
+                self.indices[stmt.index] = coordinate
+                self.draining_values[stmt.workspace] = entries[coordinate]
+                self._exec_stmt(stmt.body)
+        finally:
+            self.indices.pop(stmt.index, None)
+            self.draining_values.pop(stmt.workspace, None)
 
     def _exec_result_tile_region(self, stmt: ResultTileRegion) -> None:
         decl = stmt.decl
@@ -901,6 +967,15 @@ class _Oracle:
             cells, cell = self._workspace_cell(stmt.workspace, stmt.coord)
             contribution = self._eval_value(stmt.value)
             cells[cell] = cells.get(cell, 0.0) + contribution
+            return
+        if type(stmt) is SparseWorkspaceRegion:
+            self._exec_sparse_workspace_region(stmt)
+            return
+        if type(stmt) is SparseWorkspaceInsert:
+            self._exec_sparse_workspace_insert(stmt)
+            return
+        if type(stmt) is SparseWorkspaceDrainFor:
+            self._exec_sparse_workspace_drain(stmt)
             return
         if type(stmt) is RelayoutStage:
             self._exec_relayout_stage(stmt)

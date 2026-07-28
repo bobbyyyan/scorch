@@ -66,6 +66,11 @@ from .nodes import (
     SparseFor,
     SparseWindowFor,
     SparseWorkSource,
+    SparseWorkspaceDecl,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     StagedRead,
     Stmt,
     Store,
@@ -430,6 +435,45 @@ class LoopIRBuilder:
         value: Expr,
     ) -> WorkspaceReduce:
         return WorkspaceReduce(self._node_id(), workspace, coord, op, value)
+
+    def sparse_workspace_decl(
+        self,
+        workspace: WorkspaceId,
+        name: str,
+        dtype: ScalarType,
+        drain_dimension: DimensionId,
+    ) -> SparseWorkspaceDecl:
+        return SparseWorkspaceDecl(
+            self._node_id(), workspace, name, dtype, drain_dimension
+        )
+
+    def sparse_workspace_region(
+        self,
+        workspace: SparseWorkspaceDecl,
+        producer: Block,
+        consumer: Block,
+    ) -> SparseWorkspaceRegion:
+        return SparseWorkspaceRegion(self._node_id(), workspace, producer, consumer)
+
+    def sparse_workspace_insert(
+        self,
+        workspace: WorkspaceId,
+        coord: Expr,
+        op: ReduceOp,
+        value: Expr,
+    ) -> SparseWorkspaceInsert:
+        return SparseWorkspaceInsert(self._node_id(), workspace, coord, op, value)
+
+    def sparse_workspace_drain_for(
+        self,
+        workspace: WorkspaceId,
+        index: IndexId,
+        body: Block,
+    ) -> SparseWorkspaceDrainFor:
+        return SparseWorkspaceDrainFor(self._node_id(), workspace, index, body)
+
+    def sparse_workspace_value(self, workspace: WorkspaceId) -> SparseWorkspaceValue:
+        return SparseWorkspaceValue(self._node_id(), workspace)
 
     def relayout_decl(
         self,

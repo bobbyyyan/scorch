@@ -759,3 +759,223 @@ class CsrOutputBuilder:
             indices=tuple(self.columns),
             values=tuple(self.values),
         )
+
+
+@dataclass(frozen=True)
+class LevelTensor:
+    """One canonical, immutable level-stored tensor of DENSE/COMPRESSED levels.
+
+    ``positions``/``coordinates`` hold one entry per physical level:
+    compressed levels carry their position and coordinate tuples, dense
+    levels carry ``None`` for both (dense storage is implicit).  Explicit
+    zero values are permitted, exactly as for :class:`CsrMatrix`.
+    """
+
+    shape: Tuple[int, ...]
+    level_kinds: Tuple[LevelKind, ...]
+    positions: Tuple[Any, ...]
+    coordinates: Tuple[Any, ...]
+    values: Tuple[float, ...]
+
+
+class LevelOutputBuilder:
+    """Level-general ordered assembly: order-checked appends, level storage.
+
+    Admits any rank of DENSE and COMPRESSED levels with at least one
+    COMPRESSED level.  Appends must be lexicographically strictly
+    increasing.  ``finish`` derives the per-level position/coordinate
+    storage from the append stream alone and enforces the dense-suffix
+    contract: every level after the last compressed level is dense storage
+    with no skip representation, so each materialized position of the last
+    compressed level must receive its complete Cartesian block of trailing
+    dense coordinates.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        level_kinds: Tuple[LevelKind, ...],
+    ) -> None:
+        if type(name) is not str or not name:
+            raise LevelStorageError("output name must be a nonempty str")
+        if (
+            type(shape) is not tuple
+            or not shape
+            or any(type(extent) is not int or extent < 0 for extent in shape)
+        ):
+            raise LevelStorageError(
+                "output shape must be a nonempty tuple of nonnegative exact ints"
+            )
+        if (
+            type(level_kinds) is not tuple
+            or len(level_kinds) != len(shape)
+            or any(type(kind) is not LevelKind for kind in level_kinds)
+        ):
+            raise LevelStorageError(
+                "output level kinds must be one LevelKind per storage level"
+            )
+        if not any(kind is LevelKind.COMPRESSED for kind in level_kinds):
+            raise LevelStorageError(
+                "ordered assembly requires at least one compressed level"
+            )
+        self.name = name
+        self.shape = shape
+        self.level_kinds = level_kinds
+        self.entries: List[Tuple[Tuple[int, ...], float]] = []
+
+    def append(self, coords: Tuple[int, ...], value: float) -> None:
+        if (
+            type(coords) is not tuple
+            or len(coords) != len(self.shape)
+            or any(type(coord) is not int for coord in coords)
+        ):
+            raise LevelStorageError(
+                f"append coordinates must be {len(self.shape)} exact ints"
+            )
+        if type(value) is not float:
+            raise LevelStorageError("append value must be an exact float")
+        for level, (coord, extent) in enumerate(zip(coords, self.shape)):
+            if not 0 <= coord < extent:
+                raise LevelStorageError(
+                    f"append to {self.name} at {coords} escapes extent "
+                    f"{extent} at level {level}"
+                )
+        if self.entries and coords <= self.entries[-1][0]:
+            raise LevelStorageError(
+                f"appends to {self.name} must be lexicographically "
+                f"increasing; got {coords} after {self.entries[-1][0]}"
+            )
+        self.entries.append((coords, value))
+
+    def finish(self) -> LevelTensor:
+        rank = len(self.shape)
+        last_compressed = max(
+            level
+            for level, kind in enumerate(self.level_kinds)
+            if kind is LevelKind.COMPRESSED
+        )
+        suffix_extents = self.shape[last_compressed + 1 :]
+        suffix_cells = 1
+        for extent in suffix_extents:
+            suffix_cells *= extent
+
+        # The dense-suffix contract: entries group into complete, in-order
+        # Cartesian blocks per materialized last-compressed position.
+        if suffix_extents:
+            if len(self.entries) % suffix_cells != 0:
+                raise LevelStorageError(
+                    f"assembly of {self.name} left an incomplete trailing "
+                    "dense block"
+                )
+            expected_suffix: List[Tuple[int, ...]] = []
+
+            def _extend(prefix: Tuple[int, ...], level: int) -> None:
+                if level == len(suffix_extents):
+                    expected_suffix.append(prefix)
+                    return
+                for coord in range(suffix_extents[level]):
+                    _extend(prefix + (coord,), level + 1)
+
+            _extend((), 0)
+            for block_start in range(0, len(self.entries), suffix_cells):
+                block = self.entries[block_start : block_start + suffix_cells]
+                head = block[0][0][: last_compressed + 1]
+                for offset, (coords, _) in enumerate(block):
+                    if coords[: last_compressed + 1] != head:
+                        raise LevelStorageError(
+                            f"assembly of {self.name} split a dense block "
+                            "across materialized parents"
+                        )
+                    if coords[last_compressed + 1 :] != expected_suffix[offset]:
+                        raise LevelStorageError(
+                            f"assembly of {self.name} skipped a trailing " "dense cell"
+                        )
+
+        # Derive per-level compressed storage from the ordered stream.
+        positions: List[Any] = [None] * rank
+        coordinates: List[Any] = [None] * rank
+        # Parent-position keys per level: the stored prefix that owns one
+        # position of level l (dense levels contribute their coordinate,
+        # compressed levels contribute their materialized segment).
+        for level, kind in enumerate(self.level_kinds):
+            if kind is not LevelKind.COMPRESSED:
+                continue
+            level_coords: List[int] = []
+            level_pos: List[int] = [0]
+            previous_prefix: Any = None
+            for coords, _ in self.entries:
+                prefix_key = coords[: level + 1]
+                if prefix_key != previous_prefix:
+                    level_coords.append(coords[level])
+                    previous_prefix = prefix_key
+            # One position segment per materialized parent position, in
+            # order; parents the stream never touched own empty segments.
+            segment_counts: Dict[Any, int] = {}
+            previous_prefix = None
+            for coords, _ in self.entries:
+                parent_key = self._parent_key(coords, level)
+                prefix_key = coords[: level + 1]
+                if prefix_key != previous_prefix:
+                    segment_counts[parent_key] = segment_counts.get(parent_key, 0) + 1
+                    previous_prefix = prefix_key
+            running = 0
+            for parent_key in self._materialized_parents(level):
+                running += segment_counts.get(parent_key, 0)
+                level_pos.append(running)
+            positions[level] = tuple(level_pos)
+            coordinates[level] = tuple(level_coords)
+
+        return LevelTensor(
+            shape=self.shape,
+            level_kinds=self.level_kinds,
+            positions=tuple(positions),
+            coordinates=tuple(coordinates),
+            values=tuple(value for _, value in self.entries),
+        )
+
+    def _parent_key(self, coords: Tuple[int, ...], level: int) -> Tuple[int, ...]:
+        """The materialized-parent key of one entry at ``level``.
+
+        Compressed ancestors contribute their coordinate (their stored
+        segment identity); dense ancestors contribute their coordinate as
+        an implicit dense position component.  The key is simply the
+        coordinate prefix — parent-position identity and prefix identity
+        coincide because every ancestor position is reached through its
+        coordinates.
+        """
+
+        return coords[:level]
+
+    def _materialized_parents(self, level: int) -> List[Tuple[int, ...]]:
+        """Every parent position of ``level`` in storage order.
+
+        Walk levels above ``level``: a dense ancestor multiplies the
+        current parents by its full extent (dense storage materializes
+        every cell, including cells the stream never touched); a
+        compressed ancestor materializes exactly the distinct stored
+        prefixes, which the lexicographic append order already lists in
+        storage order.
+        """
+
+        parents: List[Tuple[int, ...]] = [()]
+        for ancestor in range(level):
+            if self.level_kinds[ancestor] is LevelKind.DENSE:
+                parents = [
+                    prefix + (coord,)
+                    for prefix in parents
+                    for coord in range(self.shape[ancestor])
+                ]
+            else:
+                seen: set = set()
+                stored: List[Tuple[int, ...]] = []
+                for coords, _ in self.entries:
+                    prefix = coords[: ancestor + 1]
+                    if prefix not in seen:
+                        seen.add(prefix)
+                        stored.append(prefix)
+                parents = stored
+        return parents
+
+    def _parent_position_count(self, level: int) -> int:
+        return len(self._materialized_parents(level))

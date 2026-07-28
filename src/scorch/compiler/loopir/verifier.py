@@ -167,6 +167,11 @@ from .nodes import (
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    SparseWorkspaceDecl,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     SparseWorkSource,
     StagedRead,
     Stmt,
@@ -280,6 +285,19 @@ class _WorkspaceState:
         self.consumed = False
 
 
+class _SparseWorkspaceState:
+    """One open sparse-workspace region's walk state."""
+
+    __slots__ = ("decl", "role", "inserted", "drained", "drain_depth")
+
+    def __init__(self, decl: SparseWorkspaceDecl) -> None:
+        self.decl = decl
+        self.role: Optional[str] = None
+        self.inserted = False
+        self.drained = False
+        self.drain_depth = 0
+
+
 class _RelayoutState:
     """One open staged-relayout region's walk state."""
 
@@ -324,6 +342,7 @@ class _Context:
         self.open_panels: Dict[TileId, PanelOuterFor] = {}
         self.matched_panel_windows: Set[TileId] = set()
         self.open_workspaces: Dict[WorkspaceId, _WorkspaceState] = {}
+        self.open_sparse_workspaces: Dict[WorkspaceId, _SparseWorkspaceState] = {}
         self.ever_workspace_ids: Set[WorkspaceId] = set()
         self.open_relayouts: Dict[RelayoutId, _RelayoutState] = {}
         self.ever_relayout_ids: Set[RelayoutId] = set()
@@ -767,6 +786,28 @@ def _check_workspace_read(
     return _VALUE
 
 
+def _check_sparse_workspace_value(
+    ctx: _Context, expr: SparseWorkspaceValue, path: str, depth: int
+) -> _ExprType:
+    workspace = _check_workspace_id(expr.workspace, path)
+    state = ctx.open_sparse_workspaces.get(workspace)
+    if state is None:
+        _fail(
+            "unbound_workspace",
+            path,
+            f"sparse workspace {_diagnostic_int(workspace.value)} has no "
+            "enclosing region in scope",
+        )
+    if state.role != "consumer" or state.drain_depth == 0:
+        _fail(
+            "workspace_read_scope",
+            path,
+            "a drained value is readable only inside the owning "
+            "workspace's drain loop",
+        )
+    return _VALUE
+
+
 def _check_relayout_id(value: object, path: str) -> RelayoutId:
     if (
         type(value) is not RelayoutId
@@ -873,6 +914,7 @@ _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     BinaryExpr: _check_binary_expr,
     WorkspaceRead: _check_workspace_read,
     StagedRead: _check_staged_read,
+    SparseWorkspaceValue: _check_sparse_workspace_value,
 }
 
 
@@ -1398,6 +1440,95 @@ def _check_workspace_region(
         del ctx.open_workspaces[decl.workspace]
 
 
+def _check_sparse_workspace_decl(
+    ctx: _Context, decl: object, path: str, depth: int
+) -> SparseWorkspaceDecl:
+    if type(decl) is not SparseWorkspaceDecl:
+        _fail(
+            "malformed_state",
+            path,
+            f"expected a SparseWorkspaceDecl, got {type(decl).__name__}",
+        )
+    _enter(ctx, decl, path, depth)
+    try:
+        workspace = _check_workspace_id(decl.workspace, path)
+        if workspace in ctx.ever_workspace_ids:
+            _fail(
+                "duplicate_workspace_id",
+                path,
+                f"workspace id {_diagnostic_int(workspace.value)} reused",
+            )
+        ctx.ever_workspace_ids.add(workspace)
+        if type(decl.name) is not str or not decl.name:
+            _fail(
+                "malformed_state",
+                path,
+                "SparseWorkspaceDecl.name must be a nonempty str",
+            )
+        if type(decl.dtype) is not ScalarType:
+            _fail(
+                "invalid_scalar_type",
+                path,
+                "SparseWorkspaceDecl.dtype must be a ScalarType member",
+            )
+        if ctx.program_dtype is None:
+            ctx.program_dtype = decl.dtype
+        elif decl.dtype is not ctx.program_dtype:
+            _fail(
+                "mixed_dtype",
+                path,
+                "this subset requires one uniform scalar type per program; "
+                f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
+            )
+        dimension = _check_dimension_id(
+            decl.drain_dimension,
+            f"{path}.drain_dimension",
+            "SparseWorkspaceDecl.drain_dimension",
+        )
+        if dimension not in ctx.dimensions:
+            _fail(
+                "undefined_dimension",
+                f"{path}.drain_dimension",
+                "the drain dimension must be a declared dimension",
+            )
+        return decl
+    finally:
+        _leave(ctx, decl)
+
+
+def _check_sparse_workspace_region(
+    ctx: _Context, stmt: SparseWorkspaceRegion, path: str, depth: int
+) -> None:
+    decl = _check_sparse_workspace_decl(
+        ctx, stmt.workspace, f"{path}.workspace", depth + 1
+    )
+    state = _SparseWorkspaceState(decl)
+    ctx.open_sparse_workspaces[decl.workspace] = state
+    try:
+        state.role = "producer"
+        ctx.producer_depth += 1
+        try:
+            _check_body(ctx, stmt.producer, f"{path}.producer", depth + 1)
+        finally:
+            ctx.producer_depth -= 1
+        state.role = "consumer"
+        _check_body(ctx, stmt.consumer, f"{path}.consumer", depth + 1)
+        if not state.inserted:
+            _fail(
+                "workspace_dead_region",
+                path,
+                "a sparse region's producer must insert into its workspace",
+            )
+        if not state.drained:
+            _fail(
+                "workspace_dead_region",
+                path,
+                "a sparse region's consumer must drain its workspace",
+            )
+    finally:
+        del ctx.open_sparse_workspaces[decl.workspace]
+
+
 def _check_relayout_decl(
     ctx: _Context, decl: object, path: str, depth: int
 ) -> RelayoutDecl:
@@ -1708,6 +1839,86 @@ def _check_workspace_reduce(
     state.produced = True
 
 
+def _check_sparse_workspace_insert(
+    ctx: _Context, stmt: SparseWorkspaceInsert, path: str, depth: int
+) -> None:
+    workspace = _check_workspace_id(stmt.workspace, path)
+    state = ctx.open_sparse_workspaces.get(workspace)
+    if state is None:
+        _fail(
+            "unbound_workspace",
+            path,
+            f"sparse workspace {_diagnostic_int(workspace.value)} has no "
+            "enclosing region in scope",
+        )
+    if state.role != "producer":
+        _fail(
+            "workspace_write_scope",
+            path,
+            "a sparse workspace accepts insertions only inside its "
+            "region's producer",
+        )
+    if type(stmt.op) is not ReduceOp:
+        # ADD is the only declared ReduceOp member; its identity is exactly
+        # the absent entry the region's empty-entry contract established.
+        _fail(
+            "malformed_state",
+            path,
+            "SparseWorkspaceInsert.op must be a ReduceOp member",
+        )
+    coord_type = _check_expr(ctx, stmt.coord, f"{path}.coord", depth + 1)
+    _require_coord(
+        ctx,
+        coord_type,
+        f"{path}.coord",
+        "a sparse-workspace insertion coordinate",
+        state.decl.drain_dimension,
+    )
+    value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
+    _require_value(value_type, f"{path}.value", "an inserted value")
+    state.inserted = True
+
+
+def _check_sparse_workspace_drain_for(
+    ctx: _Context, stmt: SparseWorkspaceDrainFor, path: str, depth: int
+) -> None:
+    workspace = _check_workspace_id(stmt.workspace, path)
+    state = ctx.open_sparse_workspaces.get(workspace)
+    if state is None:
+        _fail(
+            "unbound_workspace",
+            path,
+            f"sparse workspace {_diagnostic_int(workspace.value)} has no "
+            "enclosing region in scope",
+        )
+    if state.role != "consumer":
+        _fail(
+            "workspace_read_scope",
+            path,
+            "a sparse workspace drains only inside its region's consumer",
+        )
+    if state.drained:
+        _fail(
+            "workspace_read_scope",
+            path,
+            "a sparse workspace drains at most once per region",
+        )
+    index = _bind_index(
+        ctx,
+        stmt.index,
+        path,
+        "SparseWorkspaceDrainFor.index",
+        state.decl.drain_dimension,
+    )
+    state.drain_depth += 1
+    try:
+        _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
+    finally:
+        state.drain_depth -= 1
+        del ctx.bound_indices[index]
+    state.drained = True
+
+
 def _check_merged_sparse_for(
     ctx: _Context, stmt: MergedSparseFor, path: str, depth: int
 ) -> None:
@@ -1905,6 +2116,9 @@ _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
     MergedSparseFor: _check_merged_sparse_for,
     WorkspaceRegion: _check_workspace_region,
     WorkspaceReduce: _check_workspace_reduce,
+    SparseWorkspaceRegion: _check_sparse_workspace_region,
+    SparseWorkspaceInsert: _check_sparse_workspace_insert,
+    SparseWorkspaceDrainFor: _check_sparse_workspace_drain_for,
     RelayoutStage: _check_relayout_stage,
     ResultTileRegion: _check_result_tile_region,
     TiledReduce: _check_tiled_reduce,
@@ -2403,6 +2617,11 @@ def _check_parallel_selection(ctx: _Context, program: LoopProgram) -> None:
             for node in subtree
             if type(node) is WorkspaceRegion
         }
+        sparse_workspaces_inside = {
+            node.workspace.workspace
+            for node in subtree
+            if type(node) is SparseWorkspaceRegion
+        }
         for node in subtree:
             if type(node) is AppendEntry:
                 _fail(
@@ -2426,6 +2645,21 @@ def _check_parallel_selection(ctx: _Context, program: LoopProgram) -> None:
                         path,
                         "a workspace shared across selected iterations is "
                         "not race free",
+                    )
+            if type(node) in (
+                SparseWorkspaceInsert,
+                SparseWorkspaceDrainFor,
+                SparseWorkspaceValue,
+            ):
+                if (
+                    cast(SparseWorkspaceInsert, node).workspace
+                    not in sparse_workspaces_inside
+                ):
+                    _fail(
+                        "parallel_race",
+                        path,
+                        "a sparse workspace shared across selected "
+                        "iterations is not race free",
                     )
     finally:
         _leave(ctx, selection)

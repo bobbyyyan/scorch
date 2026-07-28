@@ -49,6 +49,10 @@ from .nodes import (
     SparseCursorDecl,
     SparseFor,
     SparseWindowFor,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     StagedRead,
     Stmt,
     Store,
@@ -65,7 +69,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v8"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v9"
 
 
 class _CanonicalIds:
@@ -145,6 +149,9 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
         for index in expr.indices:
             _seed_expr_ids(index, ids)
         return
+    if type(expr) is SparseWorkspaceValue:
+        ids.workspace(expr.workspace)
+        return
     if type(expr) is BinaryExpr:
         _seed_expr_ids(expr.lhs, ids)
         _seed_expr_ids(expr.rhs, ids)
@@ -210,6 +217,22 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         ids.workspace(stmt.workspace)
         _seed_expr_ids(stmt.coord, ids)
         _seed_expr_ids(stmt.value, ids)
+        return
+    if type(stmt) is SparseWorkspaceRegion:
+        ids.workspace(stmt.workspace.workspace)
+        ids.dimension(stmt.workspace.drain_dimension)
+        _seed_stmt_ids(stmt.producer, ids)
+        _seed_stmt_ids(stmt.consumer, ids)
+        return
+    if type(stmt) is SparseWorkspaceInsert:
+        ids.workspace(stmt.workspace)
+        _seed_expr_ids(stmt.coord, ids)
+        _seed_expr_ids(stmt.value, ids)
+        return
+    if type(stmt) is SparseWorkspaceDrainFor:
+        ids.workspace(stmt.workspace)
+        ids.index(stmt.index)
+        _seed_stmt_ids(stmt.body, ids)
         return
     if type(stmt) is RelayoutStage:
         ids.relayout(stmt.decl.relayout)
@@ -304,6 +327,11 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
             "kind": "workspace_read",
             "workspace": ids.workspace(expr.workspace),
             "coord": _serialize_expr(expr.coord, ids),
+        }
+    if type(expr) is SparseWorkspaceValue:
+        return {
+            "kind": "sparse_workspace_value",
+            "workspace": ids.workspace(expr.workspace),
         }
     if type(expr) is StagedRead:
         return {
@@ -418,6 +446,32 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "op": stmt.op.value,
             "coord": _serialize_expr(stmt.coord, ids),
             "value": _serialize_expr(stmt.value, ids),
+        }
+    if type(stmt) is SparseWorkspaceRegion:
+        return {
+            "kind": "sparse_workspace_region",
+            "workspace": {
+                "workspace": ids.workspace(stmt.workspace.workspace),
+                "dtype": stmt.workspace.dtype.value,
+                "drain_dimension": ids.dimension(stmt.workspace.drain_dimension),
+            },
+            "producer": _serialize_stmt(stmt.producer, ids),
+            "consumer": _serialize_stmt(stmt.consumer, ids),
+        }
+    if type(stmt) is SparseWorkspaceInsert:
+        return {
+            "kind": "sparse_workspace_insert",
+            "workspace": ids.workspace(stmt.workspace),
+            "op": stmt.op.value,
+            "coord": _serialize_expr(stmt.coord, ids),
+            "value": _serialize_expr(stmt.value, ids),
+        }
+    if type(stmt) is SparseWorkspaceDrainFor:
+        return {
+            "kind": "sparse_workspace_drain_for",
+            "workspace": ids.workspace(stmt.workspace),
+            "index": ids.index(stmt.index),
+            "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is RelayoutStage:
         return {
@@ -567,6 +621,8 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
             f"w{ids.workspace(expr.workspace)}"
             f"[{_render_expr(expr.coord, ids, names)}]"
         )
+    if type(expr) is SparseWorkspaceValue:
+        return f"drained(w{ids.workspace(expr.workspace)})"
     if type(expr) is StagedRead:
         rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)
         return f"staged r{ids.relayout(expr.relayout)}[{rendered}]"
@@ -685,6 +741,37 @@ def _render_stmt(
             f"[{_render_expr(stmt.coord, ids, names)}] = "
             f"{_render_expr(stmt.value, ids, names)}"
         )
+        return
+    if type(stmt) is SparseWorkspaceRegion:
+        decl = stmt.workspace
+        lines.append(
+            f"{pad}sparse_workspace_region w{ids.workspace(decl.workspace)} "
+            f"{decl.name!r} {decl.dtype.value} "
+            f"drain d{ids.dimension(decl.drain_dimension)} {{"
+        )
+        lines.append(f"{pad}  producer {{")
+        _render_stmt(stmt.producer, ids, names, indent + 2, lines)
+        lines.append(f"{pad}  }}")
+        lines.append(f"{pad}  consumer {{")
+        _render_stmt(stmt.consumer, ids, names, indent + 2, lines)
+        lines.append(f"{pad}  }}")
+        lines.append(f"{pad}}}")
+        return
+    if type(stmt) is SparseWorkspaceInsert:
+        lines.append(
+            f"{pad}sparse_workspace_insert({stmt.op.value}) "
+            f"w{ids.workspace(stmt.workspace)}"
+            f"[{_render_expr(stmt.coord, ids, names)}] = "
+            f"{_render_expr(stmt.value, ids, names)}"
+        )
+        return
+    if type(stmt) is SparseWorkspaceDrainFor:
+        lines.append(
+            f"{pad}sparse_workspace_drain_for x{ids.index(stmt.index)} "
+            f"in w{ids.workspace(stmt.workspace)} {{"
+        )
+        _render_stmt(stmt.body, ids, names, indent + 1, lines)
+        lines.append(f"{pad}}}")
         return
     if type(stmt) is RelayoutStage:
         relayout_decl = stmt.decl
