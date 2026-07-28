@@ -549,6 +549,73 @@ def lower_normalized_cin_to_loopir(
     )
 
 
+def _classify_sparse_output_family(
+    result_sparse: bool,
+    reduce_update: bool,
+    result_levels: Tuple[LevelType, ...],
+    lhs: TensorAccess,
+    lhs_index_ids: Tuple[IndexId, ...],
+    domains: Dict[IndexId, object],
+) -> bool:
+    """Gate the sparse-output families; True selects the semantic
+    doubly-compressed reduction form."""
+
+    sparse_reduction_family = (
+        result_sparse
+        and reduce_update
+        and result_levels == (LevelType.COMPRESSED, LevelType.COMPRESSED)
+    )
+    if result_sparse and not sparse_reduction_family:
+        if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
+            _fail(
+                "unsupported_sparse_output",
+                f"result {lhs.tensor.name!r} declares a sparse layout other "
+                "than canonical CSR; ordered assembly is defined for "
+                "canonical CSR only in the migrated families",
+            )
+        if reduce_update:
+            _fail(
+                "unsupported_sparse_output_reduction",
+                "a canonical CSR output cannot carry the ADD update "
+                "operator in the migrated families",
+            )
+        row_domain = domains[lhs_index_ids[0]]
+        column_domain = domains[lhs_index_ids[1]]
+        if row_domain.kind is not DomainKind.DENSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the CSR row coordinate must iterate a dense domain in the "
+                "migrated families",
+            )
+        if column_domain.kind is DomainKind.DENSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the CSR column coordinate must be driven by stored sparse "
+                "coordinates; dense-domain assembly is outside the migrated "
+                "families",
+            )
+    elif sparse_reduction_family:
+        # The doubly-compressed reduction family lowers to the SEMANTIC
+        # accumulation form (a coordinate-merged StoreReduce); only a
+        # sparse-workspace schedule can rewrite it into ordered assembly,
+        # and target lowering refuses the unscheduled form.
+        row_domain = domains[lhs_index_ids[0]]
+        column_domain = domains[lhs_index_ids[1]]
+        if row_domain.kind is not DomainKind.SPARSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the doubly-compressed row coordinate must be driven by one "
+                "stored sparse level in the migrated families",
+            )
+        if column_domain.kind is DomainKind.DENSE:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "the doubly-compressed column coordinate must be driven by "
+                "stored sparse coordinates in the migrated families",
+            )
+    return sparse_reduction_family
+
+
 def _lower_sparse_family(
     cin: IndexStmt,
     loop_vars: List[IndexVar],
@@ -580,40 +647,24 @@ def _lower_sparse_family(
     )
     lhs_index_ids = tuple(lhs.index_ids)
 
-    if result_sparse:
-        if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
-            _fail(
-                "unsupported_sparse_output",
-                f"result {lhs.tensor.name!r} declares a sparse layout other "
-                "than canonical CSR; ordered assembly is defined for "
-                "canonical CSR only in the migrated families",
-            )
-        if reduce_update:
-            _fail(
-                "unsupported_sparse_output_reduction",
-                "a canonical CSR output cannot carry the ADD update "
-                "operator in the migrated families",
-            )
-        row_domain = domains[lhs_index_ids[0]]
-        column_domain = domains[lhs_index_ids[1]]
-        if row_domain.kind is not DomainKind.DENSE:
-            _fail(
-                "unsupported_sparse_output_domain",
-                "the CSR row coordinate must iterate a dense domain in the "
-                "migrated families",
-            )
-        if column_domain.kind is DomainKind.DENSE:
-            _fail(
-                "unsupported_sparse_output_domain",
-                "the CSR column coordinate must be driven by stored sparse "
-                "coordinates; dense-domain assembly is outside the migrated "
-                "families",
-            )
+    sparse_reduction_family = _classify_sparse_output_family(
+        result_sparse,
+        reduce_update,
+        result_levels,
+        lhs,
+        lhs_index_ids,
+        domains,
+    )
 
     for index_id in loop_index_ids:
         domain = domains[index_id]
         if domain.kind in (DomainKind.UNION, DomainKind.INTERSECTION):
             if index_id not in lhs_index_ids:
+                if sparse_reduction_family:
+                    # The B1 family reduces over the merged reduction
+                    # dimension by construction; the semantic StoreReduce
+                    # form is exactly that reduction.
+                    continue
                 _fail(
                     "unsupported_merged_reduction",
                     "reducing over a merged sparse domain is outside the "
@@ -672,6 +723,10 @@ def _lower_sparse_family(
                 position_ids[key] = builder.new_position_id()
             elif domain.kind is DomainKind.UNION:
                 union_cursors.add(key)
+            elif domain.kind is DomainKind.INTERSECTION and sparse_reduction_family:
+                # INTERSECTION descent: the merged loop binds each aligned
+                # cursor's position so child levels can chain from it.
+                position_ids[key] = builder.new_position_id()
 
     def position_expr(symbol: SymbolId, level: int) -> Expr:
         """The dominating physical position of one tensor level."""
@@ -728,7 +783,9 @@ def _lower_sparse_family(
     value = lower_expr(assign.rhs)
     store_indices = tuple(builder.index_value(index_id) for index_id in lhs_index_ids)
     leaf: Stmt
-    if result_sparse:
+    if sparse_reduction_family:
+        leaf = builder.store_reduce(result_symbol, store_indices, ReduceOp.ADD, value)
+    elif result_sparse:
         leaf = builder.append_entry(result_symbol, store_indices, value)
     elif reduce_update:
         leaf = builder.store_reduce(result_symbol, store_indices, ReduceOp.ADD, value)
@@ -773,11 +830,19 @@ def _lower_sparse_family(
                 if domain.kind is DomainKind.UNION
                 else MergeMode.INTERSECTION
             )
+            merge_positions: Tuple[Optional[PositionId], ...] = ()
+            if mode is MergeMode.INTERSECTION and any(
+                (ref.tensor, ref.level) in position_ids for ref in domain.cursors
+            ):
+                merge_positions = tuple(
+                    position_ids.get((ref.tensor, ref.level)) for ref in domain.cursors
+                )
             loop = builder.merged_sparse_for(
                 mode,
                 cursor_decls,
                 index_var.index_id,
                 body,
+                merge_positions,
             )
         body = builder.block((loop,))
 

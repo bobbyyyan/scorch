@@ -919,11 +919,16 @@ class TiledReduce(Stmt):
 class MergedSparseFor(Stmt):
     """Coordinate-synchronized iteration over two or more sparse cursors.
 
-    Every cursor must target the value-bearing leaf level of its tensor, and
-    all cursor levels must store the same logical dimension — the merged
-    coordinate domain.  Hierarchical merge descent (merging non-leaf levels
-    and descending into children) is deliberately not represented by this
-    subset.
+    Every cursor level must store the same logical dimension — the merged
+    coordinate domain.  A UNION merge admits only value-bearing leaf-level
+    cursors (the historical contract).  An INTERSECTION merge additionally
+    admits non-leaf cursors when the loop binds their aligned position
+    through ``positions``: each entry pairs with the same-index cursor and
+    names the :class:`PositionId` the body observes for that cursor's
+    aligned entry, which is the descent anchor a child level's
+    :class:`SparseCursorDecl` parent expression consumes.  ``positions``
+    is empty in the historical no-descent form; when nonempty it has one
+    entry (a ``PositionId`` or ``None``) per cursor.
 
     Semantics (intrinsic to the node; the oracle and any target lowering
     must implement exactly this):
@@ -949,6 +954,7 @@ class MergedSparseFor(Stmt):
     cursors: Tuple[SparseCursorDecl, ...]
     coord_index: IndexId
     body: Block
+    positions: Tuple[Optional[PositionId], ...] = ()
 
 
 @dataclass(frozen=True)

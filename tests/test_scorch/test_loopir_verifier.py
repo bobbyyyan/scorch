@@ -1269,6 +1269,10 @@ def test_unsupported_sparse_output_non_csr():
 
 
 def test_unsupported_sparse_output_rank_three():
+    """A rank-3 DENSE/COMPRESSED layout is now admitted at the output gate
+    (the generalized ordered-assembly stream is level-general), so the forged
+    program fails closed one boundary later at append-rank reconciliation."""
+
     fixture = build_union_add()
     builder = fixture.builder
     dim_extra = builder.dimension("k")
@@ -1283,6 +1287,22 @@ def test_unsupported_sparse_output_rank_three():
     )
     programs = fixture.program
     forge(programs, dimensions=(*programs.dimensions, dim_extra))
+    expect_defect("rank_mismatch", fixture.program)
+
+
+def test_unsupported_sparse_output_permuted_modes():
+    """A non-identity storage order on a sparse output stays fail-closed."""
+
+    fixture = build_union_add()
+    builder = fixture.builder
+    decl_c = fixture.program.tensors[2]
+    forge(
+        decl_c,
+        levels=(
+            builder.level(decl_c.levels[0].kind, 1),
+            builder.level(decl_c.levels[1].kind, 0),
+        ),
+    )
     expect_defect("unsupported_sparse_output", fixture.program)
 
 

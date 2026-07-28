@@ -68,6 +68,7 @@ from ..identity import IndexId, SymbolId
 from .levels import (
     CsrMatrix,
     CsrOutputBuilder,
+    LevelOutputBuilder,
     LevelStorageError,
     LevelTensorStorage,
     MAX_LEVEL_STORAGE_RANK,
@@ -278,7 +279,7 @@ class _Oracle:
 
         self.values: Dict[SymbolId, Any] = {}
         self.storages: Dict[SymbolId, LevelTensorStorage] = {}
-        self.builders: Dict[SymbolId, CsrOutputBuilder] = {}
+        self.builders: Dict[SymbolId, "CsrOutputBuilder | LevelOutputBuilder"] = {}
         self.shapes: Dict[SymbolId, Tuple[int, ...]] = {}
         input_values: Dict[SymbolId, object] = {}
         partial_input_shapes: Dict[SymbolId, Tuple[Optional[int], ...]] = {}
@@ -387,9 +388,13 @@ class _Oracle:
         for symbol in program.outputs:
             decl = self.decls[symbol]
             shape = self.shapes[symbol]
-            if any(level.kind is not LevelKind.DENSE for level in decl.levels):
-                # The verifier admits only canonical CSR sparse outputs.
+            level_kinds = tuple(level.kind for level in decl.levels)
+            if level_kinds == (LevelKind.DENSE, LevelKind.COMPRESSED):
                 self.builders[symbol] = CsrOutputBuilder(decl.name, shape)
+            elif any(kind is not LevelKind.DENSE for kind in level_kinds):
+                self.builders[symbol] = LevelOutputBuilder(
+                    decl.name, shape, level_kinds
+                )
             else:
                 self.values[symbol] = _zeros(shape) if shape else []
         self.indices: Dict[IndexId, int] = {}
@@ -397,6 +402,7 @@ class _Oracle:
             WorkspaceId, Tuple[SparseWorkspaceDecl, Dict[int, float]]
         ] = {}
         self.draining_values: Dict[WorkspaceId, float] = {}
+        self.sparse_reductions: Dict[SymbolId, Dict[Tuple[int, ...], float]] = {}
         self.positions: Dict[PositionId, int] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
         self.tile_origins: Dict[TileId, int] = {}
@@ -510,6 +516,15 @@ class _Oracle:
     def run(self) -> Dict[SymbolId, TensorValue]:
         self._exec_stmt(self.program.body)
         results: Dict[SymbolId, TensorValue] = {}
+        for symbol, entries in self.sparse_reductions.items():
+            builder = self.builders[symbol]
+            if getattr(builder, "entries", None) or getattr(builder, "rows", None):
+                raise LoopIROracleError(
+                    "an output cannot mix ordered appends with the semantic "
+                    "sparse accumulation form"
+                )
+            for coords in sorted(entries):
+                builder.append(coords, entries[coords])
         for symbol in self.program.outputs:
             if symbol in self.builders:
                 results[symbol] = self.builders[symbol].finish()
@@ -789,6 +804,8 @@ class _Oracle:
             self.indices.pop(stmt.index, None)
             self.draining_values.pop(stmt.workspace, None)
 
+    _SPARSE_WORKSPACE_EXEC: Dict[type, Any] = {}
+
     def _exec_result_tile_region(self, stmt: ResultTileRegion) -> None:
         decl = stmt.decl
         origin = self.tile_origins.get(decl.pack)
@@ -912,11 +929,19 @@ class _Oracle:
                     )
                 if stmt.mode is MergeMode.UNION or len(aligned) == len(states):
                     self.indices[stmt.coord_index] = candidate
+                    for cursor_position, bound in enumerate(stmt.positions):
+                        if bound is not None:
+                            # INTERSECTION: every cursor is aligned at the
+                            # body, so its position is the descent anchor.
+                            self.positions[bound] = states[cursor_position].position
                     self._exec_stmt(stmt.body)
                 for state in aligned:
                     state.position += 1
         finally:
             self.indices.pop(stmt.coord_index, None)
+            for bound in stmt.positions:
+                if bound is not None:
+                    self.positions.pop(bound, None)
             for decl in stmt.cursors:
                 self.cursors.pop(decl.cursor, None)
 
@@ -968,14 +993,9 @@ class _Oracle:
             contribution = self._eval_value(stmt.value)
             cells[cell] = cells.get(cell, 0.0) + contribution
             return
-        if type(stmt) is SparseWorkspaceRegion:
-            self._exec_sparse_workspace_region(stmt)
-            return
-        if type(stmt) is SparseWorkspaceInsert:
-            self._exec_sparse_workspace_insert(stmt)
-            return
-        if type(stmt) is SparseWorkspaceDrainFor:
-            self._exec_sparse_workspace_drain(stmt)
+        sparse_workspace_exec = self._SPARSE_WORKSPACE_EXEC.get(type(stmt))
+        if sparse_workspace_exec is not None:
+            sparse_workspace_exec(self, stmt)
             return
         if type(stmt) is RelayoutStage:
             self._exec_relayout_stage(stmt)
@@ -1064,6 +1084,14 @@ class _Oracle:
             target[last] = self._eval_value(stmt.value)
             return
         if type(stmt) is StoreReduce:
+            if stmt.tensor in self.builders:
+                # The semantic sparse accumulation form: merge by coordinate
+                # now, assemble in order once at program exit.
+                coords = tuple(self._eval_coord(index) for index in stmt.indices)
+                entries = self.sparse_reductions.setdefault(stmt.tensor, {})
+                contribution = self._eval_value(stmt.value)
+                entries[coords] = entries.get(coords, 0.0) + contribution
+                return
             target, last = self._locate_store(stmt.tensor, stmt.indices)
             contribution = self._eval_value(stmt.value)
             target[last] = target[last] + contribution
@@ -1087,3 +1115,10 @@ def run_program(
 
     verify_program(program)
     return _Oracle(program, inputs, output_shapes).run()
+
+
+_Oracle._SPARSE_WORKSPACE_EXEC = {
+    SparseWorkspaceRegion: _Oracle._exec_sparse_workspace_region,
+    SparseWorkspaceInsert: _Oracle._exec_sparse_workspace_insert,
+    SparseWorkspaceDrainFor: _Oracle._exec_sparse_workspace_drain,
+}

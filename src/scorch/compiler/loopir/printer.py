@@ -204,6 +204,9 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
     if type(stmt) is MergedSparseFor:
         for cursor in stmt.cursors:
             _seed_cursor_ids(cursor, ids)
+        for bound in stmt.positions:
+            if bound is not None:
+                ids.position(bound)
         ids.index(stmt.coord_index)
         _seed_stmt_ids(stmt.body, ids)
         return
@@ -421,13 +424,19 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is MergedSparseFor:
-        return {
+        serialized = {
             "kind": "merged_sparse_for",
             "mode": stmt.mode.value,
             "cursors": [_serialize_cursor(cursor, ids) for cursor in stmt.cursors],
             "coord_index": ids.index(stmt.coord_index),
             "body": _serialize_stmt(stmt.body, ids),
         }
+        if stmt.positions:
+            serialized["positions"] = [
+                None if bound is None else ids.position(bound)
+                for bound in stmt.positions
+            ]
+        return serialized
     if type(stmt) is WorkspaceRegion:
         return {
             "kind": "workspace_region",
@@ -713,9 +722,16 @@ def _render_stmt(
         cursors = "; ".join(
             _render_cursor(cursor, ids, names) for cursor in stmt.cursors
         )
+        bound_positions = ""
+        if stmt.positions:
+            rendered_positions = ", ".join(
+                "-" if bound is None else f"p{ids.position(bound)}"
+                for bound in stmt.positions
+            )
+            bound_positions = f" binds ({rendered_positions})"
         lines.append(
             f"{pad}merged_{stmt.mode.value}_for x{ids.index(stmt.coord_index)} "
-            f"in ({cursors}) {{"
+            f"in ({cursors}){bound_positions} {{"
         )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")

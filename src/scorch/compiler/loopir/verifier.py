@@ -1932,17 +1932,37 @@ def _check_merged_sparse_for(
             path,
             "a merged loop needs at least two sparse cursors",
         )
+    if type(stmt.positions) is not tuple:
+        _fail("malformed_state", path, "positions must be an owned tuple")
+    if stmt.positions:
+        if len(stmt.positions) != len(stmt.cursors):
+            _fail(
+                "malformed_state",
+                path,
+                "a position-binding merge names one entry per cursor",
+            )
+        if stmt.mode is not MergeMode.INTERSECTION:
+            _fail(
+                "unsupported_sparse_hierarchy",
+                path,
+                "merge descent binds aligned positions only under "
+                "INTERSECTION, where every cursor is aligned at the body",
+            )
     decls = []
     for position, cursor in enumerate(stmt.cursors):
         cursor_path = f"{path}.cursors[{position}]"
         decl = _check_cursor_decl(ctx, cursor, cursor_path, depth + 1)
-        if decl.level != len(ctx.tensors[decl.tensor].levels) - 1:
+        binds_position = bool(stmt.positions) and stmt.positions[position] is not None
+        if (
+            decl.level != len(ctx.tensors[decl.tensor].levels) - 1
+            and not binds_position
+        ):
             _fail(
                 "unsupported_sparse_hierarchy",
                 cursor_path,
-                "merged cursors must target the value-bearing leaf level; "
-                "hierarchical merge descent is not represented by this "
-                "subset",
+                "merged cursors must target the value-bearing leaf level "
+                "unless the INTERSECTION merge binds their aligned position "
+                "as a descent anchor",
             )
         decls.append(decl)
     merge_dimension = ctx.level_dimension(decls[0].tensor, decls[0].level)
@@ -1959,12 +1979,29 @@ def _check_merged_sparse_for(
     index = _bind_index(
         ctx, stmt.coord_index, path, "MergedSparseFor.coord_index", merge_dimension
     )
+    bound_merge_positions = []
+    for cursor_position, position_id in enumerate(stmt.positions):
+        if position_id is None:
+            continue
+        decl = decls[cursor_position]
+        bound_merge_positions.append(
+            _bind_position(
+                ctx,
+                position_id,
+                f"{path}.positions[{cursor_position}]",
+                "MergedSparseFor.positions entry",
+                decl.tensor,
+                decl.level,
+            )
+        )
     for decl in decls:
         ctx.cursors[decl.cursor] = (decl, stmt.mode)
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
         del ctx.bound_indices[index]
+        for bound in bound_merge_positions:
+            del ctx.bound_positions[bound]
         for decl in decls:
             del ctx.cursors[decl.cursor]
 
@@ -2060,7 +2097,21 @@ def _check_store_reduce(
         # is the whole reduction-operator contract; adding a member requires
         # adding its explicit output-initialization identity check here.
         _fail("malformed_state", path, "StoreReduce.op must be a ReduceOp member")
-    _require_dense_store_target(ctx, tensor, path)
+    decl = ctx.tensors[tensor]
+    if any(
+        level.kind is not LevelKind.DENSE and level.kind is not LevelKind.COMPRESSED
+        for level in decl.levels
+    ):
+        _fail(
+            "layout_mismatch",
+            path,
+            "reductions are only defined on DENSE/COMPRESSED-level outputs",
+        )
+    # An all-dense target is the executable dense reduction.  A target with
+    # compressed levels is the SEMANTIC accumulation form of the sparse
+    # result family: the oracle merges it by coordinate, while target
+    # lowering refuses it unless a sparse-workspace schedule rewrites it
+    # into ordered assembly.
     _check_output_write_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
     _require_value(value_type, f"{path}.value", "a combined value")
@@ -2734,16 +2785,19 @@ def verify_program(program: object) -> None:
             if all(kind is LevelKind.DENSE for kind in kinds):
                 continue
             modes = tuple(level.mode for level in decl.levels)
-            if kinds != _CANONICAL_CSR_KINDS or modes != _CANONICAL_CSR_MODES:
-                # Ordered append assembly is defined for canonical CSR only in
-                # this subset; other sparse output layouts are future assembly
-                # adapters over the same append stream.
+            if any(
+                kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED
+                for kind in kinds
+            ) or modes != tuple(range(len(kinds))):
+                # The generalized ordered-assembly stream admits identity-
+                # ordered DENSE/COMPRESSED output levels; every other sparse
+                # output layout stays fail-closed.
                 _fail(
                     "unsupported_sparse_output",
                     f"program.outputs[{position}]",
-                    f"output {decl.name!r} declares a sparse layout other "
-                    "than canonical CSR (dense@0, compressed@1); this subset "
-                    "fails closed on it",
+                    f"output {decl.name!r} declares a sparse layout outside "
+                    "the identity-ordered DENSE/COMPRESSED families; this "
+                    "subset fails closed on it",
                 )
         _check_body(ctx, program.body, "program.body", 1)
         unwritten = ctx.outputs - ctx.written_outputs

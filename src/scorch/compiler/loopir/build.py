@@ -329,8 +329,16 @@ class LoopIRBuilder:
         cursors: Sequence[SparseCursorDecl],
         coord_index: IndexId,
         body: Block,
+        positions: Sequence["PositionId | None"] = (),
     ) -> MergedSparseFor:
-        return MergedSparseFor(self._node_id(), mode, tuple(cursors), coord_index, body)
+        return MergedSparseFor(
+            self._node_id(),
+            mode,
+            tuple(cursors),
+            coord_index,
+            body,
+            tuple(positions),
+        )
 
     def append_entry(
         self, tensor: SymbolId, coords: Sequence[Expr], value: Expr
