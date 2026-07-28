@@ -272,13 +272,16 @@ def _preflight_cin_structure_impl(  # noqa: C901
     authoritative view without executing attacker-controlled descriptors.
 
     The private ``allow_legacy_schedule_aliases`` mode exists only for the
-    direct legacy-lowering adapter.  Workspace insertion historically clones
-    producer and consumer syntax while retaining same-kind ``NodeId`` values
-    and clones logical ``IndexVar`` objects while retaining their paired
-    ``NodeId``, ``IndexId``, and display name.  The adapter does not consume
-    node identity and canonicalizes the index aliases before lowering.
-    Normalization, analysis, LoopIR, and request identity never enable this
-    compatibility mode.
+    direct legacy-lowering adapter.  It additionally validates mutable
+    scheduler compatibility fields because that adapter's forward copier
+    consumes them; normalization deliberately discards those fields and
+    therefore does not let their contents affect semantic admission.
+    Workspace insertion historically clones producer and consumer syntax while
+    retaining same-kind ``NodeId`` values and clones logical ``IndexVar``
+    objects while retaining their paired ``NodeId``, ``IndexId``, and display
+    name.  The adapter does not consume node identity and canonicalizes the
+    index aliases before lowering. Normalization, analysis, LoopIR, and request
+    identity never enable this compatibility mode.
     """
 
     if type(allow_legacy_schedule_aliases) is not bool:
@@ -692,49 +695,56 @@ def _preflight_cin_structure_impl(  # noqa: C901
         stack.append((True, node, path, depth))
         children: List[Tuple[object, Tuple[str, ...]]] = []
 
-        inserted_workspace = node_state.get(
-            "inserted_workspace",
-            _MISSING_CIN_FIELD,
-        )
-        if inserted_workspace is _MISSING_CIN_FIELD:
-            # Frozen operation dataclasses retain their exact class default
-            # without materializing this false compatibility flag in
-            # ``__dict__``.
-            if node_type is not BinaryOp and node_type is not UnaryOp:
+        if allow_legacy_schedule_aliases:
+            # Normalization deliberately discards these mutable scheduler
+            # compatibility fields.  Validate them only at the raw legacy
+            # lowering boundary, whose forward copier consumes them.  Treating
+            # them as semantic CIN would make ignored caller metadata affect
+            # normalization and source comparison.
+            inserted_workspace = node_state.get(
+                "inserted_workspace",
+                _MISSING_CIN_FIELD,
+            )
+            if inserted_workspace is _MISSING_CIN_FIELD:
+                # Frozen operation dataclasses retain their exact class default
+                # without materializing this false compatibility flag in
+                # ``__dict__``.
+                if node_type is not BinaryOp and node_type is not UnaryOp:
+                    diagnose(
+                        "missing_cin_field",
+                        f"{node_type.__name__}.inserted_workspace is missing",
+                        path + ("inserted_workspace",),
+                    )
+            elif type(inserted_workspace) is not bool:
                 diagnose(
-                    "missing_cin_field",
-                    f"{node_type.__name__}.inserted_workspace is missing",
+                    "invalid_cin_field",
+                    f"{node_type.__name__}.inserted_workspace must be an exact bool",
                     path + ("inserted_workspace",),
                 )
-        elif type(inserted_workspace) is not bool:
-            diagnose(
-                "invalid_cin_field",
-                f"{node_type.__name__}.inserted_workspace must be an exact bool",
-                path + ("inserted_workspace",),
-            )
-        if path == ("root",):
-            root_has_workspace_marker = inserted_workspace is True
-        no_tile_list = stored_field(node, "no_tile_list", path)
-        if no_tile_list is not _MISSING_CIN_FIELD:
-            if type(no_tile_list) is not list:
-                diagnose(
-                    "invalid_cin_field",
-                    f"{node_type.__name__}.no_tile_list must be an exact list",
-                    path + ("no_tile_list",),
-                )
-            elif any(type(index_var) is not IndexVar for index_var in no_tile_list):
-                diagnose(
-                    "invalid_cin_field",
-                    f"{node_type.__name__}.no_tile_list must contain IndexVar objects",
-                    path + ("no_tile_list",),
-                )
-            else:
-                for position, index_var in enumerate(no_tile_list):
-                    validate_legacy_index_reference(
-                        index_var,
-                        path + ("no_tile_list", f"[{position}]"),
-                        f"{node_type.__name__}.no_tile_list entry",
+            if path == ("root",):
+                root_has_workspace_marker = inserted_workspace is True
+            no_tile_list = stored_field(node, "no_tile_list", path)
+            if no_tile_list is not _MISSING_CIN_FIELD:
+                if type(no_tile_list) is not list:
+                    diagnose(
+                        "invalid_cin_field",
+                        f"{node_type.__name__}.no_tile_list must be an exact list",
+                        path + ("no_tile_list",),
                     )
+                elif any(type(index_var) is not IndexVar for index_var in no_tile_list):
+                    diagnose(
+                        "invalid_cin_field",
+                        f"{node_type.__name__}.no_tile_list must contain IndexVar "
+                        "objects",
+                        path + ("no_tile_list",),
+                    )
+                else:
+                    for position, index_var in enumerate(no_tile_list):
+                        validate_legacy_index_reference(
+                            index_var,
+                            path + ("no_tile_list", f"[{position}]"),
+                            f"{node_type.__name__}.no_tile_list entry",
+                        )
 
         # Stable-reference typing remains the full ownership verifier's
         # authority.  Presence and non-shadowing are structural requirements
@@ -962,59 +972,67 @@ def _preflight_cin_structure_impl(  # noqa: C901
                     "IndexVar._name must be an exact str",
                     path + ("_name",),
                 )
-            parent = stored_field(node, "_parent", path)
-            if parent is not _MISSING_CIN_FIELD and parent is not None:
-                validate_legacy_index_reference(
-                    parent,
-                    path + ("_parent",),
-                    "IndexVar._parent",
-                )
-            for flag_name in ("is_tiled", "is_outer", "is_inner"):
-                flag = stored_field(node, flag_name, path)
-                if flag is not _MISSING_CIN_FIELD and type(flag) is not bool:
-                    diagnose(
-                        "invalid_cin_field",
-                        f"IndexVar.{flag_name} must be an exact bool",
-                        path + (flag_name,),
+            if allow_legacy_schedule_aliases:
+                parent = stored_field(node, "_parent", path)
+                if parent is not _MISSING_CIN_FIELD and parent is not None:
+                    validate_legacy_index_reference(
+                        parent,
+                        path + ("_parent",),
+                        "IndexVar._parent",
                     )
-            tile_size_var = stored_field(node, "tile_size_var", path)
-            if tile_size_var is not _MISSING_CIN_FIELD and tile_size_var is not None:
-                validate_tile_size_var(
-                    tile_size_var,
-                    path + ("tile_size_var",),
-                )
-            legacy_accesses = stored_field(node, "_legacy_tensor_accesses", path)
-            if legacy_accesses is not _MISSING_CIN_FIELD:
-                if type(legacy_accesses) is not list:
-                    diagnose(
-                        "invalid_cin_field",
-                        "IndexVar._legacy_tensor_accesses must be an exact list",
-                        path + ("_legacy_tensor_accesses",),
-                    )
-                else:
-                    for position, access in enumerate(legacy_accesses):
-                        access_path = path + (
-                            "_legacy_tensor_accesses",
-                            f"[{position}]",
+                for flag_name in ("is_tiled", "is_outer", "is_inner"):
+                    flag = stored_field(node, flag_name, path)
+                    if flag is not _MISSING_CIN_FIELD and type(flag) is not bool:
+                        diagnose(
+                            "invalid_cin_field",
+                            f"IndexVar.{flag_name} must be an exact bool",
+                            path + (flag_name,),
                         )
-                        if (
-                            type(access) is not TensorAccess
-                            and type(access) is not WorkspaceAccess
-                        ):
-                            diagnose(
-                                "invalid_cin_field",
-                                "IndexVar._legacy_tensor_accesses entries must "
-                                "be exact TensorAccess objects",
-                                access_path,
+                tile_size_var = stored_field(node, "tile_size_var", path)
+                if (
+                    tile_size_var is not _MISSING_CIN_FIELD
+                    and tile_size_var is not None
+                ):
+                    validate_tile_size_var(
+                        tile_size_var,
+                        path + ("tile_size_var",),
+                    )
+                legacy_accesses = stored_field(
+                    node,
+                    "_legacy_tensor_accesses",
+                    path,
+                )
+                if legacy_accesses is not _MISSING_CIN_FIELD:
+                    if type(legacy_accesses) is not list:
+                        diagnose(
+                            "invalid_cin_field",
+                            "IndexVar._legacy_tensor_accesses must be an exact list",
+                            path + ("_legacy_tensor_accesses",),
+                        )
+                    else:
+                        for position, access in enumerate(legacy_accesses):
+                            access_path = path + (
+                                "_legacy_tensor_accesses",
+                                f"[{position}]",
                             )
-                        else:
-                            pending_access_references.append(
-                                (
-                                    cast(TensorAccess, access),
+                            if (
+                                type(access) is not TensorAccess
+                                and type(access) is not WorkspaceAccess
+                            ):
+                                diagnose(
+                                    "invalid_cin_field",
+                                    "IndexVar._legacy_tensor_accesses entries must "
+                                    "be exact TensorAccess objects",
                                     access_path,
-                                    "IndexVar._legacy_tensor_accesses entry",
                                 )
-                            )
+                            else:
+                                pending_access_references.append(
+                                    (
+                                        cast(TensorAccess, access),
+                                        access_path,
+                                        "IndexVar._legacy_tensor_accesses entry",
+                                    )
+                                )
         elif type(node) is TensorVar or type(node) is Workspace:
             symbol_id = stored_field(node, "symbol_id", path)
             if (
@@ -1246,44 +1264,49 @@ def _preflight_cin_structure_impl(  # noqa: C901
                         "Workspace.dense must be an exact bool",
                         path + ("dense",),
                     )
-                tile_size_var = stored_field(node, "_tile_size_var", path)
-                if (
-                    tile_size_var is not _MISSING_CIN_FIELD
-                    and tile_size_var is not None
-                ):
-                    validate_tile_size_var(
-                        tile_size_var,
-                        path + ("_tile_size_var",),
-                    )
-                workspace_accesses = stored_field(node, "workspace_accesses", path)
-                if workspace_accesses is not _MISSING_CIN_FIELD:
-                    if type(workspace_accesses) is not list:
-                        diagnose(
-                            "invalid_cin_field",
-                            "Workspace.workspace_accesses must be an exact list",
-                            path + ("workspace_accesses",),
+                if allow_legacy_schedule_aliases:
+                    tile_size_var = stored_field(node, "_tile_size_var", path)
+                    if (
+                        tile_size_var is not _MISSING_CIN_FIELD
+                        and tile_size_var is not None
+                    ):
+                        validate_tile_size_var(
+                            tile_size_var,
+                            path + ("_tile_size_var",),
                         )
-                    else:
-                        for position, access in enumerate(workspace_accesses):
-                            access_path = path + (
-                                "workspace_accesses",
-                                f"[{position}]",
+                    workspace_accesses = stored_field(
+                        node,
+                        "workspace_accesses",
+                        path,
+                    )
+                    if workspace_accesses is not _MISSING_CIN_FIELD:
+                        if type(workspace_accesses) is not list:
+                            diagnose(
+                                "invalid_cin_field",
+                                "Workspace.workspace_accesses must be an exact list",
+                                path + ("workspace_accesses",),
                             )
-                            if type(access) is not WorkspaceAccess:
-                                diagnose(
-                                    "invalid_cin_field",
-                                    "Workspace.workspace_accesses entries must be "
-                                    "exact WorkspaceAccess objects",
-                                    access_path,
+                        else:
+                            for position, access in enumerate(workspace_accesses):
+                                access_path = path + (
+                                    "workspace_accesses",
+                                    f"[{position}]",
                                 )
-                            else:
-                                pending_access_references.append(
-                                    (
-                                        cast(WorkspaceAccess, access),
+                                if type(access) is not WorkspaceAccess:
+                                    diagnose(
+                                        "invalid_cin_field",
+                                        "Workspace.workspace_accesses entries must be "
+                                        "exact WorkspaceAccess objects",
                                         access_path,
-                                        "Workspace.workspace_accesses entry",
                                     )
-                                )
+                                else:
+                                    pending_access_references.append(
+                                        (
+                                            cast(WorkspaceAccess, access),
+                                            access_path,
+                                            "Workspace.workspace_accesses entry",
+                                        )
+                                    )
                 rank_candidates = [
                     rank
                     for rank in (
@@ -1438,6 +1461,10 @@ def _preflight_cin_structure_impl(  # noqa: C901
         )
 
     for index_var, path in forward_index_objects.values():
+        if not allow_legacy_schedule_aliases:
+            # Normalization keeps the semantic IndexVar expression but resets
+            # every mutable scheduling backlink/role below.
+            continue
         expression = _safe_exact_dict_value(index_var, "_expr")
         parent = _safe_exact_dict_value(index_var, "_parent")
         is_tiled = _safe_exact_dict_value(index_var, "is_tiled")
