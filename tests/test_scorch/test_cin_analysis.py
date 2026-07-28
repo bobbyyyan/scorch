@@ -1469,6 +1469,63 @@ def test_public_lowerer_rejects_missing_optional_tile_storage() -> None:
     assert "missing_cin_field" in _assert_structured_diagnostics(error)
 
 
+@pytest.mark.parametrize("missing_field", ("_parent", "tile_size_var"))
+def test_public_lowerer_rejects_missing_detached_tile_parent_storage(
+    missing_field: str,
+) -> None:
+    """A detached logical parent must still own every copied optional field."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("R", fmt="dd", shape=(4, 7))
+    left = TensorVar("A", fmt="ds", shape=(4, 5))
+    right = TensorVar("B", fmt="dd", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.add_tile(
+        source,
+        column,
+        4,
+        compile_options=options,
+    )
+    accesses = {access.tensor.name: access for access in scheduled.tensor_accesses}
+    logical_parent = next(
+        index
+        for index in scheduled.index_vars
+        if index.name == "c" and index._expr is not None
+    )
+    forward_alias = accesses["B"].indices[1]
+    accesses["R"].indices[1] = forward_alias
+    accesses["R"].index_ids = tuple(index.index_id for index in accesses["R"].indices)
+
+    # Successive legacy tiling can legitimately detach this logical parent.
+    assert CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    del logical_parent.__dict__[missing_field]
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
 def test_verifier_reports_out_of_scope_index_reference() -> None:
     producer_i = IndexVar("i")
     result = TensorVar("C", fmt="d")
