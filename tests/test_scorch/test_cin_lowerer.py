@@ -7053,6 +7053,41 @@ def test_stale_lowerer_reuse_takes_the_validated_boundary() -> None:
     assert "invalid_cin_field" in codes
 
 
+@pytest.mark.parametrize("timed", (False, True))
+def test_valid_lowerer_reuse_fails_closed_instead_of_returning_a_subtree(timed):
+    from scorch.compiler.compilation_context import CompilationContext
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+
+    def program(result_name, source_name):
+        index = IndexVar("i")
+        result = TensorVar(result_name, fmt="d", shape=(4,))
+        source = TensorVar(source_name, fmt="d", shape=(4,))
+        return ForAll(
+            index,
+            TensorAssign(result[index], source[index], op=Operation.ADD),
+        )
+
+    context = CompilationContext(options) if timed else None
+    lowerer = CINLowerer(
+        compile_options=options,
+        compilation_context=context,
+    )
+    assert type(lowerer.lower_IndexStmt(program("C", "A"))) is llir.Function
+
+    with pytest.raises(VerificationError) as error:
+        lowerer.lower_IndexStmt(program("D", "B"))
+
+    assert {diagnostic.code for diagnostic in error.value.diagnostics} == {
+        "reused_lowerer"
+    }
+
+
 def test_permuted_dense_level_types_map_through_storage_order() -> None:
     """index-var level metadata must use mode_order position lookup, not the
     stored order as a logical-to-physical map (they differ at rank three)."""

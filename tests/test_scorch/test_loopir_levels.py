@@ -14,7 +14,9 @@ from scorch.compiler.loopir.levels import (
     CsrMatrix,
     CsrOutputBuilder,
     DenseLevel,
+    LevelOutputBuilder,
     LevelStorageError,
+    LevelTensor,
     LevelTensorStorage,
     MAX_LEVEL_STORAGE_RANK,
     from_csr,
@@ -194,3 +196,84 @@ def test_output_builder_rejects_escaping_coordinates():
         builder.append((2, 0), 1.0)
     with pytest.raises(LevelStorageError):
         builder.append((0, 3), 1.0)
+
+
+def test_level_output_builder_handles_zero_trailing_dense_extents():
+    compressed_dense = LevelOutputBuilder(
+        "C",
+        (2, 0),
+        (LevelKind.COMPRESSED, LevelKind.DENSE),
+    ).finish()
+    assert compressed_dense.positions == ((0, 0), None)
+    assert compressed_dense.coordinates == ((), None)
+    assert compressed_dense.values == ()
+
+    dense_compressed_dense = LevelOutputBuilder(
+        "D",
+        (2, 3, 0),
+        (LevelKind.DENSE, LevelKind.COMPRESSED, LevelKind.DENSE),
+    ).finish()
+    assert dense_compressed_dense.positions == (None, (0, 0, 0), None)
+    assert dense_compressed_dense.coordinates == (None, (), None)
+    assert dense_compressed_dense.values == ()
+
+
+def test_level_output_builder_does_not_materialize_empty_dense_suffixes():
+    result = LevelOutputBuilder(
+        "C",
+        (1, 10**12),
+        (LevelKind.COMPRESSED, LevelKind.DENSE),
+    ).finish()
+    assert result.values == ()
+
+
+@pytest.mark.parametrize("kind", (LevelKind.COORDINATE, LevelKind.SINGLETON))
+def test_level_output_builder_rejects_unsupported_level_kinds(kind):
+    with pytest.raises(LevelStorageError, match="DENSE and COMPRESSED"):
+        LevelOutputBuilder(
+            "C",
+            (2, 2),
+            (LevelKind.COMPRESSED, kind),
+        )
+
+
+def test_level_output_builder_enforces_complete_dense_suffix_blocks():
+    builder = LevelOutputBuilder(
+        "C",
+        (2, 2),
+        (LevelKind.COMPRESSED, LevelKind.DENSE),
+    )
+    builder.append((1, 0), 2.0)
+    with pytest.raises(LevelStorageError, match="incomplete trailing dense block"):
+        builder.finish()
+
+    complete = LevelOutputBuilder(
+        "C",
+        (2, 2),
+        (LevelKind.COMPRESSED, LevelKind.DENSE),
+    )
+    complete.append((1, 0), 2.0)
+    complete.append((1, 1), 3.0)
+    result = complete.finish()
+    assert result.positions == ((0, 1), None)
+    assert result.coordinates == ((1,), None)
+    assert result.values == (2.0, 3.0)
+
+
+def test_level_tensor_validates_its_canonical_storage():
+    with pytest.raises(LevelStorageError, match="one owned value"):
+        LevelTensor(
+            shape=(2,),
+            level_kinds=(LevelKind.COMPRESSED,),
+            positions=((0, 1),),
+            coordinates=((1,),),
+            values=(),
+        )
+    with pytest.raises(LevelStorageError, match="strictly increasing"):
+        LevelTensor(
+            shape=(3,),
+            level_kinds=(LevelKind.COMPRESSED,),
+            positions=((0, 2),),
+            coordinates=((2, 1),),
+            values=(1.0, 2.0),
+        )

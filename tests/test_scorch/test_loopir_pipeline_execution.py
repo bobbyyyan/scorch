@@ -953,6 +953,52 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
     assert getattr(error.value, "defect").code == expected
 
 
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_doubly_compressed_sparse_workspace_reaches_the_target_boundary(
+    regblock_enabled,
+):
+    """B1 is typed and scheduled, but target emission is not silently skipped.
+
+    The partial milestone owns the semantic program and its serial sparse
+    workspace in both automatic-policy arms.  Until its dedicated LLIR target
+    path lands, compilation must stop at the existing hierarchical-compressed
+    target boundary after recording successful schedule application.
+    """
+
+    from scorch.compiler.loopir.lower_llir import LoopIRTargetError
+    from scorch.compiler.scheduler import Schedule
+
+    cin = _build_boundary_cin(
+        "ss",
+        "ij",
+        (("ss", "ik"), ("ss", "kj")),
+        "ikj",
+    )
+    options = replace(
+        CompileOptions.from_environment(environ={}).with_regblock_enabled(
+            regblock_enabled
+        ),
+        requested_schedule=Schedule(),
+    )
+    context = CompilationContext(options)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            cin,
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=options,
+            compilation_context=context,
+        )
+
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert CompilerStageId.LOOPIR_SCHEDULE_APPLICATION in {
+        record.stage_id for record in context.stage_run_records
+    }
+    assert CompilerStageId.LOOPIR_TO_LLIR_LOWERING not in {
+        record.stage_id for record in context.stage_run_records
+    }
+
+
 def test_loopir_stage_timing_is_recorded():
     options = CompileOptions.from_environment()
     context = CompilationContext(options)

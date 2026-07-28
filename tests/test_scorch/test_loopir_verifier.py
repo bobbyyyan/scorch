@@ -24,9 +24,11 @@ from scorch.compiler.loopir.nodes import (
     Load,
     LoopIRNodeId,
     LoopProgram,
+    MergeMode,
     ParallelDiscipline,
     ParallelIntent,
     ParallelPart,
+    PositionId,
     ReduceOp,
     RelayoutId,
     RelayoutScope,
@@ -880,6 +882,146 @@ def build_union_add(mode=None, with_defaults=True, op=None) -> UnionAddFixture:
         ),
     )
     return UnionAddFixture(builder, program, a, b, c, row, col, merged)
+
+
+def build_sparse_workspace_program():
+    builder = LoopIRBuilder()
+    dimension = builder.dimension("i")
+    output = builder.new_symbol_id()
+    output_decl = builder.tensor(
+        output,
+        "C",
+        ScalarType.FLOAT32,
+        (dimension.dimension,),
+        (builder.level(LevelKind.COMPRESSED, 0),),
+    )
+    outer_index = builder.new_index_id()
+    workspace = builder.new_workspace_id()
+    workspace_decl = builder.sparse_workspace_decl(
+        workspace,
+        "wksp",
+        ScalarType.FLOAT32,
+        dimension.dimension,
+    )
+    insert = builder.sparse_workspace_insert(
+        workspace,
+        builder.index_value(outer_index),
+        ReduceOp.ADD,
+        builder.float_const(1.0),
+    )
+    drain_index = builder.new_index_id()
+    append = builder.append_entry(
+        output,
+        (builder.index_value(drain_index),),
+        builder.sparse_workspace_value(workspace),
+    )
+    drain = builder.sparse_workspace_drain_for(
+        workspace,
+        drain_index,
+        builder.block((append,)),
+    )
+    region = builder.sparse_workspace_region(
+        workspace_decl,
+        builder.block((insert,)),
+        builder.block((drain,)),
+    )
+    program = builder.program(
+        (dimension,),
+        (output_decl,),
+        (),
+        (output,),
+        builder.block(
+            (
+                builder.dense_for(
+                    outer_index,
+                    dimension.dimension,
+                    builder.block((region,)),
+                ),
+            )
+        ),
+    )
+    return builder, program, region, drain
+
+
+def test_sparse_workspace_program_verifies():
+    _, program, _, _ = build_sparse_workspace_program()
+    verify_program(program)
+
+
+def test_sparse_workspace_drain_must_be_direct_and_dynamic_once():
+    builder, program, region, drain = build_sparse_workspace_program()
+    repeated = builder.dense_for(
+        builder.new_index_id(),
+        region.workspace.drain_dimension,
+        builder.block((drain,)),
+    )
+    forge(region, consumer=builder.block((repeated,)))
+    defect = expect_defect("workspace_read_scope", program)
+    assert "directly" in defect.message
+
+
+def test_sparse_workspace_rejects_nested_same_workspace_drain():
+    builder, program, region, drain = build_sparse_workspace_program()
+    nested = builder.sparse_workspace_drain_for(
+        region.workspace.workspace,
+        builder.new_index_id(),
+        drain.body,
+    )
+    outer = builder.sparse_workspace_drain_for(
+        region.workspace.workspace,
+        drain.index,
+        builder.block((nested,)),
+    )
+    forge(region, consumer=builder.block((outer,)))
+    defect = expect_defect("workspace_read_scope", program)
+    assert "at most once" in defect.message
+
+
+def test_sparse_workspace_drain_must_consume_merged_value():
+    builder, program, region, drain = build_sparse_workspace_program()
+    append = drain.body.statements[0]
+    replacement = builder.append_entry(
+        append.tensor,
+        append.coords,
+        builder.float_const(0.0),
+    )
+    replacement_drain = builder.sparse_workspace_drain_for(
+        region.workspace.workspace,
+        drain.index,
+        builder.block((replacement,)),
+    )
+    forge(region, consumer=builder.block((replacement_drain,)))
+    defect = expect_defect("workspace_dead_region", program)
+    assert "consume" in defect.message
+
+
+def test_sparse_workspace_malformed_consumer_fails_closed():
+    _, program, region, _ = build_sparse_workspace_program()
+    object.__delattr__(region.consumer, "statements")
+    expect_defect("workspace_read_scope", program)
+
+
+def test_merge_positions_have_one_canonical_unbound_spelling():
+    fixture = build_union_add(
+        mode=MergeMode.INTERSECTION,
+        with_defaults=False,
+    )
+    forge(fixture.merged, positions=(None, None))
+    defect = expect_defect("malformed_state", fixture.program)
+    assert "canonical empty tuple" in defect.message
+
+
+def test_resuming_builder_scans_position_ids_inside_merge_tuple():
+    fixture = build_union_add(
+        mode=MergeMode.INTERSECTION,
+        with_defaults=False,
+    )
+    forge(
+        fixture.merged,
+        positions=(PositionId(40), PositionId(41)),
+    )
+    verify_program(fixture.program)
+    assert LoopIRBuilder.resuming(fixture.program).new_position_id() == PositionId(42)
 
 
 def test_csr_spmv_program_verifies():

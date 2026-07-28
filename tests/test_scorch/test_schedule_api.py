@@ -949,6 +949,54 @@ def test_schedule_constructor_validation(factory):
         factory()
 
 
+def test_schedule_rejects_hostile_scalar_subclasses_without_running_them():
+    class HostileStr(str):
+        def __bool__(self):
+            raise AssertionError("caller bool executed")
+
+        def __hash__(self):
+            raise AssertionError("caller hash executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+        def startswith(self, *args, **kwargs):
+            raise AssertionError("caller startswith executed")
+
+    class HostileInt(int):
+        def __index__(self):
+            raise AssertionError("caller index executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+    hostile = HostileStr("k")
+    factories = (
+        lambda: TileSpec(hostile, 4),
+        lambda: TileSpec("k", HostileInt(4)),
+        lambda: TileSpec("k", 4, placement=HostileStr("outermost")),
+        lambda: TileSpec("k", 4, kind=HostileStr("affine")),
+        lambda: TileSpec("k", 4, accum=HostileStr("direct")),
+        lambda: RelayoutSpec(hostile, "k", 4),
+        lambda: RelayoutSpec("B", hostile, 4),
+        lambda: RelayoutSpec("B", "k", HostileInt(4)),
+        lambda: RelayoutSpec("B", "k", 4, scope_var=hostile),
+        lambda: Schedule(loop_order=(hostile,)),
+        lambda: Schedule(tag=hostile),
+        lambda: Schedule(parallel_loop=hostile),
+    )
+    for factory in factories:
+        with pytest.raises((TypeError, ValueError)):
+            factory()
+
+
+def test_schedule_rejects_unowned_iterable_containers():
+    with pytest.raises(TypeError, match="owned list or tuple"):
+        Schedule(loop_order=(name for name in ("i", "j")))
+    with pytest.raises(TypeError, match="owned list or tuple"):
+        Schedule(tiles=(tile for tile in (TileSpec("i", 4),)))
+
+
 def test_schedule_width_boundary_accepts_constexpr_int_maximum():
     assert TileSpec("k", MAX_AFFINE_TILE_WIDTH).width == MAX_AFFINE_TILE_WIDTH
     assert (

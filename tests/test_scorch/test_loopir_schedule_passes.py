@@ -38,11 +38,13 @@ from scorch.compiler.loop_plan import (
     verify_loop_plan,
 )
 from scorch.compiler.loopir.build import LoopIRBuilder
+from scorch.compiler.loopir.levels import LevelTensorStorage
 from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
 from scorch.compiler.loopir.nodes import (
     BinaryOp as LoopIRBinaryOp,
     Block,
     DenseFor,
+    LevelKind,
     TileId,
     TileInnerFor,
     TileOuterFor,
@@ -54,6 +56,7 @@ from scorch.compiler.loopir.schedule_passes import (
     SchedulePassError,
     apply_affine_tile,
     apply_schedule_plan,
+    apply_sparse_workspace,
     apply_stack_tile,
     erase_schedule,
     reorder_loops,
@@ -140,11 +143,157 @@ def lower(cin, planned_loop_order=None):
     )
 
 
+def build_dcsr_sparse_matmul():
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    a = TensorVar("A", fmt="ss")
+    b = TensorVar("B", fmt="ss")
+    c = TensorVar("C", fmt="ss")
+    assign = TensorAssign(
+        c[i, j],
+        CINBinaryOp(Operation.MUL, a[i, k], b[k, j]),
+        op=Operation.ADD,
+    )
+    return ForAll(i, ForAll(k, ForAll(j, assign))), (i, k, j)
+
+
+def sparse_workspace_fixture():
+    cin, (i, k, j) = build_dcsr_sparse_matmul()
+    lowering = lower(cin)
+    workspace = WorkspaceInsertion(
+        reduction_loop=LoopRef(k.index_id),
+        axis_loops=(LoopRef(j.index_id),),
+        dense=False,
+    )
+    return lowering, workspace, (i, k, j)
+
+
 def expect_code(code, call, *args, **kwargs):
     with pytest.raises(SchedulePassError) as error:
         call(*args, **kwargs)
     assert error.value.defect.code == code, error.value.defect
     return error.value.defect
+
+
+def test_sparse_workspace_pass_preserves_semantics_and_erases_to_source():
+    lowering, workspace, _ = sparse_workspace_fixture()
+    scheduled = apply_sparse_workspace(lowering.program, workspace)
+    assert canonical_program_dump(erase_schedule(scheduled)) == canonical_program_dump(
+        lowering.program
+    )
+
+    left = [
+        [1.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 3.0],
+    ]
+    right = [
+        [1.0, 4.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 5.0, 2.0],
+    ]
+    kinds = (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+    inputs = {
+        lowering.program.inputs[0]: LevelTensorStorage.from_dense(
+            left,
+            (3, 3),
+            (0, 1),
+            kinds,
+        ),
+        lowering.program.inputs[1]: LevelTensorStorage.from_dense(
+            right,
+            (3, 3),
+            (0, 1),
+            kinds,
+        ),
+    }
+    output_shapes = {lowering.program.outputs[0]: (3, 3)}
+    base_result = run_program(lowering.program, inputs, output_shapes)
+    scheduled_result = run_program(scheduled, inputs, output_shapes)
+    assert scheduled_result == base_result
+    # Two contributions cancel exactly at (0, 0); sparse workspace and
+    # semantic accumulation both retain the explicit zero.
+    assert 0.0 in scheduled_result[lowering.program.outputs[0]].values
+
+
+def test_sparse_workspace_pass_handles_all_empty_inputs():
+    lowering, workspace, _ = sparse_workspace_fixture()
+    scheduled = apply_sparse_workspace(lowering.program, workspace)
+    empty = LevelTensorStorage.from_dense(
+        [[], []],
+        (2, 0),
+        (0, 1),
+        (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
+    )
+    result = run_program(
+        scheduled,
+        {
+            lowering.program.inputs[0]: empty,
+            lowering.program.inputs[1]: LevelTensorStorage.from_dense(
+                [],
+                (0, 4),
+                (0, 1),
+                (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
+            ),
+        },
+        {lowering.program.outputs[0]: (2, 4)},
+    )
+    assert result[lowering.program.outputs[0]].values == ()
+
+
+def test_sparse_workspace_pass_validates_fact_and_exact_family():
+    lowering, workspace, (_, _, j) = sparse_workspace_fixture()
+    malformed = WorkspaceInsertion(
+        workspace.reduction_loop,
+        workspace.axis_loops,
+        workspace.dense,
+    )
+    object.__setattr__(malformed, "axis_loops", None)
+    expect_code(
+        "invalid_schedule_plan",
+        apply_sparse_workspace,
+        lowering.program,
+        malformed,
+    )
+
+    wrong_role = WorkspaceInsertion(
+        reduction_loop=LoopRef(j.index_id),
+        axis_loops=(LoopRef(j.index_id),),
+        dense=False,
+    )
+    expect_code(
+        "sparse_workspace_target_invalid",
+        apply_sparse_workspace,
+        lowering.program,
+        wrong_role,
+    )
+
+
+def test_sparse_workspace_schedule_state_cannot_be_reordered_or_rebased():
+    lowering, workspace, (i, k, j) = sparse_workspace_fixture()
+    scheduled = apply_sparse_workspace(lowering.program, workspace)
+    expect_code(
+        "reorder_split_chain",
+        reorder_loops,
+        scheduled,
+        (i.index_id, k.index_id, j.index_id),
+    )
+    artifact = ScheduledLoopIR(
+        base_program=scheduled,
+        plan=LoopPlan(loop_order=(i.index_id,)),
+        program=scheduled,
+        loops=(),
+    )
+    expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, artifact)
+
+
+def test_merge_descent_position_prevents_child_reorder():
+    lowering, _, (i, k, j) = sparse_workspace_fixture()
+    expect_code(
+        "reorder_sparse_dependency",
+        reorder_loops,
+        lowering.program,
+        (i.index_id, j.index_id, k.index_id),
+    )
 
 
 def chain_types(program):

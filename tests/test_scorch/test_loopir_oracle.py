@@ -716,6 +716,74 @@ def test_dcsr_positions_diverge_from_coordinates():
     assert results[y] == [0.0, 0.0, 4.0, 0.0, 4.0]
 
 
+def test_oracle_wraps_incomplete_level_assembly_failures():
+    builder = _Builder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    source = builder.new_symbol_id()
+    output = builder.new_symbol_id()
+    source_decl = builder.tensor(
+        source,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_j.dimension,),
+        (builder.level(LevelKind.COMPRESSED, 0),),
+    )
+    output_decl = builder.tensor(
+        output,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.DENSE, 1),
+        ),
+    )
+    index_i = builder.new_index_id()
+    index_j = builder.new_index_id()
+    cursor = builder.new_cursor_id()
+    position = builder.new_position_id()
+    append = builder.append_entry(
+        output,
+        (builder.index_value(index_i), builder.index_value(index_j)),
+        builder.cursor_value(cursor),
+    )
+    sparse = builder.sparse_for(
+        builder.sparse_cursor(
+            cursor,
+            source,
+            0,
+            builder.root_position(),
+        ),
+        position,
+        index_j,
+        builder.block((append,)),
+    )
+    program = builder.program(
+        (dim_i, dim_j),
+        (source_decl, output_decl),
+        (source,),
+        (output,),
+        builder.block(
+            (
+                builder.dense_for(
+                    index_i,
+                    dim_i.dimension,
+                    builder.block((sparse,)),
+                ),
+            )
+        ),
+    )
+    storage = LevelTensorStorage.from_dense(
+        [1.0, 0.0],
+        (2,),
+        (0,),
+        (LevelKind.COMPRESSED,),
+    )
+    with pytest.raises(LoopIROracleError, match="output C assembly failed"):
+        run_program(program, {source: storage}, {output: (1, 2)})
+
+
 def test_out_of_order_appends_fail_closed():
     """Appends must be lexicographically increasing at runtime."""
 

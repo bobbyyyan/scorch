@@ -11,7 +11,14 @@ import copy
 import pytest
 import torch
 
-from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
+from scorch.compiler.cin import (
+    BinaryOp,
+    ForAll,
+    IndexVar,
+    Operation,
+    TensorAssign,
+    TensorVar,
+)
 from scorch.compiler.loop_plan import LoopPlan, verify_loop_plan
 from scorch.compiler.loopir.iterdomain import (
     DomainKind,
@@ -216,4 +223,57 @@ def test_analysis_rejects_cyclic_forall_nest():
     with pytest.raises(IterationDomainError) as error:
         analyze_iteration_domains(nest, LoopPlan(loop_order=()))
 
-    assert error.value.defect.code == "unsupported_statement"
+    assert error.value.defect.code == "malformed_cin"
+
+
+def test_analysis_preflights_cyclic_and_overdeep_expressions():
+    index = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    access = source[index]
+    cyclic = BinaryOp(Operation.ADD, access, source[index])
+    object.__setattr__(cyclic, "left", cyclic)
+    cyclic_program = ForAll(index, TensorAssign(result[index], cyclic))
+
+    with pytest.raises(IterationDomainError) as error:
+        analyze_iteration_domains(
+            cyclic_program,
+            LoopPlan(loop_order=(index.index_id,)),
+        )
+    assert error.value.defect.code == "malformed_cin"
+
+    deep_index = IndexVar("j")
+    deep_result = TensorVar("D", fmt="d", shape=(4,))
+    deep_source = TensorVar("B", fmt="d", shape=(4,))
+    expression = deep_source[deep_index]
+    for _ in range(300):
+        expression = BinaryOp(
+            Operation.ADD,
+            expression,
+            deep_source[deep_index],
+        )
+    deep_program = ForAll(
+        deep_index,
+        TensorAssign(deep_result[deep_index], expression),
+    )
+    with pytest.raises(IterationDomainError) as error:
+        analyze_iteration_domains(
+            deep_program,
+            LoopPlan(loop_order=(deep_index.index_id,)),
+        )
+    assert error.value.defect.code == "malformed_cin"
+
+
+def test_analysis_preflights_malformed_forall_binders():
+    index = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    program = ForAll(
+        index,
+        TensorAssign(result[index], source[index]),
+    )
+    program.index_var = object()  # type: ignore[assignment]
+
+    with pytest.raises(IterationDomainError) as error:
+        analyze_iteration_domains(program, LoopPlan(loop_order=()))
+    assert error.value.defect.code == "malformed_cin"
