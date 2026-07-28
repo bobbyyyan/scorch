@@ -19,7 +19,11 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
-from scorch.compiler.diagnostics import CompileOptionsError, VerificationError
+from scorch.compiler.diagnostics import (
+    CompileOptionsError,
+    InvalidSchedule,
+    VerificationError,
+)
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH, ScheduledCIN
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
@@ -995,6 +999,49 @@ def test_schedule_rejects_unowned_iterable_containers():
         Schedule(loop_order=(name for name in ("i", "j")))
     with pytest.raises(TypeError, match="owned list or tuple"):
         Schedule(tiles=(tile for tile in (TileSpec("i", 4),)))
+
+
+def test_schedule_revalidates_frozen_state_at_compiler_and_cache_boundaries(
+    monkeypatch,
+):
+    class HostileStr(str):
+        def __bool__(self):
+            raise AssertionError("caller bool executed")
+
+        def __hash__(self):
+            raise AssertionError("caller hash executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+    hostile = Schedule(loop_order=("i", "j", "k"))
+    object.__setattr__(
+        hostile,
+        "loop_order",
+        (HostileStr("i"), HostileStr("j"), HostileStr("k")),
+    )
+    with pytest.raises(InvalidSchedule):
+        Scheduler.apply_schedule(_build_spmm(), hostile)
+    with pytest.raises(InvalidSchedule):
+        _ = hostile.cache_key
+
+    missing = Schedule()
+    object.__delattr__(missing, "tag")
+    with pytest.raises(InvalidSchedule, match="stored fields"):
+        Scheduler.apply_schedule(_build_spmm(), missing)
+    with pytest.raises(InvalidSchedule, match="stored fields"):
+        _ = missing.cache_key
+
+    divergent = Schedule()
+    monkeypatch.setattr(
+        Schedule,
+        "tag",
+        property(lambda self: "descriptor value"),
+    )
+    with pytest.raises(InvalidSchedule, match="diverges"):
+        Scheduler.apply_schedule(_build_spmm(), divergent)
+    with pytest.raises(InvalidSchedule, match="diverges"):
+        _ = divergent.cache_key
 
 
 def test_schedule_width_boundary_accepts_constexpr_int_maximum():

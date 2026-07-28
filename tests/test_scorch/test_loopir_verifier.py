@@ -1001,6 +1001,29 @@ def test_sparse_workspace_malformed_consumer_fails_closed():
     expect_defect("workspace_read_scope", program)
 
 
+def test_sparse_workspace_role_and_output_scopes_fail_closed():
+    builder, program, region, drain = build_sparse_workspace_program()
+    insert = region.producer.statements[0]
+    forge(region, producer=builder.block((insert, drain)))
+    expect_defect("workspace_read_scope", program)
+
+    builder, program, region, drain = build_sparse_workspace_program()
+    append = drain.body.statements[0]
+    forge(region, producer=builder.block((*region.producer.statements, append)))
+    expect_defect("workspace_output_write", program)
+
+    builder, program, region, _ = build_sparse_workspace_program()
+    insert = region.producer.statements[0]
+    forged_insert = builder.sparse_workspace_insert(
+        region.workspace.workspace,
+        insert.coord,
+        insert.op,
+        builder.sparse_workspace_value(region.workspace.workspace),
+    )
+    forge(region, producer=builder.block((forged_insert,)))
+    expect_defect("workspace_read_scope", program)
+
+
 def test_merge_positions_have_one_canonical_unbound_spelling():
     fixture = build_union_add(
         mode=MergeMode.INTERSECTION,

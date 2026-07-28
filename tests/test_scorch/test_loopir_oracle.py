@@ -784,6 +784,17 @@ def test_oracle_wraps_incomplete_level_assembly_failures():
         run_program(program, {source: storage}, {output: (1, 2)})
 
 
+def test_oracle_diagnostics_bound_huge_exact_extents():
+    fixture = build_vector_add()
+    huge = 10**5000
+    with pytest.raises(LoopIROracleError, match="integer too large to render"):
+        run_program(
+            fixture.program,
+            {fixture.a: [1.0], fixture.b: [2.0]},
+            {fixture.c: (huge,)},
+        )
+
+
 def test_out_of_order_appends_fail_closed():
     """Appends must be lexicographically increasing at runtime."""
 

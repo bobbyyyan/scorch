@@ -240,6 +240,28 @@ def test_sparse_workspace_pass_handles_all_empty_inputs():
     assert result[lowering.program.outputs[0]].values == ()
 
 
+def test_sparse_workspace_print_and_canonical_forms_are_structurally_active():
+    lowering, workspace, _ = sparse_workspace_fixture()
+    scheduled = apply_sparse_workspace(lowering.program, workspace)
+
+    rendered = print_program(scheduled)
+    assert "sparse_workspace_region" in rendered
+    assert "sparse_workspace_insert(add)" in rendered
+    assert "sparse_workspace_drain_for" in rendered
+    assert "drained(w0)" in rendered
+
+    canonical = canonical_program_dump(scheduled)
+    assert '"schema":"scorch.loopir.canonical.v9"' in canonical
+    assert '"kind":"sparse_workspace_region"' in canonical
+    assert '"kind":"sparse_workspace_insert"' in canonical
+    assert '"kind":"sparse_workspace_drain_for"' in canonical
+    assert '"kind":"sparse_workspace_value"' in canonical
+    assert "wksp" not in canonical
+    assert canonical == canonical_program_dump(
+        apply_sparse_workspace(lowering.program, workspace)
+    )
+
+
 def test_sparse_workspace_pass_validates_fact_and_exact_family():
     lowering, workspace, (_, _, j) = sparse_workspace_fixture()
     malformed = WorkspaceInsertion(
@@ -284,6 +306,54 @@ def test_sparse_workspace_schedule_state_cannot_be_reordered_or_rebased():
         loops=(),
     )
     expect_code("scheduled_base_not_unscheduled", verify_scheduled_loopir, artifact)
+
+
+@pytest.mark.parametrize("regblock_enabled", (False, True))
+def test_sparse_workspace_scheduled_carrier_replays_deterministically(
+    regblock_enabled,
+):
+    lowering, workspace, _ = sparse_workspace_fixture()
+    plan = LoopPlan(
+        loop_order=lowering.loop_index_ids,
+        workspace=workspace,
+        auto_policy=AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=regblock_enabled,
+            tile_width=8 if regblock_enabled else 32,
+        ),
+        provenance="auto",
+    )
+
+    artifact = apply_schedule_plan(lowering.program, plan)
+    verify_scheduled_loopir(artifact)
+    replay = apply_schedule_plan(lowering.program, plan)
+    assert replay.program == artifact.program
+    assert canonical_program_dump(replay.program) == canonical_program_dump(
+        artifact.program
+    )
+
+
+def test_sparse_workspace_rejects_an_extra_reduction_loop():
+    lowering, workspace, _ = sparse_workspace_fixture()
+    builder = LoopIRBuilder.resuming(lowering.program)
+    extra_index = builder.new_index_id()
+    extra_loop = builder.dense_for(
+        extra_index,
+        lowering.program.dimensions[0].dimension,
+        lowering.program.body,
+    )
+    extra_program = replace(
+        lowering.program,
+        body=builder.block((extra_loop,)),
+    )
+    verify_program(extra_program)
+
+    expect_code(
+        "sparse_workspace_target_invalid",
+        apply_sparse_workspace,
+        extra_program,
+        workspace,
+    )
 
 
 def test_merge_descent_position_prevents_child_reorder():

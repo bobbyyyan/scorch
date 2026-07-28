@@ -237,6 +237,15 @@ def test_level_output_builder_rejects_unsupported_level_kinds(kind):
         )
 
 
+def test_level_output_builder_bounds_rank_before_assembly():
+    with pytest.raises(LevelStorageError, match="exceeds the level-storage limit"):
+        LevelOutputBuilder(
+            "C",
+            (1,) * (MAX_LEVEL_STORAGE_RANK + 1),
+            (LevelKind.COMPRESSED,) * (MAX_LEVEL_STORAGE_RANK + 1),
+        )
+
+
 def test_level_output_builder_enforces_complete_dense_suffix_blocks():
     builder = LevelOutputBuilder(
         "C",
@@ -277,3 +286,23 @@ def test_level_tensor_validates_its_canonical_storage():
             coordinates=((2, 1),),
             values=(1.0, 2.0),
         )
+
+
+def test_level_diagnostics_bound_huge_exact_integers():
+    huge = 10**5000
+    with pytest.raises(LevelStorageError, match="integer too large to render"):
+        LevelTensor(
+            shape=(huge,),
+            level_kinds=(LevelKind.COMPRESSED,),
+            positions=((0, 1),),
+            coordinates=((huge,),),
+            values=(1.0,),
+        )
+
+    builder = LevelOutputBuilder(
+        "C",
+        (huge,),
+        (LevelKind.COMPRESSED,),
+    )
+    with pytest.raises(LevelStorageError, match="integer too large to render"):
+        builder.append((huge,), 1.0)
