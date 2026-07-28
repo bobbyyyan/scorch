@@ -2137,3 +2137,34 @@ def test_auto_schedule_traverses_unsupported_unary_expression(entry):
         assert isinstance(scheduled, ScheduledCIN)
     else:
         assert isinstance(scheduled, ForAll)
+
+
+def test_schedule_requires_exact_tile_and_relayout_types() -> None:
+    """Subclass instances are caller code that would execute inside
+    compiler-trusted scopes; admission is exact-type only."""
+
+    from scorch.compiler.scheduler import RelayoutSpec, Schedule, TileSpec
+
+    class HostileTile(TileSpec):
+        pass
+
+    class HostileRelayout(RelayoutSpec):
+        pass
+
+    with pytest.raises(TypeError):
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                HostileTile(
+                    index_var="k",
+                    width=4,
+                    placement="child_of:i",
+                    accum="stack",
+                ),
+            ),
+        )
+    with pytest.raises(TypeError):
+        Schedule(
+            loop_order=("i", "j", "k"),
+            relayout=HostileRelayout(tensor="B"),
+        )

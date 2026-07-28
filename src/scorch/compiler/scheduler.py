@@ -384,10 +384,12 @@ class Schedule:
                 object.__setattr__(self, "tiles", tuple(self.tiles))
             except TypeError as exc:
                 raise TypeError("Schedule.tiles must be a sequence") from exc
-        if any(not isinstance(tile, TileSpec) for tile in self.tiles):
-            raise TypeError("Schedule.tiles must contain TileSpec instances")
-        if self.relayout is not None and not isinstance(self.relayout, RelayoutSpec):
-            raise TypeError("Schedule.relayout must be a RelayoutSpec or None")
+        if any(type(tile) is not TileSpec for tile in self.tiles):
+            # Exact-type admission: a TileSpec subclass is caller code that
+            # would otherwise execute inside compiler-trusted scopes.
+            raise TypeError("Schedule.tiles must contain exact TileSpec instances")
+        if self.relayout is not None and type(self.relayout) is not RelayoutSpec:
+            raise TypeError("Schedule.relayout must be an exact RelayoutSpec or None")
         if self.relayout is not None and self.relayout.scope_var is None:
             panel_tiles = [tile for tile in self.tiles if tile.kind == "panel"]
             if len(panel_tiles) == 1:
