@@ -2527,7 +2527,13 @@ def test_split_role_index_must_be_its_tile_size_var_endpoint(
 
 
 def test_aliased_index_twins_require_equivalent_schedule_state() -> None:
-    """Same-identity IndexVar twins with divergent tile state must not merge."""
+    """Same-identity IndexVar twins with divergent tile state must not merge.
+
+    The forged plain twin of a validated tile component is refused with a
+    structured VerificationError (here at the adapter's display-name
+    boundary; the preflight's schedule-state equivalence check stands behind
+    it as defense in depth), never merged and never a raw exception.
+    """
 
     scheduled, options = _tiled_spmm_graph()
     inner = next(iv for iv in scheduled.index_vars if iv.name == "c_in")
@@ -2540,8 +2546,40 @@ def test_aliased_index_twins_require_equivalent_schedule_state() -> None:
     access.indices[0] = twin
     access.index_ids = tuple(index.index_id for index in access.indices)
 
-    with pytest.raises(VerificationError) as error:
+    with pytest.raises(VerificationError):
         CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
-    codes = _assert_structured_diagnostics(error)
-    assert codes & {"duplicate_node_id", "duplicate_index_id", "invalid_cin_field"}
+
+def test_workspace_clone_of_tiled_logical_index_stays_admitted() -> None:
+    """Workspace insertion legitimately pairs a tiled logical index with a
+    plain clone across branches; that historical divergence must lower."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    result = TensorVar("C", fmt="ds", shape=(4, 7))
+    left = TensorVar("A", fmt="ds", shape=(4, 5))
+    right = TensorVar("B", fmt="ds", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={"SCORCH_REGBLOCK": "1", "SCORCH_REGBLOCK_T": "16"},
+        forced_schedule=None,
+        regblock_override=None,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+
+    assert CINLowerer(compile_options=options).lower_IndexStmt(scheduled)

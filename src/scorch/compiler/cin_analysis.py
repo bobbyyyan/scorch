@@ -1748,27 +1748,54 @@ def _preflight_cin_structure_impl(  # noqa: C901
             and first_name == second_name
         )
 
+    def plain_index_state(state_owner: object) -> bool:
+        return (
+            _safe_exact_dict_value(state_owner, "is_tiled") is False
+            and _safe_exact_dict_value(state_owner, "is_outer") is False
+            and _safe_exact_dict_value(state_owner, "is_inner") is False
+            and _safe_exact_dict_value(state_owner, "_parent") is None
+            and _safe_exact_dict_value(state_owner, "tile_size_var") is None
+            and _safe_exact_dict_value(state_owner, "_expr") is None
+        )
+
+    def tiled_logical_index_state(state_owner: object) -> bool:
+        return (
+            _safe_exact_dict_value(state_owner, "is_tiled") is True
+            and _safe_exact_dict_value(state_owner, "is_outer") is False
+            and _safe_exact_dict_value(state_owner, "is_inner") is False
+            and _safe_exact_dict_value(state_owner, "_parent") is None
+            and _safe_exact_dict_value(state_owner, "tile_size_var") is None
+            and type(_safe_exact_dict_value(state_owner, "_expr")) is IndexVarAdd
+        )
+
     def same_index_schedule_state(first: object, second: object) -> bool:
-        """Aliased index objects must also carry equivalent schedule state.
+        """Aliased index objects must carry compatible schedule state.
 
         The adapter canonicalizes same-identity aliases onto one object, so a
         divergent pair (for example a plain twin of a validated tile
         component) would merge into a state no validator approved and leak
-        raw assertions from legacy consumers.
+        raw assertions from legacy consumers.  Exactly one divergent pairing
+        is historical and admitted: workspace insertion clones a tiled
+        logical index as a plain twin in the paired branch (each side is
+        individually validated by the relational tile loops).
         """
 
         for field in ("is_tiled", "is_outer", "is_inner"):
             if _safe_exact_dict_value(first, field) is not _safe_exact_dict_value(
                 second, field
             ):
-                return False
+                return (
+                    plain_index_state(first) and tiled_logical_index_state(second)
+                ) or (plain_index_state(second) and tiled_logical_index_state(first))
         for field in ("_parent", "tile_size_var", "_expr"):
             first_value = _safe_exact_dict_value(first, field)
             second_value = _safe_exact_dict_value(second, field)
             if first_value is None and second_value is None:
                 continue
             if first_value is not second_value:
-                return False
+                return (
+                    plain_index_state(first) and tiled_logical_index_state(second)
+                ) or (plain_index_state(second) and tiled_logical_index_state(first))
         return True
 
     def paired_statement_clone(
