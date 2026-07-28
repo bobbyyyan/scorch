@@ -1345,6 +1345,83 @@ def test_public_lowerer_forward_copy_ignores_unowned_deep_instance_state() -> No
     assert program.unowned_deep_state is deep  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "root_no_tile_list",
+        "root_workspace_marker",
+        "index_parent",
+        "index_role",
+        "index_tile",
+        "index_access_backlink",
+    ),
+)
+def test_normalization_discards_legacy_only_schedule_metadata(forgery: str) -> None:
+    """Ignored scheduler backlinks cannot change semantic CIN admission."""
+
+    program, nodes = _reduction_program()
+    hostile = object()
+    if forgery == "root_no_tile_list":
+        program.no_tile_list = [hostile]  # type: ignore[list-item]
+    elif forgery == "root_workspace_marker":
+        program.inserted_workspace = hostile  # type: ignore[assignment]
+    elif forgery == "index_parent":
+        nodes.i._parent = hostile  # type: ignore[assignment]
+    elif forgery == "index_role":
+        nodes.i.is_outer = hostile  # type: ignore[assignment]
+    elif forgery == "index_tile":
+        nodes.i.tile_size_var = hostile  # type: ignore[assignment]
+    else:
+        nodes.i._legacy_tensor_accesses = [hostile]  # type: ignore[list-item]
+
+    normalized = normalize_cin(program)
+
+    assert normalized.inserted_workspace is False
+    assert normalized.no_tile_list == []
+    normalized_i = normalized.index_vars[0]
+    assert normalized_i._parent is None
+    assert normalized_i.is_outer is False
+    assert normalized_i.tile_size_var is None
+    assert normalized_i._legacy_tensor_accesses == []
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "root_no_tile_list",
+        "root_workspace_marker",
+        "index_parent",
+        "index_role",
+        "index_tile",
+        "index_access_backlink",
+    ),
+)
+def test_public_legacy_lowerer_validates_consumed_schedule_metadata(
+    forgery: str,
+) -> None:
+    """The adapter remains strict for the compatibility fields it copies."""
+
+    program, nodes = _reduction_program()
+    hostile = object()
+    if forgery == "root_no_tile_list":
+        program.no_tile_list = [hostile]  # type: ignore[list-item]
+    elif forgery == "root_workspace_marker":
+        program.inserted_workspace = hostile  # type: ignore[assignment]
+    elif forgery == "index_parent":
+        nodes.i._parent = hostile  # type: ignore[assignment]
+    elif forgery == "index_role":
+        nodes.i.is_outer = hostile  # type: ignore[assignment]
+    elif forgery == "index_tile":
+        nodes.i.tile_size_var = hostile  # type: ignore[assignment]
+    else:
+        nodes.i._legacy_tensor_accesses = [hostile]  # type: ignore[list-item]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer().lower_IndexStmt(program)
+
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
 def test_public_lowerer_rejects_missing_optional_tile_storage() -> None:
     """A stored optional tile reference must be present even when it is None."""
 
