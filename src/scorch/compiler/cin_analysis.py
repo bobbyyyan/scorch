@@ -659,6 +659,26 @@ def _preflight_cin_structure_impl(  # noqa: C901
             )
             continue
         if object_id in complete:
+            # Symbol-like leaves (index binders, tensor symbols, workspace
+            # declarations) are intrinsically shared by every use.  The one
+            # admissible shared occurrence node is the legacy workspace
+            # producer/consumer access pair, classified by the receipt
+            # post-pass below.  Every other statement, expression, or access
+            # object referenced from multiple parents previously escaped as a
+            # raw ValueError/IndexError from lowering or kernel-ABI assembly.
+            revisit_type = type(node)
+            if (
+                revisit_type is not IndexVar
+                and revisit_type is not TensorVar
+                and revisit_type is not Workspace
+                and revisit_type is not WorkspaceAccess
+            ):
+                diagnose(
+                    "duplicate_node_reference",
+                    f"{revisit_type.__name__} object is referenced from "
+                    "multiple parents",
+                    path,
+                )
             continue
 
         node_type = type(node)
@@ -1501,10 +1521,24 @@ def _preflight_cin_structure_impl(  # noqa: C901
             )
 
         if has_split_role:
+            # A split-role index must be the exact outer/inner endpoint of its
+            # own TileSizeVar; otherwise its ``_parent`` never reaches the
+            # relational tile validation below and the forward copier indexes
+            # unvalidated detached storage (raw KeyError/RecursionError).
             if (
                 is_tiled is not False
                 or type(parent) is not IndexVar
                 or type(tile_size_var) is not TileSizeVar
+                or (
+                    is_outer is True
+                    and _safe_exact_dict_value(tile_size_var, "outer_index_var")
+                    is not index_var
+                )
+                or (
+                    is_inner is True
+                    and _safe_exact_dict_value(tile_size_var, "inner_index_var")
+                    is not index_var
+                )
             ):
                 diagnose(
                     "invalid_cin_field",
@@ -1714,6 +1748,29 @@ def _preflight_cin_structure_impl(  # noqa: C901
             and first_name == second_name
         )
 
+    def same_index_schedule_state(first: object, second: object) -> bool:
+        """Aliased index objects must also carry equivalent schedule state.
+
+        The adapter canonicalizes same-identity aliases onto one object, so a
+        divergent pair (for example a plain twin of a validated tile
+        component) would merge into a state no validator approved and leak
+        raw assertions from legacy consumers.
+        """
+
+        for field in ("is_tiled", "is_outer", "is_inner"):
+            if _safe_exact_dict_value(first, field) is not _safe_exact_dict_value(
+                second, field
+            ):
+                return False
+        for field in ("_parent", "tile_size_var", "_expr"):
+            first_value = _safe_exact_dict_value(first, field)
+            second_value = _safe_exact_dict_value(second, field)
+            if first_value is None and second_value is None:
+                continue
+            if first_value is not second_value:
+                return False
+        return True
+
     def paired_statement_clone(
         first: object,
         second: object,
@@ -1757,6 +1814,18 @@ def _preflight_cin_structure_impl(  # noqa: C901
             ("consumer", "rhs"),
         }:
             workspace_prefix = candidate_workspace_prefix
+    for occurrence_paths in workspace_access_occurrences.values():
+        if len(occurrence_paths) < 2:
+            continue
+        if workspace_prefix is not None:
+            # Exactly one shared access at exactly the producer-LHS and
+            # consumer-RHS roles: the admitted legacy receipt pair.
+            continue
+        diagnose(
+            "duplicate_node_reference",
+            "WorkspaceAccess object is referenced from multiple parents",
+            occurrence_paths[1],
+        )
     for (
         identity_type,
         previous_owner,
@@ -1776,12 +1845,16 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 and type(previous_owner) is IndexVar
                 and type(current_owner) is IndexVar
             ):
-                allowed = same_index_identity(previous_owner, current_owner) and (
-                    is_access_index_path(previous_path)
-                    or is_access_index_path(path)
-                    or (
-                        {previous_branch, branch} == {"producer", "consumer"}
-                        and previous_suffix == suffix
+                allowed = (
+                    same_index_identity(previous_owner, current_owner)
+                    and same_index_schedule_state(previous_owner, current_owner)
+                    and (
+                        is_access_index_path(previous_path)
+                        or is_access_index_path(path)
+                        or (
+                            {previous_branch, branch} == {"producer", "consumer"}
+                            and previous_suffix == suffix
+                        )
                     )
                 )
             elif identity_type is NodeId:
@@ -3141,7 +3214,12 @@ def canonical_cin_dump(cin: IndexStmt) -> str:
             strict_error.diagnostics,
         )
         if not diagnostics or any(
-            diagnostic.code not in {"duplicate_node_id", "duplicate_index_id"}
+            diagnostic.code
+            not in {
+                "duplicate_node_id",
+                "duplicate_index_id",
+                "duplicate_node_reference",
+            }
             for diagnostic in diagnostics
         ):
             raise

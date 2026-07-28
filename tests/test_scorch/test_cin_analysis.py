@@ -1,3 +1,4 @@
+import copy
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, dataclass, fields, is_dataclass
 from typing import Any
@@ -592,7 +593,10 @@ def test_verifier_reports_duplicate_access_reference() -> None:
         verify_cin(program)
 
     codes = _assert_structured_diagnostics(error)
-    assert {"duplicate_node_reference", "duplicate_access_reference"} <= codes
+    # The always-on structural preflight now owns shared-object references,
+    # so the failure is structural (stage-owned) before the semantic
+    # duplicate_access_reference analysis can run.
+    assert "duplicate_node_reference" in codes
     assert "cyclic_cin_structure" not in codes
 
 
@@ -975,12 +979,14 @@ def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
     assert _assert_structured_diagnostics(strict_error) == {
         "duplicate_index_id",
         "duplicate_node_id",
+        "duplicate_node_reference",
     }
     with pytest.raises(VerificationError) as normalize_error:
         normalize_cin(scheduled, compile_options=debug_options)
     assert _assert_structured_diagnostics(normalize_error) == {
         "duplicate_index_id",
         "duplicate_node_id",
+        "duplicate_node_reference",
     }
     scheduled_dump = canonical_cin_dump(scheduled)
     assert '"kind":"where"' in scheduled_dump
@@ -1019,12 +1025,14 @@ def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
     assert _assert_structured_diagnostics(missing_marker_error) == {
         "duplicate_index_id",
         "duplicate_node_id",
+        "duplicate_node_reference",
     }
     with pytest.raises(VerificationError) as missing_dump_marker_error:
         canonical_cin_dump(missing_marker)
     assert _assert_structured_diagnostics(missing_dump_marker_error) == {
         "duplicate_index_id",
         "duplicate_node_id",
+        "duplicate_node_reference",
     }
 
 
@@ -2267,7 +2275,10 @@ def test_public_cin_root_boundaries_never_execute_class_descriptors() -> None:
         with pytest.raises(TypeError):
             entrypoint(hostile)
     for entrypoint in entrypoints[7:]:
-        with pytest.raises((TypeError, CompilerInvariantError)):
+        # lower_IndexExpr now refuses outermost expression roots before any
+        # node inspection (invalid_expression_entry), still without reading
+        # hostile class descriptors.
+        with pytest.raises((TypeError, CompilerInvariantError, VerificationError)):
             entrypoint(hostile)
 
     assert reads == 0
@@ -2312,3 +2323,225 @@ def test_root_assignment_rhs_collection_excludes_the_result_access() -> None:
     program = TensorAssign(result[i], operand[i])
 
     assert program.get_rhs_tensor_vars() == [operand]
+
+
+def _release_compile_options():
+    from scorch.compiler.compile_options import CompileOptions
+
+    return CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+
+
+def _workspace_scheduled_graph() -> IndexStmt:
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds")
+    left = TensorVar("SparseLeft", fmt="ds")
+    right = TensorVar("SparseRight", fmt="ds")
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    return Scheduler.auto_schedule(source, compile_options=_release_compile_options())
+
+
+@pytest.mark.parametrize("mode", ("normalize", "structure", "raw_lowering"))
+def test_shared_expression_object_fails_closed_everywhere(mode: str) -> None:
+    """A same-object BinaryOp diamond previously leaked a raw ValueError from
+    kernel-ABI assembly; every raw entry now rejects it structurally."""
+
+    i = IndexVar("i")
+    left = TensorVar("A", fmt="d", shape=(4,))
+    right = TensorVar("B", fmt="d", shape=(4,))
+    result = TensorVar("C", fmt="d", shape=(4,))
+    shared = BinaryOp(Operation.MUL, left[i], right[i])
+    expr = BinaryOp(Operation.ADD, shared, shared)
+    program = ForAll(i, TensorAssign(result[i], expr, op=Operation.ADD))
+
+    with pytest.raises(VerificationError) as error:
+        if mode == "normalize":
+            normalize_cin(program, compile_options=_release_compile_options())
+        elif mode == "structure":
+            verify_cin_structure(program)
+        else:
+            CINLowerer(compile_options=_release_compile_options()).lower_IndexStmt(
+                program
+            )
+
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
+
+
+def test_shared_expression_chain_is_rejected_in_linear_time() -> None:
+    """A 2**60-path shared-DAG chain must die in the bounded preflight, not
+    hang the recursive verifier, dump, or lowering walks."""
+
+    i = IndexVar("i")
+    source = TensorVar("A", fmt="d", shape=(4,))
+    result = TensorVar("C", fmt="d", shape=(4,))
+    expr: Any = source[i]
+    for _ in range(60):
+        expr = BinaryOp(Operation.ADD, expr, expr)
+    program = ForAll(i, TensorAssign(result[i], expr, op=Operation.ADD))
+
+    with pytest.raises(VerificationError) as error:
+        verify_cin_structure(program)
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
+    with pytest.raises(VerificationError) as dump_error:
+        canonical_cin_dump(program)
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(dump_error)
+
+
+def test_shared_statement_object_fails_closed() -> None:
+    """One TensorAssign object under two parents previously leaked IndexError."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="dd", shape=(4, 4))
+    source = TensorVar("A", fmt="dd", shape=(4, 4))
+    assign = TensorAssign(result[i, j], source[i, j], op=Operation.ADD)
+    program = ForAll(i, Where(ForAll(j, assign), ForAll(j, assign)))
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=_release_compile_options()).lower_IndexStmt(program)
+
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
+
+
+def test_shared_access_object_as_lhs_and_rhs_fails_closed() -> None:
+    """One TensorAccess object on both assignment sides was silently admitted."""
+
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    access = result[i]
+    program = ForAll(i, TensorAssign(access, access, op=Operation.ADD))
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=_release_compile_options()).lower_IndexStmt(program)
+
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
+
+
+def test_workspace_pair_admitted_but_third_occurrence_rejected() -> None:
+    """The exact producer-LHS/consumer-RHS shared pair stays admitted; any
+    further syntactic occurrence of the same access object fails closed."""
+
+    graph = _workspace_scheduled_graph()
+    assert CINLowerer(compile_options=_release_compile_options()).lower_IndexStmt(graph)
+
+    grafted = _workspace_scheduled_graph()
+    producer_lhs = None
+    consumer_assign = None
+    stack: list[Any] = [grafted]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if type(node) is TensorAssign:
+            if type(node.lhs) is WorkspaceAccess:
+                producer_lhs = node.lhs
+            if type(node.rhs) is WorkspaceAccess:
+                consumer_assign = node
+        for field in ("stmt", "producer", "consumer", "lhs", "rhs", "left", "right"):
+            child = getattr(node, field, None)
+            if child is not None and not isinstance(child, (str, int, float)):
+                stack.append(child)
+    assert producer_lhs is not None and consumer_assign is not None
+    consumer_assign.rhs = BinaryOp(Operation.ADD, consumer_assign.rhs, producer_lhs)
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=_release_compile_options()).lower_IndexStmt(grafted)
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
+
+
+def _tiled_spmm_graph():
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("R", fmt="dd", shape=(4, 7))
+    left = TensorVar("A", fmt="ds", shape=(4, 5))
+    right = TensorVar("B", fmt="dd", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = _release_compile_options()
+    return Scheduler.add_tile(source, column, 4, compile_options=options), options
+
+
+@pytest.mark.parametrize("hostile_parent", ("missing_field", "deep_chain"))
+def test_split_role_index_must_be_its_tile_size_var_endpoint(
+    hostile_parent: str,
+) -> None:
+    """A forged split-role index bound to a real TileSizeVar but a foreign
+    detached parent previously leaked raw KeyError or RecursionError from the
+    forward copier."""
+
+    scheduled, options = _tiled_spmm_graph()
+    outer = next(iv for iv in scheduled.index_vars if iv.name == "c_out")
+    tile_size_var = outer.tile_size_var
+    forged = IndexVar("x")
+    forged.__dict__["is_outer"] = True
+    forged.__dict__["is_tiled"] = False
+    forged.__dict__["is_inner"] = False
+    forged.__dict__["tile_size_var"] = tile_size_var
+    if hostile_parent == "missing_field":
+        parent = IndexVar("bb")
+        del parent.__dict__["is_tiled"]
+    else:
+        parent = IndexVar("h0")
+        node = parent
+        for position in range(3000):
+            nxt = IndexVar(f"h{position + 1}")
+            node.__dict__["_parent"] = nxt
+            node = nxt
+    forged.__dict__["_parent"] = parent
+    access = next(a for a in scheduled.tensor_accesses if a.tensor.name == "R")
+    access.indices[0] = forged
+    access.index_ids = tuple(index.index_id for index in access.indices)
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+
+
+def test_aliased_index_twins_require_equivalent_schedule_state() -> None:
+    """Same-identity IndexVar twins with divergent tile state must not merge."""
+
+    scheduled, options = _tiled_spmm_graph()
+    inner = next(iv for iv in scheduled.index_vars if iv.name == "c_in")
+    twin = copy.copy(inner)
+    twin.__dict__["is_inner"] = False
+    twin.__dict__["is_outer"] = False
+    twin.__dict__["_parent"] = None
+    twin.__dict__["tile_size_var"] = None
+    access = next(a for a in scheduled.tensor_accesses if a.tensor.name == "R")
+    access.indices[0] = twin
+    access.index_ids = tuple(index.index_id for index in access.indices)
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    codes = _assert_structured_diagnostics(error)
+    assert codes & {"duplicate_node_id", "duplicate_index_id", "invalid_cin_field"}
