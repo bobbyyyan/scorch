@@ -142,6 +142,10 @@ from .nodes import (
     Expr,
     IndexValue,
     LevelKind,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     Load,
     LoopIRNode,
     LoopProgram,
@@ -183,7 +187,14 @@ _LoopNode = Union[
     SparseWindowFor,
 ]
 _LeafNode = Union[Store, StoreReduce, AppendEntry]
-_ChainEnd = Union[Store, StoreReduce, AppendEntry, TiledReduce, WorkspaceRegion]
+_ChainEnd = Union[
+    Store,
+    StoreReduce,
+    AppendEntry,
+    TiledReduce,
+    WorkspaceRegion,
+    SparseWorkspaceRegion,
+]
 
 _LOOP_TYPES = (
     DenseFor,
@@ -193,6 +204,7 @@ _LOOP_TYPES = (
     TileInnerFor,
     PanelOuterFor,
     SparseWindowFor,
+    SparseWorkspaceDrainFor,
 )
 _LEAF_TYPES = (Store, StoreReduce, AppendEntry)
 _PANEL_TYPES = (PanelOuterFor, SparseWindowFor)
@@ -268,6 +280,8 @@ def _loop_key(node: _LoopNode) -> Tuple[IndexId, LoopPart]:
         return node.coord_index, LoopPart.INNER
     if type(node) is SparseFor:
         return node.coord_index, LoopPart.LOGICAL
+    if type(node) is SparseWorkspaceDrainFor:
+        return node.index, LoopPart.LOGICAL
     assert type(node) is MergedSparseFor
     return node.coord_index, LoopPart.LOGICAL
 
@@ -341,7 +355,7 @@ def _decompose_chain(
 
     loops, end = _decompose_body(
         program.body,
-        leaf_types=(*_LEAF_TYPES, WorkspaceRegion, TiledReduce),
+        leaf_types=(*_LEAF_TYPES, WorkspaceRegion, SparseWorkspaceRegion, TiledReduce),
         allow_empty=False,
         relayout_sink=relayout_sink,
         result_tile_sink=result_tile_sink,
@@ -410,10 +424,12 @@ def _wrap_loops(
             loop = builder.sparse_for(
                 node.cursor, node.position, node.coord_index, body
             )
+        elif type(node) is SparseWorkspaceDrainFor:
+            loop = builder.sparse_workspace_drain_for(node.workspace, node.index, body)
         else:
             assert type(node) is MergedSparseFor
             loop = builder.merged_sparse_for(
-                node.mode, node.cursors, node.coord_index, body
+                node.mode, node.cursors, node.coord_index, body, node.positions
             )
         body = builder.block((loop,))
     return body
@@ -960,6 +976,145 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     new_chain: List[_LoopNode] = list(prefix)
     new_chain.insert(depth, outer)
     return _rebuild_program(program, builder, new_chain, region)
+
+
+def _loop_bound_dimension(program: LoopProgram, node: _LoopNode) -> DimensionId:
+    """The declared dimension one chain loop's coordinate iterates."""
+
+    if type(node) is DenseFor:
+        return node.dimension
+    if type(node) is SparseFor:
+        decl = next(
+            tensor for tensor in program.tensors if tensor.symbol == node.cursor.tensor
+        )
+        return decl.dimensions[decl.levels[node.cursor.level].mode]
+    _fail(
+        "sparse_workspace_target_invalid",
+        "the drained axis must be a plain dense or single-cursor sparse loop",
+    )
+    raise AssertionError("unreachable")
+
+
+def apply_sparse_workspace(
+    program: LoopProgram, workspace: WorkspaceInsertion
+) -> LoopProgram:
+    """Materialize the automatic serial sparse workspace as a typed region.
+
+    Consumes one ``WorkspaceInsertion`` fact with ``dense=False`` on the
+    semantic doubly-compressed reduction chain: the subtree from the
+    recorded reduction loop down becomes the region's producer with the
+    reduction leaf rewritten into a merging ADD insertion at the drained
+    axis coordinate, and the consumer is the ordered drain appending each
+    merged entry to the sparse result.  The producer's value expression and
+    the consumer's destination are both taken structurally from the one
+    source reduction leaf, so erasure can reconstruct that source exactly -
+    the structural source-to-workspace provenance receipt.
+    """
+
+    verify_program(program)
+    if type(workspace) is not WorkspaceInsertion:
+        raise TypeError("apply_sparse_workspace expects a WorkspaceInsertion")
+    if workspace.dense or len(workspace.axis_loops) != 1:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the serial sparse workspace consumes exactly one sparse "
+            "single-axis workspace fact",
+        )
+    loops, leaf = _decompose_chain(program)
+    if type(leaf) is not StoreReduce or leaf.op is not ReduceOp.ADD:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the sparse workspace consumes the semantic sparse ADD " "reduction leaf",
+        )
+    result_symbol = leaf.tensor
+    result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
+    if all(level.kind is LevelKind.DENSE for level in result_decl.levels):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "dense outputs accumulate through the stack and reduce-out "
+            "families, not the sparse workspace",
+        )
+    reduction_index = workspace.reduction_loop.index_id
+    axis_index = workspace.axis_loops[0].index_id
+    reduction_positions = [
+        position
+        for position, node in enumerate(loops)
+        if _loop_key(node) == (reduction_index, LoopPart.LOGICAL)
+    ]
+    if len(reduction_positions) != 1:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the recorded reduction loop must appear exactly once on the "
+            "unsplit chain",
+        )
+    reduction_position = reduction_positions[0]
+    axis_nodes = [
+        node
+        for node in loops[reduction_position:]
+        if _loop_key(node) == (axis_index, LoopPart.LOGICAL)
+    ]
+    if len(axis_nodes) != 1:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the drained axis loop must appear exactly once below the "
+            "reduction loop",
+        )
+    if type(leaf.indices) is not tuple or not leaf.indices:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the reduction leaf must address the result by coordinates",
+        )
+    trailing = leaf.indices[-1]
+    if type(trailing) is not IndexValue or trailing.index != axis_index:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the drained axis must address the trailing result coordinate",
+        )
+    for coord in leaf.indices[:-1]:
+        if type(coord) is not IndexValue:
+            _fail(
+                "sparse_workspace_target_invalid",
+                "result prefix coordinates must be plain bound coordinates",
+            )
+        binder_positions = [
+            position
+            for position, node in enumerate(loops)
+            if _loop_key(node)[0] == coord.index
+        ]
+        if not binder_positions or binder_positions[0] >= reduction_position:
+            _fail(
+                "sparse_workspace_target_invalid",
+                "result prefix coordinates must be bound above the " "workspace region",
+            )
+    axis_dimension = _loop_bound_dimension(program, axis_nodes[0])
+
+    builder = LoopIRBuilder.resuming(program)
+    workspace_id = builder.new_workspace_id()
+    workspace_decl = builder.sparse_workspace_decl(
+        workspace_id, "wksp", result_decl.dtype, axis_dimension
+    )
+    insert_leaf = builder.sparse_workspace_insert(
+        workspace_id,
+        builder.index_value(axis_index),
+        ReduceOp.ADD,
+        leaf.value,
+    )
+    producer = _wrap_loops(
+        builder, loops[reduction_position:], builder.block((insert_leaf,))
+    )
+    drain_index = builder.new_index_id()
+    append = builder.append_entry(
+        result_symbol,
+        (*leaf.indices[:-1], builder.index_value(drain_index)),
+        builder.sparse_workspace_value(workspace_id),
+    )
+    drain = builder.sparse_workspace_drain_for(
+        workspace_id, drain_index, builder.block((append,))
+    )
+    region = builder.sparse_workspace_region(
+        workspace_decl, producer, builder.block((drain,))
+    )
+    return _rebuild_program(program, builder, loops[:reduction_position], region)
 
 
 def _validate_reduce_out_tile(tile: LoopTile) -> None:
@@ -2492,6 +2647,15 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
             and placement_ok
         )
 
+    sparse_workspace_form = (
+        plan.auto_policy is not None
+        and not plan.tiles
+        and plan.workspace is not None
+        and not plan.workspace.dense
+        and len(plan.workspace.axis_loops) == 1
+    )
+    if sparse_workspace_form:
+        return
     stack_form = (
         plan.auto_policy is not None
         and plan.auto_policy.regblock_enabled
@@ -2848,6 +3012,15 @@ def _chain_provenance(
         producer_loops, _, consumer_loops, _ = _decompose_region(leaf)
         ordered.extend(producer_loops)
         ordered.extend(consumer_loops)
+    if type(leaf) is SparseWorkspaceRegion:
+        producer_loops, _ = _decompose_body(
+            leaf.producer, leaf_types=(SparseWorkspaceInsert,), allow_empty=False
+        )
+        consumer_loops, _ = _decompose_body(
+            leaf.consumer, leaf_types=(AppendEntry,), allow_empty=False
+        )
+        ordered.extend(producer_loops)
+        ordered.extend(consumer_loops)
     return tuple(_loop_provenance(node) for node in ordered)
 
 
@@ -2868,6 +3041,18 @@ def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram
 
     checked = _validate_plan_for_pass(plan)
     scheduled = reorder_loops(program, checked.loop_order)
+    if (
+        checked.provenance == "auto"
+        and checked.workspace is not None
+        and not checked.workspace.dense
+        and not checked.tiles
+    ):
+        # The serial sparse-workspace automatic family: one workspace fact,
+        # no tiles, materialized as the typed producer/consumer region.
+        return select_parallel_loop(
+            apply_sparse_workspace(scheduled, checked.workspace),
+            checked,
+        )
     if (
         checked.provenance == "auto"
         and checked.workspace is not None
@@ -3120,6 +3305,7 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
         not relayout_stages
         and not result_tile_regions
         and type(leaf) is not WorkspaceRegion
+        and type(leaf) is not SparseWorkspaceRegion
         and not any(
             type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
         )
@@ -3213,6 +3399,43 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             consumer_leaf.indices,
             consumer_leaf.op,
             producer_leaf.value,
+        )
+    if type(leaf) is SparseWorkspaceRegion:
+        workspace_id = leaf.workspace.workspace
+        producer_loops, insert_leaf = _decompose_body(
+            leaf.producer, leaf_types=(SparseWorkspaceInsert,), allow_empty=False
+        )
+        consumer_loops, append_leaf = _decompose_body(
+            leaf.consumer, leaf_types=(AppendEntry,), allow_empty=False
+        )
+        insert = cast(SparseWorkspaceInsert, insert_leaf)
+        append = cast(AppendEntry, append_leaf)
+        drained_value = append.value
+        trailing_coord = append.coords[-1] if append.coords else None
+        if (
+            len(consumer_loops) != 1
+            or type(consumer_loops[0]) is not SparseWorkspaceDrainFor
+            or consumer_loops[0].workspace != workspace_id
+            or type(drained_value) is not SparseWorkspaceValue
+            or drained_value.workspace != workspace_id
+            or insert.workspace != workspace_id
+            or type(trailing_coord) is not IndexValue
+            or trailing_coord.index != consumer_loops[0].index
+        ):
+            _fail(
+                "unsupported_schedule_shape",
+                "sparse workspace-region erasure is defined for the exact "
+                "ordered-drain append form only",
+            )
+        # The structural source receipt: the producer's insertion coordinate
+        # and value plus the consumer's destination prefix reconstruct the
+        # one semantic reduction leaf the pass consumed.
+        region_loops = producer_loops
+        erased_leaf = builder.store_reduce(
+            append.tensor,
+            (*append.coords[:-1], insert.coord),
+            ReduceOp.ADD,
+            insert.value,
         )
     erased: List[_LoopNode] = []
     for node in (*loops, *region_loops):

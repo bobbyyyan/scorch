@@ -849,6 +849,9 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
         lowering.program,
         tiled,
     )
+    # The tile-free sparse-workspace fact is now an admitted automatic
+    # family; on this dense-output program the pass itself still fails
+    # closed with its structural target code.
     workspace_only = LoopPlan(
         loop_order=order,
         workspace=WorkspaceInsertion(
@@ -864,7 +867,7 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
         provenance="auto",
     )
     expect_code(
-        "unsupported_schedule_auto_family",
+        "sparse_workspace_target_invalid",
         apply_schedule_plan,
         lowering.program,
         workspace_only,
