@@ -140,6 +140,7 @@ from .nodes import (
     DenseFor,
     DensePosition,
     Expr,
+    DimensionId,
     IndexValue,
     LevelKind,
     SparseWorkspaceDrainFor,
