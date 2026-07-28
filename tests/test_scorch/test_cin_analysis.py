@@ -921,7 +921,7 @@ def test_public_lowerer_preserves_caller_owned_cin() -> None:
 
 
 def test_public_lowerer_rejects_malformed_raw_cin_before_legacy_copy() -> None:
-    """Direct legacy lowering shares normalization's structural boundary."""
+    """Direct legacy lowering retains normalization's malformed-field boundary."""
 
     i = IndexVar("i")
     result = TensorVar("C", fmt="d", shape=(4,))
@@ -933,6 +933,455 @@ def test_public_lowerer_rejects_malformed_raw_cin_before_legacy_copy() -> None:
         CINLowerer().lower_IndexStmt(program)
 
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
+    """Release compatibility does not silently weaken requested verification."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds")
+    left = TensorVar("SparseLeft", fmt="ds")
+    right = TensorVar("SparseRight", fmt="ds")
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    release_options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    debug_options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=True,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=release_options)
+
+    with pytest.raises(VerificationError) as strict_error:
+        verify_cin_structure(scheduled)
+    assert _assert_structured_diagnostics(strict_error) == {
+        "duplicate_index_id",
+        "duplicate_node_id",
+    }
+    with pytest.raises(VerificationError) as normalize_error:
+        normalize_cin(scheduled, compile_options=debug_options)
+    assert _assert_structured_diagnostics(normalize_error) == {
+        "duplicate_index_id",
+        "duplicate_node_id",
+    }
+
+    lowered = CINLowerer(compile_options=release_options).lower_IndexStmt(scheduled)
+    debug_scheduled = Scheduler.auto_schedule(
+        source,
+        compile_options=debug_options,
+    )
+    with pytest.raises(VerificationError) as debug_error:
+        CINLowerer(compile_options=debug_options).lower_IndexStmt(debug_scheduled)
+    assert _assert_structured_diagnostics(debug_error) == {
+        "unverifiable_legacy_schedule_aliases"
+    }
+
+    # The underscore boundary receives a compiler-owned tree immediately after
+    # Scheduler verified its normalized source; no caller work can intervene.
+    owned_scheduled = Scheduler.auto_schedule(
+        source,
+        compile_options=debug_options,
+    )
+    owned_lowered = CINLowerer(compile_options=debug_options)._lower_owned_IndexStmt(
+        owned_scheduled
+    )
+
+    assert lowered
+    assert owned_lowered
+
+    missing_marker = Scheduler.auto_schedule(
+        source,
+        compile_options=release_options,
+    )
+    missing_marker.inserted_workspace = False
+    with pytest.raises(VerificationError) as missing_marker_error:
+        CINLowerer(compile_options=release_options).lower_IndexStmt(missing_marker)
+    assert _assert_structured_diagnostics(missing_marker_error) == {
+        "duplicate_index_id",
+        "duplicate_node_id",
+    }
+
+
+def test_public_debug_lowerer_never_skips_semantic_checks_for_workspace_aliases() -> (
+    None
+):
+    """A post-schedule semantic mutation cannot opt out of requested checks."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds", shape=(4, 7))
+    left = TensorVar("SparseLeft", fmt="ds", shape=(4, 5))
+    right = TensorVar("SparseRight", fmt="ds", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=True,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    scheduled_left = next(
+        access.tensor
+        for access in scheduled.tensor_accesses
+        if access.tensor.name == "SparseLeft"
+    )
+    scheduled_left.shape = (4, 7)
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert _assert_structured_diagnostics(error) == {
+        "unverifiable_legacy_schedule_aliases"
+    }
+
+
+@pytest.mark.parametrize(
+    ("forgery", "expected_code"),
+    (
+        ("same_kind_node", "duplicate_node_id"),
+        ("cross_kind_node", "duplicate_node_id"),
+        ("unpaired_index", "duplicate_index_id"),
+        ("symbol", "duplicate_symbol_id"),
+        ("access", "duplicate_access_id"),
+    ),
+)
+def test_public_lowerer_legacy_alias_compatibility_is_narrow(
+    forgery: str,
+    expected_code: str,
+) -> None:
+    """Only same-kind node clones and same-node/name index clones are admitted."""
+
+    program, nodes = _reduction_program()
+    if forgery == "same_kind_node":
+        inner = program.stmt
+        assert isinstance(inner, ForAll)
+        inner.node_id = program.node_id
+    elif forgery == "cross_kind_node":
+        nodes.assignment.node_id = program.node_id
+    elif forgery == "unpaired_index":
+        nodes.k.index_id = nodes.i.index_id
+        nodes.left_access.index_ids = (nodes.i.index_id, nodes.i.index_id)
+        nodes.right_access.index_ids = (nodes.i.index_id,)
+    elif forgery == "symbol":
+        nodes.right.symbol_id = nodes.left.symbol_id
+        nodes.right_access.tensor_id = nodes.left.symbol_id
+    else:
+        nodes.right_access.access_id = nodes.left_access.access_id
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer().lower_IndexStmt(program)
+
+    assert expected_code in _assert_structured_diagnostics(error)
+
+
+@pytest.mark.parametrize("mismatch", ("node_id", "display_name"))
+def test_public_lowerer_rejects_incompatible_same_id_index_aliases(
+    mismatch: str,
+) -> None:
+    """Index aliases must retain both their cloned node identity and name."""
+
+    program, outer, inner = _same_name_nested_program()
+    inner.index_id = outer.index_id
+    for access in program.tensor_accesses:
+        access.index_ids = tuple(index.index_id for index in access.indices)
+    if mismatch == "node_id":
+        assert inner.node_id != outer.node_id
+    else:
+        inner.node_id = outer.node_id
+        inner._name = "other"
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer().lower_IndexStmt(program)
+
+    assert "duplicate_index_id" in _assert_structured_diagnostics(error)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ("parent", "tile_size_var", "is_tiled", "legacy_accesses"),
+)
+def test_public_lowerer_rejects_malformed_legacy_index_metadata(
+    forgery: str,
+) -> None:
+    """Compatibility-only index metadata cannot leak legacy exceptions."""
+
+    program, nodes = _reduction_program()
+    if forgery == "parent":
+        nodes.i._parent = object()  # type: ignore[assignment]
+    elif forgery == "tile_size_var":
+        nodes.i.tile_size_var = object()  # type: ignore[assignment]
+    elif forgery == "is_tiled":
+        nodes.i.is_tiled = 1  # type: ignore[assignment]
+    else:
+        nodes.i._legacy_tensor_accesses = object()  # type: ignore[assignment]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer().lower_IndexStmt(program)
+
+    assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+
+
+def test_workspace_alias_classifier_requires_corresponding_branch_binders() -> None:
+    """A workspace marker cannot license an unrelated cross-branch identity."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds", shape=(4, 7))
+    left = TensorVar("SparseLeft", fmt="ds", shape=(4, 5))
+    right = TensorVar("SparseRight", fmt="ds", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    assert isinstance(scheduled, ForAll)
+    region = scheduled.stmt
+    assert isinstance(region, Where)
+    producer_reduction = region.producer
+    consumer_reduction = region.consumer
+    assert isinstance(producer_reduction, ForAll)
+    assert isinstance(consumer_reduction, ForAll)
+    consumer_column = consumer_reduction.stmt
+    assert isinstance(consumer_column, ForAll)
+
+    forged = consumer_column.index_var
+    reference = producer_reduction.index_var
+    forged.node_id = reference.node_id
+    forged.index_id = reference.index_id
+    forged._name = reference.name
+    for access in consumer_reduction.tensor_accesses:
+        access.index_ids = tuple(index.index_id for index in access.indices)
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert {
+        "duplicate_index_id",
+        "duplicate_node_id",
+    } & _assert_structured_diagnostics(error)
+
+
+@pytest.mark.parametrize("forgery", ("workspace_role", "assignment_operator"))
+def test_workspace_alias_classifier_requires_exact_region_shape(
+    forgery: str,
+) -> None:
+    """Only the exact producer-write/consumer-read clone region licenses IDs."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("SparseProduct", fmt="ds", shape=(4, 7))
+    left = TensorVar("SparseLeft", fmt="ds", shape=(4, 5))
+    right = TensorVar("SparseRight", fmt="ds", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    assert isinstance(scheduled, ForAll)
+    region = scheduled.stmt
+    assert isinstance(region, Where)
+    consumer: IndexStmt = region.consumer
+    while isinstance(consumer, ForAll):
+        consumer = consumer.stmt
+    assert isinstance(consumer, TensorAssign)
+    if forgery == "workspace_role":
+        consumer.rhs = consumer.lhs
+    else:
+        consumer.op = Operation.SUB
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert "duplicate_node_id" in _assert_structured_diagnostics(error)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "inner_role",
+        "outer_role",
+        "dual_role",
+        "wrong_parent",
+        "foreign_parent",
+        "nested_access_backlink",
+        "foreign_access_backlink",
+        "nested_tile_backlink",
+    ),
+)
+def test_public_lowerer_rejects_relationally_malformed_tile_metadata(
+    forgery: str,
+) -> None:
+    """Legacy tile metadata is checked as one linked structural contract."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("DenseProduct", fmt="dd", shape=(4, 7))
+    left = TensorVar("SparseLeft", fmt="ds", shape=(4, 5))
+    right = TensorVar("DenseRight", fmt="dd", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=True,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    indices = {index.name: index for index in scheduled.index_vars}
+    inner = indices["c_in"]
+    outer = indices["c_out"]
+    if forgery == "inner_role":
+        inner.is_inner = False
+    elif forgery == "outer_role":
+        outer.is_outer = False
+    elif forgery == "dual_role":
+        inner.is_outer = True
+    elif forgery == "wrong_parent":
+        inner._parent = indices["r"]
+    elif forgery == "foreign_parent":
+        inner._parent = IndexVar("outside")
+    elif forgery == "nested_access_backlink":
+        inner._legacy_tensor_accesses = [[[[object()]]]]  # type: ignore[list-item]
+    elif forgery == "foreign_access_backlink":
+        foreign_tensor = TensorVar("Foreign", fmt="d")
+        inner._legacy_tensor_accesses = [foreign_tensor[IndexVar("outside")]]
+    else:
+        assert inner.tile_size_var is not None
+        inner.tile_size_var.no_tile_list = [[[[object()]]]]  # type: ignore[list-item]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+
+
+def test_public_lowerer_forward_copy_ignores_unowned_deep_instance_state() -> None:
+    """Discarded arbitrary attributes cannot reintroduce deepcopy recursion."""
+
+    program, _ = _reduction_program()
+    deep: object = None
+    for _ in range(1_500):
+        deep = [deep]
+    program.unowned_deep_state = deep  # type: ignore[attr-defined]
+
+    lowered = CINLowerer().lower_IndexStmt(program)
+
+    assert lowered
+    assert program.unowned_deep_state is deep  # type: ignore[attr-defined]
+
+
+def test_public_lowerer_rejects_missing_optional_tile_storage() -> None:
+    """A stored optional tile reference must be present even when it is None."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    row, reduction, column = IndexVar("r"), IndexVar("q"), IndexVar("c")
+    result = TensorVar("DenseProduct", fmt="dd", shape=(4, 7))
+    left = TensorVar("SparseLeft", fmt="ds", shape=(4, 5))
+    right = TensorVar("DenseRight", fmt="dd", shape=(5, 7))
+    source = ForAll(
+        row,
+        ForAll(
+            reduction,
+            ForAll(
+                column,
+                TensorAssign(
+                    result[row, column],
+                    left[row, reduction] * right[reduction, column],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=True,
+        verify_cin_override=False,
+    )
+    scheduled = Scheduler.auto_schedule(source, compile_options=options)
+    inner = next(index for index in scheduled.index_vars if index.name == "c_in")
+    assert inner.tile_size_var is not None
+    del inner.tile_size_var.__dict__["_index_var"]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
+
+    assert "missing_cin_field" in _assert_structured_diagnostics(error)
 
 
 def test_verifier_reports_out_of_scope_index_reference() -> None:
