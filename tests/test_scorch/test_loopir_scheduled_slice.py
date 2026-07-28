@@ -97,6 +97,57 @@ def build_spmm(dtype=F32):
     return stmt
 
 
+def build_transposed_spmm(dtype=F32):
+    """CSR A[i,j] times logical B[k,j] stored physically as dense [j,k]."""
+
+    ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
+    c = TensorVar("C", fmt="dd", dtype=dtype)
+    a = TensorVar("A", fmt="ds", dtype=dtype)
+    b = TensorVar("B", fmt="dd", dtype=dtype, mode_order=[1, 0])
+    stmt = TensorAssign(
+        c[ivs["i"], ivs["k"]],
+        CINBinaryOp(Operation.MUL, a[ivs["i"], ivs["j"]], b[ivs["k"], ivs["j"]]),
+        op=Operation.ADD,
+    )
+    for name in reversed(("i", "j", "k")):
+        stmt = ForAll(ivs[name], stmt)
+    return stmt
+
+
+def build_permuted_result_spmm(dtype=F32):
+    """Logical C[k,i] stores physically as the dense row-major [i,k] result."""
+
+    ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
+    c = TensorVar("C", fmt="dd", dtype=dtype, mode_order=[1, 0])
+    a = TensorVar("A", fmt="ds", dtype=dtype)
+    b = TensorVar("B", fmt="dd", dtype=dtype)
+    stmt = TensorAssign(
+        c[ivs["k"], ivs["i"]],
+        CINBinaryOp(Operation.MUL, a[ivs["i"], ivs["j"]], b[ivs["j"], ivs["k"]]),
+        op=Operation.ADD,
+    )
+    for name in reversed(("i", "j", "k")):
+        stmt = ForAll(ivs[name], stmt)
+    return stmt
+
+
+def build_permuted_result_matmul(dtype=F32):
+    """Matmul whose inputs and result share the physical k, j, i order."""
+
+    ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
+    c = TensorVar("C", fmt="dd", dtype=dtype, mode_order=[1, 0])
+    a = TensorVar("A", fmt="dd", dtype=dtype, mode_order=[1, 0])
+    b = TensorVar("B", fmt="dd", dtype=dtype, mode_order=[1, 0])
+    stmt = TensorAssign(
+        c[ivs["i"], ivs["k"]],
+        CINBinaryOp(Operation.MUL, a[ivs["i"], ivs["j"]], b[ivs["j"], ivs["k"]]),
+        op=Operation.ADD,
+    )
+    for name in reversed(("k", "j", "i")):
+        stmt = ForAll(ivs[name], stmt)
+    return stmt
+
+
 def build_two_reduction(dtype=F32):
     ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
     c = TensorVar("C", fmt="d", dtype=dtype)
@@ -1032,6 +1083,17 @@ STACK_PARITY_GRID = [
         SPMM_BINDINGS,
     ),
     (
+        "spmm stack-k with permuted result",
+        build_permuted_result_spmm,
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(stack("k", 4, placement="child_of:i"),),
+            parallel_loop="i",
+        ),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
         "spmm stack-k at_depth:1",
         build_spmm,
         Schedule(
@@ -1197,6 +1259,69 @@ def test_spmm_stack_k_float64_shadow_execution():
         atol=1e-10,
         rtol=1e-10,
     )
+
+
+def test_spmm_stack_k_permuted_result_shadow_execution():
+    """The legacy and LoopIR consumers flatten the physical result levels."""
+
+    torch.manual_seed(2726)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense = torch.randn(5, 6)
+    loopir_result, legacy_result, comparison = execute_shadow(
+        build_permuted_result_spmm(),
+        (4, 6),
+        csr_stensor(sparse, "A"),
+        dense_stensor(dense, "B"),
+        compile_options=scheduled_options(
+            Schedule(
+                loop_order=("i", "j", "k"),
+                tiles=(stack("k", 4, placement="child_of:i"),),
+                parallel_loop="i",
+            )
+        ),
+    )
+    assert comparison.identical
+    assert tuple(loopir_result.mode_order) == (1, 0)
+    assert tuple(legacy_result.mode_order) == (1, 0)
+    assert torch.equal(loopir_result.values, legacy_result.values)
+    assert torch.allclose(
+        loopir_result.to_torch(),
+        (sparse @ dense).T,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+def test_public_stack_schedule_writes_permuted_result_by_physical_level():
+    """The release route no longer flattens C[k,i] with logical slot i."""
+
+    from scorch import einsum
+
+    sparse = torch.tensor(
+        [[1.0, 2.0, 0.0], [0.0, 3.0, 4.0]],
+        dtype=F32,
+    )
+    dense = torch.arange(15, dtype=F32).reshape(3, 5) / 7
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(stack("k", 4, placement="child_of:i"),),
+        parallel_loop="i",
+    )
+
+    result = einsum(
+        "ij,jk->ki",
+        STensor.from_torch(sparse.to_sparse_csr(), "A"),
+        dense_stensor(dense, "B"),
+        format="dd",
+        output_mode_order=[1, 0],
+        schedule=schedule,
+        use_cache=False,
+    )
+
+    assert isinstance(result, STensor)
+    assert tuple(result.mode_order) == (1, 0)
+    assert torch.allclose(result.to_torch(), (sparse @ dense).T)
 
 
 def test_matmul_stack_shadow_execution_with_unroll():
@@ -1727,6 +1852,20 @@ RELAYOUT_PARITY_GRID = [
         (7, 16),
         (((7, 9), F32), ((9, 16), F32)),
     ),
+    (
+        "transposed dense operand relayout panel scope",
+        build_transposed_spmm,
+        relayout_schedule("j", "r-transposed-panel"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "transposed dense operand relayout pack scope",
+        build_transposed_spmm,
+        relayout_schedule("k", "r-transposed-pack"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
 ]
 
 
@@ -1866,6 +2005,28 @@ def test_spmm_relayout_float64_shadow_execution():
     )
 
 
+def test_transposed_dense_operand_relayout_shadow_execution():
+    """Relayout consumes physical level facts, not logical access order."""
+
+    torch.manual_seed(2725)
+    sparse = torch.randn(4, 5)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense_physical = torch.randn(5, 6)
+    dense_logical = dense_physical.T
+    carried = STensor.from_torch(
+        dense_logical,
+        "B",
+        mode_order=[1, 0],
+    ).to_dense()
+    assert_scheduled_shadow(
+        build_transposed_spmm(),
+        relayout_schedule("j", "r-shadow-transposed"),
+        (4, 6),
+        (csr_stensor(sparse, "A"), carried),
+        sparse @ dense_physical,
+    )
+
+
 @pytest.mark.parametrize("scope", ["j", "k"])
 def test_spmm_relayout_zero_extent_shadow_execution(scope):
     # Zero rows.
@@ -1998,6 +2159,17 @@ def dense_heap_schedule(tag, strip=3):
     )
 
 
+def permuted_result_heap_schedule(tag, strip=3):
+    return Schedule(
+        loop_order=("k", "j", "i"),
+        tiles=(
+            TileSpec("i", strip, placement="outermost", accum="heap", unroll=False),
+        ),
+        tag=tag,
+        parallel_loop="k",
+    )
+
+
 def heap_relayout_schedule(scope, tag, width=3, strip=4):
     from scorch.compiler.scheduler import RelayoutSpec
 
@@ -2071,6 +2243,13 @@ HEAP_PARITY_GRID = [
         dense_heap_schedule("h-dense", strip=4),
         (4, 6),
         MATMUL_BINDINGS,
+    ),
+    (
+        "dense matmul heap with permuted result",
+        build_permuted_result_matmul,
+        permuted_result_heap_schedule("h-dense-result-permuted", strip=4),
+        (6, 4),
+        (((5, 4), F32), ((6, 5), F32)),
     ),
     (
         "ttm multi-prefix heap exact strip",
@@ -2188,6 +2367,20 @@ HEAP_PARITY_GRID = [
         "spmm heap relayout pack scope",
         build_spmm,
         heap_relayout_schedule("k", "h-r-pack"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap transposed relayout panel scope",
+        build_transposed_spmm,
+        heap_relayout_schedule("j", "h-r-transposed-panel"),
+        (4, 6),
+        SPMM_BINDINGS,
+    ),
+    (
+        "spmm heap transposed relayout pack scope",
+        build_transposed_spmm,
+        heap_relayout_schedule("k", "h-r-transposed-pack"),
         (4, 6),
         SPMM_BINDINGS,
     ),
@@ -2369,6 +2562,33 @@ def test_dense_matmul_heap_shadow_execution():
         (dense_stensor(a, "A"), dense_stensor(b, "B")),
         a @ b,
     )
+
+
+def test_permuted_result_matmul_heap_shadow_execution():
+    """Result level order composes with compact accumulation and wrapping."""
+
+    torch.manual_seed(2914)
+    a = torch.randn(4, 5)
+    b = torch.randn(5, 6)
+    carried_a = STensor.from_torch(a, "A", mode_order=[1, 0]).to_dense()
+    carried_b = STensor.from_torch(b, "B", mode_order=[1, 0]).to_dense()
+    loopir_result, legacy_result, comparison = execute_shadow(
+        build_permuted_result_matmul(),
+        (6, 4),
+        carried_a,
+        carried_b,
+        compile_options=scheduled_options(
+            permuted_result_heap_schedule(
+                "h-dense-result-permuted-shadow",
+                strip=4,
+            )
+        ),
+    )
+    assert comparison.identical
+    assert tuple(loopir_result.mode_order) == (1, 0)
+    assert tuple(legacy_result.mode_order) == (1, 0)
+    assert torch.equal(loopir_result.values, legacy_result.values)
+    assert torch.allclose(loopir_result.to_torch(), a @ b, atol=1e-3, rtol=1e-3)
 
 
 def ttm_stensor(tensor, name):

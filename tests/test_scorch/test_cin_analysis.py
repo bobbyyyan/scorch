@@ -21,6 +21,7 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
     TileSizeVar,
+    UnaryOp,
     Where,
     Workspace,
     WorkspaceAccess,
@@ -36,9 +37,10 @@ from scorch.compiler.cin_analysis import (
     full_cin_verification,
     normalize_cin,
     verify_cin,
+    verify_cin_structure,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
-from scorch.compiler.diagnostics import VerificationError
+from scorch.compiler.diagnostics import CompilerInvariantError, VerificationError
 from scorch.compiler.identity import AccessId, IndexId, NodeId, SymbolId
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.scheduler import Schedule, Scheduler
@@ -707,6 +709,35 @@ def test_structural_preflight_reports_invalid_forward_fields(mutate, path) -> No
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
 
 
+@pytest.mark.parametrize("field", ("index_var", "stmt", "lhs"))
+def test_structural_preflight_never_reads_child_class_descriptors(field) -> None:
+    """Typed child admission uses stored exact types, never ``isinstance``."""
+
+    reads = 0
+
+    class HostileChild:
+        @property
+        def __class__(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile child class descriptor")
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    owner = program if field != "lhs" else program.stmt
+    object.__setattr__(owner, field, HostileChild())
+
+    analysis = analyze_cin(program)
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+    assert reads == 0
+
+
 def test_structural_preflight_reports_excessive_depth_iteratively() -> None:
     i = IndexVar("i")
     statement: IndexStmt = ForAll(
@@ -724,6 +755,37 @@ def test_structural_preflight_reports_excessive_depth_iteratively() -> None:
     with pytest.raises(VerificationError) as error:
         verify_cin(statement)
     assert _assert_structured_diagnostics(error) == {"cin_structure_depth_exceeded"}
+
+
+@pytest.mark.parametrize("target", ("tensor", "index"))
+def test_structural_preflight_depth_bound_keeps_postpass_total(target: str) -> None:
+    """Skipped descendants cannot escape through cross-field reconciliation."""
+
+    class HostileDict(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("hostile skipped-descendant lookup")
+
+        def __iter__(self):
+            raise RuntimeError("hostile skipped-descendant iteration")
+
+    index = IndexVar("i")
+    source = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    statement: IndexStmt = TensorAssign(result[index], source[index])
+    # Put both accesses exactly at the supported limit. Their TensorVar and
+    # IndexVar children sit one level beyond it and are intentionally skipped.
+    for depth in range(cin_analysis_module._MAX_CIN_STRUCTURE_DEPTH - 1):
+        statement = ForAll(IndexVar(f"deep_post_{depth}"), statement)
+
+    skipped = source if target == "tensor" else index
+    object.__setattr__(skipped, "__dict__", HostileDict(skipped.__dict__))
+
+    analysis = analyze_cin(statement)
+
+    assert analysis.diagnostics[0].code == "cin_structure_depth_exceeded"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(statement)
+    assert error.value.diagnostics[0].code == "cin_structure_depth_exceeded"
 
 
 @pytest.mark.parametrize(
@@ -821,13 +883,13 @@ def test_verifier_rejects_extent_mismatches_and_classifies_implicit_reductions()
 
 def test_full_verification_is_explicit_at_debug_compiler_boundary() -> None:
     i = IndexVar("i")
-    result = TensorVar("C", fmt="dd")
-    source = TensorVar("A", fmt="dd")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(5,))
     invalid = ForAll(i, TensorAssign(result[i], source[i]))
 
     normalize_cin(invalid)
     with full_cin_verification():
-        with pytest.raises(VerificationError, match="tensor_access_rank_mismatch"):
+        with pytest.raises(VerificationError, match="index_extent_mismatch"):
             Scheduler.apply_schedule(invalid, Schedule())
 
 
@@ -856,6 +918,21 @@ def test_public_lowerer_preserves_caller_owned_cin() -> None:
     assert program.parent is None
     assert program.stmt.parent is None
     assert i.tensor_accesses == []
+
+
+def test_public_lowerer_rejects_malformed_raw_cin_before_legacy_copy() -> None:
+    """Direct legacy lowering shares normalization's structural boundary."""
+
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    program = ForAll(i, TensorAssign(result[i], source[i]))
+    program.index_var = object()  # type: ignore[assignment]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer().lower_IndexStmt(program)
+
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
 
 
 def test_verifier_reports_out_of_scope_index_reference() -> None:
@@ -945,6 +1022,516 @@ def test_release_mode_normalize_cin_fails_closed_on_forged_structure() -> None:
     assert _assert_structured_diagnostics(error) == {"cin_structure_depth_exceeded"}
 
 
+@pytest.mark.parametrize("location", ("root", "expression"))
+def test_release_normalization_requires_every_node_id(location: str) -> None:
+    """Every node normalized in release mode must carry its stored NodeId."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    release_options = CompileOptions.from_environment(environ={})
+    i = IndexVar("i")
+    expression = BinaryOp(
+        Operation.ADD,
+        TensorVar("A", fmt="d")[i],
+        TensorVar("B", fmt="d")[i],
+    )
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], expression))
+    target = program if location == "root" else expression
+    object.__delattr__(target, "node_id")
+
+    analysis = analyze_cin(program)
+    assert analysis.diagnostics[0].code == "missing_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"missing_cin_field"}
+
+
+def test_workspace_access_requires_one_authoritative_workspace() -> None:
+    """The subclass-only wksp edge cannot disappear or diverge from tensor."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    release_options = CompileOptions.from_environment(environ={})
+
+    def build():
+        i = IndexVar("i")
+        source = TensorVar("A", fmt="d")
+        result = TensorVar("C", fmt="d")
+        workspace = Workspace("tmp", dim=1, dense=True)
+        producer_access = WorkspaceAccess(workspace, i)
+        program = ForAll(
+            i,
+            Where(
+                producer=TensorAssign(producer_access, source[i]),
+                consumer=TensorAssign(result[i], WorkspaceAccess(workspace, i)),
+            ),
+        )
+        return program, producer_access
+
+    missing, missing_access = build()
+    del missing_access.wksp
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(missing, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"missing_cin_field"}
+
+    divergent, divergent_access = build()
+    divergent_access.wksp = Workspace("other", dim=1, dense=True)
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(divergent, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+    forged, forged_access = build()
+    ordinary_access = TensorAccess(forged_access.wksp, forged_access.indices)
+    inner = forged.stmt
+    assert isinstance(inner, Where)
+    producer = inner.producer
+    assert isinstance(producer, TensorAssign)
+    producer.lhs = ordinary_access
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(forged, compile_options=release_options)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_rejects_hostile_container_subclasses() -> None:
+    """Preflight never executes attacker-controlled container iteration."""
+
+    class HostileList(list):
+        def __iter__(self):
+            raise RuntimeError("hostile iteration")
+
+    i = IndexVar("i")
+    access = TensorVar("A", fmt="d")[i]
+    access.indices = HostileList((i,))
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], access))
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_owns_malformed_mode_order_entries() -> None:
+    """A heterogeneous forged permutation cannot escape through sorted()."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    source = TensorVar("A", fmt="dd")
+    source.mode_order = [0, object()]  # type: ignore[list-item]
+    program = ForAll(
+        i,
+        ForAll(j, TensorAssign(TensorVar("C", fmt="dd")[i, j], source[i, j])),
+    )
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        verify_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+    malformed_format = TensorVar("D", fmt="dd")
+    assert malformed_format._format is not None
+    object.__setattr__(malformed_format._format, "_level_formats", object())
+    malformed = ForAll(
+        i,
+        ForAll(
+            j,
+            TensorAssign(TensorVar("E", fmt="dd")[i, j], malformed_format[i, j]),
+        ),
+    )
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(malformed)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+@pytest.mark.parametrize(
+    ("mutate_format", "mode_order"),
+    (
+        (
+            lambda tensor_format: object.__setattr__(
+                tensor_format,
+                "_level_formats",
+                (object(),),
+            ),
+            None,
+        ),
+        (
+            lambda tensor_format: object.__setattr__(
+                tensor_format.get_level_formats()[0],
+                "_mode",
+                object(),
+            ),
+            [0],
+        ),
+        (
+            lambda tensor_format: object.__setattr__(
+                tensor_format.get_level_formats()[0],
+                "_bit_width",
+                0,
+            ),
+            [0],
+        ),
+    ),
+)
+def test_structural_preflight_validates_complete_stored_tensor_format(
+    mutate_format,
+    mode_order,
+) -> None:
+    """Malformed exact format objects fail before format helper methods run."""
+
+    i = IndexVar("i")
+    source = TensorVar("A", fmt="d")
+    source.mode_order = mode_order
+    assert source._format is not None
+    mutate_format(source._format)
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], source[i]))
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_identity", "expected_code"),
+    (
+        ("node_id", NodeId([]), "invalid_node_id"),  # type: ignore[arg-type]
+        ("index_id", IndexId([]), "invalid_index_id"),  # type: ignore[arg-type]
+        ("symbol_id", SymbolId([]), "invalid_symbol_id"),  # type: ignore[arg-type]
+        ("access_id", AccessId([]), "invalid_access_id"),  # type: ignore[arg-type]
+        (
+            "tensor_id",
+            SymbolId([]),  # type: ignore[arg-type]
+            "invalid_symbol_reference",
+        ),
+        (
+            "index_ids",
+            (IndexId([]),),  # type: ignore[arg-type]
+            "invalid_index_reference",
+        ),
+    ),
+)
+def test_structural_preflight_rejects_unhashable_exact_identity_payloads(
+    field: str,
+    bad_identity,
+    expected_code: str,
+) -> None:
+    """Exact wrapper classes still require safe integer payloads before hashing."""
+
+    program, nodes = _reduction_program()
+    if field == "node_id":
+        nodes.assignment.node_id = bad_identity
+    elif field == "index_id":
+        nodes.i.index_id = bad_identity
+    elif field == "symbol_id":
+        nodes.left.symbol_id = bad_identity
+    elif field == "access_id":
+        nodes.left_access.access_id = bad_identity
+    elif field == "tensor_id":
+        nodes.left_access.tensor_id = bad_identity
+    else:
+        nodes.left_access.index_ids = bad_identity
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == expected_code
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert expected_code in _assert_structured_diagnostics(error)
+
+
+def test_structural_preflight_bounds_integer_domains_before_formatting() -> None:
+    """Huge runtime integers cannot escape through diagnostics or cost models."""
+
+    i = IndexVar("i")
+
+    huge_shape = TensorVar("A", fmt="d")
+    huge_shape.shape = (1 << 63,)
+    shape_program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d", shape=(1,))[i], huge_shape[i]),
+    )
+
+    product_overflow = TensorVar("B", fmt="dd")
+    product_overflow.shape = ((1 << 63) - 1, 2)
+    j = IndexVar("j")
+    product_program = ForAll(
+        i,
+        ForAll(
+            j,
+            TensorAssign(
+                TensorVar("D", fmt="dd", shape=(1, 1))[i, j],
+                product_overflow[i, j],
+            ),
+        ),
+    )
+
+    huge_width = TensorVar(
+        "E",
+        fmt=TensorFormat([LevelFormat("d", bit_width=10**10000)]),
+    )
+    width_program = ForAll(
+        i,
+        TensorAssign(TensorVar("F", fmt="d")[i], huge_width[i]),
+    )
+
+    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace.dim = 10**10000
+    workspace_program = ForAll(
+        i,
+        TensorAssign(
+            TensorVar("G", fmt="d")[i],
+            WorkspaceAccess(workspace, i),
+        ),
+    )
+
+    for program in (
+        shape_program,
+        product_program,
+        width_program,
+        workspace_program,
+    ):
+        analysis = analyze_cin(program)
+        assert analysis.diagnostics[0].code == "invalid_cin_field"
+        with pytest.raises(VerificationError) as error:
+            normalize_cin(program)
+        assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+
+
+def test_structural_preflight_bounds_stable_identity_payloads() -> None:
+    """Stable IDs are finite nonnegative compiler-domain integers."""
+
+    program, nodes = _reduction_program()
+    nodes.assignment.node_id = NodeId(10**10000)
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_node_id"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_node_id"}
+
+
+@pytest.mark.parametrize(
+    ("forgery", "expected_code"),
+    (
+        ("format_rank", "invalid_cin_field"),
+        ("access_rank", "tensor_access_rank_mismatch"),
+        ("index_mirror", "index_reference_mismatch"),
+        ("symbol_mirror", "symbol_reference_mismatch"),
+        ("missing_format", "invalid_cin_field"),
+        ("missing_mode_order", "invalid_cin_field"),
+    ),
+)
+def test_structural_preflight_reconciles_cross_field_ownership(
+    forgery: str,
+    expected_code: str,
+) -> None:
+    """Release normalization never carries split rank/reference metadata."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    source = TensorVar("A", fmt="dd", shape=(2, 3))
+    result = TensorVar("C", fmt="dd", shape=(2, 3))
+    source_access = source[i, j]
+    program = ForAll(i, ForAll(j, TensorAssign(result[i, j], source_access)))
+
+    if forgery == "format_rank":
+        source._format = TensorFormat("d")
+    elif forgery == "access_rank":
+        source_access.indices = [i]
+        source_access.index_ids = (i.index_id,)
+    elif forgery == "index_mirror":
+        source_access.index_ids = (j.index_id, i.index_id)
+    elif forgery == "symbol_mirror":
+        source_access.tensor_id = result.symbol_id
+    elif forgery == "missing_format":
+        source._format = None
+    else:
+        source.mode_order = None
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == expected_code
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert expected_code in _assert_structured_diagnostics(error)
+
+
+@pytest.mark.parametrize(
+    ("identity_kind", "expected_code"),
+    (
+        ("node", "duplicate_node_id"),
+        ("index", "duplicate_index_id"),
+        ("symbol", "duplicate_symbol_id"),
+        ("access", "duplicate_access_id"),
+    ),
+)
+def test_structural_preflight_rejects_duplicate_stable_identity_owners(
+    identity_kind: str,
+    expected_code: str,
+) -> None:
+    """Distinct CIN entities cannot share one stable identity in release mode."""
+
+    program, nodes = _reduction_program()
+    if identity_kind == "node":
+        nodes.assignment.node_id = program.node_id
+    elif identity_kind == "index":
+        nodes.k.index_id = nodes.i.index_id
+    elif identity_kind == "symbol":
+        nodes.right.symbol_id = nodes.left.symbol_id
+    else:
+        nodes.right_access.access_id = nodes.left_access.access_id
+
+    analysis = analyze_cin(program)
+
+    assert expected_code in {diagnostic.code for diagnostic in analysis.diagnostics}
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert expected_code in _assert_structured_diagnostics(error)
+
+
+def test_structural_preflight_never_hashes_identity_subclasses() -> None:
+    """A hostile stable-ID subclass cannot execute hooks during admission."""
+
+    class HostileNodeId(NodeId):
+        def __hash__(self):
+            raise RuntimeError("hostile identity hash")
+
+    program, nodes = _reduction_program()
+    nodes.assignment.node_id = HostileNodeId(nodes.assignment.node_id.value)
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_node_id"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_node_id"}
+
+
+def test_structural_preflight_never_hashes_or_names_hostile_node_classes() -> None:
+    """Exact-node admission uses identity and a class-name-free diagnostic."""
+
+    class HostileMeta(type):
+        def __hash__(cls):
+            raise RuntimeError("hostile class hash")
+
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise RuntimeError("hostile class name")
+            return super().__getattribute__(name)
+
+    class HostileForAll(ForAll, metaclass=HostileMeta):
+        pass
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    program.__class__ = HostileForAll
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_never_compares_hostile_container_classes() -> None:
+    """Container admission uses exact identity rather than metaclass equality."""
+
+    class HostileMeta(type):
+        def __eq__(cls, other):
+            raise RuntimeError("hostile class equality")
+
+    class HostileIndices(metaclass=HostileMeta):
+        pass
+
+    i = IndexVar("i")
+    access = TensorVar("A", fmt="d")[i]
+    access.indices = HostileIndices()  # type: ignore[assignment]
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], access))
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+@pytest.mark.parametrize("target", ("node", "format", "level"))
+def test_structural_preflight_rejects_hostile_stored_state(target: str) -> None:
+    """Stored-state mappings and their keys cannot execute Python hooks."""
+
+    class HostileDict(dict):
+        def __contains__(self, key):
+            raise RuntimeError("hostile state membership")
+
+        def __iter__(self):
+            raise RuntimeError("hostile state iteration")
+
+        def get(self, key, default=None):
+            raise RuntimeError("hostile state lookup")
+
+    i = IndexVar("i")
+    source = TensorVar("A", fmt="d")
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], source[i]))
+    if target == "node":
+        object.__setattr__(program, "__dict__", HostileDict(program.__dict__))
+    else:
+        assert source._format is not None
+        format_target = (
+            source._format
+            if target == "format"
+            else source._format.get_level_formats()[0]
+        )
+        object.__setattr__(
+            format_target,
+            "__dict__",
+            HostileDict(format_target.__dict__),
+        )
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_rejects_hostile_stored_state_keys() -> None:
+    """Exact dictionaries are inspected without hashing attacker-owned keys."""
+
+    class HostileKey:
+        def __hash__(self):
+            return hash("node_id")
+
+        def __eq__(self, other):
+            raise RuntimeError("hostile state-key equality")
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    state = dict(program.__dict__)
+    del state["node_id"]
+    state[HostileKey()] = program.node_id
+    object.__setattr__(program, "__dict__", state)
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
 def test_structural_preflight_rejects_descriptor_divergence() -> None:
     """A __class__-swapped property cannot split the stored/getattr graphs.
 
@@ -970,7 +1557,7 @@ def test_structural_preflight_rejects_descriptor_divergence() -> None:
     analysis = analyze_cin(program)
 
     assert analysis.diagnostics[0].code == "invalid_cin_field"
-    assert analysis.diagnostics[0].path == ("root", "stmt")
+    assert analysis.diagnostics[0].path == ("root",)
     with pytest.raises(VerificationError) as error:
         verify_cin(program)
     assert "invalid_cin_field" in _assert_structured_diagnostics(error)
@@ -995,7 +1582,142 @@ def test_structural_preflight_rejects_raising_descriptor() -> None:
     analysis = analyze_cin(program)
 
     assert analysis.diagnostics[0].code == "invalid_cin_field"
-    assert analysis.diagnostics[0].path == ("root", "parallel")
+    assert analysis.diagnostics[0].path == ("root",)
     with pytest.raises(VerificationError) as error:
         verify_cin(program)
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+
+
+def test_structural_preflight_never_executes_stateful_descriptors() -> None:
+    """Exact-node admission closes the one-read descriptor TOCTOU."""
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    reads = 0
+
+    class StatefulForAll(ForAll):
+        @property
+        def stmt(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            stored = object.__getattribute__(self, "__dict__")["stmt"]
+            return stored if reads == 1 else self
+
+    program.__class__ = StatefulForAll
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert reads == 0
+    with pytest.raises(VerificationError):
+        normalize_cin(program)
+    assert reads == 0
+
+
+def test_structural_preflight_never_executes_root_identity_descriptor() -> None:
+    """Root diagnostic construction reads only already-validated stored state."""
+
+    reads = 0
+
+    class HostileForAll(ForAll):
+        @property
+        def node_id(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile identity descriptor")
+
+    i = IndexVar("i")
+    program = ForAll(
+        i,
+        TensorAssign(TensorVar("C", fmt="d")[i], TensorVar("A", fmt="d")[i]),
+    )
+    program.__class__ = HostileForAll
+
+    analysis = analyze_cin(program)
+
+    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert reads == 0
+    with pytest.raises(VerificationError):
+        normalize_cin(program)
+    assert reads == 0
+
+
+def test_public_cin_root_boundaries_never_execute_class_descriptors() -> None:
+    """Root admission uses ``type`` rather than caller-defined ``__class__``."""
+
+    from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
+
+    reads = 0
+
+    class HostileRoot:
+        @property
+        def __class__(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile root class descriptor")
+
+    hostile: Any = HostileRoot()
+    entrypoints = (
+        analyze_cin,
+        verify_cin_structure,
+        normalize_cin,
+        canonical_cin_dump,
+        Scheduler.auto_schedule,
+        Scheduler.auto_schedule_plan,
+        CINLowerer().lower_IndexStmt,
+        CINLowerer().lower_IndexExpr,
+        CINLowerer().lower_CIN,
+        lower_normalized_cin_to_loopir,
+    )
+    for entrypoint in entrypoints[:7]:
+        with pytest.raises(TypeError):
+            entrypoint(hostile)
+    for entrypoint in entrypoints[7:]:
+        with pytest.raises((TypeError, CompilerInvariantError)):
+            entrypoint(hostile)
+
+    assert reads == 0
+
+
+@pytest.mark.parametrize("location", ("assignment", "binary_left", "unary"))
+@pytest.mark.parametrize("definition_kind", ("tensor", "index"))
+def test_structural_preflight_rejects_definitions_in_expression_edges(
+    location: str,
+    definition_kind: str,
+) -> None:
+    """Definition nodes cannot reach expression walkers that cannot clone them."""
+
+    i = IndexVar("i")
+    source = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    definition = source if definition_kind == "tensor" else i
+    if location == "assignment":
+        rhs = definition
+    elif location == "binary_left":
+        rhs = BinaryOp(Operation.ADD, definition, source[i])
+    else:
+        rhs = UnaryOp(Operation.ADD, definition)
+    program = ForAll(i, TensorAssign(result[i], rhs))  # type: ignore[arg-type]
+
+    analysis = analyze_cin(program)
+
+    assert "unsupported_expression" in {
+        diagnostic.code for diagnostic in analysis.diagnostics
+    }
+    with pytest.raises(VerificationError) as error:
+        normalize_cin(program)
+    assert "unsupported_expression" in _assert_structured_diagnostics(error)
+
+
+def test_root_assignment_rhs_collection_excludes_the_result_access() -> None:
+    """Collector dispatch starts at the root's specialized assignment method."""
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = TensorAssign(result[i], operand[i])
+
+    assert program.get_rhs_tensor_vars() == [operand]

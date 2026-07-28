@@ -14,6 +14,7 @@ from scorch.compiler.cin import (
     IndexVar,
     IndexVarAdd,
     Operation,
+    TensorAccess,
     TensorAssign,
     TensorVar,
     UnaryOp,
@@ -514,7 +515,7 @@ def test_request_extent_identity_is_bounded_before_json(extent) -> None:
 def test_request_identity_rejects_cyclic_unscheduled_cin() -> None:
     cyclic = build_elementwise()
     cyclic.stmt = cyclic
-    with pytest.raises(VerificationError, match="contains a cycle"):
+    with pytest.raises(VerificationError, match="cyclic_cin_structure"):
         loopir_request_dump(
             cyclic,
             None,
@@ -530,7 +531,7 @@ def test_request_identity_rejects_cyclic_index_expression() -> None:
     assert isinstance(cyclic.stmt, ForAll)
     inner = cyclic.stmt.index_var
     outer._expr = IndexVarAdd(outer, inner)
-    with pytest.raises(VerificationError, match="contains a cycle"):
+    with pytest.raises(VerificationError, match="cyclic_cin_structure"):
         loopir_request_dump(
             cyclic,
             None,
@@ -538,6 +539,38 @@ def test_request_identity_rejects_cyclic_index_expression() -> None:
             ELEMENTWISE_BINDINGS,
             compile_options=IDENTITY_OPTIONS,
         )
+
+
+def test_request_identity_never_executes_diverging_access_descriptor() -> None:
+    """The shared structural boundary runs before identity's recursive walk."""
+
+    cin = build_elementwise()
+    assert isinstance(cin.stmt, ForAll)
+    assignment = cin.stmt.stmt
+    assert isinstance(assignment, TensorAssign)
+    assert isinstance(assignment.rhs, BinaryOp)
+    access = assignment.rhs.left
+    assert isinstance(access, TensorAccess)
+    reads = 0
+
+    class HostileAccess(TensorAccess):
+        @property
+        def indices(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            return object.__getattribute__(self, "__dict__")["indices"]
+
+    access.__class__ = HostileAccess
+
+    with pytest.raises(VerificationError, match="invalid_cin_field"):
+        loopir_request_dump(
+            cin,
+            None,
+            (4, 5),
+            ELEMENTWISE_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+    assert reads == 0
 
 
 def test_request_identity_counts_unary_rhs_without_legacy_recursion() -> None:

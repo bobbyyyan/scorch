@@ -288,8 +288,9 @@ def test_mode_order_boundaries():
     A permuted all-dense operand is admitted exactly when its physical
     levels are nest-consistent, so the elementwise copy below now reports
     the loop-order conflict its physical storage actually has.  Permuted
-    compressed structure, permuted results, and non-permutation orders keep
-    their own stable code.
+    compressed structure and non-permutation orders keep their own stable
+    code.  A permuted result is level-mapped too, so an incompatible nest
+    reports the same physical storage-order conflict as an input.
     """
 
     i, j = IndexVar("i"), IndexVar("j")
@@ -308,18 +309,38 @@ def test_mode_order_boundaries():
     a = TensorVar("A", fmt="dd")
     c = TensorVar("C", fmt="dd", mode_order=[1, 0])
     assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_mode_order", ForAll(i, ForAll(j, assign)))
+    expect_code("unsupported_loop_order", ForAll(i, ForAll(j, assign)))
 
-    # A non-permutation order is owned by the full CIN verifier, which the
-    # lowering runs unconditionally; the lowering's own permutation guard
-    # stays as defense in depth behind it.
+    # The shared structural boundary owns permutation totality before
+    # scheduling or lowering can perform an unsafe lookup; the lowering's
+    # own permutation guard stays as defense in depth behind it.
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="dd", mode_order=[0, 0])
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
     with pytest.raises(VerificationError) as error:
         lower_normalized_cin_to_loopir(ForAll(i, ForAll(j, assign)))
-    assert "tensor_mode_order_mismatch" in str(error.value)
+    assert "invalid_cin_field" in str(error.value)
+
+
+def test_permuted_dense_result_lowers_with_level_mapped_modes():
+    """Result declarations keep physical levels distinct from logical axes."""
+
+    i, k = IndexVar("i"), IndexVar("k")
+    source = TensorVar("A", fmt="dd", mode_order=[1, 0])
+    result = TensorVar("C", fmt="dd", mode_order=[1, 0])
+    cin = ForAll(
+        k,
+        ForAll(i, TensorAssign(result[i, k], source[i, k])),
+    )
+
+    lowered = lower_normalized_cin_to_loopir(cin)
+    verify_program(lowered.program)
+
+    result_decl = next(
+        decl for decl in lowered.program.tensors if decl.symbol == lowered.result_symbol
+    )
+    assert tuple(level.mode for level in result_decl.levels) == (1, 0)
 
 
 def test_permuted_dense_operand_lowers_with_level_mapped_modes():

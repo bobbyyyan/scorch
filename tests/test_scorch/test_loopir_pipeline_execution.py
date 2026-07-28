@@ -22,6 +22,9 @@ from scorch.compiler.cin import (
     Operation,
     TensorAssign,
     TensorVar,
+    UnaryOp,
+    Where,
+    Workspace,
 )
 from scorch.compiler.compilation_context import (
     CompilationContext,
@@ -29,6 +32,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.diagnostics import VerificationError
 from scorch.exceptions import CompileSpecError
 from scorch.compiler.loopir.oracle import run_program
 from scorch.compiler.loopir.pipeline import (
@@ -36,7 +40,9 @@ from scorch.compiler.loopir.pipeline import (
     compile_cin_via_loopir,
     execute_cin_via_loopir,
     execute_shadow,
+    legacy_generated_cpp,
 )
+from scorch.format import TensorFormat
 from scorch.stensor import STensor
 
 from tests.test_scorch.test_kernels_comprehensive import assert_close
@@ -84,10 +90,18 @@ def oracle_reference(kernel, args, result_shape):
     inputs = {}
     for symbol, tensor in zip(lowering.rhs_access_symbols, args):
         inputs[symbol] = tensor.tolist()
+    result_decl = next(
+        decl
+        for decl in lowering.program.tensors
+        if decl.symbol == lowering.result_symbol
+    )
+    logical_shape = [0] * len(result_decl.levels)
+    for physical_level, level in enumerate(result_decl.levels):
+        logical_shape[level.mode] = result_shape[physical_level]
     outputs = run_program(
         lowering.program,
         inputs,
-        {lowering.result_symbol: tuple(result_shape)},
+        {lowering.result_symbol: tuple(logical_shape)},
     )
     return torch.tensor(outputs[lowering.result_symbol], dtype=torch.float64)
 
@@ -133,7 +147,7 @@ def test_runtime_binding_relayouts_nonidentity_dense_inputs():
     b_t = torch.arange(6, 12, dtype=torch.float32).reshape(2, 3)
     a = STensor.from_torch(a_t, "A", mode_order=[1, 0]).to_dense()
     b = STensor.from_torch(b_t, "B", mode_order=[1, 0]).to_dense()
-    result, _ = execute_cin_via_loopir(cin, (2, 3), a, b)
+    result, _ = execute_cin_via_loopir(cin, torch.Size((2, 3)), a, b)
     assert torch.equal(result.to_torch(), a_t + b_t)
 
 
@@ -143,6 +157,372 @@ def test_runtime_binding_rejects_format_mismatch_before_native_execution():
     dense = dense_stensor(torch.ones(2, 2), "B")
     with pytest.raises(CompileSpecError, match="expects format"):
         execute_cin_via_loopir(cin, (2, 2), sparse, dense)
+
+
+@pytest.mark.parametrize("entry_name", ("loopir", "legacy"))
+def test_runtime_entries_reject_non_stensor_args_without_descriptor_access(
+    entry_name,
+):
+    """A hostile later operand is rejected before any operand property read."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    reads = 0
+
+    class HostileOperand:
+        def __getattribute__(self, name):
+            nonlocal reads
+            if name != "__class__":
+                reads += 1
+            raise RuntimeError(f"hostile runtime descriptor {name}")
+
+    args = (
+        dense_stensor(torch.ones(2, 2), "A"),
+        HostileOperand(),
+    )
+    entry = execute_cin_via_loopir if entry_name == "loopir" else lower_and_exec_cin
+
+    with pytest.raises(CompileSpecError, match="exact STensor"):
+        entry(build_elementwise(Operation.ADD), (2, 2), *args)
+
+    assert reads == 0
+
+
+@pytest.mark.parametrize("entry_name", ("loopir", "legacy"))
+def test_runtime_entries_wrap_forged_exact_stensor_state(entry_name):
+    """Exact-class forgeries fail as public compile specifications."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    forged = object.__new__(STensor)
+    args = (
+        dense_stensor(torch.ones(2, 2), "A"),
+        forged,
+    )
+    entry = execute_cin_via_loopir if entry_name == "loopir" else lower_and_exec_cin
+
+    with pytest.raises(CompileSpecError, match="invalid internal state"):
+        entry(build_elementwise(Operation.ADD), (2, 2), *args)
+
+
+@pytest.mark.parametrize("entry_name", ("loopir", "legacy"))
+def test_runtime_surplus_hostile_operand_is_not_inspected(entry_name):
+    """Normalized CIN arity wins before any surplus operand inspection."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    reads = 0
+
+    class HostileSurplus:
+        def __getattribute__(self, name):
+            nonlocal reads
+            if name != "__class__":
+                reads += 1
+            raise RuntimeError(f"surplus operand was inspected through {name}")
+
+    args = (
+        dense_stensor(torch.ones(2, 2), "A"),
+        dense_stensor(torch.ones(2, 2), "B"),
+        HostileSurplus(),
+    )
+    entry = execute_cin_via_loopir if entry_name == "loopir" else lower_and_exec_cin
+
+    with pytest.raises(CompileSpecError, match="expects 2 runtime tensors, got 3"):
+        entry(build_elementwise(Operation.ADD), (2, 2), *args)
+
+    assert reads == 0
+
+
+@pytest.mark.parametrize("entry", (compile_cin_via_loopir, legacy_generated_cpp))
+def test_source_surplus_hostile_binding_is_not_inspected(entry):
+    """Compile-only binding arity also precedes binding-item validation."""
+
+    reads = 0
+
+    class HostileBinding:
+        def __getattribute__(self, name):
+            nonlocal reads
+            if name != "__class__":
+                reads += 1
+            raise RuntimeError(f"surplus binding was inspected through {name}")
+
+    bindings = [
+        ((2, 2), torch.float32),
+        ((2, 2), torch.float32),
+        HostileBinding(),
+    ]
+
+    with pytest.raises(CompileSpecError, match="expects 2 runtime tensors, got 3"):
+        entry(build_elementwise(Operation.ADD), (2, 2), bindings)
+
+    assert reads == 0
+
+
+def test_loopir_runtime_binding_failure_makes_explicit_context_terminal():
+    """Runtime shape/arity validation is owned by the frontend binding stage."""
+
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+
+    with pytest.raises(CompileSpecError, match="expects 2 runtime tensors, got 1"):
+        execute_cin_via_loopir(
+            build_elementwise(Operation.ADD),
+            (2, 2),
+            dense_stensor(torch.ones(2, 2), "A"),
+            compile_options=options,
+            _compilation_context=context,
+        )
+
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+@pytest.mark.parametrize("entry_name", ("loopir", "legacy"))
+def test_post_relayout_snapshot_failure_makes_context_terminal(
+    monkeypatch,
+    entry_name,
+):
+    """Aligned operands validate before CIN mutation under a failure owner."""
+
+    import scorch.ops as ops_module
+
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+    forged = object.__new__(STensor)
+
+    def forge_aligned(runtime_args, *args, **kwargs):
+        return (forged, *runtime_args[1:])
+
+    monkeypatch.setattr(
+        ops_module,
+        "_relayout_mode_order_args",
+        forge_aligned,
+    )
+    cin = build_elementwise(Operation.ADD)
+    runtime_args = (
+        dense_stensor(torch.ones(2, 2), "A"),
+        dense_stensor(torch.ones(2, 2), "B"),
+    )
+
+    with pytest.raises(CompileSpecError, match="invalid internal state"):
+        if entry_name == "loopir":
+            execute_cin_via_loopir(
+                cin,
+                (2, 2),
+                *runtime_args,
+                compile_options=options,
+                _compilation_context=context,
+            )
+        else:
+            ops_module.lower_and_exec_cin(
+                cin,
+                (2, 2),
+                *runtime_args,
+                _compile_options=options,
+                _compilation_context=context,
+            )
+
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+def test_direct_relayout_failure_makes_context_terminal(monkeypatch):
+    """A prerequisite failure between direct binding stages retires its context."""
+
+    import scorch.ops as ops_module
+
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+    error = RuntimeError("injected direct relayout failure")
+
+    def fail_relayout(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        ops_module,
+        "_relayout_mode_order_args",
+        fail_relayout,
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        ops_module.lower_and_exec_cin(
+            build_elementwise(Operation.ADD),
+            (2, 2),
+            dense_stensor(torch.ones(2, 2), "A"),
+            dense_stensor(torch.ones(2, 2), "B"),
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert failure.value is error
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+def test_runtime_rejects_forged_dense_storage_cardinality():
+    """Dense physical shape and value cardinality agree before pybind."""
+
+    forged = dense_stensor(torch.ones(2, 2), "A")
+    object.__setattr__(
+        forged.storage,
+        "_value",
+        torch.ones(3, dtype=torch.float32),
+    )
+
+    with pytest.raises(CompileSpecError, match="storage cardinality"):
+        execute_cin_via_loopir(
+            build_elementwise(Operation.ADD),
+            (2, 2),
+            forged,
+            dense_stensor(torch.ones(2, 2), "B"),
+        )
+
+
+def test_direct_result_rank_failure_precedes_metadata_and_lowering(monkeypatch):
+    """Direct execution validates its one-result format contract in-stage."""
+
+    import scorch.ops as ops_module
+
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+    lowering_calls = 0
+
+    def unexpected_lowering(*args, **kwargs):
+        nonlocal lowering_calls
+        lowering_calls += 1
+        raise AssertionError("invalid result rank reached legacy lowering")
+
+    monkeypatch.setattr(
+        ops_module.CINLowerer,
+        "_lower_owned_IndexStmt",
+        unexpected_lowering,
+    )
+    cin = build_elementwise(Operation.ADD)
+    a = dense_stensor(torch.ones(2, 2), "A")
+    b = dense_stensor(torch.ones(2, 2), "B")
+
+    with pytest.raises(CompileSpecError, match="result format rank"):
+        ops_module.lower_and_exec_cin(
+            cin,
+            (4,),
+            a,
+            b,
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert lowering_calls == 0
+    with pytest.raises(CompilationContextError) as terminal:
+        context.begin_stage(
+            CompilerStageId.LEGACY_CIN_ADAPTATION,
+            compile_options=options,
+        )
+    assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+def test_direct_result_contract_ignores_workspace_results(monkeypatch):
+    """One external result remains valid when a Where also writes a workspace."""
+
+    import scorch.ops as ops_module
+
+    class AcceptedWorkspaceResult(Exception):
+        pass
+
+    def stop_after_result_contract(*args, **kwargs):
+        raise AcceptedWorkspaceResult
+
+    monkeypatch.setattr(
+        ops_module,
+        "_relayout_mode_order_args",
+        stop_after_result_contract,
+    )
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    workspace = Workspace("wksp", dim=1, dense=True)
+    cin = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(
+                        workspace[j],
+                        CINBinaryOp(Operation.MUL, a[i, k], b[k, j]),
+                        op=Operation.ADD,
+                    ),
+                ),
+            ),
+            consumer=ForAll(j, TensorAssign(c[i, j], workspace[j])),
+        ),
+    )
+
+    with pytest.raises(AcceptedWorkspaceResult):
+        ops_module.lower_and_exec_cin(
+            cin,
+            (2, 4),
+            dense_stensor(torch.ones(2, 3), "A"),
+            dense_stensor(torch.ones(3, 4), "B"),
+        )
+
+
+def test_direct_runtime_late_format_mismatch_precedes_relayout_and_cin_mutation(
+    monkeypatch,
+):
+    """All operands validate before relayout or compiler-owned metadata writes."""
+
+    import scorch.ops as ops_module
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt="dd")
+    cin = ForAll(
+        j,
+        ForAll(
+            i,
+            TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j])),
+        ),
+    )
+    before = (tuple(a.mode_order), tuple(b.mode_order), tuple(c.mode_order))
+    monkeypatch.setattr(ops_module, "normalize_cin", lambda program, **kwargs: program)
+    relayout_calls = 0
+
+    def unexpected_relayout(*args, **kwargs):
+        nonlocal relayout_calls
+        relayout_calls += 1
+        raise AssertionError("format mismatch reached runtime relayout")
+
+    monkeypatch.setattr(
+        ops_module,
+        "_relayout_mode_order_args",
+        unexpected_relayout,
+    )
+    valid = dense_stensor(torch.ones(2, 3), "A")
+    late_mismatch = STensor.from_torch(
+        torch.ones(2, 3).to_sparse_csr(),
+        "B",
+    )
+
+    with pytest.raises(CompileSpecError, match="expects format"):
+        ops_module.lower_and_exec_cin(cin, (2, 3), valid, late_mismatch)
+
+    assert relayout_calls == 0
+    assert (tuple(a.mode_order), tuple(b.mode_order), tuple(c.mode_order)) == before
 
 
 def test_format_mismatch_is_rejected_before_mode_order_relayout(monkeypatch):
@@ -663,6 +1043,327 @@ def test_source_comparison_resolves_environment_options_once(monkeypatch):
     assert calls == 1
 
 
+@pytest.mark.parametrize("scheduled", (False, True))
+def test_pipeline_preflights_caller_cin_once(monkeypatch, scheduled):
+    """Private normalized roots reuse their proven structural boundary."""
+
+    import scorch.compiler.cin_analysis as cin_analysis_module
+    from scorch.compiler.scheduler import Schedule
+
+    original = cin_analysis_module._preflight_cin_structure
+    calls = 0
+
+    def counted(cin):
+        nonlocal calls
+        calls += 1
+        return original(cin)
+
+    monkeypatch.setattr(
+        cin_analysis_module,
+        "_preflight_cin_structure",
+        counted,
+    )
+    options = (
+        CompileOptions.from_environment(requested_schedule=Schedule())
+        if scheduled
+        else None
+    )
+
+    compile_cin_via_loopir(
+        build_elementwise(Operation.ADD),
+        (2, 3),
+        [((2, 3), torch.float32)] * 2,
+        compile_options=options,
+    )
+
+    assert calls == 1
+
+
+def test_source_comparison_ignores_nonsemantic_legacy_metadata():
+    """Comparison detaches through normalization, not an unsafe raw deepcopy."""
+
+    class HostileMetadata:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("nonsemantic metadata was copied")
+
+    cin = build_elementwise(Operation.ADD)
+    cin.no_tile_list = [HostileMetadata()]
+
+    comparison = compare_generated_sources(
+        cin,
+        (2, 3),
+        [((2, 3), torch.float32)] * 2,
+    )
+
+    assert comparison.identical
+
+
+def test_pipeline_fails_closed_on_unsupported_unary_expression():
+    """Unary CIN reaches the LoopIR boundary without visitor recursion."""
+
+    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(
+        i,
+        TensorAssign(result[i], UnaryOp(Operation.SUB, operand[i])),
+    )
+
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            program,
+            (3,),
+            [((3,), torch.float32)],
+        )
+
+    assert error.value.defect.code == "unsupported_expression"
+
+
+def test_pipeline_root_assignment_reaches_unsupported_statement_boundary():
+    """A root result access is not misclassified as a runtime input."""
+
+    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
+
+    scalar_format = TensorFormat()
+    operand = TensorVar("A", fmt=scalar_format)
+    result = TensorVar("C", fmt=scalar_format)
+
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            TensorAssign(result[()], operand[()]),
+            (),
+            [((), torch.float32)],
+        )
+
+    assert error.value.defect.code == "unsupported_statement"
+
+
+@pytest.mark.parametrize(
+    "safe_shape",
+    (
+        torch.Size((2, 3)),
+        range(2, 4),
+    ),
+)
+@pytest.mark.parametrize("entry", (compile_cin_via_loopir, legacy_generated_cpp))
+def test_source_entries_preserve_safe_sequence_shapes(entry, safe_shape):
+    """Exact torch.Size and range retain the public Sequence shape contract."""
+
+    source = entry(
+        build_elementwise(Operation.ADD),
+        safe_shape,
+        [(safe_shape, torch.float32)] * 2,
+    )
+
+    assert source
+
+
+@pytest.mark.parametrize(
+    "safe_shape",
+    (
+        torch.Size((2, 3)),
+        range(2, 4),
+    ),
+)
+def test_direct_execution_preserves_safe_sequence_result_shapes(
+    monkeypatch,
+    safe_shape,
+):
+    """The direct public helper accepts safe Sequence shapes before planning."""
+
+    import scorch.ops as ops_module
+
+    class AcceptedShape(Exception):
+        pass
+
+    def stop_after_runtime_boundary(*args, **kwargs):
+        raise AcceptedShape
+
+    monkeypatch.setattr(
+        ops_module,
+        "_plan_direct_cin_runtime_binding",
+        stop_after_runtime_boundary,
+    )
+    a = dense_stensor(torch.ones(2, 3), "A")
+    b = dense_stensor(torch.ones(2, 3), "B")
+
+    with pytest.raises(AcceptedShape):
+        ops_module.lower_and_exec_cin(
+            build_elementwise(Operation.ADD),
+            safe_shape,
+            a,
+            b,
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        range(0, 1 << 100),
+        tuple(1 for _ in range(65)),
+    ),
+)
+def test_direct_execution_rejects_unbounded_safe_sequence_rank(shape):
+    """Safe built-ins still fail in bounded time above the ABI rank limit."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    with pytest.raises(CompileSpecError, match="rank"):
+        lower_and_exec_cin(
+            build_elementwise(Operation.ADD),
+            shape,
+            dense_stensor(torch.ones(2, 3), "A"),
+            dense_stensor(torch.ones(2, 3), "B"),
+        )
+
+
+def test_runtime_metadata_late_format_mismatch_is_atomic():
+    """Compile-only format validation completes before any tensor metadata bind."""
+
+    from scorch.compiler.loopir.pipeline import _bind_runtime_metadata
+
+    cin = build_elementwise(Operation.ADD)
+    rhs = cin.get_rhs_tensor_vars()
+    results = cin.get_result_tensor_vars()
+    before = tuple(
+        (tensor.shape, tensor.dtype, tuple(tensor.mode_order))
+        for tensor in (*rhs, *results)
+    )
+
+    with pytest.raises(CompileSpecError, match="expects format"):
+        _bind_runtime_metadata(
+            cin,
+            [
+                (torch.Size((2, 3)), torch.float32),
+                (torch.Size((2, 3)), torch.float32),
+            ],
+            torch.Size((2, 3)),
+            (rhs[0].format, TensorFormat("ds")),
+        )
+
+    after = tuple(
+        (tensor.shape, tensor.dtype, tuple(tensor.mode_order))
+        for tensor in (*rhs, *results)
+    )
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "result_shape,input_bindings",
+    (
+        ((1 << 63,), (((1,), torch.float32),)),
+        ((1,), (((1 << 63,), torch.float32),)),
+        ((1,), (((1,), object()),)),
+        ((1,), (((1,),),)),
+    ),
+)
+@pytest.mark.parametrize("entry", (compile_cin_via_loopir, legacy_generated_cpp))
+def test_source_entries_validate_runtime_bindings_before_lowering(
+    entry,
+    result_shape,
+    input_bindings,
+):
+    """Both source routes own the same bounded shape/dtype contract."""
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(i, TensorAssign(result[i], operand[i]))
+
+    with pytest.raises(VerificationError):
+        entry(program, result_shape, input_bindings)
+
+
+@pytest.mark.parametrize("scheduled", (False, True))
+@pytest.mark.parametrize("list_subclass", (False, True))
+def test_legacy_source_rejects_hostile_result_shape_without_iteration(
+    scheduled,
+    list_subclass,
+):
+    """Legacy source generation reaches the shared exact-shape boundary."""
+
+    from scorch.compiler.scheduler import Schedule
+
+    reads = 0
+
+    class HostileShape:
+        def __iter__(self):
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile result-shape iteration")
+
+    class HostileList(list):
+        def __iter__(self):
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile result-shape list")
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(i, TensorAssign(result[i], operand[i]))
+    shape = HostileList([1]) if list_subclass else HostileShape()
+    options = CompileOptions.from_environment(
+        requested_schedule=Schedule() if scheduled else None
+    )
+
+    with pytest.raises(VerificationError):
+        legacy_generated_cpp(
+            program,
+            shape,
+            (((1,), torch.float32),),
+            compile_options=options,
+        )
+    assert reads == 0
+
+
+def test_legacy_execution_rejects_unrepresentable_runtime_shape_before_codegen():
+    """The production ABI never renders an out-of-range shape literal."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(i, TensorAssign(result[i], operand[i]))
+
+    with pytest.raises(ValueError, match="signed int64"):
+        lower_and_exec_cin(
+            program,
+            (1 << 63,),
+            dense_stensor(torch.ones(1), "A"),
+        )
+
+
+def test_legacy_execution_rejects_hostile_result_shape_without_iteration():
+    """The direct legacy execution entry never pre-consumes forged shapes."""
+
+    from scorch.ops import lower_and_exec_cin
+
+    reads = 0
+
+    class HostileList(list):
+        def __iter__(self):
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile direct result shape")
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(i, TensorAssign(result[i], operand[i]))
+
+    with pytest.raises(CompileSpecError):
+        lower_and_exec_cin(
+            program,
+            HostileList([1]),
+            dense_stensor(torch.ones(1), "A"),
+        )
+    assert reads == 0
+
+
 def test_shadow_routes_one_exact_options_snapshot(monkeypatch):
     import scorch.ops as ops_module
 
@@ -847,10 +1548,18 @@ def sparse_oracle_reference(kernel, dense_args, arg_formats, result_shape):
             inputs[symbol] = CsrMatrix.from_dense(listed)
         else:
             inputs[symbol] = listed
+    result_decl = next(
+        decl
+        for decl in lowering.program.tensors
+        if decl.symbol == lowering.result_symbol
+    )
+    logical_shape = [0] * len(result_decl.levels)
+    for physical_level, level in enumerate(result_decl.levels):
+        logical_shape[level.mode] = result_shape[physical_level]
     return run_program(
         lowering.program,
         inputs,
-        {lowering.result_symbol: tuple(result_shape)},
+        {lowering.result_symbol: tuple(logical_shape)},
     )
 
 
@@ -1249,8 +1958,11 @@ _LAYOUT_DIMS = {"i": 4, "j": 6, "k": 5, "l": 3}
 
 def _build_layout_cin(result_spec, operand_specs, nest, *, op, dtype):
     ivars = {name: IndexVar(name) for name in nest}
-    fmt_result, result_indices = result_spec
+    fmt_result, result_indices = result_spec[:2]
+    result_mode_order = result_spec[2] if len(result_spec) == 3 else None
     result = TensorVar("C", fmt=fmt_result, dtype=dtype)
+    if result_mode_order is not None:
+        result.mode_order = list(result_mode_order)
     rhs = None
     names = ["A", "B", "D", "E"]
     for position, (fmt, indices, mode_order) in enumerate(operand_specs):
@@ -1348,6 +2060,30 @@ _LAYOUT_FAMILIES = {
         torch.float32,
         None,
     ),
+    "permuted_result_matmul": (
+        ("dd", "ik", (1, 0)),
+        (("dd", "ij", (1, 0)), ("dd", "jk", None)),
+        "jki",
+        Operation.ADD,
+        torch.float32,
+        None,
+    ),
+    "permuted_result_rank3": (
+        ("ddd", "ijk", (1, 2, 0)),
+        (("ddd", "ijk", (1, 2, 0)),),
+        "jki",
+        None,
+        torch.float32,
+        None,
+    ),
+    "permuted_result_rank3_zero": (
+        ("ddd", "ijk", (1, 2, 0)),
+        (("ddd", "ijk", (1, 2, 0)),),
+        "jki",
+        None,
+        torch.float32,
+        {"i": 0},
+    ),
 }
 
 
@@ -1368,7 +2104,12 @@ def test_permuted_dense_layout_byte_parity(family, regblock_enabled):
         ),
         requested_schedule=Schedule(),
     )
-    result_shape = tuple(dims[x] for x in result_spec[1])
+    result_mode_order = result_spec[2] if len(result_spec) == 3 else None
+    result_shape = _layout_physical_shape(
+        result_spec[1],
+        result_mode_order,
+        dims,
+    )
     bindings = tuple(
         (_layout_physical_shape(indices, mode_order, dims), dtype)
         for _, indices, mode_order in operand_specs
@@ -1467,6 +2208,71 @@ def test_permuted_layout_execution_and_oracle_agree():
     )
     assert_close(result.to_torch(), a3_t * b3_t.permute(1, 2, 0))
 
+    # The public all-dense matmul frontend uses this temporary result layout:
+    # every tensor follows the common j,k,i storage order, while the returned
+    # tensor still exposes logical C[i,k].
+    a2_t = torch.rand(rows, reduction)
+    b2_t = torch.rand(reduction, free)
+    result, kernel = execute_cin_via_loopir(
+        _build_layout_cin(
+            ("dd", "ik", (1, 0)),
+            (("dd", "ij", (1, 0)), ("dd", "jk", None)),
+            "jki",
+            op=Operation.ADD,
+            dtype=torch.float32,
+        ),
+        (free, rows),
+        dense_stensor(a2_t, "A"),
+        dense_stensor(b2_t, "B"),
+    )
+    assert tuple(result.mode_order) == (1, 0)
+    assert result.shape == (free, rows)
+    assert_close(result.to_torch(), a2_t @ b2_t)
+    assert_close(
+        oracle_reference(kernel, (a2_t, b2_t), (free, rows)),
+        (a2_t @ b2_t).to(torch.float64),
+    )
+
+    a3_result_t = torch.rand(rows, reduction, free)
+    result, kernel = execute_cin_via_loopir(
+        _build_layout_cin(
+            ("ddd", "ijk", (1, 2, 0)),
+            (("ddd", "ijk", (1, 2, 0)),),
+            "jki",
+            op=None,
+            dtype=torch.float32,
+        ),
+        (reduction, free, rows),
+        dense_stensor(a3_result_t, "A"),
+    )
+    assert tuple(result.mode_order) == (1, 2, 0)
+    assert result.shape == (reduction, free, rows)
+    assert_close(result.to_torch(), a3_result_t)
+    assert_close(
+        oracle_reference(
+            kernel,
+            (a3_result_t,),
+            (reduction, free, rows),
+        ),
+        a3_result_t.to(torch.float64),
+    )
+
+    empty_result_t = torch.empty(0, reduction, free)
+    result, _ = execute_cin_via_loopir(
+        _build_layout_cin(
+            ("ddd", "ijk", (1, 2, 0)),
+            (("ddd", "ijk", (1, 2, 0)),),
+            "jki",
+            op=None,
+            dtype=torch.float32,
+        ),
+        (reduction, free, 0),
+        dense_stensor(empty_result_t, "A"),
+    )
+    assert tuple(result.mode_order) == (1, 2, 0)
+    assert result.shape == (reduction, free, 0)
+    assert_close(result.to_torch(), empty_result_t)
+
     a_dense = torch.rand(rows, reduction)
     b_dense = torch.rand(free, reduction)
     kernel = compile_cin_via_loopir(
@@ -1486,3 +2292,36 @@ def test_permuted_layout_execution_and_oracle_agree():
     )
     oracle_result = oracle_reference(kernel, (a_dense, b_dense), (rows, free))
     assert_close(oracle_result.to(torch.float32), a_dense @ b_dense.T)
+
+
+@torch.no_grad()
+def test_unscheduled_shadow_preserves_permuted_dense_result_layout():
+    """The advanced legacy entry wraps physical result storage logically."""
+
+    logical = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    carried = STensor.from_torch(
+        logical,
+        "A",
+        mode_order=[1, 0],
+    ).to_dense()
+    cin = _build_layout_cin(
+        ("dd", "ij", (1, 0)),
+        (("dd", "ij", (1, 0)),),
+        "ji",
+        op=None,
+        dtype=torch.float32,
+    )
+
+    loopir_result, legacy_result, comparison = execute_shadow(
+        cin,
+        (3, 2),
+        carried,
+    )
+
+    assert comparison.identical
+    assert tuple(loopir_result.mode_order) == (1, 0)
+    assert tuple(legacy_result.mode_order) == (1, 0)
+    assert loopir_result.shape == (3, 2)
+    assert legacy_result.shape == (3, 2)
+    assert torch.equal(loopir_result.to_torch(), logical)
+    assert torch.equal(legacy_result.to_torch(), logical)

@@ -24,6 +24,7 @@ from scorch.compiler.diagnostics import (
     CodegenError,
     CompilerInvariantError,
     UnsupportedFeature,
+    VerificationError,
 )
 from scorch.compiler.iterator import (  # type: ignore[import-untyped]
     ModeIterator,
@@ -577,6 +578,15 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
             KernelTensorABI(  # type: ignore[arg-type]
                 **{**valid_tensor, "level_types": levels}
             )
+    with pytest.raises(ValueError, match="kernel tensor rank must not exceed 64"):
+        KernelTensorABI(
+            **{
+                **valid_tensor,
+                "level_types": (LevelType.DENSE,) * 65,
+                "mode_order": tuple(range(65)),
+                "shape": (),
+            }
+        )
     for malformed_mode_order in ([1, 0], (True, 0), (1.0, 0)):
         with pytest.raises(TypeError, match="mode order"):
             KernelTensorABI(  # type: ignore[arg-type]
@@ -592,8 +602,14 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
         KernelTensorABI(**{**valid_tensor, "shape": (3,)})
     with pytest.raises(ValueError, match="extents must be non-negative"):
         KernelTensorABI(**{**valid_tensor, "shape": (3, -1)})
+    with pytest.raises(ValueError, match="extents must fit signed int64"):
+        KernelTensorABI(**{**valid_tensor, "shape": (3, 1 << 63)})
+    with pytest.raises(ValueError, match="element count must fit signed int64"):
+        KernelTensorABI(**{**valid_tensor, "shape": (1 << 62, 4)})
     with pytest.raises(TypeError, match="kernel tensor dtype"):
         KernelTensorABI(**{**valid_tensor, "dtype": "float32"})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unsupported kernel tensor dtype"):
+        KernelTensorABI(**{**valid_tensor, "dtype": torch.float16})
 
     tensor = KernelTensorABI(**valid_tensor)
     valid_kernel = {
@@ -617,10 +633,23 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
             TorchCppKernelABI(  # type: ignore[arg-type]
                 **{**valid_kernel, "result_rank": result_rank}
             )
+    for result_rank in (65, 1 << 63, 10**5000):
+        with pytest.raises(ValueError, match="kernel result rank must not exceed 64"):
+            TorchCppKernelABI(
+                **{
+                    **valid_kernel,
+                    "result_shape": (),
+                    "result_rank": result_rank,
+                }
+            )
     with pytest.raises(ValueError, match="shape must match the result rank"):
         TorchCppKernelABI(**{**valid_kernel, "result_shape": (3,)})
     with pytest.raises(ValueError, match="extents must be non-negative"):
         TorchCppKernelABI(**{**valid_kernel, "result_shape": (3, -1)})
+    with pytest.raises(ValueError, match="extents must fit signed int64"):
+        TorchCppKernelABI(**{**valid_kernel, "result_shape": (3, 1 << 63)})
+    with pytest.raises(ValueError, match="element count must fit signed int64"):
+        TorchCppKernelABI(**{**valid_kernel, "result_shape": (1 << 62, 4)})
     for input_tensors in ([tensor], (object(),)):
         with pytest.raises(TypeError, match="exact KernelTensorABI tuple"):
             TorchCppKernelABI(  # type: ignore[arg-type]
@@ -644,6 +673,12 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
         TorchCppKernelABI(**valid_kernel, extra_tensor_names=("bias",))
     with pytest.raises(TypeError, match="without extra tensors"):
         TorchCppKernelABI(**valid_kernel, extra_tensor_dtype=torch.float32)
+    with pytest.raises(ValueError, match="unsupported extra tensor dtype"):
+        TorchCppKernelABI(
+            **valid_kernel,
+            extra_tensor_names=("bias",),
+            extra_tensor_dtype=torch.float16,
+        )
     with pytest.raises(ValueError, match="argument names must be unique"):
         TorchCppKernelABI(**{**valid_kernel, "input_tensors": (tensor, tensor)})
     with pytest.raises(ValueError, match="argument names must be unique"):
@@ -1285,10 +1320,7 @@ def test_unknown_cin_node_fails_at_cin_lowering():
 
 
 def test_unknown_index_statement_fails_before_lowering_an_empty_kernel():
-    with pytest.raises(
-        CompilerInvariantError,
-        match=r"stage=CIN lowering: unknown IndexStmt node type 'UnknownIndexStmt'",
-    ):
+    with pytest.raises(VerificationError, match="invalid_cin_field"):
         CINLowerer().lower_IndexStmt(UnknownIndexStmt(lhs=None, rhs=None))
 
 
@@ -3510,16 +3542,87 @@ def test_compressed_value_allocation_rejects_extra_fields_and_subclasses() -> No
 
 
 def test_compressed_value_allocation_rejects_unsupported_result_dtype() -> None:
+    with pytest.raises(ValueError, match="unsupported result dtype"):
+        ResultTensorAssembler(
+            name="Result",
+            level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+            dtype=torch.bool,
+        )
+
+
+def test_result_assembler_rejects_unrepresentable_rank() -> None:
+    with pytest.raises(ValueError, match="result rank must not exceed 64"):
+        ResultTensorAssembler(
+            name="Result",
+            level_types=(LevelType.DENSE,) * 65,
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize(
+    "emitter_name",
+    (
+        "emit_value_array_init",
+        "emit_level_indices_init",
+        "emit_result_declaration",
+        "emit_storage_epilogue",
+        "emit_final_assembly",
+    ),
+)
+@pytest.mark.parametrize("forged_field", ("level_types", "dtype"))
+def test_result_assembler_general_emitters_revalidate_forged_state(
+    emitter_name: str,
+    forged_field: str,
+) -> None:
+    reads = 0
+
+    class HostileValue:
+        @property
+        def __class__(self):  # type: ignore[override]
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile assembler field")
+
+        def __iter__(self):
+            nonlocal reads
+            reads += 1
+            raise RuntimeError("hostile assembler iteration")
+
     assembler = ResultTensorAssembler(
         name="Result",
-        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
-        dtype=torch.bool,
+        level_types=(LevelType.DENSE,),
+        dtype=torch.float32,
     )
+    object.__setattr__(assembler, forged_field, HostileValue())
 
-    with pytest.raises(ValueError, match="supported result dtype"):
-        assembler.emit_compressed_value_allocation(
-            llir.Var("_total1", llir.DataType.INT64)
-        )
+    with pytest.raises(TypeError):
+        getattr(assembler, emitter_name)()
+    assert reads == 0
+
+
+@pytest.mark.parametrize(
+    "emitter_name",
+    (
+        "emit_value_array_init",
+        "emit_level_indices_init",
+        "emit_result_declaration",
+        "emit_storage_epilogue",
+        "emit_final_assembly",
+    ),
+)
+def test_result_assembler_general_emitters_reject_subclasses(
+    emitter_name: str,
+) -> None:
+    class ResultAssemblerSubclass(ResultTensorAssembler):
+        pass
+
+    assembler = ResultAssemblerSubclass(
+        name="Result",
+        level_types=(LevelType.DENSE,),
+        dtype=torch.float32,
+    )
+    with pytest.raises(TypeError, match="exact ResultTensorAssembler"):
+        getattr(assembler, emitter_name)()
 
 
 @pytest.mark.parametrize(

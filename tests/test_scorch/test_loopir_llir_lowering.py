@@ -373,11 +373,12 @@ def test_repeated_operand_loads_fail_at_target_boundary():
 
 
 def test_unsupported_mode_order_at_target_boundary():
-    """Permuted results and compressed structure stay target boundaries.
+    """Compressed structure stays a target mode-order boundary.
 
-    All-dense input permutations are level-mapped since the layout slice,
-    so the target check narrows to the two shapes it still refuses: a
-    permuted result declaration and permuted compressed structure.
+    All-dense input and result permutations are level-mapped.  Forging a
+    result permutation without rebuilding its loop order therefore reaches
+    the physical storage-order diagnostic, while compressed structure stays
+    outside the target's admitted layout surface.
     """
 
     fixture = build_matmul()
@@ -386,10 +387,10 @@ def test_unsupported_mode_order_at_target_boundary():
     forge(result_decl.levels[0], mode=1)
     forge(result_decl.levels[1], mode=0)
     expect_target_code(
-        "unsupported_mode_order",
+        "unsupported_loop_order",
         fixture.program,
         {fixture.a: (3, 5), fixture.b: (5, 4)},
-        (3, 4),
+        (4, 3),
     )
 
     # A forged compressed-structure permutation cannot even reach the
@@ -414,6 +415,41 @@ def test_unsupported_mode_order_at_target_boundary():
             result_shape=(3, 4),
         )
     assert error.value.defect.code == "domain_mismatch"
+
+
+def test_permuted_access_metadata_remains_in_logical_index_order():
+    """Physical flattening never rewrites stable logical access provenance."""
+
+    from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    source = TensorVar("A", fmt="ddd", mode_order=[1, 2, 0])
+    result = TensorVar("C", fmt="ddd", mode_order=[1, 2, 0])
+    source_access = source[i, j, k]
+    result_access = result[i, j, k]
+    cin = ForAll(
+        j,
+        ForAll(k, ForAll(i, TensorAssign(result_access, source_access))),
+    )
+    lowered = lower_normalized_cin_to_loopir(cin)
+    function = lower_loopir_to_llir(
+        lowered.program,
+        input_shapes={lowered.input_symbols[0]: (3, 4, 2)},
+        result_shape=(3, 4, 2),
+    )
+
+    metadata = {
+        node.tensor_access.role: node.tensor_access
+        for node in relayout_llir_nodes(function.body)
+        if type(node) is llir.ArrayAccess
+        and type(node.tensor_access) is llir.TensorAccessMetadata
+    }
+    assert metadata[llir.TensorAccessRole.INPUT_READ].index_ids == tuple(
+        source_access.index_ids
+    )
+    assert metadata[llir.TensorAccessRole.RESULT_WRITE].index_ids == tuple(
+        result_access.index_ids
+    )
 
 
 def test_invalid_shape_binding_coverage_and_rank():

@@ -8,11 +8,13 @@ import torch
 from scorch.compiler import llir
 import scorch.compiler.schedule_lowerer as schedule_lowerer_module  # type: ignore[import-untyped]
 from scorch.compiler.cin import (
+    BinaryOp,
     ForAll,
     IndexVar,
     Operation,
     TensorAssign,
     TensorVar,
+    UnaryOp,
     Where,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
@@ -2051,3 +2053,87 @@ def test_auto_schedule_boundaries_reject_malformed_structure(entry):
     with pytest.raises(VerificationError) as error:
         getattr(Scheduler, entry)(program)
     assert error.value.diagnostics[0].code == "cyclic_cin_structure"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_rejects_nonstatement_cin_before_copying(entry):
+    """Automatic scheduling accepts statements, never generic CIN metadata."""
+
+    i = IndexVar("i")
+    expression = TensorVar("A", fmt="d")[i]
+    for _ in range(300):
+        expression = BinaryOp(Operation.ADD, expression, TensorVar("B", fmt="d")[i])
+
+    class HostileMetadata:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("hostile ignored metadata")
+
+    object.__setattr__(expression, "no_tile_list", [HostileMetadata()])
+
+    with pytest.raises(TypeError, match=rf"{entry} expects an IndexStmt"):
+        getattr(Scheduler, entry)(expression)
+
+
+def test_cost_model_reads_permuted_extents_from_physical_levels():
+    """Logical loop extents are resolved through physical mode_order."""
+
+    k, j = IndexVar("k"), IndexVar("j")
+    operand = TensorVar(
+        "B",
+        shape=(11, 3),
+        fmt="dd",
+        mode_order=[1, 0],
+    )
+    access = operand[k, j]
+
+    assert (
+        Scheduler._estimate_index_extent(
+            k,
+            [access],
+            Scheduler._DEFAULT_COSTS,
+        )
+        == 3.0
+    )
+    assert (
+        Scheduler._estimate_index_extent(
+            j,
+            [access],
+            Scheduler._DEFAULT_COSTS,
+        )
+        == 11.0
+    )
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_rejects_malformed_mode_order_before_costing(entry):
+    """A missing logical mode cannot leak from the cost model's lookup."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    operand = TensorVar("A", fmt="dd")
+    operand.mode_order = [0, 0]
+    result = TensorVar("C", fmt="dd")
+    program = ForAll(i, ForAll(j, TensorAssign(result[i, j], operand[i, j])))
+
+    with pytest.raises(VerificationError) as error:
+        getattr(Scheduler, entry)(program)
+    assert error.value.diagnostics[0].code == "invalid_cin_field"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_traverses_unsupported_unary_expression(entry):
+    """Unsupported unary CIN remains traversable until target admission."""
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(
+        i,
+        TensorAssign(result[i], UnaryOp(Operation.SUB, operand[i])),
+    )
+
+    scheduled = getattr(Scheduler, entry)(program)
+
+    if entry == "auto_schedule_plan":
+        assert isinstance(scheduled, ScheduledCIN)
+    else:
+        assert isinstance(scheduled, ForAll)
