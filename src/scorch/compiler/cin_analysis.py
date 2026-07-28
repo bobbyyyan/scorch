@@ -326,6 +326,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
         Tuple[int, type],
         Tuple[object, Optional[int]],
     ] = {}
+    tensor_ranks: Dict[int, int] = {}
     pending_accesses: List[Tuple[TensorAccess, Tuple[str, ...]]] = []
     stack: List[Tuple[bool, object, Tuple[str, ...], int]] = [
         (False, cin, ("root",), 0)
@@ -1329,13 +1330,15 @@ def _preflight_cin_structure_impl(  # noqa: C901
                         "must agree",
                         path,
                     )
-                elif declared_rank > 0 and mode_order is None:
-                    diagnose(
-                        "invalid_cin_field",
-                        "rankful TensorVar.mode_order must declare its "
-                        "physical-to-logical permutation",
-                        path + ("mode_order",),
-                    )
+                else:
+                    tensor_ranks[id(node)] = declared_rank
+                    if declared_rank > 0 and mode_order is None:
+                        diagnose(
+                            "invalid_cin_field",
+                            "rankful TensorVar.mode_order must declare its "
+                            "physical-to-logical permutation",
+                            path + ("mode_order",),
+                        )
 
         for child, child_path in reversed(children):
             stack.append((False, child, child_path, depth + 1))
@@ -1591,6 +1594,13 @@ def _preflight_cin_structure_impl(  # noqa: C901
             continue
         if type(index_ids) is not tuple:
             continue
+        stored_rank = tensor_ranks.get(id(tensor))
+        if stored_rank is not None and len(indices) != stored_rank:
+            diagnose(
+                "tensor_access_rank_mismatch",
+                "TensorAccess index rank must match its tensor rank",
+                path + ("indices",),
+            )
         if len(index_ids) != len(indices):
             diagnose(
                 "index_reference_mismatch",
