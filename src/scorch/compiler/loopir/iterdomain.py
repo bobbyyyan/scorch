@@ -323,8 +323,15 @@ def analyze_iteration_domains(cin: IndexStmt, plan: LoopPlan) -> IterationDomain
     if type(plan) is not LoopPlan:
         raise TypeError("analyze_iteration_domains expects a LoopPlan")
     loop_ids: List[IndexId] = []
+    seen_nest_frames: set[int] = set()
     current: IndexStmt = cin
     while isinstance(current, ForAll):
+        if id(current) in seen_nest_frames:
+            _fail(
+                "unsupported_statement",
+                "the ForAll nest is cyclic",
+            )
+        seen_nest_frames.add(id(current))
         loop_ids.append(current.index_var.index_id)
         current = current.stmt
     if not isinstance(current, TensorAssign):

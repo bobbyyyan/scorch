@@ -202,3 +202,18 @@ def test_domain_table_is_immutable():
         table.domains = ()
     snapshot = copy.deepcopy(table)
     assert snapshot == table
+
+
+def test_analysis_rejects_cyclic_forall_nest():
+    """A self-referential ForAll previously looped without bound."""
+
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    nest = ForAll(i, TensorAssign(result[i], source[i], op=Operation.ADD))
+    nest.stmt = nest
+
+    with pytest.raises(IterationDomainError) as error:
+        analyze_iteration_domains(nest, LoopPlan(loop_order=()))
+
+    assert error.value.defect.code == "unsupported_statement"
