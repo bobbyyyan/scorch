@@ -208,6 +208,11 @@ class CINLowerer:
 
         self.seen_outermost_forall = False
         self.outermost_stmt: Optional[IndexStmt] = None
+        # Nonzero exactly while _lower_prepared_index_stmt is on the stack:
+        # distinguishes compiler-internal recursive re-entry (which may bypass
+        # the raw-entry boundary) from a stale reused instance or a hostile
+        # caller-supplied recurse flag (which must not).
+        self._active_lowerings: int = 0
         self.has_explicit_parallel_loop = False
         self.loop_plan: Optional[LoopPlan] = None
         self.normalized_cin: Optional[IndexStmt] = None
@@ -458,6 +463,27 @@ class CINLowerer:
         )
 
     def lower_IndexExpr(self, index_expr: IndexExpr) -> llir.Expr:
+        if self._active_lowerings == 0:
+            # A bare expression root has no statement boundary, so the
+            # structural preflight (cycles, depth, fields) never ran; the
+            # recursive expression walk below would leak RecursionError on a
+            # hostile graph.  Expression lowering is an internal traversal
+            # mode used only while a validated statement lowering is active.
+            diagnostic = CINDiagnostic(
+                code="invalid_expression_entry",
+                message=(
+                    "expression lowering is an internal traversal mode; "
+                    "lower a statement through the validated entry"
+                ),
+                path=("root",),
+                stage="legacy_cin_lowering",
+                pass_name="lower_IndexExpr",
+            )
+            raise VerificationError(
+                "stage=legacy CIN lowering: expression roots require an "
+                "active statement lowering",
+                diagnostics=(diagnostic,),
+            )
         expression_type = type(index_expr)
         if expression_type is BinaryOp:
             return self.lower_BinaryOp(cast(BinaryOp, index_expr))
@@ -2033,7 +2059,7 @@ class CINLowerer:
         if not scheduled_input and not _is_index_stmt_instance(stmt):
             raise TypeError("CIN lowering expects an IndexStmt or exact ScheduledCIN")
         plain_cin_input = not scheduled_input
-        if recurse or self.outermost_stmt is not None:
+        if recurse or self._active_lowerings > 0:
             if scheduled_input:
                 raise CompilerInvariantError(
                     "stage=CIN lowering: ScheduledCIN is valid only at the "
@@ -2177,8 +2203,27 @@ class CINLowerer:
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """Route one public or explicitly compiler-owned lowering entry."""
 
+        if recurse and self._active_lowerings == 0:
+            # ``recurse`` is an internal traversal mode used only while a
+            # lowering is already on the stack.  Honoring it at an outermost
+            # entry would skip the raw-entry structural boundary entirely.
+            diagnostic = CINDiagnostic(
+                code="invalid_recursive_entry",
+                message=(
+                    "recursive lowering is an internal traversal mode; "
+                    "outermost callers must use the validated entry"
+                ),
+                path=("root",),
+                stage="legacy_cin_lowering",
+                pass_name="prepare_stmt",
+            )
+            raise VerificationError(
+                "stage=legacy CIN lowering: recursive entry requires an "
+                "active lowering",
+                diagnostics=(diagnostic,),
+            )
         compilation_context = self._compilation_context
-        if compilation_context is None or recurse or self.outermost_stmt is not None:
+        if compilation_context is None or recurse or self._active_lowerings > 0:
             return self._lower_index_stmt_untimed(
                 stmt,
                 recurse,
@@ -2203,7 +2248,11 @@ class CINLowerer:
             compile_options=self.compile_options,
         )
         try:
-            lowered = self._lower_prepared_index_stmt(prepared_stmt, recurse)
+            self._active_lowerings += 1
+            try:
+                lowered = self._lower_prepared_index_stmt(prepared_stmt, recurse)
+            finally:
+                self._active_lowerings -= 1
         except Exception:
             compilation_context.fail_stage(lowering_token)
             raise
@@ -2222,7 +2271,11 @@ class CINLowerer:
             recurse,
             ownership_transferred=_ownership_transferred,
         )
-        lowered = self._lower_prepared_index_stmt(stmt, recurse)
+        self._active_lowerings += 1
+        try:
+            lowered = self._lower_prepared_index_stmt(stmt, recurse)
+        finally:
+            self._active_lowerings -= 1
         if apply_schedule_lowering:
             return self._apply_schedule_lowering(lowered, stmt)
         return lowered
@@ -2426,7 +2479,9 @@ class CINLowerer:
             tensor_level_types = tensor_var.get_level_types()
             mode_order = tensor_var.get_mode_order()
             for i, index_var in enumerate(index_vars):
-                index_var_level = mode_order[i]
+                # mode_order[physical] = logical: the physical level storing
+                # logical mode i is its position in the stored order.
+                index_var_level = mode_order.index(i)
                 if index_var not in self.index_var_to_rhs_tensor_level_type:
                     self.index_var_to_rhs_tensor_level_type[index_var] = []
                 self.index_var_to_rhs_tensor_level_type[index_var].append(
@@ -2442,7 +2497,7 @@ class CINLowerer:
             tensor_level_types = tensor_var.get_level_types()
             mode_order = tensor_var.get_mode_order()
             for i, index_var in enumerate(index_vars):
-                index_var_level = mode_order[i]
+                index_var_level = mode_order.index(i)
                 if index_var not in self.index_var_to_result_tensor_level_type:
                     self.index_var_to_result_tensor_level_type[index_var] = []
                 self.index_var_to_result_tensor_level_type[index_var].append(

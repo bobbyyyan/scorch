@@ -6967,3 +6967,124 @@ def test_atomic_counter_is_emitted_once_by_codegen_without_a_dead_decl() -> None
         ),
     )
     assert counter_raws == []
+
+
+def test_public_lowerer_rejects_outermost_recursive_entry() -> None:
+    """Caller-supplied ``recurse=True`` previously skipped the raw-entry
+    structural boundary entirely and leaked raw AttributeError."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    program = ForAll(i, TensorAssign(result[i], source[i], op=Operation.ADD))
+    program.index_var = object()  # type: ignore[assignment]
+
+    with pytest.raises(VerificationError) as error:
+        CINLowerer(compile_options=options).lower_IndexStmt(program, recurse=True)
+
+    codes = {diagnostic.code for diagnostic in error.value.diagnostics}
+    assert codes == {"invalid_recursive_entry"}
+
+
+def test_public_lowerer_rejects_outermost_expression_roots() -> None:
+    """A raw expression root has no statement boundary; a cyclic graph
+    previously recursed to RecursionError through lower_IndexExpr."""
+
+    from scorch.compiler.cin import BinaryOp
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    i = IndexVar("i")
+    access = TensorVar("A", fmt="d", shape=(4,))[i]
+    cyclic = BinaryOp(Operation.ADD, access, access)
+    object.__setattr__(cyclic, "left", cyclic)
+
+    for entry in ("lower_IndexExpr", "lower_CIN"):
+        with pytest.raises(VerificationError) as error:
+            getattr(CINLowerer(compile_options=options), entry)(cyclic)
+        codes = {diagnostic.code for diagnostic in error.value.diagnostics}
+        assert codes == {"invalid_expression_entry"}
+
+
+def test_stale_lowerer_reuse_takes_the_validated_boundary() -> None:
+    """A second outermost call on a used lowerer must not ride the internal
+    recursion bypass onto a malformed graph."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    i = IndexVar("i")
+    result = TensorVar("C", fmt="d", shape=(4,))
+    source = TensorVar("A", fmt="d", shape=(4,))
+    valid = ForAll(i, TensorAssign(result[i], source[i], op=Operation.ADD))
+    lowerer = CINLowerer(compile_options=options)
+    assert lowerer.lower_IndexStmt(valid)
+
+    j = IndexVar("j")
+    hostile = ForAll(
+        j,
+        TensorAssign(
+            TensorVar("D", fmt="d", shape=(4,))[j],
+            TensorVar("E", fmt="d", shape=(4,))[j],
+            op=Operation.ADD,
+        ),
+    )
+    hostile.index_var = object()  # type: ignore[assignment]
+
+    with pytest.raises(VerificationError) as error:
+        lowerer.lower_IndexStmt(hostile)
+
+    codes = {diagnostic.code for diagnostic in error.value.diagnostics}
+    assert "invalid_cin_field" in codes
+
+
+def test_permuted_dense_level_types_map_through_storage_order() -> None:
+    """index-var level metadata must use mode_order position lookup, not the
+    stored order as a logical-to-physical map (they differ at rank three)."""
+
+    from scorch.compiler.compile_options import CompileOptions
+
+    options = CompileOptions.from_environment(
+        environ={},
+        regblock_override=False,
+        verify_cin_override=False,
+    )
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    result = TensorVar("C", fmt="ddd", shape=(2, 3, 4))
+    source = TensorVar("A", fmt="ddd", shape=(2, 3, 4))
+    source.mode_order = [1, 2, 0]
+    program = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(result[i, j, k], source[i, j, k], op=Operation.ADD),
+            ),
+        ),
+    )
+    lowerer = CINLowerer(compile_options=options)
+    assert lowerer.lower_IndexStmt(program)
+
+    rhs_levels = {
+        index_var.name: entries[0][1]
+        for index_var, entries in lowerer.index_var_to_rhs_tensor_level_type.items()
+    }
+    # mode_order[physical] = logical = [1, 2, 0]: logical i (mode 0) is stored
+    # at physical level 2, j at 0, k at 1.
+    assert rhs_levels == {"i": 2, "j": 0, "k": 1}
