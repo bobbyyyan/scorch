@@ -28262,3 +28262,63 @@ limitations, and any legacy defect reproductions, push nothing, and
 finish as much of the broad coherent milestone as the evidence honestly
 supports.
 ```
+
+## Phase-6 §30-review corrections and the shared-object boundary (2026-07-28, supersedes the §30 prompt)
+
+The chronologically latest review is
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §31.  The §30 correction range
+was independently re-reviewed without trusting this handoff: the
+focused membership (720), the 86-case audit (46/40/0, byte-equal), all
+retained corpus/grid/anchor/heap/auto captures (byte-identical modulo
+the two documented cache-key characters), the randomized census (seeds
+1/2 byte-identical, fresh seeds 7/11 clean with every raw exception
+individually attributed to the documented broadcast-only legacy
+limitation), and the complete compiled battery (414) all reproduced at
+`3d2f42d`.
+
+Twenty fresh adversarial probes and three independent full-diff reviews
+then found five confirmed raw-escape classes beyond the §30 matrix, all
+now closed in four local commits:
+
+- `8f43cea` — shared CIN node objects (same-object diamonds, shared
+  statements, shared LHS/RHS accesses, exponential shared-DAG chains)
+  previously leaked raw ValueError/IndexError or lowered silently; the
+  structural preflight now diagnoses `duplicate_node_reference` for
+  every re-referenced node kind except the intrinsic symbol leaves,
+  with the exact legacy workspace producer/consumer pair classified by
+  a receipt post-pass.  Split-role tile indices must be their
+  TileSizeVar's exact endpoint (closes a raw KeyError/RecursionError
+  copier path), and aliased index twins must carry equivalent schedule
+  state (closes a divergent-twin merge).  Strict rejection sets for
+  workspace alias graphs now include `duplicate_node_reference`.
+- `9afe69b` — outermost `recurse=True`, reused-instance, and bare
+  expression-root entries no longer bypass the raw lowering boundary
+  (`invalid_recursive_entry` / `invalid_expression_entry`, active-
+  lowering counter); the two `mode_order` level-metadata sites use the
+  storage-position lookup with a rank-three regression lock.
+- `12a9267` — `analyze_iteration_domains` fails cyclic ForAll nests
+  closed instead of looping without bound.
+- `93530ce` — `Schedule` admits only exact `TileSpec`/`RelayoutSpec`.
+- `ef70023` — the twin-equivalence check is relaxed to admit exactly the
+  historical plain/tiled-logical pairing that regblock workspace
+  insertion produces (caught by the compile-options snapshot
+  memberships); divergent pairings involving tile components stay
+  rejected.
+
+All fixes are emission-neutral: every retained capture byte-identical
+(re-proven after `ef70023`), audit unchanged at 46/40/0, full-source
+mypy at exactly the 140-errors-in-11-files baseline.  A battery run at
+the pre-relaxation revision reported 413/414 with exactly the one
+twin-regression failure `ef70023` fixes, that test is green at
+`ef70023`, and the complete battery is re-proven at the session's final
+tip.  Evidence: `~/.cache/scorch-codex/phase6-b1-review-93530ce/`.  §31.4 records the
+verified-sound receipt/adapter findings and six honest limitations
+(bare-id receipt, in-window `str(post_ops)`, positional copier
+validation, legacy-scheduled stage scope, depth-vs-caller-stack, and
+the C3 provenance boundary reproduction).
+
+No schema version changed.  Phase 6 remains NO-GO on exactly the sparse
+result/workspace cluster; the §30 B1/B2 milestone definitions and the
+§29.5 four-node design remain the active plan.  B1 must preserve source
+provenance structurally in the typed plan (the raw adapter provably
+cannot recover it).  Work continues in this session toward B1.

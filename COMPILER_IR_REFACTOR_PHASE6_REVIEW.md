@@ -5020,3 +5020,179 @@ audit/capture/census manifest.
   GPU/CUDA, benchmark, packaging, scheduler, research, scratchpad, and
   tooling material remained untouched; nothing was pushed, amended,
   squashed, or reordered.
+
+## 31. Independent review of the §30 corrections and the shared-object boundary (2026-07-28)
+
+This section records the independent adversarial review of the fourteen
+§30 correction commits (`ce39b36..f13ba79` plus the `3d2f42d`
+documentation commit) demanded by the §30 routing prompt, and the four
+correction commits it produced.  The handoff was not trusted: every
+critical gate was reproduced from the retained scripts before any code
+was read, and the §30 boundaries were then challenged with fresh
+adversaries beyond the committed matrix.
+
+### 31.1 Gate reproduction at the inherited tip
+
+All reproductions ran at `3d2f42d` in the working tree with the `scorch`
+conda environment; evidence is retained under
+`~/.cache/scorch-codex/phase6-b1-review-93530ce/`.
+
+- focused review membership (six files: CIN analysis, CIN lowering,
+  schedule API, LoopPlan, plan identity, stage timing): **720 passed**
+  (the recorded 682 used a slightly narrower set definition; no
+  failures);
+- 86-case automatic audit via the retained
+  `audit/run_schedule_audit.py`: **46 admitted / 40 rejected / zero
+  divergent**, JSON equal to the retained `audit-1.json` after
+  normalizing only the embedded commit field;
+- source captures via the retained scripts: corpus **20/20**, grid
+  **42/42**, anchors **22/22**, heap **11/11** byte-identical; auto
+  **22/23** byte-identical with `report.json` differing in exactly the
+  two documented process-dependent cache-key suffix characters;
+- randomized cross-route census via the retained `census_sweep.py`:
+  seeds 1 and 2 byte-identical to the retained logs; fresh seeds 7 and
+  11 (60 cases each) report **zero parity mismatches**, and each fresh
+  `AssertionError` was individually confirmed to be the documented
+  public-unreachable broadcast-only result-axis legacy limitation
+  (`No lattice points generated`);
+- complete compiled scheduled-slice, pipeline-execution,
+  schedule-generality, and dual-path battery: **414 passed in
+  1,208.30 s**, matching the recorded gate.
+
+### 31.2 Fresh adversarial findings
+
+Twenty fresh probes (`probes/fresh_adversaries.py`, post-fix log SHA-256
+`98ef055575461f79d1deef44ab1fb2640c5c780522e9747381d56b855d67df17`) and
+three independent full-diff reviews of the correction commits produced
+five confirmed defect classes that §30 had not closed:
+
+1. **Shared-object raw escapes.**  A same-object `BinaryOp` diamond
+   passed every raw entry (the preflight deliberately admitted shared
+   completed objects, deferring `duplicate_node_reference` to the
+   debug-only ownership analysis) and leaked a raw `ValueError` from
+   kernel-ABI argument assembly; a shared `TensorAssign` leaked a raw
+   `IndexError`; a shared LHS/RHS access lowered silently; and a
+   2^60-path shared-DAG chain reached the unmemoized recursive
+   verifier/dump/lowering walks even though the preflight itself is
+   memoized and linear.
+2. **Unbound split-role tile aliases.**  A forged split-role `IndexVar`
+   carrying a real `TileSizeVar` but a foreign detached `_parent` passed
+   admission (nothing tied a split-role index to its own TileSizeVar
+   endpoint), and the forward copier then leaked raw `KeyError` on
+   missing stored fields or `RecursionError` through an unwalked parent
+   chain.
+3. **Divergent same-identity index twins.**  The legacy index-alias
+   admission compared only the `(NodeId, IndexId, name)` triple through
+   an access-path disjunct broader than the documented matching-suffix
+   contract, so a same-identity twin with divergent tile state could be
+   admitted and merged onto one canonical object whose merged state no
+   validator approved.
+4. **Raw lowering entry modes.**  Public
+   `lower_IndexStmt(..., recurse=True)` at an outermost call bypassed
+   the entire raw-entry boundary (raw `AttributeError`), a reused
+   lowerer instance rode the stale `outermost_stmt` bypass, and
+   `lower_IndexExpr`/`lower_CIN` accepted bare expression roots with no
+   structural preflight at all (raw `RecursionError` on a cyclic
+   expression).
+5. **Unbounded iteration-domain walk.**  `analyze_iteration_domains`
+   looped without bound on a self-referential `ForAll` before leaf
+   validation could reject it.
+
+Two further latent items were fixed alongside: the two index-var
+level-metadata sites in the legacy lowerer used the stored mode order as
+a logical-to-physical map (`mode_order[i]`) instead of the
+storage-position lookup (`mode_order.index(i)`) — invisible at rank two
+and for all-dense rank-three families, which is why every capture stayed
+byte-identical — and `Schedule` admitted `TileSpec`/`RelayoutSpec`
+subclasses whose caller-defined code would execute inside
+compiler-trusted scopes such as the scoped receipt window.
+
+### 31.3 The corrections
+
+Four commits close the complete set:
+
+- `8f43cea` — completed-object revisits now diagnose
+  `duplicate_node_reference` for every node kind except the
+  intrinsically shared symbol leaves (`IndexVar`, `TensorVar`,
+  `Workspace`); the one admissible shared occurrence node — the legacy
+  workspace producer-LHS/consumer-RHS access pair — is classified by a
+  receipt post-pass over recorded occurrence paths; the canonical-dump
+  compatibility fallback admits the new code so exact legacy receipts
+  still serialize; split-role indices must be the exact outer/inner
+  endpoint of their stored `TileSizeVar`; aliased index twins must carry
+  equivalent schedule state.  Strict rejection sets for
+  scheduler-owned workspace alias graphs now additionally report
+  `duplicate_node_reference`; the three existing exact-set assertions
+  were aligned.
+- `9afe69b` — an active-lowering counter recognizes internal recursive
+  re-entry; outermost `recurse=True` fails with
+  `invalid_recursive_entry`; outermost expression roots fail with
+  `invalid_expression_entry`; a reused lowerer takes the full validated
+  boundary; both `mode_order` sites use the storage-position lookup,
+  with a non-involutive rank-three regression test.
+- `12a9267` — the iteration-domain nest walk fails a cyclic `ForAll`
+  closed with `unsupported_statement`.
+- `93530ce` — `Schedule.tiles`/`Schedule.relayout` admission is
+  exact-type only.
+- `ef70023` — the schedule-state equivalence requirement was initially
+  stricter than the graphs legacy workspace insertion actually produces:
+  under regblock the consumer branch carries the tiled logical index
+  while the paired branch clone is plain, and the compile-options
+  snapshot memberships caught the release-reachable rejection (the
+  compiled battery did not, because production einsum hands the
+  scheduler result over synchronously without re-entering the raw
+  boundary).  Equivalence now admits exactly that plain/tiled-logical
+  pairing while continuing to reject every divergent pairing involving a
+  tile component; a companion test locks the legitimate regblock
+  workspace lowering.  The forged plain twin of a tile component is
+  structurally refused at the adapter display-name boundary, with the
+  equivalence check standing behind it as defense in depth.
+
+Emission neutrality was proven before committing: all corpus, grid,
+anchor, and heap captures byte-identical (re-proven after `ef70023`),
+the 86-case audit unchanged at 46/40/0, and the full-source mypy
+baseline exactly 140 errors in 11 files.  A compiled-battery run
+launched at the pre-relaxation revision reported 413/414 with exactly
+the one twin-regression failure `ef70023` fixes
+(`test_spmv_and_dense_matmul_empty_schedule_preserve_default_codegen`),
+and that test is green at `ef70023`; the complete battery is re-proven
+at this session's final tip as part of the B1/B2 gates.
+
+### 31.4 Verified-sound findings and recorded limitations
+
+The reviews confirmed sound: the scoped receipt lifecycle (set, consume,
+cleanup on success and on every injected failure path, CompilationContext
+retirement on shared-proof failure), the preservation of the three
+historical normalization records with the cancelled provisional token,
+the behavior-neutrality of the `f13ba79` extraction, the 42d484f
+presence checks for the shapes they admit, the canonical-dump fallback's
+no-masking property, the always-on access-rank reconciliation, and the
+complete dense-layout propagation table.
+
+Recorded honestly, not fixed (no demonstrated failure):
+
+- the trusted-root receipt stores bare `id()` values with no strong
+  reference or epoch; every current window holds the root in a live
+  local, so recycling is not reachable today (hardening suggestion:
+  a companion strong-reference scope);
+- the fallback kernel-cache key renders `str(post_ops)` inside the
+  receipt window; it runs strictly after the last trusted consumer and
+  the dual path requires `post_ops is None`;
+- `legacy_cin_working_copy`'s KeyError-safety is positional (it relies
+  on `_verify_legacy_cin_lowering_structure` having run at its one
+  production call site);
+- `_execute_legacy_scheduled` in the pipeline performs runtime binding
+  outside stage tokens, mitigated by its private discarded context;
+- a 256-deep admitted graph plus a deep caller stack can still surface
+  Python `RecursionError` from the recursive clone/serialize walks
+  (the preflight bounds depth, not the caller's stack budget);
+- the C3 provenance boundary reproduces exactly as §30.3 documents it:
+  fresh independently valid unmatched leaves are admitted by the raw
+  adapter and change the emitted program, so B1 must carry a structural
+  source receipt in the typed plan.
+
+No serialized contract changed: `scorch.loopir.canonical.v8`,
+`scorch.loopir.request.v2`, `scorch.loopplan.canonical.v1`, and
+`scorch.autopolicy.v1` remain current.  Phase 6 remains **NO-GO on
+exactly the sparse result/workspace cluster** (B1/B2), unchanged by this
+review.
