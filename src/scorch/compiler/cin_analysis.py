@@ -1387,11 +1387,13 @@ def _preflight_cin_structure_impl(  # noqa: C901
             or exact_identity_value(parent_state.get("index_id"), IndexId) is None
             or type(parent_state.get("_name")) is not str
             or parent_state.get("inserted_workspace") is not False
-            or parent_state.get("_parent") is not None
+            or "_parent" not in parent_state
+            or parent_state["_parent"] is not None
             or parent_state.get("is_tiled") is not True
             or parent_state.get("is_outer") is not False
             or parent_state.get("is_inner") is not False
-            or parent_state.get("tile_size_var") is not None
+            or "tile_size_var" not in parent_state
+            or parent_state["tile_size_var"] is not None
         ):
             return False
         parent_node_value = exact_identity_value(
