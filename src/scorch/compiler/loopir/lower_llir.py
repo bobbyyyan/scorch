@@ -4791,6 +4791,245 @@ class _SparseWorkspaceLowering(_TargetLowering):
         ]
 
 
+def _dense_domain_mixed_chain(program: LoopProgram) -> bool:
+    """Whether the program is the dense-domain mixed dense-leaf chain.
+
+    Routing is purely structural: a nest of single-statement dense loops
+    over one :class:`AppendEntry` leaf assembling a compressed-parent/
+    dense-suffix result.  Everything else stays on the general target
+    lowering and keeps its existing fail-closed boundaries.
+    """
+
+    if len(program.outputs) != 1:
+        return False
+    result_decl = next(
+        (decl for decl in program.tensors if decl.symbol == program.outputs[0]),
+        None,
+    )
+    if (
+        result_decl is None
+        or len(result_decl.levels) < 2
+        or result_decl.levels[0].kind is not LevelKind.COMPRESSED
+        or any(level.kind is not LevelKind.DENSE for level in result_decl.levels[1:])
+    ):
+        return False
+    body: Stmt = program.body
+    depth = 0
+    while type(body) is Block and len(body.statements) == 1:
+        only = body.statements[0]
+        if type(only) is DenseFor:
+            body = only.body
+            depth += 1
+            continue
+        return type(only) is AppendEntry and depth > 0
+    return False
+
+
+class _DenseDomainMixedLowering(_TargetLowering):
+    """Dedicated target lowering for the B2 mixed dense-leaf family.
+
+    Admits exactly the dense-domain assembly form ``lower_normalized_cin``
+    produces for compressed-parent/dense-suffix results: an all-dense
+    single-statement nest, one loop per result coordinate in identity
+    storage order, appending one value per innermost iteration.  The
+    parent coordinate materializes exactly when the dense suffix has
+    nonzero extent, matching the canonical level-storage contract for
+    zero-extent trailing dense levels; assembly appends the parent
+    coordinate once per materialized row and closes the root position
+    after the nest.
+
+    The retained legacy comparand for this family is memory-unsafe (it
+    writes an unsized values vector and never appends parent
+    coordinates), so there is deliberately no byte-parity gate: the
+    family is proven against the production LoopIR oracle and the
+    PyTorch dense reference, and the emission is correct-by-construction
+    in the established target style (``push_back``/``emplace_back``
+    call statements, ``scorch_vector_set`` position closes).
+    """
+
+    def __init__(
+        self,
+        program: LoopProgram,
+        input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+        result_shape: Tuple[int, ...],
+    ) -> None:
+        self.program = program
+        self.decls = {decl.symbol: decl for decl in program.tensors}
+        if len(program.outputs) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one output tensor",
+            )
+        self.result_symbol = program.outputs[0]
+        self.result_decl = self.decls[self.result_symbol]
+        self.result_is_dense = False
+        self.sparse_program = True
+        self.dimension_names = {}
+        self._access_ids = {}
+        self.region = None
+        self.panel = None
+        self.relayout = None
+        self.result_tile = None
+        self.result_tile_depth = -1
+        self.relayout_depth = -1
+        if program.parallel is not None:
+            _fail(
+                "unsupported_program_shape",
+                "the mixed dense-leaf family owns no parallel selection",
+            )
+        self.parallel = None
+        self._validate_display_names()
+        self.shapes = self._validate_shapes(input_shapes, result_shape)
+        self.loops = self._collect_mixed_chain()
+        self.loop_positions = {
+            loop.index: position for position, loop in enumerate(self.loops)
+        }
+        self.cursor_loops: Dict[CursorId, int] = {}
+        self.loads, self.cursor_values = self._collect_accesses()
+        self.level_drivers = self._compute_level_drivers()
+        self._validate_access_orders()
+
+    def _collect_mixed_chain(self) -> List[_Loop]:
+        def require(condition: bool, what: str) -> None:
+            if not condition:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the mixed dense-leaf target requires {what}",
+                )
+
+        result_levels = self.result_decl.levels
+        require(
+            len(result_levels) >= 2
+            and result_levels[0].kind is LevelKind.COMPRESSED
+            and all(level.kind is LevelKind.DENSE for level in result_levels[1:])
+            and tuple(level.mode for level in result_levels)
+            == tuple(range(len(result_levels))),
+            "an identity-ordered compressed-parent/dense-suffix result",
+        )
+        for symbol in self.program.inputs:
+            require(
+                all(
+                    level.kind is LevelKind.DENSE for level in self.decls[symbol].levels
+                ),
+                "all-dense inputs (mixed dense-leaf operands are a distinct " "gap)",
+            )
+        loops: List[_Loop] = []
+        body: Stmt = self.program.body
+        while True:
+            require(
+                type(body) is Block and len(cast(Block, body).statements) == 1,
+                "a single-statement dense loop nest",
+            )
+            only = cast(Block, body).statements[0]
+            if type(only) is DenseFor:
+                loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
+                body = only.body
+                continue
+            require(type(only) is AppendEntry, "an ordered append leaf")
+            append = cast(AppendEntry, only)
+            break
+        require(
+            len(loops) == len(result_levels),
+            "one dense loop per result coordinate",
+        )
+        require(
+            append.tensor == self.result_symbol
+            and len(append.coords) == len(result_levels)
+            and all(type(coord) is IndexValue for coord in append.coords)
+            and tuple(cast(IndexValue, coord).index for coord in append.coords)
+            == tuple(loop.index for loop in loops),
+            "appends of exactly the nest coordinates in order",
+        )
+        self.leaf = append
+        return loops
+
+    def _suffix_guard(self) -> llir.Expr:
+        """``C1_size > 0 [&& ...]`` over every trailing dense level."""
+
+        result_name = self.result_decl.name
+        guards: List[llir.Expr] = [
+            llir.BinOp(
+                op=">",
+                left=llir.Var(
+                    name=f"{result_name}{level}_size",
+                    type=llir.DataType.INT64,
+                ),
+                right=llir.Literal(0, llir.DataType.INT),
+            )
+            for level in range(1, len(self.result_decl.levels))
+        ]
+        guard = guards[0]
+        for clause in guards[1:]:
+            guard = llir.BinOp(op="&&", left=guard, right=clause)
+        return guard
+
+    def _lower_mixed_dense(self, position: int) -> llir.ForLoop:
+        loop = self.loops[position]
+        name = self._loop_var_name(loop)
+        body: List[llir.Stmt] = []
+        input_resolves = self._input_resolves_at(loop)
+        if input_resolves:
+            body.append(llir.Comment("Resolve dense coordinates"))
+            body.extend(input_resolves)
+        if position == 0:
+            body.append(llir.Comment("Assembly compressed _level indices"))
+            body.append(
+                llir.IfThenElse(
+                    cond=self._suffix_guard(),
+                    then_body=[
+                        llir.FunctionCallStmt(
+                            name=f"{self.result_decl.name}0_crd.push_back",
+                            args=[llir.Var(name=name, type=llir.DataType.INT64)],
+                        ),
+                    ],
+                )
+            )
+        if position + 1 < len(self.loops):
+            body.append(llir.BlankLine())
+            body.append(self._lower_mixed_dense(position + 1))
+        else:
+            body.append(
+                llir.FunctionCallStmt(
+                    name=f"{self.result_decl.name}_values.emplace_back",
+                    args=[self._lower_value(cast(AppendEntry, self.leaf).value)],
+                )
+            )
+        loop_var = llir.Var(name=name, type=llir.DataType.INT64)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(op="<", left=loop_var, right=self._loop_bound_var(loop)),
+            update=llir.Increment(var=loop_var),
+            body=body,
+        )
+        for_loop.scorch_index_var = name
+        return for_loop
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        result_name = self.result_decl.name
+        return [
+            llir.BlankLine(),
+            self._lower_mixed_dense(0),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}0_pos",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=llir.Add(
+                        llir.Var(
+                            name=f"{result_name}0_pos_index",
+                            type=llir.DataType.INT64,
+                        ),
+                        llir.Literal(1),
+                    ),
+                ),
+                value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+            ),
+        ]
+
+
 _RELAYOUT_LOST = "relayout_completion_lost"
 _RESULT_TILE_LOST = "result_tile_completion_lost"
 _PARALLEL_LOST = "parallel_completion_lost"
@@ -6917,6 +7156,8 @@ def _lower_loopir_to_llir_owned(
     lowering: _TargetLowering
     if _sparse_workspace_chain(program):
         lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
+    elif _dense_domain_mixed_chain(program):
+        lowering = _DenseDomainMixedLowering(program, input_shapes, result_shape)
     else:
         lowering = _TargetLowering(program, input_shapes, result_shape)
     raw_statements = lowering.raw_loop_statements()

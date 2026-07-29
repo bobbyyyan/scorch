@@ -700,3 +700,365 @@ def test_canonical_dump_stability_across_arms():
         assert kernel.schedule is not None
         dumps.add(canonical_program_dump(kernel.schedule.program))
     assert len(dumps) == 1
+
+
+# -- B2: the mixed compressed-parent/dense-leaf assembly family --------------
+
+
+def build_mixed_leaf_cin(rank3=False, dtype=torch.float32, binary=False):
+    """Dense-domain elementwise CIN assembling an ``sd``/``sdd`` result."""
+
+    if rank3:
+        i, j, m = IndexVar("i"), IndexVar("j"), IndexVar("m")
+        result = TensorVar("C", fmt="sdd", dtype=dtype)
+        source = TensorVar("A", fmt="ddd", dtype=dtype)
+        return ForAll(
+            i,
+            ForAll(j, ForAll(m, TensorAssign(result[i, j, m], source[i, j, m]))),
+        )
+    i, j = IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="sd", dtype=dtype)
+    source = TensorVar("A", fmt="dd", dtype=dtype)
+    if binary:
+        other = TensorVar("B", fmt="dd", dtype=dtype)
+        value = CINBinaryOp(Operation.ADD, source[i, j], other[i, j])
+        return ForAll(i, ForAll(j, TensorAssign(result[i, j], value)))
+    return ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
+
+
+def validated_mixed_storage(result, shape):
+    """Assert honest compressed-parent/dense-suffix storage; return pieces."""
+
+    rank = len(shape)
+    assert str(result.index.format) == ",".join(["s"] + ["d"] * (rank - 1))
+    assert tuple(result.index.mode_order) == tuple(range(rank))
+    mode_indices = result.index.mode_indices
+    assert len(mode_indices) == rank
+    assert len(mode_indices[0]) == 2
+    assert all(len(level_pair) == 0 for level_pair in mode_indices[1:])
+    pos0 = mode_indices[0][0].tolist()
+    crd0 = mode_indices[0][1].tolist()
+    values = result.values.tolist()
+    suffix = 1
+    for extent in shape[1:]:
+        suffix *= extent
+    assert pos0 == [0, len(crd0)]
+    assert crd0 == sorted(set(crd0))
+    assert all(0 <= row < shape[0] for row in crd0)
+    assert len(values) == len(crd0) * suffix
+    return pos0, crd0, values
+
+
+def mixed_oracle(kernel, dense_inputs, result_shape):
+    lowering = kernel.lowering
+    inputs = {
+        symbol: dense.tolist()
+        for symbol, dense in zip(lowering.rhs_access_symbols, dense_inputs)
+    }
+    outputs = run_program(
+        lowering.program, inputs, {lowering.result_symbol: tuple(result_shape)}
+    )
+    return outputs[lowering.result_symbol]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("rank3", [False, True])
+def test_mixed_leaf_execution_matches_oracle_and_pytorch(rank3, dtype):
+    torch.manual_seed(20260730)
+    shape = (2, 3, 4) if rank3 else (4, 5)
+    dense = torch.randn(shape, dtype=dtype)
+    dense[0] = 0.0  # explicit zero-valued cells stay materialized (dense leaf)
+    result, kernel = execute_cin_via_loopir(
+        build_mixed_leaf_cin(rank3, dtype),
+        shape,
+        STensor.from_torch(dense.clone(), "A").to_dense(),
+        compile_options=auto_options(False, jit=True),
+    )
+    pos0, crd0, values = validated_mixed_storage(result, shape)
+    assert crd0 == list(range(shape[0]))
+    assert torch.allclose(
+        torch.tensor(values, dtype=dtype).reshape(shape),
+        dense,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    oracle = mixed_oracle(kernel, (dense,), shape)
+    assert tuple(pos0) == oracle.positions[0]
+    assert tuple(crd0) == oracle.coordinates[0]
+    assert len(values) == len(oracle.values)
+    for got, expected in zip(values, oracle.values):
+        assert got == pytest.approx(expected, abs=1e-6, rel=1e-6)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_mixed_leaf_binary_elementwise_matches_references(regblock_enabled):
+    torch.manual_seed(20260731)
+    dense_a = torch.randn(4, 5)
+    dense_b = torch.randn(4, 5)
+    result, kernel = execute_cin_via_loopir(
+        build_mixed_leaf_cin(binary=True),
+        (4, 5),
+        STensor.from_torch(dense_a.clone(), "A").to_dense(),
+        STensor.from_torch(dense_b.clone(), "B").to_dense(),
+        compile_options=auto_options(regblock_enabled, jit=True),
+    )
+    _, crd0, values = validated_mixed_storage(result, (4, 5))
+    assert crd0 == list(range(4))
+    assert torch.allclose(
+        torch.tensor(values).reshape(4, 5),
+        dense_a + dense_b,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    oracle = mixed_oracle(kernel, (dense_a, dense_b), (4, 5))
+    assert tuple(crd0) == oracle.coordinates[0]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("rank3", "shape"),
+    [(False, (3, 0)), (False, (0, 5)), (True, (2, 3, 0))],
+)
+def test_mixed_leaf_zero_extent_cells_are_canonically_empty(rank3, shape):
+    dense = torch.zeros(shape)
+    result, kernel = execute_cin_via_loopir(
+        build_mixed_leaf_cin(rank3),
+        shape,
+        STensor.from_torch(dense.clone(), "A").to_dense(),
+        compile_options=auto_options(False, jit=True),
+    )
+    pos0, crd0, values = validated_mixed_storage(result, shape)
+    suffix = 1
+    for extent in shape[1:]:
+        suffix *= extent
+    if suffix == 0 or shape[0] == 0:
+        assert pos0 == [0, 0] and crd0 == [] and values == []
+    oracle = mixed_oracle(kernel, (dense,), shape)
+    assert tuple(pos0) == oracle.positions[0]
+    assert tuple(crd0) == oracle.coordinates[0]
+
+
+def test_mixed_leaf_source_is_route_stable_and_erases_to_base():
+    sources = set()
+    dumps = set()
+    for regblock_enabled in (False, True, None):
+        options = (
+            CompileOptions.from_environment(environ={})
+            if regblock_enabled is None
+            else auto_options(regblock_enabled)
+        )
+        kernel = compile_cin_via_loopir(
+            build_mixed_leaf_cin(),
+            (4, 5),
+            (((4, 5), torch.float32),),
+            compile_options=options,
+        )
+        sources.add(kernel.cpp_source)
+        if kernel.schedule is not None:
+            from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+            verify_scheduled_loopir(kernel.schedule)
+            assert canonical_program_dump(
+                erase_schedule(kernel.schedule.program)
+            ) == canonical_program_dump(kernel.schedule.base_program)
+            dumps.add(canonical_program_dump(kernel.schedule.program))
+    assert len(sources) == 1
+    assert len(dumps) <= 1
+    replay = compile_cin_via_loopir(
+        build_mixed_leaf_cin(),
+        (4, 5),
+        (((4, 5), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    assert replay.cpp_source in sources
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
+    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    reduction = ForAll(
+        k,
+        ForAll(
+            i,
+            ForAll(
+                j,
+                TensorAssign(
+                    TensorVar("C", fmt="sd")[k, j],
+                    TensorVar("A", fmt="ddd")[k, i, j],
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            reduction,
+            (6, 5),
+            (((6, 4, 5), torch.float32),),
+            compile_options=auto_options(regblock_enabled),
+        )
+    assert error.value.defect.code == "unsupported_sparse_output_reduction"
+
+    i2, j2 = IndexVar("i"), IndexVar("j")
+    sd_operand = ForAll(
+        i2,
+        ForAll(
+            j2,
+            TensorAssign(
+                TensorVar("C", fmt="dd")[i2, j2],
+                TensorVar("A", fmt="sd")[i2, j2],
+            ),
+        ),
+    )
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            sd_operand,
+            (4, 5),
+            (((4, 5), torch.float32),),
+            compile_options=auto_options(regblock_enabled),
+        )
+    assert error.value.defect.code == "unsupported_format"
+
+    i3, j3 = IndexVar("i"), IndexVar("j")
+    sparse_domain = ForAll(
+        i3,
+        ForAll(
+            j3,
+            TensorAssign(
+                TensorVar("C", fmt="sd")[i3, j3],
+                TensorVar("A", fmt="ss")[i3, j3],
+            ),
+        ),
+    )
+    with pytest.raises(LoopIRLoweringError) as error:
+        compile_cin_via_loopir(
+            sparse_domain,
+            (4, 5),
+            (((4, 5), torch.float32),),
+            compile_options=auto_options(regblock_enabled),
+        )
+    assert error.value.defect.code == "unsupported_sparse_output_domain"
+
+
+def test_mixed_leaf_legacy_comparand_is_failure_evidence_only():
+    """The defective legacy source is retained evidence, never an oracle.
+
+    The legacy pipeline still generates a kernel for this family whose
+    assembly is inconsistent: every dense-leaf value is appended, but the
+    compressed parent's coordinates are never assembled, so the returned
+    storage would carry values with no owning rows.  This locks the
+    defect's shape as evidence and the intentional absence of any byte
+    or execution parity gate for the B2 family.
+    """
+
+    legacy_cpp = legacy_generated_cpp(
+        build_mixed_leaf_cin(),
+        (4, 5),
+        (((4, 5), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    assert "C_values.emplace_back" in legacy_cpp
+    assert "C0_crd.push_back" not in legacy_cpp
+    assert "C0_crd.emplace_back" not in legacy_cpp
+
+    loopir_kernel = compile_cin_via_loopir(
+        build_mixed_leaf_cin(),
+        (4, 5),
+        (((4, 5), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    assert "C0_crd.push_back(i);" in loopir_kernel.cpp_source
+    assert loopir_kernel.cpp_source != legacy_cpp
+
+
+def build_mixed_leaf_program(forge=None):
+    """Hand-build the exact mixed dense-leaf chain for target adversaries."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    symbol_a = builder.new_symbol_id()
+    symbol_c = builder.new_symbol_id()
+    decl_a = builder.tensor(
+        symbol_a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (builder.level(LevelKind.DENSE, 0), builder.level(LevelKind.DENSE, 1)),
+    )
+    decl_c = builder.tensor(
+        symbol_c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.DENSE, 1),
+        ),
+    )
+    index_i = builder.new_index_id()
+    index_j = builder.new_index_id()
+    coords = (builder.index_value(index_i), builder.index_value(index_j))
+    if forge == "swapped_coords":
+        coords = (coords[1], coords[0])
+    append = builder.append_entry(
+        symbol_c,
+        coords,
+        builder.load(
+            symbol_a,
+            (builder.index_value(index_i), builder.index_value(index_j)),
+        ),
+    )
+    inner_statements = (append,)
+    inner = builder.dense_for(index_j, dim_j.dimension, builder.block(inner_statements))
+    outer = builder.dense_for(index_i, dim_i.dimension, builder.block((inner,)))
+    return (
+        builder.program(
+            (dim_i, dim_j),
+            (decl_a, decl_c),
+            (symbol_a,),
+            (symbol_c,),
+            builder.block((outer,)),
+        ),
+        symbol_a,
+    )
+
+
+def test_mixed_leaf_hand_built_program_matches_pipeline_source():
+    program, symbol_a = build_mixed_leaf_program()
+    function = lower_loopir_to_llir(
+        program,
+        input_shapes={symbol_a: (4, 5)},
+        result_shape=(4, 5),
+        compile_options=CompileOptions.from_environment(environ={}),
+    )
+    from scorch.ops import _lower_generated_llir
+
+    options = CompileOptions.from_environment(environ={})
+    cpp = _lower_generated_llir(function, options, CompilationContext(options))
+    kernel = compile_cin_via_loopir(
+        build_mixed_leaf_cin(),
+        (4, 5),
+        (((4, 5), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    assert cpp == kernel.cpp_source
+
+
+def test_mixed_leaf_swapped_append_coordinates_fail_closed():
+    program, symbol_a = build_mixed_leaf_program(forge="swapped_coords")
+    with pytest.raises(Exception) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes={symbol_a: (4, 5)},
+            result_shape=(4, 5),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    code = getattr(getattr(error.value, "defect", None), "code", None)
+    # The verifier owns this boundary: a swapped append coordinate is a
+    # coordinate-domain violation before target routing can even run.
+    assert code in ("unsupported_program_shape", "domain_mismatch")

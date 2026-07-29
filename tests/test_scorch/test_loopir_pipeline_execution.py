@@ -869,7 +869,7 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             None,
         ),
         (
-            "mixed_level_dense_axis_elementwise",
+            "mixed_level_operand_load_chain",
             ("sd", "ij", (("dd", "ij"),), "ij"),
             None,
         ),
@@ -880,13 +880,13 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
 ):
     """The sparse-result/workspace boundary is exact in both policy arms.
 
-    Two representation seams remain open after the reduce-out migration.
-    Mixed-level results whose trailing workspace axis is dense record a
-    dense-workspace F2/F4 plan but the compressed-parent/dense-leaf result
-    itself is rejected at ``unsupported_format`` (its legacy comparand
-    generates C++ that writes an unsized values vector and never appends
-    row coordinates, and its execution fails at result wrapping, so no
-    byte-parity gate can be widened there).  True sparse ``coo_workspace``
+    The B2 mixed dense-leaf assembly family now compiles (its battery is
+    ``test_loopir_sparse_workspace_target.py``), but its two adjacent seams
+    stay fail-closed at precise codes: reducing into a compressed-parent/
+    dense-leaf result carries the dense-workspace F2/F4 plan whose mixed
+    twin is not migrated (``unsupported_sparse_output_reduction``), and a
+    mixed dense-leaf OPERAND needs the undeclared physical position-load
+    chain (``unsupported_format``).  True sparse ``coo_workspace``
     families — row-scope SpMSpM, reduction-to-CSR, merged sparse
     reductions, and sparse-output roots — fail closed at their own stable
     codes, including the early ``unsupported_sparse_output`` boundary this
@@ -911,11 +911,11 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         )
         bindings = (((6, 4, 5), torch.float32),)
         out_shape = (6, 5)
-        expected = "unsupported_format"
-    elif family == "mixed_level_dense_axis_elementwise":
+        expected = "unsupported_sparse_output_reduction"
+    elif family == "mixed_level_operand_load_chain":
         i, j = IndexVar("i"), IndexVar("j")
-        result = TensorVar("C", fmt="sd")
-        source = TensorVar("A", fmt="dd")
+        result = TensorVar("C", fmt="dd")
+        source = TensorVar("A", fmt="sd")
         cin = ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
         bindings = (((4, 5), torch.float32),)
         out_shape = (4, 5)

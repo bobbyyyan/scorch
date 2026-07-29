@@ -184,6 +184,8 @@ _LEVEL_TYPE_TO_KIND: Dict[LevelType, LevelKind] = {
 
 def _check_tensor(
     tensor: TensorVar,
+    *,
+    result: bool = False,
 ) -> Tuple[ScalarType, Tuple[LevelType, ...], Tuple[int, ...]]:
     if isinstance(tensor, cin_nodes.Workspace):
         _fail(
@@ -206,7 +208,12 @@ def _check_tensor(
     if (
         any(level_type is LevelType.COMPRESSED for level_type in level_types)
         and level_types[-1] is not LevelType.COMPRESSED
+        and not result
     ):
+        # Mixed dense-leaf RESULTS are the level-based B2 assembly family
+        # (classified structurally below); mixed dense-leaf INPUTS would
+        # need physical position loads, which stay undeclared in this
+        # subset — the ``sd``-operand load chain is a distinct gap.
         _fail(
             "unsupported_format",
             f"tensor {tensor.name!r} stores a dense value-bearing leaf below "
@@ -409,8 +416,17 @@ def lower_normalized_cin_to_loopir(
             )
         reduce_update = True
 
+    # The result-only mixed dense-leaf admission never applies to a symbol
+    # that is also read: a right-hand-side occurrence is an operand role.
+    result_is_read = any(
+        access.tensor.symbol_id == result_symbol for access in rhs_accesses
+    )
     checked_tensors = {
-        access.tensor.symbol_id: _check_tensor(access.tensor) for access in all_accesses
+        access.tensor.symbol_id: _check_tensor(
+            access.tensor,
+            result=(access.tensor.symbol_id == result_symbol and not result_is_read),
+        )
+        for access in all_accesses
     }
     scalar_types = {
         symbol: scalar for symbol, (scalar, _, _) in checked_tensors.items()
@@ -566,13 +582,40 @@ def _classify_sparse_output_family(
         and reduce_update
         and result_levels == (LevelType.COMPRESSED, LevelType.COMPRESSED)
     )
+    mixed_leaf_family = (
+        len(result_levels) >= 2
+        and result_levels[0] is LevelType.COMPRESSED
+        and all(level_type is LevelType.DENSE for level_type in result_levels[1:])
+    )
     if result_sparse and not sparse_reduction_family:
+        if mixed_leaf_family:
+            # The B2 compressed-parent/dense-leaf assembly family: a dense
+            # iteration domain appends one complete dense-suffix block per
+            # materialized parent coordinate.  Its defective legacy
+            # comparand is memory-unsafe, so this family is gated on the
+            # LoopIR oracle and PyTorch differentials, never legacy parity.
+            if reduce_update:
+                _fail(
+                    "unsupported_sparse_output_reduction",
+                    "a compressed-parent/dense-leaf output cannot carry the "
+                    "ADD update operator in the migrated families",
+                )
+            for index_id in lhs_index_ids:
+                if domains[index_id].kind is not DomainKind.DENSE:
+                    _fail(
+                        "unsupported_sparse_output_domain",
+                        "compressed-parent/dense-leaf assembly requires "
+                        "every result coordinate to iterate a dense domain "
+                        "in the migrated families",
+                    )
+            return False
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
             _fail(
                 "unsupported_sparse_output",
                 f"result {lhs.tensor.name!r} declares a sparse layout other "
-                "than canonical CSR; ordered assembly is defined for "
-                "canonical CSR only in the migrated families",
+                "than canonical CSR or compressed-parent/dense-leaf; ordered "
+                "assembly is defined for those layouts only in the migrated "
+                "families",
             )
         if reduce_update:
             _fail(
