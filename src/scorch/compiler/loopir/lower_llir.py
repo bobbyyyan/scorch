@@ -54,7 +54,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Mapping, NoReturn, Optional, Set, Tuple, cast
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NoReturn,
+    Optional,
+    Set,
+    Tuple,
+    cast,
+)
 
 import torch
 
@@ -204,6 +214,27 @@ _TARGET_RESERVED_NAMES = frozenset(
         "torch",
     }
 )
+
+
+def _safe_cpp_display_identifier(name: object) -> bool:
+    """Whether a user-owned name stays outside C++ reserved namespaces.
+
+    Target lowering derives more identifiers by adding underscore-prefixed
+    suffixes and, for pointer views, a leading underscore.  Rejecting an
+    underscore at either edge, as well as any embedded double underscore,
+    prevents an otherwise innocent display name from manufacturing an
+    implementation-reserved identifier.
+    """
+
+    return (
+        type(name) is str
+        and _CPP_IDENTIFIER.fullmatch(name) is not None
+        and name not in _CPP_KEYWORDS
+        and "__" not in name
+        and not name.startswith("_")
+        and not name.endswith("_")
+    )
+
 
 _DENSE = "dense"
 _SPARSE = "sparse"
@@ -355,10 +386,7 @@ class _TargetLowering:
     def _validate_display_names(self) -> None:
         display_names: Dict[str, str] = {}
         for dimension_decl in self.program.dimensions:
-            if (
-                _CPP_IDENTIFIER.fullmatch(dimension_decl.name) is None
-                or dimension_decl.name in _CPP_KEYWORDS
-            ):
+            if not _safe_cpp_display_identifier(dimension_decl.name):
                 _fail(
                     "invalid_display_name",
                     f"dimension name {dimension_decl.name!r} is not a safe "
@@ -372,10 +400,7 @@ class _TargetLowering:
             display_names[dimension_decl.name] = "dimension"
             self.dimension_names[dimension_decl.dimension] = dimension_decl.name
         for decl in self.program.tensors:
-            if (
-                _CPP_IDENTIFIER.fullmatch(decl.name) is None
-                or decl.name in _CPP_KEYWORDS
-            ):
+            if not _safe_cpp_display_identifier(decl.name):
                 _fail(
                     "invalid_display_name",
                     f"tensor name {decl.name!r} is not a safe ASCII C++ identifier",
@@ -478,7 +503,7 @@ class _TargetLowering:
         if self.region is None:
             return
         name = self.region.workspace.name
-        if _CPP_IDENTIFIER.fullmatch(name) is None or name in _CPP_KEYWORDS:
+        if not _safe_cpp_display_identifier(name):
             _fail(
                 "invalid_display_name",
                 f"workspace name {name!r} is not a safe ASCII C++ identifier",
@@ -4071,6 +4096,129 @@ def _sparse_workspace_chain(program: LoopProgram) -> bool:
     )
 
 
+def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
+    """Return the structured root variable of one validated assignment target."""
+
+    current = target
+    while type(current) in (llir.ArrayAccess, llir.MemberAccess):
+        current = (
+            cast(llir.ArrayAccess, current).array
+            if type(current) is llir.ArrayAccess
+            else cast(llir.MemberAccess, current).base
+        )
+    return current.name if type(current) is llir.Var else None
+
+
+def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
+    """Compare completed B1 state with fresh ownership and no recursion.
+
+    The generic panel comparator is intentionally defensive and recursive
+    because it serves several heterogeneous completion boundaries. B1 checks
+    one large, known LLIR tree on every activating compile; this equivalent
+    iterative form avoids recursion and repeated field-name sorting on that
+    hot path. The managed LLIR pipeline promises a detached tree, so repeated
+    node/container ownership is invalid here; one global actual-object census
+    rejects shared aggregates and cycles in the same constant-time check.
+    """
+
+    pending: List[Tuple[object, object, int]] = [(actual, expected, 0)]
+    seen_actual: Set[int] = set()
+    while pending:
+        actual_value, expected_value, depth = pending.pop()
+        if type(actual_value) is not type(expected_value) or depth > 256:
+            return False
+        if actual_value is None:
+            continue
+        if type(actual_value) in (bool, int, float, str, llir.DataType):
+            if actual_value != expected_value:
+                return False
+            continue
+        if isinstance(actual_value, Enum):
+            if actual_value is not expected_value:
+                return False
+            continue
+        if type(actual_value) in (AccessId, SymbolId, IndexId):
+            actual_state = object.__getattribute__(actual_value, "__dict__")
+            expected_state = object.__getattribute__(expected_value, "__dict__")
+            if (
+                type(actual_state) is not dict
+                or type(expected_state) is not dict
+                or len(actual_state) != 1
+                or len(expected_state) != 1
+            ):
+                return False
+            actual_field = next(iter(actual_state))
+            expected_field = next(iter(expected_state))
+            if (
+                type(actual_field) is not str
+                or actual_field != "value"
+                or type(expected_field) is not str
+                or expected_field != "value"
+                or type(actual_state[actual_field]) is not int
+                or type(expected_state[expected_field]) is not int
+                or actual_state[actual_field] != expected_state[expected_field]
+            ):
+                return False
+            continue
+
+        if (
+            isinstance(actual_value, llir.Node)
+            or type(actual_value) is llir.TensorAccessMetadata
+        ):
+            actual_state = object.__getattribute__(actual_value, "__dict__")
+            expected_state = object.__getattribute__(expected_value, "__dict__")
+            if type(actual_state) is not dict or type(expected_state) is not dict:
+                return False
+            if len(actual_state) != len(expected_state):
+                return False
+            field_names = tuple(actual_state)
+            if any(
+                type(field_name) is not str or field_name not in expected_state
+                for field_name in field_names
+            ):
+                return False
+            actual_id = id(actual_value)
+            if actual_id in seen_actual:
+                return False
+            seen_actual.add(actual_id)
+            for field_name in reversed(field_names):
+                pending.append(
+                    (
+                        actual_state[field_name],
+                        expected_state[field_name],
+                        depth + 1,
+                    )
+                )
+            continue
+        elif type(actual_value) in (list, tuple):
+            actual_sequence = cast(Any, actual_value)
+            expected_sequence = cast(Any, expected_value)
+            if len(actual_sequence) != len(expected_sequence):
+                return False
+            # CPython interns the empty tuple used by default call/template
+            # arguments. It carries no child ownership and cannot form a
+            # cycle, so its intentional sharing is outside the detachment
+            # invariant enforced for nonempty containers and nodes.
+            if not actual_sequence:
+                continue
+            actual_id = id(actual_value)
+            if actual_id in seen_actual:
+                return False
+            seen_actual.add(actual_id)
+            for index in range(len(actual_sequence) - 1, -1, -1):
+                pending.append(
+                    (
+                        actual_sequence[index],
+                        expected_sequence[index],
+                        depth + 1,
+                    )
+                )
+            continue
+        else:
+            return False
+    return True
+
+
 class _SparseWorkspaceLowering(_TargetLowering):
     """Dedicated target lowering for the serial B1 sparse-workspace family.
 
@@ -4124,6 +4272,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         self.result_tile = None
         self.result_tile_depth = -1
         self.relayout_depth = -1
+        self._outer_loop_snapshot: Optional[llir.ForLoop] = None
         if program.parallel is not None:
             _fail(
                 "unsupported_program_shape",
@@ -4380,10 +4529,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
 
     def _reserve_family_names(self) -> None:
         workspace_name = self.workspace_decl.name
-        if (
-            _CPP_IDENTIFIER.fullmatch(workspace_name) is None
-            or workspace_name in _CPP_KEYWORDS
-        ):
+        if not _safe_cpp_display_identifier(workspace_name):
             _fail(
                 "invalid_display_name",
                 f"workspace name {workspace_name!r} is not a safe ASCII C++ "
@@ -4740,22 +4886,59 @@ class _SparseWorkspaceLowering(_TargetLowering):
             ),
         ]
 
-    def _region_statements(self) -> List[llir.Stmt]:
+    def _workspace_init_statement(self) -> llir.VarInit:
         workspace = self.workspace_decl
         torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
         element_type = dtype_to_c_datatype(torch_dtype)
+        return llir.VarInit(
+            var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+            value=llir.FunctionCall(
+                name=f"coo_workspace_1d<{element_type.value}, 1>",
+                args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
+            ),
+        )
+
+    def _region_statements(self) -> List[llir.Stmt]:
         return [
             llir.Comment("Initialize workspaces"),
-            llir.VarInit(
-                var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
-                value=llir.FunctionCall(
-                    name=f"coo_workspace_1d<{element_type.value}, 1>",
-                    args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
-                ),
-            ),
+            self._workspace_init_statement(),
             *self._merge_statements(),
             *self._drain_statements(),
             *self._row_assembly_statements(),
+        ]
+
+    def _row_prologue_statements(self) -> List[llir.Stmt]:
+        """Resolve the row coordinate at the start of the outer sparse loop."""
+
+        cursor = self.outer_loop.cursor
+        position_name = self._cursor_position_name(cursor)
+        return [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=self.row_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor),
+                    index=llir.Var(name=position_name, type=llir.DataType.INT),
+                ),
+            ),
+            llir.BlankLine(),
+        ]
+
+    def _outer_loop_prefix_statements(self) -> List[llir.Stmt]:
+        """Initialize the outer sparse cursor immediately before its loop."""
+
+        cursor = self.outer_loop.cursor
+        position_name = self._cursor_position_name(cursor)
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_end(cursor),
+                ),
+            ),
+            llir.BlankLine(),
         ]
 
     def _completed_drain_loop(self) -> llir.ForLoopAuto:
@@ -4810,6 +4993,76 @@ class _SparseWorkspaceLowering(_TargetLowering):
             ],
         )
 
+    def _completed_root_position_statement(self) -> llir.FunctionCallStmt:
+        """The exact checked root-position close left by the vector pass."""
+
+        result_name = self.result_decl.name
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(
+                    name=f"{result_name}0_pos",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                llir.Add(
+                    llir.Var(
+                        name=f"{result_name}0_pos_index",
+                        type=llir.DataType.INT64,
+                    ),
+                    llir.Literal(value=1, data_type=llir.DataType.INT32),
+                ),
+                llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+            ],
+        )
+
+    def _completed_position_init_statement(
+        self,
+        level: int,
+    ) -> llir.FunctionCallStmt:
+        """One checked position sentinel left by the dynamic-vector pass."""
+
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(
+                    name=f"{self.result_decl.name}{level}_pos",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                llir.Literal(value=0, data_type=llir.DataType.INT32),
+                llir.Literal(value=0, data_type=llir.DataType.INT32),
+            ],
+        )
+
+    def _completed_outer_loop(
+        self,
+        body: List[llir.Stmt],
+    ) -> llir.ForLoop:
+        """Rebuild the pre-pass outer-loop header around a completed row."""
+
+        snapshot = self._outer_loop_snapshot
+        if snapshot is None:
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the sparse workspace target did not retain its outer loop",
+            )
+        completed = llir.ForLoop(
+            init=snapshot.init,
+            cond=snapshot.cond,
+            update=snapshot.update,
+            body=body,
+            omp_parallel_for=snapshot.omp_parallel_for,
+            omp_schedule=snapshot.omp_schedule,
+            unroll=snapshot.unroll,
+            simd=snapshot.simd,
+            pre_parallel_body=snapshot.pre_parallel_body,
+            post_parallel_body=snapshot.post_parallel_body,
+            omp_num_threads=snapshot.omp_num_threads,
+            omp_chunk_expr=snapshot.omp_chunk_expr,
+            before_parallel_body=snapshot.before_parallel_body,
+        )
+        completed.scorch_index_var = snapshot.scorch_index_var
+        return completed
+
     def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
         """Require the exact dynamic-vector rewrite owned by the B1 target.
 
@@ -4821,67 +5074,87 @@ class _SparseWorkspaceLowering(_TargetLowering):
         target-owned completion diagnostic.
         """
 
-        workspace_name = self.workspace_decl.name
         result_name = self.result_decl.name
-        protected_vectors = (
-            f"{result_name}_values",
-            f"{result_name}1_crd",
-        )
-
-        def assignment_root_name(target: llir.Expr) -> Optional[str]:
-            current = target
-            while type(current) in (llir.ArrayAccess, llir.MemberAccess):
-                current = (
-                    cast(llir.ArrayAccess, current).array
-                    if type(current) is llir.ArrayAccess
-                    else cast(llir.MemberAccess, current).base
-                )
-            return current.name if type(current) is llir.Var else None
-
-        class _DrainCollector(LLIRWalker):
-            def __init__(self) -> None:
-                super().__init__(
-                    LLIRTraversalContext(
-                        stage="LoopIR target lowering",
-                        pass_name="validate_sparse_workspace_completion",
-                    )
-                )
-                self.candidates: List[llir.ForLoopAuto] = []
-                self.protected_calls: List[llir.Stmt] = []
-                self.protected_assignments: List[llir.Assign] = []
-                self.protected_raw_statements: List[llir.RawStmt] = []
-
-            def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
-                if (
-                    type(node) is llir.ForLoopAuto
-                    and type(node.array) is llir.Var
-                    and node.array.name == workspace_name
-                ):
-                    self.candidates.append(cast(llir.ForLoopAuto, node))
-                elif type(node) is llir.FunctionCallStmt and any(
-                    node.name.startswith(f"{name}.") for name in protected_vectors
-                ):
-                    self.protected_calls.append(cast(llir.FunctionCallStmt, node))
-                elif (
-                    type(node) is llir.MemberCallStmt
-                    and type(node.base) is llir.Var
-                    and node.base.name in protected_vectors
-                ):
-                    self.protected_calls.append(cast(llir.MemberCallStmt, node))
-                elif (
-                    type(node) is llir.Assign
-                    and assignment_root_name(node.var) in protected_vectors
-                ):
-                    self.protected_assignments.append(cast(llir.Assign, node))
-                elif type(node) is llir.RawStmt and any(
-                    re.search(rf"\b{re.escape(name)}\b", node.code)
-                    for name in protected_vectors
-                ):
-                    self.protected_raw_statements.append(cast(llir.RawStmt, node))
-
-        collector = _DrainCollector()
         try:
-            collector.walk(function)
+            expected_assembler = self.result_assembler()
+            expected_root_close = self._completed_root_position_statement()
+            expected_final_assembly = expected_assembler.emit_final_assembly()
+            expected_level_indices = expected_assembler.emit_level_indices_init()
+            expected_position_levels = {
+                f"{result_name}{level}_pos": level for level in (0, 1)
+            }
+            completed_position_inits: Set[str] = set()
+            for index, statement in enumerate(expected_level_indices):
+                if type(statement) is not llir.Assign:
+                    continue
+                root_name = _llir_assignment_root_name(statement.var)
+                level = expected_position_levels.get(cast(str, root_name))
+                if level is None:
+                    continue
+                expected_level_indices[index] = self._completed_position_init_statement(
+                    level
+                )
+                completed_position_inits.add(cast(str, root_name))
+            if completed_position_inits != set(expected_position_levels):
+                _fail(
+                    _SPARSE_WORKSPACE_LOST,
+                    "the result assembler must own both position sentinels",
+                )
+            expected_level_index_group: List[llir.Stmt] = [
+                llir.Comment("Init result level indices"),
+                *expected_level_indices,
+            ]
+            expected_size_stmts = self.result_size_inits()
+            if expected_size_stmts:
+                expected_size_stmts = [
+                    llir.Comment("Init result tensor level sizes"),
+                    *expected_size_stmts,
+                ]
+            expected_kernel_abi = self.kernel_abi()
+            expected_row_tail = self._row_assembly_statements()
+            expected_row_tail[-1] = llir.FunctionCallStmt(
+                name="scorch_vector_set",
+                args=[
+                    llir.Var(
+                        name=f"{result_name}1_pos",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+                    llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+                ],
+            )
+            expected_row_body: List[llir.Stmt] = [
+                *self._row_prologue_statements(),
+                llir.Comment("Initialize workspaces"),
+                self._workspace_init_statement(),
+                *self._merge_statements(),
+                llir.BlankLine(),
+                llir.Comment("Lower consumer CIN"),
+                llir.FunctionCallStmt(
+                    name=f"{self.workspace_decl.name}.sort",
+                    args=[],
+                ),
+                self._completed_drain_loop(),
+                *expected_row_tail,
+            ]
+            expected_body: List[llir.Stmt] = [
+                *expected_kernel_abi.emit_validation(),
+                *expected_size_stmts,
+                *expected_kernel_abi.emit_input_prologue(),
+                llir.BlankLine(),
+                *expected_level_index_group,
+                llir.Comment("Initialize result value array"),
+                *expected_assembler.emit_value_array_init(),
+                *self.tile_size_inits(),
+                llir.BlankLine(),
+                *self._outer_loop_prefix_statements(),
+                self._completed_outer_loop(expected_row_body),
+                llir.BlankLine(),
+                llir.Comment("Assembly compressed _level indices"),
+                expected_root_close,
+                *expected_final_assembly,
+            ]
+            expected_function = expected_kernel_abi.assemble_function(expected_body)
         except (
             LLIRTraversalError,
             AttributeError,
@@ -4891,36 +5164,12 @@ class _SparseWorkspaceLowering(_TargetLowering):
             ValueError,
         ) as error:
             _fail(_SPARSE_WORKSPACE_LOST, str(error))
-        expected = self._completed_drain_loop()
-        canonical = collector.candidates[0] if len(collector.candidates) == 1 else None
-        canonical_calls = (
-            [
-                statement
-                for statement in canonical.body
-                if type(statement) is llir.FunctionCallStmt
-                and statement.name
-                in (
-                    f"{result_name}_values.emplace_back",
-                    f"{result_name}1_crd.emplace_back",
-                )
-            ]
-            if canonical is not None
-            else []
-        )
-        if (
-            canonical is None
-            or not self._exact_panel_state_matches(canonical, expected)
-            or len(canonical_calls) != 2
-            or {id(call) for call in collector.protected_calls}
-            != {id(call) for call in canonical_calls}
-            or collector.protected_assignments
-            or collector.protected_raw_statements
-        ):
+        if not _exact_sparse_completion_matches(function, expected_function):
             _fail(
                 _SPARSE_WORKSPACE_LOST,
-                "the assembled function must contain exactly one canonical "
-                "workspace drain and exactly its two completed dynamic-vector "
-                "appends, with no residual or duplicated protected writes",
+                "the assembled function must exactly match the completed "
+                "sparse-workspace target, including both checked position "
+                "sentinels, the canonical producer/drain row, and final assembly",
             )
         return function
 
@@ -4929,15 +5178,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         position_name = self._cursor_position_name(cursor)
         result_name = self.result_decl.name
         row_body: List[llir.Stmt] = [
-            llir.Comment("Resolve coordinates"),
-            llir.VarInit(
-                var=llir.Var(name=self.row_name, type=llir.DataType.INT),
-                value=llir.ArrayAccess(
-                    array=self._cursor_crd_array(cursor),
-                    index=llir.Var(name=position_name, type=llir.DataType.INT),
-                ),
-            ),
-            llir.BlankLine(),
+            *self._row_prologue_statements(),
             *self._region_statements(),
         ]
         position_var = llir.Var(name=position_name, type=llir.DataType.INT)
@@ -4960,16 +5201,9 @@ class _SparseWorkspaceLowering(_TargetLowering):
             body=row_body,
         )
         row_loop.scorch_index_var = self.row_name
+        self._outer_loop_snapshot = row_loop
         return [
-            llir.Comment("Initialize iterators"),
-            llir.VarInit(
-                var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
-                value=llir.ArrayAccess(
-                    array=self._cursor_pos_array(cursor),
-                    index=self._segment_end(cursor),
-                ),
-            ),
-            llir.BlankLine(),
+            *self._outer_loop_prefix_statements(),
             row_loop,
             llir.BlankLine(),
             llir.Comment("Assembly compressed _level indices"),
