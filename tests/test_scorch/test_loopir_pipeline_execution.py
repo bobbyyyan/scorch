@@ -828,11 +828,10 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             ("ds", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
             "unsupported_sparse_output_reduction",
         ),
-        (
-            "spmspm_csr_operands",
-            ("ds", "ik", (("ds", "ij"), ("ds", "jk")), "ijk"),
-            "unsupported_sparse_output_reduction",
-        ),
+        # The ds@ds->ds SpGEMM cell left this fail-closed census when the
+        # Phase-7 parallel sparse-workspace target migrated it; its
+        # admission, byte parity, and execution differentials live in
+        # test_loopir_parallel_workspace_target.py.
         (
             "reduce_to_csr",
             ("ds", "ik", (("ds", "ij"), ("dd", "jk")), "ijk"),
