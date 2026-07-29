@@ -284,7 +284,7 @@ def test_commuted_rhs_cursor_order_executes_against_oracle_and_pytorch(
 
 @pytest.mark.parametrize(
     "reserved_name",
-    ["coo_workspace_1d", "int64_t", "size_t"],
+    ["__restrict__", "coo_workspace_1d", "int64_t", "size_t"],
 )
 def test_runtime_and_type_names_cannot_shadow_b1_emission(reserved_name):
     with pytest.raises(LoopIRTargetError) as error:
