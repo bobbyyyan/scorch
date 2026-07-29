@@ -189,6 +189,8 @@ _TARGET_RESERVED_NAMES = frozenset(
     {
         "Tensor",
         "evaluate",
+        "int32_t",
+        "int64_t",
         "result_shape",
         "scorch_chunk",
         "scorch_native",
@@ -196,6 +198,7 @@ _TARGET_RESERVED_NAMES = frozenset(
         "scorch_tensor_from_vector",
         "scorch_vector_set",
         "scorch_zero_dense",
+        "size_t",
         "std",
         "torch",
     }
@@ -3219,6 +3222,11 @@ class _TargetLowering:
             for symbol in self.program.inputs
         )
 
+    def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
+        """Validate sparse-workspace post-pass effects when this family owns them."""
+
+        return function
+
     # -- panel completion ----------------------------------------------------
 
     def _record_emitted_loop(self, position: int, loop: llir.ForLoop) -> None:
@@ -4122,6 +4130,10 @@ class _SparseWorkspaceLowering(_TargetLowering):
             )
         self.parallel = None
         self._validate_display_names()
+        self._reserve_generated_name(
+            "coo_workspace_1d",
+            "the serial sparse-workspace runtime type",
+        )
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self._validate_family_shape()
         self._reserve_family_names()
@@ -4186,20 +4198,32 @@ class _SparseWorkspaceLowering(_TargetLowering):
             and all(type(bound) is PositionId for bound in merge.positions),
             "a two-cursor position-binding INTERSECTION merge",
         )
-        left, right = merge.cursors
+        descended = [
+            (position, cursor)
+            for position, cursor in enumerate(merge.cursors)
+            if cursor.tensor == outer_cursor.tensor
+            and cursor.level == 1
+            and type(cursor.parent) is PositionValue
+            and cast(PositionValue, cursor.parent).position == outer.position
+        ]
         require(
-            left.tensor == outer_cursor.tensor
-            and left.level == 1
-            and type(left.parent) is PositionValue
-            and cast(PositionValue, left.parent).position == outer.position,
-            "a left merge cursor descending from the outer row position",
+            len(descended) == 1,
+            "one merge cursor descending from the outer row position",
         )
+        descended_position, descended_cursor = descended[0]
+        rooted = [
+            (position, cursor)
+            for position, cursor in enumerate(merge.cursors)
+            if position != descended_position
+            and cursor.tensor != descended_cursor.tensor
+            and cursor.level == 0
+            and type(cursor.parent) is RootPosition
+        ]
         require(
-            right.tensor != left.tensor
-            and right.level == 0
-            and type(right.parent) is RootPosition,
-            "a root-parented level-0 right merge cursor over a second input",
+            len(rooted) == 1,
+            "one root-parented level-0 merge cursor over the second input",
         )
+        rooted_position, rooted_cursor = rooted[0]
         merge_body = merge.body
         require(
             type(merge_body) is Block
@@ -4210,11 +4234,12 @@ class _SparseWorkspaceLowering(_TargetLowering):
         child = cast(SparseFor, merge_body.statements[0])
         child_cursor = child.cursor
         require(
-            child_cursor.tensor == right.tensor
+            child_cursor.tensor == rooted_cursor.tensor
             and child_cursor.level == 1
             and type(child_cursor.parent) is PositionValue
-            and cast(PositionValue, child_cursor.parent).position == merge.positions[1],
-            "a child cursor descending from the merge-bound right position",
+            and cast(PositionValue, child_cursor.parent).position
+            == merge.positions[rooted_position],
+            "a child cursor descending from the root cursor's merge-bound position",
         )
         child_body = child.body
         require(
@@ -4263,32 +4288,35 @@ class _SparseWorkspaceLowering(_TargetLowering):
             "an append of the drained value at the row and drain coordinates",
         )
 
-        left_decl = self.decls[left.tensor]
-        right_decl = self.decls[right.tensor]
+        descended_decl = self.decls[descended_cursor.tensor]
+        rooted_decl = self.decls[rooted_cursor.tensor]
         require(
-            program.inputs == (left.tensor, right.tensor)
-            and doubly_compressed(left_decl)
-            and doubly_compressed(right_decl)
+            len(program.inputs) == 2
+            and set(program.inputs) == {descended_cursor.tensor, rooted_cursor.tensor}
+            and doubly_compressed(descended_decl)
+            and doubly_compressed(rooted_decl)
             and doubly_compressed(self.result_decl),
             "exactly two identity-ordered doubly-compressed inputs and result",
         )
         require(
-            left_decl.dtype is right_decl.dtype
-            and left_decl.dtype is self.result_decl.dtype
+            descended_decl.dtype is rooted_decl.dtype
+            and descended_decl.dtype is self.result_decl.dtype
             and workspace_decl.dtype is self.result_decl.dtype
             and self.result_decl.dtype in _SCALAR_TO_TORCH,
             "one shared supported scalar type",
         )
         require(
-            self._level_dimension(left.tensor, 0) == self.result_decl.dimensions[0]
-            and self._level_dimension(left.tensor, 1)
-            == self._level_dimension(right.tensor, 0)
-            and self._level_dimension(right.tensor, 1) == self.result_decl.dimensions[1]
+            self._level_dimension(descended_cursor.tensor, 0)
+            == self.result_decl.dimensions[0]
+            and self._level_dimension(descended_cursor.tensor, 1)
+            == self._level_dimension(rooted_cursor.tensor, 0)
+            and self._level_dimension(rooted_cursor.tensor, 1)
+            == self.result_decl.dimensions[1]
             and workspace_decl.drain_dimension == self.result_decl.dimensions[1],
             "row, reduction, and drain dimensions in matmul agreement",
         )
-        row_dimension = self._level_dimension(left.tensor, 0)
-        merge_dimension = self._level_dimension(left.tensor, 1)
+        row_dimension = self._level_dimension(descended_cursor.tensor, 0)
+        merge_dimension = self._level_dimension(descended_cursor.tensor, 1)
         drain_dimension = workspace_decl.drain_dimension
         require(
             len({row_dimension, merge_dimension, drain_dimension}) == 3,
@@ -4309,12 +4337,18 @@ class _SparseWorkspaceLowering(_TargetLowering):
         # The value-typed cursors admissible in the insertion value, and
         # the level drivers backing the shared input access metadata.
         self._value_cursors = {
-            left.cursor: left,
+            descended_cursor.cursor: descended_cursor,
             child_cursor.cursor: child_cursor,
         }
         self.level_drivers = {
-            left.tensor: {0: outer.coord_index, 1: merge.coord_index},
-            right.tensor: {0: merge.coord_index, 1: child.coord_index},
+            descended_cursor.tensor: {
+                0: outer.coord_index,
+                1: merge.coord_index,
+            },
+            rooted_cursor.tensor: {
+                0: merge.coord_index,
+                1: child.coord_index,
+            },
         }
         self._validate_insert_value(insert.value)
 
@@ -4715,13 +4749,121 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
                 value=llir.FunctionCall(
                     name=f"coo_workspace_1d<{element_type.value}, 1>",
-                    args=[llir.Literal(value="1024", data_type=llir.DataType.INT)],
+                    args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
                 ),
             ),
             *self._merge_statements(),
             *self._drain_statements(),
             *self._row_assembly_statements(),
         ]
+
+    def _completed_drain_loop(self) -> llir.ForLoopAuto:
+        """The exact drain shape the dynamic-vector pass must leave behind."""
+
+        workspace_name = self.workspace_decl.name
+        result_name = self.result_decl.name
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        workspace_value_name = f"{workspace_name}_value"
+        return llir.ForLoopAuto(
+            var=iterator_var,
+            array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+            body=[
+                llir.VarInit(
+                    var=llir.Var(name=self.drain_name, type=llir.DataType.INT64),
+                    value=llir.MemberAccess(base=iterator_var, member="first"),
+                ),
+                llir.VarInit(
+                    var=llir.Var(
+                        name=workspace_value_name,
+                        type=dtype_to_c_datatype(
+                            _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+                        ),
+                    ),
+                    value=llir.MemberAccess(base=iterator_var, member="second"),
+                ),
+                llir.BlankLine(),
+                llir.FunctionCallStmt(
+                    name=f"{result_name}_values.emplace_back",
+                    args=[
+                        llir.Var(
+                            name=workspace_value_name,
+                            type=llir.DataType.NO_TYPE,
+                        )
+                    ],
+                ),
+                llir.FunctionCallStmt(
+                    name=f"{result_name}1_crd.emplace_back",
+                    args=[
+                        llir.Var(
+                            name=self.drain_name,
+                            type=llir.DataType.NO_TYPE,
+                        )
+                    ],
+                ),
+                llir.Increment(
+                    var=llir.Var(
+                        name=f"p{result_name}1",
+                        type=llir.DataType.INT64,
+                    )
+                ),
+            ],
+        )
+
+    def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
+        """Require the exact dynamic-vector rewrite owned by the B1 target.
+
+        B1 emits indexed assignments deliberately so it can share the
+        production dynamic-vector pass with the legacy route.  An omitted,
+        duplicated, or partial rewrite would otherwise leave unchecked writes
+        into empty result vectors.  Validate the assembled tree after all
+        managed passes and translate every malformed/cyclic state into the
+        target-owned completion diagnostic.
+        """
+
+        workspace_name = self.workspace_decl.name
+
+        class _DrainCollector(LLIRWalker):
+            def __init__(self) -> None:
+                super().__init__(
+                    LLIRTraversalContext(
+                        stage="LoopIR target lowering",
+                        pass_name="validate_sparse_workspace_completion",
+                    )
+                )
+                self.candidates: List[llir.ForLoopAuto] = []
+
+            def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+                if (
+                    type(node) is llir.ForLoopAuto
+                    and type(node.array) is llir.Var
+                    and node.array.name == workspace_name
+                    and node.array.type is llir.DataType.AUTO
+                ):
+                    self.candidates.append(cast(llir.ForLoopAuto, node))
+
+        collector = _DrainCollector()
+        try:
+            collector.walk(function)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        expected = self._completed_drain_loop()
+        if len(collector.candidates) != 1 or not self._exact_panel_state_matches(
+            collector.candidates[0],
+            expected,
+        ):
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the assembled function must contain exactly one canonical "
+                "workspace drain with completed dynamic-vector appends",
+            )
+        return function
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
         cursor = self.outer_loop.cursor
@@ -4838,13 +4980,15 @@ class _DenseDomainMixedLowering(_TargetLowering):
     coordinate once per materialized row and closes the root position
     after the nest.
 
-    The retained legacy comparand for this family is memory-unsafe (it
-    writes an unsized values vector and never appends parent
-    coordinates), so there is deliberately no byte-parity gate: the
-    family is proven against the production LoopIR oracle and the
+    The retained legacy comparand for this family produces malformed
+    storage: it appends values but never appends their compressed-parent
+    coordinates.  There is therefore deliberately no byte-parity gate:
+    the family is proven against the production LoopIR oracle and the
     PyTorch dense reference, and the emission is correct-by-construction
-    in the established target style (``push_back``/``emplace_back``
-    call statements, ``scorch_vector_set`` position closes).
+    in the established target style (``push_back``/``emplace_back`` call
+    statements, ``scorch_vector_set`` position closes).  The separately
+    retained sparse-reduction comparand owns the memory-safety failure; it
+    is not evidence for this dense-domain family.
     """
 
     def __init__(
@@ -4881,6 +5025,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
         self._validate_display_names()
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self.loops = self._collect_mixed_chain()
+        self._validate_loop_variable_names()
         self.loop_positions = {
             loop.index: position for position, loop in enumerate(self.loops)
         }
@@ -4942,6 +5087,38 @@ class _DenseDomainMixedLowering(_TargetLowering):
         )
         self.leaf = append
         return loops
+
+    def result_size_inits(self) -> List[llir.Stmt]:
+        """Initialize every result extent the mixed nest may use as a bound.
+
+        The generic target needs size variables only for dense result levels:
+        sparse loops obtain their bounds from position arrays.  B2 is
+        different—the compressed parent is intentionally traversed as a dense
+        domain before its coordinates are assembled.  A broadcast expression
+        may have no input level driving that parent dimension, so omitting its
+        result size would leave (for example) ``C0_size`` undeclared in the
+        emitted loop header.
+        """
+
+        return [
+            llir.VarInit(
+                llir.Var(
+                    name=f"{self.result_decl.name}{level}_size",
+                    type=llir.DataType.INT64,
+                ),
+                value=llir.ArrayAccess(
+                    array=llir.Var(
+                        name="result_shape",
+                        type=llir.DataType.STD_VECTOR_INT,
+                    ),
+                    index=llir.Literal(
+                        value=level,
+                        data_type=llir.DataType.INT64,
+                    ),
+                ),
+            )
+            for level in range(len(self.result_decl.levels))
+        ]
 
     def _suffix_guard(self) -> llir.Expr:
         """``C1_size > 0 [&& ...]`` over every trailing dense level."""
@@ -5033,6 +5210,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
 _RELAYOUT_LOST = "relayout_completion_lost"
 _RESULT_TILE_LOST = "result_tile_completion_lost"
 _PARALLEL_LOST = "parallel_completion_lost"
+_SPARSE_WORKSPACE_LOST = "sparse_workspace_completion_lost"
 
 
 def _relayout_access_candidates(
@@ -7238,9 +7416,12 @@ def _lower_loopir_to_llir_owned(
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
+    completed_sparse_workspace = lowering.complete_sparse_workspace(assembled)
     return lowering.complete_relayout(
         lowering.complete_result_tile(
-            lowering.complete_panel(lowering.complete_parallel(assembled))
+            lowering.complete_panel(
+                lowering.complete_parallel(completed_sparse_workspace)
+            )
         )
     )
 

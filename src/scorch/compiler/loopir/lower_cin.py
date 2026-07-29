@@ -592,8 +592,11 @@ def _classify_sparse_output_family(
             # The B2 compressed-parent/dense-leaf assembly family: a dense
             # iteration domain appends one complete dense-suffix block per
             # materialized parent coordinate.  Its defective legacy
-            # comparand is memory-unsafe, so this family is gated on the
-            # LoopIR oracle and PyTorch differentials, never legacy parity.
+            # comparand produces malformed storage with values but no parent
+            # coordinates, so this family is gated on the LoopIR oracle and
+            # PyTorch differentials, never legacy parity.  The separately
+            # retained sparse-reduction comparand owns the memory-safety
+            # failure; it is not evidence about this dense-domain family.
             if reduce_update:
                 _fail(
                     "unsupported_sparse_output_reduction",
