@@ -5338,3 +5338,193 @@ independent-oracle correctness slice described in §29.5/§31: the legacy
 mixed-level comparand is memory-unsafe and must not be used as a parity
 oracle.  Regenerate the production-derived census and repeat the full Phase-6
 exit audit only after both slices.  Phase 7 may begin only on a genuine GO.
+
+## 33. B1/B2 closure, regenerated census, and the Phase-6 exit (2026-07-28)
+
+### 33.1 Scope
+
+This session independently re-reviewed the five §32 commits, completed
+the B1 sparse-workspace target end to end, implemented the B2 mixed
+compressed-parent/dense-leaf correctness slice, regenerated the
+production-derived census, and performed the criterion-by-criterion
+Phase-6 exit audit.  Two local commits carry the code and tests:
+
+- `12c2079` — the B1 serial sparse-workspace LLIR target and its
+  differential battery;
+- `ebb243b` — the B2 mixed dense-leaf assembly family and its battery.
+
+### 33.2 Independent review of the §32 commits
+
+`deb71d4`, `c12b625`, `121e4a9`, `01de1b2`, and `ed4b51b` were re-read
+diff by diff and probed beyond their own tests: replay under deliberate
+process-global identity-allocator interference, erasure round trip plus
+re-application canonical identity, a forged `WorkspaceInsertion.dense`
+flag carrying hostile `__bool__`, artifact-continuation collision
+scanning against every stored `IndexId`, hostile bool-typed level
+scalars, incomplete huge dense suffixes, zero-extent compressed levels,
+and a ragged oracle differential against an independent dense reference.
+All nine probes passed; `_apply_schedule_lowering` was confirmed not to
+re-enter the new single-use lowerer boundary, and the one changed
+`new_index_id` call site was verified.  No defect was found; the review
+stands as recorded.
+
+### 33.3 B1: the serial sparse-workspace target is complete
+
+`lower_llir.py` now routes the exact verified chain — outer level-0
+sparse row loop over one `SparseWorkspaceRegion` — to a dedicated
+`_SparseWorkspaceLowering` (structural routing only; the general
+hierarchical-compressed boundary is untouched and every other placement
+of a region still fails closed).  The class admits exactly the shape
+`apply_sparse_workspace` produces: two identity-ordered doubly
+compressed inputs, the two-cursor INTERSECTION merge with bound-position
+descent into the child sparse loop, the ADD insertion at the child
+coordinate, and the one ordered drain appending the drained value at the
+row and drain coordinates.  Raw emission mirrors the retained serial
+`coo_workspace_1d` legacy lowering statement for statement; the shared
+managed passes produce the `emplace_back`/`scorch_vector_set` spellings.
+The one shared-driver change — the `Init result tensor level sizes`
+comment is emitted only when dense result levels exist — is provably
+inert for every previously migrated family (all carry at least one dense
+result level) and required for the all-compressed result.
+
+Byte parity holds in both automatic policy arms for float32 and float64:
+`compare_generated_sources` is identical, the arms are identical to each
+other, and the pipeline-generated legacy source matches the retained
+5,301-byte comparand modulo tensor/coordinate display names and bound
+shapes.  The public pipeline (`execute_cin_via_loopir`) compiles,
+executes, and wraps the result as honest `ss` storage with identity mode
+order derived from the verified declaration.
+
+### 33.4 B2: the mixed dense-leaf assembly family
+
+The B2 slice admits compressed-parent/dense-suffix RESULTS (`sd`,
+`sdd`, ...) for the dense-domain elementwise families.  The format gate
+keeps rejecting mixed dense-leaf OPERANDS (`unsupported_format`; the
+physical position-load chain stays undeclared), and the new
+classification branch requires every result coordinate to iterate a
+dense domain, reusing the existing level-based `AppendEntry`
+construction — no new node kinds, no schema bump
+(`scorch.loopir.canonical.v9` unchanged).  A second dedicated,
+structurally routed target lowering emits the assembly directly: the
+parent coordinate is appended exactly when the dense suffix has nonzero
+runtime extent (the canonical zero-extent contract from §32), values
+append in complete leaf blocks through explicit `emplace_back` call
+statements, and the root position closes after the nest.
+
+The retained legacy comparand for this family is defective and stays
+failure evidence only: its generated kernel appends every dense-leaf
+value but never assembles the compressed parent's coordinates, so the
+returned storage would carry values with no owning rows.  The battery
+locks that shape (`C_values.emplace_back` present, no `C0_crd` append)
+and the intentional absence of any byte or execution parity gate.  The
+family is proven against the production LoopIR oracle (exact positions,
+coordinates, values) and the PyTorch dense reference for rank-2 and
+rank-3, float32/float64, binary elementwise, zero-extent and canonically
+empty cells, in both automatic arms and on the unscheduled route, with
+erasure to the base program, route-stable sources, canonical identity,
+replay, hand-built target adversaries, and locked seam codes
+(`unsupported_sparse_output_reduction` for reducing into a mixed leaf,
+`unsupported_format` for mixed operands,
+`unsupported_sparse_output_domain` for sparse domains).
+
+### 33.5 Regenerated census and neutrality
+
+The widened deterministic family census (13 cells over the sparse-result
+cluster and its neighbors, both automatic arms) records zero route and
+zero arm divergence: B1 at byte parity, the three B2 cells admitted with
+the documented no-parity disposition, and every seam at its precise
+stable code (`ds@ds->ds` SpGEMM and `ss@ss->ds` row-scope at
+`unsupported_sparse_output_reduction`, merged reduction at
+`unsupported_merged_reduction`, root sparse output at
+`unsupported_sparse_output`, union-CSR and dense matmul at byte parity).
+The four retained randomized cross-route census seeds (1, 2, 7, 11; 60
+cases each) reproduce their sealed tallies exactly.  Fresh corpus
+(20/20), grid (42/42), anchor, and heap captures are byte-identical to
+the sealed `f13ba79` baselines; the auto capture is identical after
+normalizing exactly the two previously demonstrated process-dependent
+cache-key suffix characters.  Paired compiler latency (base `ed4b51b`
+versus tip, both orders, sources SHA-identical in all four runs) is
+neutral: per-case p50/p95 ratios 0.91–1.05, inside the historical noise
+band.
+
+### 33.6 Verification
+
+All commands used the `scorch` conda environment.  At the tip: the
+focused fast membership (schedule passes, verifier, levels, oracle,
+iterdomain, schedule API, printer, CIN and LLIR lowering, neutrality)
+passed **828**; the dedicated sparse-result battery passed **37**
+(22 B1 + 15 B2, including compiled execution); the sparse-workspace
+pipeline selection passed **24**.  The complete compiled battery
+(scheduled slice, pipeline execution, schedule generality, the new
+battery, and the regblock dual path) passed **438 in 1,262.73 s** at the
+B1 state, with the B2-touched fast suites re-proven at the tip.  Focused
+LoopIR mypy is zero findings; full-source mypy is exactly the inherited
+**140 errors in 11 files**; Black and Flake8 are clean on every changed
+file; `git diff --check` is clean.
+
+The clean detached-worktree full non-performance suite at `ebb243b`
+(with `scorch.__file__` asserted inside the worktree) reached **4,560
+passed / 14 skipped / 3 performance deselected in 2,777.79 s** before 35
+late JIT builds hit the documented macOS libomp pthread-key ceiling (31
+literal `OMP: Error #179` / `pthread_key_create` markers retained in the
+sealed log; a first run of the same suite had failed 33 nodes at the
+same signature with 4,562 passed).  One fresh process reran the complete
+35-node failed set: **35 passed in 323.30 s**; the five nodes
+recoverable from the first run had already passed a separate fresh
+process (5/5).  The proven complete non-overlapping union is therefore
+**4,595 passed / 14 skipped / 3 performance deselected / zero code
+failures** — the late failures are infrastructure, not code, and are
+recorded as such.
+
+The five protected tracked files retained their exact SHA-256 values
+through every commit, only explicit paths were staged, all unrelated
+GPU/benchmark/scheduler/research/scratchpad material remains untouched,
+nothing was pushed, and origin remains `58e8565`.  Evidence is sealed
+under `/Users/bobby/.cache/scorch-codex/phase6-b1b2-ebb243b/`
+(captures, census, latency, parity, and Phase-7 comparands).
+
+### 33.7 Phase-6 exit audit: GO
+
+Criterion by criterion at `ebb243b`: every migrated family has a typed,
+verified schedule decision (stack, panel, relayout, heap, parallel
+selection, reduce-out, general dense layouts, the serial sparse
+workspace, and the tile-free mixed dense-leaf family); the
+explicit/automatic differentials hold wherever legacy is a valid
+comparand, and the one family whose comparand is invalid carries an
+explicit, evidence-locked no-parity disposition; canonical request
+identity remains semantic with no version change; the representative
+compositions remain byte-ready (all captures identical); and release
+behavior is unchanged everywhere (production imports untouched, the
+census and captures byte-stable, paired latency neutral).
+
+The sparse-result/workspace cluster that §29–§32 held open is closed:
+B1 with byte parity and honest compiled sparse output, B2 as the
+independent-oracle correctness slice.  The remaining boundaries are all
+explicitly dispositioned outside Phase 6 with stable codes: the two-pass
+OpenMP count/fill form (`ds@ds->ds` SpGEMM, `ss@ss->ds` row-scope, and
+the dense-axis reduction into a mixed leaf, all
+`unsupported_sparse_output_reduction`) is Phase-7 target-owned
+parallel/runtime composition; mixed dense-leaf operands
+(`unsupported_format`) are the adjacent load-chain gap; COO operands,
+permuted compressed structure, and the trailing-compressed automatic
+families keep their locked codes.
+
+**Phase 6 is GO.**  No cutover, legacy deletion, or release
+dispatch/cache ownership change was performed or started.
+
+### 33.8 The permitted Phase-7 stretch and the next milestone
+
+As the one small Phase-7 runtime-composition stretch, the two-pass
+comparand baseline was captured and characterized (no code change):
+both arms of `ds@ds->ds` SpGEMM (5,618 bytes, byte-identical arms) and
+`ss@ss->ds` row-scope (6,071 bytes) are sealed under the evidence root.
+The kernels are statically parallel two-phase forms: a per-thread
+`linked_list_workspace_1d<float>` pool sized by `scorch_nthreads` over
+an nnz estimate, per-thread `make_view()` workspaces inside one
+`#pragma omp parallel` region, and a dynamic-chunk row loop — exactly
+the target-owned parallel policy plus runtime-stitch structure Phase 7
+must own as a typed twin.  The next coherent milestone is that Phase-7
+slice: a typed parallel sparse-workspace-pool surface with the working
+public route as its execution oracle, gated by the same
+verifier/oracle/erasure/adversarial discipline, still without touching
+release dispatch or cache ownership.

@@ -28381,3 +28381,84 @@ Preserve the §29.5/§31 constraints: no CSR-only schema, no global target
 weakening, no rendered-name discovery, no execution of the known
 memory-unsafe mixed-level legacy comparand, no release cutover, no push,
 and no protected/unrelated-file changes.
+
+## B1/B2 closure and the Phase-6 GO (2026-07-28; supersedes the §32 tail)
+
+The sparse-result/workspace cluster is closed and Phase 6 is **GO**
+(review §33).  Two local commits on top of `ed4b51b`:
+
+- `12c2079` — the B1 serial sparse-workspace LLIR target: a dedicated,
+  structurally routed lowering for the exact verified region chain,
+  byte-identical to the retained serial `coo_workspace_1d` legacy
+  comparand in both automatic arms (f32/f64), plus the differential
+  battery (source parity, compiled execution vs the LoopIR oracle with
+  exact positions/coordinates/values including explicit zeros, PyTorch,
+  the raw legacy kernel, and the public dispatch; empty/disjoint/
+  ragged/cancelling/zero-extent cells; deterministic drain order,
+  replay, stage timing, canonical identity, completion loss, and target
+  adversaries).  The pipeline lock now records the completed route.
+- `ebb243b` — the B2 mixed dense-leaf assembly family: `sd`/`sdd`
+  results admitted for dense-domain elementwise programs through the
+  existing level-based AppendEntry stream (no new nodes, no schema
+  bump) and a second dedicated target lowering; the memory-unsafe
+  legacy comparand is locked as failure evidence only, and the family
+  is gated on the LoopIR oracle and PyTorch in both arms and on the
+  unscheduled route.  Seams stay fail-closed:
+  `unsupported_sparse_output_reduction` (reduce into mixed leaf, also
+  the two-pass SpGEMM forms), `unsupported_format` (mixed operands),
+  `unsupported_sparse_output_domain` (sparse domains).
+
+Verification at the tip: fast membership 828; dedicated battery 37;
+pipeline selection 24; complete compiled battery 438 in 1,262.73 s at
+the B1 state with the B2 fast suites re-proven at the tip; LoopIR mypy
+zero; full-source mypy at the inherited 140/11; Black/Flake8/whitespace
+clean.  The clean detached full non-performance run reached 4,560
+passed / 14 skipped / 3 deselected before 35 late JIT builds hit the
+documented libomp pthread-key ceiling (`OMP: Error #179`; literal logs
+sealed); one fresh process passed the complete 35-node failed set, so
+the proven non-overlapping union is **4,595 passed / 14 skipped / 3
+deselected / zero code failures**.  Census: the widened 13-cell family grid
+has zero route/arm divergence; seeds 1/2/7/11 reproduce exactly; fresh
+corpus 20/20, grid 42/42, anchor, and heap captures byte-identical to
+the sealed `f13ba79` baselines; auto identical modulo the two known
+process-dependent cache-key suffix characters; paired compiler latency
+neutral (0.91–1.05 both orders, sources SHA-identical).  Evidence:
+`/Users/bobby/.cache/scorch-codex/phase6-b1b2-ebb243b/`.
+
+The five protected tracked files hash exactly as recorded; only
+explicit paths were staged; origin remains `58e8565`; nothing was
+pushed.  The permitted Phase-7 stretch was evidence-only: both arms of
+the two-pass `ds@ds->ds` SpGEMM and `ss@ss->ds` row-scope comparands
+are sealed and characterized (per-thread `linked_list_workspace_1d`
+pool, one `omp parallel` region with derived thread/chunk policies,
+dynamic-chunk row loop).
+
+### Broad copy-paste prompt for the next session
+
+Continue the compiler LoopIR migration in /Users/bobby/scorch on branch
+refactor/compiler-ir-phase3-std-move-call at the local tip recorded in
+`git log` (origin is still 58e8565; nothing is pushed).  Read AGENTS.md,
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md §33, and this final handoff
+section.  Preserve all unrelated GPU/benchmark/scheduler/research/
+scratchpad work and the five protected tracked files; do not amend,
+squash, reorder, or push commits; stage only explicit paths and give
+nontrivial commits descriptive bodies.
+
+1. Independently review the B1/B2 closure commits (12c2079, ebb243b)
+   and the §33 exit audit from the actual diffs and contracts: probe
+   the two structural routing predicates against hostile verified
+   programs, the B1 byte-parity and honest-storage claims, the B2
+   zero-extent/canonical-empty contract, the seam codes, and the
+   claimed neutrality (captures, census, latency).  Fix and commit
+   concrete defects.
+2. If the review holds, begin the Phase-7 runtime-composition slice on
+   the sealed two-pass comparands: design and implement a typed
+   parallel sparse-workspace-pool surface (per-thread pool, one
+   parallel region, derived thread/chunk policy) for the `ds@ds->ds`
+   SpGEMM family, with the working public route as the execution
+   oracle, byte parity where the comparand is sound, and the full
+   verifier/oracle/erasure/adversarial gate discipline.  Do not touch
+   release dispatch, cache ownership, or legacy paths.
+3. Keep the standing constraints: no CSR-only schema, no rendered-name
+   discovery, no execution of the memory-unsafe mixed-level legacy
+   comparand, no cutover, no push.
