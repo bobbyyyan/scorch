@@ -259,14 +259,16 @@ def test_commuted_rhs_cursor_order_still_matches_legacy(regblock_enabled, dtype)
 
 @torch.no_grad()
 @pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_commuted_rhs_cursor_order_executes_against_oracle_and_pytorch(
     regblock_enabled,
+    dtype,
 ):
     torch.manual_seed(20260801)
-    dense_a = (torch.rand(4, 6) < 0.5) * torch.randn(4, 6)
-    dense_b = (torch.rand(6, 5) < 0.5) * torch.randn(6, 5)
+    dense_a = ((torch.rand(4, 6) < 0.5) * torch.randn(4, 6)).to(dtype)
+    dense_b = ((torch.rand(6, 5) < 0.5) * torch.randn(6, 5)).to(dtype)
     result, kernel = execute_cin_via_loopir(
-        build_spmspm_cin(commuted=True),
+        build_spmspm_cin(dtype, commuted=True),
         (4, 5),
         # The module ABI follows the commuted RHS discovery order.
         sparse_ss(dense_b, "B"),
@@ -274,7 +276,7 @@ def test_commuted_rhs_cursor_order_executes_against_oracle_and_pytorch(
         compile_options=auto_options(regblock_enabled, jit=True),
     )
     storage = validated_ss_storage(result, (4, 5))
-    dense_result = dense_from_storage(storage, (4, 5), torch.float32)
+    dense_result = dense_from_storage(storage, (4, 5), dtype)
     assert torch.allclose(dense_result, dense_a @ dense_b, atol=1e-3, rtol=1e-3)
     assert_storage_matches_oracle(
         storage,
@@ -717,6 +719,297 @@ def test_sparse_workspace_census_rejects_hidden_duplicate_effects(
             compile_options=auto_options(False),
         )
     assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+# -- completion reference ownership ------------------------------------------
+#
+# The pipeline-entry statements are the exact objects the target emitted.
+# The completion boundary must therefore never derive its reference from
+# state a pass could reach and mutate in place: a shared header snapshot
+# would track hostile edits and re-admit them as "expected".
+
+
+def _find_outer_row_loop(statements):
+    from scorch.compiler import llir
+
+    for statement in statements:
+        if (
+            type(statement) is llir.ForLoop
+            and getattr(statement, "scorch_index_var", None) == "i"
+        ):
+            return statement
+    return None
+
+
+def _reachable_mutable_ids(root):
+    """ids of every LLIR node and list reachable from one tree."""
+
+    from scorch.compiler import llir
+
+    seen = set()
+    pending = [root]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, llir.Node) or type(value) is list:
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+        if isinstance(value, llir.Node):
+            pending.extend(vars(value).values())
+        elif type(value) in (list, tuple):
+            pending.extend(value)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["widened_bound", "forged_update", "hoisted_parallel"],
+)
+def test_pipeline_entry_header_mutation_fails_closed(monkeypatch, mutation):
+    """In-place edits to the emitted outer header cannot become 'expected'.
+
+    The first managed pass receives the emitted statement objects
+    themselves.  A hostile in-place rewrite of the outer row loop there
+    must diverge from the freshly reconstructed completion reference and
+    die at the completion boundary, not ride a shared snapshot through it.
+    """
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+
+    original = pass_manager.insert_sparse_prefetch
+    state = {"mutated": False}
+
+    def hostile_prefetch(statements, context):
+        outer = _find_outer_row_loop(statements)
+        if outer is not None and not state["mutated"]:
+            if mutation == "widened_bound":
+                outer.cond = llir.BinOp(
+                    op="<=",
+                    left=outer.cond.left,
+                    right=outer.cond.right,
+                )
+            elif mutation == "forged_update":
+                outer.update = llir.Increment(var=llir.Var("pB0", llir.DataType.INT))
+            else:
+                outer.omp_parallel_for = True
+            state["mutated"] = True
+        return original(statements, context)
+
+    monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", hostile_prefetch)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_completion_reference_owns_no_pipeline_entry_state(monkeypatch):
+    """The reconstructed reference shares nothing a pass could have touched."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler.loopir import lower_llir as target
+
+    entry_ids = set()
+    original_prefetch = pass_manager.insert_sparse_prefetch
+
+    def capture_entry(statements, context):
+        entry_ids.update(_reachable_mutable_ids(list(statements)))
+        return original_prefetch(statements, context)
+
+    reference_ids = set()
+    original_matches = target._exact_sparse_completion_matches
+
+    def capture_reference(actual, expected):
+        reference_ids.update(_reachable_mutable_ids(expected))
+        return original_matches(actual, expected)
+
+    monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", capture_entry)
+    monkeypatch.setattr(
+        target,
+        "_exact_sparse_completion_matches",
+        capture_reference,
+    )
+    compile_cin_via_loopir(
+        build_spmspm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    assert entry_ids and reference_ids
+    assert not (entry_ids & reference_ids)
+
+
+@pytest.mark.parametrize("duplicate", ["alias", "structural"])
+def test_duplicated_outer_row_loop_fails_closed(monkeypatch, duplicate):
+    """Neither an aliased nor a cloned second row loop survives completion."""
+
+    from copy import deepcopy
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.insert_sparse_prefetch
+    state = {"done": False}
+
+    def hostile_prefetch(statements, context):
+        prepared = list(statements)
+        outer = _find_outer_row_loop(prepared)
+        if outer is not None and not state["done"]:
+            index = prepared.index(outer)
+            prepared.insert(
+                index + 1,
+                outer if duplicate == "alias" else deepcopy(outer),
+            )
+            state["done"] = True
+        return original(prepared, context)
+
+    monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", hostile_prefetch)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["done"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_structurally_identical_aliased_statement_fails_closed(monkeypatch):
+    """Pure aliasing with no structural change still dies at completion.
+
+    Two top-level ``BlankLine`` statements are structurally identical, so
+    replacing one with the other object changes nothing a rendered-source
+    or per-statement comparison could see.  Only the fresh-ownership
+    census can reject it.
+    """
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    state = {"done": False}
+
+    def aliasing_rewrite(value, context):
+        rewritten = original(value, context)
+        assert type(rewritten) is list
+        blank_indices = [
+            index
+            for index, statement in enumerate(rewritten)
+            if type(statement) is llir.BlankLine
+        ]
+        assert len(blank_indices) >= 2
+        rewritten[blank_indices[1]] = rewritten[blank_indices[0]]
+        state["done"] = True
+        return rewritten
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        aliasing_rewrite,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["done"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_sparse_completion_matcher_censuses_shared_empty_lists():
+    """Only the interned empty tuple may be shared; empty lists may not."""
+
+    from scorch.compiler import llir
+    from scorch.compiler.loopir import lower_llir as target
+
+    def drain_loop(body):
+        return llir.ForLoopAuto(
+            var=llir.Var("it", llir.DataType.CONST_AUTO_REF),
+            array=llir.Var("wksp", llir.DataType.AUTO),
+            body=body,
+        )
+
+    shared_body = []
+    actual_shared = [drain_loop(shared_body), drain_loop(shared_body)]
+    expected = [drain_loop([]), drain_loop([])]
+    assert not target._exact_sparse_completion_matches(actual_shared, expected)
+
+    actual_fresh = [drain_loop([]), drain_loop([])]
+    assert target._exact_sparse_completion_matches(actual_fresh, expected)
+
+    # The interned empty tuple stays exempt: childless and immutable.
+    assert target._exact_sparse_completion_matches([(), ()], [(), ()])
+
+
+def test_sparse_completion_matcher_rejects_self_containing_loop():
+    """A node-level cycle (a loop whose body holds itself) is rejected."""
+
+    from scorch.compiler import llir
+    from scorch.compiler.loopir import lower_llir as target
+
+    cyclic = llir.ForLoopAuto(
+        var=llir.Var("it", llir.DataType.CONST_AUTO_REF),
+        array=llir.Var("wksp", llir.DataType.AUTO),
+        body=[],
+    )
+    cyclic.body.append(cyclic)
+    acyclic_inner = llir.ForLoopAuto(
+        var=llir.Var("it", llir.DataType.CONST_AUTO_REF),
+        array=llir.Var("wksp", llir.DataType.AUTO),
+        body=[],
+    )
+    acyclic = llir.ForLoopAuto(
+        var=llir.Var("it", llir.DataType.CONST_AUTO_REF),
+        array=llir.Var("wksp", llir.DataType.AUTO),
+        body=[acyclic_inner],
+    )
+    assert not target._exact_sparse_completion_matches(cyclic, acyclic)
+
+
+def test_dynamic_vector_rewrite_is_idempotent_on_b1(monkeypatch):
+    """Running the vector rewrite twice must not change the completed form.
+
+    This locks the pass-order surface: a duplicated managed pass either
+    leaves the canonical completed function untouched (and byte parity
+    holds) or the completion boundary rejects the drift.
+    """
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+
+    def doubled(value, context):
+        return original(original(value, context), context)
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        doubled,
+    )
+    kernel = compile_cin_via_loopir(
+        build_spmspm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        original,
+    )
+    assert kernel.cpp_source == legacy_generated_cpp(
+        build_spmspm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
