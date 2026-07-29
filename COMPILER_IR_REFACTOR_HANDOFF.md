@@ -27950,7 +27950,7 @@ compiles AND executes; four new node kinds; `scorch.loopir.canonical.v9`
 bump by the v7-to-v8 precedent), slice B2 (mixed
 compressed-parent/dense-leaf assembly, a correctness feature gated on
 oracle/PyTorch/public-route differentials because the legacy comparand
-is defective and now provably crash-prone), and the explicit Phase-7
+produces malformed storage), and the explicit Phase-7
 disposition of the two-pass OpenMP count/fill SpGEMM form.
 
 ### Updated broad prompt for the next session
@@ -27998,11 +27998,13 @@ records it, in two separately gated seams:
    overlapping/cancellation structures, and the public kernels tests.
 2. Slice B2 — mixed compressed-parent/dense-leaf result assembly with
    a dense trailing workspace axis, as a correctness feature: the
-   legacy comparand is defective (retained source and the reproduced
-   SIGSEGV), so use the LoopIR oracle, PyTorch, and the public route
-   as the gates and record the no-legacy-comparand disposition
-   explicitly. Cover complete leaf-block coverage per materialized
-   parent, explicit zeros, empty rows, zero extents, and both arms.
+   legacy comparand produces malformed storage (values without parent
+   coordinates), so use the LoopIR oracle, PyTorch, and the public
+   route as the gates and record the no-legacy-comparand disposition
+   explicitly. The reproduced generic sparse-output reduction SIGSEGV
+   is a separate boundary. Cover complete leaf-block coverage per
+   materialized parent, explicit zeros, empty rows, zero extents, and
+   both arms.
    Keep the two-pass OpenMP count/fill SpGEMM form (public ds@ds->ds)
    explicitly dispositioned to Phase 7 with a stable code and the
    working public route as its execution oracle.
@@ -28198,11 +28200,13 @@ Milestone B2 — mixed compressed-parent/dense-leaf correctness:
    assembly and the adjacent sd-operand load chain with the dense
    trailing workspace axis represented structurally.
 2. Do not use legacy byte parity as a correctness claim: the retained
-   generic ss@ss->ds comparand writes through an unsized C_values
-   vector and SIGSEGVs. Preserve that source/transcript as defect
-   evidence, quarantine it from test-process execution, and gate B2 on
-   the independent LoopIR oracle, PyTorch, and public-route
-   differentials instead.
+   B2 comparand appends values without compressed-parent coordinates
+   and therefore produces malformed storage.  Preserve that source as
+   defect evidence, quarantine it from test-process execution, and gate
+   B2 on the independent LoopIR oracle, PyTorch, and public-route
+   differentials instead.  The retained generic `ss@ss->ds`
+   sparse-output reduction SIGSEGV is a distinct boundary and must
+   likewise remain outside the test process.
 3. Cover complete dense leaf blocks per materialized compressed parent,
    empty parents/rows, explicit-zero cancellation, zero extents,
    f32/f64, multiple compressed levels, rank-three+, and both automatic
@@ -28379,8 +28383,9 @@ the automatic/dual census, and perform the criterion-by-criterion
 Phase-6 exit audit.  Only a genuine GO may open a small Phase-7 stretch.
 Preserve the §29.5/§31 constraints: no CSR-only schema, no global target
 weakening, no rendered-name discovery, no execution of the known
-memory-unsafe mixed-level legacy comparand, no release cutover, no push,
-and no protected/unrelated-file changes.
+malformed mixed-level legacy comparand or the distinct memory-unsafe
+sparse-reduction comparand, no release cutover, no push, and no
+protected/unrelated-file changes.
 
 ## B1/B2 closure and the Phase-6 GO (2026-07-28; supersedes the §32 tail)
 
@@ -28400,10 +28405,12 @@ The sparse-result/workspace cluster is closed and Phase 6 is **GO**
 - `ebb243b` — the B2 mixed dense-leaf assembly family: `sd`/`sdd`
   results admitted for dense-domain elementwise programs through the
   existing level-based AppendEntry stream (no new nodes, no schema
-  bump) and a second dedicated target lowering; the memory-unsafe
-  legacy comparand is locked as failure evidence only, and the family
-  is gated on the LoopIR oracle and PyTorch in both arms and on the
-  unscheduled route.  Seams stay fail-closed:
+  bump) and a second dedicated target lowering; the legacy comparand's
+  malformed storage (values without compressed-parent coordinates) is
+  locked as failure evidence only, and the family is gated on the
+  LoopIR oracle and PyTorch in both arms and on the unscheduled route.
+  The separate sparse-output reduction boundary owns the retained
+  memory-safety failure.  Seams stay fail-closed:
   `unsupported_sparse_output_reduction` (reduce into mixed leaf, also
   the two-pass SpGEMM forms), `unsupported_format` (mixed operands),
   `unsupported_sparse_output_domain` (sparse domains).
@@ -28460,5 +28467,142 @@ nontrivial commits descriptive bodies.
    verifier/oracle/erasure/adversarial gate discipline.  Do not touch
    release dispatch, cache ownership, or legacy paths.
 3. Keep the standing constraints: no CSR-only schema, no rendered-name
-   discovery, no execution of the memory-unsafe mixed-level legacy
-   comparand, no cutover, no push.
+   discovery, no execution of the malformed mixed-level legacy
+   comparand or the memory-unsafe sparse-reduction comparand, no
+   cutover, no push.
+
+## Rigorous B1/B2 post-GO review corrections (2026-07-29; supersedes §33 routing)
+
+The B1/B2 closure was independently reviewed rather than accepted from
+its report.  Eight local commits now close the concrete findings:
+
+- `5dbd8c9` / `189461b` — commuted cursor-role ownership, B2 result-bound
+  and loop-name validation, independent legacy-source execution, exact
+  integral capacity, and the first completion boundary/tests;
+- `74b1e11` / `0447dc7` — exhaustive drain-effect ownership and
+  hidden-duplicate tests;
+- `fb4586b` / `6cf8038` — emitted restrict-token reservation and its
+  collision regression;
+- `fd1f9a9` / `bcc6dfd` — exact whole-function completion,
+  implementation-reserved C++ display/workspace names, iterative
+  fresh-ownership matching, and the complete adversarial lock.
+
+The important late findings were not cosmetic.  Partial dynamic-vector
+rewrites could leave unchecked writes into empty `C0_pos`/`C1_pos`
+vectors; workspace insertion/drain statements could be moved or wrapped;
+aliases, duplicate effects, an early row `continue`, or a removed ABI
+validation could survive allowlist-style censuses.  The final target
+reconstructs and exactly compares the complete post-pass B1 LLIR
+function, so every statement and stored field has one owner and one
+location.  The first correct multi-walker validator was discarded after
+an activating latency gate found a ~1.38× regression; the final
+iterative exact comparison measures ~1.07× versus `6cf8038` across
+p50/mean/p95 (200 warmups, 2,000 samples, A/B/A), inside the 1.10 target.
+
+Committed-tip verification: full target **81 passed**; broad pure
+LoopIR membership **735 passed**; focused final adversaries **26
+passed** plus the independent cycle/shared-ownership lock; focused
+Black/Flake8/mypy clean; full-source mypy exactly the inherited
+140-errors-in-11-files baseline; whitespace clean.  The authoritative
+clean-detached run at exact `bcc6dfd` reached 4,596 passed / 14 skipped
+before the documented libomp pthread-key ceiling; its exact 43-node
+failed set passed in complete, unique fresh-process partitions of
+11+11+11+10, proving **4,639 passed / 14 skipped / 3 performance
+deselected / zero code failures**.  Receipts are under
+`~/.cache/scorch-codex/authoritative-bcc6dfd/`; its verifying 28-entry
+manifest has SHA-256
+`8623471a97ae2d2e9879e56a23174bb10bfaa91a7f2a04a0488782b4037895d8`.
+The §33 evidence
+manifest is repaired and verifies all 142 non-manifest entries (manifest
+SHA-256
+`7582577e49baafc3ce4815b0683988ded389f1243ecb97a489a4d48e42264b8b`).
+Review §34 contains the full defect and gate table.  Historical text now
+correctly distinguishes B2's malformed legacy storage from the separate
+memory-unsafe sparse-output reduction case.
+
+Phase 6 remains **GO** after correction.  No production dispatch,
+release cache, schema version, legacy path, or cutover changed.  No
+Phase-7 implementation has begun; only the §33.8 evidence capture
+exists.  Origin remains `58e8565`, nothing was pushed, and the five
+protected tracked files plus all unrelated GPU/benchmark/scheduler/
+research/scratchpad material remain untouched.
+
+### Broad copy-paste prompt for the next session
+
+Continue the compiler LoopIR migration in `/Users/bobby/scorch` on
+branch `refactor/compiler-ir-phase3-std-move-call` from the local tip
+recorded by `git log` (origin remains `58e8565`; nothing from this stack
+is pushed).  Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§33–34, and this superseding
+handoff section.  Preserve all unrelated GPU/CUDA, benchmark, scheduler,
+research, scratchpad, packaging, and protected tracked-file work.  Do
+not amend, squash, reorder, or push existing commits; stage only explicit
+paths and give nontrivial commits descriptive bodies.
+
+1. First independently review the complete B1/B2 correction range
+   `abc81cb..bcc6dfd` from the actual diffs.  Reproduce the exact
+   completion/fresh-ownership boundary, commuted f32/f64 source parity
+   and compiled f32 execution (add compiled f64 as a stronger fresh
+   probe), B2 broadcast/zero-extent behavior, the independent
+   legacy-source oracle, reserved-identifier failures, the repaired
+   evidence manifest, and the activating A/B/A latency gate.  Add fresh
+   hostile/malformed probes and fix/commit any concrete defect before
+   starting Phase 7.
+2. Then execute a broad Phase-7 runtime-composition milestone, not just
+   a schema sketch.  Audit the sealed two-pass comparands under
+   `~/.cache/scorch-codex/phase6-b1b2-ebb243b/phase7-comparands/` and
+   assign each fact to LoopPlan, LoopIR, target LLIR, or runtime ABI.
+   Execute only the sized, sealed automatic comparands:
+   `spgemm_ds_ds_ds_arm{BASE,RB}.cpp` at SHA-256
+   `fa1026bec895f9fcebf212babea4fa2fa02e610372e6ff8a494e80e303a4791c`
+   and `rowscope_ss_ss_ds_arm{BASE,RB}.cpp` at SHA-256
+   `cf1114aafa8650bd230a4c156431b7019a550fd0c47c2fd6b754d929e97b4f51`.
+   Keep the generic unsized-`C_values` sparse-reduction route
+   quarantined.  Design a general level-based typed surface for the
+   per-thread sparse workspace pool, borrowed view/lifetime, one
+   parallel region, count/fill or producer/assembly phases, and derived
+   thread-count/chunk/work-estimate policy.  Do not encode CSR-specific
+   shortcuts, rendered names, raw policy parsing, or target runtime
+   spellings in semantic LoopIR.
+3. Implement the complete verified vertical slice for the valid
+   `ds@ds->ds` SpGEMM family in both automatic arms: immutable
+   tuple-owned nodes/facts, fail-closed verifier and stable defect codes,
+   canonical serialization/request identity, pure schedule application
+   plus erasure, format-neutral oracle semantics, structured LLIR/C++
+   lowering, stage timing, public compilation, honest sparse-result
+   wrapping, and byte parity to the working legacy comparand wherever
+   the comparand is sound.  Exercise empty/disjoint/overlapping/ragged
+   supports, explicit-zero cancellation, zero extents, f32/f64,
+   multiple thread counts, repeated executions, deterministic storage,
+   race/adversarial cases, completion loss, replay, and both policy arms.
+4. If that family is completely green, continue in the same session
+   through the adjacent sized, sealed automatic `ss@ss->ds` row-scope
+   comparand—not the unsafe generic route—and any inseparable general
+   multi-compressed-level assembly pieces.  Regenerate the
+   production-derived family/dual census and perform a
+   criterion-by-criterion Phase-7 checkpoint audit.  Only after a
+   genuine typed/runtime-composition GO may you use remaining capacity
+   for the next smallest target-neutral optimization slice (for example
+   the mixed dense-leaf operand load chain).  Do not perform release
+   dispatch/cache cutover, legacy deletion, selector cutover, Phase 8,
+   or Phase 8.5.
+5. Keep the malformed B2 legacy comparand as non-executed failure
+   evidence and do not execute the known memory-unsafe generic
+   sparse-reduction comparand.  Use the working public routes, LoopIR
+   oracle, independent dense/sparse references, and valid compiled
+   legacy sources as the correctness oracles.
+
+After each coherent commit, run focused structural and compiled tests.
+Final gates must include the broad CIN/LoopPlan/LoopIR and
+options/identity memberships; complete scheduled-slice, pipeline,
+schedule-generality, dual-path, and new Phase-7 compiled batteries; the
+expanded production-derived census and 86-case audit; fresh
+corpus/grid/anchor/heap/auto plus activating Phase-7 captures; repeated
+public runtime differentials; paired same-session compiler latency with
+warmups/samples and A/A/order controls; Black, Flake8, focused mypy, and
+same-methodology full-source mypy parity; `git diff --check`; and a
+clean-detached full non-performance suite.  If macOS libomp reaches its
+documented pthread-key ceiling, prove a complete non-overlapping
+fresh-process union rather than relabeling aborted nodes as passes.
+Record exact commands, revisions, hashes, limitations, and evidence
+outside Git; verify protected hashes before every commit; push nothing.

@@ -4601,11 +4601,13 @@ result is recorded for the next session:
   to the retained comparand.
 - **Slice B2 (separable correctness feature): mixed
   compressed-parent/dense-leaf assembly.**  The legacy comparand is
-  defective by inspection and now also by the retained SIGSEGV
-  reproduction, so this migration is gated on the LoopIR oracle,
-  PyTorch, and public-route differentials with an explicit
-  no-legacy-comparand disposition.  The `sd`-operand load chain is a
-  distinct adjacent gap.
+  defective by inspection: it appends values without assembling the
+  compressed-parent coordinates, so it cannot provide valid sparse
+  storage.  This migration is gated on the LoopIR oracle, PyTorch, and
+  public-route differentials with an explicit no-legacy-comparand
+  disposition.  The separately retained generic sparse-output reduction
+  owns the SIGSEGV evidence; it is not evidence about this dense-domain
+  B2 family.  The `sd`-operand load chain is a distinct adjacent gap.
 - **Explicitly outside Phase 6: the two-pass OpenMP count/fill form**
   (public `ds@ds->ds` SpGEMM and `ds`-output requests).  Legacy emits a
   statically parallel two-pass kernel with per-thread workspace pools;
@@ -4926,9 +4928,11 @@ B1 is serial `coo_workspace` plus general multi-level ordered sparse
 assembly against the executing `ss@ss->ss` comparand; B2 is the mixed
 compressed-parent/dense-leaf correctness slice gated on the LoopIR
 oracle, PyTorch, and the public route because its legacy comparand is
-memory-unsafe.  The two-pass OpenMP count/fill form stays assigned to
-Phase 7.  No Phase-7 work, cutover, cache/selector change, or legacy
-deletion was started.
+malformed (values without compressed-parent coordinates).  The distinct
+generic sparse-output reduction is the memory-unsafe legacy boundary.
+The two-pass OpenMP count/fill form stays assigned to Phase 7.  No
+Phase-7 work, cutover, cache/selector change, or legacy deletion was
+started.
 
 ### 30.5 Exact-revision verification
 
@@ -5335,9 +5339,11 @@ oracle), completion-loss adversaries, stage timing, and source parity.
 
 If those gates are green, continue in the same session into B2 as the
 independent-oracle correctness slice described in §29.5/§31: the legacy
-mixed-level comparand is memory-unsafe and must not be used as a parity
-oracle.  Regenerate the production-derived census and repeat the full Phase-6
-exit audit only after both slices.  Phase 7 may begin only on a genuine GO.
+mixed-level comparand produces malformed sparse storage and must not be
+used as a parity oracle.  The separately retained sparse-output reduction
+is the memory-unsafe boundary.  Regenerate the production-derived census
+and repeat the full Phase-6 exit audit only after both slices.  Phase 7
+may begin only on a genuine GO.
 
 ## 33. B1/B2 closure, regenerated census, and the Phase-6 exit (2026-07-28)
 
@@ -5528,3 +5534,133 @@ slice: a typed parallel sparse-workspace-pool surface with the working
 public route as its execution oracle, gated by the same
 verifier/oracle/erasure/adversarial discipline, still without touching
 release dispatch or cache ownership.
+
+## 34. Rigorous post-GO review of B1/B2 (2026-07-29)
+
+### 34.1 Verdict and concrete findings
+
+The §33 GO was not accepted from its report.  The complete
+`12c2079^..abc81cb` range was read from the actual diffs, both target
+routes were exercised through the public pipeline, retained evidence
+was rechecked, and fresh malformed-pass probes were applied after the
+managed LLIR pipeline.  The review found real correctness, fail-closed,
+test-oracle, identifier, documentation, and evidence defects:
+
+1. B1 assigned descended/root cursor roles by tuple position.  The
+   semantically equivalent commuted RHS `B[k,j] * A[i,k]` therefore
+   failed in both automatic arms even though the verified schedule and
+   legacy target were valid.
+2. B2 did not declare every result-owned broadcast bound and did not
+   reject distinct loop binders that lower to one C++ name.  A valid
+   broadcast leaf could emit an undeclared extent; a colliding hand-built
+   program could shadow its own loop variable.
+3. The claimed raw-legacy execution differential compiled the candidate
+   source a second time instead of compiling independently generated
+   legacy source for the same request.
+4. B1 had no adequate post-pass completion boundary.  Identity/partial
+   vector rewrites, metadata-hidden duplicate drains, extra appends or
+   counter mutations, aliases through calls/address-of/data access,
+   moved or wrapped drains, reparented insertions, an early row
+   `continue`, raw `C0_pos`/`C1_pos` writes, wrapped position sentinels,
+   and removal of an ABI validation could all escape successive partial
+   validators.
+5. Exact token reservations (`__restrict__`, runtime/type spellings)
+   still admitted other implementation-reserved C++ identifiers such as
+   `__asm`, `__restrict`, and `__typeof__`, plus display-name edges that
+   manufacture double underscores when target suffixes are added.
+6. The retained evidence manifest included its own digest and could not
+   verify.  The prose also incorrectly attributed a separate generic
+   sparse-reduction SIGSEGV to B2; B2's legacy defect is malformed
+   storage (values without parent coordinates), not that SIGSEGV.
+
+These findings temporarily invalidated the §33 exit claim.  They are
+closed by eight focused local commits, with no amendment or reorder:
+
+- `5dbd8c9` / `189461b`: cursor-role classification, B2 bounds/name
+  validation, exact integral capacity, independent legacy execution,
+  initial completion ownership, and focused regressions;
+- `74b1e11` / `0447dc7`: exact drain-effect census and hidden-duplicate
+  adversaries;
+- `fb4586b` / `6cf8038`: the emitted restrict-token reservation and
+  collision lock;
+- `fd1f9a9` / `bcc6dfd`: the final exact completion contract,
+  implementation-reserved identifier boundary, and complete regression
+  matrix.
+
+### 34.2 Final completion contract and latency correction
+
+The final B1 boundary does not rely on a rendered-name search or a
+per-effect allowlist.  `_SparseWorkspaceLowering` reconstructs the one
+canonical LLIR function that must exist after the managed pipeline:
+all ABI validation and input-prologue statements, both checked
+compressed-position sentinels, the exact outer cursor header and complete
+producer/drain/row body, the checked root close, and final sparse
+assembly.  One exact stored-state comparison rejects every missing,
+extra, moved, wrapped, aliased, malformed, cyclic, or shared-mutable
+aggregate.  The comparator is iterative and requires fresh node/nonempty
+container ownership; CPython's childless immutable empty-tuple singleton
+is the sole sharing exemption.
+
+An initial exhaustive multi-walker implementation was correct but added
+about 38% to an activating B1 compile.  It was not retained.  The final
+single-comparison implementation was gated in a same-session
+200-warmup/2,000-sample A/B/A against `6cf8038`:
+
+| run | p50 ms | mean ms | p95 ms |
+| --- | ---: | ---: | ---: |
+| candidate first | 5.0672 | 5.0957 | 5.3794 |
+| base | 4.7375 | 4.7602 | 5.0500 |
+| candidate second | 5.0707 | 5.0936 | 5.3939 |
+
+Candidate/base ratios are 1.0696–1.0703 p50, 1.0700–1.0705 mean, and
+1.0652–1.0681 p95, all inside the 1.10 compiler-latency gate.
+
+### 34.3 Verification and evidence correction
+
+At committed code/test tip `bcc6dfd`:
+
+- the complete B1/B2 target file passed **81 tests in 184.98 s**,
+  including real compilation/execution, exact legacy-source execution,
+  commuted f32/f64 source parity and compiled f32 execution,
+  broadcast/zero extents, all completion attacks, and identifier
+  boundaries;
+- the broad pure LoopIR membership (CIN lowering, iteration domains,
+  levels, LLIR lowering, neutrality, oracle, printer, schedule passes,
+  and verifier) passed **735 tests in 3.62 s**;
+- an independent final adversarial selection passed **26**, and the
+  cycle/shared-ownership matcher lock passed independently;
+- the authoritative clean-detached run at exact `bcc6dfd` asserted
+  import provenance and collected 4,656 tests with three performance
+  cases deselected.  It reached **4,596 passed / 14 skipped** before the
+  documented macOS libomp pthread-key ceiling produced a 43-node
+  exhaustion cascade (39 literal `OMP Error #179`/`pthread_key_create`
+  markers).  The exact `lastfailed` set was proven complete, unique, and
+  non-overlapping across fresh-process partitions of 11+11+11+10; all
+  four passed.  The proven union is therefore **4,639 passed / 14
+  skipped / 3 deselected / zero code failures**;
+- Black and Flake8 are clean on all changed source and test files, focused
+  production mypy is clean, full-source mypy remains exactly the
+  inherited **140 errors in 11 files**, and `git diff --check` is clean.
+
+The retained §33 evidence tree now has a self-excluding, fully verifying
+142-entry `SHA256SUMS`; its digest is
+`7582577e49baafc3ce4815b0683988ded389f1243ecb97a489a4d48e42264b8b`.
+The authoritative full-suite logs, XML, node partitions, and provenance
+receipt are retained under
+`~/.cache/scorch-codex/authoritative-bcc6dfd/`; its verifying 28-entry
+manifest has SHA-256
+`8623471a97ae2d2e9879e56a23174bb10bfaa91a7f2a04a0488782b4037895d8`.
+The B2 wording in §§29–33 and the handoff is corrected to distinguish
+malformed mixed-leaf storage from the separate memory-unsafe
+sparse-reduction boundary.
+
+### 34.4 Exit disposition
+
+With the corrections above, the Phase-6 criterion-by-criterion verdict
+returns to **GO**.  No schema/version, release dispatch, cache ownership,
+legacy path, cutover, or selector changed.  No Phase-7 implementation
+has begun; only the evidence-only comparand capture in §33.8 exists.
+The opening coherent milestone remains the typed parallel
+sparse-workspace-pool/two-pass runtime composition characterized there,
+with the working public route as execution oracle and no use of the
+malformed or memory-unsafe comparands as correctness oracles.
