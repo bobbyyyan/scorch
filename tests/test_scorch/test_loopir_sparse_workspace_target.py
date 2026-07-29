@@ -356,6 +356,87 @@ def test_sparse_workspace_fails_closed_if_vector_rewrite_is_lost(monkeypatch):
     assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
+@pytest.mark.parametrize("tamper", ["metadata_duplicate", "stray_append"])
+def test_sparse_workspace_census_rejects_hidden_duplicate_effects(
+    monkeypatch,
+    tamper,
+):
+    """Non-rendered metadata cannot hide an extra workspace drain or write."""
+
+    from copy import deepcopy
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+    from scorch.compiler.llir_traversal import (
+        LLIRRewriter,
+        LLIRStatementSequence,
+        LLIRTraversalContext,
+    )
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+
+    class DuplicateDrain(LLIRRewriter):
+        def __init__(self):
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="test",
+                    pass_name="duplicate_sparse_workspace_drain",
+                )
+            )
+            self.done = False
+
+        def prepare_statement_sequence(
+            self,
+            statements: LLIRStatementSequence,
+            path,
+        ):
+            prepared = list(statements)
+            if self.done:
+                return prepared
+            for index, statement in enumerate(prepared):
+                if (
+                    type(statement) is llir.ForLoopAuto
+                    and type(statement.array) is llir.Var
+                    and statement.array.name == "wksp"
+                ):
+                    duplicate = deepcopy(statement)
+                    duplicate.array.type = llir.DataType.NO_TYPE
+                    prepared.insert(index + 1, duplicate)
+                    self.done = True
+                    break
+            return prepared
+
+    def tamper_with_rewrite(value, context):
+        rewritten = original(value, context)
+        if tamper == "metadata_duplicate":
+            duplicate_rewriter = DuplicateDrain()
+            result = duplicate_rewriter.rewrite(rewritten)
+            assert duplicate_rewriter.done
+            return result
+        assert type(rewritten) is list
+        rewritten.append(
+            llir.FunctionCallStmt(
+                name="C_values.emplace_back",
+                args=[llir.Literal(0.0)],
+            )
+        )
+        return rewritten
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        tamper_with_rewrite,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
 @pytest.mark.parametrize("regblock_enabled", [False, True])
 def test_completed_target_owns_the_pipeline_route(regblock_enabled):
     """B1 compiles end to end: schedule applied, target emission recorded."""
