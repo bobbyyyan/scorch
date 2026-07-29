@@ -188,6 +188,7 @@ _CPP_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TARGET_RESERVED_NAMES = frozenset(
     {
         "Tensor",
+        "__restrict__",
         "evaluate",
         "int32_t",
         "int64_t",
