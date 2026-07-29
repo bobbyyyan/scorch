@@ -4358,7 +4358,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
             if cursor_value.cursor not in self._value_cursors:
                 _fail(
                     "unsupported_program_shape",
-                    "the insertion value may read only the merge's left "
+                    "the insertion value may read only the merge's descended "
                     "cursor and the child cursor",
                 )
             return
@@ -4821,6 +4821,21 @@ class _SparseWorkspaceLowering(_TargetLowering):
         """
 
         workspace_name = self.workspace_decl.name
+        result_name = self.result_decl.name
+        protected_vectors = (
+            f"{result_name}_values",
+            f"{result_name}1_crd",
+        )
+
+        def assignment_root_name(target: llir.Expr) -> Optional[str]:
+            current = target
+            while type(current) in (llir.ArrayAccess, llir.MemberAccess):
+                current = (
+                    cast(llir.ArrayAccess, current).array
+                    if type(current) is llir.ArrayAccess
+                    else cast(llir.MemberAccess, current).base
+                )
+            return current.name if type(current) is llir.Var else None
 
         class _DrainCollector(LLIRWalker):
             def __init__(self) -> None:
@@ -4831,15 +4846,37 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     )
                 )
                 self.candidates: List[llir.ForLoopAuto] = []
+                self.protected_calls: List[llir.Stmt] = []
+                self.protected_assignments: List[llir.Assign] = []
+                self.protected_raw_statements: List[llir.RawStmt] = []
 
             def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
                 if (
                     type(node) is llir.ForLoopAuto
                     and type(node.array) is llir.Var
                     and node.array.name == workspace_name
-                    and node.array.type is llir.DataType.AUTO
                 ):
                     self.candidates.append(cast(llir.ForLoopAuto, node))
+                elif type(node) is llir.FunctionCallStmt and any(
+                    node.name.startswith(f"{name}.") for name in protected_vectors
+                ):
+                    self.protected_calls.append(cast(llir.FunctionCallStmt, node))
+                elif (
+                    type(node) is llir.MemberCallStmt
+                    and type(node.base) is llir.Var
+                    and node.base.name in protected_vectors
+                ):
+                    self.protected_calls.append(cast(llir.MemberCallStmt, node))
+                elif (
+                    type(node) is llir.Assign
+                    and assignment_root_name(node.var) in protected_vectors
+                ):
+                    self.protected_assignments.append(cast(llir.Assign, node))
+                elif type(node) is llir.RawStmt and any(
+                    re.search(rf"\b{re.escape(name)}\b", node.code)
+                    for name in protected_vectors
+                ):
+                    self.protected_raw_statements.append(cast(llir.RawStmt, node))
 
         collector = _DrainCollector()
         try:
@@ -4854,14 +4891,35 @@ class _SparseWorkspaceLowering(_TargetLowering):
         ) as error:
             _fail(_SPARSE_WORKSPACE_LOST, str(error))
         expected = self._completed_drain_loop()
-        if len(collector.candidates) != 1 or not self._exact_panel_state_matches(
-            collector.candidates[0],
-            expected,
+        canonical = collector.candidates[0] if len(collector.candidates) == 1 else None
+        canonical_calls = (
+            [
+                statement
+                for statement in canonical.body
+                if type(statement) is llir.FunctionCallStmt
+                and statement.name
+                in (
+                    f"{result_name}_values.emplace_back",
+                    f"{result_name}1_crd.emplace_back",
+                )
+            ]
+            if canonical is not None
+            else []
+        )
+        if (
+            canonical is None
+            or not self._exact_panel_state_matches(canonical, expected)
+            or len(canonical_calls) != 2
+            or {id(call) for call in collector.protected_calls}
+            != {id(call) for call in canonical_calls}
+            or collector.protected_assignments
+            or collector.protected_raw_statements
         ):
             _fail(
                 _SPARSE_WORKSPACE_LOST,
                 "the assembled function must contain exactly one canonical "
-                "workspace drain with completed dynamic-vector appends",
+                "workspace drain and exactly its two completed dynamic-vector "
+                "appends, with no residual or duplicated protected writes",
             )
         return function
 
