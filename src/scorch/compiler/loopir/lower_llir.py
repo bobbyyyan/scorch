@@ -135,6 +135,9 @@ from .nodes import (
     ParallelPart,
     ParallelSelection,
     ParallelWork,
+    PositionId,
+    PositionValue,
+    ReduceOp,
     RelayoutDecl,
     RelayoutScope,
     RelayoutStage,
@@ -146,6 +149,11 @@ from .nodes import (
     SparseFor,
     SparseWorkSource,
     SparseWindowFor,
+    SparseWorkspaceDecl,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
     StagedRead,
     Stmt,
     Store,
@@ -4030,6 +4038,759 @@ class _TargetLowering:
         return function
 
 
+def _sparse_workspace_chain(program: LoopProgram) -> bool:
+    """Whether the program is the serial sparse-workspace family chain.
+
+    Routing is purely structural over the verified typed tree: one outer
+    single-cursor sparse loop whose whole body is one
+    :class:`SparseWorkspaceRegion`.  Everything else — including any other
+    placement of a sparse workspace region — stays on the general target
+    lowering and keeps its existing fail-closed boundary.
+    """
+
+    body = program.body
+    if type(body) is not Block or len(body.statements) != 1:
+        return False
+    outer = body.statements[0]
+    if type(outer) is not SparseFor:
+        return False
+    inner = outer.body
+    return (
+        type(inner) is Block
+        and len(inner.statements) == 1
+        and type(inner.statements[0]) is SparseWorkspaceRegion
+    )
+
+
+class _SparseWorkspaceLowering(_TargetLowering):
+    """Dedicated target lowering for the serial B1 sparse-workspace family.
+
+    Admits exactly the verified shape ``apply_sparse_workspace`` produces —
+    one outer level-0 sparse row loop over a doubly-compressed input, a
+    :class:`SparseWorkspaceRegion` whose producer is a two-cursor
+    INTERSECTION merge descending through a position-bound child sparse
+    loop into a merging ADD insertion, and whose consumer is the one
+    ordered drain appending each merged entry to the identity-ordered
+    rank-2 doubly-compressed result.  Anything else fails closed with
+    ``unsupported_program_shape``.
+
+    The raw emission mirrors the retained serial ``coo_workspace_1d``
+    legacy lowering statement-for-statement — workspace allocation inside
+    the row loop, the while-merge with bound-position descent, ``sort()``
+    plus the range-for drain writing indexed appends the shared
+    dynamic-vector pass rewrites to ``emplace_back``, the per-row
+    compressed-parent assembly, and the final root position close — so the
+    generated C++ is byte-identical to the legacy pipeline's output for
+    both automatic policy arms.  The general hierarchical-compressed
+    restrictions of :class:`_TargetLowering` are untouched: this class is
+    reachable only through the exact structural chain above.
+    """
+
+    def __init__(
+        self,
+        program: LoopProgram,
+        input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+        result_shape: Tuple[int, ...],
+    ) -> None:
+        self.program = program
+        self.decls = {decl.symbol: decl for decl in program.tensors}
+        if len(program.outputs) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one output tensor",
+            )
+        self.result_symbol = program.outputs[0]
+        self.result_decl = self.decls[self.result_symbol]
+        self.result_is_dense = False
+        self.sparse_program = True
+        self.dimension_names = {}
+        self._access_ids = {}
+        # Fields the shared driver surface and inherited helpers read: the
+        # family carries no dense-workspace region, panel, staging region,
+        # heap tile, split loops, or parallel selection.
+        self.loops: List[_Loop] = []
+        self.region = None
+        self.panel = None
+        self.relayout = None
+        self.result_tile = None
+        self.result_tile_depth = -1
+        self.relayout_depth = -1
+        if program.parallel is not None:
+            _fail(
+                "unsupported_program_shape",
+                "the serial sparse-workspace family owns no parallel " "selection",
+            )
+        self.parallel = None
+        self._validate_display_names()
+        self.shapes = self._validate_shapes(input_shapes, result_shape)
+        self._validate_family_shape()
+        self._reserve_family_names()
+
+    # -- family-shape validation ---------------------------------------------
+
+    def _validate_family_shape(self) -> None:
+        def require(condition: bool, what: str) -> None:
+            if not condition:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the serial sparse-workspace target requires {what}",
+                )
+
+        def doubly_compressed(decl: TensorDecl) -> bool:
+            return (
+                len(decl.levels) == 2
+                and tuple(level.kind for level in decl.levels)
+                == (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+                and tuple(level.mode for level in decl.levels) == (0, 1)
+            )
+
+        program = self.program
+        body = program.body
+        require(
+            type(body) is Block and len(body.statements) == 1,
+            "a single-statement program body",
+        )
+        outer = body.statements[0]
+        require(type(outer) is SparseFor, "an outer sparse row loop")
+        outer = cast(SparseFor, outer)
+        outer_cursor = outer.cursor
+        require(
+            outer_cursor.level == 0 and type(outer_cursor.parent) is RootPosition,
+            "a root-parented level-0 outer row cursor",
+        )
+        inner = outer.body
+        require(
+            type(inner) is Block
+            and len(inner.statements) == 1
+            and type(inner.statements[0]) is SparseWorkspaceRegion,
+            "the sparse workspace region as the row loop's whole body",
+        )
+        region = cast(SparseWorkspaceRegion, inner.statements[0])
+        workspace_decl = region.workspace
+        require(
+            type(workspace_decl) is SparseWorkspaceDecl,
+            "an exact sparse workspace declaration",
+        )
+        producer = region.producer
+        require(
+            type(producer) is Block
+            and len(producer.statements) == 1
+            and type(producer.statements[0]) is MergedSparseFor,
+            "a producer opening with the merged reduction loop",
+        )
+        merge = cast(MergedSparseFor, producer.statements[0])
+        require(
+            merge.mode is MergeMode.INTERSECTION
+            and len(merge.cursors) == 2
+            and len(merge.positions) == 2
+            and all(type(bound) is PositionId for bound in merge.positions),
+            "a two-cursor position-binding INTERSECTION merge",
+        )
+        left, right = merge.cursors
+        require(
+            left.tensor == outer_cursor.tensor
+            and left.level == 1
+            and type(left.parent) is PositionValue
+            and cast(PositionValue, left.parent).position == outer.position,
+            "a left merge cursor descending from the outer row position",
+        )
+        require(
+            right.tensor != left.tensor
+            and right.level == 0
+            and type(right.parent) is RootPosition,
+            "a root-parented level-0 right merge cursor over a second input",
+        )
+        merge_body = merge.body
+        require(
+            type(merge_body) is Block
+            and len(merge_body.statements) == 1
+            and type(merge_body.statements[0]) is SparseFor,
+            "a child sparse loop as the merge body",
+        )
+        child = cast(SparseFor, merge_body.statements[0])
+        child_cursor = child.cursor
+        require(
+            child_cursor.tensor == right.tensor
+            and child_cursor.level == 1
+            and type(child_cursor.parent) is PositionValue
+            and cast(PositionValue, child_cursor.parent).position == merge.positions[1],
+            "a child cursor descending from the merge-bound right position",
+        )
+        child_body = child.body
+        require(
+            type(child_body) is Block
+            and len(child_body.statements) == 1
+            and type(child_body.statements[0]) is SparseWorkspaceInsert,
+            "the merging insertion as the child loop's whole body",
+        )
+        insert = cast(SparseWorkspaceInsert, child_body.statements[0])
+        require(
+            insert.workspace == workspace_decl.workspace
+            and insert.op is ReduceOp.ADD
+            and type(insert.coord) is IndexValue
+            and cast(IndexValue, insert.coord).index == child.coord_index,
+            "an ADD insertion at the child loop coordinate",
+        )
+        consumer = region.consumer
+        require(
+            type(consumer) is Block
+            and len(consumer.statements) == 1
+            and type(consumer.statements[0]) is SparseWorkspaceDrainFor,
+            "the one ordered drain as the whole consumer",
+        )
+        drain = cast(SparseWorkspaceDrainFor, consumer.statements[0])
+        require(
+            drain.workspace == workspace_decl.workspace,
+            "a drain of the region's own workspace",
+        )
+        drain_body = drain.body
+        require(
+            type(drain_body) is Block
+            and len(drain_body.statements) == 1
+            and type(drain_body.statements[0]) is AppendEntry,
+            "the ordered append as the drain loop's whole body",
+        )
+        append = cast(AppendEntry, drain_body.statements[0])
+        require(
+            append.tensor == self.result_symbol
+            and len(append.coords) == 2
+            and all(type(coord) is IndexValue for coord in append.coords)
+            and cast(IndexValue, append.coords[0]).index == outer.coord_index
+            and cast(IndexValue, append.coords[1]).index == drain.index
+            and type(append.value) is SparseWorkspaceValue
+            and cast(SparseWorkspaceValue, append.value).workspace
+            == workspace_decl.workspace,
+            "an append of the drained value at the row and drain coordinates",
+        )
+
+        left_decl = self.decls[left.tensor]
+        right_decl = self.decls[right.tensor]
+        require(
+            program.inputs == (left.tensor, right.tensor)
+            and doubly_compressed(left_decl)
+            and doubly_compressed(right_decl)
+            and doubly_compressed(self.result_decl),
+            "exactly two identity-ordered doubly-compressed inputs and result",
+        )
+        require(
+            left_decl.dtype is right_decl.dtype
+            and left_decl.dtype is self.result_decl.dtype
+            and workspace_decl.dtype is self.result_decl.dtype
+            and self.result_decl.dtype in _SCALAR_TO_TORCH,
+            "one shared supported scalar type",
+        )
+        require(
+            self._level_dimension(left.tensor, 0) == self.result_decl.dimensions[0]
+            and self._level_dimension(left.tensor, 1)
+            == self._level_dimension(right.tensor, 0)
+            and self._level_dimension(right.tensor, 1) == self.result_decl.dimensions[1]
+            and workspace_decl.drain_dimension == self.result_decl.dimensions[1],
+            "row, reduction, and drain dimensions in matmul agreement",
+        )
+        row_dimension = self._level_dimension(left.tensor, 0)
+        merge_dimension = self._level_dimension(left.tensor, 1)
+        drain_dimension = workspace_decl.drain_dimension
+        require(
+            len({row_dimension, merge_dimension, drain_dimension}) == 3,
+            "three distinct loop dimensions",
+        )
+
+        self.outer_loop = outer
+        self.sparse_region = region
+        self.workspace_decl = workspace_decl
+        self.merge = merge
+        self.child_loop = child
+        self.sparse_insert = insert
+        self.sparse_drain = drain
+        self.sparse_append = append
+        self.row_name = self.dimension_names[row_dimension]
+        self.merge_name = self.dimension_names[merge_dimension]
+        self.drain_name = self.dimension_names[drain_dimension]
+        # The value-typed cursors admissible in the insertion value, and
+        # the level drivers backing the shared input access metadata.
+        self._value_cursors = {
+            left.cursor: left,
+            child_cursor.cursor: child_cursor,
+        }
+        self.level_drivers = {
+            left.tensor: {0: outer.coord_index, 1: merge.coord_index},
+            right.tensor: {0: merge.coord_index, 1: child.coord_index},
+        }
+        self._validate_insert_value(insert.value)
+
+    def _validate_insert_value(self, expr: Expr) -> None:
+        if type(expr) is CursorValue:
+            cursor_value = cast(CursorValue, expr)
+            if cursor_value.cursor not in self._value_cursors:
+                _fail(
+                    "unsupported_program_shape",
+                    "the insertion value may read only the merge's left "
+                    "cursor and the child cursor",
+                )
+            return
+        if type(expr) is BinaryExpr:
+            binary = cast(BinaryExpr, expr)
+            if binary.op not in (BinaryOp.ADD, BinaryOp.MUL):
+                _fail(
+                    "unsupported_program_shape",
+                    "the insertion value supports ADD and MUL only",
+                )
+            self._validate_insert_value(binary.lhs)
+            self._validate_insert_value(binary.rhs)
+            return
+        _fail(
+            "unsupported_program_shape",
+            f"unsupported insertion value expression {type(expr).__name__}",
+        )
+
+    def _reserve_family_names(self) -> None:
+        workspace_name = self.workspace_decl.name
+        if (
+            _CPP_IDENTIFIER.fullmatch(workspace_name) is None
+            or workspace_name in _CPP_KEYWORDS
+        ):
+            _fail(
+                "invalid_display_name",
+                f"workspace name {workspace_name!r} is not a safe ASCII C++ "
+                "identifier",
+            )
+        owner = f"workspace {workspace_name!r}"
+        self._reserve_generated_name(workspace_name, owner)
+        self._reserve_generated_name(f"{workspace_name}_value", owner)
+        self._reserve_generated_name("it", "the workspace drain iterator")
+        for cursor in self.merge.cursors:
+            tensor_name = self.decls[cursor.tensor].name
+            self._reserve_generated_name(
+                f"{self.merge_name}_{tensor_name}",
+                f"merged coordinate of input tensor {tensor_name!r}",
+            )
+
+    # -- emission -------------------------------------------------------------
+
+    def _sparse_value(self, expr: Expr) -> llir.Expr:
+        """Lower the insertion value: every admitted cursor is aligned."""
+
+        if type(expr) is CursorValue:
+            cursor = self._value_cursors[cast(CursorValue, expr).cursor]
+            decl = self.decls[cursor.tensor]
+            torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
+            return llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{decl.name}_val",
+                    type=llir.DataType.ptr_type(torch_dtype),
+                ),
+                index=llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
+                ),
+                tensor_access=self._input_metadata(cursor.tensor),
+            )
+        binary = cast(BinaryExpr, expr)
+        return llir.BinOp(
+            op=_BINARY_TO_CXX[binary.op],
+            left=self._sparse_value(binary.lhs),
+            right=self._sparse_value(binary.rhs),
+        )
+
+    def _append_metadata(self) -> llir.TensorAccessMetadata:
+        return llir.TensorAccessMetadata(
+            access_id=self._access_id(self.result_symbol),
+            tensor_id=self.result_symbol,
+            index_ids=(
+                self.outer_loop.coord_index,
+                self.sparse_drain.index,
+            ),
+            role=llir.TensorAccessRole.RESULT_WRITE,
+        )
+
+    def _segment_start(self, cursor: SparseCursorDecl) -> llir.Expr:
+        """The pos-array index opening one cursor's segment (level-0 aware)."""
+
+        if cursor.level == 0:
+            return llir.Literal(0, llir.DataType.INT)
+        return self._cursor_parent_var(cursor)
+
+    def _segment_end(self, cursor: SparseCursorDecl) -> llir.Expr:
+        if cursor.level == 0:
+            return llir.Literal(1, llir.DataType.INT)
+        return llir.Add(
+            left=self._cursor_parent_var(cursor),
+            right=llir.Literal(1, llir.DataType.INT),
+        )
+
+    def _child_loop_statements(self) -> List[llir.Stmt]:
+        cursor = self.child_loop.cursor
+        position_name = self._cursor_position_name(cursor)
+        body: List[llir.Stmt] = [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=self.drain_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor),
+                    index=llir.Var(name=position_name, type=llir.DataType.INT),
+                ),
+            ),
+            llir.BlankLine(),
+            llir.FunctionCallStmt(
+                name=f"{self.workspace_decl.name}.insert",
+                args=[
+                    llir.Array(
+                        values=[
+                            llir.Var(
+                                name=self.drain_name,
+                                type=llir.DataType.INT64,
+                            )
+                        ],
+                        data_type=llir.DataType.INT64,
+                    ),
+                    self._sparse_value(self.sparse_insert.value),
+                ],
+            ),
+        ]
+        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=position_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_start(cursor),
+                ),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=position_var,
+                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            ),
+            body=body,
+        )
+        for_loop.scorch_index_var = self.drain_name
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_end(cursor),
+                ),
+            ),
+            llir.BlankLine(),
+            for_loop,
+        ]
+
+    def _merge_statements(self) -> List[llir.Stmt]:
+        cursors = self.merge.cursors
+        dimension_name = self.merge_name
+
+        def coordinate_var(cursor: SparseCursorDecl) -> llir.Var:
+            return llir.Var(
+                name=f"{dimension_name}_{self.decls[cursor.tensor].name}",
+                type=llir.DataType.INT,
+            )
+
+        def dimension_var() -> llir.Var:
+            return llir.Var(name=dimension_name, type=llir.DataType.INT)
+
+        iterator_inits: List[llir.Stmt] = []
+        for cursor in cursors:
+            position_name = self._cursor_position_name(cursor)
+            iterator_inits.append(
+                llir.VarInit(
+                    var=llir.Var(name=position_name, type=llir.DataType.INT),
+                    value=llir.ArrayAccess(
+                        array=self._cursor_pos_array(cursor),
+                        index=self._segment_start(cursor),
+                    ),
+                )
+            )
+            iterator_inits.append(
+                llir.VarInit(
+                    var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                    value=llir.ArrayAccess(
+                        array=self._cursor_pos_array(cursor),
+                        index=self._segment_end(cursor),
+                    ),
+                )
+            )
+
+        while_body: List[llir.Stmt] = [llir.Comment("Load coordinates")]
+        for cursor in cursors:
+            while_body.append(
+                llir.VarInit(
+                    var=coordinate_var(cursor),
+                    value=llir.ArrayAccess(
+                        array=self._cursor_crd_array(cursor),
+                        index=llir.Var(
+                            name=self._cursor_position_name(cursor),
+                            type=llir.DataType.INT,
+                        ),
+                    ),
+                )
+            )
+        while_body.extend(
+            [
+                llir.BlankLine(),
+                llir.Comment("Resolve coordinates"),
+                llir.VarInit(
+                    var=llir.Var(name=dimension_name, type=llir.DataType.INT),
+                    value=llir.FunctionCall(
+                        name="std::min",
+                        args=[
+                            llir.Array(
+                                values=tuple(
+                                    coordinate_var(cursor) for cursor in cursors
+                                ),
+                                data_type=llir.DataType.INT,
+                            )
+                        ],
+                    ),
+                ),
+                llir.BlankLine(),
+                llir.Comment("Inner loops over child regions"),
+                llir.IfThenElse(
+                    cond_list=[
+                        llir.BinOp(
+                            op="&&",
+                            left=llir.BinOp(
+                                op="==",
+                                left=coordinate_var(cursors[0]),
+                                right=dimension_var(),
+                            ),
+                            right=llir.BinOp(
+                                op="==",
+                                left=coordinate_var(cursors[1]),
+                                right=dimension_var(),
+                            ),
+                        )
+                    ],
+                    then_body_list=[self._child_loop_statements()],
+                    make_last_case_else=False,
+                ),
+                llir.BlankLine(),
+                llir.Comment("Advance iterators"),
+            ]
+        )
+        for cursor in cursors:
+            while_body.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=self._cursor_position_name(cursor),
+                        type=llir.DataType.INT,
+                    ),
+                    value=llir.BinOp(
+                        op="==",
+                        left=coordinate_var(cursor),
+                        right=dimension_var(),
+                    ),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    cast=True,
+                )
+            )
+
+        def position_cond(cursor: SparseCursorDecl) -> llir.Expr:
+            return llir.BinOp(
+                op="<",
+                left=llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
+                ),
+                right=llir.Var(
+                    name=f"{self._cursor_position_name(cursor)}_end",
+                    type=llir.DataType.INT,
+                ),
+            )
+
+        merge_loop = llir.WhileLoop(
+            cond=llir.BinOp(
+                op="&&",
+                left=position_cond(cursors[0]),
+                right=position_cond(cursors[1]),
+            ),
+            body=while_body,
+        )
+        merge_loop.scorch_index_var = dimension_name
+        return [
+            llir.Comment("Initialize iterators"),
+            *iterator_inits,
+            llir.BlankLine(),
+            merge_loop,
+        ]
+
+    def _drain_statements(self) -> List[llir.Stmt]:
+        workspace_name = self.workspace_decl.name
+        result_name = self.result_decl.name
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        counter_var = llir.Var(name=f"p{result_name}1", type=llir.DataType.INT64)
+        drain_body: List[llir.Stmt] = [
+            llir.VarInit(
+                var=llir.Var(name=self.drain_name, type=llir.DataType.INT64),
+                value=llir.MemberAccess(base=iterator_var, member="first"),
+            ),
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{workspace_name}_value",
+                    type=dtype_to_c_datatype(torch_dtype),
+                ),
+                value=llir.MemberAccess(base=iterator_var, member="second"),
+            ),
+            llir.BlankLine(),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=counter_var,
+                    tensor_access=self._append_metadata(),
+                ),
+                value=llir.Var(
+                    name=f"{workspace_name}_value",
+                    type=llir.DataType.NO_TYPE,
+                ),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}1_crd",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=counter_var,
+                ),
+                value=llir.Var(name=self.drain_name, type=llir.DataType.NO_TYPE),
+            ),
+            llir.Increment(var=counter_var),
+        ]
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
+            llir.ForLoopAuto(
+                var=iterator_var,
+                array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+                body=drain_body,
+            ),
+        ]
+
+    def _row_assembly_statements(self) -> List[llir.Stmt]:
+        result_name = self.result_decl.name
+        return [
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.FunctionCall(name=f"{result_name}1_pos.back", args=[]),
+                    right=llir.Var(name=f"p{result_name}1", type=llir.DataType.INT64),
+                ),
+                then_body=[
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}0_crd.push_back",
+                        args=[llir.Var(name=self.row_name, type=llir.DataType.INT64)],
+                    ),
+                ],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}1_pos",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+                ),
+                value=llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+            ),
+        ]
+
+    def _region_statements(self) -> List[llir.Stmt]:
+        workspace = self.workspace_decl
+        torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
+        element_type = dtype_to_c_datatype(torch_dtype)
+        return [
+            llir.Comment("Initialize workspaces"),
+            llir.VarInit(
+                var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+                value=llir.FunctionCall(
+                    name=f"coo_workspace_1d<{element_type.value}, 1>",
+                    args=[llir.Literal(value="1024", data_type=llir.DataType.INT)],
+                ),
+            ),
+            *self._merge_statements(),
+            *self._drain_statements(),
+            *self._row_assembly_statements(),
+        ]
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        cursor = self.outer_loop.cursor
+        position_name = self._cursor_position_name(cursor)
+        result_name = self.result_decl.name
+        row_body: List[llir.Stmt] = [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=self.row_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor),
+                    index=llir.Var(name=position_name, type=llir.DataType.INT),
+                ),
+            ),
+            llir.BlankLine(),
+            *self._region_statements(),
+        ]
+        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        row_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=position_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_start(cursor),
+                ),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=position_var,
+                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            ),
+            body=row_body,
+        )
+        row_loop.scorch_index_var = self.row_name
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_end(cursor),
+                ),
+            ),
+            llir.BlankLine(),
+            row_loop,
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}0_pos",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=llir.Add(
+                        llir.Var(
+                            name=f"{result_name}0_pos_index",
+                            type=llir.DataType.INT64,
+                        ),
+                        llir.Literal(1),
+                    ),
+                ),
+                value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+            ),
+        ]
+
+
 _RELAYOUT_LOST = "relayout_completion_lost"
 _RESULT_TILE_LOST = "result_tile_completion_lost"
 _PARALLEL_LOST = "parallel_completion_lost"
@@ -6153,13 +6914,24 @@ def _lower_loopir_to_llir_owned(
 
     verify_program(program)
 
-    lowering = _TargetLowering(program, input_shapes, result_shape)
+    lowering: _TargetLowering
+    if _sparse_workspace_chain(program):
+        lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
+    else:
+        lowering = _TargetLowering(program, input_shapes, result_shape)
     raw_statements = lowering.raw_loop_statements()
     kernel_abi = lowering.kernel_abi()
     assembler = lowering.result_assembler()
 
     validation_stmts = kernel_abi.emit_validation()
     size_stmts = lowering.result_size_inits()
+    if size_stmts:
+        # An all-compressed result has no dense level sizes; the legacy
+        # pipeline emits neither the initializers nor their comment.
+        size_stmts = [
+            llir.Comment("Init result tensor level sizes"),
+            *size_stmts,
+        ]
     prologue_stmts = kernel_abi.emit_input_prologue()
     value_init_stmts = assembler.emit_value_array_init()
     tile_size_stmts = lowering.tile_size_inits()
@@ -6185,7 +6957,6 @@ def _lower_loopir_to_llir_owned(
             )
         body_stmts: List[llir.Stmt] = [
             *validation_stmts,
-            llir.Comment("Init result tensor level sizes"),
             *size_stmts,
             *prologue_stmts,
             llir.BlankLine(),
