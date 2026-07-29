@@ -283,10 +283,23 @@ def test_commuted_rhs_cursor_order_executes_against_oracle_and_pytorch(
 
 
 @pytest.mark.parametrize(
-    "reserved_name",
-    ["__restrict__", "coo_workspace_1d", "int64_t", "size_t"],
+    ("reserved_name", "defect_code"),
+    [
+        ("__asm", "invalid_display_name"),
+        ("__restrict", "invalid_display_name"),
+        ("__restrict__", "invalid_display_name"),
+        ("__typeof__", "invalid_display_name"),
+        ("_Implementation", "invalid_display_name"),
+        ("trailing_", "invalid_display_name"),
+        ("coo_workspace_1d", "generated_name_collision"),
+        ("int64_t", "generated_name_collision"),
+        ("size_t", "generated_name_collision"),
+    ],
 )
-def test_runtime_and_type_names_cannot_shadow_b1_emission(reserved_name):
+def test_runtime_and_type_names_cannot_shadow_b1_emission(
+    reserved_name,
+    defect_code,
+):
     with pytest.raises(LoopIRTargetError) as error:
         compile_cin_via_loopir(
             build_spmspm_cin(
@@ -296,7 +309,36 @@ def test_runtime_and_type_names_cannot_shadow_b1_emission(reserved_name):
             (((4, 6), torch.float32), ((6, 5), torch.float32)),
             compile_options=auto_options(False),
         )
-    assert error.value.defect.code == "generated_name_collision"
+    assert error.value.defect.code == defect_code
+
+
+@pytest.mark.parametrize("workspace_name", ["__asm", "_Workspace", "workspace_"])
+def test_sparse_workspace_name_cannot_enter_cpp_reserved_namespace(
+    workspace_name,
+):
+    program, symbols = build_b1_program()
+    outer = program.body.statements[0]
+    region = outer.body.statements[0]
+    forged_region = replace(
+        region,
+        workspace=replace(region.workspace, name=workspace_name),
+    )
+    forged_outer = replace(
+        outer,
+        body=replace(outer.body, statements=(forged_region,)),
+    )
+    forged_program = replace(
+        program,
+        body=replace(program.body, statements=(forged_outer,)),
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            forged_program,
+            input_shapes=b1_shapes(symbols),
+            result_shape=(4, 5),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    assert error.value.defect.code == "invalid_display_name"
 
 
 def test_sparse_workspace_capacity_is_an_exact_integral_literal(monkeypatch):
@@ -356,7 +398,46 @@ def test_sparse_workspace_fails_closed_if_vector_rewrite_is_lost(monkeypatch):
     assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
-@pytest.mark.parametrize("tamper", ["metadata_duplicate", "stray_append"])
+def test_sparse_completion_matcher_rejects_cycles_and_shared_ownership():
+    from scorch.compiler.loopir import lower_llir as target
+
+    actual_cycle = []
+    expected_cycle = []
+    actual_cycle.append(actual_cycle)
+    expected_cycle.append(expected_cycle)
+    assert not target._exact_sparse_completion_matches(
+        actual_cycle,
+        expected_cycle,
+    )
+
+    shared = target.llir.Comment("shared")
+    assert not target._exact_sparse_completion_matches(
+        [shared, shared],
+        [target.llir.Comment("shared"), target.llir.Comment("shared")],
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "address_alias",
+        "argument_escape",
+        "counter_alias",
+        "early_continue",
+        "expression_append",
+        "extra_counter",
+        "metadata_duplicate",
+        "missing_validation",
+        "partial_child_position",
+        "partial_root_position",
+        "receiver_alias",
+        "relocated_drain",
+        "relocated_insert",
+        "stray_append",
+        "wrapped_child_position",
+        "wrapped_drain",
+    ],
+)
 def test_sparse_workspace_census_rejects_hidden_duplicate_effects(
     monkeypatch,
     tamper,
@@ -375,7 +456,7 @@ def test_sparse_workspace_census_rejects_hidden_duplicate_effects(
 
     original = pass_manager.rewrite_dynamic_vector_accesses
 
-    class DuplicateDrain(LLIRRewriter):
+    class TamperDrain(LLIRRewriter):
         def __init__(self):
             super().__init__(
                 LLIRTraversalContext(
@@ -399,27 +480,228 @@ def test_sparse_workspace_census_rejects_hidden_duplicate_effects(
                     and type(statement.array) is llir.Var
                     and statement.array.name == "wksp"
                 ):
-                    duplicate = deepcopy(statement)
-                    duplicate.array.type = llir.DataType.NO_TYPE
-                    prepared.insert(index + 1, duplicate)
+                    if tamper == "metadata_duplicate":
+                        duplicate = deepcopy(statement)
+                        duplicate.array.type = llir.DataType.NO_TYPE
+                        prepared.insert(index + 1, duplicate)
+                    elif tamper == "extra_counter":
+                        prepared.insert(
+                            index + 1,
+                            llir.Increment(llir.Var("pC1", llir.DataType.INT64)),
+                        )
+                    elif tamper == "relocated_drain":
+                        prepared.insert(0, prepared.pop(index))
+                    elif tamper == "early_continue":
+                        prepared.insert(0, llir.Continue())
+                    else:
+                        prepared[index] = llir.IfThenElse(
+                            cond=llir.Literal(True),
+                            then_body=[statement],
+                        )
                     self.done = True
                     break
             return prepared
 
+    class RemoveWorkspaceInsert(LLIRRewriter):
+        def __init__(self):
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="test",
+                    pass_name="remove_sparse_workspace_insert",
+                )
+            )
+            self.removed = None
+
+        def rewrite_statement_sequence_member(self, node, path):
+            if (
+                self.removed is None
+                and type(node) is llir.FunctionCallStmt
+                and node.name == "wksp.insert"
+            ):
+                self.removed = node
+                return ()
+            return (node,)
+
+    class RelocateWorkspaceInsert(LLIRRewriter):
+        def __init__(self, insertion):
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="test",
+                    pass_name="relocate_sparse_workspace_insert",
+                )
+            )
+            self.insertion = insertion
+            self.done = False
+
+        def prepare_statement_sequence(
+            self,
+            statements: LLIRStatementSequence,
+            path,
+        ):
+            prepared = list(statements)
+            if self.done:
+                return prepared
+            for index, statement in enumerate(prepared):
+                if (
+                    type(statement) is llir.FunctionCallStmt
+                    and statement.name == "wksp.sort"
+                ):
+                    prepared.insert(index, self.insertion)
+                    self.done = True
+                    break
+            return prepared
+
+    def replace_position_write(statements, *, level, root_close):
+        vector_name = f"C{level}_pos"
+        for index, statement in enumerate(statements):
+            if (
+                type(statement) is llir.FunctionCallStmt
+                and statement.name == "scorch_vector_set"
+                and type(statement.args[0]) is llir.Var
+                and statement.args[0].name == vector_name
+                and (
+                    (root_close and type(statement.args[1]) is llir.Add)
+                    or (
+                        not root_close
+                        and type(statement.args[1]) is llir.Literal
+                        and statement.args[1].value == 0
+                    )
+                )
+            ):
+                statements[index] = llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            vector_name,
+                            llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=statement.args[1],
+                    ),
+                    value=statement.args[2],
+                )
+                return True
+        return False
+
     def tamper_with_rewrite(value, context):
         rewritten = original(value, context)
-        if tamper == "metadata_duplicate":
-            duplicate_rewriter = DuplicateDrain()
-            result = duplicate_rewriter.rewrite(rewritten)
-            assert duplicate_rewriter.done
+        if tamper in (
+            "extra_counter",
+            "early_continue",
+            "metadata_duplicate",
+            "relocated_drain",
+            "wrapped_drain",
+        ):
+            tamper_rewriter = TamperDrain()
+            result = tamper_rewriter.rewrite(rewritten)
+            assert tamper_rewriter.done
             return result
         assert type(rewritten) is list
-        rewritten.append(
-            llir.FunctionCallStmt(
-                name="C_values.emplace_back",
-                args=[llir.Literal(0.0)],
+        if tamper == "missing_validation":
+            removed = rewritten.pop(0)
+            assert type(removed) is llir.FunctionCallStmt
+            assert removed.name == "scorch_native::validate_jit_result_shape"
+        elif tamper == "partial_child_position":
+            assert replace_position_write(
+                rewritten,
+                level=1,
+                root_close=False,
             )
-        )
+        elif tamper == "partial_root_position":
+            assert replace_position_write(
+                rewritten,
+                level=0,
+                root_close=True,
+            )
+        elif tamper == "wrapped_child_position":
+            for index, statement in enumerate(rewritten):
+                if (
+                    type(statement) is llir.FunctionCallStmt
+                    and statement.name == "scorch_vector_set"
+                    and type(statement.args[0]) is llir.Var
+                    and statement.args[0].name == "C1_pos"
+                    and type(statement.args[1]) is llir.Literal
+                    and statement.args[1].value == 0
+                ):
+                    rewritten[index] = llir.IfThenElse(
+                        cond=llir.Literal(False),
+                        then_body=[statement],
+                    )
+                    break
+            else:
+                raise AssertionError("C1 position sentinel was not found")
+        elif tamper == "relocated_insert":
+            remover = RemoveWorkspaceInsert()
+            without_insert = remover.rewrite(rewritten)
+            assert remover.removed is not None
+            relocator = RelocateWorkspaceInsert(remover.removed)
+            relocated = relocator.rewrite(without_insert)
+            assert relocator.done
+            return relocated
+        elif tamper == "argument_escape":
+            rewritten.append(
+                llir.FunctionCallStmt(
+                    name="scorch_vector_set",
+                    args=[
+                        llir.Var("C_values", llir.DataType.NO_TYPE),
+                        llir.Literal(0),
+                        llir.Literal(0.0),
+                    ],
+                )
+            )
+        elif tamper == "address_alias":
+            rewritten.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        "completion_pointer",
+                        llir.DataType.PTR_FLOAT32,
+                    ),
+                    value=llir.AddressOf(
+                        llir.ArrayAccess(
+                            array=llir.Var(
+                                "C_values",
+                                llir.DataType.STD_VECTOR_FLOAT32,
+                            ),
+                            index=llir.Literal(0),
+                        )
+                    ),
+                )
+            )
+        elif tamper == "counter_alias":
+            rewritten.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        "completion_counter_pointer",
+                        llir.DataType.PTR_INT_64,
+                    ),
+                    value=llir.AddressOf(llir.Var("pC1", llir.DataType.INT64)),
+                )
+            )
+        elif tamper == "expression_append":
+            rewritten.append(
+                llir.VarInit(
+                    var=llir.Var("completion_probe", llir.DataType.AUTO),
+                    value=llir.FunctionCall(
+                        name="C_values.emplace_back",
+                        args=[llir.Literal(0.0)],
+                    ),
+                )
+            )
+        elif tamper == "receiver_alias":
+            rewritten.append(
+                llir.VarInit(
+                    var=llir.Var("completion_alias", llir.DataType.AUTO),
+                    value=llir.FunctionCall(
+                        name="C_values.data",
+                        args=[],
+                    ),
+                )
+            )
+        else:
+            rewritten.append(
+                llir.FunctionCallStmt(
+                    name="C_values.emplace_back",
+                    args=[llir.Literal(0.0)],
+                )
+            )
         return rewritten
 
     monkeypatch.setattr(
