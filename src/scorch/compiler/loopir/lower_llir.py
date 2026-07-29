@@ -4196,10 +4196,13 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
             if len(actual_sequence) != len(expected_sequence):
                 return False
             # CPython interns the empty tuple used by default call/template
-            # arguments. It carries no child ownership and cannot form a
-            # cycle, so its intentional sharing is outside the detachment
-            # invariant enforced for nonempty containers and nodes.
-            if not actual_sequence:
+            # arguments. It carries no child ownership, cannot form a cycle,
+            # and is immutable, so its intentional sharing is outside the
+            # detachment invariant enforced for nodes and every other
+            # container.  An empty *list* stays censused: it is mutable, so
+            # sharing one between two owners is exactly the aliased state
+            # this boundary exists to reject.
+            if type(actual_value) is tuple and not actual_sequence:
                 continue
             actual_id = id(actual_value)
             if actual_id in seen_actual:
@@ -4272,7 +4275,6 @@ class _SparseWorkspaceLowering(_TargetLowering):
         self.result_tile = None
         self.result_tile_depth = -1
         self.relayout_depth = -1
-        self._outer_loop_snapshot: Optional[llir.ForLoop] = None
         if program.parallel is not None:
             _fail(
                 "unsupported_program_shape",
@@ -5033,35 +5035,40 @@ class _SparseWorkspaceLowering(_TargetLowering):
             ],
         )
 
-    def _completed_outer_loop(
-        self,
-        body: List[llir.Stmt],
-    ) -> llir.ForLoop:
-        """Rebuild the pre-pass outer-loop header around a completed row."""
+    def _outer_row_loop(self, body: List[llir.Stmt]) -> llir.ForLoop:
+        """Construct the outer sparse row loop around one row body.
 
-        snapshot = self._outer_loop_snapshot
-        if snapshot is None:
-            _fail(
-                _SPARSE_WORKSPACE_LOST,
-                "the sparse workspace target did not retain its outer loop",
-            )
-        completed = llir.ForLoop(
-            init=snapshot.init,
-            cond=snapshot.cond,
-            update=snapshot.update,
+        Both the emission and the completion reference call this builder, so
+        the completion comparand never shares mutable nodes with the tree the
+        managed passes see.  A hostile or defective pass that rewrites the
+        emitted header in place therefore diverges from this reconstruction
+        and fails the exact comparison instead of escaping through a shared
+        snapshot.
+        """
+
+        cursor = self.outer_loop.cursor
+        position_name = self._cursor_position_name(cursor)
+        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        row_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=position_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._segment_start(cursor),
+                ),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=position_var,
+                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            ),
             body=body,
-            omp_parallel_for=snapshot.omp_parallel_for,
-            omp_schedule=snapshot.omp_schedule,
-            unroll=snapshot.unroll,
-            simd=snapshot.simd,
-            pre_parallel_body=snapshot.pre_parallel_body,
-            post_parallel_body=snapshot.post_parallel_body,
-            omp_num_threads=snapshot.omp_num_threads,
-            omp_chunk_expr=snapshot.omp_chunk_expr,
-            before_parallel_body=snapshot.before_parallel_body,
         )
-        completed.scorch_index_var = snapshot.scorch_index_var
-        return completed
+        row_loop.scorch_index_var = self.row_name
+        return row_loop
 
     def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
         """Require the exact dynamic-vector rewrite owned by the B1 target.
@@ -5148,7 +5155,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 *self.tile_size_inits(),
                 llir.BlankLine(),
                 *self._outer_loop_prefix_statements(),
-                self._completed_outer_loop(expected_row_body),
+                self._outer_row_loop(expected_row_body),
                 llir.BlankLine(),
                 llir.Comment("Assembly compressed _level indices"),
                 expected_root_close,
@@ -5174,34 +5181,12 @@ class _SparseWorkspaceLowering(_TargetLowering):
         return function
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
-        cursor = self.outer_loop.cursor
-        position_name = self._cursor_position_name(cursor)
         result_name = self.result_decl.name
         row_body: List[llir.Stmt] = [
             *self._row_prologue_statements(),
             *self._region_statements(),
         ]
-        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
-        row_loop = llir.ForLoop(
-            init=llir.VarInit(
-                var=llir.Var(name=position_name, type=llir.DataType.INT),
-                value=llir.ArrayAccess(
-                    array=self._cursor_pos_array(cursor),
-                    index=self._segment_start(cursor),
-                ),
-            ),
-            cond=llir.BinOp(
-                op="<",
-                left=position_var,
-                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
-            ),
-            update=llir.Increment(
-                var=llir.Var(name=position_name, type=llir.DataType.INT)
-            ),
-            body=row_body,
-        )
-        row_loop.scorch_index_var = self.row_name
-        self._outer_loop_snapshot = row_loop
+        row_loop = self._outer_row_loop(row_body)
         return [
             *self._outer_loop_prefix_statements(),
             row_loop,
