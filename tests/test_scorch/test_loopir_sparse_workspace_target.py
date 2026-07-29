@@ -56,13 +56,25 @@ from scorch.stensor import STensor
 _CC_KINDS = (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
 
 
-def build_spmspm_cin(dtype=torch.float32):
-    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+def build_spmspm_cin(
+    dtype=torch.float32,
+    *,
+    commuted=False,
+    index_names=("i", "k", "j"),
+):
+    i, k, j = (IndexVar(name) for name in index_names)
     a = TensorVar("A", fmt="ss", dtype=dtype)
     b = TensorVar("B", fmt="ss", dtype=dtype)
     c = TensorVar("C", fmt="ss", dtype=dtype)
+    value = (
+        CINBinaryOp(Operation.MUL, b[k, j], a[i, k])
+        if commuted
+        else CINBinaryOp(Operation.MUL, a[i, k], b[k, j])
+    )
     assign = TensorAssign(
-        c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
+        c[i, j],
+        value,
+        op=Operation.ADD,
     )
     return ForAll(i, ForAll(k, ForAll(j, assign)))
 
@@ -176,7 +188,7 @@ def execute_b1(cin, result_shape, st_a, st_b, regblock_enabled):
     )
 
 
-def execute_legacy_module(kernel, result_shape, st_a, st_b, options):
+def execute_legacy_module(cpp_source, result_shape, st_a, st_b, options):
     """Safe legacy execution: run the byte-identical legacy kernel raw."""
 
     from scorch.ops import (
@@ -188,7 +200,7 @@ def execute_legacy_module(kernel, result_shape, st_a, st_b, options):
     context = CompilationContext(options)
     prepared = _prepare_generated_kernel_build(
         options.build.preamble_source,
-        kernel.cpp_source,
+        cpp_source,
         options,
         context,
     )
@@ -228,6 +240,120 @@ def test_source_parity_matches_legacy_in_both_arms(dtype):
     assert "scorch_vector_set(C0_pos, C0_pos_index + 1, C0_crd.size());" in (
         sources[False]
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_commuted_rhs_cursor_order_still_matches_legacy(regblock_enabled, dtype):
+    """The workspace pass does not promise an operand-position ordering."""
+
+    comparison = compare_generated_sources(
+        build_spmspm_cin(dtype, commuted=True),
+        (4, 5),
+        # RHS discovery follows the source expression: B, then A.
+        (((6, 5), dtype), ((4, 6), dtype)),
+        compile_options=auto_options(regblock_enabled),
+    )
+    assert comparison.identical
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+def test_commuted_rhs_cursor_order_executes_against_oracle_and_pytorch(
+    regblock_enabled,
+):
+    torch.manual_seed(20260801)
+    dense_a = (torch.rand(4, 6) < 0.5) * torch.randn(4, 6)
+    dense_b = (torch.rand(6, 5) < 0.5) * torch.randn(6, 5)
+    result, kernel = execute_cin_via_loopir(
+        build_spmspm_cin(commuted=True),
+        (4, 5),
+        # The module ABI follows the commuted RHS discovery order.
+        sparse_ss(dense_b, "B"),
+        sparse_ss(dense_a, "A"),
+        compile_options=auto_options(regblock_enabled, jit=True),
+    )
+    storage = validated_ss_storage(result, (4, 5))
+    dense_result = dense_from_storage(storage, (4, 5), torch.float32)
+    assert torch.allclose(dense_result, dense_a @ dense_b, atol=1e-3, rtol=1e-3)
+    assert_storage_matches_oracle(
+        storage,
+        oracle_result(kernel, dense_b, dense_a, (4, 5)),
+    )
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    ["coo_workspace_1d", "int64_t", "size_t"],
+)
+def test_runtime_and_type_names_cannot_shadow_b1_emission(reserved_name):
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(
+                index_names=(reserved_name, "reduction", "column"),
+            ),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert error.value.defect.code == "generated_name_collision"
+
+
+def test_sparse_workspace_capacity_is_an_exact_integral_literal(monkeypatch):
+    """The typed INT literal must not hide a legacy string primitive."""
+
+    from scorch.compiler.loopir import lower_llir as target
+
+    original = target._SparseWorkspaceLowering._region_statements
+    observed = []
+
+    def inspect_region(lowering):
+        statements = original(lowering)
+        workspace_init = statements[1]
+        assert type(workspace_init) is target.llir.VarInit
+        workspace_call = workspace_init.value
+        assert type(workspace_call) is target.llir.FunctionCall
+        capacity = workspace_call.args[0]
+        observed.append(
+            (
+                type(capacity),
+                type(capacity.value),
+                capacity.value,
+                capacity.data_type,
+            )
+        )
+        return statements
+
+    monkeypatch.setattr(
+        target._SparseWorkspaceLowering,
+        "_region_statements",
+        inspect_region,
+    )
+    compile_cin_via_loopir(
+        build_spmspm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    assert observed == [(target.llir.Literal, int, 1024, target.llir.DataType.INT)]
+
+
+def test_sparse_workspace_fails_closed_if_vector_rewrite_is_lost(monkeypatch):
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        lambda value, _context: value,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
@@ -313,9 +439,18 @@ def test_compiled_execution_matches_every_reference(regblock_enabled, dtype):
         storage, oracle_result(kernel, dense_a, dense_b, (5, 4))
     )
 
-    # Safe legacy execution: the byte-identical legacy kernel, run raw.
+    # Safe legacy execution: independently generate the exact request's
+    # legacy source, prove parity, then compile that source rather than the
+    # candidate a second time.
+    legacy_cpp = legacy_generated_cpp(
+        build_spmspm_cin(dtype),
+        (5, 4),
+        (((5, 6), dtype), ((6, 4), dtype)),
+        compile_options=auto_options(regblock_enabled),
+    )
+    assert legacy_cpp == kernel.cpp_source
     legacy_raw = execute_legacy_module(
-        kernel,
+        legacy_cpp,
         (5, 4),
         sparse_ss(dense_a, "A"),
         sparse_ss(dense_b, "B"),
@@ -726,6 +861,23 @@ def build_mixed_leaf_cin(rank3=False, dtype=torch.float32, binary=False):
     return ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
 
 
+def build_mixed_leaf_broadcast_cin(rank3=False, dtype=torch.float32):
+    """A mixed result whose compressed-parent bound comes only from C."""
+
+    if rank3:
+        i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+        result = TensorVar("C", fmt="sdd", dtype=dtype)
+        source = TensorVar("A", fmt="d", dtype=dtype)
+        return ForAll(
+            i,
+            ForAll(j, ForAll(k, TensorAssign(result[i, j, k], source[k]))),
+        )
+    i, j = IndexVar("i"), IndexVar("j")
+    result = TensorVar("C", fmt="sd", dtype=dtype)
+    source = TensorVar("A", fmt="d", dtype=dtype)
+    return ForAll(i, ForAll(j, TensorAssign(result[i, j], source[j])))
+
+
 def validated_mixed_storage(result, shape):
     """Assert honest compressed-parent/dense-suffix storage; return pieces."""
 
@@ -759,6 +911,46 @@ def mixed_oracle(kernel, dense_inputs, result_shape):
         lowering.program, inputs, {lowering.result_symbol: tuple(result_shape)}
     )
     return outputs[lowering.result_symbol]
+
+
+@pytest.mark.parametrize(
+    ("rank3", "shape"),
+    [(False, (4, 5)), (True, (2, 3, 4))],
+)
+def test_mixed_leaf_broadcast_declares_every_result_loop_bound(rank3, shape):
+    """Compressed parent domains cannot rely on a full-rank input bound."""
+
+    kernel = compile_cin_via_loopir(
+        build_mixed_leaf_broadcast_cin(rank3),
+        shape,
+        (((shape[-1],), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    for level in range(len(shape)):
+        assert f"int64_t C{level}_size = result_shape[{level}];" in kernel.cpp_source
+    assert "for (int64_t i = 0; i < C0_size; i++)" in kernel.cpp_source
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize("shape", [(4, 5), (3, 0)])
+def test_mixed_leaf_broadcast_executes_with_result_owned_parent_bound(
+    regblock_enabled, shape
+):
+    dense = torch.randn((shape[-1],))
+    result, kernel = execute_cin_via_loopir(
+        build_mixed_leaf_broadcast_cin(),
+        shape,
+        STensor.from_torch(dense.clone(), "A").to_dense(),
+        compile_options=auto_options(regblock_enabled, jit=True),
+    )
+    pos0, crd0, values = validated_mixed_storage(result, shape)
+    expected = dense.expand(shape)
+    assert torch.equal(torch.tensor(values).reshape(shape), expected)
+    oracle = mixed_oracle(kernel, (dense,), shape)
+    assert tuple(pos0) == oracle.positions[0]
+    assert tuple(crd0) == oracle.coordinates[0]
+    assert tuple(values) == oracle.values
 
 
 @torch.no_grad()
@@ -1026,6 +1218,76 @@ def build_mixed_leaf_program(forge=None):
         ),
         symbol_a,
     )
+
+
+def build_mixed_leaf_colliding_dimension_program():
+    """Two distinct binders share one display dimension and would shadow."""
+
+    builder = LoopIRBuilder()
+    dimension = builder.dimension("q")
+    symbol_a = builder.new_symbol_id()
+    symbol_c = builder.new_symbol_id()
+    decl_a = builder.tensor(
+        symbol_a,
+        "A",
+        ScalarType.FLOAT32,
+        (dimension.dimension,),
+        (builder.level(LevelKind.DENSE, 0),),
+    )
+    decl_c = builder.tensor(
+        symbol_c,
+        "C",
+        ScalarType.FLOAT32,
+        (dimension.dimension, dimension.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.DENSE, 1),
+        ),
+    )
+    outer_index = builder.new_index_id()
+    inner_index = builder.new_index_id()
+    append = builder.append_entry(
+        symbol_c,
+        (
+            builder.index_value(outer_index),
+            builder.index_value(inner_index),
+        ),
+        # At the leaf, an unguarded target would spell this outer-coordinate
+        # load with the inner loop's shadowing ``q`` variable.
+        builder.load(symbol_a, (builder.index_value(outer_index),)),
+    )
+    inner = builder.dense_for(
+        inner_index,
+        dimension.dimension,
+        builder.block((append,)),
+    )
+    outer = builder.dense_for(
+        outer_index,
+        dimension.dimension,
+        builder.block((inner,)),
+    )
+    return (
+        builder.program(
+            (dimension,),
+            (decl_a, decl_c),
+            (symbol_a,),
+            (symbol_c,),
+            builder.block((outer,)),
+        ),
+        symbol_a,
+    )
+
+
+def test_mixed_leaf_rejects_distinct_binders_with_one_cpp_name():
+    program, symbol_a = build_mixed_leaf_colliding_dimension_program()
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes={symbol_a: (3,)},
+            result_shape=(3, 3),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    assert error.value.defect.code == "generated_name_collision"
 
 
 def test_mixed_leaf_hand_built_program_matches_pipeline_source():
