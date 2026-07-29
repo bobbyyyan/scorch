@@ -75,6 +75,7 @@ from ..compile_options import CompileOptions
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..dense_pointer_hoist_pass import DensePointerHoistContext
 from ..llir_pass_manager import (
+    CompressedWhereOpenMPPassSpec,
     DensePointerHoistPassSpec,
     LLIRPassPartialFailure,
     LLIRPassManager,
@@ -799,6 +800,20 @@ class _TargetLowering:
                 "unsupported_program_shape",
                 "the migrated families require a dense, tile-origin, or "
                 "panel-origin outermost loop",
+            )
+        if type(leaf) is StoreReduce and any(
+            level.kind is not LevelKind.DENSE for level in self.result_decl.levels
+        ):
+            # The semantic coordinate-merged sparse reduction has no generic
+            # serial twin: the legacy generic route writes an unsized result
+            # vector, so only a verified sparse-workspace schedule may
+            # rewrite this leaf into ordered assembly.  Anything reaching
+            # the general lowering unscheduled fails closed.
+            _fail(
+                "unsupported_program_shape",
+                "reducing into sparse result storage requires the verified "
+                "sparse-workspace schedule; the generic route is not a "
+                "migrated family",
             )
         if any(
             loop.kind in (_TILE_OUTER, _TILE_INNER, _PANEL_OUTER)
@@ -3253,6 +3268,18 @@ class _TargetLowering:
 
         return function
 
+    def owns_two_phase_output(self) -> bool:
+        """Whether the shared compressed-Where pass owns this result's assembly."""
+
+        return False
+
+    def compressed_where_pass_spec(
+        self, compile_options: CompileOptions
+    ) -> Optional[CompressedWhereOpenMPPassSpec]:
+        """The two-phase pass configuration for families that own one."""
+
+        return None
+
     # -- panel completion ----------------------------------------------------
 
     def _record_emitted_loop(self, position: int, loop: llir.ForLoop) -> None:
@@ -4096,6 +4123,30 @@ def _sparse_workspace_chain(program: LoopProgram) -> bool:
     )
 
 
+def _parallel_sparse_workspace_chain(program: LoopProgram) -> bool:
+    """Whether the program is the dense-row parallel sparse-workspace chain.
+
+    Routing is purely structural over the verified typed tree: one outer
+    dense row loop whose whole body is one :class:`SparseWorkspaceRegion`.
+    Everything else — including any other placement of a sparse workspace
+    region — stays on the general target lowering and keeps its existing
+    fail-closed boundary.
+    """
+
+    body = program.body
+    if type(body) is not Block or len(body.statements) != 1:
+        return False
+    outer = body.statements[0]
+    if type(outer) is not DenseFor:
+        return False
+    inner = outer.body
+    return (
+        type(inner) is Block
+        and len(inner.statements) == 1
+        and type(inner.statements[0]) is SparseWorkspaceRegion
+    )
+
+
 def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
     """Return the structured root variable of one validated assignment target."""
 
@@ -4107,6 +4158,57 @@ def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
             else cast(llir.MemberAccess, current).base
         )
     return current.name if type(current) is llir.Var else None
+
+
+def _metadata_state_matches(actual: object, expected: object) -> bool:
+    """Compare two frozen access-provenance values field by exact field."""
+
+    actual_state = object.__getattribute__(actual, "__dict__")
+    expected_state = object.__getattribute__(expected, "__dict__")
+    expected_fields = ("access_id", "tensor_id", "index_ids", "role")
+    if (
+        type(actual_state) is not dict
+        or type(expected_state) is not dict
+        or tuple(sorted(actual_state)) != tuple(sorted(expected_fields))
+        or tuple(sorted(expected_state)) != tuple(sorted(expected_fields))
+    ):
+        return False
+
+    def identity_value(value: object, identity_type: type) -> Optional[int]:
+        if type(value) is not identity_type:
+            return None
+        state = object.__getattribute__(value, "__dict__")
+        if type(state) is not dict or tuple(state) != ("value",):
+            return None
+        return state["value"] if type(state["value"]) is int else None
+
+    for side in (actual_state, expected_state):
+        if (
+            identity_value(side["access_id"], AccessId) is None
+            or identity_value(side["tensor_id"], SymbolId) is None
+            or type(side["index_ids"]) is not tuple
+            or any(
+                identity_value(index_id, IndexId) is None
+                for index_id in side["index_ids"]
+            )
+            or type(side["role"]) is not llir.TensorAccessRole
+        ):
+            return False
+    return (
+        identity_value(actual_state["access_id"], AccessId)
+        == identity_value(expected_state["access_id"], AccessId)
+        and identity_value(actual_state["tensor_id"], SymbolId)
+        == identity_value(expected_state["tensor_id"], SymbolId)
+        and len(actual_state["index_ids"]) == len(expected_state["index_ids"])
+        and all(
+            identity_value(actual_index, IndexId)
+            == identity_value(expected_index, IndexId)
+            for actual_index, expected_index in zip(
+                actual_state["index_ids"], expected_state["index_ids"]
+            )
+        )
+        and actual_state["role"] is expected_state["role"]
+    )
 
 
 def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
@@ -4161,10 +4263,19 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
                 return False
             continue
 
-        if (
-            isinstance(actual_value, llir.Node)
-            or type(actual_value) is llir.TensorAccessMetadata
-        ):
+        if type(actual_value) is llir.TensorAccessMetadata:
+            # Frozen immutable access provenance is value state, not owned
+            # tree structure: the production two-phase rewrite legitimately
+            # duplicates a work body whose detached statements retain the
+            # same metadata values, so metadata compares exactly by stored
+            # state and stays outside the fresh-ownership census (like the
+            # interned empty tuple, it cannot be mutated and cannot close a
+            # cycle through its immutable leaf fields).
+            if not _metadata_state_matches(actual_value, expected_value):
+                return False
+            continue
+
+        if isinstance(actual_value, llir.Node):
             actual_state = object.__getattribute__(actual_value, "__dict__")
             expected_state = object.__getattribute__(expected_value, "__dict__")
             if type(actual_state) is not dict or type(expected_state) is not dict:
@@ -5209,6 +5320,1160 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
             ),
         ]
+
+
+class _ParallelSparseWorkspaceLowering(_TargetLowering):
+    """Dedicated target lowering for the dense-row parallel workspace family.
+
+    Admits exactly the verified shape ``apply_sparse_workspace`` produces
+    for the dense-row CSR SpGEMM family — one outer dense row loop over a
+    :class:`SparseWorkspaceRegion` whose producer descends through one
+    dense-parented sparse operand loop into a second dense-parented sparse
+    operand loop ending in a merging ADD insertion, and whose consumer is
+    the one ordered drain appending each merged entry to the identity-
+    ordered dense-row CSR result.  Anything else fails closed with
+    ``unsupported_program_shape``.
+
+    The raw emission is the exact serial per-row assembly the legacy
+    pipeline hands to the shared production compressed-``Where``/OpenMP
+    pass, and this lowering supplies that same pass configuration to the
+    managed pipeline.  The pass owns the target's runtime composition —
+    the per-thread ``linked_list_workspace_1d`` pool sized by the derived
+    thread count, the borrowed per-worker ``make_view()`` lifetimes, the
+    two-phase count/fill parallel regions with the derived SpGEMM
+    work-estimate/chunk policy, exact Torch-owned output allocation, and
+    honest final assembly — so the generated C++ is byte-identical to the
+    legacy pipeline's output for both automatic policy arms.  All runtime
+    spellings live in the target layer; the semantic program carries only
+    the format-neutral region.
+    """
+
+    def __init__(
+        self,
+        program: LoopProgram,
+        input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+        result_shape: Tuple[int, ...],
+    ) -> None:
+        self.program = program
+        self.decls = {decl.symbol: decl for decl in program.tensors}
+        if len(program.outputs) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one output tensor",
+            )
+        self.result_symbol = program.outputs[0]
+        self.result_decl = self.decls[self.result_symbol]
+        self.result_is_dense = False
+        self.sparse_program = True
+        self.dimension_names = {}
+        self._access_ids = {}
+        # Fields the shared driver surface and inherited helpers read: the
+        # family carries no dense-workspace region, panel, staging region,
+        # heap tile, split loops, or parallel selection.
+        self.loops: List[_Loop] = []
+        self.region = None
+        self.panel = None
+        self.relayout = None
+        self.result_tile = None
+        self.result_tile_depth = -1
+        self.relayout_depth = -1
+        if program.parallel is not None:
+            _fail(
+                "unsupported_program_shape",
+                "the parallel sparse-workspace family derives its policy in "
+                "target lowering and owns no program-level selection",
+            )
+        self.parallel = None
+        self._validate_display_names()
+        for name, purpose in (
+            ("coo_workspace_1d", "the serial sparse-workspace runtime type"),
+            ("linked_list_workspace_1d", "the pooled sparse-workspace runtime type"),
+            ("omp_get_thread_num", "the OpenMP worker identity call"),
+            ("SCORCH_GRAIN_CODEGEN_SPGEMM", "the SpGEMM work-grain policy token"),
+        ):
+            # scorch_nthreads/scorch_chunk are globally target-reserved
+            # already; the names above are family-specific runtime spellings.
+            self._reserve_generated_name(name, purpose)
+        self.shapes = self._validate_shapes(input_shapes, result_shape)
+        self._validate_family_shape()
+        self._reserve_family_names()
+
+    # -- family-shape validation ----------------------------------------------
+
+    def _validate_family_shape(self) -> None:
+        def require(condition: bool, what: str) -> None:
+            if not condition:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the parallel sparse-workspace target requires {what}",
+                )
+
+        def dense_row_csr(decl: TensorDecl) -> bool:
+            return (
+                len(decl.levels) == 2
+                and tuple(level.kind for level in decl.levels)
+                == (LevelKind.DENSE, LevelKind.COMPRESSED)
+                and tuple(level.mode for level in decl.levels) == (0, 1)
+            )
+
+        program = self.program
+        body = program.body
+        require(
+            type(body) is Block and len(body.statements) == 1,
+            "a single-statement program body",
+        )
+        outer = body.statements[0]
+        require(type(outer) is DenseFor, "an outer dense row loop")
+        outer = cast(DenseFor, outer)
+        inner = outer.body
+        require(
+            type(inner) is Block
+            and len(inner.statements) == 1
+            and type(inner.statements[0]) is SparseWorkspaceRegion,
+            "the sparse workspace region as the row loop's whole body",
+        )
+        region = cast(SparseWorkspaceRegion, inner.statements[0])
+        workspace_decl = region.workspace
+        require(
+            type(workspace_decl) is SparseWorkspaceDecl,
+            "an exact sparse workspace declaration",
+        )
+        producer = region.producer
+        require(
+            type(producer) is Block
+            and len(producer.statements) == 1
+            and type(producer.statements[0]) is SparseFor,
+            "a producer opening with one dense-parented sparse operand loop",
+        )
+        reduction = cast(SparseFor, producer.statements[0])
+        reduction_cursor = reduction.cursor
+
+        def dense_parented(cursor: SparseCursorDecl, index: IndexId) -> bool:
+            parent = cursor.parent
+            return (
+                cursor.level == 1
+                and type(parent) is DensePosition
+                and cast(DensePosition, parent).tensor == cursor.tensor
+                and cast(DensePosition, parent).level == 0
+                and type(cast(DensePosition, parent).parent) is RootPosition
+                and type(cast(DensePosition, parent).coord) is IndexValue
+                and cast(IndexValue, cast(DensePosition, parent).coord).index == index
+            )
+
+        require(
+            dense_parented(reduction_cursor, outer.index),
+            "a reduction cursor descending the first operand's dense row " "position",
+        )
+        reduction_body = reduction.body
+        require(
+            type(reduction_body) is Block
+            and len(reduction_body.statements) == 1
+            and type(reduction_body.statements[0]) is SparseFor,
+            "a child sparse loop as the reduction loop's whole body",
+        )
+        child = cast(SparseFor, reduction_body.statements[0])
+        child_cursor = child.cursor
+        require(
+            child_cursor.tensor != reduction_cursor.tensor
+            and dense_parented(child_cursor, reduction.coord_index),
+            "a child cursor descending the second operand's dense reduction "
+            "position",
+        )
+        child_body = child.body
+        require(
+            type(child_body) is Block
+            and len(child_body.statements) == 1
+            and type(child_body.statements[0]) is SparseWorkspaceInsert,
+            "the merging insertion as the child loop's whole body",
+        )
+        insert = cast(SparseWorkspaceInsert, child_body.statements[0])
+        require(
+            insert.workspace == workspace_decl.workspace
+            and insert.op is ReduceOp.ADD
+            and type(insert.coord) is IndexValue
+            and cast(IndexValue, insert.coord).index == child.coord_index,
+            "an ADD insertion at the child loop coordinate",
+        )
+        consumer = region.consumer
+        require(
+            type(consumer) is Block
+            and len(consumer.statements) == 1
+            and type(consumer.statements[0]) is SparseWorkspaceDrainFor,
+            "the one ordered drain as the whole consumer",
+        )
+        drain = cast(SparseWorkspaceDrainFor, consumer.statements[0])
+        require(
+            drain.workspace == workspace_decl.workspace,
+            "a drain of the region's own workspace",
+        )
+        drain_body = drain.body
+        require(
+            type(drain_body) is Block
+            and len(drain_body.statements) == 1
+            and type(drain_body.statements[0]) is AppendEntry,
+            "the ordered append as the drain loop's whole body",
+        )
+        append = cast(AppendEntry, drain_body.statements[0])
+        require(
+            append.tensor == self.result_symbol
+            and len(append.coords) == 2
+            and all(type(coord) is IndexValue for coord in append.coords)
+            and cast(IndexValue, append.coords[0]).index == outer.index
+            and cast(IndexValue, append.coords[1]).index == drain.index
+            and type(append.value) is SparseWorkspaceValue
+            and cast(SparseWorkspaceValue, append.value).workspace
+            == workspace_decl.workspace,
+            "an append of the drained value at the row and drain coordinates",
+        )
+
+        reduction_decl = self.decls[reduction_cursor.tensor]
+        child_decl = self.decls[child_cursor.tensor]
+        require(
+            len(program.inputs) == 2
+            and set(program.inputs) == {reduction_cursor.tensor, child_cursor.tensor}
+            and dense_row_csr(reduction_decl)
+            and dense_row_csr(child_decl)
+            and dense_row_csr(self.result_decl),
+            "exactly two identity-ordered dense-row CSR inputs and result",
+        )
+        require(
+            reduction_decl.dtype is child_decl.dtype
+            and reduction_decl.dtype is self.result_decl.dtype
+            and workspace_decl.dtype is self.result_decl.dtype
+            and self.result_decl.dtype in _SCALAR_TO_TORCH,
+            "one shared supported scalar type",
+        )
+        require(
+            self._level_dimension(reduction_cursor.tensor, 0)
+            == self.result_decl.dimensions[0]
+            and self._level_dimension(reduction_cursor.tensor, 1)
+            == self._level_dimension(child_cursor.tensor, 0)
+            and self._level_dimension(child_cursor.tensor, 1)
+            == self.result_decl.dimensions[1]
+            and outer.dimension == self.result_decl.dimensions[0]
+            and workspace_decl.drain_dimension == self.result_decl.dimensions[1],
+            "row, reduction, and drain dimensions in matmul agreement",
+        )
+        row_dimension = self.result_decl.dimensions[0]
+        reduction_dimension = self._level_dimension(reduction_cursor.tensor, 1)
+        drain_dimension = workspace_decl.drain_dimension
+        require(
+            len({row_dimension, reduction_dimension, drain_dimension}) == 3,
+            "three distinct loop dimensions",
+        )
+
+        self.outer_loop = outer
+        self.sparse_region = region
+        self.workspace_decl = workspace_decl
+        self.reduction_loop = reduction
+        self.child_loop = child
+        self.sparse_insert = insert
+        self.sparse_drain = drain
+        self.sparse_append = append
+        self.row_name = self.dimension_names[row_dimension]
+        self.reduction_name = self.dimension_names[reduction_dimension]
+        self.drain_name = self.dimension_names[drain_dimension]
+        # The value-typed cursors admissible in the insertion value, and
+        # the level drivers backing the shared input access metadata.
+        self._value_cursors = {
+            reduction_cursor.cursor: reduction_cursor,
+            child_cursor.cursor: child_cursor,
+        }
+        self.level_drivers = {
+            reduction_cursor.tensor: {
+                0: outer.index,
+                1: reduction.coord_index,
+            },
+            child_cursor.tensor: {
+                0: reduction.coord_index,
+                1: child.coord_index,
+            },
+        }
+        self._validate_insert_value(insert.value)
+
+    def _validate_insert_value(self, expr: Expr) -> None:
+        if type(expr) is CursorValue:
+            cursor_value = cast(CursorValue, expr)
+            if cursor_value.cursor not in self._value_cursors:
+                _fail(
+                    "unsupported_program_shape",
+                    "the insertion value may read only the reduction cursor "
+                    "and the child cursor",
+                )
+            return
+        if type(expr) is BinaryExpr:
+            binary = cast(BinaryExpr, expr)
+            if binary.op not in (BinaryOp.ADD, BinaryOp.MUL):
+                _fail(
+                    "unsupported_program_shape",
+                    "the insertion value supports ADD and MUL only",
+                )
+            self._validate_insert_value(binary.lhs)
+            self._validate_insert_value(binary.rhs)
+            return
+        _fail(
+            "unsupported_program_shape",
+            f"unsupported insertion value expression {type(expr).__name__}",
+        )
+
+    def _reserve_family_names(self) -> None:
+        workspace_name = self.workspace_decl.name
+        if not _safe_cpp_display_identifier(workspace_name):
+            _fail(
+                "invalid_display_name",
+                f"workspace name {workspace_name!r} is not a safe ASCII C++ "
+                "identifier",
+            )
+        owner = f"workspace {workspace_name!r}"
+        result_name = self.result_decl.name
+        for name in (
+            workspace_name,
+            f"{workspace_name}_value",
+            f"{workspace_name}_pool",
+            f"{workspace_name}_thread_count",
+        ):
+            self._reserve_generated_name(name, owner)
+        self._reserve_generated_name("it", "the workspace drain iterator")
+        two_phase_owner = "the two-phase count/fill assembly"
+        for name in (
+            "_worker",
+            "_cnt1",
+            "_count1",
+            "_offset1",
+            "_total1",
+            "_i",
+            "_base1",
+            "_pos1",
+        ):
+            self._reserve_generated_name(name, two_phase_owner)
+        for name in (
+            f"{result_name}1_pos_data",
+            f"{result_name}1_crd_data",
+            f"{result_name}_values_data",
+        ):
+            self._reserve_generated_name(name, two_phase_owner)
+
+    # -- emission ---------------------------------------------------------------
+
+    def owns_two_phase_output(self) -> bool:
+        return True
+
+    def compressed_where_pass_spec(
+        self, compile_options: CompileOptions
+    ) -> CompressedWhereOpenMPPassSpec:
+        """The shared production two-phase configuration for this family."""
+
+        from ..compressed_where_openmp_pass import CompressedWhereOpenMPContext
+
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        return CompressedWhereOpenMPPassSpec(
+            CompressedWhereOpenMPContext(
+                result_name=self.result_decl.name,
+                result_id=self.result_symbol,
+                compressed_levels=(1,),
+                result_assembler=self.result_assembler(),
+                workspace_name=self.workspace_decl.name,
+                workspace_ctype=dtype_to_c_datatype(torch_dtype).value,
+                compile_options=compile_options,
+            )
+        )
+
+    def _sparse_value(self, expr: Expr) -> llir.Expr:
+        """Lower the insertion value: every admitted cursor is aligned."""
+
+        if type(expr) is CursorValue:
+            cursor = self._value_cursors[cast(CursorValue, expr).cursor]
+            decl = self.decls[cursor.tensor]
+            torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
+            return llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{decl.name}_val",
+                    type=llir.DataType.ptr_type(torch_dtype),
+                ),
+                index=llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
+                ),
+                tensor_access=self._input_metadata(cursor.tensor),
+            )
+        binary = cast(BinaryExpr, expr)
+        return llir.BinOp(
+            op=_BINARY_TO_CXX[binary.op],
+            left=self._sparse_value(binary.lhs),
+            right=self._sparse_value(binary.rhs),
+        )
+
+    def _append_metadata(self) -> llir.TensorAccessMetadata:
+        return llir.TensorAccessMetadata(
+            access_id=self._access_id(self.result_symbol),
+            tensor_id=self.result_symbol,
+            index_ids=(
+                self.outer_loop.index,
+                self.sparse_drain.index,
+            ),
+            role=llir.TensorAccessRole.RESULT_WRITE,
+        )
+
+    def _dense_position_resolve(
+        self,
+        cursor: SparseCursorDecl,
+        coordinate_name: str,
+    ) -> List[llir.Stmt]:
+        """``pX0 = <coordinate>;`` for one dense-parented operand cursor."""
+
+        parent_name = f"p{self.decls[cursor.tensor].name}0"
+        return [
+            llir.Comment("Resolve dense coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=parent_name, type=llir.DataType.INT),
+                value=llir.Var(name=coordinate_name, type=llir.DataType.INT),
+            ),
+        ]
+
+    def _sparse_segment_open(self, cursor: SparseCursorDecl) -> List[llir.Stmt]:
+        """``Initialize iterators`` + segment-end bound for one child level."""
+
+        position_name = self._cursor_position_name(cursor)
+        parent_var = llir.Var(
+            name=f"p{self.decls[cursor.tensor].name}0",
+            type=llir.DataType.INT,
+        )
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=llir.Add(
+                        left=parent_var,
+                        right=llir.Literal(1, llir.DataType.INT),
+                    ),
+                ),
+            ),
+            llir.BlankLine(),
+        ]
+
+    def _sparse_operand_loop(
+        self,
+        cursor: SparseCursorDecl,
+        coordinate_name: str,
+        body_tail: List[llir.Stmt],
+    ) -> llir.ForLoop:
+        """One dense-parented sparse operand loop resolving its coordinate."""
+
+        position_name = self._cursor_position_name(cursor)
+        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        body: List[llir.Stmt] = [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=coordinate_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor),
+                    index=llir.Var(name=position_name, type=llir.DataType.INT),
+                ),
+            ),
+            llir.BlankLine(),
+            *body_tail,
+        ]
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=position_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=llir.Var(
+                        name=f"p{self.decls[cursor.tensor].name}0",
+                        type=llir.DataType.INT,
+                    ),
+                ),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=position_var,
+                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            ),
+            body=body,
+        )
+        for_loop.scorch_index_var = coordinate_name
+        return for_loop
+
+    def _producer_statements(self, *, unchecked: bool = False) -> List[llir.Stmt]:
+        """The workspace producer: reduction descent into the insertion.
+
+        The serial emission inserts through the checked spelling; the
+        completed two-phase reference reconstructs the pass-owned
+        ``insert_unchecked`` rewrite of the same statement.
+        """
+
+        insert_name = (
+            f"{self.workspace_decl.name}.insert_unchecked"
+            if unchecked
+            else f"{self.workspace_decl.name}.insert"
+        )
+        insert_statement = llir.FunctionCallStmt(
+            name=insert_name,
+            args=[
+                llir.Array(
+                    values=[
+                        llir.Var(
+                            name=self.drain_name,
+                            type=llir.DataType.INT64,
+                        )
+                    ],
+                    data_type=llir.DataType.INT64,
+                ),
+                self._sparse_value(self.sparse_insert.value),
+            ],
+        )
+        child_cursor = self.child_loop.cursor
+        child_tail: List[llir.Stmt] = [
+            *self._dense_position_resolve(child_cursor, self.reduction_name),
+            *self._sparse_segment_open(child_cursor),
+            self._sparse_operand_loop(
+                child_cursor,
+                self.drain_name,
+                [insert_statement],
+            ),
+        ]
+        reduction_cursor = self.reduction_loop.cursor
+        return [
+            *self._sparse_segment_open(reduction_cursor),
+            self._sparse_operand_loop(
+                reduction_cursor,
+                self.reduction_name,
+                child_tail,
+            ),
+        ]
+
+    def _workspace_init_statement(self) -> llir.VarInit:
+        workspace = self.workspace_decl
+        torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
+        element_type = dtype_to_c_datatype(torch_dtype)
+        return llir.VarInit(
+            var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+            value=llir.FunctionCall(
+                name=f"coo_workspace_1d<{element_type.value}, 1>",
+                args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
+            ),
+        )
+
+    def _drain_statements(self) -> List[llir.Stmt]:
+        """``sort()`` plus the range-for drain writing indexed appends."""
+
+        workspace_name = self.workspace_decl.name
+        result_name = self.result_decl.name
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        workspace_value_name = f"{workspace_name}_value"
+        counter_name = f"p{result_name}1"
+        drain_loop = llir.ForLoopAuto(
+            var=iterator_var,
+            array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+            body=[
+                llir.VarInit(
+                    var=llir.Var(name=self.drain_name, type=llir.DataType.INT64),
+                    value=llir.MemberAccess(base=iterator_var, member="first"),
+                ),
+                llir.VarInit(
+                    var=llir.Var(
+                        name=workspace_value_name,
+                        type=dtype_to_c_datatype(
+                            _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+                        ),
+                    ),
+                    value=llir.MemberAccess(base=iterator_var, member="second"),
+                ),
+                llir.BlankLine(),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_name}_values",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(name=counter_name, type=llir.DataType.INT64),
+                        tensor_access=self._append_metadata(),
+                    ),
+                    value=llir.Var(
+                        name=workspace_value_name,
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                ),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_name}1_crd",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=llir.Var(name=counter_name, type=llir.DataType.INT64),
+                    ),
+                    value=llir.Var(name=self.drain_name, type=llir.DataType.NO_TYPE),
+                ),
+                llir.Increment(
+                    var=llir.Var(name=counter_name, type=llir.DataType.NO_TYPE)
+                ),
+            ],
+        )
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
+            drain_loop,
+        ]
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        result_name = self.result_decl.name
+        row_name = self.row_name
+        pos_index = llir.Var(
+            name=f"{result_name}1_pos_index",
+            type=llir.DataType.INT,
+        )
+        catch_up = llir.ForLoop(
+            init=None,
+            cond=llir.BinOp(
+                op="<",
+                left=pos_index,
+                right=llir.Var(name=row_name, type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(
+                    name=f"{result_name}1_pos_index",
+                    type=llir.DataType.INT,
+                )
+            ),
+            body=[self._row_close_statement()],
+        )
+        row_body: List[llir.Stmt] = [
+            llir.Comment("Assemble COMPRESSED level"),
+            catch_up,
+            *self._dense_position_resolve(self.reduction_loop.cursor, row_name),
+            llir.Comment("Resolve index into dense level of values array"),
+            llir.VarInit(
+                var=llir.Var(name=f"p{result_name}0", type=llir.DataType.INT),
+                value=llir.Var(name=row_name, type=llir.DataType.INT),
+            ),
+            llir.Comment("Initialize workspaces"),
+            self._workspace_init_statement(),
+            *self._producer_statements(),
+            *self._drain_statements(),
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            self._row_close_statement(),
+        ]
+        row_var = llir.Var(name=row_name, type=llir.DataType.INT64)
+        row_loop = llir.ForLoop(
+            init=llir.VarInit(var=row_var, value=llir.Literal(0)),
+            cond=llir.BinOp(
+                op="<",
+                left=row_var,
+                right=llir.Var(
+                    name=f"{self.decls[self.reduction_loop.cursor.tensor].name}0_size",
+                    type=llir.DataType.INT,
+                ),
+            ),
+            update=llir.Increment(var=row_var),
+            body=row_body,
+        )
+        row_loop.scorch_index_var = row_name
+        return [llir.BlankLine(), row_loop]
+
+    def _row_close_statement(self) -> llir.Assign:
+        """``C1_pos[C1_pos_index + 1] = C1_crd.size()`` (legacy spelling)."""
+
+        result_name = self.result_decl.name
+        return llir.Assign(
+            var=llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{result_name}1_pos",
+                    type=llir.DataType.STD_VECTOR_C_INT,
+                ),
+                index=llir.Add(
+                    llir.Var(
+                        name=f"{result_name}1_pos_index",
+                        type=llir.DataType.INT,
+                    ),
+                    llir.Literal(1, llir.DataType.INT32),
+                ),
+            ),
+            value=llir.FunctionCall(
+                name=f"{result_name}1_crd.size",
+                args=[],
+            ),
+        )
+
+    # -- exact post-pass completion ---------------------------------------------
+
+    def _policy_work_and_rows(self) -> Tuple[str, str, llir.Expr, llir.Var]:
+        """The derived SpGEMM policy operands, in string and typed form.
+
+        Both forms are constructed together from the same verified
+        structural facts — the reduction operand's stored leaf count and
+        the child operand's mean row fanout — so neither is recovered by
+        parsing the other.
+        """
+
+        reduction_name = self.decls[self.reduction_loop.cursor.tensor].name
+        child_name = self.decls[self.child_loop.cursor.tensor].name
+        rows_text = f"{reduction_name}0_size"
+        work_text = (
+            f"(long){reduction_name}1_pos[{rows_text}] * "
+            f"({child_name}0_size > 0 ? "
+            f"{child_name}1_pos[{child_name}0_size] / {child_name}0_size + 1 : 1)"
+        )
+        rows_var = llir.Var(name=rows_text, type=llir.DataType.INT)
+
+        def child_rows() -> llir.Var:
+            return llir.Var(name=f"{child_name}0_size", type=llir.DataType.INT64)
+
+        work_expr: llir.Expr = llir.Mul(
+            llir.Cast(
+                expr=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{reduction_name}1_pos",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(name=rows_text, type=llir.DataType.INT),
+                ),
+                data_type=llir.DataType.LONG,
+            ),
+            llir.Select(
+                cond=llir.BinOp(
+                    op=">",
+                    left=child_rows(),
+                    right=llir.Literal(0, llir.DataType.INT),
+                ),
+                when_true=llir.Add(
+                    llir.BinOp(
+                        op="/",
+                        left=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{child_name}1_pos",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            index=child_rows(),
+                        ),
+                        right=child_rows(),
+                    ),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+                when_false=llir.Literal(1, llir.DataType.INT),
+            ),
+        )
+        return work_text, rows_text, work_expr, rows_var
+
+    def _completed_pool_statements(self) -> List[llir.Stmt]:
+        """Pool sizing, reservation, and per-worker construction."""
+
+        workspace_name = self.workspace_decl.name
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        pool_type = llir.DataType.linked_list_workspace_pool_type(
+            dtype_to_c_datatype(torch_dtype).value
+        )
+        _, _, work_expr, rows_var = self._policy_work_and_rows()
+        thread_count = llir.Var(
+            name=f"{workspace_name}_thread_count",
+            type=llir.DataType.INT,
+        )
+        worker = llir.Var(name="_worker", type=llir.DataType.INT)
+        return [
+            llir.VarInit(
+                var=thread_count,
+                value=llir.FunctionCall(
+                    name="scorch_nthreads",
+                    args=[
+                        work_expr,
+                        rows_var,
+                        llir.Var(
+                            name="SCORCH_GRAIN_CODEGEN_SPGEMM",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    ],
+                ),
+            ),
+            llir.VarDecl(var=llir.Var(name=f"{workspace_name}_pool", type=pool_type)),
+            llir.MemberCallStmt(
+                base=llir.Var(name=f"{workspace_name}_pool", type=pool_type),
+                member="reserve",
+                args=(
+                    llir.Cast(
+                        expr=llir.Var(
+                            name=f"{workspace_name}_thread_count",
+                            type=llir.DataType.INT,
+                        ),
+                        data_type=llir.DataType.SIZE_T,
+                    ),
+                ),
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    var=llir.Var(name="_worker", type=llir.DataType.INT),
+                    value=llir.Literal(0, llir.DataType.INT),
+                ),
+                cond=llir.BinOp(
+                    op="<",
+                    left=worker,
+                    right=llir.Var(
+                        name=f"{workspace_name}_thread_count",
+                        type=llir.DataType.INT,
+                    ),
+                ),
+                update=llir.Increment(
+                    var=llir.Var(name="_worker", type=llir.DataType.INT)
+                ),
+                body=[
+                    llir.MemberCallStmt(
+                        base=llir.Var(name=f"{workspace_name}_pool", type=pool_type),
+                        member="emplace_back",
+                        args=(
+                            llir.ArrayAccess(
+                                array=llir.Var(
+                                    name="result_shape",
+                                    type=llir.DataType.STD_VECTOR_INT,
+                                ),
+                                index=llir.Literal(1, llir.DataType.INT64),
+                            ),
+                            llir.Literal(True, llir.DataType.BOOL),
+                        ),
+                    )
+                ],
+            ),
+        ]
+
+    def _completed_view_statement(self) -> llir.VarInit:
+        """The borrowed per-worker workspace view opening each phase region."""
+
+        workspace_name = self.workspace_decl.name
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        pool_type = llir.DataType.linked_list_workspace_pool_type(
+            dtype_to_c_datatype(torch_dtype).value
+        )
+        return llir.VarInit(
+            var=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+            value=llir.MemberCall(
+                base=llir.ArrayAccess(
+                    array=llir.Var(name=f"{workspace_name}_pool", type=pool_type),
+                    index=llir.Cast(
+                        expr=llir.FunctionCall(name="omp_get_thread_num", args=()),
+                        data_type=llir.DataType.SIZE_T,
+                    ),
+                ),
+                member="make_view",
+            ),
+        )
+
+    def _completed_phase_loop(self, body: List[llir.Stmt]) -> llir.ForLoop:
+        """One completed parallel phase loop around one phase body."""
+
+        work_text, rows_text, _, _ = self._policy_work_and_rows()
+        grain = "SCORCH_GRAIN_CODEGEN_SPGEMM"
+        row_var = llir.Var(name=self.row_name, type=llir.DataType.INT64)
+        loop = llir.ForLoop(
+            init=llir.VarInit(var=row_var, value=llir.Literal(0)),
+            cond=llir.BinOp(
+                op="<",
+                left=llir.Var(name=self.row_name, type=llir.DataType.INT64),
+                right=llir.Var(name=rows_text, type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=self.row_name, type=llir.DataType.INT64)
+            ),
+            body=body,
+            omp_parallel_for=True,
+            omp_schedule="dynamic, 64",
+            pre_parallel_body=[self._completed_view_statement()],
+            omp_num_threads=f"scorch_nthreads({work_text}, {rows_text}, {grain})",
+            omp_chunk_expr=f"scorch_chunk({rows_text}, {work_text}, {grain})",
+        )
+        return loop
+
+    def _completed_phase_shared_statements(self) -> List[llir.Stmt]:
+        """The row statements both completed phases share."""
+
+        result_name = self.result_decl.name
+        return [
+            llir.Comment("Assemble COMPRESSED level"),
+            *self._dense_position_resolve(self.reduction_loop.cursor, self.row_name),
+            llir.Comment("Resolve index into dense level of values array"),
+            llir.VarInit(
+                var=llir.Var(name=f"p{result_name}0", type=llir.DataType.INT),
+                value=llir.Var(name=self.row_name, type=llir.DataType.INT),
+            ),
+            llir.Comment("Initialize workspaces"),
+            *self._producer_statements(unchecked=True),
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+        ]
+
+    def _completed_drain_bindings(self) -> List[llir.Stmt]:
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        return [
+            llir.VarInit(
+                var=llir.Var(name=self.drain_name, type=llir.DataType.INT64),
+                value=llir.MemberAccess(base=iterator_var, member="first"),
+            ),
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{self.workspace_decl.name}_value",
+                    type=dtype_to_c_datatype(
+                        _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+                    ),
+                ),
+                value=llir.MemberAccess(base=iterator_var, member="second"),
+            ),
+            llir.BlankLine(),
+        ]
+
+    def _completed_drain_loop(self, body_tail: List[llir.Stmt]) -> llir.ForLoopAuto:
+        return llir.ForLoopAuto(
+            var=llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF),
+            array=llir.Var(name=self.workspace_decl.name, type=llir.DataType.AUTO),
+            body=[*self._completed_drain_bindings(), *body_tail],
+        )
+
+    def _completed_clear_statement(self) -> llir.MemberCallStmt:
+        return llir.MemberCallStmt(
+            base=llir.Var(name=self.workspace_decl.name, type=llir.DataType.NO_TYPE),
+            member="clear",
+        )
+
+    def _completed_count_loop(self) -> llir.ForLoop:
+        counter = llir.Var(name="_cnt1", type=llir.DataType.INT)
+        body: List[llir.Stmt] = [
+            llir.VarInit(var=counter, value=llir.Literal(0, llir.DataType.INT)),
+            *self._completed_phase_shared_statements(),
+            self._completed_drain_loop(
+                [llir.Increment(var=llir.Var(name="_cnt1", type=llir.DataType.INT))]
+            ),
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name="_count1",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=llir.Var(name=self.row_name, type=llir.DataType.INT64),
+                ),
+                value=llir.Var(name="_cnt1", type=llir.DataType.INT),
+            ),
+            self._completed_clear_statement(),
+        ]
+        return self._completed_phase_loop(body)
+
+    def _completed_fill_loop(self) -> llir.ForLoop:
+        result_name = self.result_decl.name
+
+        def offset_index() -> llir.Add:
+            return llir.Add(
+                llir.Var(name="_base1", type=llir.DataType.INT64),
+                llir.Var(name="_pos1", type=llir.DataType.INT),
+            )
+
+        body: List[llir.Stmt] = [
+            llir.VarInit(
+                var=llir.Var(name="_base1", type=llir.DataType.INT64),
+                value=llir.ArrayAccess(
+                    array=llir.Var(
+                        name="_offset1",
+                        type=llir.DataType.STD_VECTOR_INT,
+                    ),
+                    index=llir.Var(name=self.row_name, type=llir.DataType.INT64),
+                ),
+            ),
+            llir.VarInit(
+                var=llir.Var(name="_pos1", type=llir.DataType.INT),
+                value=llir.Literal(0, llir.DataType.INT),
+            ),
+            *self._completed_phase_shared_statements(),
+            llir.FunctionCallStmt(name=f"{self.workspace_decl.name}.sort", args=[]),
+            self._completed_drain_loop(
+                [
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_name}_values_data",
+                                type=llir.DataType.ptr_type(
+                                    _SCALAR_TO_TORCH[self.result_decl.dtype]
+                                ),
+                            ),
+                            index=offset_index(),
+                        ),
+                        value=llir.Var(
+                            name=f"{self.workspace_decl.name}_value",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    ),
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{result_name}1_crd_data",
+                                type=llir.DataType.PTR_INT,
+                            ),
+                            index=offset_index(),
+                        ),
+                        value=llir.Var(
+                            name=self.drain_name,
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                    ),
+                    llir.Increment(var=llir.Var(name="_pos1", type=llir.DataType.INT)),
+                ]
+            ),
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            self._completed_clear_statement(),
+        ]
+        return self._completed_phase_loop(body)
+
+    def _completed_interlude_statements(self) -> List[llir.Stmt]:
+        """The serial prefix sum and exact Torch-owned output allocation."""
+
+        _, rows_text, _, _ = self._policy_work_and_rows()
+        rows_int = llir.Var(name=rows_text, type=llir.DataType.INT)
+        index = llir.Var(name="_i", type=llir.DataType.INT)
+        assembler = self.result_assembler()
+        offsets = llir.Var(name="_offset1", type=llir.DataType.STD_VECTOR_INT)
+        total = llir.Var(name="_total1", type=llir.DataType.INT64)
+        return [
+            llir.DirectInit(
+                var=offsets,
+                args=[
+                    llir.Add(
+                        llir.Cast(expr=rows_int, data_type=llir.DataType.SIZE_T),
+                        llir.Literal(1, llir.DataType.INT),
+                    )
+                ],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(name="_offset1", type=llir.DataType.STD_VECTOR_INT),
+                    index=llir.Literal(0, llir.DataType.INT),
+                ),
+                value=llir.Literal(0, llir.DataType.INT),
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    var=llir.Var(name="_i", type=llir.DataType.INT),
+                    value=llir.Literal(0, llir.DataType.INT),
+                ),
+                cond=llir.BinOp(op="<", left=index, right=rows_int),
+                update=llir.Increment(var=llir.Var(name="_i", type=llir.DataType.INT)),
+                body=[
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name="_offset1",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            ),
+                            index=llir.Add(index, llir.Literal(1, llir.DataType.INT)),
+                        ),
+                        value=llir.Add(
+                            llir.ArrayAccess(
+                                array=llir.Var(
+                                    name="_offset1",
+                                    type=llir.DataType.STD_VECTOR_INT,
+                                ),
+                                index=index,
+                            ),
+                            llir.ArrayAccess(
+                                array=llir.Var(
+                                    name="_count1",
+                                    type=llir.DataType.STD_VECTOR_C_INT,
+                                ),
+                                index=index,
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            llir.VarInit(
+                var=total,
+                value=llir.ArrayAccess(
+                    array=llir.Var(name="_offset1", type=llir.DataType.STD_VECTOR_INT),
+                    index=rows_int,
+                ),
+            ),
+            *assembler.emit_first_compressed_position_allocation(
+                llir.Var(name=rows_text, type=llir.DataType.INT),
+                llir.Var(name="_offset1", type=llir.DataType.STD_VECTOR_INT),
+            ),
+            *assembler.emit_compressed_coordinate_allocations(
+                (llir.Var(name="_total1", type=llir.DataType.INT64),)
+            ),
+            *assembler.emit_compressed_value_allocation(
+                llir.Var(name="_total1", type=llir.DataType.INT64)
+            ),
+        ]
+
+    def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
+        """Require the exact two-phase composition owned by the shared pass.
+
+        The completed function is reconstructed from the verified program
+        facts using only locally owned constructions and the frozen result
+        ABI snapshot — never the managed pass being validated — so a
+        missing, duplicated, moved, wrapped, aliased, malformed, or
+        cyclically shared state anywhere in the assembled function fails
+        closed with the family's stable completion code.
+        """
+
+        try:
+            assembler = self.result_assembler()
+            expected_kernel_abi = self.kernel_abi()
+            expected_size_stmts = self.result_size_inits()
+            if expected_size_stmts:
+                expected_size_stmts = [
+                    llir.Comment("Init result tensor level sizes"),
+                    *expected_size_stmts,
+                ]
+            counter_var = llir.Var(name="_count1", type=llir.DataType.STD_VECTOR_C_INT)
+            _, rows_text, _, _ = self._policy_work_and_rows()
+            expected_body: List[llir.Stmt] = [
+                *expected_kernel_abi.emit_validation(),
+                *expected_size_stmts,
+                *expected_kernel_abi.emit_input_prologue(),
+                llir.BlankLine(),
+                *self.tile_size_inits(),
+                llir.BlankLine(),
+                llir.BlankLine(),
+                *self._completed_pool_statements(),
+                llir.DirectInit(
+                    var=counter_var,
+                    args=[
+                        llir.Cast(
+                            expr=llir.Var(name=rows_text, type=llir.DataType.INT),
+                            data_type=llir.DataType.SIZE_T,
+                        ),
+                        llir.Literal(0, llir.DataType.INT),
+                    ],
+                ),
+                self._completed_count_loop(),
+                *self._completed_interlude_statements(),
+                self._completed_fill_loop(),
+                assembler.emit_result_declaration(),
+                *assembler.emit_storage_epilogue(),
+            ]
+            expected_function = expected_kernel_abi.assemble_function(expected_body)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        if not _exact_sparse_completion_matches(function, expected_function):
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the assembled function must exactly match the completed "
+                "two-phase parallel sparse-workspace target, including the "
+                "derived pool policy, both phase regions, the exact "
+                "allocation interlude, and honest final assembly",
+            )
+        return function
 
 
 def _dense_domain_mixed_chain(program: LoopProgram) -> bool:
@@ -7612,6 +8877,8 @@ def _lower_loopir_to_llir_owned(
     lowering: _TargetLowering
     if _sparse_workspace_chain(program):
         lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
+    elif _parallel_sparse_workspace_chain(program):
+        lowering = _ParallelSparseWorkspaceLowering(program, input_shapes, result_shape)
     elif _dense_domain_mixed_chain(program):
         lowering = _DenseDomainMixedLowering(program, input_shapes, result_shape)
     else:
@@ -7644,13 +8911,41 @@ def _lower_loopir_to_llir_owned(
         transformed_body: LLIRStatementListArtifact,
         compressed_output_parallel: bool,
     ) -> LLIRRewriteArtifact:
-        if compressed_output_parallel:
+        if compressed_output_parallel != lowering.owns_two_phase_output():
+            # Families outside the parallel workspace target never produce
+            # two-phase output; the owning family conversely requires the
+            # shared pass to have taken ownership, so a silently detached
+            # no-op cannot degrade it to an unallocated serial assembly.
             raise LoopIRTargetError(
                 LoopIRTargetDefect(
-                    "unsupported_program_shape",
-                    "LoopIR lowering never produces compressed "
-                    "two-phase output assembly",
+                    (
+                        "unsupported_program_shape"
+                        if compressed_output_parallel
+                        else _SPARSE_WORKSPACE_LOST
+                    ),
+                    (
+                        "LoopIR lowering never produces compressed "
+                        "two-phase output assembly"
+                        if compressed_output_parallel
+                        else "the shared compressed-Where pass did not take "
+                        "ownership of the two-phase parallel assembly"
+                    ),
                 )
+            )
+        if compressed_output_parallel:
+            # The pass owns output allocation, both phase loops, final
+            # assembly, and the return; mirror the legacy applied-branch
+            # composition exactly.
+            return LLIRRewriteArtifact(
+                [
+                    *validation_stmts,
+                    *size_stmts,
+                    *prologue_stmts,
+                    llir.BlankLine(),
+                    *tile_size_stmts,
+                    llir.BlankLine(),
+                    *transformed_body.statements,
+                ]
             )
         body_stmts: List[llir.Stmt] = [
             *validation_stmts,
@@ -7671,7 +8966,9 @@ def _lower_loopir_to_llir_owned(
     try:
         pipeline_result = manager.run_production_pipeline(
             LLIRStatementListArtifact(raw_statements),
-            compressed_where_pass_spec=None,
+            compressed_where_pass_spec=lowering.compressed_where_pass_spec(
+                compile_options
+            ),
             dense_pointer_pass_spec=DensePointerHoistPassSpec(
                 DensePointerHoistContext(
                     value_array_ctypes=lowering.value_array_ctypes()

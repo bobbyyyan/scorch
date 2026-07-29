@@ -1048,17 +1048,25 @@ def apply_sparse_workspace(
         )
     result_symbol = leaf.tensor
     result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
+    result_kinds = tuple(level.kind for level in result_decl.levels)
     if (
         len(result_decl.levels) != 2
-        or tuple(level.kind for level in result_decl.levels)
-        != (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+        or result_kinds
+        not in (
+            (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
+            (LevelKind.DENSE, LevelKind.COMPRESSED),
+        )
         or tuple(level.mode for level in result_decl.levels) != (0, 1)
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the serial B1 sparse workspace requires an identity-ordered "
-            "rank-2 doubly-compressed result",
+            "the sparse workspace requires an identity-ordered rank-2 "
+            "doubly-compressed or dense-row CSR result",
         )
+    doubly_compressed_result = result_kinds == (
+        LevelKind.COMPRESSED,
+        LevelKind.COMPRESSED,
+    )
     reduction_index = workspace.reduction_loop.index_id
     axis_index = workspace.axis_loops[0].index_id
     if type(leaf.indices) is not tuple or not leaf.indices:
@@ -1084,16 +1092,35 @@ def apply_sparse_workspace(
     reduction_loops = [
         node for node in loops if _loop_key(node)[0] not in result_index_set
     ]
-    if (
-        len(reduction_loops) != 1
-        or _loop_key(reduction_loops[-1]) != (reduction_index, LoopPart.LOGICAL)
-        or type(reduction_loops[-1]) is not MergedSparseFor
-        or reduction_loops[-1].mode is not MergeMode.INTERSECTION
+    if len(reduction_loops) != 1 or _loop_key(reduction_loops[-1]) != (
+        reduction_index,
+        LoopPart.LOGICAL,
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the serial B1 sparse workspace requires exactly one reduction "
-            "loop: the recorded logical INTERSECTION merge",
+            "the sparse workspace requires exactly one reduction loop: the "
+            "recorded logical reduction",
+        )
+    if doubly_compressed_result:
+        # The B1 doubly-compressed family reduces over the recorded
+        # two-cursor INTERSECTION merge.
+        if (
+            type(reduction_loops[-1]) is not MergedSparseFor
+            or reduction_loops[-1].mode is not MergeMode.INTERSECTION
+        ):
+            _fail(
+                "sparse_workspace_target_invalid",
+                "the serial B1 sparse workspace requires exactly one "
+                "reduction loop: the recorded logical INTERSECTION merge",
+            )
+    elif type(reduction_loops[-1]) is not SparseFor:
+        # The dense-row CSR family (Phase 7) reduces over one plain
+        # single-cursor stored level; merged reductions stay with the
+        # doubly-compressed form.
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the dense-row CSR sparse workspace requires exactly one "
+            "single-cursor sparse reduction loop",
         )
     reduction_positions = [
         position
@@ -1142,6 +1169,14 @@ def apply_sparse_workspace(
             _fail(
                 "sparse_workspace_target_invalid",
                 "result prefix coordinates must be bound above the " "workspace region",
+            )
+        if not doubly_compressed_result and type(loops[binder_positions[0]]) is not (
+            DenseFor
+        ):
+            _fail(
+                "sparse_workspace_target_invalid",
+                "the dense-row CSR sparse workspace binds its result row "
+                "coordinate with one plain dense loop",
             )
     axis_dimension = _loop_bound_dimension(program, axis_nodes[0])
 

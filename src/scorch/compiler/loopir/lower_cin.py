@@ -43,6 +43,7 @@ domains.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, NoReturn, Optional, Tuple
 
 import torch
@@ -566,6 +567,20 @@ def lower_normalized_cin_to_loopir(
     )
 
 
+class _SparseOutputReduction(Enum):
+    """Which semantic sparse-output reduction family one program selects.
+
+    ``NONE`` covers the assembly families (no update operator).  Both
+    reduction members lower to the coordinate-merged :class:`StoreReduce`
+    leaf; only a sparse-workspace schedule rewrites that semantic form into
+    ordered assembly, and target lowering refuses the unscheduled form.
+    """
+
+    NONE = "none"
+    DOUBLY_COMPRESSED = "doubly_compressed"
+    CSR_DENSE_ROW = "csr_dense_row"
+
+
 def _classify_sparse_output_family(
     result_sparse: bool,
     reduce_update: bool,
@@ -573,9 +588,10 @@ def _classify_sparse_output_family(
     lhs: TensorAccess,
     lhs_index_ids: Tuple[IndexId, ...],
     domains: Dict[IndexId, LoopIterationDomain],
-) -> bool:
-    """Gate the sparse-output families; True selects the semantic
-    doubly-compressed reduction form."""
+    reduction_index_ids: Tuple[IndexId, ...],
+    loop_positions: Dict[IndexId, int],
+) -> _SparseOutputReduction:
+    """Gate the sparse-output families and select the reduction form."""
 
     sparse_reduction_family = (
         result_sparse
@@ -611,7 +627,7 @@ def _classify_sparse_output_family(
                         "every result coordinate to iterate a dense domain "
                         "in the migrated families",
                     )
-            return False
+            return _SparseOutputReduction.NONE
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
             _fail(
                 "unsupported_sparse_output",
@@ -621,11 +637,34 @@ def _classify_sparse_output_family(
                 "families",
             )
         if reduce_update:
-            _fail(
-                "unsupported_sparse_output_reduction",
-                "a canonical CSR output cannot carry the ADD update "
-                "operator in the migrated families",
-            )
+            # The parallel CSR-reduction family (Phase 7): a dense row
+            # domain, plain stored-sparse reduction domains that all
+            # enclose the trailing column loop, and a stored sparse column
+            # domain select the semantic accumulation form.  Everything
+            # else — the sparse-row row-scope shape, merged or dense
+            # reduction or column domains, and trailing-level reductions
+            # below the column coordinate — keeps the historical seam code.
+            column_position = loop_positions[lhs_index_ids[-1]]
+            if (
+                domains[lhs_index_ids[0]].kind is not DomainKind.DENSE
+                or domains[lhs_index_ids[1]].kind is not DomainKind.SPARSE
+                or any(
+                    domains[index_id].kind is not DomainKind.SPARSE
+                    for index_id in reduction_index_ids
+                )
+                or any(
+                    loop_positions[index_id] > column_position
+                    for index_id in reduction_index_ids
+                )
+            ):
+                _fail(
+                    "unsupported_sparse_output_reduction",
+                    "a canonical CSR output carries the ADD update operator "
+                    "only with a dense row domain, one stored-sparse column "
+                    "domain, and plain stored-sparse reduction domains "
+                    "enclosing the column loop in the migrated families",
+                )
+            return _SparseOutputReduction.CSR_DENSE_ROW
         row_domain = domains[lhs_index_ids[0]]
         column_domain = domains[lhs_index_ids[1]]
         if row_domain.kind is not DomainKind.DENSE:
@@ -660,7 +699,11 @@ def _classify_sparse_output_family(
                 "the doubly-compressed column coordinate must be driven by "
                 "stored sparse coordinates in the migrated families",
             )
-    return sparse_reduction_family
+    return (
+        _SparseOutputReduction.DOUBLY_COMPRESSED
+        if sparse_reduction_family
+        else _SparseOutputReduction.NONE
+    )
 
 
 def _lower_sparse_family(
@@ -694,20 +737,23 @@ def _lower_sparse_family(
     )
     lhs_index_ids = tuple(lhs.index_ids)
 
-    sparse_reduction_family = _classify_sparse_output_family(
+    reduction_form = _classify_sparse_output_family(
         result_sparse,
         reduce_update,
         result_levels,
         lhs,
         lhs_index_ids,
         domains,
+        tuple(index_id for index_id in loop_index_ids if index_id not in lhs_index_ids),
+        {index_id: position for position, index_id in enumerate(loop_index_ids)},
     )
+    sparse_reduction_family = reduction_form is not _SparseOutputReduction.NONE
 
     for index_id in loop_index_ids:
         domain = domains[index_id]
         if domain.kind in (DomainKind.UNION, DomainKind.INTERSECTION):
             if index_id not in lhs_index_ids:
-                if sparse_reduction_family:
+                if reduction_form is _SparseOutputReduction.DOUBLY_COMPRESSED:
                     # The B1 family reduces over the merged reduction
                     # dimension by construction; the semantic StoreReduce
                     # form is exactly that reduction.
