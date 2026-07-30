@@ -1942,22 +1942,26 @@ class _TargetLowering:
                 "unsupported_program_shape",
                 f"tensor {decl.name!r} has incomplete logical access metadata",
             )
-        return llir.TensorAccessMetadata(
-            access_id=self._access_id(symbol),
-            tensor_id=symbol,
-            index_ids=cast(Tuple[IndexId, ...], tuple(logical_indices)),
-            role=llir.TensorAccessRole.INPUT_READ,
+        return _detach_tensor_access_metadata(
+            llir.TensorAccessMetadata(
+                access_id=self._access_id(symbol),
+                tensor_id=symbol,
+                index_ids=cast(Tuple[IndexId, ...], tuple(logical_indices)),
+                role=llir.TensorAccessRole.INPUT_READ,
+            )
         )
 
     def _result_metadata(self) -> llir.TensorAccessMetadata:
-        return llir.TensorAccessMetadata(
-            access_id=self._access_id(self.result_symbol),
-            tensor_id=self.result_symbol,
-            index_ids=tuple(
-                self._index_of(index, "store index")  # type: ignore[misc]
-                for index in self._leaf_indices()
+        return _detach_tensor_access_metadata(
+            llir.TensorAccessMetadata(
+                access_id=self._access_id(self.result_symbol),
+                tensor_id=self.result_symbol,
+                index_ids=tuple(
+                    self._index_of(index, "store index")  # type: ignore[misc]
+                    for index in self._leaf_indices()
+                ),
+                role=llir.TensorAccessRole.RESULT_WRITE,
             ),
-            role=llir.TensorAccessRole.RESULT_WRITE,
         )
 
     def _loop_logical_index(self, loop: _Loop) -> object:
@@ -2135,14 +2139,7 @@ class _TargetLowering:
             # separate value so an in-place forged metadata mutation after
             # the managed passes cannot also mutate this review boundary's
             # supposedly detached snapshot.
-            detached_metadata = llir.TensorAccessMetadata(
-                access_id=AccessId(metadata.access_id.value),
-                tensor_id=SymbolId(metadata.tensor_id.value),
-                index_ids=tuple(
-                    IndexId(index_id.value) for index_id in metadata.index_ids
-                ),
-                role=metadata.role,
-            )
+            detached_metadata = _detach_tensor_access_metadata(metadata)
             self._staged_access_snapshot = llir.ArrayAccess(
                 array=snapshot.array,
                 index=snapshot.index,
@@ -2266,14 +2263,7 @@ class _TargetLowering:
             # separate value so an in-place forged metadata mutation after
             # the managed passes cannot also mutate this detached snapshot
             # (the reviewed relayout boundary's discipline).
-            detached_metadata = llir.TensorAccessMetadata(
-                access_id=AccessId(metadata.access_id.value),
-                tensor_id=SymbolId(metadata.tensor_id.value),
-                index_ids=tuple(
-                    IndexId(index_id.value) for index_id in metadata.index_ids
-                ),
-                role=metadata.role,
-            )
+            detached_metadata = _detach_tensor_access_metadata(metadata)
             self._tiled_write_snapshot = llir.ArrayAccess(
                 array=snapshot.array,
                 index=snapshot.index,
@@ -4160,6 +4150,99 @@ def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
     return current.name if type(current) is llir.Var else None
 
 
+def _stored_identity_value(value: object, identity_type: type) -> Optional[int]:
+    """Read one exact frozen identity without invoking forged descriptors."""
+
+    if type(value) is not identity_type:
+        return None
+    state = object.__getattribute__(value, "__dict__")
+    if (
+        type(state) is not dict
+        or len(state) != 1
+        or any(type(key) is not str for key in state)
+        or "value" not in state
+        or type(state["value"]) is not int
+    ):
+        return None
+    return state["value"]
+
+
+def _detach_tensor_access_metadata(
+    metadata: llir.TensorAccessMetadata,
+) -> llir.TensorAccessMetadata:
+    """Copy every provenance identity so managed passes own no program state."""
+
+    if type(metadata) is not llir.TensorAccessMetadata:
+        raise TypeError("tensor access metadata must be exact")
+    access_id = _stored_identity_value(metadata.access_id, AccessId)
+    tensor_id = _stored_identity_value(metadata.tensor_id, SymbolId)
+    if (
+        access_id is None
+        or tensor_id is None
+        or type(metadata.index_ids) is not tuple
+        or type(metadata.role) is not llir.TensorAccessRole
+    ):
+        raise TypeError("tensor access metadata contains malformed identity state")
+    index_values = tuple(
+        _stored_identity_value(index_id, IndexId) for index_id in metadata.index_ids
+    )
+    if any(value is None for value in index_values):
+        raise TypeError(
+            "tensor access metadata contains malformed index identity state"
+        )
+    return llir.TensorAccessMetadata(
+        access_id=AccessId(access_id),
+        tensor_id=SymbolId(tensor_id),
+        index_ids=tuple(IndexId(cast(int, value)) for value in index_values),
+        role=metadata.role,
+    )
+
+
+def _capture_sparse_completion_enum_states() -> (
+    Dict[Tuple[type, int], Tuple[Tuple[str, object], ...]]
+):
+    """Snapshot LLIR enum member state before any managed pass can mutate it."""
+
+    snapshots: Dict[Tuple[type, int], Tuple[Tuple[str, object], ...]] = {}
+    for enum_type in (llir.AssignOp, llir.DataType, llir.TensorAccessRole):
+        for member in enum_type.__members__.values():
+            state = object.__getattribute__(member, "__dict__")
+            snapshots[(enum_type, id(member))] = tuple(
+                (key, state[key]) for key in state
+            )
+    return snapshots
+
+
+_SPARSE_COMPLETION_ENUM_STATES = _capture_sparse_completion_enum_states()
+
+
+def _sparse_completion_enum_state_matches(value: Enum) -> bool:
+    """Require one LLIR enum singleton to retain its import-time stored state."""
+
+    expected = _SPARSE_COMPLETION_ENUM_STATES.get((type(value), id(value)))
+    if expected is None:
+        return False
+    state = object.__getattribute__(value, "__dict__")
+    if (
+        type(state) is not dict
+        or len(state) != len(expected)
+        or any(type(key) is not str for key in state)
+        or tuple(state) != tuple(key for key, _ in expected)
+    ):
+        return False
+    for key, expected_value in expected:
+        actual_value = state[key]
+        if key == "__objclass__":
+            if actual_value is not expected_value:
+                return False
+        elif (
+            type(actual_value) is not type(expected_value)
+            or actual_value != expected_value
+        ):
+            return False
+    return True
+
+
 def _metadata_state_matches(actual: object, expected: object) -> bool:
     """Compare two frozen access-provenance values field by exact field."""
 
@@ -4169,40 +4252,37 @@ def _metadata_state_matches(actual: object, expected: object) -> bool:
     if (
         type(actual_state) is not dict
         or type(expected_state) is not dict
-        or tuple(sorted(actual_state)) != tuple(sorted(expected_fields))
-        or tuple(sorted(expected_state)) != tuple(sorted(expected_fields))
+        or len(actual_state) != len(expected_fields)
+        or len(expected_state) != len(expected_fields)
+        or any(type(key) is not str for key in actual_state)
+        or any(type(key) is not str for key in expected_state)
+        or any(field not in actual_state for field in expected_fields)
+        or any(field not in expected_state for field in expected_fields)
     ):
         return False
 
-    def identity_value(value: object, identity_type: type) -> Optional[int]:
-        if type(value) is not identity_type:
-            return None
-        state = object.__getattribute__(value, "__dict__")
-        if type(state) is not dict or tuple(state) != ("value",):
-            return None
-        return state["value"] if type(state["value"]) is int else None
-
     for side in (actual_state, expected_state):
         if (
-            identity_value(side["access_id"], AccessId) is None
-            or identity_value(side["tensor_id"], SymbolId) is None
+            _stored_identity_value(side["access_id"], AccessId) is None
+            or _stored_identity_value(side["tensor_id"], SymbolId) is None
             or type(side["index_ids"]) is not tuple
             or any(
-                identity_value(index_id, IndexId) is None
+                _stored_identity_value(index_id, IndexId) is None
                 for index_id in side["index_ids"]
             )
             or type(side["role"]) is not llir.TensorAccessRole
+            or not _sparse_completion_enum_state_matches(side["role"])
         ):
             return False
     return (
-        identity_value(actual_state["access_id"], AccessId)
-        == identity_value(expected_state["access_id"], AccessId)
-        and identity_value(actual_state["tensor_id"], SymbolId)
-        == identity_value(expected_state["tensor_id"], SymbolId)
+        _stored_identity_value(actual_state["access_id"], AccessId)
+        == _stored_identity_value(expected_state["access_id"], AccessId)
+        and _stored_identity_value(actual_state["tensor_id"], SymbolId)
+        == _stored_identity_value(expected_state["tensor_id"], SymbolId)
         and len(actual_state["index_ids"]) == len(expected_state["index_ids"])
         and all(
-            identity_value(actual_index, IndexId)
-            == identity_value(expected_index, IndexId)
+            _stored_identity_value(actual_index, IndexId)
+            == _stored_identity_value(expected_index, IndexId)
             for actual_index, expected_index in zip(
                 actual_state["index_ids"], expected_state["index_ids"]
             )
@@ -4231,12 +4311,15 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
             return False
         if actual_value is None:
             continue
-        if type(actual_value) in (bool, int, float, str, llir.DataType):
+        if type(actual_value) in (bool, int, float, str):
             if actual_value != expected_value:
                 return False
             continue
         if isinstance(actual_value, Enum):
-            if actual_value is not expected_value:
+            if (
+                actual_value is not expected_value
+                or not _sparse_completion_enum_state_matches(actual_value)
+            ):
                 return False
             continue
         if type(actual_value) in (AccessId, SymbolId, IndexId):
@@ -4687,14 +4770,16 @@ class _SparseWorkspaceLowering(_TargetLowering):
         )
 
     def _append_metadata(self) -> llir.TensorAccessMetadata:
-        return llir.TensorAccessMetadata(
-            access_id=self._access_id(self.result_symbol),
-            tensor_id=self.result_symbol,
-            index_ids=(
-                self.outer_loop.coord_index,
-                self.sparse_drain.index,
+        return _detach_tensor_access_metadata(
+            llir.TensorAccessMetadata(
+                access_id=self._access_id(self.result_symbol),
+                tensor_id=self.result_symbol,
+                index_ids=(
+                    self.outer_loop.coord_index,
+                    self.sparse_drain.index,
+                ),
+                role=llir.TensorAccessRole.RESULT_WRITE,
             ),
-            role=llir.TensorAccessRole.RESULT_WRITE,
         )
 
     def _segment_start(self, cursor: SparseCursorDecl) -> llir.Expr:
@@ -5282,7 +5367,15 @@ class _SparseWorkspaceLowering(_TargetLowering):
             ValueError,
         ) as error:
             _fail(_SPARSE_WORKSPACE_LOST, str(error))
-        if not _exact_sparse_completion_matches(function, expected_function):
+        try:
+            completion_matches = _exact_sparse_completion_matches(
+                function, expected_function
+            )
+        except LoopIRTargetError:
+            raise
+        except Exception as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        if not completion_matches:
             _fail(
                 _SPARSE_WORKSPACE_LOST,
                 "the assembled function must exactly match the completed "
@@ -5669,7 +5762,9 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         return CompressedWhereOpenMPPassSpec(
             CompressedWhereOpenMPContext(
                 result_name=self.result_decl.name,
-                result_id=self.result_symbol,
+                # The managed pass must not be able to mutate the SymbolId
+                # that keys this lowering's verified program state.
+                result_id=SymbolId(self.result_symbol.value),
                 compressed_levels=(1,),
                 result_assembler=self.result_assembler(),
                 workspace_name=self.workspace_decl.name,
@@ -5704,14 +5799,16 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         )
 
     def _append_metadata(self) -> llir.TensorAccessMetadata:
-        return llir.TensorAccessMetadata(
-            access_id=self._access_id(self.result_symbol),
-            tensor_id=self.result_symbol,
-            index_ids=(
-                self.outer_loop.index,
-                self.sparse_drain.index,
+        return _detach_tensor_access_metadata(
+            llir.TensorAccessMetadata(
+                access_id=self._access_id(self.result_symbol),
+                tensor_id=self.result_symbol,
+                index_ids=(
+                    self.outer_loop.index,
+                    self.sparse_drain.index,
+                ),
+                role=llir.TensorAccessRole.RESULT_WRITE,
             ),
-            role=llir.TensorAccessRole.RESULT_WRITE,
         )
 
     def _dense_position_resolve(
@@ -6465,7 +6562,15 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             ValueError,
         ) as error:
             _fail(_SPARSE_WORKSPACE_LOST, str(error))
-        if not _exact_sparse_completion_matches(function, expected_function):
+        try:
+            completion_matches = _exact_sparse_completion_matches(
+                function, expected_function
+            )
+        except LoopIRTargetError:
+            raise
+        except Exception as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        if not completion_matches:
             _fail(
                 _SPARSE_WORKSPACE_LOST,
                 "the assembled function must exactly match the completed "
