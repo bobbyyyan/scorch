@@ -1011,6 +1011,48 @@ def test_pass_cannot_mutate_shared_llir_enum_spelling(
     assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
+def test_completion_enum_validation_is_cached_only_within_one_comparison(
+    monkeypatch,
+):
+    """Repeated enum leaves validate once, but no result survives the boundary."""
+
+    from scorch.compiler import llir
+    from scorch.compiler.loopir import lower_llir as target
+
+    enum_key = (llir.DataType, id(llir.DataType.INT))
+    calls = []
+    original = target._sparse_completion_enum_state_matches
+
+    def counted(value):
+        calls.append((type(value), id(value)))
+        return original(value)
+
+    monkeypatch.setattr(
+        target,
+        "_sparse_completion_enum_state_matches",
+        counted,
+    )
+    actual = (
+        llir.Var("left", llir.DataType.INT),
+        llir.Var("right", llir.DataType.INT),
+    )
+    expected = (
+        llir.Var("left", llir.DataType.INT),
+        llir.Var("right", llir.DataType.INT),
+    )
+
+    assert target._exact_sparse_completion_matches(actual, expected)
+    assert calls == [enum_key]
+
+    original_value = llir.DataType.INT.value
+    object.__setattr__(llir.DataType.INT, "_value_", "forged_int")
+    try:
+        assert not target._exact_sparse_completion_matches(actual, expected)
+    finally:
+        object.__setattr__(llir.DataType.INT, "_value_", original_value)
+    assert calls == [enum_key, enum_key]
+
+
 @pytest.mark.parametrize("duplicate", ["alias", "structural"])
 def test_duplicated_outer_row_loop_fails_closed(monkeypatch, duplicate):
     """Neither an aliased nor a cloned second row loop survives completion."""
