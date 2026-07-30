@@ -5664,3 +5664,225 @@ The opening coherent milestone remains the typed parallel
 sparse-workspace-pool/two-pass runtime composition characterized there,
 with the working public route as execution oracle and no use of the
 malformed or memory-unsafe comparands as correctness oracles.
+
+## 35. Phase-7 opening milestone: the parallel two-phase CSR SpGEMM slice (2026-07-29)
+
+### 35.1 Scope and the independent §34 re-review
+
+This session first independently re-reviewed the complete
+`abc81cb..bcc6dfd` correction range from the actual diffs and reproduced
+every §34 claim: the repaired 142-entry §33 evidence manifest and the
+28-entry authoritative manifest verify at their recorded digests, the
+full B1/B2 battery passed at the tip, the broad pure LoopIR membership
+passed 735, commuted f32/f64 source parity plus compiled execution hold
+(compiled f64 was added as a stronger fresh probe), B2 broadcast and
+zero-extent behavior, the independent legacy-source execution, and the
+implementation-reserved identifier boundary all reproduce.
+
+The review then found one concrete defect the §34 corrections had
+missed.  `_SparseWorkspaceLowering` retained its emitted outer `ForLoop`
+object as the completion snapshot, and the emitted statements are the
+exact objects the first managed pass receives: a hostile in-place
+rewrite of the shared header at the sparse-prefetch entry (demonstrated
+with a widened `<=` row bound) mutated the completion reference too and
+compiled cleanly instead of dying at the boundary.  Two commits close
+it:
+
+- `70f1066` — the completion reference is now reconstructed from the
+  verified program facts by a pure builder both emission and completion
+  call independently, so it can never share mutable nodes with anything
+  a pass can reach; the fresh-ownership census exemption is narrowed to
+  the interned empty tuple (a shared empty *list* is mutable aliased
+  state and is now rejected);
+- `907ceb8` — fresh hostile probes: in-place header mutations at the
+  pipeline entry, an exhaustive id-intersection proof that the
+  completion reference owns no pipeline-entry state, aliased and cloned
+  duplicate row loops, a purely aliased `BlankLine` no rendered
+  comparison could see, matcher-level shared-empty-list and
+  self-containing-loop locks, dynamic-vector idempotence (the pass-order
+  probe), and the commuted compiled-f64 execution.
+
+The activating B1 A/B/A latency gate (200 warmups / 2,000 samples,
+candidate–base–candidate plus a base A/A control) is neutral: p50
+ratios 0.995–1.000, mean 0.997–1.027, and the one 1.14 p95 reading sits
+inside the demonstrated 3.4–4.4% base-vs-base drift band.  Evidence is
+sealed under `~/.cache/scorch-codex/phase6-b1b2-review2-907ceb8/`.
+
+### 35.2 Comparand audit and layer assignment
+
+The two sealed sized automatic comparands were verified at their
+recorded digests and audited fact by fact.  Both are two-pass OpenMP
+count/fill kernels: a per-thread `linked_list_workspace_1d` pool sized
+by a derived thread count, borrowed per-worker `make_view()` views
+inside each of two parallel regions, a dynamic-chunk row loop, an exact
+serial prefix-sum/`torch::empty` allocation interlude, and honest final
+assembly.  Responsibilities were assigned explicitly: LoopPlan owns the
+automatic decision (both arms already record exactly the tile-free
+sparse `WorkspaceInsertion` fact for `ds@ds->ds`); semantic LoopIR owns
+the format-neutral base and region forms with no new node kinds and no
+schema change (`scorch.loopir.canonical.v9` unchanged); target LLIR
+owns the entire parallel/runtime composition; and the runtime ABI owns
+the spellings (`linked_list_workspace_1d`, `make_view`,
+`insert_unchecked`, `omp_get_thread_num`, `scorch_nthreads`,
+`scorch_chunk`, `SCORCH_GRAIN_CODEGEN_SPGEMM`, `torch::empty`).  No
+CSR-specific shortcut, rendered-name discovery, raw policy parsing, or
+target spelling entered semantic LoopIR.
+
+### 35.3 The ds@ds->ds vertical slice (`64c415a` / `df777cb`)
+
+CIN lowering admits the dense-row/stored-sparse-reduction/stored-sparse
+-column CSR reduction as the existing coordinate-merged `StoreReduce`
+semantic form (an enum-classified family selection; every adjacent cell
+keeps its historical seam code, including `reduce_to_csr`, the
+trailing-level reduction, dense reduction domains, and the row-scope
+shape).  `apply_sparse_workspace` pairs its admission per result format:
+the doubly-compressed result keeps the B1 INTERSECTION-merge chain, and
+the dense-row CSR result requires one plain dense row binder over a
+single-cursor sparse reduction.  The production verifier, oracle,
+erasure, and canonical serialization needed no changes: the scheduled
+region program verifies as-is, the oracle returns exact `CsrMatrix`
+storage with scheduled/base agreement, erasure round-trips canonically,
+and both arms produce one canonical dump.
+
+The dedicated `_ParallelSparseWorkspaceLowering` validates the exact
+chain by cursor role (commuted operands are classified structurally),
+reserves every runtime and two-phase helper spelling against display
+names, emits the exact serial per-row assembly the legacy pipeline
+hands to the shared production compressed-`Where`/OpenMP pass, and
+supplies that same pass configuration to the shared managed pipeline.
+The driver's applied branch mirrors the legacy composition; ownership is
+fail-closed in both directions (a family outside the target can never
+see two-phase output; a detached pass no-op can never degrade the
+family to an unallocated serial assembly).  Byte parity holds in both
+automatic arms for float32/float64 and the commuted order, and the
+generated source reproduces the sealed comparand digest
+`fa1026be…a4791c` exactly.
+
+Two boundary corrections were required.  First, the general target
+lowering now rejects any `StoreReduce` leaf into sparse result storage:
+the newly admitted semantic form would otherwise reach the generic
+route unscheduled and emit the known memory-unsafe unsized-values
+kernel (demonstrated before the fix: `C_values[pC1] += …` into an empty
+`std::vector`).  Second, the exact completion matcher compares frozen
+`TensorAccessMetadata` by validated value outside the fresh-ownership
+census, because the production two-phase rewrite legitimately
+duplicates a work body whose detached statements retain the same
+immutable provenance values.
+
+Completion follows the §34 discipline: `complete_sparse_workspace`
+reconstructs the entire expected post-pass function — pool policy in
+typed and string form built together from the same structural facts,
+both phase loops, the exact interlude through the frozen result ABI
+snapshot's first-position/coordinate/value allocations, and the honest
+storage epilogue — using only locally owned constructions, never the
+managed pass being validated, then requires one exact fresh-ownership
+match (`sparse_workspace_completion_lost` otherwise).
+
+### 35.4 The battery and the row-scope disposition
+
+The 61-test dedicated battery proves the slice end to end: byte parity
+and the sealed digest in both arms; compiled execution against the
+LoopIR oracle (exact storage), PyTorch, an independently generated and
+separately compiled legacy source, the sealed comparand executed raw,
+and the public dispatch; empty/disjoint/overlapping/ragged supports,
+zero extents, explicit-zero cancellation, deterministic storage under
+repeated execution, and fresh-process `OMP_NUM_THREADS` 1-versus-3 runs
+proving thread-count invariance; route ownership, replay, erasure, and
+canonical-dump stability; and the adversarial surface (hand-built
+program parity, forged inserts, reserved and colliding names, recorded
+stage loss, pass-ownership loss, nine post-pass completion attacks, the
+pipeline-entry header mutation, dynamic-vector idempotence, and the
+metadata matcher lock).
+
+The adjacent `ss@ss->ds` row-scope family is deliberately dispositioned
+as failure evidence, not migrated.  Its sealed comparand sizes
+`C1_pos` by the first operand's *stored*-row count rather than the
+result's dense row extent, so any input whose first operand has an
+empty row returns malformed storage that silently associates later
+rows' values with earlier rows (demonstrated: a 4-row request with one
+empty stored row returned a length-4 position array against its sound
+full-support control's length 5, executed from the sealed comparand at
+digest `cf1114aa…97b51`).  A byte-parity twin would knowingly reproduce
+wrong results; the family keeps its stable
+`unsupported_sparse_output_reduction` seam and the battery locks both
+the defect and the non-admission.  The mixed dense-leaf operand load
+chain remains the next target-neutral slice.
+
+### 35.5 Census, audit, captures, and latency
+
+The regenerated deterministic family census (15 cells, both arms)
+records zero route and zero arm divergence: the three Phase-7 SpGEMM
+cells (base, float64, wider sizing) at byte parity, B1 at parity, the
+three B2 cells admitted, and every seam at its exact prior code.  Four
+fresh randomized cross-route sweeps (seeds 1, 2, 7, 11; 150 attempted
+cases each through the retained f13ba79 harness) report zero parity
+mismatches across 84–110 parity cases per seed; the older 60-case
+harness variant behind the sealed v2 tallies was not retained alongside
+its logs, so the fresh 150-case sweeps stand as this tip's randomized
+census (a strictly larger case set).  The 86-case parallel-selection
+audit is unchanged at 46 admitted / 40 rejected / 0 non-identical.
+Fresh corpus (20/20), grid (42/42), anchor, heap, and auto captures are
+byte-identical to the sealed `ebb243b` baselines — the auto capture
+this time with zero cache-key normalization — and eight activating
+Phase-7 captures (two arms × two dtypes × both operand orders) are
+sealed with arm-identical digests.  Repeated public runtime
+differentials pass 10/10.  Activating Phase-7 compile latency (200
+warmups / 2,000 interleaved samples) is 1.075–1.080× the legacy route
+across p50/mean/p95 — the LoopIR route re-verifies, applies, and
+exactly completes on top of everything legacy does — inside the 1.10
+gate.
+
+### 35.6 Verification
+
+All commands used the `scorch` conda environment.  At code tip
+`df777cb`: the complete compiled batteries passed **493** (the Phase-7
+battery, the full B1/B2 battery, pipeline execution, and the scheduled
+slice); the broad pure LoopIR membership passed **735**; the
+options/plan-identity membership passed **153**; the schedule
+generality battery passed clean; Black and Flake8 are clean on every
+changed file; focused production mypy is clean; full-source mypy is
+exactly the inherited **140 errors in 11 files**; `git diff --check`
+is clean.  The authoritative clean-detached run at exact `df777cb` (import
+provenance asserted) reached **4,642 passed / 14 skipped / 3
+performance deselected** in 2,979.70 s before the documented macOS
+libomp pthread-key ceiling produced a 68-node exhaustion cascade (64
+literal `OMP: Error #179`/`pthread_key_create` markers retained in the
+sealed log).  The exact 68-node failed set was proven complete, unique,
+and non-overlapping across fresh-process partitions of 17+17+17+17; all
+four passed.  The proven union is therefore **4,710 passed / 14 skipped
+/ 3 performance deselected / zero code failures**.
+
+The five protected tracked files retained their exact SHA-256 values
+through every commit, only explicit paths were staged, all unrelated
+GPU/benchmark/scheduler/research/scratchpad material remains untouched,
+nothing was pushed, and origin remains `58e8565`.  Evidence is sealed
+under `~/.cache/scorch-codex/phase7-spgemm-df777cb/` (captures, census,
+audit, latency, parity notes, and the full-suite receipts) beside the
+§35.1 review evidence.
+
+### 35.7 Phase-7 checkpoint audit
+
+Criterion by criterion at `df777cb`: the typed parallel
+sparse-workspace-pool composition exists as a verified target-owned
+surface (pool, borrowed view lifetimes, two-phase count/fill, derived
+thread/chunk/work-estimate policy) with every responsibility assigned
+to its layer; the one admitted runtime-composition family holds byte
+parity to its sound sealed comparand in both automatic arms plus
+independent oracle/PyTorch/public correctness across the required case
+matrix; fail-closed verification carries stable codes at every new
+boundary, including both completion-ownership directions; canonical
+request identity remains semantic with no version change; erasure is
+pure; and release behavior is unchanged everywhere (production imports
+untouched, all sealed captures byte-stable, the audit unchanged, and
+the family census divergence-free).  The row-scope comparand is
+dispositioned with a demonstrated soundness defect rather than
+migrated, exactly as the no-unsound-parity rule requires.
+
+**The Phase-7 checkpoint is GO** for this opening slice.  No release
+dispatch/cache cutover, selector cutover, legacy deletion, Phase 8, or
+Phase 8.5 was performed or started.  The remaining Phase-7 surface, in
+order: the mixed dense-leaf operand load chain (target-neutral), a
+sound re-derivation of the row-scope family (its typed twin must fix
+the empty-row defect legacy ships, which breaks byte parity by
+construction and therefore needs its own disposition decision), and the
+general multi-compressed-level assembly.

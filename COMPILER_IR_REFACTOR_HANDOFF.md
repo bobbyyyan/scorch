@@ -28606,3 +28606,132 @@ documented pthread-key ceiling, prove a complete non-overlapping
 fresh-process union rather than relabeling aborted nodes as passes.
 Record exact commands, revisions, hashes, limitations, and evidence
 outside Git; verify protected hashes before every commit; push nothing.
+
+## Phase-7 opening milestone: parallel two-phase CSR SpGEMM (2026-07-29; supersedes the §34 tail)
+
+The §34 corrections were independently re-reviewed from the actual
+diffs before any Phase-7 work.  Every claim reproduced (manifests,
+batteries, commuted parity with compiled f64 added, B2 extents, the
+independent legacy oracle, identifier boundaries, the A/B/A latency
+gate), and one missed defect was found and fixed: the B1 completion
+reference shared its emitted outer-loop object with the pipeline entry,
+so an in-place hostile header rewrite there compiled cleanly.
+`70f1066` reconstructs the reference freshly from verified facts (and
+narrows the census exemption to the interned empty tuple);
+`907ceb8` locks it with hostile probes including an exhaustive
+completion-reference/pipeline-entry id-intersection.  Review §35.1 and
+`~/.cache/scorch-codex/phase6-b1b2-review2-907ceb8/` hold the detail.
+
+The opening Phase-7 runtime-composition milestone is then complete in
+two commits:
+
+- `64c415a` — the automatic `ds@ds->ds` SpGEMM family compiles through
+  the typed route with byte parity to the sealed comparand
+  (`fa1026be…a4791c`) in both automatic arms, f32/f64, and both operand
+  orders.  LoopPlan is unchanged (the arms already record the tile-free
+  sparse workspace fact); semantic LoopIR reuses the existing
+  StoreReduce and SparseWorkspaceRegion forms with no schema change
+  (canonical v9); the dedicated target lowering emits the serial
+  per-row assembly and supplies the shared production
+  compressed-Where/OpenMP pass configuration, which owns the pool,
+  borrowed `make_view()` lifetimes, count/fill parallel regions,
+  derived SpGEMM thread/chunk/work-estimate policy, exact Torch-owned
+  allocation, and honest final assembly; completion reconstructs the
+  entire expected post-pass function from local constructions plus the
+  frozen result ABI snapshot and requires one exact fresh-ownership
+  match.  Two ride-along boundary fixes: the general lowering now
+  rejects StoreReduce into sparse storage outright (the unscheduled
+  route otherwise reached the known memory-unsafe unsized-values
+  kernel), and frozen TensorAccessMetadata compares by validated value
+  outside the ownership census (the two-phase rewrite legitimately
+  duplicates work bodies sharing immutable provenance).
+- `df777cb` — the 61-test battery: parity/digest, oracle/PyTorch/
+  legacy-source/sealed-comparand/public execution, empty/disjoint/
+  ragged/zero-extent/cancellation cases, deterministic storage,
+  fresh-process OMP_NUM_THREADS 1-vs-3 invariance, replay/erasure/dump
+  stability, and the adversarial surface (nine completion attacks,
+  pass-ownership loss in both directions, entry-header mutation,
+  reserved names, idempotence, the metadata matcher lock).
+
+The adjacent `ss@ss->ds` row-scope family is deliberately NOT migrated:
+its sealed comparand (`cf1114aa…97b51`) sizes `C1_pos` by the first
+operand's stored-row count and returns malformed storage whenever that
+operand has an empty row (demonstrated by executing the sealed kernel;
+locked in the battery beside its sound full-support control).  A
+byte-parity twin would knowingly reproduce wrong results, so the family
+keeps its stable `unsupported_sparse_output_reduction` seam; a sound
+typed twin cannot hold byte parity by construction and needs its own
+disposition decision.  Do not execute the generic unsized-`C_values`
+sparse-reduction route or the malformed B2 legacy comparand.
+
+Final gates at code tip `df777cb`: compiled batteries **493** (Phase-7,
+B1/B2, pipeline execution, scheduled slice); pure LoopIR membership
+**735**; options/plan-identity **153**; schedule generality clean; the
+15-cell census divergence-free with the three SpGEMM cells at parity
+and every seam at its prior code; four fresh randomized sweeps (seeds
+1/2/7/11, 150 cases each, retained f13ba79 harness) with zero parity
+mismatches — the older 60-case sweep variant was not retained with its
+logs, so the larger fresh sweeps stand for this tip; the 86-case audit
+unchanged (46/40/0); corpus/grid/anchor/heap/auto captures
+byte-identical to the sealed baselines (auto needed zero cache-key
+normalization); eight activating Phase-7 captures sealed arm-identical;
+repeated public differentials 10/10; activating Phase-7 compile latency
+1.075–1.080× the legacy route (p50/mean/p95, 200 warmups / 2,000
+interleaved samples), inside the 1.10 gate; Black/Flake8/focused mypy
+clean; full-source mypy exactly the inherited 140-errors-in-11-files;
+whitespace clean.  The authoritative clean-detached run at exact `df777cb` (import
+provenance asserted) reached **4,642 passed / 14 skipped / 3
+performance deselected** in 2,979.70 s before the documented macOS
+libomp pthread-key ceiling produced a 68-node exhaustion cascade (64
+literal `OMP: Error #179`/`pthread_key_create` markers retained in the
+sealed log).  The exact 68-node failed set was proven complete, unique,
+and non-overlapping across fresh-process partitions of 17+17+17+17; all
+four passed.  The proven union is therefore **4,710 passed / 14 skipped
+/ 3 performance deselected / zero code failures**.
+
+Evidence: `~/.cache/scorch-codex/phase7-spgemm-df777cb/` (verifying
+manifest sealed at documentation time).  The five protected tracked
+files hashed exactly at their recorded values before every commit, only
+explicit paths were staged, nothing was pushed, and origin remains
+`58e8565`.  No release dispatch/cache cutover, selector cutover, legacy
+deletion, Phase 8, or Phase 8.5 was performed.
+
+### Broad copy-paste prompt for the next session
+
+Continue the compiler LoopIR migration in `/Users/bobby/scorch` on
+branch `refactor/compiler-ir-phase3-std-move-call` from the local tip
+recorded by `git log` (origin remains `58e8565`; nothing is pushed).
+Read `AGENTS.md`, `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§34–35, and
+this superseding handoff section.  Preserve all unrelated GPU/CUDA,
+benchmark, scheduler, research, scratchpad, packaging, and protected
+tracked-file work.  Do not amend, squash, reorder, or push existing
+commits; stage only explicit paths and give nontrivial commits
+descriptive bodies.
+
+1. First independently review the complete range `3ab4ee8..<tip>` from
+   the actual diffs rather than trusting this handoff: the completion
+   reference reconstruction and ownership probes (`70f1066`/`907ceb8`)
+   and the Phase-7 SpGEMM slice (`64c415a`/`df777cb`).  Reproduce byte
+   parity and the sealed digest in both arms, compiled f32/f64
+   execution against oracle/PyTorch/legacy/public references, the
+   completion attacks, the StoreReduce-into-sparse fail-closed
+   boundary, the metadata value-vs-ownership matcher lock, and the
+   demonstrated row-scope empty-row malformation.  Add fresh hostile
+   probes and fix any concrete defect before continuing.
+2. Then take the next Phase-7 slice.  The mixed dense-leaf operand
+   load chain (`unsupported_format`) is the smallest target-neutral
+   opening; the general multi-compressed-level assembly follows.  For
+   the row-scope family, decide the disposition explicitly: a sound
+   typed twin must size `C1_pos` by the result's dense row extent,
+   cannot hold byte parity with the defective legacy kernel, and so
+   needs the no-parity discipline B2 established (oracle/PyTorch gating
+   plus locked failure evidence), or it stays fail-closed.
+3. Keep every final gate from this section: broad memberships,
+   compiled batteries, census/audit/capture regeneration against the
+   sealed baselines, repeated public differentials, paired activating
+   latency with warmups and order controls, Black/Flake8/mypy parity,
+   `git diff --check`, and a clean detached full non-performance suite
+   with a proven fresh-process union if the macOS libomp pthread-key
+   ceiling fires.  Record exact commands, revisions, hashes,
+   limitations, and evidence outside Git; verify the protected hashes
+   before every commit; push nothing.
