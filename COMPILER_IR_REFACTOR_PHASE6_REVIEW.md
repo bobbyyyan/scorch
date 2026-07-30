@@ -5714,10 +5714,13 @@ The two sealed sized automatic comparands were verified at their
 recorded digests and audited fact by fact.  Both are two-pass OpenMP
 count/fill kernels: a per-thread `linked_list_workspace_1d` pool sized
 by a derived thread count, borrowed per-worker `make_view()` views
-inside each of two parallel regions, a dynamic-chunk row loop, an exact
-serial prefix-sum/`torch::empty` allocation interlude, and honest final
-assembly.  Responsibilities were assigned explicitly: LoopPlan owns the
-automatic decision (both arms already record exactly the tile-free
+inside each of two parallel regions, a dynamic-chunk row loop, and an
+exact serial prefix-sum/`torch::empty` allocation interlude.  Only the
+`ds@ds->ds` comparand has honest final assembly.  The adjacent
+`ss@ss->ds` comparand has the same runtime skeleton but malformed
+row-scope assembly when the first operand has an empty row, as §35.4
+demonstrates.  Responsibilities were assigned explicitly: LoopPlan owns
+the automatic decision (both arms already record exactly the tile-free
 sparse `WorkspaceInsertion` fact for `ds@ds->ds`); semantic LoopIR owns
 the format-neutral base and region forms with no new node kinds and no
 schema change (`scorch.loopir.canonical.v9` unchanged); target LLIR
@@ -5782,28 +5785,35 @@ match (`sparse_workspace_completion_lost` otherwise).
 
 The 61-test dedicated battery proves the slice end to end: byte parity
 and the sealed digest in both arms; compiled execution against the
-LoopIR oracle (exact storage), PyTorch, an independently generated and
-separately compiled legacy source, the sealed comparand executed raw,
-and the public dispatch; empty/disjoint/overlapping/ragged supports,
-zero extents, explicit-zero cancellation, deterministic storage under
-repeated execution, and fresh-process `OMP_NUM_THREADS` 1-versus-3 runs
-proving thread-count invariance; route ownership, replay, erasure, and
-canonical-dump stability; and the adversarial surface (hand-built
-program parity, forged inserts, reserved and colliding names, recorded
-stage loss, pass-ownership loss, nine post-pass completion attacks, the
-pipeline-entry header mutation, dynamic-vector idempotence, and the
-metadata matcher lock).
+LoopIR oracle (exact storage), PyTorch, generated legacy and sealed
+comparand sources, and the public dispatch; empty/disjoint/overlapping/
+ragged supports, zero extents, explicit-zero cancellation,
+deterministic storage under repeated execution, and fresh-process
+`OMP_NUM_THREADS` 1-versus-3 runs proving thread-count invariance; route
+ownership, replay, erasure, and canonical-dump stability; and the
+adversarial surface (hand-built program parity, forged inserts,
+reserved and colliding names, recorded stage loss, pass-ownership loss,
+nine post-pass completion attacks, the pipeline-entry header mutation,
+dynamic-vector idempotence, and the metadata matcher lock).  The
+post-review correction in §36 makes the native differential genuinely
+independent: it first checks the exact legacy or sealed bytes, then
+appends one inert test-only comment before preparation so the native
+kernel name, cache key, build directory, and shared object differ from
+the candidate.
 
 The adjacent `ss@ss->ds` row-scope family is deliberately dispositioned
 as failure evidence, not migrated.  Its sealed comparand sizes
 `C1_pos` by the first operand's *stored*-row count rather than the
 result's dense row extent, so any input whose first operand has an
 empty row returns malformed storage that silently associates later
-rows' values with earlier rows (demonstrated: a 4-row request with one
-empty stored row returned a length-4 position array against its sound
-full-support control's length 5, executed from the sealed comparand at
-digest `cf1114aa…97b51`).  A byte-parity twin would knowingly reproduce
-wrong results; the family keeps its stable
+rows' values with earlier rows.  The post-review hermetic lock in §36
+regenerates and hashes the exact legacy source at
+`cf1114aa…97b51`, optionally cross-checks the external sealed copy,
+executes it under the independent native build identity, asserts the
+exact malformed positions `[0, 5, 8, 11]`, reconstructs the
+row-3-to-row-2 shift and wrong dense result, and proves the same kernel
+correct on its full-row-support sub-domain.  A byte-parity twin would
+knowingly reproduce wrong results; the family keeps its stable
 `unsupported_sparse_output_reduction` seam and the battery locks both
 the defect and the non-admission.  The mixed dense-leaf operand load
 chain remains the next target-neutral slice.
@@ -5858,7 +5868,9 @@ GPU/benchmark/scheduler/research/scratchpad material remains untouched,
 nothing was pushed, and origin remains `58e8565`.  Evidence is sealed
 under `~/.cache/scorch-codex/phase7-spgemm-df777cb/` (captures, census,
 audit, latency, parity notes, and the full-suite receipts) beside the
-§35.1 review evidence.
+§35.1 review evidence.  Its self-excluding manifest covers 172 entries
+and has SHA-256
+`eea1512710338fd770acc043aadaa5699f978929505ea7f2bfc19e607bbf0e6c`.
 
 ### 35.7 Phase-7 checkpoint audit
 
@@ -5886,3 +5898,145 @@ sound re-derivation of the row-scope family (its typed twin must fix
 the empty-row defect legacy ships, which breaks byte parity by
 construction and therefore needs its own disposition decision), and the
 general multi-compressed-level assembly.
+
+## 36. Phase-7 opening-slice review corrections (2026-07-30)
+
+### 36.1 Independent review findings
+
+The complete `3ab4ee8..7e04b1a` range was re-read from the diffs and
+probed beyond its committed locks before continuing Phase 7.  The
+semantic family admission, sparse-workspace scheduling, two-phase
+target composition, byte-parity cells, unsafe unscheduled quarantine,
+and row-scope non-admission were otherwise sound, but the review found
+four concrete boundary/evidence defects:
+
+1. pass-visible `TensorAccessMetadata` objects owned fresh outer
+   dataclass instances but still shared their nested `AccessId`,
+   `SymbolId`, and `IndexId` objects with verified LoopIR state and the
+   reconstructed reference.  A hostile pass could mutate a logical
+   binder in place, compile successfully, and leave the returned
+   scheduled program malformed;
+2. actual and expected LLIR trees intentionally share enum singletons.
+   Mutating (for example) `DataType.INT._value_` or
+   `AssignOp.ADD_ASSIGN._value_` changed emitted C++ while both trees
+   drifted together and the exact matcher accepted them;
+3. sorting untrusted metadata-dictionary keys leaked raw `TypeError`
+   for mixed key types, and the compressed-Where pass context received
+   the lowering's own result `SymbolId`;
+4. the native legacy differential prepared byte-identical source under
+   the candidate's same JIT identity, so it could reuse the candidate
+   module rather than independently exercise legacy semantics.  The
+   row-scope failure lock also depended on the external evidence tree
+   and did not prove the claimed row shift or the full-support
+   correctness control numerically.
+
+The review also corrected §35.2's overstatement: only the admitted
+`ds@ds->ds` comparand has honest final assembly.  The row-scope
+`ss@ss->ds` comparand shares the two-phase runtime skeleton but has the
+demonstrated malformed assembly contract.
+
+### 36.2 Production correction (`cb49ff7`)
+
+Every LoopIR-target tensor-access metadata boundary that can cross this
+managed-pass/completion boundary now copies the complete provenance
+identity graph, including the general input/result metadata paths and
+both sparse-workspace append paths.  The separate legacy lowerer is
+unchanged.  The two-phase pass receives a fresh result `SymbolId`.  The
+completion matcher validates exact stored identity state, requires
+exact string dictionary keys without sorting untrusted values, and
+converts malformed matcher state to
+`sparse_workspace_completion_lost`.
+
+The matcher also compares every LLIR enum singleton it can encounter
+against an import-time stored-state snapshot.  Identity alone is no
+longer sufficient: altered value/name/class/order state fails closed
+even when actual and expected refer to the same singleton.  The
+snapshot is limited to the three enum types in structured LLIR
+(`AssignOp`, `DataType`, and `TensorAccessRole`); no schema,
+serialization, scheduling, runtime ABI, or emitted spelling changed.
+
+### 36.3 Regression and evidence correction (`6777f20` / `82cd687`)
+
+The ownership census now includes LLIR nodes, metadata, every nested
+provenance identity, nonempty tuple/list containers, and the verified
+LoopIR program.  It proves pairwise disjoint ownership among the
+pipeline entry, the independently reconstructed reference, and program
+state.  Final-pass attacks cover all three nested identity kinds;
+additional locks cover integer and string-subclass metadata keys,
+compressed-pass result-ID mutation, and live `DataType`, `AssignOp`,
+and `TensorAccessRole` singleton mutation.  All fail with the stable
+completion diagnostic.
+
+Legacy execution tests now establish exact source parity first and
+then append one inert test-only comment before build preparation.  The
+marker changes the native kernel name, cache key, build directory, and
+shared object, so the differential cannot be satisfied by the
+candidate module.  The row-scope lock is hermetic: it regenerates and
+hashes the exact comparand source, optionally cross-checks the sealed
+file, asserts malformed positions `[0, 5, 8, 11]`, reconstructs the
+later-row shift and wrong dense result, and verifies ordered,
+in-bounds, numerically correct storage on the full-support sub-domain.
+The follow-up lock prepares the exact and marker-keyed sources without
+building them and asserts that all four native identities differ:
+kernel name, cache key, build directory, and shared-object path.
+
+### 36.4 Latency regression and correction (`6cb2284` / `9cb2ea8`)
+
+The required idle-machine latency gate found one more concrete defect
+after the safety correction.  In two alternating candidate/base pairs,
+the unoptimized corrected route measured 1.110–1.121× legacy at p50
+and p95 and 1.137–1.141× at the mean, crossing the 1.10 gate; the
+inherited base remained at 1.076–1.083×.  Candidate-vs-base LoopIR
+latency was 1.023–1.041×, so this was a real correction cost rather
+than a legacy-route or session-position effect.
+
+`cProfile` over 2,200 activating compiles attributed 1.772 s and
+695,200 calls to repeated enum-state validation: one completion tree
+checked 316 enum occurrences but contained only 23 distinct global
+singletons.  Metadata detachment itself cost only 0.066 ms per compile
+and remains unchanged.  `6cb2284` therefore caches successful enum
+validation only inside one synchronous exact-completion comparison,
+after exact actual/expected identity.  The cache is discarded before
+the next compile, so a later hostile mutation is still observed; no
+metadata, alias, cycle, or full-tree comparison check is bypassed.
+`9cb2ea8` proves repeated leaves validate once and that a mutation fails
+again on the immediately following comparison.
+
+The repeated optimized candidate/base/candidate/base gate is green.
+LoopIR-vs-legacy ratios are 1.087–1.090 across p50/mean/p95 in both
+candidate positions; candidate-vs-base LoopIR ratios are 1.000–1.010.
+The optimization recovers the regression without hiding it in an A/A
+band.
+
+### 36.5 Verification and checkpoint disposition
+
+The focused adversarial/evidence battery passed **13 tests**, the
+unchanged source parity/boundary selection passed **17 tests**, Black
+and Flake8 are clean on all three changed source/test files, focused
+production mypy is clean, full-source mypy remains exactly the inherited
+**140 errors in 11 files**, and `git diff --check` is clean.  A separate
+independent probe run reproduced the disjoint ownership sets and every
+stable failure class.  At exact final code/test tip `9cb2ea8`, the
+clean-detached affected target/pipeline battery passed **293/293** in
+736.51 s; broad pure LoopIR plus options/identity passed **888**, and
+schedule generality passed **45**.
+
+The authoritative exact-tip non-performance suite collected 4,735
+unique selected nodes and proved its four fresh-process partitions
+complete and non-overlapping by an exact sorted-union comparison.  The
+result is **4,721 passed / 14 skipped / 3 performance deselected / zero
+failures** in 3,431.00 aggregate pytest seconds.  The sole warning is
+the inherited PyTorch sparse-invariant warning.  Import provenance and
+detached-worktree cleanliness were asserted for collection and every
+partition.
+
+The corrections are emission-neutral: exact B1 and Phase-7 source
+parity remains green in both automatic arms, including f32/f64 and
+commuted operands, and the Phase-7 sealed source digest remains
+`fa1026be…a4791c`.  The self-excluding 172-entry evidence manifest
+verifies at
+`eea1512710338fd770acc043aadaa5699f978929505ea7f2bfc19e607bbf0e6c`.
+The activating-latency and final clean-worktree gates are green after
+the bounded correction.  The opening Phase-7 checkpoint remains
+**GO**.  No new Phase-7 family, release cutover, cache/selector change,
+legacy deletion, Phase 8, or Phase 8.5 work was started.

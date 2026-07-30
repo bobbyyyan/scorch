@@ -28735,3 +28735,183 @@ descriptive bodies.
    ceiling fires.  Record exact commands, revisions, hashes,
    limitations, and evidence outside Git; verify the protected hashes
    before every commit; push nothing.
+
+## Phase-7 opening-slice review corrections (2026-07-30; supersedes the §35 tail)
+
+The inherited Phase-7 opening range was independently reviewed from the
+diffs before any new family work.  Five local correction commits now
+stack on `7e04b1a`:
+
+- `cb49ff7` — detach every nested access/tensor/index identity at the
+  LoopIR-target metadata boundaries that can cross this managed-pass
+  completion boundary, detach the compressed-pass result identity,
+  validate metadata stored state without sorting hostile keys, pin
+  LLIR enum singleton state against an import-time snapshot, and turn
+  malformed completion state into the stable
+  `sparse_workspace_completion_lost` diagnostic;
+- `6777f20` — prove pairwise ownership separation among pass-entry
+  LLIR, the fresh completion reference, and verified LoopIR; lock final
+  identity edits, enum mutation, malformed metadata keys, pass-context
+  mutation, independent native legacy execution, and the exact
+  row-scope empty-row shift plus sound full-support control;
+- `82cd687` — pin directly that the inert legacy marker changes the
+  native kernel name, cache key, build directory, and shared-object
+  path;
+- `6cb2284` — remove the measured completion-validation latency
+  regression by validating each enum singleton once per synchronous
+  comparison, never across compiles;
+- `9cb2ea8` — prove the cache is bounded to one comparison and that the
+  next comparison still rejects a mutated singleton.
+
+The review defects were material.  Pass-visible metadata previously
+shared nested `AccessId`/`SymbolId`/`IndexId` objects with verified
+program state; a hostile binder edit could compile and leave a malformed
+returned schedule.  Mutable `DataType`/`AssignOp` enum singletons let
+actual and expected C++ spellings drift together while the exact
+matcher still accepted them.  Mixed metadata key types leaked a raw
+exception, and the legacy “differential” could reuse the candidate JIT
+module because its source and build identity were identical.  The
+row-scope test also skipped without external evidence and did not prove
+the claimed numerical row shift.  The first corrected latency gate then
+crossed 1.10 because 23 distinct enum singletons were revalidated at
+316 tree occurrences per compile.  All are closed by the commits above.
+
+The historical §35 wording is corrected as well: both comparands share
+the two-phase OpenMP runtime skeleton, but only `ds@ds->ds` has honest
+final assembly.  `ss@ss->ds` remains demonstrated failure evidence.
+The retained Phase-7 tree has a self-excluding 172-entry manifest whose
+SHA-256 is
+`eea1512710338fd770acc043aadaa5699f978929505ea7f2bfc19e607bbf0e6c`.
+
+Post-correction gates:
+
+- focused hostile/evidence locks **13 passed**; unchanged source-parity
+  and seam locks **17 passed**;
+- broad pure LoopIR plus options/plan identity **888 passed**;
+- schedule generality **45 passed**; the deterministic audit remains
+  **46 admitted / 40 rejected / 0 non-identical** and is byte-identical
+  to the retained result after removing only the revision field;
+- the 15-cell Phase-7 family census has zero divergence, and a fresh
+  seed-13/150-case randomized sweep has 108 parity arms and zero
+  mismatches;
+- fresh corpus **20/20**, grid **42/42**, auto **23/23**, anchor
+  **22/22**, and heap **11/11** captures are byte-identical to the
+  captures sealed at `df777cb`, which chain to the `ebb243b` baselines;
+  activating B1/Phase-7 parity remains exact in both arms, both dtypes,
+  and both operand orders;
+- Black and Flake8 are clean, focused `lower_llir.py` mypy is clean,
+  and full-source mypy remains exactly the inherited **140 errors in 11
+  files**, with zero LoopIR findings; whitespace is clean;
+- the clean-detached, provenance-asserted affected target/pipeline
+  battery at exact final code/test tip `9cb2ea8` passed **293/293** in
+  736.51 s with zero skips or failures (101 serial sparse target, 64
+  parallel target, and 128 pipeline execution); broad pure LoopIR plus
+  options/identity remains **888 passed**, and schedule generality is
+  **45 passed**;
+- authoritative clean-detached full non-performance suite at exact
+  `9cb2ea8`: **4,721 passed / 14 skipped / 3 performance deselected /
+  zero failures** across all 4,735 unique selected nodes.  Four
+  sequential fresh-process partitions exactly reconstruct collection
+  (sorted-union SHA-256
+  `885f4b6300c287cb8eb6bee3b54a7f988bf96382d4fad1340a9fb77b02258e65`);
+  aggregate pytest time is 3,431.00 s, and the sole warning is the
+  inherited PyTorch sparse-invariant warning;
+- paired activating compiler latency: the first unoptimized
+  candidate/base/candidate/base run honestly crossed the gate at
+  1.110–1.141× legacy, with the inherited base at 1.076–1.083×.
+  Profiling isolated the repeated enum scan; after `6cb2284`, the same
+  200-warmup/2,000-sample alternating gate is **1.087–1.090× legacy**
+  across p50/mean/p95 in both candidate positions, and candidate-vs-base
+  LoopIR ratios are **1.000–1.010**.
+
+The final combined evidence is retained under
+`~/.cache/scorch-codex/phase7-opening-review-9cb2ea8/`; its
+self-excluding 92-entry manifest has SHA-256
+`0fcc378c5c32b572e85f5577b5db2209b7c5a4e6aa57c96243be59b2901227a5`.
+The exact-tip affected-battery manifest independently verifies at
+`ffab2e530fc7fe94ff1cdfc66c9186952a24a2c2e4a0d306ec6f0f4af6f177c8`,
+and the exact-tip full-suite manifest independently verifies at
+`51fd7a7f28d4dad614966bc62cf00329905cda5292f67d2b615c47b841fd589d`.
+
+The production correction is emission-neutral and changes no LoopIR
+schema/version, schedule/request identity, public dispatch, release
+cache, selector, runtime ABI, or legacy path.  The Phase-7 opening
+checkpoint therefore remains **GO** after correction.  No new family,
+cutover, deletion, Phase 8, or Phase 8.5 work was started.  Origin
+remains `58e8565`; nothing was pushed; the five protected files retain
+their recorded hashes, and all unrelated GPU/CUDA, benchmark,
+scheduler, research, scratchpad, and packaging work remains untouched.
+
+### Broad copy-paste prompt for the next session
+
+Continue the compiler LoopIR migration in `/Users/bobby/scorch` on
+branch `refactor/compiler-ir-phase3-std-move-call` from the local tip
+recorded by `git log` (origin remains `58e8565`; this stack is local and
+must not be pushed).  Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§35–36, and this superseding
+handoff.  Preserve all unrelated GPU/CUDA, benchmark, scheduler,
+research, scratchpad, packaging, and protected tracked-file work.  Do
+not amend, squash, reorder, or push existing commits; stage only
+explicit paths and give nontrivial commits descriptive bodies.
+
+1. Independently review the full correction range
+   `7e04b1a..<tip>` before extending Phase 7.  Reproduce nested
+   provenance detachment across pipeline-entry/reference/program
+   ownership, final-pass identity and malformed-key failures, LLIR enum
+   state attacks, detached compressed-pass context, the four native
+   build-identity components (kernel name, cache key, build directory,
+   and shared-object path), exact B1/SpGEMM source parity, and the
+   hermetic row-scope failure/control.  Add fresh hostile probes and
+   fix/commit any concrete defect first.
+2. Deliver a broad, implementation-complete Phase-7 milestone rather
+   than stopping after an audit.  First complete the mixed dense-leaf
+   operand-load chain currently failing with `unsupported_format`
+   across the level/mode-order and rank cases its representation
+   supports.
+3. Before editing the next assembly slice, census the production
+   callers and select one **named, production-reachable**
+   multi-compressed-level family beyond exact B1.  Record its current
+   stable seam, admitted operations/layouts/ranks, and oracle/parity
+   rule, then implement that coherent vertical slice.  Do not call the
+   result general without rank-3-or-higher, parent-position,
+   empty-intermediate-parent, and nonidentity-mode-order coverage.  Keep
+   cursor/position linkage level-based and format-neutral—no CSR-only
+   shortcut, rendered-name discovery, raw policy parsing, or target
+   runtime spelling in semantic LoopIR.  This sound format substrate is
+   intentionally prioritized ahead of the defective row-scope feature.
+   If the census proves that a new representation decision is required,
+   finish and gate the mixed-load slice, commit the audit and executable
+   failing boundary, and stop before inventing the representation; do
+   not substitute unauditable design notes for the required evidence.
+4. Once those two slices are green, take the `ss@ss->ds` row-scope
+   correctness slice as the stretch milestone.  A sound typed route
+   must size/close `C1_pos` from the logical result dense-row extent,
+   preserve empty rows, and agree with the LoopIR oracle and PyTorch.
+   It must **not** byte-match the defective legacy comparand.  Retain
+   that exact comparand only as hermetic failure evidence and apply the
+   established no-parity discipline (structural activation,
+   oracle/reference execution, deterministic storage, and explicit
+   disposition).  Keep the generic unsized-values sparse-reduction
+   route quarantined.
+5. Regenerate the production-derived census after each admission and
+   finish with a criterion-by-criterion Phase-7 checkpoint audit.  If
+   and only if the broadened runtime/format surface earns a genuine GO,
+   use remaining capacity for the next smallest target-neutral Phase-7
+   family.  Do not perform release dispatch/cache/selector cutover,
+   legacy deletion, Phase 8, or Phase 8.5.
+6. Required gates: focused verifier/oracle/erasure/adversarial tests;
+   compiled f32/f64 and empty/disjoint/ragged/zero-extent cases; both
+   automatic arms and commuted operands where applicable; broad
+   CIN/LoopPlan/LoopIR and options/identity memberships; complete
+   scheduled/pipeline/target batteries; deterministic and randomized
+   family censuses; the 86-case audit; fresh corpus/grid/auto/anchor/
+   heap plus activating captures; repeated public differentials;
+   paired activating latency with A/A and order controls; Black,
+   Flake8, focused and full-source mypy parity; `git diff --check`; and
+   a clean-detached full non-performance suite.  If macOS libomp reaches
+   its pthread-key ceiling, prove a complete unique non-overlapping
+   fresh-process union instead of relabeling aborted nodes as passes.
+
+Record exact commands, revisions, hashes, limitations, and evidence
+outside Git.  Verify the five protected hashes before every commit,
+touch no unrelated work, and push nothing.
