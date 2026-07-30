@@ -4243,7 +4243,26 @@ def _sparse_completion_enum_state_matches(value: Enum) -> bool:
     return True
 
 
-def _metadata_state_matches(actual: object, expected: object) -> bool:
+def _sparse_completion_enum_state_matches_once(
+    value: Enum,
+    validated_enum_states: Set[Tuple[type, int]],
+) -> bool:
+    """Validate one enum once during a synchronous completion comparison."""
+
+    key = (type(value), id(value))
+    if key in validated_enum_states:
+        return True
+    if not _sparse_completion_enum_state_matches(value):
+        return False
+    validated_enum_states.add(key)
+    return True
+
+
+def _metadata_state_matches(
+    actual: object,
+    expected: object,
+    validated_enum_states: Set[Tuple[type, int]],
+) -> bool:
     """Compare two frozen access-provenance values field by exact field."""
 
     actual_state = object.__getattribute__(actual, "__dict__")
@@ -4271,7 +4290,9 @@ def _metadata_state_matches(actual: object, expected: object) -> bool:
                 for index_id in side["index_ids"]
             )
             or type(side["role"]) is not llir.TensorAccessRole
-            or not _sparse_completion_enum_state_matches(side["role"])
+            or not _sparse_completion_enum_state_matches_once(
+                side["role"], validated_enum_states
+            )
         ):
             return False
     return (
@@ -4305,6 +4326,11 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
 
     pending: List[Tuple[object, object, int]] = [(actual, expected, 0)]
     seen_actual: Set[int] = set()
+    # Managed passes have returned before this callback-free, exact-type
+    # traversal starts.  Validate each global enum singleton on its first
+    # occurrence in this comparison; never retain the result across compiles,
+    # where a later hostile mutation must be observed.
+    validated_enum_states: Set[Tuple[type, int]] = set()
     while pending:
         actual_value, expected_value, depth = pending.pop()
         if type(actual_value) is not type(expected_value) or depth > 256:
@@ -4318,7 +4344,9 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
         if isinstance(actual_value, Enum):
             if (
                 actual_value is not expected_value
-                or not _sparse_completion_enum_state_matches(actual_value)
+                or not _sparse_completion_enum_state_matches_once(
+                    actual_value, validated_enum_states
+                )
             ):
                 return False
             continue
@@ -4354,7 +4382,9 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
             # state and stays outside the fresh-ownership census (like the
             # interned empty tuple, it cannot be mutated and cannot close a
             # cycle through its immutable leaf fields).
-            if not _metadata_state_matches(actual_value, expected_value):
+            if not _metadata_state_matches(
+                actual_value, expected_value, validated_enum_states
+            ):
                 return False
             continue
 
