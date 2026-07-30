@@ -54,6 +54,7 @@ from scorch.compiler.scheduler import Schedule
 from scorch.stensor import STensor
 
 _CC_KINDS = (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+_INDEPENDENT_LEGACY_MARKER = "// scorch-test: independently keyed legacy execution"
 
 
 def build_spmspm_cin(
@@ -204,9 +205,8 @@ def execute_legacy_module(cpp_source, result_shape, st_a, st_b, options):
         _snapshot_runtime_tensors,
     )
 
-    independent_marker = "// scorch-test: independently keyed legacy execution"
-    assert independent_marker not in cpp_source
-    independently_keyed_source = f"{cpp_source}\n{independent_marker}\n"
+    assert _INDEPENDENT_LEGACY_MARKER not in cpp_source
+    independently_keyed_source = f"{cpp_source}\n{_INDEPENDENT_LEGACY_MARKER}\n"
     context = CompilationContext(options)
     prepared = _prepare_generated_kernel_build(
         options.build.preamble_source,
@@ -222,6 +222,36 @@ def execute_legacy_module(cpp_source, result_shape, st_a, st_b, options):
         module_args.append(snapshot.native_mode_indices)
         module_args.append(snapshot.values)
     return module.evaluate(*module_args)
+
+
+def test_legacy_execution_marker_changes_every_native_build_identity():
+    """The legacy differential cannot resolve to the candidate JIT module."""
+
+    from scorch.ops import _prepare_generated_kernel_build
+
+    options = auto_options(False, jit=True)
+    cpp_source = legacy_generated_cpp(
+        build_spmspm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=options,
+    )
+    candidate = _prepare_generated_kernel_build(
+        options.build.preamble_source,
+        cpp_source,
+        options,
+        CompilationContext(options),
+    )
+    legacy = _prepare_generated_kernel_build(
+        options.build.preamble_source,
+        f"{cpp_source}\n{_INDEPENDENT_LEGACY_MARKER}\n",
+        options,
+        CompilationContext(options),
+    )
+    assert candidate.request.name != legacy.request.name
+    assert candidate.cache_key != legacy.cache_key
+    assert candidate.request.build_directory != legacy.request.build_directory
+    assert candidate.so_path != legacy.so_path
 
 
 # -- source parity ----------------------------------------------------------
