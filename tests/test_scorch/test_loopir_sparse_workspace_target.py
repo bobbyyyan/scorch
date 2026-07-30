@@ -189,7 +189,14 @@ def execute_b1(cin, result_shape, st_a, st_b, regblock_enabled):
 
 
 def execute_legacy_module(cpp_source, result_shape, st_a, st_b, options):
-    """Safe legacy execution: run the byte-identical legacy kernel raw."""
+    """Execute legacy semantics under a build identity distinct from candidate.
+
+    Source-parity assertions compare the exact legacy bytes before this
+    boundary.  A test-only comment then gives native loading a different
+    kernel name, cache key, build directory, and shared object, so an earlier
+    candidate execution cannot satisfy the purported legacy differential
+    through the in-memory or persistent JIT cache.
+    """
 
     from scorch.ops import (
         _load_validated_prepared_kernel,
@@ -197,10 +204,13 @@ def execute_legacy_module(cpp_source, result_shape, st_a, st_b, options):
         _snapshot_runtime_tensors,
     )
 
+    independent_marker = "// scorch-test: independently keyed legacy execution"
+    assert independent_marker not in cpp_source
+    independently_keyed_source = f"{cpp_source}\n{independent_marker}\n"
     context = CompilationContext(options)
     prepared = _prepare_generated_kernel_build(
         options.build.preamble_source,
-        cpp_source,
+        independently_keyed_source,
         options,
         context,
     )
@@ -741,20 +751,31 @@ def _find_outer_row_loop(statements):
     return None
 
 
-def _reachable_mutable_ids(root):
-    """ids of every LLIR node and list reachable from one tree."""
+def _reachable_completion_owner_ids(root):
+    """Ids of every completion-owned aggregate or provenance value."""
 
     from scorch.compiler import llir
+    from scorch.compiler.identity import AccessId, IndexId, SymbolId
+    from scorch.compiler.loopir.nodes import LoopIRNode
 
     seen = set()
     pending = [root]
     while pending:
         value = pending.pop()
-        if isinstance(value, llir.Node) or type(value) is list:
+        owned = (
+            isinstance(value, (llir.Node, LoopIRNode))
+            or type(value) is llir.TensorAccessMetadata
+            or type(value) in (AccessId, SymbolId, IndexId, list)
+            or (type(value) is tuple and bool(value))
+        )
+        if owned:
             if id(value) in seen:
                 continue
             seen.add(id(value))
-        if isinstance(value, llir.Node):
+        if (
+            isinstance(value, (llir.Node, LoopIRNode))
+            or type(value) is llir.TensorAccessMetadata
+        ):
             pending.extend(vars(value).values())
         elif type(value) in (list, tuple):
             pending.extend(value)
@@ -818,14 +839,14 @@ def test_completion_reference_owns_no_pipeline_entry_state(monkeypatch):
     original_prefetch = pass_manager.insert_sparse_prefetch
 
     def capture_entry(statements, context):
-        entry_ids.update(_reachable_mutable_ids(list(statements)))
+        entry_ids.update(_reachable_completion_owner_ids(list(statements)))
         return original_prefetch(statements, context)
 
     reference_ids = set()
     original_matches = target._exact_sparse_completion_matches
 
     def capture_reference(actual, expected):
-        reference_ids.update(_reachable_mutable_ids(expected))
+        reference_ids.update(_reachable_completion_owner_ids(expected))
         return original_matches(actual, expected)
 
     monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", capture_entry)
@@ -834,14 +855,130 @@ def test_completion_reference_owns_no_pipeline_entry_state(monkeypatch):
         "_exact_sparse_completion_matches",
         capture_reference,
     )
-    compile_cin_via_loopir(
+    kernel = compile_cin_via_loopir(
         build_spmspm_cin(),
         (4, 5),
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
         compile_options=auto_options(False),
     )
-    assert entry_ids and reference_ids
+    program_ids = _reachable_completion_owner_ids(kernel.lowering.program)
+    assert entry_ids and reference_ids and program_ids
     assert not (entry_ids & reference_ids)
+    assert not (entry_ids & program_ids)
+    assert not (reference_ids & program_ids)
+
+
+def _first_tensor_access_metadata(root):
+    """Find one exact metadata value without trusting recursive visitors."""
+
+    from scorch.compiler import llir
+
+    seen = set()
+    pending = [root]
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if type(value) is llir.TensorAccessMetadata:
+            return value
+        if isinstance(value, llir.Node):
+            pending.extend(vars(value).values())
+        elif type(value) in (list, tuple):
+            pending.extend(value)
+    raise AssertionError("activating B1 tree carried no tensor access metadata")
+
+
+@pytest.mark.parametrize("identity", ["access", "tensor", "index"])
+def test_pass_visible_metadata_cannot_mutate_reference_identities(
+    monkeypatch, identity
+):
+    """A final metadata-identity edit must fail the exact completion check."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    state = {"mutated": False}
+
+    def hostile_final_pass(value, context):
+        rewritten = original(value, context)
+        if state["mutated"] or type(rewritten) is not list:
+            return rewritten
+        metadata = _first_tensor_access_metadata(rewritten)
+        if identity == "access":
+            target = metadata.access_id
+            forged = target.value + 1_000_000
+        elif identity == "tensor":
+            target = metadata.tensor_id
+            forged = target.value + 2_000_000
+        else:
+            target = metadata.index_ids[0]
+            # A colliding logical binder corrupted the returned verified
+            # program before the detached-identity correction.
+            forged = metadata.index_ids[-1].value
+        object.__setattr__(target, "value", forged)
+        state["mutated"] = True
+        return rewritten
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        hostile_final_pass,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+@pytest.mark.parametrize(
+    ("enum_name", "forged_value"),
+    [
+        ("data_type", "long"),
+        ("assign_op", "-="),
+        ("tensor_access_role", "forged_input"),
+    ],
+)
+def test_pass_cannot_mutate_shared_llir_enum_spelling(
+    monkeypatch, enum_name, forged_value
+):
+    """Global enum singletons cannot make actual and expected drift together."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+
+    member = {
+        "data_type": llir.DataType.INT,
+        "assign_op": llir.AssignOp.ADD_ASSIGN,
+        "tensor_access_role": llir.TensorAccessRole.INPUT_READ,
+    }[enum_name]
+    original_value = member.value
+    original = pass_manager.insert_sparse_prefetch
+    state = {"mutated": False}
+
+    def hostile_prefetch(statements, context):
+        object.__setattr__(member, "_value_", forged_value)
+        state["mutated"] = True
+        return original(statements, context)
+
+    monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", hostile_prefetch)
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            compile_cin_via_loopir(
+                build_spmspm_cin(),
+                (4, 5),
+                (((4, 6), torch.float32), ((6, 5), torch.float32)),
+                compile_options=auto_options(False),
+            )
+    finally:
+        object.__setattr__(member, "_value_", original_value)
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
 @pytest.mark.parametrize("duplicate", ["alias", "structural"])

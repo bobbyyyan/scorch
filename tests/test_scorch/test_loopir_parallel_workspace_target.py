@@ -69,6 +69,7 @@ from scorch.compiler.loopir.schedule_passes import (
 )
 from scorch.stensor import STensor
 from tests.test_scorch.test_loopir_sparse_workspace_target import (
+    _first_tensor_access_metadata,
     auto_options,
     execute_legacy_module,
 )
@@ -1126,6 +1127,89 @@ def test_completion_matcher_compares_shared_metadata_by_value():
     forged = [access(metadata()), access(metadata(access=8))]
     assert not target._exact_sparse_completion_matches(forged, expected)
 
+    class StoredKey(str):
+        pass
+
+    malformed = metadata()
+    malformed_state = vars(malformed)
+    malformed_state[StoredKey("access_id")] = malformed_state.pop("access_id")
+    assert not target._exact_sparse_completion_matches(
+        [access(malformed)], [access(metadata())]
+    )
+
+
+@pytest.mark.parametrize("malformed_key", [0, "str_subclass"])
+def test_malformed_metadata_keys_fail_at_completion(monkeypatch, malformed_key):
+    """Untrusted metadata dictionaries cannot leak sorting/type exceptions."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    state = {"mutated": False}
+
+    def hostile_final_pass(value, context):
+        rewritten = original(value, context)
+        if state["mutated"] or type(rewritten) is not list:
+            return rewritten
+        metadata = _first_tensor_access_metadata(rewritten)
+        metadata_state = vars(metadata)
+        if malformed_key == "str_subclass":
+
+            class StoredKey(str):
+                pass
+
+            key = StoredKey("access_id")
+            metadata_state[key] = metadata_state.pop("access_id")
+        else:
+            metadata_state[malformed_key] = "hostile"
+        state["mutated"] = True
+        return rewritten
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        hostile_final_pass,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spgemm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_two_phase_pass_context_cannot_mutate_program_result_identity(monkeypatch):
+    """The pass receives a detached result SymbolId, never the program key."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.LLIRPassManager.run_compressed_where_openmp
+    state = {"mutated": False}
+
+    def hostile_context(self, artifact, pass_spec):
+        result_id = pass_spec.context.result_id
+        object.__setattr__(result_id, "value", result_id.value + 4_000_000)
+        state["mutated"] = True
+        return original(self, artifact, pass_spec)
+
+    monkeypatch.setattr(
+        pass_manager.LLIRPassManager,
+        "run_compressed_where_openmp",
+        hostile_context,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spgemm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
 
 def test_target_failure_is_a_recorded_stage_loss():
     program, symbols = build_parallel_workspace_program(
@@ -1165,12 +1249,6 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
     non-admission.
     """
 
-    comparand_path = _SEALED_COMPARAND_DIR / "rowscope_ss_ss_ds_armBASE.cpp"
-    if not comparand_path.exists():
-        pytest.skip("sealed Phase-7 comparand evidence tree is absent")
-    sealed = comparand_path.read_bytes()
-    assert hashlib.sha256(sealed).hexdigest() == _SEALED_ROWSCOPE_SHA256
-
     def rowscope_cin():
         i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
         a = TensorVar("A", fmt="ss")
@@ -1182,6 +1260,20 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
             op=Operation.ADD,
         )
         return ForAll(i, ForAll(j, ForAll(k, assign)))
+
+    options = auto_options(False)
+    legacy_cpp = legacy_generated_cpp(
+        rowscope_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=options,
+    )
+    assert hashlib.sha256(legacy_cpp.encode("utf-8")).hexdigest() == (
+        _SEALED_ROWSCOPE_SHA256
+    )
+    comparand_path = _SEALED_COMPARAND_DIR / "rowscope_ss_ss_ds_armBASE.cpp"
+    if comparand_path.exists():
+        assert comparand_path.read_text() == legacy_cpp
 
     with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
         compile_cin_via_loopir(
@@ -1203,29 +1295,61 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
         return STensor.from_torch(dense.clone(), name).to_sparse("ss")
 
     malformed = execute_legacy_module(
-        sealed.decode("utf-8"),
+        legacy_cpp,
         (4, 5),
         sparse_ss(dense_a, "A"),
         sparse_ss(dense_b, "B"),
         auto_options(False, jit=True),
     )
-    malformed_pos = malformed.storage.index.mode_indices[1][0].tolist()
+    malformed_modes = malformed.storage.index.mode_indices
+    malformed_pos = malformed_modes[1][0].tolist()
+    malformed_crd = malformed_modes[1][1].tolist()
+    malformed_values = malformed.storage.value.tolist()
+    assert malformed_pos == [0, 5, 8, 11]
     assert len(malformed_pos) == 4, "honest ds storage would carry 5 positions"
+    assert malformed_pos[-1] == len(malformed_crd) == len(malformed_values)
+
+    expected = dense_a @ dense_b
+    interpreted = torch.zeros_like(expected)
+    for stored_row in range(len(malformed_pos) - 1):
+        for position in range(malformed_pos[stored_row], malformed_pos[stored_row + 1]):
+            interpreted[stored_row, malformed_crd[position]] = malformed_values[
+                position
+            ]
+    assert torch.allclose(interpreted[0], expected[0])
+    assert torch.allclose(interpreted[1], expected[1])
+    assert torch.count_nonzero(expected[2]) == 0
+    assert torch.allclose(interpreted[2], expected[3])
+    assert not torch.allclose(interpreted, expected)
 
     # Full row support is the comparand's sound sub-domain: the same
     # kernel then produces complete, honest positions.
     full_a = dense_a.clone()
     full_a[2, 0] = 4.0
     sound = execute_legacy_module(
-        sealed.decode("utf-8"),
+        legacy_cpp,
         (4, 5),
         sparse_ss(full_a, "A"),
         sparse_ss(dense_b, "B"),
         auto_options(False, jit=True),
     )
-    sound_pos = sound.storage.index.mode_indices[1][0].tolist()
-    assert len(sound_pos) == 5
-    assert sound_pos[0] == 0 and sound_pos == sorted(sound_pos)
+    sound_modes = sound.storage.index.mode_indices
+    assert list(sound_modes[0]) == []
+    sound_storage = (
+        sound_modes[1][0].tolist(),
+        sound_modes[1][1].tolist(),
+        sound.storage.value.tolist(),
+    )
+    assert len(sound_storage[0]) == 5
+    assert sound_storage[0][0] == 0
+    assert sound_storage[0] == sorted(sound_storage[0])
+    assert sound_storage[0][-1] == len(sound_storage[1]) == len(sound_storage[2])
+    for row in range(4):
+        columns = sound_storage[1][sound_storage[0][row] : sound_storage[0][row + 1]]
+        assert columns == sorted(set(columns))
+        assert all(0 <= column < 5 for column in columns)
+    sound_dense = dense_from_ds_storage(sound_storage, (4, 5), torch.float32)
+    assert torch.allclose(sound_dense, full_a @ dense_b, atol=1e-3, rtol=1e-3)
 
 
 # -- adjacent seams stay fail-closed --------------------------------------------
