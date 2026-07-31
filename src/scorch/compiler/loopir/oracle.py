@@ -62,7 +62,18 @@ Everything unexpected fails closed with :class:`LoopIROracleError`.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from ..identity import IndexId, SymbolId
 from .levels import (
@@ -131,6 +142,7 @@ from .verifier import verify_program
 
 TensorValue = Any
 MAX_ORACLE_RANK = MAX_LEVEL_STORAGE_RANK
+_BindingValue = TypeVar("_BindingValue")
 
 _CSR_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
 _CSR_MODES = (0, 1)
@@ -138,6 +150,56 @@ _CSR_MODES = (0, 1)
 
 class LoopIROracleError(Exception):
     """Program execution hit a state the LoopIR oracle rejects."""
+
+
+def _snapshot_binding_mapping(
+    bindings: Mapping[SymbolId, _BindingValue],
+    *,
+    kind: str,
+    key_error: str,
+    value_error: str,
+    value_snapshot: Optional[Callable[[int, _BindingValue], _BindingValue]] = None,
+) -> Dict[SymbolId, _BindingValue]:
+    """Own one caller-controlled binding mapping before final verification.
+
+    Iteration and lookup are the only operations here that can execute
+    caller-controlled mapping code. Copy exact identity values into fresh
+    :class:`SymbolId` keys so the verified program cannot subsequently be
+    changed through an aliased key object.
+    """
+
+    try:
+        keys = tuple(bindings)
+    except Exception as error:
+        raise LoopIROracleError(key_error) from error
+    key_values: List[int] = []
+    for key in keys:
+        if type(key) is not SymbolId or type(getattr(key, "value", None)) is not int:
+            raise LoopIROracleError(
+                f"{kind} keys must be exact int-valued SymbolId values"
+            )
+        key_values.append(key.value)
+    if len(set(key_values)) != len(key_values):
+        raise LoopIROracleError(f"{kind} keys must be unique SymbolId values")
+
+    owned: Dict[SymbolId, _BindingValue] = {}
+    for key, key_value in zip(keys, key_values):
+        try:
+            bound = bindings[key]
+        except Exception as error:
+            raise LoopIROracleError(value_error) from error
+        if (
+            type(key) is not SymbolId
+            or type(getattr(key, "value", None)) is not int
+            or key.value != key_value
+        ):
+            raise LoopIROracleError(
+                f"{kind} keys changed while values were being snapshotted"
+            )
+        if value_snapshot is not None:
+            bound = value_snapshot(key_value, bound)
+        owned[SymbolId(key_value)] = bound
+    return owned
 
 
 def _is_canonical_csr(decl: TensorDecl) -> bool:
@@ -185,6 +247,35 @@ def _snapshot_dense(value: object, remaining_rank: int) -> object:
         return value
     owned = cast(Sequence[object], value)
     return [_snapshot_dense(entry, remaining_rank - 1) for entry in owned]
+
+
+def _snapshot_input_bound(
+    bound: object,
+    *,
+    name: str,
+    rank: int,
+    compressed: bool,
+) -> object:
+    """Own one input value without retaining caller-controlled containers."""
+
+    if not compressed:
+        return _snapshot_dense(bound, rank)
+    if type(bound) is CsrMatrix:
+        try:
+            return from_csr(bound)
+        except LevelStorageError as error:
+            raise LoopIROracleError(
+                f"input {name} has invalid CSR storage: {error}"
+            ) from error
+    if type(bound) is LevelTensorStorage:
+        try:
+            return bound.snapshot()
+        except LevelStorageError as error:
+            raise LoopIROracleError(
+                f"input {name} has invalid level storage: {error}"
+            ) from error
+    # The final binding check rejects every other class without invoking it.
+    return bound
 
 
 def _dense_shape(rank: int, value: object, trail: str) -> Tuple[Optional[int], ...]:
@@ -1150,8 +1241,54 @@ def run_program(
     oracle.  Results remain logical nested containers regardless of layout.
     """
 
+    # Verify once before reading any bindings, preserving the oracle's cheap
+    # malformed-program boundary. Then own every caller-controlled input
+    # value before consulting output-shape callbacks, and verify again after
+    # all mapping code has run so no callback can leave untrusted program
+    # state for the oracle to traverse.
     verify_program(program)
-    return _Oracle(program, inputs, output_shapes).run()
+    decls = {decl.symbol.value: decl for decl in program.tensors}
+    input_specs = {
+        symbol.value: (
+            decls[symbol.value].name,
+            len(decls[symbol.value].levels),
+            any(
+                level.kind is not LevelKind.DENSE
+                for level in decls[symbol.value].levels
+            ),
+        )
+        for symbol in program.inputs
+    }
+
+    def snapshot_input(symbol_value: int, bound: object) -> object:
+        spec = input_specs.get(symbol_value)
+        if spec is None:
+            # Coverage validation rejects the foreign key before inspecting
+            # its value; retain it without invoking caller behavior.
+            return bound
+        name, rank, compressed = spec
+        return _snapshot_input_bound(
+            bound,
+            name=name,
+            rank=rank,
+            compressed=compressed,
+        )
+
+    owned_inputs = _snapshot_binding_mapping(
+        inputs,
+        kind="input binding",
+        key_error="input binding keys could not be snapshotted",
+        value_error="input bindings could not be snapshotted",
+        value_snapshot=snapshot_input,
+    )
+    owned_output_shapes = _snapshot_binding_mapping(
+        output_shapes,
+        kind="output shape",
+        key_error="output shape keys could not be snapshotted",
+        value_error="output shapes could not be snapshotted",
+    )
+    verify_program(program)
+    return _Oracle(program, owned_inputs, owned_output_shapes).run()
 
 
 _Oracle._SPARSE_WORKSPACE_EXEC = {

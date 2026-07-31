@@ -28,9 +28,8 @@ parallel-selection slice adds one optional program-level fact naming a dense
 logical or affine-origin loop, its canonical structural work estimate, and
 its verifier-proved race discipline; it deliberately carries no OpenMP or
 target-policy spelling.  Concepts the migrated families do not exercise are
-still not declared: there are no accumulators, integer constants, physical
-position loads (dense value-bearing leaves below sparse levels),
-or dimension-extent expressions.  The serial sparse-result slice adds a
+still not declared: there are no accumulators, integer constants, or
+dimension-extent expressions.  The serial sparse-result slice adds a
 target-neutral :class:`SparseWorkspaceRegion`: coordinate/value insertions
 merge under ADD and one ordered drain exposes the merged entries, while
 capacity, hashing, sorting, and the backing container remain target concerns.
@@ -390,10 +389,12 @@ class PositionLoad(Expr):
     """Read the scalar owned by one tensor's value-bearing leaf position.
 
     ``position`` must be position-typed for the final physical level of
-    ``tensor``.  Unlike :class:`Load`, this is a physical level access and is
-    therefore valid for a DENSE leaf below sparse structural levels.  Unlike
-    :class:`CursorValue`, it carries no merge-alignment/default semantics; a
-    merged compressed leaf continues to use the cursor-owned form.
+    ``tensor``.  Unlike :class:`Load`, this is a physical level access, so it
+    is valid for a DENSE leaf below sparse structural levels and for an
+    independently bound compressed-leaf position.  Unlike
+    :class:`CursorValue`, it carries no merge-alignment/default semantics;
+    cursor-owned reads remain the canonical form whenever those semantics are
+    required.
     """
 
     tensor: SymbolId

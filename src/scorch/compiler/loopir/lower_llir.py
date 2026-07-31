@@ -40,13 +40,12 @@ shapes and the result shape, and this boundary re-resolves every logical
 dimension's extent across all of them, failing closed on any disagreement.
 
 Fail-closed surface: this target lowering accepts the migrated program
-shapes only.  Level-0 (root-parent) cursors, compressed-parent descent
-(DCSR), merges of more than two cursors, non-innermost merges, merged
-reductions, appends outside a dense-row/merged-column nest, nonzero merge
-defaults, affine splits over merged iteration or ordered sparse assembly,
-and any statement shape outside the single-nest single-leaf form fail with
-:class:`LoopIRTargetError` and a stable code rather than being
-approximated.
+shapes only.  Unsupported neighbors—permuted compressed structure, merges
+of more than two cursors, unbound hierarchical descent, union or
+single-cursor multi-compressed assembly, unmanaged sparse reductions,
+unsupported schedule/assembly compositions, and arbitrary statement
+shapes—fail with :class:`LoopIRTargetError` and a stable code rather than
+being approximated.
 """
 
 from __future__ import annotations
@@ -2620,6 +2619,17 @@ class _TargetLowering:
             ),
         )
 
+    def _assembly_result_pos_set(self, level: Optional[int] = None) -> llir.Stmt:
+        """One result-position close in the form this target owns.
+
+        The generic target deliberately emits the indexed assignment the
+        production dynamic-vector pass consumes.  Dedicated assembly targets
+        may override this narrow builder when they own the exact checked form
+        before that generic pass.
+        """
+
+        return self._result_pos_set(level)
+
     def _dense_assembly_close_level(self, position: int) -> int:
         """The result level a dense assembly loop's catch-up closes."""
 
@@ -2650,7 +2660,7 @@ class _TargetLowering:
                     type=llir.DataType.INT,
                 )
             ),
-            body=[self._result_pos_set(level)],
+            body=[self._assembly_result_pos_set(level)],
         )
 
     def _lower_merged(self, position: int) -> List[llir.Stmt]:
@@ -3152,7 +3162,9 @@ class _TargetLowering:
             body.append(llir.BlankLine())
             body.append(llir.Comment("Assembly compressed _level indices"))
             body.append(
-                self._result_pos_set(self._dense_assembly_close_level(position))
+                self._assembly_result_pos_set(
+                    self._dense_assembly_close_level(position)
+                )
             )
         loop_var = llir.Var(name=name, type=llir.DataType.INT64)
         for_loop = llir.ForLoop(
@@ -3405,6 +3417,13 @@ class _TargetLowering:
         """Validate sparse-workspace post-pass effects when this family owns them."""
 
         return function
+
+    def prepare_result_level_indices(
+        self, statements: List[llir.Stmt]
+    ) -> List[llir.Stmt]:
+        """Prepare result-index initialization owned by this target."""
+
+        return statements
 
     def owns_two_phase_output(self) -> bool:
         """Whether the shared compressed-Where pass owns this result's assembly."""
@@ -4461,15 +4480,16 @@ def _metadata_state_matches(
 
 
 def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
-    """Compare completed B1 state with fresh ownership and no recursion.
+    """Compare completed sparse-assembly state with fresh ownership.
 
     The generic panel comparator is intentionally defensive and recursive
-    because it serves several heterogeneous completion boundaries. B1 checks
-    one large, known LLIR tree on every activating compile; this equivalent
-    iterative form avoids recursion and repeated field-name sorting on that
-    hot path. The managed LLIR pipeline promises a detached tree, so repeated
-    node/container ownership is invalid here; one global actual-object census
-    rejects shared aggregates and cycles in the same constant-time check.
+    because it serves several heterogeneous completion boundaries. The sparse
+    assembly targets check one large, known LLIR tree on every activating
+    compile; this equivalent iterative form avoids recursion and repeated
+    field-name sorting on that hot path. The managed LLIR pipeline promises a
+    detached tree, so repeated node/container ownership is invalid here; one
+    global actual-object census rejects shared aggregates and cycles in the
+    same constant-time check.
     """
 
     pending: List[Tuple[object, object, int]] = [(actual, expected, 0)]
@@ -7344,14 +7364,17 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     The raw emission mirrors the legacy generic lowering statement-for-
     statement — per-level ``Initialize iterators`` groups (root-parent
     subscripts folded to exact integers), the while-merge with
-    ``std::min`` coordinate resolution, indexed leaf appends the shared
-    dynamic-vector pass rewrites to ``emplace_back``, one conditional
-    compressed-parent append plus child position close per structural
-    level, the dense-prefix catch-up, and the root position close — so the
-    generated C++ is byte-identical to the legacy pipeline's output for
-    both automatic policy arms.  The legacy comparand is honest for this
-    family (empty child intersections suppress their parent coordinates
-    and cascade), so byte parity is the gate, exactly like B1.
+    ``std::min`` coordinate resolution, checked leaf appends and position
+    writes in the exact form the shared dynamic-vector pass would produce,
+    one conditional compressed-parent append plus child position close per
+    structural level, the dense-prefix catch-up, and the root position
+    close — so the generated C++ is byte-identical to the legacy pipeline's
+    output for both automatic policy arms.  Building those mutations safely
+    at the owning target boundary makes correctness independent of that
+    generic rewrite while preserving its pipeline stage.  The legacy
+    comparand is honest for this family (empty child intersections suppress
+    their parent coordinates and cascade), so byte parity is the gate,
+    exactly like B1.
     """
 
     def __init__(
@@ -7504,6 +7527,23 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
 
         result_name = self.result_decl.name
         coord_name = self._loop_var_name(self.loops[level])
+        child_position_index = llir.FunctionCall(
+            name=f"{result_name}{level}_crd.size", args=[]
+        )
+        child_coordinate_count = llir.FunctionCall(
+            name=f"{result_name}{level + 1}_crd.size", args=[]
+        )
+        child_position_close = llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(
+                    name=f"{result_name}{level + 1}_pos",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                child_position_index,
+                child_coordinate_count,
+            ],
+        )
         return [
             llir.IfThenElse(
                 cond=llir.BinOp(
@@ -7529,20 +7569,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     ),
                 ],
             ),
-            llir.Assign(
-                var=llir.ArrayAccess(
-                    array=llir.Var(
-                        name=f"{result_name}{level + 1}_pos",
-                        type=llir.DataType.STD_VECTOR_C_INT,
-                    ),
-                    index=llir.FunctionCall(
-                        name=f"{result_name}{level}_crd.size", args=[]
-                    ),
-                ),
-                value=llir.FunctionCall(
-                    name=f"{result_name}{level + 1}_crd.size", args=[]
-                ),
-            ),
+            child_position_close,
         ]
 
     def _merged_case_stmts(
@@ -7550,7 +7577,37 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     ) -> Optional[List[llir.Stmt]]:
         position = self.loop_positions[loop.index]
         if position == len(self.loops) - 1:
-            return super()._merged_case_stmts(loop, aligned)
+            leaf_stmts = super()._merged_case_stmts(loop, aligned)
+            if leaf_stmts is None:
+                return leaf_stmts
+            result_name = self.result_decl.name
+            leaf_level = len(self.result_decl.levels) - 1
+            if (
+                len(leaf_stmts) != 4
+                or type(leaf_stmts[0]) is not llir.Assign
+                or type(leaf_stmts[1]) is not llir.Comment
+                or type(leaf_stmts[2]) is not llir.Assign
+                or type(leaf_stmts[3]) is not llir.Increment
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the multi-compressed leaf no longer has the canonical "
+                    "value/coordinate append shape",
+                )
+            value_store = cast(llir.Assign, leaf_stmts[0])
+            coordinate_store = cast(llir.Assign, leaf_stmts[2])
+            return [
+                llir.FunctionCallStmt(
+                    name=f"{result_name}_values.emplace_back",
+                    args=[value_store.value],
+                ),
+                leaf_stmts[1],
+                llir.FunctionCallStmt(
+                    name=f"{result_name}{leaf_level}_crd.emplace_back",
+                    args=[coordinate_store.value],
+                ),
+                leaf_stmts[3],
+            ]
         return [
             *self._lower_merged(position + 1),
             llir.BlankLine(),
@@ -7561,12 +7618,92 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _dense_assembly_close_level(self, position: int) -> int:
         return position + 1
 
+    def _assembly_result_pos_set(self, level: Optional[int] = None) -> llir.Stmt:
+        raw = super()._result_pos_set(level)
+        if type(raw.var) is not llir.ArrayAccess or type(raw.var.array) is not llir.Var:
+            _fail(
+                "unsupported_program_shape",
+                "the multi-compressed position close lost its vector target",
+            )
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(name=raw.var.array.name, type=llir.DataType.NO_TYPE),
+                raw.var.index,
+                raw.value,
+            ],
+        )
+
+    def _checked_position_init_statement(self, level: int) -> llir.FunctionCallStmt:
+        """One checked position sentinel owned directly by this target."""
+
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(
+                    name=f"{self.result_decl.name}{level}_pos",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                llir.Literal(value=0, data_type=llir.DataType.INT32),
+                llir.Literal(value=0, data_type=llir.DataType.INT32),
+            ],
+        )
+
+    def prepare_result_level_indices(
+        self, statements: List[llir.Stmt]
+    ) -> List[llir.Stmt]:
+        """Build every append-owned position sentinel in its checked form."""
+
+        expected_position_levels = {
+            f"{self.result_decl.name}{level}_pos": level
+            for level, decl in enumerate(self.result_decl.levels)
+            if decl.kind is LevelKind.COMPRESSED
+        }
+        prepared: List[llir.Stmt] = []
+        converted: Set[str] = set()
+        for statement in statements:
+            root_name = (
+                _llir_assignment_root_name(statement.var)
+                if type(statement) is llir.Assign
+                else None
+            )
+            level = expected_position_levels.get(cast(str, root_name))
+            if level is None:
+                prepared.append(statement)
+                continue
+            assignment = cast(llir.Assign, statement)
+            target = assignment.var
+            if (
+                type(target) is not llir.ArrayAccess
+                or type(target.array) is not llir.Var
+                or type(target.index) is not llir.Literal
+                or type(target.index.value) is not int
+                or target.index.value != 0
+                or type(assignment.value) is not llir.Literal
+                or type(assignment.value.value) is not int
+                or assignment.value.value != 0
+                or cast(str, root_name) in converted
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the result assembler must initialize each append-owned "
+                    "compressed position vector exactly once at zero",
+                )
+            prepared.append(self._checked_position_init_statement(level))
+            converted.add(cast(str, root_name))
+        if converted != set(expected_position_levels):
+            _fail(
+                "unsupported_program_shape",
+                "the result assembler must own every compressed position sentinel",
+            )
+        return prepared
+
     def raw_loop_statements(self) -> List[llir.Stmt]:
         if self.loops[0].kind is _MERGED:
             stmts: List[llir.Stmt] = list(self._lower_merged(0))
             stmts.append(llir.BlankLine())
             stmts.append(llir.Comment("Assembly compressed _level indices"))
-            stmts.append(self._result_pos_set(0))
+            stmts.append(self._assembly_result_pos_set(0))
             return stmts
         return [llir.BlankLine(), self._lower_dense(0)]
 
@@ -9693,7 +9830,61 @@ def _lower_loopir_to_llir_owned(
 ) -> llir.Function:
     """Execute target lowering under an already-owned timing boundary."""
 
+    # Preserve the target's cheap malformed-program boundary before invoking
+    # caller-controlled Mapping code. A second verification below closes the
+    # mutation window after every callback from a custom mapping has returned;
+    # an exact dict over exact SymbolId keys executes no caller code here.
     verify_program(program)
+    mapping_callbacks_possible = type(input_shapes) is not dict
+    try:
+        shape_keys = tuple(input_shapes)
+    except Exception as error:
+        raise LoopIRTargetError(
+            LoopIRTargetDefect(
+                "invalid_shape_binding",
+                "input shapes could not be snapshotted",
+            )
+        ) from error
+    shape_key_values: List[int] = []
+    for key in shape_keys:
+        if type(key) is not SymbolId or type(getattr(key, "value", None)) is not int:
+            _fail(
+                "invalid_shape_binding",
+                "input shape keys must be exact int-valued SymbolId values",
+            )
+        shape_key_values.append(key.value)
+    if len(set(shape_key_values)) != len(shape_key_values):
+        _fail(
+            "invalid_shape_binding",
+            "input shape keys must be unique SymbolId values",
+        )
+    owned_input_shapes: Dict[SymbolId, Tuple[int, ...]] = {}
+    for key, key_value in zip(shape_keys, shape_key_values):
+        try:
+            shape = input_shapes[key]
+        except Exception as error:
+            raise LoopIRTargetError(
+                LoopIRTargetDefect(
+                    "invalid_shape_binding",
+                    "input shapes could not be snapshotted",
+                )
+            ) from error
+        if (
+            type(key) is not SymbolId
+            or type(getattr(key, "value", None)) is not int
+            or key.value != key_value
+        ):
+            _fail(
+                "invalid_shape_binding",
+                "input shape keys changed while values were being snapshotted",
+            )
+        owned_input_shapes[SymbolId(key_value)] = shape
+
+    # Mapping iteration and lookup can execute caller-controlled code. Own
+    # every binding and reverify after custom callbacks so they cannot leave
+    # a frozen program in untrusted state.
+    if mapping_callbacks_possible:
+        verify_program(program)
 
     lowering: _TargetLowering
     if _sparse_workspace_chain(program):
@@ -9710,18 +9901,24 @@ def _lower_loopir_to_llir_owned(
         ) == (LevelKind.DENSE, LevelKind.COMPRESSED)
         if row_scope:
             lowering = _RowScopeSparseWorkspaceLowering(
-                program, input_shapes, result_shape
+                program, owned_input_shapes, result_shape
             )
         else:
-            lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
+            lowering = _SparseWorkspaceLowering(
+                program, owned_input_shapes, result_shape
+            )
     elif _parallel_sparse_workspace_chain(program):
-        lowering = _ParallelSparseWorkspaceLowering(program, input_shapes, result_shape)
+        lowering = _ParallelSparseWorkspaceLowering(
+            program, owned_input_shapes, result_shape
+        )
     elif _dense_domain_mixed_chain(program):
-        lowering = _DenseDomainMixedLowering(program, input_shapes, result_shape)
+        lowering = _DenseDomainMixedLowering(program, owned_input_shapes, result_shape)
     elif _multi_compressed_assembly_chain(program):
-        lowering = _MultiCompressedAssemblyLowering(program, input_shapes, result_shape)
+        lowering = _MultiCompressedAssemblyLowering(
+            program, owned_input_shapes, result_shape
+        )
     else:
-        lowering = _TargetLowering(program, input_shapes, result_shape)
+        lowering = _TargetLowering(program, owned_input_shapes, result_shape)
     raw_statements = lowering.raw_loop_statements()
     kernel_abi = lowering.kernel_abi()
     assembler = lowering.result_assembler()
@@ -9738,7 +9935,9 @@ def _lower_loopir_to_llir_owned(
     prologue_stmts = kernel_abi.emit_input_prologue()
     value_init_stmts = assembler.emit_value_array_init()
     tile_size_stmts = lowering.tile_size_inits()
-    level_indices_stmts = assembler.emit_level_indices_init()
+    level_indices_stmts = lowering.prepare_result_level_indices(
+        assembler.emit_level_indices_init()
+    )
     if level_indices_stmts:
         level_indices_stmts = [
             llir.Comment("Init result level indices"),

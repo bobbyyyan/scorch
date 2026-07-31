@@ -30,14 +30,16 @@ provenance, and each bound loop variable becomes one declared logical
 dimension.
 
 Recorded family boundaries (deliberate, fail-closed; see the Phase-4 and
-Phase-5 reviews): identity mode order only, one uniform float32/float64
-scalar type, no workspaces/``Where``/derived index arithmetic/explicit
-parallel marks, ``ADD`` as the only update operator and ``{ADD, SUB, MUL}``
-as the only value operators, every tensor's storage-order loop variables in
-nest order, DENSE/COMPRESSED level types only with compressed value-bearing
-leaves, canonical CSR as the only sparse output (no update operator, no
-merged reductions or merged updates), and no subtraction across sparse
-domains.
+Phase-7 reviews): one uniform float32/float64 scalar type, no
+workspaces/``Where``/derived index arithmetic/explicit parallel marks,
+``ADD`` as the only update operator and ``{ADD, SUB, MUL}`` as the only
+value operators, every tensor's storage-order loop variables in nest order,
+and DENSE/COMPRESSED level types only.  Dense layouts may permute modes;
+compressed structure remains identity-ordered.  Sparse outputs and merged
+updates are admitted only through the explicitly classified CSR,
+compressed-parent/dense-leaf, and dense-prefix/multi-compressed families;
+every neighboring layout/domain combination fails closed rather than
+falling through to generic assembly.
 """
 
 from __future__ import annotations
