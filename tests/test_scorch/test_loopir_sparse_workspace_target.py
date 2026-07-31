@@ -2023,25 +2023,33 @@ def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
         )
     assert error.value.defect.code == "unsupported_sparse_output_reduction"
 
+    # The single mixed dense-leaf OPERAND now lowers through declared
+    # position loads (test_loopir_mixed_operand_target.py); the adjacent
+    # merged-mixed neighbor keeps this census's fail-closed seam because
+    # no merged loop binds the descent position.
     i2, j2 = IndexVar("i"), IndexVar("j")
-    sd_operand = ForAll(
+    merged_mixed = ForAll(
         i2,
         ForAll(
             j2,
             TensorAssign(
                 TensorVar("C", fmt="dd")[i2, j2],
-                TensorVar("A", fmt="sd")[i2, j2],
+                CINBinaryOp(
+                    Operation.MUL,
+                    TensorVar("A", fmt="sd")[i2, j2],
+                    TensorVar("B", fmt="sd")[i2, j2],
+                ),
             ),
         ),
     )
     with pytest.raises(LoopIRLoweringError) as error:
         compile_cin_via_loopir(
-            sd_operand,
+            merged_mixed,
             (4, 5),
-            (((4, 5), torch.float32),),
+            (((4, 5), torch.float32), ((4, 5), torch.float32)),
             compile_options=auto_options(regblock_enabled),
         )
-    assert error.value.defect.code == "unsupported_format"
+    assert error.value.defect.code == "unsupported_sparse_hierarchy"
 
     i3, j3 = IndexVar("i"), IndexVar("j")
     sparse_domain = ForAll(

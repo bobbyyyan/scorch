@@ -1390,14 +1390,18 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
     if comparand_path.exists():
         assert comparand_path.read_text() == legacy_cpp
 
-    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
-        compile_cin_via_loopir(
-            rowscope_cin(),
-            (4, 5),
-            (((4, 6), torch.float32), ((6, 5), torch.float32)),
-            compile_options=auto_options(False),
-        )
-    assert error.value.defect.code == "unsupported_sparse_output_reduction"
+    # The sound typed route (test_loopir_rowscope_workspace_target.py) now
+    # admits this family with logical-row-extent sizing; the defective
+    # comparand below remains hermetic failure evidence, and the typed
+    # source must never byte-match it.
+    typed = compile_cin_via_loopir(
+        rowscope_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    assert typed.cpp_source != legacy_cpp
+    assert "for (; C1_pos_index < C0_size; C1_pos_index++)" in typed.cpp_source
 
     torch.manual_seed(20260805)
     dense_a = torch.zeros(4, 6)
