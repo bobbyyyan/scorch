@@ -721,6 +721,8 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "parallel_target_missing",
     "parallel_work_mismatch",
     "parallel_race",
+    # Physical position-load code added by the Phase-7 mixed-operand slice.
+    "position_load_mismatch",
 }
 
 
@@ -4124,3 +4126,167 @@ def test_parallel_selection_compact_rejects_an_unaddressed_loop():
         rows=fixture.dim_j,
     )
     expect_defect("parallel_work_mismatch", fixture.program)
+
+
+# -- Phase-7 mixed dense-leaf operand loads -----------------------------------
+
+
+@dataclasses.dataclass
+class MixedLeafOperandFixture:
+    builder: LoopIRBuilder
+    program: LoopProgram
+    a: SymbolId
+    c: SymbolId
+    row: IndexId
+    col: IndexId
+    load: object
+
+
+def build_mixed_leaf_operand_copy(forge_load=None) -> MixedLeafOperandFixture:
+    """C[i, j] = A[i, j] with A stored compressed-row over a dense leaf."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, c = (builder.new_symbol_id() for _ in range(2))
+    decl_a = builder.tensor(
+        a,
+        "A",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        (
+            builder.level(LevelKind.COMPRESSED, 0),
+            builder.level(LevelKind.DENSE, 1),
+        ),
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    position = builder.new_position_id()
+    cursor_decl = builder.sparse_cursor(
+        builder.new_cursor_id(), a, 0, builder.root_position()
+    )
+    if forge_load is None:
+        load = builder.position_load(
+            a,
+            builder.dense_position(
+                a, 1, builder.position_value(position), builder.index_value(col)
+            ),
+        )
+    else:
+        load = forge_load(builder, a, c, position, col)
+    leaf = builder.store(c, (builder.index_value(row), builder.index_value(col)), load)
+    inner = builder.dense_for(col, dim_j.dimension, builder.block((leaf,)))
+    outer = builder.sparse_for(cursor_decl, position, row, builder.block((inner,)))
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_c),
+        (a,),
+        (c,),
+        builder.block((outer,)),
+    )
+    return MixedLeafOperandFixture(builder, program, a, c, row, col, load)
+
+
+def test_position_load_verifies_through_a_dense_leaf_below_compressed():
+    fixture = build_mixed_leaf_operand_copy()
+    verify_program(fixture.program)
+
+
+def test_position_load_rejects_reading_the_output():
+    def forge_output_read(builder, a, c, position, col):
+        return builder.position_load(
+            c,
+            builder.dense_position(
+                a, 1, builder.position_value(position), builder.index_value(col)
+            ),
+        )
+
+    fixture = build_mixed_leaf_operand_copy(forge_output_read)
+    expect_defect("output_read", fixture.program)
+
+
+def test_position_load_rejects_an_undeclared_tensor():
+    def forge_undeclared(builder, a, c, position, col):
+        return builder.position_load(
+            SymbolId(999_999),
+            builder.dense_position(
+                a, 1, builder.position_value(position), builder.index_value(col)
+            ),
+        )
+
+    fixture = build_mixed_leaf_operand_copy(forge_undeclared)
+    expect_defect("undefined_tensor", fixture.program)
+
+
+def test_position_load_rejects_a_coordinate_typed_position():
+    def forge_coordinate(builder, a, c, position, col):
+        return builder.position_load(a, builder.index_value(col))
+
+    fixture = build_mixed_leaf_operand_copy(forge_coordinate)
+    expect_defect("type_mismatch", fixture.program)
+
+
+def test_position_load_rejects_another_tensors_position():
+    """A leaf position formed on a second input cannot serve this load."""
+
+    builder = LoopIRBuilder()
+    dim_i = builder.dimension("i")
+    dim_j = builder.dimension("j")
+    a, b, c = (builder.new_symbol_id() for _ in range(3))
+    mixed_levels = lambda: (  # noqa: E731
+        builder.level(LevelKind.COMPRESSED, 0),
+        builder.level(LevelKind.DENSE, 1),
+    )
+    decl_a = builder.tensor(
+        a, "A", ScalarType.FLOAT32, (dim_i.dimension, dim_j.dimension), mixed_levels()
+    )
+    decl_b = builder.tensor(
+        b, "B", ScalarType.FLOAT32, (dim_i.dimension, dim_j.dimension), mixed_levels()
+    )
+    decl_c = builder.tensor(
+        c,
+        "C",
+        ScalarType.FLOAT32,
+        (dim_i.dimension, dim_j.dimension),
+        builder.dense_levels(2),
+    )
+    row = builder.new_index_id()
+    col = builder.new_index_id()
+    position = builder.new_position_id()
+    cursor_decl = builder.sparse_cursor(
+        builder.new_cursor_id(), a, 0, builder.root_position()
+    )
+    load = builder.position_load(
+        b,
+        builder.dense_position(
+            a, 1, builder.position_value(position), builder.index_value(col)
+        ),
+    )
+    leaf = builder.store(c, (builder.index_value(row), builder.index_value(col)), load)
+    inner = builder.dense_for(col, dim_j.dimension, builder.block((leaf,)))
+    outer = builder.sparse_for(cursor_decl, position, row, builder.block((inner,)))
+    program = builder.program(
+        (dim_i, dim_j),
+        (decl_a, decl_b, decl_c),
+        (a, b),
+        (c,),
+        builder.block((outer,)),
+    )
+    expect_defect("position_load_mismatch", program)
+
+
+def test_position_load_rejects_a_structural_level_position():
+    """The compressed level-0 position of a rank-2 tensor owns no scalar."""
+
+    def forge_structural(builder, a, c, position, col):
+        return builder.position_load(a, builder.position_value(position))
+
+    fixture = build_mixed_leaf_operand_copy(forge_structural)
+    expect_defect("non_leaf_value", fixture.program)

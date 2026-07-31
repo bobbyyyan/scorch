@@ -386,6 +386,21 @@ class CursorValue(Expr):
 
 
 @dataclass(frozen=True)
+class PositionLoad(Expr):
+    """Read the scalar owned by one tensor's value-bearing leaf position.
+
+    ``position`` must be position-typed for the final physical level of
+    ``tensor``.  Unlike :class:`Load`, this is a physical level access and is
+    therefore valid for a DENSE leaf below sparse structural levels.  Unlike
+    :class:`CursorValue`, it carries no merge-alignment/default semantics; a
+    merged compressed leaf continues to use the cursor-owned form.
+    """
+
+    tensor: SymbolId
+    position: Expr
+
+
+@dataclass(frozen=True)
 class Load(Expr):
     """A coordinate-addressed read of an all-dense input tensor.
 
@@ -393,7 +408,9 @@ class Load(Expr):
     in the domain of the corresponding declared dimension.  The result is
     value-typed with the tensor's scalar type.  Compressed tensors are
     deliberately not loadable by coordinate: their values are only reachable
-    through :class:`CursorValue`, which is what keeps coordinate search and
+    through :class:`CursorValue` at a compressed leaf, or through
+    :class:`PositionLoad` when the value-bearing leaf is a DENSE level below
+    compressed structure, which is what keeps coordinate search and
     format-specific probing out of the schema.
     """
 

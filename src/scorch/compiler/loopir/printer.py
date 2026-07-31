@@ -40,6 +40,7 @@ from .nodes import (
     PanelOuterFor,
     ParallelSelection,
     PositionId,
+    PositionLoad,
     PositionValue,
     RelayoutId,
     RelayoutStage,
@@ -69,7 +70,7 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v9"
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v10"
 
 
 class _CanonicalIds:
@@ -134,6 +135,10 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
         ids.cursor(expr.cursor)
         if expr.default is not None:
             _seed_expr_ids(expr.default, ids)
+        return
+    if type(expr) is PositionLoad:
+        ids.symbol(expr.tensor)
+        _seed_expr_ids(expr.position, ids)
         return
     if type(expr) is Load:
         ids.symbol(expr.tensor)
@@ -318,6 +323,12 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
             "default": (
                 None if expr.default is None else _serialize_expr(expr.default, ids)
             ),
+        }
+    if type(expr) is PositionLoad:
+        return {
+            "kind": "position_load",
+            "tensor": ids.symbol(expr.tensor),
+            "position": _serialize_expr(expr.position, ids),
         }
     if type(expr) is Load:
         return {
@@ -621,6 +632,11 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
         return (
             f"value(c{ids.cursor(expr.cursor)}, "
             f"default {_render_expr(expr.default, ids, names)})"
+        )
+    if type(expr) is PositionLoad:
+        return (
+            f"position_load t{ids.symbol(expr.tensor)}"
+            f"[{_render_expr(expr.position, ids, names)}]"
         )
     if type(expr) is Load:
         rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)

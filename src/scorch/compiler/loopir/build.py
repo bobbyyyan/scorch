@@ -51,6 +51,7 @@ from .nodes import (
     ParallelSelection,
     ParallelWork,
     PositionId,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RelayoutDecl,
@@ -383,6 +384,9 @@ class LoopIRBuilder:
 
     def load(self, tensor: SymbolId, indices: Sequence[Expr]) -> Load:
         return Load(self._node_id(), tensor, tuple(indices))
+
+    def position_load(self, tensor: SymbolId, position: Expr) -> PositionLoad:
+        return PositionLoad(self._node_id(), tensor, position)
 
     def binary(self, op: BinaryOp, lhs: Expr, rhs: Expr) -> BinaryExpr:
         return BinaryExpr(self._node_id(), op, lhs, rhs)

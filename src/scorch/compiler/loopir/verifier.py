@@ -154,6 +154,7 @@ from .nodes import (
     ParallelPart,
     ParallelSelection,
     ParallelWork,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RelayoutDecl,
@@ -692,6 +693,38 @@ def _check_cursor_value(
     return _VALUE
 
 
+def _check_position_load(
+    ctx: _Context, expr: PositionLoad, path: str, depth: int
+) -> _ExprType:
+    tensor = _check_symbol_id(expr.tensor, path, "PositionLoad.tensor")
+    if tensor not in ctx.tensors:
+        _fail("undefined_tensor", path, "PositionLoad references an undeclared tensor")
+    if tensor not in ctx.inputs:
+        _fail("output_read", path, "PositionLoad may only read declared inputs")
+    position_type = _check_expr(ctx, expr.position, f"{path}.position", depth + 1)
+    if type(position_type) is not _PositionType:
+        _fail(
+            "type_mismatch",
+            f"{path}.position",
+            "PositionLoad.position must be position-typed",
+        )
+    if position_type.tensor != tensor:
+        _fail(
+            "position_load_mismatch",
+            f"{path}.position",
+            "the leaf position must belong to the loaded tensor",
+        )
+    leaf_level = len(ctx.tensors[tensor].levels) - 1
+    if position_type.level != leaf_level:
+        _fail(
+            "non_leaf_value",
+            f"{path}.position",
+            "only the value-bearing leaf position owns a scalar; "
+            f"level {position_type.level} is structural",
+        )
+    return _VALUE
+
+
 def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ExprType:
     tensor = _check_symbol_id(expr.tensor, path, "Load.tensor")
     if tensor not in ctx.tensors:
@@ -920,6 +953,7 @@ _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     DensePosition: _check_dense_position,
     PositionValue: _check_position_value,
     CursorValue: _check_cursor_value,
+    PositionLoad: _check_position_load,
     Load: _check_load,
     BinaryExpr: _check_binary_expr,
     WorkspaceRead: _check_workspace_read,

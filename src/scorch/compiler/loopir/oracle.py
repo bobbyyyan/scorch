@@ -95,6 +95,7 @@ from .nodes import (
     MergeMode,
     PanelOuterFor,
     PositionId,
+    PositionLoad,
     PositionValue,
     RelayoutDecl,
     RelayoutId,
@@ -599,6 +600,36 @@ class _Oracle:
                     "drained value read outside its workspace's drain loop"
                 )
             return self.draining_values[expr.workspace]
+        if type(expr) is PositionLoad:
+            storage = self.storages.get(expr.tensor)
+            if storage is None:
+                decl = self.decls[expr.tensor]
+                dense = self.values.get(expr.tensor)
+                if dense is None:
+                    raise LoopIROracleError(
+                        f"position-loaded tensor {decl.name} has no level storage"
+                    )
+                try:
+                    storage = LevelTensorStorage.from_dense(
+                        dense,
+                        self.shapes[expr.tensor],
+                        tuple(level.mode for level in decl.levels),
+                        tuple(level.kind for level in decl.levels),
+                    )
+                except LevelStorageError as error:
+                    raise LoopIROracleError(
+                        f"input {decl.name} could not be position-materialized: "
+                        f"{error}"
+                    ) from error
+                self.storages[expr.tensor] = storage
+            position = self._eval_position(expr.position)
+            try:
+                return storage.leaf_value(position)
+            except LevelStorageError as error:
+                raise LoopIROracleError(
+                    f"position load outside {self.decls[expr.tensor].name} "
+                    f"leaf storage: {error}"
+                ) from error
         if type(expr) is Load:
             current: Any = self.values[expr.tensor]
             for position, index_expr in enumerate(expr.indices):

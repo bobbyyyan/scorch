@@ -141,7 +141,7 @@ def test_canonical_dump_carries_schema_version():
     # the sparse coordinate-window kinds, v4 the workspace node kinds, and
     # v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v9"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v10"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
@@ -760,3 +760,19 @@ def test_printer_names_a_source_free_parallel_policy_row_only():
     attach_selection(fixture, fixture.index, rows=fixture.dim)
     verify_program(fixture.program)
     assert "work(d0, row_only)" in print_program(fixture.program)
+
+
+def test_position_load_dump_and_rendering_are_canonical():
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    dump = canonical_program_dump(fixture.program)
+    payload = json.loads(dump)
+    assert payload["schema"] == CANONICAL_SCHEMA
+    assert '"kind":"position_load"' in dump
+    assert '"kind":"dense_position"' in dump
+    assert canonical_program_dump(build_mixed_leaf_operand_copy().program) == dump
+    rendered = print_program(fixture.program)
+    assert "position_load t0[dense_pos(t0, level 1, parent p0, coord x1)]" in rendered

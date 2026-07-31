@@ -1618,3 +1618,105 @@ def test_tiled_reduce_outside_the_compact_domain_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._exec_tiled_reduce(fixture.leaf)
     assert "out of bounds" in str(error.value)
+
+
+# -- Phase-7 position loads through a dense leaf below compressed --------------
+
+
+def test_position_load_copy_matches_the_dense_reference():
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    dense = [
+        [1.0, 0.0, 2.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+    storage = LevelTensorStorage.from_dense(
+        dense, (4, 3), (0, 1), (LevelKind.COMPRESSED, LevelKind.DENSE)
+    )
+    results = run_program(fixture.program, {fixture.a: storage}, {fixture.c: (4, 3)})
+    assert results[fixture.c] == dense
+
+
+def test_position_load_preserves_stored_explicit_zeros_per_row():
+    """A stored row's dense leaf serves explicit zeros, not pruned holes."""
+
+    from scorch.compiler.loopir.levels import CompressedLevel, DenseLevel
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    storage = LevelTensorStorage(
+        shape=(3, 2),
+        modes=(0, 1),
+        levels=(
+            CompressedLevel((0, 1), (1,)),
+            DenseLevel(2),
+        ),
+        values=(0.0, 7.0),
+    )
+    results = run_program(fixture.program, {fixture.a: storage}, {fixture.c: (3, 2)})
+    assert results[fixture.c] == [[0.0, 0.0], [0.0, 7.0], [0.0, 0.0]]
+
+
+def test_position_load_materializes_an_all_dense_input_lazily():
+    """A hand-built position load over an all-dense input still executes."""
+
+    builder = _Builder()
+    dim_i = builder.dimension("i")
+    a, c = (builder.new_symbol_id() for _ in range(2))
+    decl_a = builder.tensor(
+        a, "A", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    decl_c = builder.tensor(
+        c, "C", ScalarType.FLOAT32, (dim_i.dimension,), builder.dense_levels(1)
+    )
+    index = builder.new_index_id()
+    load = builder.position_load(
+        a,
+        builder.dense_position(
+            a, 0, builder.root_position(), builder.index_value(index)
+        ),
+    )
+    leaf = builder.store(c, (builder.index_value(index),), load)
+    loop = builder.dense_for(index, dim_i.dimension, builder.block((leaf,)))
+    program = builder.program(
+        (dim_i,), (decl_a, decl_c), (a,), (c,), builder.block((loop,))
+    )
+    results = run_program(program, {a: [4.0, 0.0, -1.5]}, {c: (3,)})
+    assert results[c] == [4.0, 0.0, -1.5]
+
+
+def test_position_load_outside_leaf_storage_fails_closed_at_runtime():
+    """A malformed runtime position is an oracle error, not a wrong value."""
+
+    from scorch.compiler.loopir.levels import CompressedLevel, DenseLevel
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    storage = LevelTensorStorage(
+        shape=(4, 3),
+        modes=(0, 1),
+        levels=(
+            CompressedLevel((0, 2), (0, 2)),
+            DenseLevel(3),
+        ),
+        values=(1.0, 0.0, 2.0, 0.0, 3.0, 0.0),
+    )
+    oracle = _Oracle(fixture.program, {fixture.a: storage}, {fixture.c: (4, 3)})
+    oracle.positions[fixture.program.body.statements[0].position] = 5
+    oracle.indices[fixture.col] = 0
+    oracle.indices[fixture.row] = 0
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._eval(fixture.load)
+    assert "leaf storage" in str(error.value)
