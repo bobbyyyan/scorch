@@ -557,6 +557,7 @@ class _SparseOutputReduction(Enum):
     NONE = "none"
     DOUBLY_COMPRESSED = "doubly_compressed"
     CSR_DENSE_ROW = "csr_dense_row"
+    MULTI_COMPRESSED_ASSEMBLY = "multi_compressed_assembly"
 
 
 def _classify_sparse_output_family(
@@ -606,13 +607,53 @@ def _classify_sparse_output_family(
                         "in the migrated families",
                     )
             return _SparseOutputReduction.NONE
+        compressed_suffix = 0
+        while (
+            compressed_suffix < len(result_levels)
+            and result_levels[-1 - compressed_suffix] is LevelType.COMPRESSED
+        ):
+            compressed_suffix += 1
+        multi_compressed_family = compressed_suffix >= 2 and all(
+            level_type is LevelType.DENSE
+            for level_type in result_levels[: len(result_levels) - compressed_suffix]
+        )
+        if multi_compressed_family and not reduce_update:
+            # The B3 multi-compressed intersection-assembly family: a dense
+            # prefix over a >=2-level compressed suffix, assembled by
+            # stored-sparse coordinate streams with a conditional parent
+            # append per compressed level.  The legacy comparand is honest
+            # here (unlike B2), so the family gates on byte parity plus the
+            # LoopIR oracle and PyTorch differentials.
+            prefix = len(result_levels) - compressed_suffix
+            for position, index_id in enumerate(lhs_index_ids):
+                domain_kind = domains[index_id].kind
+                if position < prefix:
+                    if domain_kind is not DomainKind.DENSE:
+                        _fail(
+                            "unsupported_sparse_output_domain",
+                            "the dense-prefix coordinates of a multi-"
+                            "compressed output must iterate dense domains "
+                            "in the migrated families",
+                        )
+                elif domain_kind is not DomainKind.INTERSECTION:
+                    # Single-cursor and united coordinate streams keep the
+                    # historical layout seam: only intersected stored
+                    # streams assemble a multi-compressed output in the
+                    # migrated families.
+                    _fail(
+                        "unsupported_sparse_output",
+                        "a multi-compressed output is assembled only by "
+                        "intersected stored coordinate streams in the "
+                        "migrated families",
+                    )
+            return _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
             _fail(
                 "unsupported_sparse_output",
                 f"result {lhs.tensor.name!r} declares a sparse layout other "
-                "than canonical CSR or compressed-parent/dense-leaf; ordered "
-                "assembly is defined for those layouts only in the migrated "
-                "families",
+                "than canonical CSR, compressed-parent/dense-leaf, or a "
+                "dense-prefix multi-compressed suffix; ordered assembly is "
+                "defined for those layouts only in the migrated families",
             )
         if reduce_update:
             # The parallel CSR-reduction family (Phase 7): a dense row
@@ -725,7 +766,13 @@ def _lower_sparse_family(
         tuple(index_id for index_id in loop_index_ids if index_id not in lhs_index_ids),
         {index_id: position for position, index_id in enumerate(loop_index_ids)},
     )
-    sparse_reduction_family = reduction_form is not _SparseOutputReduction.NONE
+    sparse_reduction_family = reduction_form in (
+        _SparseOutputReduction.DOUBLY_COMPRESSED,
+        _SparseOutputReduction.CSR_DENSE_ROW,
+    )
+    multi_compressed_assembly = (
+        reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
+    )
 
     for index_id in loop_index_ids:
         domain = domains[index_id]
@@ -794,7 +841,9 @@ def _lower_sparse_family(
                 position_ids[key] = builder.new_position_id()
             elif domain.kind is DomainKind.UNION:
                 union_cursors.add(key)
-            elif domain.kind is DomainKind.INTERSECTION and sparse_reduction_family:
+            elif domain.kind is DomainKind.INTERSECTION and (
+                sparse_reduction_family or multi_compressed_assembly
+            ):
                 # INTERSECTION descent: the merged loop binds each aligned
                 # cursor's position so child levels can chain from it.
                 position_ids[key] = builder.new_position_id()

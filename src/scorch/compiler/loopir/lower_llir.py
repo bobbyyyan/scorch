@@ -1776,14 +1776,19 @@ class _TargetLowering:
     def _bound_position_owner(
         self, position: PositionId
     ) -> Optional[Tuple[SymbolId, int]]:
-        """The (tensor, level) whose single-cursor loop binds one position."""
+        """The (tensor, level) whose nest loop binds one position."""
 
         for loop in self.loops:
-            if loop.kind not in (_SPARSE, _SPARSE_WINDOW):
+            if loop.kind in (_SPARSE, _SPARSE_WINDOW):
+                if loop.node.position == position:
+                    cursor = loop.cursors[0]
+                    return (cursor.tensor, cursor.level)
                 continue
-            if loop.node.position == position:
-                cursor = loop.cursors[0]
-                return (cursor.tensor, cursor.level)
+            if loop.kind is _MERGED:
+                bound_positions = getattr(loop.node, "positions", ())
+                for cursor, bound in zip(loop.cursors, bound_positions):
+                    if bound == position:
+                        return (cursor.tensor, cursor.level)
         return None
 
     def _compute_level_drivers(self) -> Dict[SymbolId, Dict[int, object]]:
@@ -1818,6 +1823,21 @@ class _TargetLowering:
                             "unsupported_program_shape",
                             "a cursor parent chain must ground at the root "
                             "below level 0",
+                        )
+                    return
+                if type(parent) is PositionValue:
+                    # A compressed parent level: the chain grounds at the
+                    # bound position of this tensor's own parent-level
+                    # cursor (single or merged), whose loop already records
+                    # that level's driver.
+                    owner = self._bound_position_owner(
+                        cast(PositionValue, parent).position
+                    )
+                    if owner != (cursor.tensor, level):
+                        _fail(
+                            "unsupported_program_shape",
+                            "cursor parent chains must ground at the bound "
+                            "position of the same tensor's parent level",
                         )
                     return
                 if type(parent) is DensePosition:
@@ -2556,7 +2576,7 @@ class _TargetLowering:
                     ),
                     value=llir.ArrayAccess(
                         array=self._cursor_pos_array(cursor),
-                        index=self._cursor_parent_var(cursor),
+                        index=self._cursor_parent_index(cursor, 0),
                     ),
                 )
             )
@@ -2568,47 +2588,53 @@ class _TargetLowering:
                     ),
                     value=llir.ArrayAccess(
                         array=self._cursor_pos_array(cursor),
-                        index=llir.Add(
-                            left=self._cursor_parent_var(cursor),
-                            right=llir.Literal(1, llir.DataType.INT),
-                        ),
+                        index=self._cursor_parent_index(cursor, 1),
                     ),
                 )
             )
         return stmts
 
-    def _result_pos_set(self) -> llir.Assign:
+    def _result_pos_set(self, level: Optional[int] = None) -> llir.Assign:
         """``C1_pos[C1_pos_index + 1] = C1_crd.size()`` (legacy spelling)."""
 
         result_name = self.result_decl.name
-        leaf_level = len(self.result_decl.levels) - 1
+        if level is None:
+            level = len(self.result_decl.levels) - 1
         return llir.Assign(
             var=llir.ArrayAccess(
                 array=llir.Var(
-                    name=f"{result_name}{leaf_level}_pos",
+                    name=f"{result_name}{level}_pos",
                     type=llir.DataType.STD_VECTOR_C_INT,
                 ),
                 index=llir.Add(
                     llir.Var(
-                        name=f"{result_name}{leaf_level}_pos_index",
+                        name=f"{result_name}{level}_pos_index",
                         type=llir.DataType.INT,
                     ),
                     llir.Literal(1, llir.DataType.INT32),
                 ),
             ),
             value=llir.FunctionCall(
-                name=f"{result_name}{leaf_level}_crd.size",
+                name=f"{result_name}{level}_crd.size",
                 args=[],
             ),
         )
 
-    def _assembly_catch_up(self, loop: _Loop) -> llir.ForLoop:
+    def _dense_assembly_close_level(self, position: int) -> int:
+        """The result level a dense assembly loop's catch-up closes."""
+
+        return len(self.result_decl.levels) - 1
+
+    def _assembly_catch_up(
+        self, loop: _Loop, level: Optional[int] = None
+    ) -> llir.ForLoop:
         """The legacy per-row ``Assemble COMPRESSED level`` catch-up loop."""
 
         result_name = self.result_decl.name
-        leaf_level = len(self.result_decl.levels) - 1
+        if level is None:
+            level = len(self.result_decl.levels) - 1
         pos_index = llir.Var(
-            name=f"{result_name}{leaf_level}_pos_index",
+            name=f"{result_name}{level}_pos_index",
             type=llir.DataType.INT,
         )
         return llir.ForLoop(
@@ -2620,11 +2646,11 @@ class _TargetLowering:
             ),
             update=llir.Increment(
                 var=llir.Var(
-                    name=f"{result_name}{leaf_level}_pos_index",
+                    name=f"{result_name}{level}_pos_index",
                     type=llir.DataType.INT,
                 )
             ),
-            body=[self._result_pos_set()],
+            body=[self._result_pos_set(level)],
         )
 
     def _lower_merged(self, position: int) -> List[llir.Stmt]:
@@ -3106,7 +3132,11 @@ class _TargetLowering:
         body: List[llir.Stmt] = []
         if result_is_csr_row:
             body.append(llir.Comment("Assemble COMPRESSED level"))
-            body.append(self._assembly_catch_up(loop))
+            body.append(
+                self._assembly_catch_up(
+                    loop, self._dense_assembly_close_level(position)
+                )
+            )
         body.append(llir.Comment("Resolve dense coordinates"))
         body.extend(input_resolves)
         if not loop_drives_an_input:
@@ -3121,7 +3151,9 @@ class _TargetLowering:
         if result_is_csr_row:
             body.append(llir.BlankLine())
             body.append(llir.Comment("Assembly compressed _level indices"))
-            body.append(self._result_pos_set())
+            body.append(
+                self._result_pos_set(self._dense_assembly_close_level(position))
+            )
         loop_var = llir.Var(name=name, type=llir.DataType.INT64)
         for_loop = llir.ForLoop(
             init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
@@ -7001,6 +7033,289 @@ class _DenseDomainMixedLowering(_TargetLowering):
         ]
 
 
+def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
+    """Whether the program is the B3 multi-compressed intersection chain.
+
+    Routing is purely structural: a single-statement nest of dense loops
+    over nested two-cursor merged loops appending into a dense-prefix/
+    multi-compressed-suffix result.  Everything else stays on its existing
+    route and keeps its fail-closed boundaries.
+    """
+
+    if len(program.outputs) != 1:
+        return False
+    result_decl = next(
+        (decl for decl in program.tensors if decl.symbol == program.outputs[0]),
+        None,
+    )
+    if result_decl is None:
+        return False
+    kinds = tuple(level.kind for level in result_decl.levels)
+    compressed_suffix = 0
+    while (
+        compressed_suffix < len(kinds)
+        and kinds[-1 - compressed_suffix] is LevelKind.COMPRESSED
+    ):
+        compressed_suffix += 1
+    if compressed_suffix < 2 or any(
+        kind is not LevelKind.DENSE for kind in kinds[: len(kinds) - compressed_suffix]
+    ):
+        return False
+    body: Stmt = program.body
+    merged = 0
+    while type(body) is Block and len(body.statements) == 1:
+        only = body.statements[0]
+        if type(only) is DenseFor and merged == 0:
+            body = only.body
+            continue
+        if type(only) is MergedSparseFor:
+            merged += 1
+            body = only.body
+            continue
+        return type(only) is AppendEntry and merged >= 2
+    return False
+
+
+class _MultiCompressedAssemblyLowering(_TargetLowering):
+    """Dedicated target lowering for the B3 multi-compressed family.
+
+    Admits exactly the intersection-assembly form ``lower_normalized_cin``
+    produces for dense-prefix/multi-compressed-suffix results: at most one
+    dense prefix loop, then one two-cursor INTERSECTION merged loop per
+    compressed result level (each binding both aligned cursor positions so
+    child levels descend from them), over one ordered :class:`AppendEntry`
+    leaf.  Anything else fails closed with ``unsupported_program_shape``.
+
+    The raw emission mirrors the legacy generic lowering statement-for-
+    statement — per-level ``Initialize iterators`` groups (root-parent
+    subscripts folded to exact integers), the while-merge with
+    ``std::min`` coordinate resolution, indexed leaf appends the shared
+    dynamic-vector pass rewrites to ``emplace_back``, one conditional
+    compressed-parent append plus child position close per structural
+    level, the dense-prefix catch-up, and the root position close — so the
+    generated C++ is byte-identical to the legacy pipeline's output for
+    both automatic policy arms.  The legacy comparand is honest for this
+    family (empty child intersections suppress their parent coordinates
+    and cascade), so byte parity is the gate, exactly like B1.
+    """
+
+    def __init__(
+        self,
+        program: LoopProgram,
+        input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+        result_shape: Tuple[int, ...],
+    ) -> None:
+        self.program = program
+        self.decls = {decl.symbol: decl for decl in program.tensors}
+        if len(program.outputs) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one output tensor",
+            )
+        self.result_symbol = program.outputs[0]
+        self.result_decl = self.decls[self.result_symbol]
+        self.result_is_dense = False
+        self.sparse_program = True
+        self.dimension_names = {}
+        self._access_ids = {}
+        self.region = None
+        self.panel = None
+        self.relayout = None
+        self.result_tile = None
+        self.result_tile_depth = -1
+        self.relayout_depth = -1
+        if program.parallel is not None:
+            _fail(
+                "unsupported_program_shape",
+                "the multi-compressed assembly family owns no parallel " "selection",
+            )
+        self.parallel = None
+        self._validate_display_names()
+        self._validate_assembly_layouts()
+        self.shapes = self._validate_shapes(input_shapes, result_shape)
+        self.loops = self._collect_assembly_chain()
+        self._validate_loop_variable_names()
+        self.loop_positions = {
+            loop.index: position for position, loop in enumerate(self.loops)
+        }
+        self.cursor_loops: Dict[CursorId, int] = {}
+        for position, loop in enumerate(self.loops):
+            for cursor in loop.cursors:
+                self.cursor_loops[cursor.cursor] = position
+        self.loads, self.cursor_values = self._collect_accesses()
+        self.level_drivers = self._compute_level_drivers()
+        self._validate_access_orders()
+        self._reserve_merge_names()
+
+    def _validate_assembly_layouts(self) -> None:
+        for decl in self.program.tensors:
+            modes = tuple(level.mode for level in decl.levels)
+            if modes != tuple(range(len(decl.levels))):
+                _fail(
+                    "unsupported_mode_order",
+                    f"tensor {decl.name!r} permutes compressed structure, "
+                    "which the migrated families do not cover",
+                )
+
+    def _collect_assembly_chain(self) -> List[_Loop]:
+        def require(condition: bool, what: str) -> None:
+            if not condition:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the multi-compressed assembly target requires {what}",
+                )
+
+        result_levels = self.result_decl.levels
+        compressed_suffix = 0
+        while (
+            compressed_suffix < len(result_levels)
+            and result_levels[-1 - compressed_suffix].kind is LevelKind.COMPRESSED
+        ):
+            compressed_suffix += 1
+        prefix = len(result_levels) - compressed_suffix
+        require(
+            compressed_suffix >= 2
+            and all(level.kind is LevelKind.DENSE for level in result_levels[:prefix]),
+            "a dense-prefix/multi-compressed-suffix result",
+        )
+        require(
+            prefix <= 1,
+            "at most one dense prefix loop (deeper dense parents are a "
+            "distinct gap)",
+        )
+        loops: List[_Loop] = []
+        body: Stmt = self.program.body
+        while True:
+            require(
+                type(body) is Block and len(cast(Block, body).statements) == 1,
+                "a single-statement assembly loop nest",
+            )
+            only = cast(Block, body).statements[0]
+            if type(only) is DenseFor:
+                require(
+                    not loops,
+                    "the dense prefix loop to precede every merged loop",
+                )
+                require(prefix == 1, "no dense loop over an all-compressed result")
+                loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
+                body = only.body
+                continue
+            if type(only) is MergedSparseFor:
+                require(
+                    len(loops) >= prefix,
+                    "merged loops to follow the dense prefix",
+                )
+                require(
+                    only.mode is MergeMode.INTERSECTION
+                    and len(only.cursors) == 2
+                    and len(only.positions) == 2
+                    and all(bound is not None for bound in only.positions),
+                    "two-cursor INTERSECTION merges binding both aligned " "positions",
+                )
+                first = only.cursors[0]
+                loops.append(
+                    _Loop(
+                        _MERGED,
+                        only.coord_index,
+                        self._level_dimension(first.tensor, first.level),
+                        only,
+                        tuple(only.cursors),
+                    )
+                )
+                body = only.body
+                continue
+            require(
+                type(only) is AppendEntry,
+                "an ordered append leaf",
+            )
+            require(
+                len(loops) == len(result_levels)
+                and sum(1 for loop in loops if loop.kind is _MERGED)
+                == compressed_suffix,
+                "one loop per result level with one merged loop per "
+                "compressed level",
+            )
+            self.leaf = only
+            return loops
+
+    def _parent_append_statements(self, level: int) -> List[llir.Stmt]:
+        """One conditional parent append plus child position close.
+
+        ``level`` is the parent result level whose coordinate materializes
+        exactly when the child level appended entries; the child position
+        array then closes at the parent coordinate count — the exact
+        legacy conditional-assembly spelling.
+        """
+
+        result_name = self.result_decl.name
+        coord_name = self._loop_var_name(self.loops[level])
+        return [
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.FunctionCall(
+                        name=f"{result_name}{level + 1}_pos.back", args=[]
+                    ),
+                    right=llir.Var(
+                        name=f"p{result_name}{level + 1}",
+                        type=llir.DataType.INT64,
+                    ),
+                ),
+                then_body=[
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}{level}_crd.push_back",
+                        args=[llir.Var(name=coord_name, type=llir.DataType.INT64)],
+                    ),
+                    llir.Increment(
+                        var=llir.Var(
+                            name=f"p{result_name}{level}",
+                            type=llir.DataType.INT64,
+                        )
+                    ),
+                ],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}{level + 1}_pos",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=llir.FunctionCall(
+                        name=f"{result_name}{level}_crd.size", args=[]
+                    ),
+                ),
+                value=llir.FunctionCall(
+                    name=f"{result_name}{level + 1}_crd.size", args=[]
+                ),
+            ),
+        ]
+
+    def _merged_case_stmts(
+        self, loop: _Loop, aligned: Set[CursorId]
+    ) -> Optional[List[llir.Stmt]]:
+        position = self.loop_positions[loop.index]
+        if position == len(self.loops) - 1:
+            return super()._merged_case_stmts(loop, aligned)
+        return [
+            *self._lower_merged(position + 1),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            *self._parent_append_statements(position),
+        ]
+
+    def _dense_assembly_close_level(self, position: int) -> int:
+        return position + 1
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        if self.loops[0].kind is _MERGED:
+            stmts: List[llir.Stmt] = list(self._lower_merged(0))
+            stmts.append(llir.BlankLine())
+            stmts.append(llir.Comment("Assembly compressed _level indices"))
+            stmts.append(self._result_pos_set(0))
+            return stmts
+        return [llir.BlankLine(), self._lower_dense(0)]
+
+
 _RELAYOUT_LOST = "relayout_completion_lost"
 _RESULT_TILE_LOST = "result_tile_completion_lost"
 _PARALLEL_LOST = "parallel_completion_lost"
@@ -9132,6 +9447,8 @@ def _lower_loopir_to_llir_owned(
         lowering = _ParallelSparseWorkspaceLowering(program, input_shapes, result_shape)
     elif _dense_domain_mixed_chain(program):
         lowering = _DenseDomainMixedLowering(program, input_shapes, result_shape)
+    elif _multi_compressed_assembly_chain(program):
+        lowering = _MultiCompressedAssemblyLowering(program, input_shapes, result_shape)
     else:
         lowering = _TargetLowering(program, input_shapes, result_shape)
     raw_statements = lowering.raw_loop_statements()
