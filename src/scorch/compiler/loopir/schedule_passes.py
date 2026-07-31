@@ -1101,22 +1101,28 @@ def apply_sparse_workspace(
             "the sparse workspace requires exactly one reduction loop: the "
             "recorded logical reduction",
         )
-    if doubly_compressed_result:
-        # The B1 doubly-compressed family reduces over the recorded
-        # two-cursor INTERSECTION merge.
+    row_scope_result = False
+    if not doubly_compressed_result and result_indices:
+        row_binders = [
+            node for node in loops if _loop_key(node)[0] == result_indices[0]
+        ]
+        row_scope_result = bool(row_binders) and type(row_binders[0]) is SparseFor
+    if doubly_compressed_result or row_scope_result:
+        # The B1 doubly-compressed family and the row-scope CSR family
+        # reduce over the recorded two-cursor INTERSECTION merge.
         if (
             type(reduction_loops[-1]) is not MergedSparseFor
             or reduction_loops[-1].mode is not MergeMode.INTERSECTION
         ):
             _fail(
                 "sparse_workspace_target_invalid",
-                "the serial B1 sparse workspace requires exactly one "
+                "the serial sparse workspace requires exactly one "
                 "reduction loop: the recorded logical INTERSECTION merge",
             )
     elif type(reduction_loops[-1]) is not SparseFor:
         # The dense-row CSR family (Phase 7) reduces over one plain
         # single-cursor stored level; merged reductions stay with the
-        # doubly-compressed form.
+        # doubly-compressed and row-scope forms.
         _fail(
             "sparse_workspace_target_invalid",
             "the dense-row CSR sparse workspace requires exactly one "
@@ -1170,8 +1176,10 @@ def apply_sparse_workspace(
                 "sparse_workspace_target_invalid",
                 "result prefix coordinates must be bound above the " "workspace region",
             )
-        if not doubly_compressed_result and type(loops[binder_positions[0]]) is not (
-            DenseFor
+        if (
+            not doubly_compressed_result
+            and not row_scope_result
+            and type(loops[binder_positions[0]]) is not DenseFor
         ):
             _fail(
                 "sparse_workspace_target_invalid",

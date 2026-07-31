@@ -4664,6 +4664,17 @@ class _SparseWorkspaceLowering(_TargetLowering):
 
     # -- family-shape validation ---------------------------------------------
 
+    def _admits_result_layout(self) -> bool:
+        return (
+            len(self.result_decl.levels) == 2
+            and tuple(level.kind for level in self.result_decl.levels)
+            == (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+            and tuple(level.mode for level in self.result_decl.levels) == (0, 1)
+        )
+
+    def _result_layout_requirement(self) -> str:
+        return "an identity-ordered doubly-compressed result"
+
     def _validate_family_shape(self) -> None:
         def require(condition: bool, what: str) -> None:
             if not condition:
@@ -4818,9 +4829,12 @@ class _SparseWorkspaceLowering(_TargetLowering):
             len(program.inputs) == 2
             and set(program.inputs) == {descended_cursor.tensor, rooted_cursor.tensor}
             and doubly_compressed(descended_decl)
-            and doubly_compressed(rooted_decl)
-            and doubly_compressed(self.result_decl),
-            "exactly two identity-ordered doubly-compressed inputs and result",
+            and doubly_compressed(rooted_decl),
+            "exactly two identity-ordered doubly-compressed inputs",
+        )
+        require(
+            self._admits_result_layout(),
+            self._result_layout_requirement(),
         )
         require(
             descended_decl.dtype is rooted_decl.dtype
@@ -5591,6 +5605,247 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
             ),
         ]
+
+
+class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
+    """The sound dense-row CSR twin of the serial sparse-workspace family.
+
+    Admits exactly the B1 producer/drain chain with an identity-ordered
+    dense-row CSR (``ds``) result.  The defective legacy comparand for
+    this family sizes ``C1_pos`` by the first operand's stored-row count,
+    silently associating later rows' values with earlier rows whenever a
+    logical row is empty; this typed route instead sizes and closes
+    ``C1_pos`` from the logical result row extent: a per-row positional
+    catch-up closes every skipped empty row before the stored row's
+    drain, the stored row closes its own entry, and a final catch-up
+    after the loop closes through ``C0_size``.  By construction the
+    generated source therefore never byte-matches the legacy kernel; the
+    family is proven against the production LoopIR oracle and the
+    PyTorch dense reference under the established no-parity discipline.
+    """
+
+    def _admits_result_layout(self) -> bool:
+        return (
+            len(self.result_decl.levels) == 2
+            and tuple(level.kind for level in self.result_decl.levels)
+            == (LevelKind.DENSE, LevelKind.COMPRESSED)
+            and tuple(level.mode for level in self.result_decl.levels) == (0, 1)
+        )
+
+    def _result_layout_requirement(self) -> str:
+        return "an identity-ordered dense-row CSR result"
+
+    def _row_close_statement(self) -> llir.Assign:
+        """``C1_pos[C1_pos_index + 1] = C1_crd.size()`` (raw indexed form)."""
+
+        result_name = self.result_decl.name
+        return llir.Assign(
+            var=llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{result_name}1_pos",
+                    type=llir.DataType.STD_VECTOR_C_INT,
+                ),
+                index=llir.Add(
+                    llir.Var(
+                        name=f"{result_name}1_pos_index",
+                        type=llir.DataType.INT64,
+                    ),
+                    llir.Literal(1),
+                ),
+            ),
+            value=llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+        )
+
+    def _completed_row_close_statement(self) -> llir.FunctionCallStmt:
+        """The exact checked row close left by the dynamic-vector pass."""
+
+        result_name = self.result_decl.name
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(
+                    name=f"{result_name}1_pos",
+                    type=llir.DataType.NO_TYPE,
+                ),
+                llir.Add(
+                    llir.Var(
+                        name=f"{result_name}1_pos_index",
+                        type=llir.DataType.INT64,
+                    ),
+                    llir.Literal(value=1, data_type=llir.DataType.INT32),
+                ),
+                llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+            ],
+        )
+
+    def _row_catch_up_loop(self, bound: llir.Expr, *, completed: bool) -> llir.ForLoop:
+        """Close every skipped logical row through ``bound`` exclusively."""
+
+        result_name = self.result_decl.name
+        pos_index = llir.Var(
+            name=f"{result_name}1_pos_index",
+            type=llir.DataType.INT64,
+        )
+        return llir.ForLoop(
+            init=None,
+            cond=llir.BinOp(op="<", left=pos_index, right=bound),
+            update=llir.Increment(
+                var=llir.Var(
+                    name=f"{result_name}1_pos_index",
+                    type=llir.DataType.INT64,
+                )
+            ),
+            body=[
+                (
+                    self._completed_row_close_statement()
+                    if completed
+                    else self._row_close_statement()
+                )
+            ],
+        )
+
+    def _row_bound_var(self) -> llir.Var:
+        return llir.Var(name=self.row_name, type=llir.DataType.INT64)
+
+    def _extent_bound_var(self) -> llir.Var:
+        return llir.Var(
+            name=f"{self.result_decl.name}0_size",
+            type=llir.DataType.INT64,
+        )
+
+    def _row_assembly_statements(self) -> List[llir.Stmt]:
+        return [
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            self._row_close_statement(),
+        ]
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        row_body: List[llir.Stmt] = [
+            *self._row_prologue_statements(),
+            llir.Comment("Assemble COMPRESSED level"),
+            self._row_catch_up_loop(self._row_bound_var(), completed=False),
+            *self._region_statements(),
+        ]
+        row_loop = self._outer_row_loop(row_body)
+        return [
+            *self._outer_loop_prefix_statements(),
+            row_loop,
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            self._row_catch_up_loop(self._extent_bound_var(), completed=False),
+        ]
+
+    def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
+        """Require the exact dynamic-vector rewrite owned by this target.
+
+        The reconstruction mirrors the B1 discipline — every expected node
+        is locally owned, the managed pass is never consulted — with the
+        dense-row CSR differences: one checked position sentinel, the
+        per-row and final positional catch-ups, and no compressed-parent
+        coordinate assembly.
+        """
+
+        result_name = self.result_decl.name
+        try:
+            expected_assembler = self.result_assembler()
+            expected_final_assembly = expected_assembler.emit_final_assembly()
+            expected_level_indices = expected_assembler.emit_level_indices_init()
+            sentinel_name = f"{result_name}1_pos"
+            completed_position_inits: Set[str] = set()
+            for index, statement in enumerate(expected_level_indices):
+                if type(statement) is not llir.Assign:
+                    continue
+                root_name = _llir_assignment_root_name(statement.var)
+                if root_name != sentinel_name:
+                    continue
+                expected_level_indices[index] = self._completed_position_init_statement(
+                    1
+                )
+                completed_position_inits.add(cast(str, root_name))
+            if completed_position_inits != {sentinel_name}:
+                _fail(
+                    _SPARSE_WORKSPACE_LOST,
+                    "the result assembler must own the row position sentinel",
+                )
+            expected_level_index_group: List[llir.Stmt] = [
+                llir.Comment("Init result level indices"),
+                *expected_level_indices,
+            ]
+            expected_size_stmts = self.result_size_inits()
+            if expected_size_stmts:
+                expected_size_stmts = [
+                    llir.Comment("Init result tensor level sizes"),
+                    *expected_size_stmts,
+                ]
+            expected_kernel_abi = self.kernel_abi()
+            expected_row_tail: List[llir.Stmt] = [
+                llir.BlankLine(),
+                llir.BlankLine(),
+                llir.Comment("Assembly compressed _level indices"),
+                self._completed_row_close_statement(),
+            ]
+            expected_row_body: List[llir.Stmt] = [
+                *self._row_prologue_statements(),
+                llir.Comment("Assemble COMPRESSED level"),
+                self._row_catch_up_loop(self._row_bound_var(), completed=True),
+                llir.Comment("Initialize workspaces"),
+                self._workspace_init_statement(),
+                *self._merge_statements(),
+                llir.BlankLine(),
+                llir.Comment("Lower consumer CIN"),
+                llir.FunctionCallStmt(
+                    name=f"{self.workspace_decl.name}.sort",
+                    args=[],
+                ),
+                self._completed_drain_loop(),
+                *expected_row_tail,
+            ]
+            expected_body: List[llir.Stmt] = [
+                *expected_kernel_abi.emit_validation(),
+                *expected_size_stmts,
+                *expected_kernel_abi.emit_input_prologue(),
+                llir.BlankLine(),
+                *expected_level_index_group,
+                llir.Comment("Initialize result value array"),
+                *expected_assembler.emit_value_array_init(),
+                *self.tile_size_inits(),
+                llir.BlankLine(),
+                *self._outer_loop_prefix_statements(),
+                self._outer_row_loop(expected_row_body),
+                llir.BlankLine(),
+                llir.Comment("Assembly compressed _level indices"),
+                self._row_catch_up_loop(self._extent_bound_var(), completed=True),
+                *expected_final_assembly,
+            ]
+            expected_function = expected_kernel_abi.assemble_function(expected_body)
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        try:
+            completion_matches = _exact_sparse_completion_matches(
+                function, expected_function
+            )
+        except LoopIRTargetError:
+            raise
+        except Exception as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        if not completion_matches:
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the assembled function must exactly match the completed "
+                "row-scope sparse-workspace target, including the checked "
+                "position sentinel, both positional catch-ups, and the "
+                "canonical producer/drain row",
+            )
+        return function
 
 
 class _ParallelSparseWorkspaceLowering(_TargetLowering):
@@ -9442,7 +9697,23 @@ def _lower_loopir_to_llir_owned(
 
     lowering: _TargetLowering
     if _sparse_workspace_chain(program):
-        lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
+        result_decl = next(
+            (
+                decl
+                for decl in program.tensors
+                if program.outputs and decl.symbol == program.outputs[0]
+            ),
+            None,
+        )
+        row_scope = result_decl is not None and tuple(
+            level.kind for level in result_decl.levels
+        ) == (LevelKind.DENSE, LevelKind.COMPRESSED)
+        if row_scope:
+            lowering = _RowScopeSparseWorkspaceLowering(
+                program, input_shapes, result_shape
+            )
+        else:
+            lowering = _SparseWorkspaceLowering(program, input_shapes, result_shape)
     elif _parallel_sparse_workspace_chain(program):
         lowering = _ParallelSparseWorkspaceLowering(program, input_shapes, result_shape)
     elif _dense_domain_mixed_chain(program):

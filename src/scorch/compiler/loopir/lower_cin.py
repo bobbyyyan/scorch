@@ -557,6 +557,7 @@ class _SparseOutputReduction(Enum):
     NONE = "none"
     DOUBLY_COMPRESSED = "doubly_compressed"
     CSR_DENSE_ROW = "csr_dense_row"
+    CSR_SPARSE_ROW = "csr_sparse_row"
     MULTI_COMPRESSED_ASSEMBLY = "multi_compressed_assembly"
 
 
@@ -659,10 +660,20 @@ def _classify_sparse_output_family(
             # The parallel CSR-reduction family (Phase 7): a dense row
             # domain, plain stored-sparse reduction domains that all
             # enclose the trailing column loop, and a stored sparse column
-            # domain select the semantic accumulation form.  Everything
-            # else — the sparse-row row-scope shape, merged or dense
-            # reduction or column domains, and trailing-level reductions
-            # below the column coordinate — keeps the historical seam code.
+            # domain select the semantic accumulation form.  The sparse-row
+            # row-scope shape (a stored-sparse row domain over the same
+            # doubly-compressed merge shape B1 admits) selects the
+            # row-scope form: its defective legacy comparand sizes the
+            # result rows by the first operand's stored-row count, so the
+            # typed route is proven against the oracle and PyTorch, never
+            # byte parity.  Everything else — merged or dense reduction or
+            # column domains, and trailing-level reductions below the
+            # column coordinate — keeps the historical seam code.
+            if (
+                domains[lhs_index_ids[0]].kind is DomainKind.SPARSE
+                and domains[lhs_index_ids[1]].kind is not DomainKind.DENSE
+            ):
+                return _SparseOutputReduction.CSR_SPARSE_ROW
             column_position = loop_positions[lhs_index_ids[-1]]
             if (
                 domains[lhs_index_ids[0]].kind is not DomainKind.DENSE
@@ -769,6 +780,7 @@ def _lower_sparse_family(
     sparse_reduction_family = reduction_form in (
         _SparseOutputReduction.DOUBLY_COMPRESSED,
         _SparseOutputReduction.CSR_DENSE_ROW,
+        _SparseOutputReduction.CSR_SPARSE_ROW,
     )
     multi_compressed_assembly = (
         reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
@@ -778,10 +790,13 @@ def _lower_sparse_family(
         domain = domains[index_id]
         if domain.kind in (DomainKind.UNION, DomainKind.INTERSECTION):
             if index_id not in lhs_index_ids:
-                if reduction_form is _SparseOutputReduction.DOUBLY_COMPRESSED:
-                    # The B1 family reduces over the merged reduction
-                    # dimension by construction; the semantic StoreReduce
-                    # form is exactly that reduction.
+                if reduction_form in (
+                    _SparseOutputReduction.DOUBLY_COMPRESSED,
+                    _SparseOutputReduction.CSR_SPARSE_ROW,
+                ):
+                    # The B1 and row-scope families reduce over the merged
+                    # reduction dimension by construction; the semantic
+                    # StoreReduce form is exactly that reduction.
                     continue
                 _fail(
                     "unsupported_merged_reduction",
