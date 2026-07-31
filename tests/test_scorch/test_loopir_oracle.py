@@ -1720,3 +1720,76 @@ def test_position_load_outside_leaf_storage_fails_closed_at_runtime():
     with pytest.raises(LoopIROracleError) as error:
         oracle._eval(fixture.load)
     assert "leaf storage" in str(error.value)
+
+
+@pytest.mark.parametrize("callback", ["iter", "getitem"])
+@pytest.mark.parametrize("mutated_mapping", ["inputs", "outputs"])
+def test_binding_mapping_cannot_mutate_position_load_after_verification(
+    mutated_mapping, callback
+):
+    """Caller mapping callbacks run before the oracle trusts the program."""
+
+    from scorch.compiler.loopir.verifier import LoopIRVerificationError
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    storage = LevelTensorStorage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]],
+        (2, 2),
+        (0, 1),
+        (LevelKind.COMPRESSED, LevelKind.DENSE),
+    )
+
+    class MutatingMapping(dict):
+        def __iter__(self):
+            if callback == "iter":
+                object.__setattr__(fixture.load, "tensor", [])
+            return super().__iter__()
+
+        def __getitem__(self, key):
+            if callback == "getitem":
+                object.__setattr__(fixture.load, "tensor", [])
+            return super().__getitem__(key)
+
+    inputs = {fixture.a: storage}
+    outputs = {fixture.c: (2, 2)}
+    if mutated_mapping == "inputs":
+        inputs = MutatingMapping(inputs)
+    else:
+        outputs = MutatingMapping(outputs)
+
+    with pytest.raises(LoopIRVerificationError) as error:
+        run_program(fixture.program, inputs, outputs)
+    assert error.value.defect.code == "invalid_symbol_id"
+
+
+def test_malformed_position_load_fails_before_binding_mapping_callbacks():
+    """The initial verifier remains cheaper than caller-controlled mappings."""
+
+    from scorch.compiler.loopir.verifier import LoopIRVerificationError
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    object.__setattr__(fixture.load, "tensor", [])
+    called = False
+
+    class HostileBindings(dict):
+        def __iter__(self):
+            nonlocal called
+            called = True
+            raise RuntimeError("binding mapping must not run")
+
+    with pytest.raises(LoopIRVerificationError) as error:
+        run_program(
+            fixture.program,
+            HostileBindings({fixture.a: object()}),
+            {fixture.c: (2, 2)},
+        )
+    assert error.value.defect.code == "invalid_symbol_id"
+    assert not called

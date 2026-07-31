@@ -1358,10 +1358,11 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
     Its ``C1_pos`` is sized by the first operand's *stored* row count, not
     the result's dense row extent, so any input whose first operand has an
     empty row returns malformed storage that silently associates later
-    rows' values with earlier rows.  The family therefore stays at its
-    stable seam code — a byte-parity twin would knowingly reproduce wrong
-    results — and this test locks both the demonstrated defect and the
-    non-admission.
+    rows' values with earlier rows.  The sound typed route is now admitted
+    under the no-parity discipline: it sizes ``C1_pos`` from the logical
+    result row extent rather than reproducing this defect.  This test keeps
+    the sealed legacy kernel as hermetic failure evidence and locks its
+    full-row-support control separately.
     """
 
     def rowscope_cin():

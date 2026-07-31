@@ -1,13 +1,15 @@
 """Phase-7 mixed dense-leaf operand loads: the ``sd``-family load chain.
 
 Operand tensors whose compressed structure sits above a dense
-value-bearing sub-tree (``sd``, ``sdd``, ``dsd``, rank-1 ``s``) lower
-through declared :class:`PositionLoad` reads — a dense-position spine
-grounded at the single-cursor bound row position — into the existing
-dense-result families.  The generated C++ must be byte-identical to the
-legacy pipeline's long-proven dense-output kernels in both automatic
-policy arms, execute through the shared JIT build path, and match the
-production LoopIR oracle and the PyTorch dense reference.
+value-bearing sub-tree (``sd``, ``sdd``, ``dsd``) lower through declared
+:class:`PositionLoad` reads — a dense-position spine grounded at the
+single-cursor bound row position — into the existing dense-result
+families.  Rank-1 ``s`` is the adjacent compressed-leaf control and keeps
+the established :class:`CursorValue` representation.  The generated C++
+must be byte-identical to the legacy pipeline's long-proven dense-output
+kernels in both automatic policy arms, execute through the shared JIT
+build path, and match the production LoopIR oracle and the PyTorch dense
+reference.
 
 Runtime ``sd``-family inputs are hand-built through ``TensorIndex``
 because the public ``to_sparse("sd")`` conversion does not yet build
@@ -507,6 +509,19 @@ def test_canonical_dump_is_arm_stable_and_erases_to_base():
     assert '"kind":"position_load"' in dumps[0]
 
 
+def test_rank1_compressed_leaf_keeps_the_cursor_value_representation():
+    """PositionLoad originates only for a dense leaf below sparse structure."""
+
+    kernel = compile_cin_via_loopir(
+        build_rank1_copy_cin(),
+        (4,),
+        (((4,), torch.float32),),
+        compile_options=auto_options(False),
+    )
+    assert '"kind":"cursor_value"' in kernel.program_dump
+    assert '"kind":"position_load"' not in kernel.program_dump
+
+
 def test_compile_is_deterministic_per_arm():
     for arm in (False, True):
         first = compile_cin_via_loopir(
@@ -625,6 +640,69 @@ def test_forged_spine_coordinate_fails_closed_at_the_verifier():
             compilation_context=CompilationContext(options),
         )
     assert error.value.defect.code == "domain_mismatch"
+
+
+@pytest.mark.parametrize("callback", ["iter", "getitem"])
+def test_input_shape_mapping_cannot_mutate_position_load_after_verification(
+    callback,
+):
+    """Caller mapping callbacks run before the target trusts the program."""
+
+    from scorch.compiler.loopir.verifier import LoopIRVerificationError
+
+    program, sym_a, _ = build_mixed_copy_program()
+    load = program.body.statements[0].body.statements[0].body.statements[0].value
+
+    class MutatingShapes(dict):
+        def __iter__(self):
+            if callback == "iter":
+                object.__setattr__(load, "tensor", [])
+            return super().__iter__()
+
+        def __getitem__(self, key):
+            if callback == "getitem":
+                object.__setattr__(load, "tensor", [])
+            return super().__getitem__(key)
+
+    options = CompileOptions.from_environment(environ={})
+    with pytest.raises(LoopIRVerificationError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes=MutatingShapes({sym_a: (4, 5)}),
+            result_shape=(4, 5),
+            compile_options=options,
+            compilation_context=CompilationContext(options),
+        )
+    assert error.value.defect.code == "invalid_symbol_id"
+
+
+def test_malformed_position_load_fails_before_input_shape_mapping_callbacks():
+    """The initial verifier remains cheaper than a caller-controlled mapping."""
+
+    from scorch.compiler.loopir.verifier import LoopIRVerificationError
+
+    program, sym_a, _ = build_mixed_copy_program()
+    load = program.body.statements[0].body.statements[0].body.statements[0].value
+    object.__setattr__(load, "tensor", [])
+    called = False
+
+    class HostileShapes(dict):
+        def __iter__(self):
+            nonlocal called
+            called = True
+            raise RuntimeError("shape mapping must not run")
+
+    options = CompileOptions.from_environment(environ={})
+    with pytest.raises(LoopIRVerificationError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes=HostileShapes({sym_a: (4, 5)}),
+            result_shape=(4, 5),
+            compile_options=options,
+            compilation_context=CompilationContext(options),
+        )
+    assert error.value.defect.code == "invalid_symbol_id"
+    assert not called
 
 
 def build_hierarchical_mixed_program():

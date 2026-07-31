@@ -565,6 +565,109 @@ def test_unbound_merge_positions_fail_closed():
     assert context._failed_stage_id is CompilerStageId.LOOPIR_TO_LLIR_LOWERING
 
 
+# -- target-owned checked output mutations ---------------------------------
+
+
+def _compile_b3_target(fmt="ss"):
+    shape = _SHAPES[fmt]
+    return compile_cin_via_loopir(
+        build_intersection_cin(fmt),
+        shape,
+        ((shape, torch.float32), (shape, torch.float32)),
+        compile_options=auto_options(False),
+    )
+
+
+def _b3_output_mutation_census(value):
+    """Return unchecked output assignments and direct safe mutation names."""
+
+    from scorch.compiler import llir
+
+    unchecked = []
+    direct_calls = []
+    pending = [value]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (llir.Node, list, tuple)):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+        if type(current) is llir.Assign:
+            target = current.var
+            if (
+                type(target) is llir.ArrayAccess
+                and type(target.array) is llir.Var
+                and (
+                    target.array.name == "C_values"
+                    or (
+                        target.array.name.startswith("C")
+                        and target.array.name.endswith(("_pos", "_crd"))
+                    )
+                )
+            ):
+                unchecked.append(current)
+        if type(current) is llir.FunctionCallStmt:
+            if current.name == "scorch_vector_set" or current.name.startswith("C"):
+                direct_calls.append(current.name)
+        if isinstance(current, llir.Node):
+            pending.extend(vars(current).values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+    return unchecked, direct_calls
+
+
+def test_b3_enters_dynamic_vector_pass_with_only_checked_output_mutations(
+    monkeypatch,
+):
+    """The complete rank-four target is safe before the generic rewrite."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    censuses = []
+
+    def capture(value, context):
+        censuses.append(_b3_output_mutation_census(value))
+        return original(value, context)
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        capture,
+    )
+    _compile_b3_target("ssss")
+    assert len(censuses) == 1
+    unchecked, calls = censuses[0]
+    assert unchecked == []
+    assert calls.count("C_values.emplace_back") == 1
+    assert calls.count("C3_crd.emplace_back") == 1
+    assert calls.count("scorch_vector_set") == 8
+
+
+def test_b3_dynamic_vector_pass_still_runs_but_is_byte_neutral(monkeypatch):
+    """Omitting the now-redundant rewrite leaves byte-exact safe output."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    baseline = _compile_b3_target("ssss")
+    calls = []
+
+    def omit(value, context):
+        calls.append((value, context))
+        return value
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        omit,
+    )
+    omitted = _compile_b3_target("ssss")
+    assert len(calls) == 1
+    assert omitted.cpp_source == baseline.cpp_source
+
+
 # -- adjacent seams stay fail-closed -----------------------------------------
 
 
