@@ -185,8 +185,6 @@ _LEVEL_TYPE_TO_KIND: Dict[LevelType, LevelKind] = {
 
 def _check_tensor(
     tensor: TensorVar,
-    *,
-    result: bool = False,
 ) -> Tuple[ScalarType, Tuple[LevelType, ...], Tuple[int, ...]]:
     if isinstance(tensor, cin_nodes.Workspace):
         _fail(
@@ -206,21 +204,10 @@ def _check_tensor(
             f"tensor {tensor.name!r} declares a level type outside the "
             "migrated DENSE/COMPRESSED families",
         )
-    if (
-        any(level_type is LevelType.COMPRESSED for level_type in level_types)
-        and level_types[-1] is not LevelType.COMPRESSED
-        and not result
-    ):
-        # Mixed dense-leaf RESULTS are the level-based B2 assembly family
-        # (classified structurally below); mixed dense-leaf INPUTS would
-        # need physical position loads, which stay undeclared in this
-        # subset — the ``sd``-operand load chain is a distinct gap.
-        _fail(
-            "unsupported_format",
-            f"tensor {tensor.name!r} stores a dense value-bearing leaf below "
-            "compressed structure; physical position loads are not declared "
-            "in this subset",
-        )
+    # Mixed dense-leaf RESULTS are the level-based B2 assembly family
+    # (classified structurally below); mixed dense-leaf INPUTS lower to
+    # declared physical position loads, so a dense value-bearing leaf
+    # below compressed structure is admitted in both roles.
     mode_order = tensor.mode_order
     rank = len(level_types)
     if mode_order is None:
@@ -417,17 +404,8 @@ def lower_normalized_cin_to_loopir(
             )
         reduce_update = True
 
-    # The result-only mixed dense-leaf admission never applies to a symbol
-    # that is also read: a right-hand-side occurrence is an operand role.
-    result_is_read = any(
-        access.tensor.symbol_id == result_symbol for access in rhs_accesses
-    )
     checked_tensors = {
-        access.tensor.symbol_id: _check_tensor(
-            access.tensor,
-            result=(access.tensor.symbol_id == result_symbol and not result_is_read),
-        )
-        for access in all_accesses
+        access.tensor.symbol_id: _check_tensor(access.tensor) for access in all_accesses
     }
     scalar_types = {
         symbol: scalar for symbol, (scalar, _, _) in checked_tensors.items()
@@ -855,6 +833,12 @@ def _lower_sparse_family(
                     tuple(builder.index_value(index_id) for index_id in expr.index_ids),
                 )
             leaf_level = len(level_types[symbol]) - 1
+            if level_types[symbol][leaf_level] is LevelType.DENSE:
+                # A dense value-bearing leaf below compressed structure is
+                # read at its physical leaf position; ``position_expr``
+                # grounds the dense spine at the single-cursor bound
+                # position and fails closed on merged sparse structure.
+                return builder.position_load(symbol, position_expr(symbol, leaf_level))
             cursor = cursor_ids.get((symbol, leaf_level))
             if cursor is None:
                 _fail(

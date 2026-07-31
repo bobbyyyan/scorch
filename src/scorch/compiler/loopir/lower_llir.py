@@ -147,6 +147,7 @@ from .nodes import (
     ParallelSelection,
     ParallelWork,
     PositionId,
+    PositionLoad,
     PositionValue,
     ReduceOp,
     RelayoutDecl,
@@ -539,15 +540,15 @@ class _TargetLowering:
                 for level, level_decl in enumerate(decl.levels)
                 if level_decl.kind is LevelKind.COMPRESSED
             ]
-            if not compressed:
-                continue
-            leaf = len(decl.levels) - 1
-            if compressed != [leaf]:
+            if len(compressed) > 1:
+                # One compressed level descends by a single bound cursor:
+                # at the leaf it owns the value read, above the leaf the
+                # dense sub-tree loads through its physical position.
                 _fail(
                     "unsupported_program_shape",
-                    f"input {decl.name!r} declares compressed structure "
-                    "outside the value-bearing leaf level; hierarchical "
-                    "compressed descent is outside the migrated families",
+                    f"input {decl.name!r} declares hierarchical compressed "
+                    "structure; hierarchical compressed descent is outside "
+                    "the migrated families",
                 )
 
     def _validate_shapes(
@@ -795,11 +796,14 @@ class _TargetLowering:
             )
 
     def _validate_loop_kinds(self, loops: List[_Loop], leaf: Stmt) -> None:
-        if loops[0].kind not in (_DENSE, _TILE_OUTER, _PANEL_OUTER):
+        if loops[0].kind not in (_DENSE, _TILE_OUTER, _PANEL_OUTER, _SPARSE):
+            # A single-cursor sparse outermost loop is the mixed dense-leaf
+            # operand chain's root-parent row loop; merged outermost
+            # iteration stays outside the migrated families.
             _fail(
                 "unsupported_program_shape",
-                "the migrated families require a dense, tile-origin, or "
-                "panel-origin outermost loop",
+                "the migrated families require a dense, sparse, tile-origin, "
+                "or panel-origin outermost loop",
             )
         if type(leaf) is StoreReduce and any(
             level.kind is not LevelKind.DENSE for level in self.result_decl.levels
@@ -870,11 +874,15 @@ class _TargetLowering:
             )
         for loop in loops:
             for cursor in loop.cursors:
-                if cursor.level < 1:
+                if cursor.level < 1 and loop.kind is not _SPARSE:
+                    # A single-cursor loop descends a root-parent level-0
+                    # segment exactly like a dense-parent one (the mixed
+                    # dense-leaf operand chain's row loop); merged or
+                    # windowed level-0 iteration stays fail-closed.
                     _fail(
                         "unsupported_program_shape",
                         "level-0 (root-parent) cursors are outside the "
-                        "migrated families",
+                        "migrated merged and windowed families",
                     )
 
     def _collect_region_chains(
@@ -1670,10 +1678,15 @@ class _TargetLowering:
     def _collect_accesses(self) -> Tuple[List[Load], List[CursorValue]]:
         loads: List[Load] = []
         cursor_values: List[CursorValue] = []
+        position_loads: List[PositionLoad] = []
+        self.position_loads = position_loads
 
         def walk(expr: Expr) -> None:
             if type(expr) is Load:
                 loads.append(expr)
+                return
+            if type(expr) is PositionLoad:
+                position_loads.append(expr)
                 return
             if type(expr) is StagedRead:
                 # The staged read's direct-Load view participates in the
@@ -1725,6 +1738,16 @@ class _TargetLowering:
                     "position chain per input",
                 )
             seen.add(load.tensor)
+        for position_load in position_loads:
+            if position_load.tensor in seen:
+                _fail(
+                    "unsupported_repeated_operand",
+                    f"input tensor "
+                    f"{self.decls[position_load.tensor].name!r} is loaded "
+                    "more than once; this target owns one physical "
+                    "position chain per input",
+                )
+            seen.add(position_load.tensor)
         for cursor_value in cursor_values:
             loop_position = self.cursor_loops.get(cursor_value.cursor)
             if loop_position is None:
@@ -1749,6 +1772,19 @@ class _TargetLowering:
             if decl.cursor == cursor:
                 return decl
         raise AssertionError("unreachable")
+
+    def _bound_position_owner(
+        self, position: PositionId
+    ) -> Optional[Tuple[SymbolId, int]]:
+        """The (tensor, level) whose single-cursor loop binds one position."""
+
+        for loop in self.loops:
+            if loop.kind not in (_SPARSE, _SPARSE_WINDOW):
+                continue
+            if loop.node.position == position:
+                cursor = loop.cursors[0]
+                return (cursor.tensor, cursor.level)
+        return None
 
     def _compute_level_drivers(self) -> Dict[SymbolId, Dict[int, object]]:
         """Map every tensor's physical level to the loop index driving it."""
@@ -1811,6 +1847,48 @@ class _TargetLowering:
                     "root in the migrated families",
                 )
 
+        def record_position_load(load: PositionLoad) -> None:
+            """One dense spine descending the loaded tensor's own levels.
+
+            The spine walks from the value-bearing leaf upward through
+            contiguous DENSE levels and must ground at the bound position of
+            this tensor's own single-cursor sparse loop; every spine level's
+            coordinate drives that physical level exactly like a coordinate
+            load's logical index does.
+            """
+
+            decl = self.decls[load.tensor]
+            level = len(decl.levels) - 1
+            expr: Expr = load.position
+            while type(expr) is DensePosition:
+                dense = cast(DensePosition, expr)
+                if dense.tensor != load.tensor or dense.level != level:
+                    _fail(
+                        "unsupported_program_shape",
+                        f"the position load of {decl.name!r} must descend "
+                        "its own tensor's levels in storage order",
+                    )
+                coord = self._index_of(
+                    dense.coord,
+                    f"the level-{level} position coordinate of {decl.name!r}",
+                )
+                record(load.tensor, level, coord, "a position-load spine")
+                expr = dense.parent
+                level -= 1
+            if type(expr) is not PositionValue:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the position load of {decl.name!r} must ground at a "
+                    "bound cursor position",
+                )
+            owner = self._bound_position_owner(cast(PositionValue, expr).position)
+            if owner != (load.tensor, level):
+                _fail(
+                    "unsupported_program_shape",
+                    f"the position load of {decl.name!r} must ground at the "
+                    f"bound position of its own level-{level} cursor",
+                )
+
         for load in self.loads:
             # Load indices are logical mode order by contract; level
             # ``level`` is driven by the logical coordinate it stores.
@@ -1819,6 +1897,8 @@ class _TargetLowering:
                 index = load.indices[level_decl.mode]
                 bound = self._index_of(index, f"access of {decl.name!r}")
                 record(load.tensor, level, bound, "a coordinate load")
+        for position_load in self.position_loads:
+            record_position_load(position_load)
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
                 record(cursor.tensor, cursor.level, loop.index, "a sparse loop")
@@ -2163,6 +2243,23 @@ class _TargetLowering:
                 index=llir.Var(name=physical_index, type=llir.DataType.INT),
                 tensor_access=self._input_metadata(expr.tensor),
             )
+        if type(expr) is PositionLoad:
+            # The value-bearing leaf position variable is the resolved end
+            # of the load's validated dense spine (``p{name}{leaf}``), or
+            # the cursor position itself when the spine is empty.
+            decl = self.decls[expr.tensor]
+            torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
+            return llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{decl.name}_val",
+                    type=llir.DataType.ptr_type(torch_dtype),
+                ),
+                index=llir.Var(
+                    name=f"p{decl.name}{len(decl.levels) - 1}",
+                    type=llir.DataType.INT,
+                ),
+                tensor_access=self._input_metadata(expr.tensor),
+            )
         if type(expr) is CursorValue:
             cursor = self._cursor_decl(expr.cursor)
             loop = self.loops[self.cursor_loops[expr.cursor]]
@@ -2403,6 +2500,21 @@ class _TargetLowering:
         name = self.decls[cursor.tensor].name
         return llir.Var(name=f"p{name}{cursor.level - 1}", type=llir.DataType.INT)
 
+    def _cursor_parent_index(self, cursor: SparseCursorDecl, offset: int) -> llir.Expr:
+        """The pos-array subscript at one cursor's parent position.
+
+        A level-0 cursor is dominated by the physical root position, which
+        the legacy lowering folds to the exact integer subscript (``pos[0]``
+        and ``pos[1]``); deeper levels keep the parent position variable.
+        """
+
+        if cursor.level == 0:
+            return llir.Literal(offset, llir.DataType.INT)
+        parent = self._cursor_parent_var(cursor)
+        if offset == 0:
+            return parent
+        return llir.Add(left=parent, right=llir.Literal(offset, llir.DataType.INT))
+
     def _iterator_inits(self, loop: _Loop) -> List[llir.Stmt]:
         """The legacy ``Initialize iterators`` group for one sparse loop."""
 
@@ -2416,10 +2528,7 @@ class _TargetLowering:
                 ),
                 value=llir.ArrayAccess(
                     array=self._cursor_pos_array(cursor),
-                    index=llir.Add(
-                        left=self._cursor_parent_var(cursor),
-                        right=llir.Literal(1, llir.DataType.INT),
-                    ),
+                    index=self._cursor_parent_index(cursor, 1),
                 ),
             )
             if loop.kind is _SPARSE_WINDOW:
@@ -2773,7 +2882,7 @@ class _TargetLowering:
                 var=llir.Var(name=position_name, type=llir.DataType.INT),
                 value=llir.ArrayAccess(
                     array=self._cursor_pos_array(cursor),
-                    index=self._cursor_parent_var(cursor),
+                    index=self._cursor_parent_index(cursor, 0),
                 ),
             ),
             cond=llir.BinOp(
@@ -3152,12 +3261,19 @@ class _TargetLowering:
         while self.loops[first_position].kind is _PANEL_OUTER:
             first_position += 1
         first = self.loops[first_position]
-        outer_loop = (
-            self._lower_tile_outer(first_position)
-            if first.kind is _TILE_OUTER
-            else self._lower_dense(first_position)
-        )
-        stmts: List[llir.Stmt] = [llir.BlankLine(), outer_loop]
+        stmts: List[llir.Stmt]
+        if first.kind is _SPARSE:
+            # The root-parent row loop of the mixed dense-leaf operand
+            # chain: iterator initialization replaces the pre-loop blank
+            # line at function scope, exactly the legacy outer-sparse shape.
+            stmts = list(self._lower_sparse(first_position))
+        else:
+            outer_loop = (
+                self._lower_tile_outer(first_position)
+                if first.kind is _TILE_OUTER
+                else self._lower_dense(first_position)
+            )
+            stmts = [llir.BlankLine(), outer_loop]
         if self.panel is not None or self.result_tile is not None:
             return stmts
         if self.parallel is not None:
