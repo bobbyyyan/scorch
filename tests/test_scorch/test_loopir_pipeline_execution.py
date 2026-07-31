@@ -868,7 +868,7 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             None,
         ),
         (
-            "mixed_level_operand_load_chain",
+            "mixed_level_merged_operand_chain",
             ("sd", "ij", (("dd", "ij"),), "ij"),
             None,
         ),
@@ -879,17 +879,19 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
 ):
     """The sparse-result/workspace boundary is exact in both policy arms.
 
-    The B2 mixed dense-leaf assembly family now compiles (its battery is
-    ``test_loopir_sparse_workspace_target.py``), but its two adjacent seams
+    The B2 mixed dense-leaf assembly family compiles (its battery is
+    ``test_loopir_sparse_workspace_target.py``), and the mixed dense-leaf
+    OPERAND chain now lowers through declared physical position loads (its
+    battery is ``test_loopir_mixed_operand_target.py``); the adjacent seams
     stay fail-closed at precise codes: reducing into a compressed-parent/
     dense-leaf result carries the dense-workspace F2/F4 plan whose mixed
-    twin is not migrated (``unsupported_sparse_output_reduction``), and a
-    mixed dense-leaf OPERAND needs the undeclared physical position-load
-    chain (``unsupported_format``).  True sparse ``coo_workspace``
-    families — row-scope SpMSpM, reduction-to-CSR, merged sparse
-    reductions, and sparse-output roots — fail closed at their own stable
-    codes, including the early ``unsupported_sparse_output`` boundary this
-    census audits explicitly.
+    twin is not migrated (``unsupported_sparse_output_reduction``), and
+    merging two mixed dense-leaf operands needs a bound position no merged
+    loop provides (``unsupported_sparse_hierarchy``).  True sparse
+    ``coo_workspace`` families — row-scope SpMSpM, reduction-to-CSR, merged
+    sparse reductions, and sparse-output roots — fail closed at their own
+    stable codes, including the early ``unsupported_sparse_output``
+    boundary this census audits explicitly.
     """
 
     from scorch.compiler.scheduler import Schedule
@@ -911,14 +913,24 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         bindings = (((6, 4, 5), torch.float32),)
         out_shape = (6, 5)
         expected = "unsupported_sparse_output_reduction"
-    elif family == "mixed_level_operand_load_chain":
+    elif family == "mixed_level_merged_operand_chain":
         i, j = IndexVar("i"), IndexVar("j")
         result = TensorVar("C", fmt="dd")
         source = TensorVar("A", fmt="sd")
-        cin = ForAll(i, ForAll(j, TensorAssign(result[i, j], source[i, j])))
-        bindings = (((4, 5), torch.float32),)
+        second = TensorVar("B", fmt="sd")
+        cin = ForAll(
+            i,
+            ForAll(
+                j,
+                TensorAssign(
+                    result[i, j],
+                    CINBinaryOp(Operation.MUL, source[i, j], second[i, j]),
+                ),
+            ),
+        )
+        bindings = (((4, 5), torch.float32), ((4, 5), torch.float32))
         out_shape = (4, 5)
-        expected = "unsupported_format"
+        expected = "unsupported_sparse_hierarchy"
     elif family in ("dense_domain_to_csr", "sparse_row_to_csr"):
         i, j = IndexVar("i"), IndexVar("j")
         result = TensorVar("C", fmt="ds")

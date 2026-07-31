@@ -274,12 +274,39 @@ def test_unsupported_format():
     expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
 
 
-def test_unsupported_format_dense_leaf_below_compressed():
+def test_dense_leaf_below_compressed_operand_lowers_to_position_load():
+    """The mixed dense-leaf operand chain lowers through a physical load.
+
+    The dense value-bearing leaf below compressed structure reads at its
+    leaf position: a dense-position spine grounded at the single-cursor
+    bound row position, never a coordinate load or a cursor value.
+    """
+
+    from scorch.compiler.loopir.nodes import (
+        DensePosition,
+        PositionLoad,
+        PositionValue,
+        SparseFor,
+    )
+
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="sd")
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
+    result = lower_normalized_cin_to_loopir(normalize_cin(ForAll(i, ForAll(j, assign))))
+    outer = result.program.body.statements[0]
+    assert type(outer) is SparseFor
+    assert outer.cursor.level == 0
+    inner = outer.body.statements[0]
+    leaf = inner.body.statements[0]
+    load = leaf.value
+    assert type(load) is PositionLoad
+    assert load.tensor == outer.cursor.tensor
+    spine = load.position
+    assert type(spine) is DensePosition
+    assert spine.level == 1
+    assert type(spine.parent) is PositionValue
+    assert spine.parent.position == outer.position
 
 
 def test_mode_order_boundaries():
