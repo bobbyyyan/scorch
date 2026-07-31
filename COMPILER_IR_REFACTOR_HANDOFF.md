@@ -28915,3 +28915,217 @@ explicit paths and give nontrivial commits descriptive bodies.
 Record exact commands, revisions, hashes, limitations, and evidence
 outside Git.  Verify the five protected hashes before every commit,
 touch no unrelated work, and push nothing.
+
+## Phase-7 broad-milestone review corrections (2026-07-30; supersedes the §37 prompt)
+
+Independent review found and fixed two concrete defects in the inherited
+ten-commit milestone from ``cb7e84a`` through ``f7de688``:
+
+- ``370425d`` makes every B3 result-vector mutation safe before the
+  generic dynamic-vector pass and closes target/oracle caller-Mapping
+  mutation windows with owned snapshots and post-callback verification;
+- ``a06ea1a`` adds the rank-four checked-mutation census, proves the
+  dynamic pass is byte-neutral for B3, locks ``__iter__`` and
+  ``__getitem__`` attacks, and corrects the rank-1 compressed-leaf
+  representation record.
+
+The review also corrected the inherited evidence report: its affected
+sweep was 616/619, its full suite was incomplete, its latency harness
+did not activate a new family, its ledger had no manifest, and its
+commit inventory omitted the final two admitted-family lock commits.
+Review §38 is definitive.
+
+Exact-tip gates at ``a06ea1a`` are green: 904 broad memberships; B3
+44/44; 32-cell deterministic census with zero divergence; seed-13/150
+random census with zero mismatch; 46/40/0 retained audit; all five
+capture surfaces byte-identical (20 corpus, 42 grid, 23 auto, 22
+anchors, 11 heap); activating B3 A/B/A latency worst 1.04651 against
+the 1.10 target with exact source hashes; unchanged static baselines;
+and a clean-detached collection of 4,873 nodes, with 3 performance
+deselected and a fresh-process union over all 4,870 selected nodes at
+**4,856 passed / 14 skipped / 0 failures**.  The partition outputs were
+observed but not durably retained, so a later audit that requires raw
+receipts must rerun that gate.  Nothing was pushed, origin remains
+``58e8565``, protected hashes are unchanged, and unrelated material is
+untouched.
+
+### Broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in ``/Users/bobby/scorch`` on branch
+``refactor/compiler-ir-phase3-std-move-call`` from the actual local tip
+reported by ``git log``.  Origin remains ``58e8565`` and this stack is
+local-only: do not push, amend, squash, or reorder it.  Read
+``AGENTS.md``, ``COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` §§37-38, and
+this superseding handoff.  Preserve the five protected tracked files
+at their recorded hashes and leave every unrelated GPU/CUDA,
+benchmark, scheduler, research, scratchpad, packaging, and untracked
+path untouched; stage only explicit paths and give nontrivial commits
+descriptive bodies.
+
+First independently review ``370425d`` and ``a06ea1a`` rather than
+trusting the handoff.  Reproduce the rank-four B3 pre-pass mutation
+census, the no-op dynamic-pass byte identity, both Mapping callback
+attacks and deep oracle-input ownership, exact B3 source parity, and
+the activating latency gate.  Add fresh adversarial probes and commit
+any concrete correction before extending the representation.
+
+Then deliver one broad ordered-sparse-assembly milestone covering both
+of these related families:
+
+1. single-cursor multi-compressed output streams, including
+   ``ss * dd -> ss`` and production-reachable ``dss -> dss``
+   copy/elementwise forms; and
+2. rank-2-and-higher UNION assembly, including ordered one-sided tails
+   rather than only the existing all-cursors-aligned INTERSECTION path.
+
+Census real callers and seam codes first.  Factor a shared
+level-based parent-close/coordinate-append abstraction only where the
+two families genuinely share ownership; do not introduce a CSR-only
+shortcut, rendered-name discovery, or runtime-format special case.
+Cover ranks 2-4, dense-prefix and all-compressed layouts, empty
+intermediate parents, disjoint and overlapping support, one-sided
+exhaustion, explicit zeros and cancellation, f32/f64, commuted
+operands, both automatic arms, canonical/erasure behavior, oracle and
+PyTorch differentials, and byte parity only where the legacy comparand
+is sound.  Keep nonidentity compressed mode orders, unsupported n-ary
+forms, TTM/reduction neighbors, and every unimplemented layout at
+stable fail-closed codes.
+
+If both primary families and their full gates are complete, use the
+remaining session as a stretch to implement public
+``to_sparse("sd")``/``to_sparse("sdd")`` dense-suffix block
+materialization so mixed-load runtime tests no longer need hand-built
+``TensorIndex`` values.  Do not trade away the primary assembly
+battery to start the stretch.
+
+Finish with deterministic and randomized censuses, the 86-case audit,
+all five capture surfaces, repeated public compiled differentials,
+target-activating A/B/A latency, Black/Flake8/mypy parity,
+``git diff --check``, and an exact-tip clean-detached full
+non-performance suite using a proven fresh-process union if libomp
+exhausts.  Update review and handoff documents with exact revisions,
+commands, counts, hashes, limitations, and evidence.  Re-run the
+Phase-7 checkpoint audit.  Do not start release cutover, legacy
+deletion, Phase 8, or Phase 8.5.
+
+## Historical Phase-7 broad milestone report: mixed loads, B3 assembly, sound row-scope (2026-07-30; superseded by the review corrections above)
+
+Ten inherited local commits stack on `94da378` (review §§37–38 are
+definitive):
+
+- `cb7e84a` — six fresh hostile completion probes (enum name/attribute
+  state, cross-compile cache retention, actual-vs-reference ownership,
+  role-singleton swap, frozen pass-policy mutation); the inherited
+  correction range reproduced with no concrete defect;
+- `3e6e5ea` — the reviewed spike `PositionLoad` ported to production
+  (verifier/oracle/printer/build; canonical v9→v10 by the node-kind
+  precedent; request/loopplan/autopolicy identities untouched);
+- `9e3ce04` / `f172742` — the mixed dense-leaf operand-load slice:
+  `sd`/`sdd`/`dsd` inputs lower through declared position loads at byte
+  parity to legacy in both arms (copy, MUL both orders,
+  SpMV, reduction, rank-3, the arm-divergent `sd@dd` matmul); 54-test
+  battery; rank-1 `s` remains the compressed-leaf `CursorValue` control;
+  merged/united/hierarchical/permuted neighbors locked;
+- `2fedaf4` / `a5b1a56` — the B3 multi-compressed intersection-assembly
+  family: production-einsum `ss`/`sss`/`dss`/`ssss` MUL intersections at
+  byte parity in both arms with the conditional-parent-append cascade;
+  42-test battery; union/single-cursor/TTM/two-prefix/n-ary neighbors
+  locked; base generalizations byte-neutral for existing families;
+- `7d2475a` / `f58643a` — the sound `ss@ss->ds` row-scope route:
+  `C1_pos` sized/closed from the logical row extent with per-row and
+  final positional catch-ups (always `C0_size + 1` positions, empty
+  rows preserved); never byte-matches the defective legacy comparand;
+  13-test no-parity battery; unsized-values generic route quarantined.
+- `410280a` / `f7de688` — update the admitted-family census and the
+  remaining row-scope rejection locks.
+
+Post-milestone gates: memberships **899**; deterministic census **32
+cells, zero divergence** (census_v6); randomized sweeps seeds
+1/2/7/11/13 × 150 with mixed formats, **zero mismatches**; the 86-case
+audit unchanged at **46/40/0**; corpus/grid/auto/anchor/heap captures
+**byte-identical** to the sealed `ebb243b` baselines; sixteen
+activating captures sealed with per-arm digests; full-source mypy at
+the inherited **140 errors in 11 files**; Black/Flake8/whitespace
+clean.  Affected compiled batteries: the combined seven-battery
+affected sweep at the pre-flip tip passed **616/619**, surfacing exactly
+the three stale rejection locks the newly admitted families had
+outmoded (the B2 census's operand probe, the SpGEMM battery's row-scope
+seam probe, and the pipeline census's row-scope cell); all three were
+flipped to the admitted dispositions (`410280a`, `f7de688`) and pass,
+and every dedicated battery is individually green (54 mixed-operand,
+42 multi-compressed, 13 row-scope, 165 inherited sparse/parallel).
+Paired activating latency: within-run LoopIR-vs-legacy ratios are
+**1.079-1.093** across p50/mean/p95 in every candidate position (base
+1.080-1.089), inside the 1.10 gate, and the clean alternating pair gives
+candidate-vs-base LoopIR ratios of **0.993-0.999**.  One middle pair was
+disturbed by an unrelated application at 400% CPU; its 1.40-2.09 A/A
+absolute drift band is recorded and the pair is superseded by the clean
+controls, whose within-run normalization the drift never touched.
+Exact-tip clean-detached full
+non-performance suite was incomplete; review §38 records the
+authoritative exact-tip fresh-process union.
+
+Evidence from the inherited attempt is retained under
+`~/.cache/scorch-codex/phase7-mixed-load-session/` (review
+reproduction, censuses v4-v6, randomized sweeps, audit, captures,
+activating digests, latency, and partial full-suite receipts).  That
+directory has no manifest; §38 records which receipts were independently
+usable and supersedes the incomplete affected/full-suite and latency
+claims above.  Origin remains `58e8565`; nothing was pushed; the five
+protected files retain their recorded hashes; all
+unrelated GPU/CUDA, benchmark, scheduler, research, scratchpad, and
+packaging work remains untouched.  The Phase-7 checkpoint is **GO** for
+this broad milestone; no release dispatch/cache/selector cutover,
+legacy deletion, Phase 8, or Phase 8.5 was started.
+
+### Historical copy-paste prompt (superseded; do not use)
+
+Continue the compiler LoopIR migration in `/Users/bobby/scorch` on
+branch `refactor/compiler-ir-phase3-std-move-call` from the local tip
+recorded by `git log` (origin remains `58e8565`; this stack is local
+and must not be pushed).  Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §37, and this superseding
+handoff.  Preserve all unrelated work, stage only explicit paths, give
+nontrivial commits descriptive bodies, and do not amend/squash/reorder
+or push existing commits.
+
+1. Independently review the full `94da378..<tip>` range before
+   extending Phase 7: reproduce the PositionLoad boundaries (verifier
+   defect paths, oracle leaf-value semantics, canonical v10), mixed-load
+   and B3 byte parity in both arms, the B3 empty-intermediate-parent
+   cascade, the row-scope sound sizing (empty-row preservation, the
+   never-byte-matches-legacy disposition), and the row-scope completion
+   ownership.  Add fresh hostile probes; fix and commit any concrete
+   defect first.
+2. Then select the next smallest target-neutral Phase-7 family from the
+   recorded neighbors — the strongest candidates are the single-cursor
+   multi-compressed assembly stream (`ss*dd->ss`, `dss->dss` copies;
+   seam `unsupported_sparse_output`), the united-stream rank-2+ union
+   assembly, and the `to_sparse("sd")` runtime conversion gap — census
+   production callers first and record seam/envelope/oracle rules
+   before implementing.
+3. Regenerate the deterministic and randomized censuses after each
+   admission; keep every non-admitted neighbor at its exact seam.
+4. Required gates as in this milestone: focused batteries, memberships,
+   censuses, the 86-case audit, capture byte-stability, repeated public
+   differentials, paired activating latency with A/A and order
+   controls, Black/Flake8/mypy parity, `git diff --check`, and the
+   exact-tip clean-detached full non-performance suite with the
+   fresh-process union discipline if libomp exhausts.
+5. Do not perform release dispatch/cache/selector cutover, legacy
+   deletion, Phase 8, or Phase 8.5.
+
+Record exact commands, revisions, hashes, limitations, and evidence
+outside Git.  Verify the five protected hashes before every commit,
+touch no unrelated work, and push nothing.
+
+## Final superseding pointer (2026-07-30)
+
+The authoritative review result and continuation prompt are in
+**Phase-7 broad-milestone review corrections** above.  That section,
+review §38, and commits ``370425d`` / ``a06ea1a`` supersede the
+inherited §37 prompt immediately above.  The next primary milestone is
+the combined single-cursor multi-compressed plus rank-2-and-higher UNION
+ordered-assembly family, with public ``to_sparse("sd")``/``"sdd"``
+dense-suffix materialization only as the post-gate stretch.  No cutover,
+legacy deletion, Phase 8, or Phase 8.5 is authorized.
