@@ -1498,13 +1498,14 @@ def _expect_lowering_code(code, cin, bindings, result_shape=(4, 5), *, auto=True
 def test_adjacent_seams_stay_fail_closed():
     i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
 
-    # The ss@ss->ds row-scope family stays at its stable seam until its
-    # own verified slice exists.
+    # The ss@ss->ds row-scope family left this fail-closed census when its
+    # sound verified slice landed (test_loopir_rowscope_workspace_target.py):
+    # the typed route sizes C1_pos from the logical row extent and never
+    # byte-matches the defective legacy comparand retained above.
     a = TensorVar("A", fmt="ss")
     b = TensorVar("B", fmt="ss")
     c = TensorVar("C", fmt="ds")
-    _expect_lowering_code(
-        "unsupported_sparse_output_reduction",
+    rowscope_admitted = compile_cin_via_loopir(
         ForAll(
             i,
             ForAll(
@@ -1519,7 +1520,12 @@ def test_adjacent_seams_stay_fail_closed():
                 ),
             ),
         ),
+        (4, 5),
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    assert (
+        "for (; C1_pos_index < C0_size; C1_pos_index++)" in rowscope_admitted.cpp_source
     )
 
     # A dense reduction domain keeps the old seam code.  The automatic

@@ -823,11 +823,10 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
 @pytest.mark.parametrize(
     ("family", "spec", "expected"),
     [
-        (
-            "spmspm_row_scope",
-            ("ds", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
-            "unsupported_sparse_output_reduction",
-        ),
+        # The ss@ss->ds row-scope cell left this fail-closed census when
+        # its sound typed slice landed; its no-parity admission, sizing
+        # discipline, and execution differentials live in
+        # test_loopir_rowscope_workspace_target.py.
         # The ds@ds->ds SpGEMM cell left this fail-closed census when the
         # Phase-7 parallel sparse-workspace target migrated it; its
         # admission, byte parity, and execution differentials live in
