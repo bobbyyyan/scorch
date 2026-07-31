@@ -1211,6 +1211,121 @@ def test_two_phase_pass_context_cannot_mutate_program_result_identity(monkeypatc
     assert error.value.defect.code == "sparse_workspace_completion_lost"
 
 
+def test_completion_actual_shares_nothing_with_reference(monkeypatch):
+    """The compared trees own disjoint aggregates, so the match is not vacuous.
+
+    If the reconstructed reference ever shared a mutable node, list, tuple,
+    identity, or metadata aggregate with the pass-returned function, a
+    hostile in-place edit could change both sides together and the exact
+    comparison would accept it.  Capture both sides at the real completion
+    boundary of an activating compile and prove the owner sets are disjoint.
+    """
+
+    from scorch.compiler.loopir import lower_llir as target
+    from tests.test_scorch.test_loopir_sparse_workspace_target import (
+        _reachable_completion_owner_ids,
+    )
+
+    captured = []
+    original_matches = target._exact_sparse_completion_matches
+
+    def capture_both(actual, expected):
+        captured.append(
+            (
+                _reachable_completion_owner_ids(actual),
+                _reachable_completion_owner_ids(expected),
+            )
+        )
+        return original_matches(actual, expected)
+
+    monkeypatch.setattr(
+        target,
+        "_exact_sparse_completion_matches",
+        capture_both,
+    )
+    compile_cin_via_loopir(
+        build_spgemm_cin(),
+        (4, 5),
+        (((4, 6), torch.float32), ((6, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    assert captured
+    for actual_ids, expected_ids in captured:
+        assert actual_ids and expected_ids
+        assert not (actual_ids & expected_ids)
+
+
+def test_pass_cannot_swap_metadata_role_singleton(monkeypatch):
+    """Swapping a metadata role to the other valid singleton fails closed.
+
+    Both role singletons carry valid import-time state, so this attack is
+    invisible to enum-state pinning; only the exact actual-versus-expected
+    role comparison can reject it.
+    """
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    state = {"mutated": False}
+
+    def hostile_final_pass(value, context):
+        rewritten = original(value, context)
+        if state["mutated"] or type(rewritten) is not list:
+            return rewritten
+        metadata = _first_tensor_access_metadata(rewritten)
+        forged_role = (
+            llir.TensorAccessRole.RESULT_WRITE
+            if metadata.role is llir.TensorAccessRole.INPUT_READ
+            else llir.TensorAccessRole.INPUT_READ
+        )
+        object.__setattr__(metadata, "role", forged_role)
+        state["mutated"] = True
+        return rewritten
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        hostile_final_pass,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_spgemm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_frozen_pass_policy_mutation_fails_completion():
+    """The completion reference owns its policy spellings, not the shared
+    pass-module singleton, so a frozen-policy mutation cannot drift both
+    sides of the exact comparison together."""
+
+    from scorch.compiler.compressed_where_openmp_pass import (
+        COMPRESSED_WHERE_OPENMP_POLICY,
+    )
+
+    original_schedule = COMPRESSED_WHERE_OPENMP_POLICY.omp_schedule
+    assert original_schedule == "dynamic, 64"
+    object.__setattr__(COMPRESSED_WHERE_OPENMP_POLICY, "omp_schedule", "static")
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            compile_cin_via_loopir(
+                build_spgemm_cin(),
+                (4, 5),
+                (((4, 6), torch.float32), ((6, 5), torch.float32)),
+                compile_options=auto_options(False),
+            )
+    finally:
+        object.__setattr__(
+            COMPRESSED_WHERE_OPENMP_POLICY, "omp_schedule", original_schedule
+        )
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
 def test_target_failure_is_a_recorded_stage_loss():
     program, symbols = build_parallel_workspace_program(
         insert_value_builder=lambda builder, *_: builder.float_const(2.0)

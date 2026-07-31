@@ -1053,6 +1053,69 @@ def test_completion_enum_validation_is_cached_only_within_one_comparison(
     assert calls == [enum_key, enum_key]
 
 
+@pytest.mark.parametrize("tamper", ["name", "attribute"])
+def test_pass_cannot_mutate_enum_identity_state(monkeypatch, tamper):
+    """Enum member name and attribute-set state are pinned, not only values."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+    from scorch.compiler import llir
+
+    member = llir.DataType.INT64
+    original_name = member._name_
+    original = pass_manager.insert_sparse_prefetch
+    state = {"mutated": False}
+
+    def hostile_prefetch(statements, context):
+        if tamper == "name":
+            object.__setattr__(member, "_name_", "FORGED")
+        else:
+            object.__setattr__(member, "scorch_hostile_marker", True)
+        state["mutated"] = True
+        return original(statements, context)
+
+    monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", hostile_prefetch)
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            compile_cin_via_loopir(
+                build_spmspm_cin(),
+                (4, 5),
+                (((4, 6), torch.float32), ((6, 5), torch.float32)),
+                compile_options=auto_options(False),
+            )
+    finally:
+        object.__setattr__(member, "_name_", original_name)
+        if tamper == "attribute":
+            object.__delattr__(member, "scorch_hostile_marker")
+    assert state["mutated"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_enum_mutation_between_compiles_fails_the_next_compile():
+    """No enum-validation state survives one compile into the next one."""
+
+    from scorch.compiler import llir
+
+    def compile_once():
+        return compile_cin_via_loopir(
+            build_spmspm_cin(),
+            (4, 5),
+            (((4, 6), torch.float32), ((6, 5), torch.float32)),
+            compile_options=auto_options(False),
+        )
+
+    compile_once()
+    member = llir.AssignOp.ADD_ASSIGN
+    original_value = member.value
+    object.__setattr__(member, "_value_", "-=")
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            compile_once()
+    finally:
+        object.__setattr__(member, "_value_", original_value)
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+    compile_once()
+
+
 @pytest.mark.parametrize("duplicate", ["alias", "structural"])
 def test_duplicated_outer_row_loop_fails_closed(monkeypatch, duplicate):
     """Neither an aliased nor a cloned second row loop survives completion."""
