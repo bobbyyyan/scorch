@@ -29275,11 +29275,12 @@ found and committed:
   formats (76 tests); dense-suffix boundary/context/rank/atomicity
   coverage is 22 tests.
 
-The inherited evidence directory remains useful but was not sealed:
-``tip-at-docs.txt`` changed after its 225-entry manifest, so only 224
-entries verify.  Review §40 is authoritative.  Its replacement ledger
-is ``~/.cache/scorch-codex/phase7-assembly-review-f196147/`` and is
-sealed only after this documentation tip.
+The inherited evidence directory remains useful, but its seal was
+invalidated: ``tip-at-docs.txt`` changed after its 225-entry manifest,
+so only 224 entries verify.  Review §40 is authoritative.  Its
+replacement ledger is
+``~/.cache/scorch-codex/phase7-assembly-review-f196147/`` and is sealed
+only after this documentation tip.
 
 Exact code/test-tip gates at ``f196147`` are green: focused memberships
 **498 + 123**; audit **46/40/0**; deterministic census **47/0** plus a
