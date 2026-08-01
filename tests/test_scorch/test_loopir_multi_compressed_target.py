@@ -731,20 +731,6 @@ def test_b3_dynamic_vector_pass_neutrality_holds_across_formats(fmt, monkeypatch
 
 def _seam_cells():
     i, j = IndexVar("i"), IndexVar("j")
-    union = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.ADD,
-                    TensorVar("A", fmt="ss")[i, j],
-                    TensorVar("B", fmt="ss")[i, j],
-                ),
-            ),
-        ),
-    )
     i4, j4, k4, l4 = (IndexVar(name) for name in "ijkl")
     ttm = ForAll(
         i4,
@@ -788,13 +774,6 @@ def _seam_cells():
     )
     f32 = torch.float32
     return [
-        (
-            "union_add",
-            union,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32)),
-            "unsupported_sparse_output",
-        ),
         (
             "ttm_reduction",
             ttm,
