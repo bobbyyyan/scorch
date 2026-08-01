@@ -11,10 +11,11 @@ kernels in both automatic policy arms, execute through the shared JIT
 build path, and match the production LoopIR oracle and the PyTorch dense
 reference.
 
-Runtime ``sd``-family inputs are hand-built through ``TensorIndex``
-because the public ``to_sparse("sd")`` conversion does not yet build
-dense-suffix block values; that conversion is an adjacent runtime gap,
-not part of this compiler slice.
+Runtime ``sd``-family inputs are built through the public
+``to_sparse`` dense-suffix materialization (the previously recorded
+runtime gap, now closed); the hand-built ``TensorIndex`` builders remain
+as comparands whose exact-storage equivalence is locked in
+``test_to_sparse_dense_suffix.py``.
 """
 
 import pytest
@@ -133,7 +134,13 @@ def build_rank1_copy_cin(dtype=torch.float32):
 
 
 def sparse_sd(dense, name):
-    """Compressed stored rows over dense row blocks (fmt ``sd``)."""
+    """Compressed stored rows over dense row blocks (fmt ``sd``).
+
+    Kept as the hand-built comparand:
+    ``test_to_sparse_dense_suffix.py`` proves the public conversion
+    produces exactly this storage, and the runtime batteries now build
+    their inputs through ``to_sparse``.
+    """
 
     rows = [r for r in range(dense.shape[0]) if bool(dense[r].ne(0).any())]
     pos = torch.tensor([0, len(rows)], dtype=torch.int32)
@@ -198,6 +205,20 @@ def sparse_dsd(dense, name):
         ),
         value=values,
     )
+
+
+def converted_sd(dense, name):
+    """Public-conversion ``sd`` runtime input (the closed runtime gap)."""
+
+    return STensor.from_torch(dense.clone(), name).to_sparse("sd")
+
+
+def converted_sdd(dense, name):
+    return STensor.from_torch(dense.clone(), name).to_sparse("sdd")
+
+
+def converted_dsd(dense, name):
+    return STensor.from_torch(dense.clone(), name).to_sparse("dsd")
 
 
 def sparse_s(dense, name):
@@ -361,7 +382,7 @@ def test_compiled_matmul_matches_every_reference(regblock_enabled, dtype):
     got = executed_dense(
         cin,
         (4, 5),
-        (sparse_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
+        (converted_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
         regblock_enabled,
     )
     expected = dense_a @ dense_b
@@ -383,13 +404,13 @@ def test_compiled_copy_preserves_empty_and_explicit_zero_rows(regblock_enabled):
     dense = torch.zeros(5, 3)
     dense[0, 1] = 2.0
     dense[3, 0] = -1.0
-    st = sparse_sd(dense, "A")
+    st = converted_sd(dense, "A")
     got = executed_dense(build_copy_cin(), (5, 3), (st,), regblock_enabled)
     assert torch.equal(got, dense)
 
     # A stored row whose dense block carries an explicit zero still copies
     # that block exactly (the load is physical, not pruned).
-    explicit = sparse_sd(dense, "A")
+    explicit = converted_sd(dense, "A")
     got = executed_dense(build_copy_cin(), (5, 3), (explicit,), regblock_enabled)
     assert torch.equal(got, dense)
 
@@ -400,7 +421,7 @@ def test_compiled_rank3_copy_matches_reference(fmt):
     dense[0, 1] = torch.arange(5, dtype=torch.float32)
     dense[2, 0, 3] = 7.0
     dense[2, 3, 4] = -2.5
-    builder = sparse_sdd if fmt == "sdd" else sparse_dsd
+    builder = converted_sdd if fmt == "sdd" else converted_dsd
     got = executed_dense(
         build_rank3_copy_cin(fmt), (3, 4, 5), (builder(dense, "A"),), False
     )
@@ -413,12 +434,12 @@ def test_compiled_spmv_and_reduce_match_reference():
     got = executed_dense(
         build_spmv_cin(),
         (4,),
-        (sparse_sd(dense_a, "A"), dense_stensor(x, "x")),
+        (converted_sd(dense_a, "A"), dense_stensor(x, "x")),
         False,
     )
     assert torch.allclose(got, dense_a @ x, atol=1e-3, rtol=1e-3)
 
-    got = executed_dense(build_reduce_cin(), (4,), (sparse_sd(dense_a, "A"),), False)
+    got = executed_dense(build_reduce_cin(), (4,), (converted_sd(dense_a, "A"),), False)
     assert torch.allclose(got, dense_a.sum(dim=1), atol=1e-3, rtol=1e-3)
 
 
@@ -431,7 +452,7 @@ def test_compiled_rank1_copy_matches_reference():
 @pytest.mark.parametrize("a_shape", [(0, 5), (4, 0)], ids=["zero_rows", "zero_cols"])
 def test_zero_extent_cells(a_shape):
     dense = torch.zeros(a_shape)
-    got = executed_dense(build_copy_cin(), a_shape, (sparse_sd(dense, "A"),), False)
+    got = executed_dense(build_copy_cin(), a_shape, (converted_sd(dense, "A"),), False)
     assert torch.equal(got, dense)
 
 
@@ -444,7 +465,7 @@ def test_ragged_supports_and_repeated_public_execution():
         got = executed_dense(
             build_matmul_cin(),
             (6, 3),
-            (sparse_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
+            (converted_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
             False,
         )
         assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3)
@@ -469,7 +490,7 @@ def test_execution_matches_independent_legacy_build(regblock_enabled):
     legacy = execute_legacy_module(
         cpp,
         (4, 5),
-        sparse_sd(dense_a, "A"),
+        converted_sd(dense_a, "A"),
         dense_stensor(dense_b, "B"),
         options,
     )
@@ -477,7 +498,7 @@ def test_execution_matches_independent_legacy_build(regblock_enabled):
     got = executed_dense(
         build_matmul_cin(),
         (4, 5),
-        (sparse_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
+        (converted_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
         regblock_enabled,
     )
     assert torch.allclose(got, legacy_dense, atol=1e-5, rtol=1e-5)
@@ -1031,9 +1052,9 @@ import json
 import torch
 from tests.test_scorch.test_loopir_mixed_operand_target import (
     build_matmul_cin,
+    converted_sd,
     dense_stensor,
     executed_dense,
-    sparse_sd,
 )
 
 torch.manual_seed(20260730)
@@ -1042,7 +1063,7 @@ dense_b = torch.randn(8, 6)
 got = executed_dense(
     build_matmul_cin(),
     (9, 6),
-    (sparse_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
+    (converted_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
     False,
 )
 print(json.dumps({"values": got.reshape(-1).tolist()}))
@@ -1070,7 +1091,7 @@ def test_thread_count_invariance_and_race_freedom():
     executed_dense(
         build_matmul_cin(),
         (9, 6),
-        (sparse_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
+        (converted_sd(dense_a, "A"), dense_stensor(dense_b, "B")),
         False,
     )
 
