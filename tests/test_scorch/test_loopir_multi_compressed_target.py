@@ -668,6 +668,64 @@ def test_b3_dynamic_vector_pass_still_runs_but_is_byte_neutral(monkeypatch):
     assert omitted.cpp_source == baseline.cpp_source
 
 
+_CHECKED_MUTATION_CENSUS = {
+    # fmt -> (leaf level, parent push_backs, scorch_vector_set count)
+    "ss": (1, ("C0_crd.push_back",), 4),
+    "sss": (2, ("C0_crd.push_back", "C1_crd.push_back"), 6),
+    "dss": (2, ("C1_crd.push_back",), 5),
+}
+
+
+@pytest.mark.parametrize("fmt", ["ss", "sss", "dss"])
+def test_b3_checked_mutation_census_holds_across_formats(fmt, monkeypatch):
+    """Every B3 format is safe before the generic rewrite, not only rank 4."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    original = pass_manager.rewrite_dynamic_vector_accesses
+    censuses = []
+
+    def capture(value, context):
+        censuses.append(_b3_output_mutation_census(value))
+        return original(value, context)
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        capture,
+    )
+    _compile_b3_target(fmt)
+    assert len(censuses) == 1
+    unchecked, calls = censuses[0]
+    assert unchecked == []
+    leaf_level, parent_pushes, vector_sets = _CHECKED_MUTATION_CENSUS[fmt]
+    assert calls.count("C_values.emplace_back") == 1
+    assert calls.count(f"C{leaf_level}_crd.emplace_back") == 1
+    for parent_push in parent_pushes:
+        assert calls.count(parent_push) == 1
+    assert calls.count("scorch_vector_set") == vector_sets
+
+
+@pytest.mark.parametrize("fmt", ["ss", "dss"])
+def test_b3_dynamic_vector_pass_neutrality_holds_across_formats(fmt, monkeypatch):
+    """The no-op rewrite leaves byte-exact source for rank-2 and dense-prefix."""
+
+    import scorch.compiler.llir_pass_manager as pass_manager
+
+    baseline = _compile_b3_target(fmt)
+
+    def omit(value, context):
+        return value
+
+    monkeypatch.setattr(
+        pass_manager,
+        "rewrite_dynamic_vector_accesses",
+        omit,
+    )
+    omitted = _compile_b3_target(fmt)
+    assert omitted.cpp_source == baseline.cpp_source
+
+
 # -- adjacent seams stay fail-closed -----------------------------------------
 
 

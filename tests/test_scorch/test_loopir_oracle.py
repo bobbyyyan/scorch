@@ -1793,3 +1793,83 @@ def test_malformed_position_load_fails_before_binding_mapping_callbacks():
         )
     assert error.value.defect.code == "invalid_symbol_id"
     assert not called
+
+
+def test_foreign_sparse_binding_class_is_rejected_without_invocation():
+    """A hostile compressed binding fails the exact-type check uninvoked."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    invoked = []
+
+    class HostileStorage:
+        def __getattr__(self, name):
+            invoked.append(name)
+            raise RuntimeError("must never be inspected")
+
+    with pytest.raises(LoopIROracleError) as error:
+        run_program(
+            fixture.program,
+            {fixture.a: HostileStorage()},
+            {fixture.c: (2, 2)},
+        )
+    assert "LevelTensorStorage" in str(error.value)
+    assert invoked == []
+
+
+def test_nested_dense_binding_ownership_precedes_output_shape_lookup():
+    """Deep dense containers are owned before output-shape callbacks run."""
+
+    fixture = build_matmul()
+    inner = [1.0, 2.0]
+    a = [inner, [3.0, 4.0]]
+    b = [[1.0, 0.0], [0.0, 1.0]]
+
+    class InnerMutatingShapes(dict):
+        def __getitem__(self, key):
+            inner[0] = 999.0
+            return super().__getitem__(key)
+
+    results = run_program(
+        fixture.program,
+        {fixture.a: a, fixture.b: b},
+        InnerMutatingShapes({fixture.c: (2, 2)}),
+    )
+    assert results[fixture.c] == [[1.0, 2.0], [3.0, 4.0]]
+    assert inner[0] == 999.0
+
+
+def test_oracle_binding_key_mutation_during_lookup_fails_closed():
+    """Mutating a SymbolId key inside ``__getitem__`` cannot pass snapshot."""
+
+    from scorch.compiler.loopir.levels import LevelTensorStorage as _Storage
+    from scorch.compiler.loopir.nodes import LevelKind as _Kind
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_mixed_leaf_operand_copy,
+    )
+
+    fixture = build_mixed_leaf_operand_copy()
+    storage = _Storage.from_dense(
+        [[1.0, 0.0], [0.0, 2.0]],
+        (2, 2),
+        (0, 1),
+        (_Kind.COMPRESSED, _Kind.DENSE),
+    )
+
+    class KeyMutating(dict):
+        def __getitem__(self, key):
+            value = super().__getitem__(key)
+            object.__setattr__(key, "value", key.value + 1000)
+            return value
+
+    with pytest.raises(LoopIROracleError) as error:
+        run_program(
+            fixture.program,
+            KeyMutating({fixture.a: storage}),
+            {fixture.c: (2, 2)},
+        )
+    assert "changed while values were being snapshotted" in str(error.value)

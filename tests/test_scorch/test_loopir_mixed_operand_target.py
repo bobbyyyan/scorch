@@ -33,6 +33,7 @@ from scorch.compiler.compilation_context import (
     CompilerStageId,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.identity import SymbolId
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.levels import LevelTensorStorage
 from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
@@ -703,6 +704,90 @@ def test_malformed_position_load_fails_before_input_shape_mapping_callbacks():
         )
     assert error.value.defect.code == "invalid_symbol_id"
     assert not called
+
+
+def test_hostile_shape_value_object_is_rejected_without_invocation():
+    """A tuple-subclass shape value fails the exact-type check uninvoked."""
+
+    program, sym_a, _ = build_mixed_copy_program()
+    load = program.body.statements[0].body.statements[0].body.statements[0].value
+    invoked = []
+
+    class HostileShape(tuple):
+        def __len__(self):
+            invoked.append("len")
+            object.__setattr__(load, "tensor", [])
+            return tuple.__len__(self)
+
+        def __iter__(self):
+            invoked.append("iter")
+            object.__setattr__(load, "tensor", [])
+            return tuple.__iter__(self)
+
+        def __eq__(self, other):
+            invoked.append("eq")
+            return tuple.__eq__(self, other)
+
+        __hash__ = tuple.__hash__
+
+    options = CompileOptions.from_environment(environ={})
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes={sym_a: HostileShape((4, 5))},
+            result_shape=(4, 5),
+            compile_options=options,
+            compilation_context=CompilationContext(options),
+        )
+    assert error.value.defect.code == "invalid_shape_binding"
+    assert invoked == []
+
+
+def test_duplicate_shape_mapping_keys_fail_closed():
+    """A Mapping iterating one SymbolId twice cannot pass the snapshot."""
+
+    program, sym_a, _ = build_mixed_copy_program()
+
+    class DuplicateKeys(dict):
+        def __iter__(self):
+            yield SymbolId(sym_a.value)
+            yield SymbolId(sym_a.value)
+
+    options = CompileOptions.from_environment(environ={})
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes=DuplicateKeys({sym_a: (4, 5)}),
+            result_shape=(4, 5),
+            compile_options=options,
+            compilation_context=CompilationContext(options),
+        )
+    assert error.value.defect.code == "invalid_shape_binding"
+    assert "unique" in error.value.defect.message
+
+
+def test_shape_mapping_key_mutation_during_lookup_fails_closed():
+    """Mutating a SymbolId key inside ``__getitem__`` cannot pass snapshot."""
+
+    program, sym_a, _ = build_mixed_copy_program()
+
+    class KeyMutating(dict):
+        def __getitem__(self, key):
+            value = super().__getitem__(key)
+            object.__setattr__(key, "value", key.value + 1000)
+            return value
+
+    options = CompileOptions.from_environment(environ={})
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            program,
+            input_shapes=KeyMutating({sym_a: (4, 5)}),
+            result_shape=(4, 5),
+            compile_options=options,
+            compilation_context=CompilationContext(options),
+        )
+    assert error.value.defect.code == "invalid_shape_binding"
+    assert "changed" in error.value.defect.message
 
 
 def build_hierarchical_mixed_program():
