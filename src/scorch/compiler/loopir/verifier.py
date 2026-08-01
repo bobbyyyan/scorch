@@ -17,8 +17,10 @@ The invariant families stated locally for this subset:
 - **Physical position dominance.**  A sparse cursor and a dense position
   each name their dominating parent explicitly, and the parent must be a
   position of the immediately enclosing level of the same tensor, grounded
-  at the root (``parent_position_mismatch``).  Positions are bound only by
-  ``SparseFor`` (``duplicate_position_binding`` / ``unbound_position``).
+  at the root (``parent_position_mismatch``).  Positions are bound by
+  ``SparseFor``, ``SparseWindowFor``, and position-binding merges
+  (``duplicate_position_binding`` / ``unbound_position``); a UNION-bound
+  position may be absent and can only select the next compressed child.
 - **Leaf value ownership.**  Only a cursor over the value-bearing leaf
   level of its tensor owns scalars (``non_leaf_value``); UNION-merged reads
   require an explicit default and always-aligned reads must not carry one
@@ -249,11 +251,16 @@ class _PositionType(_ExprType):
     """Position-typed within one physical level of one tensor.
 
     The root position carries ``tensor=None, level=-1``; it dominates every
-    level-0 level of every tensor.
+    level-0 level of every tensor.  ``may_be_absent`` is true only for a
+    position bound by a UNION merge: at a one-sided coordinate that cursor
+    has no physical entry.  Such a position may select the empty segment of
+    the next COMPRESSED level, but it is not an unconditional load address or
+    a base for dense-position arithmetic.
     """
 
     tensor: Optional[SymbolId]
     level: int
+    may_be_absent: bool = False
 
 
 _VALUE = _ScalarValueType()
@@ -344,7 +351,7 @@ class _Context:
         self.ever_tile_point_bindings: Dict[IndexId, TileId] = {}
         self.cursors: Dict[CursorId, Tuple[SparseCursorDecl, Optional[MergeMode]]] = {}
         self.ever_cursor_ids: Set[CursorId] = set()
-        self.bound_positions: Dict[PositionId, Tuple[SymbolId, int]] = {}
+        self.bound_positions: Dict[PositionId, _PositionType] = {}
         self.ever_bound_positions: Set[PositionId] = set()
         self.open_tiles: Dict[TileId, TileOuterFor] = {}
         self.matched_tile_inners: Set[TileId] = set()
@@ -564,6 +571,8 @@ def _check_parent_position(
     depth: int,
     tensor: SymbolId,
     level: int,
+    *,
+    allow_maybe_absent: bool = False,
 ) -> None:
     """The dominance rule: a level's parent is the position one level up."""
 
@@ -573,6 +582,13 @@ def _check_parent_position(
             "parent_position_mismatch",
             path,
             "the parent must be a physical position expression",
+        )
+    if kind.may_be_absent and not allow_maybe_absent:
+        _fail(
+            "unsupported_sparse_hierarchy",
+            path,
+            "a UNION-bound position that may be absent can only select "
+            "the next COMPRESSED child segment",
         )
     if level == 0:
         if kind.tensor is not None:
@@ -642,8 +658,7 @@ def _check_position_value(
             path,
             f"position {_diagnostic_int(position.value)} is not bound in scope",
         )
-    tensor, level = ctx.bound_positions[position]
-    return _PositionType(tensor, level)
+    return ctx.bound_positions[position]
 
 
 def _check_cursor_value(
@@ -707,6 +722,13 @@ def _check_position_load(
             "type_mismatch",
             f"{path}.position",
             "PositionLoad.position must be position-typed",
+        )
+    if position_type.may_be_absent:
+        _fail(
+            "unsupported_sparse_hierarchy",
+            f"{path}.position",
+            "a UNION-bound position that may be absent cannot be used as "
+            "an unconditional scalar load address; use CursorValue defaults",
         )
     if position_type.tensor != tensor:
         _fail(
@@ -1011,6 +1033,8 @@ def _bind_position(
     what: str,
     tensor: SymbolId,
     level: int,
+    *,
+    may_be_absent: bool = False,
 ) -> PositionId:
     bound = _check_position_id(position, path, what)
     if bound in ctx.ever_bound_positions:
@@ -1021,7 +1045,7 @@ def _bind_position(
             "in the program",
         )
     ctx.ever_bound_positions.add(bound)
-    ctx.bound_positions[bound] = (tensor, level)
+    ctx.bound_positions[bound] = _PositionType(tensor, level, may_be_absent)
     return bound
 
 
@@ -1066,7 +1090,13 @@ def _check_cursor_decl(
                 "sparse cursors are only defined on COMPRESSED levels",
             )
         _check_parent_position(
-            ctx, decl.parent, f"{path}.parent", depth + 1, tensor, decl.level
+            ctx,
+            decl.parent,
+            f"{path}.parent",
+            depth + 1,
+            tensor,
+            decl.level,
+            allow_maybe_absent=True,
         )
         return decl
     finally:
@@ -2088,6 +2118,7 @@ def _check_merged_sparse_for(
                 "MergedSparseFor.positions entry",
                 decl.tensor,
                 decl.level,
+                may_be_absent=stmt.mode is MergeMode.UNION,
             )
         )
     for decl in decls:

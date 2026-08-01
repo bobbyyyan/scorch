@@ -950,9 +950,12 @@ class MergedSparseFor(Stmt):
     is always its aligned entry; a position-binding UNION merge must bind
     every cursor, and an entry anchors descent only while its cursor is
     aligned — a child stream chained from an unaligned parent is the empty
-    segment for that candidate coordinate.  ``positions`` is empty in the
-    historical no-descent form; when nonempty it has one entry (a
-    ``PositionId`` or ``None``) per cursor.
+    segment for that candidate coordinate.  A possibly absent UNION position
+    is therefore valid only as the direct parent of the next compressed-level
+    cursor; it is not an unconditional scalar-load address or a base for
+    dense-position arithmetic.  ``positions`` is empty in the historical
+    no-descent form; when nonempty it has one entry (a ``PositionId`` or
+    ``None``) per cursor.
 
     Semantics (intrinsic to the node; the oracle and any target lowering
     must implement exactly this):

@@ -7363,10 +7363,12 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     dense-prefix/multi-compressed-suffix results: at most one dense prefix
     loop, then one stream loop per compressed result level — a single-cursor
     :class:`SparseFor` over one stored stream (dense co-operands are read at
-    their resolved coordinates), or a two-cursor INTERSECTION
-    :class:`MergedSparseFor` binding both aligned cursor positions so child
-    levels descend from them — over one ordered :class:`AppendEntry` leaf.
-    Anything else fails closed with ``unsupported_program_shape``.
+    their resolved coordinates), or a two-cursor :class:`MergedSparseFor`.
+    INTERSECTION binds both aligned cursor positions; UNION additionally
+    lowers the aligned, one-sided, and post-exhaustion cases while treating an
+    unaligned parent as an empty child stream.  Both forms descend to one
+    ordered :class:`AppendEntry` leaf.  Anything else fails closed with
+    ``unsupported_program_shape``.
 
     The raw emission mirrors the legacy generic lowering statement-for-
     statement — per-level ``Initialize iterators`` groups (root-parent
