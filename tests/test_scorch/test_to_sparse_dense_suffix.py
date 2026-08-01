@@ -14,6 +14,9 @@ conditional-parent discipline the compiled assembly families use.
 import pytest
 import torch
 
+from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
+from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.diagnostics import VerificationError
 from scorch.stensor import STensor
 from tests.test_scorch.test_loopir_mixed_operand_target import (
     sparse_dsd,
@@ -29,6 +32,16 @@ def storage_snapshot(stensor):
             for level in stensor.storage.index.mode_indices
         ],
         stensor.storage.value.tolist(),
+    )
+
+
+def tensor_snapshot(stensor):
+    return (
+        stensor.name,
+        stensor.shape,
+        str(stensor.format),
+        tuple(stensor.storage.index.mode_order),
+        storage_snapshot(stensor),
     )
 
 
@@ -100,6 +113,82 @@ def test_sparse_sources_reconvert_through_densification():
     converted = STensor.from_torch(dense.clone(), "A").to_sparse("ss").to_sparse("sd")
     assert str(converted.format) == "s,d"
     assert torch.equal(converted.to_torch(), dense)
+
+
+@pytest.mark.parametrize("field", ["options", "context"])
+def test_dense_suffix_conversion_validates_compiler_boundary(field):
+    dense = STensor.from_torch(torch.eye(2), "A")
+    options = CompileOptions.from_environment(environ={})
+    kwargs = (
+        {"_compile_options": object()}
+        if field == "options"
+        else {"_compile_options": options, "_compilation_context": object()}
+    )
+    with pytest.raises(TypeError):
+        dense.to_sparse("sd", **kwargs)
+
+
+def test_dense_suffix_conversion_rejects_a_context_for_foreign_options():
+    dense = STensor.from_torch(torch.eye(2), "A")
+    options = CompileOptions.from_environment(environ={})
+    foreign_options = CompileOptions.from_environment(environ={})
+    context = CompilationContext(foreign_options)
+    with pytest.raises(TypeError, match="exact CompileOptions snapshot"):
+        dense.to_sparse(
+            "sd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+
+def test_rank_mismatch_keeps_the_staged_historical_failure():
+    dense = STensor.from_torch(torch.eye(2), "A")
+    options = CompileOptions.from_environment(environ={})
+    context = CompilationContext(options)
+
+    with pytest.raises(VerificationError):
+        dense.to_sparse(
+            "sdd",
+            _compile_options=options,
+            _compilation_context=context,
+        )
+
+    assert [record.stage_id for record in context.stage_run_records] == [
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION
+    ]
+
+
+def test_sparse_source_densification_uses_the_supplied_context():
+    dense = torch.tensor([[0.0, 5.0], [3.0, 0.0], [0.0, 0.0]])
+    source = STensor.from_torch(dense.to_sparse_csr(), "A")
+    options = CompileOptions.from_environment()
+    context = CompilationContext(options)
+
+    converted = source.to_sparse(
+        "sd",
+        _compile_options=options,
+        _compilation_context=context,
+    )
+
+    assert torch.equal(converted.to_torch(), dense)
+    assert context.stage_run_records
+    assert context.llir_pass_run_records
+
+
+def test_dense_suffix_conversion_is_exception_atomic(monkeypatch):
+    dense = torch.tensor([[0.0, 5.0], [3.0, 0.0], [0.0, 0.0]])
+    source = STensor.from_torch(dense.to_sparse_csr(), "A")
+    before = tensor_snapshot(source)
+
+    def fail_nonzero(*args, **kwargs):
+        raise RuntimeError("injected materialization failure")
+
+    monkeypatch.setattr(torch, "nonzero", fail_nonzero)
+    with pytest.raises(RuntimeError, match="injected materialization failure"):
+        source.to_sparse("sd")
+
+    assert tensor_snapshot(source) == before
+    assert torch.equal(source.to_torch(), dense)
 
 
 def test_compressed_leaf_formats_keep_the_kernel_path():

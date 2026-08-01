@@ -50,7 +50,7 @@ from scorch.compiler.loopir.pipeline import (
 )
 from scorch.compiler.loopir.printer import canonical_program_dump
 from scorch.compiler.loopir.schedule_passes import erase_schedule
-from scorch.compiler.loopir.verifier import LoopIRVerificationError
+from scorch.compiler.loopir.verifier import LoopIRVerificationError, verify_program
 from scorch.stensor import STensor
 from scorch.storage import TensorIndex
 from tests.test_scorch.test_loopir_multi_compressed_target import (
@@ -307,7 +307,7 @@ def test_compiled_execution_matches_every_reference(regblock_enabled, fmt):
     [_disjoint_fixtures, _one_sided_row_fixtures, _column_tail_fixtures],
     ids=["disjoint", "one-sided-rows", "column-tails"],
 )
-@pytest.mark.parametrize("fmt", ["ss", "sss", "dss", "ssss"])
+@pytest.mark.parametrize("fmt", ["ss", "sss", "dss", "ssss", "dsss"])
 def test_one_sided_supports_execute_exactly(fmt, fixture_builder):
     """Disjoint and one-sided supports drain deterministic ordered tails."""
 
@@ -339,22 +339,23 @@ def test_one_sided_supports_execute_exactly(fmt, fixture_builder):
 
 
 @pytest.mark.parametrize("empty_side", ["a", "b"])
-def test_one_sided_exhaustion_from_the_start(empty_side):
+@pytest.mark.parametrize("fmt", ["ss", "sss", "dss", "ssss", "dsss"])
+def test_one_sided_exhaustion_from_the_start(fmt, empty_side):
     """An entirely empty operand leaves the other stream drained in order."""
 
-    dense_a, dense_b = _fixtures("sss", seed=13)
-    shape = _SHAPES["sss"]
+    dense_a, dense_b = _fixtures(fmt, seed=13)
+    shape = _SHAPES[fmt]
     if empty_side == "a":
         dense_a = torch.zeros(shape)
     else:
         dense_b = torch.zeros(shape)
     result = executed(
-        build_union_cin("sss"),
+        build_union_cin(fmt),
         shape,
-        (sparse(dense_a, "A", "sss"), sparse(dense_b, "B", "sss")),
+        (sparse(dense_a, "A", fmt), sparse(dense_b, "B", fmt)),
         False,
     )
-    validated_storage_pieces(result, "sss", shape)
+    validated_storage_pieces(result, fmt, shape)
     assert torch.allclose(result.to_torch(), dense_a + dense_b, atol=1e-3, rtol=1e-3)
 
 
@@ -518,6 +519,12 @@ def test_deterministic_storage_and_repeated_compiled_differential():
 _CHECKED_MUTATION_CENSUS = {
     # fmt -> (leaf level, leaf append count, parent pushes, vector sets)
     "ss": (1, 9, (("C0_crd.push_back", 5),), 8),
+    "sss": (
+        2,
+        13,
+        (("C0_crd.push_back", 5), ("C1_crd.push_back", 9)),
+        18,
+    ),
     "dss": (2, 9, (("C1_crd.push_back", 5),), 9),
     "ssss": (
         3,
@@ -529,10 +536,16 @@ _CHECKED_MUTATION_CENSUS = {
         ),
         32,
     ),
+    "dsss": (
+        3,
+        13,
+        (("C1_crd.push_back", 5), ("C2_crd.push_back", 9)),
+        19,
+    ),
 }
 
 
-@pytest.mark.parametrize("fmt", ["ss", "dss", "ssss"])
+@pytest.mark.parametrize("fmt", sorted(_CHECKED_MUTATION_CENSUS))
 def test_union_enters_dynamic_pass_with_only_checked_mutations(fmt, monkeypatch):
     """Every union case and tail is safe before the generic rewrite."""
 
@@ -736,6 +749,34 @@ def test_one_bound_one_none_union_positions_fail_closed():
             {c2: (4, 5)},
         )
     assert error.value.defect.code == "unsupported_sparse_hierarchy"
+
+
+def test_union_position_cannot_bypass_cursor_default_semantics():
+    """A one-sided UNION position is not an unconditional load address."""
+
+    program, builder, (a, b, _) = build_union_assembly_program()
+    inner = program.body.statements[0].body.statements[0]
+    leaf = inner.body.statements[0]
+    object.__setattr__(
+        leaf,
+        "value",
+        builder.binary(
+            LoopIRBinaryOp.ADD,
+            builder.position_load(
+                a,
+                builder.position_value(inner.positions[0]),
+            ),
+            builder.position_load(
+                b,
+                builder.position_value(inner.positions[1]),
+            ),
+        ),
+    )
+
+    with pytest.raises(LoopIRVerificationError) as error:
+        verify_program(program)
+    assert error.value.defect.code == "unsupported_sparse_hierarchy"
+    assert error.value.defect.path.endswith("value.lhs.position")
 
 
 def test_nonzero_union_default_fails_closed_at_the_target():
