@@ -316,15 +316,33 @@ def _assignment_dense_arrays(
                     position_to_stride[position] = stride
 
         for inner_index, inner_statement in enumerate(inner_loop.body):
-            if type(inner_statement) is not llir.Assign:
+            if type(inner_statement) is llir.Assign:
+                _find_all_val_array_accesses(
+                    inner_statement.value,
+                    position_to_stride,
+                    dense_arrays,
+                    context,
+                    inner_path + ("body", f"[{inner_index}]", "value"),
+                )
                 continue
-            _find_all_val_array_accesses(
-                inner_statement.value,
-                position_to_stride,
-                dense_arrays,
-                context,
-                inner_path + ("body", f"[{inner_index}]", "value"),
-            )
+            if (
+                type(inner_statement) is llir.FunctionCallStmt
+                and type(inner_statement.name) is str
+                and inner_statement.name.endswith("_values.emplace_back")
+            ):
+                # A checked value append is the same leaf write the legacy
+                # indexed assignment expresses before the dynamic-vector
+                # rewrite; scan its argument expressions identically.
+                for arg_index, arg in enumerate(inner_statement.args):
+                    if isinstance(arg, llir.Expr):
+                        _find_all_val_array_accesses(
+                            arg,
+                            position_to_stride,
+                            dense_arrays,
+                            context,
+                            inner_path
+                            + ("body", f"[{inner_index}]", "args", f"[{arg_index}]"),
+                        )
     return dense_arrays
 
 

@@ -621,13 +621,17 @@ def _classify_sparse_output_family(
             for level_type in result_levels[: len(result_levels) - compressed_suffix]
         )
         if multi_compressed_family and not reduce_update:
-            # The B3 multi-compressed intersection-assembly family: a dense
-            # prefix over a >=2-level compressed suffix, assembled by
-            # stored-sparse coordinate streams with a conditional parent
-            # append per compressed level.  The legacy comparand is honest
-            # here (unlike B2), so the family gates on byte parity plus the
-            # LoopIR oracle and PyTorch differentials.
+            # The multi-compressed assembly families: a dense prefix over a
+            # >=2-level compressed suffix, assembled by stored coordinate
+            # streams with a conditional parent append per compressed level.
+            # Each suffix coordinate iterates one single-cursor stored
+            # stream, one two-cursor intersection, or — when every suffix
+            # coordinate is united — one two-cursor ordered union with
+            # one-sided descent and tails.  The legacy comparands are honest
+            # here (unlike B2), so these families gate on byte parity plus
+            # the LoopIR oracle and PyTorch differentials.
             prefix = len(result_levels) - compressed_suffix
+            suffix_kinds = []
             for position, index_id in enumerate(lhs_index_ids):
                 domain_kind = domains[index_id].kind
                 if position < prefix:
@@ -638,16 +642,37 @@ def _classify_sparse_output_family(
                             "compressed output must iterate dense domains "
                             "in the migrated families",
                         )
-                elif domain_kind is not DomainKind.INTERSECTION:
-                    # Single-cursor and united coordinate streams keep the
-                    # historical layout seam: only intersected stored
-                    # streams assemble a multi-compressed output in the
-                    # migrated families.
+                else:
+                    suffix_kinds.append(domain_kind)
+            if any(kind is DomainKind.UNION for kind in suffix_kinds):
+                if not all(kind is DomainKind.UNION for kind in suffix_kinds):
+                    # A union level cannot descend through a non-united
+                    # child stream: the one-sided branches would need a
+                    # child iterator the other operand does not carry.
+                    _fail(
+                        "unsupported_sparse_output",
+                        "a united multi-compressed output must unite every "
+                        "compressed-suffix coordinate in the migrated "
+                        "families",
+                    )
+                # The homogeneous union chain is the next Phase-7 family;
+                # it keeps the historical seam until its ordered one-sided
+                # assembly ships.
+                _fail(
+                    "unsupported_sparse_output",
+                    "united stored coordinate streams do not yet assemble "
+                    "a multi-compressed output in the migrated families",
+                )
+            for kind in suffix_kinds:
+                if kind not in (DomainKind.SPARSE, DomainKind.INTERSECTION):
+                    # Dense-domain suffix coordinates keep the historical
+                    # layout seam: only stored coordinate streams assemble
+                    # a multi-compressed output in the migrated families.
                     _fail(
                         "unsupported_sparse_output",
                         "a multi-compressed output is assembled only by "
-                        "intersected stored coordinate streams in the "
-                        "migrated families",
+                        "stored coordinate streams in the migrated "
+                        "families",
                     )
             return _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):

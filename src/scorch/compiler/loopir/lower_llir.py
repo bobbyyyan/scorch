@@ -7309,12 +7309,13 @@ class _DenseDomainMixedLowering(_TargetLowering):
 
 
 def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
-    """Whether the program is the B3 multi-compressed intersection chain.
+    """Whether the program is a multi-compressed assembly chain.
 
     Routing is purely structural: a single-statement nest of dense loops
-    over nested two-cursor merged loops appending into a dense-prefix/
-    multi-compressed-suffix result.  Everything else stays on its existing
-    route and keeps its fail-closed boundaries.
+    over nested stream loops (single-cursor sparse or two-cursor merged)
+    appending into a dense-prefix/multi-compressed-suffix result.
+    Everything else stays on its existing route and keeps its fail-closed
+    boundaries.
     """
 
     if len(program.outputs) != 1:
@@ -7337,29 +7338,35 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     ):
         return False
     body: Stmt = program.body
-    merged = 0
+    streams = 0
     while type(body) is Block and len(body.statements) == 1:
         only = body.statements[0]
-        if type(only) is DenseFor and merged == 0:
+        if type(only) is DenseFor and streams == 0:
             body = only.body
             continue
         if type(only) is MergedSparseFor:
-            merged += 1
+            streams += 1
             body = only.body
             continue
-        return type(only) is AppendEntry and merged >= 2
+        if type(only) is SparseFor:
+            streams += 1
+            body = only.body
+            continue
+        return type(only) is AppendEntry and streams >= 2
     return False
 
 
 class _MultiCompressedAssemblyLowering(_TargetLowering):
-    """Dedicated target lowering for the B3 multi-compressed family.
+    """Dedicated target lowering for the multi-compressed assembly families.
 
-    Admits exactly the intersection-assembly form ``lower_normalized_cin``
-    produces for dense-prefix/multi-compressed-suffix results: at most one
-    dense prefix loop, then one two-cursor INTERSECTION merged loop per
-    compressed result level (each binding both aligned cursor positions so
-    child levels descend from them), over one ordered :class:`AppendEntry`
-    leaf.  Anything else fails closed with ``unsupported_program_shape``.
+    Admits exactly the assembly forms ``lower_normalized_cin`` produces for
+    dense-prefix/multi-compressed-suffix results: at most one dense prefix
+    loop, then one stream loop per compressed result level — a single-cursor
+    :class:`SparseFor` over one stored stream (dense co-operands are read at
+    their resolved coordinates), or a two-cursor INTERSECTION
+    :class:`MergedSparseFor` binding both aligned cursor positions so child
+    levels descend from them — over one ordered :class:`AppendEntry` leaf.
+    Anything else fails closed with ``unsupported_program_shape``.
 
     The raw emission mirrors the legacy generic lowering statement-for-
     statement — per-level ``Initialize iterators`` groups (root-parent
@@ -7472,16 +7479,33 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             if type(only) is DenseFor:
                 require(
                     not loops,
-                    "the dense prefix loop to precede every merged loop",
+                    "the dense prefix loop to precede every stream loop",
                 )
                 require(prefix == 1, "no dense loop over an all-compressed result")
                 loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
+            if type(only) is SparseFor:
+                require(
+                    len(loops) >= prefix,
+                    "stream loops to follow the dense prefix",
+                )
+                cursor = only.cursor
+                loops.append(
+                    _Loop(
+                        _SPARSE,
+                        only.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        only,
+                        (cursor,),
+                    )
+                )
+                body = only.body
+                continue
             if type(only) is MergedSparseFor:
                 require(
                     len(loops) >= prefix,
-                    "merged loops to follow the dense prefix",
+                    "stream loops to follow the dense prefix",
                 )
                 require(
                     only.mode is MergeMode.INTERSECTION
@@ -7508,9 +7532,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             )
             require(
                 len(loops) == len(result_levels)
-                and sum(1 for loop in loops if loop.kind is _MERGED)
+                and sum(1 for loop in loops if loop.kind in (_MERGED, _SPARSE))
                 == compressed_suffix,
-                "one loop per result level with one merged loop per "
+                "one loop per result level with one stream loop per "
                 "compressed level",
             )
             self.leaf = only
@@ -7609,7 +7633,52 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 leaf_stmts[3],
             ]
         return [
-            *self._lower_merged(position + 1),
+            *self._child_stream_statements(position),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            *self._parent_append_statements(position),
+        ]
+
+    def _child_stream_statements(self, position: int) -> List[llir.Stmt]:
+        """The child stream loop below one assembly level, by driver kind."""
+
+        child = self.loops[position + 1]
+        if child.kind is _SPARSE:
+            return self._lower_sparse(position + 1)
+        if child.kind is _MERGED:
+            return self._lower_merged(position + 1)
+        _fail(
+            "unsupported_program_shape",
+            "a multi-compressed assembly level must nest a stream loop",
+        )
+        raise AssertionError("unreachable")
+
+    def _loop_children(self, position: int) -> List[llir.Stmt]:
+        """Single-cursor levels append the leaf or the child stream.
+
+        A single-cursor stream loop appends its level's entries in stored
+        order: the leaf level emits the checked value/coordinate appends,
+        and every other level nests its child stream followed by the same
+        conditional parent append and child close the merged levels own.
+        """
+
+        loop = self.loops[position]
+        if position == len(self.loops) - 1:
+            leaf_stmts = self._merged_case_stmts(
+                loop, {cursor.cursor for cursor in loop.cursors}
+            )
+            if leaf_stmts is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a single-cursor assembly leaf must append its stored " "entries",
+                )
+            return leaf_stmts
+        if loop.kind is _DENSE:
+            # The dense prefix closes its child level through the assembly
+            # catch-up in ``_lower_dense``, never a conditional append.
+            return self._child_stream_statements(position)
+        return [
+            *self._child_stream_statements(position),
             llir.BlankLine(),
             llir.Comment("Assembly compressed _level indices"),
             *self._parent_append_statements(position),
@@ -7618,6 +7687,48 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _dense_assembly_close_level(self, position: int) -> int:
         return position + 1
 
+    def _exact_dense_parent_positions(self) -> bool:
+        """Whether the legacy assembler pre-sizes dense-parent position arrays.
+
+        The legacy lowering sizes a compressed level's position vector from
+        its dense parent's extent for single-operand assemblies whose input
+        carries compressed structure (and for very large dense conversions,
+        which this family's dense-domain seam keeps out).  The choice is a
+        structural property of the verified program — operand count, the
+        single operand's declared layout, and the statically bound result
+        extents — never a runtime-format probe.
+        """
+
+        if len(self.program.inputs) != 1:
+            return False
+        input_decl = self.decls[self.program.inputs[0]]
+        if any(level.kind is not LevelKind.DENSE for level in input_decl.levels):
+            return True
+        result_cells = 1
+        for extent in self.shapes[self.result_symbol]:
+            result_cells *= extent
+        return result_cells >= 1024 * 1024
+
+    def _fixed_position_count(self, level: int) -> bool:
+        """Whether one result position vector is pre-sized by a dense parent."""
+
+        return (
+            self._exact_dense_parent_positions()
+            and level > 0
+            and self.result_decl.levels[level - 1].kind is LevelKind.DENSE
+        )
+
+    def result_assembler(self) -> ResultTensorAssembler:
+        return ResultTensorAssembler(
+            name=self.result_decl.name,
+            level_types=tuple(
+                _LEVEL_KIND_TO_LEVEL_TYPE[level.kind]
+                for level in self.result_decl.levels
+            ),
+            dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
+            exact_dense_parent_positions=self._exact_dense_parent_positions(),
+        )
+
     def _assembly_result_pos_set(self, level: Optional[int] = None) -> llir.Stmt:
         raw = super()._result_pos_set(level)
         if type(raw.var) is not llir.ArrayAccess or type(raw.var.array) is not llir.Var:
@@ -7625,6 +7736,13 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "unsupported_program_shape",
                 "the multi-compressed position close lost its vector target",
             )
+        if self._fixed_position_count(
+            len(self.result_decl.levels) - 1 if level is None else level
+        ):
+            # A pre-sized position vector is written in bounds by
+            # construction (its dense parent extent is ABI-validated), so
+            # the raw indexed close is the safe legacy spelling.
+            return raw
         return llir.FunctionCallStmt(
             name="scorch_vector_set",
             args=[
@@ -7652,12 +7770,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def prepare_result_level_indices(
         self, statements: List[llir.Stmt]
     ) -> List[llir.Stmt]:
-        """Build every append-owned position sentinel in its checked form."""
+        """Build every append-owned position sentinel in its checked form.
+
+        Pre-sized dense-parent position vectors are declared at their exact
+        extent and carry no zero sentinel, so only the dynamically grown
+        levels are converted and required here.
+        """
 
         expected_position_levels = {
             f"{self.result_decl.name}{level}_pos": level
             for level, decl in enumerate(self.result_decl.levels)
             if decl.kind is LevelKind.COMPRESSED
+            and not self._fixed_position_count(level)
         }
         prepared: List[llir.Stmt] = []
         converted: Set[str] = set()
@@ -7699,8 +7823,12 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         return prepared
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
-        if self.loops[0].kind is _MERGED:
-            stmts: List[llir.Stmt] = list(self._lower_merged(0))
+        if self.loops[0].kind in (_MERGED, _SPARSE):
+            stmts: List[llir.Stmt] = (
+                list(self._lower_merged(0))
+                if self.loops[0].kind is _MERGED
+                else list(self._lower_sparse(0))
+            )
             stmts.append(llir.BlankLine())
             stmts.append(llir.Comment("Assembly compressed _level indices"))
             stmts.append(self._assembly_result_pos_set(0))
