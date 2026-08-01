@@ -6483,11 +6483,12 @@ admitted as ``MULTI_COMPRESSED_UNION``.  Representation: the existing
 no new node kinds and no canonical-schema change; the node's documented
 semantics gain the union rule (a bound entry anchors descent only while
 its cursor is aligned; a child stream chained from an unaligned parent
-is the empty segment for that candidate coordinate).  The verifier
-admits union positions only when every cursor binds one; the oracle
-binds aligned positions and an absent-parent sentinel consumable only
-by child-segment selection.  Union positions are allocated only for
-this family, so rank-1 unions and CSR union columns keep their exact
+is the empty segment for that candidate coordinate).  The intended
+contract allowed the absent-parent sentinel only for child-segment
+selection, but the initial verifier enforced complete position binding
+without preserving that optionality; §40 records the correction.
+Union positions are allocated only for this family, so rank-1 unions
+and CSR union columns keep their exact
 prior position-free programs and bytes.  The target emits the legacy
 union lattice statement-for-statement — the three-case while-merge,
 per-case leaf folding through additive-identity defaults, one-sided
@@ -6495,13 +6496,17 @@ cases and post-exhaustion tails draining the surviving operand's whole
 subtree through the same single-cursor stream emission the single-cursor
 family owns, and the shared parent-append/close — at byte parity in
 both arms for all five formats, f32/f64, and commuted operands.  The
-62-test battery adds exact oracle storage, disjoint/one-sided-row/
-column-tail/whole-operand-exhaustion coverage on every format,
-cancellation to a stored explicit zero, hand-built explicit zeros and
-empty-intermediate parents, dense-prefix empty-row closure, zero
-extents, repeated byte-stable compiled differentials, the
-checked-mutation census over every case and tail (zero unchecked
-mutations; exact per-format counts), dynamic-pass byte neutrality,
+initial 62-test battery adds exact oracle storage and source parity on
+every format.  Compiled two-arm reference coverage spans
+``ss``/``sss``/``dss`` with separate ``ssss`` execution; ``dsss`` did
+not have compiled execution.  One-sided fixtures covered four formats,
+whole-operand exhaustion only ``sss``, and the checked-mutation census
+``ss``/``dss``/``ssss``; §40 widens all three omitted matrices.  The
+battery also covers cancellation to a stored explicit zero, hand-built
+explicit zeros and empty-intermediate parents, dense-prefix empty-row
+closure, zero extents, repeated byte-stable compiled differentials, the
+checked-mutation cases above (zero unchecked mutations), dynamic-pass
+byte neutrality,
 hand-built source parity and one-sided oracle descent, verifier/target
 defect paths, and fail-closed neighbors.  One deliberate boundary was
 added during review of a surprise admission: the united leaf envelope
@@ -6528,10 +6533,14 @@ equivalence against the hand-built ``TensorIndex`` builders,
 interior-zero retention, canonical empty storage, dense-prefix position
 closure, f64, sparse-source reconversion, untouched compressed-leaf
 formats, the identity-order boundary, and compiled execution through
-the mixed-operand route.  The mixed dense-leaf runtime batteries now
-build their inputs through the public conversion, closing the recorded
-hand-built-storage requirement (the hand-built builders remain as exact
-comparands).
+the mixed-operand route.  The initial fast path nevertheless returned
+before compiler-options/context validation, ignored the caller's
+context while densifying sparse inputs, admitted wrong-rank formats,
+and could mutate a sparse receiver before a later materialization
+failure; §40 records the correction.  The mixed dense-leaf runtime
+batteries now build their inputs through the public conversion, closing
+the recorded hand-built-storage requirement (the hand-built builders
+remain as exact comparands).
 
 ### 39.6 Census, sweeps, audit, and captures
 
@@ -6593,10 +6602,12 @@ environment; evidence under
   proven complete and non-overlapping against the collected file list
   (``union-proof.txt``).
 
-The evidence directory is sealed with ``SHA256SUMS`` covering the
-census, soundness probes, sweep logs, audit, captures, activating
-digests, latency samples, static-parity outputs, and the full-suite
-partition logs.  Origin remains ``58e8565``; nothing was pushed; the
+The historical evidence directory retains the census, soundness
+probes, sweep logs, audit, captures, activating digests, latency
+samples, static-parity outputs, and full-suite partition logs.  It is
+not a valid seal: ``tip-at-docs.txt`` was edited after ``SHA256SUMS``
+was created, so 224 of 225 entries verify; §40 supplies the corrected
+review ledger.  Origin remains ``58e8565``; nothing was pushed; the
 five protected tracked files hash exactly as recorded; only explicit
 paths were staged.
 
@@ -6618,4 +6629,126 @@ untouched, sealed captures byte-stable, the audit unchanged, censuses
 divergence-free, latency inside the 1.10 budget).  **The Phase-7
 checkpoint is GO for this milestone.**  No release
 dispatch/cache/selector cutover, legacy deletion, Phase 8, or Phase 8.5
-work was performed or started.
+work was performed or started.  This initial verdict is superseded by
+the corrected audit in §40.
+
+## 40. Phase-7 ordered-assembly rigorous review corrections (2026-07-31)
+
+### 40.1 Independent review result
+
+The inherited range was nine commits, not eight: seven code/test
+commits from ``d6c759b`` through ``607d3e1`` and two documentation
+commits, ``a7c37b0`` and ``a0b88d3``.  The range was reviewed
+diff-by-diff before any correction.  The single-cursor lowering held:
+an exhaustive rank-2-through-rank-4 ``d``/``s`` operand-layout sweep
+found 66 admitted programs with zero oracle or source-parity mismatch.
+The UNION target also preserved aligned, one-sided, post-exhaustion,
+and empty-child assembly and failed closed on reordered, partial,
+heterogeneous, n-ary, and widened forms.
+
+Two material defects remained:
+
+1. A position bound by a UNION merge can be absent for one operand at a
+   one-sided coordinate.  The verifier recorded it as an unconditional
+   physical position.  A verified forged program could therefore feed
+   that binding to ``PositionLoad`` or dense-position arithmetic; the
+   oracle then received its private absent-parent sentinel where an
+   integer position was required.  This violated verifier/oracle
+   totality even though the admitted target envelope rejected the
+   forged leaf later.
+2. The direct dense-suffix ``to_sparse`` route returned before exact
+   ``CompileOptions``/``CompilationContext`` validation, did not require
+   the requested rank to match the tensor rank, and densified sparse
+   receivers through the mutating default route without the caller's
+   context.  A failure during later block materialization could leave
+   the source converted to dense, and valid timing owners silently
+   recorded no work.
+
+The semantic dense-suffix storage algorithm itself held under an
+independent 420-cell sweep: every ``d``/``s`` dense-suffix layout at
+ranks 2 through 7, including every zero-axis position, decoded exactly
+to its dense reference.  The defects were boundary ownership and
+failure atomicity, not the block representation.
+
+### 40.2 Corrections
+
+- ``1a92f50`` tracks optionality in the verifier's position type.
+  UNION-bound positions may select only the immediate next COMPRESSED
+  child segment; unconditional ``PositionLoad`` and dense-position
+  spines fail with ``unsupported_sparse_hierarchy``.  Ordinary
+  ``SparseFor``/``SparseWindowFor`` and INTERSECTION bindings remain
+  unconditional.  Valid source emission is unchanged.
+- ``9d5fb16`` moves dense-suffix admission after exact options/context
+  validation, requires format-rank equality, and obtains sparse-source
+  snapshots through ``to_dense(in_place=False)`` with the caller's
+  exact options and context.  State is committed only after complete
+  output construction; wrong-rank requests retain the historical
+  staged failure.
+- ``f196147`` locks both fixes and closes the inherited test-matrix
+  overclaims.  The UNION file now has 76 tests: one-sided fixtures,
+  whole-operand exhaustion, and checked-mutation censuses cover all
+  five output formats.  The dense-suffix file now has 22 tests,
+  including invalid/foreign boundary objects, context propagation,
+  wrong-rank stage accounting, and injected post-densification failure
+  atomicity.
+
+The target-family docstring now names both INTERSECTION and UNION, and
+the verifier overview lists every position binder.  Canonical v10,
+request and schedule identities, erasure, valid program structure,
+public dispatch, release caches, and legacy emission are unchanged.
+
+### 40.3 Verification
+
+All code/test gates ran at the clean detached code/test tip
+``f196147`` with import provenance asserted:
+
+- focused non-overlapping review memberships: **498 LoopIR tests** and
+  **123 runtime/stage tests**, all passing;
+- schedule audit: **46 admitted / 40 rejected / 0 non-identical**, byte
+  equal to the retained JSON after removing only the commit field;
+- deterministic census v7: **47 cells / 0 divergence**; fresh randomized
+  seed 17 × 150: **40 parity arms / 0 mismatches**;
+- regenerated capture surfaces: corpus **20/20**, grid **42/42**,
+  anchors **22/22**, and heap **11/11** byte-identical to the retained
+  files; every automatic C++/CIN artifact is identical, with only the
+  same two process-dependent cache-key characters differing in its
+  JSON report;
+- target-activating latency, 200 warmups and 2,000 interleaved samples
+  per cell in both orderings: every metric is within 1.10; the worst
+  ratio is **1.03349**;
+- Black and Flake8 add zero findings.  Full-source mypy is exact
+  base/candidate parity at the current invocation's **140 inherited
+  errors in 11 files** (the same two ``stensor.py`` findings merely
+  move by line number), with zero LoopIR findings;
+- clean detached full non-performance suite: **5,032 collected / 3
+  performance deselected / 5,029 selected / 5,015 passed / 14 skipped /
+  0 failures**, in eight file-disjoint fresh processes.  The partition
+  union is complete and non-overlapping and no libomp resource event
+  occurred.
+
+The inherited ``phase7-assembly-session`` evidence is retained but is
+not called sealed: its ``tip-at-docs.txt`` actual digest is
+``db383fb5...``, while ``SHA256SUMS`` expects ``2c786f09...``.  The new
+review ledger is
+``~/.cache/scorch-codex/phase7-assembly-review-f196147/``.  It is sealed
+outside Git only after the final documentation tip, excludes generated
+``__pycache__`` material, and includes the exact-tip full-suite logs,
+capture regenerations, audit, latency samples, and the inherited-seal
+failure receipt.
+
+### 40.4 Corrected checkpoint verdict
+
+Both defects are closed without widening the admitted compiler family
+or changing valid generated source.  The ordered single-cursor and
+UNION assembly envelopes remain sound at byte parity, and the public
+dense-suffix materializer now has the same strict ownership and
+failure-atomicity boundary as the staged compiler route.  The
+Phase-7 checkpoint therefore remains **GO for the corrected milestone**.
+No cutover, cache/selector change, legacy deletion, Phase 8, or Phase
+8.5 work was started.
+
+The next milestone should close the remaining production-reachable
+sparse-assembly compatibility envelope: census first, then the coherent
+rank-1 and merged dense-leaf non-reduction families, followed by the
+multi-compressed reduction/TTM vertical slice.  A Phase-8 inventory may
+begin only after a fresh Phase-7 exit audit reaches a genuine GO.

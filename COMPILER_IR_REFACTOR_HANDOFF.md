@@ -29132,9 +29132,9 @@ legacy deletion, Phase 8, or Phase 8.5 is authorized.
 
 ## Phase-7 ordered-sparse-assembly milestone (2026-07-31; supersedes the 2026-07-30 pointer)
 
-Eight local commits stack on ``3570b29`` — seven code/test commits
-(``d6c759b`` .. ``607d3e1``) plus this documentation commit (review §39
-is definitive):
+Nine local commits stack on ``3570b29`` — seven code/test commits
+(``d6c759b`` .. ``607d3e1``) plus documentation commits ``a7c37b0`` and
+``a0b88d3`` (review §39, as corrected by §40, is definitive):
 
 - ``d6c759b`` — eleven fresh review probes over the ``370425d``/
   ``a06ea1a`` correction pair (hostile shape values, duplicate/mutating
@@ -29189,11 +29189,13 @@ environment's count); whitespace clean; exact-tip clean-detached full
 non-performance suite **4,995 passed / 14 skipped / 0 failures over all 5,009 selected
 nodes** (5,012 collected, 3 performance deselected) in eight
 fresh-process file partitions with raw logs retained and the union proven complete
-and non-overlapping.  Evidence sealed with a SHA-256 manifest under
-``~/.cache/scorch-codex/phase7-assembly-session/``.  Origin remains
-``58e8565``; nothing was pushed; protected hashes unchanged; unrelated
-work untouched.  **The Phase-7 checkpoint is GO.**  No cutover, legacy
-deletion, Phase 8, or Phase 8.5 was started.
+and non-overlapping.  The historical evidence remains under
+``~/.cache/scorch-codex/phase7-assembly-session/``, but its manifest was
+invalidated when ``tip-at-docs.txt`` changed after sealing (224/225
+entries verify); the §40 review ledger supersedes that seal.  Origin
+remains ``58e8565``; nothing was pushed; protected hashes unchanged;
+unrelated work untouched.  **The Phase-7 checkpoint is GO.**  No
+cutover, legacy deletion, Phase 8, or Phase 8.5 was started.
 
 ### Broad copy-paste prompt for the next session
 
@@ -29208,7 +29210,7 @@ scheduler, research, scratchpad, packaging, and untracked path
 untouched; stage only explicit paths and give nontrivial commits
 descriptive bodies.
 
-First independently review the eight-commit milestone (``d6c759b`` ..
+First independently review the nine-commit milestone (``d6c759b`` ..
 the documentation tip) rather than trusting the handoff: reproduce the union and
 single-cursor byte parity in both arms, the one-sided oracle descent
 and absent-parent semantics, the united leaf-shape and homogeneity
@@ -29252,3 +29254,107 @@ Both primary ordered-assembly families and the ``to_sparse``
 dense-suffix stretch are complete and gated; the next session opens
 with the independent review of this nine-commit milestone.  No cutover,
 legacy deletion, Phase 8, or Phase 8.5 is authorized.
+
+## Phase-7 ordered-assembly rigorous review corrections (2026-07-31; supersedes §39 routing)
+
+The inherited milestone was independently reviewed as the actual
+nine-commit range above.  The single-cursor target passed exhaustive
+rank-2-through-rank-4 layout probes, and the UNION target preserved all
+aligned/tail assembly semantics, but two real boundary defects were
+found and committed:
+
+- ``1a92f50`` — a UNION-bound descent position is now typed as possibly
+  absent.  Only the immediate next COMPRESSED cursor may consume it;
+  ``PositionLoad`` and dense-position arithmetic reject it statically.
+- ``9d5fb16`` — dense-suffix ``to_sparse`` now validates exact compiler
+  options/context ownership before admission, requires equal ranks,
+  forwards the caller's context through non-mutating densification, and
+  commits receiver state only after complete materialization.
+- ``f196147`` — adversarial and matrix locks: UNION one-sided,
+  whole-exhaustion, and checked-mutation coverage now spans all five
+  formats (76 tests); dense-suffix boundary/context/rank/atomicity
+  coverage is 22 tests.
+
+The inherited evidence directory remains useful but was not sealed:
+``tip-at-docs.txt`` changed after its 225-entry manifest, so only 224
+entries verify.  Review §40 is authoritative.  Its replacement ledger
+is ``~/.cache/scorch-codex/phase7-assembly-review-f196147/`` and is
+sealed only after this documentation tip.
+
+Exact code/test-tip gates at ``f196147`` are green: focused memberships
+**498 + 123**; audit **46/40/0**; deterministic census **47/0** plus a
+fresh 150-case sweep with zero mismatches; corpus/grid/anchor/heap
+captures **20/42/22/11** byte-identical and automatic C++/CIN artifacts
+identical; latency in both orderings (worst **1.03349**); exact
+base/candidate static parity; and a complete eight-process detached
+suite **5,015 passed / 14 skipped / 0 failures** across all 5,029
+selected nodes.  Protected hashes and live/local origin ``58e8565``
+remain unchanged; nothing was pushed and unrelated material was not
+staged.  The corrected Phase-7 checkpoint remains **GO**.
+
+### Superseding broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in ``/Users/bobby/scorch`` on branch
+``refactor/compiler-ir-phase3-std-move-call`` from the actual local tip
+reported by ``git log``.  Do not push, amend, squash, or reorder.  Read
+``AGENTS.md``, ``COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` §§39–40, and
+this latest handoff tail.  Preserve the five protected tracked files at
+their recorded hashes; leave all unrelated GPU/CUDA, benchmark,
+scheduler, research, scratchpad, packaging, and untracked material
+untouched; stage only explicit paths and give nontrivial commits
+descriptive bodies that record motivation, representation choices, and
+gates.
+
+First independently review ``1a92f50``/``9d5fb16``/``f196147`` and the
+final documentation/evidence commit rather than trusting this report.
+Reproduce the possibly-absent UNION-position boundary (including
+``PositionLoad`` and dense-child misuse), dense-suffix exact
+options/context/rank/exception-atomicity behavior, the final collected
+test counts, and successful verification of every replacement-manifest
+entry.  Add fresh adversarial probes and fix/commit any concrete defect
+before extending the representation.
+
+Then deliver a broad Phase-7 sparse-assembly compatibility-envelope
+milestone in separately reviewable commits:
+
+1. Build a caller/seam/comparand census across both automatic arms for
+   every remaining sparse-output/value-read rejection.  At minimum
+   include rank-1 ``s`` copies/unions; ``ss*sd`` and rank-general
+   compressed-parent/dense-leaf co-operands using ``PositionLoad``;
+   ``sss@dd`` TTM and reductions into multi-compressed outputs; and the
+   neighboring 3-ary chains, multiple dense prefixes, permuted layouts,
+   SUB, and union-with-dense cases.  Execute legacy comparands where
+   safe and record public reachability, semantic soundness, and the
+   exact current defect code before changing representation.
+2. Migrate the coherent non-reduction closure: rank-1 compressed
+   copies/unions plus merged dense-leaf co-operands, generalized by
+   level/domain/position identities.  Reuse existing nodes where sound;
+   add no CSR-specific shortcuts, runtime-format sniffing,
+   rendered-name/regex routing, or operation-specific target hacks.
+   Gate sound comparands on byte parity in both arms plus oracle and
+   PyTorch differentials; retain precise codes for rejected neighbors.
+3. Migrate the production-reachable multi-compressed reduction/TTM
+   family as its own vertical slice.  Reuse structured workspace/result
+   assembly only if the ownership audit proves it.  Cover f32/f64,
+   empty/ragged/zero extents, explicit zeros/cancellation, every relevant
+   layout, and both arms.  If the legacy comparand is defective, retain
+   executable failure evidence and gate on oracle/PyTorch rather than
+   claiming parity.  If the representation truly requires another
+   milestone, finish every independently coherent subfamily and record
+   the exact remaining blocker instead of silently narrowing scope.
+4. Re-run a criterion-by-criterion Phase-7 exit audit across the complete
+   declared matrix.  Only on genuine GO may the session perform a
+   read-only Phase-8 cutover/fallback-frequency inventory.  Do not alter
+   default dispatch, caches, selectors, or delete legacy code; do not
+   start Phase 8.5.
+
+Run focused and adversarial batteries, deterministic and multi-seed
+censuses, the 86-case audit, every retained and activating capture,
+repeated compiled public differentials, target-activating A/B/A latency
+with A/A and order controls, Black/Flake8/mypy parity,
+``git diff --check``, and an exact-tip clean detached full non-performance
+suite in fresh-process partitions.  Seal evidence only after the final
+documentation tip, exclude generated ``__pycache__``, and prove every
+manifest entry verifies.  Update review and handoff with exact
+revisions, commands, counts, hashes, limitations, and the next
+superseding prompt.
