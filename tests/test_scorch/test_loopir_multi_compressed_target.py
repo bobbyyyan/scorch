@@ -745,29 +745,6 @@ def _seam_cells():
             ),
         ),
     )
-    single_cursor = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.MUL,
-                    TensorVar("A", fmt="ss")[i, j],
-                    TensorVar("B", fmt="dd")[i, j],
-                ),
-            ),
-        ),
-    )
-    copy = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j], TensorVar("A", fmt="ss")[i, j]
-            ),
-        ),
-    )
     i4, j4, k4, l4 = (IndexVar(name) for name in "ijkl")
     ttm = ForAll(
         i4,
@@ -816,20 +793,6 @@ def _seam_cells():
             union,
             (4, 5),
             (((4, 5), f32), ((4, 5), f32)),
-            "unsupported_sparse_output",
-        ),
-        (
-            "single_cursor_stream",
-            single_cursor,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32)),
-            "unsupported_sparse_output",
-        ),
-        (
-            "single_operand_copy",
-            copy,
-            (4, 5),
-            (((4, 5), f32),),
             "unsupported_sparse_output",
         ),
         (

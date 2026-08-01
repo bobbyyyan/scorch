@@ -788,11 +788,18 @@ def test_sparse_lowering_is_deterministic():
 
 
 def test_unsupported_sparse_output_layout():
-    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    c = TensorVar("C", fmt="dss")
-    a = TensorVar("A", fmt="dss")
-    assign = TensorAssign(c[i, j, k], a[i, j, k])
-    expect_code("unsupported_sparse_output", ForAll(i, ForAll(j, ForAll(k, assign))))
+    """Rank-1 compressed outputs keep the historical layout seam.
+
+    The dense-prefix/multi-compressed copy that previously occupied this
+    lock is now the admitted single-cursor assembly family; its coverage
+    lives in ``test_loopir_single_cursor_assembly_target.py``.
+    """
+
+    i = IndexVar("i")
+    c = TensorVar("C", fmt="s")
+    a = TensorVar("A", fmt="s")
+    assign = TensorAssign(c[i], a[i])
+    expect_code("unsupported_sparse_output", ForAll(i, assign))
 
 
 def test_unsupported_sparse_output_reduction():
