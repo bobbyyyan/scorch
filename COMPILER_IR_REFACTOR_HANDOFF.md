@@ -29129,3 +29129,124 @@ the combined single-cursor multi-compressed plus rank-2-and-higher UNION
 ordered-assembly family, with public ``to_sparse("sd")``/``"sdd"``
 dense-suffix materialization only as the post-gate stretch.  No cutover,
 legacy deletion, Phase 8, or Phase 8.5 is authorized.
+
+## Phase-7 ordered-sparse-assembly milestone (2026-07-31; supersedes the 2026-07-30 pointer)
+
+Nine local commits stack on ``3570b29`` (review §39 is definitive):
+
+- ``d6c759b`` — eleven fresh review probes over the ``370425d``/
+  ``a06ea1a`` correction pair (hostile shape values, duplicate/mutating
+  Mapping keys, uninvoked foreign oracle bindings, deep rank-2
+  ownership, the B3 census and no-op-pass locks widened to
+  ``ss``/``sss``/``dss``); no defect found;
+- ``0881264`` / ``506cfc1`` — the single-cursor multi-compressed
+  assembly family: production-einsum copies
+  (``ss``/``sss``/``dss``/``ssss``/``dsss``) and mixed elementwise
+  forms (``ss*dd``, ``ss*ds``, ``dss*ddd``) at byte parity in both
+  arms; legacy dense-parent pre-sizing reproduced structurally; the
+  shared sparse-prefetch pass extended (byte-neutral for legacy trees)
+  to see checked value appends; 56-test battery;
+- ``363cfed`` / ``6f6f085`` — the rank-2+ UNION assembly family with
+  deterministic ordered one-sided descent and tails: per-cursor union
+  positions on the existing ``MergedSparseFor.positions`` field (no new
+  node kinds, no canonical change), aligned-only anchoring with
+  absent-parent empty child streams, three-case emission with tails at
+  byte parity in both arms across all five formats; 62-test battery;
+  the united leaf envelope is exactly the two-operand sum
+  ((A+B)*dense fails closed; 3-ary union moved to the target's
+  ``unsupported_program_shape``, the same code as 3-ary intersection);
+- ``2d1f436`` / ``607d3e1`` — the stretch: public
+  ``to_sparse('sd')``/``to_sparse('sdd')`` (and every dense-suffix
+  d/s layout) materializes blocked storage directly (identity mode
+  order only); 16-test battery; the mixed dense-leaf runtime batteries
+  now build inputs through the public conversion.
+
+Both families gate on byte parity because the pre-implementation census
+proved their legacy comparands sound (28/28 union cells against an
+independent ordered-union reference under independent build identity;
+20/20 single-cursor cells through the public einsum route).  Elementwise
+sparse ADD has no public spelling today — the compiler-level CIN entry
+is the union caller — and the low-level ``lower_and_exec_cin`` result
+wrapper still cannot wrap multi-compressed outputs (recorded
+pre-existing limitation; einsum and the LoopIR execute path wrap
+correctly).
+
+Exact-tip gates at ``607d3e1``: 15-file LoopIR sweep **1220/1220**;
+memberships **1401 + 153**; deterministic census v7 **47 cells / 0
+divergence**; randomized v3 sweeps seeds 1/2/7/11/13 × 150 **zero
+mismatches** with v2 seed-13 byte-identical continuity; audit
+**46/40/0** (JSON normalized-equal); captures corpus 20/grid 42/auto
+23/anchors 22/heap 11 all byte-identical to the retained chain;
+twenty-two arm-identical activating captures sealed; activating A/B/A
+latency worst within-run ratio **1.02979** against the 1.10 gate with
+A/A, order-flip, and base controls (union cells 0.82-0.92, faster than
+legacy); Black/Flake8/full-source-mypy byte-parity proven
+base-vs-candidate under one invocation (146-in-12 at both revisions,
+zero LoopIR findings; the older "140-in-11" record was the inherited
+environment's count); whitespace clean; exact-tip clean-detached full
+non-performance suite **4,995 passed / 14 skipped / 0 failures over all 5,009 selected
+nodes** (5,012 collected, 3 performance deselected) in eight
+fresh-process file partitions with raw logs retained and the union proven complete
+and non-overlapping.  Evidence sealed with a SHA-256 manifest under
+``~/.cache/scorch-codex/phase7-assembly-session/``.  Origin remains
+``58e8565``; nothing was pushed; protected hashes unchanged; unrelated
+work untouched.  **The Phase-7 checkpoint is GO.**  No cutover, legacy
+deletion, Phase 8, or Phase 8.5 was started.
+
+### Broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in ``/Users/bobby/scorch`` on branch
+``refactor/compiler-ir-phase3-std-move-call`` from the actual local tip
+reported by ``git log``.  Origin remains ``58e8565`` and this stack is
+local-only: do not push, amend, squash, or reorder it.  Read
+``AGENTS.md``, ``COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` §39, and this
+superseding handoff.  Preserve the five protected tracked files at
+their recorded hashes and leave every unrelated GPU/CUDA, benchmark,
+scheduler, research, scratchpad, packaging, and untracked path
+untouched; stage only explicit paths and give nontrivial commits
+descriptive bodies.
+
+First independently review the nine-commit milestone (``d6c759b`` ..
+``607d3e1``) rather than trusting the handoff: reproduce the union and
+single-cursor byte parity in both arms, the one-sided oracle descent
+and absent-parent semantics, the united leaf-shape and homogeneity
+boundaries, the checked-mutation censuses (including the pre-sized
+dense-parent levels), the dense-suffix conversion equivalence, and the
+activating latency gate.  Add fresh adversarial probes; fix and commit
+any concrete defect before extending the representation.
+
+Then select the next Phase-7 slice from the recorded neighbors.  The
+strongest candidates, in order: (1) the remaining production-reachable
+TTM/reduction neighbors of the assembly families (``sss@dd`` TTM at
+``unsupported_sparse_output``; reductions into multi-compressed
+outputs), censusing real callers and comparand soundness first;
+(2) rank-1 compressed outputs (``s`` copies and unions), which every
+family currently rejects at ``unsupported_sparse_output``; (3) the
+mixed dense-leaf co-operand seam (``ss*sd`` PositionLoad inside merged
+values at ``unsupported_program_shape``).  Census callers and seams
+before implementing; factor shared machinery only where ownership
+genuinely matches; no CSR-specific shortcuts, rendered-name discovery,
+regex routing, or runtime-format special cases.  Keep every
+unimplemented neighbor at a precise fail-closed code.
+
+Required gates as in this milestone: focused batteries, memberships,
+deterministic and multi-seed randomized censuses, the 86-case audit,
+all capture surfaces plus activating captures, repeated compiled public
+differentials, target-activating A/B/A latency with order and A/A
+controls, Black/Flake8/mypy parity, ``git diff --check``, and an
+exact-tip clean-detached full non-performance suite with retained raw
+partition logs and a proven complete non-overlapping union, sealed with
+a SHA-256 manifest.  Update review and handoff with exact revisions,
+commands, counts, hashes, limitations, and evidence locations, and
+re-run the Phase-7 checkpoint audit.  Do not start release cutover,
+cache/selector changes, legacy deletion, Phase 8, or Phase 8.5.
+
+## Final superseding pointer (2026-07-31)
+
+The authoritative milestone report and continuation prompt are in
+**Phase-7 ordered-sparse-assembly milestone (2026-07-31)** above.  That
+section and review §39 supersede the 2026-07-30 pointer and prompt.
+Both primary ordered-assembly families and the ``to_sparse``
+dense-suffix stretch are complete and gated; the next session opens
+with the independent review of this nine-commit milestone.  No cutover,
+legacy deletion, Phase 8, or Phase 8.5 is authorized.

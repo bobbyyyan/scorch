@@ -6371,3 +6371,251 @@ schedule identity, public dispatch, release cache, selector behavior,
 the native ABI, or the legacy pipeline.  The Phase-7 broad checkpoint
 therefore remains **GO**.  The next milestone should widen ordered
 sparse assembly rather than start cutover or Phase 8.
+
+## 39. Phase-7 ordered-sparse-assembly milestone: single-cursor streams, union tails, and the dense-suffix conversion (2026-07-31)
+
+### 39.1 Independent review of the correction range
+
+The ``370425d``/``a06ea1a``/``3570b29`` correction range was
+independently reviewed from the diffs before any new work.  Every
+committed reproduction is green at the inherited tip: the B3 battery
+(44, including the rank-four pre-pass mutation census and the no-op
+dynamic-vector byte-identity lock), the mixed-operand, oracle, and
+row-scope batteries (143 combined, covering both Mapping mutation
+attacks, deep oracle-input ownership, and verify-before-callback
+ordering), and the exact B3 source-parity locks in both automatic arms.
+The retained activating-latency evidence under
+``~/.cache/scorch-codex/phase7-broad-review-a06ea1a/b3-latency/``
+verifies against its SHA256SUMS (4/4) at the recorded worst ratio
+1.04651.  Origin remained ``58e8565`` and the five protected tracked
+files hashed exactly as recorded.
+
+Eleven fresh adversarial probes were then committed (``d6c759b``), all
+passing without a defect: a hostile tuple-subclass shape value is
+rejected by the exact-type boundary with zero caller-method
+invocations; Mappings that iterate duplicate SymbolId keys or mutate
+the key object during value lookup die inside both the target and
+oracle snapshots; a foreign compressed oracle binding class is rejected
+without a single attribute access; nested rank-2 dense containers are
+deep-owned before output-shape callbacks; and the B3 checked-mutation
+census and no-op-pass byte-neutrality locks extend from the committed
+rank-4 cell to ``ss``/``sss``/``dss`` with exact per-format counts.
+No concrete defect was found in the range.
+
+### 39.2 The pre-implementation caller/seam/comparand census
+
+Retained under
+``~/.cache/scorch-codex/phase7-assembly-session/census/``
+(``family_caller_census.py``/``.json``, ``legacy_union_soundness.py``/
+``.json``, ``legacy_single_cursor_soundness.py``/``legacy_sc_soundness.json``,
+plus per-cell legacy source exemplars):
+
+- every candidate cell of both families rejected on the LoopIR route at
+  exactly ``unsupported_sparse_output`` in both arms, while the legacy
+  pipeline generated C++ for all of them, arm- and schedule-invariant;
+- the single-cursor family is production-reachable through public
+  ``scorch.einsum``: identity expressions over compressed inputs infer
+  ``ss``/``dss`` outputs (``ij->ij``, ``ijk->ijk``) and mixed MUL
+  (``ij,ij->ij`` over ``ss``×``dd``) infers ``ss``; twenty legacy
+  execution cells through that route (copies, dense-zero products,
+  commuted operands, empty rows, all-empty) match the ordered-stream
+  reference exactly, including explicit zeros — the comparand is sound;
+- no public operation spells elementwise sparse ADD; the compiler-level
+  CIN entry is the union caller.  The legacy union kernels were executed
+  directly under independent build identity across 28 cells (four
+  formats × overlapping/disjoint/one-sided-rows/b-empty/a-empty/
+  column-tails/identical-support) against an independent Python
+  ordered-union reference: all sound.  Byte parity is therefore the gate
+  for BOTH families — the B1/B3 discipline, not B2's no-parity mode;
+- recorded pre-existing limitation: the low-level
+  ``scorch.ops.lower_and_exec_cin`` result wrapper cannot wrap
+  multi-compressed sparse outputs (it derives a dense result format and
+  fails in ``TensorIndex`` validation); public einsum wraps them
+  correctly, and the LoopIR ``execute_cin_via_loopir`` wraps from the
+  verified declaration;
+- neighbors censused with exact codes: SUB
+  (``unsupported_sparse_subtraction``; legacy cannot compile SUB at
+  all), union-with-dense (``unsupported_union_with_dense``), rank-1
+  compressed outputs and dense-domain suffixes
+  (``unsupported_sparse_output``), 3-ary chains, and ``sd`` trailing
+  dense outputs (``unsupported_sparse_output_domain``).
+
+### 39.3 The single-cursor multi-compressed family (``0881264`` / ``506cfc1``)
+
+Classification widens the multi-compressed suffix from all-INTERSECTION
+to per-level stream drivers in {single-cursor SPARSE, two-cursor
+INTERSECTION}; united suffixes were left at the historical seam for the
+next slice, and dense-domain suffixes keep ``unsupported_sparse_output``.
+The construction needs no new machinery: SPARSE domains already bind
+positions and build ``SparseFor``, so no node kinds, canonical schema,
+or request identity changed.  The dedicated target admits SparseFor
+levels in the assembly chain, drains them through the base sparse-loop
+emission, and attaches the same conditional parent append and child
+close every merged level owns.  Two legacy behaviors are reproduced
+structurally: single-operand assemblies pre-size dense-parent position
+vectors from the ABI-validated parent extent (the legacy
+exact-dense-parent rule, derived from operand count, the operand's
+declared layout, and statically bound result cells — the pre-sized
+levels keep the raw in-bounds indexed close while every dynamic vector
+stays checked), and the shared sparse-prefetch pass now also scans
+checked value-append calls (``*_values.emplace_back``) for dense
+value-array operands — byte-neutral for legacy trees, which still carry
+only indexed assignments at that stage.  Byte parity holds in both arms
+across ``ss``/``sss``/``dss``/``ssss``/``dsss`` copies (f32/f64),
+``ss*dd``, ``ss*ds``, ``dss*ddd``, ``sss*ddd`` and commuted forms.  The
+56-test battery adds exact oracle storage with base/scheduled
+agreement, PyTorch and repeated public einsum differentials, pre-sized
+empty-row coverage, explicit zeros (dense-zero products and hand-built
+stored zeros), empty-intermediate-parent suppression, deterministic
+storage, zero extents, the checked-mutation census with the pre-sized
+level accounted, dynamic-pass byte neutrality, hand-built source parity
+and oracle execution, and fail-closed neighbors (PositionLoad
+co-operands at ``unsupported_program_shape``, dense-domain suffixes,
+rank-1 compressed outputs, permuted compressed mode order at
+``unsupported_mode_order``).
+
+### 39.4 The rank-2+ union assembly family (``363cfed`` / ``6f6f085``)
+
+The homogeneous union chain (elementwise ADD of two same-format
+compressed operands into ``ss``/``sss``/``dss``/``ssss``/``dsss``) is
+admitted as ``MULTI_COMPRESSED_UNION``.  Representation: the existing
+``MergedSparseFor.positions`` field carries per-cursor union anchors —
+no new node kinds and no canonical-schema change; the node's documented
+semantics gain the union rule (a bound entry anchors descent only while
+its cursor is aligned; a child stream chained from an unaligned parent
+is the empty segment for that candidate coordinate).  The verifier
+admits union positions only when every cursor binds one; the oracle
+binds aligned positions and an absent-parent sentinel consumable only
+by child-segment selection.  Union positions are allocated only for
+this family, so rank-1 unions and CSR union columns keep their exact
+prior position-free programs and bytes.  The target emits the legacy
+union lattice statement-for-statement — the three-case while-merge,
+per-case leaf folding through additive-identity defaults, one-sided
+cases and post-exhaustion tails draining the surviving operand's whole
+subtree through the same single-cursor stream emission the single-cursor
+family owns, and the shared parent-append/close — at byte parity in
+both arms for all five formats, f32/f64, and commuted operands.  The
+62-test battery adds exact oracle storage, disjoint/one-sided-row/
+column-tail/whole-operand-exhaustion coverage on every format,
+cancellation to a stored explicit zero, hand-built explicit zeros and
+empty-intermediate parents, dense-prefix empty-row closure, zero
+extents, repeated byte-stable compiled differentials, the
+checked-mutation census over every case and tail (zero unchecked
+mutations; exact per-format counts), dynamic-pass byte neutrality,
+hand-built source parity and one-sided oracle descent, verifier/target
+defect paths, and fail-closed neighbors.  One deliberate boundary was
+added during review of a surprise admission: the united leaf envelope
+is exactly the sum of the two united operand reads, so ``(A+B)*D``
+dense-factor widenings fail closed at ``unsupported_program_shape``;
+the 3-ary union moved from the layout seam to the same target code the
+3-ary intersection already carries (recorded seam move), and SUB,
+union-with-dense, and rank-1 united outputs keep their historical codes.
+
+### 39.5 The dense-suffix conversion stretch (``2d1f436`` / ``607d3e1``)
+
+Public ``to_sparse('sd')``/``to_sparse('sdd')`` (and every ``d``/``s``
+layout whose value-bearing suffix is DENSE) previously ran the
+per-entry legacy filter kernel whose storage carries values without
+parent coordinates — the recorded defective dense-suffix comparand —
+and hard-failed at storage validation.  The conversion now materializes
+the layout directly (densify, collapse trailing dense levels into
+blocks, store one block per prefix path exactly when it contains a
+nonzero, build the prefix arrays level by level), identity mode order
+only, with other mode orders and invalid formats keeping the historical
+path and staged failure bookkeeping.  The 16-test battery locks round
+trips (``sd``/``sdd``/``dsd``/``ssd``/``dssd``), exact-storage
+equivalence against the hand-built ``TensorIndex`` builders,
+interior-zero retention, canonical empty storage, dense-prefix position
+closure, f64, sparse-source reconversion, untouched compressed-leaf
+formats, the identity-order boundary, and compiled execution through
+the mixed-operand route.  The mixed dense-leaf runtime batteries now
+build their inputs through the public conversion, closing the recorded
+hand-built-storage requirement (the hand-built builders remain as exact
+comparands).
+
+### 39.6 Census, sweeps, audit, and captures
+
+- Deterministic census v7 (47 cells, the 32 inherited cells plus the
+  single-cursor flip, five copy/commuted/mixed cells, five union parity
+  cells, and four new seam cells): **zero route and zero arm
+  divergence**; every inherited cell at its exact prior outcome.
+- Randomized cross-route sweep v3 (sparse result formats and union
+  value operators added): seeds 1/2/7/11/13 × 150 cases, 34-42 parity
+  arms per seed, **zero mismatches**; reject codes are the expected
+  seam census.  The retained v2 sweep at seed 13 reproduces
+  byte-identically (76 parity arms, zero mismatches), proving the
+  legacy-reachable envelope unchanged.
+- The 86-case schedule audit: **46 admitted / 40 rejected /
+  0 non-identical**; JSON equal to the retained result after
+  normalizing only the embedded commit field.
+- Captures: corpus **20/20**, grid **42/42**, auto **23/23**, anchors
+  **22/22**, heap **11/11** byte-identical to the retained surfaces,
+  which chain to the sealed ``ebb243b`` baselines.  Twenty-two
+  activating captures for the two new families are sealed with per-arm
+  digests; every cell is arm-identical (both families are serial).
+
+### 39.7 Verification at the exact tip
+
+At code/test tip ``607d3e1`` (all commands in the ``scorch`` conda
+environment; evidence under
+``~/.cache/scorch-codex/phase7-assembly-session/``):
+
+- full 15-file LoopIR battery sweep: **1220 passed / 0 failed**
+  (includes 56 single-cursor, 62 union, 45 B3, 77 mixed+conversion);
+- pure-LoopIR membership (12 files): **1401 passed**; options/
+  plan-identity membership: **153 passed**;
+- repeated compiled public differentials (three rounds × five cells,
+  including an ``sd`` operand built by the new public conversion):
+  all green;
+- activating A/B/A compile latency (200 warmups / 2,000 interleaved
+  samples per shape; candidate ``607d3e1`` vs base ``3570b29``
+  worktrees): worst candidate within-run LoopIR/legacy ratio
+  **1.02979** across p50/mean/p95 on ``dss`` copy, ``ss`` union,
+  ``ssss`` union, and the shared B3 control, in all three candidate
+  runs including the order-flipped control; the union cells run at
+  0.82-0.92 (faster than legacy); base-run control ratios 1.018-1.026
+  match the candidate's B3 ratios; the A/A pair agrees within run
+  normalization (absolute drift 0.81-1.01 superseded by within-run
+  ratios, per the established discipline);
+- static parity proven **base-vs-candidate under one invocation**:
+  Black one pre-existing file, Flake8 nine pre-existing findings, and
+  full-source mypy **byte-identical after line normalization (146
+  errors in 12 files at both revisions, zero LoopIR findings)** — the
+  previously recorded "140 in 11 files" was the inherited session's
+  environment count, and the parity claim here is the exact
+  base/candidate equality; ``git diff --check`` clean;
+- exact-tip clean-detached full non-performance suite at ``607d3e1``:
+  **5,012 nodes collected / 3 performance deselected / 5,009 selected;
+  4,995 passed / 14 skipped / 0 failures** (aggregate pytest time
+  4,420.24 seconds) in eight file partitions, each a fresh
+  process with its raw log retained under
+  ``phase7-assembly-session/full-suite/``; the partition union is
+  proven complete and non-overlapping against the collected file list
+  (``union-proof.txt``).
+
+The evidence directory is sealed with ``SHA256SUMS`` covering the
+census, soundness probes, sweep logs, audit, captures, activating
+digests, latency samples, static-parity outputs, and the full-suite
+partition logs.  Origin remains ``58e8565``; nothing was pushed; the
+five protected tracked files hash exactly as recorded; only explicit
+paths were staged.
+
+### 39.8 Phase-7 checkpoint audit
+
+Criterion by criterion: both named ordered-assembly families are
+implementation-complete over their proven envelopes at byte parity in
+both automatic arms, with exact oracle and PyTorch differentials and
+production-caller coverage where a public route exists; every neighbor
+carries a stable fail-closed code, including the two boundaries this
+milestone deliberately added (the united leaf shape and union-chain
+homogeneity) and the one recorded seam move (3-ary union to the target
+code); the representation change is semantic-only over the existing
+schema (union positions), with canonical v10, request identity,
+schedule identity, and erasure untouched; the runtime dense-suffix
+conversion closes the recorded ``to_sparse`` gap without touching any
+compiled route; release behavior is unchanged (production imports
+untouched, sealed captures byte-stable, the audit unchanged, censuses
+divergence-free, latency inside the 1.10 budget).  **The Phase-7
+checkpoint is GO for this milestone.**  No release
+dispatch/cache/selector cutover, legacy deletion, Phase 8, or Phase 8.5
+work was performed or started.
