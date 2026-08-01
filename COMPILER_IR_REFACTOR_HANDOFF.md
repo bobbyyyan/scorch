@@ -29132,7 +29132,9 @@ legacy deletion, Phase 8, or Phase 8.5 is authorized.
 
 ## Phase-7 ordered-sparse-assembly milestone (2026-07-31; supersedes the 2026-07-30 pointer)
 
-Nine local commits stack on ``3570b29`` (review §39 is definitive):
+Eight local commits stack on ``3570b29`` — seven code/test commits
+(``d6c759b`` .. ``607d3e1``) plus this documentation commit (review §39
+is definitive):
 
 - ``d6c759b`` — eleven fresh review probes over the ``370425d``/
   ``a06ea1a`` correction pair (hostile shape values, duplicate/mutating
@@ -29206,8 +29208,8 @@ scheduler, research, scratchpad, packaging, and untracked path
 untouched; stage only explicit paths and give nontrivial commits
 descriptive bodies.
 
-First independently review the nine-commit milestone (``d6c759b`` ..
-``607d3e1``) rather than trusting the handoff: reproduce the union and
+First independently review the eight-commit milestone (``d6c759b`` ..
+the documentation tip) rather than trusting the handoff: reproduce the union and
 single-cursor byte parity in both arms, the one-sided oracle descent
 and absent-parent semantics, the united leaf-shape and homogeneity
 boundaries, the checked-mutation censuses (including the pre-sized
