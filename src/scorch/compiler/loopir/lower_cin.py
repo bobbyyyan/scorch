@@ -561,6 +561,7 @@ class _SparseOutputReduction(Enum):
     CSR_DENSE_ROW = "csr_dense_row"
     CSR_SPARSE_ROW = "csr_sparse_row"
     MULTI_COMPRESSED_ASSEMBLY = "multi_compressed_assembly"
+    MULTI_COMPRESSED_UNION = "multi_compressed_union"
 
 
 def _classify_sparse_output_family(
@@ -655,14 +656,7 @@ def _classify_sparse_output_family(
                         "compressed-suffix coordinate in the migrated "
                         "families",
                     )
-                # The homogeneous union chain is the next Phase-7 family;
-                # it keeps the historical seam until its ordered one-sided
-                # assembly ships.
-                _fail(
-                    "unsupported_sparse_output",
-                    "united stored coordinate streams do not yet assemble "
-                    "a multi-compressed output in the migrated families",
-                )
+                return _SparseOutputReduction.MULTI_COMPRESSED_UNION
             for kind in suffix_kinds:
                 if kind not in (DomainKind.SPARSE, DomainKind.INTERSECTION):
                     # Dense-domain suffix coordinates keep the historical
@@ -812,6 +806,9 @@ def _lower_sparse_family(
     multi_compressed_assembly = (
         reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
     )
+    multi_compressed_union = (
+        reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_UNION
+    )
 
     for index_id in loop_index_ids:
         domain = domains[index_id]
@@ -883,6 +880,12 @@ def _lower_sparse_family(
                 position_ids[key] = builder.new_position_id()
             elif domain.kind is DomainKind.UNION:
                 union_cursors.add(key)
+                if multi_compressed_union:
+                    # Ordered union descent: the merged loop binds every
+                    # cursor's position; a child stream chained from a
+                    # cursor that did not align at the merged coordinate
+                    # is empty in that iteration.
+                    position_ids[key] = builder.new_position_id()
             elif domain.kind is DomainKind.INTERSECTION and (
                 sparse_reduction_family or multi_compressed_assembly
             ):
@@ -1004,6 +1007,15 @@ def _lower_sparse_family(
             ):
                 merge_positions = tuple(
                     position_ids.get((ref.tensor, ref.level)) for ref in domain.cursors
+                )
+            elif mode is MergeMode.UNION and all(
+                (ref.tensor, ref.level) in position_ids for ref in domain.cursors
+            ):
+                # Only the union assembly family allocates union positions,
+                # so every other united program keeps its exact prior
+                # position-free merge.
+                merge_positions = tuple(
+                    position_ids[(ref.tensor, ref.level)] for ref in domain.cursors
                 )
             loop = builder.merged_sparse_for(
                 mode,

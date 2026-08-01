@@ -41,11 +41,11 @@ dimension's extent across all of them, failing closed on any disagreement.
 
 Fail-closed surface: this target lowering accepts the migrated program
 shapes only.  Unsupported neighbors—permuted compressed structure, merges
-of more than two cursors, unbound hierarchical descent, union or
-single-cursor multi-compressed assembly, unmanaged sparse reductions,
-unsupported schedule/assembly compositions, and arbitrary statement
-shapes—fail with :class:`LoopIRTargetError` and a stable code rather than
-being approximated.
+of more than two cursors, unbound hierarchical descent, heterogeneous or
+n-ary united assemblies, unmanaged sparse reductions, unsupported
+schedule/assembly compositions, and arbitrary statement shapes—fail with
+:class:`LoopIRTargetError` and a stable code rather than being
+approximated.
 """
 
 from __future__ import annotations
@@ -7508,11 +7508,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     "stream loops to follow the dense prefix",
                 )
                 require(
-                    only.mode is MergeMode.INTERSECTION
+                    only.mode in (MergeMode.INTERSECTION, MergeMode.UNION)
                     and len(only.cursors) == 2
                     and len(only.positions) == 2
                     and all(bound is not None for bound in only.positions),
-                    "two-cursor INTERSECTION merges binding both aligned " "positions",
+                    "two-cursor merges binding both aligned positions",
                 )
                 first = only.cursors[0]
                 loops.append(
@@ -7537,6 +7537,42 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "one loop per result level with one stream loop per "
                 "compressed level",
             )
+            union_pairs = {
+                tuple(cursor.tensor for cursor in loop.cursors)
+                for loop in loops
+                if loop.kind is _MERGED
+                and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
+            }
+            if union_pairs:
+                # One-sided union descent drains a single operand's whole
+                # subtree, so every stream level must unite the same two
+                # operands in the same order; mixing united levels with
+                # single-cursor or intersected levels has no sound
+                # one-sided child iterator.
+                require(
+                    len(union_pairs) == 1
+                    and all(
+                        loop.kind is _MERGED
+                        and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
+                        for loop in loops
+                        if loop.kind is not _DENSE
+                    ),
+                    "united assemblies to unite the same two operands at "
+                    "every compressed level",
+                )
+                # The union family's proven envelope is the elementwise sum
+                # of exactly the two united operands; wider expressions
+                # (further factors or nested operations) stay fail-closed
+                # rather than approximated.
+                value = cast(AppendEntry, only).value
+                require(
+                    type(value) is BinaryExpr
+                    and value.op is BinaryOp.ADD
+                    and type(value.lhs) is CursorValue
+                    and type(value.rhs) is CursorValue,
+                    "a united leaf to append exactly the sum of its two "
+                    "united operand reads",
+                )
             self.leaf = only
             return loops
 
@@ -7632,8 +7668,19 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 ),
                 leaf_stmts[3],
             ]
+        aligned_tensors = {
+            cursor.tensor for cursor in loop.cursors if cursor.cursor in aligned
+        }
+        if len(aligned_tensors) == len({c.tensor for c in loop.cursors}):
+            child_stmts = self._child_stream_statements(position)
+        else:
+            # A one-sided UNION case drains the single aligned operand's
+            # whole subtree in stored order.
+            child_stmts = self._one_sided_stream_statements(
+                position + 1, next(iter(aligned_tensors))
+            )
         return [
-            *self._child_stream_statements(position),
+            *child_stmts,
             llir.BlankLine(),
             llir.Comment("Assembly compressed _level indices"),
             *self._parent_append_statements(position),
@@ -7652,6 +7699,97 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             "a multi-compressed assembly level must nest a stream loop",
         )
         raise AssertionError("unreachable")
+
+    def _one_sided_cursor(self, position: int, tensor: SymbolId) -> SparseCursorDecl:
+        for cursor in self.loops[position].cursors:
+            if cursor.tensor == tensor:
+                return cursor
+        _fail(
+            "unsupported_program_shape",
+            "a one-sided union drain requires the aligned operand's cursor "
+            "at every child level",
+        )
+        raise AssertionError("unreachable")
+
+    def _one_sided_stream_statements(
+        self, position: int, tensor: SymbolId
+    ) -> List[llir.Stmt]:
+        """One operand's ordered subtree drain below a one-sided union case.
+
+        Emits the exact single-cursor stream loop the legacy union lattice
+        produces for the aligned operand — the ``_end`` iterator init, the
+        stored-order ``for`` over the operand's own child segment, the
+        folded leaf appends (the absent operand's default folds away), and
+        the same conditional parent append and child close every assembly
+        level owns.
+        """
+
+        loop = self.loops[position]
+        cursor = self._one_sided_cursor(position, tensor)
+        dimension_name = self._loop_var_name(loop)
+        position_name = self._cursor_position_name(cursor)
+        if position == len(self.loops) - 1:
+            leaf_stmts = self._merged_case_stmts(loop, {cursor.cursor})
+            if leaf_stmts is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a one-sided union leaf must append its stored entries",
+                )
+            child_body: List[llir.Stmt] = leaf_stmts
+        else:
+            child_body = [
+                *self._one_sided_stream_statements(position + 1, tensor),
+                llir.BlankLine(),
+                llir.Comment("Assembly compressed _level indices"),
+                *self._parent_append_statements(position),
+            ]
+        body: List[llir.Stmt] = [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=dimension_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor),
+                    index=llir.Var(name=position_name, type=llir.DataType.INT),
+                ),
+            ),
+            llir.BlankLine(),
+            *child_body,
+        ]
+        position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=position_name, type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._cursor_parent_index(cursor, 0),
+                ),
+            ),
+            cond=llir.BinOp(
+                op="<",
+                left=position_var,
+                right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+            ),
+            update=llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            ),
+            body=body,
+        )
+        for_loop.scorch_index_var = dimension_name
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{position_name}_end",
+                    type=llir.DataType.INT,
+                ),
+                value=llir.ArrayAccess(
+                    array=self._cursor_pos_array(cursor),
+                    index=self._cursor_parent_index(cursor, 1),
+                ),
+            ),
+            llir.BlankLine(),
+            for_loop,
+        ]
 
     def _loop_children(self, position: int) -> List[llir.Stmt]:
         """Single-cursor levels append the leaf or the child stream.

@@ -2027,12 +2027,21 @@ def _check_merged_sparse_for(
                 "a nonempty merge position tuple must bind at least one "
                 "position; use the canonical empty tuple otherwise",
             )
-        if stmt.mode is not MergeMode.INTERSECTION:
+        if stmt.mode is MergeMode.UNION:
+            if any(bound is None for bound in stmt.positions):
+                _fail(
+                    "unsupported_sparse_hierarchy",
+                    path,
+                    "a position-binding UNION merge must bind every "
+                    "cursor's position: one-sided descent needs each "
+                    "operand's own anchor",
+                )
+        elif stmt.mode is not MergeMode.INTERSECTION:
             _fail(
                 "unsupported_sparse_hierarchy",
                 path,
                 "merge descent binds aligned positions only under "
-                "INTERSECTION, where every cursor is aligned at the body",
+                "INTERSECTION or UNION",
             )
     decls = []
     for position, cursor in enumerate(stmt.cursors):
@@ -2047,8 +2056,9 @@ def _check_merged_sparse_for(
                 "unsupported_sparse_hierarchy",
                 cursor_path,
                 "merged cursors must target the value-bearing leaf level "
-                "unless the INTERSECTION merge binds their aligned position "
-                "as a descent anchor",
+                "unless the merge binds their position as a descent anchor "
+                "(aligned under INTERSECTION; per-cursor under UNION, "
+                "where an unaligned parent yields the empty child stream)",
             )
         decls.append(decl)
     merge_dimension = ctx.level_dimension(decls[0].tensor, decls[0].level)

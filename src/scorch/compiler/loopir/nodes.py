@@ -941,15 +941,18 @@ class MergedSparseFor(Stmt):
     """Coordinate-synchronized iteration over two or more sparse cursors.
 
     Every cursor level must store the same logical dimension — the merged
-    coordinate domain.  A UNION merge admits only value-bearing leaf-level
-    cursors (the historical contract).  An INTERSECTION merge additionally
-    admits non-leaf cursors when the loop binds their aligned position
-    through ``positions``: each entry pairs with the same-index cursor and
-    names the :class:`PositionId` the body observes for that cursor's
-    aligned entry, which is the descent anchor a child level's
-    :class:`SparseCursorDecl` parent expression consumes.  ``positions``
-    is empty in the historical no-descent form; when nonempty it has one
-    entry (a ``PositionId`` or ``None``) per cursor.
+    coordinate domain.  A merge admits non-leaf cursors when the loop binds
+    their position through ``positions``: each entry pairs with the
+    same-index cursor and names the :class:`PositionId` the body observes
+    for that cursor's entry, which is the descent anchor a child level's
+    :class:`SparseCursorDecl` parent expression consumes.  Under
+    INTERSECTION every cursor is aligned at the body, so a bound position
+    is always its aligned entry; a position-binding UNION merge must bind
+    every cursor, and an entry anchors descent only while its cursor is
+    aligned — a child stream chained from an unaligned parent is the empty
+    segment for that candidate coordinate.  ``positions`` is empty in the
+    historical no-descent form; when nonempty it has one entry (a
+    ``PositionId`` or ``None``) per cursor.
 
     Semantics (intrinsic to the node; the oracle and any target lowering
     must implement exactly this):

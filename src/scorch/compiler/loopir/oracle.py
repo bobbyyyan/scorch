@@ -152,6 +152,22 @@ class LoopIROracleError(Exception):
     """Program execution hit a state the LoopIR oracle rejects."""
 
 
+class _AbsentParentType:
+    """Sentinel for a union cursor's position when it did not align.
+
+    A child stream chained from an absent parent iterates the empty
+    segment; every other position use of an absent parent fails closed.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<absent union parent>"
+
+
+_ABSENT_PARENT = _AbsentParentType()
+
+
 def _snapshot_binding_mapping(
     bindings: Mapping[SymbolId, _BindingValue],
     *,
@@ -496,7 +512,10 @@ class _Oracle:
         ] = {}
         self.draining_values: Dict[WorkspaceId, float] = {}
         self.sparse_reductions: Dict[SymbolId, Dict[Tuple[int, ...], float]] = {}
-        self.positions: Dict[PositionId, int] = {}
+        # Union merges bind an absent-parent sentinel for unaligned
+        # cursors; every consumer other than child-segment selection
+        # fails closed on it through the exact-int position check.
+        self.positions: Dict[PositionId, object] = {}
         self.cursors: Dict[CursorId, _CursorState] = {}
         self.tile_origins: Dict[TileId, int] = {}
         # Workspace extents are semantic integers, not allocation requests
@@ -819,6 +838,14 @@ class _Oracle:
             raise LoopIROracleError(
                 f"cursor tensor {self.decls[decl.tensor].name} has no level storage"
             )
+        if (
+            type(decl.parent) is PositionValue
+            and self.positions.get(decl.parent.position) is _ABSENT_PARENT
+        ):
+            # The parent union cursor did not align at the current merged
+            # coordinate, so this operand contributes the empty child
+            # stream in this iteration.
+            return storage, 0, 0
         parent = self._eval_position(decl.parent)
         try:
             start, end = storage.segment(decl.level, parent)
@@ -1061,7 +1088,14 @@ class _Oracle:
                         if bound is not None:
                             # INTERSECTION: every cursor is aligned at the
                             # body, so its position is the descent anchor.
-                            self.positions[bound] = states[cursor_position].position
+                            # UNION: only an aligned cursor anchors descent;
+                            # a child stream chained from an unaligned
+                            # parent is empty in this iteration.
+                            state = states[cursor_position]
+                            if state.aligned:
+                                self.positions[bound] = state.position
+                            else:
+                                self.positions[bound] = _ABSENT_PARENT
                     self._exec_stmt(stmt.body)
                 for state in aligned:
                     state.position += 1
