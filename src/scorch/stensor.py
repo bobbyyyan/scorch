@@ -1432,9 +1432,11 @@ class STensor:
         Notes
         -----
         The 1-D case is special-cased and builds a single compressed level
-        directly from ``torch.nonzero`` (no kernel compile). For rank ≥ 2 Scorch
-        JIT-compiles a filter-zeros kernel (honoring the tensor's ``mode_order``);
-        the first call of a given shape/format incurs a C++ compile.
+        directly from ``torch.nonzero`` (no kernel compile).  Identity-order
+        rank-2-and-higher formats with a dense value-bearing suffix materialize
+        their blocked output directly from a dense snapshot; sparse inputs may
+        first use the ordinary densification kernel.  Other rank-2-and-higher
+        formats JIT-compile a filter-zeros kernel honoring ``mode_order``.
 
         Examples
         --------
@@ -1485,12 +1487,6 @@ class STensor:
                 # Invalid format requests keep the historical path and its
                 # exact staged failure bookkeeping.
                 requested_format = None
-            if (
-                requested_format is not None
-                and _is_dense_suffix_format(requested_format)
-                and list(self.storage.index.mode_order) == list(range(len(self.shape)))
-            ):
-                return self._to_sparse_dense_suffix(requested_format)
             compile_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
@@ -1501,6 +1497,17 @@ class STensor:
             compilation_context = _compilation_context_at_boundary(
                 _compilation_context, compile_options
             )
+            if (
+                requested_format is not None
+                and _is_dense_suffix_format(requested_format)
+                and requested_format.get_order() == len(self.shape)
+                and list(self.storage.index.mode_order) == list(range(len(self.shape)))
+            ):
+                return self._to_sparse_dense_suffix(
+                    requested_format,
+                    compile_options=compile_options,
+                    compilation_context=compilation_context,
+                )
             frontend_token = compilation_context.begin_stage(
                 CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
                 compile_options=compile_options,
@@ -1650,15 +1657,24 @@ class STensor:
 
         return self
 
-    def _to_sparse_dense_suffix(self, output_format: TensorFormat) -> STensor:
+    def _to_sparse_dense_suffix(
+        self,
+        output_format: TensorFormat,
+        *,
+        compile_options: CompileOptions,
+        compilation_context: CompilationContext,
+    ) -> STensor:
         """Materialize a dense-suffix block layout directly, in place.
 
         A ``d``/``s`` prefix over one-or-more trailing DENSE levels stores
         one complete dense value block per stored prefix path: a prefix
         path is stored exactly when its block contains any nonzero, and a
         stored block keeps its interior zeros.  This is the same
-        conditional-parent discipline the compiled assembly families use,
-        built directly from the densified tensor without a kernel compile.
+        conditional-parent discipline the compiled assembly families use.
+        The defective filter kernel is never used: an already-dense source is
+        copied directly, while a sparse source obtains its snapshot through
+        ordinary non-mutating densification under the caller's exact compiler
+        options and timing context.
         """
 
         kinds = output_format.get_level_types()
@@ -1672,7 +1688,12 @@ class STensor:
         while suffix < rank and kinds[rank - 1 - suffix] is LevelType.DENSE:
             suffix += 1
         split = rank - suffix
-        dense = self.to_torch() if self.has_index else self.values
+        dense_tensor = self.to_dense(
+            in_place=False,
+            _compile_options=compile_options,
+            _compilation_context=compilation_context,
+        )
+        dense = dense_tensor.storage.value.reshape(shape)
         block_numel = 1
         for extent in shape[split:]:
             block_numel *= extent
