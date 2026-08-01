@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
-from typing import Optional, Tuple, Union, List
+from typing import Iterator, Optional, Tuple, Union, List
 
 import torch
 
@@ -102,6 +102,23 @@ class Window(object):
 
     def __copy__(self):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
+
+
+def _is_dense_suffix_format(output_format: TensorFormat) -> bool:
+    """A ``d``/``s`` layout whose value-bearing suffix is DENSE.
+
+    These layouts store one complete dense block per stored prefix path,
+    so conversion materializes blocks directly instead of running the
+    per-entry filter kernel (whose legacy form mis-assembles them).
+    """
+
+    kinds = output_format.get_level_types()
+    return (
+        len(kinds) >= 2
+        and all(kind in (LevelType.DENSE, LevelType.COMPRESSED) for kind in kinds)
+        and kinds[-1] is LevelType.DENSE
+        and any(kind is LevelType.COMPRESSED for kind in kinds)
+    )
 
 
 class STensor:
@@ -1461,6 +1478,19 @@ class STensor:
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
+            requested_format: Optional[TensorFormat]
+            try:
+                requested_format = None if fmt is None else parse_format(fmt)
+            except Exception:
+                # Invalid format requests keep the historical path and its
+                # exact staged failure bookkeeping.
+                requested_format = None
+            if (
+                requested_format is not None
+                and _is_dense_suffix_format(requested_format)
+                and list(self.storage.index.mode_order) == list(range(len(self.shape)))
+            ):
+                return self._to_sparse_dense_suffix(requested_format)
             compile_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
@@ -1618,6 +1648,94 @@ class STensor:
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
 
+        return self
+
+    def _to_sparse_dense_suffix(self, output_format: TensorFormat) -> STensor:
+        """Materialize a dense-suffix block layout directly, in place.
+
+        A ``d``/``s`` prefix over one-or-more trailing DENSE levels stores
+        one complete dense value block per stored prefix path: a prefix
+        path is stored exactly when its block contains any nonzero, and a
+        stored block keeps its interior zeros.  This is the same
+        conditional-parent discipline the compiled assembly families use,
+        built directly from the densified tensor without a kernel compile.
+        """
+
+        kinds = output_format.get_level_types()
+        rank = len(kinds)
+        shape = tuple(self.shape)
+        if rank != len(shape):
+            raise TensorStorageError(
+                f"format rank {rank} does not match tensor rank {len(shape)}"
+            )
+        suffix = 0
+        while suffix < rank and kinds[rank - 1 - suffix] is LevelType.DENSE:
+            suffix += 1
+        split = rank - suffix
+        dense = self.to_torch() if self.has_index else self.values
+        block_numel = 1
+        for extent in shape[split:]:
+            block_numel *= extent
+        collapsed = dense.reshape(*shape[:split], block_numel)
+        mask = (collapsed != 0).any(dim=-1)
+        stored = torch.nonzero(mask)  # lexicographic prefix coordinates
+        paths = [tuple(int(x) for x in row) for row in stored]
+
+        mode_indices: List[List[torch.Tensor]] = []
+        for level in range(split):
+            if kinds[level] is LevelType.DENSE:
+                mode_indices.append([])
+                continue
+
+            def parent_iter(depth: int) -> Iterator[Tuple[int, ...]]:
+                if depth == 0:
+                    yield ()
+                    return
+                for parent in parent_iter(depth - 1):
+                    if kinds[depth - 1] is LevelType.DENSE:
+                        for coordinate in range(shape[depth - 1]):
+                            yield parent + (coordinate,)
+                    else:
+                        seen: List[int] = []
+                        for path in paths:
+                            if path[: depth - 1] == parent and (
+                                not seen or seen[-1] != path[depth - 1]
+                            ):
+                                seen.append(path[depth - 1])
+                        for coordinate in seen:
+                            yield parent + (coordinate,)
+
+            pos = [0]
+            crd: List[int] = []
+            for parent in parent_iter(level):
+                children = sorted(
+                    {path[level] for path in paths if path[:level] == parent}
+                )
+                crd.extend(children)
+                pos.append(len(crd))
+            mode_indices.append(
+                [
+                    torch.tensor(pos, dtype=torch.int32),
+                    torch.tensor(crd, dtype=torch.int32),
+                ]
+            )
+        for _ in range(suffix):
+            mode_indices.append([])
+        if paths:
+            values = collapsed[mask].reshape(-1).clone()
+        else:
+            values = dense.reshape(-1)[:0].clone()
+        new_tensor = STensor(
+            name=self.name,
+            shape=shape,
+            index=TensorIndex(
+                tensor_format=output_format,
+                mode_indices=mode_indices,
+                mode_order=self.storage.index.mode_order,
+            ),
+            value=values,
+        )
+        self._set_state(new_tensor.metadata, new_tensor.storage)
         return self
 
     def change_mode_order(
