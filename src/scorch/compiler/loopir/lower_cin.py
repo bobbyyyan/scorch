@@ -617,7 +617,14 @@ def _classify_sparse_output_family(
             and result_levels[-1 - compressed_suffix] is LevelType.COMPRESSED
         ):
             compressed_suffix += 1
-        multi_compressed_family = compressed_suffix >= 2 and all(
+        # An ordered compressed suffix carries two or more compressed levels
+        # or -- degenerately -- is the whole rank-1 result: one stored stream
+        # with no dense prefix and no parent level to close.  Canonical CSR
+        # keeps its own dedicated family below.
+        ordered_compressed_suffix = (
+            compressed_suffix >= 2 or len(result_levels) == compressed_suffix == 1
+        )
+        multi_compressed_family = ordered_compressed_suffix and all(
             level_type is LevelType.DENSE
             for level_type in result_levels[: len(result_levels) - compressed_suffix]
         )

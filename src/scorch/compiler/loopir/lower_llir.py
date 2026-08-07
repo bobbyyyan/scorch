@@ -7313,7 +7313,9 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
 
     Routing is purely structural: a single-statement nest of dense loops
     over nested stream loops (single-cursor sparse or two-cursor merged)
-    appending into a dense-prefix/multi-compressed-suffix result.
+    appending into a dense-prefix/multi-compressed-suffix result, where the
+    suffix is two-or-more compressed levels or the degenerate rank-1
+    all-compressed result (one stream, no dense prefix, no parent level).
     Everything else stays on its existing route and keeps its fail-closed
     boundaries.
     """
@@ -7333,7 +7335,13 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
         and kinds[-1 - compressed_suffix] is LevelKind.COMPRESSED
     ):
         compressed_suffix += 1
-    if compressed_suffix < 2 or any(
+    # Two or more compressed suffix levels, or -- degenerately -- a rank-1
+    # all-compressed result: the same ordered stream assembly with no dense
+    # prefix and no parent level to close.
+    ordered_compressed_suffix = (
+        compressed_suffix >= 2 or len(kinds) == compressed_suffix == 1
+    )
+    if not ordered_compressed_suffix or any(
         kind is not LevelKind.DENSE for kind in kinds[: len(kinds) - compressed_suffix]
     ):
         return False
@@ -7352,7 +7360,9 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
             streams += 1
             body = only.body
             continue
-        return type(only) is AppendEntry and streams >= 2
+        return type(only) is AppendEntry and (
+            streams >= 2 or streams == len(kinds) == 1
+        )
     return False
 
 
@@ -7360,7 +7370,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     """Dedicated target lowering for the multi-compressed assembly families.
 
     Admits exactly the assembly forms ``lower_normalized_cin`` produces for
-    dense-prefix/multi-compressed-suffix results: at most one dense prefix
+    dense-prefix/multi-compressed-suffix results — including the degenerate
+    rank-1 all-compressed result, which is one stream loop with no dense
+    prefix and no parent level to close: at most one dense prefix
     loop, then one stream loop per compressed result level — a single-cursor
     :class:`SparseFor` over one stored stream (dense co-operands are read at
     their resolved coordinates), or a two-cursor :class:`MergedSparseFor`.
@@ -7460,8 +7472,13 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         ):
             compressed_suffix += 1
         prefix = len(result_levels) - compressed_suffix
+        # The degenerate rank-1 all-compressed result is one stored stream
+        # with no dense prefix and no parent level to close.
+        ordered_compressed_suffix = (
+            compressed_suffix >= 2 or len(result_levels) == compressed_suffix == 1
+        )
         require(
-            compressed_suffix >= 2
+            ordered_compressed_suffix
             and all(level.kind is LevelKind.DENSE for level in result_levels[:prefix]),
             "a dense-prefix/multi-compressed-suffix result",
         )
