@@ -29359,3 +29359,173 @@ documentation tip, exclude generated ``__pycache__``, and prove every
 manifest entry verifies.  Update review and handoff with exact
 revisions, commands, counts, hashes, limitations, and the next
 superseding prompt.
+
+## Phase-7 compatibility-envelope milestone: conversion defects, the census, and rank-1 assembly (2026-08-07; supersedes the 2026-07-31 prompt)
+
+Commits: `530571e`, `cbc466f`, `2017aa0`, `79d2afe`, `8e2d279`, `04dbe60`,
+plus this documentation tip.  Origin remains `58e8565`; nothing was pushed,
+amended, squashed, or reordered; only explicit paths were staged; the five
+protected tracked files hash exactly as recorded before and after every
+commit.
+
+### Review of the inherited range: clean
+
+`1a92f50`/`9d5fb16`/`f196147`/`9ce6836`/`a606e11` were reviewed diff-by-diff
+and **no defect was found inside them**.  Both corrected boundaries reproduce
+under probes written from the node/verifier contracts, not from the committed
+tests: a `PositionLoad` on a UNION-bound position and a `DensePosition`
+parented by one both fail at `unsupported_sparse_hierarchy` on their exact
+paths, while the two sound shapes stay admitted with the oracle total.  The
+dense-suffix conversion reproduces on all four claims (720-cell independent
+decode sweep, 48 zero-extent cells, options/context/rank/atomicity/aliasing).
+Focused counts reproduce exactly (76 / 22 / 56; 154 together).  The
+replacement ledger verifies **175/175** entries.
+
+Two inherited documentation defects are corrected in review §41.1: the B3
+battery collects **43**, not the recorded 44/45; and the "498 LoopIR / 123
+runtime" focused memberships name no file set or command and have no retained
+log (the ledger's `focused/` is empty), so they are now recorded as
+unreproducible rather than as gates.
+
+### Four concrete defects found by fresh probes, all fixed first
+
+All are pre-existing, all in public `to_sparse`, none inside the reviewed
+range:
+
+- `530571e` — every `d`/`s` layout outside `d?s+` with a compressed leaf
+  (`dds`, `sds`, `ddds`, `ddss`, `dsds`, `sdds`, `sdss`, `ssds`) raised
+  `TensorIndexError` and could not be built at all.  The block materializer
+  already handled them; its admission predicate is generalized structurally.
+- `cbc466f` — rank-1 re-conversion silently corrupted an already-sparse
+  receiver (stored positions re-read as coordinates: `[0,1,0,0,2]` →
+  `[1,2,0,0,0]`), ignored `fmt` entirely, and skipped the compiler
+  options/context boundary.
+- `2017aa0` — the prefix assembly was quadratic; now one grouped pass,
+  byte-identical over 789 cells, 3.552 s → 0.148 s.
+- `79d2afe` — the regression locks for all of the above.
+
+### The census
+
+Review §41.3.  55 cells, both automatic arms, **zero arm divergence**, each in
+its own process.  It also characterized two further pre-existing public-route
+defects that this milestone does *not* fix: `einsum('ij->i')` emits C++ that
+does not compile (the legacy sparse-workspace drain subscripts a scalar key),
+and `einsum('ijk->ijk')` into `dds` fails in the legacy **output** assembler
+with the same one-dense-extent sizing bug the input conversion just lost —
+latent before, reachable now that the input builds.
+
+### The migrated slice
+
+`8e2d279` / `04dbe60` admit **rank-1 compressed ordered assembly**.  A rank-1
+all-compressed result is the degenerate case of the family the ordered
+assembly target already owns; the three sites that spelled "two or more
+compressed suffix levels" now also name it, through level identities alone.
+No new node kinds, no canonical-schema change, no request- or
+schedule-identity change, and no CSR shortcut, format sniffing, name/regex
+routing, or operation-specific hack.  Gate: byte parity in both arms over 20
+cells plus a 140-cell PyTorch differential; every excluded neighbour at its
+exact prior code; every rank>=2 family byte-unchanged.  The family **is**
+production-reachable through public `scorch.einsum` (`i->i` and `i,i->i` infer
+an `s` result matching the dense reference).  Three inherited seam locks moved
+to the neighbour that still occupies that seam, recorded in place.
+
+### What remains, and the exact blockers
+
+- **Compressed-parent/dense-leaf co-operands** (`ss*sd` and the rank-general
+  forms) stay at `unsupported_program_shape` in both arms.  Legacy generates
+  *and* executes them with well-formed storage, so this family **is**
+  byte-parity gateable.  The blocker is the assembly target's leaf envelope
+  and access-order machinery, which admits only `CursorValue` reads and dense
+  `Load`s, while these operands read through `PositionLoad` over a
+  `DensePosition` spine.  It is not a representation blocker.
+- **Multi-compressed reduction/TTM** stays at `unsupported_sparse_output`,
+  `unsupported_sparse_output_domain`, `unsupported_sparse_output_reduction`
+  and `unsupported_program_shape` depending on the nest.  The blocker is that
+  the legacy comparand is unusable: **eight reduction cells terminate the
+  process with SIGSEGV (exit 139)** when their generated C++ is executed on
+  well-formed inputs.  The slice therefore needs its own oracle-gated vertical
+  with a workspace/result ownership audit, and can never claim byte parity.
+  (Production dispatch is unaffected — `scorch.matmul` over `ss`x`ss` and
+  `ds`x dense both match `torch.matmul`.)
+- **Multiple dense prefixes / interleaved dense levels** (`dds`, `sds`,
+  `ddss`) can now be *built* but stay rejected at `unsupported_sparse_output`
+  / `unsupported_program_shape`; their legacy execution produces malformed
+  storage, so a migration must gate on the oracle, not parity.
+
+Exact-tip gates at `04dbe60` are green: focused batteries 64 + 18 + 93 +
+181 + 214; schedule audit **46/40/0** and byte-equal to its retained
+baseline; captures corpus 20 / grid 42 / anchors 22 / heap 11 byte-identical
+with the automatic surface differing only in two process-dependent cache-key
+characters; eight repeated public differentials byte-stable; activating
+latency worst **1.04189** primary and **1.06632** order-flipped against a
+1.10 budget; Black/Flake8/mypy at exact base/candidate parity (140 errors in
+11 files at both revisions, zero LoopIR findings); `git diff --check` clean;
+and a clean detached full non-performance suite of **5,168 passed / 14
+skipped / 0 failures** over 5,182 selected nodes in eight file-disjoint
+fresh processes with a proven complete, non-overlapping union.
+
+**Phase-7 does not exit on this milestone.**  No Phase-8 inventory was
+started, no cutover, cache, selector or dispatch change was made, and no
+legacy code was deleted.
+
+### Superseding broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in `/Users/bobby/scorch` on branch
+`refactor/compiler-ir-phase3-std-move-call` from the actual local tip reported
+by `git log`.  Do not push, amend, squash, or reorder.  Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§39-41, and this handoff tail.
+Preserve the five protected tracked files at their recorded hashes; leave all
+unrelated GPU/CUDA, benchmark, scheduler, research, scratchpad, packaging and
+untracked material untouched; stage only explicit paths and give nontrivial
+commits descriptive bodies.
+
+First independently review `530571e`, `cbc466f`, `2017aa0`, `79d2afe`,
+`8e2d279`, `04dbe60` and the documentation tip rather than trusting this
+report.  Reproduce: the widened `_is_directly_materialized_format` predicate
+as a strict superset (no previously routed layout may change bytes); the
+rank-1 corruption, format-rank, dense-request, boundary, context and
+atomicity contracts; the byte-identity of the linear prefix walk against the
+verbatim quadratic original; the rank-1 assembly byte parity in both arms and
+its PyTorch differential; the moved seam locks; and every entry of the
+evidence manifest.  Add fresh adversarial probes and fix and commit any
+concrete defect before extending the representation.
+
+Then deliver the next Phase-7 compatibility slice in separately reviewable
+commits:
+
+1. Migrate the **compressed-parent/dense-leaf co-operand** family
+   (`ss*sd`, `sd*ss`, `sss*sdd`, `sss*ssd`, `dss*dsd`, `ssss*sddd`, and the
+   ragged/empty forms).  The comparand is honest, so gate on byte parity in
+   both automatic arms plus oracle and PyTorch differentials.  Generalize the
+   assembly target's leaf envelope and access-order machinery through
+   position/level identities; add no CSR shortcuts, runtime-format sniffing,
+   rendered-name or regex routing, or operation-specific target hacks.  Keep
+   `ss+sd` at `unsupported_union_with_dense` and `sd` copy at
+   `unsupported_sparse_output_domain`.
+2. Then either (a) the **multi-compressed reduction/TTM** vertical, gated on
+   the oracle and PyTorch with the segfaulting legacy comparand retained only
+   as executable failure evidence, and reusing structured workspace/result
+   assembly only where an ownership audit proves it; or (b) the
+   **multiple-dense-prefix** family, gated on the oracle for the same reason.
+   Cover f32/f64, every relevant layout, cancellation, empty/ragged inputs,
+   zero extents, explicit zeros, and both arms.  If a representation boundary
+   genuinely requires another milestone, finish every independently coherent
+   subfamily and record the exact remaining blocker instead of narrowing scope
+   silently.
+3. Consider fixing the two characterized public-route defects — the rank-1
+   reduction that emits non-compiling C++, and the legacy output assembler's
+   one-dense-extent position sizing for `dds`-shaped results — since both are
+   now precisely localized.
+4. Re-run a criterion-by-criterion Phase-7 exit audit across the complete
+   declared matrix.  Only on a genuine GO may the session perform a read-only
+   Phase-8 cutover/fallback-frequency inventory.  Do not alter default
+   dispatch, caches, selectors, or delete legacy code; do not start Phase 8.5.
+
+Run focused and adversarial batteries, deterministic and multi-seed censuses,
+the 86-case audit, every retained and activating capture, repeated compiled
+public differentials, target-activating A/B/A latency with A/A and order
+controls, Black/Flake8/mypy base-vs-candidate parity, `git diff --check`, and
+an exact-tip clean detached full non-performance suite in fresh-process
+partitions with a proven complete, non-overlapping union.  Seal evidence only
+after the final documentation tip, exclude generated `__pycache__`, and prove
+every manifest entry verifies.

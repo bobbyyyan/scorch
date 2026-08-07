@@ -6752,3 +6752,324 @@ sparse-assembly compatibility envelope: census first, then the coherent
 rank-1 and merged dense-leaf non-reduction families, followed by the
 multi-compressed reduction/TTM vertical slice.  A Phase-8 inventory may
 begin only after a fresh Phase-7 exit audit reaches a genuine GO.
+
+## 41. Phase-7 compatibility-envelope milestone: conversion defects, the census, and rank-1 assembly (2026-08-07)
+
+### 41.1 Independent review of the inherited range
+
+The ``1a92f50``/``9d5fb16``/``f196147``/``9ce6836``/``a606e11`` range was
+reviewed diff-by-diff before any new work, and every reproducible claim
+was re-derived rather than trusted.  Origin remained ``58e8565`` and the
+five protected tracked files hashed exactly as recorded.  The
+replacement review ledger
+``~/.cache/scorch-codex/phase7-assembly-review-f196147/`` verifies
+**175/175** entries under ``shasum -a 256 -c SHA256SUMS``.
+
+Both corrected boundaries reproduce.  Seven independent probes, written
+from the ``nodes.py``/``verifier.py`` contracts rather than from the
+committed tests, confirm that:
+
+- a ``PositionLoad`` on a UNION-bound leaf position fails at
+  ``unsupported_sparse_hierarchy`` on path ``...value.lhs.position``;
+- the dense-child misuse — a ``DensePosition`` whose parent is a
+  UNION-bound position — fails at the same code on path
+  ``...value.position.parent``;
+- the two *sound* shapes stay admitted and total: a nested ``SparseFor``
+  chained from a possibly-absent parent, and a nested UNION merge whose
+  cursors both chain from possibly-absent parents.  ``_segment`` is the
+  single choke point all three loop forms use (``SparseFor``,
+  ``SparseWindowFor``, ``MergedSparseFor``), so an absent parent always
+  yields the empty segment, the freshly bound child position is never
+  observed, and the verifier's unconditional typing of it is correct.  A
+  one-sided row present only in the other operand produced no entries and
+  no parent coordinate, exactly as the conditional-append discipline
+  requires.
+
+The dense-suffix conversion reproduces on all four claims under fifteen
+independent probes: a **720-cell** decode sweep against an independently
+written block decoder (ranks 2-5, every ``d``/``s`` dense-suffix layout,
+three extent shapes, f32/f64, and random/all-zero/interior-zero/dense
+patterns), a **48-cell** zero-extent sweep, exact options/context
+rejection, rank equality, injected post-densification failure atomicity
+for both dense and sparse receivers, and non-aliasing of the produced
+values.
+
+Focused counts reproduce exactly: the UNION battery collects **76**, the
+dense-suffix battery **22**, the single-cursor battery **56**; run
+together they are **154 passed**.
+
+Two documentation defects were found:
+
+1. §39.1 records the B3 battery as ``44`` and §39.7 as ``45``.  The B3
+   multi-compressed battery collects **43** tests, at ``607d3e1`` and at
+   the inherited tip alike; the range never touched that file.
+2. The headline focused memberships "498 LoopIR tests and 123
+   runtime/stage tests" name no file set and no command, and the
+   replacement ledger's ``focused/`` directory is empty (0 of its 175
+   manifest entries lie under it).  ``498`` is reproducible only by
+   guessing a membership; ``123`` could not be reproduced from any
+   documented file set.  They are recorded here as **unreproducible**,
+   not as gates.
+
+**No concrete defect was found inside the reviewed range.**
+
+### 41.2 Four concrete defects found by fresh probes, and their fixes
+
+The census probes surfaced four concrete defects in the public
+``to_sparse`` conversion — the same surface ``2d1f436``/``9d5fb16``
+corrected for dense suffixes, left unfixed on two neighbouring families.
+All four are pre-existing and outside the reviewed range; all four are
+fixed here, before any representation change.
+
+**(a) ``530571e`` — multi-dense-parent layouts could not be built at
+all.**  Public ``to_sparse`` raised ``TensorIndexError`` for every
+``d``/``s`` layout with a compressed value-bearing leaf outside
+``d?s+`` — ``dds``, ``sds``, ``ddds``, ``ddss``, ``dsds``, ``sdds``,
+``sdss``, ``ssds``.  The per-entry filter kernel sizes a compressed
+level's position array from its immediately enclosing level alone, so
+``dds`` over ``(4,5,6)`` produced a 6-element position array where 21
+were required.  The block materializer already handled these layouts
+correctly (with no trailing dense level the block is one scalar and the
+walk degenerates to ordinary sparse storage); only its admission
+predicate excluded them.  ``_is_dense_suffix_format`` becomes
+``_is_directly_materialized_format``, stated structurally as "not
+``d?s+``" — the exact family the filter kernel does assemble.  The new
+predicate is a strict superset, so every previously routed layout is
+byte-unchanged and every ``d?s+`` and all-dense layout keeps the kernel
+path.  Verified by an independent decoder over **1,152** routed-family
+cells and **69** zero-extent cells.
+
+**(b) ``cbc466f`` — rank-1 re-conversion silently corrupted the
+receiver.**  The rank-1 branch filtered ``self.values`` unconditionally,
+so ``to_sparse('s')`` on an already-compressed rank-1 tensor
+reinterpreted stored positions as dense coordinates: ``[0,1,0,0,2]``
+round-tripped to ``[1,2,0,0,0]`` with no exception.
+
+**(c) ``cbc466f`` — rank-1 ignored ``fmt`` and the compiler boundary.**
+``to_sparse('d')`` and ``to_sparse('ss')`` both returned compressed
+rank-1 storage, and foreign ``_compile_options``/``_compilation_context``
+objects were never rejected.  The branch now mirrors the rank>=2
+discipline: validate the boundary first, require format-rank equality,
+reject a rank-1 request naming no compressed mode, and take a
+non-mutating dense snapshot under the caller's exact options and
+context.  Unparseable formats keep the historical path.
+
+**(d) ``2017aa0`` — prefix assembly was quadratic.**  The materializer
+rescanned the whole stored-path list once per parent at every level, so
+cost grew ~3.9x per problem doubling (3.552 s for a 32,744-block ``ssd``
+conversion).  ``torch.nonzero`` is row-major, so stored paths are
+already lexicographically sorted; the walk now groups each level's
+children in one pass and carries enumerated parents forward.  Pure
+performance change, proven **byte-identical** over a **789-cell**
+differential that runs the verbatim pre-change assembler beside the live
+one, including every zero-extent case.  The measured conversion drops to
+**0.148 s** and scales linearly.
+
+``79d2afe`` locks all four (42 new cells in the dense-suffix file, 18 in
+a new rank-1 conversion file).
+
+### 41.3 The Phase-7 compatibility-envelope census
+
+Census v10 records, for every declared cell and in both automatic arms,
+the LoopIR outcome and exact fail-closed code, whether legacy generates
+C++, whether the legacy kernel executes soundly with well-formed
+identity-ordered storage, and public reachability.  Legacy comparands
+execute through an independently keyed direct build, because the
+low-level ``lower_and_exec_cin`` wrapper cannot wrap multi-compressed
+sparse outputs (the pre-existing limitation recorded in §39.2).  Each
+cell runs in its own process so a native crash records a receipt instead
+of losing the run.  **55 cells; every cell arm-invariant.**
+
+- **Rank-1 compressed outputs** — copies, unions, intersections, mixed
+  ``s*d`` and commuted ``d*s``, and an empty operand — are **admitted**
+  after this milestone (§41.5).  ``s-s`` keeps
+  ``unsupported_sparse_subtraction`` (legacy cannot compile SUB at all),
+  ``s+d`` keeps ``unsupported_union_with_dense``, the 3-ary chain keeps
+  ``unsupported_program_shape``, and ``s->d`` was already admitted.
+- **Compressed-parent/dense-leaf co-operands** — ``ss*sd`` and its
+  commuted, f64, rank-3, rank-4, ragged and empty forms — sit at
+  ``unsupported_program_shape`` in both arms.  Legacy generates *and*
+  executes them with well-formed storage, so this family **is**
+  byte-parity gateable when migrated.  ``ss+sd`` keeps
+  ``unsupported_union_with_dense`` and ``sd`` copy keeps
+  ``unsupported_sparse_output_domain``.
+- **Multiple dense prefixes and interleaved dense levels** — ``dds``,
+  ``sds``, ``dds+dds`` at ``unsupported_sparse_output``; ``ddss``,
+  ``ddss+ddss`` at ``unsupported_program_shape``.  These inputs can now
+  be *built* (§41.2a) but their legacy execution produces malformed
+  storage, so a future migration must gate on the oracle, not parity.
+- **Multi-compressed reduction/TTM** — §41.4.
+
+Two further pre-existing public-route defects were characterized, both
+outside this milestone's scope and neither introduced by it:
+
+- ``einsum('ij->i')`` — a reduction into a rank-1 sparse output — emits
+  C++ that **does not compile**: the legacy sparse-workspace drain
+  subscripts a scalar workspace key
+  (``scorch_vector_set(T0_crd_vec, pT, it.first[0])`` →
+  *subscripted value is not an array, pointer, or vector*).
+- ``einsum('ijk->ijk')`` into ``dds`` fails at
+  ``TensorIndexError: compressed mode 2 position array has 5 elements,
+  expected 13``.  The *input* now builds correctly (§41.2a gives it a
+  13-element position array); the failure is in the legacy **output**
+  assembler, which still sizes a compressed level from one dense extent.
+  This defect is pre-existing and latent — fixing the input conversion
+  is what made it reachable.
+
+### 41.4 The reduction/TTM comparand is not byte-parity gateable
+
+Eight reduction cells — ``sss@dd`` TTM at f32 and f64, ``dss@dd`` TTM,
+``ss@dd`` and ``ss@ss`` into ``ss``, two ``ds``-output nests, and a
+ragged TTM — **terminate the process with SIGSEGV (exit 139)** when
+their legacy C++ is executed on well-formed identity-ordered inputs.
+Compilation succeeds (4,207 characters for the ``sss@dd`` cell) and the
+module loads; the crash is inside ``evaluate``.  A standalone
+reproduction is retained as an executable receipt.
+
+This is a concrete instance of the memory-safety failure ``lower_cin.py``
+already attributes to the sparse-reduction comparand.  It settles the
+gating question in advance: the reduction/TTM family **can never be
+gated on byte parity** and must use the LoopIR oracle and PyTorch
+differentials.
+
+The crash is confined to the legacy *generic comparand* route driven
+directly by the census.  Production dispatch is unaffected:
+``scorch.matmul`` over ``ss``x``ss`` and ``ds``x dense both return
+results matching ``torch.matmul``.  The LoopIR route rejects these
+nests at ``unsupported_sparse_output`` (TTM and rank-general
+reductions), ``unsupported_sparse_output_domain`` (``ss@dd``),
+``unsupported_sparse_output_reduction`` and ``unsupported_program_shape``
+(the ``ds``-output nests) — arm-invariantly.
+
+### 41.5 The rank-1 compressed assembly migration (``8e2d279`` / ``04dbe60``)
+
+A rank-1 all-compressed result is the degenerate case of the family the
+ordered-assembly target already owns: one stored stream, no dense
+prefix, and no parent level to close.  Exactly three sites spelled the
+structural rule as "two or more compressed suffix levels" — the CIN
+family classifier (``_classify_sparse_output_family``), the structural
+router (``_multi_compressed_assembly_chain``, in both its layout test
+and its stream count), and the target's chain collector
+(``_collect_assembly_chain``).  All three now also name the degenerate
+case, through level identities alone.
+
+No new node kinds, no canonical-schema change, and no request- or
+schedule-identity change.  No CSR-specific shortcut, runtime-format
+sniffing, rendered-name or regex routing, and no operation-specific
+target hack: canonical CSR keeps its own dedicated family because
+``(DENSE, COMPRESSED)`` is not a rank-1 result.
+
+The legacy comparand is honest here, so the gate is the B1/B3
+discipline:
+
+- **byte parity** with ``legacy_generated_cpp`` over **20 cells** —
+  ``s`` copy, ``s+s`` union, ``s*s`` intersection, ``s*d`` and the
+  commuted ``d*s``, at f32 and f64, in both automatic arms — all
+  identical;
+- a **PyTorch differential** over **140 compiled cells**: seven fixtures
+  (random, disjoint supports, either operand empty, exact cancellation,
+  identical supports, hand-built explicit zeros) x two dtypes x five
+  shapes x both arms — all matching;
+- every excluded neighbour keeps its exact prior code in both arms:
+  ``s-s`` at ``unsupported_sparse_subtraction``, ``s+d`` and ``d+s`` at
+  ``unsupported_union_with_dense``, 3-ary MUL and ADD at
+  ``unsupported_program_shape``;
+- the rank-1 dense output and the ``ss`` copy, ``ss+ss``, ``ss*dd`` and
+  ``ds+ds`` rank>=2 families are byte-unchanged.
+
+The 93-test battery adds honest identity-ordered storage carrying the
+exact ordered support, cancellation retaining a stored explicit zero,
+canonical empty storage, repeated byte-stable execution, and the
+single-compressed-level source shape (no ``C1_*`` arrays, no dense-size
+initializer).
+
+**Recorded seam move.**  Three inherited locks asserted that rank-1
+compressed outputs stay at ``unsupported_sparse_output``.  That seam now
+belongs to the admitted family, so each lock moves to the neighbour that
+still occupies it — a single compressed level under two or more dense
+parents, which the one-dense-prefix rule excludes — and names the move
+in place.
+
+**Production reachability.**  The family is reachable through public
+``scorch.einsum``: ``i->i`` over a compressed vector and ``i,i->i`` over
+compressed x compressed and compressed x dense all infer an ``s`` result,
+assemble the exact ordered support, and match the dense PyTorch
+reference.  (An earlier reading of this session claimed a dense
+inference; that reading was wrong because it printed the result format
+after calling ``to_torch()``, which densifies the receiver in place.
+The corrected measurement reads the format first.)
+
+Two further corrections to expectations formed during the work: the
+``ds`` CSR *copy* rejection at ``unsupported_program_shape`` is present
+at the inherited tip and is unrelated to this widening; and the
+``C6``/``C7`` census cells labelled "CSR control" do not reach the
+admitted CSR reduction family, because their loop nest is not that
+family's shape.
+
+### 41.6 Verification
+
+All gates ran in the ``scorch`` conda environment; evidence is under
+``~/.cache/scorch-codex/phase7-envelope-session/``.
+
+- **Focused batteries**: the widened conversion file **64 passed**, the
+  rank-1 conversion file **18 passed**, the rank-1 assembly battery
+  **93 passed**, the three updated seam files **181 passed**, the
+  eight-file LoopIR battery **758 passed** before the seam update (its
+  5 failures were exactly the obsolete rank-1 seam assertions), and the
+  conversion-adjacent regression subset **214 passed**.
+- **Schedule audit** at the new tip: **46 admitted / 40 rejected / 0
+  non-identical**, and its JSON is **equal to the retained baseline after
+  removing only the commit field**.
+- **Capture surfaces**: corpus **20/20**, grid **42/42**, anchors
+  **22/22**, heap **11/11** byte-identical to the retained files; the
+  automatic surface's every C++/CIN artifact is identical, with only the
+  same **two process-dependent cache-key characters** differing in
+  ``report.json``.
+- **Static parity**, base ``a606e11`` versus candidate: Black flags the
+  same single pre-existing file (``prebuilt_kernels.py``) at both
+  revisions, Flake8 reports **9** findings at both, and full-source mypy
+  is **140 errors in 11 files at both**, exactly equal after line
+  normalization, with zero LoopIR findings.  ``git diff --check`` clean.
+- **Census v10**: 55 cells, zero arm divergence.
+
+- **Repeated compiled public differentials**: eight public cells
+  (``einsum`` rank-1 copy/product/mixed, ``ss`` copy, ``ss*dd``,
+  ``ss*sd`` built by the widened conversion, ``dss`` copy, and
+  ``matmul`` over ``ss``x``ss``) match the dense reference and are
+  byte-stable across three rounds.
+- **Activating A/B/A compile latency**: 200 warmups and
+  2,000 interleaved samples per cell, in both orderings, over the three
+  newly activating rank-1 cells plus the shared ``ss`` intersection
+  control.  Every metric is inside the 1.10 budget: the worst
+  within-run LoopIR/legacy ratio is **1.04189** in the primary ordering
+  and **1.06632** in the order-flipped control.  The rank-1 union cell
+  runs at 0.988-0.994 (faster than legacy), and the shared control reads
+  1.021-1.030, matching the 1.018-1.026 range the inherited session
+  recorded for it.
+- **Exact-tip clean detached full non-performance suite**: at ``04dbe60`` in a
+  clean detached worktree: **5,185 collected / 3 performance deselected /
+  5,182 selected; 5,168 passed / 14 skipped / 0 failures**, across eight
+  file-disjoint fresh processes (649 / 648 / 648 / 648 / 648 / 648 /
+  633+14sk / 646), every partition exiting 0.  The partition union is
+  proven complete and non-overlapping against the collected file list,
+  and no libomp resource event occurred.
+
+### 41.7 Checkpoint disposition
+
+Four pre-existing public-conversion defects are closed, one coherent
+compiler family is migrated at byte parity in both automatic arms with a
+production caller, and the compatibility envelope is censused with exact
+arm-invariant codes.  Release behaviour is unchanged: the schedule audit
+is equal to its retained baseline, every sealed capture surface is
+byte-identical (modulo two process-dependent cache-key characters), and
+static findings are at exact base/candidate parity.
+
+**Phase-7 does not exit on this milestone.**  Two declared families
+remain, each with a precise blocker recorded in §41.3-§41.4: the
+compressed-parent/dense-leaf co-operands (blocked on the assembly
+target's leaf envelope, and byte-parity gateable when unblocked), and
+the multi-compressed reduction/TTM family (blocked on an unusable legacy
+comparand that segfaults, so permanently oracle-gated).  Multiple dense
+prefixes remain rejected as well.  No Phase-8 inventory was started, no
+cutover, cache, selector or dispatch change was made, and no legacy code
+was deleted.
