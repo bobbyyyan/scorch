@@ -237,3 +237,188 @@ def test_converted_inputs_execute_through_the_compiled_mixed_route():
     )
     result = out[0] if isinstance(out, tuple) else out
     assert torch.allclose(result.to_torch(), dense, atol=1e-3, rtol=1e-3)
+
+
+# --- The widened directly-materialized family ---------------------------
+#
+# The per-entry filter kernel sizes a compressed level's position array from
+# its immediately enclosing level alone, so it only assembles ``d?s+``
+# layouts.  Every other ``d``/``s`` layout — a dense value-bearing suffix, or
+# a dense level above a compressed level other than one leading prefix — is
+# materialized directly by the same block walk.  Before that widening, the
+# public conversion raised ``TensorIndexError`` for ``dds``/``sds``/``ddss``
+# and friends: the position array was sized by one dense extent instead of
+# the product of every dense parent.
+
+_LEGACY_ASSEMBLED = ["ds", "ss", "dss", "sss", "dsss", "ssss"]
+_DIRECT_COMPRESSED_LEAF = ["dds", "sds", "ddss", "dsds", "sdds", "sdss", "ssds"]
+
+
+def _dense_reference_from_storage(stensor, fmt, shape):
+    """Decode stored blocks back to a dense tensor, from the layout alone."""
+
+    from scorch.format import LevelType, parse_format
+
+    kinds = parse_format(fmt).get_level_types()
+    rank = len(kinds)
+    suffix = 0
+    while suffix < rank and kinds[rank - 1 - suffix] is LevelType.DENSE:
+        suffix += 1
+    split = rank - suffix
+    block_numel = 1
+    for extent in shape[split:]:
+        block_numel *= extent
+    mode_indices = stensor.storage.index.mode_indices
+    values = stensor.storage.value.reshape(-1)
+    paths = [()]
+    for level in range(split):
+        nxt = []
+        if kinds[level] is LevelType.DENSE:
+            for path in paths:
+                for coordinate in range(shape[level]):
+                    nxt.append(path + (coordinate,))
+        else:
+            pos, crd = mode_indices[level]
+            for parent, path in enumerate(paths):
+                for slot in range(int(pos[parent]), int(pos[parent + 1])):
+                    nxt.append(path + (int(crd[slot]),))
+        paths = nxt
+    out = torch.zeros(shape, dtype=values.dtype)
+    if block_numel == 0 or any(extent == 0 for extent in shape):
+        return out
+    for block_index, path in enumerate(paths):
+        block = values[block_index * block_numel : (block_index + 1) * block_numel]
+        assert block.numel() == block_numel, (path, block.numel(), block_numel)
+        view = out
+        for coordinate in path:
+            view = view[coordinate]
+        view.reshape(-1)[:] = block
+    return out
+
+
+@pytest.mark.parametrize("fmt", _LEGACY_ASSEMBLED)
+def test_filter_kernel_layouts_are_not_rerouted(fmt):
+    """``d?s+`` layouts keep the per-entry kernel path byte-for-byte."""
+
+    from scorch.format import parse_format
+    from scorch.stensor import _is_directly_materialized_format
+
+    assert not _is_directly_materialized_format(parse_format(fmt))
+
+
+@pytest.mark.parametrize("fmt", ["dd", "ddd", "dddd"])
+def test_all_dense_layouts_are_not_rerouted(fmt):
+    """An all-dense request carries no compressed structure to assemble."""
+
+    from scorch.format import parse_format
+    from scorch.stensor import _is_directly_materialized_format
+
+    assert not _is_directly_materialized_format(parse_format(fmt))
+
+
+@pytest.mark.parametrize(
+    "fmt", ["sd", "sdd", "dsd", "ssd", "dssd", *_DIRECT_COMPRESSED_LEAF]
+)
+def test_directly_materialized_family_is_routed(fmt):
+    from scorch.format import parse_format
+    from scorch.stensor import _is_directly_materialized_format
+
+    assert _is_directly_materialized_format(parse_format(fmt))
+
+
+@pytest.mark.parametrize("fmt", _DIRECT_COMPRESSED_LEAF)
+def test_multi_dense_parent_layouts_convert_and_decode(fmt):
+    """Compressed levels below several dense parents now assemble exactly."""
+
+    torch.manual_seed(20260807)
+    rank = len(fmt)
+    shape = {3: (3, 4, 5), 4: (2, 3, 4, 3)}[rank]
+    dense = (torch.rand(shape) < 0.3) * torch.randn(shape)
+    converted = STensor.from_torch(dense.clone(), "A").to_sparse(fmt)
+    assert str(converted.format) == ",".join(fmt)
+    assert torch.equal(
+        _dense_reference_from_storage(converted, fmt, shape), dense.float()
+    )
+
+
+@pytest.mark.parametrize("fmt", _DIRECT_COMPRESSED_LEAF)
+def test_multi_dense_parent_position_arrays_span_every_dense_parent(fmt):
+    """The defect: a position array sized by one dense extent, not the
+    product of every dense parent above its compressed level."""
+
+    torch.manual_seed(5)
+    rank = len(fmt)
+    shape = {3: (3, 4, 5), 4: (2, 3, 4, 3)}[rank]
+    dense = (torch.rand(shape) < 0.5) * torch.randn(shape)
+    converted = STensor.from_torch(dense.clone(), "A").to_sparse(fmt)
+    mode_indices = converted.storage.index.mode_indices
+    parents = 1
+    for level, kind in enumerate(fmt):
+        if kind == "d":
+            assert list(mode_indices[level]) == []
+            parents *= shape[level]
+            continue
+        pos, crd = mode_indices[level]
+        assert len(pos) == parents + 1, (level, len(pos), parents + 1)
+        assert int(pos[0]) == 0 and int(pos[-1]) == len(crd)
+        parents = len(crd)
+    assert converted.storage.value.numel() == parents
+
+
+@pytest.mark.parametrize("fmt", ["dds", "sds", "ddss"])
+def test_multi_dense_parent_zero_extents_and_all_zero(fmt):
+    rank = len(fmt)
+    for axis in range(rank):
+        shape = [2] * rank
+        shape[axis] = 0
+        converted = STensor.from_torch(torch.zeros(tuple(shape)), "A").to_sparse(fmt)
+        assert converted.storage.value.numel() == 0
+    converted = STensor.from_torch(torch.zeros((2,) * rank), "A").to_sparse(fmt)
+    assert converted.storage.value.numel() == 0
+    assert torch.equal(
+        _dense_reference_from_storage(converted, fmt, (2,) * rank),
+        torch.zeros((2,) * rank),
+    )
+
+
+@pytest.mark.parametrize("fmt", ["dds", "ddss"])
+def test_multi_dense_parent_float64_and_sparse_sources(fmt):
+    torch.manual_seed(9)
+    rank = len(fmt)
+    shape = {3: (3, 4, 5), 4: (2, 3, 4, 3)}[rank]
+    dense = ((torch.rand(shape) < 0.3) * torch.randn(shape)).double()
+    converted = STensor.from_torch(dense.clone(), "A").to_sparse(fmt)
+    assert converted.storage.value.dtype is torch.float64
+    assert torch.equal(_dense_reference_from_storage(converted, fmt, shape), dense)
+
+    source = STensor.from_torch(dense.clone().float(), "B").to_sparse("s" * rank)
+    source.to_sparse(fmt)
+    assert torch.equal(_dense_reference_from_storage(source, fmt, shape), dense.float())
+
+
+def test_multi_dense_parent_conversion_is_exception_atomic(monkeypatch):
+    torch.manual_seed(3)
+    dense = (torch.rand((3, 4, 5)) < 0.3) * torch.randn((3, 4, 5))
+    source = STensor.from_torch(dense.clone(), "A").to_sparse("sss")
+    before = tensor_snapshot(source)
+
+    def fail_nonzero(*args, **kwargs):
+        raise RuntimeError("injected materialization failure")
+
+    monkeypatch.setattr(torch, "nonzero", fail_nonzero)
+    with pytest.raises(RuntimeError, match="injected materialization failure"):
+        source.to_sparse("dds")
+
+    assert tensor_snapshot(source) == before
+
+
+def test_multi_dense_parent_conversion_validates_the_compiler_boundary():
+    dense = torch.zeros((3, 4, 5))
+    with pytest.raises(TypeError):
+        STensor.from_torch(dense.clone(), "A").to_sparse(
+            "dds", _compile_options=object()
+        )
+    with pytest.raises(TypeError):
+        STensor.from_torch(dense.clone(), "A").to_sparse(
+            "dds", _compilation_context=object()
+        )
