@@ -788,18 +788,22 @@ def test_sparse_lowering_is_deterministic():
 
 
 def test_unsupported_sparse_output_layout():
-    """Rank-1 compressed outputs keep the historical layout seam.
+    """A compressed leaf below several dense parents keeps the layout seam.
 
-    The dense-prefix/multi-compressed copy that previously occupied this
-    lock is now the admitted single-cursor assembly family; its coverage
-    lives in ``test_loopir_single_cursor_assembly_target.py``.
+    Two earlier occupants of this lock have since been migrated: the
+    dense-prefix/multi-compressed copy became the single-cursor assembly
+    family, and the rank-1 compressed output became the degenerate
+    ordered-stream family (``test_loopir_rank1_assembly_target.py``).  The
+    seam itself still holds for layouts whose compressed suffix is a
+    single level under two or more dense parents, which the assembly
+    target's one-dense-prefix rule does not cover.
     """
 
-    i = IndexVar("i")
-    c = TensorVar("C", fmt="s")
-    a = TensorVar("A", fmt="s")
-    assign = TensorAssign(c[i], a[i])
-    expect_code("unsupported_sparse_output", ForAll(i, assign))
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="dds")
+    a = TensorVar("A", fmt="dds")
+    assign = TensorAssign(c[i, j, k], a[i, j, k])
+    expect_code("unsupported_sparse_output", ForAll(i, ForAll(j, ForAll(k, assign))))
 
 
 def test_unsupported_sparse_output_reduction():

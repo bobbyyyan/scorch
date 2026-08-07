@@ -867,15 +867,26 @@ def _seam_cells():
             ),
         ),
     )
-    i1 = IndexVar("i")
-    rank1 = ForAll(
-        i1,
-        TensorAssign(
-            TensorVar("C", fmt="s")[i1],
-            CINBinaryOp(
-                Operation.ADD,
-                TensorVar("A", fmt="s")[i1],
-                TensorVar("B", fmt="s")[i1],
+    # Recorded seam move: the rank-1 united output that used to sit here is
+    # the admitted degenerate ordered-stream family
+    # (``test_loopir_rank1_assembly_target.py``).  Its neighbour on the same
+    # seam -- a united result whose single compressed level sits under two
+    # or more dense parents -- keeps the exact code.
+    k = IndexVar("k")
+    multi_dense_prefix = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    TensorVar("C", fmt="dds")[i, j, k],
+                    CINBinaryOp(
+                        Operation.ADD,
+                        TensorVar("A", fmt="dds")[i, j, k],
+                        TensorVar("B", fmt="dds")[i, j, k],
+                    ),
+                ),
             ),
         ),
     )
@@ -924,10 +935,10 @@ def _seam_cells():
             "unsupported_program_shape",
         ),
         (
-            "rank1_union_output",
-            rank1,
-            (4,),
-            (((4,), f32), ((4,), f32)),
+            "multi_dense_prefix_union_output",
+            multi_dense_prefix,
+            (3, 4, 5),
+            (((3, 4, 5), f32), ((3, 4, 5), f32)),
             "unsupported_sparse_output",
         ),
         # (A + B) * D over a dense factor keeps 2-cursor united domains

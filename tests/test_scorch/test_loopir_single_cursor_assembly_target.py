@@ -797,10 +797,24 @@ def _seam_cells():
             ),
         ),
     )
-    i1 = IndexVar("i")
-    rank1 = ForAll(
-        i1,
-        TensorAssign(TensorVar("C", fmt="s")[i1], TensorVar("A", fmt="s")[i1]),
+    # Recorded seam move: the rank-1 compressed output that used to sit here
+    # is the admitted degenerate ordered-stream family
+    # (``test_loopir_rank1_assembly_target.py``).  Its neighbour on the same
+    # seam -- a single compressed level under two or more dense parents,
+    # which the one-dense-prefix rule excludes -- keeps the exact code.
+    k = IndexVar("k")
+    multi_dense_prefix = ForAll(
+        i,
+        ForAll(
+            j,
+            ForAll(
+                k,
+                TensorAssign(
+                    TensorVar("C", fmt="dds")[i, j, k],
+                    TensorVar("A", fmt="dds")[i, j, k],
+                ),
+            ),
+        ),
     )
     return [
         (
@@ -818,10 +832,10 @@ def _seam_cells():
             "unsupported_sparse_output",
         ),
         (
-            "rank1_sparse_output",
-            rank1,
-            (4,),
-            (((4,), f32),),
+            "multi_dense_prefix_sparse_output",
+            multi_dense_prefix,
+            (3, 4, 5),
+            (((3, 4, 5), f32),),
             "unsupported_sparse_output",
         ),
     ]
