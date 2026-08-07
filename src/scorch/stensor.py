@@ -104,21 +104,38 @@ class Window(object):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
 
 
-def _is_dense_suffix_format(output_format: TensorFormat) -> bool:
-    """A ``d``/``s`` layout whose value-bearing suffix is DENSE.
+def _is_directly_materialized_format(output_format: TensorFormat) -> bool:
+    """A ``d``/``s`` layout the per-entry filter kernel cannot assemble.
 
-    These layouts store one complete dense block per stored prefix path,
-    so conversion materializes blocks directly instead of running the
-    per-entry filter kernel (whose legacy form mis-assembles them).
+    The legacy filter kernel sizes each compressed level's position array
+    from its immediately enclosing level alone, so it assembles exactly the
+    layouts whose compressed levels form one contiguous run under at most
+    one leading dense level -- ``ds``, ``ss``, ``dss``, ``sss``, ``dsss``,
+    ``ssss``, and so on.  Every other ``d``/``s`` layout is materialized
+    directly instead:
+
+    - a dense value-bearing suffix (``sd``, ``ssd``, ``dssd``, ...), whose
+      values would otherwise be stored without parent coordinates;
+    - a dense level above a compressed level that is not that single
+      leading prefix (``dds``, ``sds``, ``ddss``, ``sdss``, ...), whose
+      position array would otherwise be sized by one dense extent instead
+      of the product of every dense parent.
+
+    Both are materialized by the same rule: one complete dense block per
+    stored prefix path, a prefix path stored exactly when its block holds
+    a nonzero, and a stored block keeping its interior zeros.
     """
 
     kinds = output_format.get_level_types()
-    return (
-        len(kinds) >= 2
-        and all(kind in (LevelType.DENSE, LevelType.COMPRESSED) for kind in kinds)
-        and kinds[-1] is LevelType.DENSE
-        and any(kind is LevelType.COMPRESSED for kind in kinds)
-    )
+    if len(kinds) < 2 or not all(
+        kind in (LevelType.DENSE, LevelType.COMPRESSED) for kind in kinds
+    ):
+        return False
+    if not any(kind is LevelType.COMPRESSED for kind in kinds):
+        return False
+    # ``d?s+`` -- the exact family the per-entry filter kernel assembles.
+    body = kinds[1:] if kinds[0] is LevelType.DENSE else kinds
+    return not all(kind is LevelType.COMPRESSED for kind in body)
 
 
 class STensor:
@@ -1433,8 +1450,10 @@ class STensor:
         -----
         The 1-D case is special-cased and builds a single compressed level
         directly from ``torch.nonzero`` (no kernel compile).  Identity-order
-        rank-2-and-higher formats with a dense value-bearing suffix materialize
-        their blocked output directly from a dense snapshot; sparse inputs may
+        rank-2-and-higher formats that the per-entry filter kernel cannot
+        assemble -- a dense value-bearing suffix, or a dense level above a
+        compressed level other than one leading prefix -- materialize their
+        blocked output directly from a dense snapshot; sparse inputs may
         first use the ordinary densification kernel.  Other rank-2-and-higher
         formats JIT-compile a filter-zeros kernel honoring ``mode_order``.
 
@@ -1499,11 +1518,11 @@ class STensor:
             )
             if (
                 requested_format is not None
-                and _is_dense_suffix_format(requested_format)
+                and _is_directly_materialized_format(requested_format)
                 and requested_format.get_order() == len(self.shape)
                 and list(self.storage.index.mode_order) == list(range(len(self.shape)))
             ):
-                return self._to_sparse_dense_suffix(
+                return self._to_sparse_materialized_blocks(
                     requested_format,
                     compile_options=compile_options,
                     compilation_context=compilation_context,
@@ -1657,19 +1676,22 @@ class STensor:
 
         return self
 
-    def _to_sparse_dense_suffix(
+    def _to_sparse_materialized_blocks(
         self,
         output_format: TensorFormat,
         *,
         compile_options: CompileOptions,
         compilation_context: CompilationContext,
     ) -> STensor:
-        """Materialize a dense-suffix block layout directly, in place.
+        """Materialize a ``d``/``s`` block layout directly, in place.
 
-        A ``d``/``s`` prefix over one-or-more trailing DENSE levels stores
+        A ``d``/``s`` prefix over zero-or-more trailing DENSE levels stores
         one complete dense value block per stored prefix path: a prefix
         path is stored exactly when its block contains any nonzero, and a
-        stored block keeps its interior zeros.  This is the same
+        stored block keeps its interior zeros.  With no trailing DENSE level
+        the block is one scalar and the rule degenerates to ordinary sparse
+        storage, so the same walk serves both directly materialized families
+        (see :func:`_is_directly_materialized_format`).  This is the same
         conditional-parent discipline the compiled assembly families use.
         The defective filter kernel is never used: an already-dense source is
         copied directly, while a sparse source obtains its snapshot through
