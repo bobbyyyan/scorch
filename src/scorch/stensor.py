@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
-from typing import Iterator, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List
 
 import torch
 
@@ -1769,37 +1769,40 @@ class STensor:
         paths = [tuple(int(x) for x in row) for row in stored]
 
         mode_indices: List[List[torch.Tensor]] = []
+        # ``paths`` is lexicographically sorted (``torch.nonzero`` is
+        # row-major), so every prefix's stored children are contiguous and
+        # non-decreasing.  Each level therefore groups its children in one
+        # pass and carries the enumerated parent prefixes forward, instead of
+        # rescanning the whole path list once per parent at every level.
+        parents: List[Tuple[int, ...]] = [()]
         for level in range(split):
             if kinds[level] is LevelType.DENSE:
                 mode_indices.append([])
+                parents = [
+                    parent + (coordinate,)
+                    for parent in parents
+                    for coordinate in range(shape[level])
+                ]
                 continue
 
-            def parent_iter(depth: int) -> Iterator[Tuple[int, ...]]:
-                if depth == 0:
-                    yield ()
-                    return
-                for parent in parent_iter(depth - 1):
-                    if kinds[depth - 1] is LevelType.DENSE:
-                        for coordinate in range(shape[depth - 1]):
-                            yield parent + (coordinate,)
-                    else:
-                        seen: List[int] = []
-                        for path in paths:
-                            if path[: depth - 1] == parent and (
-                                not seen or seen[-1] != path[depth - 1]
-                            ):
-                                seen.append(path[depth - 1])
-                        for coordinate in seen:
-                            yield parent + (coordinate,)
+            grouped: Dict[Tuple[int, ...], List[int]] = {}
+            for path in paths:
+                children = grouped.get(path[:level])
+                if children is None:
+                    children = []
+                    grouped[path[:level]] = children
+                if not children or children[-1] != path[level]:
+                    children.append(path[level])
 
             pos = [0]
             crd: List[int] = []
-            for parent in parent_iter(level):
-                children = sorted(
-                    {path[level] for path in paths if path[:level] == parent}
-                )
-                crd.extend(children)
+            next_parents: List[Tuple[int, ...]] = []
+            for parent in parents:
+                for coordinate in grouped.get(parent, ()):
+                    crd.append(coordinate)
+                    next_parents.append(parent + (coordinate,))
                 pos.append(len(crd))
+            parents = next_parents
             mode_indices.append(
                 [
                     torch.tensor(pos, dtype=torch.int32),
