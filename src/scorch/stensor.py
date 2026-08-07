@@ -1471,11 +1471,55 @@ class STensor:
         to_dense : The inverse (densify).
         """
         if len(self.shape) == 1:
-            # Find indexes of non-zero elements in self.values, flatten them
-            nonzero_indices = torch.nonzero(self.values).flatten()
+            rank_one_format: Optional[TensorFormat]
+            try:
+                rank_one_format = None if fmt is None else parse_format(fmt)
+            except Exception:
+                # Invalid format requests keep the historical path.
+                rank_one_format = None
+            rank_one_options = (
+                CompileOptions.from_environment()
+                if _compile_options is None
+                else _compile_options
+            )
+            if type(rank_one_options) is not CompileOptions:
+                raise TypeError("_compile_options must be a CompileOptions instance")
+            rank_one_context = _compilation_context_at_boundary(
+                _compilation_context, rank_one_options
+            )
+            if rank_one_format is not None:
+                if rank_one_format.get_order() != 1:
+                    raise TensorStorageError(
+                        f"format rank {rank_one_format.get_order()} does not "
+                        "match tensor rank 1"
+                    )
+                if rank_one_format.get_level_types()[0] is not LevelType.COMPRESSED:
+                    # This branch assembles exactly one compressed level; a
+                    # dense rank-1 request is ``to_dense``'s job, not a
+                    # silently compressed result.
+                    raise TensorStorageError(
+                        "to_sparse builds a compressed rank-1 level; "
+                        f"{str(rank_one_format)!r} requests no compressed mode"
+                    )
+            # A sparse receiver must be read as coordinates, not as stored
+            # positions: filtering ``self.values`` directly would reinterpret
+            # a compressed value array as dense coordinates and silently
+            # corrupt the tensor.  Densify out of place under the caller's
+            # exact options and context, exactly like the rank>=2 route.
+            source_values = (
+                self.to_dense(
+                    in_place=False,
+                    _compile_options=rank_one_options,
+                    _compilation_context=rank_one_context,
+                ).storage.value.reshape(-1)
+                if self.has_index
+                else self.values
+            )
+            # Find indexes of non-zero elements, flatten them
+            nonzero_indices = torch.nonzero(source_values).flatten()
             size = len(nonzero_indices)
             # Create a filtered value tensor that only contains non-zero elements
-            filtered_values = self.values[nonzero_indices]
+            filtered_values = source_values[nonzero_indices].clone()
             new_tensor = STensor(
                 name=self.name,
                 shape=self.shape,
