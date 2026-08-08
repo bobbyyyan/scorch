@@ -174,6 +174,27 @@ def test_forged_format_bit_width_fails_closed(bit_width):
     assert str(tensor.format) == "d"
 
 
+@pytest.mark.parametrize("owner", ["format", "level"])
+def test_hostile_stored_field_keys_fail_closed(owner):
+    class HostileKey(str):
+        __hash__ = str.__hash__
+
+        def __eq__(self, other):
+            raise RuntimeError("stored-key equality must not execute")
+
+    requested = TensorFormat([LevelFormat("s")])
+    target = requested if owner == "format" else requested.get_level_formats()[0]
+    state = object.__getattribute__(target, "__dict__")
+    key = next(iter(state))
+    value = state.pop(key)
+    state[HostileKey(key)] = value
+
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
+    with pytest.raises(TensorFormatError, match="malformed stored state"):
+        tensor.to_sparse(requested)
+    assert str(tensor.format) == "d"
+
+
 @pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.float64, torch.int32, torch.int64, torch.int8, torch.uint8],
