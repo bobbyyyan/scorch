@@ -322,9 +322,16 @@ class TensorMetadata:
             raise TensorLayoutError("tensor name must be a non-empty string")
         dtype = _parse_dtype(self.dtype, "dtype")
         try:
-            device = torch.device(self.device)
-        except (TypeError, RuntimeError) as error:
-            raise TensorDeviceError(f"invalid tensor device {self.device!r}") from error
+            if type(self.device) is torch.device:
+                device = self.device
+            elif issubclass(type(self.device), str):
+                device = torch.device(str.__str__(self.device))
+            else:
+                raise TypeError
+        except Exception as error:
+            raise TensorDeviceError(
+                f"invalid tensor device of type {type(self.device).__name__}"
+            ) from error
         if device.type != "cpu":
             raise TensorDeviceError(
                 f"Scorch runtime tensors must be on CPU, got {device}"
@@ -420,6 +427,7 @@ class TensorSpec:
     ) -> None:
         try:
             parsed_format = parse_format(tensor_format)
+            parsed_dtype = _parse_dtype(dtype, "dtype")
             if any(
                 level_type == LevelType.SINGLETON
                 for level_type in parsed_format.get_level_types()
@@ -427,14 +435,16 @@ class TensorSpec:
                 raise CompileSpecError(
                     "singleton levels are not supported by the compiler"
                 )
-            if dtype not in SUPPORTED_VALUE_DTYPES:
+            if parsed_dtype not in SUPPORTED_VALUE_DTYPES:
                 raise CompileSpecError(
-                    f"compiler tensor dtype {dtype} is not supported"
+                    f"compiler tensor dtype {parsed_dtype} is not supported"
                 )
             layout = TensorLayout.from_logical_shape(
                 shape, parsed_format, mode_order, index_dtype
             )
-            metadata = TensorMetadata(name, dtype, torch.device(device), layout, False)
+            metadata = TensorMetadata(
+                name, parsed_dtype, torch.device(device), layout, False
+            )
         except (
             TensorLayoutError,
             TensorDeviceError,
