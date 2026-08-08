@@ -2391,6 +2391,54 @@ class _TargetLowering:
 
     # -- merged-loop case machinery -------------------------------------------
 
+    def _position_binding_loop(self, position: PositionId) -> Optional["_Loop"]:
+        """The nest loop that binds one position, if any."""
+
+        for loop in self.loops:
+            if loop.kind in (_SPARSE, _SPARSE_WINDOW):
+                if loop.node.position == position:  # type: ignore[attr-defined]
+                    return loop
+                continue
+            if loop.kind is _MERGED:
+                if position in getattr(loop.node, "positions", ()):
+                    return loop
+        return None
+
+    def _require_unconditional_position_load(self, load: PositionLoad) -> None:
+        """Refuse a merged-case position load over an optional position.
+
+        :class:`PositionLoad` deliberately carries no merge-alignment or
+        default semantics -- the node contract reserves those for
+        :class:`CursorValue` -- so partially evaluating one for a
+        cursor-alignment case is sound only when the position it grounds at
+        is bound unconditionally.  ``SparseFor``/``SparseWindowFor`` bindings
+        and INTERSECTION merges always bind; a UNION merge's binding is
+        optional at a one-sided coordinate, where the loaded tensor owns no
+        value-bearing position at all.  The verifier's position typing
+        already refuses to type a UNION-bound position for a position-load
+        spine; this is the owning target's independent check.
+        """
+
+        expr: Expr = load.position
+        while type(expr) is DensePosition:
+            expr = cast(DensePosition, expr).parent
+        if type(expr) is not PositionValue:
+            _fail(
+                "unsupported_program_shape",
+                "a merged-case position load must ground at a bound cursor " "position",
+            )
+        loop = self._position_binding_loop(cast(PositionValue, expr).position)
+        if loop is None or (
+            loop.kind is _MERGED
+            and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a merged-case position load must ground at an "
+                "unconditionally bound position; a UNION-bound position "
+                "carries no value at a one-sided coordinate",
+            )
+
     def _merged_case_value(
         self, expr: Expr, aligned: Set[CursorId]
     ) -> Optional[llir.Expr]:
@@ -2399,6 +2447,12 @@ class _TargetLowering:
         Returns ``None`` when the case value folds to the additive identity
         (nothing is emitted for that case, exactly as the legacy iteration
         lattice drops it).
+
+        A :class:`PositionLoad` reads through the loaded tensor's own
+        validated dense spine rather than through a merge cursor, so it is
+        case-invariant -- but only when its grounding position is bound
+        unconditionally, which
+        :meth:`_require_unconditional_position_load` enforces.
         """
 
         if type(expr) is CursorValue:
@@ -2426,6 +2480,9 @@ class _TargetLowering:
                 )
             return None
         if type(expr) is Load:
+            return self._lower_value(expr)
+        if type(expr) is PositionLoad:
+            self._require_unconditional_position_load(cast(PositionLoad, expr))
             return self._lower_value(expr)
         if type(expr) is BinaryExpr:
             left = self._merged_case_value(expr.lhs, aligned)
