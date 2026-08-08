@@ -29763,7 +29763,9 @@ The exact-tip full non-performance suite and the activating paired two-order
 latency receipt were NOT completed.  The suite collected 5,475 / 3 deselected /
 5,472 selected at `c927f62` and partitioned cleanly, but the host became
 thermally throttled mid-run (cold JIT builds fell from ~8-15 s to ~2.6 min) and
-partition 0 stopped at 559 of 684 nodes with zero failures.  An earlier
+partition 0 stopped at **662 of 684 nodes with zero test failures** (the
+trailing `FileNotFoundError` in its log is this session's own teardown, not a
+test result).  An earlier
 complete-partition run at `18d7a27` -- which differs only by the test-only
 sweep-narrowing commit -- recorded 686 passed and 671 passed / 14 skipped for
 partitions 0 and 1.  Neither is a pass receipt.  Both gates must be re-run to

@@ -7531,7 +7531,9 @@ All gates ran in the ``scorch`` conda environment; evidence is retained under
   sustained ~196% CPU beside an unrelated user workload and cold JIT builds
   slowed from ~8-15 s to ~2.6 min each -- and the run did not finish.
   Partition 0, into which this partitioning concentrated the JIT-heavy files,
-  reached 559 of 684 nodes with zero failures.  An earlier complete-partition
+  reached **662 of 684 nodes with zero test failures** before the run was
+  stopped (the trailing ``FileNotFoundError`` in its log is this session's own
+  teardown, not a test result).  An earlier complete-partition
   run at ``18d7a27`` (which differs from ``c927f62`` only by the test-only
   sweep-narrowing commit) recorded partition 0 at **686 passed** and partition
   1 at **671 passed / 14 skipped**, both exit 0.  **This is not a pass
