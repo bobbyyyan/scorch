@@ -829,9 +829,19 @@ class _TargetLowering:
         retain(target_type)
         signature.extend(("target_type", id(target_type)))
         excluded = {
+            # These caches are diagnostic witnesses, not emission inputs.  A
+            # graph change is still rejected by the complete graph signature
+            # even if a caller also tampers with its witness; with an unchanged
+            # graph, corrupting a witness can only make a later narrow check
+            # reject.  Omitting them avoids recursively signing the same value
+            # and position trees a third time on every successful compile.
+            "_bound_position_snapshot",
+            "_position_load_signatures",
             "_target_state_owners",
             "_target_state_snapshot",
             "_target_type_snapshot",
+            "_target_owner_snapshot",
+            "_value_expression_snapshot",
         }
         for key in sorted(state):
             if key in excluded:

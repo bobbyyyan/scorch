@@ -1081,6 +1081,35 @@ def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
     assert target.raw_loop_statements()
 
 
+def test_diagnostic_witness_tampering_cannot_mask_a_graph_change():
+    """Excluded diagnostic caches cannot become an integrity authority."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    object.__setattr__(target.leaf, "value", copy.deepcopy(target.leaf.value))
+
+    # Forge every narrow witness to the changed graph.  They exist only to
+    # retain specific diagnostics after the complete graph guard detects a
+    # change; none may authorize emission on its own.
+    target._bound_position_snapshot = target._validated_bound_position_bindings()
+    target._position_load_signatures = {}
+    target._value_expression_snapshot = target._validated_value_expression_signature(
+        target._access_value_expression()
+    )
+    target._target_owner_snapshot = target._validated_target_owner_signature()
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program graph" in error.value.defect.message
+
+
 @pytest.mark.parametrize("mutation", ["replace", "delete"], ids=str)
 def test_target_fails_closed_when_its_program_reference_changes(mutation):
     fixture = build_matmul()
