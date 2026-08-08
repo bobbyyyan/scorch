@@ -1448,9 +1448,9 @@ class STensor:
 
         Notes
         -----
-        The 1-D case is special-cased and builds a single compressed level
-        directly from ``torch.nonzero`` (no kernel compile).  Identity-order
-        rank-2-and-higher formats that the per-entry filter kernel cannot
+        The 1-D case is special-cased and builds a single compressed or
+        coordinate level directly from ``torch.nonzero`` (no kernel compile).
+        Rank-2-and-higher formats that the per-entry filter kernel cannot
         assemble -- a dense value-bearing suffix, or a dense level above a
         compressed level other than one leading prefix -- materialize their
         blocked output directly from a dense snapshot; sparse inputs may
@@ -1493,50 +1493,64 @@ class STensor:
                         f"format rank {rank_one_format.get_order()} does not "
                         "match tensor rank 1"
                     )
-                if rank_one_format.get_level_types()[0] is not LevelType.COMPRESSED:
-                    # This branch assembles exactly one compressed level; a
-                    # dense rank-1 request is ``to_dense``'s job, not a
-                    # silently compressed result.
+                rank_one_kind = rank_one_format.get_level_types()[0]
+                if rank_one_kind not in (
+                    LevelType.COMPRESSED,
+                    LevelType.COORDINATE,
+                ):
+                    # This branch assembles one supported sparse level; a
+                    # dense request is ``to_dense``'s job and SINGLETON is
+                    # not executable by the runtime.
                     raise TensorStorageError(
-                        "to_sparse builds a compressed rank-1 level; "
-                        f"{str(rank_one_format)!r} requests no compressed mode"
+                        "to_sparse builds a compressed or coordinate rank-1 "
+                        f"level; {str(rank_one_format)!r} requests no supported "
+                        "sparse mode"
                     )
+                output_format = rank_one_format
+            else:
+                rank_one_kind = LevelType.COMPRESSED
+                output_format = TensorFormat(
+                    level_formats=[LevelFormat(mode=rank_one_kind)]
+                )
             # A sparse receiver must be read as coordinates, not as stored
             # positions: filtering ``self.values`` directly would reinterpret
             # a compressed value array as dense coordinates and silently
             # corrupt the tensor.  Densify out of place under the caller's
             # exact options and context, exactly like the rank>=2 route.
             source_values = (
-                self.to_dense(
+                self.values
+                if self.format.is_dense()
+                else self.to_dense(
                     in_place=False,
                     _compile_options=rank_one_options,
                     _compilation_context=rank_one_context,
                 ).storage.value.reshape(-1)
-                if self.has_index
-                else self.values
             )
             # Find indexes of non-zero elements, flatten them
             nonzero_indices = torch.nonzero(source_values).flatten()
             size = len(nonzero_indices)
             # Create a filtered value tensor that only contains non-zero elements
             filtered_values = source_values[nonzero_indices].clone()
+            mode_indices = (
+                [
+                    [
+                        torch.tensor(
+                            [0, size],
+                            dtype=nonzero_indices.dtype,
+                            device=nonzero_indices.device,
+                        ),
+                        nonzero_indices,
+                    ]
+                ]
+                if rank_one_kind is LevelType.COMPRESSED
+                else [[nonzero_indices]]
+            )
             new_tensor = STensor(
                 name=self.name,
                 shape=self.shape,
                 index=TensorIndex(
-                    tensor_format=TensorFormat(
-                        level_formats=[LevelFormat(mode=LevelType.COMPRESSED)]
-                    ),
-                    mode_indices=[
-                        [
-                            torch.tensor(
-                                [0, size],
-                                dtype=nonzero_indices.dtype,
-                                device=nonzero_indices.device,
-                            ),
-                            nonzero_indices,
-                        ]
-                    ],
+                    tensor_format=output_format,
+                    mode_indices=mode_indices,
                     mode_order=self.storage.index.mode_order,
                 ),
                 value=filtered_values,
@@ -1564,7 +1578,6 @@ class STensor:
                 requested_format is not None
                 and _is_directly_materialized_format(requested_format)
                 and requested_format.get_order() == len(self.shape)
-                and list(self.storage.index.mode_order) == list(range(len(self.shape)))
             ):
                 return self._to_sparse_materialized_blocks(
                     requested_format,
