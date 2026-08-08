@@ -7523,33 +7523,26 @@ All gates ran in the ``scorch`` conda environment; evidence is retained under
   message of a pre-existing ``cin_lowerer.py`` finding.  Black and Flake8 are
   not globally clean; their findings are inherited and unchanged.
   ``git diff --check`` is clean.
-- **Exact-tip full non-performance suite: PARTIALLY COMPLETED (4 of 8
-  partitions).**  It collected **5,475 / 3 performance deselected / 5,472
-  selected** in a clean detached worktree, partitioned into eight
-  file-disjoint fresh-process groups whose union is proven complete and
-  non-overlapping.  Partition 0 ran **684 passed / 0 failed** (719 s),
-  partition 1 **684 passed / 0 failed** (561 s), partition 2 **682 passed / 0
-  failed** (243 s), and partition 3 reached 665 of 684 nodes with **0 failed**
-  before being stopped -- **2,050 nodes passed with zero failures**, plus 665
-  more clean but incomplete.  Partitions 4-7 were not run at this tip.
+- **Exact-tip clean detached full non-performance suite: COMPLETE.**  **5,462
+  collected / 3 performance deselected / 5,459 selected; 5,445 passed / 14
+  skipped / 0 failed**, in eight file-disjoint fresh processes (684 / 684 /
+  682 / 682 / 682 / 682 / 682 / 667+14sk), every partition exiting 0, with
+  ``UNION-PROOF: complete and non-overlapping``.  The partition totals sum
+  exactly to the selected node count.  Partition 0 ran at ``6436e82`` and
+  partitions 1-7 at ``f45a7b1``; those revisions differ only by
+  ``test_loopir_single_cursor_assembly_target.py``, a member of partition 1,
+  which therefore ran at ``f45a7b1``.
 
   **This gate earned its keep.**  Partition 1 initially failed two nodes:
-  ``test_adjacent_seams_stay_fail_closed[posload_co_operand-*]`` in the
-  single-cursor battery.  That inherited seam lock named ``ss * sd`` -- exactly
-  the cell this milestone migrates -- so it asserted
-  ``unsupported_program_shape`` for a program now admitted at byte parity.  The
-  layout differential did not catch it, because that harness compares compiler
-  outcomes and not test expectations.  ``f45a7b1`` moves the lock to the
-  neighbour that still occupies the seam and names the move in place;
-  partition 1 then passed 684/684.  The milestone's "every neighbour keeps its
-  exact code" claim was, until that commit, incomplete by exactly one
-  inherited lock.
-
-  The host thermally throttles under sustained cold-cache JIT load -- quiet, a
-  partition runs 684 nodes in four to twelve minutes; throttled, a few nodes
-  per ten minutes.  That is an environment limit, not a property of the change
-  set.  **This is not a complete pass receipt**; the runner is retained.  Every
-  focused battery listed above did run to completion at the tip.
+  ``test_adjacent_seams_stay_fail_closed[posload_co_operand-*]``.  That
+  inherited seam lock named ``ss * sd`` -- exactly the cell this milestone
+  migrates -- so it asserted ``unsupported_program_shape`` for a program now
+  admitted at byte parity.  The 1,584-cell layout differential could not have
+  caught it, because that harness compares compiler outcomes and not test
+  expectations.  ``f45a7b1`` moves the lock to the neighbour that still
+  occupies the seam and names the move in place; partition 1 then passed
+  684/684.  The milestone's "every neighbour keeps its exact code" claim was
+  incomplete by exactly one inherited lock until that commit.
 - **Activating paired two-order compile latency was not run**, for the same
   reason: a thermally throttled host cannot produce an honest latency receipt.
   The harness is retained with the three newly activating dense-leaf cells
@@ -7579,10 +7572,9 @@ target's shared one-dense-extent sizing defect), and multi-compressed
 reduction/TTM (blocked on a legacy comparand that segfaults, so permanently
 oracle-gated).
 
-Two gates are additionally missing through no fault of the change set: the
-exact-tip full suite and the activating paired latency receipt could not be
-completed on a thermally throttled host.  Both are prerequisites for any exit
-claim and are recorded as outstanding, not as passes.
+One gate remains outstanding: the activating paired two-order latency receipt
+could not be produced on a thermally throttled host, and is recorded as
+outstanding rather than as a pass.  The full suite did complete.
 
 **Phase 7 therefore does not exit on this milestone.**  No Phase-8 inventory
 was started, no cutover, cache, selector or default-dispatch change was made,

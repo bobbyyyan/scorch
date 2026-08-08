@@ -29759,12 +29759,11 @@ now, unverified.
 
 ### Two gates outstanding
 
-The exact-tip full non-performance suite is PARTIALLY completed (4 of 8
-partitions) and the activating paired two-order latency receipt was not run.
-Partition 0 ran 684 passed / 0 failed, partition 1 684 passed / 0 failed,
-partition 2 682 passed / 0 failed, and partition 3 reached 665 of 684 with 0
-failed -- **2,050 nodes passed with zero failures**.  Partitions 4-7 were not
-run at this tip.
+The exact-tip clean detached full non-performance suite is COMPLETE: **5,462
+collected / 3 deselected / 5,459 selected; 5,445 passed / 14 skipped / 0
+failed** in eight file-disjoint fresh processes, every partition exiting 0,
+union proven complete and non-overlapping, totals summing exactly to the
+selected count.
 
 The gate earned its keep: partition 1 initially failed
 `test_adjacent_seams_stay_fail_closed[posload_co_operand-*]`, an inherited seam
@@ -29773,10 +29772,11 @@ to the neighbour that still occupies the seam; partition 1 then passed 684/684.
 The layout differential could not have caught it, because it compares compiler
 outcomes and not test expectations.
 
-The host thermally throttles under sustained cold-cache JIT load, which is why
-the run stopped.  This is not a complete pass receipt; both gates must be
-finished on a thermally unconstrained host.  Every focused battery did run
-to completion at the tip.
+The activating paired two-order latency receipt was NOT produced -- the host
+thermally throttles under sustained JIT load, and a throttled host cannot give
+an honest latency number.  That gate remains outstanding; the harness is
+retained with the three newly activating dense-leaf cells and the shared
+control already declared.
 
 ### Superseding broad copy-paste prompt for the next session
 
@@ -29789,12 +29789,11 @@ unrelated GPU/CUDA, benchmark, scheduler, research, scratchpad, packaging and
 untracked material untouched; stage only explicit paths and give nontrivial
 commits descriptive bodies.
 
-Before anything else, re-run to completion on an unloaded host the two gates
-this session could not finish: the exact-tip clean detached full
-non-performance suite (runner retained in the ledger) and the activating
-paired two-order compile latency over `dl_ss_sd_mul`, `dl_sss_sdd_mul`,
-`dl_ssss_sddd_mul` and the `b3_ss_mul` control (harness retained). Treat their
-absence as an open gate, not as a pass.
+Before anything else, produce on an unloaded host the one gate this session
+could not finish: the activating paired two-order compile latency over
+`dl_ss_sd_mul`, `dl_sss_sdd_mul`, `dl_ssss_sddd_mul` and the `b3_ss_mul`
+control (harness retained). Treat its absence as an open gate, not as a pass.
+The full suite did complete and need not be repeated unless the tip moves.
 
 Then independently review `3bc5c07`, `67835a2`, `2f367a4`, `d55fd4b`,
 `2626a04`, `221ff31`, `fda8ef6`, `4712f4f`, `18d7a27`, `c927f62` and the
