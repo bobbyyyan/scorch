@@ -18,7 +18,7 @@ from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 
 import torch
 
-from ..format import LevelFormat, LevelType, TensorFormat
+from ..format import LevelFormat, LevelType, TensorFormat, owned_format
 from .cin import (
     BinaryOp,
     ForAll,
@@ -3130,7 +3130,7 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
         _initialize_cin_clone(clone, tensor.node_id)
         clone.symbol_id = tensor.symbol_id
         clone._name = tensor.name
-        clone._format = tensor._format
+        clone._format = None if tensor._format is None else owned_format(tensor._format)
         clone._assignment = None
         clone.shape = tuple(tensor.shape) if tensor.shape is not None else None
         clone.dtype = tensor.dtype

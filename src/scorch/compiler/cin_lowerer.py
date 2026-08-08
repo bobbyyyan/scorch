@@ -341,6 +341,44 @@ class CINLowerer:
                 f"stage=CIN lowering: unknown IndexStmt node type '{node_type}'"
             )
 
+    @staticmethod
+    def _validate_coordinate_hierarchies(stmt: IndexStmt) -> None:
+        """Reject valid formats the legacy position model cannot lower.
+
+        A pure coordinate hierarchy is the established COO stream.  Mixing a
+        coordinate level with DENSE or COMPRESSED levels needs explicit
+        parent/child grouping that the legacy CIN-to-LLIR iterator model does
+        not represent.  Validate every declared access -- including the
+        result -- once at the outer ownership boundary so the gap cannot
+        become an undeclared cursor bound or malformed result storage later.
+        """
+
+        for tensor_access in stmt.tensor_accesses:
+            level_types = tuple(tensor_access.level_types())
+            if not any(
+                level_type is LevelType.COORDINATE for level_type in level_types
+            ) or all(level_type is LevelType.COORDINATE for level_type in level_types):
+                continue
+            tensor = tensor_access.get_tensor()
+            diagnostic = CINDiagnostic(
+                code="unsupported_mixed_coordinate_hierarchy",
+                message=(
+                    "legacy CIN lowering supports coordinate-free hierarchies "
+                    "or all-coordinate COO, not a mixed hierarchy for tensor "
+                    f"{tensor.get_name()!r}"
+                ),
+                path=("root",),
+                entity_id=tensor.symbol_id,
+                stage="legacy_cin_lowering",
+                pass_name="prepare_stmt",
+            )
+            raise UnsupportedFeature(
+                "stage=legacy CIN lowering: "
+                "unsupported_mixed_coordinate_hierarchy for tensor "
+                f"{tensor.get_name()!r}",
+                diagnostics=(diagnostic,),
+            )
+
     def _emit_post_ops(
         self,
         output_var_name: str,
@@ -1118,7 +1156,8 @@ class CINLowerer:
         loop_body: List[llir.Stmt] = []
 
         if result_is_coord:
-            # Direct assignment: A0_crd[pA0] = it.first[0]; etc.
+            # Direct assignment: rank 1 uses ``it.first``; higher-rank
+            # workspaces use ``it.first[level]``.
             for i in range(len(wksp_index_vars)):
                 loop_body.append(
                     llir.Assign(
@@ -1171,7 +1210,7 @@ class CINLowerer:
                     )
                 )
         else:
-            # Fill intermediate vectors: T0_crd_vec[pT] = it.first[0]; etc.
+            # Fill intermediate vectors from the scalar/vector key component.
             for i in range(len(wksp_index_vars)):
                 loop_body.append(
                     llir.Assign(
@@ -2116,6 +2155,7 @@ class CINLowerer:
                 prepared_stmt
             )
         self._validate_index_stmt(prepared_stmt)
+        self._validate_coordinate_hierarchies(prepared_stmt)
         verify_cin_enabled = self.compile_options.verification.verify_cin
         if legacy_schedule_aliases and verify_cin_enabled and not ownership_transferred:
             # A caller-owned legacy auto-schedule is a derived compatibility

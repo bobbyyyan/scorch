@@ -53,6 +53,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from types import FunctionType
 from typing import (
     Any,
     Dict,
@@ -130,10 +131,12 @@ from .nodes import (
     CursorValue,
     DenseFor,
     DensePosition,
+    DimensionDecl,
     DimensionId,
     Expr,
     FloatConst,
     IndexValue,
+    LevelDecl,
     LevelKind,
     Load,
     LoopIRNodeId,
@@ -142,6 +145,7 @@ from .nodes import (
     MergeMode,
     PanelOuterFor,
     ParallelDiscipline,
+    ParallelIntent,
     ParallelPart,
     ParallelSelection,
     ParallelWork,
@@ -150,9 +154,11 @@ from .nodes import (
     PositionValue,
     ReduceOp,
     RelayoutDecl,
+    RelayoutId,
     RelayoutScope,
     RelayoutStage,
     ResultTileDecl,
+    ResultTileId,
     ResultTileRegion,
     RootPosition,
     ScalarType,
@@ -171,13 +177,94 @@ from .nodes import (
     StoreReduce,
     TensorDecl,
     TiledReduce,
+    TileId,
     TileInnerFor,
     TileOuterFor,
+    WorkspaceId,
+    WorkspaceDecl,
     WorkspaceRead,
     WorkspaceReduce,
     WorkspaceRegion,
 )
 from .verifier import LoopIRVerificationError, verify_program
+
+_LOOPIR_GRAPH_NODE_TYPES = (
+    AppendEntry,
+    BinaryExpr,
+    Block,
+    CursorValue,
+    DenseFor,
+    DensePosition,
+    DimensionDecl,
+    FloatConst,
+    IndexValue,
+    LevelDecl,
+    Load,
+    LoopProgram,
+    MergedSparseFor,
+    PanelOuterFor,
+    ParallelSelection,
+    ParallelWork,
+    PositionLoad,
+    PositionValue,
+    RelayoutDecl,
+    RelayoutStage,
+    ResultTileDecl,
+    ResultTileRegion,
+    RootPosition,
+    SparseCursorDecl,
+    SparseFor,
+    SparseWorkSource,
+    SparseWindowFor,
+    SparseWorkspaceDecl,
+    SparseWorkspaceDrainFor,
+    SparseWorkspaceInsert,
+    SparseWorkspaceRegion,
+    SparseWorkspaceValue,
+    StagedRead,
+    Store,
+    StoreReduce,
+    TensorDecl,
+    TiledReduce,
+    TileInnerFor,
+    TileOuterFor,
+    WorkspaceDecl,
+    WorkspaceRead,
+    WorkspaceReduce,
+    WorkspaceRegion,
+)
+_LOOPIR_GRAPH_ENUM_TYPES = (
+    BinaryOp,
+    LevelKind,
+    MergeMode,
+    ParallelDiscipline,
+    ParallelIntent,
+    ParallelPart,
+    ReduceOp,
+    RelayoutScope,
+    ScalarType,
+)
+_LOOPIR_IDENTITY_TYPES = (
+    SymbolId,
+    IndexId,
+    LoopIRNodeId,
+    DimensionId,
+    CursorId,
+    PositionId,
+    TileId,
+    WorkspaceId,
+    RelayoutId,
+    ResultTileId,
+)
+_LOOPIR_NODE_TYPE_BY_ID = {
+    id(node_type): node_type for node_type in _LOOPIR_GRAPH_NODE_TYPES
+}
+_LOOPIR_ENUM_TYPE_BY_ID = {
+    id(enum_type): enum_type for enum_type in _LOOPIR_GRAPH_ENUM_TYPES
+}
+_LOOPIR_IDENTITY_TYPE_BY_ID = {
+    id(identity_type): identity_type for identity_type in _LOOPIR_IDENTITY_TYPES
+}
 
 _SCALAR_TO_TORCH: Dict[ScalarType, torch.dtype] = {
     ScalarType.FLOAT32: torch.float32,
@@ -285,6 +372,7 @@ class _TargetLowering:
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
+        self._input_symbols = self._snapshot_program_inputs(program)
         self.decls: Dict[SymbolId, TensorDecl] = {
             decl.symbol: decl for decl in program.tensors
         }
@@ -374,15 +462,497 @@ class _TargetLowering:
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
                 self.cursor_loops[cursor.cursor] = position
+        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._position_load_signatures: Dict[
+            int, Tuple[int, Tuple[Tuple[int, int], ...], int]
+        ] = {}
         self.loads, self.cursor_values = self._collect_accesses()
+        self._value_expression_snapshot = self._validated_value_expression_signature(
+            self._access_value_expression()
+        )
+        self._target_owner_snapshot = self._validated_target_owner_signature()
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
         self._reserve_merge_names()
         self._reserve_tile_names()
         self._reserve_workspace_names()
         self._reserve_panel_names()
+        self._seal_target_state()
 
     # -- boundary validation -------------------------------------------------
+
+    def _snapshot_program_inputs(self, program: LoopProgram) -> Tuple[SymbolId, ...]:
+        """Own the exact declared-input sequence used throughout lowering.
+
+        A verified ``LoopProgram`` is frozen only by convention: adversarial
+        callers can still replace a field through ``object.__setattr__`` and
+        a tuple subclass can execute arbitrary code from membership or
+        iteration.  Snapshot exact identities once, then ensure the program
+        still exposes that same tuple at every post-construction expression
+        boundary.  Target code never consults a caller-controlled container.
+        """
+
+        self._target_type_snapshot = type(self)
+        self._program_container = program
+        state = object.__getattribute__(program, "__dict__")
+        if type(state) is not dict or "inputs" not in state:
+            _fail(
+                "unsupported_program_shape",
+                "the program must retain exact stored input declarations",
+            )
+        inputs = state["inputs"]
+        if type(inputs) is not tuple:
+            _fail(
+                "unsupported_program_shape",
+                "the program input declarations must be an owned tuple",
+            )
+        values = tuple(_stored_identity_value(symbol, SymbolId) for symbol in inputs)
+        if any(value is None for value in values) or len(set(values)) != len(values):
+            _fail(
+                "unsupported_program_shape",
+                "the program inputs must be unique exact symbol identities",
+            )
+        self._program_inputs_container = inputs
+        self._program_input_values = cast(Tuple[int, ...], values)
+        return inputs
+
+    def _validated_program_graph_signature(
+        self,
+        program: object,
+        *,
+        owners: Optional[List[object]] = None,
+    ) -> Tuple[object, ...]:
+        """Own the complete verified LoopIR artifact by identity and state.
+
+        The target retains loop, region, declaration, and leaf objects while it
+        builds legacy-shaped LLIR. Frozen dataclasses are only a conventional
+        boundary in Python: ``object.__setattr__`` can replace an ancestor body
+        with a fresh, verifier-valid subtree and leave every retained object
+        unchanged. Fingerprinting only the retained leaf therefore permits
+        stale emission. This stored-state walk starts at the current program
+        root, records every exact node/container edge and declaration, and
+        rejects cycles or foreign values without invoking caller attributes.
+        """
+
+        active: Set[int] = set()
+        seen: Set[int] = set()
+        signature: List[object] = []
+
+        def fail(message: str) -> NoReturn:
+            _fail("unsupported_program_shape", message)
+
+        def visit(value: object, depth: int) -> None:
+            if depth > 256:
+                fail("the target program graph exceeds the ownership depth bound")
+            if value is None:
+                signature.append("none")
+                return
+            if type(value) is bool:
+                signature.extend(("bool", value))
+                return
+            if type(value) is int:
+                signature.extend(("int", value))
+                return
+            if type(value) is float:
+                signature.extend(("float", value.hex()))
+                return
+            if type(value) is str:
+                signature.extend(("str", value))
+                return
+            value_type = type(value)
+            identity_type = _LOOPIR_IDENTITY_TYPE_BY_ID.get(id(value_type))
+            if identity_type is value_type:
+                try:
+                    state = object.__getattribute__(value, "__dict__")
+                except Exception:
+                    fail("the target program graph contains a malformed identity")
+                keys = tuple(state) if type(state) is dict else ()
+                if (
+                    type(state) is not dict
+                    or len(keys) != 1
+                    or type(keys[0]) is not str
+                    or keys[0] != "value"
+                    or type(state["value"]) is not int
+                ):
+                    fail("the target program graph contains a malformed identity")
+                if owners is not None:
+                    owners.append(value)
+                signature.extend(
+                    (
+                        "identity",
+                        value_type.__name__,
+                        id(value),
+                        state["value"],
+                    )
+                )
+                return
+            enum_type = _LOOPIR_ENUM_TYPE_BY_ID.get(id(value_type))
+            if enum_type is value_type:
+                try:
+                    name = object.__getattribute__(value, "_name_")
+                except Exception:
+                    fail("the target program graph contains a malformed enum value")
+                if type(name) is not str:
+                    fail("the target program graph contains a malformed enum value")
+                if owners is not None:
+                    owners.append(value)
+                signature.extend(("enum", enum_type.__name__, id(value), name))
+                return
+
+            object_id = id(value)
+            if object_id in active:
+                fail("the target program graph contains a cycle")
+            if object_id in seen:
+                signature.extend(("reference", object_id))
+                return
+
+            if type(value) is tuple:
+                if owners is not None:
+                    owners.append(value)
+                active.add(object_id)
+                seen.add(object_id)
+                try:
+                    signature.extend(("tuple", object_id, len(value)))
+                    for item in value:
+                        visit(item, depth + 1)
+                    return
+                finally:
+                    active.discard(object_id)
+
+            node_type = _LOOPIR_NODE_TYPE_BY_ID.get(id(value_type))
+            if node_type is not value_type:
+                fail("the target program graph contains an unsupported stored value")
+            try:
+                state = object.__getattribute__(value, "__dict__")
+            except Exception:
+                fail("the target program graph contains malformed node state")
+            if type(state) is not dict or any(type(key) is not str for key in state):
+                fail("the target program graph contains malformed node state")
+
+            if owners is not None:
+                owners.append(value)
+            active.add(object_id)
+            seen.add(object_id)
+            try:
+                fields = sorted(state)
+                signature.extend(("node", node_type.__name__, object_id, len(fields)))
+                for key in fields:
+                    signature.append(key)
+                    visit(state[key], depth + 1)
+                return
+            finally:
+                active.discard(object_id)
+
+        if type(program) is not LoopProgram:
+            fail("the target program graph must remain an exact LoopProgram")
+        visit(program, 0)
+        if not signature or signature[0] != "node":
+            fail("the target program graph must remain an exact LoopProgram")
+        return tuple(signature)
+
+    def _validated_target_state_signature(
+        self,
+        *,
+        owners: Optional[List[object]] = None,
+    ) -> Tuple[object, ...]:
+        """Bind every pre-emission cache that interprets the program graph.
+
+        The program graph can remain pristine while a caller rewrites a
+        retained target cache such as ``loops`` or ``result_decl``. Because
+        lowering consumes those caches, bind the complete constructor-final
+        target state before emission. Program nodes are state-checked by the
+        graph signature; this signature binds the target's exact references,
+        containers, derived maps, and synthetic views.
+        """
+
+        def fail() -> NoReturn:
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches contain malformed state",
+            )
+
+        state = object.__getattribute__(self, "__dict__")
+        if type(state) is not dict or any(type(key) is not str for key in state):
+            fail()
+        graph_owners = state.get("_program_graph_owners")
+        graph_owned_ids = state.get("_program_graph_owner_ids")
+        if type(graph_owners) is not tuple or type(graph_owned_ids) is not frozenset:
+            fail()
+        if any(type(value) is not int for value in graph_owned_ids):
+            fail()
+        active: Set[int] = set()
+        seen: Set[int] = set()
+        signature: List[object] = []
+
+        def retain(value: object) -> None:
+            if owners is not None:
+                owners.append(value)
+
+        def visit(value: object, depth: int) -> None:
+            if depth > 512:
+                fail()
+            value_type = type(value)
+            if value is None:
+                signature.append("none")
+                return
+            if value_type is bool:
+                signature.extend(("bool", value))
+                return
+            if value_type is int:
+                signature.extend(("int", value))
+                return
+            if value_type is float:
+                signature.extend(("float", cast(float, value).hex()))
+                return
+            if value_type is str:
+                signature.extend(("str", value))
+                return
+            if value_type is torch.dtype:
+                retain(value)
+                signature.extend(("torch_dtype", id(value), str(value)))
+                return
+            identity_type = _LOOPIR_IDENTITY_TYPE_BY_ID.get(id(value_type))
+            if identity_type is value_type:
+                primitive = _stored_identity_value(value, value_type)
+                if primitive is None:
+                    fail()
+                retain(value)
+                signature.extend(
+                    ("identity", value_type.__name__, id(value), primitive)
+                )
+                return
+            enum_type = _LOOPIR_ENUM_TYPE_BY_ID.get(id(value_type))
+            if enum_type is value_type:
+                retain(value)
+                name = object.__getattribute__(value, "_name_")
+                if type(name) is not str:
+                    fail()
+                signature.extend(("enum", value_type.__name__, id(value), name))
+                return
+            node_type = _LOOPIR_NODE_TYPE_BY_ID.get(id(value_type))
+            if node_type is value_type and id(value) in graph_owned_ids:
+                retain(value)
+                signature.extend(("program_node", value_type.__name__, id(value)))
+                return
+            if value_type is FunctionType:
+                retain(value)
+                signature.extend(("function", id(value)))
+                return
+
+            object_id = id(value)
+            if object_id in active:
+                fail()
+            if object_id in seen:
+                signature.extend(("reference", object_id))
+                return
+
+            if node_type is value_type:
+                node_state = object.__getattribute__(value, "__dict__")
+                if type(node_state) is not dict or any(
+                    type(key) is not str for key in node_state
+                ):
+                    fail()
+                retain(value)
+                active.add(object_id)
+                seen.add(object_id)
+                try:
+                    fields = sorted(node_state)
+                    signature.extend(
+                        (
+                            "synthetic_node",
+                            value_type.__name__,
+                            object_id,
+                            len(fields),
+                        )
+                    )
+                    for key in fields:
+                        signature.append(key)
+                        visit(node_state[key], depth + 1)
+                    return
+                finally:
+                    active.discard(object_id)
+            if value_type is _Loop:
+                state = object.__getattribute__(value, "__dict__")
+                if type(state) is not dict or tuple(state) != (
+                    "kind",
+                    "index",
+                    "dimension",
+                    "node",
+                    "cursors",
+                ):
+                    fail()
+                retain(value)
+                active.add(object_id)
+                seen.add(object_id)
+                try:
+                    signature.extend(("loop_cache", object_id, len(state)))
+                    for field in state:
+                        signature.append(field)
+                        visit(state[field], depth + 1)
+                    return
+                finally:
+                    active.discard(object_id)
+            if value_type is tuple or value_type is list:
+                sequence = cast(Any, value)
+                retain(value)
+                active.add(object_id)
+                seen.add(object_id)
+                try:
+                    signature.extend(
+                        (
+                            "tuple" if value_type is tuple else "list",
+                            object_id,
+                            len(sequence),
+                        )
+                    )
+                    for item in sequence:
+                        visit(item, depth + 1)
+                    return
+                finally:
+                    active.discard(object_id)
+            if value_type is dict:
+                mapping = cast(Dict[object, object], value)
+                retain(value)
+                active.add(object_id)
+                seen.add(object_id)
+                try:
+                    signature.extend(("dict", object_id, len(mapping)))
+                    for key, item in mapping.items():
+                        visit(key, depth + 1)
+                        visit(item, depth + 1)
+                    return
+                finally:
+                    active.discard(object_id)
+            fail()
+
+        target_type = type(self)
+        retain(target_type)
+        signature.extend(("target_type", id(target_type)))
+        excluded = {
+            "_target_state_owners",
+            "_target_state_snapshot",
+            "_target_type_snapshot",
+        }
+        for key in sorted(state):
+            if key in excluded:
+                continue
+            signature.extend(("field", key))
+            value = state[key]
+            if key in {"_program_graph_owners", "_program_graph_snapshot"}:
+                if type(value) is not tuple:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_tuple", id(value), len(value)))
+            elif key == "_program_graph_owner_ids":
+                if type(value) is not frozenset:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_frozenset", id(value), len(value)))
+            else:
+                visit(value, 0)
+        return tuple(signature)
+
+    def _seal_target_state(self) -> None:
+        """Own constructor-final target caches until raw emission begins."""
+
+        self._target_type_snapshot = type(self)
+        graph_owners: List[object] = []
+        self._program_graph_snapshot = self._validated_program_graph_signature(
+            self._program_container,
+            owners=graph_owners,
+        )
+        # ``id`` values are meaningful only while their objects remain alive.
+        # Keep the full graph strongly owned so a replacement cannot recycle
+        # an address into either the graph or target-cache signature.
+        self._program_graph_owners = tuple(graph_owners)
+        self._program_graph_owner_ids = frozenset(id(value) for value in graph_owners)
+        owners: List[object] = []
+        self._target_state_snapshot = self._validated_target_state_signature(
+            owners=owners
+        )
+        self._target_state_owners = tuple(owners)
+
+    def _require_exact_target_type(self) -> Dict[str, object]:
+        """Return exact stored target state without invoking subclass hooks."""
+
+        state = object.__getattribute__(self, "__dict__")
+        expected_type = (
+            state.get("_target_type_snapshot") if type(state) is dict else None
+        )
+        if type(state) is not dict or type(self) is not expected_type:
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches changed after target "
+                "construction",
+            )
+        return cast(Dict[str, object], state)
+
+    def _require_program_inputs_unchanged(self) -> None:
+        """Fail closed if the retained input sequence changed after binding."""
+
+        target_state = _TargetLowering._require_exact_target_type(self)
+        bound_program = target_state.get("_program_container")
+        if (
+            type(target_state) is not dict
+            or type(bound_program) is not LoopProgram
+            or target_state.get("program") is not bound_program
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target program reference changed after target construction",
+            )
+        state = object.__getattribute__(bound_program, "__dict__")
+        current = state.get("inputs") if type(state) is dict else None
+        if type(current) is not tuple or current is not target_state.get(
+            "_program_inputs_container"
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the program input declarations changed after target construction",
+            )
+        values = tuple(_stored_identity_value(symbol, SymbolId) for symbol in current)
+        if values != target_state.get("_program_input_values"):
+            _fail(
+                "unsupported_program_shape",
+                "a program input identity changed after target construction",
+            )
+
+    def _require_target_state_unchanged(self) -> None:
+        """Fail closed before any target-private cache is interpreted."""
+
+        target_state = _TargetLowering._require_exact_target_type(self)
+        current_target_state = _TargetLowering._validated_target_state_signature(self)
+        if current_target_state != target_state.get("_target_state_snapshot"):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches changed after target "
+                "construction",
+            )
+
+    def _require_program_graph_unchanged(
+        self, *, target_state_checked: bool = False
+    ) -> None:
+        """Fail closed if any retained program state changed after binding."""
+
+        _TargetLowering._require_program_inputs_unchanged(self)
+        target_state = _TargetLowering._require_exact_target_type(self)
+        bound_program = target_state.get("_program_container")
+        if type(bound_program) is not LoopProgram:
+            _fail(
+                "unsupported_program_shape",
+                "the target program reference changed after target construction",
+            )
+        current_graph = _TargetLowering._validated_program_graph_signature(
+            self, bound_program
+        )
+        if current_graph != target_state.get("_program_graph_snapshot"):
+            _fail(
+                "unsupported_program_shape",
+                "the program graph, including a target owning statement, "
+                "changed after target construction",
+            )
+        if not target_state_checked:
+            _TargetLowering._require_target_state_unchanged(self)
 
     def _validate_display_names(self) -> None:
         display_names: Dict[str, str] = {}
@@ -434,7 +1004,7 @@ class _TargetLowering:
                 dimension_decl.name,
                 f"dimension {dimension_decl.name!r}",
             )
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             decl = self.decls[symbol]
             owner = f"input tensor {decl.name!r}"
             for name in (
@@ -532,7 +1102,7 @@ class _TargetLowering:
                     f"tensor {decl.name!r} permutes compressed structure, "
                     "which the migrated families do not cover",
                 )
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             decl = self.decls[symbol]
             compressed = [
                 level
@@ -564,13 +1134,13 @@ class _TargetLowering:
                     "input shapes could not be snapshotted",
                 )
             ) from error
-        if input_keys != set(self.program.inputs):
+        if input_keys != set(self._input_symbols):
             _fail(
                 "invalid_shape_binding",
                 "input shapes must cover exactly the declared inputs",
             )
         shapes: Dict[SymbolId, Tuple[int, ...]] = {}
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             decl = self.decls[symbol]
             try:
                 shape = input_shapes[symbol]
@@ -1195,7 +1765,7 @@ class _TargetLowering:
         operand_decl = self.decls.get(decl.operand)
         if (
             operand_decl is None
-            or decl.operand not in self.program.inputs
+            or decl.operand not in self._input_symbols
             or len(operand_decl.levels) != 2
             or any(level.kind is not LevelKind.DENSE for level in operand_decl.levels)
             or operand_decl.dimensions[operand_decl.levels[0].mode]
@@ -1674,6 +2244,479 @@ class _TargetLowering:
             )
         return expr.index
 
+    def _access_value_expression(self) -> Expr:
+        """Return the one value-expression root this target accepted."""
+
+        leaf: object
+        if self.region is not None:
+            leaf = self.producer_leaf
+        else:
+            leaf = self.leaf
+        if type(leaf) not in (Store, StoreReduce, AppendEntry, WorkspaceReduce):
+            _fail(
+                "unsupported_program_shape",
+                "the target leaf no longer owns one supported value expression",
+            )
+        state = object.__getattribute__(leaf, "__dict__")
+        if type(state) is not dict or "value" not in state:
+            _fail(
+                "unsupported_program_shape",
+                "the target leaf has malformed stored value state",
+            )
+        return cast(Expr, state["value"])
+
+    def _validated_value_expression_signature(
+        self, expression: Expr
+    ) -> Tuple[object, ...]:
+        """Build an ordered, occurrence-sensitive primitive value signature.
+
+        The verifier establishes semantic validity before target construction,
+        while this target additionally owns exactly one physical read per
+        input.  Frozen nodes remain forgeable, however: replacing one read by
+        another node kind, or reusing an already-admitted read object twice,
+        used to bypass the per-kind access census.  Preserve the entire value
+        tree -- node identity, operator, ordered children, and every access
+        address -- so any post-construction rewrite fails before emission.
+
+        Shared DAG children are legal when they were present in the verified
+        tree; ``active`` detects only a back-edge, and the repeated occurrence
+        is represented a second time in the returned signature.
+        """
+
+        active: Set[int] = set()
+
+        def state_of(
+            value: object, expected: type, fields: Set[str]
+        ) -> Tuple[Dict[str, Any], int]:
+            if type(value) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value expression contains a malformed node",
+                )
+            state = object.__getattribute__(value, "__dict__")
+            if (
+                type(state) is not dict
+                or any(type(key) is not str for key in state)
+                or set(state) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value expression contains malformed stored state",
+                )
+            node_value = _stored_identity_value(state["node_id"], LoopIRNodeId)
+            if node_value is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value expression contains a malformed node identity",
+                )
+            return state, node_value
+
+        def identity(value: object, expected: type, label: str) -> int:
+            primitive = _stored_identity_value(value, expected)
+            if primitive is None:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the target value expression has a malformed {label}",
+                )
+            return primitive
+
+        def visit(value: object, depth: int) -> Tuple[object, ...]:
+            if depth > 256 or id(value) in active:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value expression must be finite and acyclic",
+                )
+            active.add(id(value))
+            try:
+                if type(value) is BinaryExpr:
+                    state, node = state_of(
+                        value,
+                        BinaryExpr,
+                        {"node_id", "op", "lhs", "rhs"},
+                    )
+                    op = state["op"]
+                    if (
+                        op is not BinaryOp.ADD
+                        and op is not BinaryOp.SUB
+                        and op is not BinaryOp.MUL
+                    ):
+                        _fail(
+                            "unsupported_program_shape",
+                            "the target value expression has a malformed binary operator",
+                        )
+                    op_tag = (
+                        "add"
+                        if op is BinaryOp.ADD
+                        else "sub" if op is BinaryOp.SUB else "mul"
+                    )
+                    return (
+                        "binary",
+                        id(value),
+                        node,
+                        op_tag,
+                        visit(state["lhs"], depth + 1),
+                        visit(state["rhs"], depth + 1),
+                    )
+                if type(value) is Load:
+                    state, node = state_of(
+                        value,
+                        Load,
+                        {"node_id", "tensor", "indices"},
+                    )
+                    indices = state["indices"]
+                    if type(indices) is not tuple:
+                        _fail(
+                            "unsupported_program_shape",
+                            "a coordinate load must retain its owned index tuple",
+                        )
+                    return (
+                        "load",
+                        id(value),
+                        node,
+                        identity(state["tensor"], SymbolId, "load tensor identity"),
+                        tuple(visit(index, depth + 1) for index in indices),
+                    )
+                if type(value) is PositionLoad:
+                    state, node = state_of(
+                        value,
+                        PositionLoad,
+                        {"node_id", "tensor", "position"},
+                    )
+                    return (
+                        "position_load",
+                        id(value),
+                        node,
+                        identity(
+                            state["tensor"],
+                            SymbolId,
+                            "position-load tensor identity",
+                        ),
+                        visit(state["position"], depth + 1),
+                    )
+                if type(value) is StagedRead:
+                    state, node = state_of(
+                        value,
+                        StagedRead,
+                        {"node_id", "relayout", "indices"},
+                    )
+                    indices = state["indices"]
+                    if type(indices) is not tuple:
+                        _fail(
+                            "unsupported_program_shape",
+                            "a staged read must retain its owned index tuple",
+                        )
+                    return (
+                        "staged_read",
+                        id(value),
+                        node,
+                        identity(state["relayout"], RelayoutId, "relayout identity"),
+                        tuple(visit(index, depth + 1) for index in indices),
+                    )
+                if type(value) is CursorValue:
+                    state, node = state_of(
+                        value,
+                        CursorValue,
+                        {"node_id", "cursor", "default"},
+                    )
+                    default = state["default"]
+                    return (
+                        "cursor_value",
+                        id(value),
+                        node,
+                        identity(state["cursor"], CursorId, "cursor identity"),
+                        None if default is None else visit(default, depth + 1),
+                    )
+                if type(value) is IndexValue:
+                    state, node = state_of(value, IndexValue, {"node_id", "index"})
+                    return (
+                        "index",
+                        id(value),
+                        node,
+                        identity(state["index"], IndexId, "index identity"),
+                    )
+                if type(value) is DensePosition:
+                    state, node = state_of(
+                        value,
+                        DensePosition,
+                        {"node_id", "tensor", "level", "parent", "coord"},
+                    )
+                    level = state["level"]
+                    if type(level) is not int or level < 0:
+                        _fail(
+                            "unsupported_program_shape",
+                            "a dense position has a malformed level",
+                        )
+                    return (
+                        "dense_position",
+                        id(value),
+                        node,
+                        identity(
+                            state["tensor"], SymbolId, "dense-position tensor identity"
+                        ),
+                        level,
+                        visit(state["parent"], depth + 1),
+                        visit(state["coord"], depth + 1),
+                    )
+                if type(value) is PositionValue:
+                    state, node = state_of(
+                        value, PositionValue, {"node_id", "position"}
+                    )
+                    return (
+                        "position",
+                        id(value),
+                        node,
+                        identity(state["position"], PositionId, "position identity"),
+                    )
+                if type(value) is RootPosition:
+                    _, node = state_of(value, RootPosition, {"node_id"})
+                    return ("root_position", id(value), node)
+                if type(value) is FloatConst:
+                    state, node = state_of(value, FloatConst, {"node_id", "value"})
+                    literal = state["value"]
+                    if type(literal) is not float:
+                        _fail(
+                            "unsupported_program_shape",
+                            "a cursor default must retain an exact float value",
+                        )
+                    return ("float", id(value), node, literal.hex())
+                if type(value) is WorkspaceRead:
+                    state, node = state_of(
+                        value,
+                        WorkspaceRead,
+                        {"node_id", "workspace", "coord"},
+                    )
+                    return (
+                        "workspace_read",
+                        id(value),
+                        node,
+                        identity(state["workspace"], WorkspaceId, "workspace identity"),
+                        visit(state["coord"], depth + 1),
+                    )
+                if type(value) is SparseWorkspaceValue:
+                    state, node = state_of(
+                        value,
+                        SparseWorkspaceValue,
+                        {"node_id", "workspace"},
+                    )
+                    return (
+                        "sparse_workspace_value",
+                        id(value),
+                        node,
+                        identity(state["workspace"], WorkspaceId, "workspace identity"),
+                    )
+                _fail(
+                    "unsupported_program_shape",
+                    f"unsupported target value node {type(value).__name__}",
+                )
+            finally:
+                active.discard(id(value))
+
+        return visit(expression, 0)
+
+    def _validated_target_owner_signature(self) -> Tuple[object, ...]:
+        """Bind value trees and access coordinates to their actual owners.
+
+        Heap and workspace lowering deliberately expose synthetic direct-write
+        views to the legacy-shaped LLIR emitter.  The semantic LoopIR owners
+        must nevertheless remain the exact statements from which those views
+        were derived: otherwise replacing a ``TiledReduce`` field or the
+        workspace consumer could be silently ignored, while mutating a shared
+        index child could redirect compact writes.  Snapshot both the actual
+        owner and any synthetic view, in order, with exact stored fields.
+        """
+
+        def state_of(
+            statement: object, expected: type, fields: Set[str]
+        ) -> Tuple[Dict[str, Any], int]:
+            if type(statement) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner contains a malformed statement",
+                )
+            state = object.__getattribute__(statement, "__dict__")
+            if (
+                type(state) is not dict
+                or any(type(key) is not str for key in state)
+                or set(state) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner contains malformed stored state",
+                )
+            node = _stored_identity_value(state["node_id"], LoopIRNodeId)
+            if node is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner has a malformed node identity",
+                )
+            return state, node
+
+        def identity(value: object, expected: type, label: str) -> int:
+            primitive = _stored_identity_value(value, expected)
+            if primitive is None:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the target value owner has a malformed {label}",
+                )
+            return primitive
+
+        def indices(value: object, label: str) -> Tuple[Tuple[object, ...], ...]:
+            if type(value) is not tuple:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the target {label} must remain an owned tuple",
+                )
+            return tuple(
+                self._validated_value_expression_signature(index) for index in value
+            )
+
+        def reduction_op(value: object) -> str:
+            if value is not ReduceOp.ADD:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner has a malformed reduction operator",
+                )
+            return "add"
+
+        def statement(statement: object) -> Tuple[object, ...]:
+            if type(statement) is Store:
+                state, node = state_of(
+                    statement,
+                    Store,
+                    {"node_id", "tensor", "indices", "value"},
+                )
+                return (
+                    "store",
+                    id(statement),
+                    node,
+                    identity(state["tensor"], SymbolId, "store tensor identity"),
+                    indices(state["indices"], "store indices"),
+                    self._validated_value_expression_signature(state["value"]),
+                )
+            if type(statement) is StoreReduce:
+                state, node = state_of(
+                    statement,
+                    StoreReduce,
+                    {"node_id", "tensor", "indices", "op", "value"},
+                )
+                return (
+                    "store_reduce",
+                    id(statement),
+                    node,
+                    identity(state["tensor"], SymbolId, "store-reduce tensor identity"),
+                    indices(state["indices"], "store-reduce indices"),
+                    reduction_op(state["op"]),
+                    self._validated_value_expression_signature(state["value"]),
+                )
+            if type(statement) is AppendEntry:
+                state, node = state_of(
+                    statement,
+                    AppendEntry,
+                    {"node_id", "tensor", "coords", "value"},
+                )
+                return (
+                    "append_entry",
+                    id(statement),
+                    node,
+                    identity(state["tensor"], SymbolId, "append tensor identity"),
+                    indices(state["coords"], "append coordinates"),
+                    self._validated_value_expression_signature(state["value"]),
+                )
+            if type(statement) is WorkspaceReduce:
+                state, node = state_of(
+                    statement,
+                    WorkspaceReduce,
+                    {"node_id", "workspace", "coord", "op", "value"},
+                )
+                return (
+                    "workspace_reduce",
+                    id(statement),
+                    node,
+                    identity(state["workspace"], WorkspaceId, "workspace identity"),
+                    self._validated_value_expression_signature(state["coord"]),
+                    reduction_op(state["op"]),
+                    self._validated_value_expression_signature(state["value"]),
+                )
+            if type(statement) is TiledReduce:
+                state, node = state_of(
+                    statement,
+                    TiledReduce,
+                    {"node_id", "result_tile", "indices", "op", "value"},
+                )
+                return (
+                    "tiled_reduce",
+                    id(statement),
+                    node,
+                    identity(
+                        state["result_tile"],
+                        ResultTileId,
+                        "result-tile identity",
+                    ),
+                    indices(state["indices"], "tiled-reduce indices"),
+                    reduction_op(state["op"]),
+                    self._validated_value_expression_signature(state["value"]),
+                )
+            _fail(
+                "unsupported_program_shape",
+                "the target leaf no longer has a supported value owner",
+            )
+
+        if self.region is not None:
+            if self.producer_leaf is None or self._region_leaf is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the workspace region lost a producer or consumer owner",
+                )
+            return (
+                "workspace_region",
+                statement(self.producer_leaf),
+                statement(self._region_leaf),
+            )
+        if self._tiled_leaf is not None:
+            if self._tiled_view is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the result tile lost its synthetic direct-write view",
+                )
+            return (
+                "result_tile",
+                statement(self._tiled_leaf),
+                statement(self._tiled_view),
+            )
+        return ("leaf", statement(self.leaf))
+
+    def _require_value_expression_unchanged(self) -> None:
+        """Revalidate the exact value tree immediately before target use."""
+
+        # Preserve the narrowest diagnostic at this boundary: malformed
+        # position spines and replaced access/owner nodes are characterized by
+        # the value validators before the complete graph guard reports a more
+        # general retained-graph change.
+        _TargetLowering._require_program_inputs_unchanged(self)
+        _TargetLowering._require_target_state_unchanged(self)
+        current_bindings = self._validated_bound_position_bindings()
+        if current_bindings != self._bound_position_snapshot:
+            _fail(
+                "unsupported_program_shape",
+                "a position-binding loop changed after target construction",
+            )
+        current_value = self._validated_value_expression_signature(
+            self._access_value_expression()
+        )
+        current_owner = self._validated_target_owner_signature()
+        if (
+            current_value != self._value_expression_snapshot
+            or current_owner != self._target_owner_snapshot
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target value expression changed after target construction, "
+                "or its owning statement was replaced",
+            )
+        _TargetLowering._require_program_graph_unchanged(
+            self, target_state_checked=True
+        )
+
     def _collect_accesses(self) -> Tuple[List[Load], List[CursorValue]]:
         loads: List[Load] = []
         cursor_values: List[CursorValue] = []
@@ -1738,15 +2781,19 @@ class _TargetLowering:
                 )
             seen.add(load.tensor)
         for position_load in position_loads:
-            if position_load.tensor in seen:
+            tensor, _, signature = self._validated_position_load_spine(
+                position_load, require_unconditional=False
+            )
+            self._position_load_signatures[id(position_load)] = signature
+            if tensor in seen:
                 _fail(
                     "unsupported_repeated_operand",
                     f"input tensor "
-                    f"{self.decls[position_load.tensor].name!r} is loaded "
+                    f"{self.decls[tensor].name!r} is loaded "
                     "more than once; this target owns one physical "
                     "position chain per input",
                 )
-            seen.add(position_load.tensor)
+            seen.add(tensor)
         for cursor_value in cursor_values:
             loop_position = self.cursor_loops.get(cursor_value.cursor)
             if loop_position is None:
@@ -1777,18 +2824,328 @@ class _TargetLowering:
     ) -> Optional[Tuple[SymbolId, int]]:
         """The (tensor, level) whose nest loop binds one position."""
 
-        for loop in self.loops:
-            if loop.kind in (_SPARSE, _SPARSE_WINDOW):
-                if loop.node.position == position:
-                    cursor = loop.cursors[0]
-                    return (cursor.tensor, cursor.level)
-                continue
-            if loop.kind is _MERGED:
-                bound_positions = getattr(loop.node, "positions", ())
-                for cursor, bound in zip(loop.cursors, bound_positions):
-                    if bound == position:
-                        return (cursor.tensor, cursor.level)
+        position_value = _stored_identity_value(position, PositionId)
+        if position_value is None:
+            return None
+        bindings = self._validated_bound_position_bindings()
+        if bindings != self._bound_position_snapshot:
+            _fail(
+                "unsupported_program_shape",
+                "a position-binding loop changed after target construction",
+            )
+        binding = bindings.get(position_value)
+        if binding is None:
+            return None
+        tensor_value, level, _, _ = binding
+        for symbol in self.decls:
+            if _stored_identity_value(symbol, SymbolId) == tensor_value:
+                return symbol, level
         return None
+
+    def _validated_bound_position_bindings(
+        self,
+    ) -> Dict[int, Tuple[int, int, str, Optional[MergeMode]]]:
+        """Read every position binding without invoking forged equality.
+
+        Position loads depend on the tensor/level owner and, for merged loops,
+        whether a binding can be absent.  Snapshot those primitive facts when
+        the target is built and re-read exact stored state at emission, so a
+        forged position container or hostile ``__eq__`` cannot escape the
+        target boundary or silently retarget a load.
+        """
+
+        bindings: Dict[int, Tuple[int, int, str, Optional[MergeMode]]] = {}
+
+        def state_of(value: object, expected: type, fields: Set[str]) -> Dict[str, Any]:
+            if type(value) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop contains a malformed node",
+                )
+            state = object.__getattribute__(value, "__dict__")
+            if (
+                type(state) is not dict
+                or any(type(key) is not str for key in state)
+                or set(state) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop contains malformed stored state",
+                )
+            if _stored_identity_value(state["node_id"], LoopIRNodeId) is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop contains a malformed node identity",
+                )
+            return state
+
+        def cursor_owner(cursor: object) -> Tuple[int, int]:
+            state = state_of(
+                cursor,
+                SparseCursorDecl,
+                {"node_id", "cursor", "tensor", "level", "parent"},
+            )
+            if _stored_identity_value(state["cursor"], CursorId) is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop has a malformed cursor identity",
+                )
+            tensor_value = _stored_identity_value(state["tensor"], SymbolId)
+            level = state["level"]
+            if tensor_value is None or type(level) is not int or level < 0:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop has a malformed cursor owner",
+                )
+            return tensor_value, level
+
+        def record(
+            bound: object,
+            cursor: object,
+            kind: str,
+            mode: Optional[MergeMode],
+        ) -> None:
+            position_value = _stored_identity_value(bound, PositionId)
+            if position_value is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-binding loop must bind exact position identities",
+                )
+            if position_value in bindings:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position identity may be bound by only one loop cursor",
+                )
+            tensor_value, level = cursor_owner(cursor)
+            bindings[position_value] = (tensor_value, level, kind, mode)
+
+        for loop in self.loops:
+            if loop.kind is _SPARSE:
+                state = state_of(
+                    loop.node,
+                    SparseFor,
+                    {"node_id", "cursor", "position", "coord_index", "body"},
+                )
+                if len(loop.cursors) != 1 or state["cursor"] is not loop.cursors[0]:
+                    _fail(
+                        "unsupported_program_shape",
+                        "a sparse loop's cursor changed after nest collection",
+                    )
+                record(state["position"], loop.cursors[0], _SPARSE, None)
+                continue
+            if loop.kind is _SPARSE_WINDOW:
+                state = state_of(
+                    loop.node,
+                    SparseWindowFor,
+                    {
+                        "node_id",
+                        "tile",
+                        "cursor",
+                        "position",
+                        "coord_index",
+                        "body",
+                    },
+                )
+                if len(loop.cursors) != 1 or state["cursor"] is not loop.cursors[0]:
+                    _fail(
+                        "unsupported_program_shape",
+                        "a sparse-window loop's cursor changed after nest collection",
+                    )
+                record(state["position"], loop.cursors[0], _SPARSE_WINDOW, None)
+                continue
+            if loop.kind is not _MERGED:
+                continue
+            state = state_of(
+                loop.node,
+                MergedSparseFor,
+                {"node_id", "mode", "cursors", "coord_index", "body", "positions"},
+            )
+            mode = state["mode"]
+            if mode is not MergeMode.UNION and mode is not MergeMode.INTERSECTION:
+                _fail(
+                    "unsupported_program_shape",
+                    "a merged position-binding loop has a malformed merge mode",
+                )
+            cursors = state["cursors"]
+            positions = state["positions"]
+            if (
+                type(cursors) is not tuple
+                or len(cursors) != len(loop.cursors)
+                or any(
+                    actual is not retained
+                    for actual, retained in zip(cursors, loop.cursors)
+                )
+                or type(positions) is not tuple
+                or (positions and len(positions) != len(loop.cursors))
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "a merged loop's position bindings changed after nest collection",
+                )
+            for cursor, bound in zip(loop.cursors, positions):
+                if bound is not None:
+                    record(bound, cursor, _MERGED, mode)
+        return bindings
+
+    def _validated_position_load_spine(
+        self,
+        load: PositionLoad,
+        *,
+        require_unconditional: bool,
+    ) -> Tuple[
+        SymbolId,
+        Tuple[Tuple[int, IndexId], ...],
+        Tuple[int, Tuple[Tuple[int, int], ...], int],
+    ]:
+        """Revalidate one physical load spine at the target boundary.
+
+        Verification happens before target construction, but frozen LoopIR
+        nodes remain forgeable through ``object.__setattr__``.  Read exact
+        stored fields, bound the walk by the tensor rank, and re-check the
+        tensor/level/coordinate linkage so a post-verification cycle or
+        cross-owner substitution fails closed instead of hanging or emitting
+        an access through another tensor's position.
+        """
+
+        _TargetLowering._require_program_inputs_unchanged(self)
+
+        def state_of(value: object, expected: type, fields: Set[str]) -> Dict[str, Any]:
+            if type(value) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-load spine contains a malformed node",
+                )
+            stored = object.__getattribute__(value, "__dict__")
+            if (
+                type(stored) is not dict
+                or any(type(key) is not str for key in stored)
+                or set(stored) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-load spine contains malformed stored state",
+                )
+            if _stored_identity_value(stored["node_id"], LoopIRNodeId) is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-load spine contains a malformed node identity",
+                )
+            return stored
+
+        load_state = state_of(load, PositionLoad, {"node_id", "tensor", "position"})
+        tensor = load_state["tensor"]
+        tensor_value = _stored_identity_value(tensor, SymbolId)
+        if (
+            tensor_value is None
+            or tensor not in self.decls
+            or tensor_value not in self._program_input_values
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a position load must name one declared input tensor",
+            )
+        decl = self.decls[tensor]
+        level = len(decl.levels) - 1
+        expr = load_state["position"]
+        seen: Set[int] = set()
+        drivers: List[Tuple[int, IndexId]] = []
+        driver_signature: List[Tuple[int, int]] = []
+
+        while type(expr) is DensePosition:
+            if id(expr) in seen or len(seen) >= len(decl.levels):
+                _fail(
+                    "unsupported_program_shape",
+                    "a position-load spine must be finite and acyclic",
+                )
+            seen.add(id(expr))
+            dense = state_of(
+                expr,
+                DensePosition,
+                {"node_id", "tensor", "level", "parent", "coord"},
+            )
+            if (
+                _stored_identity_value(dense["tensor"], SymbolId) != tensor_value
+                or type(dense["level"]) is not int
+                or dense["level"] != level
+                or level < 0
+                or decl.levels[level].kind is not LevelKind.DENSE
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    f"the position load of {decl.name!r} must descend its own "
+                    "dense levels in storage order",
+                )
+            coordinate = state_of(dense["coord"], IndexValue, {"node_id", "index"})[
+                "index"
+            ]
+            coordinate_value = _stored_identity_value(coordinate, IndexId)
+            loop_dimensions = {
+                dimension_value
+                for loop in self.loops
+                if _stored_identity_value(loop.index, IndexId) == coordinate_value
+                for dimension_value in (
+                    _stored_identity_value(loop.dimension, DimensionId),
+                )
+                if dimension_value is not None
+            }
+            if coordinate_value is None or len(loop_dimensions) != 1:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the level-{level} position coordinate of {decl.name!r} "
+                    "must be a directly bound loop coordinate",
+                )
+            levels = decl.levels
+            dimensions = decl.dimensions
+            mode = levels[level].mode if 0 <= level < len(levels) else None
+            expected_dimension = (
+                _stored_identity_value(dimensions[mode], DimensionId)
+                if type(levels) is tuple
+                and type(dimensions) is tuple
+                and type(mode) is int
+                and 0 <= mode < len(dimensions)
+                else None
+            )
+            if expected_dimension is None or loop_dimensions != {expected_dimension}:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the level-{level} position coordinate of {decl.name!r} "
+                    "must belong to that level's logical dimension",
+                )
+            drivers.append((level, coordinate))
+            driver_signature.append((level, coordinate_value))
+            expr = dense["parent"]
+            level -= 1
+
+        position = state_of(expr, PositionValue, {"node_id", "position"})["position"]
+        position_value = _stored_identity_value(position, PositionId)
+        if position_value is None:
+            _fail(
+                "unsupported_program_shape",
+                "a position load must ground at an exact bound position",
+            )
+        owner = self._bound_position_owner(position)
+        if owner != (tensor, level):
+            _fail(
+                "unsupported_program_shape",
+                f"the position load of {decl.name!r} must ground at the "
+                f"bound position of its own level-{level} cursor",
+            )
+        if require_unconditional:
+            binding = self._validated_bound_position_bindings().get(position_value)
+            if binding is None or (
+                binding[2] == _MERGED and binding[3] is MergeMode.UNION
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "a merged-case position load must ground at an "
+                    "unconditionally bound position; a UNION-bound position "
+                    "carries no value at a one-sided coordinate",
+                )
+        return (
+            tensor,
+            tuple(drivers),
+            (tensor_value, tuple(driver_signature), position_value),
+        )
 
     def _compute_level_drivers(self) -> Dict[SymbolId, Dict[int, object]]:
         """Map every tensor's physical level to the loop index driving it."""
@@ -1876,37 +3233,17 @@ class _TargetLowering:
             load's logical index does.
             """
 
-            decl = self.decls[load.tensor]
-            level = len(decl.levels) - 1
-            expr: Expr = load.position
-            while type(expr) is DensePosition:
-                dense = cast(DensePosition, expr)
-                if dense.tensor != load.tensor or dense.level != level:
-                    _fail(
-                        "unsupported_program_shape",
-                        f"the position load of {decl.name!r} must descend "
-                        "its own tensor's levels in storage order",
-                    )
-                coord = self._index_of(
-                    dense.coord,
-                    f"the level-{level} position coordinate of {decl.name!r}",
-                )
-                record(load.tensor, level, coord, "a position-load spine")
-                expr = dense.parent
-                level -= 1
-            if type(expr) is not PositionValue:
+            tensor, drivers, signature = self._validated_position_load_spine(
+                load, require_unconditional=False
+            )
+            expected_signature = self._position_load_signatures.get(id(load))
+            if expected_signature is None or signature != expected_signature:
                 _fail(
                     "unsupported_program_shape",
-                    f"the position load of {decl.name!r} must ground at a "
-                    "bound cursor position",
+                    "a position load changed after target construction",
                 )
-            owner = self._bound_position_owner(cast(PositionValue, expr).position)
-            if owner != (load.tensor, level):
-                _fail(
-                    "unsupported_program_shape",
-                    f"the position load of {decl.name!r} must ground at the "
-                    f"bound position of its own level-{level} cursor",
-                )
+            for level, coord in drivers:
+                record(tensor, level, coord, "a position-load spine")
 
         for load in self.loads:
             # Load indices are logical mode order by contract; level
@@ -1982,7 +3319,7 @@ class _TargetLowering:
             self._cursor_decl(cursor_value.cursor).tensor
             for cursor_value in self.cursor_values
         }
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             if symbol not in read_symbols and self.decls[symbol].levels:
                 if symbol not in self.level_drivers:
                     _fail(
@@ -2070,7 +3407,7 @@ class _TargetLowering:
 
     def _input_bound_var(self, loop: _Loop) -> Optional[llir.Var]:
         lookup = self._loop_logical_index(loop)
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             decl = self.decls[symbol]
             per_tensor = self.level_drivers.get(symbol, {})
             for level in range(len(decl.levels)):
@@ -2162,7 +3499,7 @@ class _TargetLowering:
 
     def _input_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
         stmts: List[llir.Stmt] = []
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             decl = self.decls[symbol]
             per_tensor = self.level_drivers.get(symbol, {})
             for level in range(len(decl.levels)):
@@ -2391,19 +3728,6 @@ class _TargetLowering:
 
     # -- merged-loop case machinery -------------------------------------------
 
-    def _position_binding_loop(self, position: PositionId) -> Optional["_Loop"]:
-        """The nest loop that binds one position, if any."""
-
-        for loop in self.loops:
-            if loop.kind in (_SPARSE, _SPARSE_WINDOW):
-                if loop.node.position == position:  # type: ignore[attr-defined]
-                    return loop
-                continue
-            if loop.kind is _MERGED:
-                if position in getattr(loop.node, "positions", ()):
-                    return loop
-        return None
-
     def _require_unconditional_position_load(self, load: PositionLoad) -> None:
         """Refuse a merged-case position load over an optional position.
 
@@ -2419,24 +3743,19 @@ class _TargetLowering:
         spine; this is the owning target's independent check.
         """
 
-        expr: Expr = load.position
-        while type(expr) is DensePosition:
-            expr = cast(DensePosition, expr).parent
-        if type(expr) is not PositionValue:
+        tensor, drivers, signature = self._validated_position_load_spine(
+            load, require_unconditional=True
+        )
+        if self._position_load_signatures.get(id(load)) != signature:
             _fail(
                 "unsupported_program_shape",
-                "a merged-case position load must ground at a bound cursor " "position",
+                "a position load changed after target construction",
             )
-        loop = self._position_binding_loop(cast(PositionValue, expr).position)
-        if loop is None or (
-            loop.kind is _MERGED
-            and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
-        ):
+        expected = self.level_drivers.get(tensor, {})
+        if any(expected.get(level) != coordinate for level, coordinate in drivers):
             _fail(
                 "unsupported_program_shape",
-                "a merged-case position load must ground at an "
-                "unconditionally bound position; a UNION-bound position "
-                "carries no value at a one-sided coordinate",
+                "a position-load spine changed after target construction",
             )
 
     def _merged_case_value(
@@ -3358,6 +4677,8 @@ class _TargetLowering:
         managed passes.
         """
 
+        _TargetLowering._require_value_expression_unchanged(self)
+
         first_position = 0
         while self.loops[first_position].kind is _PANEL_OUTER:
             first_position += 1
@@ -3422,7 +4743,7 @@ class _TargetLowering:
                     shape=self.shapes[symbol],
                     dtype=_SCALAR_TO_TORCH[self.decls[symbol].dtype],
                 )
-                for symbol in self.program.inputs
+                for symbol in self._input_symbols
             ),
         )
 
@@ -3467,7 +4788,7 @@ class _TargetLowering:
                 f"{self.decls[symbol].name}_val",
                 dtype_to_c_datatype(_SCALAR_TO_TORCH[self.decls[symbol].dtype]).value,
             )
-            for symbol in self.program.inputs
+            for symbol in self._input_symbols
         )
 
     def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
@@ -4702,6 +6023,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
+        self._input_symbols = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -4723,6 +6045,8 @@ class _SparseWorkspaceLowering(_TargetLowering):
         self.relayout = None
         self.result_tile = None
         self.result_tile_depth = -1
+        self._tiled_leaf = None
+        self._tiled_view = None
         self.relayout_depth = -1
         if program.parallel is not None:
             _fail(
@@ -4738,6 +6062,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self._validate_family_shape()
         self._reserve_family_names()
+        self._seal_target_state()
 
     # -- family-shape validation ---------------------------------------------
 
@@ -5654,6 +6979,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         return function
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_program_graph_unchanged(self)
         result_name = self.result_decl.name
         row_body: List[llir.Stmt] = [
             *self._row_prologue_statements(),
@@ -5799,6 +7125,7 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
         ]
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_program_graph_unchanged(self)
         row_body: List[llir.Stmt] = [
             *self._row_prologue_statements(),
             llir.Comment("Assemble COMPRESSED level"),
@@ -5958,6 +7285,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
+        self._input_symbols = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -5979,6 +7307,8 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         self.relayout = None
         self.result_tile = None
         self.result_tile_depth = -1
+        self._tiled_leaf = None
+        self._tiled_view = None
         self.relayout_depth = -1
         if program.parallel is not None:
             _fail(
@@ -6000,6 +7330,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self._validate_family_shape()
         self._reserve_family_names()
+        self._seal_target_state()
 
     # -- family-shape validation ----------------------------------------------
 
@@ -6529,6 +7860,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         ]
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_program_graph_unchanged(self)
         result_name = self.result_decl.name
         row_name = self.row_name
         pos_index = llir.Var(
@@ -7156,6 +8488,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
+        self._input_symbols = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -7173,6 +8506,8 @@ class _DenseDomainMixedLowering(_TargetLowering):
         self.relayout = None
         self.result_tile = None
         self.result_tile_depth = -1
+        self._tiled_leaf = None
+        self._tiled_view = None
         self.relayout_depth = -1
         if program.parallel is not None:
             _fail(
@@ -7188,9 +8523,16 @@ class _DenseDomainMixedLowering(_TargetLowering):
             loop.index: position for position, loop in enumerate(self.loops)
         }
         self.cursor_loops: Dict[CursorId, int] = {}
+        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._position_load_signatures = {}
         self.loads, self.cursor_values = self._collect_accesses()
+        self._value_expression_snapshot = self._validated_value_expression_signature(
+            self._access_value_expression()
+        )
+        self._target_owner_snapshot = self._validated_target_owner_signature()
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
+        self._seal_target_state()
 
     def _collect_mixed_chain(self) -> List[_Loop]:
         def require(condition: bool, what: str) -> None:
@@ -7209,7 +8551,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
             == tuple(range(len(result_levels))),
             "an identity-ordered compressed-parent/dense-suffix result",
         )
-        for symbol in self.program.inputs:
+        for symbol in self._input_symbols:
             require(
                 all(
                     level.kind is LevelKind.DENSE for level in self.decls[symbol].levels
@@ -7340,6 +8682,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
         return for_loop
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_value_expression_unchanged(self)
         result_name = self.result_decl.name
         return [
             llir.BlankLine(),
@@ -7462,6 +8805,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
+        self._input_symbols = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -7479,6 +8823,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self.relayout = None
         self.result_tile = None
         self.result_tile_depth = -1
+        self._tiled_leaf = None
+        self._tiled_view = None
         self.relayout_depth = -1
         if program.parallel is not None:
             _fail(
@@ -7498,15 +8844,62 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
                 self.cursor_loops[cursor.cursor] = position
+        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._position_load_signatures = {}
         self.loads, self.cursor_values = self._collect_accesses()
+        self._value_expression_snapshot = self._validated_value_expression_signature(
+            self._access_value_expression()
+        )
+        self._target_owner_snapshot = self._validated_target_owner_signature()
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
         self._reserve_merge_names()
+        self._seal_target_state()
 
     def _validate_assembly_layouts(self) -> None:
         for decl in self.program.tensors:
-            modes = tuple(level.mode for level in decl.levels)
-            if modes != tuple(range(len(decl.levels))):
+            levels = decl.levels
+            if type(levels) is not tuple:
+                _fail(
+                    "unsupported_mode_order",
+                    f"tensor {decl.name!r} has malformed level declarations",
+                )
+            modes: List[object] = []
+            kinds: List[object] = []
+            for level in levels:
+                if type(level) is not LevelDecl:
+                    _fail(
+                        "unsupported_mode_order",
+                        f"tensor {decl.name!r} has malformed level declarations",
+                    )
+                state = object.__getattribute__(level, "__dict__")
+                if (
+                    type(state) is not dict
+                    or any(type(key) is not str for key in state)
+                    or set(state) != {"node_id", "kind", "mode"}
+                    or _stored_identity_value(state["node_id"], LoopIRNodeId) is None
+                    or (
+                        state["kind"] is not LevelKind.DENSE
+                        and state["kind"] is not LevelKind.COMPRESSED
+                    )
+                ):
+                    _fail(
+                        "unsupported_mode_order",
+                        f"tensor {decl.name!r} has malformed level declarations",
+                    )
+                modes.append(state["mode"])
+                kinds.append(state["kind"])
+            if any(type(mode) is not int for mode in modes) or sorted(
+                cast(List[int], modes)
+            ) != list(range(len(levels))):
+                _fail(
+                    "unsupported_mode_order",
+                    f"tensor {decl.name!r} must use one exact permutation of "
+                    "its logical modes",
+                )
+            if tuple(modes) == tuple(range(len(levels))):
+                continue
+            if any(kind is not LevelKind.DENSE for kind in kinds):
                 _fail(
                     "unsupported_mode_order",
                     f"tensor {decl.name!r} permutes compressed structure, "
@@ -7913,9 +9306,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         extents — never a runtime-format probe.
         """
 
-        if len(self.program.inputs) != 1:
+        if len(self._input_symbols) != 1:
             return False
-        input_decl = self.decls[self.program.inputs[0]]
+        input_decl = self.decls[self._input_symbols[0]]
         if any(level.kind is not LevelKind.DENSE for level in input_decl.levels):
             return True
         result_cells = 1
@@ -8037,6 +9430,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         return prepared
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_value_expression_unchanged(self)
         if self.loops[0].kind in (_MERGED, _SPARSE):
             stmts: List[llir.Stmt] = (
                 list(self._lower_merged(0))
