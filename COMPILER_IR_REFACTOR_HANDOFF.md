@@ -29406,10 +29406,11 @@ range:
 
 ### The census
 
-Review §41.3.  55 cells, both automatic arms, **zero arm divergence**, each in
-its own process.  It also characterized two further pre-existing public-route
-defects that this milestone does *not* fix: `einsum('ij->i')` emits C++ that
-does not compile (the legacy sparse-workspace drain subscripts a scalar key),
+Review §41.3.  54 cells (12 + 14 + 13 + 15), both automatic arms, **zero arm
+divergence**, each in its own process.  The earlier 55 count included the
+public-reachability heading.  It also characterized two further pre-existing
+public-route defects that this milestone does *not* fix: `einsum('ij->i')`
+emits C++ that does not compile (the legacy sparse-workspace drain subscripts a scalar key),
 and `einsum('ijk->ijk')` into `dds` fails in the legacy **output** assembler
 with the same one-dense-extent sizing bug the input conversion just lost —
 latent before, reachable now that the input builds.
@@ -29452,14 +29453,18 @@ to the neighbour that still occupies that seam, recorded in place.
   / `unsupported_program_shape`; their legacy execution produces malformed
   storage, so a migration must gate on the oracle, not parity.
 
-Exact-tip gates at `04dbe60` are green: focused batteries 64 + 18 + 93 +
-181 + 214; schedule audit **46/40/0** and byte-equal to its retained
+Exact-tip gates at `04dbe60` include focused green batteries 64 + 18 + 93 +
+181; the separately reported 214 result has no retained command or file
+membership and is not independently reproducible.  The schedule audit is
+**46/40/0** and byte-equal to its retained
 baseline; captures corpus 20 / grid 42 / anchors 22 / heap 11 byte-identical
 with the automatic surface differing only in two process-dependent cache-key
 characters; eight repeated public differentials byte-stable; activating
-latency worst **1.04189** primary and **1.06632** order-flipped against a
-1.10 budget; Black/Flake8/mypy at exact base/candidate parity (140 errors in
-11 files at both revisions, zero LoopIR findings); `git diff --check` clean;
+paired same-tip LoopIR/legacy latency worst **1.04189** primary and
+**1.06632** order-flipped against a 1.10 budget; full-source mypy is exact
+base/candidate parity (140 errors in 11 files, zero LoopIR findings), while
+the retained Black/Flake8 files do not prove the originally claimed parity;
+`git diff --check` clean;
 and a clean detached full non-performance suite of **5,168 passed / 14
 skipped / 0 failures** over 5,182 selected nodes in eight file-disjoint
 fresh processes with a proven complete, non-overlapping union.
@@ -29529,3 +29534,104 @@ an exact-tip clean detached full non-performance suite in fresh-process
 partitions with a proven complete, non-overlapping union.  Seal evidence only
 after the final documentation tip, exclude generated `__pycache__`, and prove
 every manifest entry verifies.
+
+## Phase-7 compatibility-envelope rigorous review corrections (2026-08-07; supersedes the preceding prompt)
+
+Seven local correction commits stack on inherited tip `2b36b7b`, without
+amending, reordering, or pushing:
+
+- `d2e45c5` / `2cef248` preserve exact rank-1 sparse-format metadata and bit
+  widths, admit rank-1 coordinate storage, avoid needless dense cloning, and
+  admit the already-sound nonidentity physical-layout materializer;
+- `efa78fe` adds the missing production-oracle, genuinely stored-zero, and
+  zero-extent evidence for rank-1 assembly;
+- `29d13b8` / `67216cc` validate and deeply detach caller-owned
+  `TensorFormat`/`LevelFormat` state at the public conversion boundary;
+- `f216e31` / `c806db4` close the hostile stored-key escape without invoking
+  attacker-controlled equality.
+
+The inherited compiler lowering is byte-sound, but its evidence must be read
+under the corrected interpretation in review §42: the census has **54** cells
+(12 + 14 + 13 + 15), the retained 214-test claim is unreproducible, the
+758-pass/5-failure log is exploratory red evidence, and the latency receipt is
+a same-tip LoopIR/legacy pair in two orders rather than A/B/A. Full-tree
+base/candidate parity is 15 inherited Black findings, 47 inherited Flake8
+findings, and 140 mypy errors in 11 files after line normalization.
+
+One broader pre-existing seam is deliberately not hidden: `tensor.format`
+returns the tensor's retained value object, so `object.__setattr__` on that
+returned `TensorFormat` or nested `LevelFormat` can corrupt its own metadata.
+That is a repository-wide format-exposure/identity question, not a safe
+one-call-site patch.
+
+Exact final receipts, evidence location, and the Phase-7 disposition are in
+review §42. Nothing changed LoopIR schemas or identities, compiler routing,
+default LoopIR release dispatch, selectors, caches, or valid generated C++;
+the public runtime conversion routing changed exactly where §42 records it.
+At exact code tip `c806db4`, the complete partitioned suite is **5,207 passed /
+14 skipped / 0 failures** over 5,221 selected nodes, and the accurately labelled
+paired two-order latency rerun is inside 1.10 everywhere (worst **1.06301**).
+
+### Superseding broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in `/Users/bobby/scorch` on branch
+`refactor/compiler-ir-phase3-std-move-call` from the actual local tip reported
+by `git log`. Do not push, amend, squash, or reorder. Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§39-42, and this handoff tail.
+Preserve the five protected tracked files at their recorded hashes; leave all
+unrelated GPU/CUDA, benchmark, scheduler, research, scratchpad, packaging and
+untracked material untouched; stage only explicit paths and give nontrivial
+commits descriptive bodies.
+
+First independently review `d2e45c5`, `2cef248`, `efa78fe`, `29d13b8`,
+`67216cc`, `f216e31`, `c806db4`, and the final documentation tip rather than
+trusting the report. Reproduce the exact format/bit-width and coordinate
+contracts; nonidentity physical-layout round trips; oracle, stored-zero, and
+zero-extent rank-1 evidence; deep input-format detachment; hostile stored-key
+rejection; the 54-cell census; and every final evidence-manifest entry. Add
+fresh adversarial probes and fix and commit any concrete defect before
+extending the representation.
+
+Then deliver a broad Phase-7 milestone in separately reviewable commits:
+
+1. Audit the systemic returned-format mutability seam across `STensor.format`,
+   tensor layouts, storage/index exposure, serialization, canonical/cache
+   identities, and every internal consumer that relies on format object
+   identity. Implement one coherent defensive ownership/value boundary only
+   if the audit proves it safe and measures its hot-path cost; otherwise
+   record the exact compatibility blocker and retain an explicit
+   characterization/compatibility lock.
+2. As the primary vertical slice, migrate the **rank-general
+   compressed-parent/dense-leaf co-operand** family: at minimum `ss*sd`,
+   `sd*ss`, `sss*sdd`, `sss*ssd`, `dss*dsd`, and `ssss*sddd`, including
+   commuted, permuted, ragged, empty, zero-extent, stored-zero, f32 and f64
+   cases in both automatic arms. Generalize the assembly leaf/access envelope
+   through `PositionLoad`, `DensePosition`, and level/domain/position
+   identities. Add no CSR shortcut, runtime-format sniffing, rendered-name or
+   regex routing, or operation-specific target hack. The legacy comparand is
+   sound here, so require byte parity plus production-oracle and PyTorch
+   differentials; keep rejected neighbors at their precise codes.
+3. Complete a substantial second coherent slice: preferably the
+   **multi-compressed reduction/TTM** vertical, otherwise the
+   **multiple-dense-prefix/interleaved output** family. The legacy reduction
+   comparand segfaults and the dense-prefix output assembler is malformed, so
+   retain those only as executable failure evidence and gate new correctness
+   on the LoopIR oracle and PyTorch. Cover every relevant layout, f32/f64,
+   cancellation, explicit stored zeros, empty/ragged inputs, zero extents, and
+   both arms. Reuse structured workspace/result assembly only after proving
+   ownership; do not chase byte parity with unsafe legacy behavior.
+4. Re-run the criterion-by-criterion Phase-7 exit audit over the complete
+   declared matrix. Only a genuine GO permits a read-only Phase-8
+   cutover/fallback-frequency inventory. Do not alter default dispatch,
+   caches, selectors, or delete legacy code; do not start Phase 8.5.
+
+Run focused and adversarial batteries, the deterministic **54-cell** census,
+separate multi-seed randomized sweeps, the 86-case audit, every retained and
+activating capture, repeated compiled public differentials, accurately labelled paired two-order
+latency (plus A/A or A/B/A only if actually run), full-tree Black/Flake8/mypy
+base-vs-candidate parity, `git diff --check`, and an exact-tip clean detached
+full non-performance suite in fresh-process partitions with a proven complete,
+non-overlapping union. Do not cite the unsupported 214-test claim or reuse red
+exploratory receipts as green gates. Seal evidence only after the final
+documentation tip, exclude generated `__pycache__`, and prove every manifest
+entry verifies.

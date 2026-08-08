@@ -6878,7 +6878,9 @@ execute through an independently keyed direct build, because the
 low-level ``lower_and_exec_cin`` wrapper cannot wrap multi-compressed
 sparse outputs (the pre-existing limitation recorded in §39.2).  Each
 cell runs in its own process so a native crash records a receipt instead
-of losing the run.  **55 cells; every cell arm-invariant.**
+of losing the run.  **54 cells; every cell arm-invariant.**  The original
+``55`` report counted the public-reachability heading as though it were a
+cell; the four groups contain 12 + 14 + 13 + 15 cells.
 
 - **Rank-1 compressed outputs** — copies, unions, intersections, mixed
   ``s*d`` and commuted ``d*s``, and an empty operand — are **admitted**
@@ -6968,8 +6970,9 @@ discipline:
   identical;
 - a **PyTorch differential** over **140 compiled cells**: seven fixtures
   (random, disjoint supports, either operand empty, exact cancellation,
-  identical supports, hand-built explicit zeros) x two dtypes x five
-  shapes x both arms — all matching;
+  identical supports, and dense fixtures containing zeros) x two dtypes x
+  five admitted operations x both arms — all matching.  These fixtures did
+  not contain hand-built *stored* zeros; §42 adds that missing lock;
 - every excluded neighbour keeps its exact prior code in both arms:
   ``s-s`` at ``unsupported_sparse_subtraction``, ``s+d`` and ``d+s`` at
   ``unsupported_union_with_dense``, 3-ary MUL and ADD at
@@ -7015,8 +7018,10 @@ All gates ran in the ``scorch`` conda environment; evidence is under
   rank-1 conversion file **18 passed**, the rank-1 assembly battery
   **93 passed**, the three updated seam files **181 passed**, the
   eight-file LoopIR battery **758 passed** before the seam update (its
-  5 failures were exactly the obsolete rank-1 seam assertions), and the
-  conversion-adjacent regression subset **214 passed**.
+  5 failures were exactly the obsolete rank-1 seam assertions).  That
+  eight-file run is an exploratory red receipt, not a final gate.  The
+  reported conversion-adjacent **214 passed** result has no retained command
+  or file membership and is therefore not independently reproducible.
 - **Schedule audit** at the new tip: **46 admitted / 40 rejected / 0
   non-identical**, and its JSON is **equal to the retained baseline after
   removing only the commit field**.
@@ -7025,19 +7030,21 @@ All gates ran in the ``scorch`` conda environment; evidence is under
   automatic surface's every C++/CIN artifact is identical, with only the
   same **two process-dependent cache-key characters** differing in
   ``report.json``.
-- **Static parity**, base ``a606e11`` versus candidate: Black flags the
-  same single pre-existing file (``prebuilt_kernels.py``) at both
-  revisions, Flake8 reports **9** findings at both, and full-source mypy
-  is **140 errors in 11 files at both**, exactly equal after line
-  normalization, with zero LoopIR findings.  ``git diff --check`` clean.
-- **Census v10**: 55 cells, zero arm divergence.
+- **Static parity**, base ``a606e11`` versus candidate: the retained Black
+  and Flake8 logs cover only the candidate and do not establish the claimed
+  base/candidate parity; their one-file/nine-finding counts came from a
+  narrower invocation.  Full-source mypy is **140 errors in 11 files at
+  both**, exactly equal after line normalization, with zero LoopIR findings.
+  §42 replaces all three static receipts with one documented full-tree
+  methodology.  ``git diff --check`` was clean.
+- **Census v10**: 54 cells, zero arm divergence.
 
 - **Repeated compiled public differentials**: eight public cells
   (``einsum`` rank-1 copy/product/mixed, ``ss`` copy, ``ss*dd``,
   ``ss*sd`` built by the widened conversion, ``dss`` copy, and
   ``matmul`` over ``ss``x``ss``) match the dense reference and are
   byte-stable across three rounds.
-- **Activating A/B/A compile latency**: 200 warmups and
+- **Activating paired compile latency**: 200 warmups and
   2,000 interleaved samples per cell, in both orderings, over the three
   newly activating rank-1 cells plus the shared ``ss`` intersection
   control.  Every metric is inside the 1.10 budget: the worst
@@ -7045,7 +7052,8 @@ All gates ran in the ``scorch`` conda environment; evidence is under
   and **1.06632** in the order-flipped control.  The rank-1 union cell
   runs at 0.988-0.994 (faster than legacy), and the shared control reads
   1.021-1.030, matching the 1.018-1.026 range the inherited session
-  recorded for it.
+  recorded for it.  These are same-tip LoopIR-versus-legacy runs in two
+  orders, not a cross-revision A/B/A or self-A/A experiment.
 - **Exact-tip clean detached full non-performance suite**: at ``04dbe60`` in a
   clean detached worktree: **5,185 collected / 3 performance deselected /
   5,182 selected; 5,168 passed / 14 skipped / 0 failures**, across eight
@@ -7073,3 +7081,118 @@ comparand that segfaults, so permanently oracle-gated).  Multiple dense
 prefixes remain rejected as well.  No Phase-8 inventory was started, no
 cutover, cache, selector or dispatch change was made, and no legacy code
 was deleted.
+
+## 42. Phase-7 compatibility-envelope rigorous review corrections (2026-08-07)
+
+### 42.1 Review result and evidence corrections
+
+The inherited tip was ``2b36b7b``. Seven local commits were added without
+amending, reordering, or pushing:
+
+- ``d2e45c5`` / ``2cef248`` — correct public sparse-format conversion;
+- ``efa78fe`` — complete the rank-1 assembly semantic evidence;
+- ``29d13b8`` / ``67216cc`` — validate and detach caller-owned formats;
+- ``f216e31`` / ``c806db4`` — reject hostile stored-field keys.
+
+The inherited rank-1 LoopIR lowering remains byte-sound, but its runtime and
+evidence claims needed correction:
+
+- the compatibility census contains **54**, not 55, cells: 12 + 14 + 13 +
+  15, with zero arm divergence;
+- the retained **214 passed** line has neither a command nor file membership
+  and is not independently reproducible, so it is not an authoritative gate;
+- the retained 758-pass/5-failure pre-seam run is an exploratory red receipt:
+  all five failures are the obsolete rank-1 seam assertions moved by the
+  milestone, not a final green battery;
+- the inherited latency evidence is a same-tip LoopIR-versus-legacy paired
+  comparison in two orders, not cross-revision A/B/A or self-A/A evidence;
+- full-tree base/candidate parity is **15 Black findings**, **47 Flake8
+  findings**, and **140 mypy errors in 11 files**. Black and Flake8 are not
+  clean: their unchanged findings are inherited, while mypy is equal after
+  line-number normalization.
+
+The schedule audit remains **46 admitted / 40 rejected / 0 non-identical**.
+Corpus 20, grid 42, anchors 22, and heap 11 remain byte-identical; every
+automatic C++/CIN artifact is identical, with only the known two
+process-dependent cache-key characters differing in its report.
+
+### 42.2 Runtime corrections and completed evidence
+
+Fresh probes found three runtime boundary defects and one evidence gap:
+
+1. Rank-1 ``to_sparse`` discarded the exact requested format metadata and
+   always built COMPRESSED storage. ``d2e45c5`` preserves the requested
+   ``TensorFormat`` and bit width, admits both COMPRESSED and COORDINATE
+   rank-1 levels, rejects DENSE/SINGLETON requests precisely, and avoids
+   routing already-dense vectors through an unnecessary dense clone.
+2. The direct block materializer unnecessarily rejected nonidentity
+   ``mode_order`` even though its physical-order representation already
+   handled permutations correctly. ``d2e45c5`` admits those layouts;
+   ``2cef248`` locks dense and sparse-source round trips, exact metadata, all
+   supported value dtypes, and the dense fast path.
+3. The public boundary could retain caller-owned ``TensorFormat`` and nested
+   ``LevelFormat`` objects. Later ``object.__setattr__`` mutation could
+   desynchronize the declared layout from its index arrays. ``29d13b8``
+   validates exact stored fields, level kinds, containers, and signed-int64
+   bit widths, then rebuilds a deeply owned snapshot for both rank-1 and
+   rank-2-plus routes. ``67216cc`` locks detachment, hostile subclasses,
+   malformed state, invalid widths, and failure atomicity.
+4. That first ownership check still compared dictionary keys before proving
+   they were exact strings, allowing a hostile ``str`` subclass to execute
+   overloaded equality and leak an arbitrary exception. ``f216e31``
+   validates key types first; ``c806db4`` locks both outer-format and
+   nested-level attacks.
+
+The inherited rank-1 battery also lacked direct oracle coverage, genuinely
+stored-zero operands, and zero-extent execution. ``efa78fe`` adds all three:
+every admitted family runs through the production LoopIR oracle; copy,
+intersection, and union consume and retain hand-built stored zeros; and
+zero-extent union is byte-identical and canonical in both automatic arms.
+The file now collects **103 tests**.
+
+No LoopIR node, canonical/request/schedule identity, LoopIR pipeline route, or
+valid generated C++ changed in these corrections. The public runtime
+``to_sparse`` conversion route deliberately changed for the corrected formats.
+
+### 42.3 Deferred compatibility seam
+
+Input-format ownership is now closed, but a returned ``STensor`` still exposes
+its retained format through ``tensor.format``. A caller using
+``object.__setattr__`` on that returned ``TensorFormat`` or a nested
+``LevelFormat`` can still corrupt the tensor's own metadata after construction.
+This is pre-existing and repository-wide rather than specific to
+``to_sparse``. It remains deferred pending an audit of every public format
+exposure and every internal identity consumer; it should not be patched only
+at this one conversion call site.
+
+### 42.4 Verification and disposition
+
+Evidence is retained under
+``~/.cache/scorch-codex/phase7-envelope-review-efa78fe/``. Full-tree static
+parity between base ``a606e11`` and candidate ``c806db4``, the 54-cell census,
+schedule audit, captures, and paired latency are green under the corrected
+interpretations above. The final focused files collect **111**
+public-conversion tests and **103** rank-1 assembly tests; the adjacent seam
+membership contains **181**. All are included in the exact-tip suite below.
+The exact-tip same-revision LoopIR-versus-legacy latency rerun uses 200 warmups
+and 2,000 interleaved samples per cell in both orders; its worst ratio is
+**1.06301** (rank-1 copy p95), inside the 1.10 target. This is paired two-order
+evidence, not A/B/A or A/A.
+
+The exact-tip clean detached suite at ``c806db4`` collected **5,224**, with
+3 performance tests deselected and **5,221 selected**. Eight file-disjoint
+fresh processes passed **5,207**, skipped **14**, and failed **0** (637 + 14
+skipped / 654 / 653 / 653 / 651 / 653 / 653 / 653). The partition union is
+proven complete and non-overlapping over 79 files; every process imported from
+the detached tree, every partition exited 0, and no libomp resource event
+occurred.
+
+The five protected tracked files retain their recorded hashes; live and local
+origin remain ``58e8565``; nothing was pushed and unrelated material was not
+staged.
+
+**Phase 7 remains open.** The corrections make the rank-1 milestone honest
+but do not migrate compressed-parent/dense-leaf co-operands,
+multi-compressed reduction/TTM, or multiple-dense-prefix outputs. No Phase-8
+inventory, cutover, LoopIR release-dispatch, cache/selector change, or legacy
+deletion was performed.
