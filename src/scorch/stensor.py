@@ -98,7 +98,13 @@ def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
     if type(tensor_format) is not TensorFormat:
         raise TensorTypeError("to_sparse format must be an exact TensorFormat")
     state = object.__getattribute__(tensor_format, "__dict__")
-    if type(state) is not dict or tuple(state) != ("_level_formats",):
+    state_keys = tuple(state) if type(state) is dict else ()
+    if (
+        type(state) is not dict
+        or len(state_keys) != 1
+        or type(state_keys[0]) is not str
+        or state_keys[0] != "_level_formats"
+    ):
         raise TensorFormatError("to_sparse format has malformed stored state")
     levels = state["_level_formats"]
     if type(levels) is not tuple:
@@ -111,10 +117,13 @@ def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
                 f"to_sparse format level {level} must be an exact LevelFormat"
             )
         level_state = object.__getattribute__(level_format, "__dict__")
-        if type(level_state) is not dict or set(level_state) != {
-            "_mode",
-            "_bit_width",
-        }:
+        level_keys = tuple(level_state) if type(level_state) is dict else ()
+        if (
+            type(level_state) is not dict
+            or len(level_keys) != 2
+            or any(type(key) is not str for key in level_keys)
+            or set(level_keys) != {"_mode", "_bit_width"}
+        ):
             raise TensorFormatError(
                 f"to_sparse format level {level} has malformed stored state"
             )
