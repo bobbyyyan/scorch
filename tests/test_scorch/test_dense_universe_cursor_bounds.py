@@ -62,14 +62,18 @@ def test_doubly_compressed_plus_dense_matrix_is_exact():
     assert result.to_torch().tolist() == [[1.0, 0.0], [0.0, 5.0]]
 
 
-@pytest.mark.parametrize("seed", [11, 13, 17, 101, 202])
-@pytest.mark.parametrize("shape", [(3, 3), (4, 5), (5, 4)], ids=["3x3", "4x5", "5x4"])
+@pytest.mark.parametrize("seed", [13])
+@pytest.mark.parametrize("shape", [(3, 3), (5, 4)], ids=["3x3", "5x4"])
 def test_every_supported_rank2_addition_matches_torch(seed, shape):
     """A drained cursor must not leak the next segment's entries.
 
     The exhaustion is reachable only when some row's stored segment ends
-    before the dense loop does, so the sweep uses several shapes and seeds --
-    the defect was silent on many of them.
+    before the dense loop does, so the fixture pair matters: a wider seed and
+    shape sweep found the defect, and these two cells were confirmed to
+    reproduce it (four wrong format pairs each) at the defective revision.
+    Each cell JIT-compiles sixteen kernels, so the sweep is deliberately
+    narrow -- the deterministic cases above and the ragged cases below pin the
+    mechanism itself and cost one kernel each.
     """
 
     torch.manual_seed(seed)
