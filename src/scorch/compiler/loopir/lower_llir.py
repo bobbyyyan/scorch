@@ -53,7 +53,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from types import FunctionType
+from types import FunctionType, MappingProxyType
 from typing import (
     Any,
     Dict,
@@ -265,6 +265,13 @@ _LOOPIR_ENUM_TYPE_BY_ID = {
 _LOOPIR_IDENTITY_TYPE_BY_ID = {
     id(identity_type): identity_type for identity_type in _LOOPIR_IDENTITY_TYPES
 }
+_MAPPING_WITNESS_FIELDS = frozenset(
+    {"_bound_position_snapshot", "_position_load_signatures"}
+)
+_TUPLE_WITNESS_FIELDS = frozenset(
+    {"_target_owner_snapshot", "_value_expression_snapshot"}
+)
+_IMMUTABLE_WITNESS_FIELDS = _MAPPING_WITNESS_FIELDS | _TUPLE_WITNESS_FIELDS
 
 _SCALAR_TO_TORCH: Dict[ScalarType, torch.dtype] = {
     ScalarType.FLOAT32: torch.float32,
@@ -829,25 +836,26 @@ class _TargetLowering:
         retain(target_type)
         signature.extend(("target_type", id(target_type)))
         excluded = {
-            # These caches are diagnostic witnesses, not emission inputs.  A
-            # graph change is still rejected by the complete graph signature
-            # even if a caller also tampers with its witness; with an unchanged
-            # graph, corrupting a witness can only make a later narrow check
-            # reject.  Omitting them avoids recursively signing the same value
-            # and position trees a third time on every successful compile.
-            "_bound_position_snapshot",
             "_target_state_owners",
             "_target_state_snapshot",
             "_target_type_snapshot",
-            "_target_owner_snapshot",
-            "_value_expression_snapshot",
         }
         for key in sorted(state):
             if key in excluded:
                 continue
             signature.extend(("field", key))
             value = state[key]
-            if key in {"_program_graph_owners", "_program_graph_snapshot"}:
+            if key in _MAPPING_WITNESS_FIELDS:
+                if type(value) is not MappingProxyType:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_mapping_witness", id(value)))
+            elif key in _TUPLE_WITNESS_FIELDS:
+                if type(value) is not tuple:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_tuple_witness", id(value)))
+            elif key in {"_program_graph_owners", "_program_graph_snapshot"}:
                 if type(value) is not tuple:
                     fail()
                 retain(value)
@@ -865,6 +873,42 @@ class _TargetLowering:
         """Own constructor-final target caches until raw emission begins."""
 
         self._target_type_snapshot = type(self)
+        # The narrow integrity witnesses duplicate facts in the complete graph
+        # signature.  Freeze their mutable mappings once, then bind every
+        # witness opaquely by exact identity in the target-state signature.
+        # Successful emission can therefore consult ``get`` / mapping equality
+        # without exposing a caller-controlled object, while the target guard
+        # avoids recursively walking the same value/position trees again.
+        state = object.__getattribute__(self, "__dict__")
+        present_witness_fields = _IMMUTABLE_WITNESS_FIELDS.intersection(state)
+        if (
+            present_witness_fields
+            and present_witness_fields != _IMMUTABLE_WITNESS_FIELDS
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches contain malformed state",
+            )
+        for field in _MAPPING_WITNESS_FIELDS:
+            if field not in present_witness_fields:
+                continue
+            witness = state.get(field)
+            if type(witness) is dict:
+                object.__setattr__(self, field, MappingProxyType(dict(witness)))
+            elif type(witness) is not MappingProxyType:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target's retained program caches contain malformed state",
+                )
+        if any(
+            type(state.get(field)) is not tuple
+            for field in _TUPLE_WITNESS_FIELDS
+            if field in present_witness_fields
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches contain malformed state",
+            )
         graph_owners: List[object] = []
         self._program_graph_snapshot = self._validated_program_graph_signature(
             self._program_container,

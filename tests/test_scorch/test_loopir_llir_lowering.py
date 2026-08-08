@@ -13,6 +13,7 @@ structural activation is never waived.
 """
 
 import copy
+from types import MappingProxyType
 
 import pytest
 import torch
@@ -1081,8 +1082,8 @@ def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
     assert target.raw_loop_statements()
 
 
-def test_diagnostic_witness_tampering_cannot_mask_a_graph_change():
-    """Excluded diagnostic caches cannot become an integrity authority."""
+def test_diagnostic_witness_replacement_cannot_mask_a_graph_change():
+    """Frozen diagnostic caches cannot become an integrity authority."""
 
     from scorch.compiler.loopir import lower_llir as lower_llir_module
 
@@ -1094,21 +1095,85 @@ def test_diagnostic_witness_tampering_cannot_mask_a_graph_change():
     )
     object.__setattr__(target.leaf, "value", copy.deepcopy(target.leaf.value))
 
-    # Forge every excluded narrow witness to the changed graph.  They exist
-    # only to retain specific diagnostics after the complete graph guard
-    # detects a change; none may authorize emission on its own.  The separate
-    # position-load-signature map remains signed because successful emission
-    # consults it directly.
-    target._bound_position_snapshot = target._validated_bound_position_bindings()
-    target._value_expression_snapshot = target._validated_value_expression_signature(
-        target._access_value_expression()
+    # Forge every narrow witness with an exact immutable replacement.  The
+    # witnesses retain specific diagnostics after the complete graph guard
+    # detects a change; none may authorize emission or replace its sealed
+    # constructor-owned container.
+    object.__setattr__(
+        target,
+        "_bound_position_snapshot",
+        MappingProxyType(target._validated_bound_position_bindings()),
     )
-    target._target_owner_snapshot = target._validated_target_owner_signature()
+    object.__setattr__(
+        target,
+        "_position_load_signatures",
+        MappingProxyType(dict(target._position_load_signatures)),
+    )
+    object.__setattr__(
+        target,
+        "_value_expression_snapshot",
+        tuple(
+            list(
+                target._validated_value_expression_signature(
+                    target._access_value_expression()
+                )
+            )
+        ),
+    )
+    object.__setattr__(
+        target,
+        "_target_owner_snapshot",
+        tuple(list(target._validated_target_owner_signature())),
+    )
 
     with pytest.raises(LoopIRTargetError) as error:
         target.raw_loop_statements()
     assert error.value.defect.code == "unsupported_program_shape"
-    assert "program graph" in error.value.defect.message
+    assert "retained program caches" in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "_bound_position_snapshot",
+        "_position_load_signatures",
+        "_value_expression_snapshot",
+        "_target_owner_snapshot",
+    ],
+)
+def test_target_rejects_hostile_diagnostic_witness_before_using_it(field):
+    """A replaced witness cannot run callbacks at a narrow integrity check."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    class CallbackBomb:
+        def __eq__(self, other):
+            raise RuntimeError("hostile witness comparison executed")
+
+    class CallbackBombDict(dict):
+        def __len__(self):
+            raise RuntimeError("hostile witness length executed")
+
+        def get(self, *args, **kwargs):
+            raise RuntimeError("hostile witness lookup executed")
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    replacement = (
+        MappingProxyType(CallbackBombDict())
+        if field in {"_bound_position_snapshot", "_position_load_signatures"}
+        else (CallbackBomb(),)
+    )
+    object.__setattr__(target, field, replacement)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
 
 
 @pytest.mark.parametrize("mutation", ["replace", "delete"], ids=str)
