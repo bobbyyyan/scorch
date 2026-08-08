@@ -35,12 +35,14 @@ from scorch.format import (
     parse_format,
 )
 from scorch.exceptions import (
+    CompileSpecError,
+    TensorDeviceError,
     TensorFormatError,
     TensorIndexError,
     TensorLayoutError,
     TensorTypeError,
 )
-from scorch.layout import TensorLayout, TensorMetadata
+from scorch.layout import TensorLayout, TensorMetadata, TensorSpec
 from scorch.stensor import STensor
 from scorch.storage import SparseStorage, TensorIndex, TensorStorage
 
@@ -380,6 +382,29 @@ def test_foreign_scalar_class_spoofs_fail_closed():
         )
     with pytest.raises(TensorIndexError, match="index_dtype"):
         TensorIndex("d", [[]], index_dtype=DtypeSpoof())  # type: ignore[arg-type]
+
+
+def test_metadata_device_failure_does_not_render_a_hostile_value():
+    class DeviceBomb:
+        def __repr__(self):
+            raise OverflowError("repr bomb")
+
+    with pytest.raises(TensorDeviceError, match="DeviceBomb"):
+        TensorMetadata(  # type: ignore[arg-type]
+            "A",
+            torch.float32,
+            DeviceBomb(),
+            TensorLayout.from_logical_shape((1,), "d"),
+        )
+
+
+def test_tensor_spec_dtype_failure_does_not_render_a_hostile_value():
+    class DtypeBomb:
+        def __str__(self):
+            raise ValueError("str bomb")
+
+    with pytest.raises(CompileSpecError, match="torch.dtype"):
+        TensorSpec("d", (1,), dtype=DtypeBomb())  # type: ignore[arg-type]
 
 
 def test_metadata_setters_preserve_the_storage_layout_owner():
