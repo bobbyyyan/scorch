@@ -2691,9 +2691,31 @@ class _TargetLowering:
         # Preserve the narrowest diagnostic at this boundary: malformed
         # position spines and replaced access/owner nodes are characterized by
         # the value validators before the complete graph guard reports a more
-        # general retained-graph change.
+        # general retained-graph change.  On the overwhelmingly common
+        # unchanged path, the complete graph signature already subsumes those
+        # narrower signatures, so return before rebuilding them.  If the graph
+        # scan itself fails, defer that error until the narrow validators have
+        # had the opportunity to retain their established diagnostics.
         _TargetLowering._require_program_inputs_unchanged(self)
         _TargetLowering._require_target_state_unchanged(self)
+        target_state = _TargetLowering._require_exact_target_type(self)
+        bound_program = target_state.get("_program_container")
+        if type(bound_program) is not LoopProgram:
+            _fail(
+                "unsupported_program_shape",
+                "the target program reference changed after target construction",
+            )
+        graph_error: Optional[LoopIRTargetError] = None
+        try:
+            current_graph = _TargetLowering._validated_program_graph_signature(
+                self, bound_program
+            )
+        except LoopIRTargetError as error:
+            graph_error = error
+        else:
+            if current_graph == target_state.get("_program_graph_snapshot"):
+                return
+
         current_bindings = self._validated_bound_position_bindings()
         if current_bindings != self._bound_position_snapshot:
             _fail(
@@ -2713,8 +2735,12 @@ class _TargetLowering:
                 "the target value expression changed after target construction, "
                 "or its owning statement was replaced",
             )
-        _TargetLowering._require_program_graph_unchanged(
-            self, target_state_checked=True
+        if graph_error is not None:
+            raise graph_error
+        _fail(
+            "unsupported_program_shape",
+            "the program graph, including a target owning statement, "
+            "changed after target construction",
         )
 
     def _collect_accesses(self) -> Tuple[List[Load], List[CursorValue]]:

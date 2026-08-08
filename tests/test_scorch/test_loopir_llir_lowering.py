@@ -1052,6 +1052,35 @@ def test_target_graph_registry_is_exhaustive_for_the_loopir_schema():
     assert set(lower_llir_module._LOOPIR_ENUM_TYPE_BY_ID.values()) == enum_types
 
 
+def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
+    """The complete graph guard is the successful-path ownership proof."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+
+    def redundant_scan(*args, **kwargs):
+        raise AssertionError("an unchanged graph must not repeat narrow scans")
+
+    for name in (
+        "_validated_bound_position_bindings",
+        "_validated_value_expression_signature",
+        "_validated_target_owner_signature",
+    ):
+        monkeypatch.setattr(
+            lower_llir_module._TargetLowering,
+            name,
+            redundant_scan,
+        )
+
+    assert target.raw_loop_statements()
+
+
 @pytest.mark.parametrize("mutation", ["replace", "delete"], ids=str)
 def test_target_fails_closed_when_its_program_reference_changes(mutation):
     fixture = build_matmul()
