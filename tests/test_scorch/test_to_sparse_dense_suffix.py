@@ -17,6 +17,7 @@ import torch
 from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.diagnostics import VerificationError
+from scorch.format import LevelFormat, LevelType, TensorFormat
 from scorch.stensor import STensor
 from tests.test_scorch.test_loopir_mixed_operand_target import (
     sparse_dsd,
@@ -368,6 +369,21 @@ def test_multi_dense_parent_layouts_convert_and_decode(fmt):
     assert torch.equal(
         _dense_reference_from_storage(converted, fmt, shape), dense.float()
     )
+
+
+def test_materialized_format_is_deeply_detached_from_caller():
+    requested_level = LevelFormat("s", bit_width=64)
+    requested = TensorFormat([requested_level, LevelFormat("d")])
+    dense = torch.tensor([[0.0, 2.0, 0.0], [3.0, 0.0, 4.0]])
+    converted = STensor.from_torch(dense.clone(), "A").to_sparse(requested)
+
+    object.__setattr__(requested_level, "_mode", LevelType.DENSE)
+    object.__setattr__(requested, "_level_formats", ())
+
+    assert str(converted.format) == "s,d"
+    assert converted.format.get_level_formats()[0].bit_width == 64
+    assert torch.equal(converted.to_torch(), dense)
+    converted.storage.validate()
 
 
 @pytest.mark.parametrize("fmt", _DIRECT_COMPRESSED_LEAF)

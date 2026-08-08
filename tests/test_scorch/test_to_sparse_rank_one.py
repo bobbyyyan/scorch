@@ -24,8 +24,8 @@ import torch
 
 from scorch.compiler.compilation_context import CompilationContext
 from scorch.compiler.compile_options import CompileOptions
-from scorch.exceptions import TensorStorageError
-from scorch.format import LevelFormat, TensorFormat
+from scorch.exceptions import TensorFormatError, TensorStorageError, TensorTypeError
+from scorch.format import LevelFormat, LevelType, TensorFormat
 from scorch.stensor import STensor
 
 VECTOR = [0.0, 1.0, 0.0, 0.0, 2.0, 0.0]
@@ -105,6 +105,73 @@ def test_exact_requested_sparse_format_metadata_is_preserved(kind):
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
     assert tensor.format == requested
     assert tensor.format.serialize() == requested.serialize()
+
+
+def test_requested_format_and_nested_level_are_deeply_detached():
+    level = LevelFormat("s", bit_width=64)
+    requested = TensorFormat([level])
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
+
+    object.__setattr__(level, "_mode", LevelType.DENSE)
+    object.__setattr__(requested, "_level_formats", (LevelFormat("o"),))
+
+    assert str(tensor.format) == "s"
+    assert tensor.format.get_level_formats()[0].bit_width == 64
+    assert tensor.to_torch().tolist() == VECTOR
+    tensor.storage.validate()
+
+
+def test_level_sequence_input_is_deeply_detached():
+    level = LevelFormat("o", bit_width=32)
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse([level])
+    object.__setattr__(level, "_mode", LevelType.DENSE)
+    assert str(tensor.format) == "o"
+    assert tensor.format.get_level_formats()[0].bit_width == 32
+    assert tensor.to_torch().tolist() == VECTOR
+
+
+def test_tensor_format_subclass_fails_closed_without_mutating_receiver():
+    class DerivedFormat(TensorFormat):
+        pass
+
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
+    with pytest.raises(TensorTypeError, match="exact TensorFormat"):
+        tensor.to_sparse(DerivedFormat("s"))
+    assert str(tensor.format) == "d"
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing_levels", "list_levels", "foreign_level", "missing_mode", "bad_mode"],
+)
+def test_forged_format_structure_fails_closed(malformation):
+    requested = TensorFormat([LevelFormat("s")])
+    level = requested.get_level_formats()[0]
+    if malformation == "missing_levels":
+        object.__delattr__(requested, "_level_formats")
+    elif malformation == "list_levels":
+        object.__setattr__(requested, "_level_formats", [level])
+    elif malformation == "foreign_level":
+        object.__setattr__(requested, "_level_formats", (object(),))
+    elif malformation == "missing_mode":
+        object.__delattr__(level, "_mode")
+    else:
+        object.__setattr__(level, "_mode", "s")
+
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
+    with pytest.raises(TensorFormatError, match="to_sparse format"):
+        tensor.to_sparse(requested)
+    assert str(tensor.format) == "d"
+
+
+@pytest.mark.parametrize("bit_width", [True, 0, -1, "64", 1 << 63])
+def test_forged_format_bit_width_fails_closed(bit_width):
+    requested = TensorFormat([LevelFormat("s")])
+    object.__setattr__(requested.get_level_formats()[0], "_bit_width", bit_width)
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
+    with pytest.raises(TensorFormatError, match="positive signed-int64 exact int"):
+        tensor.to_sparse(requested)
+    assert str(tensor.format) == "d"
 
 
 @pytest.mark.parametrize(
