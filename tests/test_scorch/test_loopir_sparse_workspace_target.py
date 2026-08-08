@@ -1806,6 +1806,33 @@ def build_mixed_leaf_broadcast_cin(rank3=False, dtype=torch.float32):
     return ForAll(i, ForAll(j, TensorAssign(result[i, j], source[j])))
 
 
+def test_mixed_leaf_target_checks_graph_before_reading_result_name(monkeypatch):
+    """A malformed declaration cannot escape before the B2 graph guard."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    original = lower_llir_module._DenseDomainMixedLowering.raw_loop_statements
+
+    def deleting(self):
+        object.__delattr__(self.result_decl, "name")
+        return original(self)
+
+    monkeypatch.setattr(
+        lower_llir_module._DenseDomainMixedLowering,
+        "raw_loop_statements",
+        deleting,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            build_mixed_leaf_cin(),
+            (4, 5),
+            (((4, 5), torch.float32),),
+            compile_options=auto_options(False),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program graph" in error.value.defect.message
+
+
 def validated_mixed_storage(result, shape):
     """Assert honest compressed-parent/dense-suffix storage; return pieces."""
 

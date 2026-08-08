@@ -502,6 +502,31 @@ def test_canonical_dump_renumbers_ids_and_normalization_is_idempotent() -> None:
     assert canonical_cin_dump(first_normalized) == canonical_cin_dump(second_normalized)
 
 
+def test_normalization_detaches_tensor_formats_across_artifacts() -> None:
+    caller_format = TensorFormat("d")
+
+    def build(prefix: str) -> ForAll:
+        i = IndexVar("i")
+        source = TensorVar(f"{prefix}A", fmt=caller_format)
+        result = TensorVar(f"{prefix}C", fmt=caller_format)
+        return ForAll(i, TensorAssign(result[i], source[i]))
+
+    first = normalize_cin(build("first_"))
+    second = normalize_cin(build("second_"))
+    first_formats = tuple(access.tensor.format for access in first.tensor_accesses)
+    second_formats = tuple(access.tensor.format for access in second.tensor_accesses)
+    before = (canonical_cin_dump(first), canonical_cin_dump(second))
+
+    assert all(tensor_format is not caller_format for tensor_format in first_formats)
+    assert all(tensor_format is not caller_format for tensor_format in second_formats)
+    assert all(left is not right for left in first_formats for right in second_formats)
+
+    object.__setattr__(caller_format, "_level_formats", (LevelFormat("s"),))
+    assert (canonical_cin_dump(first), canonical_cin_dump(second)) == before
+    verify_cin(first)
+    verify_cin(second)
+
+
 def test_workspace_normalization_is_idempotent_and_strips_backreferences() -> None:
     i = IndexVar("i")
     source = TensorVar("A", fmt="d")

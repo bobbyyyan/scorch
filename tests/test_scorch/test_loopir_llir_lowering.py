@@ -859,6 +859,347 @@ def stack_matmul_shapes(fixture, rows=3, inner=4, cols=5):
     )
 
 
+def _expect_post_construction_graph_rejection(
+    program,
+    input_shapes,
+    result_shape,
+    mutate,
+    *,
+    reverify=True,
+    message="program graph",
+):
+    """Exercise the retained target directly across its mutation window."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.verifier import verify_program
+
+    target = lower_llir_module._TargetLowering(
+        program,
+        input_shapes,
+        result_shape,
+    )
+    mutate(target)
+    if reverify:
+        verify_program(program)
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert message in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["root", "ancestor", "leaf", "input_decl", "result_decl"],
+    ids=str,
+)
+def test_target_binds_the_complete_dense_program_graph(mutation):
+    """Fresh verifier-valid graph twins cannot leave retained owners stale."""
+
+    from scorch.compiler.loopir.build import LoopIRBuilder
+
+    fixture = build_matmul()
+    shapes = {fixture.a: (2, 3), fixture.b: (3, 4)}
+
+    def mutate(target):
+        if mutation == "root":
+            object.__setattr__(
+                target.program, "body", copy.deepcopy(target.program.body)
+            )
+            return
+        if mutation == "ancestor":
+            outer = target.loops[0].node
+            object.__setattr__(outer, "body", copy.deepcopy(outer.body))
+            return
+        if mutation == "leaf":
+            body = target.loops[-1].node.body
+            object.__setattr__(body, "statements", (copy.deepcopy(target.leaf),))
+            return
+        tensor_index = 0 if mutation == "input_decl" else 2
+        old = target.program.tensors[tensor_index]
+        builder = LoopIRBuilder.resuming(target.program)
+        fresh = builder.tensor(
+            old.symbol,
+            old.name,
+            old.dtype,
+            old.dimensions,
+            old.levels,
+        )
+        tensors = list(target.program.tensors)
+        tensors[tensor_index] = fresh
+        object.__setattr__(target.program, "tensors", tuple(tensors))
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        shapes,
+        (2, 4),
+        mutate,
+    )
+
+
+def test_target_graph_snapshot_strongly_owns_replaced_root():
+    """A freed graph object cannot recycle its address into the signature."""
+
+    import gc
+    import weakref
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.verifier import verify_program
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    original = fixture.program.body
+    original_ref = weakref.ref(original)
+    fresh = copy.deepcopy(original)
+    object.__setattr__(fixture.program, "body", fresh)
+    del original
+    gc.collect()
+    assert original_ref() is not None
+    assert any(owner is original_ref() for owner in target._program_graph_owners)
+    verify_program(fixture.program)
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program graph" in error.value.defect.message
+
+
+def test_target_graph_rejects_hostile_class_descriptor_without_invoking_it():
+    """Foreign stored values cannot execute class/metaclass hooks."""
+
+    class ClassBombMeta(type):
+        def __eq__(cls, other):
+            raise RuntimeError("hostile metaclass equality executed")
+
+        def __hash__(cls):
+            raise RuntimeError("hostile metaclass hash executed")
+
+    class ClassBomb(metaclass=ClassBombMeta):
+        @property
+        def __class__(self):
+            raise RuntimeError("hostile __class__ descriptor executed")
+
+    fixture = build_matmul()
+
+    def mutate(target):
+        object.__setattr__(target.leaf, "value", ClassBomb())
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+        mutate,
+        reverify=False,
+        message="unsupported target value",
+    )
+
+
+def test_target_graph_rejects_hostile_identity_key_without_equality():
+    """Malformed identity dictionaries cannot execute key comparison hooks."""
+
+    class KeyBomb:
+        def __hash__(self):
+            return hash("value")
+
+        def __eq__(self, other):
+            raise RuntimeError("hostile identity-key equality executed")
+
+    fixture = build_matmul()
+
+    def mutate(target):
+        state = object.__getattribute__(target.leaf.node_id, "__dict__")
+        state.clear()
+        state[KeyBomb()] = 1
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+        mutate,
+        reverify=False,
+        message="malformed node identity",
+    )
+
+
+def test_target_graph_registry_is_exhaustive_for_the_loopir_schema():
+    """Every new schema node or enum must explicitly enter the graph guard."""
+
+    from enum import EnumMeta
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir import nodes as loopir_nodes
+
+    node_types = {
+        candidate
+        for candidate in vars(loopir_nodes).values()
+        if type(candidate) is type
+        and candidate.__module__ == loopir_nodes.__name__
+        and issubclass(candidate, loopir_nodes.LoopIRNode)
+        and candidate
+        not in {loopir_nodes.LoopIRNode, loopir_nodes.Expr, loopir_nodes.Stmt}
+    }
+    enum_types = {
+        candidate
+        for candidate in vars(loopir_nodes).values()
+        if isinstance(candidate, EnumMeta)
+        and candidate.__module__ == loopir_nodes.__name__
+    }
+    assert set(lower_llir_module._LOOPIR_GRAPH_NODE_TYPES) == node_types
+    assert set(lower_llir_module._LOOPIR_GRAPH_ENUM_TYPES) == enum_types
+    assert set(lower_llir_module._LOOPIR_NODE_TYPE_BY_ID.values()) == node_types
+    assert set(lower_llir_module._LOOPIR_ENUM_TYPE_BY_ID.values()) == enum_types
+
+
+@pytest.mark.parametrize("mutation", ["replace", "delete"], ids=str)
+def test_target_fails_closed_when_its_program_reference_changes(mutation):
+    fixture = build_matmul()
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    if mutation == "replace":
+        object.__setattr__(target, "program", object())
+    else:
+        object.__delattr__(target, "program")
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program reference" in error.value.defect.message
+
+
+@pytest.mark.parametrize("mutation", ["loop", "result_decl"], ids=str)
+def test_target_binds_program_derived_caches_before_emission(mutation):
+    """A pristine program cannot be interpreted through rewritten caches."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    if mutation == "loop":
+        target.loops[0] = target.loops[-1]
+    else:
+        target.result_decl = target.decls[fixture.a]
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program caches" in error.value.defect.message
+
+
+@pytest.mark.parametrize("mutation", ["delete_region", "malformed_loop"], ids=str)
+def test_target_validates_caches_before_interpreting_them(mutation):
+    """Malformed retained caches fail closed without leaking attribute errors."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    if mutation == "delete_region":
+        object.__delattr__(target, "region")
+    else:
+        target.loops = [object()]
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program caches" in error.value.defect.message
+
+
+def test_target_class_replacement_cannot_override_the_integrity_guard():
+    """A swapped subclass cannot dynamically replace a base boundary check."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    hostile_callbacks = []
+
+    class HostileMeta(type):
+        def __instancecheck__(cls, instance):
+            hostile_callbacks.append("instancecheck")
+            raise RuntimeError("hostile metaclass callback executed")
+
+        def __subclasscheck__(cls, subclass):
+            hostile_callbacks.append("subclasscheck")
+            raise RuntimeError("hostile metaclass callback executed")
+
+    class HostileTarget(lower_llir_module._TargetLowering, metaclass=HostileMeta):
+        def _require_program_graph_unchanged(self):
+            hostile_callbacks.append("graph guard")
+
+        def _require_value_expression_unchanged(self):
+            hostile_callbacks.append("value guard")
+
+        def _lower_dense(self, position):
+            hostile_callbacks.append("lower dense")
+            raise RuntimeError("hostile lowering callback executed")
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    object.__setattr__(target, "__class__", HostileTarget)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_llir_module._TargetLowering.raw_loop_statements(target)
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program caches" in error.value.defect.message
+    assert hostile_callbacks == []
+
+
+def test_target_binds_synthetic_cached_loopir_nodes_by_state():
+    """Synthetic relayout views are not covered by the program-graph walk."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = relayout_program()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        relayout_shapes(fixture),
+        (4, 6),
+    )
+    view = next(iter(target._staged_views.values()))
+    object.__setattr__(view, "tensor", fixture.a)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "program caches" in error.value.defect.message
+
+
+@pytest.mark.parametrize("field", ["name", "dtype"], ids=str)
+def test_target_fails_closed_on_malformed_retained_tensor_declaration(field):
+    """Malformed post-construction declarations cannot leak target errors."""
+
+    fixture = build_matmul()
+
+    def mutate(target):
+        declaration = target.program.tensors[-1]
+        if field == "name":
+            object.__delattr__(declaration, "name")
+        else:
+            object.__setattr__(declaration, "dtype", "float")
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+        mutate,
+        reverify=False,
+    )
+
+
 def test_stack_region_lowers_through_the_target():
     fixture = build_stack_matmul(width=4)
     shapes, result_shape = stack_matmul_shapes(fixture)
@@ -866,6 +1207,95 @@ def test_stack_region_lowers_through_the_target():
         fixture.program, input_shapes=shapes, result_shape=result_shape
     )
     assert function is not None
+
+
+def test_workspace_target_rejects_post_construction_consumer_replacement(monkeypatch):
+    """The actual consumer owner cannot diverge from its retained target view."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.build import LoopIRBuilder
+    from scorch.compiler.loopir.nodes import BinaryOp
+    from scorch.compiler.loopir.verifier import verify_program
+
+    fixture = build_stack_matmul(width=4)
+    shapes, result_shape = stack_matmul_shapes(fixture)
+    original = lower_llir_module._TargetLowering.raw_loop_statements
+
+    def replacing(self):
+        assert self._region_leaf is not None
+        builder = LoopIRBuilder.resuming(self.program)
+        object.__setattr__(
+            self._region_leaf,
+            "value",
+            builder.binary(
+                BinaryOp.ADD,
+                self._region_leaf.value,
+                builder.float_const(1.0),
+            ),
+        )
+        verify_program(self.program)
+        return original(self)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "raw_loop_statements",
+        replacing,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=shapes,
+            result_shape=result_shape,
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "owning statement" in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["producer", "consumer", "workspace_decl"],
+    ids=str,
+)
+def test_workspace_target_binds_both_region_branches_and_declaration(mutation):
+    """The current graph must still reach the exact retained workspace state."""
+
+    from scorch.compiler.loopir.build import LoopIRBuilder
+
+    fixture = build_stack_matmul(width=4)
+    shapes, result_shape = stack_matmul_shapes(fixture)
+
+    def mutate(target):
+        assert target.region is fixture.region
+        if mutation == "producer":
+            object.__setattr__(
+                fixture.region,
+                "producer",
+                copy.deepcopy(fixture.region.producer),
+            )
+            return
+        if mutation == "consumer":
+            object.__setattr__(
+                fixture.region,
+                "consumer",
+                copy.deepcopy(fixture.region.consumer),
+            )
+            return
+        old = fixture.region.workspace
+        builder = LoopIRBuilder.resuming(fixture.program)
+        fresh = builder.workspace_decl(
+            old.workspace,
+            old.name,
+            old.dtype,
+            old.tile,
+        )
+        object.__setattr__(fixture.region, "workspace", fresh)
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        shapes,
+        result_shape,
+        mutate,
+    )
 
 
 def test_workspace_producer_needs_a_reduction_loop():
@@ -2041,6 +2471,114 @@ def test_heap_target_emits_the_legacy_compact_source():
         "#pragma omp parallel for num_threads(scorch_nthreads(A1_pos[A0_size], "
         "A0_size)) schedule(dynamic, scorch_chunk(A0_size, A1_pos[A0_size]))"
     ) in source
+
+
+def test_heap_target_rejects_post_construction_semantic_leaf_replacement(monkeypatch):
+    """The actual TiledReduce cannot diverge from its synthetic direct view."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.verifier import verify_program
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.raw_loop_statements
+
+    def replacing(self):
+        assert self._tiled_leaf is not None
+        value = self._tiled_leaf.value
+        assert type(value) is lower_llir_module.BinaryExpr
+        object.__setattr__(self._tiled_leaf, "value", value.lhs)
+        verify_program(self.program)
+        return original(self)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "raw_loop_statements",
+        replacing,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=heap_shapes(fixture),
+            result_shape=(4, 6),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "owning statement" in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["region_body", "leaf_slot", "result_tile_decl"],
+    ids=str,
+)
+def test_heap_target_binds_region_body_leaf_and_declaration(mutation):
+    """Heap completion cannot emit through stale retained region objects."""
+
+    from scorch.compiler.loopir.build import LoopIRBuilder
+
+    fixture = heap_program()
+
+    def mutate(target):
+        if mutation == "region_body":
+            object.__setattr__(
+                fixture.region,
+                "body",
+                copy.deepcopy(fixture.region.body),
+            )
+            return
+        if mutation == "leaf_slot":
+            object.__setattr__(
+                fixture.pack_point.body,
+                "statements",
+                (copy.deepcopy(fixture.leaf),),
+            )
+            return
+        old = fixture.region.decl
+        builder = LoopIRBuilder.resuming(fixture.program)
+        fresh = builder.result_tile_decl(
+            old.result_tile,
+            old.result,
+            old.pack,
+        )
+        object.__setattr__(fixture.region, "decl", fresh)
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+        mutate,
+    )
+
+
+@pytest.mark.parametrize("mutation", ["retarget", "missing"], ids=str)
+def test_heap_target_rejects_post_construction_index_mutation(monkeypatch, mutation):
+    """Shared index children cannot redirect a compact write or raw-escape."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    original = lower_llir_module._TargetLowering.raw_loop_statements
+
+    def mutating(self):
+        assert self._tiled_leaf is not None
+        indices = self._tiled_leaf.indices
+        if mutation == "retarget":
+            object.__setattr__(indices[0], "index", indices[1].index)
+        else:
+            object.__delattr__(indices[0], "index")
+        return original(self)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "raw_loop_statements",
+        mutating,
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_loopir_to_llir(
+            fixture.program,
+            input_shapes=heap_shapes(fixture),
+            result_shape=(4, 6),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
 
 
 def test_heap_generated_names_reserve_flattened_container_declarations():

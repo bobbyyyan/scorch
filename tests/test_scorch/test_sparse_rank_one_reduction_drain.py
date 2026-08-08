@@ -17,6 +17,7 @@ import pytest
 import torch
 
 import scorch
+from scorch.exceptions import TensorIndexError
 from scorch.stensor import STensor
 
 
@@ -61,7 +62,7 @@ def test_two_contraction_reduction_into_a_vector_is_still_defective():
     torch.manual_seed(5)
     dense = (torch.rand(3, 4, 5) < 0.4) * torch.randn(3, 4, 5)
     for subscripts in ("ijk->i", "ijk->j"):
-        with pytest.raises(Exception) as error:
+        with pytest.raises(TensorIndexError) as error:
             scorch.einsum(subscripts, sparse(dense, "A", "sss"))
         assert "strictly increasing" in str(error.value)
 
@@ -79,12 +80,46 @@ def test_all_empty_reduction_into_a_sparse_vector_is_zero():
     assert torch.allclose(result.to_torch(), torch.zeros(4), atol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("shape", [(4, 5), (4, 0), (0, 5)])
+def test_direct_coordinate_result_drain_matches(dtype, shape):
+    """The changed scalar-key branch also owns direct ``o`` assembly."""
+
+    torch.manual_seed(17)
+    dense = ((torch.rand(shape) < 0.4) * torch.randn(shape)).to(dtype)
+    result = scorch.einsum(
+        "ij->i",
+        sparse(dense, "A", "ss"),
+        format="o",
+    )
+    expected = dense.sum(dim=1)
+    assert str(result.format) == "o"
+    assert torch.allclose(
+        result.to_torch(),
+        expected,
+        atol=1e-12 if dtype is torch.float64 else 1e-6,
+        rtol=1e-12 if dtype is torch.float64 else 1e-6,
+    )
+
+
 def test_ragged_reduction_into_a_sparse_vector_matches():
     dense = torch.zeros(4, 5)
     dense[1] = torch.arange(1.0, 6.0)
     dense[3, 4] = 7.0
     result = scorch.einsum("ij->i", sparse(dense, "A", "ss"))
     assert torch.allclose(result.to_torch(), dense.sum(dim=1), atol=1e-6)
+
+
+def test_coordinate_result_drain_preserves_noncontiguous_output_coordinates():
+    """The scalar workspace key is the actual output coordinate, not an ordinal."""
+
+    dense = torch.zeros(6, 4)
+    dense[1, 2] = 3.0
+    dense[4, 0] = 7.0
+    result = scorch.einsum("ij->i", sparse(dense, "A", "ss"), format="o")
+    assert result.storage.index.mode_indices[0][0].tolist() == [1, 4]
+    assert result.storage.value.tolist() == [3.0, 7.0]
+    assert torch.equal(result.to_torch(), dense.sum(dim=1))
 
 
 def test_repeated_reduction_is_stable():

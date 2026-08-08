@@ -33,6 +33,7 @@ from scorch.compiler.cin import (
     TensorVar,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.compiler.loopir.pipeline import legacy_generated_cpp
 from scorch.stensor import STensor
 
@@ -152,9 +153,9 @@ def test_rank3_addition_matches_torch():
     assert torch.allclose(total.to_torch(), left + right, atol=1e-6, rtol=1e-6)
 
 
-def _add_cin(left_fmt, right_fmt):
+def _add_cin(left_fmt, right_fmt, result_fmt="dd"):
     ivars = (IndexVar("i"), IndexVar("j"))
-    result = TensorVar("C", fmt="dd", dtype=torch.float32)
+    result = TensorVar("C", fmt=result_fmt, dtype=torch.float32)
     left = TensorVar("A", fmt=left_fmt, dtype=torch.float32)[ivars]
     right = TensorVar("B", fmt=right_fmt, dtype=torch.float32)[ivars]
     stmt = TensorAssign(result[ivars], CINBinaryOp(Operation.ADD, left, right))
@@ -186,6 +187,87 @@ def test_all_sparse_lattice_is_byte_unchanged():
         compile_options=CompileOptions.from_environment(environ={}),
     )
     assert "pA1 < pA1_end && j_A == j" not in source
+
+
+@pytest.mark.parametrize("mixed_format", ["do", "so", "od", "os"])
+def test_mixed_coordinate_input_hierarchy_fails_before_codegen(mixed_format):
+    """The legacy iterator model refuses mixed input hierarchies explicitly."""
+
+    with pytest.raises(UnsupportedFeature) as error:
+        legacy_generated_cpp(
+            _add_cin(mixed_format, "dd"),
+            (4, 5),
+            (((4, 5), torch.float32), ((4, 5), torch.float32)),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    assert len(error.value.diagnostics) == 1
+    assert error.value.diagnostics[0].code == "unsupported_mixed_coordinate_hierarchy"
+    assert error.value.diagnostics[0].entity_id is not None
+
+
+@pytest.mark.parametrize("mixed_format", ["do", "so", "od", "os"])
+def test_mixed_coordinate_result_hierarchy_fails_before_codegen(mixed_format):
+    """The same outer boundary covers the result, not only RHS lattices."""
+
+    with pytest.raises(UnsupportedFeature) as error:
+        legacy_generated_cpp(
+            _add_cin("dd", "dd", mixed_format),
+            (4, 5),
+            (((4, 5), torch.float32), ((4, 5), torch.float32)),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    diagnostic = error.value.diagnostics[0]
+    assert diagnostic.code == "unsupported_mixed_coordinate_hierarchy"
+    assert "tensor 'C'" in diagnostic.message
+
+
+def test_rank3_mixed_coordinate_hierarchy_uses_the_same_boundary():
+    ivars = tuple(IndexVar(name) for name in "ijk")
+    result = TensorVar("C", fmt="ddd", dtype=torch.float32)[ivars]
+    source = TensorVar("A", fmt="doo", dtype=torch.float32)[ivars]
+    stmt = TensorAssign(result, source)
+    for index_var in reversed(ivars):
+        stmt = ForAll(index_var, stmt)
+    with pytest.raises(UnsupportedFeature) as error:
+        legacy_generated_cpp(
+            stmt,
+            (2, 3, 4),
+            (((2, 3, 4), torch.float32),),
+            compile_options=CompileOptions.from_environment(environ={}),
+        )
+    assert error.value.diagnostics[0].code == "unsupported_mixed_coordinate_hierarchy"
+
+
+def test_all_coordinate_input_retains_finite_segment_bounds():
+    """The supported COO chain still owns both cursor ends structurally."""
+
+    source = legacy_generated_cpp(
+        _add_cin("oo", "dd"),
+        (4, 5),
+        (((4, 5), torch.float32), ((4, 5), torch.float32)),
+        compile_options=CompileOptions.from_environment(environ={}),
+    )
+    assert "int pA0_end = A0_crd_tensor.size(0);" in source
+    assert "int pA1_end = 0;" in source
+    assert "pA1 < pA1_end && j_A == j" in source
+
+
+def test_all_coordinate_result_remains_supported():
+    source = legacy_generated_cpp(
+        _add_cin("oo", "oo", "oo"),
+        (4, 5),
+        (((4, 5), torch.float32), ((4, 5), torch.float32)),
+        compile_options=CompileOptions.from_environment(environ={}),
+    )
+    assert "C0_crd.emplace_back" in source
+
+
+@pytest.mark.parametrize("mixed_format", ["do", "so", "od", "os"])
+def test_public_einsum_rejects_a_mixed_coordinate_result(mixed_format):
+    dense = STensor.from_torch(torch.arange(6.0).reshape(2, 3), "A")
+    with pytest.raises(UnsupportedFeature) as error:
+        scorch.einsum("ij->ij", dense, format=mixed_format)
+    assert error.value.diagnostics[0].code == "unsupported_mixed_coordinate_hierarchy"
 
 
 def test_public_matmul_is_unaffected():

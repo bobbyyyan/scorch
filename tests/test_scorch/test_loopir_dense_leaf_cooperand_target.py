@@ -523,6 +523,146 @@ def test_permuted_compressed_structure_stays_fail_closed(regblock_enabled):
     )
 
 
+_PERMUTED_DENSE_COOPERANDS = [
+    ("rank2", "ij", "ji", (1, 0), "ss"),
+    ("rank3", "ijk", "kij", (1, 2, 0), "sss"),
+]
+
+
+def build_permuted_dense_cooperand(result_indices, dense_indices, mode_order, fmt):
+    ivars = {name: IndexVar(name) for name in result_indices}
+    result_access = TensorVar("C", fmt=fmt, dtype=torch.float32)[
+        tuple(ivars[name] for name in result_indices)
+    ]
+    sparse_access = TensorVar("A", fmt=fmt, dtype=torch.float32)[
+        tuple(ivars[name] for name in result_indices)
+    ]
+    dense_access = TensorVar(
+        "B",
+        fmt="d" * len(result_indices),
+        dtype=torch.float32,
+        mode_order=list(mode_order),
+    )[tuple(ivars[name] for name in dense_indices)]
+    statement = TensorAssign(
+        result_access,
+        CINBinaryOp(Operation.MUL, sparse_access, dense_access),
+    )
+    for name in reversed(result_indices):
+        statement = ForAll(ivars[name], statement)
+    return statement
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
+@pytest.mark.parametrize(
+    "name,result_indices,dense_indices,mode_order,result_fmt",
+    _PERMUTED_DENSE_COOPERANDS,
+    ids=[case[0] for case in _PERMUTED_DENSE_COOPERANDS],
+)
+def test_permuted_all_dense_cooperand_matches_legacy_bytes(
+    name,
+    result_indices,
+    dense_indices,
+    mode_order,
+    result_fmt,
+    regblock_enabled,
+):
+    result_shape = tuple(_DIMS[index] for index in result_indices)
+    dense_logical_shape = tuple(_DIMS[index] for index in dense_indices)
+    dense_physical_shape = tuple(dense_logical_shape[index] for index in mode_order)
+    assert dense_physical_shape == result_shape
+    comparison = compare_generated_sources(
+        build_permuted_dense_cooperand(
+            result_indices, dense_indices, mode_order, result_fmt
+        ),
+        result_shape,
+        ((result_shape, torch.float32), (dense_physical_shape, torch.float32)),
+        compile_options=auto_options(regblock_enabled),
+    )
+    assert comparison.identical, name
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
+@pytest.mark.parametrize(
+    "name,result_indices,dense_indices,mode_order,result_fmt",
+    _PERMUTED_DENSE_COOPERANDS,
+    ids=[case[0] for case in _PERMUTED_DENSE_COOPERANDS],
+)
+def test_permuted_all_dense_cooperand_executes_and_matches_oracle(
+    name,
+    result_indices,
+    dense_indices,
+    mode_order,
+    result_fmt,
+    regblock_enabled,
+):
+    result_shape = tuple(_DIMS[index] for index in result_indices)
+    dense_logical_shape = tuple(_DIMS[index] for index in dense_indices)
+    torch.manual_seed(20260808 + len(result_indices))
+    sparse_dense = ((torch.rand(result_shape) < 0.45) * torch.randn(result_shape)).to(
+        torch.float32
+    )
+    dense = torch.randn(dense_logical_shape)
+    sparse = STensor.from_torch(sparse_dense.clone(), "A").to_sparse(result_fmt)
+    carried_dense = STensor.from_torch(
+        dense.clone(), "B", mode_order=list(mode_order)
+    ).to_dense()
+    cin = build_permuted_dense_cooperand(
+        result_indices, dense_indices, mode_order, result_fmt
+    )
+    result = execute_cin_via_loopir(
+        cin,
+        result_shape,
+        sparse,
+        carried_dense,
+        compile_options=auto_options(regblock_enabled, jit=True),
+    )
+    result = result[0] if isinstance(result, tuple) else result
+    expected = sparse_dense * dense.permute(
+        *(dense_indices.index(index) for index in result_indices)
+    )
+    validated_storage_pieces(result, result_fmt, result_shape)
+    assert torch.equal(result.to_torch(), expected), name
+
+    kernel = compile_cin_via_loopir(
+        cin,
+        result_shape,
+        ((result_shape, torch.float32), (result_shape, torch.float32)),
+        compile_options=auto_options(regblock_enabled),
+    )
+    lowering = kernel.lowering
+    sparse_storage = LevelTensorStorage.from_dense(
+        sparse_dense.tolist(),
+        result_shape,
+        tuple(range(len(result_shape))),
+        tuple(LevelKind.COMPRESSED for _ in result_shape),
+    )
+    oracle_result = run_program(
+        kernel.schedule.program if kernel.schedule is not None else lowering.program,
+        {
+            lowering.rhs_access_symbols[0]: sparse_storage,
+            lowering.rhs_access_symbols[1]: dense.tolist(),
+        },
+        {lowering.result_symbol: result_shape},
+    )[lowering.result_symbol]
+    oracle_dense = torch.zeros(result_shape)
+
+    def materialize(level, parent, prefix):
+        if level == len(result_shape):
+            oracle_dense[prefix] = oracle_result.values[parent]
+            return
+        start = oracle_result.positions[level][parent]
+        end = oracle_result.positions[level][parent + 1]
+        for position in range(start, end):
+            materialize(
+                level + 1,
+                position,
+                prefix + (oracle_result.coordinates[level][position],),
+            )
+
+    materialize(0, 0, ())
+    assert torch.equal(oracle_dense, expected), name
+
+
 # -- the UNION-bound position boundary ---------------------------------------
 
 
@@ -648,6 +788,313 @@ def test_union_cursor_value_control_is_unchanged():
         program, {a: (4, 5), b: (4, 5)}, (4, 5)
     )
     assert lowering.raw_loop_statements()
+
+
+def admitted_dense_leaf_target(operand_fmts=("ss", "sd")):
+    kernel = compiled("ss", operand_fmts, "mul", torch.float32, False)
+    shapes = {symbol: shape_of("ss") for symbol in kernel.lowering.rhs_access_symbols}
+    return _lower_llir_module._MultiCompressedAssemblyLowering(
+        kernel.lowering.program, shapes, shape_of("ss")
+    )
+
+
+def position_load_ground(load):
+    position = load.position
+    while type(position) is _lower_llir_module.DensePosition:
+        position = position.parent
+    return position
+
+
+def different_bound_position(lowering, tensor, *, require_leaf=False):
+    for loop in lowering.loops:
+        positions = tuple(getattr(loop.node, "positions", ()))
+        position = getattr(loop.node, "position", None)
+        if position is not None:
+            positions += (position,)
+        for candidate in positions:
+            if candidate is None:
+                continue
+            owner = lowering._bound_position_owner(candidate)
+            if owner is None or owner[0] == tensor:
+                continue
+            if require_leaf and owner[1] != len(lowering.decls[owner[0]].levels) - 1:
+                continue
+            if owner is not None:
+                return candidate, owner[0]
+    raise AssertionError("the fixture must bind a position for another tensor")
+
+
+def replace_value_access(expr, original, replacement):
+    if type(expr) is not _lower_llir_module.BinaryExpr:
+        return False
+    if expr.lhs is original:
+        object.__setattr__(expr, "lhs", replacement)
+        return True
+    if expr.rhs is original:
+        object.__setattr__(expr, "rhs", replacement)
+        return True
+    return replace_value_access(
+        expr.lhs, original, replacement
+    ) or replace_value_access(expr.rhs, original, replacement)
+
+
+def test_target_rejects_a_post_construction_position_spine_cycle():
+    lowering = admitted_dense_leaf_target()
+    load = lowering.position_loads[0]
+    assert type(load.position) is _lower_llir_module.DensePosition
+    object.__setattr__(load.position, "parent", load.position)
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "finite and acyclic" in error.value.defect.message
+
+
+def test_target_rejects_a_cross_tensor_position_substitution():
+    lowering = admitted_dense_leaf_target()
+    load = lowering.position_loads[0]
+    ground = position_load_ground(load)
+    replacement, _ = different_bound_position(lowering, load.tensor)
+    object.__setattr__(ground, "position", replacement)
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "value expression changed" in error.value.defect.message
+
+
+def test_target_rejects_a_self_consistent_wholesale_position_load_retarget():
+    """Changing tensor and address together must not evade the census."""
+
+    lowering = admitted_dense_leaf_target()
+    load = lowering.position_loads[0]
+    replacement, tensor = different_bound_position(
+        lowering, load.tensor, require_leaf=True
+    )
+    object.__setattr__(load, "tensor", tensor)
+    object.__setattr__(
+        load,
+        "position",
+        _lower_llir_module.PositionValue(
+            _lower_llir_module.LoopIRNodeId(910_001), replacement
+        ),
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "changed after target construction" in error.value.defect.message
+
+
+def test_target_rejects_a_fresh_position_load_outside_the_access_census():
+    lowering = admitted_dense_leaf_target()
+    original = lowering.position_loads[0]
+    replacement, tensor = different_bound_position(
+        lowering, original.tensor, require_leaf=True
+    )
+    fresh = _lower_llir_module.PositionLoad(
+        _lower_llir_module.LoopIRNodeId(910_002),
+        tensor,
+        _lower_llir_module.PositionValue(
+            _lower_llir_module.LoopIRNodeId(910_003), replacement
+        ),
+    )
+    value = lowering.leaf.value
+    assert type(value) is _lower_llir_module.BinaryExpr
+    if value.lhs is original:
+        object.__setattr__(value, "lhs", fresh)
+    else:
+        assert value.rhs is original
+        object.__setattr__(value, "rhs", fresh)
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "changed after target construction" in error.value.defect.message
+
+
+@pytest.mark.parametrize("replacement_kind", ["load", "cursor"])
+def test_target_rejects_a_position_load_replaced_by_another_access_kind(
+    replacement_kind,
+):
+    if replacement_kind == "load":
+        lowering = admitted_dense_leaf_target(("ss", "sd", "dd"))
+        retained = lowering.loads[0]
+        replacement = _lower_llir_module.Load(
+            _lower_llir_module.LoopIRNodeId(910_010),
+            retained.tensor,
+            tuple(
+                _lower_llir_module.IndexValue(
+                    _lower_llir_module.LoopIRNodeId(910_011 + position),
+                    index.index,
+                )
+                for position, index in enumerate(retained.indices)
+            ),
+        )
+    else:
+        lowering = admitted_dense_leaf_target()
+        retained = lowering.cursor_values[0]
+        replacement = _lower_llir_module.CursorValue(
+            _lower_llir_module.LoopIRNodeId(910_020),
+            retained.cursor,
+            retained.default,
+        )
+    original = lowering.position_loads[0]
+    assert replace_value_access(lowering.leaf.value, original, replacement)
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "value expression changed" in error.value.defect.message
+
+
+@pytest.mark.parametrize("retained_kind", ["cursor", "position_load"])
+def test_target_rejects_a_shared_access_occurrence(retained_kind):
+    lowering = admitted_dense_leaf_target()
+    cursor = lowering.cursor_values[0]
+    position_load = lowering.position_loads[0]
+    if retained_kind == "cursor":
+        original, replacement = position_load, cursor
+    else:
+        original, replacement = cursor, position_load
+    assert replace_value_access(lowering.leaf.value, original, replacement)
+    value = lowering.leaf.value
+    assert type(value) is _lower_llir_module.BinaryExpr
+    assert value.lhs is value.rhs
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "value expression changed" in error.value.defect.message
+
+
+def test_target_rejects_a_position_spine_coordinate_from_the_wrong_dimension():
+    indices = {name: IndexVar(name) for name in "ijk"}
+    result = TensorVar("C", fmt="sss", dtype=torch.float32)[
+        indices["i"], indices["j"], indices["k"]
+    ]
+    sparse = TensorVar("A", fmt="sss", dtype=torch.float32)[
+        indices["i"], indices["j"], indices["k"]
+    ]
+    dense_leaf = TensorVar("B", fmt="sd", dtype=torch.float32)[
+        indices["i"], indices["k"]
+    ]
+    cin = TensorAssign(result, CINBinaryOp(Operation.MUL, sparse, dense_leaf))
+    for name in reversed("ijk"):
+        cin = ForAll(indices[name], cin)
+    kernel = compile_cin_via_loopir(
+        cin,
+        (4, 5, 3),
+        (((4, 5, 3), torch.float32), ((4, 3), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    program = (
+        kernel.schedule.program
+        if kernel.schedule is not None
+        else kernel.lowering.program
+    )
+    verify_program(program)
+    input_shapes = {
+        decl.symbol: ((4, 5, 3) if decl.name == "A" else (4, 3))
+        for decl in program.tensors
+        if decl.symbol in program.inputs
+    }
+    lowering = _lower_llir_module._MultiCompressedAssemblyLowering(
+        program, input_shapes, (4, 5, 3)
+    )
+    load = lowering.position_loads[0]
+    assert type(load.position) is _lower_llir_module.DensePosition
+    wrong_index = next(
+        loop.index
+        for loop in lowering.loops
+        if lowering.dimension_names[loop.dimension] == "j"
+    )
+    object.__setattr__(
+        load.position,
+        "coord",
+        _lower_llir_module.IndexValue(
+            _lower_llir_module.LoopIRNodeId(910_030), wrong_index
+        ),
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        _lower_llir_module._MultiCompressedAssemblyLowering(
+            program, input_shapes, (4, 5, 3)
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "logical dimension" in error.value.defect.message
+
+
+def test_target_rejects_a_hostile_program_input_membership_container():
+    class ContainsBomb(tuple):
+        def __contains__(self, value):
+            raise RuntimeError("program input membership must not run")
+
+    lowering = admitted_dense_leaf_target()
+    object.__setattr__(
+        lowering.program,
+        "inputs",
+        ContainsBomb(lowering.program.inputs),
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "input" in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "bad_mode", [99, -1, True], ids=["out-of-range", "negative", "bool"]
+)
+def test_target_rejects_malformed_all_dense_mode_values(bad_mode):
+    cin = build_permuted_dense_cooperand("ij", "ji", (1, 0), "ss")
+    kernel = compile_cin_via_loopir(
+        cin,
+        (4, 5),
+        (((4, 5), torch.float32), ((4, 5), torch.float32)),
+        compile_options=auto_options(False),
+    )
+    program = (
+        kernel.schedule.program
+        if kernel.schedule is not None
+        else kernel.lowering.program
+    )
+    dense_decl = next(decl for decl in program.tensors if decl.name == "B")
+    object.__setattr__(dense_decl.levels[0], "mode", bad_mode)
+    with pytest.raises(LoopIRTargetError) as error:
+        _lower_llir_module._MultiCompressedAssemblyLowering(
+            program,
+            {symbol: (4, 5) for symbol in program.inputs},
+            (4, 5),
+        )
+    assert error.value.defect.code == "unsupported_mode_order"
+
+
+def test_target_rejects_a_malformed_position_load_tensor_before_hashing():
+    lowering = admitted_dense_leaf_target()
+    program = lowering.program
+    load = lowering.position_loads[0]
+    object.__setattr__(load, "tensor", [])
+    shapes = {symbol: shape_of("ss") for symbol in lowering.program.inputs}
+    with pytest.raises(LoopIRTargetError) as error:
+        _lower_llir_module._MultiCompressedAssemblyLowering(
+            program, shapes, shape_of("ss")
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "declared input tensor" in error.value.defect.message
+
+
+def test_target_rejects_hostile_merged_position_state_without_equality():
+    class EqualityBomb:
+        def __eq__(self, other):
+            raise RuntimeError("position equality must not run")
+
+    lowering = admitted_dense_leaf_target()
+    merged = next(
+        loop.node
+        for loop in lowering.loops
+        if loop.kind is _lower_llir_module._MERGED
+        and getattr(loop.node, "positions", ())
+    )
+    positions = list(merged.positions)
+    positions[0] = EqualityBomb()
+    object.__setattr__(merged, "positions", tuple(positions))
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "exact position identities" in error.value.defect.message
 
 
 # -- identity neutrality -----------------------------------------------------
