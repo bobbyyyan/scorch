@@ -16,7 +16,13 @@ from .exceptions import (
     TensorTypeError,
     TensorValidationError,
 )
-from .format import FormatInput, LevelType, TensorFormat, parse_format
+from .format import (
+    FormatInput,
+    LevelType,
+    TensorFormat,
+    owned_format,
+    parse_format,
+)
 
 ShapeLike = Sequence[int]
 _MAX_INT64 = (1 << 63) - 1
@@ -114,7 +120,11 @@ class TensorLayout:
     def __post_init__(self) -> None:
         logical_shape = _normalize_shape(self.logical_shape, "logical_shape")
         physical_shape = _normalize_shape(self.physical_shape, "physical_shape")
-        tensor_format = parse_format(self.format)
+        # A layout is the tensor's single authoritative format holder, so it
+        # detaches the caller's value here rather than on every read.  See
+        # ``format.owned_format``: fail-open, so no argument this accepted
+        # before becomes an error.
+        tensor_format = owned_format(parse_format(self.format))
         rank = len(logical_shape)
         permutation = _normalize_permutation(self.permutation, rank)
         index_dtype = _parse_dtype(self.index_dtype, "index_dtype")

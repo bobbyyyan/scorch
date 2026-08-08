@@ -16,7 +16,13 @@ from .exceptions import (
     TensorStorageError,
     TensorTypeError,
 )
-from .format import FormatInput, LevelType, TensorFormat, parse_format
+from .format import (
+    FormatInput,
+    LevelType,
+    TensorFormat,
+    owned_format,
+    parse_format,
+)
 from .layout import TensorLayout, validate_runtime_contract
 
 IndexModes = Tuple[Tuple[torch.Tensor, ...], ...]
@@ -158,7 +164,11 @@ class TensorIndex:
             raise TensorIndexError(
                 "tensor_format is required; use TensorFormat() for a scalar"
             )
-        tensor_format = parse_format(tensor_format)
+        # Direct index construction retains the format, so it detaches the
+        # caller's value on the way in (``format.owned_format``, fail-open).
+        # ``_from_layout`` needs no rebuild: a ``TensorLayout`` already owns
+        # the format it hands over.
+        tensor_format = owned_format(parse_format(tensor_format))
         normalized = _normalize_mode_indices(mode_indices, tensor_format)
         if mode_order is None:
             order = tuple(range(tensor_format.get_order()))

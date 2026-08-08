@@ -28,7 +28,7 @@ from .exceptions import (
     TensorTypeError,
     TensorValidationError,
 )
-from .format import TensorFormat, LevelFormat, LevelType
+from .format import TensorFormat, LevelFormat, LevelType, audit_format_state
 from .layout import TensorLayout, TensorMetadata
 from .storage import SparseStorage, TensorIndex
 from .utils import (
@@ -97,6 +97,14 @@ def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
 
     if type(tensor_format) is not TensorFormat:
         raise TensorTypeError("to_sparse format must be an exact TensorFormat")
+    audited = audit_format_state(tensor_format)
+    if audited is not None:
+        # The shared construction-side audit already proved every stored
+        # field exact and rebuilt both container layers.
+        return TensorFormat(audited)
+    # Otherwise re-walk the same state to name the exact defect: this public
+    # entry point owes a precise error, not the fail-open construction
+    # behaviour.
     state = object.__getattribute__(tensor_format, "__dict__")
     state_keys = tuple(state) if type(state) is dict else ()
     if (

@@ -443,3 +443,94 @@ def _normalize_level_formats(
 def parse_format(fmt: FormatInput) -> TensorFormat:
     """Canonical parser used by every public format-taking API."""
     return fmt if isinstance(fmt, TensorFormat) else TensorFormat(fmt)
+
+
+MAX_FORMAT_BIT_WIDTH = (1 << 63) - 1
+
+
+def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
+    """Structurally audit one format's stored state; rebuild its levels.
+
+    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but
+    ``object.__setattr__`` still forges or mutates their stored state, and a
+    caller who keeps a reference to a format an object retained can change
+    that object's declared layout after the fact.  This inspects the exact
+    stored fields without invoking any overridable accessor -- key types are
+    proven to be exact ``str`` before any comparison or hashing, so a hostile
+    ``str`` subclass cannot run overloaded equality here -- and returns a
+    freshly built level list.
+
+    Returns ``None`` when the argument is not an exact ``TensorFormat`` or
+    when its stored state is not exactly the expected shape.  Callers that owe
+    the strict public contract raise on ``None``; construction boundaries
+    treat it as "nothing safe to rebuild" and keep the value they were given,
+    which preserves today's acceptance of ``TensorFormat`` subclasses.
+    """
+
+    if type(tensor_format) is not TensorFormat:
+        return None
+    try:
+        state = object.__getattribute__(tensor_format, "__dict__")
+    except AttributeError:
+        return None
+    state_keys = tuple(state) if type(state) is dict else ()
+    if (
+        type(state) is not dict
+        or len(state_keys) != 1
+        or type(state_keys[0]) is not str
+        or state_keys[0] != "_level_formats"
+    ):
+        return None
+    levels = state["_level_formats"]
+    if type(levels) is not tuple:
+        return None
+
+    owned_levels: List[LevelFormat] = []
+    for level_format in levels:
+        if type(level_format) is not LevelFormat:
+            return None
+        try:
+            level_state = object.__getattribute__(level_format, "__dict__")
+        except AttributeError:
+            return None
+        level_keys = tuple(level_state) if type(level_state) is dict else ()
+        if (
+            type(level_state) is not dict
+            or len(level_keys) != 2
+            or any(type(key) is not str for key in level_keys)
+            or set(level_keys) != {"_mode", "_bit_width"}
+        ):
+            return None
+        mode = level_state["_mode"]
+        bit_width = level_state["_bit_width"]
+        if type(mode) is not LevelType:
+            return None
+        if bit_width is not None and (
+            type(bit_width) is not int
+            or bit_width <= 0
+            or bit_width > MAX_FORMAT_BIT_WIDTH
+        ):
+            return None
+        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
+    return owned_levels
+
+
+def owned_format(tensor_format: TensorFormat) -> TensorFormat:
+    """Detach one format on the way *in* to a retaining object.
+
+    This is the construction-side half of the format-ownership boundary: an
+    object that will retain a format rebuilds it, so a caller who keeps the
+    original cannot mutate the retained metadata afterwards.  It also breaks
+    the sharing that let one process-global memoized format become several
+    unrelated tensors' declared layout.
+
+    Fail-open by design: anything this cannot prove structurally exact is
+    returned unchanged, so no previously accepted argument becomes an error.
+    The read side is deliberately untouched -- rebuilding on every ``.format``
+    access measured as a double-digit regression on the live dispatch path.
+    """
+
+    owned_levels = audit_format_state(tensor_format)
+    if owned_levels is None:
+        return tensor_format
+    return TensorFormat(owned_levels)
