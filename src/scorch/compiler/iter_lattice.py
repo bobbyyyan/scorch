@@ -452,7 +452,7 @@ class LatticePoint:
         raise NotImplementedError(f"Unhandled CIN type {type(cin)}")
 
     def get_child_subregion_loops(
-        self, cin_lowerer: CINLowerer, cin: IndexStmt
+        self, cin_lowerer: CINLowerer, cin: IndexStmt, lattice: "IterationLattice"
     ) -> Sequence[llir.Stmt]:
         """
         Iterates over the child lattice points and generate an inner loop over each
@@ -486,25 +486,40 @@ class LatticePoint:
             all_inner_lattice_points.extend(self.child_lattice_points)
 
         if self.child_lattice_points or (self.iterators and len(self.iterators) > 1):
+            dense_universe = lattice.dense_index_var_llir is not None
             stmts.append(llir.Comment("Inner loops over child regions"))
             if_conditions: List[llir.Expr] = []
             then_body_list = []
             else_body: List[llir.Stmt] = []
 
             for child_lp in all_inner_lattice_points:
-                candidate_coord_var_llirs = map(
-                    lambda it: it.get_coord_var_llir(), child_lp.get_iterators()
-                )
-
                 if_condition = None
                 then_body: List[llir.Stmt] = []
 
-                for coord_var_llir in candidate_coord_var_llirs:
-                    this_condition = llir.BinOp(
+                for iterator in child_lp.get_iterators():
+                    this_condition: llir.Expr = llir.BinOp(
                         op="==",
-                        left=coord_var_llir,
+                        left=iterator.get_coord_var_llir(),
                         right=self.get_index_var_llir(),
                     )
+                    if dense_universe:
+                        # A dense universe drives the loop by the dense
+                        # extent, so it never exhausts the sparse cursors:
+                        # once a segment is drained the cursor still points
+                        # at the NEXT segment's first stored coordinate, and
+                        # a bare coordinate equality can spuriously match it
+                        # (a silently wrong sum) while the coordinate load
+                        # itself reads past the segment.  Bound the cursor by
+                        # its own segment end before comparing.
+                        this_condition = llir.BinOp(
+                            op="&&",
+                            left=llir.BinOp(
+                                op="<",
+                                left=iterator.get_iterator_var_llir(),
+                                right=iterator.get_iterator_var_end_var_llir(),
+                            ),
+                            right=this_condition,
+                        )
                     if if_condition is None:
                         if_condition = this_condition
                     else:
@@ -547,10 +562,33 @@ class LatticePoint:
             if iterators:
                 stmts.append(llir.Comment("Load coordinates"))
                 for it in iterators:
+                    value = it.get_coord_var_value_llir()
+                    if lattice.dense_index_var_llir is not None:
+                        # A dense universe drives the loop by the dense
+                        # extent, so a sparse cursor can be past its own
+                        # segment end here -- including on the very first
+                        # iteration when the segment is empty, where the
+                        # coordinate array may hold nothing at all.  Reading
+                        # it unconditionally is an out-of-bounds load (an
+                        # all-zero sparse operand added to a dense one
+                        # terminated the process).  Select the stored
+                        # coordinate only while the cursor is live; the
+                        # value chosen otherwise is never observed, because
+                        # every consuming case is itself guarded by the same
+                        # bound.
+                        value = llir.Select(
+                            cond=llir.BinOp(
+                                op="<",
+                                left=it.get_iterator_var_llir(),
+                                right=it.get_iterator_var_end_var_llir(),
+                            ),
+                            when_true=value,
+                            when_false=llir.Literal(0, llir.DataType.INT),
+                        )
                     stmts.append(
                         llir.VarInit(
                             var=it.get_coord_var_llir(),
-                            value=it.get_coord_var_value_llir(),
+                            value=value,
                         )
                     )
             # Only need to break ties among the resolved sparse coordinates
@@ -1060,7 +1098,7 @@ class IterationLattice:
 
         child_subregion = list(
             lattice_point.get_child_subregion_loops(
-                self.cin_lowerer, self.for_all_stmt.stmt
+                self.cin_lowerer, self.for_all_stmt.stmt, self
             )
         )
 
