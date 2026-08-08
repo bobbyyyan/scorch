@@ -836,7 +836,6 @@ class _TargetLowering:
             # reject.  Omitting them avoids recursively signing the same value
             # and position trees a third time on every successful compile.
             "_bound_position_snapshot",
-            "_position_load_signatures",
             "_target_state_owners",
             "_target_state_snapshot",
             "_target_type_snapshot",

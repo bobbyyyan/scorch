@@ -1018,6 +1018,27 @@ def test_target_rejects_a_position_spine_coordinate_from_the_wrong_dimension():
     assert "logical dimension" in error.value.defect.message
 
 
+@pytest.mark.parametrize("replacement", ["missing", "foreign", "hostile"], ids=str)
+def test_target_owns_the_position_load_signature_cache(replacement):
+    """The successful merged-case path must not invoke a forged cache."""
+
+    class GetBomb:
+        def get(self, *args, **kwargs):
+            raise RuntimeError("hostile position-signature lookup executed")
+
+    lowering = admitted_dense_leaf_target()
+    forged = {
+        "missing": None,
+        "foreign": object(),
+        "hostile": GetBomb(),
+    }[replacement]
+    object.__setattr__(lowering, "_position_load_signatures", forged)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        lowering.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+
+
 def test_target_rejects_a_hostile_program_input_membership_container():
     class ContainsBomb(tuple):
         def __contains__(self, value):

@@ -1094,11 +1094,12 @@ def test_diagnostic_witness_tampering_cannot_mask_a_graph_change():
     )
     object.__setattr__(target.leaf, "value", copy.deepcopy(target.leaf.value))
 
-    # Forge every narrow witness to the changed graph.  They exist only to
-    # retain specific diagnostics after the complete graph guard detects a
-    # change; none may authorize emission on its own.
+    # Forge every excluded narrow witness to the changed graph.  They exist
+    # only to retain specific diagnostics after the complete graph guard
+    # detects a change; none may authorize emission on its own.  The separate
+    # position-load-signature map remains signed because successful emission
+    # consults it directly.
     target._bound_position_snapshot = target._validated_bound_position_bindings()
-    target._position_load_signatures = {}
     target._value_expression_snapshot = target._validated_value_expression_signature(
         target._access_value_expression()
     )
