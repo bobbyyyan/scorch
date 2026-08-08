@@ -122,8 +122,8 @@ class TensorLayout:
         physical_shape = _normalize_shape(self.physical_shape, "physical_shape")
         # A layout is the tensor's single authoritative format holder, so it
         # detaches the caller's value here rather than on every read.  See
-        # ``format.owned_format``: fail-open, so no argument this accepted
-        # before becomes an error.
+        # ``format.owned_format``: canonical subclasses are normalized, while
+        # malformed values fail closed instead of retaining caller-owned state.
         tensor_format = owned_format(parse_format(self.format))
         rank = len(logical_shape)
         permutation = _normalize_permutation(self.permutation, rank)

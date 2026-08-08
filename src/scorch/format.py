@@ -6,6 +6,7 @@ import json
 from typing import (
     TYPE_CHECKING,
     Any,
+    cast,
     ClassVar,
     List,
     Mapping,
@@ -442,10 +443,21 @@ def _normalize_level_formats(
 
 def parse_format(fmt: FormatInput) -> TensorFormat:
     """Canonical parser used by every public format-taking API."""
-    return fmt if isinstance(fmt, TensorFormat) else TensorFormat(fmt)
 
-
-MAX_FORMAT_BIT_WIDTH = (1 << 63) - 1
+    # This is the overwhelmingly common internal call shape.  Keep it as the
+    # same single exact-type comparison as the historical implementation;
+    # subclass/foreign handling below is deliberately more defensive, but
+    # should not tax every ordinary dispatch by running an MRO walk.
+    if type(fmt) is TensorFormat:
+        return fmt
+    try:
+        if issubclass(type(fmt), TensorFormat):
+            return cast(TensorFormat, fmt)
+        return TensorFormat(cast(Any, fmt))
+    except (TensorFormatError, TensorTypeError):
+        raise
+    except Exception as error:
+        raise TensorFormatError("tensor format is malformed") from error
 
 
 def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
@@ -460,19 +472,19 @@ def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
     ``str`` subclass cannot run overloaded equality here -- and returns a
     freshly built level list.
 
-    Returns ``None`` when the argument is not an exact ``TensorFormat`` or
-    when its stored state is not exactly the expected shape.  Callers that owe
-    the strict public contract raise on ``None``; construction boundaries
-    treat it as "nothing safe to rebuild" and keep the value they were given,
-    which preserves today's acceptance of ``TensorFormat`` subclasses.
+    Returns ``None`` when the argument is not a ``TensorFormat`` or when its
+    stored state is not exactly the expected base-value shape.  A subclass
+    with that exact state is safe to canonicalize as a fresh base value; no
+    subclass methods are invoked while inspecting it.
     """
 
-    if type(tensor_format) is not TensorFormat:
+    if not issubclass(type(tensor_format), TensorFormat):
         return None
-    try:
-        state = object.__getattribute__(tensor_format, "__dict__")
-    except AttributeError:
-        return None
+    # Read the base class's actual instance dictionary through its descriptor.
+    # ``object.__getattribute__(value, "__dict__")`` still honors a subclass's
+    # overriding ``__dict__`` data descriptor, which could run caller code or
+    # conceal extra state at this ownership boundary.
+    state = TensorFormat.__dict__["__dict__"].__get__(tensor_format, TensorFormat)
     state_keys = tuple(state) if type(state) is dict else ()
     if (
         type(state) is not dict
@@ -487,12 +499,11 @@ def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
 
     owned_levels: List[LevelFormat] = []
     for level_format in levels:
-        if type(level_format) is not LevelFormat:
+        if not issubclass(type(level_format), LevelFormat):
             return None
-        try:
-            level_state = object.__getattribute__(level_format, "__dict__")
-        except AttributeError:
-            return None
+        level_state = LevelFormat.__dict__["__dict__"].__get__(
+            level_format, LevelFormat
+        )
         level_keys = tuple(level_state) if type(level_state) is dict else ()
         if (
             type(level_state) is not dict
@@ -505,11 +516,7 @@ def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
         bit_width = level_state["_bit_width"]
         if type(mode) is not LevelType:
             return None
-        if bit_width is not None and (
-            type(bit_width) is not int
-            or bit_width <= 0
-            or bit_width > MAX_FORMAT_BIT_WIDTH
-        ):
+        if bit_width is not None and (type(bit_width) is not int or bit_width <= 0):
             return None
         owned_levels.append(LevelFormat(mode, bit_width=bit_width))
     return owned_levels
@@ -524,13 +531,15 @@ def owned_format(tensor_format: TensorFormat) -> TensorFormat:
     the sharing that let one process-global memoized format become several
     unrelated tensors' declared layout.
 
-    Fail-open by design: anything this cannot prove structurally exact is
-    returned unchanged, so no previously accepted argument becomes an error.
+    Structurally canonical subclasses remain accepted, but are normalized to
+    the base value type.  Anything malformed fails closed: retaining it would
+    preserve mutable caller-owned state at the ownership boundary.
+
     The read side is deliberately untouched -- rebuilding on every ``.format``
     access measured as a double-digit regression on the live dispatch path.
     """
 
     owned_levels = audit_format_state(tensor_format)
     if owned_levels is None:
-        return tensor_format
+        raise TensorFormatError("tensor format has malformed stored state")
     return TensorFormat(owned_levels)

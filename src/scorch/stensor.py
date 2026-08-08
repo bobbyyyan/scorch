@@ -99,12 +99,21 @@ def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
         raise TensorTypeError("to_sparse format must be an exact TensorFormat")
     audited = audit_format_state(tensor_format)
     if audited is not None:
+        for audited_level in audited:
+            if (
+                audited_level.bit_width is not None
+                and audited_level.bit_width > _MAX_FORMAT_BIT_WIDTH
+            ):
+                raise TensorFormatError(
+                    "to_sparse format level bit_width must be a positive "
+                    "signed-int64 exact int or None"
+                )
         # The shared construction-side audit already proved every stored
         # field exact and rebuilt both container layers.
         return TensorFormat(audited)
     # Otherwise re-walk the same state to name the exact defect: this public
-    # entry point owes a precise error, not the fail-open construction
-    # behaviour.
+    # entry point owes a more precise error than the shared construction
+    # boundary.
     state = object.__getattribute__(tensor_format, "__dict__")
     state_keys = tuple(state) if type(state) is dict else ()
     if (
@@ -823,7 +832,15 @@ class STensor:
 
         :meth:`clone` is an alias for this operation.
         """
-        return STensor._from_validated(self.metadata, self.storage.copy())
+        storage = self.storage.copy()
+        metadata = TensorMetadata(
+            name=self.metadata.name,
+            dtype=self.metadata.dtype,
+            device=self.metadata.device,
+            layout=storage.layout,
+            requires_grad=self.metadata.requires_grad,
+        )
+        return STensor._from_validated(metadata, storage)
 
     @classmethod
     def from_components(
@@ -1545,12 +1562,8 @@ class STensor:
         to_dense : The inverse (densify).
         """
         if len(self.shape) == 1:
+            parsed_rank_one_format = None if fmt is None else parse_format(fmt)
             rank_one_format: Optional[TensorFormat]
-            try:
-                parsed_rank_one_format = None if fmt is None else parse_format(fmt)
-            except Exception:
-                # Invalid format requests keep the historical path.
-                parsed_rank_one_format = None
             rank_one_format = (
                 None
                 if parsed_rank_one_format is None
@@ -1636,18 +1649,30 @@ class STensor:
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
+            parsed_requested_format = None if fmt is None else parse_format(fmt)
             requested_format: Optional[TensorFormat]
-            try:
-                parsed_requested_format = None if fmt is None else parse_format(fmt)
-            except Exception:
-                # Invalid format requests keep the historical path and its
-                # exact staged failure bookkeeping.
-                parsed_requested_format = None
             requested_format = (
                 None
                 if parsed_requested_format is None
                 else _owned_sparse_format(parsed_requested_format)
             )
+            if requested_format is not None:
+                if requested_format.get_order() != len(self.shape):
+                    raise TensorStorageError(
+                        f"format rank {requested_format.get_order()} does not "
+                        f"match tensor rank {len(self.shape)}"
+                    )
+                requested_level_types = tuple(requested_format.get_level_types())
+                if any(
+                    level_type is LevelType.COORDINATE
+                    for level_type in requested_level_types
+                ) and any(
+                    level_type is not LevelType.COORDINATE
+                    for level_type in requested_level_types
+                ):
+                    raise TensorStorageError(
+                        "to_sparse does not support mixed coordinate hierarchies"
+                    )
             compile_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
@@ -1718,11 +1743,8 @@ class STensor:
                         ]
                     )
                 else:
-                    output_format = (
-                        requested_format
-                        if requested_format is not None
-                        else _owned_sparse_format(parse_format(fmt))
-                    )
+                    assert requested_format is not None
+                    output_format = requested_format
 
                 A = TensorVar(
                     name="A",

@@ -165,7 +165,8 @@ class TensorIndex:
                 "tensor_format is required; use TensorFormat() for a scalar"
             )
         # Direct index construction retains the format, so it detaches the
-        # caller's value on the way in (``format.owned_format``, fail-open).
+        # caller's value on the way in (``format.owned_format``).  Canonical
+        # subclasses are normalized; malformed values fail closed.
         # ``_from_layout`` needs no rebuild: a ``TensorLayout`` already owns
         # the format it hands over.
         tensor_format = owned_format(parse_format(tensor_format))
@@ -545,12 +546,23 @@ class SparseStorage:
         _validate_index_storage(self._layout, self._mode_indices, self._value)
 
     def copy(self) -> "SparseStorage":
+        # A storage copy must not retain the source's metadata graph.  In
+        # particular, ``TensorFormat`` is frozen only by convention -- a
+        # caller can still use ``object.__setattr__`` -- so sharing the layout
+        # let a mutation through the copy rewrite the source tensor too.
+        layout = TensorLayout(
+            logical_shape=self._layout.logical_shape,
+            physical_shape=self._layout.physical_shape,
+            format=self._layout.format,
+            permutation=self._layout.permutation,
+            index_dtype=self._layout.index_dtype,
+        )
         indices = tuple(
             tuple(index.clone().detach() for index in arrays)
             for arrays in self._mode_indices
         )
         return SparseStorage(
-            self._layout,
+            layout,
             self._value.clone(),
             mode_indices=indices,
         )
