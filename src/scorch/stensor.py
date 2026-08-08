@@ -21,6 +21,7 @@ from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
 from .compiler.compilation_context import CompilerStageId, CompilationContext
 from .exceptions import (
+    TensorFormatError,
     TensorIndexError,
     TensorLayoutError,
     TensorStorageError,
@@ -78,6 +79,62 @@ def _finalize_generated_mode_indices(
         repaired[last_written + 1 :] = repaired[last_written]
         finalized[level][0] = repaired
     return finalized
+
+
+_MAX_FORMAT_BIT_WIDTH = (1 << 63) - 1
+
+
+def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
+    """Validate and detach one parsed public ``to_sparse`` format.
+
+    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but Python's
+    ``object.__setattr__`` can still forge or mutate their stored state.  A
+    runtime tensor must not retain caller-owned format objects: changing one
+    after conversion would otherwise change the tensor's declared layout while
+    leaving its index arrays and values untouched.  Inspect exact stored fields
+    without invoking overridable accessors, then rebuild both container layers.
+    """
+
+    if type(tensor_format) is not TensorFormat:
+        raise TensorTypeError("to_sparse format must be an exact TensorFormat")
+    state = object.__getattribute__(tensor_format, "__dict__")
+    if type(state) is not dict or tuple(state) != ("_level_formats",):
+        raise TensorFormatError("to_sparse format has malformed stored state")
+    levels = state["_level_formats"]
+    if type(levels) is not tuple:
+        raise TensorFormatError("to_sparse format levels must be an exact tuple")
+
+    owned_levels = []
+    for level, level_format in enumerate(levels):
+        if type(level_format) is not LevelFormat:
+            raise TensorFormatError(
+                f"to_sparse format level {level} must be an exact LevelFormat"
+            )
+        level_state = object.__getattribute__(level_format, "__dict__")
+        if type(level_state) is not dict or set(level_state) != {
+            "_mode",
+            "_bit_width",
+        }:
+            raise TensorFormatError(
+                f"to_sparse format level {level} has malformed stored state"
+            )
+        mode = level_state["_mode"]
+        bit_width = level_state["_bit_width"]
+        if type(mode) is not LevelType:
+            raise TensorFormatError(
+                f"to_sparse format level {level} mode must be an exact LevelType"
+            )
+        if bit_width is not None and (
+            type(bit_width) is not int
+            or bit_width <= 0
+            or bit_width > _MAX_FORMAT_BIT_WIDTH
+        ):
+            raise TensorFormatError(
+                f"to_sparse format level {level} bit_width must be a positive "
+                "signed-int64 exact int or None"
+            )
+        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
+    return TensorFormat(owned_levels)
 
 
 class Window(object):
@@ -1473,10 +1530,15 @@ class STensor:
         if len(self.shape) == 1:
             rank_one_format: Optional[TensorFormat]
             try:
-                rank_one_format = None if fmt is None else parse_format(fmt)
+                parsed_rank_one_format = None if fmt is None else parse_format(fmt)
             except Exception:
                 # Invalid format requests keep the historical path.
-                rank_one_format = None
+                parsed_rank_one_format = None
+            rank_one_format = (
+                None
+                if parsed_rank_one_format is None
+                else _owned_sparse_format(parsed_rank_one_format)
+            )
             rank_one_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
@@ -1559,11 +1621,16 @@ class STensor:
         else:
             requested_format: Optional[TensorFormat]
             try:
-                requested_format = None if fmt is None else parse_format(fmt)
+                parsed_requested_format = None if fmt is None else parse_format(fmt)
             except Exception:
                 # Invalid format requests keep the historical path and its
                 # exact staged failure bookkeeping.
-                requested_format = None
+                parsed_requested_format = None
+            requested_format = (
+                None
+                if parsed_requested_format is None
+                else _owned_sparse_format(parsed_requested_format)
+            )
             compile_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
@@ -1634,7 +1701,11 @@ class STensor:
                         ]
                     )
                 else:
-                    output_format = parse_format(fmt)
+                    output_format = (
+                        requested_format
+                        if requested_format is not None
+                        else _owned_sparse_format(parse_format(fmt))
+                    )
 
                 A = TensorVar(
                     name="A",
