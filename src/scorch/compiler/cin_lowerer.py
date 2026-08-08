@@ -1090,6 +1090,29 @@ class CINLowerer:
         )
 
         # Build loop: for (const auto& it : wksp) { ... }
+        # A one-dimensional sparse workspace is the ``coo_workspace_1d``
+        # class, whose iterator dereferences to ``std::pair<int64_t, T>``:
+        # its key is the scalar coordinate itself, not an indexable
+        # container.  Subscripting it emits C++ that does not compile
+        # ("subscripted value is not an array, pointer, or vector"), which
+        # is what made every sparse rank-1-output reduction -- for example
+        # public ``einsum('ij->i')`` -- fail at build time.  Every other
+        # workspace is ``coo_workspace<T, N>``, whose key is a
+        # ``std::vector<int64_t>`` and is subscripted per level.
+        scalar_workspace_key = wksp.dim == 1 and not wksp.is_dense()
+
+        def workspace_key_component(level: int) -> llir.Expr:
+            first = llir.MemberAccess(
+                base=llir.Var(name=loop_var.name, type=loop_var.type),
+                member="first",
+            )
+            if scalar_workspace_key:
+                return first
+            return llir.ArrayAccess(
+                array=first,
+                index=llir.Literal(level, llir.DataType.INT64),
+            )
+
         loop_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
         loop_array = llir.Var(name=wksp_name, type=llir.DataType.AUTO)
         loop_body: List[llir.Stmt] = []
@@ -1109,16 +1132,7 @@ class CINLowerer:
                                 type=llir.DataType.INT64,
                             ),
                         ),
-                        value=llir.ArrayAccess(
-                            array=llir.MemberAccess(
-                                base=llir.Var(
-                                    name=loop_var.name,
-                                    type=loop_var.type,
-                                ),
-                                member="first",
-                            ),
-                            index=llir.Literal(i, llir.DataType.INT64),
-                        ),
+                        value=workspace_key_component(i),
                     )
                 )
             # A_values[pA0] = it.second;
@@ -1171,16 +1185,7 @@ class CINLowerer:
                                 type=llir.DataType.INT64,
                             ),
                         ),
-                        value=llir.ArrayAccess(
-                            array=llir.MemberAccess(
-                                base=llir.Var(
-                                    name=loop_var.name,
-                                    type=loop_var.type,
-                                ),
-                                member="first",
-                            ),
-                            index=llir.Literal(i, llir.DataType.INT64),
-                        ),
+                        value=workspace_key_component(i),
                     )
                 )
             # T_val_vec[pT] = it.second;
