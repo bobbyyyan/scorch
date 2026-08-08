@@ -7523,23 +7523,25 @@ All gates ran in the ``scorch`` conda environment; evidence is retained under
   message of a pre-existing ``cin_lowerer.py`` finding.  Black and Flake8 are
   not globally clean; their findings are inherited and unchanged.
   ``git diff --check`` is clean.
-- **Exact-tip full non-performance suite: NOT COMPLETED.**  It collected
-  **5,475 / 3 performance deselected / 5,472 selected** at ``c927f62`` in a
-  clean detached worktree, partitioned into eight file-disjoint fresh-process
-  groups whose union is proven complete and non-overlapping.  The host then
-  became heavily contended and thermally throttled -- ``PerfPowerServices``
-  sustained ~196% CPU beside an unrelated user workload and cold JIT builds
-  slowed from ~8-15 s to ~2.6 min each -- and the run did not finish.
-  Partition 0, into which this partitioning concentrated the JIT-heavy files,
-  reached **662 of 684 nodes with zero test failures** before the run was
-  stopped (the trailing ``FileNotFoundError`` in its log is this session's own
-  teardown, not a test result).  An earlier complete-partition
-  run at ``18d7a27`` (which differs from ``c927f62`` only by the test-only
-  sweep-narrowing commit) recorded partition 0 at **686 passed** and partition
-  1 at **671 passed / 14 skipped**, both exit 0.  **This is not a pass
-  receipt**; the suite must be re-run to completion on an unloaded host, and
-  the runner is retained for exactly that.  Every focused battery listed above
-  did run to completion at the tip.
+- **Exact-tip full non-performance suite: PARTIALLY COMPLETED.**  It collected
+  **5,475 / 3 performance deselected / 5,472 selected** at the final tip
+  ``6436e82`` in a clean detached worktree, partitioned into eight
+  file-disjoint fresh-process groups whose union is proven complete and
+  non-overlapping.  **Partition 0 ran to completion: 684 passed, 0 failed,
+  719.10 s, exit 0** -- the JIT-heaviest partition, and the one carrying
+  ``test_format_ownership_boundary.py``, ``test_kernels.py``,
+  ``test_perf.py``, both ``test_known_compiler_gaps*`` files,
+  ``test_autotune_learned.py`` and ``codegen/test_regblock_dual_path.py``.
+  **Partition 1 reached 443 nodes with zero failures** before the run was
+  stopped.  Partitions 2-7 were not run at this tip.
+
+  The host thermally throttles under sustained cold-cache JIT load: quiet, it
+  ran 684 nodes in twelve minutes; with ``PerfPowerServices`` back at ~197%
+  CPU, partition 1 fell to roughly four nodes per ten minutes.  That is an
+  environment limit, not a property of the change set -- **no test failed in
+  either partition**.  **This is not a complete pass receipt**; the runner is
+  retained and the suite must be re-run on a thermally unconstrained host.
+  Every focused battery listed above did run to completion at the tip.
 - **Activating paired two-order compile latency was not run**, for the same
   reason: a thermally throttled host cannot produce an honest latency receipt.
   The harness is retained with the three newly activating dense-leaf cells

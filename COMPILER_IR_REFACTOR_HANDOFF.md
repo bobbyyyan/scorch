@@ -29759,18 +29759,19 @@ now, unverified.
 
 ### Two gates outstanding
 
-The exact-tip full non-performance suite and the activating paired two-order
-latency receipt were NOT completed.  The suite collected 5,475 / 3 deselected /
-5,472 selected at `c927f62` and partitioned cleanly, but the host became
-thermally throttled mid-run (cold JIT builds fell from ~8-15 s to ~2.6 min) and
-partition 0 stopped at **662 of 684 nodes with zero test failures** (the
-trailing `FileNotFoundError` in its log is this session's own teardown, not a
-test result).  An earlier
-complete-partition run at `18d7a27` -- which differs only by the test-only
-sweep-narrowing commit -- recorded 686 passed and 671 passed / 14 skipped for
-partitions 0 and 1.  Neither is a pass receipt.  Both gates must be re-run to
-completion on an unloaded host before any Phase-7 exit claim depends on them.
-Every focused battery did run to completion at the tip.
+The exact-tip full non-performance suite is PARTIALLY completed and the
+activating paired two-order latency receipt was not run.  The suite collected
+5,475 / 3 deselected / 5,472 selected at the final tip `6436e82` and
+partitioned cleanly.  **Partition 0 ran to completion: 684 passed, 0 failed,
+719.10 s, exit 0** -- the JIT-heaviest partition, carrying the format-ownership
+lock, `test_kernels.py`, both known-compiler-gaps files, the autotune battery
+and the regblock dual-path codegen tests.  **Partition 1 reached 443 nodes with
+zero failures**; partitions 2-7 were not run at this tip.  The host thermally
+throttles under sustained cold-cache JIT load -- quiet, it ran 684 nodes in
+twelve minutes; throttled, roughly four nodes per ten minutes.  No test failed
+in either partition, but this is not a complete pass receipt.  Both gates must
+be finished on a thermally unconstrained host.  Every focused battery did run
+to completion at the tip.
 
 ### Superseding broad copy-paste prompt for the next session
 
