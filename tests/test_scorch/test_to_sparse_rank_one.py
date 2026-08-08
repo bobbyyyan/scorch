@@ -25,6 +25,7 @@ import torch
 from scorch.compiler.compilation_context import CompilationContext
 from scorch.compiler.compile_options import CompileOptions
 from scorch.exceptions import TensorStorageError
+from scorch.format import LevelFormat, TensorFormat
 from scorch.stensor import STensor
 
 VECTOR = [0.0, 1.0, 0.0, 0.0, 2.0, 0.0]
@@ -90,12 +91,53 @@ def test_wrong_rank_request_fails_closed():
 
 
 def test_dense_rank_one_request_fails_closed():
-    """A rank-1 ``d`` request no longer returns compressed storage."""
+    """A rank-1 ``d`` request no longer returns sparse storage."""
 
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
-    with pytest.raises(TensorStorageError, match="requests no compressed mode"):
+    with pytest.raises(TensorStorageError, match="requests no supported sparse mode"):
         tensor.to_sparse("d")
     assert str(tensor.format) == "d"
+
+
+@pytest.mark.parametrize("kind", ["s", "o"])
+def test_exact_requested_sparse_format_metadata_is_preserved(kind):
+    requested = TensorFormat([LevelFormat(kind, bit_width=64)])
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
+    assert tensor.format == requested
+    assert tensor.format.serialize() == requested.serialize()
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.float64, torch.int32, torch.int64, torch.int8, torch.uint8],
+)
+def test_coordinate_rank_one_request_is_honored(dtype):
+    dense = torch.tensor([0, 2, 0, 3], dtype=dtype)
+    tensor = STensor.from_torch(dense.clone(), "A").to_sparse("o")
+    assert str(tensor.format) == "o"
+    assert len(tensor.storage.index.mode_indices[0]) == 1
+    assert tensor.storage.index.mode_indices[0][0].tolist() == [1, 3]
+    assert tensor.storage.value.tolist() == [2, 3]
+    assert tensor.storage.value.dtype is dtype
+
+
+def test_coordinate_rank_one_request_round_trips_sparse_source():
+    dense = torch.tensor(VECTOR)
+    tensor = STensor.from_torch(dense.clone(), "A").to_sparse("s").to_sparse("o")
+    assert str(tensor.format) == "o"
+    assert tensor.storage.index.mode_indices[0][0].tolist() == [1, 4]
+    assert torch.equal(tensor.to_torch(), dense)
+
+
+def test_dense_rank_one_source_does_not_take_the_densification_path(monkeypatch):
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
+
+    def unexpected_densification(*args, **kwargs):
+        raise AssertionError("dense rank-1 conversion must not clone through to_dense")
+
+    monkeypatch.setattr(STensor, "to_dense", unexpected_densification)
+    tensor.to_sparse("s")
+    assert coordinates(tensor) == [1, 4]
 
 
 def test_unparseable_format_keeps_the_historical_path():

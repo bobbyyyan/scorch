@@ -203,16 +203,45 @@ def test_compressed_leaf_formats_keep_the_kernel_path():
     assert ds.storage.value.tolist() == [5.0, 3.0]
 
 
-def test_nonidentity_mode_order_keeps_the_historical_path():
-    """The materialization is identity-order only; other orders keep the
-    prior (failing) kernel behavior rather than guessing a layout."""
+@pytest.mark.parametrize(
+    "shape,mode_order,fmt",
+    [
+        ((2, 3), [1, 0], "sd"),
+        ((2, 3, 4), [2, 0, 1], "dds"),
+        ((2, 3, 4), [1, 2, 0], "sds"),
+    ],
+)
+def test_nonidentity_mode_order_materializes_in_physical_order(shape, mode_order, fmt):
+    dense = torch.arange(
+        int(torch.tensor(shape).prod().item()), dtype=torch.float32
+    ).reshape(shape)
+    dense[dense.remainder(3) != 0] = 0
+    tensor = STensor.from_torch(dense.clone(), "A").change_mode_order(mode_order)
 
-    from scorch.exceptions import TensorStorageError
+    tensor.to_sparse(fmt)
 
-    dense = torch.tensor([[0.0, 5.0, 0.0], [1.0, 0.0, 2.0]])
-    tensor = STensor.from_torch(dense.clone(), "A").change_mode_order([1, 0])
-    with pytest.raises(TensorStorageError):
-        tensor.to_sparse("sd")
+    assert str(tensor.format) == ",".join(fmt)
+    assert tuple(tensor.storage.index.mode_order) == tuple(mode_order)
+    assert tensor.logical_shape == shape
+    assert tensor.physical_shape == tuple(shape[mode] for mode in mode_order)
+    assert torch.equal(tensor.to_torch(), dense)
+
+
+def test_nonidentity_sparse_source_materializes_without_losing_logical_axes():
+    dense = torch.tensor(
+        [
+            [[0.0, 1.0, 0.0, 2.0], [0.0, 0.0, 3.0, 0.0], [4.0, 0.0, 0.0, 0.0]],
+            [[0.0, 5.0, 0.0, 0.0], [6.0, 0.0, 0.0, 7.0], [0.0, 0.0, 8.0, 0.0]],
+        ]
+    )
+    tensor = STensor.from_torch(dense.clone(), "A").change_mode_order([2, 0, 1])
+    tensor.to_sparse("sss")
+
+    tensor.to_sparse("dds")
+
+    assert str(tensor.format) == "d,d,s"
+    assert tuple(tensor.storage.index.mode_order) == (2, 0, 1)
+    assert torch.equal(tensor.to_torch(), dense)
 
 
 def test_converted_inputs_execute_through_the_compiled_mixed_route():
