@@ -769,16 +769,25 @@ def test_hand_built_program_executes_on_the_oracle():
 def _seam_cells():
     i, j = IndexVar("i"), IndexVar("j")
     f32 = torch.float32
+    # Recorded seam move: the ``ss*sd`` compressed-parent/dense-leaf
+    # co-operand that used to sit here is the admitted position-load family
+    # (``test_loopir_dense_leaf_cooperand_target.py``).  Its neighbour on the
+    # same seam -- a dense-leaf co-operand whose result carries two or more
+    # dense parents, which the one-dense-prefix rule in the assembly chain
+    # collector excludes -- keeps the exact code.
+    k, ell = IndexVar("k"), IndexVar("l")
     posload_operand = ForAll(
         i,
         ForAll(
             j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.MUL,
-                    TensorVar("A", fmt="ss")[i, j],
-                    TensorVar("B", fmt="sd")[i, j],
+            ForAll(
+                k,
+                ForAll(
+                    ell,
+                    TensorAssign(
+                        TensorVar("C", fmt="ddss")[i, j, k, ell],
+                        TensorVar("A", fmt="ddss")[i, j, k, ell],
+                    ),
                 ),
             ),
         ),
@@ -802,7 +811,6 @@ def _seam_cells():
     # (``test_loopir_rank1_assembly_target.py``).  Its neighbour on the same
     # seam -- a single compressed level under two or more dense parents,
     # which the one-dense-prefix rule excludes -- keeps the exact code.
-    k = IndexVar("k")
     multi_dense_prefix = ForAll(
         i,
         ForAll(
@@ -820,8 +828,8 @@ def _seam_cells():
         (
             "posload_co_operand",
             posload_operand,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32)),
+            (2, 3, 4, 5),
+            (((2, 3, 4, 5), f32),),
             "unsupported_program_shape",
         ),
         (
