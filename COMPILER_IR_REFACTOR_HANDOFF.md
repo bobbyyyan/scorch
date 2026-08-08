@@ -29635,3 +29635,211 @@ non-overlapping union. Do not cite the unsupported 214-test claim or reuse red
 exploratory receipts as green gates. Seal evidence only after the final
 documentation tip, exclude generated `__pycache__`, and prove every manifest
 entry verifies.
+
+## Phase-7 closure milestone: silent-correctness fixes, the format-ownership boundary, and dense-leaf co-operands (2026-08-08; supersedes the preceding prompt)
+
+Ten local commits stack on inherited tip `9ca2212`, without amending,
+reordering, or pushing:
+
+- `3bc5c07` / `67835a2` bound sparse cursors under a dense universe;
+- `2f367a4` / `d55fd4b` read one-dimensional workspace keys as scalars;
+- `2626a04` / `221ff31` own retained tensor formats at construction;
+- `fda8ef6` / `4712f4f` lower dense-leaf co-operand reads in merged cases;
+- `18d7a27` / `c927f62` retire one string-encoded var construction and narrow
+  the cursor-bound sweep to two confirmed cells.
+
+Origin remains `58e8565`; nothing was pushed; only explicit paths were staged;
+the five protected tracked files hash exactly as recorded before and after
+every commit.
+
+### Review of the inherited range: clean
+
+`d2e45c5`, `2cef248`, `efa78fe`, `29d13b8`, `67216cc`, `f216e31`, `c806db4`
+and the documentation tip were reviewed from the contracts, and **no defect was
+found inside them**.  Format/bit-width preservation, rank-1 COORDINATE
+assembly, DENSE/SINGLETON and rank rejection, the dense fast path (including
+the removed `reshape(-1)`, proven unreachable-by-construction), permuted-layout
+round trips, deep detachment and hostile-key rejection all reproduce.  The
+replacement ledger verifies **262/262**.
+
+### Two silent-correctness defects found by fresh probes, fixed first
+
+Both pre-existing, both publicly reachable, both outside the reviewed range.
+
+- **`3bc5c07`** — plain `A + B` returned **silently wrong sums** whenever the
+  lattice had a dense universe: 19 wrong results over a 5-seed x 3-shape x
+  16-format-pair sweep, up to 2.3 absolute, including `ds + dd` (CSR plus a
+  dense matrix).  An all-zero sparse receiver plus a dense operand
+  **terminated the process with SIGSEGV**.  Cause: a lattice-point case
+  selected on a bare `coord == index` equality, with an unguarded coordinate
+  load, while a dense-universe loop never exhausts the sparse cursors.  Both
+  the case guard and the load are now bounded by the cursor's own segment end.
+- **`2f367a4`** — every reduction into a sparse rank-1 result emitted
+  non-compiling C++ (the defect §41.3 characterized).  The drain subscripted a
+  `coo_workspace_1d` key, which is a scalar.  `einsum('ij->i')` and
+  `('ij->j')` now work.  This exposes a second, distinct pre-existing defect:
+  reducing two indices into a rank-1 vector still assembles malformed storage
+  (a workspace *placement* defect), which storage validation rejects and an
+  explicit test characterizes.
+
+Blast radius measured over a 1,584-cell layout enumeration: LoopIR programs
+**0 regressions / 0 newly rejected / 0 code changes / 0 arm divergence**;
+legacy source changes for 506 cells, with **zero overlap** with the 186
+byte-parity arm-instances; all four sealed capture surfaces byte-identical.
+
+### The systemic format seam: audited, and closed on the write side
+
+The audit found the seam wider and worse than §42.3 stated: five retained-object
+exposures (not one), a `TensorLayout.permutation` forge that silently transposes
+a `matmul` result, and — worst — a **process-global** consequence, because the
+prebuilt resolution memo handed its own cached format straight to result
+tensors, so forging a returned result changed every later
+`matmul(..., format='ds')` in the process.
+
+Copy-on-read was measured and rejected (+10-18% at `STensor.format` alone,
++7.6% via `parse_format`, and it would still not close the write side).  The
+boundary is installed at construction — `TensorLayout.__post_init__` and
+`TensorIndex.__init__` — through a shared `format.audit_format_state` /
+`owned_format`, fail-open so nothing previously accepted becomes an error.
+Measured neutral: interleaved three-round warm-matmul medians 0.97-1.01.
+
+**Still open, locked explicitly:** forging a tensor's *own* retained value
+objects still corrupts that tensor.  The damage no longer escapes it.  Closing
+that needs structurally unforgeable value types across four core classes and is
+a separate slice.  Three CHARACTERIZATION LOCK tests record it.
+
+### The migrated slice
+
+`fda8ef6` / `4712f4f` admit the **rank-general compressed-parent/dense-leaf
+co-operand** family (`ss*sd`, `sd*ss`, `sss*sdd`, `sss*ssd`, `dss*dsd`,
+`ssss*sddd`, plus commuted, dense-prefix and interleaved-dense forms).  The
+blocker was exactly one site — `_merged_case_value` refused `PositionLoad` —
+while the target's loop nest, the verifier's typing, the oracle and the shared
+access machinery were all already correct.  A position load is case-invariant,
+so it is admitted only when its grounding position is bound unconditionally;
+`_require_unconditional_position_load` enforces that at the target boundary,
+independently of the verifier, and both boundaries were demonstrated firing.
+
+No node kinds, canonical schema, request or schedule identity changed, and no
+CSR shortcut, format sniffing, name/regex routing or operation-specific hack
+was added.  Gate: **51 newly admitted cells (102 arm-instances), all byte-identical
+to legacy in both arms**, plus a **108-cell** sweep adding compiled execution
+versus PyTorch, byte-identical produced storage versus an independently keyed
+legacy build, honest storage, and the production oracle — across random,
+ragged, empty and dense fixtures, f32/f64, zero extents, stored explicit zeros,
+ranks 2-4 and a 3-ary chain.  Recorded seam move: `ss*sd*dd` joins the admitted
+family at byte parity.  Permuted *compressed* structure stays fail-closed and is
+recorded as a characterized boundary, not as coverage.
+
+### What remains, and the exact blockers
+
+- **Multiple dense prefixes / interleaved dense levels** (`dds`, `sds`,
+  `ddss`).  The representation is NOT the blocker — the oracle assembles a
+  `dds` result correctly with the required 21-element position array.  Two
+  concrete blockers: `_collect_assembly_chain` admits at most one dense prefix
+  loop and `_child_stream_statements` requires a stream loop below every
+  level; and, newly found, the base `_TargetLowering` **shares the legacy
+  assembler's one-dense-extent position-sizing defect** (relaxing only the CIN
+  classifier let `dds+dds` through it and produce a 5-element position array
+  where 21 were required).  The slice must drive the dense catch-up counter and
+  the result position-vector sizing from the flattened dense-prefix index.  The
+  classifier is deliberately left unchanged so that route stays unreachable.
+- **Multi-compressed reduction/TTM.**  Unchanged; the legacy comparand still
+  segfaults, so it is permanently oracle-gated.  The workspace *placement*
+  defect exposed by `2f367a4` is in the same machinery this slice must own.
+
+### Evidence corrections
+
+The compatibility census's numeric-soundness column was **vacuous** — it called
+`to_torch()` on a natively built legacy result that has no such method, so
+`matches_torch` was unset in every cell while the cell still reported
+"executed".  The harness now decodes the produced level storage directly and
+the column is real.  Every soundness claim that column was cited for was, until
+now, unverified.
+
+### Two gates outstanding
+
+The exact-tip full non-performance suite and the activating paired two-order
+latency receipt were NOT completed.  The suite collected 5,475 / 3 deselected /
+5,472 selected at `c927f62` and partitioned cleanly, but the host became
+thermally throttled mid-run (cold JIT builds fell from ~8-15 s to ~2.6 min) and
+partition 0 stopped at 559 of 684 nodes with zero failures.  An earlier
+complete-partition run at `18d7a27` -- which differs only by the test-only
+sweep-narrowing commit -- recorded 686 passed and 671 passed / 14 skipped for
+partitions 0 and 1.  Neither is a pass receipt.  Both gates must be re-run to
+completion on an unloaded host before any Phase-7 exit claim depends on them.
+Every focused battery did run to completion at the tip.
+
+### Superseding broad copy-paste prompt for the next session
+
+Continue the LoopIR migration in `/Users/bobby/scorch` on branch
+`refactor/compiler-ir-phase3-std-move-call` from the actual local tip reported
+by `git log`. Do not push, amend, squash, or reorder. Read `AGENTS.md`,
+`COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` §§41-43, and this handoff tail.
+Preserve the five protected tracked files at their recorded hashes; leave all
+unrelated GPU/CUDA, benchmark, scheduler, research, scratchpad, packaging and
+untracked material untouched; stage only explicit paths and give nontrivial
+commits descriptive bodies.
+
+Before anything else, re-run to completion on an unloaded host the two gates
+this session could not finish: the exact-tip clean detached full
+non-performance suite (runner retained in the ledger) and the activating
+paired two-order compile latency over `dl_ss_sd_mul`, `dl_sss_sdd_mul`,
+`dl_ssss_sddd_mul` and the `b3_ss_mul` control (harness retained). Treat their
+absence as an open gate, not as a pass.
+
+Then independently review `3bc5c07`, `67835a2`, `2f367a4`, `d55fd4b`,
+`2626a04`, `221ff31`, `fda8ef6`, `4712f4f`, `18d7a27`, `c927f62` and the
+documentation tip rather
+than trusting this report. Reproduce: the dense-universe cursor bound (both the
+wrong-sum sweep and the empty-operand crash, at base and at tip); the scalar
+workspace-key rule and the second, still-open two-contraction reduction defect;
+the construction-side format ownership, its fail-open behaviour, the closed
+process-global cache poisoning, and its measured hot-path neutrality; the
+`PositionLoad` merged-case admission with its UNION boundary demonstrated from
+both the verifier and the target; the 51 newly admitted byte-parity cells and
+the 108-cell evidence sweep; and every evidence-manifest entry. Add fresh
+adversarial probes and fix and commit any concrete defect before extending the
+representation.
+
+Then deliver the next Phase-7 slice in separately reviewable commits:
+
+1. Migrate the **multiple-dense-prefix / interleaved-dense output** family
+   (`dds`, `ddss`, and their unions; assess `sds` separately since its prefix
+   is not all-dense). Drive the dense catch-up counter and the result
+   position-vector sizing from the flattened dense-prefix index. Move the CIN
+   classifier, the structural router and the target together — relaxing the
+   classifier alone routes these programs into the base target, which shares
+   the legacy one-dense-extent sizing defect. Gate on the LoopIR oracle and
+   PyTorch, never byte parity: the legacy output assembler is malformed here.
+   Cover f32/f64, cancellation, explicit stored zeros, empty/ragged inputs,
+   zero extents and both arms. While you are there, consider fixing the legacy
+   output assembler's sizing defect too, and re-measure its blast radius the
+   same way §43.2 does.
+2. Then the **multi-compressed reduction/TTM** vertical, gated on the oracle
+   and PyTorch with the segfaulting legacy comparand retained only as
+   executable failure evidence, and reusing structured workspace/result
+   assembly only where an ownership audit proves it. Fold in the
+   two-contraction rank-1 reduction workspace-placement defect characterized in
+   `d55fd4b`.
+3. Consider closing the remaining half of the format seam with structurally
+   unforgeable value types (`LevelFormat`, `TensorFormat`, `TensorLayout`,
+   `TensorMetadata`), which the soundness audit judged the only airtight
+   option. It must preserve equality, hashing, pickling and every `is`
+   relationship the repository depends on, and must be measured, not assumed.
+4. Re-run the criterion-by-criterion Phase-7 exit audit over the complete
+   declared matrix. Only a genuine GO permits a read-only Phase-8
+   cutover/fallback-frequency inventory. Do not alter default dispatch, caches,
+   selectors, or delete legacy code; do not start Phase 8.5.
+
+Run focused and adversarial batteries, the deterministic **54-cell** census
+(with its now-real numeric column), separate multi-seed randomized sweeps, the
+86-case audit, every retained and activating capture, repeated compiled public
+differentials, accurately labelled paired two-order latency, full-tree
+Black/Flake8/mypy base-vs-candidate parity, `git diff --check`, and an exact-tip
+clean detached full non-performance suite in fresh-process partitions with a
+proven complete, non-overlapping union. Do not cite the unsupported 214-test
+claim, count the census heading as a cell, reuse red exploratory receipts as
+green gates, or label paired same-tip latency as A/B/A. Seal evidence only after
+the final documentation tip, exclude generated `__pycache__`, and prove every
+manifest entry verifies.

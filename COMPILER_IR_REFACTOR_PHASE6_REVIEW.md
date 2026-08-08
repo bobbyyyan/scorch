@@ -7196,3 +7196,386 @@ but do not migrate compressed-parent/dense-leaf co-operands,
 multi-compressed reduction/TTM, or multiple-dense-prefix outputs. No Phase-8
 inventory, cutover, LoopIR release-dispatch, cache/selector change, or legacy
 deletion was performed.
+
+## 43. Phase-7 closure milestone: two silent-correctness fixes, the format-ownership boundary, and the dense-leaf co-operand family (2026-08-07/08)
+
+### 43.1 Independent review of the inherited range
+
+The inherited tip was ``9ca2212``.  ``2b36b7b..9ca2212`` -- ``d2e45c5``,
+``2cef248``, ``efa78fe``, ``29d13b8``, ``67216cc``, ``f216e31``, ``c806db4``
+and the documentation tip -- was reviewed before any new work, with every
+reproducible claim re-derived from the contracts rather than from the
+committed tests.  Origin remains ``58e8565``; the five protected tracked files
+hash exactly as recorded.  The replacement ledger
+``~/.cache/scorch-codex/phase7-envelope-review-efa78fe/`` verifies
+**262/262** entries under ``shasum -a 256 -c SHA256SUMS``.
+
+**No defect was found inside the reviewed range.**  Every runtime contract it
+introduced reproduces:
+
+- exact requested rank-1 ``TensorFormat`` and per-level ``bit_width``
+  preservation, over widths ``None``/1/8/16/24/32/63/64/2**63-1, from both
+  dense and already-sparse receivers, surviving ``copy()`` and serialization;
+- rank-1 ``COMPRESSED`` versus ``COORDINATE`` assembly producing exactly
+  ``[pos, crd]`` and ``[crd]`` respectively, over an 800-case randomized
+  differential against a ``torch.nonzero`` oracle with zero failures;
+- precise rejection of ``DENSE``/``SINGLETON`` rank-1 requests and of
+  format-rank mismatches, with the receiver unmutated on every path;
+- the already-dense fast path, including the removal of its trailing
+  ``reshape(-1)``: no reachable rank-1 dense ``STensor`` can carry a non-flat,
+  non-contiguous or wrong-length ``values``, because ``SparseStorage``
+  rejects ``value.dim() != 1`` and non-contiguous values and the all-dense
+  validator forces ``numel() == prod(physical_shape)``.  The path does not
+  alias the caller's buffer;
+- nonidentity ``mode_order`` round trips through the direct block
+  materializer, and deep detachment of caller-owned ``TensorFormat`` and
+  ``LevelFormat`` state including hostile ``str``-subclass keys in both the
+  outer and nested dictionaries.
+
+Two observations are recorded rather than treated as range defects, because
+both are byte-identical at the base revision: ``to_sparse`` parses ``fmt``
+twice and routes on the first parse; and a ``bit_width`` at or above 2**63 is
+rejected at the public boundary although the ``LevelFormat`` constructor
+accepts it, which is the pre-existing repository-wide signed-int64 invariant
+applied uniformly.
+
+### 43.2 Two silent-correctness defects found by fresh probes, fixed first
+
+Both are pre-existing, publicly reachable, and outside the reviewed range.
+Both are fixed before the migration is extended.
+
+**(a) ``3bc5c07`` -- ``STensor.__add__`` returned silently wrong sums, and
+crashed on an empty sparse operand.**  A lattice point selected its case on a
+bare ``coord == index`` equality.  Under a *dense universe* -- any elementwise
+expression in which some operand's level at that index is DENSE -- the emitted
+loop is a plain counted ``for`` over the dense extent and never exhausts the
+*sparse* operands' cursors.  Once a segment drained, the cursor still
+addressed the next segment's first stored coordinate, so whenever that
+coordinate equalled the current index the next row's value was folded into
+this row.
+
+A five-seed x three-shape sweep over every supported rank-2 format pair
+produced **19 wrong results**, with errors up to 2.3 absolute.  The affected
+pairs are ``ds + dd`` (canonical CSR plus a dense matrix), ``ds + sd``,
+``ss + dd``, ``ss + sd`` and their commuted forms -- ordinary user code, with
+no exception and no warning.  Separately, an all-zero sparse receiver added to
+a dense operand **terminated the process with SIGSEGV**, because the very
+first coordinate load addressed an empty array.
+
+Each lattice-point case is now conjoined with its own cursor bound
+(``pX < pX_end``) before the coordinate comparison, and under a dense universe
+the coordinate load itself is selected on the same bound.  The value chosen
+when a cursor is spent is never observed, because every consuming case carries
+the same guard.  After the fix the same sweep produces **zero** wrong results
+and the crash is gone.
+
+**(b) ``2f367a4`` -- every reduction into a sparse rank-1 result emitted C++
+that did not compile.**  ``coo_workspace_1d`` dereferences to
+``std::pair<int64_t, T>``: its key IS the coordinate.  Every other workspace is
+``coo_workspace<T, N>``, whose key is a ``std::vector<int64_t>``.  The result
+drain subscripted the key unconditionally, so
+``scorch_vector_set(T0_crd_vec, pT, it.first[0])`` failed at build time with
+*subscripted value is not an array, pointer, or vector* -- the non-compiling
+rank-1 reduction characterized in §41.3.  A third reader of the same key in
+the same file already spelled the rule correctly; the two drain readers now
+share it, keyed on the workspace class the lowering actually selected.
+
+``scorch.einsum('ij->i')`` and ``('ij->j')`` over ``ss`` and ``ds`` receivers
+now execute and match the dense reference.  This exposes a **second, distinct**
+pre-existing defect that the compile failure had masked: reducing *two*
+indices into a rank-1 vector (``ijk->i``, ``ijk->j``) assembles malformed
+storage, because the workspace is rebuilt inside the second contraction loop
+and the drain emits one entry per (surviving, outer contracted) pair.  Storage
+validation rejects that result rather than returning it.  It is characterized
+by an explicit test, not hidden.
+
+**Blast radius, measured.**  Both fixes are confined to the legacy route.  Over
+a 1,584-cell ``d``/``s`` layout enumeration at ranks 1-4 in both automatic
+arms, every LoopIR-admitted program is byte-identical: **0 regressions, 0
+newly rejected, 0 fail-closed code changes, 0 arm divergence**.  Legacy
+generated source changes for **506 cells**, and those cells have **zero
+overlap** with the 186 arm-instances that carry a byte-parity gate -- every one
+of them is rejected by the LoopIR route.  All four sealed capture surfaces
+regenerate byte-identically: corpus **20/20**, grid **42/42**, anchors
+**22/22**, heap **11/11**.
+
+### 43.3 The systemic returned-format mutability seam (``2626a04`` / ``221ff31``)
+
+§42.3 deferred this pending an audit of every public format exposure and every
+identity consumer.  That audit was performed across five independent surfaces
+and judged from three independent stances.  It found the seam **wider and
+worse** than §42.3 described.
+
+Wider: ``tensor.format`` is one of five retained-object exposures.
+``STensor.layout``, ``STensor.metadata`` and ``STensor.storage`` also return
+the retained instance, and ``TensorLayout`` is strictly more dangerous than
+``TensorFormat`` -- forging ``permutation`` yields a silently transposed
+``matmul`` result with no exception and no format object involved at all.
+
+Worse: the damage was **process-global**.  The prebuilt matmul resolution memo
+handed its own cached ``TensorFormat`` straight through to result tensors, so
+one ``object.__setattr__`` on a *returned result* rewrote that memo and changed
+every later ``matmul(..., format='ds')`` in the process -- either raising from
+an unrelated call site or returning a bare ``torch.Tensor`` where an
+``STensor`` was contracted.
+
+The audit also settled what must *not* be done.  Copy-on-read at
+``STensor.format`` alone measured **+10% to +18%** on warm CSR-times-dense
+matmul against a +/-1% same-shape control, and would still not close the seam,
+because the hostile object enters on the write side.  Making ``parse_format``
+always rebuild measured **+7.6%** on the same shape.  Native memory safety is
+already closed independently: every prebuilt entry point re-validates through
+``csrc/native_abi.h``, and three separate attempted memory-corruption forges
+were all rejected with clean errors rather than a crash.
+
+The boundary is therefore installed **on the way in**, at the two sites that
+retain a format: ``TensorLayout.__post_init__`` (a tensor's single
+authoritative format holder) and ``TensorIndex.__init__``.
+``TensorIndex._from_layout`` needs no rebuild, because the layout already owns
+what it hands over.  ``format.audit_format_state`` performs the structural
+audit -- exact stored fields, key types proven exact ``str`` before any
+comparison or hashing, exact ``LevelType``, positive signed-int64 bit widths --
+and ``format.owned_format`` rebuilds both container layers.  ``to_sparse``'s
+``_owned_sparse_format`` now delegates to the shared audit while keeping the
+precise public error messages its locked tests require.  The boundary is
+fail-open: anything not provably structurally exact is returned unchanged, so
+no argument construction accepted before becomes an error.
+
+Cost, measured as interleaved three-round warm-matmul medians against base:
+**0.97-1.01** on csr@dense 64, csr@dense 256 and csr@csr 128 -- neutral within
+this machine's noise.  A warm dense-output matmul constructs no
+``TensorLayout``; a sparse-output one constructs exactly one.
+
+**What remains open is stated, not hidden.**  Reads are still undefended: a
+caller can forge a returned tensor's own retained value objects and
+desynchronize that tensor's declared layout from its index arrays.  The damage
+is now confined to that tensor -- it no longer escapes into a process-global
+memo or into an unrelated tensor built from the same caller value.  Closing it
+needs structurally unforgeable value types (a change to ``LevelFormat``,
+``TensorFormat``, ``TensorLayout`` and ``TensorMetadata`` covering equality,
+hashing, pickling and the dataclass surface), which is not attempted here.
+Three tests are labelled CHARACTERIZATION LOCK and record exactly that.
+
+### 43.4 The compressed-parent/dense-leaf co-operand migration (``fda8ef6`` / ``4712f4f``)
+
+An operand whose value-bearing leaf is a DENSE level below compressed
+structure -- ``sd``, ``ssd``, ``sdd``, ``dsd``, ``sddd``, ``ssdd``, ``sssd``
+and the rank-general forms -- is read through ``PositionLoad`` over a
+``DensePosition`` spine rather than through a merge cursor.  The blocker was
+localized exactly: the ordered assembly target already built the correct loop
+nest, the verifier already typed these programs, the oracle already ran them,
+and the shared access machinery already validated the spine and recorded its
+level drivers.  Only ``_merged_case_value`` -- the per-alignment-case leaf
+evaluation -- refused the node kind, so every ``ss*sd``-shaped chain failed
+closed at ``unsupported_program_shape``.
+
+A position load is case-invariant: it addresses the loaded tensor's own
+validated dense spine, not a merge cursor.  Partially evaluating it for one
+cursor-alignment case is therefore sound *provided the position it grounds at
+is bound unconditionally*.  ``SparseFor``/``SparseWindowFor`` bindings and
+INTERSECTION merges always bind; a UNION merge's binding is optional at a
+one-sided coordinate, where the loaded tensor owns no value-bearing position at
+all.  ``_require_unconditional_position_load`` enforces exactly that at the
+owning target boundary, independently of the verifier's position typing
+(``1a92f50``), which already refuses to type a UNION-bound position for a
+position-load spine.  Both boundaries were demonstrated firing on a hand-built
+program, with the INTERSECTION and cursor-read controls staying admitted.
+
+No new node kinds, no canonical-schema change, no request- or
+schedule-identity change, and no CSR shortcut, runtime-format sniffing,
+rendered-name or regex routing, or operation-specific target hack: the
+admission is expressed through the existing position and level identities
+alone.
+
+The legacy comparand is honest here, so the gate is the B1/B3 discipline:
+
+- **byte parity** over the 1,584-cell layout enumeration: **51 newly admitted
+  cells (102 arm-instances)**, every one byte-identical to
+  ``legacy_generated_cpp`` in both arms, with 0 regressions, 0 newly rejected,
+  0 code changes and 0 arm divergence;
+- a **108-cell evidence sweep** in both arms adding compiled execution against
+  the dense PyTorch reference, **byte-identical produced storage against an
+  independently keyed legacy build**, honest identity-ordered result storage,
+  and the production LoopIR oracle.  Fixtures cover random, ragged (an empty
+  leading slice), all-empty and fully dense; layouts cover ranks 2-4, both
+  operand orders, dense prefixes, interleaved dense levels and a 3-ary chain;
+  coverage includes float32 and float64, 16 zero-extent cells and hand-built
+  stored explicit zeros.  **103 of 103 non-boundary cells pass every check.**
+
+**Recorded seam move.**  ``ss*sd*dd`` -- a dense-factor widening over a
+dense-leaf co-operand -- moves from ``unsupported_program_shape`` into the
+admitted family at byte parity, joining the 3-ary intersection the target
+already carried.  ``ss+sd`` keeps ``unsupported_union_with_dense`` and ``sd``
+copy keeps ``unsupported_sparse_output_domain``.
+
+**Permuted compressed structure is not in this envelope.**  The five permuted
+cells in the sweep are recorded as a characterized boundary, not as coverage:
+``_validate_layouts`` admits permutation only for all-dense tensors, and a
+dense-leaf co-operand does not make a permuted compressed layout lowerable.
+The rejection is pre-existing and unchanged.
+
+### 43.5 The two remaining clusters, with newly localized blockers
+
+Neither is migrated.  Both blockers are now more precisely located than §41
+recorded, with executable evidence.
+
+**Multiple dense prefixes / interleaved dense levels.**  ``dds``, ``sds`` and
+``ddss`` outputs stay rejected.  A prototype confirmed the representation is
+*not* the blocker: the LoopIR oracle assembles a ``dds`` result correctly,
+producing the required 21-element position array for a 4x5 dense prefix.  Two
+concrete blockers were isolated instead.  First, ``_collect_assembly_chain``
+admits at most one dense prefix loop and ``_child_stream_statements`` requires
+a stream loop below every level, so a second dense prefix has no emission
+path.  Second -- and newly found -- the **base ``_TargetLowering`` shares the
+legacy assembler's one-dense-extent position-sizing defect**: relaxing only
+the CIN classifier let ``dds+dds`` compile through it and produce a 5-element
+position array where 21 were required, the exact failure §41.3 attributes to
+the legacy output assembler.  The generalization therefore requires the dense
+catch-up counter and the result position-vector sizing to be driven by the
+flattened dense-prefix index, not by a single loop variable.  That is a
+coherent slice of its own and is not attempted here; the classifier is
+deliberately left unchanged so the defective route stays unreachable.
+
+**Multi-compressed reduction/TTM.**  Unchanged at
+``unsupported_sparse_output``, ``unsupported_sparse_output_domain``,
+``unsupported_sparse_output_reduction`` and ``unsupported_program_shape``
+depending on the nest.  The legacy comparand still terminates with SIGSEGV, so
+this family can never claim byte parity and needs its own oracle-gated
+vertical with a workspace/result ownership audit.  §43.2(b) adds one concrete
+datum: the workspace *placement* defect it exposed -- a workspace rebuilt
+inside the second contraction loop -- is in the same machinery this slice
+would have to own.
+
+### 43.6 The regenerated compatibility census
+
+Census v10 was re-run at the tip, one cell per subprocess, with the
+numeric-soundness column repaired (§43.7).  **54 cells (12 + 14 + 13 + 15),
+all 54 arm-invariant** on their arm-resolved LoopIR and legacy source columns.
+
+- **The B group flips.**  ``ss*sd``, its commuted, f64, rank-3, rank-4, ragged
+  and empty forms, the ``ss*ds``/``ss*dd`` controls and the 3-ary
+  ``ss*sd*dd`` -- twelve of the fourteen B cells -- are now **admitted**, each
+  executing to the dense reference with well-formed identity-ordered storage.
+  ``ss+sd`` keeps ``unsupported_union_with_dense``; ``sd`` copy keeps
+  ``unsupported_sparse_output_domain``.
+- **Eight reduction/TTM cells still terminate with SIGSEGV (exit 139)** during
+  legacy execution -- C1-C7 and C13 -- exactly the eight §41.4 recorded.  Their
+  source columns are recorded by a separate compile-only pass, because the
+  crash prevents the executing pass from writing its per-cell record at all.
+- **The repaired numeric column is new evidence.**  Eight cells produce
+  malformed legacy storage (``B11``, ``D5``-``D11``), and **four of them are
+  also numerically wrong** against the dense reference: ``B11`` (``sd`` copy),
+  ``D9`` (``sds`` copy), ``D10`` (``sd+sd``) and ``D11`` (``sdd`` copy).  The
+  vacuous column had reported all of these as merely "executed".  This
+  strengthens, rather than weakens, the decision to gate the multiple-dense-
+  prefix and trailing-dense-output families on the oracle: their legacy
+  comparand is not just malformed, it is wrong.
+
+### 43.7 Evidence corrections carried forward
+
+- The compatibility census's numeric-soundness column was **vacuous**: it
+  called ``to_torch()`` on the natively built legacy result, which exposes no
+  such method, so ``matches_torch`` was unset in every cell while the harness
+  still reported the cell as "executed".  The harness now decodes the produced
+  level storage directly, and the column is real.  The soundness claims that
+  column was cited for were, until now, unverified.
+- §42.3's "input-format ownership is now closed" was too strong: three further
+  public input-side boundaries retained caller-owned formats.  §43.3 closes
+  them.
+- The "498 LoopIR / 123 runtime" memberships (§40.3), the "214 passed" line
+  and the "758 passed" pre-seam receipt remain unreproducible or exploratory
+  and are not gates.
+
+### 43.8 Verification
+
+All gates ran in the ``scorch`` conda environment; evidence is retained under
+``~/.cache/scorch-codex/phase7-closure-session/``.
+
+- **Focused batteries** at the tip: dense-universe cursor bounds **29
+  passed**; sparse rank-1 reduction drains and the dense-leaf co-operand target
+  together **202 passed**; the format-ownership boundary **17 passed**; the
+  three inherited format/conversion files **147 passed**; the LLIR string
+  budget **41 passed**.  Every one of these files is a member of the exact-tip
+  suite below.
+- **Exhaustive layout differential**: 1,584 cells x 2 automatic arms at ranks
+  1-4, base ``9ca2212`` versus candidate.  **3,066 unchanged, 0 regressions, 0
+  newly rejected, 0 fail-closed code changes, 0 arm divergence, 102
+  newly-admitted arm-instances (51 cells) every one at byte parity with
+  legacy.**  Legacy source drifts on 506 cells, with **zero overlap** with the
+  186 base byte-parity arm-instances.
+- **Family evidence sweep**: 108 cells, **103 of 103 non-boundary cells pass
+  every check** (byte parity in both arms, execution against the dense PyTorch
+  reference, honest identity-ordered storage, byte-identical storage against an
+  independently keyed legacy build, and the production oracle).  The five
+  permuted-compressed cells are recorded as a characterized boundary.
+- **Deterministic census v10** at the tip: **54 cells (12 + 14 + 13 + 15), 54
+  arm-invariant**; eight reduction/TTM cells terminate with SIGSEGV (exit 139)
+  during legacy execution and are recorded by a separate compile-only pass.
+- **Schedule audit**: **46 admitted / 40 rejected / 0 non-identical**, its JSON
+  equal to the retained baseline after removing only the commit field.
+- **Capture surfaces**: corpus **20/20**, grid **42/42**, anchors **22/22**,
+  heap **11/11** byte-identical to the retained baselines.
+- **Full-tree static parity**, base ``9ca2212`` versus candidate ``18d7a27``,
+  one invocation each of ``black --check src tests``, ``flake8 src tests`` and
+  ``mypy src``: Black **15 findings at both, identical file set**; Flake8 **47
+  at both, identical after line normalization**; mypy **140 errors in 11 files
+  at both**, whose only residual difference is a line number embedded in the
+  message of a pre-existing ``cin_lowerer.py`` finding.  Black and Flake8 are
+  not globally clean; their findings are inherited and unchanged.
+  ``git diff --check`` is clean.
+- **Exact-tip full non-performance suite: NOT COMPLETED.**  It collected
+  **5,475 / 3 performance deselected / 5,472 selected** at ``c927f62`` in a
+  clean detached worktree, partitioned into eight file-disjoint fresh-process
+  groups whose union is proven complete and non-overlapping.  The host then
+  became heavily contended and thermally throttled -- ``PerfPowerServices``
+  sustained ~196% CPU beside an unrelated user workload and cold JIT builds
+  slowed from ~8-15 s to ~2.6 min each -- and the run did not finish.
+  Partition 0, into which this partitioning concentrated the JIT-heavy files,
+  reached 559 of 684 nodes with zero failures.  An earlier complete-partition
+  run at ``18d7a27`` (which differs from ``c927f62`` only by the test-only
+  sweep-narrowing commit) recorded partition 0 at **686 passed** and partition
+  1 at **671 passed / 14 skipped**, both exit 0.  **This is not a pass
+  receipt**; the suite must be re-run to completion on an unloaded host, and
+  the runner is retained for exactly that.  Every focused battery listed above
+  did run to completion at the tip.
+- **Activating paired two-order compile latency was not run**, for the same
+  reason: a thermally throttled host cannot produce an honest latency receipt.
+  The harness is retained with the three newly activating dense-leaf cells
+  (``dl_ss_sd_mul``, ``dl_sss_sdd_mul``, ``dl_ssss_sddd_mul``) plus the shared
+  ``b3_ss_mul`` control already declared.
+- **The five protected tracked files** retain their recorded SHA-256 values;
+  live and local origin remain ``58e8565``; nothing was pushed, amended,
+  squashed or reordered; only explicit paths were staged.
+
+### 43.9 Phase-7 exit audit
+
+Criterion by criterion.  *Migrated families complete over their proven
+envelopes*: the compressed-parent/dense-leaf co-operand family is, at byte
+parity in both automatic arms with oracle and PyTorch differentials and legacy
+storage identity.  *Every neighbour carries a stable fail-closed code*: yes, in
+both arms, with one recorded seam move (``ss*sd*dd``).  *Representation
+unchanged*: no node kinds, canonical schema, request identity, schedule
+identity or erasure changed.  *Release behaviour unchanged*: the schedule audit
+equals its baseline, every sealed capture surface is byte-identical, and no
+default dispatch, cache or selector changed.  *The declared matrix is closed*:
+**it is not.**
+
+Two declared families remain unmigrated, each with a precise blocker recorded
+in §43.5: multiple dense prefixes / interleaved dense levels (blocked on the
+dense catch-up counter and result position-vector sizing, and on the base
+target's shared one-dense-extent sizing defect), and multi-compressed
+reduction/TTM (blocked on a legacy comparand that segfaults, so permanently
+oracle-gated).
+
+Two gates are additionally missing through no fault of the change set: the
+exact-tip full suite and the activating paired latency receipt could not be
+completed on a thermally throttled host.  Both are prerequisites for any exit
+claim and are recorded as outstanding, not as passes.
+
+**Phase 7 therefore does not exit on this milestone.**  No Phase-8 inventory
+was started, no cutover, cache, selector or default-dispatch change was made,
+and no legacy code was deleted.  The milestone's own contribution is
+nonetheless larger than a family migration: two pre-existing silent-correctness
+defects in public operations are closed, the process-global half of the format
+seam is closed, and the census's numeric-soundness column -- which had never
+actually run -- is now real.
