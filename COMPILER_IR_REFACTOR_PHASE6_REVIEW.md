@@ -7523,25 +7523,33 @@ All gates ran in the ``scorch`` conda environment; evidence is retained under
   message of a pre-existing ``cin_lowerer.py`` finding.  Black and Flake8 are
   not globally clean; their findings are inherited and unchanged.
   ``git diff --check`` is clean.
-- **Exact-tip full non-performance suite: PARTIALLY COMPLETED.**  It collected
-  **5,475 / 3 performance deselected / 5,472 selected** at the final tip
-  ``6436e82`` in a clean detached worktree, partitioned into eight
+- **Exact-tip full non-performance suite: PARTIALLY COMPLETED (4 of 8
+  partitions).**  It collected **5,475 / 3 performance deselected / 5,472
+  selected** in a clean detached worktree, partitioned into eight
   file-disjoint fresh-process groups whose union is proven complete and
-  non-overlapping.  **Partition 0 ran to completion: 684 passed, 0 failed,
-  719.10 s, exit 0** -- the JIT-heaviest partition, and the one carrying
-  ``test_format_ownership_boundary.py``, ``test_kernels.py``,
-  ``test_perf.py``, both ``test_known_compiler_gaps*`` files,
-  ``test_autotune_learned.py`` and ``codegen/test_regblock_dual_path.py``.
-  **Partition 1 reached 443 nodes with zero failures** before the run was
-  stopped.  Partitions 2-7 were not run at this tip.
+  non-overlapping.  Partition 0 ran **684 passed / 0 failed** (719 s),
+  partition 1 **684 passed / 0 failed** (561 s), partition 2 **682 passed / 0
+  failed** (243 s), and partition 3 reached 665 of 684 nodes with **0 failed**
+  before being stopped -- **2,050 nodes passed with zero failures**, plus 665
+  more clean but incomplete.  Partitions 4-7 were not run at this tip.
 
-  The host thermally throttles under sustained cold-cache JIT load: quiet, it
-  ran 684 nodes in twelve minutes; with ``PerfPowerServices`` back at ~197%
-  CPU, partition 1 fell to roughly four nodes per ten minutes.  That is an
-  environment limit, not a property of the change set -- **no test failed in
-  either partition**.  **This is not a complete pass receipt**; the runner is
-  retained and the suite must be re-run on a thermally unconstrained host.
-  Every focused battery listed above did run to completion at the tip.
+  **This gate earned its keep.**  Partition 1 initially failed two nodes:
+  ``test_adjacent_seams_stay_fail_closed[posload_co_operand-*]`` in the
+  single-cursor battery.  That inherited seam lock named ``ss * sd`` -- exactly
+  the cell this milestone migrates -- so it asserted
+  ``unsupported_program_shape`` for a program now admitted at byte parity.  The
+  layout differential did not catch it, because that harness compares compiler
+  outcomes and not test expectations.  ``f45a7b1`` moves the lock to the
+  neighbour that still occupies the seam and names the move in place;
+  partition 1 then passed 684/684.  The milestone's "every neighbour keeps its
+  exact code" claim was, until that commit, incomplete by exactly one
+  inherited lock.
+
+  The host thermally throttles under sustained cold-cache JIT load -- quiet, a
+  partition runs 684 nodes in four to twelve minutes; throttled, a few nodes
+  per ten minutes.  That is an environment limit, not a property of the change
+  set.  **This is not a complete pass receipt**; the runner is retained.  Every
+  focused battery listed above did run to completion at the tip.
 - **Activating paired two-order compile latency was not run**, for the same
   reason: a thermally throttled host cannot produce an honest latency receipt.
   The harness is retained with the three newly activating dense-leaf cells

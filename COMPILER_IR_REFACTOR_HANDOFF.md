@@ -29759,18 +29759,23 @@ now, unverified.
 
 ### Two gates outstanding
 
-The exact-tip full non-performance suite is PARTIALLY completed and the
-activating paired two-order latency receipt was not run.  The suite collected
-5,475 / 3 deselected / 5,472 selected at the final tip `6436e82` and
-partitioned cleanly.  **Partition 0 ran to completion: 684 passed, 0 failed,
-719.10 s, exit 0** -- the JIT-heaviest partition, carrying the format-ownership
-lock, `test_kernels.py`, both known-compiler-gaps files, the autotune battery
-and the regblock dual-path codegen tests.  **Partition 1 reached 443 nodes with
-zero failures**; partitions 2-7 were not run at this tip.  The host thermally
-throttles under sustained cold-cache JIT load -- quiet, it ran 684 nodes in
-twelve minutes; throttled, roughly four nodes per ten minutes.  No test failed
-in either partition, but this is not a complete pass receipt.  Both gates must
-be finished on a thermally unconstrained host.  Every focused battery did run
+The exact-tip full non-performance suite is PARTIALLY completed (4 of 8
+partitions) and the activating paired two-order latency receipt was not run.
+Partition 0 ran 684 passed / 0 failed, partition 1 684 passed / 0 failed,
+partition 2 682 passed / 0 failed, and partition 3 reached 665 of 684 with 0
+failed -- **2,050 nodes passed with zero failures**.  Partitions 4-7 were not
+run at this tip.
+
+The gate earned its keep: partition 1 initially failed
+`test_adjacent_seams_stay_fail_closed[posload_co_operand-*]`, an inherited seam
+lock naming `ss * sd` -- exactly the migrated cell.  `f45a7b1` moves that lock
+to the neighbour that still occupies the seam; partition 1 then passed 684/684.
+The layout differential could not have caught it, because it compares compiler
+outcomes and not test expectations.
+
+The host thermally throttles under sustained cold-cache JIT load, which is why
+the run stopped.  This is not a complete pass receipt; both gates must be
+finished on a thermally unconstrained host.  Every focused battery did run
 to completion at the tip.
 
 ### Superseding broad copy-paste prompt for the next session
