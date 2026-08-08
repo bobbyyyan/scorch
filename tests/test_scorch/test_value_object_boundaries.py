@@ -314,8 +314,10 @@ def test_stensor_requires_complete_runtime_state_and_validates_storage_metadata(
 
     storage = _dense_storage()
     tensor = STensor(name="x", storage=storage)
-    assert tensor.storage is storage
-    assert tensor.metadata.layout is storage.layout
+    assert tensor.storage is not storage
+    assert tensor.storage.value.data_ptr() == storage.value.data_ptr()
+    assert tensor.metadata.layout is tensor.storage.layout
+    assert tensor.storage.layout is not storage.layout
     assert tensor.shape == (2, 3)
     assert tensor.logical_shape == (2, 3)
     assert tensor.dtype == torch.float32

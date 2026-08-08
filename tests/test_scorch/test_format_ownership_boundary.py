@@ -34,10 +34,15 @@ from scorch.format import (
     owned_format,
     parse_format,
 )
-from scorch.exceptions import TensorFormatError, TensorTypeError
-from scorch.layout import TensorLayout
+from scorch.exceptions import (
+    TensorFormatError,
+    TensorIndexError,
+    TensorLayoutError,
+    TensorTypeError,
+)
+from scorch.layout import TensorLayout, TensorMetadata
 from scorch.stensor import STensor
-from scorch.storage import TensorIndex
+from scorch.storage import SparseStorage, TensorIndex, TensorStorage
 
 
 def csr(name="A", size=3):
@@ -98,6 +103,386 @@ def test_two_tensors_built_from_one_caller_format_do_not_share_it():
     first = TensorLayout.from_logical_shape((4, 5), caller)
     second = TensorLayout.from_logical_shape((6, 7), caller)
     assert first.format is not second.format
+
+
+def test_storages_do_not_retain_or_cross_share_a_caller_layout():
+    caller = TensorLayout.from_logical_shape((2, 2), "dd")
+    first = SparseStorage(caller, torch.arange(4.0), mode_indices=((), ()))
+    second = SparseStorage(caller, torch.arange(4.0, 8.0), mode_indices=((), ()))
+
+    assert first.layout is not caller
+    assert second.layout is not caller
+    assert first.layout is not second.layout
+    object.__setattr__(caller, "permutation", (1, 0))
+    first.validate()
+    second.validate()
+    assert first.layout.permutation == (0, 1)
+    assert second.layout.permutation == (0, 1)
+
+
+def test_tensors_do_not_cross_share_an_explicit_caller_storage_graph():
+    layout = TensorLayout.from_logical_shape((2, 2), "dd")
+    caller = SparseStorage(layout, torch.arange(4.0), mode_indices=((), ()))
+    first = STensor("A", storage=caller)
+    second = STensor("B", storage=caller)
+
+    assert first.storage is not caller
+    assert second.storage is not caller
+    assert first.storage is not second.storage
+    assert first.storage.value.data_ptr() == caller.value.data_ptr()
+    assert second.storage.value.data_ptr() == caller.value.data_ptr()
+    assert first.layout is not second.layout
+    assert first.format is not second.format
+
+    object.__setattr__(first.format, "_level_formats", (LevelFormat("o"),))
+    assert second.format == TensorFormat("dd")
+    second.storage.validate()
+
+
+def test_foreign_tensor_class_spoof_fails_closed_at_storage_boundary():
+    class TensorSpoof:
+        @property
+        def __class__(self):
+            return torch.Tensor
+
+    layout = TensorLayout.from_logical_shape((1,), "d")
+    with pytest.raises(TensorTypeError, match="torch.Tensor"):
+        SparseStorage(layout, TensorSpoof(), mode_indices=[[]])  # type: ignore[arg-type]
+
+
+def test_value_tensor_subclass_properties_cannot_interpose_on_storage():
+    class ValueBomb(torch.Tensor):
+        @staticmethod
+        def __new__(cls, value):
+            return torch.Tensor._make_subclass(cls, value, False)
+
+        @property
+        def layout(self):
+            raise RuntimeError("subclass layout must not run")
+
+    caller = ValueBomb(torch.tensor([2.0]))
+    storage = SparseStorage(
+        TensorLayout.from_logical_shape((1,), "d"), caller, mode_indices=[[]]
+    )
+    assert type(storage._value) is torch.Tensor
+    assert storage.value.data_ptr() == caller.data_ptr()
+    storage.validate()
+
+
+def test_metadata_does_not_retain_a_caller_layout_graph():
+    caller = TensorLayout.from_logical_shape((2, 3), "dd")
+    metadata = TensorMetadata("A", torch.float32, torch.device("cpu"), caller)
+
+    assert metadata.layout is not caller
+    assert metadata.layout.format is not caller.format
+    object.__setattr__(caller, "permutation", (1, 0))
+    object.__setattr__(
+        caller.format,
+        "_level_formats",
+        (LevelFormat("o"), LevelFormat("o")),
+    )
+    assert metadata.layout.permutation == (0, 1)
+    assert metadata.layout.format == TensorFormat("dd")
+    metadata.serialize()
+
+
+def test_storages_do_not_retain_or_cross_share_tensor_index_arrays():
+    caller_index = TensorIndex(
+        "s",
+        [[torch.tensor([0, 1]), torch.tensor([0])]],
+    )
+    layout = TensorLayout.from_logical_shape((3,), "s", index_dtype=torch.int64)
+    first = SparseStorage(layout, torch.tensor([5.0]), index=caller_index)
+    second = SparseStorage(layout, torch.tensor([7.0]), index=caller_index)
+
+    caller_coordinate = caller_index._mode_indices[0][1]
+    first_coordinate = first._mode_indices[0][1]
+    second_coordinate = second._mode_indices[0][1]
+    assert first_coordinate is not caller_coordinate
+    assert second_coordinate is not caller_coordinate
+    assert first_coordinate is not second_coordinate
+
+    caller_coordinate[0] = 2
+    first.validate()
+    second.validate()
+    assert first_coordinate.tolist() == [0]
+    assert second_coordinate.tolist() == [0]
+
+
+class _ToggleInt(int):
+    armed = False
+
+    def __int__(self):
+        raise RuntimeError("subclass conversion must not run")
+
+    def __hash__(self):
+        if self.armed:
+            raise RuntimeError("hash bomb")
+        return int.__hash__(self)
+
+    def __eq__(self, other):
+        if self.armed:
+            raise RuntimeError("equality bomb")
+        return int.__eq__(self, other)
+
+
+def test_retaining_boundaries_canonicalize_integer_subclasses():
+    extent = _ToggleInt(3)
+    mode = _ToggleInt(0)
+    layout = TensorLayout.from_logical_shape(
+        (extent,), "s", (mode,), index_dtype=torch.int64
+    )
+    index = TensorIndex(
+        "s",
+        [[torch.tensor([0, 1]), torch.tensor([1])]],
+        mode_order=(mode,),
+    )
+
+    assert type(layout.logical_shape[0]) is int
+    assert type(layout.physical_shape[0]) is int
+    assert type(layout.permutation[0]) is int
+    assert type(index._mode_order[0]) is int
+
+    extent.armed = True
+    mode.armed = True
+    assert layout.element_count == 3
+    SparseStorage(layout, torch.tensor([5.0]), index=index).validate()
+
+
+def test_redundant_storage_shapes_canonicalize_integer_subclasses():
+    class EqBombInt(int):
+        def __eq__(self, other):
+            raise RuntimeError("subclass equality must not run")
+
+    layout = TensorLayout.from_logical_shape((2,), "d")
+    storage = SparseStorage(layout, torch.ones(2), mode_indices=[[]])
+    tensor = STensor("A", shape=(EqBombInt(2),), storage=storage)
+    assert tensor.shape == (2,)
+    compatibility = TensorStorage(
+        layout=layout,
+        shape=(EqBombInt(2),),
+        value=torch.ones(2),
+        mode_indices=[[]],
+    )
+    compatibility.validate()
+
+
+def test_tensor_storage_owns_layout_before_redundant_shape_comparison():
+    class LayoutBomb(TensorLayout):
+        armed = False
+
+        def __getattribute__(self, name):
+            if name == "physical_shape" and type(self).armed:
+                raise RuntimeError("subclass layout property must not run")
+            return super().__getattribute__(name)
+
+    caller = LayoutBomb.from_logical_shape((2,), "d")
+    LayoutBomb.armed = True
+    storage = TensorStorage(
+        layout=caller,
+        shape=(2,),
+        value=torch.ones(2),
+        mode_indices=[[]],
+    )
+    assert type(storage.layout) is TensorLayout
+    storage.validate()
+
+    class LayoutSpoof:
+        @property
+        def __class__(self):
+            return TensorLayout
+
+    with pytest.raises(TensorTypeError, match="TensorLayout"):
+        TensorStorage(
+            layout=LayoutSpoof(),  # type: ignore[arg-type]
+            shape=(2,),
+            value=torch.ones(2),
+            mode_indices=[[]],
+        )
+
+
+@pytest.mark.parametrize("field", ["shape", "permutation", "mode_order"])
+def test_foreign_integer_class_spoofs_fail_closed(field):
+    class IntSpoof:
+        @property
+        def __class__(self):
+            return int
+
+    spoof = IntSpoof()
+    with pytest.raises(TensorTypeError, match="integer"):
+        if field == "shape":
+            TensorLayout.from_logical_shape((spoof,), "d")  # type: ignore[arg-type]
+        elif field == "permutation":
+            TensorLayout.from_logical_shape((3,), "d", (spoof,))  # type: ignore[arg-type]
+        else:
+            TensorIndex("d", [[]], mode_order=(spoof,))  # type: ignore[arg-type]
+
+
+def test_metadata_canonicalizes_a_string_subclass():
+    class ToggleStr(str):
+        armed = False
+
+        def strip(self, *args):
+            return self
+
+        def __hash__(self):
+            if self.armed:
+                raise RuntimeError("hash bomb")
+            return str.__hash__(self)
+
+    caller = ToggleStr(" A ")
+    metadata = TensorMetadata(
+        caller,
+        torch.float32,
+        torch.device("cpu"),
+        TensorLayout.from_logical_shape((1,), "d"),
+    )
+    assert type(metadata.name) is str
+    assert metadata.name == "A"
+    caller.armed = True
+    hash(metadata)
+
+
+def test_foreign_scalar_class_spoofs_fail_closed():
+    class StrSpoof:
+        @property
+        def __class__(self):
+            return str
+
+    class BoolSpoof:
+        @property
+        def __class__(self):
+            return bool
+
+    class DtypeSpoof:
+        @property
+        def __class__(self):
+            return torch.dtype
+
+    layout = TensorLayout.from_logical_shape((1,), "d")
+    with pytest.raises(TensorLayoutError, match="name"):
+        TensorMetadata(  # type: ignore[arg-type]
+            StrSpoof(), torch.float32, torch.device("cpu"), layout
+        )
+    with pytest.raises(TensorTypeError, match="requires_grad"):
+        TensorMetadata(  # type: ignore[arg-type]
+            "A", torch.float32, torch.device("cpu"), layout, BoolSpoof()
+        )
+    with pytest.raises(TensorTypeError, match="requires_grad"):
+        STensor(storage=SparseStorage(layout, torch.ones(1), mode_indices=[[]]), requires_grad=BoolSpoof())  # type: ignore[arg-type]
+    with pytest.raises(TensorTypeError, match="torch.dtype"):
+        TensorLayout.from_logical_shape(  # type: ignore[arg-type]
+            (1,), "d", index_dtype=DtypeSpoof()
+        )
+    with pytest.raises(TensorTypeError, match="torch.dtype"):
+        TensorMetadata(  # type: ignore[arg-type]
+            "A", DtypeSpoof(), torch.device("cpu"), layout
+        )
+    with pytest.raises(TensorIndexError, match="index_dtype"):
+        TensorIndex("d", [[]], index_dtype=DtypeSpoof())  # type: ignore[arg-type]
+
+
+def test_metadata_setters_preserve_the_storage_layout_owner():
+    tensor = csr("A")
+    tensor.name = "renamed"
+    assert tensor.name == "renamed"
+    assert tensor.metadata.layout is tensor.storage.layout
+    tensor.storage.validate()
+
+    tensor.requires_grad = True
+    assert tensor.requires_grad is True
+    assert tensor.metadata.layout is tensor.storage.layout
+    tensor.storage.validate()
+
+
+def test_index_tensor_subclasses_cannot_cross_retaining_boundaries():
+    class StickyTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, value):
+            return torch.Tensor._make_subclass(cls, value, False)
+
+        def detach(self):
+            return self
+
+        def clone(self, *args, **kwargs):
+            return self
+
+    caller_positions = StickyTensor(torch.tensor([0, 1], dtype=torch.int64))
+    caller_coordinates = StickyTensor(torch.tensor([1], dtype=torch.int64))
+    index = TensorIndex("s", [[caller_positions, caller_coordinates]])
+    layout = TensorLayout.from_logical_shape((3,), "s", index_dtype=torch.int64)
+    storage = SparseStorage(layout, torch.tensor([5.0]), index=index)
+
+    for retained, caller in zip(
+        index._mode_indices[0], (caller_positions, caller_coordinates)
+    ):
+        assert type(retained) is torch.Tensor
+        assert retained.data_ptr() != caller.data_ptr()
+    for retained, caller in zip(
+        storage._mode_indices[0], (caller_positions, caller_coordinates)
+    ):
+        assert type(retained) is torch.Tensor
+        assert retained.data_ptr() != caller.data_ptr()
+
+    caller_coordinates[0] = 2
+    storage.validate()
+    assert storage._mode_indices[0][1].tolist() == [1]
+
+
+def test_sparse_storage_audits_tensor_index_stored_state_without_properties():
+    class PropertyBombIndex(TensorIndex):
+        @property
+        def format(self):
+            raise RuntimeError("format property must not run")
+
+        @property
+        def mode_order(self):
+            raise RuntimeError("mode-order property must not run")
+
+        @property
+        def index_dtype(self):
+            raise RuntimeError("dtype property must not run")
+
+    index = PropertyBombIndex("s", [[torch.tensor([0, 1]), torch.tensor([1])]])
+    layout = TensorLayout.from_logical_shape((3,), "s", index_dtype=torch.int64)
+    storage = SparseStorage(layout, torch.tensor([5.0]), index=index)
+    storage.validate()
+    wrapped = STensor("A", shape=(3,), index=index, value=torch.tensor([5.0]))
+    wrapped.storage.validate()
+    compatibility = TensorStorage(index=index, value=torch.tensor([5.0]), shape=(3,))
+    compatibility.validate()
+
+
+def test_tensor_index_subclass_dict_descriptor_cannot_interpose_on_audit():
+    class DictBombIndex(TensorIndex):
+        @property
+        def __dict__(self):
+            raise RuntimeError("subclass __dict__ must not run")
+
+    index = DictBombIndex("s", [[torch.tensor([0, 1]), torch.tensor([1])]])
+    layout = TensorLayout.from_logical_shape((3,), "s", index_dtype=torch.int64)
+    SparseStorage(layout, torch.tensor([5.0]), index=index).validate()
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing_format", "missing_order", "missing_dtype", "missing_indices", "extra"],
+)
+def test_sparse_storage_rejects_malformed_tensor_index_state(malformation):
+    index = TensorIndex("s", [[torch.tensor([0, 1]), torch.tensor([1])]])
+    field = {
+        "missing_format": "_format",
+        "missing_order": "_mode_order",
+        "missing_dtype": "_index_dtype",
+        "missing_indices": "_mode_indices",
+    }.get(malformation)
+    if field is None:
+        object.__setattr__(index, "_extra", object())
+    else:
+        del index.__dict__[field]
+    layout = TensorLayout.from_logical_shape((3,), "s", index_dtype=torch.int64)
+    with pytest.raises(TensorIndexError, match="malformed stored state"):
+        SparseStorage(layout, torch.tensor([5.0]), index=index)
 
 
 def test_forging_a_result_format_does_not_poison_later_unrelated_calls():

@@ -14,9 +14,9 @@ conditional-parent discipline the compiled assembly families use.
 import pytest
 import torch
 
-from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
+from scorch.compiler.compilation_context import CompilationContext
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.diagnostics import VerificationError
+from scorch.exceptions import TensorStorageError
 from scorch.format import LevelFormat, LevelType, TensorFormat
 from scorch.stensor import STensor
 from tests.test_scorch.test_loopir_mixed_operand_target import (
@@ -142,21 +142,19 @@ def test_dense_suffix_conversion_rejects_a_context_for_foreign_options():
         )
 
 
-def test_rank_mismatch_keeps_the_staged_historical_failure():
+def test_rank_mismatch_fails_atomically_before_opening_a_stage():
     dense = STensor.from_torch(torch.eye(2), "A")
     options = CompileOptions.from_environment(environ={})
     context = CompilationContext(options)
 
-    with pytest.raises(VerificationError):
+    with pytest.raises(TensorStorageError, match="format rank"):
         dense.to_sparse(
             "sdd",
             _compile_options=options,
             _compilation_context=context,
         )
 
-    assert [record.stage_id for record in context.stage_run_records] == [
-        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION
-    ]
+    assert context.stage_run_records == ()
 
 
 def test_sparse_source_densification_uses_the_supplied_context():
