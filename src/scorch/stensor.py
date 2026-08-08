@@ -1,7 +1,6 @@
 from __future__ import annotations
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import replace
 from typing import Dict, Optional, Tuple, Union, List
 
 import torch
@@ -29,8 +28,13 @@ from .exceptions import (
     TensorValidationError,
 )
 from .format import TensorFormat, LevelFormat, LevelType, audit_format_state
-from .layout import TensorLayout, TensorMetadata
-from .storage import SparseStorage, TensorIndex
+from .layout import TensorLayout, TensorMetadata, _normalize_shape
+from .storage import (
+    SparseStorage,
+    TensorIndex,
+    _owned_sparse_storage,
+    _owned_tensor_index_components,
+)
 from .utils import (
     parse_format,
     _kernel_name,
@@ -287,25 +291,21 @@ class STensor:
         requires_grad: Optional[bool] = False,
     ) -> None:
         tensor_name = "tensor" if name is None else name
-        if not isinstance(requires_grad, bool):
+        if type(requires_grad) is not bool:
             raise TensorTypeError("requires_grad must be a bool")
         if storage is not None:
             if index is not None or value is not None:
                 raise TensorStorageError(
                     "storage cannot be combined with separate index or value arguments"
                 )
-            if not isinstance(storage, SparseStorage):
-                raise TensorTypeError("storage must be a SparseStorage")
+            runtime_storage = _owned_sparse_storage(storage)
             if shape is not None:
-                if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
-                    raise TensorTypeError("shape must be a sequence of integers")
-                declared_shape = tuple(shape)
-                if declared_shape != storage.layout.physical_shape:
+                declared_shape = _normalize_shape(shape, "shape")
+                if declared_shape != runtime_storage.layout.physical_shape:
                     raise TensorLayoutError(
                         f"shape {declared_shape} does not match storage physical "
-                        f"shape {storage.layout.physical_shape}"
+                        f"shape {runtime_storage.layout.physical_shape}"
                     )
-            runtime_storage = storage
         else:
             missing = [
                 field
@@ -321,17 +321,18 @@ class STensor:
                     "runtime STensor construction requires shape, index, and value; "
                     f"missing {', '.join(missing)}. Use TensorSpec for compile-only tensors."
                 )
-            if not isinstance(index, TensorIndex):
-                raise TensorTypeError("index must be a TensorIndex")
             if not isinstance(value, torch.Tensor):
                 raise TensorTypeError("value must be a torch.Tensor")
             if shape is None:
                 raise TensorLayoutError("shape is required for runtime storage")
+            index_format, _, index_order, index_dtype = _owned_tensor_index_components(
+                index, own_arrays=False
+            )
             layout = TensorLayout.from_physical_shape(
-                shape, index.format, index.mode_order, index.index_dtype
+                shape, index_format, index_order, index_dtype
             )
             runtime_storage = SparseStorage(layout, value, index=index)
-        metadata = TensorMetadata(
+        metadata = TensorMetadata._from_owned_layout(
             tensor_name,
             runtime_storage.value.dtype,
             runtime_storage.value.device,
@@ -354,7 +355,7 @@ class STensor:
             raise TensorTypeError("metadata must be TensorMetadata")
         if not isinstance(storage, SparseStorage):
             raise TensorTypeError("storage must be SparseStorage")
-        if metadata.layout != storage.layout:
+        if metadata.layout is not storage.layout:
             raise TensorLayoutError(
                 "metadata and storage must reference the same layout"
             )
@@ -424,7 +425,13 @@ class STensor:
 
     @name.setter
     def name(self, name: str) -> None:
-        self._metadata = replace(self._metadata, name=name)
+        self._metadata = TensorMetadata._from_owned_layout(
+            name=name,
+            dtype=self._metadata.dtype,
+            device=self._metadata.device,
+            layout=self._storage.layout,
+            requires_grad=self._metadata.requires_grad,
+        )
 
     @property
     def values(self) -> torch.Tensor:
@@ -534,9 +541,15 @@ class STensor:
 
     @requires_grad.setter
     def requires_grad(self, value: bool) -> None:
-        if not isinstance(value, bool):
+        if type(value) is not bool:
             raise TensorTypeError("requires_grad must be a bool")
-        self._metadata = replace(self._metadata, requires_grad=value)
+        self._metadata = TensorMetadata._from_owned_layout(
+            name=self._metadata.name,
+            dtype=self._metadata.dtype,
+            device=self._metadata.device,
+            layout=self._storage.layout,
+            requires_grad=value,
+        )
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -833,7 +846,7 @@ class STensor:
         :meth:`clone` is an alias for this operation.
         """
         storage = self.storage.copy()
-        metadata = TensorMetadata(
+        metadata = TensorMetadata._from_owned_layout(
             name=self.metadata.name,
             dtype=self.metadata.dtype,
             device=self.metadata.device,

@@ -23,7 +23,12 @@ from .format import (
     owned_format,
     parse_format,
 )
-from .layout import TensorLayout, validate_runtime_contract
+from .layout import (
+    TensorLayout,
+    _normalize_shape,
+    owned_layout,
+    validate_runtime_contract,
+)
 
 IndexModes = Tuple[Tuple[torch.Tensor, ...], ...]
 _INDEX_DTYPES = (torch.int32, torch.int64)
@@ -74,34 +79,57 @@ def _normalize_mode_indices(
             )
         normalized_arrays = []
         for slot, index in enumerate(arrays):
-            if not isinstance(index, torch.Tensor):
+            index_type = type(index)
+            try:
+                mro = type.__getattribute__(index_type, "__mro__")
+            except Exception as error:
+                raise TensorTypeError(
+                    f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
+                ) from error
+            if not any(base is torch.Tensor for base in mro):
                 raise TensorTypeError(
                     f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
                 )
-            if index.layout != torch.strided:
+            try:
+                base = torch.Tensor.as_subclass(index, torch.Tensor)
+            except Exception as error:
+                raise TensorIndexError(
+                    f"mode_indices[{mode}][{slot}] is malformed"
+                ) from error
+            if type(base) is not torch.Tensor:
+                raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
+            if base.layout != torch.strided:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must use strided storage"
                 )
-            if index.device.type != "cpu":
+            if base.device.type != "cpu":
                 raise TensorDeviceError(
-                    f"mode_indices[{mode}][{slot}] must be on CPU, got {index.device}"
+                    f"mode_indices[{mode}][{slot}] must be on CPU, got {base.device}"
                 )
-            if index.dtype not in _INDEX_DTYPES:
+            if base.dtype not in _INDEX_DTYPES:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must use int32 or int64, "
-                    f"got {index.dtype}"
+                    f"got {base.dtype}"
                 )
-            if index.dim() != 1:
+            if base.dim() != 1:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must be one-dimensional"
                 )
-            if not index.is_contiguous():
+            if not base.is_contiguous():
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must be contiguous"
                 )
             # Index coordinates are structural data.  Own an independent copy so
             # caller mutation cannot invalidate a previously validated object.
-            normalized_arrays.append(index.detach().clone())
+            try:
+                owned = torch.Tensor.clone(torch.Tensor.detach(base))
+            except Exception as error:
+                raise TensorIndexError(
+                    f"mode_indices[{mode}][{slot}] is malformed"
+                ) from error
+            if type(owned) is not torch.Tensor:
+                raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
+            normalized_arrays.append(owned)
         normalized.append(tuple(normalized_arrays))
     return tuple(normalized)
 
@@ -178,9 +206,13 @@ class TensorIndex:
                 mode_order, Sequence
             ):
                 raise TensorTypeError("mode_order must be a sequence of integers")
-            order = tuple(mode_order)
-        if any(isinstance(mode, bool) or not isinstance(mode, int) for mode in order):
-            raise TensorTypeError("mode_order entries must be integers")
+            supplied_order = tuple(mode_order)
+            if any(
+                type(mode) is bool or not issubclass(type(mode), int)
+                for mode in supplied_order
+            ):
+                raise TensorTypeError("mode_order entries must be integers")
+            order = tuple(int.__int__(mode) for mode in supplied_order)
         if len(order) != tensor_format.get_order() or sorted(order) != list(
             range(tensor_format.get_order())
         ):
@@ -199,6 +231,11 @@ class TensorIndex:
             if index_dtype is None and observed is None
             else (observed if index_dtype is None else index_dtype)
         )
+        if type(declared) is not torch.dtype:
+            raise TensorIndexError(
+                "index_dtype must be torch.int32 or torch.int64, got "
+                f"{type(declared).__name__}"
+            )
         if declared not in _INDEX_DTYPES:
             raise TensorIndexError(
                 f"index_dtype must be torch.int32 or torch.int64, got {declared}"
@@ -318,6 +355,53 @@ class TensorIndex:
 
     def get_sizes(self) -> List[int]:
         return [self.get_size(mode) for mode in range(self.get_order())]
+
+
+def _owned_tensor_index_components(
+    index: object,
+    *,
+    own_arrays: bool = True,
+) -> Tuple[TensorFormat, IndexModes, Tuple[int, ...], torch.dtype]:
+    """Audit and detach a retained ``TensorIndex`` without virtual reads."""
+
+    index_type = type(index)
+    try:
+        mro = type.__getattribute__(index_type, "__mro__")
+    except Exception as error:
+        raise TensorTypeError("index must be a TensorIndex") from error
+    if not any(base is TensorIndex for base in mro):
+        raise TensorTypeError("index must be a TensorIndex")
+    try:
+        state = TensorIndex.__dict__["__dict__"].__get__(index, TensorIndex)
+    except Exception as error:
+        raise TensorIndexError("index has malformed stored state") from error
+    expected = {"_format", "_mode_indices", "_mode_order", "_index_dtype"}
+    if (
+        type(state) is not dict
+        or any(type(key) is not str for key in state)
+        or set(state) != expected
+        or type(state["_mode_indices"]) is not tuple
+        or any(type(arrays) is not tuple for arrays in state["_mode_indices"])
+        or type(state["_mode_order"]) is not tuple
+    ):
+        raise TensorIndexError("index has malformed stored state")
+
+    tensor_format = owned_format(state["_format"])
+    supplied_order = state["_mode_order"]
+    if any(
+        type(mode) is bool or not issubclass(type(mode), int) for mode in supplied_order
+    ):
+        raise TensorIndexError("index has malformed stored state")
+    order = tuple(int.__int__(mode) for mode in supplied_order)
+    index_dtype = state["_index_dtype"]
+    if type(index_dtype) is not torch.dtype:
+        raise TensorIndexError("index has malformed stored state")
+    normalized = (
+        _normalize_mode_indices(state["_mode_indices"], tensor_format)
+        if own_arrays
+        else state["_mode_indices"]
+    )
+    return tensor_format, normalized, order, index_dtype
 
 
 def _check_coordinate_bounds(coordinate: torch.Tensor, extent: int, label: str) -> None:
@@ -468,42 +552,61 @@ class SparseStorage:
         mode_indices: Optional[Sequence[Sequence[torch.Tensor]]] = None,
         index: Optional[TensorIndex] = None,
     ) -> None:
-        if not isinstance(layout, TensorLayout):
-            raise TensorTypeError("SparseStorage layout must be a TensorLayout")
-        if not isinstance(value, torch.Tensor):
+        layout = owned_layout(layout)
+        value_type = type(value)
+        try:
+            value_mro = type.__getattribute__(value_type, "__mro__")
+        except Exception as error:
+            raise TensorTypeError(
+                "SparseStorage value must be a torch.Tensor"
+            ) from error
+        if not any(base is torch.Tensor for base in value_mro):
             raise TensorTypeError("SparseStorage value must be a torch.Tensor")
-        if value.layout != torch.strided:
+        try:
+            base_value = torch.Tensor.as_subclass(value, torch.Tensor)
+        except Exception as error:
+            raise TensorStorageError("values tensor is malformed") from error
+        if type(base_value) is not torch.Tensor:
+            raise TensorStorageError("values tensor is malformed")
+        if base_value.layout != torch.strided:
             raise TensorStorageError("values must use strided storage")
-        if value.device.type != "cpu":
-            raise TensorDeviceError(f"Scorch values must be on CPU, got {value.device}")
-        if value.dim() != 1:
+        if base_value.device.type != "cpu":
+            raise TensorDeviceError(
+                f"Scorch values must be on CPU, got {base_value.device}"
+            )
+        if base_value.dim() != 1:
             raise TensorStorageError("values must be a flat one-dimensional tensor")
-        if not value.is_contiguous():
+        if not base_value.is_contiguous():
             raise TensorStorageError("values must be contiguous")
-        if value.is_neg() or value.is_conj():
+        if base_value.is_neg() or base_value.is_conj():
             raise TensorStorageError(
                 "values must resolve lazy negative and conjugate view bits"
             )
-        validate_runtime_contract(layout.format, value.dtype)
+        validate_runtime_contract(layout.format, base_value.dtype)
         if (mode_indices is None) == (index is None):
             raise TensorStorageError(
                 "provide exactly one of mode_indices or a TensorIndex"
             )
         if index is not None:
-            if not isinstance(index, TensorIndex):
-                raise TensorTypeError("index must be a TensorIndex")
-            if index.format != layout.format:
+            (
+                index_format,
+                normalized,
+                index_order,
+                index_dtype,
+            ) = _owned_tensor_index_components(index)
+            if index_format != layout.format:
                 raise TensorIndexError("index format does not match storage layout")
-            if tuple(index.mode_order) != layout.permutation:
+            if index_order != layout.permutation:
                 raise TensorIndexError("index mode_order does not match storage layout")
-            if index.index_dtype != layout.index_dtype:
+            if index_dtype != layout.index_dtype:
                 raise TensorIndexError("index dtype does not match storage layout")
-            normalized = index._mode_indices
         else:
             normalized = _normalize_mode_indices(mode_indices, layout.format)  # type: ignore[arg-type]
         # Keep tensor metadata independent from the caller while retaining normal
         # tensor payload aliasing semantics for element updates.
-        owned_value = value.detach()
+        owned_value = torch.Tensor.detach(base_value)
+        if type(owned_value) is not torch.Tensor:
+            raise TensorStorageError("values tensor is malformed")
         _validate_index_storage(layout, normalized, owned_value)
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_mode_indices", normalized)
@@ -546,25 +649,13 @@ class SparseStorage:
         _validate_index_storage(self._layout, self._mode_indices, self._value)
 
     def copy(self) -> "SparseStorage":
-        # A storage copy must not retain the source's metadata graph.  In
-        # particular, ``TensorFormat`` is frozen only by convention -- a
-        # caller can still use ``object.__setattr__`` -- so sharing the layout
-        # let a mutation through the copy rewrite the source tensor too.
-        layout = TensorLayout(
-            logical_shape=self._layout.logical_shape,
-            physical_shape=self._layout.physical_shape,
-            format=self._layout.format,
-            permutation=self._layout.permutation,
-            index_dtype=self._layout.index_dtype,
-        )
-        indices = tuple(
-            tuple(index.clone().detach() for index in arrays)
-            for arrays in self._mode_indices
-        )
+        # The constructor detaches both retaining graphs. Passing the owned
+        # values directly avoids cloning them once here and a second time in
+        # their canonicalizers.
         return SparseStorage(
-            layout,
+            self._layout,
             self._value.clone(),
-            mode_indices=indices,
+            mode_indices=self._mode_indices,
         )
 
     def __eq__(self, other: object) -> bool:
@@ -640,6 +731,36 @@ class SparseStorage:
     __repr__ = __str__
 
 
+def _owned_sparse_storage(storage: object) -> SparseStorage:
+    """Detach a storage's structural graph while preserving payload aliasing."""
+
+    storage_type = type(storage)
+    try:
+        mro = type.__getattribute__(storage_type, "__mro__")
+    except Exception as error:
+        raise TensorTypeError("storage must be a SparseStorage") from error
+    if not any(base is SparseStorage for base in mro):
+        raise TensorTypeError("storage must be a SparseStorage")
+    try:
+        state = SparseStorage.__dict__["__dict__"].__get__(storage, SparseStorage)
+    except Exception as error:
+        raise TensorStorageError("storage has malformed stored state") from error
+    expected = {"_layout", "_mode_indices", "_value"}
+    if (
+        type(state) is not dict
+        or any(type(key) is not str for key in state)
+        or set(state) != expected
+        or type(state["_mode_indices"]) is not tuple
+        or any(type(arrays) is not tuple for arrays in state["_mode_indices"])
+    ):
+        raise TensorStorageError("storage has malformed stored state")
+    return SparseStorage(
+        state["_layout"],
+        state["_value"],
+        mode_indices=state["_mode_indices"],
+    )
+
+
 class TensorStorage(SparseStorage):
     """Compatibility constructor that still produces validated SparseStorage.
 
@@ -672,17 +793,21 @@ class TensorStorage(SparseStorage):
                     "TensorStorage requires a layout or complete index/value/shape; "
                     f"missing {', '.join(missing)}"
                 )
-            if not isinstance(index, TensorIndex):
-                raise TensorTypeError("index must be a TensorIndex")
+            index_format, _, index_order, index_dtype = _owned_tensor_index_components(
+                index, own_arrays=False
+            )
             layout = TensorLayout.from_physical_shape(
-                shape, index.format, index.mode_order, index.index_dtype  # type: ignore[arg-type]
+                shape,  # type: ignore[arg-type]
+                index_format,
+                index_order,
+                index_dtype,
             )
         elif shape is not None:
-            if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
-                raise TensorTypeError("TensorStorage shape must be a sequence")
-            if tuple(shape) != layout.physical_shape:
+            layout = owned_layout(layout)
+            declared_shape = _normalize_shape(shape, "TensorStorage shape")
+            if declared_shape != layout.physical_shape:
                 raise TensorLayoutError(
-                    f"TensorStorage shape {tuple(shape)} does not match layout "
+                    f"TensorStorage shape {declared_shape} does not match layout "
                     f"physical shape {layout.physical_shape}"
                 )
         if value is None:

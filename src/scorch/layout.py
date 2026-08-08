@@ -56,10 +56,15 @@ def _normalize_shape(shape: ShapeLike, field: str) -> Tuple[int, ...]:
     normalized = []
     product = 1
     for mode, extent in enumerate(shape):
-        if isinstance(extent, bool) or not isinstance(extent, int):
+        extent_type = type(extent)
+        if extent_type is bool or not issubclass(extent_type, int):
             raise TensorTypeError(
                 f"{field}[{mode}] must be an integer, got {type(extent).__name__}"
             )
+        # Do not retain or execute arithmetic supplied by an ``int``
+        # subclass after this boundary.  Calling the base descriptor directly
+        # both bypasses an overridden ``__int__`` and produces an exact int.
+        extent = int.__int__(extent)
         if extent < 0:
             raise TensorLayoutError(f"{field}[{mode}] must be nonnegative")
         if extent > _MAX_INT64:
@@ -78,9 +83,10 @@ def _normalize_permutation(
         return tuple(range(rank))
     if isinstance(permutation, (str, bytes)) or not isinstance(permutation, Sequence):
         raise TensorTypeError("layout permutation must be a sequence of integers")
-    result = tuple(permutation)
-    if any(isinstance(mode, bool) or not isinstance(mode, int) for mode in result):
+    supplied = tuple(permutation)
+    if any(type(mode) is bool or not issubclass(type(mode), int) for mode in supplied):
         raise TensorTypeError("layout permutation entries must be integers")
+    result = tuple(int.__int__(mode) for mode in supplied)
     if len(result) != rank:
         raise TensorLayoutError(
             f"layout permutation has rank {len(result)}, expected {rank}"
@@ -97,14 +103,14 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 def _parse_dtype(value: Union[str, torch.dtype], field: str) -> torch.dtype:
-    if isinstance(value, torch.dtype):
+    if type(value) is torch.dtype:
         return value
-    if isinstance(value, str):
-        name = value.removeprefix("torch.")
+    if issubclass(type(value), str):
+        name = str.removeprefix(str.__str__(value), "torch.")
         parsed = getattr(torch, name, None)
-        if isinstance(parsed, torch.dtype):
+        if type(parsed) is torch.dtype:
             return parsed
-    raise TensorTypeError(f"{field} must be a torch.dtype, got {value!r}")
+    raise TensorTypeError(f"{field} must be a torch.dtype, got {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -248,6 +254,52 @@ class TensorLayout:
             raise TensorLayoutError("serialized layout is malformed") from error
 
 
+def owned_layout(layout: object) -> TensorLayout:
+    """Return a detached canonical layout from exact stored base state.
+
+    ``TensorLayout`` is frozen only by convention. Retaining a caller's object
+    lets later ``object.__setattr__`` mutation rewrite every storage or metadata
+    value that shares it. Canonical subclasses remain accepted, but subclass
+    descriptors are bypassed and extra/malformed stored state fails closed.
+    """
+
+    try:
+        is_layout = issubclass(type(layout), TensorLayout)
+    except TypeError:
+        is_layout = False
+    if not is_layout:
+        raise TensorTypeError("layout must be a TensorLayout")
+    state = TensorLayout.__dict__["__dict__"].__get__(layout, TensorLayout)
+    expected = {
+        "logical_shape",
+        "physical_shape",
+        "format",
+        "permutation",
+        "index_dtype",
+    }
+    if (
+        type(state) is not dict
+        or any(type(key) is not str for key in state)
+        or set(state) != expected
+        or type(state["logical_shape"]) is not tuple
+        or type(state["physical_shape"]) is not tuple
+        or type(state["permutation"]) is not tuple
+    ):
+        raise TensorLayoutError("layout has malformed stored state")
+    try:
+        return TensorLayout(
+            logical_shape=state["logical_shape"],
+            physical_shape=state["physical_shape"],
+            format=state["format"],
+            permutation=state["permutation"],
+            index_dtype=state["index_dtype"],
+        )
+    except (TensorTypeError, TensorLayoutError):
+        raise
+    except Exception as error:
+        raise TensorLayoutError("layout has malformed stored state") from error
+
+
 @dataclass(frozen=True)
 class TensorMetadata:
     """All non-payload runtime tensor metadata in one immutable value."""
@@ -259,7 +311,14 @@ class TensorMetadata:
     requires_grad: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name.strip():
+        self._normalize_fields(own_layout=True)
+
+    def _normalize_fields(self, *, own_layout: bool) -> None:
+        if not issubclass(type(self.name), str):
+            raise TensorLayoutError("tensor name must be a non-empty string")
+        # Bypass a subclass override and retain an exact immutable ``str``.
+        name = str.strip(self.name)
+        if not name:
             raise TensorLayoutError("tensor name must be a non-empty string")
         dtype = _parse_dtype(self.dtype, "dtype")
         try:
@@ -270,14 +329,45 @@ class TensorMetadata:
             raise TensorDeviceError(
                 f"Scorch runtime tensors must be on CPU, got {device}"
             )
-        if not isinstance(self.layout, TensorLayout):
-            raise TensorTypeError("metadata layout must be a TensorLayout")
-        validate_runtime_contract(self.layout.format, dtype)
-        if not isinstance(self.requires_grad, bool):
+        if own_layout:
+            layout = owned_layout(self.layout)
+        elif type(self.layout) is TensorLayout:
+            layout = self.layout
+        else:
+            raise TensorTypeError("owned metadata layout must be a TensorLayout")
+        validate_runtime_contract(layout.format, dtype)
+        if type(self.requires_grad) is not bool:
             raise TensorTypeError("requires_grad must be a bool")
-        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "name", name)
         object.__setattr__(self, "dtype", dtype)
         object.__setattr__(self, "device", device)
+        object.__setattr__(self, "layout", layout)
+
+    @classmethod
+    def _from_owned_layout(
+        cls,
+        name: str,
+        dtype: torch.dtype,
+        device: torch.device,
+        layout: TensorLayout,
+        requires_grad: bool = False,
+    ) -> "TensorMetadata":
+        """Build metadata sharing one storage-owned canonical layout.
+
+        Public construction always detaches its caller. A runtime tensor,
+        however, intentionally has one layout object jointly owned by its
+        metadata and storage; this private boundary preserves that invariant
+        without copying the already-owned value a second time.
+        """
+
+        metadata = object.__new__(cls)
+        object.__setattr__(metadata, "name", name)
+        object.__setattr__(metadata, "dtype", dtype)
+        object.__setattr__(metadata, "device", device)
+        object.__setattr__(metadata, "layout", layout)
+        object.__setattr__(metadata, "requires_grad", requires_grad)
+        metadata._normalize_fields(own_layout=False)
+        return metadata
 
     def to_dict(self) -> Mapping[str, Any]:
         return {
