@@ -650,7 +650,7 @@ class _TargetLowering:
             fail("the target program graph must remain an exact LoopProgram")
         return tuple(signature)
 
-    def _validated_target_state_signature(
+    def _validated_target_state_signature(  # noqa: C901
         self,
         *,
         owners: Optional[List[object]] = None,
