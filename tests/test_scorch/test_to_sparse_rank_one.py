@@ -10,6 +10,8 @@ owns.  Three consequences, all covered here:
   ``to_sparse('s')`` on an already-compressed rank-1 tensor reinterpreted
   positions as coordinates and silently corrupted it;
 - a wrong-rank or dense request silently produced compressed storage;
+- an unparseable request was swallowed and silently treated as the default
+  compressed format;
 - foreign ``_compile_options``/``_compilation_context`` objects were never
   rejected, and a sparse source recorded no densification work.
 
@@ -228,10 +230,51 @@ def test_dense_rank_one_source_does_not_take_the_densification_path(monkeypatch)
     assert coordinates(tensor) == [1, 4]
 
 
-def test_unparseable_format_keeps_the_historical_path():
-    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse("not-a-format")
-    assert str(tensor.format) == "s"
-    assert coordinates(tensor) == [1, 4]
+@pytest.mark.parametrize("shape", [(6,), (2, 3)], ids=["rank1", "rank2"])
+@pytest.mark.parametrize(
+    "bad_format", ["not-a-format", ["s", "not-a-format"], object()]
+)
+def test_unparseable_format_fails_atomically_at_every_rank(shape, bad_format):
+    tensor = STensor.from_torch(
+        torch.arange(6, dtype=torch.float32).reshape(shape), "A"
+    )
+    metadata = tensor.metadata
+    storage = tensor.storage
+    values = tensor.storage.value.clone()
+
+    with pytest.raises((TensorFormatError, TensorTypeError)):
+        tensor.to_sparse(bad_format)
+
+    assert tensor.metadata is metadata
+    assert tensor.storage is storage
+    assert tensor.format.is_dense()
+    assert torch.equal(tensor.storage.value, values)
+
+
+@pytest.mark.parametrize("mixed_format", ["do", "so", "od", "os"])
+def test_rank2_mixed_coordinate_request_fails_atomically(mixed_format):
+    dense = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    tensor = STensor.from_torch(dense.clone(), "A")
+    metadata = tensor.metadata
+    storage = tensor.storage
+    values = storage.value.clone()
+
+    with pytest.raises(
+        TensorStorageError, match="does not support mixed coordinate hierarchies"
+    ):
+        tensor.to_sparse(mixed_format)
+
+    assert tensor.metadata is metadata
+    assert tensor.storage is storage
+    assert torch.equal(tensor.storage.value, values)
+    assert torch.equal(tensor.to_torch(), dense)
+
+
+def test_rank2_all_coordinate_request_still_round_trips():
+    dense = torch.tensor([[0.0, 2.0, 0.0], [3.0, 0.0, 4.0]])
+    tensor = STensor.from_torch(dense.clone(), "A").to_sparse("oo")
+    assert str(tensor.format) == "o,o"
+    assert torch.equal(tensor.to_torch(), dense)
 
 
 @pytest.mark.parametrize("bad", [object(), "options", 3])

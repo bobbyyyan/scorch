@@ -22,6 +22,7 @@ separate change to four core types (equality, hashing, pickling, and the
 dataclass surface) and is not attempted here.
 """
 
+import pytest
 import torch
 
 import scorch
@@ -33,6 +34,7 @@ from scorch.format import (
     owned_format,
     parse_format,
 )
+from scorch.exceptions import TensorFormatError, TensorTypeError
 from scorch.layout import TensorLayout
 from scorch.stensor import STensor
 from scorch.storage import TensorIndex
@@ -120,25 +122,34 @@ def test_forging_a_result_format_does_not_poison_later_unrelated_calls():
     assert torch.allclose(later.to_torch(), torch.eye(3), atol=1e-6)
 
 
-# -- fail-open behaviour is preserved ----------------------------------------
+# -- canonical subclasses and malformed state -------------------------------
 
 
 class _FormatSubclass(TensorFormat):
     pass
 
 
-def test_a_format_subclass_is_still_accepted_unchanged():
-    """The boundary must not tighten what construction accepted before."""
+class _LevelFormatSubclass(LevelFormat):
+    pass
+
+
+def test_a_canonical_format_subclass_is_accepted_but_detached():
+    """Subclass values keep their semantics without crossing ownership."""
 
     caller = _FormatSubclass("ds")
     layout = TensorLayout.from_logical_shape((4, 5), caller)
-    assert layout.format is caller
+    assert layout.format is not caller
+    assert type(layout.format) is TensorFormat
+    assert layout.format.serialize() == caller.serialize()
 
 
-def test_owned_format_returns_non_exact_inputs_unchanged():
+def test_owned_format_canonicalizes_a_structurally_plain_subclass():
     caller = _FormatSubclass("ds")
-    assert owned_format(caller) is caller
-    assert audit_format_state(caller) is None
+    owned = owned_format(caller)
+    assert owned is not caller
+    assert type(owned) is TensorFormat
+    assert owned.serialize() == caller.serialize()
+    assert audit_format_state(caller) is not None
 
 
 def test_owned_format_rebuilds_an_exact_format():
@@ -160,12 +171,129 @@ def test_audit_rejects_a_forged_bit_width():
     assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is None
 
 
+@pytest.mark.parametrize("owner", ["layout", "index"])
+@pytest.mark.parametrize(
+    "malformation", ["list_levels", "tuple_subclass", "extra_key", "invalid_level"]
+)
+def test_retaining_boundaries_reject_malformed_format_state(owner, malformation):
+    class TupleSubclass(tuple):
+        pass
+
+    caller = TensorFormat("ds")
+    levels = caller.get_level_formats()
+    if malformation == "list_levels":
+        object.__setattr__(caller, "_level_formats", list(levels))
+    elif malformation == "tuple_subclass":
+        object.__setattr__(caller, "_level_formats", TupleSubclass(levels))
+    elif malformation == "extra_key":
+        object.__setattr__(caller, "_extra", object())
+    else:
+        object.__setattr__(levels[1], "_mode", "s")
+
+    with pytest.raises(TensorFormatError, match="malformed stored state"):
+        if owner == "layout":
+            TensorLayout.from_logical_shape((2, 3), caller)
+        else:
+            TensorIndex(
+                tensor_format=caller,
+                mode_indices=[[], [torch.tensor([0, 1, 1]), torch.tensor([0])]],
+            )
+
+
+def test_two_layouts_built_from_one_subclass_do_not_share_it():
+    caller = _FormatSubclass("ds")
+    first = TensorLayout.from_logical_shape((2, 3), caller)
+    second = TensorLayout.from_logical_shape((4, 5), caller)
+    assert first.format is not caller
+    assert second.format is not caller
+    assert first.format is not second.format
+
+
+def test_canonical_level_subclass_is_accepted_and_detached():
+    level = _LevelFormatSubclass("s", bit_width=64)
+    caller = TensorFormat([LevelFormat("d"), level])
+    layout = TensorLayout.from_logical_shape((2, 3), caller)
+    retained = layout.format.get_level_formats()[1]
+    assert type(retained) is LevelFormat
+    assert retained is not level
+    assert retained.bit_width == 64
+
+    object.__setattr__(level, "_mode", LevelType.COORDINATE)
+    assert retained.get_level_type() is LevelType.COMPRESSED
+
+
+def test_outer_subclass_dict_descriptor_cannot_interpose_on_the_audit():
+    class FormatWithDictBomb(TensorFormat):
+        @property
+        def __dict__(self):
+            raise RuntimeError("subclass __dict__ must not run")
+
+    caller = FormatWithDictBomb("ds")
+    layout = TensorLayout.from_logical_shape((2, 3), caller)
+    assert type(layout.format) is TensorFormat
+    assert layout.format.serialize() == TensorFormat("ds").serialize()
+
+
+def test_nested_subclass_dict_descriptor_cannot_interpose_on_the_audit():
+    class LevelWithDictBomb(LevelFormat):
+        @property
+        def __dict__(self):
+            raise RuntimeError("subclass __dict__ must not run")
+
+    caller = TensorFormat([LevelFormat("d"), LevelWithDictBomb("s")])
+    layout = TensorLayout.from_logical_shape((2, 3), caller)
+    assert all(
+        type(level) is LevelFormat for level in layout.format.get_level_formats()
+    )
+    assert layout.format.serialize() == TensorFormat("ds").serialize()
+
+
+def test_a_foreign_class_spoof_cannot_cross_the_ownership_boundary():
+    class Spoof:
+        @property
+        def __class__(self):
+            return TensorFormat
+
+        def get_order(self):
+            return 2
+
+        def get_level_types(self):
+            return [LevelType.DENSE, LevelType.COMPRESSED]
+
+    spoof = Spoof()
+    assert isinstance(spoof, TensorFormat)
+    with pytest.raises(TensorTypeError, match="tensor format must be"):
+        TensorLayout.from_logical_shape((2, 3), spoof)  # type: ignore[arg-type]
+
+
+def test_a_raising_class_spoof_becomes_a_domain_error():
+    class ClassBomb:
+        @property
+        def __class__(self):
+            raise RuntimeError("class bomb")
+
+    with pytest.raises(TensorFormatError, match="tensor format is malformed"):
+        parse_format(ClassBomb())  # type: ignore[arg-type]
+
+
 def test_audit_preserves_bit_widths():
     caller = TensorFormat([LevelFormat("d", bit_width=16), LevelFormat("s")])
     levels = audit_format_state(caller)
     assert levels is not None
     assert levels[0].bit_width == 16
     assert levels[1].bit_width is None
+
+
+def test_constructor_valid_large_bit_width_is_owned_without_aliasing():
+    level = LevelFormat("d", bit_width=1 << 80)
+    caller = TensorFormat([level])
+    layout = TensorLayout.from_logical_shape((3,), caller)
+    assert layout.format is not caller
+    assert layout.format.get_level_formats()[0] is not level
+    assert layout.format.get_level_formats()[0].bit_width == 1 << 80
+
+    object.__setattr__(level, "_mode", LevelType.COORDINATE)
+    assert layout.format.get_level_types() == [LevelType.DENSE]
 
 
 def test_parse_format_still_passes_through_an_exact_format():
@@ -203,13 +331,43 @@ def test_a_returned_tensor_still_exposes_its_own_retained_format():
     ]
 
 
-def test_a_copy_still_shares_its_source_metadata():
-    """CHARACTERIZATION LOCK -- ``copy()`` passes metadata through unchanged."""
-
+def test_a_copy_detaches_the_complete_metadata_graph():
     tensor = csr("A")
+    tensor.requires_grad = True
     duplicate = tensor.copy()
-    assert duplicate.metadata is tensor.metadata
-    assert duplicate.format is tensor.format
+    assert duplicate.metadata is not tensor.metadata
+    assert duplicate.layout is not tensor.layout
+    assert duplicate.format is not tensor.format
+    assert duplicate.metadata.layout is duplicate.storage.layout
+    assert duplicate.metadata == tensor.metadata
+    assert duplicate.requires_grad is True
+    assert duplicate.name == tensor.name
+    assert duplicate.shape == tensor.shape
+
+    object.__setattr__(
+        duplicate.format,
+        "_level_formats",
+        (LevelFormat("o"), LevelFormat("o")),
+    )
+    assert list(tensor.format.get_level_types()) == [
+        LevelType.DENSE,
+        LevelType.COMPRESSED,
+    ]
+
+
+def test_dense_to_dense_copy_detaches_metadata():
+    tensor = STensor.from_torch(torch.eye(3), "A")
+    duplicate = tensor.to_dense(in_place=False)
+    assert duplicate.metadata is not tensor.metadata
+    assert duplicate.layout is not tensor.layout
+    assert duplicate.format is not tensor.format
+
+    object.__setattr__(
+        duplicate.format,
+        "_level_formats",
+        (LevelFormat("o"), LevelFormat("o")),
+    )
+    assert tensor.format.is_dense()
 
 
 def test_index_arrays_are_already_defensive_on_public_reads():
