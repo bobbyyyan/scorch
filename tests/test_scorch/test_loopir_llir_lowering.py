@@ -1146,6 +1146,69 @@ def test_target_integrity_seal_is_one_shot():
     assert "already sealed" in error.value.defect.message
 
 
+def test_input_authority_exists_before_final_target_seal(monkeypatch):
+    """Construction-time position checks can use external input authority."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    original = lower_llir_module._TargetLowering._seal_target_state
+    observed = []
+
+    def checked_seal(target, seal_token):
+        authority = lower_llir_module._target_input_authority(target)
+        assert authority.graph_snapshot is None
+        assert seal_token is authority.seal_token
+        target._require_program_inputs_unchanged()
+        observed.append(authority)
+        original(target, seal_token)
+
+    monkeypatch.setattr(
+        lower_llir_module._TargetLowering,
+        "_seal_target_state",
+        checked_seal,
+    )
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+
+    assert len(observed) == 1
+    assert target.raw_loop_statements()
+
+
+def test_failed_constructor_cannot_finalize_partial_authority():
+    """A retained late-failure target cannot resurrect itself by sealing."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    forge(fixture.program.tensors[-1], name="A_val")
+    target = lower_llir_module._TargetLowering.__new__(
+        lower_llir_module._TargetLowering
+    )
+    with pytest.raises(LoopIRTargetError) as error:
+        target.__init__(
+            fixture.program,
+            {fixture.a: (2, 3), fixture.b: (3, 4)},
+            (2, 4),
+        )
+    assert error.value.defect.code == "generated_name_collision"
+    authority = lower_llir_module._target_input_authority(target)
+    assert authority.graph_snapshot is None
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target._seal_target_state()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "construction-time sealing authority" in error.value.defect.message
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "missing or incomplete" in error.value.defect.message
+
+
 def test_target_reseal_cannot_authorize_cache_mutation():
     """Deleted and forged instance state cannot bless a rejected target."""
 
@@ -1305,6 +1368,40 @@ def test_hostile_state_key_cannot_run_before_external_authority(owner):
     with pytest.raises(LoopIRTargetError) as error:
         target.raw_loop_statements()
     assert error.value.defect.code == "unsupported_program_shape"
+
+
+def test_hostile_program_key_cannot_run_during_input_snapshot():
+    """Construction validates exact program keys before finding inputs."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    class EqualityBombKey:
+        armed = False
+
+        def __hash__(self):
+            return hash("inputs")
+
+        def __eq__(self, other):
+            if self.armed:
+                raise RuntimeError("hostile construction-key equality executed")
+            return False
+
+    fixture = build_matmul()
+    state = object.__getattribute__(fixture.program, "__dict__")
+    inputs = state.pop("inputs")
+    key = EqualityBombKey()
+    state[key] = None
+    state["inputs"] = inputs
+    key.armed = True
+
+    with pytest.raises(LoopIRTargetError) as error:
+        lower_llir_module._TargetLowering(
+            fixture.program,
+            {fixture.a: (2, 3), fixture.b: (3, 4)},
+            (2, 4),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "stored input declarations" in error.value.defect.message
 
 
 def test_generated_name_reserver_is_retired_at_seal():
