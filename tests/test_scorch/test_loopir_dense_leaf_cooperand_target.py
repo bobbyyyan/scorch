@@ -804,6 +804,49 @@ def test_unchanged_dense_leaf_target_reuses_the_sealed_binding_snapshot(
     assert lowering.raw_loop_statements()
 
 
+def test_unchanged_dense_leaf_target_resolves_external_authority_once(monkeypatch):
+    """The sealed graph owns position-spine integrity on the successful path."""
+
+    lowering = admitted_dense_leaf_target()
+    original_seal_authority = _lower_llir_module._target_seal_authority
+    original_input_authority = _lower_llir_module._target_input_authority
+    original_replay = (
+        _lower_llir_module._TargetLowering._require_program_inputs_unchanged
+    )
+    calls = {"seal": 0, "input": 0, "replay": 0}
+
+    def counted_seal_authority(candidate):
+        calls["seal"] += 1
+        return original_seal_authority(candidate)
+
+    def counted_input_authority(candidate):
+        calls["input"] += 1
+        return original_input_authority(candidate)
+
+    def counted_replay(candidate, authority=None):
+        calls["replay"] += 1
+        return original_replay(candidate, authority)
+
+    monkeypatch.setattr(
+        _lower_llir_module,
+        "_target_seal_authority",
+        counted_seal_authority,
+    )
+    monkeypatch.setattr(
+        _lower_llir_module,
+        "_target_input_authority",
+        counted_input_authority,
+    )
+    monkeypatch.setattr(
+        _lower_llir_module._TargetLowering,
+        "_require_program_inputs_unchanged",
+        counted_replay,
+    )
+
+    assert lowering.raw_loop_statements()
+    assert calls == {"seal": 1, "input": 1, "replay": 0}
+
+
 def test_union_cursor_value_control_is_unchanged():
     """The same nest reading through cursors stays admitted in both places."""
 
