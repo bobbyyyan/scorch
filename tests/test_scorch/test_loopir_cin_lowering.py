@@ -788,20 +788,27 @@ def test_sparse_lowering_is_deterministic():
 
 
 def test_unsupported_sparse_output_layout():
-    """A compressed leaf below several dense parents keeps the layout seam.
+    """An INTERLEAVED dense level keeps the layout seam.
 
-    Two earlier occupants of this lock have since been migrated: the
+    Three earlier occupants of this lock have since been migrated: the
     dense-prefix/multi-compressed copy became the single-cursor assembly
-    family, and the rank-1 compressed output became the degenerate
-    ordered-stream family (``test_loopir_rank1_assembly_target.py``).  The
-    seam itself still holds for layouts whose compressed suffix is a
-    single level under two or more dense parents, which the assembly
-    target's one-dense-prefix rule does not cover.
+    family, the rank-1 compressed output became the degenerate
+    ordered-stream family (``test_loopir_rank1_assembly_target.py``), and a
+    single compressed level under two or more dense parents became the
+    flattened-prefix family
+    (``test_loopir_multi_dense_prefix_target.py``).
+
+    The seam itself still holds for an interleaved layout -- a compressed
+    level ABOVE a dense one.  A dense prefix flattens to a static product
+    of extents, which is what the migrated family sizes its position
+    vectors from; a dense level whose parent is a compressed level has a
+    DYNAMIC stored-coordinate parent count instead, so no such flattened
+    segment number exists for it.
     """
 
     i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    c = TensorVar("C", fmt="dds")
-    a = TensorVar("A", fmt="dds")
+    c = TensorVar("C", fmt="sds")
+    a = TensorVar("A", fmt="sds")
     assign = TensorAssign(c[i, j, k], a[i, j, k])
     expect_code("unsupported_sparse_output", ForAll(i, ForAll(j, ForAll(k, assign))))
 
