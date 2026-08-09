@@ -36,6 +36,7 @@ from scorch.compiler.loopir.nodes import (
     ResultTileId,
     ResultTileRegion,
     ScalarType,
+    SparseWorkspaceInsert,
     StagedRead,
     Stmt,
     StoreReduce,
@@ -903,11 +904,11 @@ def build_sparse_workspace_program():
         workspace,
         "wksp",
         ScalarType.FLOAT32,
-        dimension.dimension,
+        (dimension.dimension,),
     )
     insert = builder.sparse_workspace_insert(
         workspace,
-        builder.index_value(outer_index),
+        (builder.index_value(outer_index),),
         ReduceOp.ADD,
         builder.float_const(1.0),
     )
@@ -919,7 +920,7 @@ def build_sparse_workspace_program():
     )
     drain = builder.sparse_workspace_drain_for(
         workspace,
-        drain_index,
+        (drain_index,),
         builder.block((append,)),
     )
     region = builder.sparse_workspace_region(
@@ -954,7 +955,7 @@ def test_sparse_workspace_drain_must_be_direct_and_dynamic_once():
     builder, program, region, drain = build_sparse_workspace_program()
     repeated = builder.dense_for(
         builder.new_index_id(),
-        region.workspace.drain_dimension,
+        region.workspace.key_dimensions[0],
         builder.block((drain,)),
     )
     forge(region, consumer=builder.block((repeated,)))
@@ -966,12 +967,12 @@ def test_sparse_workspace_rejects_nested_same_workspace_drain():
     builder, program, region, drain = build_sparse_workspace_program()
     nested = builder.sparse_workspace_drain_for(
         region.workspace.workspace,
-        builder.new_index_id(),
+        (builder.new_index_id(),),
         drain.body,
     )
     outer = builder.sparse_workspace_drain_for(
         region.workspace.workspace,
-        drain.index,
+        drain.indices,
         builder.block((nested,)),
     )
     forge(region, consumer=builder.block((outer,)))
@@ -989,7 +990,7 @@ def test_sparse_workspace_drain_must_consume_merged_value():
     )
     replacement_drain = builder.sparse_workspace_drain_for(
         region.workspace.workspace,
-        drain.index,
+        drain.indices,
         builder.block((replacement,)),
     )
     forge(region, consumer=builder.block((replacement_drain,)))
@@ -1005,7 +1006,7 @@ def test_sparse_workspace_malformed_consumer_fails_closed():
 
 def test_sparse_workspace_role_and_output_scopes_fail_closed():
     builder, program, region, drain = build_sparse_workspace_program()
-    insert = region.producer.statements[0]
+    insert = rank_k_insert(region)
     forge(region, producer=builder.block((insert, drain)))
     expect_defect("workspace_read_scope", program)
 
@@ -1015,10 +1016,10 @@ def test_sparse_workspace_role_and_output_scopes_fail_closed():
     expect_defect("workspace_output_write", program)
 
     builder, program, region, _ = build_sparse_workspace_program()
-    insert = region.producer.statements[0]
+    insert = rank_k_insert(region)
     forged_insert = builder.sparse_workspace_insert(
         region.workspace.workspace,
-        insert.coord,
+        insert.coords,
         insert.op,
         builder.sparse_workspace_value(region.workspace.workspace),
     )
@@ -4290,3 +4291,190 @@ def test_position_load_rejects_a_structural_level_position():
 
     fixture = build_mixed_leaf_operand_copy(forge_structural)
     expect_defect("non_leaf_value", fixture.program)
+
+
+# -- rank-K key domains ------------------------------------------------------
+#
+# ``len(key_dimensions) == 1`` is the K == 1 instance of the same node, not a
+# separate kind.  These lock the K >= 2 behaviour the multi-compressed
+# reduction/TTM vertical needs: one coordinate and one bound index per key
+# dimension, in key order, and a strictly increasing LEXICOGRAPHIC drain.
+
+
+def build_rank_k_workspace_program(
+    key_rank=2,
+    *,
+    coords=None,
+    drain_indices=None,
+    key_permutation=None,
+    contraction_extent=None,
+):
+    """One rank-``key_rank`` sparse workspace draining into a rank-K result.
+
+    The region sits ABOVE every producer loop -- the anchoring the
+    multi-compressed reduction vertical needs -- so one region accumulates
+    the whole key space and drains it once.  ``key_permutation`` reorders the
+    key dimensions relative to the producer's loop nest, which is what makes
+    the drain's lexicographic contract observable: with a non-identity
+    permutation the insertion order is not the key order.
+
+    ``contraction_extent`` adds one innermost producer loop whose index does
+    NOT appear in the key -- a contraction.  Every one of its iterations
+    inserts the same key, so the region must merge them under ADD into a
+    single drained entry.  That is the reduction shape this whole vertical
+    exists for.
+
+    ``coords`` / ``drain_indices`` override the insertion key and the drain
+    binding so a caller can build a deliberately malformed program.
+    """
+
+    builder = LoopIRBuilder()
+    loop_dimensions = [builder.dimension(name) for name in "ijk"[:key_rank]]
+    order = (
+        list(key_permutation) if key_permutation is not None else list(range(key_rank))
+    )
+    key_dimensions = [loop_dimensions[position] for position in order]
+    output = builder.new_symbol_id()
+    output_decl = builder.tensor(
+        output,
+        "C",
+        ScalarType.FLOAT32,
+        tuple(dimension.dimension for dimension in key_dimensions),
+        tuple(builder.level(LevelKind.COMPRESSED, level) for level in range(key_rank)),
+    )
+    loop_indices = [builder.new_index_id() for _ in range(key_rank)]
+    workspace = builder.new_workspace_id()
+    workspace_decl = builder.sparse_workspace_decl(
+        workspace,
+        "wksp",
+        ScalarType.FLOAT32,
+        tuple(dimension.dimension for dimension in key_dimensions),
+    )
+    inputs = ()
+    inserted_value = builder.float_const(1.0)
+    contraction = None
+    contraction_index = None
+    if contraction_extent is not None:
+        # A dense operand over (loop dims..., r) both gives the contraction
+        # dimension a tensor-mapped runtime extent and makes the merged
+        # value a real reduction with a checkable reference.
+        contraction = builder.dimension("r")
+        contraction_index = builder.new_index_id()
+        operand = builder.new_symbol_id()
+        operand_decl = builder.tensor(
+            operand,
+            "A",
+            ScalarType.FLOAT32,
+            tuple(dimension.dimension for dimension in loop_dimensions)
+            + (contraction.dimension,),
+            tuple(
+                builder.level(LevelKind.DENSE, level) for level in range(key_rank + 1)
+            ),
+        )
+        inputs = (operand,)
+        inserted_value = builder.load(
+            operand,
+            tuple(builder.index_value(index) for index in loop_indices)
+            + (builder.index_value(contraction_index),),
+        )
+    insert = builder.sparse_workspace_insert(
+        workspace,
+        (
+            coords
+            if coords is not None
+            else tuple(builder.index_value(loop_indices[p]) for p in order)
+        ),
+        ReduceOp.ADD,
+        inserted_value,
+    )
+    producer = builder.block((insert,))
+    if contraction_extent is not None:
+        producer = builder.block(
+            (builder.dense_for(contraction_index, contraction.dimension, producer),)
+        )
+    for index, dimension in zip(reversed(loop_indices), reversed(loop_dimensions)):
+        producer = builder.block(
+            (builder.dense_for(index, dimension.dimension, producer),)
+        )
+    bound = (
+        drain_indices
+        if drain_indices is not None
+        else tuple(builder.new_index_id() for _ in range(key_rank))
+    )
+    append = builder.append_entry(
+        output,
+        tuple(builder.index_value(index) for index in bound),
+        builder.sparse_workspace_value(workspace),
+    )
+    drain = builder.sparse_workspace_drain_for(
+        workspace, bound, builder.block((append,))
+    )
+    region = builder.sparse_workspace_region(
+        workspace_decl, producer, builder.block((drain,))
+    )
+    program = builder.program(
+        tuple(loop_dimensions) + ((contraction,) if contraction is not None else ()),
+        ((operand_decl,) if contraction is not None else ()) + (output_decl,),
+        inputs,
+        (output,),
+        builder.block((region,)),
+    )
+    return builder, program, region, drain
+
+
+def rank_k_insert(region):
+    """The single ``SparseWorkspaceInsert`` at the bottom of the producer."""
+
+    node = region.producer
+    while type(node) is not SparseWorkspaceInsert:
+        node = node.statements[0] if type(node) is Block else node.body
+    return node
+
+
+@pytest.mark.parametrize("key_rank", [1, 2, 3])
+def test_rank_k_sparse_workspace_program_verifies(key_rank):
+    _, program, region, drain = build_rank_k_workspace_program(key_rank)
+    verify_program(program)
+    assert len(region.workspace.key_dimensions) == key_rank
+    assert len(drain.indices) == key_rank
+
+
+def test_sparse_workspace_key_must_be_a_nonempty_tuple():
+    builder, program, region, _ = build_rank_k_workspace_program(2)
+    forge(region.workspace, key_dimensions=())
+    defect = expect_defect("malformed_state", program)
+    assert "nonempty tuple" in defect.message
+
+
+def test_sparse_workspace_key_may_not_repeat_a_dimension():
+    builder, program, region, _ = build_rank_k_workspace_program(2)
+    repeated = region.workspace.key_dimensions[0]
+    forge(region.workspace, key_dimensions=(repeated, repeated))
+    defect = expect_defect("malformed_state", program)
+    assert "repeat a dimension" in defect.message
+
+
+def test_insertion_must_supply_one_coordinate_per_key_dimension():
+    builder, program, region, _ = build_rank_k_workspace_program(2)
+    insert = rank_k_insert(region)
+    forge(insert, coords=insert.coords[:1])
+    defect = expect_defect("malformed_state", program)
+    assert "one coordinate per declared key dimension" in defect.message
+
+
+def test_drain_must_bind_one_index_per_key_dimension():
+    builder, program, region, drain = build_rank_k_workspace_program(2)
+    forge(drain, indices=drain.indices[:1])
+    defect = expect_defect("malformed_state", program)
+    assert "one index per declared key dimension" in defect.message
+
+
+def test_insertion_coordinates_must_match_their_own_key_dimension():
+    """Coordinate agreement is per-position, not merely per-set."""
+
+    builder, program, region, _ = build_rank_k_workspace_program(2)
+    insert = rank_k_insert(region)
+    forge(insert, coords=(insert.coords[1], insert.coords[0]))
+    defect = expect_defect("domain_mismatch", program)
+    assert "dimension 'j' but dimension 'i' is required" in defect.message
+    assert defect.path.endswith(".coords[0]")

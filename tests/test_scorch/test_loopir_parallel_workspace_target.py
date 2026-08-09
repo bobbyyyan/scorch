@@ -299,7 +299,7 @@ def test_completed_target_owns_the_pipeline_route(regblock_enabled):
     assert kernel.schedule is not None
     verify_scheduled_loopir(kernel.schedule)
     assert '"kind":"sparse_workspace_region"' in kernel.program_dump
-    assert '"schema":"scorch.loopir.canonical.v10"' in kernel.program_dump
+    assert '"schema":"scorch.loopir.canonical.v11"' in kernel.program_dump
     assert kernel.cpp_source == legacy_generated_cpp(
         build_spgemm_cin(),
         (4, 5),
@@ -740,7 +740,7 @@ def build_parallel_workspace_program(insert_value_builder=None):
     )
     workspace = builder.new_workspace_id()
     workspace_decl = builder.sparse_workspace_decl(
-        workspace, "wksp", ScalarType.FLOAT32, dim_k.dimension
+        workspace, "wksp", ScalarType.FLOAT32, (dim_k.dimension,)
     )
     if insert_value_builder is None:
         insert_value = builder.binary(
@@ -752,7 +752,7 @@ def build_parallel_workspace_program(insert_value_builder=None):
         insert_value = insert_value_builder(builder, cursor_a1, cursor_b1)
     insert = builder.sparse_workspace_insert(
         workspace,
-        builder.index_value(index_k),
+        (builder.index_value(index_k),),
         ReduceOp.ADD,
         insert_value,
     )
@@ -769,7 +769,7 @@ def build_parallel_workspace_program(insert_value_builder=None):
         builder.sparse_workspace_value(workspace),
     )
     drain = builder.sparse_workspace_drain_for(
-        workspace, drain_index, builder.block((append,))
+        workspace, (drain_index,), builder.block((append,))
     )
     region = builder.sparse_workspace_region(
         workspace_decl,

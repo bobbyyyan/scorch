@@ -1873,3 +1873,172 @@ def test_oracle_binding_key_mutation_during_lookup_fails_closed():
             {fixture.c: (2, 2)},
         )
     assert "changed while values were being snapshotted" in str(error.value)
+
+
+# -- rank-K sparse workspace keys -------------------------------------------
+#
+# The drain contract is strictly increasing LEXICOGRAPHIC key order.  When the
+# key dimensions are listed in result level order that is also the canonical
+# append order, which is what makes multi-level ordered result assembly
+# correct without any sort in the IR.  These execute that contract directly.
+
+from tests.test_scorch.test_loopir_verifier import (  # noqa: E402
+    build_rank_k_workspace_program,
+    rank_k_insert,
+)
+
+
+def _level_entries(tensor):
+    """Expand hierarchical level storage into ``(key_tuple, value)`` pairs.
+
+    Compressed levels are parent-linked, not a flat COO list: level ``L``'s
+    coordinate array is indexed by position, and level ``L+1``'s position
+    array segments it.  Zipping the coordinate arrays would be wrong -- the
+    outer level stores one coordinate per distinct parent, not one per
+    entry -- so this walks the position links, which is exactly the
+    positions-are-not-coordinates discipline the assembly must honour.
+    """
+
+    entries = []
+
+    def walk(level, parent_position, prefix):
+        if level == len(tensor.level_kinds):
+            entries.append((tuple(prefix), tensor.values[parent_position]))
+            return
+        positions = tensor.positions[level]
+        coordinates = tensor.coordinates[level]
+        for position in range(
+            positions[parent_position], positions[parent_position + 1]
+        ):
+            walk(level + 1, position, prefix + [coordinates[position]])
+
+    walk(0, 0, [])
+    return entries
+
+
+def _drained_keys(program, shape):
+    output = program.outputs[0]
+    results = run_program(program, {}, {output: shape})
+    tensor = results[output]
+    assert all(kind is LevelKind.COMPRESSED for kind in tensor.level_kinds)
+    entries = _level_entries(tensor)
+    return tensor, [key for key, _ in entries], [value for _, value in entries]
+
+
+@pytest.mark.parametrize("key_rank", [1, 2, 3])
+def test_rank_k_drain_visits_every_key_exactly_once(key_rank):
+    """One entry per distinct key, merged under ADD, no duplicates."""
+
+    shape = (2, 3, 2)[:key_rank]
+    _, program, _, _ = build_rank_k_workspace_program(key_rank)
+    verify_program(program)
+    _, keys, values = _drained_keys(program, shape)
+
+    expected = [()]
+    for extent in shape:
+        expected = [row + (value,) for row in expected for value in range(extent)]
+    assert keys == expected
+    assert len(keys) == len(set(keys))
+    # Each key is inserted exactly once with 1.0 and ADD merges by key.
+    assert values == [1.0] * len(expected)
+
+
+def test_rank_2_drain_is_lexicographic_not_insertion_ordered():
+    """Insertion order and key order deliberately disagree here.
+
+    The producer's loop nest runs ``i`` then ``j`` while the key is
+    ``(j, i)``, so insertions arrive ``(0,0), (1,0), (2,0), (0,1), ...``.
+    A drain that merely preserved insertion order, or sorted by the leading
+    component alone, would not produce the sequence below.  This is the
+    case the inherited single-drain form could not express at all, and the
+    ordering property multi-level ordered assembly rests on.
+    """
+
+    _, program, _, _ = build_rank_k_workspace_program(2, key_permutation=(1, 0))
+    verify_program(program)
+    _, keys, _ = _drained_keys(program, (3, 2))
+
+    assert keys == [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+    assert keys == sorted(keys)
+
+
+def test_rank_3_drain_is_lexicographic_under_a_rotated_key():
+    """Rank 3 with the key rotated one step against the producer nest."""
+
+    _, program, _, _ = build_rank_k_workspace_program(3, key_permutation=(2, 0, 1))
+    verify_program(program)
+    _, keys, _ = _drained_keys(program, (2, 2, 3))
+
+    assert keys == sorted(keys)
+    assert len(keys) == 12
+    assert keys[0] == (0, 0, 0) and keys[-1] == (1, 1, 2)
+
+
+@pytest.mark.parametrize("contraction_extent", [1, 4])
+def test_rank_k_drain_merges_a_contraction_under_add(contraction_extent):
+    """A contraction loop inside the region merges into one entry per key.
+
+    The innermost producer loop's index does not appear in the key, so all
+    ``contraction_extent`` of its iterations insert into the same entry.  The
+    region must merge them under ADD and the drain must still visit each key
+    exactly once -- the reduction shape this whole vertical exists for.  The
+    merged values are checked against an independent Python reduction.
+    """
+
+    rows, columns = 2, 3
+    _, program, _, _ = build_rank_k_workspace_program(
+        2, contraction_extent=contraction_extent
+    )
+    verify_program(program)
+    operand = [
+        [
+            [float(r * 100 + c * 10 + k) for k in range(contraction_extent)]
+            for c in range(columns)
+        ]
+        for r in range(rows)
+    ]
+    output = program.outputs[0]
+    results = run_program(
+        program,
+        {program.inputs[0]: operand},
+        {output: (rows, columns)},
+    )
+    tensor = results[output]
+    entries = _level_entries(tensor)
+    keys = [key for key, _ in entries]
+    values = [value for _, value in entries]
+
+    assert keys == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+    assert values == [sum(operand[r][c]) for r in range(rows) for c in range(columns)]
+
+
+def test_rank_mismatched_insertion_fails_closed_in_the_oracle():
+    """``zip`` would truncate to the shorter side; the executor must not.
+
+    ``run_program`` verifies before executing, so the verifier is the
+    authoritative boundary for this shape and a forged program never reaches
+    the executor through it.  The executor still owns an explicit check
+    rather than a silent truncation, driven here directly through the same
+    ``_Oracle`` idiom the tile-scope fail-closed tests use.
+    """
+
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    _, program, region, _ = build_rank_k_workspace_program(2)
+    insert = rank_k_insert(region)
+    forge(insert, coords=insert.coords[:1])
+    oracle = _Oracle(program, {}, {program.outputs[0]: (2, 3)})
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(program.body)
+    assert "1 coordinates for a rank-2 key" in str(error.value)
+
+
+def test_rank_mismatched_drain_fails_closed_in_the_oracle():
+    from scorch.compiler.loopir.oracle import _Oracle
+
+    _, program, _, drain = build_rank_k_workspace_program(2)
+    forge(drain, indices=drain.indices[:1])
+    oracle = _Oracle(program, {}, {program.outputs[0]: (2, 3)})
+    with pytest.raises(LoopIROracleError) as error:
+        oracle._exec_stmt(program.body)
+    assert "binds 1 indices for a rank-2 key" in str(error.value)

@@ -1546,11 +1546,11 @@ def build_dense_outer_region_program():
     outer_index = builder.new_index_id()
     workspace = builder.new_workspace_id()
     workspace_decl = builder.sparse_workspace_decl(
-        workspace, "wksp", ScalarType.FLOAT32, dimension.dimension
+        workspace, "wksp", ScalarType.FLOAT32, (dimension.dimension,)
     )
     insert = builder.sparse_workspace_insert(
         workspace,
-        builder.index_value(outer_index),
+        (builder.index_value(outer_index),),
         ReduceOp.ADD,
         builder.float_const(1.0),
     )
@@ -1561,7 +1561,7 @@ def build_dense_outer_region_program():
         builder.sparse_workspace_value(workspace),
     )
     drain = builder.sparse_workspace_drain_for(
-        workspace, drain_index, builder.block((append,))
+        workspace, (drain_index,), builder.block((append,))
     )
     region = builder.sparse_workspace_region(
         workspace_decl, builder.block((insert,)), builder.block((drain,))
@@ -1629,7 +1629,7 @@ def build_b1_program(insert_value_builder=None):
     )
     workspace = builder.new_workspace_id()
     workspace_decl = builder.sparse_workspace_decl(
-        workspace, "wksp", ScalarType.FLOAT32, dim_j.dimension
+        workspace, "wksp", ScalarType.FLOAT32, (dim_j.dimension,)
     )
     if insert_value_builder is None:
         insert_value = builder.binary(
@@ -1641,7 +1641,7 @@ def build_b1_program(insert_value_builder=None):
         insert_value = insert_value_builder(builder, cursor_a1, cursor_b1)
     insert = builder.sparse_workspace_insert(
         workspace,
-        builder.index_value(index_j),
+        (builder.index_value(index_j),),
         ReduceOp.ADD,
         insert_value,
     )
@@ -1662,7 +1662,7 @@ def build_b1_program(insert_value_builder=None):
         builder.sparse_workspace_value(workspace),
     )
     drain = builder.sparse_workspace_drain_for(
-        workspace, drain_index, builder.block((append,))
+        workspace, (drain_index,), builder.block((append,))
     )
     region = builder.sparse_workspace_region(
         workspace_decl,

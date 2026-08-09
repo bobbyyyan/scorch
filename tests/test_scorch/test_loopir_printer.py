@@ -141,7 +141,7 @@ def test_canonical_dump_carries_schema_version():
     # the sparse coordinate-window kinds, v4 the workspace node kinds, and
     # v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v10"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v11"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
