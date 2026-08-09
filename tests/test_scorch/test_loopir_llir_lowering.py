@@ -13,6 +13,7 @@ structural activation is never waived.
 """
 
 import copy
+from collections.abc import Mapping
 from types import MappingProxyType
 
 import pytest
@@ -1097,6 +1098,126 @@ def test_target_graph_registry_is_exhaustive_for_the_loopir_schema():
     assert set(lower_llir_module._LOOPIR_GRAPH_ENUM_TYPES) == enum_types
     assert set(lower_llir_module._LOOPIR_NODE_TYPE_BY_ID.values()) == node_types
     assert set(lower_llir_module._LOOPIR_ENUM_TYPE_BY_ID.values()) == enum_types
+    for registry in (
+        lower_llir_module._LOOPIR_NODE_TYPE_BY_ID,
+        lower_llir_module._LOOPIR_ENUM_TYPE_BY_ID,
+        lower_llir_module._LOOPIR_IDENTITY_TYPE_BY_ID,
+        lower_llir_module._LOOPIR_NODE_FIELDS_BY_ID,
+    ):
+        assert type(registry) is MappingProxyType
+
+
+@pytest.mark.parametrize(
+    "registry_name",
+    [
+        "_LOOPIR_NODE_TYPE_BY_ID",
+        "_LOOPIR_ENUM_TYPE_BY_ID",
+        "_LOOPIR_IDENTITY_TYPE_BY_ID",
+        "_LOOPIR_NODE_FIELDS_BY_ID",
+    ],
+    ids=str,
+)
+def test_target_rejects_a_hostile_mapping_proxy_registry(monkeypatch, registry_name):
+    """A proxy around a hostile Mapping cannot execute during emission."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    callbacks = []
+
+    class MappingBomb(Mapping):
+        def __getitem__(self, key):
+            callbacks.append(("getitem", key))
+            raise RuntimeError("hostile schema lookup executed")
+
+        def __iter__(self):
+            callbacks.append(("iter", None))
+            raise RuntimeError("hostile schema iteration executed")
+
+        def __len__(self):
+            callbacks.append(("len", None))
+            raise RuntimeError("hostile schema length executed")
+
+    fixture = heap_program()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+    monkeypatch.setattr(
+        lower_llir_module,
+        registry_name,
+        MappingProxyType(MappingBomb()),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "schema registry" in error.value.defect.message
+    assert callbacks == []
+
+
+@pytest.mark.parametrize(
+    ("registry_name", "entry_type_name"),
+    [
+        ("_LOOPIR_NODE_TYPE_BY_ID", "LoopProgram"),
+        ("_LOOPIR_ENUM_TYPE_BY_ID", "ScalarType"),
+        ("_LOOPIR_IDENTITY_TYPE_BY_ID", "SymbolId"),
+        ("_LOOPIR_NODE_FIELDS_BY_ID", "LoopProgram"),
+    ],
+    ids=lambda value: value,
+)
+def test_target_rejects_a_rebound_incomplete_schema_registry(
+    monkeypatch, registry_name, entry_type_name
+):
+    """An ordinary replacement proxy cannot silently omit schema entries."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    registry = getattr(lower_llir_module, registry_name)
+    entry_type = getattr(lower_llir_module, entry_type_name)
+    replacement = dict(registry)
+    replacement.pop(id(entry_type))
+    monkeypatch.setattr(
+        lower_llir_module,
+        registry_name,
+        MappingProxyType(replacement),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "schema registry" in error.value.defect.message
+
+
+@pytest.mark.parametrize("arity", range(4), ids=str)
+def test_target_rejects_a_truncated_schema_authority(monkeypatch, arity):
+    """Schema-authority arity is proved before any NamedTuple descriptor."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    authority = lower_llir_module._LOOPIR_SCHEMA_AUTHORITY
+    monkeypatch.setattr(
+        lower_llir_module,
+        "_LOOPIR_SCHEMA_AUTHORITY",
+        tuple.__new__(type(authority), tuple(authority)[:arity]),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "schema registry" in error.value.defect.message
 
 
 def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
@@ -1126,6 +1247,44 @@ def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
         )
 
     assert target.raw_loop_statements()
+
+
+def test_unchanged_target_resolves_external_authority_once(monkeypatch):
+    """One seal lookup owns the successful-path integrity validation."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    original_seal_authority = lower_llir_module._target_seal_authority
+    original_input_authority = lower_llir_module._target_input_authority
+    calls = {"seal": 0, "input": 0}
+
+    def counted_seal_authority(candidate):
+        calls["seal"] += 1
+        return original_seal_authority(candidate)
+
+    def counted_input_authority(candidate):
+        calls["input"] += 1
+        return original_input_authority(candidate)
+
+    monkeypatch.setattr(
+        lower_llir_module,
+        "_target_seal_authority",
+        counted_seal_authority,
+    )
+    monkeypatch.setattr(
+        lower_llir_module,
+        "_target_input_authority",
+        counted_input_authority,
+    )
+
+    assert target.raw_loop_statements()
+    assert calls == {"seal": 1, "input": 1}
 
 
 def test_target_integrity_seal_is_one_shot():
@@ -1305,6 +1464,96 @@ def test_instance_snapshot_rebinding_cannot_replace_external_authority():
     assert "retained program caches" in error.value.defect.message
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["graph_snapshot", "graph_owners", "target_snapshot", "target_owners"],
+    ids=str,
+)
+def test_external_authority_rebinding_cannot_replace_sealed_state(field):
+    """A replaced tuple authority still has an instance-state anchor."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    authority = lower_llir_module._target_seal_authority(target)
+    current = object.__getattribute__(authority, field)
+    with pytest.raises(AttributeError):
+        object.__setattr__(authority, field, current + ((),))
+    lower_llir_module._TARGET_SEAL_AUTHORITIES[id(target)] = authority._replace(
+        **{field: current + ((),)}
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
+
+
+@pytest.mark.parametrize("arity", range(10), ids=str)
+def test_external_authority_rejects_a_truncated_named_tuple(arity):
+    """Authority arity is proved before any NamedTuple descriptor is read."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    authority = lower_llir_module._target_seal_authority(target)
+    malformed = tuple.__new__(type(authority), tuple(authority)[:arity])
+    lower_llir_module._TARGET_SEAL_AUTHORITIES[id(target)] = malformed
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            target.raw_loop_statements()
+        assert error.value.defect.code == "unsupported_program_shape"
+        assert "authority" in error.value.defect.message
+    finally:
+        lower_llir_module._TARGET_SEAL_AUTHORITIES[id(target)] = authority
+
+
+@pytest.mark.parametrize(
+    "replacement", [object(), "callable"], ids=["object", "callable"]
+)
+def test_external_authority_rejects_a_hostile_target_reference(replacement):
+    """Authority lookup proves the weak-reference type before invoking it."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    callbacks = []
+
+    class CallbackBomb:
+        def __call__(self):
+            callbacks.append("called")
+            raise RuntimeError("hostile target reference executed")
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    authority = lower_llir_module._target_seal_authority(target)
+    target_ref = CallbackBomb() if replacement == "callable" else replacement
+    lower_llir_module._TARGET_SEAL_AUTHORITIES[id(target)] = authority._replace(
+        target_ref=target_ref
+    )
+    try:
+        with pytest.raises(LoopIRTargetError) as error:
+            target.raw_loop_statements()
+        assert error.value.defect.code == "unsupported_program_shape"
+        assert "authority" in error.value.defect.message
+        assert callbacks == []
+    finally:
+        lower_llir_module._TARGET_SEAL_AUTHORITIES[id(target)] = authority
+
+
 def test_hostile_input_value_snapshot_cannot_run_equality_callback():
     """Input checks consult primitive external authority before target state."""
 
@@ -1330,6 +1579,28 @@ def test_hostile_input_value_snapshot_cannot_run_equality_callback():
         target.raw_loop_statements()
     assert error.value.defect.code == "unsupported_program_shape"
     assert "input identity" in error.value.defect.message
+
+
+def test_input_mutation_diagnostic_precedes_malformed_target_cache():
+    """Cold diagnostic replay preserves the narrower input boundary."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    object.__setattr__(
+        fixture.program, "inputs", tuple(reversed(fixture.program.inputs))
+    )
+    object.__setattr__(target, "loops", [target.loops])
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "input declarations" in error.value.defect.message
 
 
 @pytest.mark.parametrize("owner", ["target", "program"], ids=str)
@@ -1441,6 +1712,9 @@ def test_read_only_target_caches_are_privately_frozen_at_seal():
         if field in state:
             assert type(state[field]) is tuple
 
+    assert type(target.loops) is tuple
+    with pytest.raises(AttributeError):
+        object.__setattr__(target.loops[0], "index", target.loops[-1].index)
     with pytest.raises(TypeError):
         target.decls[fixture.a] = target.result_decl
     with pytest.raises(AttributeError):
@@ -1599,7 +1873,11 @@ def test_target_binds_program_derived_caches_before_emission(mutation):
         (2, 4),
     )
     if mutation == "loop":
-        target.loops[0] = target.loops[-1]
+        object.__setattr__(
+            target,
+            "loops",
+            (target.loops[-1], *target.loops[1:]),
+        )
     else:
         target.result_decl = target.decls[fixture.a]
     with pytest.raises(LoopIRTargetError) as error:
@@ -1690,6 +1968,70 @@ def test_target_binds_synthetic_cached_loopir_nodes_by_state():
         target.raw_loop_statements()
     assert error.value.defect.code == "unsupported_program_shape"
     assert "program caches" in error.value.defect.message
+
+
+def test_synthetic_cache_schema_permutation_cannot_collide(monkeypatch):
+    """A coordinated field-schema rewrite cannot preserve a sealed cache."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+    view = target._tiled_view
+    assert view is not None
+    state = object.__getattribute__(view, "__dict__")
+    fields_by_id = dict(lower_llir_module._LOOPIR_NODE_FIELDS_BY_ID)
+    fields = fields_by_id[id(type(view))]
+    indices_position = fields.index("indices")
+    value_position = fields.index("value")
+    changed_fields = list(fields)
+    changed_fields[indices_position], changed_fields[value_position] = (
+        changed_fields[value_position],
+        changed_fields[indices_position],
+    )
+    fields_by_id[id(type(view))] = tuple(changed_fields)
+    monkeypatch.setattr(
+        lower_llir_module,
+        "_LOOPIR_NODE_FIELDS_BY_ID",
+        MappingProxyType(fields_by_id),
+    )
+    state["indices"], state["value"] = state["value"], state["indices"]
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "schema registry" in error.value.defect.message
+
+
+def test_synthetic_cache_rejects_a_missing_schema_entry(monkeypatch):
+    """A rebound private registry cannot leak a raw key lookup failure."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = heap_program()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        heap_shapes(fixture),
+        (4, 6),
+    )
+    view = target._tiled_view
+    assert view is not None
+    fields_by_id = dict(lower_llir_module._LOOPIR_NODE_FIELDS_BY_ID)
+    fields_by_id.pop(id(type(view)))
+    monkeypatch.setattr(
+        lower_llir_module,
+        "_LOOPIR_NODE_FIELDS_BY_ID",
+        MappingProxyType(fields_by_id),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "schema registry" in error.value.defect.message
 
 
 @pytest.mark.parametrize("field", ["name", "dtype"], ids=str)
