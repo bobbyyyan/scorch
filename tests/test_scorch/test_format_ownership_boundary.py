@@ -612,6 +612,54 @@ class _ForeignIntSpoof:
         return False
 
 
+class _ForeignLevelTypeSpoof:
+    @property
+    def __class__(self):
+        return LevelType
+
+    def __str__(self):
+        raise AssertionError("foreign mode __str__ must not run")
+
+    def __repr__(self):
+        raise AssertionError("foreign mode __repr__ must not run")
+
+    def __format__(self, spec):
+        raise AssertionError("foreign mode __format__ must not run")
+
+
+class _ForeignLevelFormatSpoof:
+    @property
+    def __class__(self):
+        return LevelFormat
+
+    def __str__(self):
+        raise AssertionError("foreign level __str__ must not run")
+
+    def __repr__(self):
+        raise AssertionError("foreign level __repr__ must not run")
+
+
+class _HostileLevelAlias(str):
+    def strip(self, *args):
+        raise AssertionError("alias strip override must not run")
+
+    def lower(self):
+        raise AssertionError("alias lower override must not run")
+
+    def __str__(self):
+        raise AssertionError("alias __str__ must not run")
+
+    def __repr__(self):
+        raise AssertionError("alias __repr__ must not run")
+
+    def __format__(self, spec):
+        raise AssertionError("alias __format__ must not run")
+
+
+class _PlainLevelFormatSubclass(LevelFormat):
+    pass
+
+
 def test_audit_canonicalizes_a_constructor_valid_int_subclass_bit_width():
     """An ``IntEnum`` width is a legal format, not malformed stored state.
 
@@ -649,6 +697,56 @@ def test_level_format_rejects_a_foreign_int_class_spoof():
     assert isinstance(spoof, int)
     with pytest.raises(TensorTypeError, match="integer"):
         LevelFormat("s", bit_width=spoof)  # type: ignore[arg-type]
+
+
+def test_level_format_rejects_a_foreign_level_type_class_spoof_without_callbacks():
+    spoof = _ForeignLevelTypeSpoof()
+    assert isinstance(spoof, LevelType)
+    with pytest.raises(TensorTypeError, match="string alias or LevelType"):
+        LevelFormat(spoof)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_tensor_format_rejects_foreign_level_format_class_spoofs(nested):
+    spoof = _ForeignLevelFormatSpoof()
+    assert isinstance(spoof, LevelFormat)
+    value = [spoof] if nested else spoof
+    with pytest.raises(TensorTypeError, match="tensor format"):
+        TensorFormat(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_tensor_format_preserves_real_level_format_subclasses(nested):
+    level = _PlainLevelFormatSubclass("s", bit_width=32)
+    value = [level] if nested else level
+    tensor_format = TensorFormat(value)
+    assert tensor_format.get_level_formats()[0] is level
+
+    retained = owned_format(tensor_format).get_level_formats()[0]
+    assert type(retained) is LevelFormat
+    assert retained.get_level_type() is LevelType.COMPRESSED
+    assert retained.bit_width == 32
+
+
+def test_real_string_subclass_aliases_bypass_every_override():
+    alias = _HostileLevelAlias(" Dense ")
+    formats = (
+        TensorFormat([LevelFormat(alias)]),
+        TensorFormat(alias),
+        TensorFormat([alias]),
+    )
+    assert all(
+        tensor_format.get_level_types() == [LevelType.DENSE]
+        for tensor_format in formats
+    )
+    assert all(
+        audit_format_state(tensor_format) is not None for tensor_format in formats
+    )
+
+
+def test_invalid_string_subclass_alias_reports_without_rendering_it():
+    with pytest.raises(TensorFormatError, match="invalid level format 'not-a-mode'"):
+        LevelFormat(_HostileLevelAlias("not-a-mode"))
 
 
 @pytest.mark.parametrize("owner", ["layout", "index"])
@@ -771,14 +869,18 @@ def test_a_foreign_class_spoof_cannot_cross_the_ownership_boundary():
         TensorLayout.from_logical_shape((2, 3), spoof)  # type: ignore[arg-type]
 
 
-def test_a_raising_class_spoof_becomes_a_domain_error():
+def test_a_raising_class_spoof_is_rejected_without_reading_class():
     class ClassBomb:
+        class_reads = 0
+
         @property
         def __class__(self):
+            type(self).class_reads += 1
             raise RuntimeError("class bomb")
 
-    with pytest.raises(TensorFormatError, match="tensor format is malformed"):
+    with pytest.raises(TensorTypeError, match="tensor format must be"):
         parse_format(ClassBomb())  # type: ignore[arg-type]
+    assert ClassBomb.class_reads == 0
 
 
 def test_audit_preserves_bit_widths():
