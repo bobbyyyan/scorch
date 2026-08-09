@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -11,7 +12,6 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -94,6 +94,13 @@ _STR_TO_LEVEL_TYPE = {
 }
 
 
+def _actual_type_name(value: object) -> str:
+    """Return the real type name without invoking caller-owned descriptors."""
+
+    name = type.__dict__["__name__"].__get__(type(value), type)
+    return str.__str__(name)
+
+
 def _parse_level_type(s: str) -> LevelType:
     """Convert one canonicalized string alias to a :class:`LevelType`."""
     string_type = type(s)
@@ -108,7 +115,7 @@ def _parse_level_type(s: str) -> LevelType:
         key = str.lower(str.strip(text))
     else:
         raise TensorTypeError(
-            f"level format must be a string or LevelType, got {type(s).__name__}"
+            f"level format must be a string or LevelType, got {_actual_type_name(s)}"
         )
     try:
         return _STR_TO_LEVEL_TYPE[key]
@@ -179,7 +186,7 @@ class LevelFormat:
         else:
             raise TensorTypeError(
                 "level format mode must be a string alias or LevelType, "
-                f"got {type(mode).__name__}"
+                f"got {_actual_type_name(mode)}"
             )
         if bit_width is not None:
             bit_width_type = type(bit_width)
@@ -488,7 +495,7 @@ def _normalize_level_formats(
         else:
             raise TensorTypeError(
                 "tensor format levels must be LevelFormat, LevelType, or string; "
-                f"got {type(level).__name__}"
+                f"got {_actual_type_name(level)}"
             )
     return tuple(result)
 
