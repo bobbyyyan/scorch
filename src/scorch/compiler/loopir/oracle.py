@@ -508,7 +508,7 @@ class _Oracle:
                 self.values[symbol] = _zeros(shape) if shape else []
         self.indices: Dict[IndexId, int] = {}
         self.sparse_workspaces: Dict[
-            WorkspaceId, Tuple[SparseWorkspaceDecl, Dict[int, float]]
+            WorkspaceId, Tuple[SparseWorkspaceDecl, Dict[Tuple[int, ...], float]]
         ] = {}
         self.draining_values: Dict[WorkspaceId, float] = {}
         self.sparse_reductions: Dict[SymbolId, Dict[Tuple[int, ...], float]] = {}
@@ -930,14 +930,28 @@ class _Oracle:
                 "sparse workspace insert outside an executing region"
             )
         decl, entries = open_workspace
-        extent = self._dimension_extent(decl.drain_dimension)
-        coordinate = self._eval_coord(stmt.coord)
-        if not 0 <= coordinate < extent:
+        if len(stmt.coords) != len(decl.key_dimensions):
+            # ``zip`` would silently truncate to the shorter side, so a
+            # malformed insertion would merge under a short key instead of
+            # failing.  The verifier rejects this shape, but ``run_program``
+            # is also called directly, so the oracle owns its own check.
             raise LoopIROracleError(
-                f"sparse workspace coordinate {coordinate} outside [0, {extent})"
+                "sparse workspace insertion supplies "
+                f"{len(stmt.coords)} coordinates for a rank-"
+                f"{len(decl.key_dimensions)} key"
             )
+        key: List[int] = []
+        for coord, dimension in zip(stmt.coords, decl.key_dimensions):
+            extent = self._dimension_extent(dimension)
+            coordinate = self._eval_coord(coord)
+            if not 0 <= coordinate < extent:
+                raise LoopIROracleError(
+                    f"sparse workspace coordinate {coordinate} outside [0, {extent})"
+                )
+            key.append(coordinate)
         contribution = self._eval_value(stmt.value)
-        entries[coordinate] = entries.get(coordinate, 0.0) + contribution
+        entry_key = tuple(key)
+        entries[entry_key] = entries.get(entry_key, 0.0) + contribution
 
     def _exec_sparse_workspace_drain(self, stmt: SparseWorkspaceDrainFor) -> None:
         open_workspace = self.sparse_workspaces.get(stmt.workspace)
@@ -949,14 +963,24 @@ class _Oracle:
             raise LoopIROracleError(
                 "sparse workspace drain re-entered while already draining"
             )
-        _, entries = open_workspace
+        decl, entries = open_workspace
+        if len(stmt.indices) != len(decl.key_dimensions):
+            raise LoopIROracleError(
+                f"sparse workspace drain binds {len(stmt.indices)} indices "
+                f"for a rank-{len(decl.key_dimensions)} key"
+            )
         try:
-            for coordinate in sorted(entries):
-                self.indices[stmt.index] = coordinate
-                self.draining_values[stmt.workspace] = entries[coordinate]
+            # Strictly increasing lexicographic key order: tuple ordering is
+            # exactly the drain contract, and for key dimensions listed in
+            # result level order it is also the canonical append order.
+            for key in sorted(entries):
+                for index, coordinate in zip(stmt.indices, key):
+                    self.indices[index] = coordinate
+                self.draining_values[stmt.workspace] = entries[key]
                 self._exec_stmt(stmt.body)
         finally:
-            self.indices.pop(stmt.index, None)
+            for index in stmt.indices:
+                self.indices.pop(index, None)
             self.draining_values.pop(stmt.workspace, None)
 
     _SPARSE_WORKSPACE_EXEC: Dict[type, Any] = {}

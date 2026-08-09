@@ -70,7 +70,12 @@ from .nodes import (
 )
 from .verifier import verify_program
 
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v10"
+# v11 widens the sparse-workspace family from a single drain dimension to
+# an ordered key domain: ``sparse_workspace_region.workspace`` now carries
+# ``key_dimensions`` (a list) instead of ``drain_dimension``,
+# ``sparse_workspace_insert`` carries ``coords`` instead of ``coord``, and
+# ``sparse_workspace_drain_for`` carries ``indices`` instead of ``index``.
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v11"
 
 
 class _CanonicalIds:
@@ -228,18 +233,21 @@ def _seed_stmt_ids(stmt: Stmt, ids: _CanonicalIds) -> None:
         return
     if type(stmt) is SparseWorkspaceRegion:
         ids.workspace(stmt.workspace.workspace)
-        ids.dimension(stmt.workspace.drain_dimension)
+        for dimension in stmt.workspace.key_dimensions:
+            ids.dimension(dimension)
         _seed_stmt_ids(stmt.producer, ids)
         _seed_stmt_ids(stmt.consumer, ids)
         return
     if type(stmt) is SparseWorkspaceInsert:
         ids.workspace(stmt.workspace)
-        _seed_expr_ids(stmt.coord, ids)
+        for coord in stmt.coords:
+            _seed_expr_ids(coord, ids)
         _seed_expr_ids(stmt.value, ids)
         return
     if type(stmt) is SparseWorkspaceDrainFor:
         ids.workspace(stmt.workspace)
-        ids.index(stmt.index)
+        for key_index in stmt.indices:
+            ids.index(key_index)
         _seed_stmt_ids(stmt.body, ids)
         return
     if type(stmt) is RelayoutStage:
@@ -473,7 +481,10 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "workspace": {
                 "workspace": ids.workspace(stmt.workspace.workspace),
                 "dtype": stmt.workspace.dtype.value,
-                "drain_dimension": ids.dimension(stmt.workspace.drain_dimension),
+                "key_dimensions": [
+                    ids.dimension(dimension)
+                    for dimension in stmt.workspace.key_dimensions
+                ],
             },
             "producer": _serialize_stmt(stmt.producer, ids),
             "consumer": _serialize_stmt(stmt.consumer, ids),
@@ -483,14 +494,14 @@ def _serialize_stmt(stmt: Stmt, ids: _CanonicalIds) -> Dict[str, object]:
             "kind": "sparse_workspace_insert",
             "workspace": ids.workspace(stmt.workspace),
             "op": stmt.op.value,
-            "coord": _serialize_expr(stmt.coord, ids),
+            "coords": [_serialize_expr(coord, ids) for coord in stmt.coords],
             "value": _serialize_expr(stmt.value, ids),
         }
     if type(stmt) is SparseWorkspaceDrainFor:
         return {
             "kind": "sparse_workspace_drain_for",
             "workspace": ids.workspace(stmt.workspace),
-            "index": ids.index(stmt.index),
+            "indices": [ids.index(key_index) for key_index in stmt.indices],
             "body": _serialize_stmt(stmt.body, ids),
         }
     if type(stmt) is RelayoutStage:
@@ -782,7 +793,12 @@ def _render_stmt(
             f"w{ids.workspace(sparse_workspace_decl.workspace)} "
             f"{sparse_workspace_decl.name!r} "
             f"{sparse_workspace_decl.dtype.value} "
-            f"drain d{ids.dimension(sparse_workspace_decl.drain_dimension)} {{"
+            "key ("
+            + ", ".join(
+                f"d{ids.dimension(dimension)}"
+                for dimension in sparse_workspace_decl.key_dimensions
+            )
+            + ") {"
         )
         lines.append(f"{pad}  producer {{")
         _render_stmt(stmt.producer, ids, names, indent + 2, lines)
@@ -796,14 +812,17 @@ def _render_stmt(
         lines.append(
             f"{pad}sparse_workspace_insert({stmt.op.value}) "
             f"w{ids.workspace(stmt.workspace)}"
-            f"[{_render_expr(stmt.coord, ids, names)}] = "
-            f"{_render_expr(stmt.value, ids, names)}"
+            "["
+            + ", ".join(_render_expr(coord, ids, names) for coord in stmt.coords)
+            + "] = "
+            + _render_expr(stmt.value, ids, names)
         )
         return
     if type(stmt) is SparseWorkspaceDrainFor:
         lines.append(
-            f"{pad}sparse_workspace_drain_for x{ids.index(stmt.index)} "
-            f"in w{ids.workspace(stmt.workspace)} {{"
+            f"{pad}sparse_workspace_drain_for ("
+            + ", ".join(f"x{ids.index(key_index)}" for key_index in stmt.indices)
+            + f") in w{ids.workspace(stmt.workspace)} {{"
         )
         _render_stmt(stmt.body, ids, names, indent + 1, lines)
         lines.append(f"{pad}}}")

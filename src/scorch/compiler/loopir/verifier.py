@@ -1554,17 +1554,34 @@ def _check_sparse_workspace_decl(
                 "this subset requires one uniform scalar type per program; "
                 f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
             )
-        dimension = _check_dimension_id(
-            decl.drain_dimension,
-            f"{path}.drain_dimension",
-            "SparseWorkspaceDecl.drain_dimension",
-        )
-        if dimension not in ctx.dimensions:
+        key_dimensions = decl.key_dimensions
+        if type(key_dimensions) is not tuple or not key_dimensions:
             _fail(
-                "undefined_dimension",
-                f"{path}.drain_dimension",
-                "the drain dimension must be a declared dimension",
+                "malformed_state",
+                f"{path}.key_dimensions",
+                "SparseWorkspaceDecl.key_dimensions must be a nonempty tuple "
+                "of declared dimensions",
             )
+        seen: Set[DimensionId] = set()
+        for position, entry in enumerate(key_dimensions):
+            dimension = _check_dimension_id(
+                entry,
+                f"{path}.key_dimensions[{position}]",
+                "SparseWorkspaceDecl.key_dimensions",
+            )
+            if dimension not in ctx.dimensions:
+                _fail(
+                    "undefined_dimension",
+                    f"{path}.key_dimensions[{position}]",
+                    "every key dimension must be a declared dimension",
+                )
+            if dimension in seen:
+                _fail(
+                    "malformed_state",
+                    f"{path}.key_dimensions[{position}]",
+                    "a sparse workspace key may not repeat a dimension",
+                )
+            seen.add(dimension)
         return decl
     finally:
         _leave(ctx, decl)
@@ -1975,14 +1992,24 @@ def _check_sparse_workspace_insert(
             path,
             "SparseWorkspaceInsert.op must be a ReduceOp member",
         )
-    coord_type = _check_expr(ctx, stmt.coord, f"{path}.coord", depth + 1)
-    _require_coord(
-        ctx,
-        coord_type,
-        f"{path}.coord",
-        "a sparse-workspace insertion coordinate",
-        state.decl.drain_dimension,
-    )
+    coords = stmt.coords
+    key_dimensions = state.decl.key_dimensions
+    if type(coords) is not tuple or len(coords) != len(key_dimensions):
+        _fail(
+            "malformed_state",
+            f"{path}.coords",
+            "a sparse-workspace insertion must supply exactly one "
+            "coordinate per declared key dimension, in key order",
+        )
+    for position, (coord, dimension) in enumerate(zip(coords, key_dimensions)):
+        coord_type = _check_expr(ctx, coord, f"{path}.coords[{position}]", depth + 1)
+        _require_coord(
+            ctx,
+            coord_type,
+            f"{path}.coords[{position}]",
+            "a sparse-workspace insertion coordinate",
+            dimension,
+        )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
     _require_value(value_type, f"{path}.value", "an inserted value")
     state.inserted = True
@@ -2012,19 +2039,36 @@ def _check_sparse_workspace_drain_for(
             path,
             "a sparse workspace drains at most once per region",
         )
-    index = _bind_index(
-        ctx,
-        stmt.index,
-        path,
-        "SparseWorkspaceDrainFor.index",
-        state.decl.drain_dimension,
-    )
+    key_dimensions = state.decl.key_dimensions
+    drain_indices = stmt.indices
+    if type(drain_indices) is not tuple or len(drain_indices) != len(key_dimensions):
+        _fail(
+            "malformed_state",
+            f"{path}.indices",
+            "a sparse-workspace drain must bind exactly one index per "
+            "declared key dimension, in key order",
+        )
+    # ``_bind_index`` already enforces the once-only discipline, so a
+    # repeated index inside this tuple fails as ``duplicate_index_binding``
+    # on its second bind; no separate uniqueness check is needed here.
+    bound: List[IndexId] = []
+    for position, (entry, dimension) in enumerate(zip(drain_indices, key_dimensions)):
+        bound.append(
+            _bind_index(
+                ctx,
+                entry,
+                f"{path}.indices[{position}]",
+                "SparseWorkspaceDrainFor.indices",
+                dimension,
+            )
+        )
     state.drain_depth += 1
     try:
         _check_body(ctx, stmt.body, f"{path}.body", depth + 1)
     finally:
         state.drain_depth -= 1
-        del ctx.bound_indices[index]
+        for index in bound:
+            del ctx.bound_indices[index]
     state.drained = True
 
 

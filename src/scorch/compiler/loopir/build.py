@@ -489,10 +489,10 @@ class LoopIRBuilder:
         workspace: WorkspaceId,
         name: str,
         dtype: ScalarType,
-        drain_dimension: DimensionId,
+        key_dimensions: Sequence[DimensionId],
     ) -> SparseWorkspaceDecl:
         return SparseWorkspaceDecl(
-            self._node_id(), workspace, name, dtype, drain_dimension
+            self._node_id(), workspace, name, dtype, tuple(key_dimensions)
         )
 
     def sparse_workspace_region(
@@ -506,19 +506,21 @@ class LoopIRBuilder:
     def sparse_workspace_insert(
         self,
         workspace: WorkspaceId,
-        coord: Expr,
+        coords: Sequence[Expr],
         op: ReduceOp,
         value: Expr,
     ) -> SparseWorkspaceInsert:
-        return SparseWorkspaceInsert(self._node_id(), workspace, coord, op, value)
+        return SparseWorkspaceInsert(
+            self._node_id(), workspace, tuple(coords), op, value
+        )
 
     def sparse_workspace_drain_for(
         self,
         workspace: WorkspaceId,
-        index: IndexId,
+        indices: Sequence[IndexId],
         body: Block,
     ) -> SparseWorkspaceDrainFor:
-        return SparseWorkspaceDrainFor(self._node_id(), workspace, index, body)
+        return SparseWorkspaceDrainFor(self._node_id(), workspace, tuple(indices), body)
 
     def sparse_workspace_value(self, workspace: WorkspaceId) -> SparseWorkspaceValue:
         return SparseWorkspaceValue(self._node_id(), workspace)

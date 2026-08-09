@@ -674,23 +674,33 @@ class WorkspaceReduce(Stmt):
 
 @dataclass(frozen=True)
 class SparseWorkspaceDecl(LoopIRNode):
-    """One scoped serial sparse workspace over exactly one drain dimension.
+    """One scoped serial sparse workspace over an ordered key domain.
 
-    The workspace buffers coordinate/value pairs of ``drain_dimension``:
-    insertions merge by coordinate under ADD, and the consumer observes the
-    merged entries in strictly increasing coordinate order.  ``name`` is
-    presentation only.  Capacity, hashing, and the backing container are
-    target concerns — no size or container spelling appears in the node.
-    There is deliberately no multi-dimensional drain form in this subset;
-    the one-dimension drain is exactly the serial ``coo_workspace`` the
-    automatic sparse-workspace family requires.
+    The workspace buffers key/value pairs over ``key_dimensions``, an ordered
+    tuple of one or more declared dimensions: insertions merge by the whole
+    key tuple under ADD, and the consumer observes the merged entries in
+    strictly increasing **lexicographic** key order.  ``name`` is presentation
+    only.  Capacity, hashing, and the backing container are target concerns —
+    no size or container spelling appears in the node.
+
+    The key domain is the workspace's own, declared independently of any
+    result layout: no result level structure, dense-prefix extent, or result
+    rank appears here.  That separation is the point.  A workspace whose key
+    rank differs from the result rank is ordinary — a rank-1 key draining
+    into the trailing level of a rank-3 result is the TTM shape — and
+    conflating the two is precisely the defect that made the legacy
+    multi-compressed reduction path reject every insertion.
+
+    ``len(key_dimensions) == 1`` is the serial single-drain form the migrated
+    B1/row-scope families use; it is the ``K == 1`` instance of this node, not
+    a separate kind.
     """
 
     node_id: LoopIRNodeId
     workspace: WorkspaceId
     name: str
     dtype: ScalarType
-    drain_dimension: DimensionId
+    key_dimensions: Tuple[DimensionId, ...]
 
 
 @dataclass(frozen=True)
@@ -710,7 +720,7 @@ class SparseWorkspaceRegion(Stmt):
     - ``consumer`` runs second and owns the one ordered drain:
       :class:`SparseWorkspaceDrainFor` of this workspace is legal only
       inside it and observes every merged entry exactly once in strictly
-      increasing drain-coordinate order;
+      increasing lexicographic key order;
     - the workspace ceases to exist at region exit — its lifetime is
       exactly the region, so an empty workspace is observed on every
       execution of the region (once per iteration of the enclosing scope).
@@ -725,16 +735,16 @@ class SparseWorkspaceRegion(Stmt):
 class SparseWorkspaceInsert(Stmt):
     """A merging insertion into one in-scope sparse workspace.
 
-    Combines the entry at ``coord`` with ``value`` using ``op``
+    Combines the entry at ``coords`` with ``value`` using ``op``
     (``entry = entry op value``; an absent entry is created with the
     value).  Only ADD is admitted, and its identity is exactly the absent
-    entry the owning region's empty-entry contract established.  ``coord``
-    must be coordinate-typed over the workspace's drain dimension and is
-    legal only inside the owning region's producer.
+    entry the owning region's empty-entry contract established.  ``coords``
+    must have one coordinate-typed expression per declared key dimension, in
+    key order, and is legal only inside the owning region's producer.
     """
 
     workspace: WorkspaceId
-    coord: Expr
+    coords: Tuple[Expr, ...]
     op: ReduceOp
     value: Expr
 
@@ -744,16 +754,22 @@ class SparseWorkspaceDrainFor(Stmt):
     """The ordered drain of one in-scope sparse workspace.
 
     Visits every merged entry of the workspace exactly once in strictly
-    increasing drain-coordinate order, binding ``index`` to the entry's
-    coordinate for the body; the entry's merged value is read through
+    increasing **lexicographic** key order, binding ``indices`` — one index
+    per declared key dimension, in key order — to the entry's key components
+    for the body; the entry's merged value is read through
     :class:`SparseWorkspaceValue`.  Legal only inside the owning region's
     consumer, at most once per region.  How the ordering is realized (the
     serial container sorts before iteration) is a target concern — no sort
     spelling appears in the node.
+
+    Lexicographic key order is what makes multi-level ordered result
+    assembly correct without any sort in the IR: when the key dimensions are
+    listed in result level order, the drain visits entries in exactly the
+    order the result's levels must be appended.
     """
 
     workspace: WorkspaceId
-    index: IndexId
+    indices: Tuple[IndexId, ...]
     body: Block
 
 

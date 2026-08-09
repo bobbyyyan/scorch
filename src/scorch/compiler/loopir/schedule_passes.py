@@ -284,7 +284,10 @@ def _loop_key(node: _LoopNode) -> Tuple[IndexId, LoopPart]:
     if type(node) is SparseFor:
         return node.coord_index, LoopPart.LOGICAL
     if type(node) is SparseWorkspaceDrainFor:
-        return node.index, LoopPart.LOGICAL
+        # A rank-K drain is one loop node binding K key indices; its loop key
+        # is the innermost coordinate it establishes.  For a rank-1 key this
+        # is the inherited single drain index.
+        return node.indices[-1], LoopPart.LOGICAL
     assert type(node) is MergedSparseFor
     return node.coord_index, LoopPart.LOGICAL
 
@@ -428,7 +431,9 @@ def _wrap_loops(
                 node.cursor, node.position, node.coord_index, body
             )
         elif type(node) is SparseWorkspaceDrainFor:
-            loop = builder.sparse_workspace_drain_for(node.workspace, node.index, body)
+            loop = builder.sparse_workspace_drain_for(
+                node.workspace, node.indices, body
+            )
         else:
             assert type(node) is MergedSparseFor
             loop = builder.merged_sparse_for(
@@ -1191,11 +1196,11 @@ def apply_sparse_workspace(
     builder = LoopIRBuilder.resuming(program)
     workspace_id = builder.new_workspace_id()
     workspace_decl = builder.sparse_workspace_decl(
-        workspace_id, "wksp", result_decl.dtype, axis_dimension
+        workspace_id, "wksp", result_decl.dtype, (axis_dimension,)
     )
     insert_leaf = builder.sparse_workspace_insert(
         workspace_id,
-        builder.index_value(axis_index),
+        (builder.index_value(axis_index),),
         ReduceOp.ADD,
         leaf.value,
     )
@@ -1209,7 +1214,7 @@ def apply_sparse_workspace(
         builder.sparse_workspace_value(workspace_id),
     )
     drain = builder.sparse_workspace_drain_for(
-        workspace_id, drain_index, builder.block((append,))
+        workspace_id, (drain_index,), builder.block((append,))
     )
     region = builder.sparse_workspace_region(
         workspace_decl, producer, builder.block((drain,))
@@ -3512,29 +3517,43 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
         insert = cast(SparseWorkspaceInsert, insert_leaf)
         append = cast(AppendEntry, append_leaf)
         drained_value = append.value
-        trailing_coord = append.coords[-1] if append.coords else None
+        # The drain binds one index per key dimension, and the append must
+        # address the result's trailing ``key_rank`` coordinates with exactly
+        # those indices in key order.  For a rank-1 key this is the inherited
+        # single trailing-coordinate form.
+        key_rank = len(leaf.workspace.key_dimensions)
+        drain = consumer_loops[0] if len(consumer_loops) == 1 else None
+        trailing_coords = (
+            append.coords[len(append.coords) - key_rank :]
+            if len(append.coords) >= key_rank
+            else ()
+        )
         if (
-            len(consumer_loops) != 1
-            or type(consumer_loops[0]) is not SparseWorkspaceDrainFor
-            or consumer_loops[0].workspace != workspace_id
+            drain is None
+            or type(drain) is not SparseWorkspaceDrainFor
+            or drain.workspace != workspace_id
             or type(drained_value) is not SparseWorkspaceValue
             or drained_value.workspace != workspace_id
             or insert.workspace != workspace_id
-            or type(trailing_coord) is not IndexValue
-            or trailing_coord.index != consumer_loops[0].index
+            or len(insert.coords) != key_rank
+            or len(trailing_coords) != key_rank
+            or any(
+                type(coord) is not IndexValue or coord.index != index
+                for coord, index in zip(trailing_coords, drain.indices)
+            )
         ):
             _fail(
                 "unsupported_schedule_shape",
                 "sparse workspace-region erasure is defined for the exact "
                 "ordered-drain append form only",
             )
-        # The structural source receipt: the producer's insertion coordinate
-        # and value plus the consumer's destination prefix reconstruct the
-        # one semantic reduction leaf the pass consumed.
+        # The structural source receipt: the producer's insertion key and
+        # value plus the consumer's destination prefix reconstruct the one
+        # semantic reduction leaf the pass consumed.
         region_loops = producer_loops
         erased_leaf = builder.store_reduce(
             append.tensor,
-            (*append.coords[:-1], insert.coord),
+            (*append.coords[: len(append.coords) - key_rank], *insert.coords),
             ReduceOp.ADD,
             insert.value,
         )

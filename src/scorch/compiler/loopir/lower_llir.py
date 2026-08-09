@@ -6852,8 +6852,9 @@ class _SparseWorkspaceLowering(_TargetLowering):
         require(
             insert.workspace == workspace_decl.workspace
             and insert.op is ReduceOp.ADD
-            and type(insert.coord) is IndexValue
-            and cast(IndexValue, insert.coord).index == child.coord_index,
+            and len(insert.coords) == 1
+            and type(insert.coords[0]) is IndexValue
+            and cast(IndexValue, insert.coords[0]).index == child.coord_index,
             "an ADD insertion at the child loop coordinate",
         )
         consumer = region.consumer
@@ -6881,7 +6882,8 @@ class _SparseWorkspaceLowering(_TargetLowering):
             and len(append.coords) == 2
             and all(type(coord) is IndexValue for coord in append.coords)
             and cast(IndexValue, append.coords[0]).index == outer.coord_index
-            and cast(IndexValue, append.coords[1]).index == drain.index
+            and len(drain.indices) == 1
+            and cast(IndexValue, append.coords[1]).index == drain.indices[0]
             and type(append.value) is SparseWorkspaceValue
             and cast(SparseWorkspaceValue, append.value).workspace
             == workspace_decl.workspace,
@@ -6915,12 +6917,13 @@ class _SparseWorkspaceLowering(_TargetLowering):
             == self._level_dimension(rooted_cursor.tensor, 0)
             and self._level_dimension(rooted_cursor.tensor, 1)
             == self.result_decl.dimensions[1]
-            and workspace_decl.drain_dimension == self.result_decl.dimensions[1],
+            and len(workspace_decl.key_dimensions) == 1
+            and workspace_decl.key_dimensions[0] == self.result_decl.dimensions[1],
             "row, reduction, and drain dimensions in matmul agreement",
         )
         row_dimension = self._level_dimension(descended_cursor.tensor, 0)
         merge_dimension = self._level_dimension(descended_cursor.tensor, 1)
-        drain_dimension = workspace_decl.drain_dimension
+        drain_dimension = workspace_decl.key_dimensions[0]
         require(
             len({row_dimension, merge_dimension, drain_dimension}) == 3,
             "three distinct loop dimensions",
@@ -7033,7 +7036,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 tensor_id=self.result_symbol,
                 index_ids=(
                     self.outer_loop.coord_index,
-                    self.sparse_drain.index,
+                    self.sparse_drain.indices[0],
                 ),
                 role=llir.TensorAccessRole.RESULT_WRITE,
             ),
@@ -8087,8 +8090,9 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         require(
             insert.workspace == workspace_decl.workspace
             and insert.op is ReduceOp.ADD
-            and type(insert.coord) is IndexValue
-            and cast(IndexValue, insert.coord).index == child.coord_index,
+            and len(insert.coords) == 1
+            and type(insert.coords[0]) is IndexValue
+            and cast(IndexValue, insert.coords[0]).index == child.coord_index,
             "an ADD insertion at the child loop coordinate",
         )
         consumer = region.consumer
@@ -8116,7 +8120,8 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             and len(append.coords) == 2
             and all(type(coord) is IndexValue for coord in append.coords)
             and cast(IndexValue, append.coords[0]).index == outer.index
-            and cast(IndexValue, append.coords[1]).index == drain.index
+            and len(drain.indices) == 1
+            and cast(IndexValue, append.coords[1]).index == drain.indices[0]
             and type(append.value) is SparseWorkspaceValue
             and cast(SparseWorkspaceValue, append.value).workspace
             == workspace_decl.workspace,
@@ -8148,12 +8153,13 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             and self._level_dimension(child_cursor.tensor, 1)
             == self.result_decl.dimensions[1]
             and outer.dimension == self.result_decl.dimensions[0]
-            and workspace_decl.drain_dimension == self.result_decl.dimensions[1],
+            and len(workspace_decl.key_dimensions) == 1
+            and workspace_decl.key_dimensions[0] == self.result_decl.dimensions[1],
             "row, reduction, and drain dimensions in matmul agreement",
         )
         row_dimension = self.result_decl.dimensions[0]
         reduction_dimension = self._level_dimension(reduction_cursor.tensor, 1)
-        drain_dimension = workspace_decl.drain_dimension
+        drain_dimension = workspace_decl.key_dimensions[0]
         require(
             len({row_dimension, reduction_dimension, drain_dimension}) == 3,
             "three distinct loop dimensions",
@@ -8309,7 +8315,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
                 tensor_id=self.result_symbol,
                 index_ids=(
                     self.outer_loop.index,
-                    self.sparse_drain.index,
+                    self.sparse_drain.indices[0],
                 ),
                 role=llir.TensorAccessRole.RESULT_WRITE,
             ),
