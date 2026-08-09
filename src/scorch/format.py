@@ -96,17 +96,26 @@ _STR_TO_LEVEL_TYPE = {
 
 def _parse_level_type(s: str) -> LevelType:
     """Convert one canonicalized string alias to a :class:`LevelType`."""
-    if not isinstance(s, str):
+    string_type = type(s)
+    if string_type is str:
+        text = s
+        key = s.strip().lower()
+    elif issubclass(string_type, str):
+        # Bypass every subclass hook while preserving real ``str`` subclasses
+        # as accepted aliases.  The base descriptors return exact strings, so
+        # both lookup and any failure rendering below are callback-free.
+        text = str.__str__(s)
+        key = str.lower(str.strip(text))
+    else:
         raise TensorTypeError(
             f"level format must be a string or LevelType, got {type(s).__name__}"
         )
-    key = s.strip().lower()
     try:
         return _STR_TO_LEVEL_TYPE[key]
     except KeyError as error:
         aliases = ", ".join(sorted(_STR_TO_LEVEL_TYPE))
         raise TensorFormatError(
-            f"invalid level format {s!r}; expected one of: {aliases}"
+            f"invalid level format {text!r}; expected one of: {aliases}"
         ) from error
 
 
@@ -159,21 +168,32 @@ class LevelFormat:
         mode: Union[str, LevelType],
         bit_width: Optional[int] = None,
     ):
-        parsed_mode = _parse_level_type(mode) if isinstance(mode, str) else mode
-        if not isinstance(parsed_mode, LevelType):
+        mode_type = type(mode)
+        parsed_mode: LevelType
+        if mode_type is str:
+            parsed_mode = _parse_level_type(cast(str, mode))
+        elif mode_type is LevelType:
+            parsed_mode = cast(LevelType, mode)
+        elif issubclass(mode_type, str):
+            parsed_mode = _parse_level_type(cast(str, mode))
+        else:
             raise TensorTypeError(
                 "level format mode must be a string alias or LevelType, "
                 f"got {type(mode).__name__}"
             )
         if bit_width is not None:
             bit_width_type = type(bit_width)
-            if bit_width_type is bool or not issubclass(bit_width_type, int):
+            if bit_width_type is int:
+                canonical_bit_width = bit_width
+            elif bit_width_type is bool or not issubclass(bit_width_type, int):
                 raise TensorTypeError("level format bit_width must be an integer")
-            # Validate the underlying integer without trusting subclass
-            # comparison or conversion hooks.  Retain the caller's value here
-            # for constructor compatibility; retaining boundaries canonicalize
-            # it to the exact integer proven by this check.
-            if int.__int__(bit_width) <= 0:
+            else:
+                # Validate the underlying integer without trusting subclass
+                # comparison or conversion hooks.  Retain the caller's value
+                # here for constructor compatibility; retaining boundaries
+                # canonicalize it to the exact integer proven by this check.
+                canonical_bit_width = int.__int__(bit_width)
+            if canonical_bit_width <= 0:
                 raise TensorFormatError("level format bit_width must be positive")
         object.__setattr__(self, "_mode", parsed_mode)
         object.__setattr__(self, "_bit_width", bit_width)
@@ -397,7 +417,15 @@ FormatInput = Union[
 
 
 def _tokenize_format_string(value: str) -> Tuple[str, ...]:
-    text = value.strip().lower()
+    value_type = type(value)
+    if value_type is str:
+        source = value
+        text = value.strip().lower()
+    elif issubclass(value_type, str):
+        source = str.__str__(value)
+        text = str.lower(str.strip(source))
+    else:
+        raise TensorTypeError("tensor format must be a string or sequence of levels")
     if not text:
         return tuple()
     if text in _STR_TO_LEVEL_TYPE:
@@ -405,7 +433,7 @@ def _tokenize_format_string(value: str) -> Tuple[str, ...]:
     if "," in text:
         tokens = tuple(token.strip() for token in text.split(","))
         if any(not token for token in tokens):
-            raise TensorFormatError(f"invalid comma-separated tensor format {value!r}")
+            raise TensorFormatError(f"invalid comma-separated tensor format {source!r}")
         return tokens
     return tuple(text)
 
@@ -422,22 +450,41 @@ def _normalize_level_formats(
 ) -> Tuple[LevelFormat, ...]:
     if value is None:
         return tuple()
-    if isinstance(value, LevelFormat):
-        return (value,)
-    if isinstance(value, LevelType):
-        return (LevelFormat(value),)
-    if isinstance(value, str):
-        value = _tokenize_format_string(value)
-    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
-        raise TensorTypeError(
-            "tensor format must be a string, level, or sequence of levels"
-        )
-    result = []
-    for level in value:
-        if isinstance(level, LevelFormat):
-            result.append(level)
-        elif isinstance(level, (LevelType, str)):
-            result.append(LevelFormat(level))
+    value_type = type(value)
+    normalized_value: Sequence[Union[LevelFormat, LevelType, str]]
+    if value_type is LevelFormat:
+        return (cast(LevelFormat, value),)
+    if value_type is LevelType:
+        return (LevelFormat(cast(LevelType, value)),)
+    if value_type is str:
+        normalized_value = _tokenize_format_string(cast(str, value))
+    elif value_type is list or value_type is tuple:
+        normalized_value = cast(Sequence[Union[LevelFormat, LevelType, str]], value)
+    elif issubclass(value_type, LevelFormat):
+        return (cast(LevelFormat, value),)
+    elif issubclass(value_type, str):
+        normalized_value = _tokenize_format_string(cast(str, value))
+    else:
+        if issubclass(value_type, (bytes, bytearray)) or not issubclass(
+            value_type, Sequence
+        ):
+            raise TensorTypeError(
+                "tensor format must be a string, level, or sequence of levels"
+            )
+        normalized_value = cast(Sequence[Union[LevelFormat, LevelType, str]], value)
+    result: List[LevelFormat] = []
+    for level in normalized_value:
+        level_type = type(level)
+        if level_type is LevelFormat:
+            result.append(cast(LevelFormat, level))
+        elif level_type is LevelType:
+            result.append(LevelFormat(cast(LevelType, level)))
+        elif level_type is str:
+            result.append(LevelFormat(cast(str, level)))
+        elif issubclass(level_type, LevelFormat):
+            result.append(cast(LevelFormat, level))
+        elif issubclass(level_type, str):
+            result.append(LevelFormat(cast(str, level)))
         else:
             raise TensorTypeError(
                 "tensor format levels must be LevelFormat, LevelType, or string; "
