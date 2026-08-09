@@ -29850,3 +29850,219 @@ claim, count the census heading as a cell, reuse red exploratory receipts as
 green gates, or label paired same-tip latency as A/B/A. Seal evidence only after
 the final documentation tip, exclude generated `__pycache__`, and prove every
 manifest entry verifies.
+
+## Exact-tip ownership review and integrity-cost closure (2026-08-08; supersedes the preceding prompt)
+
+Twenty-two code/test commits stack on documentation tip `8a2a83a`, ending at
+code/test tip `b91b773`; this documentation commit follows. Nothing was pushed,
+amended, squashed or reordered;
+origin remains `58e8565`. The five protected tracked files retain their
+recorded hashes and no unrelated tracked or untracked material was staged.
+
+### Review outcome and corrections
+
+The review reproduced the inherited conversion/layout/compiler contracts and
+then probed ownership beyond the committed test matrix. It found and fixed
+real cross-owner runtime gaps, hostile diagnostic callbacks, post-verification
+LoopIR graph/cache mutations, self-authorizing target snapshots, schema
+registry replacement, malformed authority arity and one measurable integrity
+cost regression. Review §44 records each boundary and commit.
+
+The final compiler authority is deliberately narrow:
+
+- the complete verified LoopIR graph and every interpreting target cache are
+  owned by exact state/identity snapshots with strong lifetimes;
+- construction and final snapshots live in an external weakly keyed authority,
+  cross-anchored to the target rather than trusted from the instance alone;
+- the four schema registries are exact canonical read-only proxies pinned in a
+  tuple-immutable bundle before any lookup;
+- both authority tuples prove exact type and arity before a field descriptor;
+- callback-bearing mappings, weak-ref lookalikes, malformed identities/enums,
+  cycles, alias changes and cache replacement fail with controlled target
+  diagnostics; and
+- unchanged emission shares one authority lookup and uses frozen witnesses;
+  changed paths replay the narrow scans that own their established messages.
+
+The initial correct implementation crossed the 1.10 compile-latency target.
+The final optimization did not weaken that contract: all three constructors
+freeze the complete position-binding result immediately, and merged alignment
+cases reuse that exact proxy only after the complete graph/cache guard. The
+cold changed path still performs the full stored-state walk. A separate
+reviewer confirmed the sequencing across base and specialized targets and
+independently rejected graph swaps, equal fresh proxies, malformed witnesses
+and attempted proxy mutation.
+
+### Exact final evidence
+
+Evidence is retained under
+`~/.cache/scorch-codex/phase7-closure-review-final/` and in the corresponding
+unloaded Redwood directory.
+
+- Exact detached code-tip runtime ownership membership: **228 passed** over
+  the six affected runtime and conversion files at ``b91b773`` with asserted
+  import provenance.
+- ``test_loopir_llir_lowering.py`` and
+  ``test_loopir_dense_leaf_cooperand_target.py`` contribute **510 passing
+  tests** within the exact detached production-tip memberships at
+  ``1a550d4``. Compiler A: **398 passed**; Compiler B: **520 passed**. Final
+  ``b91b773`` changes only the disjoint schedule-generality test file.
+- The first literal full-suite run at ``1a550d4`` stopped on one contradictory
+  old test fixture. Its ``doo`` result is deliberately rejected and emits
+  malformed assembly if the guard is bypassed. Test-only ``b91b773`` keeps the
+  two-coordinate workspace-key source coverage on format-admitted ``ooo`` and
+  explicitly locks scheduled-``doo`` rejection; both focused tests pass. This
+  does not claim native rank-greater-than-one workspace correctness. The final
+  full suite below runs at ``b91b773``.
+- Schedule audit: **46 admitted / 40 rejected / 0 non-identical**, normalized
+  JSON equal to the retained baseline.
+- Final captures: **118/118 raw byte-identical** (corpus 20, grid 42, anchors
+  22, heap 11, automatic 23); the per-file manifest is identical to the
+  retained chain.
+- Compatibility census carried forward from ``bb76e26``: **54 cells, 0 arm
+  divergence**; all 25 admitted cells are byte-identical to legacy. The three
+  later commits are emission-neutral (one successful-path integrity
+  optimization and two test locks); the ``1a550d4`` capture set plus the
+  test-only final diff prove unchanged production source. Eight known unsafe
+  reduction/TTM cells exit 139, eight
+  legacy outputs are malformed, and the four numeric mismatches are a subset
+  of those malformed outputs; all well-formed executions agree.
+- Full-source static parity against `8a2a83a`: one inherited Black finding,
+  nine inherited Flake8 findings, and 140 mypy errors in 11 files on each side;
+  normalized logs are byte-identical, and LoopIR production mypy is clean.
+- Exact Redwood alternating latency (200 warmups / 2,000 samples):
+  rank-2/3/4 dense-leaf p50/p95 ratios **1.0886/1.0991**,
+  **1.0703/1.0748** and **1.0449/1.0452**; B3 **1.0909/1.0961**. All are
+  inside 1.10. The adjacent same-tip A/A control is 0.9994-1.0145 at p50 and
+  0.9996-1.0065 at p95; all 60 tracked ``src/scorch`` Python files are proven
+  byte-identical to detached ``1a550d4``. The completed JSON is retained, but
+  the original harness processes did not record separate exit-code receipts.
+- Exact clean detached non-performance suite at ``b91b773``: **5,632 passed /
+  14 skipped / 0 failures / 2 known sparse-invariant warnings over all 5,646
+  selected nodes** in eight file-disjoint fresh processes (5,649 collected, 3
+  performance tests
+  deselected), with a proven complete/non-overlapping node union and no libomp
+  ceiling event.
+
+### Phase disposition
+
+This was an integrity review, not an implicit format-matrix expansion. Phase 7
+therefore remains open on the same two representation clusters:
+
+1. multiple dense-prefix/interleaved sparse outputs (`dds`, `ddss`, and an
+   explicit `sds` decision), including flattened dense-prefix position sizing;
+2. multi-compressed reduction/TTM, including the two-contraction workspace
+   placement defect, gated on LoopIR oracle and PyTorch because the retained
+   legacy comparand is memory-unsafe.
+
+No Phase-8 dispatch, cache, selector or fallback change was made; no legacy
+implementation was deleted.
+
+### Superseding broad copy-paste prompt for the next session
+
+```text
+Continue the compiler-IR migration from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, review §43-§44 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md and the final section of
+COMPILER_IR_REFACTOR_HANDOFF.md, inspect the graph yourself, and do not trust
+the handoff without reproducing its contracts. Do not push, amend, squash or
+reorder existing commits. Preserve the five protected dirty tracked files and
+all unrelated GPU/benchmark/scheduler/research/scratchpad material; stage only
+explicit paths.
+
+The protected tracked files and required SHA-256 values are:
+`.gitignore` = `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`,
+`pyproject.toml` =
+`191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`,
+`src/scorch/__init__.py` =
+`5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`,
+`tests/packaging/smoke_install.py` =
+`f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`,
+and `tests/test_scorch/test_resources.py` =
+`3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+Start with a rigorous independent review of 8a2a83a..b91b773 plus the final
+docs commit. Reproduce the runtime format/layout/metadata/storage ownership
+contracts, hostile-scalar diagnostics, complete LoopIR graph/cache integrity,
+external construction/final target authority lifecycle, canonical registry
+identity, exact authority arity and the sealed position-binding reuse. Verify
+the final source/capture/census/static/latency/full-suite receipts from their
+raw artifacts. Explicitly reproduce ``b91b773``'s scheduled-``doo`` rejection
+and ``ooo`` pair-read lock, treating the latter as structural-only and
+preserving the open rank-greater-than-one workspace coordinate-rank/shape and
+result-assembly limitation. Preserve the evidence qualifications: the current
+closure ledger verifies 540/540, the historical assembly ledger is expected to
+verify 224/225 and must not be resealed, the execution census is carried from
+``bb76e26``, and the historical latency harnesses lack separate process-exit
+receipts. Add fresh adversarial probes for mutation, aliasing, cycles,
+forged tuple/proxy/weakref state, descriptor callbacks, target construction
+order and specialized-target cache drift. If a concrete defect exists, fix it
+first with a focused production commit and a separate regression-test commit,
+then rerun proportionate gates.
+
+Then take a broad Phase-7 closure milestone rather than stopping after one
+small happy-path family:
+
+1. Implement the multiple-dense-prefix sparse-output family end to end for
+   dds and ddss, including copy, intersection and ordered UNION assembly in
+   both automatic arms. Make an explicit, evidence-backed decision for the
+   interleaved sds layout in the same session. Model the flattened product of
+   all dense coordinates preceding a compressed level and size every position
+   vector from level identities; move CIN admission, scheduling/oracle,
+   erasure, target lowering and public result wrapping together. Do not use
+   CSR shortcuts, rendered names, regexes or format-string sniffing. Where the
+   legacy assembler is malformed or memory-unsafe, gate on LoopIR oracle and
+   PyTorch rather than byte parity. Cover ranks 3-5, f32/f64, commuted operands,
+   ragged and empty streams, zero extents, cancellation, explicit stored zeros
+   and both automatic arms. Explicitly disposition the adjacent trailing-dense
+   D10/D11 families (``sd+sd`` and ``sdd``), and keep permuted-compressed
+   layouts fail-closed unless they are deliberately migrated with their own
+   evidence.
+
+2. In the same session, implement the multi-compressed reduction/TTM vertical
+   rather than merely inventorying it. Retain each SIGSEGVing legacy kernel as
+   executable failure evidence only. Give workspace allocation, reset,
+   lifetime, producer reduction, drain and ordered result assembly explicit
+   structured ownership; reuse existing nodes only where a responsibility
+   audit proves the semantics match. Include the known rank-1 two-contraction
+   workspace-placement defect, plus the declared rank-2/rank-3 sparse
+   reduction and TTM matrix across every relevant migrated layout, both
+   automatic arms and f32/f64. Cover cancellation, explicit stored zeros,
+   empty/ragged inputs, zero extents and commuted forms. Require canonical
+   erasure/oracle equivalence, public PyTorch differentials and exact
+   fail-closed codes for every still-excluded neighbor. Run each of the eight
+   §41.4 SIGSEGV cells only in its own fresh subprocess with a timeout and
+   resource isolation, and include the inherited rank-2-workspace/rank-3-shape
+   mismatch in the workspace ownership audit.
+
+3. Re-run the Phase-7 exit audit criterion by criterion over the expanded
+   declared matrix. Only a genuine GO permits a read-only Phase-8 inventory of
+   fallback frequency, cache/request identity and cutover dependencies. Do not
+   start a cutover experiment, change default dispatch, selectors or caches,
+   remove a fallback, delete legacy code or begin Phase 8.5 in this session.
+
+4. Optionally close the residual runtime format seam with structurally
+   unforgeable LevelFormat/TensorFormat/TensorLayout/TensorMetadata values only
+   after the compiler milestones and only if equality, hashing, pickling,
+   dataclass behavior, repository-required identity relations and compile
+   latency remain exact. Do not trade one process-global aliasing defect for a
+   broad compatibility break.
+
+For every implementation boundary, use focused plus adversarial tests, the
+deterministic real 54-cell census and an expanded family census, independent
+multi-seed randomized oracle sweeps, the 86-case schedule audit, all retained
+and activating captures, compiled public differentials and exact source
+comparisons. For unsafe families, source comparison means repeat/arm/oracle
+comparison, never equality to an unsafe legacy output. Run alternating paired
+latency on an unloaded host (200 warmups / 2,000 samples, both p50 and p95 at
+or below 1.10) with an A/A control for marginal tails and an activating case
+for every new family, full-tree Black/Flake8/mypy parity between the inherited
+tip and candidate, git diff --check, protected-file hashes, and an exact-tip
+clean detached full non-performance suite in fresh-process file-disjoint partitions with a
+proven complete/non-overlapping node union. Do not call a crash a parity pass,
+use an unsafe legacy result as a correctness oracle, average away a failed
+percentile, or cite a receipt whose exact revision/import provenance was not
+proved. Seal the evidence manifest only after the final code and documentation
+tips, exclude generated caches/worktrees, verify every manifest entry, document
+the honest GO/NO-GO boundary, and finish with commits plus a still-broader
+continuation prompt.
+```

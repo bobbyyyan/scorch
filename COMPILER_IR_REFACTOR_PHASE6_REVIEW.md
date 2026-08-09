@@ -7583,3 +7583,254 @@ nonetheless larger than a family migration: two pre-existing silent-correctness
 defects in public operations are closed, the process-global half of the format
 seam is closed, and the census's numeric-soundness column -- which had never
 actually run -- is now real.
+
+## 44. Exact-tip review: retained ownership and target integrity (2026-08-08)
+
+This review starts at inherited documentation tip ``8a2a83a`` and audits the
+whole 25-commit inclusive span ``2b36b7b^..8a2a83a``.  The preceding report's
+count of 16 is not a history error: those are the commits it added above
+``9ca2212``; the total also includes the eight commits it reviewed above
+``2b36b7b`` and that inclusive base checkpoint itself.  No commit was amended,
+squashed or reordered.
+
+### 44.1 Evidence audit and inherited verdict
+
+The 540-entry ``phase7-closure-session`` ledger verifies **540/540** from
+scratch.  The older §39 ``phase7-assembly-session`` ledger does not: its
+``tip-at-docs.txt`` was changed about 25 seconds after ``SHA256SUMS`` was
+written, so that manifest now verifies **224/225**.  The changed file only records a Git
+tip and does not alter a code, test, capture or timing receipt; this is an
+evidence-sealing defect, not a code-result discrepancy.  The failed check,
+expected digest, actual digest and timestamps are retained in this review's
+ledger instead of silently resealing the old directory.
+
+The inherited family migration itself remains sound over its stated envelope.
+Fresh review probes reproduced rank-1 and dense-suffix conversion, the
+``PositionLoad`` UNION boundary, the 54-cell compatibility census and the
+sealed capture surfaces.  The review nevertheless found ownership gaps outside
+that envelope which could make retained runtime or compiler state diverge after
+validation.  They are fixed before any further Phase-7 representation work.
+
+### 44.2 Runtime ownership corrections (``554fdaf`` through ``9bc8c91``)
+
+The construction-side format copy in §43 was necessary but incomplete.  A
+caller could still cross a retaining boundary with subclassed or forged
+formats, layouts, metadata, sparse-storage objects, tensor indices, index
+tensors, shapes, permutations, names, dtypes or devices.  Several paths then
+read properties from the caller object after validating different stored state,
+or shared structural objects between two tensors.  A broad ``to_sparse`` error
+handler also converted an invalid requested format into the default path, and
+mixed coordinate/non-coordinate hierarchies could begin materialization before
+being rejected.
+
+The corrected boundary now:
+
+- audits exact stored base fields without invoking subclass descriptors;
+- canonicalizes integer and string subclasses, shapes, permutations, names,
+  dtype/device values and both format-container layers;
+- rebuilds layouts, metadata, indices and sparse-storage structure for each
+  owner, cloning structural index tensors while preserving normal numeric
+  value-buffer aliasing;
+- preserves one canonical layout object shared by a tensor's own metadata and
+  storage, including metadata setter paths;
+- rejects malformed or foreign structural state through Scorch domain errors;
+- makes ``to_sparse`` reject invalid requested formats and mixed coordinate
+  hierarchies atomically instead of swallowing the request; and
+- forms device/dtype diagnostics from safe type information, so a bad value's
+  ``str``/``repr`` hook cannot execute while reporting the error.
+
+The tests cover cross-owner mutation, tensor-subclass and ``__dict__``
+descriptor interposition, malformed fields, index-tensor subclasses, hostile
+scalar rendering, copy detachment and storage/layout identity.  The numeric
+payload remains intentionally observable and mutable under the repository's
+existing tensor semantics.
+
+One compatibility seam remains explicit: ``STensor.format``, ``layout``,
+``metadata`` and ``storage`` still return the tensor's own nominally frozen
+Python value objects.  A caller using ``object.__setattr__`` can corrupt that
+same tensor.  This review closes cross-owner and post-validation retention; it
+does not claim structurally unforgeable public value types.
+
+### 44.3 Compiler ownership corrections (``d067fd7`` through ``f034b69``)
+
+Normalized CIN and verified LoopIR are also frozen only by convention.  Fresh
+probes found that a caller could replace or mutate a retained statement,
+access, identity, position spine, synthetic view, workspace branch, heap leaf,
+target class or target-private cache after verification.  Several successful
+emission paths then consumed the changed object without one common integrity
+authority; a self-consistent ``PositionLoad`` retarget was the clearest escape.
+
+The target now owns an exact, cycle-bounded signature of the complete program
+graph and its constructor-final cache graph, strongly retaining every signed
+object so an address cannot be recycled into the signature.  Exact stored node,
+enum and identity classes are registry-locked; repeated occurrences, aliasing,
+position-to-tensor/level/domain links, input membership, target type and every
+specialized synthetic region are checked before raw emission.  Narrow
+position/value/owner validators are replayed on the changed path so established
+diagnostics remain stable.  The sparse-workspace and heap specializations bind
+both semantic branches and their declarations rather than relying on the base
+target's fields.
+
+Adjacent correctness fixes discovered by those probes are included in the
+same reviewed boundary:
+
+- CIN normalization owns tensor formats, and the adjacent CIN-lowering
+  preflight rejects mixed coordinate hierarchies before materialization;
+- all-dense co-operands use logical ``LevelDecl.mode`` identity under a
+  non-identity physical order;
+- a position load must retain its exact access occurrence and validated dense
+  spine; and
+- rank-1 coordinate-result drains use the scalar workspace-key contract.
+
+No LoopIR node, canonical schema, plan/request identity, automatic
+LoopIR/legacy compiler-routing rule or valid generated C++ spelling changes in
+this review.
+
+### 44.4 The measured integrity-cost correction
+
+The first fail-closed implementation at ``dbad96b`` was correct but too slow.
+On an unloaded Redwood run (200 warmups / 2,000 samples, both orderings), the
+rank-2 dense-leaf case and B3 control were repeatedly about **1.112-1.115** at
+p50/p95 against the legacy compiler, over the declared 1.10 ceiling.  Profiling
+attributed the crossing to rebuilding overlapping graph, binding, value, owner
+and target-cache signatures on the successful path.
+
+``0c09ea3`` makes the complete graph signature the unchanged-path proof and
+replays narrow scans only after a graph difference.  The next optimization,
+``2224d29``, initially classified every narrow snapshot as diagnostic-only;
+review immediately disproved that assumption because successful merged
+emission reads the ``PositionLoad`` map.  ``aa2a3ef`` restored that map.  A
+second independent probe then showed the bound-position map is also read on a
+successful path and that recursively signing caller-replaced witnesses could
+execute callbacks.
+
+``12be09c`` freezes the coherent four-witness family at construction: the two
+mappings become fresh exact read-only proxies; the value and owner signatures
+are recursively immutable tuples.  The target cache binds each strongly owned
+witness by exact identity without calling ``len``, equality, iteration or
+lookup on a replacement.  Dedicated serial and parallel sparse-workspace
+targets own none of these witnesses, so the family is optional as a whole
+rather than globally required.  Missing, partial, foreign, same-value
+replacement and callback-bearing replacement state all fail closed; the
+unchanged route does not repeat the narrow walks.
+
+The final independent review did not stop there.  ``58fa714`` / ``730e59d``
+move the construction authority outside the forgeable target instance and
+cross-anchor its graph and cache snapshots to the retained instance fields.
+``4913f46`` / ``2d9e93d`` make the same authority available during
+construction without accepting a second seal or an incomplete pre-seal
+record.  This closes the otherwise circular case in which rewriting both an
+instance cache and the instance's own purported snapshot could bless the
+rewrite.
+
+The last review pass found two additional fail-closed gaps in the optimized
+boundary itself.  First, ``type(x) is MappingProxyType`` did not prove that a
+schema registry was canonical: a proxy can wrap a hostile ``Mapping``, and an
+ordinary replacement proxy could omit a required node or enum without being
+observed on some successful paths.  Second, exact ``NamedTuple`` type did not
+prove tuple arity: ``tuple.__new__`` could manufacture a truncated authority
+whose field descriptor leaked ``IndexError``.  ``c18abd6`` / ``bb76e26`` pin
+the four exact canonical registry proxies in one tuple-immutable bundle before
+*any* lookup, validate both schema and target authority arity before a field
+descriptor, prove weak-reference type before invocation, and make retained
+loop caches real tuples.  They also share one external authority lookup across
+an unchanged emission and replay input validation only on the cold mismatch
+path, retaining every narrower diagnostic.  Hostile proxy mappings, missing
+entries, truncated and oversized authorities, equal fresh mirrors, weak-ref
+lookalikes, cycles, malformed caches and ordinary graph mutations all fail
+with controlled target diagnostics in the final adversarial review.
+
+That boundary was correct, but the first exact unloaded-host latency rerun was
+still marginal: the rank-2 dense-leaf and B3 paths were about 1.106 in both
+fixed orders, while an alternating run was 1.097 at p50 but 1.104 at p95.
+Profiling exposed one semantic duplicate rather than a reason to weaken the
+guard: every merged alignment case rewalked all position bindings even though
+the complete binding result was already an exact target witness.  ``80c9e18``
+/ ``1a550d4`` freeze that result immediately in all three constructors and
+reuse it only after the complete graph/cache check; changed paths still replay
+the stored-state walk.  Independent probes replaced the live graph, installed
+an equal fresh proxy, attempted proxy mutation and exercised both base and
+multi-compressed merged routes.  Every mutation failed closed and unchanged
+source stayed byte-identical.
+
+The exact final Redwood alternating run at ``1a550d4`` (200 warmups /
+2,000 samples) is inside the 1.10 p50/p95 target on all four cases.  The
+dense-leaf rank-2/3/4 ratios are respectively **1.0886/1.0991**,
+**1.0703/1.0748** and **1.0449/1.0452**; B3 is **1.0909/1.0961**.  B3's
+untrimmed mean ratio is 1.1097 because of isolated tail samples, so it is
+reported rather than silently averaged away; the declared gate is p50/p95.
+An immediately adjacent same-tip alternating A/A control is 0.9994-1.0145 at
+p50 and 0.9996-1.0065 at p95, attributing that tail behavior to the host rather
+than a changed code path.  Every LoopIR source is byte-identical to its legacy
+source in both runs; the exact rank-2/3/4/B3 SHA-256 values are retained with
+the harnesses and raw JSON.  A retrospective provenance receipt proves all 60
+tracked ``src/scorch`` Python files on Redwood byte-equal to the clean detached
+``1a550d4`` tree and records the host, Python and exact Scorch import path.  The
+original harness processes did not retain separate exit-code receipts; the
+completed JSON, source proof and adjacent A/A output are retained without
+claiming otherwise.
+
+### 44.5 Verification
+
+All commands use the ``scorch`` conda environment.  Final code/test evidence is
+under ``~/.cache/scorch-codex/phase7-closure-review-final/``; exact Redwood
+latency receipts and harnesses are copied into ``latency-final/`` and
+remain in the corresponding Redwood evidence directory.
+
+- Exact code-tip runtime ownership membership: **228 passed** over the six
+  affected runtime and conversion files at detached ``b91b773`` with asserted
+  import provenance.
+- Exact production-tip compiler memberships at ``1a550d4``: **398 passed**
+  over CIN analysis, dense-universe and dense-leaf target tests; **520 passed** over LLIR
+  lowering, serial sparse-workspace, rank-1 drain, parallel-workspace and
+  multi-compressed target tests.  Final ``b91b773`` changes only the disjoint
+  schedule-generality test file.
+- The first literal full-suite run at ``1a550d4`` correctly stopped in the
+  pre-existing nested workspace-pair test: its ``doo`` result contradicted the
+  deliberate mixed-coordinate rejection and, when that guard is bypassed,
+  produces malformed assembly.  ``b91b773`` changes no production code.  It
+  exercises the same two-coordinate workspace-key source contract with
+  format-admitted ``ooo`` output and adds an explicit scheduled-``doo``
+  rejection lock; both focused tests pass.  This is structural source coverage,
+  not a claim of native rank-greater-than-one workspace correctness.  The exact
+  final full suite below runs at that test tip.
+- Schedule audit: **46 admitted / 40 rejected / 0 non-identical**.  Corpus
+  **20/20**, grid **42/42**, anchor **22/22**, heap **11/11** and automatic
+  **23/23** captures are raw byte-identical.  The 54-cell execution census was
+  run at ``bb76e26`` and carries forward because ``80c9e18`` changes only
+  successful-path integrity work while ``1a550d4`` and ``b91b773`` are
+  test-only; the ``1a550d4`` capture set plus the test-only final diff prove
+  unchanged production source.  It remains arm-invariant with every
+  successful admitted arm byte-equal to legacy; the eight known unsafe legacy
+  reduction/TTM cells remain executable failure evidence.
+- Full-source base/candidate parity: **one inherited Black finding, nine
+  inherited Flake8 findings and 140 mypy errors in 11 files** at both
+  ``8a2a83a`` and ``1a550d4``; all three normalized logs are byte-identical,
+  the production LoopIR mypy membership is clean, and ``b91b773`` changes no
+  source file.
+  ``git diff --check`` is clean.
+- Exact code-tip clean detached non-performance suite: **5,632 passed / 14
+  skipped / 0 failures / 2 known sparse-invariant warnings over all 5,646
+  selected nodes** at ``b91b773`` in eight file-disjoint fresh processes
+  (5,649 collected, 3 performance tests
+  deselected).  A pre-run proof places all 85 tracked pytest modules exactly
+  once, the collected-node union is complete and non-overlapping, every JUnit
+  load matches its partition receipt, and no libomp ceiling event occurred.
+- The five protected tracked files retain their recorded SHA-256 values;
+  origin remains ``58e8565``; nothing was pushed; every unrelated tracked and
+  untracked path remains untouched.
+
+### 44.6 Phase-7 exit disposition
+
+This review fixes ownership and integrity defects; it does not silently widen
+the migrated format matrix.  The two §43.5 clusters remain:
+
+1. multiple dense prefixes / interleaved dense output (``dds``, ``ddss`` and a
+   separate ``sds`` decision), requiring a flattened dense-prefix counter and
+   correctly sized position vectors; and
+2. multi-compressed reduction/TTM, requiring an oracle-gated workspace/result
+   vertical because the legacy comparand segfaults.
+
+**Phase 7 therefore remains open.**  No Phase-8 cutover, default-dispatch,
+selector, cache or fallback change was made, and no legacy implementation was
+deleted.
