@@ -1,6 +1,7 @@
 import copy
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, dataclass, fields, is_dataclass
+import enum
 from typing import Any
 
 import pytest
@@ -525,6 +526,48 @@ def test_normalization_detaches_tensor_formats_across_artifacts() -> None:
     assert (canonical_cin_dump(first), canonical_cin_dump(second)) == before
     verify_cin(first)
     verify_cin(second)
+
+
+class _CINWidth(enum.IntEnum):
+    W32 = 32
+
+
+class _HostileCINWidth(int):
+    def __int__(self):
+        raise AssertionError("subclass __int__ must not run")
+
+    def __index__(self):
+        raise AssertionError("subclass __index__ must not run")
+
+    def __le__(self, other):
+        raise AssertionError("subclass comparison must not run")
+
+    def __gt__(self, other):
+        raise AssertionError("subclass comparison must not run")
+
+
+@pytest.mark.parametrize("width", [_CINWidth.W32, _HostileCINWidth(32)])
+def test_normalization_canonicalizes_constructor_valid_bit_width_subclasses(
+    width,
+) -> None:
+    i = IndexVar("i")
+    source_format = TensorFormat([LevelFormat("d", bit_width=width)])
+    source = TensorVar("A", fmt=source_format, shape=(3,))
+    result = TensorVar("C", fmt="d", shape=(3,))
+    program = ForAll(i, TensorAssign(result[i], source[i]))
+
+    with full_cin_verification():
+        normalized = normalize_cin(program)
+        lowered = CINLowerer().lower_IndexStmt(program)
+
+    assert lowered is not None
+    assert source.format is not None
+    assert source.format.get_level_formats()[0].bit_width is width
+    normalized_source = normalized.stmt.rhs.tensor
+    assert normalized_source.format is not None
+    normalized_width = normalized_source.format.get_level_formats()[0].bit_width
+    assert normalized_width == 32
+    assert type(normalized_width) is int
 
 
 def test_workspace_normalization_is_idempotent_and_strips_backreferences() -> None:

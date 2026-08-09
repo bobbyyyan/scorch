@@ -476,7 +476,7 @@ def test_multi_dense_parent_conversion_validates_the_compiler_boundary():
         (["dense", "dense", "singleton"], (2, 3, 4)),
     ],
 )
-def test_requested_singleton_levels_are_rejected_atomically(fmt, shape):
+def test_requested_singleton_levels_are_rejected_atomically(fmt, shape, monkeypatch):
     """A singleton request must fail before materialization, like rank 1.
 
     ``layout.validate_runtime_contract`` already declares singleton levels
@@ -489,7 +489,20 @@ def test_requested_singleton_levels_are_rejected_atomically(fmt, shape):
     torch.manual_seed(11)
     dense = (torch.rand(shape) < 0.4) * torch.randn(shape)
     source = STensor.from_torch(dense.clone(), "A")
+    metadata = source.metadata
+    storage = source.storage
     before = tensor_snapshot(source)
+
+    def fail_if_compiler_setup_starts(*args, **kwargs):
+        raise AssertionError("singleton rejection must precede compiler setup")
+
+    monkeypatch.setattr(
+        CompileOptions,
+        "from_environment",
+        classmethod(fail_if_compiler_setup_starts),
+    )
     with pytest.raises(TensorStorageError, match="singleton"):
         source.to_sparse(fmt)
+    assert source.metadata is metadata
+    assert source.storage is storage
     assert tensor_snapshot(source) == before

@@ -587,6 +587,31 @@ class _Width(enum.IntEnum):
     W32 = 32
 
 
+class _HostileWidth(int):
+    def __int__(self):
+        raise AssertionError("subclass __int__ must not run")
+
+    def __index__(self):
+        raise AssertionError("subclass __index__ must not run")
+
+    def __le__(self, other):
+        raise AssertionError("subclass comparison must not run")
+
+
+class _LyingNegativeWidth(int):
+    def __le__(self, other):
+        return False
+
+
+class _ForeignIntSpoof:
+    @property
+    def __class__(self):
+        return int
+
+    def __le__(self, other):
+        return False
+
+
 def test_audit_canonicalizes_a_constructor_valid_int_subclass_bit_width():
     """An ``IntEnum`` width is a legal format, not malformed stored state.
 
@@ -601,6 +626,29 @@ def test_audit_canonicalizes_a_constructor_valid_int_subclass_bit_width():
     assert levels is not None
     assert levels[1].bit_width == 32
     assert type(levels[1].bit_width) is int
+
+
+def test_level_format_validates_integer_subclasses_without_callbacks():
+    width = _HostileWidth(32)
+    level = LevelFormat("s", bit_width=width)
+    assert level.bit_width is width
+
+    levels = audit_format_state(TensorFormat([level]))
+    assert levels is not None
+    assert levels[0].bit_width == 32
+    assert type(levels[0].bit_width) is int
+
+
+def test_level_format_rejects_a_lying_negative_integer_subclass():
+    with pytest.raises(TensorFormatError, match="positive"):
+        LevelFormat("s", bit_width=_LyingNegativeWidth(-8))
+
+
+def test_level_format_rejects_a_foreign_int_class_spoof():
+    spoof = _ForeignIntSpoof()
+    assert isinstance(spoof, int)
+    with pytest.raises(TensorTypeError, match="integer"):
+        LevelFormat("s", bit_width=spoof)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("owner", ["layout", "index"])
