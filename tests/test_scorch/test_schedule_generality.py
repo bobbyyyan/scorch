@@ -15,6 +15,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
@@ -125,14 +126,14 @@ def _build_outer_workspace_spgemm(result_format: str) -> ForAll:
     return _nest((reduction, row, col), assignment)
 
 
-def _build_nested_rank_two_workspace() -> ForAll:
+def _build_nested_rank_two_workspace(result_format: str) -> ForAll:
     batch, reduction, row, col = (
         IndexVar("a"),
         IndexVar("q"),
         IndexVar("r"),
         IndexVar("c"),
     )
-    out = TensorVar("BatchedProduct", fmt="doo")
+    out = TensorVar("BatchedProduct", fmt=result_format)
     left = TensorVar("BatchedLeft", fmt="ddd", mode_order=[0, 2, 1])
     right = TensorVar("BatchedRight", fmt="ddd")
     assignment = TensorAssign(
@@ -1686,7 +1687,11 @@ def test_nested_rank_two_workspace_pair_reads_are_stable() -> None:
         loop_order=("a", "q", "r", "c"),
         tag="workspace-pair-nested-rank-two",
     )
-    statement = _build_nested_rank_two_workspace()
+    # The pair-read contract needs two workspace coordinates, not an invalid
+    # mixed coordinate hierarchy.  All-coordinate output exercises the same
+    # nested rank-two workspace key without asking legacy result assembly to
+    # manufacture dense-prefix parentage it does not represent.
+    statement = _build_nested_rank_two_workspace("ooo")
     original = str(statement)
 
     with regblock_force(False):
@@ -1698,6 +1703,24 @@ def test_nested_rank_two_workspace_pair_reads_are_stable() -> None:
     assert "int64_t r = it.first[0];" in first_cpp
     assert "int64_t c = it.first[1];" in first_cpp
     assert "float wksp_value = it.second;" in first_cpp
+
+
+def test_nested_rank_two_mixed_coordinate_result_fails_before_lowering() -> None:
+    schedule = Schedule(
+        loop_order=("a", "q", "r", "c"),
+        tag="workspace-pair-invalid-mixed-result",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_nested_rank_two_workspace("doo"), schedule
+    )
+
+    with pytest.raises(UnsupportedFeature) as error:
+        _lower_to_cpp(scheduled)
+
+    assert len(error.value.diagnostics) == 1
+    diagnostic = error.value.diagnostics[0]
+    assert diagnostic.code == "unsupported_mixed_coordinate_hierarchy"
+    assert "tensor 'BatchedProduct'" in diagnostic.message
 
 
 def test_spgemm_affine_tile_is_rejected_before_sparse_output_assembly():
