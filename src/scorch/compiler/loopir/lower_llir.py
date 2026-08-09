@@ -4650,6 +4650,19 @@ class _TargetLowering:
 
         return len(self.result_decl.levels) - 1
 
+    def _assembly_catch_up_bound(self, loop: _Loop) -> llir.Expr:
+        """The segment index one dense assembly loop has reached.
+
+        A single dense parent numbers its child segments by its own loop
+        variable, which is the legacy spelling.  Targets whose result carries
+        more than one dense parent above a compressed level override this to
+        the flattened product of every enclosing dense coordinate, because
+        that -- not any single loop variable -- is the child level's segment
+        number.
+        """
+
+        return llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT)
+
     def _assembly_catch_up(
         self, loop: _Loop, level: Optional[int] = None
     ) -> llir.ForLoop:
@@ -4667,7 +4680,7 @@ class _TargetLowering:
             cond=llir.BinOp(
                 op="<",
                 left=pos_index,
-                right=llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT),
+                right=self._assembly_catch_up_bound(loop),
             ),
             update=llir.Increment(
                 var=llir.Var(
@@ -5137,15 +5150,28 @@ class _TargetLowering:
             for_loop,
         ]
 
-    def _lower_dense(self, position: int) -> llir.ForLoop:
-        loop = self.loops[position]
-        name = self._loop_var_name(loop)
-        result_is_csr_row = (
+    def _dense_loop_owns_result_assembly(self, position: int, loop: _Loop) -> bool:
+        """Whether this dense loop owns the result's catch-up and close.
+
+        The generic lowering gives that ownership to the dense loop driving
+        the appended result's outermost coordinate.  Targets whose result
+        carries several dense parents above one compressed level own it at
+        the innermost dense parent instead, because the child segments are
+        numbered by the flattened dense coordinate, which only that loop
+        completes.
+        """
+
+        return (
             not self.result_is_dense
             and type(self.leaf) is AppendEntry
             and self._index_of(self.leaf.coords[0], "the appended row coordinate")
             == loop.index
         )
+
+    def _lower_dense(self, position: int) -> llir.ForLoop:
+        loop = self.loops[position]
+        name = self._loop_var_name(loop)
+        result_is_csr_row = self._dense_loop_owns_result_assembly(position, loop)
         input_resolves = self._input_resolves_at(loop)
         result_resolves = self._result_resolves_at(loop)
         loop_drives_an_input = any(
@@ -9377,10 +9403,14 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     ):
         compressed_suffix += 1
     # Two or more compressed suffix levels, or -- degenerately -- a rank-1
-    # all-compressed result: the same ordered stream assembly with no dense
-    # prefix and no parent level to close.
+    # all-compressed result (the same ordered stream assembly with no dense
+    # prefix and no parent level to close), or one compressed level below two
+    # or more dense parents.  Exactly one dense parent over exactly one
+    # compressed level is canonical CSR and keeps its own route.
     ordered_compressed_suffix = (
-        compressed_suffix >= 2 or len(kinds) == compressed_suffix == 1
+        compressed_suffix >= 2
+        or len(kinds) == compressed_suffix == 1
+        or (compressed_suffix == 1 and len(kinds) - compressed_suffix >= 2)
     )
     if not ordered_compressed_suffix or any(
         kind is not LevelKind.DENSE for kind in kinds[: len(kinds) - compressed_suffix]
@@ -9402,7 +9432,9 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
             body = only.body
             continue
         return type(only) is AppendEntry and (
-            streams >= 2 or streams == len(kinds) == 1
+            streams >= 2
+            or streams == len(kinds) == 1
+            or (streams == 1 and compressed_suffix == 1 and len(kinds) >= 3)
         )
     return False
 
@@ -9467,6 +9499,10 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self._tiled_leaf = None
         self._tiled_view = None
         self.relayout_depth = -1
+        # Replaced by ``_collect_assembly_chain`` with the result's own dense
+        # prefix length; bound first so no ordering accident can read it
+        # before the chain has been validated.
+        self._dense_prefix = 0
         if program.parallel is not None:
             _fail(
                 "unsupported_program_shape",
@@ -9568,18 +9604,16 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         # The degenerate rank-1 all-compressed result is one stored stream
         # with no dense prefix and no parent level to close.
         ordered_compressed_suffix = (
-            compressed_suffix >= 2 or len(result_levels) == compressed_suffix == 1
+            compressed_suffix >= 2
+            or len(result_levels) == compressed_suffix == 1
+            or (compressed_suffix == 1 and prefix >= 2)
         )
         require(
             ordered_compressed_suffix
             and all(level.kind is LevelKind.DENSE for level in result_levels[:prefix]),
             "a dense-prefix/multi-compressed-suffix result",
         )
-        require(
-            prefix <= 1,
-            "at most one dense prefix loop (deeper dense parents are a "
-            "distinct gap)",
-        )
+        self._dense_prefix = prefix
         loops: List[_Loop] = []
         body: Stmt = self.program.body
         while True:
@@ -9590,10 +9624,14 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             only = cast(Block, body).statements[0]
             if type(only) is DenseFor:
                 require(
-                    not loops,
+                    all(existing.kind is _DENSE for existing in loops),
                     "the dense prefix loop to precede every stream loop",
                 )
-                require(prefix == 1, "no dense loop over an all-compressed result")
+                require(prefix >= 1, "no dense loop over an all-compressed result")
+                require(
+                    len(loops) < prefix,
+                    "exactly one dense loop per dense result prefix level",
+                )
                 loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
@@ -9799,9 +9837,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         ]
 
     def _child_stream_statements(self, position: int) -> List[llir.Stmt]:
-        """The child stream loop below one assembly level, by driver kind."""
+        """The child loop below one assembly level, by driver kind.
+
+        Every level below the dense prefix nests a stream loop.  A dense
+        prefix level that is not the innermost one nests the next dense
+        prefix loop instead: it owns no coordinate stream and no conditional
+        parent append, because the whole prefix flattens into one segment
+        number for the first compressed level.
+        """
 
         child = self.loops[position + 1]
+        if child.kind is _DENSE and self.loops[position].kind is _DENSE:
+            return [llir.BlankLine(), self._lower_dense(position + 1)]
         if child.kind is _SPARSE:
             return self._lower_sparse(position + 1)
         if child.kind is _MERGED:
@@ -9811,6 +9858,50 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             "a multi-compressed assembly level must nest a stream loop",
         )
         raise AssertionError("unreachable")
+
+    def _dense_loop_owns_result_assembly(self, position: int, loop: _Loop) -> bool:
+        """Only the innermost dense prefix loop closes the first compressed level.
+
+        With one dense parent this is the outermost loop and reduces exactly
+        to the generic rule.  With several, the outer dense loops complete no
+        child segment on their own -- the segment number is the flattened
+        dense coordinate -- so they own neither the catch-up nor the close.
+        """
+
+        return loop.kind is _DENSE and position == self._dense_prefix - 1
+
+    def _assembly_catch_up_bound(self, loop: _Loop) -> llir.Expr:
+        """The flattened dense-prefix coordinate this loop has reached.
+
+        The first compressed result level owns one segment per cell of the
+        dense prefix, numbered in the prefix's own lexicographic order.  That
+        number is ``(((i0 * E1) + i1) * E2 + i2) ...`` over the dense prefix
+        loops and their own iteration bounds -- the same bound spellings the
+        emitted ``for`` statements use, so the arithmetic cannot disagree with
+        the iteration space.  A single dense parent degenerates to ``i0``,
+        which is the inherited spelling byte for byte.
+        """
+
+        prefix = self._dense_prefix
+        if prefix <= 1:
+            return _TargetLowering._assembly_catch_up_bound(self, loop)
+        flattened: llir.Expr = llir.Var(
+            name=self._loop_var_name(self.loops[0]),
+            type=llir.DataType.INT,
+        )
+        for position in range(1, prefix):
+            inner = self.loops[position]
+            flattened = llir.Add(
+                left=llir.Mul(
+                    left=flattened,
+                    right=self._loop_bound_var(inner),
+                ),
+                right=llir.Var(
+                    name=self._loop_var_name(inner),
+                    type=llir.DataType.INT,
+                ),
+            )
+        return flattened
 
     def _one_sided_cursor(self, position: int, tensor: SymbolId) -> SparseCursorDecl:
         for cursor in self.loops[position].cursors:
@@ -9949,6 +10040,15 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         extents — never a runtime-format probe.
         """
 
+        if self._dense_prefix >= 2:
+            # Several dense parents size the first compressed level at the
+            # PRODUCT of their extents.  The pre-sized spelling names exactly
+            # one level's ``_size`` variable and therefore cannot express that
+            # count; the legacy assembler's identical limitation is what makes
+            # its output for this family malformed.  These results are built
+            # through the checked growth path instead, which derives the
+            # length from the writes the flattened catch-up actually performs.
+            return False
         if len(self._input_symbols) != 1:
             return False
         input_decl = self.decls[self._input_symbols[0]]
