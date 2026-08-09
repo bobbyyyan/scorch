@@ -166,9 +166,14 @@ class LevelFormat:
                 f"got {type(mode).__name__}"
             )
         if bit_width is not None:
-            if isinstance(bit_width, bool) or not isinstance(bit_width, int):
+            bit_width_type = type(bit_width)
+            if bit_width_type is bool or not issubclass(bit_width_type, int):
                 raise TensorTypeError("level format bit_width must be an integer")
-            if bit_width <= 0:
+            # Validate the underlying integer without trusting subclass
+            # comparison or conversion hooks.  Retain the caller's value here
+            # for constructor compatibility; retaining boundaries canonicalize
+            # it to the exact integer proven by this check.
+            if int.__int__(bit_width) <= 0:
                 raise TensorFormatError("level format bit_width must be positive")
         object.__setattr__(self, "_mode", parsed_mode)
         object.__setattr__(self, "_bit_width", bit_width)

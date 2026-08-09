@@ -1176,15 +1176,24 @@ def _preflight_cin_structure_impl(  # noqa: C901
                                         "LevelFormat._mode must be an exact LevelType",
                                         level_path + ("_mode",),
                                     )
-                                if bit_width is not None and (
-                                    type(bit_width) is not int
-                                    or bit_width <= 0
-                                    or bit_width > _MAX_RUNTIME_EXTENT
-                                ):
+                                invalid_bit_width = False
+                                if bit_width is not None:
+                                    bit_width_type = type(bit_width)
+                                    if bit_width_type is bool or not issubclass(
+                                        bit_width_type, int
+                                    ):
+                                        invalid_bit_width = True
+                                    else:
+                                        canonical_bit_width = int.__int__(bit_width)
+                                        invalid_bit_width = (
+                                            canonical_bit_width <= 0
+                                            or canonical_bit_width > _MAX_RUNTIME_EXTENT
+                                        )
+                                if invalid_bit_width:
                                     diagnose(
                                         "invalid_cin_field",
                                         "LevelFormat._bit_width must be a positive "
-                                        "signed-int64 exact int or None",
+                                        "signed-int64 integer or None",
                                         level_path + ("_bit_width",),
                                     )
             shape = stored_field(node, "shape", path)
