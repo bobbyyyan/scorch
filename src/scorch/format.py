@@ -516,8 +516,20 @@ def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
         bit_width = level_state["_bit_width"]
         if type(mode) is not LevelType:
             return None
-        if bit_width is not None and (type(bit_width) is not int or bit_width <= 0):
-            return None
+        if bit_width is not None:
+            bit_width_type = type(bit_width)
+            if bit_width_type is bool or not issubclass(bit_width_type, int):
+                return None
+            # ``LevelFormat.__init__`` accepts any non-bool ``int`` subclass,
+            # so an ``IntEnum`` width is a legally constructed format and must
+            # survive this boundary rather than becoming a construction error.
+            # Canonicalize it exactly the way every other retained scalar is
+            # canonicalized: the base descriptor bypasses an overridden
+            # ``__int__`` and yields an exact ``int``, so no caller arithmetic
+            # is retained or executed past this point.
+            bit_width = int.__int__(bit_width)
+            if bit_width <= 0:
+                return None
         owned_levels.append(LevelFormat(mode, bit_width=bit_width))
     return owned_levels
 

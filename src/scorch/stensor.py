@@ -1686,6 +1686,20 @@ class STensor:
                     raise TensorStorageError(
                         "to_sparse does not support mixed coordinate hierarchies"
                     )
+                if any(
+                    level_type is LevelType.SINGLETON
+                    for level_type in requested_level_types
+                ):
+                    # ``validate_runtime_contract`` already declares singleton
+                    # levels unrunnable, and the rank-1 arm rejects them before
+                    # touching the receiver.  Without this the rank>=2 arm runs
+                    # the whole JIT pipeline and leaks a bare ``ValueError``
+                    # out of code generation, so an invalid requested format
+                    # was not being rejected atomically after all.
+                    raise TensorStorageError(
+                        "to_sparse does not support singleton levels; "
+                        "'singleton' requests no supported sparse materialization"
+                    )
             compile_options = (
                 CompileOptions.from_environment()
                 if _compile_options is None
