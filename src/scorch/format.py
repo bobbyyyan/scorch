@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping as _AbcMapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 import json
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -99,6 +100,48 @@ def _actual_type_name(value: object) -> str:
 
     name = type.__dict__["__name__"].__get__(type(value), type)
     return str.__str__(name)
+
+
+# ``collections.abc`` registers the concrete builtins virtually rather than
+# by inheritance -- ``Mapping not in dict.__mro__`` and
+# ``Sequence not in list.__mro__`` -- so an MRO-identity recognizer has to
+# name them explicitly.  These tuples are the boundary's declared runtime
+# recognizers; anything else must genuinely derive from the ABC, and virtual
+# registrations beyond these builtins fail closed exactly like every other
+# foreign lookalike here.
+_MAPPING_BASES: Tuple[type, ...] = (_AbcMapping, dict, MappingProxyType)
+_SEQUENCE_BASES: Tuple[type, ...] = (Sequence, list, tuple, range)
+
+
+def _derives_from(value_type: type, *bases: type) -> bool:
+    """Whether ``value_type``'s real MRO contains any of ``bases``.
+
+    This exists instead of ``issubclass``/``isinstance`` against the
+    ``collections.abc`` ABCs.  ``ABCMeta``'s subclass check inserts the
+    candidate into its positive and negative ``WeakSet`` caches, and those
+    inserts call the candidate metaclass's ``__hash__`` and ``__eq__``.  A
+    caller-owned metaclass therefore observed public format validation, and
+    a raising one escaped it as a bare ``RuntimeError`` — including on the
+    success path for a genuine ``Sequence`` subclass.
+
+    Identity membership in the MRO, read through the base ``type``
+    descriptor, answers the same question for every genuine subclass while
+    running no caller-owned code.  Virtual (``register``-ed) subclasses are
+    not recognized and therefore fail closed, which is exactly how this
+    boundary already treats every other foreign lookalike.
+    """
+
+    try:
+        mro = type.__dict__["__mro__"].__get__(value_type, type)
+    except Exception:
+        return False
+    if type(mro) is not tuple:
+        return False
+    for entry in mro:
+        for base in bases:
+            if entry is base:
+                return True
+    return False
 
 
 def _parse_level_type(s: str) -> LevelType:
@@ -396,17 +439,23 @@ class TensorFormat:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TensorFormat":
         """Reconstruct a format from :meth:`to_dict`."""
-        if not isinstance(data, Mapping) or "levels" not in data:
+        # Recognition is by real MRO, never by an ABC check: see
+        # ``_derives_from``.  Reading a value once it has been recognized as
+        # a genuine mapping/sequence is ordinary consumption, not validation.
+        if not _derives_from(type(data), *_MAPPING_BASES) or "levels" not in data:
             raise TensorFormatError("serialized tensor format must contain 'levels'")
         fill_value = data.get("fill_value", 0.0)
         if fill_value != 0.0:
             raise TensorFormatError("only a zero tensor fill value is supported")
         levels = data["levels"]
-        if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
+        levels_type = type(levels)
+        if not _derives_from(levels_type, *_SEQUENCE_BASES) or _derives_from(
+            levels_type, str, bytes, bytearray
+        ):
             raise TensorFormatError("serialized tensor format levels must be a list")
         parsed = []
         for level in levels:
-            if not isinstance(level, Mapping) or "type" not in level:
+            if not _derives_from(type(level), *_MAPPING_BASES) or "type" not in level:
                 raise TensorFormatError(
                     "each serialized tensor level must contain a 'type'"
                 )
@@ -472,8 +521,8 @@ def _normalize_level_formats(
     elif issubclass(value_type, str):
         normalized_value = _tokenize_format_string(cast(str, value))
     else:
-        if issubclass(value_type, (bytes, bytearray)) or not issubclass(
-            value_type, Sequence
+        if _derives_from(value_type, bytes, bytearray) or not _derives_from(
+            value_type, *_SEQUENCE_BASES
         ):
             raise TensorTypeError(
                 "tensor format must be a string, level, or sequence of levels"
