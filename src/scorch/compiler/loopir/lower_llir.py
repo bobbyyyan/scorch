@@ -3636,8 +3636,6 @@ class _TargetLowering:
         an access through another tensor's position.
         """
 
-        _TargetLowering._require_program_inputs_unchanged(self)
-
         def state_of(value: object, expected: type, fields: Set[str]) -> Dict[str, Any]:
             if type(value) is not expected:
                 _fail(
@@ -9381,10 +9379,10 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     Routing is purely structural: a single-statement nest of dense loops
     over nested stream loops (single-cursor sparse or two-cursor merged)
     appending into a dense-prefix/multi-compressed-suffix result, where the
-    suffix is two-or-more compressed levels or the degenerate rank-1
-    all-compressed result (one stream, no dense prefix, no parent level).
-    Everything else stays on its existing route and keeps its fail-closed
-    boundaries.
+    suffix is two-or-more compressed levels, the degenerate rank-1
+    all-compressed result (one stream, no dense prefix, no parent level), or
+    one compressed level below at least two dense parents.  Everything else
+    stays on its existing route and keeps its fail-closed boundaries.
     """
 
     if len(program.outputs) != 1:
@@ -9445,10 +9443,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     Admits exactly the assembly forms ``lower_normalized_cin`` produces for
     dense-prefix/multi-compressed-suffix results — including the degenerate
     rank-1 all-compressed result, which is one stream loop with no dense
-    prefix and no parent level to close: at most one dense prefix
-    loop, then one stream loop per compressed result level — a single-cursor
-    :class:`SparseFor` over one stored stream (dense co-operands are read at
-    their resolved coordinates), or a two-cursor :class:`MergedSparseFor`.
+    prefix and no parent level to close, and a single compressed level below
+    several dense parents: one dense loop per prefix level, then one stream
+    loop per compressed result level — a single-cursor :class:`SparseFor`
+    over one stored stream (dense co-operands are read at their resolved
+    coordinates), or a two-cursor :class:`MergedSparseFor`.
     INTERSECTION binds both aligned cursor positions; UNION additionally
     lowers the aligned, one-sided, and post-exhaustion cases while treating an
     unaligned parent as an empty child stream.  Both forms descend to one
@@ -9463,12 +9462,15 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     one conditional compressed-parent append plus child position close per
     structural level, the dense-prefix catch-up, and the root position
     close — so the generated C++ is byte-identical to the legacy pipeline's
-    output for both automatic policy arms.  Building those mutations safely
-    at the owning target boundary makes correctness independent of that
-    generic rewrite while preserving its pipeline stage.  The legacy
-    comparand is honest for this family (empty child intersections suppress
-    their parent coordinates and cascade), so byte parity is the gate,
-    exactly like B1.
+    output for both automatic policy arms where the legacy assembler is
+    sound.  Building those mutations safely at the owning target boundary
+    makes correctness independent of that generic rewrite while preserving
+    its pipeline stage.  The legacy comparand is honest for the rank-1 and
+    multi-compressed-suffix forms (empty child intersections suppress their
+    parent coordinates and cascade), so byte parity gates those forms.  For
+    several dense parents over one compressed level, legacy closes segments
+    against only the innermost coordinate and is malformed; that form is
+    instead gated by the LoopIR oracle and compiled reference differentials.
     """
 
     def __init__(

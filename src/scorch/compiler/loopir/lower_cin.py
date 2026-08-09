@@ -637,15 +637,16 @@ def _classify_sparse_output_family(
             for level_type in result_levels[: len(result_levels) - compressed_suffix]
         )
         if multi_compressed_family and not reduce_update:
-            # The multi-compressed assembly families: a dense prefix over a
-            # >=2-level compressed suffix, assembled by stored coordinate
-            # streams with a conditional parent append per compressed level.
-            # Each suffix coordinate iterates one single-cursor stored
-            # stream, one two-cursor intersection, or — when every suffix
-            # coordinate is united — one two-cursor ordered union with
-            # one-sided descent and tails.  The legacy comparands are honest
-            # here (unlike B2), so these families gate on byte parity plus
-            # the LoopIR oracle and PyTorch differentials.
+            # Ordered sparse assembly: either a dense prefix over a >=2-level
+            # compressed suffix, the rank-1 compressed stream, or several
+            # dense parents over one compressed level.  Each suffix coordinate
+            # iterates one single-cursor stored stream, one two-cursor
+            # intersection, or — when every suffix coordinate is united — one
+            # two-cursor ordered union with one-sided descent and tails.  The
+            # legacy comparands are honest for the first two forms, which gate
+            # on byte parity.  The several-dense-parent comparand closes by
+            # only one coordinate and is malformed, so that form gates on the
+            # LoopIR oracle and compiled PyTorch differentials instead.
             prefix = len(result_levels) - compressed_suffix
             suffix_kinds = []
             for position, index_id in enumerate(lhs_index_ids):
