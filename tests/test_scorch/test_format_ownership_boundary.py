@@ -23,8 +23,12 @@ dataclass surface) and is not attempted here.
 """
 
 from abc import ABCMeta
+from collections import OrderedDict
 from collections.abc import Sequence
 import enum
+import json
+from types import MappingProxyType
+from typing import ClassVar, List
 
 import pytest
 import torch
@@ -1077,3 +1081,132 @@ def test_index_arrays_are_already_defensive_on_public_reads():
     second = tensor.index.mode_indices
     assert first[1][0] is not second[1][0]
     assert torch.equal(first[1][0], second[1][0])
+
+
+# -- runtime sequence/mapping recognition runs no caller-owned code ---------
+#
+# The recognizers used to be ``issubclass``/``isinstance`` against the
+# ``collections.abc`` ABCs.  ``ABCMeta``'s subclass check inserts the
+# candidate into its positive and negative ``WeakSet`` caches, and those
+# inserts call the candidate metaclass's ``__hash__`` and ``__eq__`` -- so a
+# caller-owned metaclass observed public format validation, and a raising one
+# escaped the public constructor as a bare ``builtins.RuntimeError``.
+
+
+class _HashCountingMeta(type):
+    """A metaclass that records every hash/equality the runtime asks of it."""
+
+    calls: ClassVar[List[str]] = []
+
+    def __hash__(cls):
+        _HashCountingMeta.calls.append("__hash__")
+        return type.__hash__(cls)
+
+    def __eq__(cls, other):
+        _HashCountingMeta.calls.append("__eq__")
+        return cls is other
+
+
+class _HashCountingCandidate(metaclass=_HashCountingMeta):
+    pass
+
+
+class _RaisingHashMeta(type):
+    def __hash__(cls):
+        raise RuntimeError("caller metaclass code ran inside scorch validation")
+
+
+class _RaisingHashCandidate(metaclass=_RaisingHashMeta):
+    pass
+
+
+class _CountingSequenceMeta(ABCMeta):
+    calls: ClassVar[List[str]] = []
+
+    def __hash__(cls):
+        _CountingSequenceMeta.calls.append("__hash__")
+        return ABCMeta.__hash__(cls)
+
+
+class _CountingSequence(Sequence, metaclass=_CountingSequenceMeta):
+    def __init__(self, values):
+        self._values = tuple(values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+
+def test_foreign_sequence_rejection_invokes_no_metaclass_hook():
+    """Rejecting a non-sequence must not consult the candidate's metaclass."""
+
+    _HashCountingMeta.calls = []
+    with pytest.raises(TensorTypeError, match="sequence of levels"):
+        TensorFormat(_HashCountingCandidate())
+    # The ABC-based check measured eight ``__hash__`` calls here.
+    assert _HashCountingMeta.calls == []
+
+    _HashCountingMeta.calls = []
+    with pytest.raises(TensorTypeError, match="sequence of levels"):
+        TensorFormat(_HashCountingCandidate())
+    # ...and two ``__eq__`` calls on the second, from the negative cache.
+    assert _HashCountingMeta.calls == []
+
+
+def test_real_sequence_success_path_invokes_no_metaclass_hook():
+    """A genuine ``Sequence`` subclass is accepted without running its hooks.
+
+    This is the success-path half: the ABC check invoked the caller
+    metaclass twice even when the value was perfectly valid, so a raising
+    ``__hash__`` could kill an otherwise-legal construction.
+    """
+
+    _CountingSequenceMeta.calls = []
+    assert str(TensorFormat(_CountingSequence(("d", "s")))) == "d,s"
+    assert _CountingSequenceMeta.calls == []
+
+
+def test_raising_metaclass_cannot_escape_public_format_construction():
+    """A caller exception must never leave a public format entry point."""
+
+    with pytest.raises(TensorTypeError, match="sequence of levels"):
+        TensorFormat(_RaisingHashCandidate())
+
+    with pytest.raises(TensorFormatError, match="levels"):
+        TensorFormat.from_dict({"levels": _RaisingHashCandidate()})
+
+    with pytest.raises(TensorFormatError, match="must contain 'levels'"):
+        TensorFormat.from_dict(_RaisingHashCandidate())
+
+    with pytest.raises(TensorFormatError, match="'type'"):
+        TensorFormat.from_dict({"levels": [_RaisingHashCandidate()]})
+
+
+def test_from_dict_still_accepts_every_real_mapping_and_sequence():
+    """The MRO recognizer must not narrow the accepted builtin shapes.
+
+    ``collections.abc`` registers the concrete builtins virtually rather
+    than by inheritance, so an MRO-identity recognizer has to name them; this
+    pins that it does.
+    """
+
+    fmt = TensorFormat(["d", "s"])
+    payload = fmt.to_dict()
+
+    assert TensorFormat.from_dict(payload) == fmt
+    assert TensorFormat.from_dict(MappingProxyType(payload)) == fmt
+    assert TensorFormat.from_dict(OrderedDict(payload)) == fmt
+    assert TensorFormat.from_dict({"levels": tuple(payload["levels"])}) == fmt
+    assert TensorFormat.from_dict(json.loads(fmt.serialize())) == fmt
+
+    class _ListSubclass(list):
+        pass
+
+    assert str(TensorFormat(_ListSubclass(["d", "s"]))) == "d,s"
+
+    with pytest.raises(TensorFormatError, match="levels must be a list"):
+        TensorFormat.from_dict({"levels": "ds"})
+    with pytest.raises(TensorFormatError, match="levels must be a list"):
+        TensorFormat.from_dict({"levels": b"ds"})
