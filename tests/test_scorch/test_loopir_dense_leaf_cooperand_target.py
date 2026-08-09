@@ -779,6 +779,24 @@ def test_intersection_bound_position_load_is_admitted_by_the_target():
     assert lowering.raw_loop_statements()
 
 
+def test_unchanged_dense_leaf_target_reuses_the_sealed_binding_snapshot(
+    monkeypatch,
+):
+    """Merged alignment cases do not repeat the complete binding walk."""
+
+    lowering = admitted_dense_leaf_target()
+
+    def redundant_binding_scan(*args, **kwargs):
+        raise AssertionError("raw emission must use the sealed binding snapshot")
+
+    monkeypatch.setattr(
+        _lower_llir_module._TargetLowering,
+        "_validated_bound_position_bindings",
+        redundant_binding_scan,
+    )
+    assert lowering.raw_loop_statements()
+
+
 def test_union_cursor_value_control_is_unchanged():
     """The same nest reading through cursors stays admitted in both places."""
 
