@@ -30066,3 +30066,237 @@ tips, exclude generated caches/worktrees, verify every manifest entry, document
 the honest GO/NO-GO boundary, and finish with commits plus a still-broader
 continuation prompt.
 ```
+
+## Flattened dense-prefix migration and the cluster-2 NO-GO (2026-08-09; supersedes the preceding prompt)
+
+Three code/test commits stack on documentation tip `52d43cc`, ending at
+code/test tip `4ce6bca`; this documentation commit follows. Nothing was
+pushed, amended, squashed or reordered; origin remains `58e8565`. The five
+protected tracked files retain their recorded hashes and no unrelated tracked
+or untracked material was staged.
+
+    78e4ca6  feat(compiler): assemble sparse outputs under several dense parents
+    35094ba  fix(runtime): close two ownership-boundary gaps found by fresh probes
+    4ce6bca  test(compiler): lock the flattened dense prefix and move four seam locks
+
+### Review outcome
+
+The 23-commit span `8a2a83a..52d43cc` was reviewed by re-deriving every
+contract from code and raw artifacts. **No defect inside the reviewed range
+survived adversarial verification.** Fresh probes outside it found two real,
+publicly reachable runtime defects, both fixed first: `audit_format_state`
+rejected constructor-valid `int`-subclass bit widths (so every retaining
+boundary refused a format the constructor had just accepted), and `to_sparse`
+did not reject a requested SINGLETON level above rank 1 (leaking a bare
+`ValueError` out of code generation instead of rejecting atomically).
+
+Evidence qualifications are preserved, not repaired: the closure ledger
+verifies 540/540; the historical assembly ledger verifies **224/225 and was
+not resealed**, with the mechanism now proven (the manifest digest equals the
+SHA-256 of `tip-at-docs.txt`'s first line only, and a second line was appended
+~25 s after sealing); the carried-forward census was independently re-run at
+`52d43cc` and reproduced byte for byte, so the carry-forward is disclosed
+**and** correct; the historical latency harnesses still lack process-exit
+receipts. Two new evidence inaccuracies are recorded rather than resealed:
+`target-membership-proof/summary.json` attributes the 398/520 memberships to
+`b91b773` though they ran at `1a550d4`, and §44.4's "one shared authority
+lookup, cold-path-only validation replay" claim is measurably false for merged
+position-load emission (2 lookups, 1 successful-path replay).
+
+### Cluster 1 is migrated; cluster 2 is an explicit NO-GO
+
+`dds`, `ddss`, `ddds`, `dddss` and the rank-general forms are migrated end to
+end -- copy, intersection and ordered UNION -- in both automatic arms. The
+blocker was that a compressed level's child-segment number was modelled as one
+dense loop variable; it is the **flattened** dense coordinate. Two narrow
+overridable hooks now carry that (`_assembly_catch_up_bound`,
+`_dense_loop_owns_result_assembly`), both degenerating to the inherited
+spelling byte for byte at prefix 1, and `_exact_dense_parent_positions` returns
+False for prefix >= 2 because the pre-sized spelling cannot express a product
+extent. **The legacy comparand is malformed for this family and is proven so
+from its own generated source**, so the gate is the LoopIR oracle plus the
+dense PyTorch reference, never byte parity.
+
+Interleaved `sds` stays fail-closed with evidence; trailing-dense D10/D11
+(`sd+sd`, `sdd`) keep `unsupported_sparse_output_domain`; permuted compressed
+structure keeps its pre-LoopIR `InvalidSchedule` rejection. Five inherited
+seam locks named migrated cells and were moved to the neighbour that still
+occupies each seam, with each move named in place.
+
+**Default public dispatch is deliberately unchanged.** `scorch.einsum` over
+`dds` operands still reaches the legacy assembler and still raises the same
+`TensorIndexError` it raised at `52d43cc`, verified against an isolated base
+tree. Changing that is a Phase-8 cutover and was forbidden here.
+
+**Cluster 2 (multi-compressed reduction/TTM) was NOT implemented.** Delivering
+a partially verified workspace vertical would be worse than delivering none,
+so it was not started. What this session adds instead is a localized,
+independently verified root-cause map -- see review §45.6 for the four exact
+sites (`scheduler.py:2084`, `cin_lowerer.py:~998`, `csrc/header.h:653`,
+`cin_lowerer.py:1923`/`:1930`) and the reproduced public consequence.
+
+### Exact final evidence
+
+Retained under `~/.cache/scorch-codex/phase7-multiprefix-4ce6bca/`.
+
+- 1,584-cell x 2-arm layout differential against isolated base `52d43cc`:
+  **3,012 unchanged / 0 regressions / 0 legacy drift / 0 newly rejected**,
+  12 newly-admitted arm-instances (6 cells), 144 `dds` code sharpenings.
+- Multi-seed randomized oracle sweep: **560/560 over five seeds**, comparing
+  compiled storage, base oracle, scheduled oracle and PyTorch, with exact
+  `(pos, crd)` equality against the oracle.
+- 54-cell census, one fresh subprocess per cell with timeout and RLIMIT
+  isolation: **46 records, 46/46 arm-invariant**, the same eight SIGSEGV cells
+  (C1-C7, C13), **42/46 byte-identical**, and exactly D5/D6/D7/D8 flipping to
+  admitted in both arms. 25 inherited admissions stay at byte parity; the four
+  that are not are exactly the four whose legacy storage is recorded malformed.
+- Schedule audit **46/40/0**, JSON identical to the retained baseline.
+- Captures **117/118** raw byte-identical; the one difference is an
+  environment-derived `cache_key_suffix` that also differs between two runs of
+  the unmodified base tree.
+- Static parity: Black 15/15, Flake8 47/47 with byte-identical normalized
+  logs, mypy 140 errors in 11 files on both sides. `git diff --check` clean.
+- Exact-tip clean detached suite: **5,734 passed / 14 skipped / 0 failed over
+  all 5,748 selected nodes** in eight file-disjoint fresh processes, complete
+  and non-overlapping union over 86 tracked modules. It caught a sixth
+  inherited seam lock that no other gate could.
+- **Latency: OUTSTANDING, not passed.** A/A control tight (p50 0.984-1.000,
+  p95 0.982-0.999), but three of four paired shapes cross 1.10 -- and so do
+  two of three INHERITED shapes measured on an isolated base `52d43cc` tree on
+  the same host. Shared-control candidate-minus-base delta is +0.0052 p50 /
+  +0.0114 p95. This host carries a baseline offset the 1.10 target was not
+  calibrated for; re-run on unloaded Redwood before any Phase-7 exit.
+
+### Phase disposition
+
+**Phase 7 remains open.** One of the two declared clusters is closed; the
+other is not, and the latency gate is outstanding. No Phase-8 inventory was
+started, no cutover, and no default dispatch, selector, cache or fallback
+change was made; no legacy code was deleted.
+
+### Superseding broad copy-paste prompt for the next session
+
+```text
+Continue the compiler-IR migration from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, review §43-§45 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md and the final section of
+COMPILER_IR_REFACTOR_HANDOFF.md, inspect the graph yourself, and do not trust
+the handoff without reproducing its contracts. Do not push, amend, squash or
+reorder existing commits. Preserve the five protected dirty tracked files and
+all unrelated GPU/benchmark/scheduler/research/scratchpad material; stage only
+explicit paths.
+
+The protected tracked files and required SHA-256 values are:
+`.gitignore` = `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`,
+`pyproject.toml` =
+`191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`,
+`src/scorch/__init__.py` =
+`5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`,
+`tests/packaging/smoke_install.py` =
+`f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`,
+and `tests/test_scorch/test_resources.py` =
+`3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+Start with a rigorous independent review of 52d43cc..<code tip> plus the
+documentation commit. Reproduce the flattened dense-prefix contract directly:
+a compressed level under N dense parents owns prod(extents)+1 position slots;
+`_assembly_catch_up_bound` and `_dense_loop_owns_result_assembly` must
+degenerate to the inherited spelling byte for byte at prefix 1; and
+`_exact_dense_parent_positions` must stay False for prefix >= 2. Re-derive the
+two runtime fixes (int-subclass bit-width canonicalization through
+`int.__int__` with bool/non-positive still fail-closed; atomic SINGLETON
+rejection with the receiver unmutated). Verify the five moved seam locks name
+the neighbour that actually still occupies each seam, and that the 144
+`dds` code sharpenings to `unsupported_sparse_output_domain` are each the
+correct diagnosis. Preserve every evidence qualification: the closure ledger
+verifies 540/540, the historical assembly ledger verifies 224/225 and must NOT
+be resealed, the `target-membership-proof/summary.json` revision attribution
+is wrong and must not be silently corrected in place, and §44.4's shared-lookup
+cost claim is false for merged position-load emission. Add fresh adversarial
+probes for mutation, aliasing, cycles, forged tuple/proxy/weakref state,
+descriptor callbacks, target construction order and specialized-target cache
+drift. If a concrete defect exists, fix it first with a focused production
+commit and a separate regression-test commit, then rerun proportionate gates.
+
+Then take the multi-compressed reduction/TTM vertical as the milestone, and
+implement it rather than inventorying it again. Its four blockers are already
+localized and independently reproduced; start from them:
+
+  1. `scheduler.py:2084` anchors the Where at `reduction_vars_todo[-1]`, the
+     INNERMOST reduction variable, and derives `dim_workspace` from the free
+     variables after it, so every outer contraction stays above the Where.
+     This is the root cause of the §43.2(b) rank-1 two-contraction defect.
+  2. `cin_lowerer.py:~998` emits `coo_workspace<T, wksp.dim>(1024,
+     result_shape)`: template arity is the workspace KEY rank, runtime
+     argument is the whole RESULT shape.
+  3. `csrc/header.h:653` requires `coord.size() == N && _resultShape.size()
+     == N`, so any key-rank/result-rank difference throws
+     "workspace coordinate rank mismatch" on every insert. (2)+(3) are the
+     inherited rank-2-workspace/rank-3-shape mismatch.
+  4. `cin_lowerer.py:1923` takes the drain's leaf coordinate from workspace
+     index 0 while deriving the level from the LAST index -- correct only for
+     a rank-1 key -- and `cin_lowerer.py:1930` writes at most two coordinate
+     levels, so a rank-3 coordinate result never receives level 0.
+
+Give workspace allocation, reset, lifetime, producer reduction, drain and
+ordered result assembly explicit structured ownership on LoopIR; reuse
+existing nodes only where a responsibility audit proves the semantics match.
+Cover the declared rank-2/rank-3 sparse reduction and TTM matrix across every
+relevant migrated layout (including the newly migrated dense-prefix ones),
+both automatic arms and f32/f64, plus cancellation, explicit stored zeros,
+empty/ragged inputs, zero extents and commuted forms. Gate on canonical
+erasure/oracle equivalence and public PyTorch differentials, never on the
+memory-unsafe legacy comparand; retain each SIGSEGVing legacy kernel as
+executable failure evidence only and run each of the eight §41.4 cells in its
+own fresh subprocess with a timeout and RLIMIT isolation (note: macOS has no
+`timeout(1)` -- use a Python `subprocess.run(timeout=...)` driver with
+`preexec_fn` setting RLIMIT_CPU/RLIMIT_CORE, as this session did). Require
+exact fail-closed codes for every still-excluded neighbour.
+
+Also disposition, with evidence, the neighbours this session deliberately left
+out: interleaved `sds` (needs a dense loop below a stream loop plus rollback
+of speculative per-cell position closes when a compressed ancestor does not
+materialize) and trailing-dense `sd`/`sdd` (parent coordinates come from a
+cursor, not a dense loop). Migrate them only with their own evidence, and keep
+permuted-compressed layouts fail-closed unless deliberately migrated.
+
+Then re-run the Phase-7 exit audit criterion by criterion over the expanded
+declared matrix. Only a genuine GO permits a read-only Phase-8 inventory of
+fallback frequency, cache/request identity and cutover dependencies. That
+inventory must include the boundary this session recorded: default public
+dispatch still routes the migrated multiple-dense-prefix family to the
+malformed legacy assembler, so `scorch.einsum` over `dds`/`ddss` operands
+still raises `TensorIndexError` even though the LoopIR route is correct and
+oracle-verified. Do not start a cutover experiment, change default dispatch,
+selectors or caches, remove a fallback, delete legacy code or begin Phase 8.5.
+
+Optionally, and only after the compiler milestone, close the residual runtime
+format seam with structurally unforgeable
+LevelFormat/TensorFormat/TensorLayout/TensorMetadata values -- only if
+equality, hashing, pickling, dataclass behaviour, repository-required identity
+relations and compile latency all remain exact. Do not trade one aliasing
+defect for a broad compatibility break.
+
+For every implementation boundary, use focused plus adversarial tests, the
+deterministic real 54-cell census and an expanded family census, independent
+multi-seed randomized oracle sweeps, the 86-case schedule audit, all retained
+and activating captures, compiled public differentials and exact source
+comparisons. For unsafe families, source comparison means repeat/arm/oracle
+comparison, never equality to an unsafe legacy output. Run alternating paired
+latency on an unloaded host (200 warmups / 2000 samples, both p50 and p95 at
+or below 1.10) with an A/A control for marginal tails and an activating case
+for every new family; if the host is loaded or thermally throttled, record the
+gate as OUTSTANDING rather than reporting a number you cannot defend. Run
+full-tree Black/Flake8/mypy parity between the inherited tip and candidate,
+git diff --check, protected-file hashes, and an exact-tip clean detached full
+non-performance suite in fresh-process file-disjoint partitions with a proven
+complete/non-overlapping node union -- and note that the partition harness
+refuses to start on a dirty worktree, so never run a capture or anchor survey
+that writes into the suite worktree while the suite is running. Do not call a
+crash a parity pass, use an unsafe legacy result as a correctness oracle,
+average away a failed percentile, or cite a receipt whose exact revision and
+import provenance was not proved. Seal the evidence manifest only after the
+final code and documentation tips, exclude generated caches/worktrees/binaries,
+verify every manifest entry, document the honest GO/NO-GO boundary, and finish
+with commits plus a still-broader continuation prompt.
+```
