@@ -387,6 +387,7 @@ class _TargetSealAuthority:
     program: Optional[LoopProgram] = None
     input_container: Optional[Tuple[SymbolId, ...]] = None
     input_values: Optional[Tuple[int, ...]] = None
+    seal_token: Optional[object] = None
     graph_snapshot: Optional[Tuple[object, ...]] = None
     graph_owners: Optional[Tuple[object, ...]] = None
     target_snapshot: Optional[Tuple[object, ...]] = None
@@ -396,18 +397,81 @@ class _TargetSealAuthority:
 _TARGET_SEAL_AUTHORITIES: Dict[int, _TargetSealAuthority] = {}
 
 
-def _target_seal_authority(target: object) -> _TargetSealAuthority:
-    """Return the complete external authority for one exact live target."""
+def _begin_target_input_authority(
+    target: object,
+    program: LoopProgram,
+    inputs: Tuple[SymbolId, ...],
+    values: Tuple[int, ...],
+) -> object:
+    """Bind immutable input authority before construction reads the graph."""
+
+    target_id = id(target)
+    existing = _TARGET_SEAL_AUTHORITIES.get(target_id)
+    if existing is not None:
+        if existing.target_ref() is target:
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained input authority is already bound and "
+                "cannot be rebound",
+            )
+        _fail(
+            "unsupported_program_shape",
+            "the target seal registry contains a conflicting live identity",
+        )
+
+    def release_target(reference: ReferenceType[Any]) -> None:
+        current = _TARGET_SEAL_AUTHORITIES.get(target_id)
+        if current is not None and current.target_ref is reference:
+            _TARGET_SEAL_AUTHORITIES.pop(target_id, None)
+
+    try:
+        target_ref = weakref_ref(target, release_target)
+    except TypeError:
+        _fail(
+            "unsupported_program_shape",
+            "the target's retained program caches cannot be weakly owned",
+        )
+    seal_token = object()
+    _TARGET_SEAL_AUTHORITIES[target_id] = _TargetSealAuthority(
+        target_ref=target_ref,
+        target_type=type(target),
+        program=program,
+        input_container=inputs,
+        input_values=values,
+        seal_token=seal_token,
+    )
+    return seal_token
+
+
+def _target_input_authority(target: object) -> _TargetSealAuthority:
+    """Return the construction-time input authority for one live target."""
 
     authority = _TARGET_SEAL_AUTHORITIES.get(id(target))
     if (
         type(authority) is not _TargetSealAuthority
         or authority.target_ref() is not target
         or authority.target_type is None
-        or authority.program is None
+        or type(authority.program) is not LoopProgram
         or authority.input_container is None
         or authority.input_values is None
-        or authority.graph_snapshot is None
+        or authority.seal_token is None
+        or type(authority.input_container) is not tuple
+        or type(authority.input_values) is not tuple
+        or any(type(value) is not int for value in authority.input_values)
+    ):
+        _fail(
+            "unsupported_program_shape",
+            "the target's retained input authority is missing or incomplete",
+        )
+    return authority
+
+
+def _target_seal_authority(target: object) -> _TargetSealAuthority:
+    """Return the complete external authority for one exact live target."""
+
+    authority = _target_input_authority(target)
+    if (
+        authority.graph_snapshot is None
         or authority.graph_owners is None
         or authority.target_snapshot is None
         or authority.target_owners is None
@@ -438,7 +502,7 @@ class _TargetLowering:
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
-        self._input_symbols = self._snapshot_program_inputs(program)
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
         self.decls: Dict[SymbolId, TensorDecl] = {
             decl.symbol: decl for decl in program.tensors
         }
@@ -543,11 +607,13 @@ class _TargetLowering:
         self._reserve_tile_names()
         self._reserve_workspace_names()
         self._reserve_panel_names()
-        self._seal_target_state()
+        self._seal_target_state(seal_token)
 
     # -- boundary validation -------------------------------------------------
 
-    def _snapshot_program_inputs(self, program: LoopProgram) -> Tuple[SymbolId, ...]:
+    def _snapshot_program_inputs(
+        self, program: LoopProgram
+    ) -> Tuple[Tuple[SymbolId, ...], object]:
         """Own the exact declared-input sequence used throughout lowering.
 
         A verified ``LoopProgram`` is frozen only by convention: adversarial
@@ -560,8 +626,20 @@ class _TargetLowering:
 
         self._target_type_snapshot = type(self)
         self._program_container = program
+        if type(program) is not LoopProgram:
+            _fail(
+                "unsupported_program_shape",
+                "the target must retain an exact LoopProgram",
+            )
         state = object.__getattribute__(program, "__dict__")
-        if type(state) is not dict or "inputs" not in state:
+        fields = _LOOPIR_NODE_FIELDS_BY_ID[id(LoopProgram)]
+        state_keys = tuple(state) if type(state) is dict else ()
+        if (
+            type(state) is not dict
+            or len(state_keys) != len(fields)
+            or any(type(key) is not str for key in state_keys)
+            or any(field not in state for field in fields)
+        ):
             _fail(
                 "unsupported_program_shape",
                 "the program must retain exact stored input declarations",
@@ -580,7 +658,13 @@ class _TargetLowering:
             )
         self._program_inputs_container = inputs
         self._program_input_values = cast(Tuple[int, ...], values)
-        return inputs
+        seal_token = _begin_target_input_authority(
+            self,
+            program,
+            inputs,
+            self._program_input_values,
+        )
+        return inputs, seal_token
 
     def _validated_program_graph_signature(
         self,
@@ -1085,36 +1169,40 @@ class _TargetLowering:
                 visit(value, 0)
         return tuple(signature)
 
-    def _seal_target_state(self) -> None:
+    def _seal_target_state(self, seal_token: object = None) -> None:
         """Own constructor-final target caches until raw emission begins."""
 
         target_id = id(self)
-        existing = _TARGET_SEAL_AUTHORITIES.get(target_id)
-        if existing is not None:
-            if existing.target_ref() is self:
-                _fail(
-                    "unsupported_program_shape",
-                    "the target's retained program caches are already sealed and "
-                    "cannot be rebound",
-                )
+        existing = _target_input_authority(self)
+        if (
+            existing.graph_snapshot is not None
+            or existing.graph_owners is not None
+            or existing.target_snapshot is not None
+            or existing.target_owners is not None
+        ):
             _fail(
                 "unsupported_program_shape",
-                "the target seal registry contains a conflicting live identity",
+                "the target's retained program caches are already sealed and "
+                "cannot be rebound",
             )
-
-        def release_target(reference: ReferenceType[Any]) -> None:
-            current = _TARGET_SEAL_AUTHORITIES.get(target_id)
-            if current is not None and current.target_ref is reference:
-                _TARGET_SEAL_AUTHORITIES.pop(target_id, None)
-
-        try:
-            target_ref = weakref_ref(self, release_target)
-        except TypeError:
+        if seal_token is not existing.seal_token:
             _fail(
                 "unsupported_program_shape",
-                "the target's retained program caches cannot be weakly owned",
+                "the target lacks its construction-time sealing authority",
             )
-        _TARGET_SEAL_AUTHORITIES[target_id] = _TargetSealAuthority(target_ref)
+        if (
+            existing.target_type is not type(self)
+            or existing.program is not self._program_container
+            or existing.input_container is not self._program_inputs_container
+            or existing.input_values is not self._program_input_values
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained input authority changed during target "
+                "construction",
+            )
+        _TargetLowering._require_program_inputs_unchanged(self)
+        target_ref = existing.target_ref
 
         state = object.__getattribute__(self, "__dict__")
         if type(state) is not dict or any(type(key) is not str for key in state):
@@ -1214,10 +1302,7 @@ class _TargetLowering:
         )
         self._target_state_owners = tuple(owners)
         current_authority = _TARGET_SEAL_AUTHORITIES.get(target_id)
-        if (
-            type(current_authority) is not _TargetSealAuthority
-            or current_authority.target_ref is not target_ref
-        ):
+        if current_authority is not existing:
             _fail(
                 "unsupported_program_shape",
                 "the target seal registry changed during target construction",
@@ -1228,6 +1313,7 @@ class _TargetLowering:
             program=self._program_container,
             input_container=self._program_inputs_container,
             input_values=self._program_input_values,
+            seal_token=existing.seal_token,
             graph_snapshot=self._program_graph_snapshot,
             graph_owners=self._program_graph_owners,
             target_snapshot=self._target_state_snapshot,
@@ -1259,11 +1345,29 @@ class _TargetLowering:
     def _require_program_inputs_unchanged(self) -> None:
         """Fail closed if the retained input sequence changed after binding."""
 
-        target_state = _TargetLowering._require_exact_target_type(self)
-        authority = _target_seal_authority(self)
+        target_state = object.__getattribute__(self, "__dict__")
+        authority = _target_input_authority(self)
+        if type(target_state) is not dict or any(
+            type(key) is not str for key in target_state
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches changed after target "
+                "construction",
+            )
+        if (
+            type(self) is not authority.target_type
+            or target_state.get("_target_type_snapshot") is not authority.target_type
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches changed after target "
+                "construction",
+            )
         bound_program = target_state.get("_program_container")
         if (
             type(target_state) is not dict
+            or type(bound_program) is not LoopProgram
             or bound_program is not authority.program
             or target_state.get("program") is not authority.program
         ):
@@ -6436,7 +6540,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
-        self._input_symbols = self._snapshot_program_inputs(program)
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -6475,7 +6579,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self._validate_family_shape()
         self._reserve_family_names()
-        self._seal_target_state()
+        self._seal_target_state(seal_token)
 
     # -- family-shape validation ---------------------------------------------
 
@@ -7698,7 +7802,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
-        self._input_symbols = self._snapshot_program_inputs(program)
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -7743,7 +7847,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         self.shapes = self._validate_shapes(input_shapes, result_shape)
         self._validate_family_shape()
         self._reserve_family_names()
-        self._seal_target_state()
+        self._seal_target_state(seal_token)
 
     # -- family-shape validation ----------------------------------------------
 
@@ -8901,7 +9005,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
-        self._input_symbols = self._snapshot_program_inputs(program)
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -8945,7 +9049,7 @@ class _DenseDomainMixedLowering(_TargetLowering):
         self._target_owner_snapshot = self._validated_target_owner_signature()
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
-        self._seal_target_state()
+        self._seal_target_state(seal_token)
 
     def _collect_mixed_chain(self) -> List[_Loop]:
         def require(condition: bool, what: str) -> None:
@@ -9218,7 +9322,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         result_shape: Tuple[int, ...],
     ) -> None:
         self.program = program
-        self._input_symbols = self._snapshot_program_inputs(program)
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
         self.decls = {decl.symbol: decl for decl in program.tensors}
         if len(program.outputs) != 1:
             _fail(
@@ -9267,7 +9371,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
         self._reserve_merge_names()
-        self._seal_target_state()
+        self._seal_target_state(seal_token)
 
     def _validate_assembly_layouts(self) -> None:
         for decl in self.program.tensors:
