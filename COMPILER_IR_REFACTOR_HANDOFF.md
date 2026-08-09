@@ -30069,8 +30069,8 @@ continuation prompt.
 
 ## Flattened dense-prefix migration and the cluster-2 NO-GO (2026-08-09; supersedes the preceding prompt)
 
-Three code/test commits stack on documentation tip `52d43cc`, ending at
-code/test tip `4ce6bca`; this documentation commit follows. Nothing was
+Four code/test commits stack on documentation tip `52d43cc`, ending at
+code/test tip `a1582a9`; this documentation commit follows. Nothing was
 pushed, amended, squashed or reordered; origin remains `58e8565`. The five
 protected tracked files retain their recorded hashes and no unrelated tracked
 or untracked material was staged.
@@ -30078,6 +30078,7 @@ or untracked material was staged.
     78e4ca6  feat(compiler): assemble sparse outputs under several dense parents
     35094ba  fix(runtime): close two ownership-boundary gaps found by fresh probes
     4ce6bca  test(compiler): lock the flattened dense prefix and move four seam locks
+    a1582a9  test(compiler): move the layout seam lock to the interleaved neighbour
 
 ### Review outcome
 
@@ -30119,7 +30120,7 @@ dense PyTorch reference, never byte parity.
 
 Interleaved `sds` stays fail-closed with evidence; trailing-dense D10/D11
 (`sd+sd`, `sdd`) keep `unsupported_sparse_output_domain`; permuted compressed
-structure keeps its pre-LoopIR `InvalidSchedule` rejection. Five inherited
+structure keeps its pre-LoopIR `InvalidSchedule` rejection. Six inherited
 seam locks named migrated cells and were moved to the neighbour that still
 occupies each seam, with each move named in place.
 
@@ -30132,7 +30133,8 @@ tree. Changing that is a Phase-8 cutover and was forbidden here.
 a partially verified workspace vertical would be worse than delivering none,
 so it was not started. What this session adds instead is a localized,
 independently verified root-cause map -- see review §45.6 for the four exact
-sites (`scheduler.py:2084`, `cin_lowerer.py:~998`, `csrc/header.h:653`,
+sites (`scheduler.py:2084`, `cin_lowerer.py:~998`,
+`src/scorch/csrc/header.h:653-655`,
 `cin_lowerer.py:1923`/`:1930`) and the reproduced public consequence.
 
 ### Exact final evidence
@@ -30197,22 +30199,27 @@ The protected tracked files and required SHA-256 values are:
 and `tests/test_scorch/test_resources.py` =
 `3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
 
-Start with a rigorous independent review of 52d43cc..<code tip> plus the
-documentation commit. Reproduce the flattened dense-prefix contract directly:
+Start with a rigorous independent review of `52d43cc..bb429f4`, including the
+documentation and eight exact-tip review-correction commits. Reproduce the
+flattened dense-prefix contract directly:
 a compressed level under N dense parents owns prod(extents)+1 position slots;
 `_assembly_catch_up_bound` and `_dense_loop_owns_result_assembly` must
 degenerate to the inherited spelling byte for byte at prefix 1; and
 `_exact_dense_parent_positions` must stay False for prefix >= 2. Re-derive the
 two runtime fixes (int-subclass bit-width canonicalization through
 `int.__int__` with bool/non-positive still fail-closed; atomic SINGLETON
-rejection with the receiver unmutated). Verify the five moved seam locks name
+rejection with the receiver unmutated). Verify the six moved seam locks name
 the neighbour that actually still occupies each seam, and that the 144
 `dds` code sharpenings to `unsupported_sparse_output_domain` are each the
 correct diagnosis. Preserve every evidence qualification: the closure ledger
 verifies 540/540, the historical assembly ledger verifies 224/225 and must NOT
 be resealed, the `target-membership-proof/summary.json` revision attribution
-is wrong and must not be silently corrected in place, and §44.4's shared-lookup
-cost claim is false for merged position-load emission. Add fresh adversarial
+is wrong and must not be silently corrected in place. §44.4's shared-lookup
+cost claim was false for merged position-load emission; `bcdd10d` removes the
+redundant successful-path replay and `d50f446` locks seal/input/replay at
+1/1/0 while retaining cold-path diagnostics. Re-derive the later actual-type,
+integer-width, hostile-alias, metaclass-diagnostic and runtime-Sequence format
+boundaries. Add fresh adversarial
 probes for mutation, aliasing, cycles, forged tuple/proxy/weakref state,
 descriptor callbacks, target construction order and specialized-target cache
 drift. If a concrete defect exists, fix it first with a focused production
@@ -30229,8 +30236,9 @@ localized and independently reproduced; start from them:
   2. `cin_lowerer.py:~998` emits `coo_workspace<T, wksp.dim>(1024,
      result_shape)`: template arity is the workspace KEY rank, runtime
      argument is the whole RESULT shape.
-  3. `csrc/header.h:653` requires `coord.size() == N && _resultShape.size()
-     == N`, so any key-rank/result-rank difference throws
+  3. `src/scorch/csrc/header.h:653-655` requires
+     `coord.size() == N && _resultShape.size() == N`, so any
+     key-rank/result-rank difference throws
      "workspace coordinate rank mismatch" on every insert. (2)+(3) are the
      inherited rank-2-workspace/rank-3-shape mismatch.
   4. `cin_lowerer.py:1923` takes the drain's leaf coordinate from workspace
@@ -30299,4 +30307,180 @@ import provenance was not proved. Seal the evidence manifest only after the
 final code and documentation tips, exclude generated caches/worktrees/binaries,
 verify every manifest entry, document the honest GO/NO-GO boundary, and finish
 with commits plus a still-broader continuation prompt.
+```
+
+## Exact-tip multi-prefix review corrections (2026-08-09; supersedes the preceding prompt)
+
+Eight focused code/test commits follow review base ``372b0fc`` and end at
+code/test tip ``bb429f4``; this documentation commit follows.  Nothing was
+pushed, amended, squashed or reordered.  The flattened-dense-prefix migration
+itself survived the independent review, while four shared boundary defects
+were fixed and locked:
+
+```
+c5657cc  fix(format): align integer width validation
+bcdd10d  fix(compiler): avoid redundant position-load ownership replay
+625c04f  test(format): lock integer width boundaries
+d50f446  test(compiler): lock merged position-load authority reuse
+6e9ef24  fix(format): validate level modes by actual type
+49a5758  test(format): lock actual level type validation
+d38d3b8  fix(format): close metaclass callback gaps
+bb429f4  test(format): lock metaclass-free validation
+```
+
+The fixes align constructor and ownership validation for true integer
+subclasses, remove one redundant successful-path ``PositionLoad`` authority
+replay while retaining all cold-path checks, reject foreign ``__class__``
+lookalikes by actual type/MRO, and prevent hostile metaclass descriptors from
+escaping public format validation.  The activating authority count is now
+seal/input/replay **1/1/0**.  No LoopIR schema, identity, schedule, dispatch,
+cache or generated C++ changed.
+
+The exact-tip gates are recorded in review §46 and under
+``~/.cache/scorch-codex/phase7-multiprefix-review-bb429f4/``.  Highlights:
+
+- focused membership **296 passed**; complete clean detached suite **5,750
+  passed / 14 skipped / zero failures over all 5,764 selected nodes**;
+- schedule audit twice at **46/40/0** with raw-identical repeats;
+- the provenance-correct raw 120 harness is honestly **116 pass plus exactly
+  four retained ``ds``-copy rejections and exit 1**; its separate exact-tuple
+  characterization exits 0; the wider and randomized gates pass **162/162**
+  and **560/560**;
+- corpus **20/20** and grid **42/42** byte-identical to the retained captures;
+- exact 54-cell census: **46 arm-invariant records, the same eight isolated
+  SIGSEGV cells, zero timeouts**.  Its raw wrapper exits 1 only because it
+  compares lexicographic ``C13,C2`` ordering with numeric ``C2,...,C13``;
+  an order-insensitive characterization exits 0 and all 46
+  environment-independent projections equal the retained baseline.  Numeric
+  conversion fields are retained separately because this host's loaded native
+  tensor lacks ``to_torch``; the raw failure remains;
+- full static parity: the same 15 Black files, Flake8 raw-identical at 47
+  findings, and mypy raw-identical at 140 errors in 11 files;
+- Redwood's fresh repeat passes every p50/p95 threshold, while its first and
+  flipped-order runs retain marginal crossings and remain classified mixed;
+  MKT Slurm job ``16596836`` passes twice (worst p50/p95 **1.0960/1.0953**)
+  with exact Redwood source digests and a tight A/A control.
+
+Phase 7 remains open on exactly the multi-compressed sparse-reduction/TTM
+workspace vertical.  No Phase-8 cutover, selector/cache/default-dispatch
+change or legacy deletion occurred.
+
+### Superseding broad copy-paste prompt for the next session
+
+```text
+Continue the compiler-IR migration from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, review §45-§46 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md and the final section of
+COMPILER_IR_REFACTOR_HANDOFF.md, inspect the graph yourself, and do not trust
+the handoff without reproducing its contracts. Do not push, amend, squash or
+reorder existing commits. Preserve the five protected dirty tracked files and
+all unrelated GPU/benchmark/scheduler/research/scratchpad material; stage only
+explicit paths.
+
+The protected tracked files and required SHA-256 values are:
+`.gitignore` = `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`,
+`pyproject.toml` =
+`191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`,
+`src/scorch/__init__.py` =
+`5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`,
+`tests/packaging/smoke_install.py` =
+`f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`,
+and `tests/test_scorch/test_resources.py` =
+`3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+First independently review the complete final range, especially
+`372b0fc..bb429f4`. Re-derive rather than assume: actual-type/MRO validation
+must execute no caller callbacks; valid int subclasses canonicalize at the
+ownership boundary while bool/non-positive/foreign lookalikes fail closed;
+merged PositionLoad emission performs exactly one seal lookup, one nested
+input-authority lookup and zero successful-path replays; cold forged/mutated/
+aliased/cyclic forms retain exact controlled diagnostics. Reproduce the
+historical evidence qualifications too: six seam locks moved, the 120 raw
+harness is 116+4 expected rejections and exits 1, and the census raw wrapper
+exits 1 for an ordering-comparator bug despite reproducing the exact semantic
+set. If you find a concrete defect, fix it first in a focused production
+commit plus a separate regression-test commit.
+
+The primary milestone is the complete Phase-7 multi-compressed sparse-
+reduction/TTM vertical. Implement it, do not merely inventory it again. Start
+from the four verified legacy blockers:
+
+1. `src/scorch/compiler/scheduler.py:2084` anchors the Where at the innermost
+   remaining reduction variable, leaving outer contractions above the
+   workspace region.
+2. `src/scorch/compiler/cin_lowerer.py` near line 998 instantiates
+   `coo_workspace<T, key_rank>` with the whole result shape, conflating
+   workspace-key rank and result rank.
+3. `src/scorch/csrc/header.h:653-655` requires both coordinate and result-shape
+   arity to equal the template rank, so that conflation rejects every insert.
+4. `src/scorch/compiler/cin_lowerer.py:1923/1930` drains from the wrong key
+   coordinate for rank > 1 and caps coordinate assembly at two levels.
+
+Give workspace allocation, reset, lifetime, producer reduction, key-domain
+shape, drain and ordered multi-level result assembly explicit structured
+LoopIR ownership across nodes, builder, verifier, canonical printer, oracle,
+analysis, schedule application/erasure, LLIR lowering, completion and public
+result wrapping. Keep positions distinct from coordinates and parent-link
+compressed levels; the design must remain general level-based compilation,
+not a CSR/rank-2 special case. Separate workspace key dimensions from result
+layout dimensions structurally. Prove race discipline and deterministic
+ordered drain semantics, including cancellation and explicit stored zeros.
+
+Cover rank-2 and rank-3 sparse reductions and TTM across `ss`, `sss`, `dss`,
+`dds` and every relevant migrated multiple-dense-prefix/multi-compressed
+layout, both automatic arms, f32/f64, commuted operands, empty/ragged inputs,
+zero extents, singleton extents and cancellation. Add randomized differential
+storage checks, not only dense numeric checks: exact pos/crd/value ownership,
+level lengths, canonical ordering and public wrapping. Gate correctness on
+canonical erasure, the format-neutral LoopIR oracle and PyTorch. Never treat
+the unsafe legacy output as an oracle or demand byte parity from a malformed
+kernel. Preserve each of the eight known legacy SIGSEGV cells as source and
+failure evidence only, one fresh subprocess per cell with timeout plus
+RLIMIT_CPU/RLIMIT_CORE; require exact fail-closed codes for every excluded
+neighbour.
+
+If the representation naturally unlocks interleaved `sds` or trailing-dense
+`sd`/`sdd`, migrate each only as a separately auditable sub-slice with its own
+oracle/erasure/storage evidence. Otherwise retain and test their exact seams:
+`sds` needs a dense loop below a sparse stream plus rollback of speculative
+position closes; `sd`/`sdd` obtain parent coordinates from cursors rather than
+dense-loop induction. Keep permuted compressed structures fail-closed unless
+they receive a deliberate general-level implementation.
+
+Then rerun the Phase-7 exit audit criterion by criterion. Use focused and
+adversarial memberships, the provenance-correct 120/162/560 gates, the real
+54-cell census and an expanded family census, the 86-case schedule audit,
+retained plus activating source captures, public compiled differentials,
+full-tree Black/Flake8/mypy parity, protected hashes, git diff --check, and an
+exact-tip clean detached full non-performance suite in fresh-process,
+file-disjoint partitions with a proven complete/non-overlapping node union.
+Do not relabel a nonzero harness, average away a failed percentile, or cite a
+receipt without exact revision and import provenance.
+
+For latency, use local M5 only for quick attribution. Run the binding x86
+receipt on an unloaded host with 200 warmups / 2,000 samples, both p50 and p95
+<=1.10, plus A/A and order controls. Redwood is available; MKT is also useful
+as an independent Slurm control, as this review demonstrated. On MKT use
+`ssh sc` plus `sbatch --account=mkt --partition=mkt`, create and build only
+inside an allocation under `/scr/u/bobbyy`, use `/matx` only for durable
+staging/results, and never SSH directly to `mkt1`. Record environment/toolchain
+differences; MKT is corroboration for the CPU backend, not a substitute for
+source identity or the semantic gates.
+
+Only a genuine Phase-7 GO permits the stretch milestone. If all criteria pass
+and time remains, begin Phase 8 broadly but safely: first produce a read-only
+fallback/cutover census covering public dispatch frequency, canonical
+request/cache identity, dual-arm composition, unsupported codes and legacy
+dependencies; then implement at most an explicitly opt-in shadow/cutover pilot
+for already proven families, with legacy-vs-LoopIR source/result/cache
+differentials and rollback. Do not flip default dispatch, delete a legacy
+path, weaken fallback behavior or start Phase 8.5 without a separately gated
+decision. If Phase 7 is still NO-GO, stop there and hand over the exact blocker
+rather than starting cutover work.
+
+Commit coherent production, test and documentation slices separately with
+descriptive bodies. Seal the evidence manifest only after the final code and
+documentation tips, exclude worktrees, extension caches, binaries and other
+generated material, verify every manifest entry, leave origin untouched, and
+finish with the honest GO/NO-GO plus an even broader continuation prompt.
 ```

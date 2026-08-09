@@ -7949,7 +7949,7 @@ A third probe claim -- that the format parser executes a hostile ``__repr__``
 foreign objects by exact type before rendering them, returning
 ``TensorTypeError`` with no hook fired.
 
-### 45.4 The multiple-dense-prefix sparse-output migration (``78e4ca6`` / ``4ce6bca``)
+### 45.4 The multiple-dense-prefix sparse-output migration (``78e4ca6..a1582a9``)
 
 ``dds``, ``ddss``, ``ddds``, ``dddss`` and the rank-general forms are migrated
 end to end -- copy, intersection and ordered UNION assembly, in both automatic
@@ -8040,7 +8040,10 @@ the §43.8 discipline.  Two of them are moving for the *second* time, and the
 comments record both hops.  A fifth lock, in
 ``test_loopir_dense_leaf_cooperand_target.py``, was found only by running the
 focused suites and is moved to a ``dds`` result fed by a ``dsd`` dense-leaf
-operand.
+operand.  The detached full suite then found a **sixth** lock in
+``test_loopir_cin_lowering.py``; ``a1582a9`` moves that lock from the newly
+admitted ``dds`` copy to the interleaved ``sds`` neighbour.  The total is six,
+not five.
 
 The layout differential additionally shows **144 arm-instances of ``dds``
 neighbours whose fail-closed code sharpens** from ``unsupported_sparse_output``
@@ -8071,7 +8074,7 @@ root-cause map, which is strictly more than the inventory §43.5 left:
    ``coo_workspace<T, wksp.dim>(1024, result_shape)``: the template arity is
    the workspace **key** rank while the runtime argument is the whole
    **result** shape.
-3. ``csrc/header.h:653`` -- ``insert`` requires
+3. ``src/scorch/csrc/header.h:653-655`` -- ``insert`` requires
    ``coord.size() == N && _resultShape.size() == N``, so whenever the key rank
    differs from the result rank *every* insert throws
    ``workspace coordinate rank mismatch``.  Together with (2) this is the
@@ -8110,13 +8113,21 @@ All gates ran in the ``scorch`` conda environment.  Evidence is retained under
   drift, 0 newly rejected**, 12 newly-admitted arm-instances (6 cells) and 144
   code-sharpening arm-instances, all ``dds``.  None of the newly admitted
   cells is at byte parity, which is the expected and required outcome for a
-  family whose legacy assembler is malformed.
+  family whose legacy assembler is malformed.  Consequently the retained
+  ``envelope/diff.txt`` ends in the harness-level text ``VERDICT: FAIL``: that
+  verdict means "not every admitted candidate is byte-equal to legacy," not a
+  regression in this oracle-gated family.  The file is retained as expected
+  non-parity evidence and must not be described as a passing byte-parity gate.
 - **Execution sweeps**: a 120-case matrix (ranks 3-5, f32/f64, copy/mul/add,
   zero extents, singleton prefixes, both arms) and a 162-case matrix (mixed
   and commuted operands, random/ragged/empty/explicit-stored-zero fixtures,
   cancellation) both pass storage well-formedness, the dense PyTorch
   differential and base/scheduled oracle agreement.  The only rejections are
-  the four pre-existing, unchanged ``ds``-copy cells.
+  the four pre-existing, unchanged ``ds``-copy cells.  The historical ledger
+  retained the scripts but **not** their stdout, exit status, revision, or
+  import-provenance receipts, and those scripts hard-code the active checkout;
+  these counts therefore remain claims pending the provenance-correct rerun in
+  the subsequent exact-tip review, not self-contained historical gates.
 - **Independent multi-seed randomized oracle sweep**: **560/560 checks over
   five seeds**, spanning seven layouts (``dds``, ``ddss``, ``ddds``,
   ``dddss`` plus the inherited ``dss``/``sss``/``ss`` controls), MUL and ADD,
@@ -8221,7 +8232,7 @@ on the LoopIR oracle and the dense PyTorch reference because its legacy
 comparand is provably malformed.
 
 *Every neighbour carries a stable fail-closed code.*  Yes, in both arms, with
-the moves recorded: five inherited seam locks relocated to the neighbour that
+the moves recorded: six inherited seam locks relocated to the neighbour that
 still occupies each seam, and 144 arm-instances of ``dds`` neighbours whose
 code sharpens from ``unsupported_sparse_output`` to
 ``unsupported_sparse_output_domain``.  ``sds`` keeps
@@ -8263,3 +8274,129 @@ receipt independently re-derived rather than trusted, two evidence
 inaccuracies recorded rather than resealed, and the remaining cluster reduced
 from "blocked, needs its own vertical" to four named lines of code with a
 reproduced public consequence.
+
+## 46. Exact-tip review corrections and cross-host closure (2026-08-09)
+
+This section supersedes §45's continuation instructions.  The code/test tip is
+``bb429f4``.  The review first re-read and adversarially exercised the complete
+``52d43cc..372b0fc`` milestone; the flattened-dense-prefix target itself is
+sound over its declared envelope.  Four defects were instead found in shared
+validation and emission boundaries reached by the milestone, and each was
+fixed before any continuation work:
+
+1. ``c5657cc`` / ``625c04f`` align ``LevelFormat`` construction, ownership
+   audit and CIN normalization for genuine ``int`` subclasses.  Validation
+   now obtains the canonical value through the base ``int`` descriptor,
+   rejects foreign ``__class__`` spoofs and lying comparisons, retains the
+   constructor-valid subclass until the ownership boundary, and stores an
+   exact owned integer after normalization.  ``bool`` and non-positive widths
+   remain rejected.
+2. ``bcdd10d`` / ``d50f446`` remove the redundant successful-path authority
+   replay from merged ``PositionLoad`` emission.  The sealed-target and final
+   graph checks remain authoritative, cold-path replay still owns its precise
+   diagnostics, and an activating count lock pins seal / nested-input lookup /
+   explicit replay at exactly **1 / 1 / 0**.
+3. ``6e9ef24`` / ``49a5758`` make level-mode validation use actual type/MRO
+   state, not caller-controlled ``__class__`` attributes.  Real ``str`` and
+   ``LevelFormat`` subclasses remain compatible; foreign lookalikes fail
+   closed without invoking their hooks.
+4. ``d38d3b8`` / ``bb429f4`` close the remaining rejection-path callbacks:
+   actual type names are read through base descriptors and canonicalized
+   through ``str.__str__``, and runtime sequence recognition uses
+   ``collections.abc.Sequence`` rather than the ``typing`` alias that queried
+   a hostile metaclass.  Public failures are controlled ``TensorTypeError``
+   instances, never caller exceptions.
+
+The fixes add no LoopIR node, schema, schedule/request identity, dispatch,
+cache, selector or C++ spelling change.  The protected files and unrelated
+work remain outside every commit.
+
+### 46.1 Evidence corrections
+
+The historical evidence is not rewritten.  The §45 milestone has four
+code/test commits through ``a1582a9`` (not three), moved **six** seam locks
+(not five), and its retained non-parity envelope correctly ends in
+``VERDICT: FAIL`` because the twelve oracle-gated new admissions must differ
+from malformed legacy output.  The historical 120/162 scripts lacked their
+own revision, import, stdout and exit receipts.  Their exact-tip reruns now
+show the distinction that the old prose blurred:
+
+- the raw 120-case harness exits **1**, with **116 PASS / 4 FAIL**; a separate
+  exit-0 characterization proves the complete fail set is exactly
+  ``ds(3,4)`` copy x ``{float32,float64}`` x both arms, each at the retained
+  ``unsupported_program_shape`` seam;
+- the wider harness exits 0 at **162/162**, and the randomized oracle/storage
+  sweep exits 0 at **560/560 over five seeds**.
+
+Likewise, the exact 54-cell census reproduces **46 records, 46 arm-invariant,
+eight SIGSEGV cells (C1-C7 and C13), and zero timeouts**.  Its raw wrapper exits
+1 only because it lexicographically sorts ``C13`` before ``C2`` and compares
+that list against numeric order; the retained raw result is paired with an
+order-insensitive exit-0 set characterization.  The exit map, record names and
+all 46 environment-independent semantic projections equal the retained
+``4ce6bca`` baseline.  Raw numeric-conversion fields are retained but excluded
+from that projection because this host's loaded ``scorch_ops.Tensor`` lacks
+``to_torch``; all 40 such probes record the exact inspect error.  Neither raw
+nonzero receipt is renamed or averaged into a pass.
+
+The native workspace reference is now written as
+``src/scorch/csrc/header.h:653-655``.  The entry point begins at line 653, the
+rank invariant is checked at line 654, and its diagnostic is thrown at line
+655; the earlier shortened path obscured the actual owner.
+
+### 46.2 Exact-tip verification
+
+Evidence is retained under
+``~/.cache/scorch-codex/phase7-multiprefix-review-bb429f4/``.
+
+- Focused format/CIN/conversion membership: **296 passed**.  The complete
+  clean detached non-performance suite collected 5,767 nodes, deselected the
+  three performance nodes, and completed **5,750 passed / 14 skipped / zero
+  failures over all 5,764 selected nodes**.  All 86 tracked pytest modules
+  occur exactly once across eight fresh-process partitions; every partition
+  ran at exact ``bb429f4`` and exited 0.
+- The exact schedule audit was run twice: **46 admitted / 40 rejected / zero
+  non-identical**, with raw-identical repeated output and normalized equality
+  to the retained baseline.  The historical revision-pinned wrapper rejects
+  this newer tip as designed and is retained as an incompatibility receipt.
+- The exact 120/162/560 receipts have asserted revision and import provenance,
+  empty stderr and a clean detached source tree.  The 20-source corpus and
+  42-source grid each regenerate byte-identically to the retained captures;
+  their native-build sentinel directories remain empty.  The correctness
+  subledger seals 288 retained files (manifest SHA-256
+  ``0181d9c77ec1fee68cf3d6b95789731dd53806bb32c6649031286613190d5120``)
+  and explicitly excludes worktrees, extension caches, pycache and native
+  build products; all 288 entries verify.
+- Full static parity against clean ``372b0fc``: Black exits 1/1 with the same
+  15 finding files and 15/135 counts (only concurrent output order differs),
+  Flake8 is raw-byte-identical at 47 inherited findings, and mypy is
+  raw-byte-identical at 140 errors in 11 files plus two notes.  No Flake8 or
+  mypy coordinate drift exists.  ``git diff --check`` is clean.
+- Redwood ran 200 warmups / 2,000 samples for seven activating or shared
+  control shapes.  A fresh alternating repeat is wholly inside 1.10 (worst
+  p50 **1.0960**, p95 **1.0986**) and its A/A control is tight (worst p50
+  **1.0059**, p95 **1.0136**).  The first and order-flipped runs retain
+  marginal crossings (worst **1.1131/1.1125**), so those runs are not averaged
+  away and the Redwood evidence remains mixed.
+- At the user's suggestion, Slurm job ``16596836`` repeated the gate on MKT
+  in job-local ``/scr/u/bobbyy`` storage (AMD EPYC 9334, four allocated CPUs,
+  no direct ``mkt1`` login).  Both candidate repeats are wholly inside 1.10,
+  worst **1.0960/1.0953** and **1.0950/1.0946** p50/p95; the A/A control is
+  inside **1.0013/1.0095**.  The seven emitted-source payloads are byte-equal
+  between MKT and Redwood and between ``d50f446`` and ``bb429f4``.  Failed
+  setup attempts (missing native extension, then an incorrectly rooted
+  package metadata build) remain in the ledger rather than being hidden; the
+  scratch-local overlay build used by the successful job exited 0.
+
+### 46.3 Phase disposition
+
+The review corrections are complete, but **Phase 7 remains open**.  The one
+remaining production-relevant cluster is still §45.6's multi-compressed
+sparse-reduction/TTM workspace vertical.  Its four blockers remain at
+``scheduler.py:2084``, ``cin_lowerer.py:~998``,
+``src/scorch/csrc/header.h:653-655`` and
+``cin_lowerer.py:1923``/``:1930``.  No Phase-8 cutover, default-dispatch,
+selector or cache change was made, and no fallback or legacy implementation
+was removed.  Cross-host latency evidence now attributes §45's local crossing
+away from these emission-neutral corrections, but it cannot close the absent
+semantic vertical; Phase 7 therefore has no exit verdict yet.
