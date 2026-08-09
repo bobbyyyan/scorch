@@ -51,7 +51,7 @@ approximated.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from enum import Enum
 from types import FunctionType, MappingProxyType
 from typing import (
@@ -65,6 +65,7 @@ from typing import (
     Tuple,
     cast,
 )
+from weakref import ReferenceType, ref as weakref_ref
 
 import torch
 
@@ -265,6 +266,10 @@ _LOOPIR_ENUM_TYPE_BY_ID = {
 _LOOPIR_IDENTITY_TYPE_BY_ID = {
     id(identity_type): identity_type for identity_type in _LOOPIR_IDENTITY_TYPES
 }
+_LOOPIR_NODE_FIELDS_BY_ID = {
+    id(node_type): tuple(field.name for field in dataclass_fields(node_type))
+    for node_type in _LOOPIR_GRAPH_NODE_TYPES
+}
 _MAPPING_WITNESS_FIELDS = frozenset(
     {"_bound_position_snapshot", "_position_load_signatures"}
 )
@@ -272,6 +277,19 @@ _TUPLE_WITNESS_FIELDS = frozenset(
     {"_target_owner_snapshot", "_value_expression_snapshot"}
 )
 _IMMUTABLE_WITNESS_FIELDS = _MAPPING_WITNESS_FIELDS | _TUPLE_WITNESS_FIELDS
+_OPAQUE_MAPPING_CACHE_FIELDS = frozenset(
+    {"cursor_loops", "decls", "dimension_names", "loop_positions", "shapes"}
+)
+_OPAQUE_TUPLE_CACHE_FIELDS = frozenset(
+    {
+        "_input_symbols",
+        "_program_input_values",
+        "_program_inputs_container",
+        "cursor_values",
+        "loads",
+        "position_loads",
+    }
+)
 
 _SCALAR_TO_TORCH: Dict[ScalarType, torch.dtype] = {
     ScalarType.FLOAT32: torch.float32,
@@ -358,6 +376,47 @@ class LoopIRTargetError(Exception):
 
 def _fail(code: str, message: str) -> NoReturn:
     raise LoopIRTargetError(LoopIRTargetDefect(code, message))
+
+
+@dataclass(frozen=True)
+class _TargetSealAuthority:
+    """Externally retained construction authority for one live target."""
+
+    target_ref: ReferenceType[Any]
+    target_type: Optional[type] = None
+    program: Optional[LoopProgram] = None
+    input_container: Optional[Tuple[SymbolId, ...]] = None
+    input_values: Optional[Tuple[int, ...]] = None
+    graph_snapshot: Optional[Tuple[object, ...]] = None
+    graph_owners: Optional[Tuple[object, ...]] = None
+    target_snapshot: Optional[Tuple[object, ...]] = None
+    target_owners: Optional[Tuple[object, ...]] = None
+
+
+_TARGET_SEAL_AUTHORITIES: Dict[int, _TargetSealAuthority] = {}
+
+
+def _target_seal_authority(target: object) -> _TargetSealAuthority:
+    """Return the complete external authority for one exact live target."""
+
+    authority = _TARGET_SEAL_AUTHORITIES.get(id(target))
+    if (
+        type(authority) is not _TargetSealAuthority
+        or authority.target_ref() is not target
+        or authority.target_type is None
+        or authority.program is None
+        or authority.input_container is None
+        or authority.input_values is None
+        or authority.graph_snapshot is None
+        or authority.graph_owners is None
+        or authority.target_snapshot is None
+        or authority.target_owners is None
+    ):
+        _fail(
+            "unsupported_program_shape",
+            "the target's retained program authority is missing or incomplete",
+        )
+    return authority
 
 
 @dataclass(frozen=True)
@@ -535,15 +594,18 @@ class _TargetLowering:
         builds legacy-shaped LLIR. Frozen dataclasses are only a conventional
         boundary in Python: ``object.__setattr__`` can replace an ancestor body
         with a fresh, verifier-valid subtree and leave every retained object
-        unchanged. Fingerprinting only the retained leaf therefore permits
-        stale emission. This stored-state walk starts at the current program
-        root, records every exact node/container edge and declaration, and
-        rejects cycles or foreign values without invoking caller attributes.
+        unchanged. This stored-state walk starts at the current program root,
+        validates every exact node/container edge, and records one shallow
+        immutable authority record for every mutable node, identity, and enum.
+        Exact tuples need no record of their own: their owning node record binds
+        the tuple by identity, and their elements cannot subsequently change.
+        The resulting authority supports a non-recursive pre-emission check
+        while retaining the same cycle and foreign-value boundary.
         """
 
         active: Set[int] = set()
         seen: Set[int] = set()
-        signature: List[object] = []
+        records: List[Tuple[object, ...]] = []
 
         def fail(message: str) -> NoReturn:
             _fail("unsupported_program_shape", message)
@@ -552,21 +614,21 @@ class _TargetLowering:
             if depth > 256:
                 fail("the target program graph exceeds the ownership depth bound")
             if value is None:
-                signature.append("none")
                 return
             if type(value) is bool:
-                signature.extend(("bool", value))
                 return
             if type(value) is int:
-                signature.extend(("int", value))
                 return
             if type(value) is float:
-                signature.extend(("float", value.hex()))
                 return
             if type(value) is str:
-                signature.extend(("str", value))
                 return
             value_type = type(value)
+            object_id = id(value)
+            if object_id in active:
+                fail("the target program graph contains a cycle")
+            if object_id in seen:
+                return
             identity_type = _LOOPIR_IDENTITY_TYPE_BY_ID.get(id(value_type))
             if identity_type is value_type:
                 try:
@@ -584,11 +646,12 @@ class _TargetLowering:
                     fail("the target program graph contains a malformed identity")
                 if owners is not None:
                     owners.append(value)
-                signature.extend(
+                seen.add(object_id)
+                records.append(
                     (
                         "identity",
-                        value_type.__name__,
-                        id(value),
+                        value,
+                        value_type,
                         state["value"],
                     )
                 )
@@ -603,14 +666,8 @@ class _TargetLowering:
                     fail("the target program graph contains a malformed enum value")
                 if owners is not None:
                     owners.append(value)
-                signature.extend(("enum", enum_type.__name__, id(value), name))
-                return
-
-            object_id = id(value)
-            if object_id in active:
-                fail("the target program graph contains a cycle")
-            if object_id in seen:
-                signature.extend(("reference", object_id))
+                seen.add(object_id)
+                records.append(("enum", value, enum_type, name))
                 return
 
             if type(value) is tuple:
@@ -619,7 +676,6 @@ class _TargetLowering:
                 active.add(object_id)
                 seen.add(object_id)
                 try:
-                    signature.extend(("tuple", object_id, len(value)))
                     for item in value:
                         visit(item, depth + 1)
                     return
@@ -633,7 +689,14 @@ class _TargetLowering:
                 state = object.__getattribute__(value, "__dict__")
             except Exception:
                 fail("the target program graph contains malformed node state")
-            if type(state) is not dict or any(type(key) is not str for key in state):
+            fields = _LOOPIR_NODE_FIELDS_BY_ID[id(value_type)]
+            state_keys = tuple(state) if type(state) is dict else ()
+            if (
+                type(state) is not dict
+                or len(state_keys) != len(fields)
+                or any(type(key) is not str for key in state_keys)
+                or any(field not in state for field in fields)
+            ):
                 fail("the target program graph contains malformed node state")
 
             if owners is not None:
@@ -641,10 +704,16 @@ class _TargetLowering:
             active.add(object_id)
             seen.add(object_id)
             try:
-                fields = sorted(state)
-                signature.extend(("node", node_type.__name__, object_id, len(fields)))
+                records.append(
+                    (
+                        "state",
+                        value,
+                        node_type,
+                        fields,
+                        tuple(state[key] for key in fields),
+                    )
+                )
                 for key in fields:
-                    signature.append(key)
                     visit(state[key], depth + 1)
                 return
             finally:
@@ -653,9 +722,144 @@ class _TargetLowering:
         if type(program) is not LoopProgram:
             fail("the target program graph must remain an exact LoopProgram")
         visit(program, 0)
-        if not signature or signature[0] != "node":
+        if (
+            not records
+            or records[0][0] != "state"
+            or records[0][1] is not program
+            or records[0][2] is not LoopProgram
+        ):
             fail("the target program graph must remain an exact LoopProgram")
-        return tuple(signature)
+        return tuple(records)
+
+    def _require_program_graph_snapshot_unchanged(
+        self,
+        program: object,
+        snapshot: object,
+    ) -> None:
+        """Check constructor-owned graph records without rebuilding the graph."""
+
+        def fail(message: str) -> NoReturn:
+            _fail("unsupported_program_shape", message)
+
+        def changed() -> NoReturn:
+            # Preserve the recursive authority's specific cycle, depth,
+            # foreign-value, and malformed-state diagnostics on the cold
+            # path. A structurally valid but different graph receives the
+            # established generic retained-graph diagnostic.
+            _TargetLowering._validated_program_graph_signature(self, program)
+            fail(
+                "the program graph, including a target owning statement, "
+                "changed after target construction"
+            )
+
+        if type(program) is not LoopProgram or type(snapshot) is not tuple:
+            fail("the target program graph must remain an exact LoopProgram")
+        if not snapshot:
+            fail("the target program graph must remain an exact LoopProgram")
+        first = snapshot[0]
+        if (
+            type(first) is not tuple
+            or len(first) != 5
+            or type(first[0]) is not str
+            or first[0] != "state"
+            or first[1] is not program
+            or first[2] is not LoopProgram
+        ):
+            fail("the target program graph must remain an exact LoopProgram")
+
+        for record in snapshot:
+            if type(record) is not tuple or not record or type(record[0]) is not str:
+                fail("the target program graph contains malformed authority state")
+            kind = record[0]
+            if kind == "identity":
+                if len(record) != 4:
+                    fail("the target program graph contains malformed authority state")
+                value, expected_type, expected_value = record[1:]
+                identity_type = _LOOPIR_IDENTITY_TYPE_BY_ID.get(id(expected_type))
+                if (
+                    identity_type is not expected_type
+                    or type(expected_value) is not int
+                ):
+                    fail("the target program graph contains malformed authority state")
+                if type(value) is not expected_type:
+                    changed()
+                try:
+                    state = object.__getattribute__(value, "__dict__")
+                except Exception:
+                    changed()
+                keys = tuple(state) if type(state) is dict else ()
+                if (
+                    type(state) is not dict
+                    or any(type(key) is not str for key in keys)
+                    or keys != ("value",)
+                    or type(state["value"]) is not int
+                    or state["value"] != expected_value
+                ):
+                    changed()
+                continue
+            if kind == "enum":
+                if len(record) != 4:
+                    fail("the target program graph contains malformed authority state")
+                value, expected_type, expected_name = record[1:]
+                enum_type = _LOOPIR_ENUM_TYPE_BY_ID.get(id(expected_type))
+                if enum_type is not expected_type or type(expected_name) is not str:
+                    fail("the target program graph contains malformed authority state")
+                if type(value) is not expected_type:
+                    changed()
+                try:
+                    current_name = object.__getattribute__(value, "_name_")
+                except Exception:
+                    changed()
+                if type(current_name) is not str or current_name != expected_name:
+                    changed()
+                continue
+            if kind != "state" or len(record) != 5:
+                fail("the target program graph contains malformed authority state")
+            value, expected_type, fields, expected_values = record[1:]
+            node_type = _LOOPIR_NODE_TYPE_BY_ID.get(id(expected_type))
+            if (
+                node_type is not expected_type
+                or type(fields) is not tuple
+                or any(type(field) is not str for field in fields)
+                or fields != _LOOPIR_NODE_FIELDS_BY_ID[id(expected_type)]
+                or type(expected_values) is not tuple
+                or len(expected_values) != len(fields)
+            ):
+                fail("the target program graph contains malformed authority state")
+            if type(value) is not expected_type:
+                changed()
+            try:
+                state = object.__getattribute__(value, "__dict__")
+            except Exception:
+                changed()
+            state_keys = tuple(state) if type(state) is dict else ()
+            if (
+                type(state) is not dict
+                or len(state_keys) != len(fields)
+                or any(type(key) is not str for key in state_keys)
+                or any(field not in state for field in fields)
+            ):
+                changed()
+            for field, expected in zip(fields, expected_values):
+                current = state[field]
+                expected_type_of_value = type(expected)
+                if expected is None:
+                    matches = current is None
+                elif expected_type_of_value is bool:
+                    matches = type(current) is bool and current == expected
+                elif expected_type_of_value is int:
+                    matches = type(current) is int and current == expected
+                elif expected_type_of_value is float:
+                    matches = (
+                        type(current) is float
+                        and cast(float, current).hex() == cast(float, expected).hex()
+                    )
+                elif expected_type_of_value is str:
+                    matches = type(current) is str and current == expected
+                else:
+                    matches = current is expected
+                if not matches:
+                    changed()
 
     def _validated_target_state_signature(  # noqa: C901
         self,
@@ -714,8 +918,15 @@ class _TargetLowering:
             if value_type is str:
                 signature.extend(("str", value))
                 return
+            object_id = id(value)
+            if object_id in active:
+                fail()
+            if object_id in seen:
+                signature.extend(("reference", object_id))
+                return
             if value_type is torch.dtype:
                 retain(value)
+                seen.add(object_id)
                 signature.extend(("torch_dtype", id(value), str(value)))
                 return
             identity_type = _LOOPIR_IDENTITY_TYPE_BY_ID.get(id(value_type))
@@ -724,6 +935,7 @@ class _TargetLowering:
                 if primitive is None:
                     fail()
                 retain(value)
+                seen.add(object_id)
                 signature.extend(
                     ("identity", value_type.__name__, id(value), primitive)
                 )
@@ -734,36 +946,30 @@ class _TargetLowering:
                 name = object.__getattribute__(value, "_name_")
                 if type(name) is not str:
                     fail()
+                seen.add(object_id)
                 signature.extend(("enum", value_type.__name__, id(value), name))
                 return
             node_type = _LOOPIR_NODE_TYPE_BY_ID.get(id(value_type))
             if node_type is value_type and id(value) in graph_owned_ids:
                 retain(value)
+                seen.add(object_id)
                 signature.extend(("program_node", value_type.__name__, id(value)))
                 return
-            if value_type is FunctionType:
-                retain(value)
-                signature.extend(("function", id(value)))
-                return
-
-            object_id = id(value)
-            if object_id in active:
-                fail()
-            if object_id in seen:
-                signature.extend(("reference", object_id))
-                return
-
             if node_type is value_type:
                 node_state = object.__getattribute__(value, "__dict__")
-                if type(node_state) is not dict or any(
-                    type(key) is not str for key in node_state
+                fields = _LOOPIR_NODE_FIELDS_BY_ID[id(value_type)]
+                node_state_keys = tuple(node_state) if type(node_state) is dict else ()
+                if (
+                    type(node_state) is not dict
+                    or len(node_state_keys) != len(fields)
+                    or any(type(key) is not str for key in node_state_keys)
+                    or any(field not in node_state for field in fields)
                 ):
                     fail()
                 retain(value)
                 active.add(object_id)
                 seen.add(object_id)
                 try:
-                    fields = sorted(node_state)
                     signature.extend(
                         (
                             "synthetic_node",
@@ -824,8 +1030,8 @@ class _TargetLowering:
                 seen.add(object_id)
                 try:
                     signature.extend(("dict", object_id, len(mapping)))
-                    for key, item in mapping.items():
-                        visit(key, depth + 1)
+                    for mapping_key, item in mapping.items():
+                        visit(mapping_key, depth + 1)
                         visit(item, depth + 1)
                     return
                 finally:
@@ -855,6 +1061,16 @@ class _TargetLowering:
                     fail()
                 retain(value)
                 signature.extend(("opaque_tuple_witness", id(value)))
+            elif key in _OPAQUE_MAPPING_CACHE_FIELDS:
+                if type(value) is not MappingProxyType:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_mapping_cache", id(value)))
+            elif key in _OPAQUE_TUPLE_CACHE_FIELDS:
+                if type(value) is not tuple:
+                    fail()
+                retain(value)
+                signature.extend(("opaque_tuple_cache", id(value)))
             elif key in {"_program_graph_owners", "_program_graph_snapshot"}:
                 if type(value) is not tuple:
                     fail()
@@ -872,6 +1088,59 @@ class _TargetLowering:
     def _seal_target_state(self) -> None:
         """Own constructor-final target caches until raw emission begins."""
 
+        target_id = id(self)
+        existing = _TARGET_SEAL_AUTHORITIES.get(target_id)
+        if existing is not None:
+            if existing.target_ref() is self:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target's retained program caches are already sealed and "
+                    "cannot be rebound",
+                )
+            _fail(
+                "unsupported_program_shape",
+                "the target seal registry contains a conflicting live identity",
+            )
+
+        def release_target(reference: ReferenceType[Any]) -> None:
+            current = _TARGET_SEAL_AUTHORITIES.get(target_id)
+            if current is not None and current.target_ref is reference:
+                _TARGET_SEAL_AUTHORITIES.pop(target_id, None)
+
+        try:
+            target_ref = weakref_ref(self, release_target)
+        except TypeError:
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches cannot be weakly owned",
+            )
+        _TARGET_SEAL_AUTHORITIES[target_id] = _TargetSealAuthority(target_ref)
+
+        state = object.__getattribute__(self, "__dict__")
+        if type(state) is not dict or any(type(key) is not str for key in state):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches contain malformed state",
+            )
+        authority_fields = {
+            "_program_graph_snapshot",
+            "_program_graph_owners",
+            "_program_graph_owner_ids",
+            "_target_state_snapshot",
+            "_target_state_owners",
+        }
+        if any(field in state for field in authority_fields):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches are already sealed and "
+                "cannot be rebound",
+            )
+        if type(state.get("_reserve_generated_name")) is not FunctionType:
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches contain malformed state",
+            )
+        object.__delattr__(self, "_reserve_generated_name")
         self._target_type_snapshot = type(self)
         # The narrow integrity witnesses duplicate facts in the complete graph
         # signature.  Freeze their mutable mappings once, then bind every
@@ -879,7 +1148,6 @@ class _TargetLowering:
         # Successful emission can therefore consult ``get`` / mapping equality
         # without exposing a caller-controlled object, while the target guard
         # avoids recursively walking the same value/position trees again.
-        state = object.__getattribute__(self, "__dict__")
         present_witness_fields = _IMMUTABLE_WITNESS_FIELDS.intersection(state)
         if (
             present_witness_fields
@@ -909,6 +1177,27 @@ class _TargetLowering:
                 "unsupported_program_shape",
                 "the target's retained program caches contain malformed state",
             )
+        for field in _OPAQUE_MAPPING_CACHE_FIELDS:
+            if field not in state:
+                continue
+            cache = state[field]
+            if type(cache) is not dict:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target's retained program caches contain malformed state",
+                )
+            object.__setattr__(self, field, MappingProxyType(dict(cache)))
+        for field in _OPAQUE_TUPLE_CACHE_FIELDS:
+            if field not in state:
+                continue
+            cache = state[field]
+            if type(cache) is list:
+                object.__setattr__(self, field, tuple(cache))
+            elif type(cache) is not tuple:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target's retained program caches contain malformed state",
+                )
         graph_owners: List[object] = []
         self._program_graph_snapshot = self._validated_program_graph_signature(
             self._program_container,
@@ -924,15 +1213,42 @@ class _TargetLowering:
             owners=owners
         )
         self._target_state_owners = tuple(owners)
+        current_authority = _TARGET_SEAL_AUTHORITIES.get(target_id)
+        if (
+            type(current_authority) is not _TargetSealAuthority
+            or current_authority.target_ref is not target_ref
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the target seal registry changed during target construction",
+            )
+        _TARGET_SEAL_AUTHORITIES[target_id] = _TargetSealAuthority(
+            target_ref=target_ref,
+            target_type=type(self),
+            program=self._program_container,
+            input_container=self._program_inputs_container,
+            input_values=self._program_input_values,
+            graph_snapshot=self._program_graph_snapshot,
+            graph_owners=self._program_graph_owners,
+            target_snapshot=self._target_state_snapshot,
+            target_owners=self._target_state_owners,
+        )
 
     def _require_exact_target_type(self) -> Dict[str, object]:
         """Return exact stored target state without invoking subclass hooks."""
 
         state = object.__getattribute__(self, "__dict__")
-        expected_type = (
-            state.get("_target_type_snapshot") if type(state) is dict else None
-        )
-        if type(state) is not dict or type(self) is not expected_type:
+        authority = _target_seal_authority(self)
+        if type(state) is not dict or any(type(key) is not str for key in state):
+            _fail(
+                "unsupported_program_shape",
+                "the target's retained program caches changed after target "
+                "construction",
+            )
+        if (
+            type(self) is not authority.target_type
+            or state.get("_target_type_snapshot") is not authority.target_type
+        ):
             _fail(
                 "unsupported_program_shape",
                 "the target's retained program caches changed after target "
@@ -944,27 +1260,39 @@ class _TargetLowering:
         """Fail closed if the retained input sequence changed after binding."""
 
         target_state = _TargetLowering._require_exact_target_type(self)
+        authority = _target_seal_authority(self)
         bound_program = target_state.get("_program_container")
         if (
             type(target_state) is not dict
-            or type(bound_program) is not LoopProgram
-            or target_state.get("program") is not bound_program
+            or bound_program is not authority.program
+            or target_state.get("program") is not authority.program
         ):
             _fail(
                 "unsupported_program_shape",
                 "the target program reference changed after target construction",
             )
         state = object.__getattribute__(bound_program, "__dict__")
-        current = state.get("inputs") if type(state) is dict else None
-        if type(current) is not tuple or current is not target_state.get(
-            "_program_inputs_container"
+        if type(state) is not dict or any(type(key) is not str for key in state):
+            _fail(
+                "unsupported_program_shape",
+                "the program input declarations changed after target construction",
+            )
+        current = state.get("inputs")
+        if (
+            type(current) is not tuple
+            or current is not authority.input_container
+            or target_state.get("_program_inputs_container")
+            is not authority.input_container
         ):
             _fail(
                 "unsupported_program_shape",
                 "the program input declarations changed after target construction",
             )
         values = tuple(_stored_identity_value(symbol, SymbolId) for symbol in current)
-        if values != target_state.get("_program_input_values"):
+        if (
+            values != authority.input_values
+            or target_state.get("_program_input_values") is not authority.input_values
+        ):
             _fail(
                 "unsupported_program_shape",
                 "a program input identity changed after target construction",
@@ -973,9 +1301,10 @@ class _TargetLowering:
     def _require_target_state_unchanged(self) -> None:
         """Fail closed before any target-private cache is interpreted."""
 
-        target_state = _TargetLowering._require_exact_target_type(self)
+        _TargetLowering._require_exact_target_type(self)
+        authority = _target_seal_authority(self)
         current_target_state = _TargetLowering._validated_target_state_signature(self)
-        if current_target_state != target_state.get("_target_state_snapshot"):
+        if current_target_state != authority.target_snapshot:
             _fail(
                 "unsupported_program_shape",
                 "the target's retained program caches changed after target "
@@ -989,21 +1318,21 @@ class _TargetLowering:
 
         _TargetLowering._require_program_inputs_unchanged(self)
         target_state = _TargetLowering._require_exact_target_type(self)
-        bound_program = target_state.get("_program_container")
-        if type(bound_program) is not LoopProgram:
+        authority = _target_seal_authority(self)
+        bound_program = authority.program
+        if (
+            type(bound_program) is not LoopProgram
+            or target_state.get("_program_container") is not bound_program
+        ):
             _fail(
                 "unsupported_program_shape",
                 "the target program reference changed after target construction",
             )
-        current_graph = _TargetLowering._validated_program_graph_signature(
-            self, bound_program
+        _TargetLowering._require_program_graph_snapshot_unchanged(
+            self,
+            bound_program,
+            authority.graph_snapshot,
         )
-        if current_graph != target_state.get("_program_graph_snapshot"):
-            _fail(
-                "unsupported_program_shape",
-                "the program graph, including a target owning statement, "
-                "changed after target construction",
-            )
         if not target_state_checked:
             _TargetLowering._require_target_state_unchanged(self)
 
@@ -2752,22 +3081,27 @@ class _TargetLowering:
         _TargetLowering._require_program_inputs_unchanged(self)
         _TargetLowering._require_target_state_unchanged(self)
         target_state = _TargetLowering._require_exact_target_type(self)
-        bound_program = target_state.get("_program_container")
-        if type(bound_program) is not LoopProgram:
+        authority = _target_seal_authority(self)
+        bound_program = authority.program
+        if (
+            type(bound_program) is not LoopProgram
+            or target_state.get("_program_container") is not bound_program
+        ):
             _fail(
                 "unsupported_program_shape",
                 "the target program reference changed after target construction",
             )
         graph_error: Optional[LoopIRTargetError] = None
         try:
-            current_graph = _TargetLowering._validated_program_graph_signature(
-                self, bound_program
+            _TargetLowering._require_program_graph_snapshot_unchanged(
+                self,
+                bound_program,
+                authority.graph_snapshot,
             )
         except LoopIRTargetError as error:
             graph_error = error
         else:
-            if current_graph == target_state.get("_program_graph_snapshot"):
-                return
+            return
 
         current_bindings = self._validated_bound_position_bindings()
         if current_bindings != self._bound_position_snapshot:
