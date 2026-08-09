@@ -677,7 +677,9 @@ class _TargetLowering:
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
                 self.cursor_loops[cursor.cursor] = position
-        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._bound_position_snapshot = MappingProxyType(
+            self._validated_bound_position_bindings()
+        )
         self._position_load_signatures: Dict[
             int, Tuple[int, Tuple[Tuple[int, int], ...], int]
         ] = {}
@@ -3448,11 +3450,15 @@ class _TargetLowering:
         position_value = _stored_identity_value(position, PositionId)
         if position_value is None:
             return None
-        bindings = self._validated_bound_position_bindings()
-        if bindings != self._bound_position_snapshot:
+        # The snapshot is built by the complete binding walk before any
+        # position-load consumer runs.  Construction is uninterrupted and
+        # callback-free from that point; raw emission additionally proves the
+        # graph and the frozen proxy unchanged before reaching this helper.
+        bindings = self._bound_position_snapshot
+        if type(bindings) is not MappingProxyType:
             _fail(
                 "unsupported_program_shape",
-                "a position-binding loop changed after target construction",
+                "the retained position-binding snapshot is malformed",
             )
         binding = bindings.get(position_value)
         if binding is None:
@@ -3470,8 +3476,10 @@ class _TargetLowering:
 
         Position loads depend on the tensor/level owner and, for merged loops,
         whether a binding can be absent.  Snapshot those primitive facts when
-        the target is built and re-read exact stored state at emission, so a
-        forged position container or hostile ``__eq__`` cannot escape the
+        the target is built.  Successful emission uses that exact read-only
+        witness after the complete graph guard; a changed graph replays this
+        stored-state walk to preserve its narrow diagnostic.  A forged
+        position container or hostile ``__eq__`` therefore cannot escape the
         target boundary or silently retarget a load.
         """
 
@@ -3752,7 +3760,17 @@ class _TargetLowering:
                 f"bound position of its own level-{level} cursor",
             )
         if require_unconditional:
-            binding = self._validated_bound_position_bindings().get(position_value)
+            # Raw emission has already proved both the complete program graph
+            # and this exact read-only witness unchanged.  Rewalking every
+            # loop binding for each merged alignment case would repeat the
+            # same ownership proof several times in one uninterrupted call.
+            bindings = self._bound_position_snapshot
+            if type(bindings) is not MappingProxyType:
+                _fail(
+                    "unsupported_program_shape",
+                    "the retained position-binding snapshot is malformed",
+                )
+            binding = bindings.get(position_value)
             if binding is None or (
                 binding[2] == _MERGED and binding[3] is MergeMode.UNION
             ):
@@ -9144,7 +9162,9 @@ class _DenseDomainMixedLowering(_TargetLowering):
             loop.index: position for position, loop in enumerate(self.loops)
         }
         self.cursor_loops: Dict[CursorId, int] = {}
-        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._bound_position_snapshot = MappingProxyType(
+            self._validated_bound_position_bindings()
+        )
         self._position_load_signatures = {}
         self.loads, self.cursor_values = self._collect_accesses()
         self._value_expression_snapshot = self._validated_value_expression_signature(
@@ -9465,7 +9485,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         for position, loop in enumerate(self.loops):
             for cursor in loop.cursors:
                 self.cursor_loops[cursor.cursor] = position
-        self._bound_position_snapshot = self._validated_bound_position_bindings()
+        self._bound_position_snapshot = MappingProxyType(
+            self._validated_bound_position_bindings()
+        )
         self._position_load_signatures = {}
         self.loads, self.cursor_values = self._collect_accesses()
         self._value_expression_snapshot = self._validated_value_expression_signature(
