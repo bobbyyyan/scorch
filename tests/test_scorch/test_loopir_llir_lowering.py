@@ -1024,6 +1024,52 @@ def test_target_graph_rejects_hostile_identity_key_without_equality():
     )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [("cycle", "cycle"), ("foreign", "unsupported stored value")],
+    ids=str,
+)
+def test_graph_record_mismatch_replays_specific_structural_diagnostic(
+    mutation, message
+):
+    """The fast unchanged check keeps recursive diagnostics on failures."""
+
+    fixture = build_matmul()
+
+    def mutate(target):
+        outer = target.loops[0].node
+        object.__setattr__(outer, "body", outer if mutation == "cycle" else object())
+
+    _expect_post_construction_graph_rejection(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+        mutate,
+        reverify=False,
+        message=message,
+    )
+
+
+def test_graph_record_authority_does_not_make_field_order_semantic():
+    """A verified dataclass state with reordered keys remains admissible."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+    from scorch.compiler.loopir.verifier import verify_program
+
+    fixture = build_matmul()
+    state = object.__getattribute__(fixture.program, "__dict__")
+    node_id = state.pop("node_id")
+    state["node_id"] = node_id
+    verify_program(fixture.program)
+
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    assert target.raw_loop_statements()
+
+
 def test_target_graph_registry_is_exhaustive_for_the_loopir_schema():
     """Every new schema node or enum must explicitly enter the graph guard."""
 
@@ -1080,6 +1126,253 @@ def test_unchanged_target_skips_redundant_narrow_integrity_scans(monkeypatch):
         )
 
     assert target.raw_loop_statements()
+
+
+def test_target_integrity_seal_is_one_shot():
+    """Constructor authority cannot be rebound even when state is unchanged."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target._seal_target_state()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "already sealed" in error.value.defect.message
+
+
+def test_target_reseal_cannot_authorize_cache_mutation():
+    """Deleted and forged instance state cannot bless a rejected target."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    dimension = next(iter(target.dimension_names))
+    changed_names = dict(target.dimension_names)
+    changed_names[dimension] = "for"
+    object.__setattr__(target, "dimension_names", changed_names)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
+
+    for field in (
+        "_program_graph_snapshot",
+        "_program_graph_owners",
+        "_program_graph_owner_ids",
+        "_target_state_snapshot",
+        "_target_state_owners",
+    ):
+        object.__delattr__(target, field)
+    object.__setattr__(target, "_reserve_generated_name", lambda *args: None)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target._seal_target_state()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "already sealed" in error.value.defect.message
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
+
+
+def test_target_seal_registry_does_not_retain_finished_targets():
+    """External seal authority is weak and cannot leak compiler targets."""
+
+    import gc
+    import weakref
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    target_id = id(target)
+    target_ref = weakref.ref(target)
+    authority = lower_llir_module._TARGET_SEAL_AUTHORITIES.get(target_id)
+    assert authority is not None
+    assert authority.target_ref() is target
+
+    del target
+    gc.collect()
+    assert target_ref() is None
+    assert lower_llir_module._TARGET_SEAL_AUTHORITIES.get(target_id) is None
+
+
+def test_instance_snapshot_rebinding_cannot_replace_external_authority():
+    """A forged excluded snapshot cannot bless a changed target cache."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    changed_names = dict(target.dimension_names)
+    dimension = next(iter(changed_names))
+    changed_names[dimension] = "forged"
+    object.__setattr__(
+        target,
+        "dimension_names",
+        MappingProxyType(changed_names),
+    )
+    forged_snapshot = target._validated_target_state_signature()
+    object.__setattr__(target, "_target_state_snapshot", forged_snapshot)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
+
+
+def test_hostile_input_value_snapshot_cannot_run_equality_callback():
+    """Input checks consult primitive external authority before target state."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    class EqualityBomb:
+        def __eq__(self, other):
+            raise RuntimeError("hostile input-snapshot equality executed")
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    object.__setattr__(
+        target,
+        "_program_input_values",
+        tuple(EqualityBomb() for _ in target._program_input_values),
+    )
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "input identity" in error.value.defect.message
+
+
+@pytest.mark.parametrize("owner", ["target", "program"], ids=str)
+def test_hostile_state_key_cannot_run_before_external_authority(owner):
+    """Stored-state key validation precedes every trusted string lookup."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    lookup = "_target_type_snapshot" if owner == "target" else "inputs"
+
+    class EqualityBombKey:
+        armed = False
+
+        def __hash__(self):
+            return hash(lookup)
+
+        def __eq__(self, other):
+            if self.armed:
+                raise RuntimeError("hostile state-key equality executed")
+            return False
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    key = EqualityBombKey()
+    value = object.__getattribute__(
+        target if owner == "target" else target.program,
+        "__dict__",
+    )
+    value[key] = None
+    key.armed = True
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+
+
+def test_generated_name_reserver_is_retired_at_seal():
+    """Construction-only mutable reservation state is absent during emission."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+
+    state = object.__getattribute__(target, "__dict__")
+    assert "_reserve_generated_name" not in state
+    assert target.raw_loop_statements()
+
+
+def test_read_only_target_caches_are_privately_frozen_at_seal():
+    """Successful emission cannot observe in-place cache mutations."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    state = object.__getattribute__(target, "__dict__")
+
+    for field in lower_llir_module._OPAQUE_MAPPING_CACHE_FIELDS:
+        if field in state:
+            assert type(state[field]) is MappingProxyType
+    for field in lower_llir_module._OPAQUE_TUPLE_CACHE_FIELDS:
+        if field in state:
+            assert type(state[field]) is tuple
+
+    with pytest.raises(TypeError):
+        target.decls[fixture.a] = target.result_decl
+    with pytest.raises(AttributeError):
+        target.loads.append(target.loads[0])
+    assert target.raw_loop_statements()
+
+
+@pytest.mark.parametrize("field", ["decls", "_input_symbols"], ids=str)
+def test_equal_read_only_cache_replacement_cannot_change_opaque_owner(field):
+    """Fresh equal cache containers cannot replace the sealed private copy."""
+
+    from scorch.compiler.loopir import lower_llir as lower_llir_module
+
+    fixture = build_matmul()
+    target = lower_llir_module._TargetLowering(
+        fixture.program,
+        {fixture.a: (2, 3), fixture.b: (3, 4)},
+        (2, 4),
+    )
+    current = object.__getattribute__(target, "__dict__")[field]
+    replacement = dict(current) if field == "decls" else tuple(list(current))
+    assert replacement == current
+    assert replacement is not current
+    object.__setattr__(target, field, replacement)
+
+    with pytest.raises(LoopIRTargetError) as error:
+        target.raw_loop_statements()
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "retained program caches" in error.value.defect.message
 
 
 def test_diagnostic_witness_replacement_cannot_mask_a_graph_change():
