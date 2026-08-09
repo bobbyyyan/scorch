@@ -753,7 +753,7 @@ def _seam_cells():
             ),
         ),
     )
-    ddss = build_intersection_cin("ddss")
+    interleaved = build_intersection_cin("sds")
     three = ForAll(
         i,
         ForAll(
@@ -781,12 +781,19 @@ def _seam_cells():
             (((3, 4, 6), f32), ((6, 5), f32)),
             "unsupported_sparse_output",
         ),
+        # Recorded seam move: the two-dense-prefix ``ddss`` intersection that
+        # used to sit here is the admitted flattened-prefix family
+        # (``test_loopir_multi_dense_prefix_target.py``).  Its neighbour on
+        # the same seam -- an INTERLEAVED result whose compressed level sits
+        # ABOVE a dense one, so the dense level's parent count is a dynamic
+        # stored-coordinate count rather than a static product -- keeps the
+        # exact code.
         (
-            "two_dense_prefix_levels",
-            ddss,
-            (2, 3, 4, 5),
-            (((2, 3, 4, 5), f32), ((2, 3, 4, 5), f32)),
-            "unsupported_program_shape",
+            "interleaved_dense_between_compressed",
+            interleaved,
+            (3, 4, 5),
+            (((3, 4, 5), f32), ((3, 4, 5), f32)),
+            "unsupported_sparse_output",
         ),
         (
             "three_operand_chain",

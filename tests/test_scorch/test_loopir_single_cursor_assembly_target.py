@@ -769,29 +769,31 @@ def test_hand_built_program_executes_on_the_oracle():
 def _seam_cells():
     i, j = IndexVar("i"), IndexVar("j")
     f32 = torch.float32
-    # Recorded seam move: the ``ss*sd`` compressed-parent/dense-leaf
-    # co-operand that used to sit here is the admitted position-load family
-    # (``test_loopir_dense_leaf_cooperand_target.py``).  Its neighbour on the
-    # same seam -- a dense-leaf co-operand whose result carries two or more
-    # dense parents, which the one-dense-prefix rule in the assembly chain
-    # collector excludes -- keeps the exact code.
+    # Recorded seam move (second time on this seam).  The ``ss*sd``
+    # compressed-parent/dense-leaf co-operand that first sat here became the
+    # position-load family (``test_loopir_dense_leaf_cooperand_target.py``);
+    # its replacement -- a result carrying two or more dense parents -- is now
+    # the admitted flattened-prefix family
+    # (``test_loopir_multi_dense_prefix_target.py``).  The neighbour that
+    # still occupies the seam is the trailing dense LEAF under a
+    # stored-sparse parent (``sdd``): its parent coordinates come from a
+    # cursor rather than a dense loop, so no flattened dense segment number
+    # reaches them at all.
     k, ell = IndexVar("k"), IndexVar("l")
-    posload_operand = ForAll(
+    trailing_dense_leaf = ForAll(
         i,
         ForAll(
             j,
             ForAll(
                 k,
-                ForAll(
-                    ell,
-                    TensorAssign(
-                        TensorVar("C", fmt="ddss")[i, j, k, ell],
-                        TensorVar("A", fmt="ddss")[i, j, k, ell],
-                    ),
+                TensorAssign(
+                    TensorVar("C", fmt="sdd")[i, j, k],
+                    TensorVar("A", fmt="sdd")[i, j, k],
                 ),
             ),
         ),
     )
+    del ell
     dense_domains = ForAll(
         i,
         ForAll(
@@ -806,31 +808,34 @@ def _seam_cells():
             ),
         ),
     )
-    # Recorded seam move: the rank-1 compressed output that used to sit here
-    # is the admitted degenerate ordered-stream family
-    # (``test_loopir_rank1_assembly_target.py``).  Its neighbour on the same
-    # seam -- a single compressed level under two or more dense parents,
-    # which the one-dense-prefix rule excludes -- keeps the exact code.
-    multi_dense_prefix = ForAll(
+    # Recorded seam move (second time on this seam).  The rank-1 compressed
+    # output that first sat here became the degenerate ordered-stream family
+    # (``test_loopir_rank1_assembly_target.py``); its replacement -- a single
+    # compressed level under two or more dense parents -- is now the admitted
+    # flattened-prefix family (``test_loopir_multi_dense_prefix_target.py``).
+    # The neighbour that still occupies the seam is the INTERLEAVED result:
+    # a compressed level above a dense one, where the dense level's parent
+    # count is a dynamic stored-coordinate count rather than a static product.
+    interleaved_prefix = ForAll(
         i,
         ForAll(
             j,
             ForAll(
                 k,
                 TensorAssign(
-                    TensorVar("C", fmt="dds")[i, j, k],
-                    TensorVar("A", fmt="dds")[i, j, k],
+                    TensorVar("C", fmt="sds")[i, j, k],
+                    TensorVar("A", fmt="sds")[i, j, k],
                 ),
             ),
         ),
     )
     return [
         (
-            "posload_co_operand",
-            posload_operand,
-            (2, 3, 4, 5),
-            (((2, 3, 4, 5), f32),),
-            "unsupported_program_shape",
+            "trailing_dense_leaf_output",
+            trailing_dense_leaf,
+            (3, 4, 5),
+            (((3, 4, 5), f32),),
+            "unsupported_sparse_output_domain",
         ),
         (
             "dense_domain_suffix",
@@ -840,8 +845,8 @@ def _seam_cells():
             "unsupported_sparse_output",
         ),
         (
-            "multi_dense_prefix_sparse_output",
-            multi_dense_prefix,
+            "interleaved_dense_sparse_output",
+            interleaved_prefix,
             (3, 4, 5),
             (((3, 4, 5), f32),),
             "unsupported_sparse_output",

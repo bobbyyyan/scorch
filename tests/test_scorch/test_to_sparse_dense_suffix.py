@@ -465,3 +465,31 @@ def test_multi_dense_parent_conversion_validates_the_compiler_boundary():
         STensor.from_torch(dense.clone(), "A").to_sparse(
             "dds", _compilation_context=object()
         )
+
+
+@pytest.mark.parametrize(
+    "fmt,shape",
+    [
+        (["dense", "singleton"], (3, 4)),
+        (["singleton", "compressed"], (3, 4)),
+        (["singleton", "dense", "compressed"], (2, 3, 4)),
+        (["dense", "dense", "singleton"], (2, 3, 4)),
+    ],
+)
+def test_requested_singleton_levels_are_rejected_atomically(fmt, shape):
+    """A singleton request must fail before materialization, like rank 1.
+
+    ``layout.validate_runtime_contract`` already declares singleton levels
+    unrunnable and the rank-1 arm rejects them up front.  The rank>=2 arm
+    used to run the whole JIT pipeline and then leak a bare ``ValueError``
+    out of code generation, so an invalid requested format was not being
+    rejected atomically at all.
+    """
+
+    torch.manual_seed(11)
+    dense = (torch.rand(shape) < 0.4) * torch.randn(shape)
+    source = STensor.from_torch(dense.clone(), "A")
+    before = tensor_snapshot(source)
+    with pytest.raises(TensorStorageError, match="singleton"):
+        source.to_sparse(fmt)
+    assert tensor_snapshot(source) == before

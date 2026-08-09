@@ -22,6 +22,8 @@ separate change to four core types (equality, hashing, pickling, and the
 dataclass surface) and is not attempted here.
 """
 
+import enum
+
 import pytest
 import torch
 
@@ -578,6 +580,51 @@ def test_audit_rejects_forged_stored_state():
 def test_audit_rejects_a_forged_bit_width():
     level = LevelFormat("s")
     object.__setattr__(level, "_bit_width", -1)
+    assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is None
+
+
+class _Width(enum.IntEnum):
+    W32 = 32
+
+
+def test_audit_canonicalizes_a_constructor_valid_int_subclass_bit_width():
+    """An ``IntEnum`` width is a legal format, not malformed stored state.
+
+    ``LevelFormat.__init__`` accepts any non-bool ``int`` subclass, so
+    rejecting one at the retaining boundary would turn a construction the
+    public constructor accepts into an error.
+    """
+
+    level = LevelFormat("s", bit_width=_Width.W32)
+    assert type(level.bit_width) is not int
+    levels = audit_format_state(TensorFormat([LevelFormat("d"), level]))
+    assert levels is not None
+    assert levels[1].bit_width == 32
+    assert type(levels[1].bit_width) is int
+
+
+@pytest.mark.parametrize("owner", ["layout", "index"])
+def test_retaining_boundaries_accept_an_int_subclass_bit_width(owner):
+    caller = TensorFormat([LevelFormat("d"), LevelFormat("s", bit_width=_Width.W32)])
+    if owner == "layout":
+        retained = TensorLayout.from_logical_shape((3, 4), caller).format
+    else:
+        retained = TensorIndex(
+            caller,
+            [[], [torch.tensor([0, 0, 0, 0]), torch.tensor([], dtype=torch.long)]],
+        ).format
+    assert retained is not caller
+    width = retained.get_level_formats()[1].bit_width
+    assert width == 32
+    assert type(width) is int
+
+
+@pytest.mark.parametrize("forged", [True, 0, -8])
+def test_audit_still_rejects_bool_and_non_positive_bit_widths(forged):
+    """Canonicalizing int subclasses must not widen the accepted set."""
+
+    level = LevelFormat("s")
+    object.__setattr__(level, "_bit_width", forged)
     assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is None
 
 

@@ -867,24 +867,29 @@ def _seam_cells():
             ),
         ),
     )
-    # Recorded seam move: the rank-1 united output that used to sit here is
-    # the admitted degenerate ordered-stream family
-    # (``test_loopir_rank1_assembly_target.py``).  Its neighbour on the same
-    # seam -- a united result whose single compressed level sits under two
-    # or more dense parents -- keeps the exact code.
+    # Recorded seam move (second time on this seam).  The rank-1 united
+    # output that first sat here became the degenerate ordered-stream family
+    # (``test_loopir_rank1_assembly_target.py``); its replacement -- a united
+    # result whose single compressed level sits under two or more dense
+    # parents -- is now the admitted flattened-prefix family
+    # (``test_loopir_multi_dense_prefix_target.py``).  The neighbour that
+    # still occupies the seam is the INTERLEAVED united result: a compressed
+    # level above a dense one, whose dense level's parent count is a dynamic
+    # stored-coordinate count instead of a static product, so no flattened
+    # segment number exists for it.
     k = IndexVar("k")
-    multi_dense_prefix = ForAll(
+    interleaved_union = ForAll(
         i,
         ForAll(
             j,
             ForAll(
                 k,
                 TensorAssign(
-                    TensorVar("C", fmt="dds")[i, j, k],
+                    TensorVar("C", fmt="sds")[i, j, k],
                     CINBinaryOp(
                         Operation.ADD,
-                        TensorVar("A", fmt="dds")[i, j, k],
-                        TensorVar("B", fmt="dds")[i, j, k],
+                        TensorVar("A", fmt="sds")[i, j, k],
+                        TensorVar("B", fmt="sds")[i, j, k],
                     ),
                 ),
             ),
@@ -935,8 +940,8 @@ def _seam_cells():
             "unsupported_program_shape",
         ),
         (
-            "multi_dense_prefix_union_output",
-            multi_dense_prefix,
+            "interleaved_dense_union_output",
+            interleaved_union,
             (3, 4, 5),
             (((3, 4, 5), f32), ((3, 4, 5), f32)),
             "unsupported_sparse_output",
