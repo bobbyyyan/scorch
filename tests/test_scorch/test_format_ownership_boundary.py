@@ -22,6 +22,8 @@ separate change to four core types (equality, hashing, pickling, and the
 dataclass surface) and is not attempted here.
 """
 
+from abc import ABCMeta
+from collections.abc import Sequence
 import enum
 
 import pytest
@@ -660,6 +662,56 @@ class _PlainLevelFormatSubclass(LevelFormat):
     pass
 
 
+class _NameDescriptorBombMeta(type):
+    reads = 0
+
+    @property
+    def __name__(cls):
+        _NameDescriptorBombMeta.reads += 1
+        raise AssertionError("metaclass __name__ descriptor must not run")
+
+
+class _ForeignActualType(metaclass=_NameDescriptorBombMeta):
+    pass
+
+
+class _HostileClassName(str):
+    callbacks = 0
+
+    def __str__(self):
+        type(self).callbacks += 1
+        raise AssertionError("class-name __str__ must not run")
+
+    def __repr__(self):
+        type(self).callbacks += 1
+        raise AssertionError("class-name __repr__ must not run")
+
+    def __format__(self, spec):
+        type(self).callbacks += 1
+        raise AssertionError("class-name __format__ must not run")
+
+
+class _ClassGuardMeta(ABCMeta):
+    reads = 0
+
+    def __getattribute__(cls, name):
+        if name == "__class__":
+            _ClassGuardMeta.reads += 1
+            raise AssertionError("sequence metaclass __class__ must not run")
+        return ABCMeta.__getattribute__(cls, name)
+
+
+class _GuardedSequence(Sequence, metaclass=_ClassGuardMeta):
+    def __init__(self, values):
+        self._values = tuple(values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+
 def test_audit_canonicalizes_a_constructor_valid_int_subclass_bit_width():
     """An ``IntEnum`` width is a legal format, not malformed stored state.
 
@@ -747,6 +799,46 @@ def test_real_string_subclass_aliases_bypass_every_override():
 def test_invalid_string_subclass_alias_reports_without_rendering_it():
     with pytest.raises(TensorFormatError, match="invalid level format 'not-a-mode'"):
         LevelFormat(_HostileLevelAlias("not-a-mode"))
+
+
+def test_rejected_actual_types_bypass_metaclass_name_descriptors():
+    _NameDescriptorBombMeta.reads = 0
+    foreign = _ForeignActualType()
+
+    with pytest.raises(TensorTypeError, match="got _ForeignActualType"):
+        LevelFormat(foreign)  # type: ignore[arg-type]
+    with pytest.raises(TensorTypeError, match="got _ForeignActualType"):
+        TensorFormat([foreign])  # type: ignore[list-item]
+
+    assert _NameDescriptorBombMeta.reads == 0
+
+
+def test_rejected_actual_type_names_are_canonicalized_before_rendering():
+    class Foreign:
+        pass
+
+    Foreign.__name__ = _HostileClassName("Foreign")
+    _HostileClassName.callbacks = 0
+    foreign = Foreign()
+
+    with pytest.raises(TensorTypeError, match="got Foreign"):
+        LevelFormat(foreign)  # type: ignore[arg-type]
+    with pytest.raises(TensorTypeError, match="got Foreign"):
+        TensorFormat([foreign])  # type: ignore[list-item]
+
+    assert _HostileClassName.callbacks == 0
+
+
+def test_real_sequence_mro_check_bypasses_the_candidate_metaclass():
+    _ClassGuardMeta.reads = 0
+    value = _GuardedSequence(("d", "s"))
+
+    direct = TensorFormat(value)
+    parsed = parse_format(value)  # type: ignore[arg-type]
+
+    assert direct.get_level_types() == [LevelType.DENSE, LevelType.COMPRESSED]
+    assert parsed.get_level_types() == [LevelType.DENSE, LevelType.COMPRESSED]
+    assert _ClassGuardMeta.reads == 0
 
 
 @pytest.mark.parametrize("owner", ["layout", "index"])
