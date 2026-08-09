@@ -8400,3 +8400,308 @@ selector or cache change was made, and no fallback or legacy implementation
 was removed.  Cross-host latency evidence now attributes §45's local crossing
 away from these emission-neutral corrections, but it cannot close the absent
 semantic vertical; Phase 7 therefore has no exit verdict yet.
+
+## 47. The ordered workspace key domain, a fifth cluster-2 blocker, and a NO-GO (2026-08-09)
+
+This milestone starts at inherited documentation tip ``8b4b5fc``.  It reviews
+``372b0fc..8b4b5fc``, fixes the two defects that survived adversarial
+verification, lands the representational half of the Phase-7 cluster-2
+vertical, and records a **NO-GO** with a blocker that the inherited
+four-blocker map does not contain.  Origin remains ``58e8565``; nothing was
+pushed, amended, squashed or reordered; the five protected tracked files hash
+exactly as recorded.
+
+### 47.1 Independent review of the inherited range
+
+Four contracts were re-derived from the code and from live probes, never from
+the review or handoff prose, and every claimed defect was then put to
+independent adversarial verifiers instructed to refute it.
+
+**Three contracts reproduce.**
+
+- *Valid int subclasses canonicalize at the ownership boundary.*
+  ``LevelFormat.__init__`` deliberately RETAINS the caller's object and only
+  computes a canonical value for validation (``format.py:191-206``); the
+  conversion to an exact ``int`` happens at ``audit_format_state``
+  (``format.py:589``), which every one of the five retaining sites reaches.
+  An ``IntEnum`` width survives the whole public path and is owned as exact
+  ``int``.  A subclass lying in either direction cannot move the verdict:
+  ``NegLie(8)`` (whose ``__int__``/``__le__`` claim it is negative) is
+  accepted and owned as 8, while ``PosLie(-3)`` (whose ``__int__`` claims 32)
+  is rejected.  ``bool``, zero and negative widths fail closed with zero
+  caller hooks.
+- *Merged ``PositionLoad`` emission performs exactly one seal lookup, one
+  nested input-authority lookup and zero successful-path replays.*  Measured
+  at 1/1/0 with an independent counting harness, and the cold mismatch path
+  keeps its diagnostics.
+- *Forged, mutated, aliased and cyclic cold paths retain controlled
+  diagnostics.*
+
+**The fourth does not.**  "Actual-type/MRO format validation executes no
+caller callbacks" is false, and two independently reproduced defects are the
+reason (§47.2).
+
+### 47.2 Two defects found by fresh probes, fixed first (``7c8617e`` / ``a79ac78``)
+
+``_normalize_level_formats`` decided whether a foreign object was a sequence
+with ``issubclass(value_type, collections.abc.Sequence)``.  ``ABCMeta``'s
+subclass check inserts the candidate into its positive and negative
+``WeakSet`` caches, and those inserts call the candidate metaclass's
+``__hash__`` and ``__eq__``.  Measured on an ordinary
+``class Hostile(metaclass=HostileMeta)``: **eight ``__hash__`` calls** on the
+first ``TensorFormat(hostile)`` and **two ``__eq__`` calls** on the second,
+with a control confirming ``issubclass(Hostile, (bytes, bytearray))`` fires
+none.  With a metaclass whose ``__hash__`` raises, a bare
+``builtins.RuntimeError`` **escaped the public ``TensorFormat(...)``
+constructor**.  That contradicts §46 item 4's "public failures are controlled
+``TensorTypeError`` instances, never caller exceptions" and §46 item 3's
+"foreign lookalikes fail closed without invoking their hooks."
+
+The hook also fired on the **success** path: constructing a format from a
+genuine ``collections.abc.Sequence`` subclass invoked the caller metaclass
+twice, so a raising ``__hash__`` could kill an otherwise-legal construction.
+``TensorFormat.from_dict`` carried the same defect at three sites.
+
+This is worth stating plainly: ``d38d3b8`` — the commit written to *close*
+metaclass callback gaps — moved ``Sequence`` from the ``typing`` alias to
+``collections.abc`` to harden the MRO check.  It closed the ``__class__``
+route and left the ``__hash__``/``__eq__`` route open, and the lock it shipped
+with (``test_real_sequence_mro_check_bypasses_the_candidate_metaclass``)
+counts only ``__class__`` reads, so the surviving route passed unnoticed.
+
+``_derives_from`` replaces every one of these with identity membership in the
+real MRO, read through the base ``type.__mro__`` descriptor — the same
+base-descriptor idiom ``_actual_type_name``, ``_normalize_shape`` and
+``_normalize_permutation`` already use.  The hostile-metaclass probes now
+measure **zero hooks** and report ``TensorTypeError``/``TensorFormatError``.
+
+Acceptance is unchanged, and that required care: ``collections.abc``
+registers the concrete builtins *virtually* rather than by inheritance
+(``Mapping not in dict.__mro__``, ``Sequence not in list.__mro__``), so a
+naive MRO recognizer would have silently rejected plain ``dict`` and ``list``
+and broken ``from_dict``.  ``_MAPPING_BASES``/``_SEQUENCE_BASES`` name them
+explicitly; ``dict``, ``OrderedDict``, ``mappingproxy``, ``list``, ``tuple``,
+list subclasses, real ``Sequence`` subclasses and the ``serialize`` round trip
+all still work.  Virtual registrations beyond those builtins now fail closed,
+which is how this boundary already treats every other foreign lookalike.
+
+``a79ac78`` adds four locks.  **Three fail against ``8b4b5fc``'s
+``format.py`` and pass against the fix**, verified by swapping the file in and
+back; the fourth is the anti-narrowing lock that would have caught the
+builtin-registration trap.
+
+### 47.3 Evidence qualifications, reproduced rather than trusted
+
+All three reproduce at the tip.
+
+- **Six seam locks.**  Five ``Recorded seam move`` annotations were added in
+  ``52d43cc..a1582a9`` plus ``a1582a9``'s docstring move in
+  ``test_loopir_cin_lowering.py``.  The sixth annotation, in
+  ``test_loopir_multi_dense_prefix_target.py``, is the *code-sharpening* cell
+  §45.5 describes separately, not a lock move — so the count is six, exactly
+  as §46.1 corrects it.
+- **The raw 120-case harness exits 1** with **116 PASS and exactly four
+  failures**, all ``ds(3, 4)`` copy × ``{float32, float64}`` × both arms at
+  the retained ``unsupported_program_shape`` seam, stderr empty.  The wider
+  harness exits 0 at **162/162** and the randomized oracle/storage sweep exits
+  0 at **560/560 over five seeds**.
+- **The 54-cell census** produces **46 records, 46 arm-invariant, eight
+  SIGSEGV cells (C1-C7 and C13), zero timeouts**, and **all 46 cell records
+  are byte-identical to the retained ``bb429f4`` baseline**.  Its wrapper
+  exits 1 solely because it compares the lexicographic list
+  ``["C1","C13","C2",...]`` against the numeric ``["C1","C2",...,"C13"]``; the
+  sets are equal.
+
+### 47.4 The ordered key domain (``a1fc642`` / ``81d9d7c``)
+
+The serial sparse workspace was declared over exactly one drain dimension, and
+``nodes.py`` said so: *"There is deliberately no multi-dimensional drain form
+in this subset."*  That is the representational reason cluster 2 has no home
+in LoopIR — a rank-2 sparse reduction out of rank 3 needs a two-component key,
+and TTM needs a key whose rank differs from the result's.
+
+The three nodes now carry ordered tuples: ``SparseWorkspaceDecl
+.key_dimensions``, ``SparseWorkspaceInsert.coords``, ``SparseWorkspaceDrainFor
+.indices``.  ``len(key_dimensions) == 1`` is the ``K == 1`` instance of the
+same node, not a separate kind, so every migrated family keeps its exact
+shape.
+
+Two contracts are now stated structurally rather than implied.
+
+- **The key domain is declared independently of any result layout.**  No
+  result level structure, dense-prefix extent or result rank appears in the
+  decl.  Conflating them is exactly what makes the legacy path instantiate
+  ``coo_workspace<T, key_rank>`` with the whole result shape and then reject
+  every insert.
+- **The drain visits entries in strictly increasing lexicographic key
+  order.**  When the key dimensions are listed in result level order that is
+  also the canonical append order, which is what will make multi-level
+  ordered assembly correct without any sort in the IR.
+
+**Blocker 3 is not a native limit, and this is worth correcting in the
+inherited map.**  ``coo_workspace<T,N>`` is already fully rank-N: its
+constructor's shape vector is used *only* to flatten the dedup key, and
+``sort()`` (``header.h:692-704``) compares the N coordinate components in
+order — a genuine lexicographic comparator, not a flattened index.  Passing
+the **key-domain extents** instead of the result shape makes
+``coord.size() == _resultShape.size() == N`` hold.  **No C++ change is
+required.**  Blocker 3 is a consequence of blocker 2, not an independent
+obstacle.
+
+Ownership landed at every site the milestone names except LLIR lowering:
+nodes, builder, verifier, canonical printer (schema **v10 → v11**, because the
+serialized shape changed), oracle, and schedule application/erasure.
+``lower_llir`` is deliberately left as the **sole rank-1 fail-closed
+boundary** — both existing targets now assert ``len(key_dimensions) == 1``
+explicitly, since they emit ``coo_workspace_1d<T, 1>``.
+
+Two defects in the new representation were caught by the pre-implementation
+ownership map rather than by tests: the canonical schema version had not been
+bumped despite a changed serialized shape, and the oracle's
+``zip(stmt.coords, decl.key_dimensions)`` would have silently truncated a
+malformed key to the shorter side instead of failing.  Both are fixed; the
+oracle owns an explicit rank check because ``run_program`` is reachable
+directly.
+
+### 47.5 Cluster 2: a fifth blocker, and the reachability split (``d6e32f0``)
+
+The inherited four-blocker map is accurate but **incomplete**, and the missing
+blocker changes what a migration slice can attempt.
+
+``Scheduler.select_loop_order`` ends with a forced reorder — *"ensure at least
+one free variable appears after the last reduction variable"* — that moves the
+last free variable to the very end of the loop order whenever none follows the
+last reduction, **with no legality check**.  Measured by instrumenting
+``_verify_storage_order`` and printing ``plan.loop_order`` beside each access
+layout's storage positions:
+
+- ``sss ijk->ij`` declared ``i,j,k`` becomes plan ``i,k,j`` while ``A``'s
+  storage order is ``i,j,k``;
+- ``ss ij->i`` declared ``i,j`` becomes plan ``j,i``.
+
+Both then die at ``loop_plan_legality.py:288``'s ``sparse_parent_dominance``
+**before any LoopIR admission decision is reached**.  That reorder exists
+precisely because the legacy ``insert_workspace`` can only key a workspace on
+free variables below the *innermost* reduction — blocker 1 seen from the other
+side.
+
+**It is deliberately not fixed here.**  ``Scheduler.apply_schedule`` is the
+single owner of Schedule-to-LoopPlan translation for *both* pipelines
+(``loopir/pipeline.py:250-280``), so there is no LoopIR-only divergence point.
+Legacy computes these reductions correctly from the reordered order today —
+verified against PyTorch on ``ss``/``ds``/``dd`` rank-2 and ``sss`` rank-3
+cells, maximum difference 2.4e-07 — so changing the order would change
+generated code on the default dispatch path.  That is a Phase-8 cutover
+decision, which this milestone is forbidden to make.
+
+The consequence is a **reachability split**, now pinned as a committed
+arm-invariant census (``test_loopir_reduction_ttm_census.py``, 25 tests):
+
+- **Five cells are reorder-blocked**: ``sss ijk->i``, ``sss ijk->j``,
+  ``sss ijk->ij``, ``ss ij->i``, ``ds ij->i``.  No LoopIR-side widening can
+  reach them.
+- **Seven cells are reachable**, with legal plan orders and exact LoopIR
+  admission codes: ``unsupported_sparse_output`` (``sss ijk->k``,
+  ``ss ij->j``, ``ds ij->j`` and both TTM forms),
+  ``sparse_workspace_target_invalid`` (``sss ijk->ik``) and
+  ``unsupported_schedule_auto_family`` (``sss ijk->jk``).
+
+The seven reachable cells span every shape the vertical needs — rank-1 and
+rank-2 keys, with and without a bound prefix, single-cursor and merged
+producers — under one rule: **anchor the region at the outermost reduction and
+key it on the result indices at or below that anchor, in result level order.**
+B1 SpGEMM is that rule's ``K = 1, prefix = 1`` instance, which is why the
+migrated family is the ``K == 1`` case of the ordered key domain rather than a
+separate form.  A public probe additionally records that TTM
+``ijk,kl->ijl`` over ``sss × ss`` fails with ``compressed mode 1 position
+array must start at zero`` — a *distinct* legacy malformation from the
+reductions' ``coordinates must be strictly increasing``, not previously noted.
+
+### 47.6 Verification
+
+Evidence retained under ``~/.cache/scorch-codex/phase7-cluster2-8b4b5fc/``.
+
+- **Generated source identity: 62/62 byte-identical.**  The retained 20-source
+  corpus and 42-source grid captures regenerate byte-for-byte against the
+  ``bb429f4`` baseline from a clean detached candidate worktree, with the
+  native-build sentinel holding zero artifacts exactly as the baseline
+  records.  This is the direct proof that the representation change is
+  emission-neutral.
+- **Schedule audit: 46 admitted / 40 rejected / 0 non-identical**, its JSON
+  **identical to the retained baseline** after removing only the commit field.
+- **Full static parity in isolated base/candidate worktrees**: Black **15
+  finding files at both**, identical set; Flake8 **47 at both**, identical
+  after path normalization; mypy **140 errors in 11 files at both**,
+  identical.  The only movement is Black's count of *unchanged* files
+  (135 → 136) from the one added test file.  ``git diff --check`` clean.
+- **Exact-tip clean detached full non-performance suite: COMPLETE.**
+  **5,796 passed / 14 skipped / 0 failed over all 5,810 selected nodes**
+  (5,813 collected, 3 performance deselected), in eight file-disjoint
+  fresh-process partitions (728 / 727 / 725 / 727 / 725 / 727 / 727 /
+  710+14sk), every partition exiting 0, all at exact ``d6e32f0`` in a clean
+  detached worktree.  A pre-run proof places all **85** modules carrying a
+  selected node exactly once and shows the partition node counts sum exactly
+  to the selected total, so the union is complete and non-overlapping.  Of
+  the 87 tracked pytest modules the two remaining ones are accounted for:
+  ``test_helpers.py`` defines no test function, and ``test_perf_large.py``'s
+  two tests are performance-marked.
+- Focused suites: 2,661 LoopIR tests, 291 verifier/oracle tests, 81
+  format-ownership tests, 25 census tests, 238 format/CIN/tensor tests.
+- Request and cache identity cannot have moved: ``plan_identity`` digests
+  ``(cin, plan, result_shape, inputs, compile_options)``, never the LoopIR
+  program.
+- The five protected tracked files retain their recorded SHA-256 values;
+  origin remains ``58e8565``; 119 unrelated untracked GPU/benchmark/scheduler/
+  research paths are untouched; only explicit paths were staged.
+
+### 47.7 Phase-7 exit audit
+
+*Migrated families complete over their proven envelopes.*  Unchanged — no new
+family was migrated.  The representational half of cluster 2 landed and is
+oracle-verified at K = 1, 2 and 3, including a rank-2 key whose insertion
+order deliberately disagrees with its key order.
+
+*Every neighbour carries a stable fail-closed code.*  Yes, and cluster 2's
+twelve cells are now pinned arm-invariantly rather than re-derived.
+
+*Representation unchanged.*  **No.**  Deliberately: the sparse-workspace nodes
+gained an ordered key domain and the canonical schema moved v10 → v11.
+Release behaviour is unchanged — 62/62 generated sources byte-identical, the
+schedule audit identical, no dispatch/selector/cache change.
+
+*The declared matrix is closed.*  **No.**  Cluster 2's semantic half —
+schedule-pass admission, the rank-K LLIR target with multi-level ordered
+assembly, and public wrapping — is **not implemented**, and five of its twelve
+cells are unreachable behind a shared-scheduler blocker this milestone
+declines to touch.
+
+*The activating paired latency receipt.*  Not re-run.  This milestone's
+changes are proven emission-neutral by byte-identical generated sources, so
+there is no new activating shape to measure; §46.2's cross-host evidence
+stands unchanged.
+
+**Phase 7 is NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
+default-dispatch change was made, and no legacy code was deleted.
+
+**The exact remaining blocker, stated as precisely as it is now known.**
+Cluster 2 needs three things, in order:
+
+1. **Schedule-pass admission** implementing the §47.5 anchoring rule.
+   ``apply_sparse_workspace`` still gates on ``len(workspace.axis_loops) == 1``
+   and a rank-2 identity-ordered result.  The plan layer is already ready:
+   ``WorkspaceInsertion.axis_loops`` is a tuple and the automatic scheduler
+   already emits every free variable after the last reduction.
+2. **A rank-K LLIR target** with multi-level ordered assembly.  This is the
+   bulk: the existing ``_SparseWorkspaceLowering`` is ~1,270 lines for the
+   rank-1 CSR case, hard-codes a two-level assembly, and names its single key
+   dimension throughout.  It needs the key-domain extents passed to
+   ``coo_workspace<T,K>`` (no C++ change) and per-level position tracking with
+   parent linking.
+3. **CIN admission**, which is one wall: ``lower_cin.py:688``'s
+   ``result_levels != (DENSE, COMPRESSED)`` catch-all rejects every rank-2/3
+   key and every multi-compressed TTM result, plus ``:599`` for the rank-1-key
+   TTM shape.
+
+And, separately gated, the five reorder-blocked cells require a decision about
+``Scheduler.select_loop_order``'s forced reorder that changes default-dispatch
+generated code.

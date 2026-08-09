@@ -30484,3 +30484,198 @@ documentation tips, exclude worktrees, extension caches, binaries and other
 generated material, verify every manifest entry, leave origin untouched, and
 finish with the honest GO/NO-GO plus an even broader continuation prompt.
 ```
+
+## Ordered workspace key domain and the cluster-2 NO-GO (2026-08-09; supersedes the preceding prompt)
+
+Five code/test commits follow review base ``8b4b5fc``; this documentation
+commit follows.  Nothing was pushed, amended, squashed or reordered.
+
+```
+7c8617e  fix(format): recognize runtime sequences without ABC callbacks
+a79ac78  test(format): lock callback-free sequence recognition
+a1fc642  feat(compiler): give the sparse workspace an ordered key domain
+81d9d7c  test(compiler): lock rank-K sparse workspace keys
+d6e32f0  test(compiler): census the cluster-2 reduction/TTM boundary
+```
+
+**Two defects were found in the reviewed range and fixed first.**  C2, C3 and
+C4 reproduce; C1 ("actual-type/MRO validation executes no caller callbacks")
+does not.  ``issubclass(t, collections.abc.Sequence)`` reaches caller code
+through ``ABCMeta``'s ``WeakSet`` caches, which hash and compare the candidate
+class: eight ``__hash__`` calls on the first ``TensorFormat(hostile)``, two
+``__eq__`` on the second, a bare ``builtins.RuntimeError`` escaping the public
+constructor when ``__hash__`` raises, and two hooks even on the SUCCESS path
+for a genuine ``Sequence`` subclass.  ``from_dict`` had it at three more
+sites.  ``d38d3b8`` — the commit written to close metaclass callback gaps —
+closed the ``__class__`` route and left this one; its lock counts only
+``__class__`` reads.  ``_derives_from`` now answers by real-MRO identity read
+through the base ``type.__mro__`` descriptor, with the virtually-registered
+builtins named explicitly so ``dict``/``list`` acceptance does not narrow.
+
+**The representational half of cluster 2 landed.**  ``SparseWorkspaceDecl``
+now carries ``key_dimensions``, ``SparseWorkspaceInsert`` ``coords``, and
+``SparseWorkspaceDrainFor`` ``indices``; ``K == 1`` is the same node's K = 1
+instance.  The key domain is declared independently of the result layout, and
+the drain contract is strictly increasing lexicographic key order.  Canonical
+schema v10 → v11.  ``lower_llir`` is the sole remaining rank-1 boundary.
+
+**Blocker 3 in the inherited map is wrong and should be struck.**
+``coo_workspace<T,N>`` is already fully rank-N — its ``sort()`` is a genuine
+lexicographic comparator over the N components, and its shape vector only
+flattens the dedup key.  Passing the key-domain extents instead of the result
+shape suffices.  **No C++ change is required.**
+
+**A fifth blocker exists that the inherited map does not contain.**
+``Scheduler.select_loop_order``'s forced reorder moves the last free variable
+to the end of the loop order whenever none follows the last reduction, with no
+legality check, producing plans that violate the operand's own parent
+dominance (``sss ijk->ij`` → ``i,k,j``; ``ss ij->i`` → ``j,i``).  Five cluster-2
+cells die there before LoopIR sees them.  It is not LoopIR's to fix:
+``apply_schedule`` is shared with legacy dispatch and legacy computes those
+reductions correctly today (checked against PyTorch, max diff 2.4e-07).
+
+Exact-tip gates: **62/62 generated sources byte-identical** to the retained
+``bb429f4`` corpus/grid captures; schedule audit **46/40/0** with JSON
+identical to the retained baseline; isolated static parity exact (Black 15
+finding files, Flake8 47, mypy 140 in 11 files at both sides); the complete
+clean detached suite **5,796 passed / 14 skipped / zero failures over all
+5,810 selected nodes** in eight proven-disjoint fresh-process partitions; the
+120/162/560 and 54-cell census qualifications all reproduced.
+
+**Phase 7 is NO-GO.**  The remaining work is cluster 2's semantic half:
+schedule-pass admission for the seven reachable cells, a rank-K LLIR target
+with multi-level ordered assembly, and the ``lower_cin.py:688`` admission
+wall.  The five reorder-blocked cells need a separately gated decision about
+default-dispatch loop ordering.
+
+### Superseding broad copy-paste prompt for the next session
+
+```text
+Continue the compiler-IR migration from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, review §45-§47 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md and the final section of
+COMPILER_IR_REFACTOR_HANDOFF.md, inspect the graph and code yourself, and do
+not trust the handoff without reproducing its contracts. Do not push, amend,
+squash or reorder existing commits. Preserve the five protected dirty tracked
+files and all unrelated GPU/benchmark/scheduler/research/scratchpad material;
+stage only explicit paths.
+
+The protected tracked files and required SHA-256 values are:
+`.gitignore` = `301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105`,
+`pyproject.toml` =
+`191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea`,
+`src/scorch/__init__.py` =
+`5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845`,
+`tests/packaging/smoke_install.py` =
+`f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679`,
+and `tests/test_scorch/test_resources.py` =
+`3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9`.
+
+First independently review `8b4b5fc..<tip>`, especially the five code/test
+commits. Re-derive rather than assume: the ABC-callback fix must leave every
+public format entry point invoking ZERO caller-owned hooks on both the
+rejecting and the accepting path, must keep bare builtin exceptions from
+escaping, and must not narrow the accepted mapping/sequence set (dict,
+OrderedDict, mappingproxy, list, tuple, list subclasses, real Sequence
+subclasses, serialize round trip). Confirm the rank-K key domain is byte-
+neutral: regenerate the 20-source corpus and 42-source grid captures and
+require 62/62 byte identity, and require the 86-case schedule audit to equal
+its retained baseline. Reproduce the 120 (116 + four ds-copy rejections,
+exit 1), 162/162, 560/560 and 54-cell census (46 records, eight SIGSEGV
+C1-C7/C13, wrapper exit 1 from lexicographic C13/C2 ordering) qualifications.
+If you find a concrete defect, fix it first in a focused production commit
+plus a separate regression-test commit.
+
+The primary milestone is the SEMANTIC half of Phase-7 cluster 2. The
+representation is already there; do not redo it. Work the seven REACHABLE
+cells pinned in tests/test_scorch/test_loopir_reduction_ttm_census.py --
+`sss ijk->k`, `sss ijk->ik`, `sss ijk->jk`, `ss ij->j`, `ds ij->j`, and both
+TTM forms -- under the recorded rule: anchor the SparseWorkspaceRegion at the
+OUTERMOST reduction and key it on the result indices at or below that anchor,
+in result level order. That rule assigns prefix/key/K per cell in the census
+docstring; B1 SpGEMM is its K=1, prefix=1 instance, so every migrated family
+must stay byte-identical.
+
+Three things are needed, in order:
+1. Schedule-pass admission. `apply_sparse_workspace` still gates on
+   `len(workspace.axis_loops) == 1` (schedule_passes.py ~1033) and a rank-2
+   identity-ordered result (~1058). The plan layer is already rank-K ready:
+   `WorkspaceInsertion.axis_loops` is a tuple and the automatic scheduler
+   already emits every free variable after the last reduction. Also widen
+   `_check_auto_plan_family`'s twin gate (~2760).
+2. A rank-K LLIR target with multi-level ordered assembly. This is the bulk.
+   `_SparseWorkspaceLowering` is ~1,270 lines of rank-1 CSR with a hard
+   two-level assembly (`_row_assembly_statements`), a single `drain_name`, and
+   a literal `coo_workspace_1d<T, 1>`. Pass the KEY-domain extents to
+   `coo_workspace<T,K>` -- no C++ change is needed, the native container is
+   already rank-N with a true lexicographic `sort()`. Keep positions distinct
+   from coordinates and link each compressed child to its parent position; do
+   not add a CSR or rank-2 shortcut.
+3. CIN admission. `lower_cin.py:688`'s `result_levels != (DENSE, COMPRESSED)`
+   catch-all is the single wall for every rank-2/3 key and every
+   multi-compressed TTM result; `:599` is the wall for the rank-1-key TTM
+   shape.
+
+Cover f32/f64, commuted operands, empty and ragged inputs, zero and singleton
+extents, cancellation and stored zeros, in both automatic arms. Test exact
+pos/crd/value storage, level lengths, canonical order and public wrapping, not
+merely dense numerical equality. Gate on canonical erasure, the format-neutral
+LoopIR oracle and PyTorch. Never treat the unsafe legacy output as an oracle
+or demand byte parity from a malformed kernel -- and note that TTM
+`ijk,kl->ijl` over `sss x ss` fails legacy validation with `compressed mode 1
+position array must start at zero`, a DIFFERENT malformation from the
+reductions' `coordinates must be strictly increasing`. Run each known legacy
+SIGSEGV cell only in an isolated subprocess with timeout and
+RLIMIT_CPU/RLIMIT_CORE. When a census cell starts compiling, MOVE its lock to
+the neighbour that still occupies the seam and name the move in place; do not
+delete it.
+
+Do NOT attempt the five reorder-blocked cells (`sss ijk->i`, `sss ijk->j`,
+`sss ijk->ij`, `ss ij->i`, `ds ij->i`) as part of this milestone. They die at
+`loop_plan_legality`'s `sparse_parent_dominance` because
+`Scheduler.select_loop_order`'s forced reorder produces a plan that violates
+the operand's parent dominance, and `Scheduler.apply_schedule` is shared with
+legacy dispatch. Fixing it changes default-dispatch generated code, so it
+needs its own gated decision. If you want to prepare that decision, produce a
+read-only census of every program whose forced reorder currently fires and
+what its legacy output would become -- but do not land the change.
+
+Then rerun the Phase-7 exit audit criterion by criterion: focused and
+adversarial memberships, provenance-correct 120/162/560, the crash-isolated
+54-cell census plus an expanded family census, the 86-case schedule audit,
+retained plus activating source captures, compiled public differentials,
+isolated base-vs-candidate Black/Flake8/mypy parity, protected hashes,
+git diff --check, and an exact-tip clean detached full non-performance suite
+in fresh-process file-disjoint partitions with a proven complete and
+non-overlapping node union. The partitioner and its proof are retained under
+`~/.cache/scorch-codex/phase7-cluster2-8b4b5fc/full-suite/`. Do not relabel a
+nonzero harness, average away a failed percentile, or cite a receipt without
+exact revision and import provenance.
+
+For latency, use local M5 only for quick attribution. Run the binding x86
+receipt on an unloaded host with 200 warmups / 2,000 samples, both p50 and p95
+<= 1.10, plus A/A and order controls. Redwood is available; MKT is a useful
+independent Slurm control -- `ssh sc`, `sbatch --account=mkt --partition=mkt`,
+create and build only inside an allocation under `/scr/u/bobbyy`, `/matx` for
+durable staging only, never SSH directly to `mkt1`. Record environment
+differences; MKT is corroboration, not a substitute for the semantic or
+source-identity gates. Note that a purely representational slice needs no new
+latency receipt if its generated sources are byte-identical -- prove that
+instead.
+
+Only a genuine Phase-7 GO permits the stretch milestone. If all criteria pass
+and time remains, produce a read-only Phase-8 fallback/cutover census covering
+public dispatch frequency, canonical request/cache identity, dual-arm
+composition, unsupported codes and legacy dependencies; then implement at most
+an explicitly opt-in shadow/cutover pilot for already proven families, with
+legacy-vs-LoopIR source/result/cache differentials and rollback. Do not flip
+default dispatch, delete a legacy path, weaken fallback behavior or start
+Phase 8.5 without a separately gated decision. If Phase 7 is still NO-GO, stop
+and hand over the exact blocker rather than starting cutover work.
+
+Commit coherent production, test and documentation slices separately with
+descriptive bodies. Seal the evidence manifest only after the final code and
+documentation tips, exclude worktrees, extension caches, binaries, pycache and
+other generated material, verify every manifest entry, leave origin untouched,
+and finish with an honest GO/NO-GO plus an even broader continuation prompt.
+```
