@@ -8705,3 +8705,187 @@ Cluster 2 needs three things, in order:
 And, separately gated, the five reorder-blocked cells require a decision about
 ``Scheduler.select_loop_order``'s forced reorder that changes default-dispatch
 generated code.
+
+## 48. Rigorous review corrections to the ordered-key milestone (2026-08-09)
+
+This review starts at inherited documentation tip ``cf8cd44`` and reads the
+complete ``8b4b5fc..cf8cd44`` range independently.  The ordered key-domain
+representation itself is sound over its stated node/verifier/oracle contract,
+and ``coo_workspace<T,N>`` really is rank-general.  Three surrounding
+contracts were not sound: standard ``Sequence`` compatibility and public
+diagnostic totality, root-region schedule erasure/provenance, and the claimed
+cluster-2 census/evidence map.  They are corrected in five focused commits:
+
+```
+cf831f3  fix(format): preserve callback-safe sequence compatibility
+e8a3f74  test(format): lock sequence compatibility and error translation
+f3b1ab3  fix(compiler): erase root-owned workspace regions
+cde1b9f  test(compiler): lock root rank-K workspace erasure
+e13ecba  test(compiler): correct the cluster-2 frontier census
+```
+
+Nothing here admits a new target family, changes generated C++, changes the
+canonical v11 schema, or changes dispatch, selector, cache, request identity,
+or legacy scheduling.  Phase 7 remains **NO-GO**.
+
+### 48.1 Format recognition was callback-safe but compatibility and diagnostics were not
+
+The real-MRO recognizer from ``7c8617e`` avoids ``ABCMeta`` cache callbacks;
+fresh hostile metaclass probes confirm that type recognition itself invokes
+no caller ``__hash__``, ``__eq__``, ``__subclasscheck__``,
+``__instancecheck__``, ``__class__``, ``__name__`` or ``__mro__`` hook.
+Section 47 nevertheless overclaimed two consequences.
+
+First, the previous ABC boundary accepted standard virtual ``Sequence``
+implementations that ``_SEQUENCE_BASES`` omitted.  Exact base/candidate probes
+showed ``deque(["d", "s"])`` and ``array("u", "ds")`` changing from a valid
+``d,s`` format to ``TensorTypeError``, and ``memoryview(b"")`` changing from
+the valid empty format to rejection.  ``cf831f3`` names the complete concrete
+standard-library set that the prior boundary recognized, restoring those
+outcomes without reintroducing an ABC query.
+
+Second, callback-free **recognition** cannot mean callback-free **consumption**
+of a genuine user-defined ``Sequence`` or ``Mapping``: its protocol methods
+must run to obtain the payload.  Before this review, exceptions from those
+methods escaped the direct ``TensorFormat`` constructor and ``from_dict`` as
+bare caller ``RuntimeError`` instances.  The public boundaries now translate
+such failures to ``TensorFormatError`` while preserving the original cause.
+The corrected contract is therefore precise: recognition invokes no caller
+hook; consumption may invoke the recognized protocol, but no ordinary caller
+exception escapes the format API unclassified.
+
+### 48.2 The generalized root-owned region could not be erased
+
+The rank-K tests introduced exactly the placement the semantic vertical
+needs: ``SparseWorkspaceRegion`` owns the program root, above every producer
+loop.  The program verified and the oracle executed it, but
+``erase_schedule`` failed before reaching the generalized erasure logic
+because ``_decompose_chain`` unconditionally required an outer loop.  The
+same assumption prevented scheduled-chain provenance from describing the
+root-owned region.
+
+``f3b1ab3`` makes empty outer chains an explicit opt-in and enables it only
+for provenance and erasure; schedule-construction passes keep their previous
+nonempty boundary.  The regression lock covers K = 1, 2 and 3 and a stronger
+rank-2 case whose key is rotated against producer order and whose four-way
+contraction has non-symmetric values.  Scheduled and erased oracle storage is
+exactly equal, the independently computed lexicographic entries agree, and
+provenance is producer loops followed by the composite drain identity.
+
+### 48.3 The committed census is a representative frontier, not an exhaustive cluster
+
+The ``d6e32f0`` coverage assertion proved only that its own two lists contained
+12 names.  It omitted four of the six TTM layouts explicitly named by §45.6.
+The corrected review matrix contains **16 representatives**:
+
+- five cells blocked only under the empty automatic origin;
+- five reachable reduction cells; and
+- six reachable TTM cells, crossing result/receiver layouts
+  ``sss``/``dss``/``dds`` with canonical dense/compressed second factors
+  ``dd``/``ss``.
+
+All eleven reachable representatives remain arm-invariant at their recorded
+later diagnostics.  The word "representative" is binding: a separate
+level-general audit already finds adjacent ``dss`` reduction and mixed
+``ds``/``sd`` factor variants not enumerated by the 16-cell lock.  A migration
+must derive and expand that frontier; it must not treat the committed list as
+proof of format/rank exhaustiveness.
+
+The five automatic-origin failures are also not intrinsically unreachable.
+Committed controls supply legal explicit orders for ``sss ijk->ij`` and
+``ss ij->i`` and reach later LoopIR target/lowering diagnostics.  A
+LoopIR-specific automatic-plan repair is therefore architecturally possible
+without changing legacy default emission, although it needs its own gated
+design.  Sections 47.5/47.7 were wrong to call this necessarily a Phase-8
+default-dispatch decision.
+
+The blanket claim that legacy computes all five blocked reductions correctly
+is removed.  It contradicts the existing runtime lock that public
+``sss ijk->i`` and ``sss ijk->j`` reject malformed storage, and the quoted
+``2.4e-07`` had no retained receipt.  Likewise, the five automatic-origin
+failures have stable stage/message locks but no structured ``defect.code``;
+only the eleven reachable entries carry codes.
+
+### 48.4 Corrected implementation map
+
+``lower_llir`` is not the sole K = 1 boundary.  The current semantic vertical
+has independent restrictions in:
+
+1. ``apply_sparse_workspace`` and ``_check_auto_plan_family`` (schedule fact
+   admission and replay);
+2. both sparse-workspace LLIR target classes (rank-1 runtime spelling and
+   two-level assembly); and
+3. family-dependent CIN admission/target gates.
+
+There is no single ``lower_cin.py`` line that owns every remaining cell.
+For example, ``sss->jk`` reaches ``unsupported_schedule_auto_family`` and
+``sss->ik`` reaches ``sparse_workspace_target_invalid``; both have already
+passed CIN.  The canonical TTM representatives stop at the broader sparse
+result admission, while the earlier line-599 claim applies to different
+compressed-parent/dense-leaf shapes.  The next implementation must inventory
+the route per family rather than widening one catch-all and assuming closure.
+
+The native correction remains valid with narrower wording.  The
+``coo_workspace<T,N>`` shape vector supplies key-domain rank/extents for
+bounds, negative-extent and overflow checks and checked flattening/dedup;
+``sort()`` independently compares all N coordinate components
+lexicographically.  Passing key-domain extents is sufficient, and no native
+C++ change is required.
+
+### 48.5 Verification and evidence correction
+
+The prior ledger's README truthfully says its 120/162/560 and 54-cell
+correctness sweeps ran at inherited ``8b4b5fc``.  Sections 47.3/47.6 and the
+handoff incorrectly presented them as exact-candidate evidence even though
+``a1fc642`` changed oracle and erasure semantics.  This review reruns those
+gates at exact code tip ``e13ecba`` with clean-worktree/import provenance and
+keeps every raw nonzero receipt distinct from its characterization.
+
+- Format/value/CIN focus: **274 passed**.
+- Verifier/oracle/schedule/printer/workspace focus: **647 passed**.
+- Corrected representative census: **35 passed**.
+- Exact-tip correctness sweeps: the raw 120-case harness exits 1 with exactly
+  the four inherited ``ds(3,4)`` copy rejections (116/120), and its separate
+  expected-rejection characterization exits 0; the wider sweep is 162/162 and
+  the five-seed oracle sweep is 560/560.  The crash-isolated census completes
+  all 54 children with 46/46 arm-invariant records, exactly the inherited
+  eight SIGSEGV cells ``C1``--``C7``/``C13``, and zero timeouts.  Its raw
+  wrapper still exits 1 solely because it compares ``C13`` and ``C2``
+  lexicographically; the order-insensitive semantic characterization exits 0.
+- Neutrality: fresh 20-source corpus and 42-source grid captures are
+  byte-identical between ``cf8cd44`` and ``e13ecba`` and to the retained
+  captures.  Both 86-case schedule audits are 46 admitted / 40 rejected / 0
+  nonidentical and normalize byte-identically to the retained audit.
+- Isolated full-tree static parity: both revisions have the same 15 inherited
+  Black finding files, 47 Flake8 findings, and 140 mypy errors in 11 files;
+  Flake8/mypy logs are byte-identical, while sorted path-normalized Black logs
+  are byte-identical after removing parallel worker completion order.
+- Exact-tip clean detached full suite: 5,828 collected, 3 performance tests
+  deselected, and all 5,825 selected nodes covered exactly once across eight
+  file-disjoint fresh processes: **5,811 passed, 14 skipped, 0 failed/errors**.
+  All 87 tracked test modules are accounted for, every partition exits 0, and
+  no libomp/pthread-key event occurs.
+
+Evidence is retained under
+``~/.cache/scorch-codex/phase7-cluster2-review-e13ecba/``.  The correctness,
+neutrality, and full-suite manifests verify 501/501, 213/213, and 56/56
+entries respectively; the full-suite manifest digest is
+``571e6b6767fb1bd5096a8b391dd115110100414d533c3bdd089e5da878135cb0``.
+
+Generated-source identity, not a new timing run, is the appropriate latency
+gate for these representation/validation corrections: no production target
+is newly activated.  The existing §46 cross-host receipts remain historical
+evidence; they are not relabelled as runs at this tip.  If the next semantic
+slice changes an activating target, use the MKT Slurm allocation as the
+preferred independent host when Redwood is loaded or unavailable, following
+the repository's ``/scr/u/bobbyy`` and no-direct-``mkt1`` rules.
+
+### 48.6 Disposition
+
+The ordered key domain is now a usable semantic foundation, including honest
+root-region erasure, but no rank-K LLIR target or public reduction/TTM family
+has landed.  **Phase 7 remains NO-GO.**  The next milestone should complete
+the semantic vertical across the expanded reachable frontier and, in
+parallel, make a separately gated decision for LoopIR automatic-origin repair.
+No Phase-8 cutover, default dispatch flip, cache/selector change, fallback
+weakening or legacy deletion is authorized before a genuine Phase-7 GO.

@@ -30679,3 +30679,130 @@ documentation tips, exclude worktrees, extension caches, binaries, pycache and
 other generated material, verify every manifest entry, leave origin untouched,
 and finish with an honest GO/NO-GO plus an even broader continuation prompt.
 ```
+
+## Ordered-key rigorous review corrections (2026-08-09; supersedes every preceding prompt)
+
+Five local review commits follow inherited documentation tip ``cf8cd44``;
+nothing was pushed, amended, squashed or reordered:
+
+```
+cf831f3  fix(format): preserve callback-safe sequence compatibility
+e8a3f74  test(format): lock sequence compatibility and error translation
+f3b1ab3  fix(compiler): erase root-owned workspace regions
+cde1b9f  test(compiler): lock root rank-K workspace erasure
+e13ecba  test(compiler): correct the cluster-2 frontier census
+```
+
+The review found three defects.  The callback-free format recognizer narrowed
+valid standard ``Sequence`` inputs (``deque``, Unicode ``array``, empty
+``memoryview``), and exceptions raised while consuming a recognized custom
+container escaped the public API.  Compatibility is restored; recognition is
+hook-free; consumption failures become ``TensorFormatError``.  Rank-K
+workspaces whose region owns the root verified and oracle-executed but could
+not be erased or described by schedule provenance; both now accept that empty
+outer chain.  Finally, the 12-cell "whole cluster" census omitted four of six
+canonical TTM layouts.  It is now an honest **16-cell representative
+frontier**: five empty-auto-origin blocks and eleven reachable cells, with
+legal explicit-order controls proving the five blocks are origin-specific.
+
+Inherited §47 claims are superseded.  ``lower_llir`` is not the sole K=1 wall;
+schedule admission/replay, both targets and family-specific CIN gates are
+independent.  No one ``lower_cin.py`` line owns every cell.  The auto-origin
+failures have stage/message locks, not defect codes.  Legacy does not compute
+all five correctly: existing tests require public ``sss->i``/``sss->j`` to
+reject malformed storage.  Native ``coo_workspace<T,N>`` remains rank-general,
+but key extents own bounds/overflow/flattening as well as dedup.
+
+Focused exact-tip gates are **274**, **647**, and **35** tests, all green.  At
+exact code tip ``e13ecba``, the wide gates reproduce honestly: raw 120 =
+116/120 plus exactly four characterized inherited rejections; 162/162 and
+560/560 pass; the crash-isolated census has 46/46 arm-invariant records, the
+same eight SIGSEGV cells and no timeout; 62/62 generated sources are
+byte-identical; the schedule audit remains 46/40/0; static findings are
+base-identical; and the complete/disjoint eight-process full suite is **5,811
+passed / 14 skipped / 0 failed** (5,825 selected, 3 perf-deselected, all 87
+tracked modules accounted for).  Raw nonzero receipts remain distinct from
+their exit-0 characterizations.  Evidence and verified manifests live under
+``~/.cache/scorch-codex/phase7-cluster2-review-e13ecba/``; review §48 owns the
+detailed results and corrects the old base-only evidence attribution.  Phase
+7 remains **NO-GO**: no rank-K target or reduction/TTM public vertical landed,
+and no Phase-8/cutover/dispatch/cache change occurred.
+
+### Broad copy-paste prompt for the next session
+
+```text
+Continue from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, §45-§48 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md, and the FINAL handoff section. Inspect
+code and raw receipts yourself. Do not push, amend, squash or reorder. Preserve
+all unrelated GPU/CUDA/benchmark/scheduler/research/scratchpad material and
+stage only explicit files.
+
+Keep these protected dirty files byte-exact: `.gitignore`
+301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105;
+`pyproject.toml` 191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea;
+`src/scorch/__init__.py` 5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845;
+`tests/packaging/smoke_install.py`
+f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679;
+`tests/test_scorch/test_resources.py`
+3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9.
+
+First review `8b4b5fc..<tip>`, especially the five §48 commits. Reproduce
+callback-free format TYPE RECOGNITION, controlled recognized-protocol
+CONSUMPTION failures, restored Sequence compatibility, root-owned K=1/2/3
+erasure, rotated-key contraction semantics, root provenance, and the
+5-blocked/11-reachable/16-representative census. Probe virtual ABCs, mutation
+during consumption, root+parallel composition, key/result-rank disagreement,
+permuted keys, empty extents and forged/cyclic nodes. Fix defects first.
+
+Then finish the broad SEMANTIC Phase-7 cluster-2 vertical:
+
+1. Derive the full reachable frontier. Start with the eleven representatives,
+   then audit adjacent level-general `dss` reductions, mixed `ds`/`sd` factors,
+   commuted operands, higher ranks, permuted modes, dense prefixes and
+   zero/singleton extents. Record each route/code; the census is not exhaustive.
+2. Implement schedule admission/replay and sparse-workspace transformation
+   from dominance/result-level identities. Root ownership is legal; preserve
+   canonical erasure to the unscheduled semantic program.
+3. Generalize both LLIR targets structurally. Pass KEY extents to
+   `coo_workspace<T,K>`; keep coordinates distinct from positions, parent-link
+   every compressed segment, support dense prefixes, and use no CSR shortcut,
+   rendered-name discovery, regex or format-string sniffing.
+4. Widen family-specific CIN/target gates and return honest multi-level
+   `(pos, crd, values)` storage. Cover f32/f64, stored zeros, cancellation,
+   empty/ragged/zero extents, commutation and both arms. Compare exact storage
+   and order against the format-neutral oracle plus PyTorch. Unsafe legacy
+   kernels are failure evidence only; isolate SIGSEGV probes with timeout and
+   RLIMIT_CPU/RLIMIT_CORE.
+5. Separately decide the five empty-auto-origin failures. Legal explicit plans
+   reach later seams, so prefer a LoopIR-only automatic-plan repair that leaves
+   legacy default emission untouched. Prove the affected census, legality,
+   oracle equivalence, request identity and release neutrality; otherwise keep
+   the exact blocker.
+
+Keep schema v11 unless serialized semantics truly change. Move seam locks to
+still-unsupported neighbours; never delete them. Run exact-tip focused and
+adversarial tests, expanded census, erasure/oracle and compiled public
+differentials, raw 120 plus 162/560, crash-isolated 54-cell census, 86-case
+schedule audit, source captures, base/candidate statics, protected hashes,
+diff-check, and a clean detached full non-perf suite in file-disjoint fresh
+processes with a complete/disjoint node proof. Never call base-only evidence
+exact-tip, relabel nonzero output, hide infrastructure failure, or average
+timing drift.
+
+For source-changing activation, run paired latency with A/A/order controls on
+an independent host. Prefer Stanford SC/MKT when Redwood is loaded:
+`kinit bobbyy@CS.STANFORD.EDU`, `ssh sc`, Slurm
+`--account=mkt --partition=mkt` (or `mkt-interactive`), and build/run only in
+the allocation under `/scr/u/bobbyy`; never compile on the login node or SSH
+directly to `mkt1`. If activating sources are byte-identical, prove that
+instead of manufacturing timing.
+
+Repeat the Phase-7 exit audit. Only genuine GO permits a read-only Phase-8
+cutover census and at most an opt-in shadow pilot. Do not flip default dispatch,
+weaken fallback, delete legacy code or start Phase 8.5 without a separate gate.
+If still NO-GO, stop at the exact blocker. Commit production/test/docs slices
+separately, seal only final-tip evidence excluding worktrees/caches/binaries,
+verify every manifest entry, leave origin untouched, and report an honest
+verdict plus a broader prompt.
+```
