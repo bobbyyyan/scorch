@@ -741,7 +741,15 @@ def _seam_cells():
                 ForAll(
                     l4,
                     TensorAssign(
-                        TensorVar("C", fmt="sss")[i4, j4, l4],
+                        # Recorded seam move: the ``sss`` TTM result that used
+                        # to sit here is the admitted ordered-key workspace
+                        # family (``test_loopir_ordered_key_workspace_target
+                        # .py``).  Its neighbour on the same seam keeps the
+                        # code -- a DENSE result prefix level bound by the
+                        # receiver's STORED level, whose parent count is a
+                        # dynamic stored-coordinate count rather than a
+                        # static extent, so no ordered assembly is defined.
+                        TensorVar("C", fmt="dss")[i4, j4, l4],
                         CINBinaryOp(
                             Operation.MUL,
                             TensorVar("A", fmt="sss")[i4, j4, k4],
@@ -775,11 +783,11 @@ def _seam_cells():
     f32 = torch.float32
     return [
         (
-            "ttm_reduction",
+            "ttm_reduction_dense_prefix_over_stored_level",
             ttm,
             (3, 4, 5),
             (((3, 4, 6), f32), ((6, 5), f32)),
-            "unsupported_sparse_output",
+            "unsupported_sparse_output_domain",
         ),
         # Recorded seam move: the two-dense-prefix ``ddss`` intersection that
         # used to sit here is the admitted flattened-prefix family

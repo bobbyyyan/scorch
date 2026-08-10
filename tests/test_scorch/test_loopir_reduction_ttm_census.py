@@ -1,56 +1,53 @@
-"""Phase-7 cluster 2: the multi-compressed reduction / TTM fail-closed census.
+"""Phase-7 cluster 2: the multi-compressed reduction / TTM frontier census.
 
 Cluster 2 -- sparse reductions and TTM over multi-compressed receivers -- is
-**not migrated**.  This module pins the representative matrix declared by the
-Phase-7 review in both automatic arms, so the next migration slice starts from
-a locked map rather than a re-derived one.  It is a deliberately finite
-frontier, not a claim to enumerate every possible rank/layout combination.
+now **partly migrated**.  This module pins the representative matrix in both
+automatic arms so the split between what the ordered-key sparse-workspace
+vertical reaches and what it still does not is a locked fact rather than a
+re-derived one.  It remains a deliberately finite frontier, not a claim to
+enumerate every rank/layout combination: a level-general audit finds adjacent
+``dss``/``sds`` reductions and mixed ``ds``/``sd`` factor variants that this
+list does not name, and a migration must derive those itself.
 
-The cells split into two groups, and the split is the point.
+The cells split three ways.
 
-**Auto-origin reorder-blocked (5 cells).**  ``Scheduler.select_loop_order`` ends with a
-forced reorder (``scheduler.py``, "ensure at least one free variable appears
-after the last reduction variable"): when no free variable follows the last
-reduction it moves the last free variable to the very end of the loop order,
-with no legality check.  For these cells that permutation violates the sparse
-operand's own parent dominance -- ``sss ijk->ij`` declared ``i,j,k`` becomes
-``i,k,j`` while ``A``'s storage order is ``i,j,k`` -- so the LoopIR route
-rejects the plan at ``loop_plan_legality``'s ``sparse_parent_dominance``
-before any LoopIR admission decision is reached.
+**Migrated (9 cells).**  Their automatic plan order is legal and the
+ordered-key workspace target lowers them end to end, in both arms.  They span
+rank-1, rank-2 and rank-3 keys, root-anchored and prefix-anchored regions,
+single-cursor and merged producers, and dense and compressed second factors.
+Their storage/oracle/PyTorch differentials live in
+``test_loopir_ordered_key_workspace_target.py``; what is locked HERE is only
+that they compile arm-invariantly, so a regression that un-migrates one is
+caught by the census as well as by its own suite.
 
-That reorder exists precisely because the legacy ``insert_workspace`` can only
-key a workspace on free variables *below the innermost reduction*.  It is a
-fifth blocker beside the four recorded in review section 45.6.  It blocks the
-empty automatic origin specifically: an explicit legal schedule carries a
-representative cell past LoopPlan to its later LoopIR seam.  Changing the
-shared legacy scheduler would change default-path code, but a LoopIR-specific
-automatic-plan repair remains a separately gated option.
+**Auto-tile blocked (2 cells).**  ``TTM dds x {dd,ss} -> dds`` is legal and
+its target shape is supported, but the automatic origin also emits an affine
+tile for it: ``Scheduler._select_index_vars_to_tile`` tiles every dense index
+variable that does not appear in every access, and ``j`` qualifies for a
+``dds`` receiver against a ``kl`` second factor.  A plan carrying BOTH a
+sparse workspace and a tile has no replay contract -- the only implemented
+workspace+tile composition is the dense reduce-out fusion -- so it stops at
+``unsupported_schedule_auto_family``.  This is a schedule-composition
+blocker, not a target or representation one.
 
-**Reachable (11 cells).**  Their automatic plan order is legal, and they stop
-at LoopIR-side admission walls instead.  These are the cells a migration slice
-can actually take.  They cover rank-1 and rank-2 keys, with and without a
-bound prefix, single-cursor and merged producers, plus all six canonical TTM
-layout variants named by the inherited review (three receiver/result layouts
-crossed with dense and compressed second factors).
+**Auto-origin reorder-blocked (5 cells).**  ``Scheduler.select_loop_order``
+ends with a forced reorder (``scheduler.py``, "ensure at least one free
+variable appears after the last reduction variable"): when no free variable
+follows the last reduction it moves the last free variable to the very end of
+the loop order, with no legality check.  For these cells that permutation
+violates the sparse operand's own parent dominance -- ``sss ijk->ij`` declared
+``i,j,k`` becomes ``i,k,j`` while ``A``'s storage order is ``i,j,k`` -- so the
+LoopIR route rejects the plan at ``loop_plan_legality``'s
+``sparse_parent_dominance`` before any LoopIR admission decision is reached.
 
-Applying the anchoring rule -- anchor the region at the OUTERMOST reduction
-and key it on the result indices at or below that anchor, in result level
-order -- to the reachable cells gives:
-
-===================  ==========  =====  ========  ======  ===
-cell                 reductions  p      prefix    key     K
-===================  ==========  =====  ========  ======  ===
-``sss ijk->k``       i, j        0      --        k       1
-``sss ijk->ik``      j           1      i         k       1
-``sss ijk->jk``      i           0      --        j, k    2
-``ss ij->j``         i           0      --        j       1
-``ds ij->j``         i           0      --        j       1
-``TTM ijk,kl->ijl``  k           2      i, j      l       1 (six layouts)
-===================  ==========  =====  ========  ======  ===
-
-B1 SpGEMM (``ik,kj->ij``) is the same rule's ``K = 1, prefix = 1`` instance,
-which is why the migrated family is exactly the K == 1 case of the ordered
-key domain rather than a separate form.
+The explicit-order controls below sharpen what a LoopIR-only automatic-plan
+repair would and would not buy.  A legal declared order does carry these cells
+past LoopPlan -- so the block really is origin-specific -- but the program it
+produces has an EMPTY workspace key: every result coordinate is bound above
+the outermost reduction, leaving nothing to drain.  That ``K == 0`` shape is a
+scalar-accumulator reduction, which no migrated family owns.  Repairing the
+origin alone therefore moves the failure from LoopPlan to a later LoopIR seam
+without migrating anything; the two must be decided together.
 """
 
 import pytest
@@ -144,45 +141,32 @@ REORDER_BLOCKED = [
     _reduction_cell("ds ij->i", "ds", "s", "ij", "i"),
 ]
 
-# Legal plan order; stopped by a LoopIR-side admission wall with an exact code.
-REACHABLE = [
-    (
-        *_reduction_cell("sss ijk->k", "sss", "s", "ijk", "k"),
-        "unsupported_sparse_output",
-    ),
-    (
-        *_reduction_cell("sss ijk->ik", "sss", "ss", "ijk", "ik"),
-        "sparse_workspace_target_invalid",
-    ),
-    (
-        *_reduction_cell("sss ijk->jk", "sss", "ss", "ijk", "jk"),
-        "unsupported_schedule_auto_family",
-    ),
-    (*_reduction_cell("ss ij->j", "ss", "s", "ij", "j"), "unsupported_sparse_output"),
-    (*_reduction_cell("ds ij->j", "ds", "s", "ij", "j"), "unsupported_sparse_output"),
-    (
-        *_ttm_cell("TTM sss x dd -> sss", "sss", "dd", "sss"),
-        "unsupported_sparse_output",
-    ),
-    (
-        *_ttm_cell("TTM sss x ss -> sss", "sss", "ss", "sss"),
-        "unsupported_sparse_output",
-    ),
-    (
-        *_ttm_cell("TTM dss x dd -> dss", "dss", "dd", "dss"),
-        "unsupported_sparse_output",
-    ),
-    (
-        *_ttm_cell("TTM dss x ss -> dss", "dss", "ss", "dss"),
-        "unsupported_sparse_output",
-    ),
+# Legal plan order, supported target shape: the ordered-key vertical lowers
+# these end to end.  The ``(prefix, key rank)`` split each one exercises is
+# recorded beside it because that -- not the layout spelling -- is what the
+# migration is general over.
+MIGRATED = [
+    (*_reduction_cell("sss ijk->k", "sss", "s", "ijk", "k"), 0, 1),
+    (*_reduction_cell("sss ijk->ik", "sss", "ss", "ijk", "ik"), 1, 1),
+    (*_reduction_cell("sss ijk->jk", "sss", "ss", "ijk", "jk"), 0, 2),
+    (*_reduction_cell("ss ij->j", "ss", "s", "ij", "j"), 0, 1),
+    (*_reduction_cell("ds ij->j", "ds", "s", "ij", "j"), 0, 1),
+    (*_ttm_cell("TTM sss x dd -> sss", "sss", "dd", "sss"), 2, 1),
+    (*_ttm_cell("TTM sss x ss -> sss", "sss", "ss", "sss"), 2, 1),
+    (*_ttm_cell("TTM dss x dd -> dss", "dss", "dd", "dss"), 2, 1),
+    (*_ttm_cell("TTM dss x ss -> dss", "dss", "ss", "dss"), 2, 1),
+]
+
+# Legal plan order and a supported target shape, but the automatic origin
+# also emits an affine tile, and no workspace+tile replay contract exists.
+AUTO_TILE_BLOCKED = [
     (
         *_ttm_cell("TTM dds x dd -> dds", "dds", "dd", "dds"),
-        "unsupported_sparse_output",
+        "unsupported_schedule_auto_family",
     ),
     (
         *_ttm_cell("TTM dds x ss -> dds", "dds", "ss", "dds"),
-        "unsupported_sparse_output",
+        "unsupported_schedule_auto_family",
     ),
 ]
 
@@ -195,7 +179,8 @@ def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
     """The shared automatic origin's forced reorder makes the plan illegal.
 
     These stop before LoopIR gets a say on this origin.  The explicit-schedule
-    control below proves that this is not an intrinsic program boundary.
+    control below proves that this is not an intrinsic program boundary -- and
+    also that repairing the origin alone would not migrate them.
     """
 
     name, cin, result_shape, bindings = cell
@@ -221,15 +206,22 @@ def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
             _reduction_cell("ss ij->i", "ss", "s", "ij", "i"),
             ("i", "j"),
             LoopIRLoweringError,
-            "unsupported_sparse_output",
+            "unsupported_sparse_output_domain",
         ),
     ],
     ids=("sss-legal-explicit-order", "ss-legal-explicit-order"),
 )
-def test_auto_reorder_block_is_origin_specific(
+def test_auto_reorder_block_is_origin_specific_but_not_sufficient(
     cell, loop_order, exception, expected_code
 ):
-    """A legal explicit order reaches the later LoopIR family boundary."""
+    """A legal explicit order reaches a later LoopIR seam -- and stops there.
+
+    Both controls bind every result coordinate ABOVE the outermost reduction,
+    so the ordered workspace key is empty.  That is the exact reason a
+    LoopIR-only automatic-plan repair is necessary but not sufficient for
+    these cells: the legal program it would produce is a ``K == 0`` scalar
+    accumulation that no migrated family owns.
+    """
 
     name, cin, result_shape, bindings = cell
     options = CompileOptions.from_environment(
@@ -241,17 +233,48 @@ def test_auto_reorder_block_is_origin_specific(
 
 
 @pytest.mark.parametrize("arm", [False, True])
-@pytest.mark.parametrize("cell", REACHABLE, ids=[cell[0] for cell in REACHABLE])
-def test_reachable_cells_keep_their_exact_admission_code(cell, arm):
-    """A legal plan order, stopped by a LoopIR admission wall with an exact code.
+@pytest.mark.parametrize("cell", MIGRATED, ids=[cell[0] for cell in MIGRATED])
+def test_migrated_cells_compile_arm_invariantly(cell, arm):
+    """Every migrated cell lowers to a complete kernel in both arms."""
 
-    Each of these is a cell a migration slice can take.  If one starts
-    compiling, this lock must move to the neighbour that still occupies the
-    seam rather than be deleted.
+    name, cin, result_shape, bindings, prefix, key_rank = cell
+    kernel = compile_cin_via_loopir(
+        cin, result_shape, bindings, compile_options=auto_options(arm)
+    )
+    assert "wksp.sort();" in kernel.cpp_source, name
+    result_decl = next(
+        decl
+        for decl in kernel.lowering.program.tensors
+        if decl.symbol == kernel.lowering.result_symbol
+    )
+    assert len(result_decl.levels) == prefix + key_rank, name
+
+
+@pytest.mark.parametrize("cell", MIGRATED, ids=[cell[0] for cell in MIGRATED])
+def test_migrated_cells_are_arm_source_identical(cell):
+    name, cin, result_shape, bindings, _, _ = cell
+    sources = {
+        arm: compile_cin_via_loopir(
+            cin, result_shape, bindings, compile_options=auto_options(arm)
+        ).cpp_source
+        for arm in (False, True)
+    }
+    assert sources[False] == sources[True], name
+
+
+@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize(
+    "cell", AUTO_TILE_BLOCKED, ids=[cell[0] for cell in AUTO_TILE_BLOCKED]
+)
+def test_auto_tile_blocked_cells_keep_their_schedule_code(cell, arm):
+    """A workspace plan that also carries a tile has no replay contract.
+
+    If a workspace+tile composition is ever implemented, this lock moves to
+    whatever still occupies the seam rather than being deleted.
     """
 
     name, cin, result_shape, bindings, expected_code = cell
-    with pytest.raises((LoopIRLoweringError, SchedulePassError)) as error:
+    with pytest.raises(SchedulePassError) as error:
         compile_cin_via_loopir(
             cin, result_shape, bindings, compile_options=auto_options(arm)
         )
@@ -262,6 +285,23 @@ def test_census_covers_the_declared_representative_matrix():
     """Pin the finite review matrix without claiming layout exhaustiveness."""
 
     assert len(REORDER_BLOCKED) == 5
-    assert len(REACHABLE) == 11
-    names = [cell[0] for cell in REORDER_BLOCKED] + [cell[0] for cell in REACHABLE]
+    assert len(MIGRATED) == 9
+    assert len(AUTO_TILE_BLOCKED) == 2
+    names = (
+        [cell[0] for cell in REORDER_BLOCKED]
+        + [cell[0] for cell in MIGRATED]
+        + [cell[0] for cell in AUTO_TILE_BLOCKED]
+    )
     assert len(names) == len(set(names)) == 16
+    # All six canonical TTM layouts named by the inherited review are present.
+    ttm = [name for name in names if name.startswith("TTM ")]
+    assert len(ttm) == 6
+    assert len({name.split("->")[1].strip() for name in ttm}) == 3
+
+
+def test_migrated_cells_span_every_key_rank_and_anchor():
+    """The migration is general over the split, not over a layout list."""
+
+    splits = {(cell[4], cell[5]) for cell in MIGRATED}
+    assert {prefix for prefix, _ in splits} == {0, 1, 2}
+    assert {key_rank for _, key_rank in splits} == {1, 2}
