@@ -6297,52 +6297,98 @@ class _TargetLowering:
         return function
 
 
-def _sparse_workspace_chain(program: LoopProgram) -> bool:
-    """Whether the program is the serial sparse-workspace family chain.
+def _single_statement(block: object) -> Optional[Stmt]:
+    """The one statement of an exact single-statement block, if any."""
 
-    Routing is purely structural over the verified typed tree: one outer
-    single-cursor sparse loop whose whole body is one
-    :class:`SparseWorkspaceRegion`.  Everything else — including any other
-    placement of a sparse workspace region — stays on the general target
-    lowering and keeps its existing fail-closed boundary.
+    if type(block) is not Block or len(cast(Block, block).statements) != 1:
+        return None
+    return cast(Block, block).statements[0]
+
+
+def _rank_one_key_region(outer: object) -> Optional[SparseWorkspaceRegion]:
+    """One rank-1-key workspace region directly under ``outer``, if any."""
+
+    inner = _single_statement(getattr(outer, "body", None))
+    if type(inner) is not SparseWorkspaceRegion:
+        return None
+    region = cast(SparseWorkspaceRegion, inner)
+    decl = region.workspace
+    if type(decl) is not SparseWorkspaceDecl or len(decl.key_dimensions) != 1:
+        return None
+    return region
+
+
+def _sparse_workspace_chain(program: LoopProgram) -> bool:
+    """Whether the program is the serial B1/row-scope sparse-workspace chain.
+
+    Routing is purely structural over the verified typed tree, and it names
+    the family's own identity rather than merely "a region somewhere": one
+    outer single-cursor sparse loop, one rank-1 ordered key, and a producer
+    opening with the two-cursor merge this family reduces over.  A rank-K
+    key, a different producer opening, or any other placement belongs to the
+    rank-general ordered-key target instead of being rejected here.
     """
 
-    body = program.body
-    if type(body) is not Block or len(body.statements) != 1:
-        return False
-    outer = body.statements[0]
+    outer = _single_statement(program.body)
     if type(outer) is not SparseFor:
         return False
-    inner = outer.body
-    return (
-        type(inner) is Block
-        and len(inner.statements) == 1
-        and type(inner.statements[0]) is SparseWorkspaceRegion
-    )
+    region = _rank_one_key_region(outer)
+    if region is None:
+        return False
+    return type(_single_statement(region.producer)) is MergedSparseFor
 
 
 def _parallel_sparse_workspace_chain(program: LoopProgram) -> bool:
     """Whether the program is the dense-row parallel sparse-workspace chain.
 
-    Routing is purely structural over the verified typed tree: one outer
-    dense row loop whose whole body is one :class:`SparseWorkspaceRegion`.
-    Everything else — including any other placement of a sparse workspace
-    region — stays on the general target lowering and keeps its existing
-    fail-closed boundary.
+    Structural identity again: one outer dense row loop, one rank-1 ordered
+    key, and a producer whose two nested single-cursor sparse loops descend
+    two DIFFERENT operands' dense row/reduction positions — the CSR x CSR
+    shape this family owns.  Anything else routes to the rank-general
+    ordered-key target.
     """
 
-    body = program.body
-    if type(body) is not Block or len(body.statements) != 1:
-        return False
-    outer = body.statements[0]
+    outer = _single_statement(program.body)
     if type(outer) is not DenseFor:
         return False
-    inner = outer.body
+    region = _rank_one_key_region(outer)
+    if region is None:
+        return False
+    reduction = _single_statement(region.producer)
+    if type(reduction) is not SparseFor:
+        return False
+    child = _single_statement(cast(SparseFor, reduction).body)
+    if type(child) is not SparseFor:
+        return False
+    reduction_cursor = cast(SparseFor, reduction).cursor
+    child_cursor = cast(SparseFor, child).cursor
     return (
-        type(inner) is Block
-        and len(inner.statements) == 1
-        and type(inner.statements[0]) is SparseWorkspaceRegion
+        reduction_cursor.tensor != child_cursor.tensor
+        and type(reduction_cursor.parent) is DensePosition
+        and type(child_cursor.parent) is DensePosition
     )
+
+
+def _ordered_key_sparse_workspace_chain(program: LoopProgram) -> bool:
+    """Whether the program is a rank-general ordered-key workspace chain.
+
+    A possibly-empty prefix of dense or single-cursor sparse loops whose
+    innermost body is one :class:`SparseWorkspaceRegion`.  ``p == 0`` — the
+    region owning the program root — is admitted here precisely because that
+    is the shape a whole-tensor rank-K reduction takes.
+    """
+
+    body: object = program.body
+    while True:
+        only = _single_statement(body)
+        if only is None:
+            return False
+        if type(only) is SparseWorkspaceRegion:
+            return True
+        if type(only) in (DenseFor, SparseFor):
+            body = only.body
+            continue
+        return False
 
 
 def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
@@ -7916,6 +7962,1113 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
                 "canonical producer/drain row",
             )
         return function
+
+
+def _ordered_key_workspace_nodes(
+    function: object, workspace_name: str
+) -> Tuple[List[object], List[object]]:
+    """Locate one assembled function's workspace init and ordered drain.
+
+    Located by the workspace's own declared identifier, which the target
+    reserved, rather than by position: a pass that moved, duplicated or
+    dropped either node is then visible as a count change instead of being
+    matched against whatever now sits at the old index.
+    """
+
+    class _Collector(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="locate_ordered_key_workspace",
+                )
+            )
+            self.inits: List[object] = []
+            self.drains: List[object] = []
+
+        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if type(node) is llir.VarInit:
+                variable = cast(llir.VarInit, node).var
+                if type(variable) is llir.Var and variable.name == workspace_name:
+                    self.inits.append(node)
+                return
+            if type(node) is llir.ForLoopAuto:
+                array = cast(llir.ForLoopAuto, node).array
+                if type(array) is llir.Var and array.name == workspace_name:
+                    self.drains.append(node)
+
+    collector = _Collector()
+    collector.walk(cast(Any, function))
+    return collector.inits, collector.drains
+
+
+class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
+    """Rank-general target lowering for the ordered-key sparse workspace.
+
+    This is the structural generalization of the two K = 1 workspace
+    targets: the same region semantics over a key domain of ANY rank, over
+    ANY producer nest the general loop machinery can already emit, and over
+    a result of any rank whose levels split into a bound prefix and a
+    drained compressed suffix.  Nothing here is layout- or name-driven:
+    admission reads level kinds, declared dimensions, loop node types and
+    bound coordinate identities, and the emitted runtime type is chosen by
+    the key rank alone.
+
+    The admitted shape, stated once:
+
+    - ``p >= 0`` prefix loops, outermost first, each binding result level
+      ``l`` -- a :class:`DenseFor` for a dense level, a single-cursor
+      :class:`SparseFor` for a compressed one.  ``p == 0`` means the region
+      owns the program root, which is what a whole-tensor rank-K reduction
+      needs;
+    - one :class:`SparseWorkspaceRegion` whose producer is any nest of
+      dense, single-cursor sparse, or two-cursor merged loops descending to
+      exactly one merging ADD :class:`SparseWorkspaceInsert` whose ``K``
+      coordinates are the ``K`` innermost producer loops' coordinates, in
+      key order;
+    - a consumer that is the one ordered drain binding ``K`` indices and
+      appending the drained value at the prefix coordinates followed by the
+      drained key.
+
+    Assembly keeps coordinates strictly distinct from positions.  Each key
+    level above the innermost appends a coordinate only when the drained key
+    opens a new segment there, and every compressed level's position array
+    is written at its own parent's coordinate count -- the parent link -- so
+    a rank-3 key assembles three genuinely nested levels rather than three
+    zipped coordinate lists.  The drain visits entries in strictly
+    increasing lexicographic key order (the region's own contract), which is
+    exactly the order those appends require, so no sort appears in the
+    assembly.
+
+    ``coo_workspace<T, K>`` is already rank-general; it receives the KEY
+    domain's extents, never the result shape, which is what makes its rank
+    invariant hold.  ``K == 1`` keeps the retained ``coo_workspace_1d``
+    spelling, so the migrated families' generated C++ is unchanged.
+    """
+
+    def __init__(
+        self,
+        program: LoopProgram,
+        input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+        result_shape: Tuple[int, ...],
+    ) -> None:
+        self.program = program
+        self._input_symbols, seal_token = self._snapshot_program_inputs(program)
+        self.decls = {decl.symbol: decl for decl in program.tensors}
+        if len(program.outputs) != 1:
+            _fail(
+                "unsupported_program_shape",
+                "this target lowering supports exactly one output tensor",
+            )
+        self.result_symbol = program.outputs[0]
+        self.result_decl = self.decls[self.result_symbol]
+        self.result_is_dense = False
+        self.sparse_program = True
+        self.dimension_names = {}
+        self._access_ids = {}
+        self.region = None
+        self.panel = None
+        self.relayout = None
+        self.result_tile = None
+        self.result_tile_depth = -1
+        self._tiled_leaf = None
+        self._tiled_view = None
+        self.relayout_depth = -1
+        self._dense_prefix = 0
+        if program.parallel is not None:
+            _fail(
+                "unsupported_program_shape",
+                "the ordered-key sparse-workspace family owns no parallel " "selection",
+            )
+        self.parallel = None
+        self._validate_display_names()
+        self._validate_result_layout()
+        self.shapes = self._validate_shapes(input_shapes, result_shape)
+        self.loops = self._collect_ordered_key_chain()
+        self._validate_loop_variable_names()
+        self.loop_positions = {
+            loop.index: position for position, loop in enumerate(self.loops)
+        }
+        self.cursor_loops = {}
+        for position, loop in enumerate(self.loops):
+            for cursor in loop.cursors:
+                self.cursor_loops[cursor.cursor] = position
+        self._bound_position_snapshot = MappingProxyType(
+            self._validated_bound_position_bindings()
+        )
+        self._position_load_signatures = {}
+        self.loads, self.cursor_values = self._collect_accesses()
+        self._value_expression_snapshot = self._validated_value_expression_signature(
+            self._access_value_expression()
+        )
+        self._target_owner_snapshot = self._validated_target_owner_signature()
+        self.level_drivers = self._compute_level_drivers()
+        self._validate_access_orders()
+        self._reserve_merge_names()
+        self._reserve_family_names()
+        self._seal_target_state(seal_token)
+
+    # -- admission ------------------------------------------------------------
+
+    def _validate_result_layout(self) -> None:
+        levels = self.result_decl.levels
+        if tuple(level.mode for level in levels) != tuple(range(len(levels))):
+            _fail(
+                "unsupported_program_shape",
+                "the ordered-key sparse-workspace target requires an "
+                "identity-ordered result",
+            )
+        dense_prefix = 0
+        while (
+            dense_prefix < len(levels) and levels[dense_prefix].kind is LevelKind.DENSE
+        ):
+            dense_prefix += 1
+        if any(
+            level.kind is not LevelKind.COMPRESSED for level in levels[dense_prefix:]
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "the ordered-key sparse-workspace target requires a dense "
+                "prefix followed by compressed levels",
+            )
+        self._dense_prefix = dense_prefix
+
+    def _collect_ordered_key_chain(self) -> List[_Loop]:
+        """Validate the whole admitted shape and return the lexical loop nest.
+
+        The returned nest is the prefix loops followed by the producer loops,
+        which is exactly the chain the shared loop machinery emits; the drain
+        is not a loop node and is emitted by this target directly.
+        """
+
+        def require(condition: bool, what: str) -> None:
+            if not condition:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the ordered-key sparse-workspace target requires {what}",
+                )
+
+        result_levels = self.result_decl.levels
+        loops: List[_Loop] = []
+        prefix_indices: List[IndexId] = []
+        body: Stmt = self.program.body
+        region: Optional[SparseWorkspaceRegion] = None
+        while region is None:
+            require(
+                type(body) is Block and len(cast(Block, body).statements) == 1,
+                "a single-statement prefix chain",
+            )
+            only = cast(Block, body).statements[0]
+            if type(only) is SparseWorkspaceRegion:
+                region = cast(SparseWorkspaceRegion, only)
+                break
+            level = len(loops)
+            require(
+                level < len(result_levels),
+                "no more prefix loops than result levels",
+            )
+            if type(only) is DenseFor:
+                dense_for = cast(DenseFor, only)
+                require(
+                    result_levels[level].kind is LevelKind.DENSE,
+                    "a dense prefix loop only above a dense result level",
+                )
+                loops.append(
+                    _Loop(_DENSE, dense_for.index, dense_for.dimension, dense_for, ())
+                )
+                prefix_indices.append(dense_for.index)
+                body = dense_for.body
+                continue
+            if type(only) is SparseFor:
+                sparse_for = cast(SparseFor, only)
+                require(
+                    result_levels[level].kind is LevelKind.COMPRESSED,
+                    "a stored prefix loop only above a compressed result level",
+                )
+                cursor = sparse_for.cursor
+                loops.append(
+                    _Loop(
+                        _SPARSE,
+                        sparse_for.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        sparse_for,
+                        (cursor,),
+                    )
+                )
+                prefix_indices.append(sparse_for.coord_index)
+                body = sparse_for.body
+                continue
+            require(False, "a dense or single-cursor sparse prefix loop")
+        assert region is not None
+        workspace_decl = region.workspace
+        require(
+            type(workspace_decl) is SparseWorkspaceDecl,
+            "an exact sparse workspace declaration",
+        )
+        key_rank = len(workspace_decl.key_dimensions)
+        prefix = len(loops)
+        require(
+            prefix + key_rank == len(result_levels),
+            "one prefix loop per bound result level and one key dimension "
+            "per drained result level",
+        )
+        require(
+            all(level.kind is LevelKind.COMPRESSED for level in result_levels[prefix:]),
+            "every drained result level to be compressed",
+        )
+        require(
+            workspace_decl.dtype is self.result_decl.dtype
+            and self.result_decl.dtype in _SCALAR_TO_TORCH,
+            "one shared supported scalar type for the workspace and result",
+        )
+
+        # -- producer -------------------------------------------------------
+        producer_body: Stmt = region.producer
+        insert: Optional[SparseWorkspaceInsert] = None
+        while insert is None:
+            require(
+                type(producer_body) is Block
+                and len(cast(Block, producer_body).statements) == 1,
+                "a single-statement producer nest",
+            )
+            only = cast(Block, producer_body).statements[0]
+            if type(only) is SparseWorkspaceInsert:
+                insert = cast(SparseWorkspaceInsert, only)
+                break
+            if type(only) is DenseFor:
+                dense_for = cast(DenseFor, only)
+                loops.append(
+                    _Loop(_DENSE, dense_for.index, dense_for.dimension, dense_for, ())
+                )
+                producer_body = dense_for.body
+                continue
+            if type(only) is SparseFor:
+                sparse_for = cast(SparseFor, only)
+                cursor = sparse_for.cursor
+                loops.append(
+                    _Loop(
+                        _SPARSE,
+                        sparse_for.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        sparse_for,
+                        (cursor,),
+                    )
+                )
+                producer_body = sparse_for.body
+                continue
+            if type(only) is MergedSparseFor:
+                merged = cast(MergedSparseFor, only)
+                require(
+                    merged.mode in (MergeMode.INTERSECTION, MergeMode.UNION)
+                    and len(merged.cursors) == 2
+                    and len(merged.positions) == 2
+                    and all(bound is not None for bound in merged.positions),
+                    "two-cursor merges binding both aligned positions",
+                )
+                first = merged.cursors[0]
+                loops.append(
+                    _Loop(
+                        _MERGED,
+                        merged.coord_index,
+                        self._level_dimension(first.tensor, first.level),
+                        merged,
+                        tuple(merged.cursors),
+                    )
+                )
+                producer_body = merged.body
+                continue
+            require(
+                False,
+                "a dense, single-cursor sparse, or two-cursor merged producer " "loop",
+            )
+        require(
+            len(loops) >= prefix + key_rank + 1,
+            "at least one reduction loop between the prefix and the key",
+        )
+        key_loops = loops[len(loops) - key_rank :]
+        require(
+            insert.workspace == workspace_decl.workspace
+            and insert.op is ReduceOp.ADD
+            and len(insert.coords) == key_rank
+            and all(type(coord) is IndexValue for coord in insert.coords)
+            and [cast(IndexValue, coord).index for coord in insert.coords]
+            == [loop.index for loop in key_loops],
+            "an ADD insertion at the innermost producer coordinates, in key " "order",
+        )
+        require(
+            tuple(loop.dimension for loop in key_loops)
+            == tuple(workspace_decl.key_dimensions),
+            "the declared key dimensions to be exactly the drained loops' "
+            "own dimensions",
+        )
+
+        # -- consumer -------------------------------------------------------
+        consumer = region.consumer
+        require(
+            type(consumer) is Block
+            and len(consumer.statements) == 1
+            and type(consumer.statements[0]) is SparseWorkspaceDrainFor,
+            "the one ordered drain as the whole consumer",
+        )
+        drain = cast(SparseWorkspaceDrainFor, consumer.statements[0])
+        require(
+            drain.workspace == workspace_decl.workspace
+            and len(drain.indices) == key_rank,
+            "a drain of the region's own workspace binding one index per key "
+            "dimension",
+        )
+        drain_body = drain.body
+        require(
+            type(drain_body) is Block
+            and len(drain_body.statements) == 1
+            and type(drain_body.statements[0]) is AppendEntry,
+            "the ordered append as the drain loop's whole body",
+        )
+        append = cast(AppendEntry, drain_body.statements[0])
+        require(
+            append.tensor == self.result_symbol
+            and len(append.coords) == len(result_levels)
+            and all(type(coord) is IndexValue for coord in append.coords)
+            and [cast(IndexValue, coord).index for coord in append.coords]
+            == [*prefix_indices, *drain.indices]
+            and type(append.value) is SparseWorkspaceValue
+            and cast(SparseWorkspaceValue, append.value).workspace
+            == workspace_decl.workspace,
+            "an append of the drained value at the prefix and drained " "coordinates",
+        )
+        require(
+            len({loop.dimension for loop in loops}) == len(loops),
+            "one distinct declared dimension per loop",
+        )
+
+        self.sparse_region = region
+        self.workspace_decl = workspace_decl
+        self.sparse_insert = insert
+        self.sparse_drain = drain
+        self.sparse_append = append
+        self.key_rank = key_rank
+        self.prefix_depth = prefix
+        self.leaf = insert
+        return loops
+
+    def _access_value_expression(self) -> Expr:
+        state = object.__getattribute__(self.sparse_insert, "__dict__")
+        if type(state) is not dict or "value" not in state:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion has malformed stored value state",
+            )
+        return cast(Expr, state["value"])
+
+    def _leaf_indices(self) -> Tuple[Expr, ...]:
+        """The loop coordinates that drive each result level.
+
+        A prefix level is driven by its own binding loop.  A drained level is
+        driven by the producer loop that GENERATED that key component -- the
+        drain's own bound index is a consumer-side name for the same
+        coordinate and is not a loop variable of the nest, so the shared
+        level-driver machinery is told the producer loop, which is the
+        coordinate's real source.  The emitted result access keeps the
+        drain's own indices (see ``_append_metadata``).
+        """
+
+        return (
+            *self.sparse_append.coords[: self.prefix_depth],
+            *self.sparse_insert.coords,
+        )
+
+    def _validated_target_owner_signature(self) -> Tuple[object, ...]:
+        """Seal both owning statements: the insertion and the ordered append.
+
+        The shared builder knows the leaf statement kinds of the streaming
+        families; this family's owners are a workspace insertion and an
+        append whose value is the drained entry, so their exact stored state
+        is validated here with the same discipline.
+        """
+
+        def owned_state(statement: object, expected: type, fields: Set[str]) -> dict:
+            if type(statement) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner is no longer the exact statement "
+                    "this family admitted",
+                )
+            state = object.__getattribute__(statement, "__dict__")
+            if (
+                type(state) is not dict
+                or any(type(key) is not str for key in state)
+                or set(state) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner contains malformed stored state",
+                )
+            return cast(dict, state)
+
+        def identity(value: object, expected: type, label: str) -> int:
+            primitive = _stored_identity_value(value, expected)
+            if primitive is None:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the target value owner has a malformed {label}",
+                )
+            return cast(int, primitive)
+
+        insert_state = owned_state(
+            self.sparse_insert,
+            SparseWorkspaceInsert,
+            {"node_id", "workspace", "coords", "op", "value"},
+        )
+        if insert_state["op"] is not ReduceOp.ADD:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion has a malformed reduction operator",
+            )
+        if type(insert_state["coords"]) is not tuple:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion coordinates must remain an owned tuple",
+            )
+        append_state = owned_state(
+            self.sparse_append,
+            AppendEntry,
+            {"node_id", "tensor", "coords", "value"},
+        )
+        if type(append_state["coords"]) is not tuple:
+            _fail(
+                "unsupported_program_shape",
+                "the ordered append coordinates must remain an owned tuple",
+            )
+        drained = append_state["value"]
+        if type(drained) is not SparseWorkspaceValue:
+            _fail(
+                "unsupported_program_shape",
+                "the ordered append must write the drained workspace entry",
+            )
+        return (
+            "ordered_key_workspace",
+            id(self.sparse_insert),
+            identity(insert_state["node_id"], LoopIRNodeId, "insertion node identity"),
+            identity(
+                insert_state["workspace"], WorkspaceId, "insertion workspace identity"
+            ),
+            tuple(
+                self._validated_value_expression_signature(coord)
+                for coord in insert_state["coords"]
+            ),
+            "add",
+            self._validated_value_expression_signature(insert_state["value"]),
+            id(self.sparse_append),
+            identity(append_state["node_id"], LoopIRNodeId, "append node identity"),
+            identity(append_state["tensor"], SymbolId, "append tensor identity"),
+            tuple(
+                self._validated_value_expression_signature(coord)
+                for coord in append_state["coords"]
+            ),
+            identity(
+                object.__getattribute__(drained, "__dict__").get("workspace"),
+                WorkspaceId,
+                "drained workspace identity",
+            ),
+        )
+
+    def _reserve_family_names(self) -> None:
+        workspace_name = self.workspace_decl.name
+        if not _safe_cpp_display_identifier(workspace_name):
+            _fail(
+                "invalid_display_name",
+                f"workspace name {workspace_name!r} is not a safe ASCII C++ "
+                "identifier",
+            )
+        owner = f"workspace {workspace_name!r}"
+        self._reserve_generated_name(
+            "coo_workspace_1d" if self.key_rank == 1 else "coo_workspace",
+            "the ordered-key sparse-workspace runtime type",
+        )
+        self._reserve_generated_name(workspace_name, owner)
+        self._reserve_generated_name(f"{workspace_name}_value", owner)
+        self._reserve_generated_name("it", "the workspace drain iterator")
+        if self.key_rank > 1:
+            self._reserve_generated_name(f"{workspace_name}_opened", owner)
+        for level in range(self.prefix_depth, len(self.result_decl.levels) - 1):
+            self._reserve_generated_name(
+                f"{self.workspace_decl.name}_base{level}",
+                owner,
+            )
+
+    # -- names ---------------------------------------------------------------
+
+    def _drain_coordinate_name(self, component: int) -> str:
+        """The emitted name of one drained key component.
+
+        It is the key dimension's own display name -- the same name the
+        producer loop that inserted that component uses -- so the drain and
+        the producer cannot disagree about which coordinate they mean.
+        """
+
+        return self.dimension_names[self.workspace_decl.key_dimensions[component]]
+
+    # -- emission ------------------------------------------------------------
+
+    def _workspace_init_statement(self) -> llir.VarInit:
+        workspace = self.workspace_decl
+        torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
+        element_type = dtype_to_c_datatype(torch_dtype)
+        if self.key_rank == 1:
+            return llir.VarInit(
+                var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+                value=llir.FunctionCall(
+                    name=f"coo_workspace_1d<{element_type.value}, 1>",
+                    args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
+                ),
+            )
+        # The rank-K container's shape vector is the KEY domain's extents,
+        # never the result shape: it bounds, dedups and flattens key
+        # coordinates, so conflating it with the result rank is exactly what
+        # made every insertion of a rank-K key throw.
+        return llir.VarInit(
+            var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+            value=llir.FunctionCall(
+                name=f"coo_workspace<{element_type.value}, {self.key_rank}>",
+                args=[
+                    llir.Literal(value=1024, data_type=llir.DataType.INT),
+                    llir.Array(
+                        values=[
+                            self._key_extent_expression(component)
+                            for component in range(self.key_rank)
+                        ],
+                        data_type=llir.DataType.INT64,
+                    ),
+                ],
+            ),
+        )
+
+    def _key_extent_expression(self, component: int) -> llir.Expr:
+        """The declared extent of one key dimension.
+
+        Every key component drains into its own result level, so the result
+        shape entry for that level IS the key domain's extent -- read from
+        the runtime result shape, not from any layout assumption.
+        """
+
+        return llir.ArrayAccess(
+            array=llir.Var(
+                name="result_shape",
+                type=llir.DataType.STD_VECTOR_INT,
+            ),
+            index=llir.Literal(
+                value=self.prefix_depth + component,
+                data_type=llir.DataType.INT,
+            ),
+        )
+
+    def _innermost_merge_index(self) -> object:
+        innermost = None
+        for loop in self.loops:
+            if loop.kind is _MERGED:
+                innermost = loop.index
+        return innermost
+
+    def _insert_value(
+        self, aligned: Optional[Set[CursorId]] = None
+    ) -> Optional[llir.Expr]:
+        """The insertion's value expression at its own alignment state.
+
+        Only fully-aligned merge cases descend, so every enclosing merge's
+        cursors are aligned where the insertion runs, as is every
+        single-cursor loop's own cursor.  When the innermost producer loop is
+        itself a merge, ``aligned`` carries that one loop's case instead, and
+        an absent operand folds to its declared additive identity.
+        """
+
+        expression = self._access_value_expression()
+        if not any(loop.kind is _MERGED for loop in self.loops):
+            return self._lower_value(expression)
+        innermost = self._innermost_merge_index()
+        resolved: Set[CursorId] = set()
+        for loop in self.loops:
+            if aligned is not None and loop.index == innermost:
+                resolved |= set(aligned)
+                continue
+            resolved |= {cursor.cursor for cursor in loop.cursors}
+        return self._merged_case_value(expression, resolved)
+
+    def _insert_statement(self, value: Optional[llir.Expr] = None) -> llir.Stmt:
+        if value is None:
+            lowered = self._insert_value()
+            if lowered is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the workspace insertion value folded away outside a "
+                    "merged alignment case",
+                )
+            value = cast(llir.Expr, lowered)
+        return llir.FunctionCallStmt(
+            name=f"{self.workspace_decl.name}.insert",
+            args=[
+                llir.Array(
+                    values=[
+                        llir.Var(
+                            name=self._loop_var_name(loop),
+                            type=llir.DataType.INT64,
+                        )
+                        for loop in self.loops[len(self.loops) - self.key_rank :]
+                    ],
+                    data_type=llir.DataType.INT64,
+                ),
+                value,
+            ],
+        )
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        return [self._insert_statement()]
+
+    def _merged_case_stmts(
+        self, loop: _Loop, aligned: Set[CursorId]
+    ) -> Optional[List[llir.Stmt]]:
+        """One alignment case of a merged producer loop.
+
+        A merge above the innermost producer loop descends into its child
+        loop; only the fully-aligned case can, because a one-sided branch
+        would have to iterate a child stream the absent operand does not
+        carry.  The innermost merge instead inserts, folding the case's own
+        absent-operand identity into the value exactly as the shared merged
+        value lowering does.
+        """
+
+        position = self.loop_positions[loop.index]
+        if position != len(self.loops) - 1:
+            if aligned != {cursor.cursor for cursor in loop.cursors}:
+                _fail(
+                    "unsupported_program_shape",
+                    "a one-sided merge case above the innermost producer "
+                    "loop would need a child stream the absent operand does "
+                    "not carry",
+                )
+            return self._loop_children(position)
+        value = self._insert_value(aligned)
+        if value is None:
+            return None
+        return [self._insert_statement(value)]
+
+    def _append_metadata(self) -> llir.TensorAccessMetadata:
+        return _detach_tensor_access_metadata(
+            llir.TensorAccessMetadata(
+                access_id=self._access_id(self.result_symbol),
+                tensor_id=self.result_symbol,
+                index_ids=tuple(
+                    cast(IndexValue, coord).index for coord in self.sparse_append.coords
+                ),
+                role=llir.TensorAccessRole.RESULT_WRITE,
+            ),
+        )
+
+    def _drain_entry_bindings(self, iterator_var: llir.Var) -> List[llir.Stmt]:
+        """Bind the drained key components and merged value."""
+
+        workspace_name = self.workspace_decl.name
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        stmts: List[llir.Stmt] = []
+        key_expr: llir.Expr = llir.MemberAccess(base=iterator_var, member="first")
+        for component in range(self.key_rank):
+            value: llir.Expr
+            if self.key_rank == 1:
+                value = key_expr
+            else:
+                value = llir.ArrayAccess(
+                    array=llir.MemberAccess(base=iterator_var, member="first"),
+                    index=llir.Literal(value=component, data_type=llir.DataType.INT),
+                )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=self._drain_coordinate_name(component),
+                        type=llir.DataType.INT64,
+                    ),
+                    value=value,
+                )
+            )
+        stmts.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{workspace_name}_value",
+                    type=dtype_to_c_datatype(torch_dtype),
+                ),
+                value=llir.MemberAccess(base=iterator_var, member="second"),
+            )
+        )
+        return stmts
+
+    def _drain_statements(self) -> List[llir.Stmt]:
+        workspace_name = self.workspace_decl.name
+        result_name = self.result_decl.name
+        levels = len(self.result_decl.levels)
+        leaf_level = levels - 1
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        opened_var = llir.Var(name=f"{workspace_name}_opened", type=llir.DataType.BOOL)
+
+        body: List[llir.Stmt] = self._drain_entry_bindings(iterator_var)
+        body.append(llir.BlankLine())
+
+        # Key levels above the leaf materialize one coordinate per NEW
+        # segment.  ``opened`` cascades: once an outer key component starts a
+        # new segment every inner one must too, even when its coordinate
+        # repeats the previous entry's.
+        intermediate = list(range(self.prefix_depth, leaf_level))
+        if intermediate:
+            body.append(llir.VarInit(var=opened_var, value=llir.Literal(False)))
+        for level in intermediate:
+            component = level - self.prefix_depth
+            coordinate = llir.Var(
+                name=self._drain_coordinate_name(component),
+                type=llir.DataType.INT64,
+            )
+            body.append(
+                llir.IfThenElse(
+                    cond=llir.BinOp(
+                        op="||",
+                        left=opened_var,
+                        right=llir.BinOp(
+                            op="||",
+                            left=llir.BinOp(
+                                op="==",
+                                left=llir.Var(
+                                    name=f"p{result_name}{level}",
+                                    type=llir.DataType.INT64,
+                                ),
+                                right=llir.Var(
+                                    name=f"{workspace_name}_base{level}",
+                                    type=llir.DataType.INT64,
+                                ),
+                            ),
+                            right=llir.BinOp(
+                                op="!=",
+                                left=llir.FunctionCall(
+                                    name=f"{result_name}{level}_crd.back", args=[]
+                                ),
+                                right=coordinate,
+                            ),
+                        ),
+                    ),
+                    then_body=[
+                        llir.Assign(var=opened_var, value=llir.Literal(True)),
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}{level}_crd.push_back",
+                            args=[coordinate],
+                        ),
+                        llir.Increment(
+                            var=llir.Var(
+                                name=f"p{result_name}{level}",
+                                type=llir.DataType.INT64,
+                            )
+                        ),
+                    ],
+                )
+            )
+        body.extend(
+            [
+                llir.FunctionCallStmt(
+                    name=f"{result_name}_values.emplace_back",
+                    args=[
+                        llir.Var(
+                            name=f"{workspace_name}_value",
+                            type=llir.DataType.NO_TYPE,
+                            tensor_access=self._append_metadata(),
+                        )
+                    ],
+                ),
+                llir.FunctionCallStmt(
+                    name=f"{result_name}{leaf_level}_crd.emplace_back",
+                    args=[
+                        llir.Var(
+                            name=self._drain_coordinate_name(self.key_rank - 1),
+                            type=llir.DataType.NO_TYPE,
+                        )
+                    ],
+                ),
+                llir.Increment(
+                    var=llir.Var(
+                        name=f"p{result_name}{leaf_level}",
+                        type=llir.DataType.INT64,
+                    )
+                ),
+            ]
+        )
+        # Parent-link every intermediate key level: the child's position
+        # array is written at the parent's own coordinate count, so a
+        # repeated child coordinate under a new parent stays a new segment.
+        for level in intermediate:
+            body.append(
+                llir.FunctionCallStmt(
+                    name="scorch_vector_set",
+                    args=[
+                        llir.Var(
+                            name=f"{result_name}{level + 1}_pos",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        llir.FunctionCall(
+                            name=f"{result_name}{level}_crd.size", args=[]
+                        ),
+                        llir.FunctionCall(
+                            name=f"{result_name}{level + 1}_crd.size", args=[]
+                        ),
+                    ],
+                )
+            )
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
+            llir.ForLoopAuto(
+                var=iterator_var,
+                array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+                body=body,
+            ),
+        ]
+
+    def _segment_base_statements(self) -> List[llir.Stmt]:
+        """Snapshot each intermediate key level's coordinate count on entry.
+
+        A region that runs once per prefix cell must not merge its first
+        drained segment into the previous cell's last one just because the
+        two coordinates happen to be equal, so "new segment" is measured
+        against this region's own starting count, never against emptiness.
+        """
+
+        result_name = self.result_decl.name
+        workspace_name = self.workspace_decl.name
+        return [
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{workspace_name}_base{level}",
+                    type=llir.DataType.INT64,
+                ),
+                value=llir.Var(
+                    name=f"p{result_name}{level}",
+                    type=llir.DataType.INT64,
+                ),
+            )
+            for level in range(self.prefix_depth, len(self.result_decl.levels) - 1)
+        ]
+
+    def _producer_statements(self) -> List[llir.Stmt]:
+        producer = self.loops[self.prefix_depth]
+        if producer.kind is _DENSE:
+            return [llir.BlankLine(), self._lower_dense(self.prefix_depth)]
+        if producer.kind is _SPARSE:
+            return self._lower_sparse(self.prefix_depth)
+        return self._lower_merged(self.prefix_depth)
+
+    def _region_statements(self) -> List[llir.Stmt]:
+        return [
+            llir.Comment("Initialize workspaces"),
+            self._workspace_init_statement(),
+            *self._segment_base_statements(),
+            *self._producer_statements(),
+            *self._drain_statements(),
+        ]
+
+    def _loop_children(self, position: int) -> List[llir.Stmt]:
+        if position + 1 > self.prefix_depth:
+            return _TargetLowering._loop_children(self, position)
+        if position + 1 == self.prefix_depth:
+            children: List[llir.Stmt] = list(self._region_statements())
+        else:
+            child = self.loops[position + 1]
+            children = (
+                [llir.BlankLine(), self._lower_dense(position + 1)]
+                if child.kind is _DENSE
+                else list(self._lower_sparse(position + 1))
+            )
+        closes = self._level_close_statements(position)
+        if not closes:
+            return children
+        return [
+            *children,
+            llir.BlankLine(),
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            *closes,
+        ]
+
+    def _level_close_statements(self, position: int) -> List[llir.Stmt]:
+        """Close result level ``position``'s child after that loop's body.
+
+        A compressed level materializes its coordinate exactly when its child
+        gained entries, and then closes the child's position array at its own
+        coordinate count.  A dense level owns no close here: ``_lower_dense``
+        already emits the flattened catch-up and close for the innermost
+        dense parent, which is the only dense loop that completes a cell.
+        """
+
+        if self.result_decl.levels[position].kind is not LevelKind.COMPRESSED:
+            return []
+        return self._parent_append_statements(position)
+
+    def _dense_loop_owns_result_assembly(self, position: int, loop: _Loop) -> bool:
+        """Only the innermost dense prefix loop closes the first compressed level."""
+
+        return (
+            loop.kind is _DENSE
+            and position == self._dense_prefix - 1
+            and self._dense_prefix < len(self.result_decl.levels)
+        )
+
+    def _dense_assembly_close_level(self, position: int) -> int:
+        return self._dense_prefix
+
+    def _parent_append_statements(self, level: int) -> List[llir.Stmt]:
+        result_name = self.result_decl.name
+        coord_name = self._loop_var_name(self.loops[level])
+        return [
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.FunctionCall(
+                        name=f"{result_name}{level + 1}_pos.back", args=[]
+                    ),
+                    right=llir.Var(
+                        name=f"p{result_name}{level + 1}",
+                        type=llir.DataType.INT64,
+                    ),
+                ),
+                then_body=[
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}{level}_crd.push_back",
+                        args=[llir.Var(name=coord_name, type=llir.DataType.INT64)],
+                    ),
+                    llir.Increment(
+                        var=llir.Var(
+                            name=f"p{result_name}{level}",
+                            type=llir.DataType.INT64,
+                        )
+                    ),
+                ],
+            ),
+            llir.FunctionCallStmt(
+                name="scorch_vector_set",
+                args=[
+                    llir.Var(
+                        name=f"{result_name}{level + 1}_pos",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    llir.FunctionCall(name=f"{result_name}{level}_crd.size", args=[]),
+                    llir.FunctionCall(
+                        name=f"{result_name}{level + 1}_crd.size", args=[]
+                    ),
+                ],
+            ),
+        ]
+
+    def _assembly_catch_up_bound(self, loop: _Loop) -> llir.Expr:
+        prefix = self._dense_prefix
+        if prefix <= 1:
+            return _TargetLowering._assembly_catch_up_bound(self, loop)
+        flattened: llir.Expr = llir.Var(
+            name=self._loop_var_name(self.loops[0]),
+            type=llir.DataType.INT,
+        )
+        for position in range(1, prefix):
+            inner = self.loops[position]
+            flattened = llir.Add(
+                left=llir.Mul(
+                    left=flattened,
+                    right=self._loop_bound_var(inner),
+                ),
+                right=llir.Var(
+                    name=self._loop_var_name(inner),
+                    type=llir.DataType.INT,
+                ),
+            )
+        return flattened
+
+    def _assembly_result_pos_set(self, level: Optional[int] = None) -> llir.Stmt:
+        result_name = self.result_decl.name
+        if level is None:
+            level = len(self.result_decl.levels) - 1
+        return llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(name=f"{result_name}{level}_pos", type=llir.DataType.NO_TYPE),
+                llir.Add(
+                    llir.Var(
+                        name=f"{result_name}{level}_pos_index",
+                        type=llir.DataType.INT64,
+                    ),
+                    llir.Literal(value=1, data_type=llir.DataType.INT32),
+                ),
+                llir.FunctionCall(name=f"{result_name}{level}_crd.size", args=[]),
+            ],
+        )
+
+    def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
+        """Require the region's own nodes to survive the managed passes intact.
+
+        This family deliberately emits its allocation, insertion and ordered
+        drain in their final checked form -- ``emplace_back``, ``push_back``
+        and ``scorch_vector_set`` -- so no shared rewrite is required to make
+        the assembly safe.  That independence is worth proving rather than
+        assuming: an omitted, duplicated or partially rewritten drain would
+        otherwise silently change which entries reach the result.
+        """
+
+        try:
+            expected_init = self._workspace_init_statement()
+            drain_statements = self._drain_statements()
+            expected_drain = drain_statements[-1]
+        except (
+            LLIRTraversalError,
+            AttributeError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        try:
+            inits, drains = _ordered_key_workspace_nodes(
+                function, self.workspace_decl.name
+            )
+        except LoopIRTargetError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            _fail(_SPARSE_WORKSPACE_LOST, str(error))
+        if len(inits) != 1 or len(drains) != 1:
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the assembled function must retain exactly one workspace "
+                "allocation and one ordered drain",
+            )
+        if not _exact_sparse_completion_matches(
+            inits[0], expected_init
+        ) or not _exact_sparse_completion_matches(drains[0], expected_drain):
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "the assembled workspace allocation or ordered drain no "
+                "longer matches the ordered-key target's own emission",
+            )
+        return function
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        _TargetLowering._require_value_expression_unchanged(self)
+        _TargetLowering._require_program_graph_unchanged(self)
+        if self.prefix_depth == 0:
+            statements = list(self._region_statements())
+        else:
+            first = self.loops[0]
+            statements = (
+                [llir.BlankLine(), self._lower_dense(0)]
+                if first.kind is _DENSE
+                else list(self._lower_sparse(0))
+            )
+        if self.result_decl.levels[0].kind is LevelKind.COMPRESSED:
+            # One root segment: close level 0 once, after the whole nest.  A
+            # dense first level instead had every flattened cell closed by
+            # its own innermost dense parent, so it needs nothing here.
+            statements.append(llir.BlankLine())
+            statements.append(llir.Comment("Assembly compressed _level indices"))
+            statements.append(self._assembly_result_pos_set(0))
+        return statements
 
 
 class _ParallelSparseWorkspaceLowering(_TargetLowering):
@@ -12396,6 +13549,10 @@ def _lower_loopir_to_llir_owned(
             )
     elif _parallel_sparse_workspace_chain(program):
         lowering = _ParallelSparseWorkspaceLowering(
+            program, owned_input_shapes, result_shape
+        )
+    elif _ordered_key_sparse_workspace_chain(program):
+        lowering = _OrderedKeySparseWorkspaceLowering(
             program, owned_input_shapes, result_shape
         )
     elif _dense_domain_mixed_chain(program):

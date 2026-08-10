@@ -151,7 +151,6 @@ from .nodes import (
     LoopIRNode,
     LoopProgram,
     MergedSparseFor,
-    MergeMode,
     PanelOuterFor,
     ParallelDiscipline,
     ParallelIntent,
@@ -991,19 +990,41 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
     return _rebuild_program(program, builder, new_chain, region)
 
 
+def _cursor_dimension(program: LoopProgram, cursor: SparseCursorDecl) -> DimensionId:
+    """The declared dimension one sparse cursor's stored level iterates."""
+
+    decl = next(tensor for tensor in program.tensors if tensor.symbol == cursor.tensor)
+    return decl.dimensions[decl.levels[cursor.level].mode]
+
+
 def _loop_bound_dimension(program: LoopProgram, node: _LoopNode) -> DimensionId:
-    """The declared dimension one chain loop's coordinate iterates."""
+    """The declared dimension one chain loop's coordinate iterates.
+
+    Every loop form that can bind a workspace key coordinate answers this:
+    a dense loop names its dimension directly, a single-cursor sparse loop
+    takes its stored level's dimension, and a merge takes the shared
+    dimension its aligned cursors iterate -- verified to be shared rather
+    than assumed, because a merge whose cursors disagreed would give the
+    key domain two different extents.
+    """
 
     if type(node) is DenseFor:
         return node.dimension
     if type(node) is SparseFor:
-        decl = next(
-            tensor for tensor in program.tensors if tensor.symbol == node.cursor.tensor
-        )
-        return decl.dimensions[decl.levels[node.cursor.level].mode]
+        return _cursor_dimension(program, node.cursor)
+    if type(node) is MergedSparseFor:
+        dimensions = {_cursor_dimension(program, cursor) for cursor in node.cursors}
+        if len(dimensions) != 1:
+            _fail(
+                "sparse_workspace_target_invalid",
+                "a merged loop binding a workspace key must align cursors "
+                "over one shared declared dimension",
+            )
+        return next(iter(dimensions))
     _fail(
         "sparse_workspace_target_invalid",
-        "the drained axis must be a plain dense or single-cursor sparse loop",
+        "the drained axis must be a dense, single-cursor sparse, or merged "
+        "sparse loop",
     )
     raise AssertionError("unreachable")
 
@@ -1013,15 +1034,32 @@ def apply_sparse_workspace(
 ) -> LoopProgram:
     """Materialize the automatic serial sparse workspace as a typed region.
 
-    Consumes one ``WorkspaceInsertion`` fact with ``dense=False`` on the
-    semantic doubly-compressed reduction chain: the subtree from the
-    recorded reduction loop down becomes the region's producer with the
-    reduction leaf rewritten into a merging ADD insertion at the drained
-    axis coordinate, and the consumer is the ordered drain appending each
-    merged entry to the sparse result.  The producer's value expression and
-    the consumer's destination are both taken structurally from the one
-    source reduction leaf, so erasure can reconstruct that source exactly -
-    the structural source-to-workspace provenance receipt.
+    Consumes one ``WorkspaceInsertion`` fact with ``dense=False`` on a
+    semantic sparse ADD-reduction chain and materializes the ordered-key
+    region the fact describes.  Placement is derived from two identities and
+    nothing else:
+
+    - the **key** is exactly the recorded ``axis_loops``, which the automatic
+      origin defines as every free variable below the innermost reduction,
+      and which must therefore be the trailing run of both the loop chain and
+      the result's own coordinate list;
+    - the **anchor** is exactly the first loop below the result's bound
+      prefix, i.e. the OUTERMOST reduction, so one region accumulates every
+      contraction outer to the key.
+
+    Everything from the anchor down becomes the producer, with the reduction
+    leaf rewritten into a merging ADD insertion at the key coordinates; the
+    consumer is the one ordered drain appending each merged entry at the
+    prefix coordinates followed by the drained key.  ``prefix == 0`` is legal
+    and means the region owns the program root -- the shape a whole-tensor
+    rank-K reduction needs.  ``len(key) == 1`` is the K == 1 instance of this
+    same construction, not a separate family, so the migrated B1,
+    dense-row CSR, and row-scope families build byte-identically.
+
+    The producer's value expression and the consumer's destination are both
+    taken structurally from the one source reduction leaf, so erasure can
+    reconstruct that source exactly - the structural source-to-workspace
+    provenance receipt.
     """
 
     verify_program(program)
@@ -1031,20 +1069,25 @@ def apply_sparse_workspace(
         _validate_loop_plan_structure(LoopPlan(loop_order=(), workspace=workspace))
     except (VerificationError, AttributeError, TypeError, ValueError) as error:
         _fail("invalid_schedule_plan", str(error))
-    if workspace.dense or len(workspace.axis_loops) != 1:
+    if workspace.dense or not workspace.axis_loops:
         _fail(
             "sparse_workspace_target_invalid",
             "the serial sparse workspace consumes exactly one sparse "
-            "single-axis workspace fact",
+            "workspace fact over a non-empty ordered key",
         )
-    if (
-        workspace.reduction_loop.part is not LoopPart.LOGICAL
-        or workspace.axis_loops[0].part is not LoopPart.LOGICAL
+    if workspace.reduction_loop.part is not LoopPart.LOGICAL or any(
+        axis.part is not LoopPart.LOGICAL for axis in workspace.axis_loops
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the sparse workspace reduction and drain axis must name "
+            "the sparse workspace reduction and drain axes must name "
             "unsplit logical loops",
+        )
+    key_indices = [axis.index_id for axis in workspace.axis_loops]
+    if len(set(key_indices)) != len(key_indices):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the ordered workspace key must name distinct loops",
         )
     loops, leaf = _decompose_chain(program)
     if type(leaf) is not StoreReduce or leaf.op is not ReduceOp.ADD:
@@ -1054,31 +1097,29 @@ def apply_sparse_workspace(
         )
     result_symbol = leaf.tensor
     result_decl = next(decl for decl in program.tensors if decl.symbol == result_symbol)
-    result_kinds = tuple(level.kind for level in result_decl.levels)
-    if (
-        len(result_decl.levels) != 2
-        or result_kinds
-        not in (
-            (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
-            (LevelKind.DENSE, LevelKind.COMPRESSED),
-        )
-        or tuple(level.mode for level in result_decl.levels) != (0, 1)
+    if tuple(level.mode for level in result_decl.levels) != tuple(
+        range(len(result_decl.levels))
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the sparse workspace requires an identity-ordered rank-2 "
-            "doubly-compressed or dense-row CSR result",
+            "the sparse workspace requires an identity-ordered result",
         )
-    doubly_compressed_result = result_kinds == (
-        LevelKind.COMPRESSED,
-        LevelKind.COMPRESSED,
-    )
+    if not any(level.kind is LevelKind.COMPRESSED for level in result_decl.levels):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the sparse workspace assembles a result with at least one "
+            "compressed level",
+        )
     reduction_index = workspace.reduction_loop.index_id
-    axis_index = workspace.axis_loops[0].index_id
     if type(leaf.indices) is not tuple or not leaf.indices:
         _fail(
             "sparse_workspace_target_invalid",
             "the reduction leaf must address the result by coordinates",
+        )
+    if len(leaf.indices) != len(result_decl.levels):
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the reduction leaf must address one coordinate per result level",
         )
     result_indices: List[IndexId] = []
     for coord in leaf.indices:
@@ -1088,139 +1129,114 @@ def apply_sparse_workspace(
                 "result coordinates must be plain bound coordinates",
             )
         result_indices.append(coord.index)
-    if axis_index != result_indices[-1] or reduction_index in result_indices:
+    key_rank = len(key_indices)
+    prefix = len(result_indices) - key_rank
+    if prefix < 0 or result_indices[prefix:] != key_indices:
         _fail(
             "sparse_workspace_target_invalid",
-            "the workspace fact must name the final reduction loop and the "
-            "trailing free result axis",
+            "the workspace key must be the trailing run of the result's own "
+            "coordinates, in result level order",
         )
-    result_index_set = set(result_indices)
-    reduction_loops = [
-        node for node in loops if _loop_key(node)[0] not in result_index_set
-    ]
-    if len(reduction_loops) != 1 or _loop_key(reduction_loops[-1]) != (
-        reduction_index,
-        LoopPart.LOGICAL,
+    if reduction_index in result_indices:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the recorded reduction loop must not bind a result coordinate",
+        )
+    # Every result coordinate is bound exactly once, in result level order,
+    # and the key occupies the trailing loops of the chain: those two facts
+    # place the region without consulting any layout spelling.
+    binder_positions: List[int] = []
+    for index_id in result_indices:
+        positions = [
+            position
+            for position, node in enumerate(loops)
+            if _loop_key(node) == (index_id, LoopPart.LOGICAL)
+        ]
+        if len(positions) != 1:
+            _fail(
+                "sparse_workspace_target_invalid",
+                "each result coordinate must be bound by exactly one "
+                "unsplit logical loop on the chain",
+            )
+        binder_positions.append(positions[0])
+    if any(
+        earlier >= later
+        for earlier, later in zip(binder_positions, binder_positions[1:])
     ):
         _fail(
             "sparse_workspace_target_invalid",
-            "the sparse workspace requires exactly one reduction loop: the "
-            "recorded logical reduction",
+            "result coordinates must be bound in result level order",
         )
-    row_scope_result = False
-    if not doubly_compressed_result and result_indices:
-        row_binders = [
-            node for node in loops if _loop_key(node)[0] == result_indices[0]
-        ]
-        row_scope_result = bool(row_binders) and type(row_binders[0]) is SparseFor
-    if doubly_compressed_result or row_scope_result:
-        # The B1 doubly-compressed family and the row-scope CSR family
-        # reduce over the recorded two-cursor INTERSECTION merge.
-        if (
-            type(reduction_loops[-1]) is not MergedSparseFor
-            or reduction_loops[-1].mode is not MergeMode.INTERSECTION
-        ):
-            _fail(
-                "sparse_workspace_target_invalid",
-                "the serial sparse workspace requires exactly one "
-                "reduction loop: the recorded logical INTERSECTION merge",
-            )
-    elif type(reduction_loops[-1]) is not SparseFor:
-        # The dense-row CSR family (Phase 7) reduces over one plain
-        # single-cursor stored level; merged reductions stay with the
-        # doubly-compressed and row-scope forms.
+    if binder_positions[:prefix] != list(range(prefix)):
         _fail(
             "sparse_workspace_target_invalid",
-            "the dense-row CSR sparse workspace requires exactly one "
-            "single-cursor sparse reduction loop",
+            "result prefix coordinates must be bound by the outermost loops, "
+            "above the workspace region",
         )
-    reduction_positions = [
-        position
-        for position, node in enumerate(loops)
-        if _loop_key(node) == (reduction_index, LoopPart.LOGICAL)
-    ]
-    if len(reduction_positions) != 1:
+    if binder_positions[prefix:] != list(range(len(loops) - key_rank, len(loops))):
         _fail(
             "sparse_workspace_target_invalid",
-            "the recorded reduction loop must appear exactly once on the "
-            "unsplit chain",
+            "the drained key coordinates must be bound by the innermost "
+            "loops of the chain",
         )
-    reduction_position = reduction_positions[0]
-    axis_nodes = [
-        node
-        for node in loops[reduction_position:]
-        if _loop_key(node) == (axis_index, LoopPart.LOGICAL)
-    ]
-    if len(axis_nodes) != 1:
+    anchor = prefix
+    reduction_nodes = loops[anchor : len(loops) - key_rank]
+    if not reduction_nodes:
         _fail(
             "sparse_workspace_target_invalid",
-            "the drained axis loop must appear exactly once below the "
-            "reduction loop",
+            "the sparse workspace requires at least one reduction loop "
+            "between the result prefix and the drained key",
         )
-    axis_position = loops.index(axis_nodes[0])
-    if axis_position <= reduction_position or type(axis_nodes[0]) is not SparseFor:
+    result_index_set = set(result_indices)
+    if any(_loop_key(node)[0] in result_index_set for node in reduction_nodes):
         _fail(
             "sparse_workspace_target_invalid",
-            "the drained trailing result axis must be a single-cursor "
-            "logical sparse loop below the reduction",
+            "no result coordinate may be bound between the region anchor and "
+            "the drained key",
         )
-    trailing = leaf.indices[-1]
-    if type(trailing) is not IndexValue or trailing.index != axis_index:
+    if _loop_key(reduction_nodes[-1]) != (reduction_index, LoopPart.LOGICAL):
         _fail(
             "sparse_workspace_target_invalid",
-            "the drained axis must address the trailing result coordinate",
+            "the recorded reduction loop must be the innermost reduction "
+            "above the drained key",
         )
-    for coord in leaf.indices[:-1]:
-        coord = cast(IndexValue, coord)
-        binder_positions = [
-            position
-            for position, node in enumerate(loops)
-            if _loop_key(node)[0] == coord.index
-        ]
-        if not binder_positions or binder_positions[0] >= reduction_position:
-            _fail(
-                "sparse_workspace_target_invalid",
-                "result prefix coordinates must be bound above the " "workspace region",
-            )
-        if (
-            not doubly_compressed_result
-            and not row_scope_result
-            and type(loops[binder_positions[0]]) is not DenseFor
-        ):
-            _fail(
-                "sparse_workspace_target_invalid",
-                "the dense-row CSR sparse workspace binds its result row "
-                "coordinate with one plain dense loop",
-            )
-    axis_dimension = _loop_bound_dimension(program, axis_nodes[0])
+    key_dimensions = tuple(
+        _loop_bound_dimension(program, node) for node in loops[len(loops) - key_rank :]
+    )
+    if len(set(key_dimensions)) != key_rank:
+        _fail(
+            "sparse_workspace_target_invalid",
+            "the ordered workspace key must span distinct declared dimensions",
+        )
 
     builder = LoopIRBuilder.resuming(program)
     workspace_id = builder.new_workspace_id()
     workspace_decl = builder.sparse_workspace_decl(
-        workspace_id, "wksp", result_decl.dtype, (axis_dimension,)
+        workspace_id, "wksp", result_decl.dtype, key_dimensions
     )
     insert_leaf = builder.sparse_workspace_insert(
         workspace_id,
-        (builder.index_value(axis_index),),
+        tuple(builder.index_value(index_id) for index_id in key_indices),
         ReduceOp.ADD,
         leaf.value,
     )
-    producer = _wrap_loops(
-        builder, loops[reduction_position:], builder.block((insert_leaf,))
-    )
-    drain_index = builder.new_index_id()
+    producer = _wrap_loops(builder, loops[anchor:], builder.block((insert_leaf,)))
+    drain_indices = tuple(builder.new_index_id() for _ in range(key_rank))
     append = builder.append_entry(
         result_symbol,
-        (*leaf.indices[:-1], builder.index_value(drain_index)),
+        (
+            *leaf.indices[:prefix],
+            *(builder.index_value(index_id) for index_id in drain_indices),
+        ),
         builder.sparse_workspace_value(workspace_id),
     )
     drain = builder.sparse_workspace_drain_for(
-        workspace_id, (drain_index,), builder.block((append,))
+        workspace_id, drain_indices, builder.block((append,))
     )
     region = builder.sparse_workspace_region(
         workspace_decl, producer, builder.block((drain,))
     )
-    return _rebuild_program(program, builder, loops[:reduction_position], region)
+    return _rebuild_program(program, builder, loops[:anchor], region)
 
 
 def _validate_reduce_out_tile(tile: LoopTile) -> None:
@@ -2758,7 +2774,12 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
         and not plan.tiles
         and plan.workspace is not None
         and not plan.workspace.dense
-        and len(plan.workspace.axis_loops) == 1
+        # An ordered key domain of any rank is the same replay contract: the
+        # automatic origin records every free variable below the innermost
+        # reduction, and ``apply_sparse_workspace`` derives the region's
+        # anchor and key from those loops.  ``len(axis_loops) == 1`` is the
+        # K == 1 instance, not a separate family.
+        and len(plan.workspace.axis_loops) >= 1
     )
     if sparse_workspace_form:
         return

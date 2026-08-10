@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, NoReturn, Optional, Tuple
+from typing import Dict, List, NoReturn, Optional, Tuple, cast
 
 import torch
 
@@ -560,8 +560,49 @@ class _SparseOutputReduction(Enum):
     DOUBLY_COMPRESSED = "doubly_compressed"
     CSR_DENSE_ROW = "csr_dense_row"
     CSR_SPARSE_ROW = "csr_sparse_row"
+    ORDERED_KEY_WORKSPACE = "ordered_key_workspace"
     MULTI_COMPRESSED_ASSEMBLY = "multi_compressed_assembly"
     MULTI_COMPRESSED_UNION = "multi_compressed_union"
+
+
+def _ordered_key_split(
+    result_levels: Tuple[LevelType, ...],
+    lhs_index_ids: Tuple[IndexId, ...],
+    reduction_index_ids: Tuple[IndexId, ...],
+    loop_positions: Dict[IndexId, int],
+) -> Optional[Tuple[int, int]]:
+    """The ``(prefix, key_rank)`` split of one ordered-key reduction result.
+
+    Derived from identities alone: the workspace key is exactly the run of
+    result coordinates bound strictly below the innermost reduction, and the
+    prefix is exactly the run bound above the outermost reduction.  Returns
+    ``None`` when no such split exists, which is the shape's own definition of
+    "not this family" rather than a layout guess.
+    """
+
+    if not reduction_index_ids or len(lhs_index_ids) != len(result_levels):
+        return None
+    positions = [loop_positions.get(index_id) for index_id in lhs_index_ids]
+    if any(position is None for position in positions):
+        return None
+    ordered_positions = cast(List[int], positions)
+    if any(
+        earlier >= later
+        for earlier, later in zip(ordered_positions, ordered_positions[1:])
+    ):
+        # Permuted result modes: the stored order would not be the drain
+        # order, and no ordered assembly is defined for that here.
+        return None
+    reduction_positions = [loop_positions[index_id] for index_id in reduction_index_ids]
+    first_reduction = min(reduction_positions)
+    last_reduction = max(reduction_positions)
+    prefix = sum(1 for position in ordered_positions if position < first_reduction)
+    key_rank = sum(1 for position in ordered_positions if position > last_reduction)
+    if prefix + key_rank != len(lhs_index_ids) or key_rank < 1:
+        # Some result coordinate is interleaved between two reduction loops;
+        # one workspace region cannot own it.
+        return None
+    return prefix, key_rank
 
 
 def _classify_sparse_output_family(
@@ -581,6 +622,77 @@ def _classify_sparse_output_family(
         and reduce_update
         and result_levels == (LevelType.COMPRESSED, LevelType.COMPRESSED)
     )
+    dense_prefix_length = 0
+    while (
+        dense_prefix_length < len(result_levels)
+        and result_levels[dense_prefix_length] is LevelType.DENSE
+    ):
+        dense_prefix_length += 1
+    ordered_key_shape = (
+        result_sparse
+        and reduce_update
+        and dense_prefix_length < len(result_levels)
+        and all(
+            level_type is LevelType.COMPRESSED
+            for level_type in result_levels[dense_prefix_length:]
+        )
+        and result_levels
+        not in (
+            (LevelType.COMPRESSED, LevelType.COMPRESSED),
+            (LevelType.DENSE, LevelType.COMPRESSED),
+        )
+    )
+    if ordered_key_shape:
+        # The ordered-key sparse-workspace family: a dense prefix, then one
+        # or more compressed levels, reduced under ADD.  The workspace's key
+        # is the trailing run of result coordinates below the innermost
+        # reduction; every coordinate above the outermost reduction binds a
+        # result prefix level directly.  Both runs are derived from loop and
+        # level identities -- no layout string, rank table, or format
+        # spelling participates.
+        split = _ordered_key_split(
+            result_levels, lhs_index_ids, reduction_index_ids, loop_positions
+        )
+        if split is None:
+            _fail(
+                "unsupported_sparse_output_domain",
+                "an ordered-key sparse reduction needs its result "
+                "coordinates split into a prefix bound above the outermost "
+                "reduction and a non-empty key bound below the innermost "
+                "one, in result level order",
+            )
+        prefix, key_rank = cast(Tuple[int, int], split)
+        if prefix != dense_prefix_length and any(
+            result_levels[position] is LevelType.DENSE
+            for position in range(prefix, len(result_levels))
+        ):
+            _fail(
+                "unsupported_sparse_output_domain",
+                "every dense result level of an ordered-key sparse "
+                "reduction must be bound above the outermost reduction",
+            )
+        for position, index_id in enumerate(lhs_index_ids):
+            domain_kind = domains[index_id].kind
+            if position >= len(result_levels) - key_rank:
+                # A drained key coordinate may iterate any domain: the
+                # workspace merges and orders its entries, so the assembly
+                # does not depend on the insertion order.
+                continue
+            if result_levels[position] is LevelType.DENSE:
+                if domain_kind is not DomainKind.DENSE:
+                    _fail(
+                        "unsupported_sparse_output_domain",
+                        "a dense result prefix level of an ordered-key "
+                        "sparse reduction must iterate a dense domain",
+                    )
+            elif domain_kind is not DomainKind.SPARSE:
+                _fail(
+                    "unsupported_sparse_output_domain",
+                    "a compressed result prefix level of an ordered-key "
+                    "sparse reduction must be driven by one stored sparse "
+                    "level",
+                )
+        return _SparseOutputReduction.ORDERED_KEY_WORKSPACE
     mixed_leaf_family = (
         len(result_levels) >= 2
         and result_levels[0] is LevelType.COMPRESSED
@@ -818,6 +930,7 @@ def _lower_sparse_family(
         _SparseOutputReduction.DOUBLY_COMPRESSED,
         _SparseOutputReduction.CSR_DENSE_ROW,
         _SparseOutputReduction.CSR_SPARSE_ROW,
+        _SparseOutputReduction.ORDERED_KEY_WORKSPACE,
     )
     multi_compressed_assembly = (
         reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
@@ -833,10 +946,11 @@ def _lower_sparse_family(
                 if reduction_form in (
                     _SparseOutputReduction.DOUBLY_COMPRESSED,
                     _SparseOutputReduction.CSR_SPARSE_ROW,
+                    _SparseOutputReduction.ORDERED_KEY_WORKSPACE,
                 ):
-                    # The B1 and row-scope families reduce over the merged
-                    # reduction dimension by construction; the semantic
-                    # StoreReduce form is exactly that reduction.
+                    # The B1, row-scope, and ordered-key families reduce over
+                    # the merged reduction dimension by construction; the
+                    # semantic StoreReduce form is exactly that reduction.
                     continue
                 _fail(
                     "unsupported_merged_reduction",
@@ -844,6 +958,14 @@ def _lower_sparse_family(
                     "migrated families",
                 )
             if reduce_update:
+                if (
+                    reduction_form is _SparseOutputReduction.ORDERED_KEY_WORKSPACE
+                    and index_id in lhs_index_ids
+                ):
+                    # A merged KEY coordinate is ordinary here: the workspace
+                    # owns ordering, so a coordinate produced by a merge is
+                    # inserted exactly like one produced by a single cursor.
+                    continue
                 _fail(
                     "unsupported_merged_update",
                     "combining a merged sparse domain with the ADD update "
