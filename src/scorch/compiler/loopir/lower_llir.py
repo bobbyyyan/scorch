@@ -56,12 +56,14 @@ from enum import Enum
 from types import FunctionType, MappingProxyType
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
     NamedTuple,
     NoReturn,
     Optional,
+    Sequence,
     Set,
     Tuple,
     TypeGuard,
@@ -77,6 +79,7 @@ from .. import llir
 from ..compile_options import CompileOptions
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..dense_pointer_hoist_pass import DensePointerHoistContext
+from ..dynamic_vector_access_pass import DYNAMIC_VECTOR_ACCESS_CONTEXT
 from ..llir_pass_manager import (
     CompressedWhereOpenMPPassSpec,
     DensePointerHoistPassSpec,
@@ -90,6 +93,7 @@ from ..llir_traversal import (
     LLIRTraversalError,
     LLIRTraversalContext,
     LLIRWalker,
+    SUPPORTED_LLIR_NODE_TYPES,
     SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
 from ..loop_plan import MAX_AFFINE_TILE_WIDTH
@@ -6569,6 +6573,19 @@ def _metadata_state_matches(
     )
 
 
+_COMPLETION_SCALAR_TYPES = frozenset((bool, int, float, str))
+_COMPLETION_ENUM_TYPES = frozenset(
+    (llir.AssignOp, llir.DataType, llir.TensorAccessRole)
+)
+_COMPLETION_IDENTITY_TYPES = frozenset((AccessId, SymbolId, IndexId))
+# Exactly the concrete ``llir.Node`` subclasses.  Matching on the exact type
+# rather than ``isinstance`` is equivalent here -- the type-equality test at
+# the top of the loop already guarantees both sides share one type, and the
+# expected side is always target-built -- and it keeps the hot dispatch to
+# one set probe.
+_COMPLETION_NODE_TYPES = frozenset(SUPPORTED_LLIR_NODE_TYPES)
+
+
 def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
     """Compare completed sparse-assembly state with fresh ownership.
 
@@ -6580,37 +6597,108 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
     detached tree, so repeated node/container ownership is invalid here; one
     global actual-object census rejects shared aggregates and cycles in the
     same constant-time check.
+
+    Every dispatch is an exact-type set probe and every read goes through
+    ``object.__getattribute__``: no forged ``__class__``, ``__eq__`` or
+    ``__hash__`` on managed state is consulted.  Nodes are the majority of a
+    real body, so they are tested first and their field walk merges the
+    key-shape check with the work queue push.
     """
 
     pending: List[Tuple[object, object, int]] = [(actual, expected, 0)]
+    push = pending.append
+    pop = pending.pop
     seen_actual: Set[int] = set()
+    mark_seen = seen_actual.add
     # Managed passes have returned before this callback-free, exact-type
     # traversal starts.  Validate each global enum singleton on its first
     # occurrence in this comparison; never retain the result across compiles,
     # where a later hostile mutation must be observed.
     validated_enum_states: Set[Tuple[type, int]] = set()
+    node_types = _COMPLETION_NODE_TYPES
+    scalar_types = _COMPLETION_SCALAR_TYPES
+    enum_types = _COMPLETION_ENUM_TYPES
+    identity_types = _COMPLETION_IDENTITY_TYPES
+    metadata_type = llir.TensorAccessMetadata
+    read_state = object.__getattribute__
+    enum_state_matches = _sparse_completion_enum_state_matches_once
+    metadata_matches = _metadata_state_matches
     while pending:
-        actual_value, expected_value, depth = pending.pop()
-        if type(actual_value) is not type(expected_value) or depth > 256:
+        actual_value, expected_value, depth = pop()
+        value_type = type(actual_value)
+        if value_type is not type(expected_value) or depth > 256:
             return False
         if actual_value is None:
             continue
-        if type(actual_value) in (bool, int, float, str):
+        depth += 1
+        if value_type in node_types:
+            actual_state = read_state(actual_value, "__dict__")
+            expected_state = read_state(expected_value, "__dict__")
+            if (
+                type(actual_state) is not dict
+                or type(expected_state) is not dict
+                or len(actual_state) != len(expected_state)
+            ):
+                return False
+            actual_id = id(actual_value)
+            if actual_id in seen_actual:
+                return False
+            mark_seen(actual_id)
+            for field_name, field_value in actual_state.items():
+                # The name is type-checked before it indexes the expected
+                # state, so a forged key never reaches a hash or equality
+                # hook on the other side.
+                if type(field_name) is not str or field_name not in expected_state:
+                    return False
+                push((field_value, expected_state[field_name], depth))
+            continue
+        if value_type in scalar_types:
             if actual_value != expected_value:
                 return False
             continue
-        if isinstance(actual_value, Enum):
-            if (
-                actual_value is not expected_value
-                or not _sparse_completion_enum_state_matches_once(
-                    actual_value, validated_enum_states
-                )
+        if value_type in enum_types:
+            if actual_value is not expected_value or not enum_state_matches(
+                cast(Enum, actual_value), validated_enum_states
             ):
                 return False
             continue
-        if type(actual_value) in (AccessId, SymbolId, IndexId):
-            actual_state = object.__getattribute__(actual_value, "__dict__")
-            expected_state = object.__getattribute__(expected_value, "__dict__")
+        if value_type is list or value_type is tuple:
+            actual_sequence = cast(Any, actual_value)
+            expected_sequence = cast(Any, expected_value)
+            if len(actual_sequence) != len(expected_sequence):
+                return False
+            # CPython interns the empty tuple used by default call/template
+            # arguments. It carries no child ownership, cannot form a cycle,
+            # and is immutable, so its intentional sharing is outside the
+            # detachment invariant enforced for nodes and every other
+            # container.  An empty *list* stays censused: it is mutable, so
+            # sharing one between two owners is exactly the aliased state
+            # this boundary exists to reject.
+            if value_type is tuple and not actual_sequence:
+                continue
+            actual_id = id(actual_value)
+            if actual_id in seen_actual:
+                return False
+            mark_seen(actual_id)
+            for index in range(len(actual_sequence)):
+                push((actual_sequence[index], expected_sequence[index], depth))
+            continue
+        if value_type is metadata_type:
+            # Frozen immutable access provenance is value state, not owned
+            # tree structure: the production two-phase rewrite legitimately
+            # duplicates a work body whose detached statements retain the
+            # same metadata values, so metadata compares exactly by stored
+            # state and stays outside the fresh-ownership census (like the
+            # interned empty tuple, it cannot be mutated and cannot close a
+            # cycle through its immutable leaf fields).
+            if not metadata_matches(
+                actual_value, expected_value, validated_enum_states
+            ):
+                return False
+            continue
+        if value_type in identity_types:
+            actual_state = read_state(actual_value, "__dict__")
+            expected_state = read_state(expected_value, "__dict__")
             if (
                 type(actual_state) is not dict
                 or type(expected_state) is not dict
@@ -6631,76 +6719,7 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
             ):
                 return False
             continue
-
-        if type(actual_value) is llir.TensorAccessMetadata:
-            # Frozen immutable access provenance is value state, not owned
-            # tree structure: the production two-phase rewrite legitimately
-            # duplicates a work body whose detached statements retain the
-            # same metadata values, so metadata compares exactly by stored
-            # state and stays outside the fresh-ownership census (like the
-            # interned empty tuple, it cannot be mutated and cannot close a
-            # cycle through its immutable leaf fields).
-            if not _metadata_state_matches(
-                actual_value, expected_value, validated_enum_states
-            ):
-                return False
-            continue
-
-        if isinstance(actual_value, llir.Node):
-            actual_state = object.__getattribute__(actual_value, "__dict__")
-            expected_state = object.__getattribute__(expected_value, "__dict__")
-            if type(actual_state) is not dict or type(expected_state) is not dict:
-                return False
-            if len(actual_state) != len(expected_state):
-                return False
-            field_names = tuple(actual_state)
-            if any(
-                type(field_name) is not str or field_name not in expected_state
-                for field_name in field_names
-            ):
-                return False
-            actual_id = id(actual_value)
-            if actual_id in seen_actual:
-                return False
-            seen_actual.add(actual_id)
-            for field_name in reversed(field_names):
-                pending.append(
-                    (
-                        actual_state[field_name],
-                        expected_state[field_name],
-                        depth + 1,
-                    )
-                )
-            continue
-        elif type(actual_value) in (list, tuple):
-            actual_sequence = cast(Any, actual_value)
-            expected_sequence = cast(Any, expected_value)
-            if len(actual_sequence) != len(expected_sequence):
-                return False
-            # CPython interns the empty tuple used by default call/template
-            # arguments. It carries no child ownership, cannot form a cycle,
-            # and is immutable, so its intentional sharing is outside the
-            # detachment invariant enforced for nodes and every other
-            # container.  An empty *list* stays censused: it is mutable, so
-            # sharing one between two owners is exactly the aliased state
-            # this boundary exists to reject.
-            if type(actual_value) is tuple and not actual_sequence:
-                continue
-            actual_id = id(actual_value)
-            if actual_id in seen_actual:
-                return False
-            seen_actual.add(actual_id)
-            for index in range(len(actual_sequence) - 1, -1, -1):
-                pending.append(
-                    (
-                        actual_sequence[index],
-                        expected_sequence[index],
-                        depth + 1,
-                    )
-                )
-            continue
-        else:
-            return False
+        return False
     return True
 
 
@@ -7967,44 +7986,6 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
         return function
 
 
-def _ordered_key_workspace_nodes(
-    function: object, workspace_name: str
-) -> Tuple[List[object], List[object]]:
-    """Locate one assembled function's workspace init and ordered drain.
-
-    Located by the workspace's own declared identifier, which the target
-    reserved, rather than by position: a pass that moved, duplicated or
-    dropped either node is then visible as a count change instead of being
-    matched against whatever now sits at the old index.
-    """
-
-    class _Collector(LLIRWalker):
-        def __init__(self) -> None:
-            super().__init__(
-                LLIRTraversalContext(
-                    stage="LoopIR target lowering",
-                    pass_name="locate_ordered_key_workspace",
-                )
-            )
-            self.inits: List[object] = []
-            self.drains: List[object] = []
-
-        def leave_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
-            if type(node) is llir.VarInit:
-                variable = cast(llir.VarInit, node).var
-                if type(variable) is llir.Var and variable.name == workspace_name:
-                    self.inits.append(node)
-                return
-            if type(node) is llir.ForLoopAuto:
-                array = cast(llir.ForLoopAuto, node).array
-                if type(array) is llir.Var and array.name == workspace_name:
-                    self.drains.append(node)
-
-    collector = _Collector()
-    collector.walk(cast(Any, function))
-    return collector.inits, collector.drains
-
-
 class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
     """Rank-general target lowering for the ordered-key sparse workspace.
 
@@ -8995,51 +8976,15 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         )
 
     def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
-        """Require the region's own nodes to survive the managed passes intact.
+        """Return after the pipeline-owned immutable effect check.
 
-        This family deliberately emits its allocation, insertion and ordered
-        drain in their final checked form -- ``emplace_back``, ``push_back``
-        and ``scorch_vector_set`` -- so no shared rewrite is required to make
-        the assembly safe.  That independence is worth proving rather than
-        assuming: an omitted, duplicated or partially rewritten drain would
-        otherwise silently change which entries reach the result.
+        The completion reference must be captured before the managed passes:
+        rebuilding it here would re-enter the target after its one authorized
+        emission and could also share mutable state with a hostile first pass.
+        ``_lower_loopir_to_llir_owned`` therefore owns the reference and the
+        comparison immediately around the pass-manager call.
         """
 
-        try:
-            expected_init = self._workspace_init_statement()
-            drain_statements = self._drain_statements()
-            expected_drain = drain_statements[-1]
-        except (
-            LLIRTraversalError,
-            AttributeError,
-            RecursionError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as error:
-            _fail(_SPARSE_WORKSPACE_LOST, str(error))
-        try:
-            inits, drains = _ordered_key_workspace_nodes(
-                function, self.workspace_decl.name
-            )
-        except LoopIRTargetError:
-            raise
-        except Exception as error:  # noqa: BLE001
-            _fail(_SPARSE_WORKSPACE_LOST, str(error))
-        if len(inits) != 1 or len(drains) != 1:
-            _fail(
-                _SPARSE_WORKSPACE_LOST,
-                "the assembled function must retain exactly one workspace "
-                "allocation and one ordered drain",
-            )
-        if not _exact_sparse_completion_matches(
-            inits[0], expected_init
-        ) or not _exact_sparse_completion_matches(drains[0], expected_drain):
-            _fail(
-                _SPARSE_WORKSPACE_LOST,
-                "the assembled workspace allocation or ordered drain no "
-                "longer matches the ordered-key target's own emission",
-            )
         return function
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
@@ -13453,6 +13398,310 @@ def _complete_relayout_impl(
     return function
 
 
+_CHECKPOINT_NODE_TYPES = frozenset(SUPPORTED_LLIR_NODE_TYPES)
+_CHECKPOINT_ENUM_TYPES = frozenset(
+    (llir.AssignOp, llir.DataType, llir.TensorAccessRole)
+)
+# Immutable leaves plus the three pinned LLIR enum singleton types: everything
+# a detached checkpoint may keep by reference rather than by copy.
+_CHECKPOINT_PASSTHROUGH_TYPES = frozenset(
+    (bool, int, float, str, *_CHECKPOINT_ENUM_TYPES)
+)
+_CHECKPOINT_IDENTITY_FACTORIES: Dict[type, Callable[[int], object]] = {
+    AccessId: AccessId,
+    SymbolId: SymbolId,
+    IndexId: IndexId,
+}
+_CHECKPOINT_MAX_DEPTH = 256
+
+
+class _OrderedKeyCheckpointError(Exception):
+    """State the ordered-key target's own emission cannot contain."""
+
+
+class _OrderedKeyExpectedBody:
+    """One-traversal detaching mirror of the ordered-key target's own body.
+
+    The completion boundary needs the exact statement list the managed
+    pipeline must hand back, captured *before* any managed pass runs.  Building
+    that reference by re-running the shared dynamic-vector pass was right in
+    structure and wrong in ownership: the shared rewriter deliberately carries
+    ``TensorAccessMetadata`` across by reference, so the reference body and the
+    pipeline body pointed at one frozen provenance object and a hostile
+    post-pass ``metadata.__dict__`` write moved both sides at once — the
+    comparison then accepted its own corruption.
+
+    This builder detaches instead.  Every node, every mutable container and
+    every access-provenance identity in the reference is freshly owned, so the
+    only objects it still shares with the pipeline input are immutable scalars
+    and the three LLIR enum singletons, whose stored state
+    ``_exact_sparse_completion_matches`` independently pins against an
+    import-time snapshot.
+
+    It is also the cheaper construction.  One traversal replaces the shared
+    pass's declaration walk plus rewrite walk, and it mirrors exactly the three
+    transformations the ordered-key target's own emission can undergo: the
+    consecutive coordinate-store deduplication, the appending result-vector
+    store, and the checked position store.  The policy is read from the shared
+    pass's own frozen configuration rather than restated here, so the mirror
+    cannot silently drift from the pass it mirrors.
+
+    Anything the target never emits is refused rather than guessed at: a
+    dynamic-vector declaration below the body root, and an indexed variable
+    *spelling* — both are handled in the shared pass by machinery (a nested
+    declaration scan, a pattern-substituted name) this boundary deliberately
+    does not carry.  Refusing is safe in the direction that matters: it fails
+    the compile closed with the completion defect code instead of comparing
+    against a reference that does not describe the pipeline's contract.
+
+    Every read is a ``type()`` test or an ``object.__getattribute__``: nothing
+    here can be steered by a forged ``__class__``, ``__eq__``, ``__hash__`` or
+    ``__reduce_ex__``.  Managed state never reaches this builder at all, since
+    it runs before the pass manager is called.
+    """
+
+    def __init__(self, statements: List[llir.Stmt]) -> None:
+        config = DYNAMIC_VECTOR_ACCESS_CONTEXT.config
+        self._vector_type_prefix = config.vector_type_prefix
+        self._append_suffixes = config.append_suffixes
+        self._deduplicate_suffixes = config.deduplicate_suffixes
+        self._append_method = config.append_method
+        self._checked_set_function = config.checked_set_function
+        self._source = statements
+        self._vector_names = self._root_vector_names(statements)
+
+    def _root_vector_names(self, statements: List[llir.Stmt]) -> frozenset:
+        """Name the dynamic result vectors the body declares at its root."""
+
+        names: Set[str] = set()
+        for statement in statements:
+            if type(statement) is not llir.VarDecl:
+                continue
+            variable = cast(llir.VarDecl, statement).var
+            if (
+                type(variable) is llir.Var
+                and type(variable.type) is llir.DataType
+                and variable.type.value.startswith(self._vector_type_prefix)
+                and type(variable.name) is str
+            ):
+                names.add(variable.name)
+        return frozenset(names)
+
+    def build(self) -> List[llir.Stmt]:
+        """Return the fully detached body the managed pipeline must produce."""
+
+        return cast(List[llir.Stmt], self._sequence(self._source, 0))
+
+    def _store_target(self, expression: object) -> Optional[Tuple[str, object]]:
+        """Match one indexed store into a declared dynamic result vector."""
+
+        if type(expression) is not llir.ArrayAccess:
+            return None
+        access = cast(llir.ArrayAccess, expression)
+        array = access.array
+        if type(array) is not llir.Var:
+            return None
+        name = cast(llir.Var, array).name
+        if type(name) is not str or name not in self._vector_names:
+            return None
+        return name, access.index
+
+    def _sequence(self, values: Sequence[object], depth: int) -> object:
+        """Mirror one statement or expression sequence, deduplicating stores.
+
+        Only an ``Assign`` can be deduplicated or converted, and an expression
+        sequence cannot hold one, so both kinds of sequence take this one path
+        without needing to be told apart.
+        """
+
+        if depth > _CHECKPOINT_MAX_DEPTH:
+            raise _OrderedKeyCheckpointError(
+                "the ordered workspace body exceeds the supported nesting depth"
+            )
+        assign_type = llir.Assign
+        prepared: List[object] = []
+        for candidate in values:
+            if type(candidate) is assign_type:
+                matched = self._store_target(cast(llir.Assign, candidate).var)
+                if (
+                    matched is not None
+                    and cast(llir.Assign, candidate).op == llir.AssignOp.ASSIGN
+                    and matched[0].endswith(self._deduplicate_suffixes)
+                    and prepared
+                    and type(prepared[-1]) is assign_type
+                    and candidate == prepared[-1]
+                ):
+                    continue
+            prepared.append(candidate)
+
+        depth += 1
+        value_of = self._value
+        passthrough = _CHECKPOINT_PASSTHROUGH_TYPES
+        built: List[object] = []
+        for member in prepared:
+            member_type = type(member)
+            if member is None or member_type in passthrough:
+                built.append(member)
+            elif member_type is assign_type:
+                built.append(self._store_statement(cast(llir.Assign, member), depth))
+            else:
+                built.append(value_of(member, depth))
+        if type(values) is list:
+            return built
+        return tuple(built)
+
+    def _store_statement(self, assignment: llir.Assign, depth: int) -> object:
+        """Mirror one ``Assign``, converting a dynamic-vector store in place."""
+
+        matched = self._store_target(assignment.var)
+        if matched is None or assignment.op != llir.AssignOp.ASSIGN:
+            return self._node(assignment, llir.Assign, depth)
+        name, position = matched
+        value = cast(llir.Expr, self._value(assignment.value, depth + 1))
+        if name.endswith(self._append_suffixes):
+            return llir.FunctionCallStmt(
+                name=f"{name}.{self._append_method}",
+                args=[value],
+            )
+        return llir.FunctionCallStmt(
+            name=self._checked_set_function,
+            args=[
+                llir.Var(name=name, type=llir.DataType.NO_TYPE),
+                cast(llir.Expr, self._value(position, depth + 1)),
+                value,
+            ],
+        )
+
+    def _value(self, value: object, depth: int) -> object:
+        value_type = type(value)
+        # Immutable leaves dominate an emitted body, and enum members are
+        # process-wide singletons the comparison side pins against an
+        # import-time snapshot, so sharing them is required rather than
+        # merely allowed.  One set test covers both.
+        if value_type in _CHECKPOINT_PASSTHROUGH_TYPES or value is None:
+            return value
+        if value_type in _CHECKPOINT_NODE_TYPES:
+            return self._node(value, value_type, depth)
+        if value_type is list or value_type is tuple:
+            return self._sequence(cast(Sequence[object], value), depth)
+        if value_type is llir.TensorAccessMetadata:
+            return _detach_tensor_access_metadata(
+                cast(llir.TensorAccessMetadata, value)
+            )
+        if value_type in _CHECKPOINT_IDENTITY_FACTORIES:
+            stored = _stored_identity_value(value, value_type)
+            if stored is None:
+                raise _OrderedKeyCheckpointError(
+                    "the ordered workspace body carries a malformed identity"
+                )
+            return _CHECKPOINT_IDENTITY_FACTORIES[value_type](stored)
+        raise _OrderedKeyCheckpointError(
+            "the ordered workspace body carries an unsupported value of type "
+            f"'{value_type.__name__}'"
+        )
+
+    def _node(self, node: object, node_type: type, depth: int) -> object:
+        if depth > _CHECKPOINT_MAX_DEPTH:
+            raise _OrderedKeyCheckpointError(
+                "the ordered workspace body exceeds the supported nesting depth"
+            )
+        state = object.__getattribute__(node, "__dict__")
+        if type(state) is not dict:
+            raise _OrderedKeyCheckpointError(
+                f"an emitted '{node_type.__name__}' lost its stored field state"
+            )
+        if node_type is llir.Var:
+            self._require_plain_variable(state)
+        elif node_type is llir.VarDecl:
+            self._require_root_declared_vector(state)
+        clone: object = object.__new__(node_type)
+        cloned_state = object.__getattribute__(clone, "__dict__")
+        depth += 1
+        value_of = self._value
+        passthrough = _CHECKPOINT_PASSTHROUGH_TYPES
+        for field_name, field_value in state.items():
+            if type(field_name) is not str:
+                raise _OrderedKeyCheckpointError(
+                    f"an emitted '{node_type.__name__}' carries a non-string field"
+                )
+            if field_value is None or type(field_value) in passthrough:
+                cloned_state[field_name] = field_value
+            else:
+                cloned_state[field_name] = value_of(field_value, depth)
+        return clone
+
+    def _require_plain_variable(self, state: Dict[str, object]) -> None:
+        name = state.get("name")
+        if type(name) is not str:
+            raise _OrderedKeyCheckpointError("an emitted variable lost its name")
+        if "[" in name:
+            raise _OrderedKeyCheckpointError(
+                "the ordered workspace target emits no subscripted variable "
+                "spelling, so no name substitution is mirrored here"
+            )
+
+    def _require_root_declared_vector(self, state: Dict[str, object]) -> None:
+        variable = state.get("var")
+        if type(variable) is not llir.Var:
+            return
+        typed = cast(llir.Var, variable)
+        if (
+            type(typed.type) is llir.DataType
+            and typed.type.value.startswith(self._vector_type_prefix)
+            and typed.name not in self._vector_names
+        ):
+            raise _OrderedKeyCheckpointError(
+                "the ordered workspace target declares every dynamic result "
+                "vector at the body root"
+            )
+
+
+def _ordered_key_expected_checkpoint(
+    lowering: _TargetLowering,
+    body: List[llir.Stmt],
+) -> Optional[List[llir.Stmt]]:
+    """Build the detached exact post-pipeline body before callbacks can run."""
+
+    if type(lowering) is not _OrderedKeySparseWorkspaceLowering:
+        return None
+    try:
+        expected = _OrderedKeyExpectedBody(body).build()
+    except (
+        _OrderedKeyCheckpointError,
+        AttributeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        _fail(_SPARSE_WORKSPACE_LOST, str(error))
+    if type(expected) is not list:
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "the ordered workspace checkpoint did not remain a statement list",
+        )
+    return expected
+
+
+def _require_ordered_key_completion_checkpoint(
+    body: List[llir.Stmt],
+    expected: Optional[List[llir.Stmt]],
+) -> None:
+    """Require exact final structure and fresh managed-pass ownership."""
+
+    if expected is None:
+        return
+    try:
+        matches = _exact_sparse_completion_matches(body, expected)
+    except Exception as error:  # noqa: BLE001
+        _fail(_SPARSE_WORKSPACE_LOST, str(error))
+    if not matches:
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "the managed pipeline changed the ordered workspace body or "
+            "returned shared ownership",
+        )
+
+
 def _lower_loopir_to_llir_owned(
     program: LoopProgram,
     *,
@@ -13581,6 +13830,22 @@ def _lower_loopir_to_llir_owned(
             *level_indices_stmts,
         ]
     final_assembly_stmts = assembler.emit_final_assembly()
+    ordered_key_completion_reference = _ordered_key_expected_checkpoint(
+        lowering,
+        [
+            *validation_stmts,
+            *size_stmts,
+            *prologue_stmts,
+            llir.BlankLine(),
+            *level_indices_stmts,
+            llir.Comment("Initialize result value array"),
+            *value_init_stmts,
+            *tile_size_stmts,
+            llir.BlankLine(),
+            *raw_statements,
+            *final_assembly_stmts,
+        ],
+    )
 
     def assemble_body(
         transformed_body: LLIRStatementListArtifact,
@@ -13665,6 +13930,10 @@ def _lower_loopir_to_llir_owned(
             compile_options=compile_options,
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
+    _require_ordered_key_completion_checkpoint(
+        pipeline_result.artifact.value,
+        ordered_key_completion_reference,
+    )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
     completed_sparse_workspace = lowering.complete_sparse_workspace(assembled)
     return lowering.complete_relayout(
