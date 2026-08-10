@@ -31130,3 +31130,105 @@ NEW ledger directory under ~/.cache/scorch-codex/ excluding worktrees, caches,
 binaries and __pycache__, verify every manifest entry, leave origin untouched,
 and finish with a candid GO/NO-GO plus an even broader continuation prompt.
 ```
+
+## The post-assembly window covered by structure, and a corrected origin record (2026-08-10; supersedes every preceding prompt)
+
+Three local commits follow inherited committed tip ``a3b8d1e``; nothing was
+pushed, amended, squashed, reordered or discarded, and no ``git stash`` was run.
+**Origin is ``a3b8d1e``, not ``58e8565`` and not ``692a450``.**  ``git ls-remote``
+resolves this branch on origin to ``a3b8d1e``, and the remote-tracking reflog
+records the push at 15:25:13 on 2026-08-10 -- after the previous session's own
+``origin-ls-remote.txt`` receipt was written at 15:03, which is why that receipt
+says ``692a450`` and is stale rather than wrong.  ``.git/packed-refs`` still
+carries ``58e8565`` for the remote-tracking ref and a staler ``cb49ff7`` for the
+local branch; loose refs override both, so ``ls-remote`` is the only honest
+source and reading that file has now produced the wrong answer twice.  **The
+ordered-key vertical, the completion seal and the post-assembly window are
+published; the standing "all LOCAL-ONLY" note is obsolete.**  This session
+pushed nothing and left origin where it is.  The five protected tracked files
+hash exactly as recorded.  Evidence ledger:
+``~/.cache/scorch-codex/orderedkey-window-structural/`` (new; it does not extend
+``orderedkey-postassembly-window``, whose ``fullsuite/`` manifest remains valid
+for what it sealed).
+
+**What the previous session left.**  It ended mid-gate.  Partition 5 of the full
+suite completed at 15:27, after the session closed: tallied independently from
+the eight JUnit XMLs rather than from the driver's JSON, the suite is **6,075
+tests, 0 failures, 0 errors, 14 skipped**, all eight partitions exiting 0 at one
+revision, ``a3b8d1e``.  No documentation commit exists -- the committed review
+ends at §50.9 and the handoff at the completion seal, with §51 drafts living only
+in a scratchpad.  The ledger was never sealed beyond ``fullsuite/SHA256SUMS``.
+Four gates never ran at that tip: paired latency (drivers only, no receipts),
+the extended attacks (probe only, no output), the legacy extent sweep (only the
+quick census; the full sweep is a 14:36 scratchpad artifact, sixteen minutes
+before the 14:52 commits), and the frontier differential -- whose
+``frontier_ext.json`` is a 14:43 artifact copied into the ledger at 14:59, an
+**intermediate-revision receipt sitting in a final-tip directory**.  None of
+those was relabelled here.
+
+**This milestone adds no compiler capability.**  It closes one class the
+inherited fix leaves open, and corrects the origin record and two schema claims.
+Review §51 owns the detail.
+
+**The defect.**  ``895fca3`` was right that the completion seal narrowed the
+boundary: the two-node check it replaced ran on the assembled function, so
+moving the checkpoint earlier dropped ABI assembly and the four completion
+stages out of coverage.  Its closure is two exact-identity requirements, and
+identity carries the earlier deep comparison forward only for the objects it
+names -- **top-level statements**.  An in-place rewrite inside an
+already-verified statement moves no identity.  Measured against ``895fca3``:
+rewriting a ``Comment`` nested inside a verified statement **compiles, with the
+tampered text in the emitted C++**, and duplicating a statement inside the
+ordered drain **compiles**.  Neither is live -- the only code in that window is
+one ``llir.Function`` construction plus four stages that each return their input
+unless the plan carries the corresponding region, and an ordered-key plan
+carries none -- but that is a reachability argument, which is the exact argument
+``895fca3``'s own message was written against.
+
+**The closure moves the comparison instead of adding one.**
+``_require_ordered_key_completed_body`` runs after assembly and all four
+completions and compares the assembled body against the detached reference, so
+the whole window is covered by structure.  The reference is still captured
+before the pass manager -- capture and compare are separable, and §50.2
+conflated them; only the comparison moves.
+``_exact_sparse_completion_matches`` is still entered **exactly once per
+ordered-key compile**, now locked by a test in both arms, so cost is unchanged.
+A second comparison would have added the 4.2-5.0% of a compile §50.4 attributes
+to one, against a 1.10 ceiling whose inherited headroom is 1.0729.  Three O(1)
+root requirements precede the traversal: ``895fca3``'s returned-function
+identity (retained as the deliberate tripwire for a future workspace-plus-tile
+composition), its per-statement identity (retained -- it additionally pins that
+assembly substituted no value-equal twin, and names the index), and one new
+requirement that the root be an **exact** ``llir.Function``, because a subclass
+with identical stored state satisfies every identity test and would otherwise
+surface as a generic ``CodegenError`` rather than this family's defect.
+
+**Five inherited claims re-derived; three stand, two need correcting.**  The
+detaching mirror is structurally identical to the shared pass it mirrors on 56
+of 56 cases.  The four pre-assembly passes are value-identity on 56 of 56 --
+and all four *detach* on all 56, so under ``==`` they appear to change every
+body, because nine of the 36 concrete node types are not dataclasses and two of
+those nine are ``ForLoop`` and ``Function``.  Corrected: **no LLIR field is
+declared as a bare ``Assign``** (``ForLoop.update`` is
+``Union[Increment, FunctionCall, Assign]``, and the defensible claim, which the
+committed test already uses, is that it is the only position holding an
+``Assign`` outside a sequence); and ``SUPPORTED_LLIR_NODE_TYPES`` **is not
+subclass-free** -- it holds ``BinOp`` alongside its own subclasses ``Add`` and
+``Mul``, so the count of 36 does not justify the exact-type rewrite.  The
+condition that does, and that is measured, is that every declared subclass of a
+supported type is itself supported.  Not reproduced: the "168 calls over three
+other users" census -- over the 40-cell grid the comparator is entered 56 times
+from exactly one site, with zero foreign kinds and zero node subclasses.
+
+**Not addressed.**  The three Phase-7 blockers and the frontier extension.
+Blocker 1's remaining decision needs an experiment that is a probe rather than a
+compile: a plan carrying the ordered-key workspace *without* a tile is
+unreachable through both public routes, since the automatic origin emits the
+tile and an explicit ``Schedule`` inserts no workspace, so §49.5's untested "its
+target shape is supported" stays untested.  Blockers 2 and 3 are untouched, and
+the 748-cell frontier is neither re-run at this tip nor extended to rank 6,
+non-ADD reductions, COO/singleton levels or wider contractions.
+
+**Phase 7 remains NO-GO**, on the same three blockers.  No Phase-8 inventory,
+cutover, cache, selector or default-dispatch change was made; no fallback was
+weakened; no legacy code was deleted.

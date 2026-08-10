@@ -9635,3 +9635,352 @@ rank >= 3.
 **Phase 7 remains NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
 default-dispatch change was made; no fallback was weakened and no legacy code
 deleted.
+
+## 51. Exact-tip review of the post-assembly window: one defect, five claims re-derived, and a corrected origin record (2026-08-10)
+
+This section opens at inherited committed tip ``a3b8d1e`` and reviews
+``dcc2701..a3b8d1e`` -- the production commit ``895fca3`` and its test commit
+``a3b8d1e``.  It lands one compiler change: the completion boundary's single
+structural comparison **moves to the far side of the completion window**, which
+closes a class ``895fca3``'s identity requirements leave open.  It also corrects
+the recorded origin state, which was wrong in both of the last two sections.
+
+Sections 49 and 50 are preserved above as written.  Where this section
+contradicts them, this section is correct.
+
+### 51.1 The origin record was wrong, and the branch is no longer local
+
+Both §50 and the inherited handoff state that origin is ``58e8565`` and that
+nothing was pushed.  ``git ls-remote`` says otherwise, and the remote-tracking
+reflog says when:
+
+| push | revision | time |
+| --- | --- | --- |
+| ``@{2}`` | ``58e8565`` | 2026-07-22 16:52:20 -0700 |
+| ``@{1}`` | ``692a450`` | 2026-08-10 11:09:01 -0700 |
+| ``@{0}`` | ``a3b8d1e`` | 2026-08-10 15:25:13 -0700 |
+
+**Origin is ``a3b8d1e``.**  ``refs/heads/refactor/compiler-ir-phase3-std-move-call``
+on ``git@github.com:bobbyyyan/scorch.git`` resolves to it, and the local
+``.git/packed-refs`` entry for the remote-tracking ref still carries the stale
+``58e8565`` (its entry for the local branch is staler still, ``cb49ff7``), which
+is why reading that file has produced the wrong answer twice.  Loose refs
+override it; ``ls-remote`` is the only honest source.
+
+Two consequences are worth stating plainly.  The ordered-key vertical, the
+completion seal and the post-assembly window are **published, not local-only** --
+the standing "all LOCAL-ONLY" note is obsolete.  And the push at 15:25:13
+happened *after* the previous session recorded ``statics/origin-ls-remote.txt``
+as ``692a450`` at 15:03, so that receipt was accurate when written and stale
+within the hour.  Nothing here pushes; origin is left exactly where it is.
+
+### 51.2 What the previous session actually completed, and what it did not
+
+It ended mid-gate, so the record needed establishing by inspection rather than
+by reading its own summary.
+
+**The full suite did finish, and it is green at the exact tip.**  Partition 5
+had no ``part5.exit`` and no ``part5.xml`` when this session opened; both landed
+at 15:27 when the detached run completed.  Tallied independently from the eight
+JUnit XMLs rather than from the driver's own JSON: **6,075 tests, 0 failures, 0
+errors, 14 skipped**, every partition exiting 0, the aggregate stamping revision
+``a3b8d1ed70b71c3b137a62c3b27fa01e1262e621``.  Partition 5 alone is 759 tests in
+1,989.68 s.  All eight partitions ran at one revision -- no split-revision
+precedent was needed this time.
+
+**No documentation commit exists.**  The committed review ends at §50.9 and the
+committed handoff's last section is the completion seal.  Drafts of a §51 and a
+handoff section exist only in the previous session's scratchpad; every number in
+them was treated as unverified here and re-derived, and two of their claims did
+not survive (§51.5).
+
+**The ledger was never sealed.**  Only ``fullsuite/SHA256SUMS`` exists, covering
+55 files in that one subdirectory; it verifies clean.  There is no manifest over
+the ledger as a whole.
+
+**Four gates never ran at this tip.**  ``latency/`` holds the two drivers and no
+receipts.  ``attacks/`` holds the probe and no output.  ``legacy/`` holds only
+the quick census; the full sweep exists solely in the scratchpad, timestamped
+14:36, i.e. sixteen minutes before the 14:52 commits, so it describes an
+intermediate revision.  ``frontier/frontier_ext.json`` is likewise a 14:43
+artifact copied into the ledger at 14:59 -- **an intermediate-revision receipt
+in a final-tip directory**, which is exactly the relabelling this review is
+required not to accept.
+
+### 51.3 The seal's reference must be captured before the pass manager, and that is not why the comparison must be
+
+Re-derived from the code rather than from §50.2.  Two independent reasons, and
+they license different things.
+
+*Ownership.*  The shared ``rewrite_dynamic_vector_accesses`` carries
+``TensorAccessMetadata`` across by reference.  A reference built by re-running
+that pass over post-pipeline state would share one frozen provenance object with
+the body it is meant to check, so a hostile write to ``metadata.__dict__``
+moves both sides at once -- §50.3's reproduced escape.  More generally, a
+reference *built from* post-pass state mirrors whatever the passes did, including
+their corruption, so it cannot be a contract.
+
+*One authorized emission.*  Rebuilding the reference after the managed passes
+would re-enter the target after it has emitted once, and the second emission
+could be steered by managed state.  ``_ordered_key_expected_checkpoint`` runs at
+``lower_llir.py:13897``, before ``run_production_pipeline`` at 13971, so the
+reference is a pure function of the target's own pre-pipeline emission.
+
+What neither reason licenses is performing the **comparison** early.  Capture
+and compare are separate; §50.2 conflated them, and that conflation is what left
+the window open.  The comparator consults no forged hook -- every dispatch is an
+exact-type set probe and every read goes through ``object.__getattribute__`` --
+so it is safe to run at any point after managed and completion code has
+returned.  Running it later is strictly better and costs nothing.
+
+### 51.4 The one defect: identity carries verification forward only for the objects it names
+
+``895fca3`` is right that the window needed closing and right about why: the
+two-node check it replaced ran on the *assembled function*, so moving the
+boundary earlier silently dropped ABI assembly and the four completion stages
+out of coverage.  Its two requirements -- ``returned is assembled``, and
+per-index object identity between the assembled body and the pipeline's list --
+are both sound and both worth keeping.
+
+They are not a closure.  Identity carries the earlier deep comparison forward
+for the objects it names, and it names **top-level statements**.  An in-place
+rewrite *inside* an already-verified statement moves no identity at all.
+
+**Measured against ``895fca3``, not argued.**  Patching the last completion
+stage to run after the four early-returning stages:
+
+| class | outcome at ``895fca3`` | evidence |
+| --- | --- | --- |
+| new function sharing the body list, one element a value-equal twin | REJECTED | requirement 1 |
+| same function, one shared-list element swapped for a twin | REJECTED | requirement 2, at statement 38 |
+| **a ``Comment`` rewritten inside a verified statement** | **COMPILED** | tampered text present in the emitted C++ |
+| **a statement duplicated inside the ordered drain** | **COMPILED** | tamper landed, kernel built |
+| a ``Function`` subclass with identical stored state | fails closed, but as ``CodegenError`` at the root, not as this family's defect | |
+| a dense-receiver compile (other family) | COMPILED, boundary reached once and short-circuited | |
+
+The two COMPILED rows are the defect.  Neither is live today: the only code
+executing in that window is one ``llir.Function`` construction -- ``list(body)``
+in a fresh ABI signature -- plus four completion stages that each return their
+input unless the plan carries the corresponding region, and an ordered-key plan
+carries none.  But **that is a reachability argument**, and ``895fca3``'s own
+commit message is the argument against relying on one: "the window is inert by
+reachability, which is exactly the kind of argument that stops being true
+without warning."  The fix reinstated that argument one level down.
+
+**The closure moves the comparison rather than adding one.**
+``_require_ordered_key_completed_body`` now runs after assembly and all four
+completions and compares the assembled body against the detached reference.
+Assembly and every stage are covered by structure instead of by identity plus
+reachability.  ``_exact_sparse_completion_matches`` is still called **exactly
+once per ordered-key compile** -- measured, and now locked by a test in both
+arms -- so the cost is unchanged.  That mattered: a second comparison would have
+added the 4.2-5.0% of a compile §50.4 attributes to one, against a 1.10 ceiling
+whose headroom at ``a3b8d1e`` is 1.0729.  The affordable strengthening was the
+one that moves work, not the one that adds it.
+
+Three O(1) root requirements run before the traversal.  Two are ``895fca3``'s,
+retained -- the returned-function identity, which remains the deliberate
+tripwire the moment a plan composes a workspace with a tile, panel or relayout,
+and per-statement identity, which additionally pins that assembly substituted no
+value-equal twin and names the offending index.  The third is new: **the root
+must be an exact ``llir.Function``**.  A subclass carrying identical state
+satisfies every identity test; codegen does refuse it downstream on exact-type
+dispatch, but this family owns its diagnosis, so it is refused here with
+``sparse_workspace_completion_lost``.
+
+After the change all six classes above behave as required, with **zero foreign
+hook invocations** observed across the matrix, and the committed ordered-key
+suite passes 240 tests.
+
+### 51.5 The five load-bearing claims, re-derived -- three stand, two need correcting
+
+Every one of these was re-derived from the schema or by measurement.  Two are
+stated wrongly in the scratchpad draft, and one of the two is stated wrongly in
+a way that would matter.
+
+**1. The detaching mirror reproduces the shared pass.**  Stands.  On an
+independently constructed 28-cell x 2-arm grid, ``_OrderedKeyExpectedBody``'s
+output is **structurally identical to ``rewrite_dynamic_vector_accesses``'s on
+56 of 56 cases**.  The draft's "136/136" is a different grid; the substance is
+the same and the count is grid-dependent, so this section states its own.
+
+**2. ``ForLoop.update`` and bare ``Assign`` positions.**  Needs correcting.
+Read literally, "the only bare-``Assign`` field position" is false: **no field
+in the LLIR schema is declared as a bare ``Assign``.**  ``ForLoop.update`` is
+``Union[Increment, FunctionCall, Assign]``, and the only other position
+mentioning ``Assign`` is ``Assign.var: AssignmentTarget``, which is the
+assignment's own target.  The defensible form -- and the one the committed test
+``test_for_loop_update_is_the_only_non_sequence_assign_position`` already uses --
+is that ``ForLoop.update`` is the only position that can hold an ``Assign``
+outside a statement sequence.  That is what makes the mirror's "sequences only"
+rule equal the shared pass's "not ``update``" rule.  Empirically, across the
+grid, every ``ForLoop.update`` is an ``Increment`` (180 occurrences) and **none
+targets a dynamic vector**, so the rules never diverge in practice either.
+
+**3. ``SUPPORTED_LLIR_NODE_TYPES``.**  Needs correcting, and this is the one
+that matters.  The count is right: ``llir`` declares 39 ``Node`` classes,
+``SUPPORTED_LLIR_NODE_TYPES`` holds 36, and the three excluded are exactly the
+abstract bases ``Node``, ``Stmt`` and ``Expr``.  ``llir`` defines exactly three
+enums (``AssignOp``, ``DataType``, ``TensorAccessRole``).  But the set is **not
+subclass-free**: it contains ``BinOp`` together with its own subclasses ``Add``
+and ``Mul``.  So "it is exactly the 36 concrete subclasses" does not by itself
+justify the ``isinstance`` -> exact-type rewrite.  The condition that does is
+the one measured here: **every declared node class that is a subclass of a
+supported type is itself supported** -- there are no exceptions -- so exact-type
+dispatch accepts precisely the instances ``isinstance`` dispatch would.  A
+hypothetical ``Add3(Add)`` left out of the set would break the equivalence while
+leaving the count at 36, which is why the argument has to be made this way.
+
+**4. The comparator census over the three other users.**  Not reproduced, and
+recorded as not reproduced.  The comparator has four call sites; over the
+40-cell ordered-key grid it is entered **56 times from exactly one site**,
+``_require_ordered_key_completion_checkpoint``, because that grid does not route
+to the other three families at all.  Every value kind it met is inside its
+accepted set: **zero foreign kinds, zero foreign enums, zero node subclass
+instances**, over 33 distinct kinds.  The draft's "168 calls over three other
+users" is a claim about a wider corpus than this grid and is neither confirmed
+nor contradicted here.
+
+**5. The four pre-assembly passes are value-identity on this family.**  Stands,
+and the trap is real.  The pipeline is ``sparse_prefetch`` ->
+``dense_pointer_hoist`` -> ``single_iteration_loop_elimination`` ->
+``loop_invariant_factor_hoist`` -> body assembly -> ``dynamic_vector_access``;
+the compressed-Where pass is not configured for this family.  Compared
+structurally, all four pre-assembly passes change **nothing** by value on 56 of
+56 cases.  Compared with ``==`` they would appear to change **everything**: all
+four hand back detached objects on all 56 cases, and nine of the 36 concrete
+node types are not dataclasses -- ``BlankLine``, ``Break``, ``Comment``,
+``Continue``, ``ForLoop``, ``Function``, ``Return``, ``UnaryOp``, ``WhileLoop``
+-- so ``==`` on them is object identity.  ``ForLoop`` and ``Function`` are in
+that list, which is why the naive comparison misfires on every body.
+
+### 51.6 What this section does not do
+
+Three blockers and the frontier extension are **not addressed**, and no partial
+work on them is committed.  Blocker 1's decision needs one experiment this
+section did not run: a plan carrying the ordered-key workspace *without* a tile
+is unreachable through both public routes -- the automatic origin emits the tile,
+and an explicit ``Schedule`` inserts no workspace -- so settling §49.5's
+untested "its target shape is supported" requires suppressing tile selection
+while keeping automatic workspace insertion, which is a probe, not a compile.
+Blockers 2 and 3 and the rank-6/non-ADD/COO frontier extension are untouched.
+The declared 748-cell frontier is therefore neither re-run at this tip nor
+extended, and §51.2 records why the inherited receipt cannot be relabelled as
+exact-tip.
+
+### 51.7 Compiler latency: moving the comparison is free, and that is measured
+
+The ceiling for a compile-only integrity boundary on this branch is **1.10**.
+The inherited seal added a comparison and measured p50/mean 1.0558-1.0560 with a
+max of 1.0729.  This change adds none -- it relocates the one comparison -- so
+the prediction is a null result, and a null result is what a paired measurement
+has to be able to show.
+
+Base is a detached worktree at ``a3b8d1e``; the candidate is this tree.  Each
+measurement is a fresh subprocess importing exactly one source tree and timing
+the same 40-cell ordered-key compile-only grid (no JIT, no C++ compiler); 20
+rounds, alternating the within-round order, 4 warmups and 21 samples per
+process, plus a base-against-base A/A control in every round.  The per-round
+statistic is the median of that process's samples, and the pooled variants
+repeat the calculation on the fastest sample.
+
+| statistic | min | p50 | mean | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| A/B ratio (median) | 0.9477 | 1.0039 | 1.0017 | 1.0475 | **1.0686** |
+| A/A control (median) | 0.9547 | 0.9959 | 1.0020 | 1.0554 | **1.0714** |
+
+Pooled fastest-sample A/B 0.9882; pooled A/A 0.9796.  Order controls agree:
+base-first mean 0.9907, candidate-first mean 1.0127, a 2.2% spread that sits
+well inside the A/A floor, so ordering is not carrying the result.
+
+**Every declared statistic is at or below 1.10, the largest being 1.0686 -- and
+the A/B maximum is below the A/A maximum**, so the candidate is not merely
+inside the ceiling but inside the measurement's own noise floor.  The A/B mean
+of 1.0017 against an A/A mean of 1.0020 is the null result the design predicts.
+The independent structural check on the same claim is the committed test
+requiring exactly one comparator entry per compile in both arms.
+
+### 51.8 Corrections to the inherited record
+
+1. **Origin is ``a3b8d1e``**, not ``58e8565`` (§50, handoff) and not ``692a450``
+   (the inherited statics receipt, accurate at 15:03 and stale by 15:25).  The
+   branch is published.
+2. **§50.2 conflated capturing the reference with comparing against it.**  Only
+   the capture must precede the pass manager; the comparison must follow the
+   completion window, and performing it early is what left the window open.
+3. **No LLIR field is declared as a bare ``Assign``.**  ``ForLoop.update`` is a
+   three-way union; the correct claim is "the only position holding an
+   ``Assign`` outside a sequence", which the committed test already states.
+4. **``SUPPORTED_LLIR_NODE_TYPES`` is not subclass-free.**  It contains
+   ``BinOp`` alongside ``Add`` and ``Mul``.  The exact-type rewrite is justified
+   by "every declared subclass of a supported type is itself supported", not by
+   the count of 36.
+5. **§50.8's Black finding count.**  Confirmed wrong, in the direction already
+   suspected: 15 findings and 137 clean files, on both base and candidate.
+6. **The "168 comparator calls over three other users" census is unreproduced**
+   at this grid, where the comparator is entered 56 times from one site.
+
+### 51.9 Verification
+
+All gates ran in the ``scorch`` conda environment.  Base is a detached worktree
+at ``a3b8d1e``; the candidate is this tree.
+
+- **Release neutrality against ``a3b8d1e``: byte-identical.**  The 20-source
+  corpus 20/20 and the 42-source ``ss@dd`` grid 42/42 identical, with no
+  differing file; the 86-case schedule audit ``total=86 admitted=46 rejected=40
+  nonidentical=0`` on both sides and identical between them.  Flake8 (47 lines)
+  and mypy (146 lines) hash-identical between base and candidate.  Black reports
+  ``15 files would be reformatted, 137 files would be left unchanged`` on **both**
+  sides -- the only stream that differs is Black's stderr, and it differs solely
+  by worktree path prefix and parallel-worker ordering, with neither changed file
+  in the list.  This also confirms the standing correction that §50.8's "one
+  finding" was wrong: it is 15 findings and 137 clean.
+- **mypy on the candidate: 140 errors in 11 files, and zero in a changed file.**
+  Identical to the recorded baseline.  ``git diff --check`` exits 0, and the five
+  protected tracked files hash exactly as recorded.
+- **The committed ordered-key suite: 240 passed.**  That includes the whole
+  inherited eighteen-case tamper matrix, the nine classes ``a3b8d1e`` added, all
+  forty normal reduction/TTM compile cells in both automatic arms, and the four
+  new locks.  The residual-sharing proof of §50.3 now binds on the **assembled**
+  body -- the object the caller actually receives -- rather than the pipeline's
+  list, which is strictly the better place for it.
+- **The extended matrix: six classes, zero foreign hook invocations.**  Two of
+  the six compiled at ``a3b8d1e`` and are rejected here; one was previously
+  refused only as a generic ``CodegenError`` and is now refused with this
+  family's own code; and the other-family case confirms the boundary is entered
+  once and short-circuits on a null reference.
+- **Representation unchanged.**  No node kind, no canonical schema change (v11
+  stands), no request- or schedule-identity change.
+- **No default dispatch, cache, selector or fallback change**, and no legacy code
+  removed.
+
+Four gates are **not** claimed at this tip and are recorded as absent rather
+than inherited: the 748-cell frontier differential, the crash-isolated legacy
+extent/dtype/density census, the compiled public differential over the twenty
+migrated cells, and the erasure/oracle differential.  §51.2 records why the
+inherited artifacts for the first two cannot be relabelled exact-tip.
+
+### 51.10 Phase-7 exit audit, re-run
+
+*Migrated families complete over their proven envelopes.*  Unchanged from §49.9
+and §50.9.  This section migrates nothing.
+
+*Every neighbour carries a stable fail-closed code.*  Not re-measured at this
+tip.  The frontier differential did not run, and the inherited receipt is an
+intermediate-revision artifact.
+
+*Representation unchanged.*  Yes.
+
+*Release behaviour unchanged.*  Yes, and measured: 20/20 and 42/42 generated
+sources byte-identical to base, the 86-case audit identical, zero native
+artifacts, and no dispatch, cache, selector or fallback change.
+
+*The declared matrix is closed.*  **No.**  Seven of the sixteen representatives
+remain behind the three blockers of §49.5, as sharpened by §50 and unchanged
+here.
+
+*The activating paired latency receipt.*  Present and declared in full below.
+
+**Phase 7 is NO-GO**, on exactly the three standing blockers.  No Phase-8
+inventory, cutover, cache, selector or default-dispatch change was made; no
+fallback was weakened and no legacy code was deleted.
