@@ -13702,6 +13702,70 @@ def _require_ordered_key_completion_checkpoint(
         )
 
 
+def _require_ordered_key_assembled_body(
+    returned: llir.Function,
+    assembled: llir.Function,
+    verified_body: List[llir.Stmt],
+    expected: Optional[List[llir.Stmt]],
+) -> None:
+    """Extend the completion boundary across the post-pipeline window.
+
+    ``_require_ordered_key_completion_checkpoint`` verifies the statement list
+    the managed pipeline returns.  Four stages then run before the caller sees a
+    function -- ABI assembly, then the parallel, panel, result-tile and relayout
+    completions -- and the two-node check this boundary replaced did cover them,
+    because it ran on the assembled function.  Leaving that window unchecked
+    would be a real narrowing: a duplicated ordered drain introduced there is
+    exactly the silent-storage corruption the verified body is checked for.
+
+    Both requirements below are exact-identity tests over the verified objects,
+    so together they cost one length compare and one pointer compare per
+    top-level statement rather than a second traversal.
+
+    *No completion transformed this family.*  Each of the four stages returns
+    its input unchanged unless the plan carries the corresponding region, and an
+    ordered-key plan carries none of them today.  Requiring the returned
+    function to BE the assembled function proves that for this compile instead
+    of assuming it -- and it fails closed the moment a future plan composes a
+    workspace with a tile, panel or relayout, which is precisely when the
+    replay contract has to be extended deliberately rather than silently.
+
+    *Assembly preserved the verified statements.*  ``assemble_function`` wraps
+    the body in a fresh ABI signature and copies the list, so every verified
+    statement must still be present, in order, as the same object.  Identity is
+    the exact right test here: these objects were deep-compared against the
+    detached reference moments earlier, so identity carries that verification
+    forward, while any substitution, drop, duplication or reorder breaks it.
+    """
+
+    if expected is None:
+        return
+    if returned is not assembled:
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "an ordered workspace plan reached a post-assembly completion "
+            "stage, which has no replay contract with the verified body",
+        )
+    try:
+        state = object.__getattribute__(assembled, "__dict__")
+        body = state["body"] if type(state) is dict else None
+    except (AttributeError, KeyError, TypeError) as error:
+        _fail(_SPARSE_WORKSPACE_LOST, str(error))
+    if type(body) is not list or len(body) != len(verified_body):
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "ABI assembly did not carry the verified ordered workspace body "
+            "forward as one statement list of the same length",
+        )
+    for index, statement in enumerate(verified_body):
+        if body[index] is not statement:
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "ABI assembly replaced, reordered or duplicated verified "
+                f"ordered workspace statement {index}",
+            )
+
+
 def _lower_loopir_to_llir_owned(
     program: LoopProgram,
     *,
@@ -13936,13 +14000,20 @@ def _lower_loopir_to_llir_owned(
     )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
     completed_sparse_workspace = lowering.complete_sparse_workspace(assembled)
-    return lowering.complete_relayout(
+    returned = lowering.complete_relayout(
         lowering.complete_result_tile(
             lowering.complete_panel(
                 lowering.complete_parallel(completed_sparse_workspace)
             )
         )
     )
+    _require_ordered_key_assembled_body(
+        returned,
+        assembled,
+        pipeline_result.artifact.value,
+        ordered_key_completion_reference,
+    )
+    return returned
 
 
 def lower_loopir_to_llir(
