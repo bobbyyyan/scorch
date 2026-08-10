@@ -215,6 +215,65 @@ def test_sparse_workspace_pass_preserves_semantics_and_erases_to_source():
     assert 0.0 in scheduled_result[lowering.program.outputs[0]].values
 
 
+@pytest.mark.parametrize("key_rank", [1, 2, 3])
+def test_root_anchored_rank_k_sparse_workspace_erases_and_executes(key_rank):
+    """A region above every producer loop has an intentionally empty prefix."""
+
+    from tests.test_scorch.test_loopir_verifier import (
+        build_rank_k_workspace_program,
+    )
+
+    _, scheduled, _, _ = build_rank_k_workspace_program(key_rank)
+    erased = erase_schedule(scheduled)
+    verify_program(erased)
+
+    assert "sparse_workspace" not in print_program(erased)
+    assert erase_schedule(erased) is erased
+
+    shape = (2, 3, 2)[:key_rank]
+    output_shapes = {scheduled.outputs[0]: shape}
+    assert run_program(scheduled, {}, output_shapes) == run_program(
+        erased, {}, output_shapes
+    )
+
+
+def test_root_rank_k_erasure_preserves_rotated_keys_and_contraction():
+    """A non-symmetric reduction distinguishes key order from loop order."""
+
+    from scorch.compiler.loopir.schedule_passes import _chain_provenance
+    from tests.test_scorch.test_loopir_oracle import _level_entries
+    from tests.test_scorch.test_loopir_verifier import (
+        build_rank_k_workspace_program,
+    )
+
+    _, scheduled, _, drain = build_rank_k_workspace_program(
+        2, key_permutation=(1, 0), contraction_extent=4
+    )
+    erased = erase_schedule(scheduled)
+    provenance = _chain_provenance(scheduled)
+
+    # Producer i/j/contraction loops execute first, followed by the one
+    # composite drain loop, whose scheduling identity is its innermost key.
+    assert len(provenance) == 4
+    assert provenance[-1].index == drain.indices[-1]
+
+    operand = [
+        [
+            [float(i * 100 + j * 10 + reduction) for reduction in range(4)]
+            for j in range(3)
+        ]
+        for i in range(2)
+    ]
+    bindings = {scheduled.inputs[0]: operand}
+    shapes = {scheduled.outputs[0]: (3, 2)}
+    scheduled_result = run_program(scheduled, bindings, shapes)[scheduled.outputs[0]]
+    erased_result = run_program(erased, bindings, shapes)[erased.outputs[0]]
+    expected = [((j, i), sum(operand[i][j])) for j in range(3) for i in range(2)]
+
+    assert scheduled_result == erased_result
+    assert _level_entries(scheduled_result) == expected
+
+
 def test_sparse_workspace_pass_handles_all_empty_inputs():
     lowering, workspace, _ = sparse_workspace_fixture()
     scheduled = apply_sparse_workspace(lowering.program, workspace)
