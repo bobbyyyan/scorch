@@ -9264,6 +9264,17 @@ managed pipeline is a shared, extensible pass chain, and this target's entire
 argument for correctness is that the pipeline hands its emission back intact.
 That argument was not being checked.
 
+**Measured rather than argued.**  The committed eighteen-case tamper matrix was
+replayed against a detached worktree at the inherited tip, each case asserting
+that its tamper actually landed: **18 of 18 were ACCEPTED**.  Replayed against
+the sealed tip, **18 of 18 are rejected** with
+``sparse_workspace_completion_lost``.  The dropped-insertion case was taken all
+the way through JIT build and execution on the inherited tip: it built, it ran,
+and it returned **zero stored entries and an all-zero dense result**
+(``[[0,0,0],[0,0,0]]``) where the correct answer is ``[[1,4,2],[5,3,6]]``.  The
+receipts are ``probes/inherited-escapes.stdout.txt`` and
+``probes/sealed-escapes.stdout.txt``.
+
 ### 50.2 The seal
 
 The reference is now the **whole assembled body**, captured before the pass
@@ -9536,6 +9547,18 @@ milestone does not skip it -- §50.4 measures it and §50.8 records it.
    ``~/.cache/scorch-codex/orderedkey-completion-seal/``.**  It is a new
    directory; it does not extend ``phase7-orderedkey-vertical``, whose
    manifests stay valid for what they sealed.
+9. **"Origin remains ``58e8565``" is false, and was already false before this
+   session opened.**  ``git ls-remote origin
+   refs/heads/refactor/compiler-ir-phase3-std-move-call`` returns
+   ``692a4509fbd2df2f08be592a90a1f26b9e8db20f``, and the local
+   remote-tracking reflog records ``update by push`` to that commit, with the
+   loose ref written at 11:09 on 2026-08-10 -- about half an hour before this
+   session's first action.  All eight inherited commits are therefore on
+   origin.  ``.git/packed-refs`` still carries the stale ``58e8565``, which is
+   where the repeated claim came from; the loose ref wins.  **This session
+   pushed nothing**: its three commits are local only and the branch is three
+   commits ahead of origin.  Nothing was done about the existing remote state
+   -- no force-push, no reset, no branch surgery.
 
 ### 50.8 Verification
 
@@ -9570,7 +9593,19 @@ recorded beside each receipt in the ledger named in 50.7.8.
   finding (``src/scorch/prebuilt_kernels.py``) reproduces at base.
 - **Paired compile-only latency**: the table in §50.4.
 - **Complete non-performance suite** in clean, file-disjoint fresh processes
-  with a complete non-overlapping union proof.
+  with a complete non-overlapping union proof.  **6,063 selected nodes, 6,049
+  passed, 14 skipped, 3 deselected, zero failures and zero errors, all eight
+  partitions exiting 0**, no infrastructure-failure pattern matched, and the
+  detached worktree still clean afterwards.  Unlike the inherited run, **every
+  partition ran at the same revision** -- the exact final tip ``f7c8f55`` -- so
+  this is an exact-tip receipt with no split-revision argument attached.  The
+  pre-run proof places all 86 selected modules of the 88 tracked exactly once,
+  with both the module and node partitions complete and disjoint; the two
+  tracked modules selecting nothing under ``-m "not perf"`` are
+  ``test_helpers.py`` and ``test_perf_large.py``.  The node count moves from
+  the inherited tip's 5,949 to 6,063, and the difference is fully accounted
+  for: the ordered-key target file is the only test module that changed, and
+  it goes from 114 nodes to 228.
 
 ### 50.9 Phase-7 exit audit, re-run
 

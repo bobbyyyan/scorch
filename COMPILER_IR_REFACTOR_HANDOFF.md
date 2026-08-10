@@ -30950,9 +30950,13 @@ an even broader continuation prompt.
 
 ## Ordered workspace completion seal and the legacy-comparand correction (2026-08-10; supersedes every preceding prompt)
 
-Three local commits follow inherited committed tip ``692a450``; nothing was
-pushed, amended, squashed or reordered.  Origin remains ``58e8565``.  The five
-protected tracked files hash exactly as recorded.  Evidence ledger:
+Four local commits follow inherited committed tip ``692a450``; nothing was
+pushed, amended, squashed, reordered or discarded.  **Origin does not remain
+``58e8565``**: `git ls-remote` shows this branch on origin at ``692a450``,
+pushed at 11:09 on 2026-08-10, before this session opened -- the repeated
+``58e8565`` claim comes from a stale entry in ``.git/packed-refs``.  This
+session pushed nothing; the local tip is four commits ahead of origin.  The
+five protected tracked files hash exactly as recorded.  Evidence ledger:
 ``~/.cache/scorch-codex/orderedkey-completion-seal/`` (new; it does not extend
 ``phase7-orderedkey-vertical``, whose manifests remain valid for what they
 sealed).
@@ -31011,6 +31015,13 @@ records that, streaming per cell so a terminating route would be named.  All
 twenty legacy sources differ from ours, and the suite asserts it: the nine
 locks are semantic parity, never byte parity.
 
+**The eighteen-case tamper matrix, measured both ways.**  Replayed against a
+detached worktree at the inherited tip, **18 of 18 were accepted**; replayed
+against the sealed tip, **18 of 18 are rejected** with
+`sparse_workspace_completion_lost`.  The dropped-insertion case was taken
+through JIT build and execution on the inherited tip and returned zero stored
+entries and an all-zero dense result where the answer is `[[1,4,2],[5,3,6]]`.
+
 **Verification at the final tip.**  Ordered-key target file 228/228; adjacent
 LoopIR/CIN/schedule/LLIR pass memberships 1,115/1,115; the three other users of
 the rewritten comparator 185/185; the complete adversarial matrix; the
@@ -31018,8 +31029,12 @@ twenty-cell legacy battery; release neutrality (20-source corpus and 42-source
 grid byte-identical, 86-case schedule audit identical); statics (mypy
 byte-identical; Flake8/Black differ only on untracked working-tree-only files);
 ``git diff --check`` clean; paired latency as above; and the complete
-non-performance suite in file-disjoint fresh processes with a
-complete/non-overlapping union proof.
+non-performance suite in eight clean, file-disjoint fresh processes --
+**6,063 selected, 6,049 passed, 14 skipped, zero failures, zero errors, all
+partitions exit 0**, every partition at the same revision ``f7c8f55``, with a
+complete/non-overlapping union proof over all 86 selected modules.  The node
+count moves 5,949 -> 6,063 entirely because the ordered-key file goes 114 ->
+228.
 
 **Phase 7 remains NO-GO.**  The three blockers of review §49.5 are untouched:
 workspace-plus-tile plan composition, the automatic-origin reorder together
