@@ -347,6 +347,7 @@ def _decompose_body(
 def _decompose_chain(
     program: LoopProgram,
     *,
+    allow_empty: bool = False,
     relayout_sink: Optional[List[RelayoutStage]] = None,
     result_tile_sink: Optional[List[ResultTileRegion]] = None,
 ) -> Tuple[List[_LoopNode], _ChainEnd]:
@@ -362,7 +363,7 @@ def _decompose_chain(
     loops, end = _decompose_body(
         program.body,
         leaf_types=(*_LEAF_TYPES, WorkspaceRegion, SparseWorkspaceRegion, TiledReduce),
-        allow_empty=False,
+        allow_empty=allow_empty,
         relayout_sink=relayout_sink,
         result_tile_sink=result_tile_sink,
     )
@@ -3109,6 +3110,12 @@ def _chain_provenance(
     result_tile_regions: List[ResultTileRegion] = []
     loops, leaf = _decompose_chain(
         program,
+        # A workspace is allowed to own the program root.  In particular,
+        # rank-K sparse reductions anchor their region above every producer
+        # loop, so their outer chain is intentionally empty.  Provenance and
+        # erasure must accept that scheduled root shape; schedule-construction
+        # passes keep the nonempty-chain boundary.
+        allow_empty=True,
         relayout_sink=relayout_stages,
         result_tile_sink=result_tile_regions,
     )
@@ -3404,6 +3411,9 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
     result_tile_regions: List[ResultTileRegion] = []
     loops, leaf = _decompose_chain(
         program,
+        # See _chain_provenance: a sparse-workspace region may deliberately
+        # own the root when it accumulates a whole rank-K key domain.
+        allow_empty=True,
         relayout_sink=relayout_stages,
         result_tile_sink=result_tile_regions,
     )
