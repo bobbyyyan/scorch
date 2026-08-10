@@ -23,7 +23,8 @@ dataclass surface) and is not attempted here.
 """
 
 from abc import ABCMeta
-from collections import OrderedDict
+from array import array
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 import enum
 import json
@@ -1139,6 +1140,31 @@ class _CountingSequence(Sequence, metaclass=_CountingSequenceMeta):
         return self._values[index]
 
 
+class _ExplodingSequence(Sequence):
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        raise RuntimeError("sequence consumption escaped")
+
+
+class _ExplodingDict(dict):
+    def __contains__(self, key):
+        raise RuntimeError("mapping consumption escaped")
+
+
+class _ExplodingFill:
+    def __ne__(self, other):
+        raise RuntimeError("fill comparison escaped")
+
+
+class _ExplodingKey(str):
+    def __eq__(self, other):
+        raise RuntimeError("mapping key comparison escaped")
+
+    __hash__ = str.__hash__
+
+
 def test_foreign_sequence_rejection_invokes_no_metaclass_hook():
     """Rejecting a non-sequence must not consult the candidate's metaclass."""
 
@@ -1184,6 +1210,26 @@ def test_raising_metaclass_cannot_escape_public_format_construction():
         TensorFormat.from_dict({"levels": [_RaisingHashCandidate()]})
 
 
+def test_protocol_consumption_failures_are_translated_at_public_boundaries():
+    """Recognized containers run their protocol, but never leak its errors."""
+
+    with pytest.raises(TensorFormatError, match="sequence is malformed") as error:
+        TensorFormat(_ExplodingSequence())
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+    with pytest.raises(TensorFormatError, match="serialized.*malformed") as error:
+        TensorFormat.from_dict(_ExplodingDict(levels=[]))
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+    with pytest.raises(TensorFormatError, match="serialized.*malformed") as error:
+        TensorFormat.from_dict({"levels": [], "fill_value": _ExplodingFill()})
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+    with pytest.raises(TensorFormatError, match="serialized.*malformed") as error:
+        TensorFormat.from_dict({_ExplodingKey("levels"): []})
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
 def test_from_dict_still_accepts_every_real_mapping_and_sequence():
     """The MRO recognizer must not narrow the accepted builtin shapes.
 
@@ -1199,12 +1245,16 @@ def test_from_dict_still_accepts_every_real_mapping_and_sequence():
     assert TensorFormat.from_dict(MappingProxyType(payload)) == fmt
     assert TensorFormat.from_dict(OrderedDict(payload)) == fmt
     assert TensorFormat.from_dict({"levels": tuple(payload["levels"])}) == fmt
+    assert TensorFormat.from_dict({"levels": deque(payload["levels"])}) == fmt
     assert TensorFormat.from_dict(json.loads(fmt.serialize())) == fmt
 
     class _ListSubclass(list):
         pass
 
     assert str(TensorFormat(_ListSubclass(["d", "s"]))) == "d,s"
+    assert str(TensorFormat(deque(["d", "s"]))) == "d,s"
+    assert str(TensorFormat(array("u", "ds"))) == "d,s"
+    assert TensorFormat(memoryview(b"")) == TensorFormat()
 
     with pytest.raises(TensorFormatError, match="levels must be a list"):
         TensorFormat.from_dict({"levels": "ds"})
