@@ -30806,3 +30806,132 @@ separately, seal only final-tip evidence excluding worktrees/caches/binaries,
 verify every manifest entry, leave origin untouched, and report an honest
 verdict plus a broader prompt.
 ```
+
+## Ordered-key semantic vertical: 33 newly admitted cells (2026-08-09; supersedes every preceding prompt)
+
+Three local commits follow inherited documentation tip ``5571c82``; nothing was
+pushed, amended, squashed or reordered.
+
+The independent review of ``cf8cd44..5571c82`` found **no surviving defect**.
+Callback-free format recognition (zero hooks over nine hostile-metaclass
+probes), classified protocol consumption, restored ``deque``/``array``/
+``memoryview`` compatibility, root-owned K = 1/2/3 erasure, rotated-key
+contraction semantics with independently re-derived parent-linked storage,
+root provenance, and the 5/11/16 census all reproduce; all three sealed
+manifests verify (501/501, 213/213, 56/56).  The only exception that escapes
+the format API is ``KeyboardInterrupt``, which ``except Exception`` correctly
+does not catch.
+
+The milestone then lands the **semantic** half of Phase-7 cluster 2.  CIN gains
+an ordered-key reduction family whose ``(prefix, key rank)`` split is derived
+from loop and level identities; ``apply_sparse_workspace`` becomes rank-general
+and accepts a root-owned region; and a new rank-general LLIR target assembles
+multi-level ordered results with genuine parent links, reusing the shared loop,
+merge and value machinery rather than re-implementing it.  ``coo_workspace<T,K>``
+receives KEY-domain extents and needed **no native change**; ``K == 1`` keeps
+the retained ``coo_workspace_1d`` spelling, so the migrated families' generated
+C++ is unchanged.
+
+Over a **143-cell frontier derived from semantic identities** (not the census):
+**33 newly admitted cells, 9 -> 42 admitted, zero regressions, 45 code
+sharpenings, arm-invariant everywhere**.  Nine of the sixteen committed census
+representatives are migrated, and the vertical is general over the split rather
+than the list: ``(prefix, K)`` of (0,1), (0,2), (0,3), (1,1), (1,2) and (2,1)
+are all exercised.  A 520-check compiled public differential — exact
+``(pos, crd, values)`` storage against the oracle, scheduled-versus-erased
+equality, and a dense PyTorch reference — passes over both automatic arms,
+f32/f64, singleton/ragged/empty/zero extents, explicitly stored operand zeros,
+cancellation, commuted operands and dense/compressed second factors.  Its only
+8 failures are one blocker, characterized separately.
+
+**Three blockers remain, each precisely located.**  (1) ``TTM dds`` carries an
+affine tile beside its workspace and no workspace+tile replay contract exists;
+suppressing the tile would change legacy default emission.  (2) The five
+auto-origin reorder-blocked cells need BOTH a LoopIR-only plan repair and a
+``K == 0`` scalar-accumulation family — measured over ten blocked cells, the
+legal declared order always yields an EMPTY key, so the repair alone only moves
+the failure to a later seam.  (3) A dense result prefix level bound by a stored
+loop at rank >= 3 keeps ``unsupported_sparse_output_domain``; one inherited seam
+lock moved there.
+
+Phase 7 remains **NO-GO**: the declared matrix is not closed.  No Phase-8
+cutover, default-dispatch, cache, selector or fallback change was made, and no
+legacy code was deleted.  Canonical schema stays v11.  Review §49 owns the
+detailed results.
+
+### Broad copy-paste prompt for the next session
+
+```text
+Continue from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, §45-§49 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md, and the FINAL handoff section. Inspect
+code and raw receipts yourself. Do not push, amend, squash or reorder. Never
+run `git stash`. Preserve all unrelated GPU/CUDA/benchmark/scheduler/research/
+scratchpad material and stage only explicit files.
+
+Keep these protected dirty files byte-exact: `.gitignore`
+301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105;
+`pyproject.toml` 191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea;
+`src/scorch/__init__.py` 5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845;
+`tests/packaging/smoke_install.py`
+f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679;
+`tests/test_scorch/test_resources.py`
+3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9.
+
+First review `5571c82..<tip>` rigorously. Independently re-derive, do not read:
+the ordered-key (prefix, key-rank) split from loop/level identities; rank-general
+schedule placement including root-owned regions; multi-level ordered assembly
+with per-region segment bases; KEY-domain extents in `coo_workspace<T,K>`; the
+narrowed workspace routing predicates; and the post-pass completion check.
+Attack them: cross-region repeated outer keys, K>=3 with a bound prefix,
+permuted result modes, interleaved result coordinates between reductions,
+merged KEY coordinates, UNION producers, zero/singleton/ragged extents,
+explicitly stored zeros, forged/cyclic nodes, and hostile Mapping/Sequence
+operands. Fix defects before any new work.
+
+Then continue the cluster-2 vertical:
+
+1. Re-derive the frontier (>=143 cells) and extend it: rank-5, permuted
+   contractions, UNION-domain keys, mixed dense/compressed prefixes, and
+   `sds`/`ssd`/`dsd` receivers. Record every route; the census is a
+   representative list, never a proof of exhaustiveness.
+2. Decide the workspace+tile replay contract for `TTM dds`. Either implement a
+   fused workspace+tile application (like `apply_reduce_out_tiles`) or prove
+   why the automatic tile must be suppressed for ordered-key plans WITHOUT
+   changing legacy default emission. Require legality, oracle equivalence,
+   request identity and byte-identical sources for every unaffected cell.
+3. Design the `K == 0` bound-prefix scalar-accumulation family together with a
+   LoopIR-only automatic-plan repair. Both are needed; neither alone migrates a
+   cell. A new node kind or a documented rank-0 key instance is a schema
+   decision — bump canonical v11 only if serialized semantics genuinely change,
+   and re-seal every canonical-dump lock if so.
+4. Consider row-scope dense prefixes at rank >= 3 (a DENSE result level bound by
+   a STORED loop) as a separate slice with its own dynamic-parent catch-up.
+5. Keep every gate: exact-tip focused and adversarial tests, expanded frontier
+   differential, erasure/oracle and compiled public differentials, raw 120 plus
+   162/560, crash-isolated 54-cell census with timeout and RLIMIT_CPU/CORE,
+   86-case schedule audit, source captures, base/candidate Black/Flake8/mypy,
+   protected hashes, `git diff --check`, and a clean detached full non-perf
+   suite in file-disjoint fresh processes with a complete/disjoint node proof.
+   Never call base-only evidence exact-tip, relabel nonzero output, hide
+   infrastructure failure, or average timing drift.
+
+For source-changing activation, run paired latency with A/A and order controls
+on an independent host. Prefer Stanford SC/MKT when Redwood is loaded:
+`kinit bobbyy@CS.STANFORD.EDU`, `ssh sc`, Slurm
+`--account=mkt --partition=mkt` (or `mkt-interactive`), and build/run only in
+the allocation under `/scr/u/bobbyy`; never compile on the login node or SSH
+directly to `mkt1`. If the activating sources for previously migrated families
+are byte-identical, prove that instead of manufacturing timing; newly admitted
+families have no legacy comparand, so state that rather than inventing one.
+
+Repeat the Phase-7 exit audit. Only a genuine GO permits a read-only Phase-8
+cutover/fallback census and at most an explicitly opt-in shadow pilot for
+already proven families. Do not flip default dispatch, weaken fallback, alter
+release caches/selectors, delete legacy code, or start Phase 8.5 without a
+separate gate. If still NO-GO, stop at the exact blocker. Commit production,
+test and documentation slices separately with descriptive bodies, seal only
+final-tip evidence excluding worktrees/caches/binaries/pycache, verify every
+manifest entry, leave origin untouched, and finish with an honest GO/NO-GO plus
+an even broader continuation prompt.
+```

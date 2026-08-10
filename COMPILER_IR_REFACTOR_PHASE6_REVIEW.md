@@ -8889,3 +8889,255 @@ the semantic vertical across the expanded reachable frontier and, in
 parallel, make a separately gated decision for LoopIR automatic-origin repair.
 No Phase-8 cutover, default dispatch flip, cache/selector change, fallback
 weakening or legacy deletion is authorized before a genuine Phase-7 GO.
+
+## 49. The ordered-key semantic vertical: 33 newly admitted cells, three named blockers (2026-08-09)
+
+This milestone starts at inherited documentation tip ``5571c82``.  It reviews
+``cf8cd44..5571c82`` independently, then lands the **semantic** half of the
+Phase-7 cluster-2 vertical that §47/§48 left open: a rank-general ordered-key
+sparse-workspace route from CIN admission through schedule application to a
+new LLIR target and honest multi-level public storage.  Origin remains
+``58e8565``; nothing was pushed, amended, squashed or reordered; the five
+protected tracked files hash exactly as recorded.
+
+### 49.1 Independent review of the inherited range: no surviving defect
+
+Every §48 contract was re-derived from the code and from live probes.
+
+- **Recognition is callback-free; consumption is classified.**  Hostile
+  metaclasses (recording ``__hash__``/``__eq__``/``__subclasscheck__``/
+  ``__instancecheck__``/``__name__``/``__mro__``, and a raising ``__hash__``)
+  drive ``TensorFormat(...)``, ``parse_format``, ``from_dict`` and
+  ``LevelFormat`` through nine probes with a **total hook-invocation count of
+  zero**, each reporting a ``scorch.exceptions`` error.  A genuine
+  ``collections.abc.Sequence``/``Mapping`` subclass whose protocol raises is
+  translated to ``TensorFormatError`` at every public entry, including a
+  mutating sequence and a raising ``__iter__``.  The one exception that still
+  escapes is ``KeyboardInterrupt``, which ``except Exception`` deliberately
+  does not catch; §48.1's wording ("no ordinary caller exception") is exact
+  rather than overstated, and catching it would be a defect of its own.
+- **Standard virtual Sequence compatibility is restored.**  ``deque(["d","s"])``
+  and ``array("u", "ds")`` build a valid ``d,s`` format and ``memoryview(b"")``
+  the empty format.  ``bytes``/``bytearray`` stay rejected, and
+  ``memoryview(b"ds")``/``array("i", ...)`` reach the level-content error, so
+  recognition did not move which boundary reports content.
+- **Virtual registrations beyond the named builtins fail closed**, while
+  ``dict``/``OrderedDict``/``mappingproxy`` round trips are unchanged.
+- **Root-owned rank-K erasure reproduces at K = 1, 2 and 3**: each program
+  verifies, executes, erases to a workspace-free program, is erasure-
+  idempotent, and its scheduled and erased oracle storage are exactly equal.
+- **The rotated rank-2 key with a four-way contraction reproduces**, and its
+  storage was re-derived independently from the raw arrays:
+  ``pos0=[0,3] crd0=[0,1,2] pos1=[0,2,4,6] crd1=[0,1,0,1,0,1]`` with contracted
+  values — strictly increasing lexicographic key order, with the key order
+  genuinely different from the producer's loop order.  Provenance is the three
+  producer loops followed by the composite drain.
+- **Malformed, cyclic and rank-disagreeing programs fail closed** — truncated
+  insert coordinates, truncated drain indices, duplicate and empty key
+  domains, a cyclic producer block, a drain inside the producer, and a direct
+  ``run_program`` call on a truncated key — each with a domain error and a
+  precise path.
+- **The sealed evidence verifies**: 501/501, 213/213 and 56/56 manifest
+  entries, and ``FINAL_STATE_SHA256SUMS`` binds both committed documentation
+  files at their current content.
+
+**No defect in ``cf8cd44..5571c82`` survived verification**, so this milestone
+opens no fix commit before the vertical.
+
+### 49.2 The frontier, derived rather than re-read
+
+§48.3 was explicit that the committed 16-cell census is a representative
+frontier, not an exhaustive one.  Before touching any code this milestone
+derived a **143-cell** frontier from semantic identities — every rank-2 and
+rank-3 receiver layout crossed with every result subset, rank-3 results with
+mixed dense/compressed layouts, rank-4 reductions, four second-factor layouts
+crossed with three TTM result layouts, commuted operands, permuted
+contractions, and the migrated SpGEMM/SpMM controls — recording the exact
+route (exception class plus defect code) for each in both automatic arms.
+
+The frontier is **arm-invariant at all 143 cells, before and after**.
+
+### 49.3 What landed, layer by layer
+
+Three production files change.  Every admission decision is expressed through
+level kinds, declared dimensions, loop node types and bound coordinate
+identities — no CSR shortcut, no rendered-name discovery, no regex, no
+format-string sniffing.  A committed test parses the new target's source and
+asserts that no string literal it evaluates is a level alias or a
+layout-shaped token, and that no pattern-matching module is used.
+
+**1. CIN admission (`lower_cin.py`).**  A new
+``_SparseOutputReduction.ORDERED_KEY_WORKSPACE`` family covers a result whose
+levels are a (possibly empty) dense prefix followed by one or more compressed
+levels, reduced under ADD, excluding the two shapes the migrated families
+already own — ``(COMPRESSED, COMPRESSED)`` and ``(DENSE, COMPRESSED)``.  Its
+split is computed, not tabulated: ``_ordered_key_split`` returns
+``(prefix, key_rank)`` where the prefix is the run of result coordinates bound
+above the OUTERMOST reduction and the key is the run bound below the INNERMOST
+one.  A result coordinate interleaved between two reductions, a permuted
+result mode order, or an empty key returns ``None`` — the shape's own
+definition of "not this family".  Two domain rules follow: a dense result
+prefix level must iterate a dense domain and a compressed one must be driven
+by one stored sparse level, while a **drained key coordinate may iterate any
+domain**, including a dense one.  That last rule is the point of a workspace:
+it owns ordering, so insertion order need not be result order, and TTM against
+a dense second factor becomes ordinary rather than exceptional.
+
+**2. Schedule application (`schedule_passes.py`).**  ``apply_sparse_workspace``
+is rank-general.  It consumes the same ``WorkspaceInsertion`` fact the
+automatic origin already emits — whose ``axis_loops`` is by construction every
+free variable below the innermost reduction — and derives placement from two
+identities: the key must be the trailing run of both the result's own
+coordinates and the loop chain, and the anchor is the first loop below the
+bound prefix, i.e. the outermost reduction.  ``prefix == 0`` is legal and means
+the region owns the program root.  The family-shape restrictions the K = 1 code
+carried (rank-2 result, ``(C,C)``/``(D,C)`` kinds, exactly one reduction loop,
+an INTERSECTION merge or a single cursor, a sparse drained axis, a dense row
+binder) are gone; what remains is placement legality, which is the pass's
+actual job.  ``_loop_bound_dimension`` now also answers for a merged loop and
+verifies its cursors share one declared dimension rather than assuming it.
+``_check_auto_plan_family`` accepts an ordered key of any rank.
+
+Because the construction order is unchanged, the migrated B1, dense-row CSR
+and row-scope families build byte-identically.
+
+**3. A rank-general LLIR target (`lower_llir.py`).**
+``_OrderedKeySparseWorkspaceLowering`` admits ``p >= 0`` prefix loops binding
+result levels (a dense loop over a dense level, a single-cursor sparse loop
+over a compressed one), one region, any producer nest of dense / single-cursor
+/ two-cursor merged loops descending to one ADD insertion at the ``K``
+innermost producer coordinates, and one ordered drain appending at the prefix
+coordinates followed by the drained key.  It reuses the shared loop machinery
+rather than re-implementing it — dense-position resolution, cursor descent,
+merged alignment cases and value lowering are the general ones — which is why
+``sd`` and ``ds`` second factors work without a line of their own.
+
+Two details are worth stating because getting either wrong is silent.
+
+*Coordinates are not positions.*  Each key level above the leaf appends a
+coordinate only when the drained key opens a new segment there, and the test is
+measured against a per-region base (``wksp_base{level}`` captured at region
+entry) — never against emptiness.  Without that base, a region whose first
+drained coordinate equals the previous region's last would silently merge two
+parents' segments, producing storage that still sums correctly while losing a
+level of structure.  A dedicated lock builds exactly that input.  The "opened"
+flag cascades, so a new outer segment forces a new inner segment even when the
+inner coordinate repeats.
+
+*The key domain is not the result shape.*  ``coo_workspace<T,K>`` receives the
+``K`` drained levels' own extents — ``coo_workspace<float, 2>(1024,
+{result_shape[0], result_shape[1]})``.  This is the correction §47.4 predicted,
+now exercised: **no native C++ change was required**.  ``K == 1`` keeps the
+retained ``coo_workspace_1d<T, 1>`` spelling, so the migrated families'
+generated sources are unchanged.
+
+Routing was narrowed rather than extended: ``_sparse_workspace_chain`` and
+``_parallel_sparse_workspace_chain`` now name their families' structural
+identity (a rank-1 key plus, respectively, a two-cursor merged producer or two
+dense-parented single-cursor loops over different operands) instead of "a
+region under some loop".  Everything else reaches the rank-general target,
+which either lowers it or fails closed with its own precise code.
+
+**4. Post-pass integrity.**  The new target emits its allocation, insertion and
+drain in final checked form — ``emplace_back``, ``push_back`` and
+``scorch_vector_set`` — so it depends on no shared rewrite.  That independence
+is proven rather than assumed: ``complete_sparse_workspace`` locates the
+assembled function's workspace allocation and ordered drain by the workspace's
+own reserved identifier, requires exactly one of each, and compares both
+exactly against a fresh rebuild.
+
+### 49.4 What the vertical reaches
+
+Across the derived 143-cell frontier, in both automatic arms:
+
+- **33 newly admitted cells**, 9 -> 42 admitted in total;
+- **zero regressions** — every cell admitted at base is still admitted;
+- **45 code sharpenings**, 38 of them ``unsupported_sparse_output`` ->
+  ``unsupported_sparse_output_domain``, i.e. the diagnosis now names the actual
+  domain violation instead of reporting an unrecognized layout;
+- **65 cells unchanged**, and **arm-invariance at every cell**.
+
+Of the sixteen committed census representatives, **nine are migrated**:
+``sss ijk->k`` (prefix 0, K 1), ``ss ij->j`` (0, 1), ``ds ij->j`` (0, 1),
+``sss ijk->ik`` (1, 1), ``sss ijk->jk`` (0, 2), and the four
+``TTM {sss,dss} x {dd,ss}`` cells (2, 1).  The migration is general over the
+``(prefix, K)`` split rather than that list, which the committed suites
+exercise well beyond the census: ``ssss ijkl->l`` (0, 1), ``->kl`` (0, 2),
+``->jkl`` (0, 3), ``->il`` (1, 1), ``->ikl`` (1, 2) and ``->ijl`` (2, 1), plus
+``ds``/``sd`` second factors, commuted operands and ``ddss`` receivers.
+``(1, 2)`` matters disproportionately: it is the only shape where a region runs
+once per prefix cell *and* assembles nested key levels, so it is the only one
+that can expose a cross-region segment merge.
+
+### 49.5 Three blockers remain, each named precisely
+
+1. **Workspace + tile composition (2 census cells).**  ``TTM dds x {dd,ss} ->
+   dds`` is legal and its target shape is supported, but the automatic origin
+   also emits an affine tile: ``Scheduler._select_index_vars_to_tile`` tiles
+   every dense index variable absent from some access, and ``j`` qualifies for
+   a ``dds`` receiver against a ``kl`` factor.  A plan carrying both a sparse
+   workspace and a tile has no replay contract — the only implemented
+   composition is the dense reduce-out fusion — so it stops at
+   ``unsupported_schedule_auto_family``.  Suppressing the tile is not
+   available: ``_apply_automatic_tiles`` is shared with legacy default
+   dispatch, so changing it would change default generated code.
+2. **The automatic-origin reorder, and why repairing it is not enough
+   (5 census cells).**  ``Scheduler.select_loop_order``'s unchecked forced
+   reorder still blocks ``sss ijk->{i,j,ij}``, ``ss ij->i`` and ``ds ij->i`` at
+   ``sparse_parent_dominance``.  This milestone sharpens the inherited claim
+   with a measurement: under their own DECLARED order, **all ten** blocked
+   cells probed (including ``dss ijk->i``, ``dds ijk->ij``, ``sds ijk->ij``,
+   ``ssd ijk->ij`` and ``ssss ijkl->ijk``) bind every result coordinate above
+   the outermost reduction, so the ordered key is **empty**.  ``K == 0`` is a
+   scalar-accumulation reduction — a shape no migrated family owns and one the
+   representation has no node for, since a workspace region is defined by its
+   key domain and a rank-0 key is a different construction, not a degenerate
+   instance.  A LoopIR-only automatic-plan repair is therefore **necessary but
+   provably not sufficient**: on its own it moves the failure from LoopPlan to
+   a later LoopIR seam and migrates nothing.  The two must be gated together.
+   Sections 47.5/47.7/48.3 are corrected accordingly: the repair is neither a
+   Phase-8 dispatch decision (§47) nor sufficient on its own (§48).
+3. **Row-scope dense prefixes at rank >= 3.**  A DENSE result prefix level
+   bound by a STORED loop needs the row-scope catch-up against a *dynamic*
+   parent count at depth.  It is rejected up front with
+   ``unsupported_sparse_output_domain``, which names the actual violation.
+   One inherited seam lock moved here (§49.7).
+
+### 49.6 Verification
+
+All gates ran in the ``scorch`` conda environment.
+
+- **Compiled public differential: 520 checks, 8 failures, and every failure is
+  blocker 1.**  Each migrated cell is executed through the real JIT path and
+  checked four ways — exact ``(pos, crd)`` level storage against the
+  scheduled-program oracle, scheduled-versus-erased oracle equality, stored
+  value agreement, and a dense PyTorch reference — across both automatic arms,
+  ``float32`` and ``float64``, singleton/ragged/empty/zero extents, exact
+  cancellation, commuted operands and dense/compressed second factors.  The
+  eight failures are ``TTM dds x {dd,ss}`` in both arms and both dtypes, each
+  at ``unsupported_schedule_auto_family``.  The harness retains that raw
+  nonzero receipt and a separate exit-0 characterization asserts the blocked
+  set is exactly those and nothing else.
+- **The legacy comparand is not a gate for this family**, and that is
+  deliberate: every migrated cell is one the legacy assembler rejects,
+  corrupts, or terminates on.  Correctness is gated on the LoopIR oracle plus
+  the dense PyTorch reference.  Byte parity is asserted only where it is
+  meaningful — that the K = 1 families' generated sources did not move.
+- **Representation unchanged.**  No node kind, no canonical schema change
+  (v11 stands), no request- or schedule-identity change.  ``plan_identity``
+  digests ``(cin, plan, result_shape, inputs, compile_options)``, never the
+  LoopIR program.
+- **No default dispatch, cache, selector or fallback change**, and no legacy
+  code removed.
+
+### 49.7 Recorded seam moves
+
+One inherited seam lock named a cell this milestone migrates.
+``test_loopir_multi_compressed_target.py``'s ``ttm_reduction`` cell asserted
+``unsupported_sparse_output`` for ``TTM sss x dd -> sss``; it is moved to the
+neighbour that still occupies the seam — the same TTM with a ``dss`` result,
+whose DENSE prefix level is bound by the receiver's STORED level — and the move
+is named in place.  The census itself is rewritten around the three-way split
+(9 migrated / 2 auto-tile blocked / 5 reorder blocked) with its
+explicit-order controls updated to the sharpened codes, and it keeps the
+"representative, not exhaustive" statement §48.3 insisted on.
