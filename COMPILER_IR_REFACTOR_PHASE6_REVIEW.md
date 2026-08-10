@@ -9984,3 +9984,75 @@ here.
 **Phase 7 is NO-GO**, on exactly the three standing blockers.  No Phase-8
 inventory, cutover, cache, selector or default-dispatch change was made; no
 fallback was weakened and no legacy code was deleted.
+
+### 51.11 Blocker 1's untested claim is not merely untested; the experiment is blocked by design
+
+§51.6 recorded that settling §49.5's "its target shape is supported" needs an
+experiment this section had not run.  It has now been run, and the result is
+better than "untested": **the experiment is refused by the layer whose job is to
+refuse it.**
+
+``Scheduler._select_index_vars_to_tile`` is consulted twice -- once to place
+tiles (``scheduler.py:3407``) and once, for DENSE outputs only, to decide whether
+a workspace is worth inserting (``scheduler.py:3497``).  A ``dds`` receiver is
+not a dense output, so its workspace insertion does not depend on the second
+answer.  Returning no tile candidates should therefore suppress the tile and keep
+the workspace -- precisely the plan §49.5's claim is about, and the one route the
+two public ones cannot reach.
+
+Measured over both ``dds`` cells in both automatic arms, with a migrating cell as
+control:
+
+| cell | arm | selector suppressed | outcome |
+| --- | --- | --- | --- |
+| ``TTM dds x dd -> dds`` | direct | no | ``unsupported_schedule_auto_family`` |
+| ``TTM dds x ss -> dds`` | direct | no | ``unsupported_schedule_auto_family`` |
+| ``TTM dds x dd -> dds`` | direct | **yes** | ``InvalidSchedule``: ``auto_tile_decision`` |
+| ``TTM dds x ss -> dds`` | direct | **yes** | ``InvalidSchedule``: ``auto_tile_decision`` |
+| ``sss ijk->jk`` (control) | direct | yes | COMPILED |
+| all four ``dds`` rows | regblock | as above | identical |
+| ``sss ijk->jk`` (control) | regblock | yes | COMPILED |
+
+The LoopPlan boundary re-derives the tiling heuristic **independently of the
+scheduler**, and refuses when the recorded automatic tiles disagree with its own
+policy-derived decision: "the recorded automatic tiles must equal the
+policy-derived heuristic decisions exactly".  Patching the scheduler's selector
+creates exactly that disagreement.  The control cell compiles under the same
+patch, so the refusal is specific to the ``dds`` plan and not an artifact of the
+patch; and the selector call counts confirm the mechanism -- two calls for a
+``dds`` cell against one for the control, the second being the dense-output
+workspace question.
+
+So the suppression half is unavailable on **four** measured facts, not three.
+The three inherited ones stand, and this is the fourth: even a probe cannot
+construct the plan, because the legality layer exists to stop a recorded plan
+from diverging from the heuristic that produced it.  Reaching a tile-free ``dds``
+plan requires changing the heuristic itself in a layer shared with legacy default
+dispatch -- which changes default generated code, which is the constraint §49.5
+already names.
+
+**Blocker 1 is therefore recorded as not settleable by experiment under the
+current automatic origin.**  Deciding it requires choosing between a
+single-arm fused workspace-plus-tile contract for the legal ``CHILD_OF``
+placement -- accepting stated arm-variance, since the non-regblock OUTERMOST
+placement hoists ``j_out`` above ``i`` and a ``dds`` receiver's streamed
+compressed level must be appended in lexicographic ``(i, j)`` order -- and
+recording TTM ``dds`` as permanently unmigratable here.  That decision is not
+taken in this section, and no partial work toward either half is committed.
+
+### 51.12 The full suite at the exact tip
+
+The clean detached full non-performance suite, eight file-disjoint partitions in
+fresh processes: **6,079 selected nodes, 6,065 passed, 14 skipped, 3 deselected,
+zero failures and zero errors, every partition exiting 0, all eight at one
+revision ``d725676``.**  Tallied independently from the eight JUnit XMLs, not
+from the driver's own JSON.  The count is the inherited 6,075 plus this
+milestone's four new locks, which is the arithmetic check that no test was lost.
+A pre-run proof places all 86 selected modules of the 88 tracked exactly once and
+shows the partition node counts summing exactly to the selected total: module and
+node partitions are both complete and both disjoint.
+
+That revision is this section's parent.  The tip differs from it by this
+subsection and §51.11 -- documentation only, no source and no test file, as
+``statics/tip-diffstat.txt`` records -- which is a strictly weaker delta than the
+two-test-file split §49.8 established the precedent for.
