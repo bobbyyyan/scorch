@@ -6385,8 +6385,11 @@ def _ordered_key_sparse_workspace_chain(program: LoopProgram) -> bool:
             return False
         if type(only) is SparseWorkspaceRegion:
             return True
-        if type(only) in (DenseFor, SparseFor):
-            body = only.body
+        if type(only) is DenseFor:
+            body = cast(DenseFor, only).body
+            continue
+        if type(only) is SparseFor:
+            body = cast(SparseFor, only).body
             continue
         return False
 
