@@ -846,10 +846,18 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             ("dd", "ij", (("ds", "ij"), ("ds", "ij")), "ij"),
             "unsupported_merged_update",
         ),
+        # Recorded seam move: the rank-1 sparse root reduced over an OUTER
+        # dense loop that used to sit here is the admitted ordered-key
+        # workspace family (``test_loopir_ordered_key_workspace_target.py``) --
+        # a workspace owns ordering, so a key coordinate driven by a dense
+        # domain is ordinary.  Its neighbour on the same seam keeps the
+        # boundary: a sparse-output root with NO reduction below its
+        # coordinates, so there is no key to drain and no stored stream to
+        # assemble from either.
         (
             "sparse_output_root",
-            ("s", "i", (("dd", "ji"), ("d", "j")), "ji"),
-            "unsupported_sparse_output",
+            ("ss", "ij", (("dd", "ij"), ("d", "j")), "ij"),
+            "unsupported_sparse_output_domain",
         ),
         (
             "dense_domain_to_csr",
