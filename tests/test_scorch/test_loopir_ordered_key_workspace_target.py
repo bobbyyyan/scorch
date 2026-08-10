@@ -2387,3 +2387,475 @@ def test_row_scope_dense_prefix_is_rejected_by_the_target():
         "unsupported_program_shape",
         "unsupported_sparse_output_domain",
     )
+
+
+# -- the post-assembly window ------------------------------------------------
+#
+# The sealed checkpoint verifies the statement list the managed pipeline
+# returns.  Four stages then run before the caller sees a function: ABI
+# assembly, then the parallel, panel, result-tile and relayout completions.
+# The two-node check the seal replaced DID cover that window, because it ran on
+# the assembled function, so leaving it unchecked was a real narrowing -- a
+# drain duplicated there is exactly the silent storage corruption the verified
+# body is checked for.  These lock the window shut from both ends.
+
+
+def test_post_assembly_drain_duplication_is_rejected(monkeypatch):
+    """Duplicating the ordered drain during ABI assembly fails closed.
+
+    ``assemble_function`` is shared by every target, so it is the one piece of
+    the post-checkpoint window that a change elsewhere could plausibly reach.
+    """
+
+    import scorch.compiler.torch_cpp_abi as torch_cpp_abi
+
+    original = torch_cpp_abi.TorchCppKernelABI.assemble_function
+    state = {"duplicated": False}
+
+    def hostile(self, body):
+        function = original(self, body)
+        statements = object.__getattribute__(function, "__dict__")["body"]
+        for index, statement in enumerate(list(statements)):
+            if type(statement) is llir.ForLoopAuto:
+                statements.insert(index + 1, statement)
+                state["duplicated"] = True
+                break
+        return function
+
+    monkeypatch.setattr(torch_cpp_abi.TorchCppKernelABI, "assemble_function", hostile)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["duplicated"], "the probe must actually duplicate the drain"
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_post_assembly_statement_substitution_is_rejected(monkeypatch):
+    """A verified statement replaced by a value-equal copy fails closed.
+
+    Identity is the right test here precisely because these statements were
+    deep-compared against the detached reference moments earlier: carrying that
+    verification forward requires the same objects, not merely equal ones.
+    """
+
+    import scorch.compiler.torch_cpp_abi as torch_cpp_abi
+
+    original = torch_cpp_abi.TorchCppKernelABI.assemble_function
+    state = {"substituted": False}
+
+    def hostile(self, body):
+        function = original(self, body)
+        statements = object.__getattribute__(function, "__dict__")["body"]
+        for index, statement in enumerate(statements):
+            if type(statement) is llir.Comment:
+                statements[index] = llir.Comment(statement.value)
+                state["substituted"] = True
+                break
+        return function
+
+    monkeypatch.setattr(torch_cpp_abi.TorchCppKernelABI, "assemble_function", hostile)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["substituted"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_a_post_assembly_completion_stage_is_rejected(monkeypatch):
+    """A completion stage that transforms this family has no replay contract.
+
+    All four stages are inert for every ordered-key cell today, and each is
+    guarded by its own ``is None`` test.  Requiring the returned function to BE
+    the assembled function proves that per compile instead of assuming it, and
+    it is the gate a future workspace-plus-tile composition must open
+    deliberately.
+    """
+
+    from scorch.compiler.loopir import lower_llir
+
+    original = lower_llir._TargetLowering.complete_relayout
+    state = {"rewrapped": False}
+
+    def hostile(self, function):
+        returned = original(self, function)
+        state["rewrapped"] = True
+        return llir.Function(
+            return_type=returned.return_type,
+            name=returned.name,
+            args=returned.args,
+            body=list(object.__getattribute__(returned, "__dict__")["body"]),
+        )
+
+    monkeypatch.setattr(lower_llir._TargetLowering, "complete_relayout", hostile)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["rewrapped"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_ordered_key_cells_still_reach_a_kernel_through_the_window():
+    """The post-assembly requirements are inert for a correct compile."""
+
+    for cell in REDUCTION_CELLS:
+        _, operand_fmt, result_fmt, operand_indices, result_indices, shape = cell
+        result_shape = tuple(shape[operand_indices.index(c)] for c in result_indices)
+        for arm in (False, True):
+            kernel = compile_cin_via_loopir(
+                reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
+                result_shape,
+                ((shape, _F32),),
+                compile_options=auto_options(arm),
+            )
+            assert "wksp.sort();" in kernel.cpp_source
+
+
+# -- extended tamper classes -------------------------------------------------
+
+
+def test_ordered_key_completion_rejects_a_same_typed_subclass(monkeypatch):
+    """A node rewritten into a SUBCLASS of its own type fails closed.
+
+    The comparator's leading type-identity test already refuses this, and the
+    exact-type node dispatch keeps it refused; the point of the lock is that
+    the refusal never consults the subclass's own hooks.
+    """
+
+    hooks = []
+
+    class Recording(llir.ForLoop):
+        def __eq__(self, other):
+            hooks.append("__eq__")
+            raise AssertionError("__eq__ was consulted")
+
+        def __hash__(self):
+            hooks.append("__hash__")
+            raise AssertionError("__hash__ was consulted")
+
+        def __reduce_ex__(self, protocol):
+            hooks.append("__reduce_ex__")
+            raise AssertionError("__reduce_ex__ was consulted")
+
+    def tamper(rewritten):
+        for value in owned_objects(rewritten):
+            if type(value) is llir.ForLoop:
+                clone = object.__new__(Recording)
+                object.__getattribute__(clone, "__dict__").update(
+                    object.__getattribute__(value, "__dict__")
+                )
+                return replace_object(rewritten, value, clone)
+        return 0
+
+    state = install_hostile_pass(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["changed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+    assert hooks == [], f"the boundary consulted subclass hooks: {hooks}"
+
+
+def test_ordered_key_completion_rejects_a_tuple_where_a_list_was(monkeypatch):
+    """A pass returning an immutable sequence for a mutable one fails closed."""
+
+    def tamper(rewritten):
+        for value in owned_objects(rewritten):
+            if not isinstance(value, llir.Node):
+                continue
+            state = object.__getattribute__(value, "__dict__")
+            for field_name in tuple(state):
+                member = state[field_name]
+                if type(member) is list and member:
+                    state[field_name] = tuple(member)
+                    return 1
+        return 0
+
+    state = install_hostile_pass(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["changed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_ordered_key_completion_rejects_a_distinct_enum_twin(monkeypatch):
+    """A DIFFERENT object of an accepted enum type with identical stored state.
+
+    The pinned-state check compares stored state, so a twin would satisfy it;
+    the identity requirement is what refuses this, and both are needed.
+    """
+
+    def tamper(rewritten):
+        for owner in owned_objects(rewritten):
+            if not isinstance(owner, llir.Node):
+                continue
+            state = object.__getattribute__(owner, "__dict__")
+            for field_name in tuple(state):
+                member = state[field_name]
+                if type(member) in (
+                    llir.AssignOp,
+                    llir.DataType,
+                    llir.TensorAccessRole,
+                ):
+                    twin = object.__new__(type(member))
+                    object.__getattribute__(twin, "__dict__").update(
+                        object.__getattribute__(member, "__dict__")
+                    )
+                    if twin is member:
+                        continue
+                    state[field_name] = twin
+                    return 1
+        return 0
+
+    state = install_hostile_pass(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["changed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_ordered_key_completion_rejects_a_partially_applied_tamper(monkeypatch):
+    """One of two structurally equal subtrees changed leaves the body valid.
+
+    The result still compiles as C++ and is internally consistent; only the
+    reference disagrees.  That is the direction a whole-body comparison must
+    catch and a two-node check cannot.
+    """
+
+    def tamper(rewritten):
+        groups = {}
+        for value in owned_objects(rewritten):
+            if type(value) is llir.Comment:
+                text = object.__getattribute__(value, "__dict__").get("value")
+                groups.setdefault(text, []).append(value)
+        for text, members in groups.items():
+            if len(members) >= 2 and type(text) is str:
+                object.__getattribute__(members[0], "__dict__")["value"] = text + " "
+                return 1
+        return 0
+
+    state = install_hostile_pass(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["changed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_ordered_key_completion_rejects_a_benign_consistent_rename(monkeypatch):
+    """An internally consistent rename is still refused, and that is the point.
+
+    This family's contract is that the managed pipeline hands its emission back
+    unchanged, so a transformation that would be semantically harmless is
+    refused rather than guessed about.  Any future pass that legitimately needs
+    to touch this body has to extend the contract deliberately.
+    """
+
+    def tamper(rewritten):
+        variables = [v for v in owned_objects(rewritten) if type(v) is llir.Var]
+        targets = [v for v in variables if v.name.startswith("i")]
+        if not targets:
+            return 0
+        old = targets[0].name
+        changed = 0
+        for variable in variables:
+            if variable.name == old:
+                object.__getattribute__(variable, "__dict__")["name"] = old + "_r"
+                changed += 1
+        return changed
+
+    state = install_hostile_pass(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["changed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_ordered_key_completion_rejects_pre_pipeline_mutation(monkeypatch):
+    """Mutating the PRE-pipeline body after the reference was built fails closed.
+
+    ``assemble_body`` splices the prologue and final-assembly statements into
+    the pipeline's body by reference, so a pass that reaches back and mutates
+    one of those nodes in place moves the pipeline body without moving the
+    already-detached reference.
+    """
+
+    from scorch.compiler.loopir import lower_llir
+
+    original = lower_llir._ordered_key_expected_checkpoint
+    state = {"mutated": False}
+
+    def checkpoint(lowering, body):
+        expected = original(lowering, body)
+        if expected is not None:
+            for statement in reversed(body):
+                if type(statement) is llir.Comment:
+                    stored = object.__getattribute__(statement, "__dict__")
+                    if type(stored.get("value")) is str:
+                        stored["value"] += " tampered"
+                        state["mutated"] = True
+                        break
+        return expected
+
+    monkeypatch.setattr(lower_llir, "_ordered_key_expected_checkpoint", checkpoint)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["mutated"], "the probe must actually mutate the pre-pipeline body"
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+# -- why the detaching mirror's two refusals are exact -----------------------
+
+
+def test_for_loop_update_is_the_only_non_sequence_assign_position():
+    """The mirror's "sequences only" rule equals the pass's "not update" rule.
+
+    ``_OrderedKeyExpectedBody`` converts a dynamic-vector store only when the
+    ``Assign`` is a member of a sequence; the shared pass converts one unless
+    its path ends in ``update``.  Those two rules agree exactly because
+    ``ForLoop.update`` is the ONLY field in the whole LLIR schema that can hold
+    a bare ``Assign`` outside a list -- which is a schema fact, so it is locked
+    as one rather than left as an empirical observation about today's bodies.
+    """
+
+    import collections.abc
+    import typing
+
+    from scorch.compiler.llir_traversal import SUPPORTED_LLIR_NODE_TYPES
+
+    sequence_origins = {
+        list,
+        tuple,
+        set,
+        frozenset,
+        collections.abc.Sequence,
+        collections.abc.MutableSequence,
+        collections.abc.Iterable,
+    }
+
+    def admits_a_bare_assign(annotation):
+        origin = typing.get_origin(annotation)
+        if origin in sequence_origins:
+            return False
+        if origin is typing.Union:
+            return any(
+                admits_a_bare_assign(argument)
+                for argument in typing.get_args(annotation)
+            )
+        if isinstance(annotation, type):
+            try:
+                return issubclass(llir.Assign, annotation)
+            except TypeError:
+                return False
+        return False
+
+    bare_assign_fields = []
+    for node_type in SUPPORTED_LLIR_NODE_TYPES:
+        # ``__init__`` hints cover the hand-written nodes as well as the
+        # dataclasses, so the derivation is over the whole schema.
+        hints = typing.get_type_hints(node_type.__init__, vars(llir))
+        for name, annotation in hints.items():
+            if name in ("self", "return"):
+                continue
+            if admits_a_bare_assign(annotation):
+                bare_assign_fields.append((node_type.__name__, name))
+    assert bare_assign_fields == [("ForLoop", "update")], bare_assign_fields
+
+
+def test_the_expected_body_mirror_reproduces_the_shared_pass():
+    """The detaching mirror computes exactly what the managed pass computes.
+
+    This is the seal's central fidelity claim, and it is checkable directly
+    rather than through the list of empirical facts that motivated it: run the
+    same pre-pipeline body through both constructions and require structural
+    equality, with enums compared by identity and provenance identities by
+    stored value -- exactly what the comparator accepts.
+    """
+
+    from enum import Enum
+
+    from scorch.compiler.dynamic_vector_access_pass import (
+        DYNAMIC_VECTOR_ACCESS_CONTEXT,
+        rewrite_dynamic_vector_accesses,
+    )
+    from scorch.compiler.llir_traversal import SUPPORTED_LLIR_NODE_TYPES
+    from scorch.compiler.loopir import lower_llir
+
+    node_types = frozenset(SUPPORTED_LLIR_NODE_TYPES)
+
+    def differs(left, right, path=(), depth=0):
+        if depth > 400:
+            return [(path, "depth cap")]
+        if type(left) is not type(right):
+            return [(path, f"type {type(left).__name__}/{type(right).__name__}")]
+        if left is None:
+            return []
+        if type(left) in (bool, int, float, str):
+            return [] if left == right else [(path, f"{left!r}/{right!r}")]
+        if isinstance(left, Enum):
+            return [] if left is right else [(path, f"enum {left!r}/{right!r}")]
+        if type(left) in (list, tuple):
+            if len(left) != len(right):
+                return [(path, f"len {len(left)}/{len(right)}")]
+            found = []
+            for index, (a, b) in enumerate(zip(left, right)):
+                found += differs(a, b, path + (str(index),), depth + 1)
+            return found
+        if type(left) in (
+            lower_llir.AccessId,
+            lower_llir.SymbolId,
+            lower_llir.IndexId,
+        ):
+            a = lower_llir._stored_identity_value(left, type(left))
+            b = lower_llir._stored_identity_value(right, type(right))
+            return [] if (a == b and a is not None) else [(path, f"id {a}/{b}")]
+        if type(left) is llir.TensorAccessMetadata or type(left) in node_types:
+            left_state = object.__getattribute__(left, "__dict__")
+            right_state = object.__getattribute__(right, "__dict__")
+            if set(left_state) != set(right_state):
+                return [(path, "field names")]
+            found = []
+            for key in sorted(left_state):
+                found += differs(
+                    left_state[key], right_state[key], path + (key,), depth + 1
+                )
+            return found
+        return [(path, f"unknown {type(left).__name__}")]
+
+    compared = []
+    original = lower_llir._ordered_key_expected_checkpoint
+
+    def checkpoint(lowering, body):
+        if type(lowering) is lower_llir._OrderedKeySparseWorkspaceLowering:
+            mirror = lower_llir._OrderedKeyExpectedBody(deepcopy(body)).build()
+            shared = rewrite_dynamic_vector_accesses(
+                deepcopy(body), DYNAMIC_VECTOR_ACCESS_CONTEXT
+            )
+            compared.append(differs(shared, mirror))
+        return original(lowering, body)
+
+    try:
+        lower_llir._ordered_key_expected_checkpoint = checkpoint
+        for cell in REDUCTION_CELLS:
+            _, operand_fmt, result_fmt, operand_indices, result_indices, shape = cell
+            result_shape = tuple(
+                shape[operand_indices.index(c)] for c in result_indices
+            )
+            for arm in (False, True):
+                compile_cin_via_loopir(
+                    reduction_cin(
+                        operand_fmt, result_fmt, operand_indices, result_indices
+                    ),
+                    result_shape,
+                    ((shape, _F32),),
+                    compile_options=auto_options(arm),
+                )
+        for cell in TTM_CELLS:
+            _, a_fmt, b_fmt, c_fmt = cell
+            for arm in (False, True):
+                compile_cin_via_loopir(
+                    ttm_cin(a_fmt, b_fmt, c_fmt),
+                    (4, 5, 3),
+                    (((4, 5, 6), _F32), ((6, 3), _F32)),
+                    compile_options=auto_options(arm),
+                )
+    finally:
+        lower_llir._ordered_key_expected_checkpoint = original
+
+    assert len(compared) == 2 * (len(REDUCTION_CELLS) + len(TTM_CELLS))
+    divergent = [found for found in compared if found]
+    assert not divergent, divergent[:3]
