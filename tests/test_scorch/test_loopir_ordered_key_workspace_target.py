@@ -2859,3 +2859,166 @@ def test_the_expected_body_mirror_reproduces_the_shared_pass():
     assert len(compared) == 2 * (len(REDUCTION_CELLS) + len(TTM_CELLS))
     divergent = [found for found in compared if found]
     assert not divergent, divergent[:3]
+
+
+# -- the window closed by structure rather than by identity -------------------
+#
+# Verifying the pipeline's statement list and then carrying that verification
+# across the completion window by object identity leaves one class open: an
+# in-place rewrite INSIDE an already-verified statement preserves every
+# identity, so a nested change one level down is invisible.  That was measured,
+# not supposed -- before the comparison moved to the far side of the window, a
+# comment rewritten inside a verified statement reached the emitted source and a
+# statement duplicated inside the ordered drain compiled.  The single structural
+# comparison now runs on the assembled body, so the whole window is covered by
+# structure; these three lock the classes that closure adds, and the fourth
+# locks the cost claim that made it affordable.
+
+
+def _last_completion_stage_tamper(monkeypatch, tamper):
+    """Run ``tamper`` on the function the last completion stage returns."""
+
+    from scorch.compiler.loopir import lower_llir
+
+    original = lower_llir._TargetLowering.complete_relayout
+    state = {"landed": False}
+
+    def hostile(self, function):
+        returned = original(self, function)
+        state["landed"] = tamper(returned)
+        return returned
+
+    monkeypatch.setattr(lower_llir._TargetLowering, "complete_relayout", hostile)
+    return state
+
+
+def test_post_assembly_nested_rewrite_is_rejected(monkeypatch):
+    """A rewrite INSIDE a verified statement fails closed.
+
+    Every top-level statement is still the same object, so the identity tests
+    are all satisfied; only the structural comparison on the assembled body
+    sees this.
+    """
+
+    def tamper(function):
+        body = object.__getattribute__(function, "__dict__")["body"]
+        for top in body:
+            if type(top) is llir.Comment:
+                continue
+            for node in _reachable_nodes(top):
+                if type(node) is not llir.Comment:
+                    continue
+                state = object.__getattribute__(node, "__dict__")
+                text = state.get("value")
+                if isinstance(text, str):
+                    state["value"] = text + " tampered"
+                    return True
+        return False
+
+    state = _last_completion_stage_tamper(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["landed"], "the probe must actually rewrite a nested comment"
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_post_assembly_nested_duplication_is_rejected(monkeypatch):
+    """A statement duplicated INSIDE the ordered drain fails closed.
+
+    This is the semantic-damage member of the class: a duplicated append inside
+    the drain files every entry twice, and no top-level identity moves.
+    """
+
+    def tamper(function):
+        body = object.__getattribute__(function, "__dict__")["body"]
+        for top in body:
+            if type(top) is not llir.ForLoopAuto:
+                continue
+            nested = object.__getattribute__(top, "__dict__").get("body")
+            if type(nested) is list and nested:
+                nested.append(nested[-1])
+                return True
+        return False
+
+    state = _last_completion_stage_tamper(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["landed"], "the probe must actually duplicate a drained statement"
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_post_assembly_function_subclass_is_rejected(monkeypatch):
+    """A ``Function`` SUBCLASS carrying identical state fails closed here.
+
+    It satisfies both identity requirements, and codegen would refuse it later
+    on exact-type dispatch, but this family owns the diagnosis, so the root type
+    is pinned at the boundary with the family's own defect code.
+    """
+
+    import scorch.compiler.torch_cpp_abi as torch_cpp_abi
+
+    subclass = type("SubclassedFunction", (llir.Function,), {})
+    original = torch_cpp_abi.TorchCppKernelABI.assemble_function
+    state = {"landed": False}
+
+    def hostile(self, body):
+        function = original(self, body)
+        clone = object.__new__(subclass)
+        object.__getattribute__(clone, "__dict__").update(
+            object.__getattribute__(function, "__dict__")
+        )
+        state["landed"] = True
+        return clone
+
+    monkeypatch.setattr(torch_cpp_abi.TorchCppKernelABI, "assemble_function", hostile)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe()
+    assert state["landed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+    assert type(subclass) is type
+
+
+def test_the_completion_comparison_runs_exactly_once_per_compile(monkeypatch):
+    """Moving the comparison across the window added no second traversal.
+
+    The comparison covers assembly and all four completion stages instead of
+    the pipeline's list alone, and it is still the same single call -- which is
+    what keeps the boundary inside its compile-latency ceiling.
+    """
+
+    from scorch.compiler.loopir import lower_llir
+
+    original = lower_llir._exact_sparse_completion_matches
+    calls = []
+
+    def counted(actual, expected):
+        calls.append(type(actual).__name__)
+        return original(actual, expected)
+
+    monkeypatch.setattr(lower_llir, "_exact_sparse_completion_matches", counted)
+    for arm in (False, True):
+        del calls[:]
+        assert compile_ordered_key_probe(arm) is not None
+        assert calls == ["list"], calls
+
+
+def _reachable_nodes(root):
+    """Every LLIR node reachable from ``root``, without consulting ``__eq__``."""
+
+    found = []
+    seen = set()
+    stack = [root]
+    while stack:
+        value = stack.pop()
+        if id(value) in seen:
+            continue
+        kind = type(value)
+        if kind is list or kind is tuple:
+            seen.add(id(value))
+            stack.extend(value)
+            continue
+        if isinstance(value, llir.Node):
+            seen.add(id(value))
+            found.append(value)
+            stack.extend(object.__getattribute__(value, "__dict__").values())
+    return found
