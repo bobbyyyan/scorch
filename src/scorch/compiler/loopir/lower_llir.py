@@ -8369,7 +8369,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         coordinate and is not a loop variable of the nest, so the shared
         level-driver machinery is told the producer loop, which is the
         coordinate's real source.  The emitted result access keeps the
-        drain's own indices (see ``_append_metadata``).
+        drain's own indices.
         """
 
         return (
@@ -8651,18 +8651,6 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             return None
         return [self._insert_statement(value)]
 
-    def _append_metadata(self) -> llir.TensorAccessMetadata:
-        return _detach_tensor_access_metadata(
-            llir.TensorAccessMetadata(
-                access_id=self._access_id(self.result_symbol),
-                tensor_id=self.result_symbol,
-                index_ids=tuple(
-                    cast(IndexValue, coord).index for coord in self.sparse_append.coords
-                ),
-                role=llir.TensorAccessRole.RESULT_WRITE,
-            ),
-        )
-
     def _drain_entry_bindings(self, iterator_var: llir.Var) -> List[llir.Stmt]:
         """Bind the drained key components and merged value."""
 
@@ -8767,13 +8755,15 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             )
         body.extend(
             [
+                # The drained value is a scalar the region owns, not a tensor
+                # access, so it carries no access provenance -- the same
+                # shape the retained rank-1 drain leaves behind.
                 llir.FunctionCallStmt(
                     name=f"{result_name}_values.emplace_back",
                     args=[
                         llir.Var(
                             name=f"{workspace_name}_value",
                             type=llir.DataType.NO_TYPE,
-                            tensor_access=self._append_metadata(),
                         )
                     ],
                 ),
