@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from array import array as _Array
+from collections import deque as _Deque
 from collections.abc import Mapping as _AbcMapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -102,15 +104,28 @@ def _actual_type_name(value: object) -> str:
     return str.__str__(name)
 
 
-# ``collections.abc`` registers the concrete builtins virtually rather than
-# by inheritance -- ``Mapping not in dict.__mro__`` and
-# ``Sequence not in list.__mro__`` -- so an MRO-identity recognizer has to
-# name them explicitly.  These tuples are the boundary's declared runtime
-# recognizers; anything else must genuinely derive from the ABC, and virtual
-# registrations beyond these builtins fail closed exactly like every other
-# foreign lookalike here.
+# ``collections.abc`` registers several concrete standard-library types
+# virtually rather than by inheritance -- ``Mapping not in dict.__mro__`` and
+# ``Sequence not in list.__mro__`` -- so an MRO-identity recognizer has to name
+# them explicitly.  Keep the complete concrete Sequence set that the old ABC
+# check accepted: some of these cannot contain valid level aliases, but
+# recognition must not change which boundary reports that content error.
+# Anything else must genuinely derive from the ABC; arbitrary third-party
+# virtual registrations fail closed exactly like every other foreign
+# lookalike here.
 _MAPPING_BASES: Tuple[type, ...] = (_AbcMapping, dict, MappingProxyType)
-_SEQUENCE_BASES: Tuple[type, ...] = (Sequence, list, tuple, range)
+_SEQUENCE_BASES: Tuple[type, ...] = (
+    Sequence,
+    list,
+    tuple,
+    range,
+    str,
+    bytes,
+    bytearray,
+    memoryview,
+    _Deque,
+    _Array,
+)
 
 
 def _derives_from(value_type: type, *bases: type) -> bool:
@@ -364,9 +379,17 @@ class TensorFormat:
             ]
         ] = None,
     ):
-        object.__setattr__(
-            self, "_level_formats", _normalize_level_formats(level_formats)
-        )
+        try:
+            normalized = _normalize_level_formats(level_formats)
+        except (TensorFormatError, TensorTypeError):
+            raise
+        except Exception as error:
+            # A genuine user-defined Sequence has to be consumed to obtain
+            # its levels.  Its iteration/indexing hooks are outside the
+            # callback-free *recognition* contract, but their exceptions must
+            # not escape this public constructor as arbitrary builtins.
+            raise TensorFormatError("tensor format sequence is malformed") from error
+        object.__setattr__(self, "_level_formats", normalized)
 
     def get_level_formats(self) -> Tuple[LevelFormat, ...]:
         """Return immutable per-mode :class:`LevelFormat` values in storage order.
@@ -441,26 +464,40 @@ class TensorFormat:
         """Reconstruct a format from :meth:`to_dict`."""
         # Recognition is by real MRO, never by an ABC check: see
         # ``_derives_from``.  Reading a value once it has been recognized as
-        # a genuine mapping/sequence is ordinary consumption, not validation.
-        if not _derives_from(type(data), *_MAPPING_BASES) or "levels" not in data:
-            raise TensorFormatError("serialized tensor format must contain 'levels'")
-        fill_value = data.get("fill_value", 0.0)
-        if fill_value != 0.0:
-            raise TensorFormatError("only a zero tensor fill value is supported")
-        levels = data["levels"]
-        levels_type = type(levels)
-        if not _derives_from(levels_type, *_SEQUENCE_BASES) or _derives_from(
-            levels_type, str, bytes, bytearray
-        ):
-            raise TensorFormatError("serialized tensor format levels must be a list")
-        parsed = []
-        for level in levels:
-            if not _derives_from(type(level), *_MAPPING_BASES) or "type" not in level:
+        # a genuine mapping/sequence is ordinary consumption and can invoke
+        # its protocol hooks.  Translate any exception from that consumption
+        # into this public boundary's domain error.
+        try:
+            if not _derives_from(type(data), *_MAPPING_BASES) or "levels" not in data:
                 raise TensorFormatError(
-                    "each serialized tensor level must contain a 'type'"
+                    "serialized tensor format must contain 'levels'"
                 )
-            parsed.append(LevelFormat(level["type"], level.get("bit_width")))
-        return cls(parsed)
+            fill_value = data.get("fill_value", 0.0)
+            if fill_value != 0.0:
+                raise TensorFormatError("only a zero tensor fill value is supported")
+            levels = data["levels"]
+            levels_type = type(levels)
+            if not _derives_from(levels_type, *_SEQUENCE_BASES) or _derives_from(
+                levels_type, str, bytes, bytearray
+            ):
+                raise TensorFormatError(
+                    "serialized tensor format levels must be a list"
+                )
+            parsed = []
+            for level in levels:
+                if (
+                    not _derives_from(type(level), *_MAPPING_BASES)
+                    or "type" not in level
+                ):
+                    raise TensorFormatError(
+                        "each serialized tensor level must contain a 'type'"
+                    )
+                parsed.append(LevelFormat(level["type"], level.get("bit_width")))
+            return cls(parsed)
+        except (TensorFormatError, TensorTypeError):
+            raise
+        except Exception as error:
+            raise TensorFormatError("serialized tensor format is malformed") from error
 
 
 FormatInput = Union[
