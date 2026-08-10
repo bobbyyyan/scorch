@@ -9217,3 +9217,386 @@ manufactured.
 **Phase 7 is NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
 default-dispatch change was made; no fallback was weakened and no legacy code
 deleted.
+
+## 50. The ordered workspace completion seal, the legacy-comparand correction, and eight record fixes (2026-08-10)
+
+This milestone opens at inherited committed tip ``692a450`` and reviews
+``5571c82..692a450``.  It lands no new compiler capability: it closes a
+**silent-correctness hole in the ordered-key completion boundary**, corrects a
+**false claim about the legacy comparand** that runs through §49 and the
+committed suite, and corrects **eight statements in the inherited record**.
+Origin remains ``58e8565``; nothing was pushed, amended, squashed or reordered;
+the five protected tracked files hash exactly as recorded.
+
+Sections 49.1-49.9 are preserved above as written.  Where this section
+contradicts them, this section is correct.
+
+### 50.1 The inherited completion boundary was not a completion boundary
+
+``_OrderedKeySparseWorkspaceLowering.complete_sparse_workspace`` located the
+assembled function's workspace ``VarInit`` and its ordered ``ForLoopAuto``
+drain by the workspace's own reserved identifier, required exactly one of each,
+and compared each against a fresh rebuild from the target.  §49.3 called that
+"post-pass integrity".  It is not: it checks **two nodes out of a body of three
+hundred**, and it checks them *in isolation from where they sit*.
+
+Everything below was reproduced against the inherited tip.  A managed pass
+could:
+
+- **drop, duplicate, or rewrite the producer insertion.**  ``wksp.insert`` was
+  never located at all.  Dropping it compiles cleanly and returns an
+  **all-zero public result**; rewriting its value argument to ``0.0f`` does the
+  same; rewriting one of its leading key coordinates files every entry under
+  the wrong key and still yields well-formed storage.
+- **move the drain after the ``return``**, or up to sit immediately after the
+  allocation.  Both nodes still exist, still match their rebuilds, and the
+  result is empty or unfilled.
+- **wrap the whole allocation-to-drain region in ``if (false)``**, or relocate
+  it to the top of the body.  Node-for-node the region is untouched.
+- **append ``wksp.clear()``** after the insertion.
+- **flip an enclosing loop to atomic scheduling or to ``omp parallel for``**,
+  turning a serial accumulation into a racing one.
+- **swap two prerequisite declarations** so a result vector is used before it
+  is declared.
+
+None of these are hypothetical hardening scenarios in the abstract sense: the
+managed pipeline is a shared, extensible pass chain, and this target's entire
+argument for correctness is that the pipeline hands its emission back intact.
+That argument was not being checked.
+
+### 50.2 The seal
+
+The reference is now the **whole assembled body**, captured before the pass
+manager is called and compared once, by ``_exact_sparse_completion_matches``,
+against what the pipeline returns.  ``complete_sparse_workspace`` therefore
+becomes a documented no-op for this family: rebuilding a reference *after* the
+managed passes would re-enter the target after its one authorized emission, and
+could share mutable state with a hostile first pass.
+``_lower_loopir_to_llir_owned`` owns the reference and both ends of the
+comparison, immediately around the pass-manager call.
+
+### 50.3 The metadata-alias escape, and the detaching mirror that closes it
+
+The first draft of this seal built the reference by re-running the shared
+``rewrite_dynamic_vector_accesses`` pass over the pre-pipeline body.  That is
+right in structure and **wrong in ownership**.  The shared LLIR rewriter
+deliberately carries ``TensorAccessMetadata`` across *by reference*
+(``rewrite_var`` and ``rewrite_array_access`` both pass ``node.tensor_access``
+through unchanged), so the reference body and the pipeline body pointed at one
+frozen provenance object.  A hostile post-pass write to
+``metadata.__dict__["role"]`` moved **both sides at once**, and the comparison
+accepted its own corruption.  Reproduced: with the role of the one carried
+access flipped in the final graph, the compile **succeeded**.
+
+The fix is ``_OrderedKeyExpectedBody``, a narrow target-owned detaching
+rewriter that in one traversal:
+
+- deep-detaches every node, every mutable container, every
+  ``TensorAccessMetadata`` and every ``AccessId``/``SymbolId``/``IndexId``
+  inside one;
+- mirrors exactly the transformations this target's own emission can undergo --
+  the consecutive coordinate-store deduplication, the appending result-vector
+  store, and the checked position store -- reading the shared pass's own frozen
+  ``DynamicVectorAccessConfig`` rather than restating its policy, so the mirror
+  cannot drift from the pass it mirrors;
+- refuses, with the completion defect code, the two shapes this target never
+  emits and whose handling in the shared pass needs machinery this boundary
+  deliberately does not carry: a dynamic-vector declaration below the body
+  root, and a subscripted variable *spelling* (the shared pass substitutes
+  those by pattern; this boundary imports no pattern matching);
+- reads only through ``type()`` and ``object.__getattribute__``, so no forged
+  ``__class__``, ``__eq__``, ``__hash__`` or ``__reduce_ex__`` is consulted --
+  and in any case it runs before the pass manager, so it never sees managed
+  state at all.
+
+**The residual sharing is proved, not asserted.**  A committed test captures
+the reference, the pipeline's input body and the pipeline's final body,
+enumerates every object reachable from each, and requires the intersection to
+contain only ``None``, the immutable scalars, the interned empty tuple, and
+LLIR enum singletons.  Enum members *must* be shared -- the comparison requires
+identity for them -- and that sharing is safe because their stored state is
+independently pinned against an import-time snapshot; a separate test mutates
+``TensorAccessRole.INPUT_READ.__dict__["_value_"]`` mid-pipeline and requires
+the compile to fail closed.  No node, list, non-empty tuple, provenance record
+or provenance identity is shared.
+
+Empirical basis for the two refusals, measured over all forty
+reduction/TTM compile cells in both automatic arms: **no emitted variable name
+contains a subscript**, **no dynamic-vector declaration appears below the body
+root**, **no statement sequence is a tuple**, **the deduplication never fires**,
+**no ``Assign`` in a ``ForLoop.update`` position targets a dynamic vector**, and
+the only conversions that fire are ``scorch_vector_set`` on the ``C{n}_pos``
+arrays (36 + 28 + 18 across the grid).  The field-value kinds reachable from an
+emitted body are exactly ``None``, ``bool``/``int``/``float``/``str``,
+``DataType``/``AssignOp``/``TensorAccessRole``, ``TensorAccessMetadata``,
+``list``, ``tuple`` and the 36 concrete LLIR node types -- which is exactly the
+mirror's accepted set.  Anything outside it is refused rather than guessed at.
+
+### 50.4 Compiler latency: the draft was not robustly green, the seal is
+
+The ceiling for a compile-only integrity boundary on this branch is **1.10**.
+The draft two-pass construction measured p50/mean **1.093-1.098** with one p95
+at **1.107** -- over the ceiling, and therefore not shippable.
+
+Two changes bought the margin, neither of them a weakening of the check:
+
+1. **One traversal instead of three.**  The shared pass runs a declaration
+   walk and then a rewrite walk, each with full per-node revalidation; the
+   detaching mirror does one pass with an exact-type dispatch and an
+   ``object.__new__`` plus ``__dict__`` copy per node.
+2. **The shared comparator's hot loop was rewritten, semantics preserved.**
+   ``_exact_sparse_completion_matches`` now dispatches on exact type through
+   frozensets instead of ``isinstance`` chains, tests nodes first (they are the
+   majority of a real body), and merges the field-name shape check with the
+   work-queue push instead of running a ``tuple()``, a generator ``any()`` and
+   a ``reversed()`` over the same keys.  Matching nodes on exact type rather
+   than ``isinstance`` is equivalent here and independently checked:
+   ``SUPPORTED_LLIR_NODE_TYPES`` is exactly the set of the 36 concrete
+   ``llir.Node`` subclasses, and the loop's leading type-equality test already
+   guarantees both sides share one type.  The forged-key ordering is preserved
+   -- a field name is type-checked *before* it indexes the expected state, so a
+   forged key never reaches a hash or equality hook.
+
+Attributed cost after the change, over three representative cells: reference
+build 3.7-4.3% and comparison 4.2-5.0% of a compile, against 4.0-4.7% and
+6.2-7.1% before -- and the boundary replaces inherited work of its own.
+
+**The measured result.**  Base is a detached worktree at ``692a450``; the
+candidate is this tree.  Each measurement is a fresh subprocess importing
+exactly one source tree and timing the same 40-cell ordered-key compile-only
+grid (no JIT, no C++ compiler); 20 rounds, alternating the within-round order,
+4 warmups and 21 samples per process, plus a base-against-base A/A control in
+every round.  The per-round statistic is the median of that process's samples,
+and ``min`` variants repeat the whole calculation on the fastest sample.
+
+| statistic | min | p50 | mean | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| A/B ratio (median) | 1.0404 | 1.0560 | 1.0558 | 1.0648 | **1.0654** |
+| A/B ratio (min-of-samples) | 1.0467 | 1.0603 | 1.0599 | 1.0711 | **1.0729** |
+| A/A control (median) | 0.9836 | 0.9988 | 0.9989 | 1.0054 | 1.0181 |
+| A/A control (min-of-samples) | 0.9894 | 1.0005 | 1.0001 | 1.0111 | 1.0127 |
+
+Pooled fastest-sample ratio 1.0594; pooled A/A 0.9999.  Order controls agree:
+base-first mean 1.0584, candidate-first mean 1.0531, a 0.5% spread that sits
+inside the A/A floor, so the ordering is not carrying the result.  **Every
+declared statistic is at or below 1.10, the largest being 1.0729.**
+
+### 50.5 The attack matrix, re-run against the final design
+
+Every case below is a committed test.  Each requires ``LoopIRTargetError`` with
+``sparse_workspace_completion_lost``, and each asserts that its tamper actually
+landed, so a silently inert probe cannot pass as a lock.
+
+*Producer insertion:* drop, duplicate, value mutation, **key mutation**,
+**callee rename**, ``if(true)`` wrapper, nested ``Function`` wrapper, an added
+``wksp.clear()``, relocation before its own coordinate declaration, relocation
+to just before ``wksp.sort()``.
+*Drain and region:* drain relocated to the allocation, drain moved after
+``Return``, whole region wrapped in ``if(false)``, **whole region relocated**.
+*Surroundings:* declaration/result-position swap, **enclosing ``omp parallel
+for``/schedule/num-threads mutation**, enclosing legacy atomic-field mutation.
+*Ownership:* shared ``BlankLine``, **shared equal ``Var``**, **shared equal
+non-empty ``template_args`` tuple**, and -- because this family's emitted body
+contains no two equal lists, so a structure-preserving shared-list tamper is
+not constructible end to end -- a **direct lock on the comparator's list
+census** on a pair that differs in ownership alone.
+*Forged state:* **a cycle** (a loop body reassigned to the whole function body,
+required to reject in finite time), **a deleted stored field**, **an added
+stored field**.
+*Provenance:* **role mutation**, **``access_id``/``tensor_id`` mutation**,
+**``index_ids`` mutation**, **whole-object substitution with a differing
+value** -- all rejected; and **substitution with a value-equal copy shared
+across accesses** -- accepted, as the positive control that provenance is value
+state, which the production two-phase rewrite depends on.
+*Pinned state:* **enum-singleton stored-state mutation**.
+*Hostile objects:* a value whose ``__class__``, ``__eq__``, ``__hash__`` and
+``__reduce_ex__`` all record and raise, with **zero hook invocations observed**.
+(The test that covered the last case was named for pickle; the final design
+uses no serialization, and it is renamed accordingly.)
+
+All of these pass, together with **all 40 normal reduction/TTM compile cells**
+in both automatic arms.
+
+### 50.6 The legacy comparand: nine of twenty are sound, and that was never true of "none"
+
+§49.6 and the committed suite's module docstring both stated that "every
+migrated cell is one the legacy assembler rejects, corrupts, or terminates on",
+and §49.9 used that to declare the activating paired-latency receipt "not
+applicable".  **Independent measurement contradicts it.**  Every one of the
+twenty migrated cells generates legacy C++ in both automatic arms -- the
+generator never refuses -- and for nine of them that C++ is *sound*.
+
+Measured in twenty disposable processes per arm, each with ``RLIMIT_CPU`` and
+``RLIMIT_CORE`` set and a wall-clock timeout:
+
+**Sound (9).**  ``ss ij->j``, ``ds ij->j``, ``sd ij->j``, ``sss ijk->ik``,
+``sss ijk->jk``, ``dss ijk->jk``, ``ssss ijkl->jkl``, ``TTM dss x dd -> dss``
+and ``TTM dss x ss -> dss``.  For each, the legacy public route executes and
+returns **exactly the same sparse storage and the same values** as the LoopIR
+route.  The suite now locks that -- exact ``(pos, crd)`` levels, exact drained
+values, equal formats, and equal dense results -- in both arms, at f32 and f64,
+and under exact cancellation.  An adjacent forced-sparse ``dd ij->j`` cell is
+sound on the same terms and is included, though it was never one of the census
+cells.
+
+**Unsound (11), in exactly three classes, arm-invariant.**
+*Duplicate drained coordinates* (``TensorIndexError``: "compressed mode 0
+coordinates must be strictly increasing within parent 0") -- ``sss ijk->k``,
+``dss ijk->k``, ``ssss ijkl->l``, ``ssss ijkl->il``.
+*C++ that does not compile* -- ``ssss ijkl->kl`` and ``ssss ijkl->ikl``, both
+at ``error: use of undeclared identifier 'k'`` on ``B0_crd.push_back(k);``.
+*Malformed child positions* (``TensorIndexError``: "compressed mode 1 position
+array must start at zero") -- ``ssss ijkl->ijl``, ``TTM sss x dd``,
+``TTM sss x ss``, ``TTM sss x ds``, ``TTM sss x sd``.
+The LoopIR route succeeds on all eleven, in both arms.  A table-driven,
+subprocess-isolated characterization now records exactly this, streaming its
+verdict per cell so a route that terminated the interpreter would be *named*
+rather than swallowing the table.
+
+**Source parity is separately and explicitly denied.**  All twenty legacy
+sources exist in both arms and **every one differs** from the LoopIR source.
+The nine locks are semantic parity -- runtime and storage -- never byte parity,
+and the suite asserts the non-identity so the two can never be conflated.
+
+**Consequence for the latency claim.**  §49.9's "not applicable, and that is
+proven" is half right and half wrong.  It is right that every *pre-existing
+activating* generated source is byte-identical between base and candidate, so
+those need no re-measurement.  It is wrong that "the newly admitted families
+have no honest comparand": nine of them do.  What is true is narrower and is
+what this section claims: default dispatch is unchanged, so no production path
+was activated, and a runtime comparison against the nine sound legacy kernels
+would measure two different kernels, not a regression.  Source parity being
+unavailable is **not** a reason to skip compiler-latency measurement, and this
+milestone does not skip it -- §50.4 measures it and §50.8 records it.
+
+### 50.7 Eight corrections to the inherited record
+
+1. **"Three local commits follow inherited documentation tip ``5571c82``"**
+   (handoff, ordered-key vertical section).  There are **eight**: ``a9c9aca``,
+   ``71e75fc``, ``ead8207``, ``0ceb807``, ``0a960f3``, ``2456bbc``, ``60cbc06``
+   and ``692a450``.  ``git log --oneline 5571c82..692a450 | wc -l`` = 8.
+2. **"Compiled public differential: 520 checks, 8 failures"** (§49.6).  Those
+   are the numbers of the **predecessor** run at ``a9c9aca``.  The retained
+   sub-ledger's own receipt is ``exit.txt`` = 0 with **``checks: 568
+   failures: 0``**.  The predecessor is retained only as
+   ``raw-run-a9c9aca-predecessor.stdout.txt``, which holds the eight ``[FAIL]``
+   lines and the summary line and **no exit-code receipt and no complete
+   stdout** -- so it is not the "retained raw nonzero receipt" §49.6 and the
+   sealed ``FINAL_STATE.md`` describe.  The honest statement is: the final
+   characterized differential is 568/0, and the earlier 520/8 run is partially
+   retained.
+3. **Sealed ``FINAL_STATE`` manifests bind the documentation blobs of their own
+   moment.**  ``phase7-cluster2-review-e13ecba/FINAL_STATE_SHA256SUMS`` already
+   fails to verify against the current
+   ``COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` and
+   ``COMPILER_IR_REFACTOR_HANDOFF.md``, because ``5571c82`` and ``692a450``
+   rewrote them.  That is correct behaviour for a historical manifest and a
+   defect in how they are described: a manifest binding a mutable repository
+   file is a record of that file *at seal time*, never a claim about its
+   current content.  This milestone's own append will retire
+   ``phase7-orderedkey-vertical``'s document entries the same way.
+4. **Several inherited receipts are not exact-tip.**  The ordered-key
+   vertical's own neutrality summary says so in its own note: the source
+   captures and the schedule audit ran at ``0a960f3``, not at the final tip;
+   the full-suite partitions split across ``0a960f3`` and ``60cbc06``.  Those
+   are defensible splits with a stated argument, and they are **not** exact-tip
+   receipts.  They must not be cited as such.
+5. **The differential's stored-operand-zeros arm did not use a stored-zero
+   operand.**  In ``ordered_key_differential.py``'s ``run_reduction_cell``, the
+   ``stored_zeros=True`` path builds ``st`` and ``nonzero_dense`` and then
+   **never reads either**; execution proceeds on ``st_a = sparse(dense, ...)``,
+   the ordinary ``to_sparse`` route, which filters structural zeros out of a
+   compressed operand.  ``pyflakes`` reports the dead local directly.  So the
+   "explicitly stored operand zeros" coverage claimed for the 520/568-check
+   differential was, for compressed operands, the ordinary arm run twice.  The
+   committed suite now carries a genuine one: a hand-built compressed operand
+   whose ``(pos, crd, values)`` arrays store a real ``0.0``, in both arms and
+   at f32 and f64, checked against the oracle.
+6. **The 143-cell frontier does not cover "all result subsets".**  §49.2 says
+   "every rank-2 and rank-3 receiver layout crossed with every result subset".
+   ``frontier.py`` enumerates the rank-3 result indices
+   ``("i","j","k","ij","ik","jk")`` -- the canonical, index-ordered, **nonempty
+   proper** subsets -- and no permuted order (no ``ji``, ``ki``, ``kj``) and not
+   the full set ``ijk``.  Rank 4 covers ``l``, ``kl``, ``jkl`` only: three of
+   fourteen.  The frontier remains far broader than the census and remains
+   representative, not exhaustive, exactly as §48.3 insisted.
+7. **Not every rejected route carries a defect code.**  §49.9 says "every
+   neighbour carries a stable fail-closed code ... at all 143 frontier cells".
+   Of the 143, **27 raise ``InvalidSchedule``, which has no ``defect``
+   attribute at all**; their stable identifier is a structured
+   ``LoopPlanDiagnostic`` (``code='sparse_parent_dominance'``,
+   ``path=('loop_order','sparse_access')``, ``stage='loop_plan'``) inside
+   ``diagnostics``.  Worse, the retained frontier harness did not read that
+   field: it recovered the string by matching the exception *message*.  The
+   accurate statement is that every neighbour carries a stable **classified
+   diagnostic**, of which 116 are defect codes and 27 are loop-plan
+   diagnostics.  A new committed test reads the structured field for five
+   reorder-blocked cells in both arms and asserts ``defect`` is absent.
+8. **The evidence ledger for this milestone is
+   ``~/.cache/scorch-codex/orderedkey-completion-seal/``.**  It is a new
+   directory; it does not extend ``phase7-orderedkey-vertical``, whose
+   manifests stay valid for what they sealed.
+
+### 50.8 Verification
+
+All gates ran in the ``scorch`` conda environment on the Apple M5 development
+machine, with exact revision, import-path and clean-worktree provenance
+recorded beside each receipt in the ledger named in 50.7.8.
+
+- **Ordered-key target file**: the complete file, **228 selected, 228 passed**
+  (up from 161 inherited), including the subprocess-isolated characterization.
+- **Adjacent memberships**: the dynamic-vector-access pass, the LLIR pass
+  manager, LLIR traversal, LoopIR->LLIR lowering, CIN lowering, schedule
+  passes, LoopIR neutrality and pipeline execution -- **1,115 passed**; and
+  the sparse-workspace, row-scope and parallel workspace target suites, the
+  three other users of the comparator this milestone rewrote -- **185
+  passed**.
+- **Adversarial probes**: the complete matrix of §50.5 -- **33 passed** as the
+  completion-integrity slice of the target file.
+- **Legacy differential battery**: twenty cells x two arms in disposable
+  processes, producing the disposition table of §50.6.
+- **Release neutrality**: the 20-source corpus, the 42-source ``ss@dd`` grid,
+  and the 86-case schedule audit, captured base-vs-candidate.  **All 20 corpus
+  sources and all 42 grid sources are byte-identical**, and the audit is
+  identical at ``total=86 admitted=46 rejected=40 nonidentical=0``.
+- **Statics**: Black, Flake8 and mypy over ``src`` and ``tests`` in both trees,
+  plus ``git diff --check`` (clean).  mypy is **byte-identical** between the
+  arms (140 errors in 11 files, none in a changed file).  Flake8 and Black
+  differ only by findings in files that **exist solely in the working tree and
+  are untracked** -- three F401s in untracked benchmark/GPU test modules and
+  four untracked ``test_spmm_*`` modules Black would reformat.  Restricted to
+  tracked files both gates are identical, and both changed files are clean
+  under Flake8 and unchanged under Black.  The one pre-existing tracked Black
+  finding (``src/scorch/prebuilt_kernels.py``) reproduces at base.
+- **Paired compile-only latency**: the table in §50.4.
+- **Complete non-performance suite** in clean, file-disjoint fresh processes
+  with a complete non-overlapping union proof.
+
+### 50.9 Phase-7 exit audit, re-run
+
+*Migrated families complete over their proven envelopes.*  Yes, and now on
+stronger evidence than §49.9 had: nine of the twenty cells additionally match a
+sound legacy route exactly in storage and value, in both arms, at both dtypes
+and under cancellation.
+
+*Every neighbour carries a stable fail-closed disposition.*  Yes -- corrected
+per 50.7.7: 116 defect codes and 27 loop-plan diagnostics, arm-invariant.
+
+*Representation unchanged.*  Yes.  No node kind, no canonical schema change
+(v11 stands), no request- or schedule-identity change.
+
+*Release behaviour unchanged.*  Yes: the source corpus, the wide grid and the
+schedule audit are byte-identical between base and candidate, and no dispatch,
+cache, selector or fallback changed.
+
+*Compiler latency within the declared ceiling.*  Yes, and measured rather than
+waived -- see §50.4 and §50.8.
+
+*The declared matrix is closed.*  **No.**  The three blockers of §49.5 stand
+untouched: workspace-plus-tile plan composition, the automatic-origin reorder
+together with the missing ``K == 0`` family, and row-scope dense prefixes at
+rank >= 3.
+
+**Phase 7 remains NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
+default-dispatch change was made; no fallback was weakened and no legacy code
+deleted.

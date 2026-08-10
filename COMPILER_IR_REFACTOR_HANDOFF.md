@@ -30947,3 +30947,171 @@ final-tip evidence excluding worktrees/caches/binaries/pycache, verify every
 manifest entry, leave origin untouched, and finish with an honest GO/NO-GO plus
 an even broader continuation prompt.
 ```
+
+## Ordered workspace completion seal and the legacy-comparand correction (2026-08-10; supersedes every preceding prompt)
+
+Three local commits follow inherited committed tip ``692a450``; nothing was
+pushed, amended, squashed or reordered.  Origin remains ``58e8565``.  The five
+protected tracked files hash exactly as recorded.  Evidence ledger:
+``~/.cache/scorch-codex/orderedkey-completion-seal/`` (new; it does not extend
+``phase7-orderedkey-vertical``, whose manifests remain valid for what they
+sealed).
+
+**This milestone adds no compiler capability.**  It closes a silent-correctness
+hole, corrects a false claim that ran through the previous review and the
+committed suite, and corrects eight statements in the record.  Review §50 owns
+the detail; the corrections are numbered there.
+
+**The hole.**  The inherited ordered-key completion boundary located the
+workspace allocation and the ordered drain by name, required one of each, and
+compared each against a rebuild.  It never located the producer insertion and
+never checked lexical placement.  Reproduced against the inherited tip: a
+managed pass could drop, duplicate, or rewrite ``wksp.insert`` (an all-zero
+public result), move the drain past the ``return``, wrap the whole region in
+``if (false)``, relocate the region, append ``wksp.clear()``, flip an enclosing
+loop to atomic or ``omp parallel for``, or swap prerequisite declarations --
+and the compile succeeded.
+
+**The seal.**  The whole assembled body is now captured before the pass manager
+runs and compared once, after, by ``_exact_sparse_completion_matches``.
+
+**The escape the first draft still had.**  Building that reference by re-running
+the shared dynamic-vector pass leaves ``TensorAccessMetadata`` shared by
+reference between the reference and the pipeline body, so a hostile
+``metadata.__dict__["role"]`` write moved both sides and was accepted --
+reproduced as a successful compile.  It is closed by ``_OrderedKeyExpectedBody``,
+a narrow target-owned single-traversal detaching mirror that deep-detaches
+provenance and identities, mirrors exactly the three transformations this
+target's emission can undergo (reading the shared pass's own frozen config, not
+a restatement of it), and refuses the two shapes the target never emits.  A
+committed test proves the reference shares nothing forgeable with either
+pipeline graph: only ``None``, immutable scalars, the interned empty tuple, and
+LLIR enum singletons -- whose stored state is independently pinned, and whose
+mutation is separately locked.
+
+**Latency.**  The draft measured p50/mean 1.093-1.098 with a p95 of 1.107,
+over the 1.10 ceiling.  One traversal instead of three, plus a
+semantics-preserving rewrite of the shared comparator's hot loop, brings the
+paired compile-only ratio to **p50 1.056 / mean 1.056 / p95 1.065 / max
+1.065** on medians and **max 1.073** on fastest samples, over 20 rounds in both
+orders with an A/A control (p95 1.005).  Every declared statistic is at or
+below 1.10.
+
+**The legacy comparand was misdescribed.**  "Every migrated cell is one the
+legacy assembler rejects, corrupts, or terminates on" is false.  All twenty
+cells generate legacy C++ in both arms, and **nine are sound** -- ``ss``,
+``ds``, ``sd`` ``ij->j``, ``sss ijk->ik``, ``sss ijk->jk``, ``dss ijk->jk``,
+``ssss ijkl->jkl``, and ``TTM dss x {dd,ss}`` -- returning exactly the same
+sparse storage and values as the LoopIR route.  Those nine are now locked in
+both arms, at f32 and f64, under cancellation.  The other **eleven are unsound
+in exactly three measured ways**: duplicate drained coordinates (4), C++ that
+does not compile at ``undeclared identifier 'k'`` (2), and a malformed child
+position array (5); a table-driven, subprocess-isolated characterization
+records that, streaming per cell so a terminating route would be named.  All
+twenty legacy sources differ from ours, and the suite asserts it: the nine
+locks are semantic parity, never byte parity.
+
+**Verification at the final tip.**  Ordered-key target file 228/228; adjacent
+LoopIR/CIN/schedule/LLIR pass memberships 1,115/1,115; the three other users of
+the rewritten comparator 185/185; the complete adversarial matrix; the
+twenty-cell legacy battery; release neutrality (20-source corpus and 42-source
+grid byte-identical, 86-case schedule audit identical); statics (mypy
+byte-identical; Flake8/Black differ only on untracked working-tree-only files);
+``git diff --check`` clean; paired latency as above; and the complete
+non-performance suite in file-disjoint fresh processes with a
+complete/non-overlapping union proof.
+
+**Phase 7 remains NO-GO.**  The three blockers of review §49.5 are untouched:
+workspace-plus-tile plan composition, the automatic-origin reorder together
+with the missing ``K == 0`` family, and row-scope dense prefixes at rank >= 3.
+No Phase-8 inventory, cutover, cache, selector, fallback or default-dispatch
+change was made; no legacy code was deleted; canonical schema stays v11.
+
+### Broad copy-paste prompt for the next session
+
+```text
+Continue the compiler IR migration from the actual local tip of
+refactor/compiler-ir-phase3-std-move-call. Read AGENTS.md, then §49 and §50 of
+COMPILER_IR_REFACTOR_PHASE6_REVIEW.md and the FINAL handoff section. Inspect
+code and raw receipts yourself; do not take a summary's word for a number. Do
+not push, amend, squash, reorder or discard. Never run `git stash`. Preserve
+all unrelated dirty/untracked GPU, CUDA, benchmark, packaging, research,
+scheduler and scratchpad material, and stage only explicit paths.
+
+Keep these protected dirty files byte-exact: `.gitignore`
+301c1e74df278c81495605b33dc09f5f8e91098b38e70b130acc725ba0eba105;
+`pyproject.toml` 191c3372a43e545be5acf8c75c423997e3fdabced1f4fbdd19c140f5afbf1eea;
+`src/scorch/__init__.py` 5e2f22c75cfc7b3a91e003a1de594809e5ff8309995a28c1b886b6b7cde2d845;
+`tests/packaging/smoke_install.py`
+f18264fc2a590955bb97543f3885aeaae7f487e0c530b33f23fca28d11497679;
+`tests/test_scorch/test_resources.py`
+3d8092cb19d63fbb5e9aaa6468654089393a7bc5027501856aa956350bf923c9.
+
+First review this milestone's three commits rigorously and independently.
+Re-derive, do not read: the ordered-key completion reference and where it must
+be captured; the detaching mirror's accepted value set and its two refusals;
+the ownership residue it shares with the pipeline; and the rewritten comparator
+hot loop. Attack them. Re-run the whole §50.5 matrix and extend it: a pass that
+rewrites a node into a same-typed subclass; a pass that returns a tuple where a
+list was; provenance whose identity objects are shared but value-equal; an
+enum member replaced by a distinct member with identical stored state; a
+partially-applied tamper that leaves the body valid but the reference stale;
+and a pass that mutates the PRE-pipeline body in place after the reference was
+built. Confirm zero caller hooks under each. Then re-derive the nine sound and
+eleven unsound legacy comparands independently, in disposable processes, and
+check whether any of the eleven becomes sound (or any of the nine unsound) at
+other extents, dtypes and densities -- the disposition is measured, not
+axiomatic.
+
+Then continue the cluster-2 vertical, which is where the remaining value is:
+
+1. Decide the workspace+tile replay contract for `TTM dds`. Either implement a
+   fused workspace+tile application (as `apply_reduce_out_tiles` does for the
+   dense reduce-out family) or prove why the automatic tile must be suppressed
+   for ordered-key plans WITHOUT changing legacy default emission
+   (`_apply_automatic_tiles` is shared with legacy default dispatch). Require
+   legality, oracle equivalence, request identity, and byte-identical sources
+   for every unaffected cell.
+2. Design the `K == 0` bound-prefix scalar-accumulation family together with a
+   LoopIR-only automatic-plan repair. Both are needed; neither alone migrates a
+   cell -- measured over ten blocked cells, the legal declared order always
+   yields an EMPTY key. A new node kind or a documented rank-0 key instance is
+   a schema decision: bump canonical v11 only if serialized semantics genuinely
+   change, and re-seal every canonical-dump lock if so.
+3. Consider row-scope dense prefixes at rank >= 3 (a DENSE result level bound
+   by a STORED loop) as a separate slice with its own dynamic-parent catch-up.
+4. Re-derive and EXTEND the frontier. The retained 143-cell frontier covers
+   canonical index-ordered nonempty proper subsets at rank 3 and only
+   {l, kl, jkl} at rank 4 -- not permuted result orders, not the full index
+   set, not rank 5. Add those, plus UNION-domain keys, mixed dense/compressed
+   prefixes, and `sds`/`ssd`/`dsd` receivers. Record the exact route per cell,
+   and read structured diagnostics (`LoopPlanDiagnostic.code` inside
+   `InvalidSchedule.diagnostics`) rather than matching message text; 27 of the
+   current 143 have no defect code at all.
+
+Keep every gate at the exact final tip and never relabel a receipt taken at an
+intermediate revision as exact-tip: focused and adversarial tests, the frontier
+differential, erasure/oracle and compiled public differentials with a GENUINE
+stored-zero fixture (the inherited differential built one and discarded it),
+crash-isolated census with timeout and RLIMIT_CPU/CORE, the 86-case schedule
+audit, the 20-source and 42-source captures, base/candidate Black/Flake8/mypy,
+protected hashes, `git diff --check`, and a clean detached full non-perf suite
+in file-disjoint fresh processes with a complete/disjoint node proof. For any
+source-changing activation run paired latency with A/A and order controls and
+declare every statistic against the 1.10 ceiling; source parity being
+unavailable is not a reason to skip compiler-latency measurement. Prefer
+Stanford SC/MKT over Redwood for a cross-host run: `ssh sc`, Slurm
+`--account=mkt --partition=mkt` (or `mkt-interactive`), build and run only
+inside the allocation under `/scr/u/bobbyy`, never on the login node and never
+by SSHing to `mkt1` directly.
+
+Repeat the Phase-7 exit audit. Only a genuine GO permits a read-only Phase-8
+cutover/fallback census and at most an explicitly opt-in shadow pilot for
+already proven families. Do not flip default dispatch, weaken fallback, alter
+release caches/selectors, delete legacy code, or start Phase 8. If still
+NO-GO, stop at the exact blocker. Commit production, test and documentation
+slices separately with descriptive bodies, seal only final-tip evidence into a
+NEW ledger directory under ~/.cache/scorch-codex/ excluding worktrees, caches,
+binaries and __pycache__, verify every manifest entry, leave origin untouched,
+and finish with a candid GO/NO-GO plus an even broader continuation prompt.
+```
