@@ -30854,6 +30854,18 @@ the failure to a later seam.  (3) A dense result prefix level bound by a stored
 loop at rank >= 3 keeps ``unsupported_sparse_output_domain``; one inherited seam
 lock moved there.
 
+The clean detached full non-performance suite found **seven failures nothing
+else could have found** -- it compares test expectations, not compiler
+outcomes.  All seven were this milestone's own: a seventh inherited seam lock
+naming a newly admitted cell, and two wrong expectations in the new suite (the
+``ds``-result neighbours are a TARGET boundary, not a CIN one; the
+stored-zeros fixture could not hold a stored zero because ``to_sparse``
+filters them).  Both are fixed and re-run green.  Final result: **5,949
+selected nodes, 5,935 passed, 14 skipped, zero failures**, every partition
+exiting 0, with all 86 selected modules placed exactly once.  Partitions 0-3,
+5 and 6 ran at ``0a960f3`` and 4 and 7 at ``60cbc06``; those tips differ by
+exactly the two test files that are members of exactly those two partitions.
+
 Phase 7 remains **NO-GO**: the declared matrix is not closed.  No Phase-8
 cutover, default-dispatch, cache, selector or fallback change was made, and no
 legacy code was deleted.  Canonical schema stays v11.  Review §49 owns the

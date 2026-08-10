@@ -9141,3 +9141,79 @@ is named in place.  The census itself is rewritten around the three-way split
 (9 migrated / 2 auto-tile blocked / 5 reorder blocked) with its
 explicit-order controls updated to the sharpened codes, and it keeps the
 "representative, not exhaustive" statement §48.3 insisted on.
+
+### 49.8 The full suite earned its keep again, and two more corrections
+
+The clean detached full non-performance suite found **seven failures the
+frontier differential and the census could not have found** -- both of those
+compare compiler outcomes, not test expectations.  All seven were this
+milestone's own defects, and all are corrected:
+
+- **A seventh inherited seam lock** (``2456bbc``).
+  ``test_loopir_pipeline_execution.py``'s ``sparse_output_root`` cell asserted
+  ``unsupported_sparse_output`` for a rank-1 sparse result reduced over an
+  OUTER dense loop.  The ordered-key workspace now lowers that shape, because
+  a workspace owns ordering and a key coordinate driven by a dense domain is
+  therefore ordinary rather than unassemblable.  The lock moves to the
+  neighbour that still occupies the seam -- a sparse-output root with no
+  reduction below its coordinates, so there is no key to drain and no stored
+  stream to assemble from -- verified arm-invariant at
+  ``unsupported_sparse_output_domain``.
+- **Two wrong expectations in this milestone's own suite** (``60cbc06``).  The
+  ``ds``-result neighbours at rank 3 are a TARGET boundary, not a CIN one:
+  their ``(prefix, key rank)`` split is well formed, so CIN admits them and
+  the ordered-key target refuses them.  They now assert ``LoopIRTargetError``
+  with the distinct message each half of the split produces.  And the
+  stored-operand-zeros fixture could not state what it claimed -- ``to_sparse``
+  filters structural zeros out of a compressed operand -- so it is rebuilt on
+  an all-dense operand, where every cell genuinely is stored, and asserts that
+  a column stored everywhere and zero everywhere keeps its key and drains an
+  explicit zero.
+
+**Final full-suite result: 5,949 selected nodes, 5,935 passed, 14 skipped,
+zero failures and zero errors, every partition exiting 0.**  A pre-run proof
+places all 86 selected modules of the 88 tracked exactly once and shows the
+partition node counts summing exactly to the selected total, so the union is
+complete and non-overlapping.  Partitions 0-3, 5 and 6 ran at ``0a960f3`` and
+partitions 4 and 7 at ``60cbc06``; those revisions differ by exactly two test
+files, which are members of partitions 4 and 7 respectively and of no other
+partition, so every other partition ran identical files at either revision.
+This is the §45.7 split-revision precedent, applied to two partitions instead
+of one.
+
+### 49.9 Phase-7 exit audit
+
+*Migrated families complete over their proven envelopes.*  Yes for the
+ordered-key family over its declared envelope: ``(prefix, K)`` splits of
+(0,1), (0,2), (0,3), (1,1), (1,2) and (2,1), dense and compressed second
+factors, commuted operands, f32/f64, both automatic arms,
+singleton/ragged/empty/zero extents, stored zeros and cancellation, gated on
+the LoopIR oracle and the dense PyTorch reference because the legacy comparand
+for these cells rejects, corrupts or terminates.
+
+*Every neighbour carries a stable fail-closed code.*  Yes, arm-invariantly at
+all 143 frontier cells, with two seam locks moved and named in place and 45
+diagnostics sharpened.
+
+*Representation unchanged.*  Yes.  No node kind, no canonical schema change
+(v11 stands), no request- or schedule-identity change.
+
+*Release behaviour unchanged.*  Yes: 62/62 generated sources byte-identical to
+base and to the retained captures, the 86-case schedule audit identical to
+base and to the retained baseline, zero native artifacts, and no dispatch,
+cache, selector or fallback change.
+
+*The declared matrix is closed.*  **No.**  Seven of the sixteen
+representatives remain, behind the three blockers of §49.5.
+
+*The activating paired latency receipt.*  **Not applicable, and that is proven
+rather than asserted.**  Every pre-existing activating generated source is
+byte-identical between base and candidate, so there is nothing to re-measure
+for them.  The newly admitted families have no honest comparand -- legacy
+either rejects them or returns malformed storage -- and default dispatch is
+unchanged, so no production path was activated.  No timing run was
+manufactured.
+
+**Phase 7 is NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
+default-dispatch change was made; no fallback was weakened and no legacy code
+deleted.
