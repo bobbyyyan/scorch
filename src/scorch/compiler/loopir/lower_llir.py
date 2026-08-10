@@ -13702,40 +13702,49 @@ def _require_ordered_key_completion_checkpoint(
         )
 
 
-def _require_ordered_key_assembled_body(
+def _require_ordered_key_completed_body(
     returned: llir.Function,
     assembled: llir.Function,
-    verified_body: List[llir.Stmt],
+    pipeline_body: List[llir.Stmt],
     expected: Optional[List[llir.Stmt]],
 ) -> None:
-    """Extend the completion boundary across the post-pipeline window.
+    """Verify the completion boundary on the body the CALLER actually receives.
 
-    ``_require_ordered_key_completion_checkpoint`` verifies the statement list
-    the managed pipeline returns.  Four stages then run before the caller sees a
-    function -- ABI assembly, then the parallel, panel, result-tile and relayout
-    completions -- and the two-node check this boundary replaced did cover them,
-    because it ran on the assembled function.  Leaving that window unchecked
-    would be a real narrowing: a duplicated ordered drain introduced there is
-    exactly the silent-storage corruption the verified body is checked for.
+    Four stages sit between the pipeline's statement list and the function this
+    lowering returns -- ABI assembly, then the parallel, panel, result-tile and
+    relayout completions.  Checking the pipeline's list and then carrying that
+    verification across the window by object identity leaves one class open: an
+    in-place mutation *inside* an already-verified statement preserves every
+    identity, so a nested rewrite or a duplicated statement one level down is
+    invisible.  That was measured, not supposed -- a comment rewritten inside a
+    verified statement reaches the emitted source, and a statement duplicated
+    inside the ordered drain compiles.
 
-    Both requirements below are exact-identity tests over the verified objects,
-    so together they cost one length compare and one pointer compare per
-    top-level statement rather than a second traversal.
+    The single structural comparison is therefore performed **here**, against
+    the assembled body, rather than before assembly.  That is the same one
+    traversal at the same cost, moved to the far side of the window, so the
+    whole window is covered by structure rather than by a reachability argument
+    about what happens to run inside it.  Three cheap requirements bound the
+    root before the traversal starts:
 
     *No completion transformed this family.*  Each of the four stages returns
     its input unchanged unless the plan carries the corresponding region, and an
     ordered-key plan carries none of them today.  Requiring the returned
-    function to BE the assembled function proves that for this compile instead
-    of assuming it -- and it fails closed the moment a future plan composes a
-    workspace with a tile, panel or relayout, which is precisely when the
-    replay contract has to be extended deliberately rather than silently.
+    function to BE the assembled function proves that per compile instead of
+    assuming it, and fails closed the moment a future plan composes a workspace
+    with a tile, panel or relayout -- precisely when the replay contract has to
+    be extended deliberately rather than silently.
 
-    *Assembly preserved the verified statements.*  ``assemble_function`` wraps
-    the body in a fresh ABI signature and copies the list, so every verified
-    statement must still be present, in order, as the same object.  Identity is
-    the exact right test here: these objects were deep-compared against the
-    detached reference moments earlier, so identity carries that verification
-    forward, while any substitution, drop, duplication or reorder breaks it.
+    *The root is an exact ``llir.Function``.*  A hostile assembler returning a
+    ``Function`` subclass carrying identical state satisfies every identity test
+    here; codegen refuses it downstream on exact-type dispatch, but this family
+    owns the diagnosis, so it is refused here with the completion code.
+
+    *Assembly preserved the verified statements as objects.*  ``list(body)``
+    keeps every statement, so per-index identity against the pipeline's own list
+    additionally pins that assembly substituted no value-equal twin -- a
+    detachment property the structural compare alone would accept -- and names
+    the offending index.
     """
 
     if expected is None:
@@ -13746,24 +13755,31 @@ def _require_ordered_key_assembled_body(
             "an ordered workspace plan reached a post-assembly completion "
             "stage, which has no replay contract with the verified body",
         )
+    if type(assembled) is not llir.Function:
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "ABI assembly did not return an exact LLIR function for an "
+            "ordered workspace plan",
+        )
     try:
         state = object.__getattribute__(assembled, "__dict__")
         body = state["body"] if type(state) is dict else None
     except (AttributeError, KeyError, TypeError) as error:
         _fail(_SPARSE_WORKSPACE_LOST, str(error))
-    if type(body) is not list or len(body) != len(verified_body):
+    if type(body) is not list or len(body) != len(pipeline_body):
         _fail(
             _SPARSE_WORKSPACE_LOST,
-            "ABI assembly did not carry the verified ordered workspace body "
-            "forward as one statement list of the same length",
+            "ABI assembly did not carry the ordered workspace body forward as "
+            "one statement list of the same length",
         )
-    for index, statement in enumerate(verified_body):
+    for index, statement in enumerate(pipeline_body):
         if body[index] is not statement:
             _fail(
                 _SPARSE_WORKSPACE_LOST,
-                "ABI assembly replaced, reordered or duplicated verified "
-                f"ordered workspace statement {index}",
+                "ABI assembly replaced, reordered or duplicated ordered "
+                f"workspace statement {index}",
             )
+    _require_ordered_key_completion_checkpoint(cast(List[llir.Stmt], body), expected)
 
 
 def _lower_loopir_to_llir_owned(
@@ -13994,10 +14010,6 @@ def _lower_loopir_to_llir_owned(
             compile_options=compile_options,
             stage_id=CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
         )
-    _require_ordered_key_completion_checkpoint(
-        pipeline_result.artifact.value,
-        ordered_key_completion_reference,
-    )
     assembled = kernel_abi.assemble_function(pipeline_result.artifact.value)
     completed_sparse_workspace = lowering.complete_sparse_workspace(assembled)
     returned = lowering.complete_relayout(
@@ -14007,7 +14019,10 @@ def _lower_loopir_to_llir_owned(
             )
         )
     )
-    _require_ordered_key_assembled_body(
+    # The one structural comparison runs on the far side of the completion
+    # window, so ABI assembly and all four completion stages are covered by
+    # structure rather than by identity plus a reachability argument.
+    _require_ordered_key_completed_body(
         returned,
         assembled,
         pipeline_result.artifact.value,
