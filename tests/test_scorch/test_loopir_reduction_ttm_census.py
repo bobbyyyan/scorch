@@ -1,14 +1,14 @@
 """Phase-7 cluster 2: the multi-compressed reduction / TTM fail-closed census.
 
 Cluster 2 -- sparse reductions and TTM over multi-compressed receivers -- is
-**not migrated**.  This module pins the exact boundary each cell stops at, in
-both automatic arms, so the next migration slice starts from a locked map
-rather than a re-derived one, and so no cell can silently change its
-diagnosis.
+**not migrated**.  This module pins the representative matrix declared by the
+Phase-7 review in both automatic arms, so the next migration slice starts from
+a locked map rather than a re-derived one.  It is a deliberately finite
+frontier, not a claim to enumerate every possible rank/layout combination.
 
 The cells split into two groups, and the split is the point.
 
-**Reorder-blocked (5 cells).**  ``Scheduler.select_loop_order`` ends with a
+**Auto-origin reorder-blocked (5 cells).**  ``Scheduler.select_loop_order`` ends with a
 forced reorder (``scheduler.py``, "ensure at least one free variable appears
 after the last reduction variable"): when no free variable follows the last
 reduction it moves the last free variable to the very end of the loop order,
@@ -20,16 +20,18 @@ before any LoopIR admission decision is reached.
 
 That reorder exists precisely because the legacy ``insert_workspace`` can only
 key a workspace on free variables *below the innermost reduction*.  It is a
-fifth blocker beside the four recorded in review section 45.6, and it is not
-LoopIR's to fix: ``Scheduler.apply_schedule`` is shared with legacy dispatch,
-legacy produces numerically correct results from the reordered order today,
-and changing it would change generated code on the default path.
+fifth blocker beside the four recorded in review section 45.6.  It blocks the
+empty automatic origin specifically: an explicit legal schedule carries a
+representative cell past LoopPlan to its later LoopIR seam.  Changing the
+shared legacy scheduler would change default-path code, but a LoopIR-specific
+automatic-plan repair remains a separately gated option.
 
-**Reachable (7 cells).**  Their automatic plan order is legal, and they stop
+**Reachable (11 cells).**  Their automatic plan order is legal, and they stop
 at LoopIR-side admission walls instead.  These are the cells a migration slice
-can actually take, and between them they span every shape the vertical needs:
-rank-1 and rank-2 keys, with and without a bound prefix, single-cursor and
-merged producers.
+can actually take.  They cover rank-1 and rank-2 keys, with and without a
+bound prefix, single-cursor and merged producers, plus all six canonical TTM
+layout variants named by the inherited review (three receiver/result layouts
+crossed with dense and compressed second factors).
 
 Applying the anchoring rule -- anchor the region at the OUTERMOST reduction
 and key it on the result indices at or below that anchor, in result level
@@ -43,7 +45,7 @@ cell                 reductions  p      prefix    key     K
 ``sss ijk->jk``      i           0      --        j, k    2
 ``ss ij->j``         i           0      --        j       1
 ``ds ij->j``         i           0      --        j       1
-``TTM ijk,kl->ijl``  k           2      i, j      l       1
+``TTM ijk,kl->ijl``  k           2      i, j      l       1 (six layouts)
 ===================  ==========  =====  ========  ======  ===
 
 B1 SpGEMM (``ik,kj->ij``) is the same rule's ``K = 1, prefix = 1`` instance,
@@ -62,10 +64,13 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
+from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan_legality import InvalidSchedule
 from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
+from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
 from scorch.compiler.loopir.schedule_passes import SchedulePassError
+from scorch.compiler.scheduler import Schedule
 from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
 
 
@@ -156,11 +161,27 @@ REACHABLE = [
     (*_reduction_cell("ss ij->j", "ss", "s", "ij", "j"), "unsupported_sparse_output"),
     (*_reduction_cell("ds ij->j", "ds", "s", "ij", "j"), "unsupported_sparse_output"),
     (
+        *_ttm_cell("TTM sss x dd -> sss", "sss", "dd", "sss"),
+        "unsupported_sparse_output",
+    ),
+    (
         *_ttm_cell("TTM sss x ss -> sss", "sss", "ss", "sss"),
         "unsupported_sparse_output",
     ),
     (
+        *_ttm_cell("TTM dss x dd -> dss", "dss", "dd", "dss"),
+        "unsupported_sparse_output",
+    ),
+    (
+        *_ttm_cell("TTM dss x ss -> dss", "dss", "ss", "dss"),
+        "unsupported_sparse_output",
+    ),
+    (
         *_ttm_cell("TTM dds x dd -> dds", "dds", "dd", "dds"),
+        "unsupported_sparse_output",
+    ),
+    (
+        *_ttm_cell("TTM dds x ss -> dds", "dds", "ss", "dds"),
         "unsupported_sparse_output",
     ),
 ]
@@ -171,10 +192,10 @@ REACHABLE = [
     "cell", REORDER_BLOCKED, ids=[cell[0] for cell in REORDER_BLOCKED]
 )
 def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
-    """The shared scheduler's forced reorder makes the plan itself illegal.
+    """The shared automatic origin's forced reorder makes the plan illegal.
 
-    These stop before LoopIR gets a say, which is why no LoopIR-side
-    admission widening can reach them.
+    These stop before LoopIR gets a say on this origin.  The explicit-schedule
+    control below proves that this is not an intrinsic program boundary.
     """
 
     name, cin, result_shape, bindings = cell
@@ -185,6 +206,38 @@ def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
     message = str(error.value)
     assert "stage=LoopPlan" in message, name
     assert "sparse_parent_dominance" in message, name
+
+
+@pytest.mark.parametrize(
+    ("cell", "loop_order", "exception", "expected_code"),
+    [
+        (
+            _reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"),
+            ("i", "j", "k"),
+            LoopIRTargetError,
+            "unsupported_program_shape",
+        ),
+        (
+            _reduction_cell("ss ij->i", "ss", "s", "ij", "i"),
+            ("i", "j"),
+            LoopIRLoweringError,
+            "unsupported_sparse_output",
+        ),
+    ],
+    ids=("sss-legal-explicit-order", "ss-legal-explicit-order"),
+)
+def test_auto_reorder_block_is_origin_specific(
+    cell, loop_order, exception, expected_code
+):
+    """A legal explicit order reaches the later LoopIR family boundary."""
+
+    name, cin, result_shape, bindings = cell
+    options = CompileOptions.from_environment(
+        environ={}, requested_schedule=Schedule(loop_order=loop_order)
+    )
+    with pytest.raises(exception) as error:
+        compile_cin_via_loopir(cin, result_shape, bindings, compile_options=options)
+    assert error.value.defect.code == expected_code, (name, error.value.defect)
 
 
 @pytest.mark.parametrize("arm", [False, True])
@@ -205,10 +258,10 @@ def test_reachable_cells_keep_their_exact_admission_code(cell, arm):
     assert error.value.defect.code == expected_code, (name, error.value.defect)
 
 
-def test_the_census_covers_the_whole_declared_cluster():
-    """No cell may quietly leave the census."""
+def test_census_covers_the_declared_representative_matrix():
+    """Pin the finite review matrix without claiming layout exhaustiveness."""
 
     assert len(REORDER_BLOCKED) == 5
-    assert len(REACHABLE) == 7
+    assert len(REACHABLE) == 11
     names = [cell[0] for cell in REORDER_BLOCKED] + [cell[0] for cell in REACHABLE]
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 16
