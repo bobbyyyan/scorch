@@ -587,46 +587,32 @@ def test_repeated_outer_key_across_regions_stays_two_segments():
     assert_matches_oracle_and_pytorch((dense,), result, kernel, result_shape, reference)
 
 
-def test_explicitly_stored_operand_zeros_reach_the_result():
-    """An operand zero that is STORED, not absent, still contributes a key.
+def test_stored_operand_zeros_keep_their_key():
+    """A STORED operand zero still contributes a key to the result.
 
-    Built through ``from_coo`` so the zero survives into the operand's stored
-    values instead of being filtered out by densify/re-sparsify.  Its key must
-    therefore appear in the result even though its contribution is 0.0 --
-    which is the sparse-structure contract, not a numeric one.
+    Which entries a drained result holds is a property of the iteration
+    domain, not of the values: a key that was inserted must appear even when
+    everything inserted under it was 0.0.  The operand is all-dense so every
+    cell really is stored -- ``to_sparse`` filters structural zeros out of a
+    compressed operand, so a compressed fixture could not state this.
     """
 
-    indices = torch.tensor(
-        [
-            [0, 0, 1, 1],
-            [0, 1, 0, 1],
-            [2, 3, 2, 4],
-        ]
-    )
-    values = torch.tensor([1.5, 0.0, 0.0, 2.5], dtype=_F32)
-    shape = (2, 2, 5)
-    operand = STensor.from_coo(
-        indices=indices, values=values, shape=shape, name="A"
-    ).to_sparse("sss")
-    stored = operand.values.tolist()
-    assert 0.0 in stored, "the fixture must retain an explicitly stored zero"
-
+    shape = (3, 5)
+    dense = torch.zeros(shape, dtype=_F32)
+    dense[0, 1] = 2.0
+    dense[2, 4] = -1.0
+    # Column 3 is stored everywhere and zero everywhere.
     result, kernel = execute_cin_via_loopir(
-        reduction_cin("sss", "ss", "ijk", "jk"),
-        (2, 5),
-        operand,
+        reduction_cin("dd", "s", "ij", "j"),
+        (5,),
+        STensor.from_torch(dense.clone(), "A"),
         compile_options=auto_options(False, jit=True),
     )
     levels, drained = compiled_storage(result)
-    # Four stored operand entries over four distinct (j, k) keys.
-    assert levels[1][1] == (2, 3, 2, 4)
-    assert 0.0 in drained, "a stored zero must keep its coordinate"
-
-    dense = torch.zeros(shape, dtype=torch.float64)
-    for position in range(indices.shape[1]):
-        dense[tuple(int(x) for x in indices[:, position])] = float(values[position])
+    assert levels[0][1] == (0, 1, 2, 3, 4), "every stored column keeps its key"
+    assert drained[3] == 0.0, "an all-zero stored column keeps an explicit zero"
     assert_matches_oracle_and_pytorch(
-        (dense.to(_F32),), result, kernel, (2, 5), dense.sum(dim=(0,))
+        (dense,), result, kernel, (5,), dense.to(torch.float64).sum(dim=(0,))
     )
 
 
@@ -692,18 +678,13 @@ def test_canonical_dump_is_arm_stable():
 @pytest.mark.parametrize(
     ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "code"),
     [
-        # A dense result level bound by a STORED prefix loop would need the
-        # row-scope catch-up against a dynamic parent count; that neighbour
-        # is not migrated here.
-        ("sss", "ds", "ijk", "ik", "unsupported_sparse_output_domain"),
-        ("sss", "ds", "ijk", "jk", "unsupported_sparse_output_domain"),
-        # A stored result prefix level driven by a DENSE domain likewise has
-        # no coordinate stream to append.
+        # A stored result prefix level driven by a DENSE domain has no
+        # coordinate stream to append, and CIN says so.
         ("dds", "ss", "ijk", "ik", "unsupported_sparse_output_domain"),
         # A compressed-parent/dense-leaf result keeps its own reduction seam.
         ("sss", "sd", "ijk", "ik", "unsupported_sparse_output_reduction"),
     ],
-    ids=["dense-row-ik", "dense-row-jk", "dense-driven-prefix", "dense-leaf"],
+    ids=["dense-driven-prefix", "dense-leaf"],
 )
 def test_unmigrated_neighbours_keep_precise_domain_codes(
     operand_fmt, result_fmt, operand_indices, result_indices, code, arm
@@ -718,6 +699,40 @@ def test_unmigrated_neighbours_keep_precise_domain_codes(
             compile_options=auto_options(arm),
         )
     assert error.value.defect.code == code
+
+
+@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize(
+    ("result_indices", "message"),
+    [
+        ("ik", "a stored prefix loop only above a compressed result level"),
+        ("jk", "every drained result level to be compressed"),
+    ],
+    ids=["dense-row-prefix", "dense-row-drained"],
+)
+def test_dense_result_level_under_a_stored_loop_stops_at_the_target(
+    result_indices, message, arm
+):
+    """The row-scope shape at rank 3 is a TARGET boundary, not a CIN one.
+
+    A ``ds`` result whose dense level is bound by the receiver's stored loop
+    passes CIN -- the split is well formed -- and is refused by the
+    ordered-key target, which would otherwise have to catch positions up
+    against a dynamic parent count.  The two cells differ in which half of
+    the split the dense level lands in, and each says so.
+    """
+
+    shape = (3, 4, 5)
+    result_shape = tuple(shape["ijk".index(c)] for c in result_indices)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            reduction_cin("sss", "ds", "ijk", result_indices),
+            result_shape,
+            ((shape, _F32),),
+            compile_options=auto_options(arm),
+        )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert message in str(error.value)
 
 
 def test_row_scope_dense_prefix_is_rejected_by_the_target():
