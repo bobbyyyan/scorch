@@ -31506,3 +31506,168 @@ stands.  Every gate is the Apple M5 machine; no cross-host run.
 decision and blocker 2 built.  No Phase-8 inventory, cutover, cache, selector or
 default-dispatch change was made; no fallback was weakened; no legacy code was
 deleted.
+
+## Blocker 3 built: the row-scope dense prefix, its two hosts, and a reach the CIN rule cannot measure (2026-08-11; supersedes every preceding prompt)
+
+Four local commits follow inherited committed tip ``bb7f391``; nothing was
+pushed, amended, squashed, reordered or discarded, and no ``git stash`` was run.
+**Origin is ``a3b8d1e``** — ``git ls-remote`` resolves this branch on origin to
+it, and ``.git/packed-refs`` still carries the stale ``58e8565`` for the
+remote-tracking ref and the staler ``cb49ff7`` for the local branch, so that file
+was read for nothing here.  The five protected tracked files hash exactly as
+recorded.  Evidence ledger: ``~/.cache/scorch-codex/rowscope-blocker3/`` (new).
+
+**What this milestone lands.  Blocker 3 is BUILT** — a DENSE result prefix level
+bound by a STORED loop, in both the ordered-key and bound-prefix families, which
+share one CIN rule.  Review §54 owns the detail.  **Blocker 3 was the only open
+blocker.**
+
+**The reach cannot be measured from the CIN rule, and that is the correction that
+mattered.**  Giving that one ``_fail`` a sentinel defect code shows it gates
+exactly **34** cells in both arms, and nothing else moves.  Relaxing only the
+STORED case moves 30 of them: **26 reach the TARGET**, 4 reach blocker 1's
+auto-tile seam (``TTM sds x * -> dds``), and 4 stay refused by the **compressed**
+-prefix rule beside it (``TTM sds x * -> dss``, the dense-domain assembly seam
+this session was told not to reopen — and does not).  But the built change
+migrates **29**, not 26.  The three extra — ``sss ijk->ik [ds]``,
+``sds ijk->ik [ds]`` and ``MM ss x ds -> ds`` — have a canonical-CSR ``(D,C)``
+receiver, which CIN routes to ``CSR_SPARSE_ROW``, a family that already permits a
+stored row domain.  The CIN prefix rule never sees them; the ordered-key TARGET
+alone refused them.  §53.6's lesson in the opposite direction: a prediction can
+over-count by naming cells a branch merely reaches, and a probe can under-count by
+measuring one of two gates.
+
+**The host is neither class the prompt named.**  Measured off the live classifier
+and the raising frame, ``_OrderedKeySparseWorkspaceLowering`` owns **all 26**
+reachable frontier cells (``_collect_ordered_key_chain``'s "a stored prefix loop
+only above a compressed result level" is the whole refusal) and
+``_MultiCompressedAssemblyLowering`` owns the bound-prefix half — where
+``_bound_prefix_assembly_chain`` required a ``DenseFor`` at every prefix position,
+so the program fell through to the generic target and was refused by its
+hierarchical-compressed-INPUT rule, a refusal that names the operand and says
+nothing about the prefix.  ``_RowScopeSparseWorkspaceLowering`` is the
+**precedent**, not the host: rank-2-only by ``_admits_result_layout``, and in a
+different CIN family.
+
+**The change.**  CIN's ordered-key prefix domain rule admits ``DomainKind.SPARSE``
+beside ``DomainKind.DENSE`` at a dense result prefix level — sound because a dense
+level stores no coordinates, so the only obligation is that its child's position
+array be closed at every LOGICAL cell, which a stored stream's skipped cells get
+from the catch-up.  MERGED stays refused (no single cursor to advance it).  The
+compressed-prefix rule beside it is untouched.  Three shared module functions
+carry the emission: the per-cell catch-up and close are byte-for-byte what
+``_lower_dense`` already emits for the same level, and the one new group is a
+FINAL catch-up through the prefix's total cell count — a dense prefix ends at its
+own extent and needs none, a stored prefix stops at its last stored coordinate and
+leaves every later cell open.  ``_assembly_catch_up`` gains a keyword-only
+``bound`` override; every inherited caller omits it.  Three predicates are re-keyed
+from a loop's driver to the RESULT level (behaviour-preserving: the two agreed
+before a stored prefix level existed), the assembly stream tallies now count only
+suffix positions, and the APPEND leaf additionally requires a dense-driven prefix
+so the multi-compressed family's untouched CIN rule is stated at the target too.
+
+**No scheduler change, and "no plan repair" is true in two halves.**  The
+ordered-key half's plan records ``select_loop_order``'s FORCED order, so blocker
+2's retry never fires; the bound-prefix half records the PRE-forced order because a
+rank-0 key is refused at ``sparse_parent_dominance`` without it.  Both halves are
+locked as tests.  **No representation change: v11 stands.**
+
+**Verification.**  Release neutrality against ``bb7f391`` **byte-identical**
+(corpus 20/20, grid 42/42, audit ``total=86 admitted=46 rejected=40
+nonidentical=0`` both sides and identical between them).  Because both arms are
+clean detached worktrees, mypy is **hash-identical** (146 lines, 140 errors in 11
+files, none in a changed file) and so is flake8 (47 lines); §53.11 had to weaken
+this to "the error set is identical" because its candidate was the working tree.
+The empty-``Schedule()`` surface: 118 cases, the legacy arm emitting for the same
+**100** on both trees with **identical digests**, the LoopIR arm identical on 45
+and rising to 52, and **zero refusal records changed** — so unlike blocker 2 this
+build costs nothing there, and §53.8's ``ValueError: ivar_j is not in list``
+degradation is neither widened nor repaired.  The 748-cell declared frontier at the
+final tip, reading **both** LoopPlan exits: **135 admitted / 415 defect codes / 198
+loop-plan diagnostics / zero unclassified / the same three arm-variant cells**,
+delta ``+29 admitted, -29 defect codes, zero admitted cells lost``.  Compiled
+public + erasure/oracle differential **1,944 checks, zero failures** (the
+inherited 936 extended by 1,008), whose load-bearing addition is a ``holes`` arm
+that FORCES prefix cells empty and asserts off the built storage that the operand
+really skips some — a prefix whose every cell is stored never runs a catch-up, so
+the inherited random-sparsity arms could not have caught a wrong bound.
+``_needs_stored_prefix_final_catch_up`` was added after the differential began, so
+its neutrality is measured, not argued: over 1,494 cell-arms (270 emitting) the
+generated C++ digests are identical and the frontier routes differ in zero cells.
+
+**The full suite earned its keep.**  A first pass at the production+test tip
+returned **six failures**, every one an inherited seam lock naming exactly a shape
+blocker 3 migrates -- and one of them a test that would have kept PASSING for the
+wrong reason (its explicitly ordered route now stops at the operand's
+hierarchical-compressed rule, not at the prefix).  All four locks are moved in
+place per §49.7 and the suite was re-run at the corrected tip ``0821799``:
+**6,282 selected, 6,267 passed, 15 skipped, 3 deselected, 0 failed, 0 errors**,
+eight file-disjoint partitions all exiting 0 at one revision, module and node
+partitions complete and disjoint, worktree clean before and after.  The node delta
+from the base's 6,203 is accounted exactly: **+79 = 86 added - 7 removed**, and all
+seven removals are named seam locks MOVED or tests RENAMED, none lost.  Gates 1
+and 2 are read out of the suite's own JUnit XMLs: **495 nodes / 494 passed / 1
+skipped** and **1,180 nodes / all passed**.  One finding came from the gate rather
+than inspection: the inherited ``fullsuite/suite_report.py`` hardcoded the PREVIOUS
+session's scratchpad, so it printed that session's aggregate -- a copied harness
+reporting a gate that had not run.  Its path is a parameter now.
+
+**Paired compile-only latency against the 1.10 ceiling**, base ``bb7f391`` vs
+final ``0821799``, 20 rounds / 4 warmups / 21 samples with A/A and order controls,
+grid checksum 141162 over 40 cells asserted equal in all 60 measurements, machine
+idle: A/B median mean 1.0026 / max **1.0338**, A/B min-of-samples mean 1.0011 /
+max 1.0168, A/A control median max 1.0164 and min-of-samples max 1.0171, pooled
+fastest-sample A/B 1.0085 vs A/A 1.0009, order means 1.0010 base-first / 1.0042
+candidate-first.  **Every declared statistic is at or below 1.10; the largest
+anywhere is 1.0338.**  Unlike §53.11 the largest IS an A/B number, and that is
+stated rather than smoothed: it is one round (15, candidate-first, whose own A/A
+control was 0.9972), the min-of-samples A/B max sits just BELOW its A/A
+counterpart, and the mean offset is +0.3%.  No systematic cost beyond ~0.3% is
+visible and nothing approaches the ceiling.
+
+**Also taken (carried items).**  ``test_the_generated_accumulator_identifier_is_
+name_reserved`` unit-tests what §53.11 measured but never asserted.
+``test_redispositioned_neighbours_keep_their_shape_specific_codes`` records two of
+§53.7's 57 re-dispositioned neighbours, with the measured precondition that the
+forced and pre-forced orders really differ for each.
+
+**Not addressed.**  **Blocker 1 stays closed by decision**, and this change makes
+four more cells reach it.  The **dense-domain assembly seam** is untouched by
+design (``ds ij->i``, ``dss ijk->i``, ``TTM sds x * -> dss``): admitting it means
+appending one entry per row of a dense iteration space, which is a design decision
+for Bobby.  The **1139-cell frontier extension** was not re-run and neither was the
+**heavy legacy sweep** for the eleven unsound-claimed cells, so §52.8's scoping
+note stands.  Carried item (c) — whether the legacy replay boundary should fail
+closed structurally instead of ``ValueError: ivar_j is not in list`` — is
+**recorded as a deliberate limit, not fixed**: this build measurably does not
+aggravate it (zero refusal records changed), and it remains a real degradation on
+the empty-``Schedule()`` surface for any family whose legal order legacy cannot
+lower.  Every gate is the Apple M5 machine; no cross-host run.
+
+**PHASE 7 IS GO on its declared exit criteria** -- the first milestone in this
+sequence able to say so.  All six audit questions answer yes and the §49.5 matrix
+is closed: blocker 2 built, blocker 3 built here, blocker 1 closed by decision.
+
+Three measured facts bound what that licenses, and the next session should treat
+the first two as its opening duties rather than as follow-ups:
+
+1. **Blocker 1's hole is four cells wider than when it was closed, because of this
+   build.**  ``TTM sds x {dd,ds,sd,ss} -> dds`` now pass CIN and stop at
+   ``unsupported_schedule_auto_family``, so the auto-tile seam refuses six shapes
+   where §52.7 accepted it against two.  All are fail-closed with structured
+   codes, but a fallback census must budget for six.
+2. **The 1139-cell frontier extension has not run for three consecutive
+   milestones.**  The declared 748 is a strict subset -- the extension is what
+   covers rank 6, non-ADD operators, COO/SINGLETON levels, three- and four-operand
+   chains, and zero extents crossed with every receiver.  A census over the 748 is
+   a census over a knowingly partial frontier.
+3. **The eleven unsound-claimed cells' arm-invariance is still unmeasured**, and
+   §52.8 found three configuration-dependent.  Those are exactly the cells a
+   fallback census must be certain about.
+
+No Phase-8 inventory, cutover, cache, selector or default-dispatch change was made
+here; no fallback was weakened; no legacy code was deleted.  A GO permits a
+**read-only** Phase-8 cutover/fallback census next, and at most an explicitly
+opt-in shadow pilot for already-proven families.  Every gate in §§49-54 is the
+Apple M5 machine; a cutover decision about release behaviour on a branch whose
+value is generated-code equivalence should not rest on one host.
