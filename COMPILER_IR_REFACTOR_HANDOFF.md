@@ -31816,7 +31816,7 @@ directory over.  Both the root and the two trees are parameters now, and the roo
 derives from the script's own location.  ``HARNESS_PROVENANCE.md`` records this
 and states exactly what scope each harness ran at.
 
-## What the next session should do
+### (superseded) What the previous session said to do next
 
 **Do not attempt the cutover on this evidence.**  The census says why, and the
 three blockers below are what would have to change.  In priority order:
@@ -31846,3 +31846,123 @@ three blockers below are what would have to change.  In priority order:
 **Do not reopen:** whether ``ds ij->i`` / ``dss ijk->i`` / ``TTM sds x * -> dss``
 should migrate.  Still a deliberate seam and still Bobby's design decision.
 Blocker 1 stays closed by decision; 55.3 resizes its hole, it does not reopen it.
+
+## The cross-host run: three hosts, zero divergence, and a corrected comparand (2026-08-11; supersedes every preceding prompt)
+
+Two local commits follow inherited committed tip ``c13b45c`` and **no production
+file changed**: ``git diff c13b45c..HEAD -- src/`` is empty.  Nothing was pushed,
+amended, squashed, reordered or discarded, and no ``git stash`` was run.
+**Origin is ``a3b8d1e``** — ``git ls-remote`` resolves the branch there;
+``.git/packed-refs`` still carries the stale ``58e8565``/``cb49ff7`` and was not
+read for any claim.  Evidence ledger:
+``~/.cache/scorch-codex/crosshost-phase8-census/`` (new).
+
+**What this milestone lands.**  Carried item (b), the cross-host run, which
+§§52–55 recorded as blocked and §55.9 named as duty 1.  Bobby unblocked
+``redwood`` and MKT, so it ran — on **two** further hosts, not one.  Review §56
+owns the detail.  **Phase 7 stays GO.  A Phase-8 cutover stays NO-GO**, for the
+census's own reasons, none of which this milestone touches.
+
+**1. Three hosts, zero divergence, compared on records rather than summaries.**
+M5 (arm64 / macOS 26.4.1 / Apple clang 21 / py3.11.15 / **torch 2.13.0**),
+``redwood`` (x86_64 Intel i9-14900K / Ubuntu 22.04 / g++ 11.4 / py3.11.15 /
+**torch 2.5.1**) and ``mkt1`` (x86_64 **AMD** EPYC 9334 / Ubuntu 24.04 / g++ 13.3 /
+**py3.12.3** / **torch 2.10.0**).  All three census harnesses re-ran end to end on
+both new hosts: frontier **1139/1139 identical**, dual census **1139/1139
+identical**, byte-equivalence **496/496 identical**, on every field — route,
+defect code, paths, stages, diagnostic counts, source digests — and identical
+between the two new hosts as well.  The comparator asserts equal length *and*
+identical ``(family, name[, arm])`` ordering before pairing positionally, and
+refuses to compare otherwise.  The torch spread (2.5.1 → 2.13.0) is the sharpest
+axis and it moved nothing.  **The single-host caveat carried since §49 is
+discharged.**
+
+**2. Provenance is measured, not asserted.**  ``redwood`` runs a pinned detached
+worktree at ``c13b45c``; ``mkt1`` runs a ``git archive`` of the same commit; both
+independently compute the ``src/**/*.py`` manifest digest
+``1258fea6c2626e11cb1e8a75453a501e6fd595808952c6d3437517b7d4423850``, reached by
+different transports with neither copied from the other.
+``git diff 6e8e09c..c13b45c -- src/`` is empty, so the tip stands in for the tip
+the M5 census ran at.  The extension is built **in place from the measured tree**
+on each host — ``redwood``'s shared env had ``scorch_ops`` from an unrelated
+``perf/spmm-fastpath`` build, and every harness asserts its import origin, so the
+confound is excluded by construction.  Bobby's ``perf/spmm-fastpath`` checkout and
+its conda env were left untouched; MKT ran under Slurm (job 16736984, COMPLETED,
+exit 0:0, 1m56s) with the tree, build, ``TMPDIR`` and artifacts on
+``/scr/bobbyy/refactor-crosshost`` per the storage policy.
+
+**3. A CORRECTION the second comparand forces: the number is 105, and the set is
+exact.**  Both equivalence columns reproduce on all three hosts — 112 against
+legacy under an empty ``Schedule()``, **105 against legacy under default
+dispatch**.  §55.5 records both but draws its headline *and* its structural
+finding from the 112, which is the wrong row **by §55.5's own rule**: the same
+section proves an empty ``Schedule()`` is not identity on the legacy path (it
+changes legacy's outcome on 662 of 1139 cells) and says neutrality arguments must
+not migrate between that surface and default dispatch.  A cutover moves default
+dispatch.  Exactly **7 cell-arms** separate the rows (reverse direction empty),
+and **the two cells §55.5 had to name as exceptions to its own dense-receiver
+rule — ``MM ss x ss -> ss`` and ``MM ds x ds -> ds`` — are exactly its
+sparse-receiver members**.  The 112 has receivers ``{d:87, dd:21, ss:2, ds:2}``;
+the 105 has ``{d:87, dd:18}`` and **zero sparse receivers**.  The correction makes
+the census's product exact rather than hedged: *against the comparand a cutover
+actually moves, the typed route is byte-identical to legacy on exactly the
+dense-receiver cell-arms, and on no sparse-receiver cell-arm at all.*  **A
+dense-receiver shadow pilot is therefore 105 cell-arms, not 112.**
+
+**Not addressed, and stated rather than folded in.**  The heavy legacy sweep and
+the full non-performance suite were **not** re-run cross-host — only the three
+census harnesses were.  **Latency was not measured cross-host** and must not be
+read into these runs; nothing here is a paired A/B.  No blocker was reopened or
+closed.  No dispatch, cache, selector or fallback change; no legacy code deleted;
+no cutover and no shadow pilot, not even an opt-in one.
+
+## What the next session should do
+
+The census's three reasons to refuse a cutover are untouched by the cross-host
+result, and duty 1 is now spent.  In priority order:
+
+1. **Decide the dense-receiver shadow pilot — over 105 cell-arms, not 112.**  It
+   is the one cutover-shaped step the census supports, it is now backed by three
+   hosts rather than one, and §56.5 has made its membership exact: enumerate from
+   ``legacy_default_same == true`` in ``census/equiv_1139.json``, **not**
+   ``legacy_empty_same``.  Opt-in, no default-dispatch change.  The four
+   ``matmul`` sparse-receiver arms must not ride in on an empty-``Schedule()``
+   byte match.
+2. **Price the sparse-receiver families honestly.**  Still the largest hole and
+   now the largest: a cutover changes emitted code on 344 admitted cell-arms and
+   **no gate on this branch has ever measured an emitted kernel's runtime** —
+   compile-only latency measures the compiler.  Until a kernel-performance
+   harness exists for the migrated families, "the typed route emits better code"
+   is an inspection claim, not a measurement.  §55.5's own example
+   (``ss ij->j [s]``, 2,218 chars against legacy's 2,845, one whole pass deleted)
+   is the natural first case: it should be *run*, not read.
+3. **Consider running the full non-performance suite on x86.**  The three census
+   harnesses reproduce exactly, which is evidence about the compiler pipeline's
+   host-independence but not about the 6,309-node suite.  It is cheap now that
+   both hosts are staged and would close the remaining "every gate is the M5"
+   sentence for good.
+4. **Re-run the extended 1139 frontier on any milestone that reshuffles
+   diagnostics** — the 748 was a faithful proxy for blocker 3 and a poor one for
+   blocker 2; the discriminator is whether the change touches a rule many
+   families reach, not how big the change looks.
+
+**Open questions that belong to Bobby, not to a session** (recorded because a
+previous handoff wrote them as "do not reopen", which overstated their standing —
+they are decisions *deferred to* Bobby, not decisions *made by* him):
+
+- **Whether a COMPRESSED result level may be driven by a dense domain.**  This is
+  what ``ds ij->i``, ``dss ijk->i`` and ``TTM sds x * -> dss`` turn on; admitting
+  it means appending one entry per row of a dense iteration space.  A real
+  semantic choice about what the compiler should emit, not a gap to close in
+  passing.
+- **Whether Phase 8 revisits the automatic tile heuristic.**  Blocker 1 is closed
+  *by decision* and is not "unmigratable in principle": it is unmigratable for
+  exactly as long as ``_apply_automatic_tiles`` emits an affine tile for a ``dds``
+  receiver while living in a layer shared with legacy default dispatch.  §55.2
+  resized its seam to 14 cell-arms in arm 0 and 12 in arm 1 — the decision was
+  taken against 2.
+
+Reference: harnesses in the new ledger take a ledger root as ``$1`` and default to
+their own location; the staged trees are ``redwood:/scratch/bobbyy/scorch-refactor-tip``
+(pinned worktree, git-backed) and ``mkt1:/scr/bobbyy/refactor-crosshost/scorch-tip``
+(archive, rebuild via the retained ``mkt_crosshost.sbatch``).

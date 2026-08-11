@@ -12029,3 +12029,211 @@ evidence that does not exist yet.
   master has expired and a valid Kerberos ticket is not sufficient.  Every
   harness in this ledger takes a tree root as its first argument and will run
   there unchanged once a master exists.
+
+## 56. The cross-host run: three hosts, zero divergence, and the comparand the cutover question turns on (2026-08-11)
+
+This section opens at inherited committed tip ``c13b45c`` and takes **carried
+item (b)** — the cross-host run that §§52–55 recorded as blocked rather than
+declined.  Bobby unblocked both ``redwood`` and the MKT allocation, so it ran.
+It is a **read-only measurement session**: no production file changed, no
+dispatch, cache, selector or fallback was touched, no legacy code deleted, and
+no cutover or shadow pilot was started.
+
+Sections 49 through 55 are preserved above as written.  Where this section
+contradicts them, this section is correct.
+
+### 56.1 What the single-host caveat actually was
+
+Every gate in §§49–55 ran on one machine — the Apple M5.  §54.8 stated the limit
+plainly ("one further limit that no amount of local work removes"), and §55.9
+promoted it to the top of the next session's duties on the grounds that if the
+1139-cell dispositions and the byte-equivalence split fail to reproduce on
+another host, "that is the most important thing anyone could learn about this
+branch".
+
+The caveat is not idle worry.  The frontier and census read their dispositions
+off exception types and defect codes produced by a Python compiler pipeline, and
+the equivalence census compares *generated C++ text*.  Anything host-dependent
+in that chain — dictionary or set iteration order leaking into emitted names, a
+``torch`` version changing a dtype or shape inference result, a platform branch
+in the ABI or policy layer, floating-point formatting in an emitted literal —
+would show up as a different code or a different digest.
+
+### 56.2 The three hosts, and why they are a real contrast
+
+| | M5 (inherited) | redwood | mkt1 |
+| --- | --- | --- | --- |
+| arch | **arm64** | x86_64 | x86_64 |
+| CPU | Apple M5 | Intel i9-14900K | **AMD** EPYC 9334 |
+| OS | macOS 26.4.1 | Ubuntu 22.04.4 | Ubuntu 24.04.4 |
+| compiler | Apple clang 21.0.0 | g++ 11.4.0 | g++ 13.3.0 |
+| Python | 3.11.15 | 3.11.15 | **3.12.3** |
+| torch | **2.13.0** | **2.5.1** | **2.10.0**+cu128 |
+
+Two architectures, three CPU vendors, two operating-system families, two
+compiler families across three versions, two Python minor versions, and **three
+torch versions spanning 2.5.1 to 2.13.0**.  The torch spread matters most: it is
+the dependency the pipeline actually consults for dtypes, shapes and the
+extension ABI, and an eight-minor-version gap is a far more aggressive test than
+a second Linux box would have been.
+
+### 56.3 Provenance, established rather than asserted
+
+- **The measured source is the same source on all three.**  ``redwood`` runs a
+  pinned detached ``git worktree`` at ``c13b45c``, clean; ``mkt1`` runs a
+  ``git archive`` of the same commit.  Both independently compute a manifest
+  digest — sha256 over the sorted sha256 of every ``src/**/*.py`` — and both
+  produce ``1258fea6c2626e11cb1e8a75453a501e6fd595808952c6d3437517b7d4423850``.
+  The two hosts were reached by different transports and neither digest was
+  copied from the other.
+- **``c13b45c`` is a valid stand-in for the tip the M5 census ran at.**
+  ``git diff 6e8e09c..c13b45c -- src/`` is empty; the two intervening commits are
+  test and documentation.
+- **Nothing was pushed.**  Origin is still ``a3b8d1e``; commits moved to
+  ``redwood`` as a ``git bundle`` and to ``mkt1`` as a source archive.
+- **The extension is built from the measured tree on each host**, in place
+  (``build_ext --inplace``), so ``PYTHONPATH`` resolves both ``scorch`` and
+  ``scorch_ops`` inside the pinned tree.  This is not cosmetic: ``redwood``'s
+  shared ``scorch`` env had ``scorch_ops`` built from an unrelated
+  ``perf/spmm-fastpath`` checkout, and every harness asserts its import origin,
+  so the confound is excluded by construction and then measured.  Bobby's
+  ``perf/spmm-fastpath`` checkout and its conda env were left untouched.
+- **MKT storage policy respected**: the tree, the build, ``TMPDIR`` and all run
+  artifacts live under ``/scr/bobbyy/refactor-crosshost`` on the node, reached
+  through Slurm (``sbatch -p mkt --account=mkt``, job 16736984, COMPLETED, exit
+  0:0, 1m56s); ``/matx`` holds only the input archives and a copy of the JSON
+  receipts.
+
+### 56.4 The result: zero divergence, on the records and not on the summaries
+
+All three harnesses were re-run end to end on both new hosts and compared
+**record by record on the full parsed JSON**, not on headline counts — two runs
+can agree on every summary and disagree on a defect code.  The positional pairing
+is itself justified rather than assumed: the comparator asserts equal length
+*and* an identical ``(family, name[, arm])`` sequence before it compares, and
+refuses to compare positionally otherwise.
+
+| harness | records | redwood vs M5 | mkt1 vs M5 | redwood vs mkt1 |
+| --- | --- | --- | --- | --- |
+| frontier (extended 1139) | 1139 | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** |
+| dual cutover/fallback census | 1139 | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** |
+| byte-equivalence census | 496 | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** |
+
+Zero differing records anywhere: every ``route``, every defect ``code``, every
+``paths`` and ``stages`` list, every diagnostic count, every
+``carries_defect_attr`` flag, and every generated-source digest.  Consequences
+worth stating separately, because each was previously single-host:
+
+- **248 admitted / 652 defect codes / 239 loop-plan diagnostics / 0 unclassified
+  / 3 arm-variant** reproduces exactly, on both new hosts.
+- The four cutover quadrants **A 228 / B 20 / C 703 / D 188** reproduce exactly.
+- The **662-cell** empty-``Schedule()``-is-not-identity result reproduces exactly,
+  including its per-transition breakdown.
+- The byte-equivalence split reproduces exactly on **both** comparands.
+
+**The single-host caveat carried by §§49–55 and named as duty 1 by §55.9 is
+discharged.**  Generated-code equivalence on this branch is not an artifact of
+the M5, of macOS, of clang, of arm64, or of one torch version.
+
+### 56.5 A correction that the second comparand forces: the number is 105, and the set is exact
+
+§55.5 reports the byte-equivalence split against two comparands, in a table, and
+both numbers reproduce on all three hosts:
+
+| comparand | byte-identical | different | legacy refuses |
+| --- | --- | --- | --- |
+| legacy under the same empty ``Schedule()`` | 112 | 344 | 40 |
+| legacy under **default dispatch** | **105** | 351 | 40 |
+
+The numbers are not in dispute.  What this section corrects is **which one the
+conclusion is drawn from**.  §55.5 builds both its headline ("a cutover is a
+byte-neutral no-op on 112 of 496 admitted cell-arms") and its structural finding
+("the structure of the 112 is the finding … essentially exactly the
+dense-receiver cells … every one with an all-dense result format **except**
+``MM ss x ss -> ss`` and ``MM ds x ds -> ds``") on the **empty-Schedule()** row.
+
+That is the wrong row for that conclusion, **by §55.5's own rule**.  The same
+section establishes that an empty ``Schedule()`` is not identity on the legacy
+path — it changes legacy's outcome on 662 of 1139 cells — and concludes that
+"neutrality arguments must not migrate between that surface and release default
+dispatch".  A cutover changes what **default dispatch** emits.  So the
+cutover-relevant comparand is the second row, and the honest headline number is
+**105**, not 112.
+
+Measured, the correction makes the finding **stronger and exact** rather than
+weaker.  Exactly **7 cell-arms** separate the two rows, and the reverse direction
+is empty (nothing is default-identical without being empty-identical):
+
+| cell-arm | receiver |
+| --- | --- |
+| ``rank3 dsd ijk->ik [dd]`` arm1 | dd |
+| ``rank3 ddd ijk->ik [dd]`` arm1 | dd |
+| ``matmul MM ss x ss -> ss`` arm0, arm1 | **ss** |
+| ``matmul MM ds x ds -> ds`` arm0, arm1 | **ds** |
+| ``matmul MM ds x dd -> dd`` arm1 | dd |
+
+**The two cells §55.5 had to name as exceptions to its own dense-receiver rule
+are exactly the sparse-receiver members of the 7.**  Drop to the correct
+comparand and they drop out with it:
+
+- the **112** has receiver formats ``{d: 87, dd: 21, ss: 2, ds: 2}`` — **4
+  sparse-receiver cell-arms**, which is why §55.5 needed the word "essentially"
+  and an explicit exception clause;
+- the **105** has receiver formats ``{d: 87, dd: 18}`` — **zero** sparse-receiver
+  cell-arms.
+
+So the census's main product should be stated without the hedge:
+
+> **Against the comparand a cutover actually moves, the typed route is
+> byte-identical to legacy on exactly the dense-receiver cell-arms — 105 of 496 —
+> and on no sparse-receiver cell-arm at all.**
+
+This does not change the Phase-8 verdict; it sharpens its basis.  §55.5's
+conclusion ("a cutover is an equivalence-preserving refactor only for dense
+receivers; for every sparse-receiver family it is a behaviour change") was right,
+and was being argued from a surface that contained four counterexamples to it.
+On the correct surface there are none.  The practical consequence is for
+§55.9 duty 2: **a dense-receiver shadow pilot is 105 cell-arms, not 112**, and
+the four ``matmul`` sparse-receiver arms must not be carried into it on the
+strength of an empty-``Schedule()`` byte match.
+
+### 56.6 What this section does not do
+
+- **No production file changed.**  ``git diff c13b45c..HEAD -- src/`` is empty.
+  The only tracked changes are this section and a handoff section.  (``CLAUDE.md``
+  was also corrected — its build instructions still described a ``setup.py`` and a
+  top-level ``csrc/``, neither of which exists at this tip — but it is listed on
+  line 1 of ``.gitignore`` and is therefore untracked and outside this or any
+  commit.)
+- **The working tree carries pre-existing uncommitted drift** unrelated to the
+  refactor (``src/scorch/__init__.py``, ``gpu.py``, ``src/scorch/csrc/cuda/``,
+  packaging and resource tests).  None of it was committed, and none of it can
+  have reached a measurement: all three hosts ran **pinned** trees at ``c13b45c``
+  — a clean detached worktree on ``redwood`` and a ``git archive`` on ``mkt1`` —
+  never this working tree, and both independently reproduce the same ``src/``
+  manifest digest.
+- **The Phase-8 cutover verdict is unchanged: NO-GO.**  56.4 removes the
+  single-host caveat, which was a *reason to distrust the census*, not one of the
+  census's reasons to refuse a cutover.  Those are untouched: 703 fallback cells
+  resting on a legacy characterized for 21, four of them data-dependent; 344
+  cell-arms whose emitted code changes; and no kernel-runtime harness anywhere on
+  this branch.
+- **Phase 7 stays GO**, on the §54.8 criteria, unchanged.
+- **No blocker was reopened, none was closed.**  Blocker 1 in particular is
+  untouched.
+- **The heavy legacy sweep and the full suite were not re-run cross-host.**  Only
+  the three census harnesses were.  The sweep's value is a claim about *legacy's*
+  soundness, which 55.4 has already shown is data-dependent and therefore not
+  certifiable by adding hosts; the full suite is a claim about *this tree*, worth
+  running on x86 but not a census input.  Both are stated as not run rather than
+  folded into the reproduction claim.
+- **Latency was not measured cross-host**, and should not be read into these
+  runs: wall-clock differed widely (frontier 10.6 s on redwood; the whole MKT job
+  1m56s) and nothing here is a paired A/B.
+
+**Evidence ledger** ``~/.cache/scorch-codex/crosshost-phase8-census/`` —
+``receipts/`` (nine JSONs, three harnesses × three hosts), ``hosts/`` (toolchain
+manifests), ``provenance/`` (digests, the sbatch script, the full Slurm job log),
+``compare/`` (``compare_hosts.py`` and ``comparand_structure.py``, both taking the
+ledger root as ``$1`` and defaulting to their own location — never a hardcoded
+path — with their outputs retained), and ``SHA256SUMS``.
