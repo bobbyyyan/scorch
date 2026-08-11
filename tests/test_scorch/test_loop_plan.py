@@ -789,10 +789,15 @@ def test_one_cin_can_be_scheduled_independently_two_ways() -> None:
 def test_auto_plan_replay_does_not_rerun_loop_order_policy() -> None:
     cin = _build_spmm()
 
-    def select_ikj(working, costs):
+    def select_ikj(working, costs, pre_forced_order=None):
         del costs
         by_name = {index_var.name: index_var for index_var in working.index_vars}
-        return [by_name["i"], by_name["k"], by_name["j"]]
+        order = [by_name["i"], by_name["k"], by_name["j"]]
+        if pre_forced_order is not None:
+            # Mirror the real out-parameter: this stub applies no forced
+            # reorder, so the pre-forced order is the order it returns.
+            pre_forced_order.extend(order)
+        return order
 
     with patch.object(Scheduler, "select_loop_order", side_effect=select_ikj):
         scheduled = Scheduler.apply_schedule(cin, Schedule())

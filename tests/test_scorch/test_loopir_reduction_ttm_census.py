@@ -133,12 +133,31 @@ def _ttm_cell(name, a_fmt, b_fmt, c_fmt):
 # The plan order these cells receive violates the operand's parent dominance,
 # so they never reach a LoopIR admission decision.  ``InvalidSchedule`` carries
 # no ``defect.code``; the stage and reason are checked from its message.
+#
+# The occupants are the PERMUTED-result cells.  The automatic plan origin now
+# repairs a forced order the storage-order rules refuse -- but only when the
+# order the composition started from is itself legal, and for a permuted result
+# it is not: ``result_storage_order`` refuses both.  The cells this list used to
+# name (``sss ijk->{i,j,ij}``, ``ss ij->i``, ``ds ij->i``) moved when the
+# bound-prefix family landed; ``BOUND_PREFIX_MIGRATED`` below records where each
+# went, and ``test_loopir_bound_prefix_target`` owns the family.
 REORDER_BLOCKED = [
-    _reduction_cell("sss ijk->i", "sss", "s", "ijk", "i"),
-    _reduction_cell("sss ijk->j", "sss", "s", "ijk", "j"),
-    _reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"),
-    _reduction_cell("ss ij->i", "ss", "s", "ij", "i"),
-    _reduction_cell("ds ij->i", "ds", "s", "ij", "i"),
+    _reduction_cell("ss ij->ji", "ss", "ss", "ij", "ji"),
+    _reduction_cell("ds ij->ji", "ds", "ds", "ij", "ji"),
+    _reduction_cell("sss ijk->ikj", "sss", "sss", "ijk", "ikj"),
+    _reduction_cell("sss ijk->ki", "sss", "ds", "ijk", "ki"),
+]
+
+# Where the five cells this census used to lock as reorder-blocked now go.
+# Three are admitted by the bound-prefix family; two are refused by that
+# family's own prefix domain rule (a COMPRESSED result level driven by a DENSE
+# domain), and ``sss ijk->{j,ij}`` by interleaving and the target respectively.
+BOUND_PREFIX_MIGRATED = [
+    (_reduction_cell("sss ijk->i", "sss", "s", "ijk", "i"), True),
+    (_reduction_cell("ss ij->i", "ss", "s", "ij", "i"), True),
+    (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), False),
+    (_reduction_cell("sss ijk->j", "sss", "s", "ijk", "j"), False),
+    (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), False),
 ]
 
 # Legal plan order, supported target shape: the ordered-key vertical lowers
@@ -178,9 +197,10 @@ AUTO_TILE_BLOCKED = [
 def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
     """The shared automatic origin's forced reorder makes the plan illegal.
 
-    These stop before LoopIR gets a say on this origin.  The explicit-schedule
-    control below proves that this is not an intrinsic program boundary -- and
-    also that repairing the origin alone would not migrate them.
+    These stop before LoopIR gets a say on this origin, and the plan origin's
+    order repair cannot answer for them: their result is permuted, so the order
+    the composition started from is refused by ``result_storage_order`` too and
+    there is no legal order to fall back to.
     """
 
     name, cin, result_shape, bindings = cell
@@ -203,24 +223,29 @@ def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
             "unsupported_program_shape",
         ),
         (
-            _reduction_cell("ss ij->i", "ss", "s", "ij", "i"),
+            _reduction_cell("ds ij->i", "ds", "s", "ij", "i"),
             ("i", "j"),
             LoopIRLoweringError,
             "unsupported_sparse_output_domain",
         ),
     ],
-    ids=("sss-legal-explicit-order", "ss-legal-explicit-order"),
+    ids=("sss-legal-explicit-order", "ds-legal-explicit-order"),
 )
-def test_auto_reorder_block_is_origin_specific_but_not_sufficient(
+def test_the_legal_explicit_order_is_where_each_cell_meets_its_own_boundary(
     cell, loop_order, exception, expected_code
 ):
-    """A legal explicit order reaches a later LoopIR seam -- and stops there.
+    """A legal explicit order reaches a later seam -- and these two stop there.
 
-    Both controls bind every result coordinate ABOVE the outermost reduction,
-    so the ordered workspace key is empty.  That is the exact reason a
-    LoopIR-only automatic-plan repair is necessary but not sufficient for
-    these cells: the legal program it would produce is a ``K == 0`` scalar
-    accumulation that no migrated family owns.
+    Both controls bind every result coordinate ABOVE the outermost reduction, so
+    the ordered key is empty.  That shape is no longer unowned: the bound-prefix
+    family owns it, which is what makes ``ss ij->i`` and ``sss ijk->i`` compile
+    here now.  These two do not migrate with them, and for different reasons --
+    ``ds ij->i`` has a COMPRESSED result level driven by a DENSE domain, and
+    ``sss ijk->ij`` has a doubly-compressed receiver that never reaches the
+    ordered-key branch.  So the "necessary but not sufficient" claim §49.5 made
+    about a LoopIR-only repair is settled by construction rather than by
+    argument: the repair and the family are both in, gated together, and these
+    two still stop at their own boundaries.
     """
 
     name, cin, result_shape, bindings = cell
@@ -230,6 +255,35 @@ def test_auto_reorder_block_is_origin_specific_but_not_sufficient(
     with pytest.raises(exception) as error:
         compile_cin_via_loopir(cin, result_shape, bindings, compile_options=options)
     assert error.value.defect.code == expected_code, (name, error.value.defect)
+
+
+@pytest.mark.parametrize(
+    ("cell", "admitted"),
+    BOUND_PREFIX_MIGRATED,
+    ids=[cell[0][0] for cell in BOUND_PREFIX_MIGRATED],
+)
+@pytest.mark.parametrize("arm", [False, True])
+def test_the_former_reorder_blocked_cells_split_three_ways(cell, admitted, arm):
+    """Each of the five now reaches a decision, and the record says which."""
+
+    name, cin, result_shape, bindings = cell
+    if admitted:
+        kernel = compile_cin_via_loopir(
+            cin, result_shape, bindings, compile_options=auto_options(arm)
+        )
+        # The bound-prefix family accumulates into a scalar; no workspace
+        # region of either representation participates.
+        assert "wksp" not in kernel.cpp_source, name
+        assert "_reduction = 0.0;" in kernel.cpp_source, name
+        return
+    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
+        compile_cin_via_loopir(
+            cin, result_shape, bindings, compile_options=auto_options(arm)
+        )
+    assert error.value.defect.code in (
+        "unsupported_sparse_output_domain",
+        "unsupported_program_shape",
+    ), (name, error.value.defect)
 
 
 @pytest.mark.parametrize("arm", [False, True])
@@ -284,15 +338,17 @@ def test_auto_tile_blocked_cells_keep_their_schedule_code(cell, arm):
 def test_census_covers_the_declared_representative_matrix():
     """Pin the finite review matrix without claiming layout exhaustiveness."""
 
-    assert len(REORDER_BLOCKED) == 5
+    assert len(REORDER_BLOCKED) == 4
+    assert len(BOUND_PREFIX_MIGRATED) == 5
     assert len(MIGRATED) == 9
     assert len(AUTO_TILE_BLOCKED) == 2
     names = (
         [cell[0] for cell in REORDER_BLOCKED]
+        + [cell[0][0] for cell in BOUND_PREFIX_MIGRATED]
         + [cell[0] for cell in MIGRATED]
         + [cell[0] for cell in AUTO_TILE_BLOCKED]
     )
-    assert len(names) == len(set(names)) == 16
+    assert len(names) == len(set(names)) == 20
     # All six canonical TTM layouts named by the inherited review are present.
     ttm = [name for name in names if name.startswith("TTM ")]
     assert len(ttm) == 6

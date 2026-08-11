@@ -2269,13 +2269,12 @@ def test_canonical_dump_is_arm_stable():
 @pytest.mark.parametrize(
     ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "shape"),
     [
-        ("ss", "s", "ij", "i", (4, 5)),
-        ("ds", "s", "ij", "i", (4, 5)),
-        ("sss", "s", "ijk", "i", (3, 4, 5)),
-        ("sss", "s", "ijk", "j", (3, 4, 5)),
-        ("sss", "ss", "ijk", "ij", (3, 4, 5)),
+        ("ss", "ss", "ij", "ji", (4, 5)),
+        ("ds", "ds", "ij", "ji", (4, 5)),
+        ("sss", "sss", "ijk", "ikj", (3, 4, 5)),
+        ("sss", "ds", "ijk", "ki", (3, 4, 5)),
     ],
-    ids=["ss->i", "ds->i", "sss->i", "sss->j", "sss->ij"],
+    ids=["ss->ji", "ds->ji", "sss->ikj", "sss->ki"],
 )
 def test_reorder_blocked_neighbours_carry_a_plan_diagnostic_not_a_defect_code(
     operand_fmt, result_fmt, operand_indices, result_indices, shape, arm
@@ -2288,6 +2287,14 @@ def test_reorder_blocked_neighbours_carry_a_plan_diagnostic_not_a_defect_code(
     Recording that distinction matters because the retained frontier receipt
     derived the same string by matching the *message text*, which is a
     classification of a diagnostic rather than a read of one.
+
+    The occupants are now the PERMUTED-result cells, whose pre-forced order is
+    refused by the result's own storage-order rule as well, so the automatic
+    plan origin has no legal order to fall back to.  The cells this test used
+    to name -- ``ss->i``, ``ds->i``, ``sss->i``, ``sss->j`` and ``sss->ij`` --
+    moved when the bound-prefix family landed: three are admitted and the rest
+    reach their own shape-specific codes.  ``test_loopir_bound_prefix_target``
+    owns all five, and the two-way gating that separates them.
     """
 
     from scorch.compiler.diagnostics import InvalidSchedule
