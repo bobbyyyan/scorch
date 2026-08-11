@@ -10534,6 +10534,73 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     return False
 
 
+def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
+    """Whether the program is a bound-prefix accumulation chain.
+
+    Routing is purely structural, and independently re-derives the receiver
+    shape CIN's bound-prefix family owns: a dense prefix over an all-compressed
+    suffix, excluding the canonical-CSR ``(DENSE, COMPRESSED)`` and
+    doubly-compressed ``(COMPRESSED, COMPRESSED)`` receivers that keep their own
+    families.  One loop per result level -- dense loops for the prefix, one
+    single-cursor stream loop per compressed level -- then a non-empty sub-nest
+    of dense and single-cursor sparse reduction loops, then one ``StoreReduce``
+    leaf.  Everything else stays on its existing route and keeps its
+    fail-closed boundaries.
+    """
+
+    if len(program.outputs) != 1:
+        return False
+    result_decl = next(
+        (decl for decl in program.tensors if decl.symbol == program.outputs[0]),
+        None,
+    )
+    if result_decl is None:
+        return False
+    kinds = tuple(level.kind for level in result_decl.levels)
+    compressed_suffix = 0
+    while (
+        compressed_suffix < len(kinds)
+        and kinds[-1 - compressed_suffix] is LevelKind.COMPRESSED
+    ):
+        compressed_suffix += 1
+    prefix = len(kinds) - compressed_suffix
+    if (
+        compressed_suffix < 1
+        or any(kind is not LevelKind.DENSE for kind in kinds[:prefix])
+        or kinds == (LevelKind.DENSE, LevelKind.COMPRESSED)
+        or kinds == (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+    ):
+        return False
+    body: Stmt = program.body
+    assembled = 0
+    streams = 0
+    reductions = 0
+    while type(body) is Block and len(body.statements) == 1:
+        only = body.statements[0]
+        if assembled < len(kinds):
+            if type(only) is DenseFor and assembled < prefix:
+                assembled += 1
+                body = only.body
+                continue
+            if type(only) is SparseFor and assembled >= prefix:
+                assembled += 1
+                streams += 1
+                body = only.body
+                continue
+            return False
+        if type(only) is DenseFor or type(only) is SparseFor:
+            reductions += 1
+            body = only.body
+            continue
+        return (
+            type(only) is StoreReduce
+            and reductions >= 1
+            and streams == compressed_suffix
+            and assembled == len(kinds)
+        )
+    return False
+
+
 class _MultiCompressedAssemblyLowering(_TargetLowering):
     """Dedicated target lowering for the multi-compressed assembly families.
 
@@ -10599,9 +10666,13 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self._tiled_view = None
         self.relayout_depth = -1
         # Replaced by ``_collect_assembly_chain`` with the result's own dense
-        # prefix length; bound first so no ordering accident can read it
-        # before the chain has been validated.
+        # prefix length, the number of leading loops that assemble result
+        # levels, and the depth of the optional reduction sub-nest below them;
+        # bound first so no ordering accident can read one before the chain has
+        # been validated.
         self._dense_prefix = 0
+        self._assembly_depth = 0
+        self._reduction_depth = 0
         if program.parallel is not None:
             _fail(
                 "unsupported_program_shape",
@@ -10632,6 +10703,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
         self._reserve_merge_names()
+        self._reserve_reduction_accumulator_name()
         self._seal_target_state(seal_token)
 
     def _validate_assembly_layouts(self) -> None:
@@ -10715,12 +10787,49 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self._dense_prefix = prefix
         loops: List[_Loop] = []
         body: Stmt = self.program.body
+        reduction_loops = 0
         while True:
             require(
                 type(body) is Block and len(cast(Block, body).statements) == 1,
                 "a single-statement assembly loop nest",
             )
             only = cast(Block, body).statements[0]
+            if len(loops) - reduction_loops == len(result_levels) and type(only) in (
+                DenseFor,
+                SparseFor,
+            ):
+                # The optional reduction sub-nest of the bound-prefix family.
+                # Every result coordinate is already bound, so these loops
+                # assemble nothing: they only accumulate, and the shared
+                # dense/sparse loop machinery emits them unchanged.  A merged
+                # reduction domain is refused here rather than approximated,
+                # exactly as the generic nest validator refuses one.
+                reduction_loops += 1
+                if type(only) is DenseFor:
+                    loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
+                    body = only.body
+                else:
+                    stream = cast(SparseFor, only)
+                    cursor = stream.cursor
+                    loops.append(
+                        _Loop(
+                            _SPARSE,
+                            stream.coord_index,
+                            self._level_dimension(cursor.tensor, cursor.level),
+                            stream,
+                            (cursor,),
+                        )
+                    )
+                    body = stream.body
+                continue
+            if type(only) in (DenseFor, SparseFor, MergedSparseFor):
+                # Every loop the reduction sub-nest admits was consumed above,
+                # so a loop reaching here below it is a merged reduction.
+                require(
+                    reduction_loops == 0,
+                    "the reduction sub-nest to carry only dense and "
+                    "single-cursor sparse loops above its accumulating leaf",
+                )
             if type(only) is DenseFor:
                 require(
                     all(existing.kind is _DENSE for existing in loops),
@@ -10775,6 +10884,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 )
                 body = only.body
                 continue
+            if reduction_loops:
+                self._assembly_depth = len(result_levels)
+                self._reduction_depth = reduction_loops
+                self._require_bound_prefix_leaf(
+                    only,
+                    require,
+                    loops,
+                    result_levels,
+                    compressed_suffix,
+                )
+                self.leaf = only
+                return loops
             require(
                 type(only) is AppendEntry,
                 "an ordered append leaf",
@@ -10786,6 +10907,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "one loop per result level with one stream loop per "
                 "compressed level",
             )
+            self._assembly_depth = len(loops)
             union_pairs = {
                 tuple(cursor.tensor for cursor in loop.cursors)
                 for loop in loops
@@ -10824,6 +10946,145 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 )
             self.leaf = only
             return loops
+
+    def _require_bound_prefix_leaf(
+        self,
+        leaf: Stmt,
+        require: Callable[[bool, str], None],
+        loops: List[_Loop],
+        result_levels: Tuple[LevelDecl, ...],
+        compressed_suffix: int,
+    ) -> None:
+        """Validate the accumulating leaf of one bound-prefix assembly.
+
+        The reduction sub-nest is admitted only for the family CIN classifies
+        as bound-prefix accumulation, re-derived here from the program alone:
+        one additive :class:`StoreReduce` into the result, whose coordinates are
+        exactly the assembly loops' own coordinates in order -- which is the
+        statement that every result coordinate is bound above the outermost
+        reduction -- over a receiver outside the doubly-compressed shape that
+        keeps its own family.
+        """
+
+        require(
+            len(loops) == self._assembly_depth + self._reduction_depth
+            and sum(
+                1
+                for loop in loops[: self._assembly_depth]
+                if loop.kind in (_MERGED, _SPARSE)
+            )
+            == compressed_suffix,
+            "one loop per result level with one stream loop per compressed "
+            "level above the reduction sub-nest",
+        )
+        require(
+            all(loop.kind is not _MERGED for loop in loops[: self._assembly_depth]),
+            "single-cursor stream loops above a reduction sub-nest",
+        )
+        require(
+            tuple(level.kind for level in result_levels)
+            != (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
+            "a receiver outside the doubly-compressed reduction shape, which "
+            "keeps its own family",
+        )
+        require(
+            type(leaf) is StoreReduce
+            and cast(StoreReduce, leaf).tensor == self.result_symbol
+            and cast(StoreReduce, leaf).op is ReduceOp.ADD,
+            "an additive reduction leaf writing the declared result",
+        )
+        coordinates = cast(StoreReduce, leaf).indices
+        require(
+            len(coordinates) == self._assembly_depth
+            and [
+                self._index_of(coordinate, "the reduced result coordinate")
+                for coordinate in coordinates
+            ]
+            == [loop.index for loop in loops[: self._assembly_depth]],
+            "the reduced result coordinates to be exactly the assembly loop "
+            "coordinates, in order",
+        )
+
+    def _reserve_reduction_accumulator_name(self) -> None:
+        """Reserve the scalar this family's reduction sub-nest accumulates in."""
+
+        if not self._reduction_depth:
+            return
+        self._reserve_generated_name(
+            self._reduction_accumulator_name(),
+            f"reduction accumulator of output tensor {self.result_decl.name!r}",
+        )
+
+    def _reduction_accumulator_name(self) -> str:
+        return f"{self.result_decl.name}_reduction"
+
+    def _reduction_accumulator_var(self) -> llir.Var:
+        return llir.Var(
+            name=self._reduction_accumulator_name(),
+            type=(
+                llir.DataType.FLOAT32
+                if self.result_decl.dtype is ScalarType.FLOAT32
+                else llir.DataType.FLOAT64
+            ),
+        )
+
+    def _bound_prefix_leaf_statements(self, position: int) -> List[llir.Stmt]:
+        """The accumulator, its reduction sub-nest, and the ordered append.
+
+        Emitted inside the innermost assembly loop: one zeroed scalar local,
+        the reduction sub-nest the shared loop machinery lowers, then the same
+        checked value/coordinate appends every other leaf of this family emits
+        -- reading the accumulator instead of an operand.
+        """
+
+        accumulator = self._reduction_accumulator_var()
+        result_name = self.result_decl.name
+        leaf_level = len(self.result_decl.levels) - 1
+        position_name = f"p{result_name}{leaf_level}"
+        return [
+            llir.Comment("Initialize the reduction accumulator"),
+            llir.VarInit(
+                var=accumulator,
+                value=llir.Literal(0.0, accumulator.type),
+            ),
+            llir.BlankLine(),
+            # The shared child dispatch owns the reduction sub-nest: its loops
+            # assemble nothing, so they need this family's assembly overrides
+            # no more than the generic target's loops do.
+            *_TargetLowering._loop_children(self, position),
+            llir.BlankLine(),
+            llir.FunctionCallStmt(
+                name=f"{result_name}_values.emplace_back",
+                args=[llir.Var(name=accumulator.name, type=accumulator.type)],
+            ),
+            llir.Comment("Set coordinates"),
+            llir.FunctionCallStmt(
+                name=f"{result_name}{leaf_level}_crd.emplace_back",
+                args=[
+                    llir.Var(
+                        name=self._loop_var_name(self.loops[position]),
+                        type=llir.DataType.INT64,
+                    )
+                ],
+            ),
+            llir.Increment(var=llir.Var(name=position_name, type=llir.DataType.INT64)),
+        ]
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        """``C_reduction += <value>;`` at the bottom of the reduction sub-nest."""
+
+        if not self._reduction_depth:
+            return _TargetLowering._lower_leaf(self)
+        accumulator = self._reduction_accumulator_var()
+        return [
+            llir.Assign(
+                var=llir.Var(name=accumulator.name, type=llir.DataType.NO_TYPE),
+                value=self._lower_value(
+                    cast(StoreReduce, self.leaf).value,
+                ),
+                op=llir.AssignOp.ADD_ASSIGN,
+            )
+        ]
 
     def _parent_append_statements(self, level: int) -> List[llir.Stmt]:
         """One conditional parent append plus child position close.
@@ -10885,7 +11146,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self, loop: _Loop, aligned: Set[CursorId]
     ) -> Optional[List[llir.Stmt]]:
         position = self.loop_positions[loop.index]
-        if position == len(self.loops) - 1:
+        if position == self._assembly_depth - 1:
             leaf_stmts = super()._merged_case_stmts(loop, aligned)
             if leaf_stmts is None:
                 return leaf_stmts
@@ -11030,7 +11291,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         cursor = self._one_sided_cursor(position, tensor)
         dimension_name = self._loop_var_name(loop)
         position_name = self._cursor_position_name(cursor)
-        if position == len(self.loops) - 1:
+        if position == self._assembly_depth - 1:
             leaf_stmts = self._merged_case_stmts(loop, {cursor.cursor})
             if leaf_stmts is None:
                 _fail(
@@ -11100,10 +11361,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         order: the leaf level emits the checked value/coordinate appends,
         and every other level nests its child stream followed by the same
         conditional parent append and child close the merged levels own.
+
+        Below the innermost assembly loop the bound-prefix family nests a
+        reduction sub-nest whose loops assemble nothing; those positions are
+        dispatched by the shared child machinery unchanged.
         """
 
         loop = self.loops[position]
-        if position == len(self.loops) - 1:
+        if position >= self._assembly_depth:
+            return _TargetLowering._loop_children(self, position)
+        if position == self._assembly_depth - 1:
+            if self._reduction_depth:
+                return self._bound_prefix_leaf_statements(position)
             leaf_stmts = self._merged_case_stmts(
                 loop, {cursor.cursor for cursor in loop.cursors}
             )
@@ -13965,7 +14234,9 @@ def _lower_loopir_to_llir_owned(
         )
     elif _dense_domain_mixed_chain(program):
         lowering = _DenseDomainMixedLowering(program, owned_input_shapes, result_shape)
-    elif _multi_compressed_assembly_chain(program):
+    elif _multi_compressed_assembly_chain(program) or _bound_prefix_assembly_chain(
+        program
+    ):
         lowering = _MultiCompressedAssemblyLowering(
             program, owned_input_shapes, result_shape
         )

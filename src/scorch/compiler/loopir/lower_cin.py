@@ -561,6 +561,7 @@ class _SparseOutputReduction(Enum):
     CSR_DENSE_ROW = "csr_dense_row"
     CSR_SPARSE_ROW = "csr_sparse_row"
     ORDERED_KEY_WORKSPACE = "ordered_key_workspace"
+    BOUND_PREFIX_ACCUMULATION = "bound_prefix_accumulation"
     MULTI_COMPRESSED_ASSEMBLY = "multi_compressed_assembly"
     MULTI_COMPRESSED_UNION = "multi_compressed_union"
 
@@ -571,13 +572,21 @@ def _ordered_key_split(
     reduction_index_ids: Tuple[IndexId, ...],
     loop_positions: Dict[IndexId, int],
 ) -> Optional[Tuple[int, int]]:
-    """The ``(prefix, key_rank)`` split of one ordered-key reduction result.
+    """The ``(prefix, key_rank)`` split of one ordered sparse reduction result.
 
-    Derived from identities alone: the workspace key is exactly the run of
-    result coordinates bound strictly below the innermost reduction, and the
-    prefix is exactly the run bound above the outermost reduction.  Returns
-    ``None`` when no such split exists, which is the shape's own definition of
-    "not this family" rather than a layout guess.
+    Derived from identities alone: the key is exactly the run of result
+    coordinates bound strictly below the innermost reduction, and the prefix is
+    exactly the run bound above the outermost reduction.  Returns ``None`` when
+    no such split exists -- that is, when some result coordinate is interleaved
+    between two reduction loops -- which is the shape's own definition of "not
+    this family" rather than a layout guess.
+
+    ``key_rank == 0`` is a legitimate split, not a degenerate one: every result
+    coordinate is then bound above the outermost reduction, so the reduction is
+    a scalar accumulation under an already-complete result prefix and no
+    workspace region participates.  The two splits select different families,
+    which is why the caller reads ``key_rank`` rather than treating a rank-0 key
+    as an empty instance of a rank->=1 one.
     """
 
     if not reduction_index_ids or len(lhs_index_ids) != len(result_levels):
@@ -598,9 +607,9 @@ def _ordered_key_split(
     last_reduction = max(reduction_positions)
     prefix = sum(1 for position in ordered_positions if position < first_reduction)
     key_rank = sum(1 for position in ordered_positions if position > last_reduction)
-    if prefix + key_rank != len(lhs_index_ids) or key_rank < 1:
+    if prefix + key_rank != len(lhs_index_ids):
         # Some result coordinate is interleaved between two reduction loops;
-        # one workspace region cannot own it.
+        # neither one workspace region nor a bound prefix can own it.
         return None
     return prefix, key_rank
 
@@ -643,23 +652,32 @@ def _classify_sparse_output_family(
         )
     )
     if ordered_key_shape:
-        # The ordered-key sparse-workspace family: a dense prefix, then one
-        # or more compressed levels, reduced under ADD.  The workspace's key
-        # is the trailing run of result coordinates below the innermost
-        # reduction; every coordinate above the outermost reduction binds a
-        # result prefix level directly.  Both runs are derived from loop and
-        # level identities -- no layout string, rank table, or format
-        # spelling participates.
+        # Two families share this receiver shape -- a dense prefix, then one
+        # or more compressed levels, reduced under ADD -- and the split's key
+        # rank selects between them.  The key is the trailing run of result
+        # coordinates below the innermost reduction; every coordinate above
+        # the outermost reduction binds a result prefix level directly.  Both
+        # runs are derived from loop and level identities -- no layout string,
+        # rank table, or format spelling participates.
+        #
+        # ``key_rank >= 1`` is the ordered-key sparse-workspace family: one
+        # workspace region owns the key domain and drains it in order.
+        # ``key_rank == 0`` is the bound-prefix accumulation family: the
+        # prefix loops already visit result cells in lexicographic order (the
+        # split's strictly-increasing test, plus the per-level domain rules
+        # below), so the reduction accumulates into a scalar that the ordered
+        # append reads and no workspace region exists to own.
         split = _ordered_key_split(
             result_levels, lhs_index_ids, reduction_index_ids, loop_positions
         )
         if split is None:
             _fail(
                 "unsupported_sparse_output_domain",
-                "an ordered-key sparse reduction needs its result "
-                "coordinates split into a prefix bound above the outermost "
-                "reduction and a non-empty key bound below the innermost "
-                "one, in result level order",
+                "an ordered sparse reduction needs its result coordinates "
+                "split into a prefix bound above the outermost reduction and "
+                "a key bound below the innermost one, in result level order; "
+                "no result coordinate may be interleaved between two "
+                "reduction loops",
             )
         prefix, key_rank = cast(Tuple[int, int], split)
         if prefix != dense_prefix_length and any(
@@ -692,6 +710,12 @@ def _classify_sparse_output_family(
                     "sparse reduction must be driven by one stored sparse "
                     "level",
                 )
+        if key_rank == 0:
+            # Every result coordinate binds a prefix level under the rules
+            # just applied, so the whole result access is complete before the
+            # outermost reduction opens.  That is the bound-prefix family; it
+            # needs no workspace and therefore no workspace node.
+            return _SparseOutputReduction.BOUND_PREFIX_ACCUMULATION
         return _SparseOutputReduction.ORDERED_KEY_WORKSPACE
     mixed_leaf_family = (
         len(result_levels) >= 2
@@ -931,6 +955,11 @@ def _lower_sparse_family(
         _SparseOutputReduction.CSR_DENSE_ROW,
         _SparseOutputReduction.CSR_SPARSE_ROW,
         _SparseOutputReduction.ORDERED_KEY_WORKSPACE,
+        # The bound-prefix family reduces into sparse result storage exactly
+        # like the others, so it lowers to the same semantic StoreReduce leaf.
+        # Unlike the ordered-key family, no schedule pass rewrites it: the
+        # owning target reads the accumulation directly.
+        _SparseOutputReduction.BOUND_PREFIX_ACCUMULATION,
     )
     multi_compressed_assembly = (
         reduction_form is _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY

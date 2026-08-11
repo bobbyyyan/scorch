@@ -531,12 +531,18 @@ class TorchCppKernelABI:
         return (llir.DataType.TACO_TENSOR, self.function_name, self.emit_arguments())
 
     def assemble_function(self, body: List[llir.Stmt]) -> llir.Function:
-        """Wrap one verified body in a fresh ABI-owned function signature."""
+        """Wrap one verified body in a fresh ABI-owned function signature.
 
-        self._validate()
+        :meth:`signature` validates this frozen metadata before doing anything,
+        so it is the single validation of one assembly; the body type-check does
+        not depend on it and stays behind it, which keeps a malformed-metadata
+        call failing on the metadata exactly as it did when this method
+        validated a second time itself.
+        """
+
+        return_type, name, args = self.signature()
         if type(body) is not list:
             raise TypeError("kernel function body must be an exact LLIR list")
-        return_type, name, args = self.signature()
         return llir.Function(
             return_type=return_type,
             name=name,

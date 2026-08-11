@@ -70,6 +70,12 @@ _REGBLOCK_FORCE: ContextVar[Optional[bool]] = ContextVar(
     "scorch_regblock_force", default=None
 )
 
+# The loop-plan legality codes that are properties of the recorded loop ORDER
+# alone -- the two rules ``_verify_storage_order`` owns.  Named here so the
+# automatic plan origin can recognize a refusal a different legal order could
+# answer without restating either rule.
+_ORDER_LEGALITY_CODES = frozenset({"result_storage_order", "sparse_parent_dominance"})
+
 
 def get_forced_regblock() -> Optional[bool]:
     """Return the register-block compatibility override for this context."""
@@ -2252,7 +2258,18 @@ class Scheduler:
         cin: CIN,
         costs: Optional[_CostModelConstants] = None,
         compile_options: Optional[CompileOptions] = None,
+        *,
+        pre_forced_order: Optional[List[IndexVar]] = None,
     ) -> List[IndexVar]:
+        """Select the automatic logical loop order.
+
+        ``pre_forced_order``, when given an empty list, receives the composed
+        order as it stands immediately before the sparse-output forced reorder
+        below -- the one block of this composition that no legality rule
+        constrains.  It is an out-parameter rather than a second return value so
+        that every existing caller, which passes nothing, executes exactly the
+        statements it executed before.
+        """
         if costs is None:
             _, costs = _scheduler_costs_at_boundary(costs, compile_options)
         elif compile_options is not None:
@@ -2272,6 +2289,10 @@ class Scheduler:
         loop_order = Scheduler.apply_mode_order_constraints(
             cin, loop_order, costs=costs
         )
+        if pre_forced_order is not None:
+            if type(pre_forced_order) is not list or pre_forced_order:
+                raise TypeError("pre_forced_order must be an empty exact list")
+            pre_forced_order.extend(loop_order)
 
         # For sparse output with reduction variables, ensure at least one free
         # variable appears after the last reduction variable.  The lowerer
@@ -3110,29 +3131,12 @@ class Scheduler:
         )
 
         if is_identity:
-            logical_order = Scheduler.select_loop_order(
+            scheduled_cin, plan = Scheduler._originate_auto_plan(
                 cin,
-                costs=costs,
-            )
-            auto_tiles: List[LoopTile] = []
-            auto_workspace: List[WorkspaceInsertion] = []
-            scheduled_cin = Scheduler._apply_auto_order_owned(
-                cin,
-                logical_order,
-                plan_tiles=auto_tiles,
-                plan_workspace=auto_workspace,
-                compile_options=options,
-            )
-            plan = verify_loop_plan(
                 source_cin,
-                LoopPlan(
-                    loop_order=tuple(index_var.index_id for index_var in logical_order),
-                    tiles=tuple(auto_tiles),
-                    workspace=auto_workspace[0] if auto_workspace else None,
-                    auto_policy=Scheduler._auto_origin_policy(options.scheduler),
-                    provenance="auto",
-                    tag=schedule.tag,
-                ),
+                options,
+                costs,
+                tag=schedule.tag,
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -3456,6 +3460,139 @@ class Scheduler:
         )
 
     @staticmethod
+    def _refused_for_order_legality(error: InvalidSchedule) -> bool:
+        """Whether one plan refusal names a rule about the loop ORDER alone.
+
+        ``loop_plan_legality._verify_storage_order`` owns exactly two such
+        rules -- a non-workspace result's own physical storage order, and every
+        sparse access's physical-parent dominance -- and both are properties of
+        the recorded order rather than of the program.  A refusal naming one of
+        them is therefore a statement that the order the automatic origin chose
+        is illegal, which is the only refusal a different legal order can
+        answer.  Every other code stays untouched, including the tile and
+        workspace decisions the same layer pins to a re-derived heuristic.
+        """
+
+        diagnostics = getattr(error, "diagnostics", ())
+        if type(diagnostics) is not tuple:
+            return False
+        return any(
+            getattr(diagnostic, "code", None) in _ORDER_LEGALITY_CODES
+            for diagnostic in diagnostics
+        )
+
+    @staticmethod
+    def _verified_auto_plan(
+        working: CIN,
+        plan_source: CIN,
+        logical_order: List[IndexVar],
+        options: CompileOptions,
+        scheduler_policy: SchedulerPolicy,
+        *,
+        tag: str,
+        require_complete_plan: bool,
+    ) -> Tuple[CIN, LoopPlan]:
+        """Apply one automatic order and verify the plan that records it."""
+
+        auto_tiles: List[LoopTile] = []
+        auto_workspace: List[WorkspaceInsertion] = []
+        scheduled_cin = Scheduler._apply_auto_order_owned(
+            working,
+            logical_order,
+            options,
+            scheduler_policy=scheduler_policy,
+            plan_tiles=auto_tiles,
+            plan_workspace=auto_workspace,
+            require_complete_plan=require_complete_plan,
+        )
+        plan = verify_loop_plan(
+            plan_source,
+            LoopPlan(
+                loop_order=tuple(index_var.index_id for index_var in logical_order),
+                tiles=tuple(auto_tiles),
+                workspace=auto_workspace[0] if auto_workspace else None,
+                auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                provenance="auto",
+                tag=tag,
+            ),
+        )
+        return scheduled_cin, plan
+
+    @staticmethod
+    def _originate_auto_plan(
+        working: CIN,
+        plan_source: CIN,
+        options: CompileOptions,
+        costs: _CostModelConstants,
+        *,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
+        tag: str = "",
+        require_complete_plan: bool = False,
+    ) -> Tuple[CIN, LoopPlan]:
+        """Originate one verified automatic plan at a plan-producing boundary.
+
+        :meth:`select_loop_order` ends with an unchecked forced reorder that
+        moves the last free variable inward so that a free variable follows the
+        last reduction -- the nest shape legacy lowering and workspace insertion
+        require.  Nothing constrains that block, and for a sparse result whose
+        every coordinate is already bound above the outermost reduction it
+        produces an order the plan's own legality rules refuse: moving one
+        result coordinate inward puts a compressed physical parent below its
+        child.  Such a program needs no workspace at all, so the reorder buys
+        nothing and costs legality.
+
+        When exactly that happens -- the recorded plan refused for an
+        order-legality rule, and the composition's own pre-forced order
+        different from the forced one -- the plan is re-originated from the
+        pre-forced order and offered to the same trust boundary, which accepts
+        or refuses it on its own terms.  Two properties make this narrow:
+
+        * It defers to the legality layer instead of restating either the
+          reorder or the rules it breaks, so no policy is duplicated here.
+        * It runs only after a refusal, so a program that produces generated
+          code today cannot reach it; and if the pre-forced order is refused
+          too, the original refusal is the one reported.
+        """
+
+        policy = options.scheduler if scheduler_policy is None else scheduler_policy
+        pre_forced: List[IndexVar] = []
+        logical_order = Scheduler.select_loop_order(
+            working, costs=costs, pre_forced_order=pre_forced
+        )
+        try:
+            return Scheduler._verified_auto_plan(
+                working,
+                plan_source,
+                logical_order,
+                options,
+                policy,
+                tag=tag,
+                require_complete_plan=require_complete_plan,
+            )
+        except InvalidSchedule as refusal:
+            if not Scheduler._refused_for_order_legality(refusal) or [
+                index_var.index_id for index_var in pre_forced
+            ] == [index_var.index_id for index_var in logical_order]:
+                raise
+            repaired = copy.deepcopy(plan_source)
+            repaired_order: List[IndexVar] = []
+            Scheduler.select_loop_order(
+                repaired, costs=costs, pre_forced_order=repaired_order
+            )
+            try:
+                return Scheduler._verified_auto_plan(
+                    repaired,
+                    plan_source,
+                    repaired_order,
+                    options,
+                    policy,
+                    tag=tag,
+                    require_complete_plan=require_complete_plan,
+                )
+            except (InvalidSchedule, UnsupportedFeature, VerificationError):
+                raise refusal
+
+    @staticmethod
     def _apply_auto_order_owned(
         cin: CIN,
         loop_order: List[IndexVar],
@@ -3751,29 +3888,13 @@ class Scheduler:
                         ),
                     )
                 else:
-                    logical_order = Scheduler.select_loop_order(working, costs=costs)
-                    auto_tiles: List[LoopTile] = []
-                    auto_workspace: List[WorkspaceInsertion] = []
-                    Scheduler._apply_auto_order_owned(
+                    _, plan = Scheduler._originate_auto_plan(
                         working,
-                        logical_order,
-                        options,
-                        scheduler_policy=scheduler_policy,
-                        plan_tiles=auto_tiles,
-                        plan_workspace=auto_workspace,
-                        require_complete_plan=True,
-                    )
-                    plan = verify_loop_plan(
                         normalized,
-                        LoopPlan(
-                            loop_order=tuple(
-                                index_var.index_id for index_var in logical_order
-                            ),
-                            tiles=tuple(auto_tiles),
-                            workspace=auto_workspace[0] if auto_workspace else None,
-                            auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
-                            provenance="auto",
-                        ),
+                        options,
+                        costs,
+                        scheduler_policy=scheduler_policy,
+                        require_complete_plan=True,
                     )
                 scheduled = ScheduledCIN(normalized, plan)
         except Exception:
