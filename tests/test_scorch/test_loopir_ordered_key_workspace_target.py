@@ -1404,17 +1404,21 @@ def test_ordered_key_checkpoint_shares_no_forgeable_state_with_the_pipeline():
     real_checkpoint = lower_llir._ordered_key_expected_checkpoint
     real_require = lower_llir._require_ordered_key_completion_checkpoint
 
-    def capture_checkpoint(lowering, body):
-        expected = real_checkpoint(lowering, body)
+    def capture_checkpoint(lowering, kernel_abi, body):
+        expected = real_checkpoint(lowering, kernel_abi, body)
         if expected is not None:
             captured["input"] = reachable(body)
-            captured["expected"] = reachable(expected)
+            # The reference now carries the required ABI signature beside the
+            # body, so the residual-sharing proof binds on both.
+            captured["expected"] = reachable(
+                [expected.body, expected.return_type, expected.name, expected.args]
+            )
         return expected
 
-    def capture_require(body, expected):
+    def capture_require(actual, expected):
         if expected is not None:
-            captured["final"] = reachable(body)
-        return real_require(body, expected)
+            captured["final"] = reachable(actual)
+        return real_require(actual, expected)
 
     lower_llir._ordered_key_expected_checkpoint = capture_checkpoint
     lower_llir._require_ordered_key_completion_checkpoint = capture_require
@@ -2460,13 +2464,18 @@ def test_post_assembly_statement_substitution_is_rejected(monkeypatch):
 
 
 def test_a_post_assembly_completion_stage_is_rejected(monkeypatch):
-    """A completion stage that transforms this family has no replay contract.
+    """A completion stage that SUBSTITUTES a function has no replay contract.
 
     All four stages are inert for every ordered-key cell today, and each is
     guarded by its own ``is None`` test.  Requiring the returned function to BE
-    the assembled function proves that per compile instead of assuming it, and
-    it is the gate a future workspace-plus-tile composition must open
-    deliberately.
+    the assembled function proves that per compile instead of assuming it.
+
+    It proves exactly that and no more: because every stage returns the object
+    it was handed, this requirement cannot detect a stage that *ran*.  A fused
+    workspace-plus-tile plan would satisfy it -- the gate such a plan has to
+    open deliberately is the structural comparison, which sees the nested
+    in-place rewrites result-tile completion performs.  See
+    ``test_no_completion_stage_constructs_a_new_function``.
     """
 
     from scorch.compiler.loopir import lower_llir
@@ -2679,8 +2688,8 @@ def test_ordered_key_completion_rejects_pre_pipeline_mutation(monkeypatch):
     original = lower_llir._ordered_key_expected_checkpoint
     state = {"mutated": False}
 
-    def checkpoint(lowering, body):
-        expected = original(lowering, body)
+    def checkpoint(lowering, kernel_abi, body):
+        expected = original(lowering, kernel_abi, body)
         if expected is not None:
             for statement in reversed(body):
                 if type(statement) is llir.Comment:
@@ -2819,14 +2828,14 @@ def test_the_expected_body_mirror_reproduces_the_shared_pass():
     compared = []
     original = lower_llir._ordered_key_expected_checkpoint
 
-    def checkpoint(lowering, body):
+    def checkpoint(lowering, kernel_abi, body):
         if type(lowering) is lower_llir._OrderedKeySparseWorkspaceLowering:
             mirror = lower_llir._OrderedKeyExpectedBody(deepcopy(body)).build()
             shared = rewrite_dynamic_vector_accesses(
                 deepcopy(body), DYNAMIC_VECTOR_ACCESS_CONTEXT
             )
             compared.append(differs(shared, mirror))
-        return original(lowering, body)
+        return original(lowering, kernel_abi, body)
 
     try:
         lower_llir._ordered_key_expected_checkpoint = checkpoint
@@ -3000,6 +3009,244 @@ def test_the_completion_comparison_runs_exactly_once_per_compile(monkeypatch):
         del calls[:]
         assert compile_ordered_key_probe(arm) is not None
         assert calls == ["list"], calls
+
+
+# -- the ABI signature across the completion window ---------------------------
+
+
+def _install_hostile_completion_stage(monkeypatch, tamper):
+    """Let ``tamper`` corrupt the function the LAST completion stage returns."""
+
+    from scorch.compiler.loopir import lower_llir
+
+    original = lower_llir._TargetLowering.complete_relayout
+    state = {"landed": False}
+
+    def hostile(self, function):
+        returned = original(self, function)
+        state["landed"] = bool(tamper(returned))
+        return returned
+
+    monkeypatch.setattr(lower_llir._TargetLowering, "complete_relayout", hostile)
+    return state
+
+
+def _tamper_rename(function):
+    state = object.__getattribute__(function, "__dict__")
+    state["name"] = str(state["name"]) + "_TAMPERED"
+    return 1
+
+
+def _tamper_return_type(function):
+    state = object.__getattribute__(function, "__dict__")
+    before = state["return_type"]
+    replacement = next(
+        candidate
+        for candidate in (llir.DataType.FLOAT32, llir.DataType.INT32)
+        if candidate is not before
+    )
+    state["return_type"] = replacement
+    return 1
+
+
+def _tamper_drop_one_argument(function):
+    state = object.__getattribute__(function, "__dict__")
+    args = state["args"]
+    assert type(args) is list and len(args) > 1
+    del args[-1]
+    return 1
+
+
+def _tamper_duplicate_last_argument(function):
+    state = object.__getattribute__(function, "__dict__")
+    args = state["args"]
+    assert type(args) is list and args
+    args.append(args[-1])
+    return 1
+
+
+def _tamper_rename_one_argument(function):
+    state = object.__getattribute__(function, "__dict__")
+    args = state["args"]
+    assert type(args) is list and args
+    victim = args[-1]
+    inner = object.__getattribute__(victim, "__dict__")
+    inner["name"] = str(inner["name"]) + "_TAMPERED"
+    return 1
+
+
+@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        _tamper_rename,
+        _tamper_return_type,
+        _tamper_drop_one_argument,
+        _tamper_duplicate_last_argument,
+        _tamper_rename_one_argument,
+    ],
+    ids=["name", "return_type", "drop_arg", "duplicate_arg", "rename_arg"],
+)
+def test_the_abi_signature_is_covered_across_the_completion_window(
+    monkeypatch,
+    tamper,
+    arm,
+):
+    """A body-only reference left three ``llir.Function`` fields unverified.
+
+    That was measured, not supposed.  Against a body-only reference, each of
+    these five tampers **compiled**, three of them putting a corrupted public
+    signature straight into the emitted C++ -- a renamed entry point, a
+    ``float`` return type where a tensor was declared, and a signature one
+    argument short of the body's own references.  Codegen type-checks the
+    argument *elements* but never which arguments they are, so it is no
+    backstop for content, and no identity requirement in the window observes
+    any of the three fields because every completion stage returns the object
+    it was handed.
+    """
+
+    state = _install_hostile_completion_stage(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe(arm)
+    assert state["landed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+@pytest.mark.parametrize("arm", [False, True])
+def test_a_wholesale_function_dict_swap_preserving_every_field_is_accepted(
+    monkeypatch,
+    arm,
+):
+    """The positive control: container identity alone is not a corruption.
+
+    Replacing the function's ``__dict__`` with an equal mapping, and its body
+    with a fresh list holding the same statements in the same order, changes
+    nothing the emitted C++ can observe.  The boundary checks per-element
+    identity and structure, never the identity of the containers, so this is
+    accepted -- and it has to be, or the check would be pinning an
+    implementation detail of assembly rather than the program.
+    """
+
+    def tamper(function):
+        state = object.__getattribute__(function, "__dict__")
+        replacement = dict(state)
+        replacement["body"] = list(replacement["body"])
+        state.clear()
+        state.update(replacement)
+        return 1
+
+    state = _install_hostile_completion_stage(monkeypatch, tamper)
+    assert compile_ordered_key_probe(arm) is not None
+    assert state["landed"]
+
+
+@pytest.mark.parametrize("arm", [False, True])
+def test_the_assembled_root_must_carry_exactly_the_declared_function_fields(
+    monkeypatch,
+    arm,
+):
+    """An extra stored field on the root would otherwise ride along unread."""
+
+    def tamper(function):
+        object.__getattribute__(function, "__dict__")["smuggled"] = 1
+        return 1
+
+    state = _install_hostile_completion_stage(monkeypatch, tamper)
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_ordered_key_probe(arm)
+    assert state["landed"]
+    assert error.value.defect.code == "sparse_workspace_completion_lost"
+
+
+def test_no_completion_stage_constructs_a_new_function():
+    """Why the returned-function identity is not the fused-plan tripwire.
+
+    §51.4 and the boundary's own first draft claimed that requiring
+    ``returned is assembled`` "fails closed the moment a future plan composes a
+    workspace with a tile, panel or relayout".  It does not: all four stages
+    return the object they were given -- result-tile and relayout completion
+    each have exactly one return expression, ``function``, and both mutate
+    nested loop bodies in place -- so a fused plan would satisfy this
+    requirement.  What fails closed for such a plan is the structural
+    comparison, because those in-place rewrites are not in the reference.  This
+    test pins the measurement so the claim cannot drift back.
+    """
+
+    import ast
+    import inspect
+    import textwrap
+
+    from scorch.compiler.loopir import lower_llir
+
+    for name in ("_complete_result_tile_impl", "_complete_relayout_impl"):
+        source = textwrap.dedent(inspect.getsource(getattr(lower_llir, name)))
+        spellings = sorted(
+            {
+                ast.unparse(node.value)
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Return) and node.value is not None
+            }
+        )
+        assert spellings == ["function"], (name, spellings)
+
+    for name in (
+        "complete_parallel",
+        "complete_panel",
+        "complete_result_tile",
+        "complete_relayout",
+    ):
+        source = textwrap.dedent(
+            inspect.getsource(getattr(lower_llir._TargetLowering, name))
+        )
+        spellings = sorted(
+            {
+                ast.unparse(node.value)
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Return) and node.value is not None
+            }
+        )
+        assert not any("llir.Function(" in spelling for spelling in spellings), (
+            name,
+            spellings,
+        )
+
+
+def test_the_signature_reference_is_the_abis_own_authority():
+    """The required signature is asked for, not restated.
+
+    ``assemble_function`` and the completion reference read one method, so the
+    reference cannot drift from the spelling assembly actually emits; and each
+    call hands back freshly built arguments, so asking twice cannot alias the
+    assembled function's own state.
+    """
+
+    from scorch.compiler.torch_cpp_abi import KernelTensorABI, TorchCppKernelABI
+    from scorch.format import LevelType
+
+    abi = TorchCppKernelABI(
+        result_shape=(4, 5),
+        result_rank=2,
+        input_tensors=(
+            KernelTensorABI(
+                name="A",
+                level_types=(LevelType.COMPRESSED, LevelType.COMPRESSED),
+                mode_order=(0, 1),
+                shape=(4, 5),
+                dtype=_F32,
+            ),
+        ),
+    )
+    return_type, name, args = abi.signature()
+    assembled = abi.assemble_function([])
+    assert assembled.return_type is return_type
+    assert assembled.name == name
+    assert [(var.name, var.type) for var in assembled.args] == [
+        (var.name, var.type) for var in args
+    ]
+    # Fresh, unshared arguments on every call.
+    again = abi.signature()[2]
+    assert all(first is not second for first, second in zip(args, again))
+    assert all(first is not second for first, second in zip(args, assembled.args))
 
 
 def _reachable_nodes(root):
