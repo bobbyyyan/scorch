@@ -402,12 +402,14 @@ def test_exact_cancellation_still_stores_its_entry():
             "unsupported_sparse_output_domain",
             "interleaved between two reduction loops",
         ),
-        # A DENSE result prefix level driven by a stored stream.
-        (
-            ("ssss", "dss", "ijkl", "ijk"),
-            "unsupported_sparse_output_domain",
-            "must iterate a dense domain",
-        ),
+        # Recorded seam move: a DENSE result prefix level driven by a stored
+        # stream used to sit here, and blocker 3 migrates it -- see
+        # ``test_loopir_row_scope_prefix_target.py``, which owns that cell and
+        # proves it against the oracle and PyTorch.  The residue of the rule is
+        # a dense prefix level driven by a MERGED domain, which needs two
+        # operands and so cannot be spelled by this list's single-operand
+        # builder; it is locked by
+        # ``test_a_merged_prefix_domain_stays_refused_at_cin`` in that module.
     ],
     ids=lambda value: value if isinstance(value, str) else "cell",
 )

@@ -2346,21 +2346,22 @@ def test_unmigrated_neighbours_keep_precise_domain_codes(
 @pytest.mark.parametrize(
     ("result_indices", "message"),
     [
-        ("ik", "a stored prefix loop only above a compressed result level"),
         ("jk", "every drained result level to be compressed"),
     ],
-    ids=["dense-row-prefix", "dense-row-drained"],
+    ids=["dense-row-drained"],
 )
 def test_dense_result_level_under_a_stored_loop_stops_at_the_target(
     result_indices, message, arm
 ):
-    """The row-scope shape at rank 3 is a TARGET boundary, not a CIN one.
+    """A DRAINED dense result level is still a target boundary.
 
-    A ``ds`` result whose dense level is bound by the receiver's stored loop
-    passes CIN -- the split is well formed -- and is refused by the
-    ordered-key target, which would otherwise have to catch positions up
-    against a dynamic parent count.  The two cells differ in which half of
-    the split the dense level lands in, and each says so.
+    Recorded seam move.  This test carried two cells, differing in which half
+    of the split the dense level lands in.  The PREFIX half (``ik``) is blocker
+    3 and is migrated -- see ``test_loopir_row_scope_prefix_target.py``, and
+    ``test_the_migrated_row_scope_prefix_no_longer_stops_here`` below, which
+    states the migration where the lock used to be.  The DRAINED half survives:
+    a workspace key level owns its own ordering and appends one coordinate per
+    drained entry, so a dense level cannot be one, and no catch-up applies.
     """
 
     shape = (3, 4, 5)
@@ -2376,12 +2377,38 @@ def test_dense_result_level_under_a_stored_loop_stops_at_the_target(
     assert message in str(error.value)
 
 
-def test_row_scope_dense_prefix_is_rejected_by_the_target():
-    """A dense result level under a stored loop stops at the target.
+@pytest.mark.parametrize("arm", [False, True])
+def test_the_migrated_row_scope_prefix_no_longer_stops_here(arm):
+    """``sss ijk->ik [ds]`` compiles now, and this is where that is recorded.
 
-    Reached through an explicit legal order, so the rejection is a program
-    boundary rather than the automatic origin's; the arm axis does not apply
-    to an explicitly scheduled compile.
+    It was the ``dense-row-prefix`` cell above.  CIN routes a canonical-CSR
+    receiver to ``CSR_SPARSE_ROW``, which already permits a stored row domain,
+    so its refusal was never a CIN one -- the ordered-key target's prefix
+    require was the whole boundary, and blocker 3 moves exactly that.  The
+    migration is asserted at the old lock's site so the seam's history stays
+    readable from the seam.
+    """
+
+    assert compile_cin_via_loopir(
+        reduction_cin("sss", "ds", "ijk", "ik"),
+        (3, 5),
+        (((3, 4, 5), _F32),),
+        compile_options=auto_options(arm),
+    ).cpp_source
+
+
+def test_the_explicitly_ordered_route_stops_at_the_operand_not_the_prefix():
+    """Corrected: this cell no longer stops where its name used to say.
+
+    It was ``test_row_scope_dense_prefix_is_rejected_by_the_target``, asserting
+    that ``sss ijk->ik [ds]`` under an explicit legal order stops at the target
+    because of its dense result prefix level.  Blocker 3 migrated that prefix,
+    and the test kept PASSING -- for an unrelated reason: the explicitly ordered
+    route builds no workspace region, so the program reaches the generic target,
+    which refuses ``sss`` at its hierarchical-compressed-INPUT rule before any
+    prefix rule is consulted.  A test that passes for the wrong reason is worse
+    than one that fails, so the boundary it actually proves is named here and
+    the message is asserted, not just the code.
     """
 
     options = CompileOptions.from_environment(
@@ -2394,10 +2421,8 @@ def test_row_scope_dense_prefix_is_rejected_by_the_target():
             (((3, 4, 5), _F32),),
             compile_options=options,
         )
-    assert error.value.defect.code in (
-        "unsupported_program_shape",
-        "unsupported_sparse_output_domain",
-    )
+    assert error.value.defect.code == "unsupported_program_shape"
+    assert "hierarchical compressed" in str(error.value)
 
 
 # -- the post-assembly window ------------------------------------------------

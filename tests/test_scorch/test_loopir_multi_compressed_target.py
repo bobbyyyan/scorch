@@ -741,19 +741,24 @@ def _seam_cells():
                 ForAll(
                     l4,
                     TensorAssign(
-                        # Recorded seam move: the ``sss`` TTM result that used
-                        # to sit here is the admitted ordered-key workspace
-                        # family (``test_loopir_ordered_key_workspace_target
-                        # .py``).  Its neighbour on the same seam keeps the
-                        # code -- a DENSE result prefix level bound by the
-                        # receiver's STORED level, whose parent count is a
-                        # dynamic stored-coordinate count rather than a
-                        # static extent, so no ordered assembly is defined.
+                        # Recorded seam move, the second on this cell.  §49.7
+                        # moved the ``sss`` TTM result off this seam into the
+                        # ordered-key workspace family and left a DENSE result
+                        # prefix level bound by the receiver's STORED level in
+                        # its place; blocker 3 migrates THAT too, because a
+                        # dense level owes only that its child's position array
+                        # be closed at every logical cell, which the row-scope
+                        # catch-up supplies.  Its neighbour on the same seam
+                        # keeps not just the code but the same RULE: a dense
+                        # result prefix level driven by an INTERSECTION, which
+                        # has no single cursor whose coordinate advances a
+                        # catch-up, so no ordered assembly is defined.  ``i``
+                        # is shared by both operands and therefore intersected.
                         TensorVar("C", fmt="dss")[i4, j4, l4],
                         CINBinaryOp(
                             Operation.MUL,
                             TensorVar("A", fmt="sss")[i4, j4, k4],
-                            TensorVar("B", fmt="dd")[k4, l4],
+                            TensorVar("B", fmt="sss")[i4, k4, l4],
                         ),
                         op=Operation.ADD,
                     ),
@@ -783,10 +788,10 @@ def _seam_cells():
     f32 = torch.float32
     return [
         (
-            "ttm_reduction_dense_prefix_over_stored_level",
+            "ttm_reduction_dense_prefix_over_intersected_level",
             ttm,
             (3, 4, 5),
-            (((3, 4, 6), f32), ((6, 5), f32)),
+            (((3, 4, 6), f32), ((3, 6, 5), f32)),
             "unsupported_sparse_output_domain",
         ),
         # Recorded seam move: the two-dense-prefix ``ddss`` intersection that
