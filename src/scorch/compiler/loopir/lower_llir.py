@@ -4666,9 +4666,20 @@ class _TargetLowering:
         return llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT)
 
     def _assembly_catch_up(
-        self, loop: _Loop, level: Optional[int] = None
+        self,
+        loop: _Loop,
+        level: Optional[int] = None,
+        *,
+        bound: Optional[llir.Expr] = None,
     ) -> llir.ForLoop:
-        """The legacy per-row ``Assemble COMPRESSED level`` catch-up loop."""
+        """The legacy per-row ``Assemble COMPRESSED level`` catch-up loop.
+
+        ``bound`` overrides the segment index the catch-up closes through.  Every
+        inherited caller omits it and receives exactly the loop-derived bound it
+        received before; a stored prefix additionally needs one final catch-up
+        whose bound is the prefix's total cell count rather than any loop's
+        current coordinate, and that is the only caller that passes it.
+        """
 
         result_name = self.result_decl.name
         if level is None:
@@ -4682,7 +4693,7 @@ class _TargetLowering:
             cond=llir.BinOp(
                 op="<",
                 left=pos_index,
-                right=self._assembly_catch_up_bound(loop),
+                right=(self._assembly_catch_up_bound(loop) if bound is None else bound),
             ),
             update=llir.Increment(
                 var=llir.Var(
@@ -7986,6 +7997,121 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
         return function
 
 
+def _stored_prefix_positions(
+    loops: Sequence[_Loop], dense_prefix: int
+) -> Tuple[int, ...]:
+    """Which dense result prefix levels this nest drives with a stored stream.
+
+    Read from the collected loop nest and the receiver's own dense prefix length,
+    so it is a property of the verified program rather than of any layout string.
+    An empty result is the inherited all-dense prefix, whose emission this
+    predicate leaves untouched.
+    """
+
+    return tuple(
+        position
+        for position in range(min(dense_prefix, len(loops)))
+        if loops[position].kind is _SPARSE
+    )
+
+
+def _needs_stored_prefix_final_catch_up(
+    lowering: _TargetLowering, dense_prefix: int
+) -> bool:
+    """Whether this nest owes one final catch-up past its stored prefix.
+
+    Carries the same ``dense_prefix < len(levels)`` guard
+    ``_dense_loop_owns_result_assembly`` carries: with no compressed level below
+    the prefix there is no position array to close, and no level to name.
+    """
+
+    return 0 < dense_prefix < len(lowering.result_decl.levels) and bool(
+        _stored_prefix_positions(lowering.loops, dense_prefix)
+    )
+
+
+def _stored_prefix_cell_total(
+    lowering: _TargetLowering, dense_prefix: int
+) -> llir.Expr:
+    """How many cells the dense result prefix has, as one bound expression.
+
+    The first compressed result level owns one segment per prefix cell, numbered
+    in the prefix's own lexicographic order, so the index that closes the last
+    segment is the PRODUCT of the prefix extents.  Each factor is spelled by the
+    same ``_loop_bound_var`` policy ``_assembly_catch_up_bound`` uses for the
+    same level, so the total cannot disagree with the per-cell numbering.
+    """
+
+    total: Optional[llir.Expr] = None
+    for position in range(dense_prefix):
+        extent = lowering._loop_bound_var(lowering.loops[position])
+        total = extent if total is None else llir.Mul(left=total, right=extent)
+    if total is None:
+        _fail(
+            "unsupported_program_shape",
+            "a stored dense result prefix needs at least one prefix level",
+        )
+        raise AssertionError("unreachable")
+    return total
+
+
+def _stored_prefix_open_statements(
+    lowering: _TargetLowering, position: int
+) -> List[llir.Stmt]:
+    """The catch-up a STORED innermost dense-prefix loop owes before its body.
+
+    This is the same group ``_lower_dense`` emits for the same level when the
+    loop is dense; only its position within the body differs, because a stored
+    loop must resolve its own coordinate before a bound that reads it.
+    """
+
+    return [
+        llir.Comment("Assemble COMPRESSED level"),
+        lowering._assembly_catch_up(
+            lowering.loops[position],
+            lowering._dense_assembly_close_level(position),
+        ),
+    ]
+
+
+def _stored_prefix_close_statements(
+    lowering: _TargetLowering, position: int
+) -> List[llir.Stmt]:
+    """The close a STORED innermost dense-prefix loop owes after its body."""
+
+    return [
+        llir.BlankLine(),
+        llir.Comment("Assembly compressed _level indices"),
+        lowering._assembly_result_pos_set(
+            lowering._dense_assembly_close_level(position)
+        ),
+    ]
+
+
+def _stored_prefix_final_statements(
+    lowering: _TargetLowering, dense_prefix: int
+) -> List[llir.Stmt]:
+    """Close every prefix cell a stored prefix never reached.
+
+    A dense prefix loop ends at its own extent, so its last cell's close is the
+    level's last segment and nothing is left open.  A stored prefix stops at its
+    last stored coordinate, so every cell after it -- and, with more than one
+    prefix level, every cell of every skipped outer coordinate -- is still open.
+    One catch-up through the prefix's total cell count closes all of them, which
+    is exactly what the rank-2 row-scope family does through ``C0_size``.
+    """
+
+    return [
+        llir.BlankLine(),
+        llir.Comment("Assembly compressed _level indices"),
+        lowering._assembly_catch_up(
+            lowering.loops[dense_prefix - 1],
+            lowering._dense_assembly_close_level(dense_prefix - 1),
+            bound=_stored_prefix_cell_total(lowering, dense_prefix),
+        ),
+    ]
+
+
 class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
     """Rank-general target lowering for the ordered-key sparse workspace.
 
@@ -8166,8 +8292,11 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             if type(only) is SparseFor:
                 sparse_for = cast(SparseFor, only)
                 require(
-                    result_levels[level].kind is LevelKind.COMPRESSED,
-                    "a stored prefix loop only above a compressed result level",
+                    result_levels[level].kind is LevelKind.COMPRESSED
+                    or level < self._dense_prefix,
+                    "a stored prefix loop only above a compressed result level "
+                    "or a dense result prefix level whose skipped cells it "
+                    "catches up",
                 )
                 cursor = sparse_for.cursor
                 loops.append(
@@ -8854,6 +8983,17 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 if child.kind is _DENSE
                 else list(self._lower_sparse(position + 1))
             )
+        if self._owns_stored_prefix_assembly(position):
+            # A stored innermost dense-prefix loop owns the catch-up and close
+            # ``_lower_dense`` owns when that loop is dense.  They belong here,
+            # inside the stream loop's body and around its children, because
+            # ``_lower_sparse`` resolves this loop's coordinate first and the
+            # catch-up bound reads it.
+            return [
+                *_stored_prefix_open_statements(self, position),
+                *children,
+                *_stored_prefix_close_statements(self, position),
+            ]
         closes = self._level_close_statements(position)
         if not closes:
             return children
@@ -8864,6 +9004,21 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             llir.Comment("Assembly compressed _level indices"),
             *closes,
         ]
+
+    def _owns_stored_prefix_assembly(self, position: int) -> bool:
+        """Whether a STORED loop here completes the first compressed level's cell.
+
+        The dense twin of this predicate is ``_dense_loop_owns_result_assembly``:
+        only the innermost dense-prefix loop completes a flattened prefix cell,
+        so only it closes the first compressed level, whether it is driven by a
+        dense domain or by one stored stream.
+        """
+
+        return (
+            position == self._dense_prefix - 1
+            and self._dense_prefix < len(self.result_decl.levels)
+            and self.loops[position].kind is _SPARSE
+        )
 
     def _level_close_statements(self, position: int) -> List[llir.Stmt]:
         """Close result level ``position``'s child after that loop's body.
@@ -9006,6 +9161,10 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             statements.append(llir.BlankLine())
             statements.append(llir.Comment("Assembly compressed _level indices"))
             statements.append(self._assembly_result_pos_set(0))
+        elif _needs_stored_prefix_final_catch_up(self, self._dense_prefix):
+            # A stored prefix stops at its last stored coordinate instead of at
+            # the prefix's extent, so the cells past it are still open.
+            statements.extend(_stored_prefix_final_statements(self, self._dense_prefix))
         return statements
 
 
@@ -10578,11 +10737,18 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
     while type(body) is Block and len(body.statements) == 1:
         only = body.statements[0]
         if assembled < len(kinds):
-            if type(only) is DenseFor and assembled < prefix:
-                assembled += 1
-                body = only.body
-                continue
-            if type(only) is SparseFor and assembled >= prefix:
+            if assembled < prefix:
+                # A dense result prefix level admits either driver: a dense loop
+                # visits every cell, and a stored loop visits a monotone
+                # subsequence whose skipped cells the target catches up.  Only
+                # the compressed suffix is counted as a stream, so the leaf's
+                # stream tally stays a statement about the suffix alone.
+                if type(only) is DenseFor or type(only) is SparseFor:
+                    assembled += 1
+                    body = only.body
+                    continue
+                return False
+            if type(only) is SparseFor:
                 assembled += 1
                 streams += 1
                 body = only.body
@@ -10831,22 +10997,31 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     "single-cursor sparse loops above its accumulating leaf",
                 )
             if type(only) is DenseFor:
-                require(
-                    all(existing.kind is _DENSE for existing in loops),
-                    "the dense prefix loop to precede every stream loop",
-                )
                 require(prefix >= 1, "no dense loop over an all-compressed result")
                 require(
                     len(loops) < prefix,
                     "exactly one dense loop per dense result prefix level",
+                )
+                # A dense loop occurs only at a prefix position, and a suffix
+                # stream only at a position at or past the prefix, so the
+                # inherited "dense prefix precedes every stream loop" property
+                # is implied by these two bounds rather than restated -- and it
+                # has to be, because a stored prefix level now puts a stream
+                # loop above a dense prefix loop legitimately.
+                require(
+                    result_levels[len(loops)].kind is LevelKind.DENSE,
+                    "a dense assembly loop only above a dense result level",
                 )
                 loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
             if type(only) is SparseFor:
                 require(
-                    len(loops) >= prefix,
-                    "stream loops to follow the dense prefix",
+                    len(loops) >= prefix
+                    or result_levels[len(loops)].kind is LevelKind.DENSE,
+                    "stream loops to follow the dense prefix, or to drive one "
+                    "dense result prefix level whose skipped cells the target "
+                    "catches up",
                 )
                 cursor = only.cursor
                 loops.append(
@@ -10902,10 +11077,15 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             )
             require(
                 len(loops) == len(result_levels)
-                and sum(1 for loop in loops if loop.kind in (_MERGED, _SPARSE))
-                == compressed_suffix,
+                and sum(
+                    1
+                    for position, loop in enumerate(loops)
+                    if position >= prefix and loop.kind in (_MERGED, _SPARSE)
+                )
+                == compressed_suffix
+                and all(loop.kind is _DENSE for loop in loops[:prefix]),
                 "one loop per result level with one stream loop per "
-                "compressed level",
+                "compressed level, over a dense-driven prefix",
             )
             self._assembly_depth = len(loops)
             union_pairs = {
@@ -10970,8 +11150,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             len(loops) == self._assembly_depth + self._reduction_depth
             and sum(
                 1
-                for loop in loops[: self._assembly_depth]
-                if loop.kind in (_MERGED, _SPARSE)
+                for position, loop in enumerate(loops[: self._assembly_depth])
+                if position >= self._dense_prefix and loop.kind in (_MERGED, _SPARSE)
             )
             == compressed_suffix,
             "one loop per result level with one stream loop per compressed "
@@ -11207,7 +11387,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         """
 
         child = self.loops[position + 1]
-        if child.kind is _DENSE and self.loops[position].kind is _DENSE:
+        if child.kind is _DENSE and position + 1 < self._dense_prefix:
+            # A dense child inside the dense prefix nests the next prefix loop.
+            # Keyed on the child's own position rather than on this loop's
+            # driver, because a stored prefix level legitimately nests a dense
+            # prefix level below it.
             return [llir.BlankLine(), self._lower_dense(position + 1)]
         if child.kind is _SPARSE:
             return self._lower_sparse(position + 1)
@@ -11382,10 +11566,23 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     "a single-cursor assembly leaf must append its stored " "entries",
                 )
             return leaf_stmts
-        if loop.kind is _DENSE:
-            # The dense prefix closes its child level through the assembly
-            # catch-up in ``_lower_dense``, never a conditional append.
-            return self._child_stream_statements(position)
+        if self.result_decl.levels[position].kind is LevelKind.DENSE:
+            # A dense result level stores no coordinate, so it never emits the
+            # conditional parent append.  A dense-driven prefix level closes its
+            # child through the catch-up ``_lower_dense`` emits; a stored one
+            # owns the same catch-up and close here, for the reason
+            # ``_owns_stored_prefix_assembly`` states.  Keyed on the RESULT
+            # level rather than the loop's driver: before a stored prefix level
+            # existed the two agreed, and only the result level is the fact that
+            # decides whether a coordinate is appended.
+            children = self._child_stream_statements(position)
+            if loop.kind is _SPARSE and position == self._dense_prefix - 1:
+                return [
+                    *_stored_prefix_open_statements(self, position),
+                    *children,
+                    *_stored_prefix_close_statements(self, position),
+                ]
+            return children
         return [
             *self._child_stream_statements(position),
             llir.BlankLine(),
@@ -11548,10 +11745,25 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 if self.loops[0].kind is _MERGED
                 else list(self._lower_sparse(0))
             )
-            stmts.append(llir.BlankLine())
-            stmts.append(llir.Comment("Assembly compressed _level indices"))
-            stmts.append(self._assembly_result_pos_set(0))
+            if self.result_decl.levels[0].kind is LevelKind.COMPRESSED:
+                # One root segment for a compressed first level, closed once
+                # after the whole nest.  Keyed on the result level, not on the
+                # loop's driver: a stored loop above a DENSE first level appends
+                # no root coordinate and has no level-0 position array to close.
+                stmts.append(llir.BlankLine())
+                stmts.append(llir.Comment("Assembly compressed _level indices"))
+                stmts.append(self._assembly_result_pos_set(0))
+            else:
+                stmts.extend(_stored_prefix_final_statements(self, self._dense_prefix))
             return stmts
+        if _needs_stored_prefix_final_catch_up(self, self._dense_prefix):
+            # A dense-driven outermost prefix level over a stored inner one:
+            # the inner stream still stops short of the prefix's cell count.
+            return [
+                llir.BlankLine(),
+                self._lower_dense(0),
+                *_stored_prefix_final_statements(self, self._dense_prefix),
+            ]
         return [llir.BlankLine(), self._lower_dense(0)]
 
 

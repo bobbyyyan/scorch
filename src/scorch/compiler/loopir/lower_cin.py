@@ -697,11 +697,25 @@ def _classify_sparse_output_family(
                 # does not depend on the insertion order.
                 continue
             if result_levels[position] is LevelType.DENSE:
-                if domain_kind is not DomainKind.DENSE:
+                if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
+                    # A dense result level stores no coordinates, so the only
+                    # obligation a prefix loop owes it is that its child's
+                    # position array be closed at EVERY logical cell of the
+                    # level, not merely at the cells the loop visits.  A dense
+                    # domain visits them all and owes nothing further.  One
+                    # stored stream visits a monotone subsequence, and the
+                    # target closes the cells it skips with the row-scope
+                    # catch-up -- the same obligation, and the same mechanism,
+                    # the canonical-CSR row-scope family already discharges at
+                    # rank 2.  A merged domain is refused rather than caught
+                    # up: it has no single cursor whose coordinate advances the
+                    # catch-up, and neither family's prefix chain admits a
+                    # merged loop above a result level.
                     _fail(
                         "unsupported_sparse_output_domain",
                         "a dense result prefix level of an ordered-key "
-                        "sparse reduction must iterate a dense domain",
+                        "sparse reduction must iterate a dense domain or one "
+                        "stored sparse level",
                     )
             elif domain_kind is not DomainKind.SPARSE:
                 _fail(
