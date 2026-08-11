@@ -31360,3 +31360,149 @@ Every gate is the Apple M5 machine; no cross-host run.
 decision rather than by migration.  No Phase-8 inventory, cutover, cache,
 selector or default-dispatch change was made; no fallback was weakened; no legacy
 code was deleted.
+
+## Blocker 2 built: the rank-0 ordered key, its host, and a repaired plan origin (2026-08-11; supersedes every preceding prompt)
+
+Three local commits follow inherited committed tip ``4644608``; nothing was
+pushed, amended, squashed, reordered or discarded, and no ``git stash`` was run.
+**Origin is ``a3b8d1e``** — ``git ls-remote`` resolves this branch on origin to
+it, and ``.git/packed-refs`` still carries the stale ``58e8565`` for the
+remote-tracking ref and the staler ``cb49ff7`` for the local branch, so that file
+was read for nothing here.  The five protected tracked files hash exactly as
+recorded.  Evidence ledger:
+``~/.cache/scorch-codex/boundprefix-blocker2/`` (new).
+
+**What this milestone lands.  Blocker 2 is BUILT** — the ``K == 0`` family, the
+target extension that hosts it, and the automatic plan-origin repair, gated
+together — plus one avoidable constant §52.9 left for this session.  Review §53
+owns the detail.
+
+**The seam §52.6 named is not on the automatic arm's path, and that is the
+correction that mattered.**  ``Scheduler.auto_schedule_plan`` has **no production
+caller**: measured by replacing it with a function that raises, all ten of
+§49.5's cells route identically in both arms.  The plan the automatic arm
+consumes comes from ``Scheduler._apply_schedule_legacy``'s ``is_identity``
+branch, reached through ``apply_schedule(cin, Schedule())``.  A repair landed only
+at the seam §52.6 named would have migrated nothing.  The repair is implemented
+once in ``Scheduler._originate_auto_plan`` and both plan origins call it, so they
+cannot drift — and the neutrality argument is no longer "this entry is unused"
+but a property of the repair: **it runs only after the recorded plan has been
+refused**, so no program that produces generated code today can change.  Gate 3
+measures exactly that and does not fire.
+
+**The repair.**  ``select_loop_order`` gains a keyword-only ``pre_forced_order``
+out-parameter (validated as an exact empty list; every existing caller passes
+nothing and is byte-identical).  When the plan built from the forced order is
+refused with an ``InvalidSchedule`` naming one of the **two rules
+``_verify_storage_order`` owns** — ``result_storage_order`` or
+``sparse_parent_dominance``, the only legality rules that are properties of the
+order alone — the plan is re-originated from the pre-forced order on a fresh copy
+and offered to the same boundary; if that is refused too, the original refusal is
+reported.  Measured for all ten cells in both arms: the forced order is refused
+at ``sparse_parent_dominance`` and the pre-forced order is **accepted with
+``workspace=None`` and ``tiles=()`` re-derived**.  Nothing re-derives the order
+itself — ``loop_plan_legality``, ``loop_plan``, ``legacy_cin_adapter`` and the
+whole ``loopir`` package never reference ``select_loop_order`` — and
+``_replay_auto_plan_owned`` rebuilds from ``plan.loop_order``, so a repaired
+order replays.
+
+**The family.**  ``_ordered_key_split`` now separates two facts it used to
+conflate: interleaving (no split) stays ``None``, and ``key_rank == 0`` is a
+split selecting its own member ``BOUND_PREFIX_ACCUMULATION``.  The prefix domain
+rules are unchanged and, with a rank-0 key, apply to every coordinate.  The
+family joins the ``StoreReduce`` set and is deliberately **not** added to the
+merged-domain continuations, so a merged reduction fails closed at CIN.  **No
+representation change: v11 stands**, checked against the node definitions — the
+accumulator is an LLIR local, as every other family's is.
+
+**The host.**  ``_MultiCompressedAssemblyLowering``, exactly as §52.6 found.
+``_multi_compressed_assembly_chain`` is untouched; a new disjoint
+``_bound_prefix_assembly_chain`` routes the shape, ``_collect_assembly_chain``
+collects the optional sub-nest, ``_require_bound_prefix_leaf`` requires the
+``StoreReduce``'s coordinates to be exactly the assembly loops' coordinates in
+order, and the sub-nest is emitted by the **shared** dense/sparse machinery —
+which is why a dense reduction loop inside a stream loop needed no new code.  The
+accumulator's identifier goes through the same name-reservation authority as
+every merge temporary.
+
+**Eight cells migrate, not five, and two of the predicted five do not.**
+``ds ij->i`` and ``dss ijk->i`` have a rank-1 COMPRESSED receiver driven by a
+DENSE domain, which the family's own prefix rule refuses (admitting them would be
+dense-domain assembly of a compressed level).  §52.6's list was of cells the
+ordered-key *branch reaches*, and reaching it is not being admitted by it.  Five
+cells the ten-cell list never enumerated do migrate — ``sd ij->i``,
+``ssd ijk->i``, ``sds ijk->i``, ``ssss ijkl->i``, ``sdss ijkl->i`` — **four** of
+them carrying a **dense** reduction loop, which is why delegating the sub-nest to
+the shared machinery is load-bearing: no dense-reduction emission was written for
+this family at all.  Plus ``dsss ijkl->ijk`` into a ``dss``
+receiver, which is outside the 748-grid's format conventions and covered by the
+differential.
+
+**The repair's scope is 65 frontier cells, and that is deliberate.**  Derived
+before any production code was written and then reproduced exactly: 8 newly
+ADMITTED, 57 moved from ``sparse_parent_dominance`` to a shape-specific
+fail-closed code, 64 still there (the permuted-result cells, whose pre-forced
+order is refused too), **zero admitted cells lost**, arm-variance unchanged.  A
+narrower predicate conditioned on the bound-prefix shape would have cut the 57 to
+35 and made the neighbours §52.6 asks to characterize unreachable at their own
+codes; it was rejected as fitting the mechanism to the family it enables.
+
+**The gating is measured out of process**, against trees with one half reverted:
+family alone leaves all ten at ``sparse_parent_dominance`` with **zero**
+admitted; repair alone moves all ten to the family's own refusal with **zero**
+admitted.  The family-only arm compiles three of the ten under their declared
+order, which is the positive control.
+
+**One release-visible surface degrades its refusal, and it is measured rather
+than glossed.**  The inherited neutrality harness covers default dispatch and
+explicit NON-empty schedules; the repair sits in the branch reached by an
+explicitly EMPTY ``Schedule()``, so that surface was captured separately over 118
+programs on each tree (``neutrality/empty_schedule_neutrality.py``, new here).
+The neutrality property holds exactly — **legacy emits for the same 100 of 118 on
+both trees with identical digests**, and the LoopIR arm is identical on those 100
+and rises 40 → 45.  But for the 18 that refuse on both trees, the legacy arm's
+refusal *kind* changes from a structured ``InvalidSchedule``
+``sparse_parent_dominance`` diagnostic to an unstructured
+``ValueError: ivar_j is not in list`` from inside the legacy lowerer: the repaired
+order is legal but has no legacy form.  It is not repairable at that boundary
+(``apply_schedule`` propagates one plan and both consumers read it, so splitting
+them needs a mode flag inside a shared layer), it touches only programs that
+already failed, and the LoopIR arm's disposition for the same shapes *improves*.
+``test_the_legacy_comparand_still_refuses_this_family`` locks the property, not
+the message.  Deciding whether the legacy replay boundary should fail closed
+structurally is carried forward.
+
+**Verification.**  Release neutrality against ``4644608`` **byte-identical**
+(corpus 20/20, grid 42/42, audit ``total=86 admitted=46 rejected=40
+nonidentical=0`` both sides and identical between them).  The 748-cell declared
+frontier at the final tip, reading **both** LoopPlan exits: **106 admitted / 444
+defect codes / 198 loop-plan diagnostics / zero unclassified / three
+arm-variant**, the whole delta being the 65-cell firing set.  Compiled public +
+erasure/oracle differential **936 checks, zero failures**.  mypy 140 errors in 11
+files on both arms, none in a changed file, the outputs differing in exactly one
+non-error line (the checked-source-file count, which is the untracked
+``src/scorch/gpu.py``); flake8 differs only by the pre-existing untracked-module
+F401s; black clean on every changed file.  Two
+findings came from the gate rather than from inspection — a new mypy
+``attr-defined`` error and an unused test import — and both are fixed at the final
+tip.
+
+The complete non-performance suite at the final code tip: **6,203 selected, 6,188 passed, 15 skipped, 3 deselected, 0 failed, 0 errors**, eight file-disjoint partitions all exiting 0 at one revision, the node delta from the base's 6,095 accounted exactly (+108 = 130 added - 22 renamed locks).  Paired compile-only latency against the 1.10 ceiling: A/B median mean 1.0005 / max 1.0048, min-of-samples max 1.0089, A/A control max 1.0103 / 1.0140, pooled fastest-sample 1.0021 — **every declared statistic inside the ceiling, the largest being 1.0140**.
+
+**Also taken.**  ``assemble_function``'s redundant ``self._validate()`` is
+removed (``signature()`` validates first), with the body type-check moved behind
+``signature()`` so a malformed-metadata call still fails on the metadata.
+
+**Not addressed.**  **Blocker 3 is untouched** — a DENSE result prefix level
+bound by a STORED loop still needs the row-scope catch-up against a dynamic
+parent count at depth.  (The bound-prefix family does admit a dense result
+prefix, but only when that level iterates a *dense* domain, which is the rule
+blocker 3 is about.)  The **1139-cell frontier extension** was not re-run — it is
+the first item on this session's declared sacrifice list.  The **heavy legacy
+sweep** for the eleven unsound-claimed cells was not run, so §52.8's scoping note
+stands.  Every gate is the Apple M5 machine; no cross-host run.
+
+**Phase 7 remains NO-GO, now on blocker 3 alone**, with blocker 1 closed by
+decision and blocker 2 built.  No Phase-8 inventory, cutover, cache, selector or
+default-dispatch change was made; no fallback was weakened; no legacy code was
+deleted.

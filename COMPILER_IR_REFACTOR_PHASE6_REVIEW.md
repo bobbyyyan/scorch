@@ -10573,3 +10573,534 @@ was deleted.
 - **No cross-host run.**  Every gate here is the Apple M5 machine.  Scorch does
   not use MKT as a routine CPU test target, and nothing in this change is
   platform-dependent, but the record should not imply a second host confirmed it.
+
+## 53. Blocker 2 built: the rank-0 ordered key, its host, and a repaired plan origin (2026-08-11)
+
+This section opens at inherited committed tip ``4644608`` and reviews
+``a3b8d1e..4644608`` — the production commit ``12bd832``, its test commit
+``97d23fe``, and the documentation commit ``4644608``.  It **builds blocker 2**:
+the ``K == 0`` family, the target extension that hosts it, and the automatic
+plan-origin repair, gated together.  It also corrects three claims §52.6 makes
+about that work, one of which would have made the repair migrate nothing.
+
+Sections 49 through 52 are preserved above as written.  Where this section
+contradicts them, this section is correct.
+
+### 53.1 The inherited state, re-established by inspection
+
+- **Origin is ``a3b8d1e`` and the branch is published.**  ``git ls-remote``
+  resolves ``refs/heads/refactor/compiler-ir-phase3-std-move-call`` on origin to
+  ``a3b8d1ed70b71c3b137a62c3b27fa01e1262e621``; the local tip ``4644608`` is
+  seven commits ahead and zero behind.  ``.git/packed-refs`` still carries the
+  stale ``58e8565``/``cb49ff7`` and was not read for any claim here.  Nothing was
+  pushed.
+- The five protected tracked files hash exactly as
+  ``statics/protected-hashes.txt`` records, before and after every change here.
+- **§52.6's declared-order accounting is off by two.**  It records that "six
+  reach ``unsupported_sparse_output_domain`` and two — ``sss ijk->ij`` and
+  ``ssd ijk->ij`` — reach ``LoopIRTargetError/unsupported_program_shape``", which
+  accounts for eight of the ten cells.  Measured at the tip, **eight** reach
+  ``unsupported_sparse_output_domain`` and two reach
+  ``unsupported_program_shape``; the two the record loses are ``dds ijk->ij`` and
+  ``sds ijk->ij``.  The three-way gate §49.5 predicted is intact; only the count
+  was wrong.
+
+### 53.2 The repair seam §52.6 names is not on the automatic arm's path
+
+This is the correction that matters, because building to §52.6's instruction
+would have produced a change that migrates nothing.
+
+§52.6 records that the repair belongs in ``Scheduler.auto_schedule_plan``,
+"the plan-producing automatic origin whose own docstring records that release
+dispatch does not consume it".  The docstring is accurate and the conclusion
+drawn from it is not: **``auto_schedule_plan`` has no production caller at all.**
+Across ``src/`` the only occurrence is its own definition and its own
+``TypeError`` message; the four modules that call it are all tests
+(``test_cin_analysis``, ``test_loop_plan``, ``test_loopir_pipeline_execution``,
+``test_schedule_api``).  The automatic arm every gate on this branch measures
+reaches its plan
+through ``compile_cin_via_loopir`` →
+``pipeline._apply_requested_schedule`` → ``Scheduler.apply_schedule(cin,
+Schedule())`` → ``Scheduler._apply_schedule_legacy``'s ``is_identity`` branch.
+
+Measured rather than argued: with ``auto_schedule_plan`` replaced by a function
+that raises ``AssertionError``, all ten of §49.5's cells route **identically** in
+both arms, and one automatic compile makes exactly one
+``_apply_schedule_legacy`` call.
+
+So the repair had to land at the origin that is actually consumed.  Doing that
+does **not** weaken the neutrality argument, because the argument that carries
+the change is not "this entry is unused" but a property of the repair itself:
+
+> It runs only after the recorded plan has been **refused**.  A program whose
+> automatic plan verifies today never reaches it, so no program that produces
+> generated code today can change.
+
+That is a stronger claim than the seam-based one, and it is what gate 3
+measures.  The repair is implemented once, in ``Scheduler._originate_auto_plan``,
+and both plan-producing origins — the ``is_identity`` branch and
+``auto_schedule_plan`` — now call it, so the two cannot drift.
+
+### 53.3 What the repair is
+
+``select_loop_order`` composes four steps and ends with an unchecked fifth: a
+block that moves the last free variable to the innermost position when no free
+variable follows the last reduction.  Its purpose is the nest shape legacy
+lowering and workspace insertion need.  For a sparse result whose every
+coordinate is already bound above the outermost reduction it buys nothing — such
+a program needs no workspace at all — and it costs legality: moving one result
+coordinate inward puts a compressed physical parent below its child.
+
+The repair is therefore:
+
+* ``select_loop_order`` gains a **keyword-only out-parameter**,
+  ``pre_forced_order``, which when given an empty list receives the composed
+  order as it stands immediately before that block.  Every existing caller
+  passes nothing and executes exactly the statements it executed before; the
+  parameter is validated as an exact empty ``list``.
+* ``_originate_auto_plan`` builds the plan from the forced order.  If that plan
+  is refused with an ``InvalidSchedule`` naming one of the **two rules
+  ``_verify_storage_order`` owns** — ``result_storage_order`` and
+  ``sparse_parent_dominance``, the only legality rules that are properties of
+  the order alone — and the pre-forced order differs, it re-originates the plan
+  from the pre-forced order on a fresh copy of the same normalized CIN and
+  offers it to the same trust boundary.  If that is refused too, the **original**
+  refusal is the one reported.
+
+The retry re-runs the selection on a **fresh deep copy of the same normalized
+CIN** rather than reusing the first copy's ``IndexVar`` objects, so no state the
+first attempt's surgery mutated can leak into the second.  That re-run sits
+outside the inner ``try``, which is deliberate and safe rather than an oversight:
+it is the identical call, on an equal pristine copy, that already succeeded
+microseconds earlier on the first copy — the selection reads the CIN and mutates
+nothing, and it runs before any surgery in both attempts — so it cannot introduce
+a failure mode the first attempt would not already have raised.  The inner
+``try`` therefore covers exactly what can newly refuse: plan construction and its
+verification.
+
+Two things this deliberately does not do.  It does not restate the reorder, and
+it does not restate the rules the reorder breaks: the legality layer stays the
+sole authority, consulted rather than duplicated.  And it does not touch any
+decision that layer *pins* — ``_verify_tiling_capabilities`` and
+``_verify_auto_workspace_decision`` require the recorded tiles and workspace to
+equal a re-derived heuristic, which is why §51.11's tile suppression was refused
+at ``auto_tile_decision``, whereas the order is checked only for legality.  That
+asymmetry is what makes an order repair available and a tile repair not.
+
+**Both re-derivations were measured, not assumed.**  For all ten cells, in both
+arms: the forced order's plan is refused at ``sparse_parent_dominance``, and the
+pre-forced order's plan is **accepted** with ``workspace=None`` and ``tiles=()``
+re-derived by the same boundary.  And nothing re-derives the *order*:
+``loop_plan_legality``, ``loop_plan``, ``legacy_cin_adapter`` and the whole
+``loopir`` package contain no reference to ``select_loop_order`` or
+``init_loop_order``, and ``_replay_auto_plan_owned`` rebuilds the legacy nest
+from ``plan.loop_order`` itself, so a repaired order replays.
+
+### 53.4 What the family is
+
+``_ordered_key_split`` returns the ``(prefix, key_rank)`` split of one ordered
+sparse reduction's result coordinates.  It previously refused ``key_rank == 0``
+in the same clause that refuses interleaving.  Those are different facts, and
+separating them is the whole CIN change:
+
+* ``prefix + key_rank != len(lhs)`` means some result coordinate is interleaved
+  between two reduction loops.  No split exists; this stays ``None``.
+* ``key_rank == 0`` means every result coordinate is bound above the outermost
+  reduction.  That is a split, and it selects its own family member,
+  ``BOUND_PREFIX_ACCUMULATION``.
+
+The prefix domain rules are **unchanged and now apply to every position**: with
+``key_rank == 0`` the loop's "a drained key coordinate may iterate any domain"
+skip can never fire, so each coordinate is held to its result level's rule — a
+dense level must iterate a dense domain, a compressed level must be driven by
+one stored sparse level.  The dense-levels-above-the-reduction check is
+vacuously satisfied, because ``prefix`` is the whole rank.
+
+The family joins the ``StoreReduce`` set, so it lowers to the same semantic
+accumulation leaf every sparse reduction family uses.  Unlike the ordered-key
+family, no schedule pass rewrites it: the owning target reads the accumulation
+directly.  It is deliberately **not** added to the two merged-domain
+continuations, so a merged reduction domain fails closed at CIN with
+``unsupported_merged_reduction`` rather than reaching the target.
+
+**No representation change.**  ``WorkspaceDecl`` is bound to a ``TileId`` and
+buffers one affine split's point domain; ``SparseWorkspaceDecl`` requires an
+ordered key of one or more dimensions.  Neither can express a rank-0
+accumulator, and neither needs to: the accumulator is an LLIR local exactly as
+every other family's is.  No node kind, no canonical schema change — **v11
+stands** — and no request- or schedule-identity change.
+
+### 53.5 The host, and what it grew
+
+§52.6's identification of ``_MultiCompressedAssemblyLowering`` as the host is
+correct and it saved the session real work.  The target already admits these
+receivers and already emits everything the family needs above the reduction: one
+dense loop per prefix level, one stream loop per compressed result level, the
+conditional compressed-parent append with child position close per structural
+level, the dense-prefix catch-up, and the root close.
+
+What it grew is exactly what §52.6 predicted plus the bookkeeping that makes it
+safe:
+
+* ``_bound_prefix_assembly_chain`` routes the new shape.  It independently
+  re-derives the receiver — a dense prefix over an all-compressed suffix,
+  excluding the canonical-CSR ``(D, C)`` and doubly-compressed ``(C, C)``
+  receivers that keep their own families — then walks one loop per result level,
+  a non-empty sub-nest of dense and single-cursor sparse reduction loops, and one
+  ``StoreReduce`` leaf.  ``_multi_compressed_assembly_chain`` is **untouched**,
+  so the existing route is byte-identical by construction, and the two
+  predicates are disjoint: one requires an append leaf, the other an
+  accumulating one.
+* ``_collect_assembly_chain`` collects the optional sub-nest after the assembly
+  loops are complete, and ``_require_bound_prefix_leaf`` validates the leaf: one
+  additive ``StoreReduce`` into the declared result whose coordinates are
+  **exactly the assembly loops' coordinates in order** — which is the program-level
+  statement that every result coordinate is bound above the outermost reduction —
+  over a receiver outside the doubly-compressed shape.  A merged loop below the
+  sub-nest is refused with its own message.
+* The three leaf-position tests that read ``len(self.loops) - 1`` now read
+  ``self._assembly_depth - 1``, which is the same number whenever there is no
+  sub-nest.
+* ``_bound_prefix_leaf_statements`` emits the accumulator, and ``_lower_leaf``
+  emits ``C_reduction += <value>``.  The reduction sub-nest itself is emitted by
+  the **shared** dense/sparse machinery: ``_loop_children`` delegates every
+  position at or below the sub-nest to ``_TargetLowering._loop_children``, which
+  is why a dense reduction loop inside a stream loop (``sd``, ``sds``, ``ssd``,
+  ``sdss``) needed no new code at all.
+* The accumulator's C++ identifier is reserved through the same
+  ``_reserve_generated_name`` authority as every merge temporary, so a user
+  tensor spelled ``C_reduction`` fails closed with
+  ``generated_name_collision``.
+
+The emitted kernel for ``ss ij->i`` is one stream loop over the result's stored
+rows, a zeroed ``float C_reduction``, the operand's own child segment loop
+accumulating into it, and the checked value/coordinate appends — and for
+``ssss ijkl->ijk`` the same, with all three structural levels closing
+conditionally.
+
+### 53.6 Eight cells migrate, not five, and two of the five do not
+
+The prompt for this session, following §52.6, expected exactly five: ``ss ij->i``,
+``ds ij->i``, ``sss ijk->i``, ``dss ijk->i`` and ``ssss ijkl->ijk``.  The measured
+answer is eight, and it overlaps the prediction in three.  This is a finding
+about the prediction, not a tolerance.
+
+**``ds ij->i`` and ``dss ijk->i`` do not migrate**, and the reason is the
+family's own prefix domain rule.  Both have a rank-1 **COMPRESSED** receiver
+whose single coordinate iterates a **DENSE** domain (level 0 of ``ds``/``dss`` is
+dense), and a compressed result level must be driven by one stored sparse level.
+Admitting them would mean appending one entry per row of a dense iteration
+space, including rows with nothing stored — the dense-domain assembly seam the
+migrated families keep closed by design.  §52.6's five-cell list is a list of
+cells the ordered-key **branch reaches**; reaching the branch is not being
+admitted by it, and the section did not check the domain rules against the
+receivers it named.  Their measured disposition is
+``unsupported_sparse_output_domain``, naming the actual violation.
+
+**Five cells the ten-cell list never enumerated do migrate**: ``sd ij->i``,
+``ssd ijk->i``, ``sds ijk->i``, ``ssss ijkl->i`` and ``sdss ijkl->i``.  **Four**
+of them carry a **dense reduction loop** inside the sub-nest — ``sd`` at depth 1,
+``sds``/``ssd`` mixing a dense and a sparse reduction in either order, and
+``sdss`` at depth 1 of three — which is why delegating the sub-nest to the shared
+loop machinery is load-bearing rather than tidy: not one line of dense-reduction
+emission was written for this family.  §49.5 enumerated the ten cells it had
+probed, not the family's reach; the frontier is what measures the reach.
+
+One further admitted cell sits outside the 748-cell grid's format conventions
+and is therefore not in that count: ``dsss ijkl->ijk`` into a ``dss`` receiver —
+a **DENSE result prefix level** over a compressed suffix, which exercises the
+dense-prefix catch-up and the pre-sized parent position vector.  It is covered by
+the differential.
+
+### 53.7 The repair's scope is 65 cells, and that is deliberate
+
+The repair fires wherever the forced reorder produced an order the storage-order
+rules refuse and the unforced order is legal.  Over the 748-cell frontier that
+is **exactly 65 cells** (130 cell-arm pairs).  That number was derived *before
+any production code was written*, by replaying the ``is_identity`` block's own
+plan construction for both orders over every cell, and the built change then
+reproduced it exactly:
+
+| | cells |
+| --- | --- |
+| newly ADMITTED | **8** |
+| moved from ``sparse_parent_dominance`` to a shape-specific fail-closed code | **57** |
+| still at ``sparse_parent_dominance`` | 64 |
+| admitted cells lost | **0** |
+
+The 57 split as 35 ``unsupported_sparse_output_domain``, 10
+``unsupported_sparse_output_reduction``, 9 ``unsupported_program_shape`` and 3
+``unsupported_union_with_dense``.  Every one stays refused; what changes is that
+the refusal now names the shape's actual violation instead of naming the
+automatic order.  The 64 that stay are the **permuted-result** cells, whose
+pre-forced order is refused by the result's own ``result_storage_order`` rule as
+well — the repair correctly finds no legal order to fall back to.
+
+A narrower predicate was available and was rejected.  Conditioning the repair on
+the bound-prefix shape itself would have reduced the moved set from 57 to 35 and
+made the ``sss ijk->j`` and ``... ijk->ij`` neighbours §52.6 asks to characterize
+unreachable at their own codes.  It would also have fitted the mechanism to the
+family it happens to enable, which is the failure mode this repository's
+engineering standard names first.  The general form repairs a defect in the
+heuristic — it can emit an illegal order — and defers to the layer whose job is
+to say so.  The 57 moves are reported here as a measured, enumerated consequence
+rather than smoothed over.
+
+### 53.8 One release-visible surface degrades its refusal, and it is measured
+
+The inherited neutrality harness covers default dispatch (its corpus and grid)
+and explicit non-empty schedules (its 86-case audit).  The repair sits in the
+branch reached by an explicitly **empty** ``Schedule()``, which neither covers,
+so that surface was captured separately: both pipelines' generated C++ for 118
+programs — reductions at rank 2 and 3 over every receiver spelling, plus
+elementwise, matmul and TTM controls — on each tree.
+
+**The neutrality property holds exactly.**  On the legacy arm, **100 of 118
+programs emit on both trees, the same 100, with identical SHA-256 digests**; the
+LoopIR arm is identical on those same 100 and rises from 40 emitting to 45, the
+five migrating cells in this case set.  No program that produced C++ produces
+different C++.
+
+**A cost that is not byte-visible is recorded rather than glossed.**  For the 18
+programs that refuse on both trees, the legacy arm's refusal *kind* changes: it
+was ``InvalidSchedule`` carrying a structured ``sparse_parent_dominance``
+diagnostic, and it is now ``ValueError: ivar_j is not in list`` raised from
+inside the legacy lowerer.  The mechanism is direct: ``apply_schedule``
+propagates only the plan, ``legacy_generated_cpp`` replays that plan through the
+legacy lowering, and the repaired order is legal but has no legacy form — which
+is the same limitation ``_validate_loop_kinds`` states as "the legacy generic
+route writes an unsized result vector".  ``InvalidSchedule`` is a ``ValueError``
+subclass, so a caller catching ``ValueError`` is unaffected in type; a caller
+catching ``InvalidSchedule`` now sees an unstructured error.
+
+This is a genuine degradation and it is not repairable at this boundary: the
+branch returns one plan and both consumers read it, so giving the LoopIR arm a
+repaired plan while giving the legacy arm the old refusal would need a mode flag
+inside a shared layer — worse than the cost it removes.  It is accepted with
+three qualifications: it touches only programs that already failed, only on the
+legacy *comparison* surface, and the LoopIR arm's disposition for those same
+shapes **improves** from "the automatic order is illegal" to a structured defect
+code naming the shape's actual violation.
+``test_the_legacy_comparand_still_refuses_this_family`` locks the property (no
+emission) without pinning the message.
+
+### 53.9 The two halves gate together, and the gating is measured
+
+§49.5 requires the family and the repair to be gated together.  Both halves were
+measured **out of process**, against source trees with one half reverted to
+``4644608`` and the import asserted to come from the reverted tree:
+
+| arm | the ten cells, automatic | admitted |
+| --- | --- | --- |
+| family only (CIN + target; scheduler at ``4644608``) | all ten at ``InvalidSchedule/sparse_parent_dominance`` | **0** |
+| repair only (scheduler; CIN + target at ``4644608``) | all ten at the family's own refusal — ``unsupported_sparse_output_domain`` or ``unsupported_program_shape`` | **0** |
+| both | three of the ten admitted; the other seven at their own codes | 8 over the frontier |
+
+The family-only arm also compiles three of the ten under their **declared**
+order, which is the positive control: the family works, and only the automatic
+order stands between it and the automatic arm.
+
+### 53.10 The other seven neighbours, each refused for its own reason
+
+Three of §49.5's ten are admitted.  The remaining seven are two plus five: the
+two §53.6 accounts for (``ds ij->i`` and ``dss ijk->i``, refused by the family's
+own prefix domain rule), and these five.  Measured at the final tip, both arms:
+
+| cell | disposition | why |
+| --- | --- | --- |
+| ``sss ijk->j`` | ``unsupported_sparse_output_domain`` | interleaving: its single result coordinate sits at position 1 between reductions at 0 and 2, so ``prefix + key_rank = 0 != 1`` and no split exists |
+| ``dds ijk->ij`` | ``unsupported_sparse_output_domain`` | ``(C, C)`` receiver → doubly-compressed family, whose row coordinate must be driven by a stored sparse level; ``dds``'s is dense |
+| ``sds ijk->ij`` | ``unsupported_sparse_output_domain`` | same family, whose column coordinate must be stored-sparse; ``sds``'s is dense |
+| ``sss ijk->ij`` | ``LoopIRTargetError/unsupported_program_shape`` | same family, admitted by CIN and then refused at the target's hierarchical compressed descent |
+| ``ssd ijk->ij`` | ``LoopIRTargetError/unsupported_program_shape`` | same |
+
+The four ``(C, C)`` receivers never reach the ordered-key branch at all —
+``_classify_sparse_output_family`` routes them to the doubly-compressed family
+first — and ``_bound_prefix_assembly_chain`` independently refuses that receiver,
+so the exclusion holds at both layers.
+
+### 53.11 Verification
+
+All gates ran in the ``scorch`` conda environment on the Apple M5 development
+machine.  Base is a detached worktree at ``4644608``.
+
+- **Release neutrality against ``4644608``: byte-identical.**  The 20-source
+  corpus 20/20 and the 42-source ``ss@dd`` grid 42/42 with no differing file; the
+  86-case schedule audit ``total=86 admitted=46 rejected=40 nonidentical=0`` on
+  both sides and identical between them.  This is the gate that would catch a
+  repair leaking into legacy default dispatch, and it does not fire — as the
+  refusal-only trigger requires.
+- **The 748-cell declared frontier at the final tip, reading BOTH LoopPlan
+  exits** (``InvalidSchedule`` and ``UnsupportedFeature``, from
+  ``LoopPlanDiagnostic.code``, never message text): **748 cells = 106 admitted +
+  444 defect codes + 198 loop-plan diagnostics, zero unclassified**, and three
+  arm-variant cells — the same three rank-3 dense-receiver neighbours outside the
+  envelope.  The three sums add to 748.  Against the sealed 98/387/263 baseline
+  the whole delta is the 65-cell firing set of 53.7 and nothing else, cell by
+  cell.  As §52.5 found, **none of the 748 reaches the second exit**, so reading
+  both is a property of the harness rather than a difference in these numbers —
+  stated so the figure is not mistaken for evidence that the second exit was
+  exercised here.
+- **Compiled public + erasure/oracle differential: 936 checks, zero failures**,
+  extending the inherited 648 by 288 to the new family with the same four checks —
+  exact ``(pos, crd)`` level storage against the scheduled-program oracle,
+  scheduled-versus-erased oracle equality, stored value agreement, and a dense
+  PyTorch reference — across both automatic arms, ``float32`` and ``float64``,
+  singleton/ragged/empty/zero extents, exact cancellation, and genuinely stored
+  operand zeros.
+- **Complete non-performance suite at the final code tip ``a0b5d6f``**,
+  eight file-disjoint partitions in fresh processes with per-partition ``TMPDIR``,
+  ``XDG_CACHE_HOME`` and ``TORCH_EXTENSIONS_DIR``: **6,203 selected nodes,
+  6,188 passed, 15 skipped, 3 deselected,
+  0 failures and 0 errors, every partition exiting 0**, all
+  eight at one revision.  Tallied independently from the eight JUnit XMLs rather than
+  from the driver's own JSON, and the JUnit total equals the pre-run selected count
+  exactly.  The pre-run proof places all 89 tracked modules
+  exactly once, shows the partition loads [775, 775, 777, 775, 775, 777, 775, 774] summing to
+  6,203, and reports module and node partitions both complete and both
+  disjoint.  The detached worktree was clean before and after.
+
+  **The node delta is accounted exactly.**  The base at ``4644608`` collects
+  **6,095**; this tip collects **6,203**, a net
+  **+108** made of **130 added and 22
+  removed**.  Added: **+102**
+  in the new ``test_loopir_bound_prefix_target``,
+  **+20**
+  in the reduction/TTM census, and
+  **+8**
+  in the ordered-key module.  Removed: the
+  10
+  ordered-key and
+  12
+  census parametrizations of the cells that migrated or were renamed.  Every removed
+  node is a renamed or re-parametrized lock, not a lost test; the ledger lists all
+  22 by name.
+- **Gates 1 and 2 are read out of those same JUnit XMLs** rather than from a separate
+  invocation, which is stricter: the suite ran every module exactly once at one
+  revision, so the two gates cannot disagree with the suite total.  Gate 1, the three
+  assembly-target files: **403 nodes, 402 passed, 0 failed, 0
+  errors, 1 skipped**.  Gate 2, the eleven adjacent memberships — CIN lowering,
+  schedule passes, loop-plan legality, LoopIR neutrality, pipeline execution,
+  LoopIR->LLIR lowering, scheduler, schedule API, the reduction/TTM census, schedule
+  generality and the CIN lowerer: **1180 nodes, 1180 passed, 0 failed,
+  0 errors, 0 skipped**.
+- **Statics.**  mypy reports **140 errors in 11 files on both arms, none in a
+  changed file**, at 146 lines each; the two outputs differ in **exactly one
+  line** and it is not an error — "checked 61 source files" on the fresh base
+  worktree against "checked 62" in the working tree, which is the untracked
+  working-tree-only ``src/scorch/gpu.py``.  (§52.9's "hash-identical" is
+  therefore too strong for any base that is a clean worktree; the error set is
+  what is identical.)  Flake8 differs between the arms only by the three
+  pre-existing F401s in untracked working-tree-only test modules, plus the
+  unchanged ``C901`` on ``_apply_schedule_legacy`` at a moved line.  Black is
+  clean on every changed file.  ``git diff --check`` exits 0 and the five
+  protected tracked files hash exactly as recorded.
+- **Representation unchanged.**  No node kind, no canonical schema change (v11
+  stands), no request- or schedule-identity change.
+- **No default dispatch, cache, selector or fallback change**, and no legacy
+  code removed.
+
+Two of the gate's own findings are worth recording because they were caught by
+the gate rather than by inspection: the neutrality run's mypy arm caught a new
+``"Stmt" has no attribute "body"`` error in the reduction sub-nest collector
+(fixed by narrowing inside each branch), and its flake8 arm caught an unused
+import in the new test module.  Both are fixed at the final tip.
+
+**One avoidable constant taken.**  §52.9 identified ``assemble_function``'s
+redundant ``self._validate()`` — ``signature()`` validates before doing anything
+— and left it for this session.  It is removed, with the body type-check moved
+behind ``signature()`` so a malformed-metadata call still fails on the metadata
+exactly as it did.
+
+**Paired compile-only latency.**  The ceiling for a compile-only integrity boundary on
+this branch is **1.10**.  Base is the detached worktree at ``4644608``; the candidate is
+the final-tip worktree.  Each measurement is a fresh subprocess importing exactly one
+source tree and timing the same 40-cell ordered-key compile-only grid (no JIT, no C++
+compiler); 20 rounds alternating the within-round order,
+4 warmups and 21 samples per process, plus a
+base-against-base A/A control in every round.  The grid checksum is asserted equal across
+all three measurements of every round, so the two arms compile byte-identical work
+(141162 characters of C++ over 40 cells, verified equal on both trees).  The machine was
+otherwise idle: the suite and the differential had both finished.
+
+| statistic | min | p50 | mean | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| A/B ratio (median) | 0.9934 | 1.0008 | 1.0005 | 1.0048 | **1.0048** |
+| A/A control (median) | 0.9894 | 1.0009 | 1.0004 | 1.0074 | **1.0103** |
+| A/B ratio (min-of-samples) | 0.9925 | 1.0001 | 1.0005 | 1.0079 | **1.0089** |
+| A/A control (min-of-samples) | 0.9935 | 1.0020 | 1.0011 | 1.0061 | **1.0140** |
+
+Pooled fastest-sample A/B 1.0021; pooled A/A
+1.0018.  Order controls: base-first mean
+1.0016, candidate-first mean
+0.9994.
+
+**Every declared statistic, including the min-of-samples row, is at or below 1.10; the
+largest anywhere is 1.0140 — and it is an A/A control number, not an A/B one.**  The
+largest A/B statistic is **1.0089**, the min-of-samples maximum, against an A/A
+min-of-samples maximum of 1.0140.  Headroom against the ceiling is ~9%, against
+the inherited candidate's 0.4%.
+
+**§52.9's min-of-samples offset does not persist, and the causal question it
+asked is answerable only in part.**  The inherited candidate showed a consistent
+~6-7% per-round min-of-samples offset that its A/A control did not show; here the
+A/B min-of-samples row sits *below* its own A/A control at every statistic
+(mean 1.0005 against 1.0011, max 1.0089 against 1.0140), so there is no residual
+offset left to explain and nothing further to find.  What this run cannot do is
+attribute the disappearance: its base is ``4644608``, which already contains the
+code that produced the inherited offset, so the A/B ratio measures only this
+session's delta — the family, the target extension, the repair, and the removed
+redundant validation.  The honest statement is that the offset is absent at this
+tip, not that removing ``assemble_function``'s second ``self._validate()`` is
+proven to have been its whole cause.  Settling that would need a three-way
+measurement against ``ab0c19f``, which is not worth a gate.
+
+### 53.12 Phase-7 exit audit, re-run
+
+*Migrated families complete over their proven envelopes.*  Yes for the new
+family over its measured reach: eight frontier cells plus the dense-prefix cell,
+all executed through the real JIT path against the oracle and PyTorch in both
+arms and both dtypes.  The reach is smaller than §52.6 predicted in two cells
+and larger in five, and 53.6 says which and why.
+
+*Every neighbour carries a stable fail-closed disposition.*  Yes, re-measured
+over 748 cells: 444 defect codes, 198 loop-plan diagnostics across both exits,
+**zero unclassified**, none carrying a ``defect`` attribute.  Fifty-seven
+neighbours now carry a *more specific* code than before, which is an improvement
+in diagnosis and a change in the record either way.
+
+*Representation unchanged.*  Yes.  v11 stands.
+
+*Release behaviour unchanged.*  Yes, and measured: corpus 20/20 and grid 42/42
+byte-identical, the 86-case audit identical, no dispatch, cache, selector or
+fallback change.
+
+*Compiler latency within the declared ceiling.*  See 53.11's latency table.
+
+*The declared matrix is closed.*  **No.**  Blocker 2 is now built; blocker 3 —
+row-scope dense prefixes at rank >= 3 — is untouched, and blocker 1 stays closed
+by decision rather than by migration.
+
+**Phase 7 is NO-GO, on blocker 3.**  No Phase-8 inventory, cutover, cache,
+selector or default-dispatch change was made; no fallback was weakened and no
+legacy code was deleted.
+
+### 53.13 What this section does not do
+
+- **Blocker 3 is untouched.**  A DENSE result prefix level bound by a STORED
+  loop still needs the row-scope catch-up against a dynamic parent count at
+  depth, and is still rejected up front with
+  ``unsupported_sparse_output_domain``.  Note that the bound-prefix family does
+  admit a dense result prefix (``dsss ijkl->ijk`` into ``dss``) — but only when
+  that level iterates a *dense* domain, which is the rule blocker 3 is about.
+- **The 1139-cell frontier extension was not re-run.**  It is the first item on
+  this session's declared sacrifice list, and the 748-cell declared frontier was
+  run instead, at the final tip, reading both exits.
+- **The heavy legacy sweep for the eleven unsound-claimed cells was not run**,
+  so §52.8's scoping note stands unchanged: their arm-invariance is still
+  unmeasured and three of them are configuration-dependent.
+- **A merged reduction domain is refused, not supported.**  The family's
+  sub-nest admits dense and single-cursor sparse loops only; a merged reduction
+  fails closed at CIN with ``unsupported_merged_reduction`` and, defensively, at
+  the target.
+- **No cross-host run.**  Every gate here is the Apple M5 machine.
