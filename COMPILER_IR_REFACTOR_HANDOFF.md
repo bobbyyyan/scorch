@@ -31232,3 +31232,131 @@ non-ADD reductions, COO/singleton levels or wider contractions.
 **Phase 7 remains NO-GO**, on the same three blockers.  No Phase-8 inventory,
 cutover, cache, selector or default-dispatch change was made; no fallback was
 weakened; no legacy code was deleted.
+
+## The ABI signature across the completion window, the extended frontier, and blocker 1 decided (2026-08-11; supersedes every preceding prompt)
+
+Three local commits follow inherited committed tip ``ab0c19f``; nothing was
+pushed, amended, squashed, reordered or discarded, and no ``git stash`` was run.
+**Origin is ``a3b8d1e``** — ``git ls-remote`` resolves this branch on origin to
+it, and ``.git/packed-refs`` still carries the stale ``58e8565`` for the
+remote-tracking ref and the staler ``cb49ff7`` for the local branch, so that file
+was read for nothing here.  The ordered-key vertical, the completion seal and the
+post-assembly window are **published**; the standing "all LOCAL-ONLY" note stays
+obsolete.  This session pushed nothing.  The five protected tracked files hash
+exactly as recorded.  Evidence ledger:
+``~/.cache/scorch-codex/orderedkey-abi-signature-window/`` (new; it does not
+extend ``orderedkey-window-structural``, whose manifest stays valid for what it
+sealed).
+
+**What this milestone lands.**  One compiler change, plus three of the four gates
+§51.9 recorded as absent, plus the frontier at the exact tip and extended, plus a
+decision on blocker 1.  Review §52 owns the detail.
+
+**The defect.**  §51's move covers the completion window by structure — but its
+reference is a **body**, and ``llir.Function`` stores four fields.  Measured at
+``ab0c19f`` by patching the last completion stage: renaming the function,
+rewriting the return type, dropping an argument, and renaming an argument each
+**compile**, three of them putting a corrupted public signature into the emitted
+C++.  Codegen type-checks the argument *elements* and never which arguments they
+are, so it is a type backstop and not a content one; and no identity requirement
+in the window observes any of the three fields, because every completion stage
+returns the object it was handed.
+
+**The closure adds no comparison.**  ``TorchCppKernelABI.signature()`` becomes
+the one source for the spelling ``assemble_function`` emits; the checkpoint
+captures it from that authority before the pass manager, so ABI assembly is
+covered too, not only the four stages after it; and the boundary compares the
+assembled function's four stored fields inside the **existing** traversal, as one
+wrapper sequence — so the comparator is still entered exactly once per
+ordered-key compile, and because the queue pops from the tail the O(#args)
+members settle before the body walk.  The root's stored field set is additionally
+required to be exactly the four declared fields.
+
+**Two inherited claims corrected.**  ``returned is assembled`` is **not** the
+fused-plan tripwire §51.4 called it: all four completion stages return their
+input — ``_complete_result_tile_impl`` and ``_complete_relayout_impl`` each have
+exactly one return expression, ``function``, and both rewrite nested loop bodies
+in place — so a fused plan satisfies it.  The gate that refuses such a plan is
+the structural comparison, which is what a fused replay contract must extend.
+And the exact-root requirement should **not** move to codegen: codegen already
+fails closed for every family on a ``Function`` subclass
+(``CodegenError: No C++ codegen implemented for LLIR node type: HostileFunction
+at root``), so keeping the check here buys diagnosis ownership only, which is
+sufficient and does not touch a layer shared with legacy dispatch.
+
+**The window matrix is seventeen classes with zero gaps and zero foreign hook
+invocations**, and two non-rejections are recorded as such: a wholesale
+``__dict__`` swap that preserves every read field is accepted by design (its
+reordering and renaming variants are refused), and a pass that walks the caller's
+frame to rewrite the reference and the body consistently compiles — the
+boundary's stated threat-model limit rather than a closable gap.
+
+**The frontier.**  The declared 748 reproduce **exactly** at the tip — 98
+admitted, 387 defect codes, 263 loop-plan diagnostics, zero unclassified — and
+the extension adds 391 cells (rank 6, non-ADD reduction operators, COO/singleton
+levels, multi-operand contractions beyond TTM, and zero/degenerate extents
+crossed with every receiver) for **1139 cells: 199 admitted, 580 defect codes,
+360 loop-plan diagnostics, zero unclassified, three arm-variant**.  The three
+arm-variant cells are the same three rank-3 dense-receiver neighbours outside the
+ordered-key envelope, so the scoped arm-invariance claim stays honest and the
+unscoped one stays false.  **A harness defect surfaced**: the LoopPlan legality
+layer has two exits and the inherited harness read only one, so a rejected
+neighbour's stable identifier is a three-way classification —
+``defect`` code, ``InvalidSchedule`` diagnostic (327), or ``UnsupportedFeature``
+diagnostic (33).  None of the 748 reaches the second exit, which is why reading
+one looked complete.
+
+**The legacy census ran, and the expensive claim holds.**  666 crash-isolated
+measurements with ``RLIMIT_CPU``/``RLIMIT_CORE`` and a timeout: all ten
+sound-claimed cells are sound at **60 of 60** configurations each (five shapes ×
+two dtypes × both arms × three densities), and LoopIR executed and matched the
+dense reference on all 666.  **One correction**: three of the eleven unsound
+cells — ``dss ijk->k``, ``sss ijk->k``, ``ssss ijkl->il`` — are sound at 2 of 6
+configurations, becoming sound exactly when the outer reduced extent collapses to
+1, so their disposition is configuration-dependent rather than a property of the
+cell.  The unsound-claimed cells ran arm 0 / f32 only, so §50.6's
+"arm-invariant" is re-confirmed for the sound ten and **not** for the unsound
+eleven.
+
+**Blocker 1 is decided: TTM ``dds`` is not migratable under the current
+automatic origin**, and the fused workspace-plus-tile contract is declined — on
+four costs, one of them newly priced: a fused contract needs the detaching mirror
+to reproduce ``_complete_result_tile_impl``'s in-place nested rewrites, which is
+§50.3's drift problem again for a far larger stage.  It would also be the first
+arm-variant migrated family (the non-regblock OUTERMOST placement is illegal, not
+unimplemented), there is no correctness pressure (legacy's neighbouring TTM
+``sss`` route is unsound at 0 of 6 configurations per cell), and it buys two
+census cells in one arm.  This is a closed decision, not a permanent
+impossibility: it turns on the tile heuristic living in a layer shared with
+legacy default dispatch, which is a Phase-8 question.
+
+**Not addressed.**  **Blocker 2 is re-derived but not built.**  Its accounting is
+now exact: nine of the ten cells are genuine K == 0 bound-prefix scalar
+accumulation, ``sss ijk->j`` is interleaved between two reductions and is a
+different construction, and of the nine, four have ``(C,C)`` receivers that route
+to the doubly-compressed family before the ordered-key branch is consulted — so a
+K == 0 family reaches exactly five cells: ``ss ij->i``, ``ds ij->i``,
+``sss ijk->i``, ``dss ijk->i``, ``ssss ijkl->ijk``.  No schema change is needed,
+checked against the node definitions rather than asserted: ``WorkspaceDecl`` is
+bound to a ``TileId`` and ``SparseWorkspaceDecl`` requires >= 1 key dimension, so
+neither can express a rank-0 accumulator, and the accumulator is an LLIR local
+exactly as every other family's is — **v11 stands**.  Two findings should govern
+the next estimate: the host is **not** a new target but
+``_MultiCompressedAssemblyLowering``, which already admits these receivers
+(dense prefix over compressed suffix, including the degenerate rank-1
+all-compressed) and already emits the per-level append, segment close,
+dense-prefix catch-up and root close — its only bar is ``not reduce_update``, and
+the missing construction is a reduction sub-nest below the innermost assembly
+loop accumulating into a scalar the ``AppendEntry`` reads; and the repair seam is
+``Scheduler.auto_schedule_plan``, which release dispatch does not consume, where
+— unlike the tiles, which ``_verify_tiling_capabilities`` pins to a re-derived
+heuristic and which is why §51.11's suppression was refused at
+``auto_tile_decision`` — the loop **order** is checked only for legality.
+**Blocker 3 is untouched.**  The compiled public differential over the twenty
+migrated cells and the erasure/oracle differential are the fourth absent gate.
+Every gate is the Apple M5 machine; no cross-host run.
+
+**Phase 7 remains NO-GO**, on blockers 2 and 3, with blocker 1 closed by
+decision rather than by migration.  No Phase-8 inventory, cutover, cache,
+selector or default-dispatch change was made; no fallback was weakened; no legacy
+code was deleted.
