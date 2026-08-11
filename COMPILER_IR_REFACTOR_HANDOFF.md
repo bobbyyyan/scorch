@@ -31671,3 +31671,178 @@ here; no fallback was weakened; no legacy code was deleted.  A GO permits a
 opt-in shadow pilot for already-proven families.  Every gate in §§49-54 is the
 Apple M5 machine; a cutover decision about release behaviour on a branch whose
 value is generated-code equivalence should not rest on one host.
+
+## The extended frontier, the eleven cells' arm-invariance, and a read-only Phase-8 cutover census (2026-08-11; supersedes every preceding prompt)
+
+Two local commits follow inherited committed tip ``6e8e09c`` — one test, one
+documentation — and **no production file changed**: ``git diff 6e8e09c..HEAD --
+src/ csrc/`` is empty.  Nothing was pushed, amended, squashed, reordered or
+discarded, and no ``git stash`` was run.  **Origin is ``a3b8d1e``** —
+``git ls-remote`` resolves this branch on origin to it, and ``.git/packed-refs``
+still carries the stale ``58e8565``/``cb49ff7``, so that file was read for
+nothing here.  The inherited tip was **fourteen** commits ahead of origin, not
+thirteen.  The five protected tracked files hash exactly as recorded.  Evidence
+ledger: ``~/.cache/scorch-codex/phase8-census-frontier-ext/`` (new).
+
+**What this milestone lands.**  The two measurements §54.8 named as the next
+session's opening duties, and the read-only census they are inputs to.  Review
+§55 owns the detail.  **Phase 7 stays GO.  A Phase-8 cutover is NO-GO on this
+evidence, and the census says exactly why.**
+
+**1. The 1139-cell frontier extension ran, and it exonerates blocker 3 while
+convicting blocker 2.**  Base ``bb7f391`` and final ``6e8e09c``, both pinned
+detached worktrees, both LoopPlan exits read off ``LoopPlanDiagnostic.code``.
+Final: **248 admitted / 652 defect codes / 239 loop-plan diagnostics / 0
+unclassified / 3 arm-variant**.  The declared 748 subset reproduces
+**135 / 415 / 198 exactly**, and the base subset reproduces §54.1's
+106 / 444 / 198 exactly.  **The extension-only 391 cells are identical at both
+tips**: all **33** moved cells are in the declared 748 — 29 to ADMITTED, 4 to the
+auto-tile seam, arm 1 identical, zero admitted cells lost.  For blocker 3 the 748
+was a faithful proxy.
+
+For **blocker 2** it was not, and that is the finding that justifies the run.
+§52.5's own receipt was diffed against ``bb7f391`` **cell by cell** (cell order
+matches exactly, so this is a pairing and not a subtraction of summaries):
+**121 cells moved**, 65 in the declared 748 — precisely §53.7's "exactly 65
+cells" — and **56 in the extension**, every one leaving
+``sparse_parent_dominance``, **12 of them to ADMITTED**.  So §53.7's headline is
+748-scoped and the repair's measured scope is **20 newly admitted, not 8**, and
+**101 re-dispositioned, not 57**, with zero admitted lost.  The twelve include
+``ssssss ijklmn->ijk [sss]`` (rank 6) and ``3-factor sss x d x d -> s`` (a
+three-operand vector contraction) — families the declared envelope never names,
+covered by no differential.  Three deferrals cost an understated admitted set by
+a factor of two and a half for two milestones.
+
+**2. The blocker-1 seam is FOURTEEN cells in arm 0 and twelve in arm 1**, not the
+six the prompt says to budget for and not §52.7's two.  The two numbers come from
+different enumerations and ``2 + 4`` mixes them.  Enumerated: ``TTM dds x
+{dd,ss,ds,sd} -> dds`` (§52.7's family, of which only two are legacy-census
+cells), ``TTM sds x {...} -> dds`` (blocker 3's four), ``TTM ddd x {...} -> dds``
+(four, named in neither section), and ``ddd ijk->k [d]`` / ``ddd ijk->ik [dd]``
+in arm 0 only.  All fail closed with structured codes; none is in the extension.
+
+**3. The eleven unsound-claimed cells are arm-invariant, and there is a FOURTH
+configuration-dependent cell.**  The heavy sweep the ten sound cells got — five
+shapes x two dtypes x **both arms** x three densities, crash-isolated — was run
+on the eleven: **720 measurements, 330 paired configurations, ZERO arm-variant**,
+zero contradictions, and LoopIR correct on all 720.  §50.6's arm-invariance claim
+for the eleven, which §52.8 explicitly could not confirm, is confirmed.  But
+§52.8's *three* configuration-dependent cells are **four**: ``ssss ijkl->l`` is
+sound at 4 of 60.  §52.8 missed it because its lean density set is
+``{0.4, 0.9}`` and every sound configuration of that cell is at **0.15** — the
+density axis, not the shape axis.  And §52.8's mechanism ("sound exactly when the
+outer reduced extent collapses to 1") is incomplete: every additional sound
+configuration occurs at density 0.15 at shapes that do not collapse.  **Legacy's
+soundness for these cells is data-dependent, not shape-dependent** — a cell can
+measure SOUND on a sparse draw and UNSOUND at the same shape on a denser one.  No
+finite sweep can certify them.
+
+**4. The read-only Phase-8 cutover/fallback census.**  Production **never reaches
+the typed route**: ``compile_cin_via_loopir``/``execute_cin_via_loopir`` have zero
+non-test callers, no dynamic import, no env flag.  All 1139 cells were run
+compile-only through three columns — typed, legacy under the same empty
+``Schedule()``, and legacy under **no** schedule (what default dispatch really
+runs).  Quadrants vs default dispatch: **A** typed-admits/legacy-emits **228**,
+**B** typed-admits/legacy-refuses **20**, **C** typed-refuses/legacy-emits
+**703**, **D** both refuse **188**.  C is the fallback load: production would keep
+working on 703 of 1139 cells only because legacy answers, and legacy is
+characterized for 21 cells, four of them data-dependent.
+
+**The number that decides the cutover**: over the 496 admitted cell-arms, the
+typed route is byte-identical to legacy on **112** and emits **different** code on
+**344** (40 more, legacy refuses outright).  The differences are structural, not
+cosmetic — on ``ss ij->j [s]`` the typed route emits 2,218 characters against
+legacy's 2,845, draining the workspace straight into the result and deleting a
+whole second pass.  **The 112 are essentially exactly the dense-receiver cells.**
+So: **a cutover is an equivalence-preserving refactor only for dense receivers;
+for every sparse-receiver family it is a behaviour change**, needing per-family
+correctness evidence (the 1,944-check differential covers the migrated families
+and nothing else — 113 extension-only admitted cells have none) and per-family
+*kernel performance* evidence, which no gate on this branch has ever collected
+because compile-only latency measures the compiler, not the kernel.
+
+Also recorded: an empty ``Schedule()`` is **not identity** on the legacy path —
+it changes legacy's outcome on 662 of 1139 cells — so neutrality arguments must
+not migrate between that surface and release default dispatch.
+
+**5. Carried item (a), decided — and §53.8's mechanism corrected.**  ``ValueError:
+ivar_j is not in list`` is **not** replay-induced.  Read off the traceback, the
+raising frame is ``cin.py:841`` ``level_of_index_var``, from
+``cin_lowerer.py:734`` ``lower_TensorAssign``, and **the same frame raises with no
+requested schedule at all** — plain default dispatch, which never consults
+``apply_schedule``.  It is not 18 programs on one surface: it is **140 cells on
+default dispatch**, legacy's single largest refusal class there.  **Decision:
+record the limit, do not repair this boundary** — the boundary is not the defect
+site, and a structured refusal belongs in the legacy CIN lowerer, which is shared
+with release default dispatch and out of scope for a read-only session.
+``test_the_legacy_unstructured_refusal_is_not_repair_induced`` locks the
+corrected mechanism, asserting the frame structurally and never the message.
+
+**6. Carried item (c) taken.**  §53.7's two locked neighbours become **28** — the
+whole set expressible as one-operand reductions whose repair precondition holds,
+spanning three of the four codes.  The fourth, ``unsupported_union_with_dense``,
+needs a two-operand combiner and stays uncovered, stated rather than glossed.
+
+**Not addressed.**  **Carried item (b), the cross-host run, is BLOCKED, not
+skipped**: ``redwood`` is reached through the ``myth`` proxy, which accepts only
+keyboard-interactive auth (password + Duo), and the long-lived control master has
+expired.  A Kerberos ticket is present and is not sufficient.  Every gate here is
+still the Apple M5 machine.  To unblock, establish the master interactively once
+(``ssh -fN myth``) and the frontier, census and sweep harnesses in this ledger all
+take a tree root as their first argument and will run there unchanged.
+
+**Gates.**  **No production file changed** — ``git diff 6e8e09c..HEAD -- src/
+csrc/`` is empty — so release neutrality is proven by construction and the
+measurement is confirmation.  Corpus **20/20**, grid **42/42**, audit
+``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides and identical
+between them; mypy **hash-identical** (146 lines) and flake8 **hash-identical**
+(47 lines); black's stdout identical and its stderr differing **only in the tree
+path**, same 15 pre-existing targets, the changed file in neither list.  The
+empty-``Schedule()`` surface: 118 cases, legacy emitting for the same **100**
+with identical digests, the LoopIR arm identical at **52**, and **zero refusal
+records changed**.  Full non-performance suite at the production+test tip
+``3b6b24f``: **6,309 selected / 6,294 passed / 15 skipped / 3 deselected / 0
+failed / 0 errors**, eight file-disjoint partitions all exiting 0 at one
+revision, module and node partitions complete and disjoint, worktree clean before
+and after.  Node delta from 6,282 is **+27 with nothing removed** — +26 from the
+parametrize expansion and +1 for the new test.  Gate 1 **522 nodes / 521 passed /
+1 skipped**; gate 2 **1,180 nodes / all passed**, identical to §54.6 as an
+unchanged production tree requires.  Paired compile-only latency: A/B median max **1.0133** against an A/A control max of **1.0301**, A/B min-of-samples max 1.0124 against A/A 1.0259, A/B mean **0.9993**, pooled fastest-sample A/B 0.9967 vs A/A 0.9977, order means 0.9971 base-first / 1.0015 candidate-first, grid checksum 141162 over 40 cells asserted equal in all 60 measurements.  **Every statistic is at or below the 1.10 ceiling; the largest anywhere is an A/A number.**  It is structurally an A/A because both trees' ``src/`` are byte-identical, and it is reported as a noise-floor calibration (~+-1.5% median, ~+-1.3% min-of-samples on this host) rather than as a passed cost gate.
+
+**Two harnesses were found reporting someone else's evidence.**
+``latency/run_latency.sh`` hardcoded ``~/.cache/scorch-codex/rowscope-blocker3``
+as its ledger root — the same defect §54.6 caught in ``suite_report.py``, one
+directory over.  Both the root and the two trees are parameters now, and the root
+derives from the script's own location.  ``HARNESS_PROVENANCE.md`` records this
+and states exactly what scope each harness ran at.
+
+## What the next session should do
+
+**Do not attempt the cutover on this evidence.**  The census says why, and the
+three blockers below are what would have to change.  In priority order:
+
+1. **Get a second host.**  This is now the cheapest high-value item and it is
+   blocked only on one interactive step: ``ssh -fN myth`` with the Duo prompt
+   answered, after which ``redwood`` is reachable and every harness in this
+   ledger takes a tree root as ``$1``.  The frontier extension takes ~45 s, the
+   dual census a few minutes, the byte-equivalence census a few minutes.  If the
+   1139-cell dispositions and the 112/344 byte-equivalence split reproduce on
+   x86, four milestones' worth of single-host caveat closes at once; if they do
+   not, that is the most important thing anyone could learn about this branch.
+2. **Decide the dense-receiver shadow pilot.**  It is the one cutover-shaped step
+   the census supports: 112 cell-arms where typed and legacy emission are
+   byte-identical *by measurement*, enumerated in
+   ``census/equiv_1139.json``.  Opt-in, no default-dispatch change.
+3. **Price the sparse-receiver families honestly.**  A cutover changes emitted
+   code on 344 admitted cell-arms, and **no gate on this branch has ever measured
+   an emitted kernel's runtime** — compile-only latency measures the compiler.
+   Until a kernel-performance harness exists for the migrated families, "the
+   typed route emits better code" is an inspection claim, not a measurement.
+4. **Re-run the extension on any milestone that reshuffles diagnostics.**  The
+   748 was a faithful proxy for blocker 3 and a poor one for blocker 2; the
+   discriminator is whether the change touches a rule that many families reach,
+   not how big the change looks.
+
+**Do not reopen:** whether ``ds ij->i`` / ``dss ijk->i`` / ``TTM sds x * -> dss``
+should migrate.  Still a deliberate seam and still Bobby's design decision.
+Blocker 1 stays closed by decision; 55.3 resizes its hole, it does not reopen it.
