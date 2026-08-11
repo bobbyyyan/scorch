@@ -444,6 +444,77 @@ def test_a_merged_reduction_domain_is_refused_at_cin(arm):
     assert error.value.defect.code == "unsupported_merged_reduction"
 
 
+def test_the_generated_accumulator_identifier_is_name_reserved():
+    """An input spelled ``C_reduction`` fails closed, it does not shadow.
+
+    The accumulator's C++ identifier goes through the same
+    ``_reserve_generated_name`` authority as every merge temporary, so a user
+    tensor that happens to spell it collides at the reservation rather than
+    silently aliasing the accumulator inside the emitted kernel.  §53.11
+    measured this and left it untested; it is a unit test now.
+    """
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("C_reduction", fmt="ss", dtype=torch.float32)[i, j]
+    c = TensorVar("C", fmt="s", dtype=torch.float32)[i]
+    cin = ForAll(i, ForAll(j, TensorAssign(c, a, op=Operation.ADD)))
+    with pytest.raises(LoopIRTargetError) as error:
+        compile_cin_via_loopir(
+            cin,
+            (EXTENT["i"],),
+            (((EXTENT["i"], EXTENT["j"]), torch.float32),),
+            compile_options=auto_options(False),
+        )
+    assert error.value.defect.code == "generated_name_collision"
+    assert "C_reduction" in error.value.defect.message
+
+
+@pytest.mark.parametrize(
+    "cell,code",
+    [
+        # ``forced`` moves the last free variable inward and lands on an order
+        # the result's own storage-order rules refuse, so the repair has a
+        # pre-forced order to fall back to and these cells reach a rule that
+        # describes their SHAPE.  Each carries a different code, which is the
+        # point: the repair's generality is what makes three distinct
+        # shape-specific diagnoses reachable instead of one order complaint.
+        (("sss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("sss", "ss", "ijk", "ij"), "unsupported_program_shape"),
+    ],
+    ids=lambda value: str(value),
+)
+def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
+    """§53.7's 57 moved neighbours: two of them, recorded rather than incidental.
+
+    The repair is deliberately general -- it fires wherever the forced reorder
+    produced an order the storage-order rules refuse and the unforced order is
+    legal -- so 57 refused neighbours gained a code naming their own violation.
+    That improvement was measured over the frontier and never locked.  Two of
+    them are locked here, and the measured precondition for each is that
+    ``select_loop_order``'s forced order really does differ from its pre-forced
+    one; a cell where the two agree cannot be in the moved set at all.
+    """
+
+    operand_fmt, result_fmt, operand_indices, result_indices = cell
+    options = auto_options(False)
+    pre_forced = []
+    forced = Scheduler.select_loop_order(
+        normalize_cin(
+            reduction_cin(
+                operand_fmt, result_fmt, operand_indices, result_indices, torch.float32
+            ),
+            compile_options=options,
+        ),
+        costs=options.scheduler.cost_model,
+        pre_forced_order=pre_forced,
+    )
+    assert [v.name for v in forced] != [v.name for v in pre_forced]
+
+    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
+        compiled(cell, False)
+    assert error.value.defect.code == code
+
+
 # -- the gating ---------------------------------------------------------------
 
 
