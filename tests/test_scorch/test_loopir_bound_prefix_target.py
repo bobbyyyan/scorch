@@ -480,21 +480,62 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
         # describes their SHAPE.  Each carries a different code, which is the
         # point: the repair's generality is what makes three distinct
         # shape-specific diagnoses reachable instead of one order complaint.
-        (("sss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        #
+        # This is the whole lockable set at this tip, enumerated rather than
+        # sampled: every rank-2 and rank-3 reduction cell for which the repair
+        # precondition holds (forced order differs from pre-forced), whose code
+        # is shape-specific, and which is arm-invariant.  §53.7's fourth code,
+        # ``unsupported_union_with_dense``, needs a two-operand combiner and so
+        # cannot be expressed through ``reduction_cin``; it stays uncovered here
+        # and that is stated rather than left to look complete.
+        (("ssd", "ss", "ijk", "ij"), "unsupported_program_shape"),
+        (("ssd", "ds", "ijk", "ij"), "unsupported_program_shape"),
         (("sss", "ss", "ijk", "ij"), "unsupported_program_shape"),
+        (("sss", "ds", "ijk", "ij"), "unsupported_program_shape"),
+        (("dds", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
+        (("dds", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
+        (("dds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("ds", "s", "ij", "i"), "unsupported_sparse_output_domain"),
+        (("dsd", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
+        (("dsd", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
+        (("dsd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("dss", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
+        (("dss", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
+        (("dss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("sds", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
+        (("sds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("ssd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("sss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
+        (("dds", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("dds", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("dsd", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("dsd", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("dss", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("dss", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("sds", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("sds", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("ssd", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        (("sss", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
     ],
     ids=lambda value: str(value),
 )
 def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
-    """§53.7's 57 moved neighbours: two of them, recorded rather than incidental.
+    """§53.7's moved neighbours: the whole lockable set, not a sample.
 
     The repair is deliberately general -- it fires wherever the forced reorder
     produced an order the storage-order rules refuse and the unforced order is
     legal -- so 57 refused neighbours gained a code naming their own violation.
-    That improvement was measured over the frontier and never locked.  Two of
-    them are locked here, and the measured precondition for each is that
-    ``select_loop_order``'s forced order really does differ from its pre-forced
-    one; a cell where the two agree cannot be in the moved set at all.
+    That improvement was measured over the frontier and only two cells were
+    locked.  All 28 that are expressible as one-operand reductions are locked
+    here, spanning the three codes reachable that way, and the measured
+    precondition for each is that ``select_loop_order``'s forced order really
+    does differ from its pre-forced one; a cell where the two agree cannot be in
+    the moved set at all.
+
+    Blocker 3 has since ADMITTED part of §53.7's original 57, so this set is the
+    lockable remainder at this tip rather than a subset of that historical
+    number -- which is why each cell's code is asserted rather than assumed from
+    the §53.7 split.
     """
 
     operand_fmt, result_fmt, operand_indices, result_indices = cell
@@ -515,6 +556,78 @@ def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
     with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
         compiled(cell, False)
     assert error.value.defect.code == code
+
+
+def test_the_legacy_unstructured_refusal_is_not_repair_induced():
+    """``ValueError: ivar_* is not in list`` is legacy's OWN default-path limit.
+
+    §53.8 records this refusal as a degradation the plan-replay boundary
+    introduced: ``apply_schedule`` propagates only the plan, the legacy lowering
+    replays it, and the repaired order has no legacy form.  That mechanism is
+    not what happens.  The same ``ValueError`` is raised from the same frame
+    with **no requested schedule at all** -- that is, on plain default dispatch,
+    which never consults ``apply_schedule`` and so cannot be replaying anything.
+
+    The refusal therefore belongs to the legacy CIN lowerer, not to the replay
+    boundary: ``lower_TensorAssign`` asks ``level_of_index_var`` for the level of
+    a REDUCED index variable, which by construction is absent from the result's
+    sorted index vars, and ``list.index`` raises.  It is a standing limit of the
+    legacy route rather than a regression this branch caused, which is why the
+    honest disposition is to record it deliberately instead of repairing a
+    boundary that is not the defect site.
+
+    The frame is asserted structurally rather than by message text, exactly as
+    every other disposition on this branch is read.  The cell is chosen so the
+    contrast is visible in one test: the TYPED route admits this program, so a
+    cutover would replace an unstructured legacy ``ValueError`` with a working
+    kernel here, not merely with a better diagnostic.
+    """
+
+    import traceback
+
+    from scorch.compiler.loopir.pipeline import legacy_generated_cpp
+
+    cell = ("ss", "s", "ij", "i")
+    operand_fmt, result_fmt, operand_indices, result_indices = cell
+    shape, result_shape = shapes_for(operand_indices, result_indices)
+
+    def legacy_frame(options):
+        with pytest.raises(ValueError) as error:
+            legacy_generated_cpp(
+                reduction_cin(
+                    operand_fmt,
+                    result_fmt,
+                    operand_indices,
+                    result_indices,
+                    torch.float32,
+                ),
+                result_shape,
+                ((shape, torch.float32),),
+                compile_options=options,
+            )
+        # Unstructured: an InvalidSchedule would carry LoopPlanDiagnostics.
+        assert not isinstance(error.value, InvalidSchedule)
+        assert not getattr(error.value, "diagnostics", ())
+        return traceback.extract_tb(error.tb)[-1]
+
+    default_dispatch = CompileOptions.from_environment(
+        environ={}
+    ).with_regblock_enabled(False)
+    assert default_dispatch.requested_schedule is None
+
+    without_schedule = legacy_frame(default_dispatch)
+    with_empty_schedule = legacy_frame(auto_options(False))
+
+    # Same raising frame with and without a schedule: the boundary is not the
+    # cause.  ``level_of_index_var`` lives in CIN, below the scheduler entirely.
+    assert without_schedule.name == "level_of_index_var"
+    assert with_empty_schedule.name == "level_of_index_var"
+    assert without_schedule.filename.endswith("compiler/cin.py")
+    assert with_empty_schedule.filename == without_schedule.filename
+
+    # And the typed route does not merely diagnose this shape better: it
+    # compiles it.
+    assert compiled(cell, False).cpp_source
 
 
 # -- the gating ---------------------------------------------------------------
