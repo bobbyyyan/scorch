@@ -517,16 +517,30 @@ class TorchCppKernelABI:
             for name in self.extra_tensor_names
         ]
 
+    def signature(self) -> Tuple[llir.DataType, str, List[llir.Var]]:
+        """The frozen public signature: return type, name, fresh arguments.
+
+        One source for the spelling :meth:`assemble_function` emits, so a
+        boundary that needs to state what the signature *must* be can ask for
+        it rather than restating the policy.  Every call is a pure function of
+        this frozen metadata and returns freshly built, unshared arguments, so
+        asking twice cannot alias the assembled function's own state.
+        """
+
+        self._validate()
+        return (llir.DataType.TACO_TENSOR, self.function_name, self.emit_arguments())
+
     def assemble_function(self, body: List[llir.Stmt]) -> llir.Function:
         """Wrap one verified body in a fresh ABI-owned function signature."""
 
         self._validate()
         if type(body) is not list:
             raise TypeError("kernel function body must be an exact LLIR list")
+        return_type, name, args = self.signature()
         return llir.Function(
-            return_type=llir.DataType.TACO_TENSOR,
-            name=self.function_name,
-            args=self.emit_arguments(),
+            return_type=return_type,
+            name=name,
+            args=args,
             body=list(body),
         )
 

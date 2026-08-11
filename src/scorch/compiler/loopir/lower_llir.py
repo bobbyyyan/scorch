@@ -13656,10 +13656,39 @@ class _OrderedKeyExpectedBody:
             )
 
 
+@dataclass(frozen=True)
+class _OrderedKeyCompletionReference:
+    """Everything the function this family returns is required to carry.
+
+    The body is the detaching mirror's output.  The other three members are the
+    ``llir.Function`` fields a body-only reference leaves unverified, and
+    leaving them unverified was measured rather than supposed: after the
+    reference is captured, dropping one argument, renaming the function, or
+    rewriting the return type each reaches the emitted C++ with a corrupted
+    public signature.  Every completion stage hands back the object it was
+    given, so no identity requirement in the window observes any of the three,
+    and the body comparison never reads them.
+
+    The signature is a pure function of the frozen ABI metadata, so it is
+    captured from that same authority before the pass manager runs and compared
+    on the far side of the completion window -- which covers ABI assembly
+    itself, not only the four stages after it.  It costs a handful of argument
+    nodes against a body of some hundreds of statements, and it is folded into
+    the single existing traversal rather than added beside it, so the comparator
+    is still entered exactly once per ordered-key compile.
+    """
+
+    body: List[llir.Stmt]
+    return_type: llir.DataType
+    name: str
+    args: List[llir.Var]
+
+
 def _ordered_key_expected_checkpoint(
     lowering: _TargetLowering,
+    kernel_abi: TorchCppKernelABI,
     body: List[llir.Stmt],
-) -> Optional[List[llir.Stmt]]:
+) -> Optional[_OrderedKeyCompletionReference]:
     """Build the detached exact post-pipeline body before callbacks can run."""
 
     if type(lowering) is not _OrderedKeySparseWorkspaceLowering:
@@ -13679,26 +13708,57 @@ def _ordered_key_expected_checkpoint(
             _SPARSE_WORKSPACE_LOST,
             "the ordered workspace checkpoint did not remain a statement list",
         )
-    return expected
+    try:
+        signature = kernel_abi.signature()
+    except (AttributeError, TypeError, ValueError) as error:
+        _fail(_SPARSE_WORKSPACE_LOST, str(error))
+    if (
+        type(signature) is not tuple
+        or len(signature) != 3
+        or type(signature[1]) is not str
+        or type(signature[2]) is not list
+    ):
+        _fail(
+            _SPARSE_WORKSPACE_LOST,
+            "the ordered workspace checkpoint could not capture an exact ABI "
+            "signature to require of the assembled function",
+        )
+    return_type, name, args = signature
+    return _OrderedKeyCompletionReference(
+        body=expected,
+        return_type=return_type,
+        name=name,
+        args=args,
+    )
 
 
 def _require_ordered_key_completion_checkpoint(
-    body: List[llir.Stmt],
-    expected: Optional[List[llir.Stmt]],
+    actual: List[object],
+    expected: Optional[_OrderedKeyCompletionReference],
 ) -> None:
-    """Require exact final structure and fresh managed-pass ownership."""
+    """Require exact final structure and fresh managed-pass ownership.
+
+    ``actual`` is the assembled function's four stored fields in the reference's
+    own order.  Wrapping them in one sequence keeps this a **single** comparator
+    entry -- the property §51.7 measured as free and a committed test locks --
+    and the comparator pops from the tail, so the O(#args) signature members are
+    settled before the body traversal starts.
+    """
 
     if expected is None:
         return
     try:
-        matches = _exact_sparse_completion_matches(body, expected)
+        matches = _exact_sparse_completion_matches(
+            actual,
+            [expected.body, expected.return_type, expected.name, expected.args],
+        )
     except Exception as error:  # noqa: BLE001
         _fail(_SPARSE_WORKSPACE_LOST, str(error))
     if not matches:
         _fail(
             _SPARSE_WORKSPACE_LOST,
-            "the managed pipeline changed the ordered workspace body or "
-            "returned shared ownership",
+            "the managed pipeline or a completion stage changed the ordered "
+            "workspace body, its ABI signature, or returned shared ownership",
         )
 
 
@@ -13706,7 +13766,7 @@ def _require_ordered_key_completed_body(
     returned: llir.Function,
     assembled: llir.Function,
     pipeline_body: List[llir.Stmt],
-    expected: Optional[List[llir.Stmt]],
+    expected: Optional[_OrderedKeyCompletionReference],
 ) -> None:
     """Verify the completion boundary on the body the CALLER actually receives.
 
@@ -13721,24 +13781,39 @@ def _require_ordered_key_completed_body(
     inside the ordered drain compiles.
 
     The single structural comparison is therefore performed **here**, against
-    the assembled body, rather than before assembly.  That is the same one
-    traversal at the same cost, moved to the far side of the window, so the
-    whole window is covered by structure rather than by a reachability argument
-    about what happens to run inside it.  Three cheap requirements bound the
-    root before the traversal starts:
+    the assembled function's stored state, rather than before assembly.  That is
+    the same one traversal at the same cost, moved to the far side of the
+    window, so the whole window is covered by structure rather than by a
+    reachability argument about what happens to run inside it.
 
-    *No completion transformed this family.*  Each of the four stages returns
-    its input unchanged unless the plan carries the corresponding region, and an
-    ordered-key plan carries none of them today.  Requiring the returned
-    function to BE the assembled function proves that per compile instead of
-    assuming it, and fails closed the moment a future plan composes a workspace
-    with a tile, panel or relayout -- precisely when the replay contract has to
-    be extended deliberately rather than silently.
+    What the comparison covers is the function's **whole** stored state, not
+    only its body.  A body-only reference leaves ``return_type``, ``name`` and
+    ``args`` verified by nothing, and that gap is measured rather than
+    hypothetical: after the reference is captured, renaming the function,
+    rewriting the return type, or dropping one argument each compiles, with the
+    corrupted public signature in the emitted C++.  Codegen type-checks the
+    argument *elements* but never which arguments they are, so it is not a
+    backstop for content.  The exact root field set is required for the same
+    reason -- an added stored field would otherwise ride along unread.
+
+    Three cheap requirements bound the root before the traversal starts.
+
+    *The returned function is the assembled function.*  This is a real
+    invariant, and it is worth stating exactly what it does and does not prove.
+    All four completion stages return the object they were given -- none
+    constructs a new ``llir.Function`` -- so this requirement cannot detect that
+    a stage *ran*; a fused workspace-plus-tile contract would satisfy it.  What
+    fails closed for such a plan is the structural comparison below, because
+    result-tile completion rewrites nested loop bodies the reference does not
+    contain.  That comparison is therefore the gate a future fused contract has
+    to extend deliberately, and this requirement is the cheaper, narrower one:
+    no stage substituted a different function object.
 
     *The root is an exact ``llir.Function``.*  A hostile assembler returning a
     ``Function`` subclass carrying identical state satisfies every identity test
-    here; codegen refuses it downstream on exact-type dispatch, but this family
-    owns the diagnosis, so it is refused here with the completion code.
+    here.  Codegen does independently refuse it, for every family, on exact-type
+    dispatch -- so this is not the only barrier -- but it refuses as a generic
+    unknown-node ``CodegenError``, and this family owns its own diagnosis.
 
     *Assembly preserved the verified statements as objects.*  ``list(body)``
     keeps every statement, so per-index identity against the pipeline's own list
@@ -13763,7 +13838,16 @@ def _require_ordered_key_completed_body(
         )
     try:
         state = object.__getattribute__(assembled, "__dict__")
-        body = state["body"] if type(state) is dict else None
+        if type(state) is not dict or len(state) != 4:
+            _fail(
+                _SPARSE_WORKSPACE_LOST,
+                "an ordered workspace plan's assembled function does not carry "
+                "exactly the four declared LLIR function fields",
+            )
+        body = state["body"]
+        return_type = state["return_type"]
+        name = state["name"]
+        args = state["args"]
     except (AttributeError, KeyError, TypeError) as error:
         _fail(_SPARSE_WORKSPACE_LOST, str(error))
     if type(body) is not list or len(body) != len(pipeline_body):
@@ -13779,7 +13863,9 @@ def _require_ordered_key_completed_body(
                 "ABI assembly replaced, reordered or duplicated ordered "
                 f"workspace statement {index}",
             )
-    _require_ordered_key_completion_checkpoint(cast(List[llir.Stmt], body), expected)
+    _require_ordered_key_completion_checkpoint(
+        [body, return_type, name, args], expected
+    )
 
 
 def _lower_loopir_to_llir_owned(
@@ -13912,6 +13998,7 @@ def _lower_loopir_to_llir_owned(
     final_assembly_stmts = assembler.emit_final_assembly()
     ordered_key_completion_reference = _ordered_key_expected_checkpoint(
         lowering,
+        kernel_abi,
         [
             *validation_stmts,
             *size_stmts,
