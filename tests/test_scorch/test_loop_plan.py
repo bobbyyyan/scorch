@@ -2448,7 +2448,19 @@ def test_auto_origin_derives_workspace_storage_from_the_workspace_axis() -> None
         axis_loops=(LoopRef(ids["j"]),),
         dense=True,
     )
-    assert tuple(tile.loop.index_id for tile in plan.tiles) == (ids["j"],)
+    # WAS ``== (j,)``.  The receiver is ``sd`` -- non-dense -- so the automatic
+    # origin no longer tiles it.  The test's headline claim ("a sparse result may
+    # still use a dense trailing workspace") is untouched and is still asserted
+    # above; only the tile is gone.
+    #
+    # The tile it used to assert was not merely unproven, it was WRONG.  Measured
+    # on the unmodified tree, ``einsum('kij->kj', A_ddd, format='sd')`` returns
+    # incorrect values at every shape tried -- (4,5,6), (8,3,7), (2,9,4), maximum
+    # absolute error 3.33 / 2.10 / 5.76 against a dense reference.  This test only
+    # ever inspected the PLAN, so it locked a tile whose emitted kernel silently
+    # computed the wrong answer.  With the tile gone the same program fails to
+    # build instead, which is a worse kernel and a better outcome.
+    assert plan.tiles == ()
     replay = Scheduler.apply_schedule(
         cin,
         Schedule(),
@@ -2616,11 +2628,24 @@ def test_auto_origin_candidate_order_ignores_physical_mode_permutation(
         axis_loops=(LoopRef(ids["m"]),),
         dense=True,
     )
-    assert tuple(tile.loop.index_id for tile in plan.tiles) == (
-        ids["m"],
-        ids["j"],
-        ids["k"],
-    )
+    # WAS ``== (m, j, k)``.  The receiver here is ``dsd`` -- non-dense -- and the
+    # automatic origin no longer emits an affine tile over a non-dense receiver,
+    # because hoisting the tile loop breaks the lexicographic parent-prefix order
+    # its compressed level is assembled in.  ``Scheduler.apply_schedule`` already
+    # refused that composition for an explicit schedule; the automatic origin was
+    # vacuously exempt from its own rule.
+    #
+    # COVERAGE LOST, recorded rather than dropped quietly: this test's stated
+    # purpose is that candidate enumeration follows LOGICAL access order and not a
+    # permuted physical ``mode_order`` (the derived twin once walked
+    # ``storage_index_ids`` and rejected a valid plan with ``auto_tile_decision``,
+    # stored ``m, j, k`` versus derived ``m, k, j``).  That property is no longer
+    # observable through THIS program, because the tiles whose order it compared
+    # are no longer derived here.  Reconstructing it needs a DENSE receiver that
+    # still tiles under a permuted operand ``mode_order``; the obvious candidate
+    # (``ddd ijk->ik [dd]`` with a permuted operand) is refused earlier by
+    # ``result_storage_order``, so it is an open item rather than a quick swap.
+    assert plan.tiles == ()
     replay = Scheduler.apply_schedule(
         cin,
         Schedule(),

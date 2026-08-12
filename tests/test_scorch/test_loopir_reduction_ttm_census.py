@@ -174,20 +174,28 @@ MIGRATED = [
     (*_ttm_cell("TTM sss x ss -> sss", "sss", "ss", "sss"), 2, 1),
     (*_ttm_cell("TTM dss x dd -> dss", "dss", "dd", "dss"), 2, 1),
     (*_ttm_cell("TTM dss x ss -> dss", "dss", "ss", "dss"), 2, 1),
+    # Moved here from AUTO_TILE_BLOCKED when the automatic origin stopped
+    # emitting an affine tile over a non-dense receiver.  The tile was never
+    # legal: it hoists the tile loop above the loops indexing the receiver's
+    # dense prefix, so a ``dds`` receiver's compressed level no longer sees its
+    # ``(i, j)`` parent prefix in lexicographic order.  Measured before the
+    # change, legacy's public route raised ``TensorIndexError`` on these at every
+    # extent, dtype, density and arm, and legacy's own lowering SEGFAULTED.
+    (*_ttm_cell("TTM dds x dd -> dds", "dds", "dd", "dds"), 2, 1),
+    (*_ttm_cell("TTM dds x ss -> dds", "dds", "ss", "dds"), 2, 1),
 ]
 
-# Legal plan order and a supported target shape, but the automatic origin
-# also emits an affine tile, and no workspace+tile replay contract exists.
-AUTO_TILE_BLOCKED = [
-    (
-        *_ttm_cell("TTM dds x dd -> dds", "dds", "dd", "dds"),
-        "unsupported_schedule_auto_family",
-    ),
-    (
-        *_ttm_cell("TTM dds x ss -> dds", "dds", "ss", "dds"),
-        "unsupported_schedule_auto_family",
-    ),
-]
+# The workspace+tile seam is EMPTY for this census's matrix.  It was two cells
+# (``TTM dds x {dd,ss} -> dds``), and they are in MIGRATED above because the
+# composition that blocked them -- a plan carrying both a sparse workspace and an
+# affine tile -- is no longer constructed for a non-dense receiver.
+#
+# The seam itself is not gone.  Over the 1139-cell frontier it is still occupied,
+# by ``ddd ijk->k [d]`` and ``ddd ijk->ik [dd]`` in arm 0 -- both DENSE receivers,
+# where the legality rule is inert by construction and the tile is legitimate.
+# Those two live outside this file's TTM matrix; the lock for them is
+# ``test_dense_receivers_keep_their_automatic_tile`` below.
+AUTO_TILE_BLOCKED: list = []
 
 
 @pytest.mark.parametrize("arm", [False, True])
@@ -317,22 +325,45 @@ def test_migrated_cells_are_arm_source_identical(cell):
 
 
 @pytest.mark.parametrize("arm", [False, True])
-@pytest.mark.parametrize(
-    "cell", AUTO_TILE_BLOCKED, ids=[cell[0] for cell in AUTO_TILE_BLOCKED]
-)
-def test_auto_tile_blocked_cells_keep_their_schedule_code(cell, arm):
-    """A workspace plan that also carries a tile has no replay contract.
+def test_the_workspace_tile_seam_is_empty_for_this_matrix(arm):
+    """The successor to ``test_auto_tile_blocked_cells_keep_their_schedule_code``.
 
-    If a workspace+tile composition is ever implemented, this lock moves to
-    whatever still occupies the seam rather than being deleted.
+    That lock's own docstring said it "moves to whatever still occupies the seam
+    rather than being deleted".  Nothing in this census's matrix occupies it any
+    more: the automatic origin no longer composes a sparse workspace with an
+    affine tile, because it no longer emits an affine tile over a non-dense
+    receiver at all.
     """
 
-    name, cin, result_shape, bindings, expected_code = cell
-    with pytest.raises(SchedulePassError) as error:
-        compile_cin_via_loopir(
+    assert AUTO_TILE_BLOCKED == []
+    for name, cin, result_shape, bindings, _prefix, _key_rank in MIGRATED:
+        if not name.startswith("TTM dds"):
+            continue
+        kernel = compile_cin_via_loopir(
             cin, result_shape, bindings, compile_options=auto_options(arm)
         )
-    assert error.value.defect.code == expected_code, (name, error.value.defect)
+        assert kernel.cpp_source, name
+
+
+@pytest.mark.parametrize("arm", [False, True])
+def test_dense_receivers_keep_their_automatic_tile(arm):
+    """The legality rule must be INERT on a dense receiver.
+
+    This is the neutrality half of the tile-legality change and the reason it can
+    claim to be byte-neutral wherever tiling is legal: the guard fires only on a
+    receiver it has positively identified as non-dense, so an all-dense receiver
+    must still get exactly the tile it got before.
+    """
+
+    from scorch.compiler.scheduler import Scheduler
+
+    dense_receiver = _reduction_cell("ddd ijk->ik", "ddd", "dd", "ijk", "ik")
+    _name, cin, _result_shape, _bindings = dense_receiver
+    scheduled = Scheduler.auto_schedule_plan(cin, regblock_enabled=arm)
+    assert scheduled.verified_loop_plan.tiles, (
+        "a dense receiver must keep its automatic affine tile; the non-dense "
+        "guard is not allowed to reach it"
+    )
 
 
 def test_census_covers_the_declared_representative_matrix():
@@ -340,8 +371,10 @@ def test_census_covers_the_declared_representative_matrix():
 
     assert len(REORDER_BLOCKED) == 4
     assert len(BOUND_PREFIX_MIGRATED) == 5
-    assert len(MIGRATED) == 9
-    assert len(AUTO_TILE_BLOCKED) == 2
+    # 9 -> 11 and 2 -> 0: the two ``TTM dds`` cells moved lists rather than
+    # leaving the matrix, so the 20-name total below is unchanged.
+    assert len(MIGRATED) == 11
+    assert len(AUTO_TILE_BLOCKED) == 0
     names = (
         [cell[0] for cell in REORDER_BLOCKED]
         + [cell[0][0] for cell in BOUND_PREFIX_MIGRATED]

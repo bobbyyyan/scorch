@@ -607,26 +607,42 @@ def test_a_row_whose_contributions_cancel_is_still_stored():
 
 
 @pytest.mark.parametrize("b_fmt", ["dd", "ss", "ds", "sd"], ids=str)
-def test_the_auto_tile_neighbours_stay_blocked_on_blocker_one(b_fmt):
-    """``TTM sds x * -> dds`` reaches the target only to meet blocker 1.
+@pytest.mark.parametrize("arm", [False, True])
+def test_the_auto_tile_neighbours_are_admitted_once_the_tile_is_legal(b_fmt, arm):
+    """``TTM sds x * -> dds`` used to reach the target only to meet blocker 1.
 
-    Relaxing the prefix domain rule lets CIN admit these, and then the
-    automatic origin's affine tile meets a plan carrying both a sparse
-    workspace and a tile, for which no replay contract exists.  That is
-    blocker 1, closed by decision in §52.7, and it is characterized here rather
-    than silently absorbed into this family's reach.
+    This lock is the successor to
+    ``test_the_auto_tile_neighbours_stay_blocked_on_blocker_one``, which asserted
+    ``unsupported_schedule_auto_family`` here.  That refusal was downstream of an
+    ILLEGAL tile: the automatic origin emitted an affine tile over a ``dds``
+    receiver, hoisting the tile loop above the loops indexing the receiver's
+    dense prefix, so its compressed level no longer saw its ``(i, j)`` parent
+    prefix in lexicographic order.  ``Scheduler.apply_schedule`` already refused
+    exactly that composition for an explicitly requested schedule; the automatic
+    origin was vacuously exempt.  With the rule applied to both layers no tile is
+    produced, the plan carries only the sparse workspace, and these compile.
+
+    Measured before the change: legacy's public route raised ``TensorIndexError``
+    on all twelve cells of this seam at every extent, dtype, density and arm, and
+    legacy's own lowering of the same CIN SEGFAULTED.  So the composition this
+    once locked as "blocked" was never a working kernel.
+
+    The earlier version parametrized ``b_fmt`` and then hardcoded ``"dd"`` in the
+    call, so all four cases tested the same program; ``b_fmt`` is now used.
     """
 
-    from scorch.compiler.loopir.schedule_passes import SchedulePassError
-
-    with pytest.raises(SchedulePassError) as raised:
-        compile_cin_via_loopir(
-            ttm_cin("sds", "dd", "dds", torch.float32),
-            (EXTENT["i"], EXTENT["j"], EXTENT["l"]),
-            (
-                ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
-                ((EXTENT["k"], EXTENT["l"]), torch.float32),
-            ),
-            compile_options=auto_options(False),
-        )
-    assert raised.value.defect.code == "unsupported_schedule_auto_family"
+    kernel = compile_cin_via_loopir(
+        ttm_cin("sds", b_fmt, "dds", torch.float32),
+        (EXTENT["i"], EXTENT["j"], EXTENT["l"]),
+        (
+            ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
+            ((EXTENT["k"], EXTENT["l"]), torch.float32),
+        ),
+        compile_options=auto_options(arm),
+    )
+    assert kernel.cpp_source
+    assert kernel.schedule is not None
+    assert not kernel.schedule.plan.tiles, (
+        "a dds receiver must not carry an affine tile: hoisting it breaks the "
+        "lexicographic parent-prefix order its compressed level is assembled in"
+    )
