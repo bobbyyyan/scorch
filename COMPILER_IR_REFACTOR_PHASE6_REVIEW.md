@@ -12685,3 +12685,247 @@ grid), ``blocker1-legacy-soundness/`` (the fourteen cells' legacy verdicts),
 production emission, affected-cell correctness), and
 ``compressed-prefix-reach/`` (sentinel probe, relaxed probe, reach and semantics
 documents).
+
+## 58. The TTM regression's mechanism, and the dense-domain semantics re-derived operand-side (2026-08-12)
+
+Opens at committed tip ``ed4ce50`` (§57's work, committed in four pieces plus the
+correction commit).  Two things land: the §57.7 TTM regression is explained, and
+§57.9's dense-domain semantics are replaced with an operand-side derivation.  No
+production file changes in this section — ``git diff ed4ce50..HEAD -- src/`` is
+empty — and nothing is wired into dispatch.
+
+### 58.1 The regression is one kernel, not two
+
+The emitted C++ does not depend on density.  Verified by emitting at both
+densities and comparing SHA-256 across all four TTM cell-shapes and all three
+columns, and visible in §57.7's own sealed receipt, whose ``sources`` phase
+records the same ``typed`` digest at d=0.001 and d=0.05.  So the question is not
+why the typed route emits worse code at high density; it is why one fixed pair of
+kernels inverts its ranking as occupancy rises.
+
+### 58.2 The two kernels differ in assembly strategy, and in nothing else
+
+Read side by side, ``typed`` is ONE pass, SERIAL, appending into ``std::vector``;
+``legacy_empty`` is TWO passes (count, then fill), **parallel on both** under
+``#pragma omp parallel for``, writing into exactly-sized ``torch::empty``.
+
+What is IDENTICAL in both, character for character: the k-merge, the
+``A_val[pA2] * B_val[pB1]`` product, the workspace object
+``coo_workspace_1d<float, 1>(1024)``, and the ``wksp.sort()`` drain.  That rules
+out three of the four suspects **by construction rather than by measurement** —
+the sparse-workspace drain's cost, the hash/COO key-domain behaviour, and the
+per-``(i,j)`` workspace allocation are paid in equal measure by both routes at
+every density.  The tile is ruled out separately: §57.7 measures the tile fix at
+0.970–1.036 and these cells have ``dss`` receivers the guard never reaches.
+
+### 58.3 It is a one-bit migration gap, not a heuristic
+
+The two-phase parallel assembly is a SHARED LLIR pass,
+``compressed_where_openmp_pass.py``, and both pipelines can run it.  Which one
+does is decided by one virtual: ``_TargetLowering.owns_two_phase_output()``
+returns False (``lower_llir.py:5484``) and exactly one LoopIR family overrides it
+— ``_ParallelSparseWorkspaceLowering`` (``:9511``), and only for
+``compressed_levels=(1,)``.  ``lower_llir.py:14504`` hard-couples the two so a
+mismatch fails closed.  The regressing cells are hosted by
+``_OrderedKeySparseWorkspaceLowering``, which never overrides it, and their
+``dss`` receiver has TWO compressed levels.  Legacy's ``cin_lowerer`` runs the
+same shared pass on the same programs and gets ``_count1`` AND ``_count2``, so
+the pass already supports two compressed levels; only the LoopIR-side opt-in is
+missing.
+
+### 58.4 Demonstrated over the corpus, not over the two measured cells
+
+A fix aimed at a mechanism inferred from two cells will appear to work on those
+two cells.  So the prediction was stated and then tested compile-only over all 11
+cells x 2 shapes: *the typed route loses exactly where legacy's kernel is parallel
+and the typed one is not, and nowhere else.*
+
+| group | cell-shapes | §57.7 ratios |
+| --- | --- | --- |
+| legacy PARALLEL / typed SERIAL | **4** — exactly the four TTM cell-shapes | 0.359, 0.398, 0.804, 1.004 |
+| both SERIAL | **18** — every other cell-shape | 0.984–1.241, no loss anywhere |
+
+Zero exceptions in either direction.
+
+### 58.5 CORRECTION to §57.7: the variable is not density
+
+Legacy's pragma requests ``num_threads(scorch_nthreads(A1_pos[A0_size], A0_size))``
+and ``scorch_policy.h:123`` defines that as
+``min(rows/SCORCH_ROWS_PER_THREAD, work/SCORCH_GRAIN_DEFAULT)`` clamped to
+``[1, omp_get_num_procs()]``, with the constants 16 and 500.  **Legacy's own
+parallelism is gated, and the gate opens with density.**  Evaluated on the real
+operands, that thread count orders all eight measurements monotonically and
+without exception:
+
+| ``scorch_nthreads`` | §57.7 ratios |
+| --- | --- |
+| **1** | 1.044, 1.164, 1.487, 1.749 — typed wins every one |
+| **2** | 1.004, 0.804 |
+| **4** | 0.398, 0.359 |
+
+Density is a proxy for one term.  The other is the OUTER EXTENT, which is why the
+regression is shape-dependent in a way density cannot explain — at ``i = 32``
+legacy is capped at 2 threads and loses 1.24x, at ``i = 64`` it gets 4 and wins
+2.8x — and why the occupancy hypothesis fails outright: ``TTM dss x dd -> dss`` at
+(32,64,128,64) d=0.05 has a **100% dense** result (131,072 of 131,072 cells) and
+measures NEUTRAL at 1.004, while the 96%-occupied (64,128,64,128) measures 0.398.
+
+### 58.6 The ablation, and a hypothesis of this session's own that it refuted
+
+A third column was built from legacy's OWN emitted source with its two
+``#pragma omp parallel for`` lines deleted and nothing else touched — an exact A/B
+on one variable, chosen over an env knob because ``scorch_nthreads`` reads
+``omp_get_num_procs()``, which ``OMP_NUM_THREADS`` does not change.  All three
+columns agreed bit-for-bit on output storage before anything was timed.  A/A floor
+0.978–1.013; pinned base worktree; quiet machine.
+
+| cell | shape | d | ``nthr`` | ``legacy/typed`` | ``legacy_serial/typed`` | legacy's parallel speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| ``dss x ss`` | (64,128,64,128) | 0.05 | 4 | 0.360 | **1.228** | **3.41x** |
+| ``dss x dd`` | (64,128,64,128) | 0.05 | 4 | 0.389 | **1.183** | **3.04x** |
+| ``dss x ss`` | (32,64,128,64) | 0.05 | 2 | 0.790 | **1.465** | 1.85x |
+| ``dss x dd`` | (32,64,128,64) | 0.05 | 2 | 0.941 | **1.395** | 1.48x |
+| ``dss x ss`` | (64,128,64,128) | 0.001 | 1 | 1.437 | 1.321 | 0.92x |
+| ``dss x dd`` | (64,128,64,128) | 0.001 | 1 | 0.988 | 0.887 | 0.90x |
+| ``dss x ss`` | (32,64,128,64) | 0.001 | 1 | 1.788 | 1.719 | 0.96x |
+| ``dss x dd`` | (32,64,128,64) | 0.001 | 1 | 1.070 | 0.985 | 0.92x |
+
+**The regression is 100% parallelism and 0% allocation.**  Delete two pragmas and
+every d=0.05 regression inverts into a typed win of 1.18–1.47x.
+
+**This refutes a hypothesis this session had written down before measuring it.**
+The mechanism note predicted a residual attributable to ``std::vector`` growth
+versus exact allocation, reasoning that a 2.8x loss exceeds the ~2x an ideal "two
+passes on four threads" allows.  The residual is real and its sign is the
+OPPOSITE: the typed single-pass is *faster* than legacy's serial two-pass, so
+legacy must overcome a 1.2–1.5x strategy deficit *and then* win by 2.8x — which is
+why its parallel speedup has to be, and is, above 3x.  Recorded because the
+arithmetic that looked anomalous was pointing at the right anomaly and the wrong
+cause.
+
+At ``nthreads = 1`` the pragma is not merely inert, it **costs 4–10%**: the OpenMP
+region is entered and torn down for one thread.  That, plus the redundant counting
+pass, is the whole of the typed route's low-density win.
+
+### 58.7 What the measurement says the fix must be
+
+Opting the family into the existing shared pass — the obvious move, and the one
+§58.3 makes look easy — is the WRONG target, and the ablation is what shows it.
+It would surrender the 1.18–1.47x single-pass advantage and merely TIE legacy at
+high density, and unconditionally adopted it would turn the 1.44–1.79x low-density
+wins into ties, since ``nthreads = 1`` is exactly where the counting pass buys
+nothing.  Bobby's standard for this branch is "more performant than legacy on a
+wide variety of problem sizes", not "not worse".
+
+The measurement points at a third option better than either existing kernel:
+**keep the typed single-pass strategy and parallelize it**, with per-thread output
+buffers concatenated in outer-loop order.  The outer loop is over a dense ``i``
+and the receiver's compressed level 1 sits under ``i``, so per-thread buffers
+concatenated in ``i`` order reproduce the required lexicographic assembly exactly.
+The cost is one ``O(nnz_out)`` memcpy per array in place of legacy's full
+recompute — strictly cheaper than the counting pass it replaces, on the evidence
+above — gated on the same ``scorch_nthreads > 1`` condition so the serial path is
+provably untouched at ``nthreads = 1`` and the low-density wins are preserved by
+construction.  Bobby chose this option on 2026-08-12.  **It is not built in this
+section.**
+
+### 58.8 The dense-domain semantics, re-derived operand-side
+
+§57.9 keyed its three cases on ``S(L)``, the levels strictly below the RESULT
+level.  The question Bobby's decision asks — did the operand have anything here —
+is about the OPERAND's structure under the coordinate.  Rewritten at
+``compressed-prefix-reach/DENSE_DOMAIN_ASSEMBLY_SEMANTICS.md``, with §57.9's
+version quarantined beside it under its diagnosis.  Three measured errors:
+
+1. **Wrong answer on the motivating cell.**  ``ds ij->i [s]`` is rank-1 so ``S(L)``
+   is empty, so case 2 appends unconditionally and the result densifies.  The
+   operand's compressed level 1 makes the structural answer available as
+   ``A1_pos[i+1] > A1_pos[i]``.  The densification §57.9 called forced is not.
+2. **Its precedent is a different family.**  Measured off ``_ordered_key_split``:
+   ``:2181``'s cell ``dd ij->j [s]`` is ``(prefix, key_rank) = (0, 1)``, a drained
+   KEY under a workspace, while ``ds ij->i [s]`` is ``(1, 0)``, a bound PREFIX with
+   no workspace at all.  The drained key's unconditional append follows from the
+   workspace holding an entry per inserted key; the bound-prefix family has no
+   workspace to hold one.
+3. **Its cost claim does not hold where it was applied.**  It declines an
+   operand-side probe because the result-side counter "answers the same question
+   with machinery already in the tree".  That counter emits
+   ``if (C{L+1}_pos.back() < pC{L+1})``, and for a rank-1 result there is no
+   ``C1_pos`` and no ``pC1``.  The machinery is structurally unavailable in exactly
+   the case case 2 was covering.
+
+### 58.9 Derivability over all 58 cells, and two that are not in this seam
+
+Method: ``lower_cin._fail`` instrumented to snapshot the raising frame's locals —
+``domains``, ``lhs_index_ids``, ``result_levels``, ``prefix``, ``key_rank``,
+``position`` — for all 58 cells driven through the real lowering.  Not modelled
+from cell names.
+
+**The seam is 56 cells, not 58.**  The refused level's actual domain kind is DENSE
+on 56, **UNION** on ``ss+ss ij->i [s]`` and **INTERSECTION** on
+``ss*ss ij->i [s]``.  The rule's condition is ``domain_kind is not
+DomainKind.SPARSE``, which lumps three kinds into one refusal.  This explains
+rather than merely records §57.8's leftover: relaxing to admit DENSE left exactly
+those two carrying the sentinel because relaxing DENSE admits neither UNION nor
+INTERSECTION.  They are a separate merged-domain seam and a separate decision, so
+this document does not owe them a rule — and extending to them by analogy would
+have been wrong specifically in the intersection case, whose non-emptiness is not
+a function of the streams' extents and cannot be answered by a position bound at
+all.
+
+**45 of the 56 need no new machinery.**  They have a compressed result level below
+the refused one, so the existing result-side counter answers exactly (ttm 32,
+rank4 8, rank6 4, rank5 1).  **11 need the operand-side predicate**, and they are
+exactly the rank-1 ``[s]``-on-``i`` family with ``(prefix, key_rank) = (1, 0)``:
+``ds ij->i [s]`` and its five degenerate variants, ``dss``/``dds``/``dsd
+ijk->i [s]``, and ``dsss``/``ddss ijkl->i [s]``.  **All eleven are derivable**;
+nine are a single position-bound comparison, ``dsd`` adds a compile-time extent
+conjunct, and ``dds``/``ddss`` index the array at a flattened position because an
+intervening dense level makes the child's range contiguous.  No cell in the 58 is
+undecidable.  §57.9's case 2 — the unconditional append — applies to **none** of
+the 58 cells it was written for.
+
+### 58.10 The predicate priced, against an admitted sibling
+
+``ss ij->i [s]`` is ADMITTED today and is the exact structural sibling of
+``ds ij->i [s]``: same family, same ``(1, 0)`` split, same result shape, differing
+only in operand level 0.  Its emitted append is unconditional **because its ``i``
+loop is a stored stream** — the iteration domain is already carrying the guard.
+Make level 0 dense and the domain stops carrying it.  The delta is: give the
+loop-init expression ``A1_pos[pA0]`` a name, and wrap the three existing append
+statements in one ``if (pA1_end > pA1_begin)``.
+
+Zero new runtime array reads (both operands of the comparison are already read to
+open the loop), zero new pointer declarations, no new LLIR node kinds, ~25–40
+lines in the bound-prefix target.  It does not disturb the result-side counter
+path: case R is selected exactly when ``C{L+1}_pos`` exists and case O exactly when
+it does not, so the 45 case-R cells emit byte-identically.  The predicate is
+*cheaper* than the mechanism §57.9 preferred, which loads ``C{L+1}_pos.back()``
+from a growing vector where this compares two locals.
+
+**Disposition of the two cells the decision was taken for.**  ``ds ij->i [s]`` and
+``dss ijk->i [s]`` both take guard ``A1_pos[i+1] > A1_pos[i]``: a row of the dense
+``i`` domain with no stored ``j`` gets **no key**, and the compressed result level
+stays sparse rather than becoming fully dense.  §54.9's objection is answered
+rather than accepted — it is true of unconditional append and false of the
+operand-side guard.  ``:2181`` holds under the new rule in both readings, and
+unlike §57.9 the rule does not need ``:2181`` to license anything.
+
+### 58.11 What this section does not do
+
+- **No production file changes.**  ``git diff ed4ce50..HEAD -- src/`` is empty;
+  ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+  callers.
+- **The TTM fix is specified, not built**, and the cross-host re-proof it will need
+  is not run.  The kernel-runtime grid is still single-host.
+- **The dense-domain seam is specified, not built** — this is a semantics document
+  and a derivability proof, not an implementation plan.
+- **The merged-domain seam (UNION, INTERSECTION) is named and left to Bobby.**
+- No blocker other than 1 is touched; the Phase-8 cutover verdict is unchanged; the
+  shadow pilot's membership is still un-re-derived.
+
+**Evidence ledgers**, each with ``SHA256SUMS`` and harnesses taking a tree root as
+``$1``: ``ttm-density-mechanism/`` (source dump, pragma census, thread-count
+prediction, three-column ablation, ``MECHANISM.md``, ``ABLATION.md``) and
+``dense-domain-semantics/`` (the seam-state capture over all 58 cells), plus the
+amended ``compressed-prefix-reach/``.

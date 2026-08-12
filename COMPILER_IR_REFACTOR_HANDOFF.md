@@ -32120,3 +32120,115 @@ cutover verdict is unchanged.
    first production change on this branch in four milestones, it is measured, and
    it strictly improves failure modes — but it is Bobby's call, and it changes
    emitted code for a family of TTM shapes.
+
+## The TTM regression explained, and the dense-domain semantics re-derived operand-side (2026-08-12; supersedes every preceding prompt)
+
+Follows committed tip ``ed4ce50``.  **Origin is still ``a3b8d1e``**; nothing
+pushed, amended, squashed, reordered or discarded, and no ``git stash`` was run.
+§57's work is now COMMITTED in four pieces — production, tests, docs, then a
+correction commit.  Review §58 owns the detail.
+
+**1. §57's own corrections, committed and then swept.**  The §57 work landed as
+``a52b061`` (production, 68 lines across ``scheduler.py`` and
+``loop_plan_legality.py``), ``eda3a07`` (tests), ``5230796`` (docs).  Then a sweep
+of §57 against itself, the handoff tail, and the sealed receipts found **nine**
+falsified claims, not the one the prompt named.  Beyond the two stale §57.10
+bullets: §57.1 and §57.7 disagreed on the harness's own shape ("two A/A controls
+per configuration" x 44 = 88, but §57.7 reports 120 — the truth is three per timed
+column over the **40** configurations that time, four being TYPED-REFUSED); §57.7's
+quoted A/A floor 0.946 is the SECOND-lowest of its 120 controls, the lowest being
+0.896 in a record with status OK; §57.2's dismissal of §55.5's comparand does not
+survive §57.3, which measures production at **2,848** characters — within three of
+the row §57.2 rules out — so §55.5 reached the right row for the wrong reason;
+§57.6's "cells that never worked" is measured at one shape and §57.4 shows one of
+those cells sound at ``i = 1``; and §57.9a undercounted its own quarantine, which
+holds THREE void runs with one diagnosis naming a cause §57.9a never mentions.
+All nine corrected in ``ed4ce50``, each verified by recomputing the receipt.
+
+**2. The §57.7 TTM regression is explained, and it is not any of the four
+suspects.**  The emitted source is byte-identical at both densities, so it is one
+kernel whose ranking inverts, not two kernels.  Read side by side, ``typed`` is one
+SERIAL pass appending into ``std::vector``; ``legacy`` is two passes, **parallel on
+both**, into exactly-sized ``torch::empty``.  The k-merge, the product, the
+workspace object and the ``wksp.sort()`` drain are character-for-character
+IDENTICAL, which rules out the workspace drain, the hash/COO behaviour and the
+per-``(i,j)`` allocation by construction.  Cause: a one-bit migration gap.
+``_TargetLowering.owns_two_phase_output()`` is False and exactly one LoopIR family
+overrides it, for ``compressed_levels=(1,)`` only; the regressing cells' host never
+does, while legacy's ``cin_lowerer`` drives the same SHARED pass on the same
+programs.
+
+**3. CORRECTION to §57.7: the variable is not density.**  It is the thread count
+legacy's own pragma requests, ``min(rows/16, stored_ij/500)``, which orders all
+eight measurements monotonically — ``nthreads=1`` gives 1.044/1.164/1.487/1.749
+(typed wins every one), ``2`` gives 1.004/0.804, ``4`` gives 0.398/0.359.  Density
+is a proxy for one term; the other is the OUTER EXTENT, which is why the regression
+is shape-dependent, and why the occupancy hypothesis dies: a **100% dense** result
+measures NEUTRAL at 1.004 while a 96% one measures 0.398.  Demonstrated corpus-wide
+rather than on the two measured cells: the four cell-shapes where legacy is
+parallel and typed is serial are exactly the four that regress, and all 18 others
+have both columns serial and none regresses.
+
+**4. The ablation, which refuted this session's own hypothesis.**  Rebuilding
+legacy's source with its two pragmas deleted and nothing else: every d=0.05
+regression inverts into a typed WIN of 1.18-1.47x.  **The regression is 100%
+parallelism and 0% allocation.**  The predicted ``std::vector``-growth residual is
+real with the OPPOSITE sign — the typed single-pass is faster than legacy's serial
+two-pass, so legacy must overcome a strategy deficit and then win by 2.8x, which is
+why its measured parallel speedup is 3.04-3.41x on 4 threads.  At ``nthreads=1``
+the pragma COSTS 4-10%.  All columns agreed bit-for-bit on storage before timing;
+A/A floor 0.978-1.013.
+
+**5. The fix Bobby chose, specified and NOT built.**  Adopting legacy's two-phase
+strategy is the wrong target: it surrenders the 1.18-1.47x single-pass advantage
+and only ties.  Instead: **parallelize the typed single-pass** with per-thread
+output buffers concatenated in outer-loop order — sound because the outer loop is a
+dense ``i`` and the compressed level sits under it — gated on ``scorch_nthreads > 1``
+so the serial path is provably untouched where the wins live.
+
+**6. §57.9's dense-domain semantics were specified wrong, and are replaced.**  They
+key on the RESULT's sub-levels; the question is about the OPERAND's structure.
+Three measured errors: the motivating cell ``ds ij->i [s]`` gets unconditional
+append and densifies when ``A1_pos[i+1] > A1_pos[i]`` was available; the precedent
+``:2181`` is a ``(prefix, key_rank) = (0, 1)`` drained-KEY cell cited to license a
+``(1, 0)`` bound-PREFIX decision, a different family with no workspace; and the
+cost claim fails where applied, because the result-side counter reads ``C{L+1}_pos``
+which does not exist for a rank-1 result.
+
+**7. Derivability, measured over all 58 by instrumenting the refusal point.**  The
+seam is **56 cells, not 58** — ``ss+ss ij->i`` is UNION and ``ss*ss ij->i`` is
+INTERSECTION, and the rule lumps three domain kinds into one refusal.  That
+explains §57.8's leftover exactly.  Of the 56, **45** are answered by the existing
+result-side counter with zero new machinery, and **11** — the rank-1 ``->i [s]``
+family — need the operand-side predicate.  **All eleven are derivable**; none of
+the 58 is undecidable; and §57.9's case 2 applies to **none** of them.  Priced
+against the ADMITTED sibling ``ss ij->i [s]``, whose append is unconditional only
+because its ``i`` loop is a stored stream: the delta is one named local and one
+``if``, zero new runtime array reads, ~25-40 lines, and it cannot disturb the
+result-side path because the two cases are mutually exclusive by construction.
+
+**Not addressed, and stated rather than folded in.**  The TTM fix is specified, not
+built.  The kernel-runtime grid is still single-host.  The dense-domain seam is
+specified, not built.  The merged-domain (UNION/INTERSECTION) seam is named and
+left to Bobby.  No blocker other than 1 is touched, the shadow pilot's membership
+is still un-re-derived, and the Phase-8 cutover verdict is unchanged.
+
+## What the next session should do
+
+1. **Build the parallel single-pass assembly** Bobby chose (§58.7): per-thread
+   output buffers concatenated in outer-loop order, gated on
+   ``scorch_nthreads > 1``.  Prove it neutral-or-better at EVERY density — the
+   d=0.001 wins must survive, and d=0.05 must beat legacy rather than tie.
+2. **Then cross-host** on redwood and mkt1.  Redwood needs an in-place extension
+   build so its shared env's ``perf/spmm-fastpath`` ``scorch_ops`` is not picked
+   up.  A/A controls, pinned detached worktrees, interleaved, quiet.
+3. **Implement the dense-domain seam** in ``lower_llir.py`` per the rewritten
+   semantics: 45 cells reuse the result-side counter, 11 need the operand-side
+   predicate.  Scope out the subset independently blocked by the
+   hierarchical-compressed-operand rule (``lower_llir.py:1703``).
+4. **Take the merged-domain decision** for the UNION and INTERSECTION cells, which
+   are a separate seam.  The union case is an O(1) disjunction; the intersection
+   case needs a merge-produced structural counter and cannot be answered by a
+   position bound.
+5. **Re-derive the shadow pilot's membership against production emission** (§57.3).
+   Still owed; both 105 and 112 are wrong, family by family.
