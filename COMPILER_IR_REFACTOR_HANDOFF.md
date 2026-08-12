@@ -31987,14 +31987,27 @@ both), then blocker 1, then the dense-domain seam's reach and semantics.  Review
 Both pipelines converge on ``_load_validated_prepared_kernel`` then
 ``module.evaluate``; the harness patches that one loader, runs each production
 entry once, and captures the exact module and argument tuple production used.
-ABBA-interleaved, auto-calibrated reps, two same-binary A/A controls per
-configuration, one disposable subprocess per configuration.
+ABBA-interleaved, auto-calibrated reps, a same-binary A/A control on each timed
+column — three per configuration, not the two an earlier draft said — and one
+disposable subprocess per configuration.  Only 40 of the grid's 44 configurations
+time at all, and 40 x 3 is the 120 controls quoted below.
 
 **2. Blocker 1 is FIXED, and the objection that closed it was measurable and
-false.**  Legacy on the fourteen seam cells: the twelve TTM cells raise
-``TensorIndexError`` on the public route and **SEGFAULT** on legacy's own lowering,
-in both arms at every extent, dtype and density.  Only ``ddd ijk->ik [dd]`` is
-sound.  The fix applies the legality rule the scheduler ALREADY states for
+false.**  Legacy on the fourteen seam cells, over the pinned-base 780-measurement
+grid: legacy's own lowering **SEGFAULTS on 720 of 720** configurations of the
+twelve ``TTM * -> dds`` cells, in both arms at every extent, dtype and density,
+and its public route raises ``TensorIndexError`` on 672 of those 720 and fails to
+compile on 36.  It is sound on **12**, and that exception is load-bearing rather
+than a footnote: all twelve are ``TTM ddd x ss -> dds`` at shape ``[1, 4, 5, 3]``
+— outer extent ``i = 1``, where there is no lexicographic order for the tile to
+destroy — and they measure 12/12 sound on BOTH trees, so the fix is
+correct-to-correct exactly where legacy was accidentally correct.  Of the two
+non-TTM seam cells, ``ddd ijk->ik [dd]`` is sound on both routes (30/30) and
+``ddd ijk->k [d]`` is sound on legacy's own lowering (30/30) while its public
+route raises ``TypeError``.  (An earlier draft of this paragraph said the twelve
+TTM cells fail "at every extent" and that only ``ddd ijk->ik [dd]`` is sound;
+§57.4 corrects both, and the ``i = 1`` case is what that correction found.)
+The fix applies the legality rule the scheduler ALREADY states for
 explicit schedules (``scheduler.py:2994``) to the automatic origin, which was
 vacuously exempt from it.  It required **both** layers — the legacy mutation and
 ``loop_plan_legality._derive_auto_decisions``, which independently re-derives the
@@ -32008,12 +32021,18 @@ nowhere else**, and **104/104 of those were already broken** — **52 segfaults
 become zero**.
 
 **3. Kernel runtime, reported honestly.**  Re-run on a quiet machine, A/A floor
-**0.977–1.044** over 120 controls: the typed route wins **1.14–1.75×** at density
-0.001 and **loses 1.25–2.8×** at density 0.05 on the same TTM cells; every
-reduction and the forced-sparse control are neutral.  **"The typed route emits
-better code" does not hold as a general performance claim.**  Single-host; a
-second host is owed.  Separately, **the tile fix is runtime-NEUTRAL**: base vs
-candidate spans 0.970–1.036 on all 44 configurations, inside the floor.
+**0.977–1.044** over 120 controls: at density 0.001 the typed route wins
+**1.16–1.75×** on the TTM cells, and it **loses 1.24–2.8×** at density 0.05 on
+those same cells.  The rank-2 reductions ``ss ij->j [s]`` and ``ds ij->j [s]``
+also win, 1.14–1.21×, at density 0.001; the rank-3/4 reductions, all of
+``sd ij->j``, and the forced-sparse ``dd ij->j [s]`` control are neutral at
+0.999–1.006.  (An earlier draft folded the reduction wins into the TTM range and
+then called every reduction neutral, which contradicted its own lower bound of
+1.14 — that number IS a reduction.)  **"The typed route emits better code" does
+not hold as a general performance claim.**  Single-host; a second host is owed.
+Separately, **the tile fix is runtime-NEUTRAL**: base vs candidate spans
+0.970–1.036 on the 40 of 44 configurations the typed route compiles, inside the
+floor; the other four are TYPED-REFUSED and were never timed.
 
 **4. TWO CORRECTIONS to the census's comparand, and they matter for duty 1.**
 §55.5's flagship "2,218 against 2,845" is drawn from the **empty-Schedule()** row,
@@ -32023,8 +32042,9 @@ comparand is not production: ``legacy_generated_cpp`` with no requested schedule
 **never runs the auto-scheduler** (``pipeline.py:594``), while ``scorch.einsum``
 does — and for matmul production often resolves a PREBUILT kernel and emits no
 code at all.  On production's own entry an empty ``Schedule()`` IS identity (6/6
-reductions, 72/78 overall).  **Neither census column faithfully models production
-dispatch.**  The dense-receiver shadow pilot's membership — 105 or 112 — must be
+reductions, and 72/78 across TTM and matmul — "72/78 overall" in an earlier draft
+both dropped the six reductions from the numerator and understated the
+denominator).  **Neither census column faithfully models production dispatch.**  The dense-receiver shadow pilot's membership — 105 or 112 — must be
 re-derived against production's actual emission before anyone acts on it.
 
 **5. The dense-domain seam: reach measured, semantics fixed, NOT implemented.**  A
@@ -32067,23 +32087,29 @@ total trusted: **8 removed** (exactly the reversed-decision seam locks) and **18
 added** (the fixed ``b_fmt`` parametrization over both arms, the two ``TTM dds``
 cells joining ``MIGRATED``, and the two new locks).  Step 1b is fully gated.
 
-**Not addressed, and stated rather than folded in.**  The
-kernel-runtime grid has not been re-run on a quiet machine or cross-host, so
-§57.7's numbers are provisional and single-host.  The blocker-1 heavy sweep
-against the pinned base is owed (its first run was quarantined as
-tree-contaminated).  The dense-domain seam is not implemented.  No blocker other
-than 1 is touched and the Phase-8 cutover verdict is unchanged.
+**Not addressed, and stated rather than folded in.**  The kernel-runtime grid is
+SINGLE-HOST: its quiet-machine re-run is done and sealed, and what is owed is
+redwood and mkt1.  The blocker-1 heavy sweep is likewise single-host and likewise
+not owed — its first run was quarantined as tree-contaminated, and it was re-run
+in full (780 measurements) against the pinned base worktree, which is what §57.4
+rests on.  (Both of these sentences said "owed" in an earlier draft, written
+before §§57.4 and 57.7 were amended with the completed runs.)  The dense-domain
+seam is not implemented.  No blocker other than 1 is touched and the Phase-8
+cutover verdict is unchanged.
 
 ## What the next session should do
 
-1. **Finish and read the candidate suite.**  It is the one gate on the tile fix
-   that was still running.  If it is green, the fix has: reach measured,
-   correctness 720/720, production emission characterized cell by cell with zero
-   regressions, and 52 segfaults removed.
-2. **Re-run the kernel-runtime grid on a quiet machine, then on redwood and
-   mkt1.**  The density-dependent TTM regression (up to 2.9× slower at 0.05) is
-   the most important open number on the branch and it is currently single-host
-   and contended.  Transports are staged (§56).
+1. ~~**Finish and read the candidate suite.**~~  DONE, and this item was already
+   stale when it was written: the confirming suite is reported GREEN four
+   paragraphs above (6319 / 0 failures / 6304 passed against base 6309 / 0).  The
+   tile fix has reach measured, correctness 720/720, production emission
+   characterized cell by cell with zero regressions, and 52 segfaults removed.
+2. **Run the kernel-runtime grid on redwood and mkt1.**  The quiet-machine re-run
+   is done (floor 0.977–1.044 over 120 controls); what is missing is a second
+   host.  The density-dependent TTM regression — **up to 2.8× slower** at 0.05,
+   the reciprocal of the measured 0.359, not the 2.9× an earlier draft of this
+   line quoted — is the most important open number on the branch.  Transports are
+   staged (§56).
 3. **Re-derive the shadow pilot's membership against production emission**, not
    against either census column.  §57.3 shows both columns diverge from production
    in different directions and neither is what a cutover moves.

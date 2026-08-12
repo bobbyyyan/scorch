@@ -12264,11 +12264,21 @@ Both pipelines converge on one seam — ``_load_validated_prepared_kernel`` then
 ``module.evaluate(*module_args)`` — so the harness patches that single loader,
 runs each production entry ONCE, and captures the exact module and argument tuple
 production used rather than reconstructing them.  Timing is ABBA-interleaved with
-auto-calibrated reps, and every configuration carries **two same-binary A/A
-noise-floor controls**, one per side, per the repo convention that perf gates are
-never calibrated against a fixed ratio constant.  Crash isolation is not
+auto-calibrated reps, and every configuration carries a same-binary A/A
+noise-floor control **on each timed column**, per the repo convention that perf
+gates are never calibrated against a fixed ratio constant.  Crash isolation is not
 boilerplate: one disposable subprocess per configuration, because the very first
 comparand the harness was pointed at segfaults.
+
+**CORRECTION to this subsection, made when the receipts were re-read.**  "Two
+controls, one per side" is wrong, and wrong in a way that does not reconcile with
+§57.7's own count.  The harness times THREE columns (``legacy_empty``,
+``public_einsum``, ``typed``; ``legacy_default`` is excluded after its segfault)
+and controls each, so a timed configuration carries three controls.  Of the grid's
+44 configurations only **40** time at all — the four ``ss ij->j [d]``
+configurations are TYPED-REFUSED, so there is no typed side to pair against — and
+40 x 3 is exactly the 120 controls §57.7 reports.  Two per configuration over 44
+would be 88, a number that appears nowhere.
 
 **A trap worth recording.**  Every compile-only census harness builds options with
 ``from_environment(environ={})``.  That is correct for them and part of why they
@@ -12292,6 +12302,24 @@ The 2,845 is the **empty-Schedule()** row — the comparand §56.5 itself rules 
 for cutover reasoning.  On the default-dispatch row legacy emits *fewer*
 characters than typed and there is no second pass to delete.  The argument as
 written does not survive its own choice of comparand.
+
+**AMENDED BY §57.3, which was measured after this subsection was drafted, and
+which partly rehabilitates §55.5.**  The sentence above rests on §56.5's ruling
+that default dispatch is the comparand a cutover moves.  §57.3 then measured
+production itself and found that ruling too strong: for this very cell
+**production emits 2,848 characters WITH a COO workspace**, i.e. within three
+characters of the 2,845 row and carrying the materialization the 2,845 row is
+marked "yes" for, while the 1,993/1,996 default-dispatch column is not runnable
+and is not what production executes.  So the empty-``Schedule()`` row is the
+production-faithful one for this cell and the default-dispatch row is not.
+
+What survives is narrower and still worth recording: §55.5 reached the right row
+for the wrong reason, having never checked which row production emits, and the
+1,993 column shows that "typed deletes a second pass" is not a property of legacy
+in general.  What does NOT survive is the claim that §55.5's argument fails
+BECAUSE of its comparand.  §57.3's own conclusion is the governing one — neither
+census column faithfully models production dispatch, and which is closer depends
+on the family.
 
 ### 57.3 The default-dispatch comparand is not runnable, and not production
 
@@ -12405,11 +12433,21 @@ Two false starts, both caught by measurement:
 | frontier, 1139 cells × both arms | **24 cell-arms** ``unsupported_schedule_auto_family`` → ADMITTED; **0 admitted lost**, **0 unclassified**, arm-invariant; nothing else moved.  248/652/239 → 260/640/239, base reproducing §55.2 exactly |
 | correctness of the newly admitted | **720/720** — 12 cells × 5 shapes × 2 dtypes × 2 arms × 3 densities, all executing, all matching a dense reference, all with well-formed assembled storage |
 | production emission, 506 case-arms | 104 changed, **all TTM**; nothing else in the corpus moved |
-| were the 104 correct before? | **104/104 broken → broken. Zero regressions.** Zero were correct on either tree |
+| were the 104 correct before? | **104/104 broken → broken. Zero regressions.** Zero correct on either tree *at the corpus's configuration* — see the scope note below |
 | failure mode of the 104 | base **52 SIGSEGV** / 44 ``TensorIndexError`` / 4 ``RuntimeError`` / 4 build failure → candidate **0 SIGSEGV** / 44 / 4 / 32 build failure / 24 ``IndexError`` |
 
+**A SCOPE NOTE this table needs, and §57.4 forces.**  The 104 verdict is measured
+at the production corpus's single configuration, ``(10,12,14)×(14,8)``.  That is
+enough to say those 104 case-arms were broken on both trees, and it is NOT enough
+to say the underlying cells never worked anywhere: §57.4 measures
+``TTM ddd x ss -> dds`` SOUND in 12 of 60 configurations, all at outer extent
+``i = 1``, and 12/12 on both trees.  So the honest reading is "no case-arm in this
+corpus regressed", not "these cells never worked" — and the ``i = 1`` behaviour is
+correct-to-correct, which §57.4 measured directly rather than inferring.
+
 **52 segfaults become zero.**  The emission change is not neutral and is not a
-regression: it is a strictly better failure mode on cells that never worked, plus
+regression: it is a strictly better failure mode on case-arms that did not work at
+any configuration measured here, plus
 twelve cells the typed route can now compile correctly in both arms — which also
 retires §52.7's second cost, that this would be the first arm-variant migrated
 family.  It is not; both arms admit identically.
@@ -12422,8 +12460,15 @@ measures **0 unclassified**.
 
 ### 57.7 Kernel runtime: real wins, and a real regression
 
-A/A noise floor across the grid: **0.946–1.046**, typically within ±2%.  Ratios are
-legacy-time ÷ typed-time, so above 1 means the typed route is faster.
+A/A noise floor across the grid: **0.896–1.046** over 120 same-binary controls.
+119 of the 120 span 0.946–1.046 and are typically within ±2%; the outlier is a
+single contended excursion — ``sss ijk->ik [ss]`` (256,128,64) at d=0.05,
+``legacy_empty`` column, **0.896** — in a record whose status is OK, so it is part
+of the floor and not an excluded sample.  An earlier draft of this line quoted
+0.946 as the floor, which is the second-lowest control; calibrating against it
+would understate the contended run's own noise by 5 points.  No win or regression
+reported below is inside even the widened floor.  Ratios are legacy-time ÷
+typed-time, so above 1 means the typed route is faster.
 
 Re-run on a QUIET machine (nothing else scheduled), which tightened the floor to
 **0.977–1.044** over 120 controls and reproduced the contended run's pattern and
@@ -12443,10 +12488,22 @@ general performance claim**; it holds at low density and inverts as density rise
 Reported as a finding rather than tuned around.  Still single-host: a second host
 is owed.
 
+> **SUPERSEDED IN PART BY §58.**  "The pattern is density" is a proxy, and a
+> later session identified the variable it proxies for.  The regression tracks
+> the thread count legacy's own emitted pragma requests,
+> ``scorch_nthreads(stored_ij, rows) = min(rows/16, stored_ij/500)``, which
+> orders all eight TTM measurements monotonically and explains the shape
+> dependence density alone cannot.  §58 owns the mechanism; the measurements in
+> this subsection stand unchanged.
+
 **The tile-legality fix itself is runtime-NEUTRAL.**  Base against candidate on
 the same grid: typed median ratios span **0.970–1.036**, entirely inside the
-combined A/A floor of 0.961–1.044, on all 44 configurations, and legacy's own
-ratios move no further.  The fix buys correctness and costs no measured runtime.
+combined A/A floor of 0.961–1.044, on the **40 of 44** configurations the typed
+route compiles, and legacy's own ratios move no further.  The fix buys correctness
+and costs no measured runtime.  The remaining four are ``ss ij->j [d]`` at both
+shapes and both densities, which the typed route REFUSES on both trees, so no
+typed ratio exists for them; an earlier draft said "all 44", which counted four
+configurations that were never timed.
 
 ### 57.8 Step 2a: the compressed-prefix rule reaches 58 cells, and admits none
 
@@ -12497,8 +12554,11 @@ counter answers the same question with machinery already in the tree.
 
 ### 57.9a The suite, its control, and eleven locks that encoded the old decision
 
-**Two suite runs were void before a real one existed, and both were method
-errors worth recording.**
+**Three suite attempts were void before a real one existed, across two method
+errors worth recording.**  An earlier draft of this paragraph said "two", having
+counted the quarantine's diagnosis file rather than its logs; the quarantine holds
+two distinct multi-thousand-line runs, and the third attempt left no artifact at
+all.
 
 1. Run as ONE monolithic pytest process over ~6,300 nodes, the suite reported
    **565 failures** — every one ``Fatal Python error: Aborted`` inside
@@ -12512,8 +12572,20 @@ errors worth recording.**
    total over an empty set.  A harness that can report success without running
    anything is worse than one that crashes.
 
-Both are quarantined under ``blocker1-tilefix/receipts/suite/superseded/`` with
-their diagnoses, rather than deleted.
+There was also a THIRD void run, and it is the one whose diagnosis is actually on
+disk.  ``superseded/cand.log`` records **566 failed / 5728 passed** with the same
+``_execute_child`` abort signature, and ``superseded/WHY_SUPERSEDED.md`` attributes
+it to a different cause than run 1: it was launched CONCURRENTLY with the
+blocker-1 heavy sweep, which spawns a subprocess per configuration that itself
+spawns ninja and clang, and together they exhausted the per-uid process budget
+(``kern.maxprocperuid`` = 10666).  Same symptom, different mechanism — fork
+contention from a neighbour rather than fork-after-threads inside one process —
+and the general rule the file draws is the one this branch now runs on.
+
+So the quarantine holds ``cand.log`` (566) and ``cand_monolithic.log`` (565) with
+one diagnosis file covering the former; the ``mapfile`` attempt produced no
+artifact to quarantine, because its failure was to enumerate nothing.  Saying
+"both are quarantined with their diagnoses" was true of neither pair.
 
 **The controlled result, partitioned, one tree at a time:**
 
@@ -12587,13 +12659,22 @@ under a permuted operand ``mode_order``; the obvious candidate
   non-test callers and the neutrality suite still passes.
 - **The dense-domain assembly seam is NOT implemented** — only its reach measured
   and its semantics fixed in writing.
-- **The kernel-runtime grid has not been re-run on a quiet machine or on a second
-  host.**  The §57.7 numbers are provisional and single-host.  Stated as
-  outstanding rather than assumed.
-- **The blocker-1 heavy sweep against the pinned base is owed** — its first run
-  was quarantined as tree-contaminated (launched against the live tree, which was
-  then edited mid-run).  §57.4's verdicts stand on the clean single-shape sweep
-  and the standalone reproductions; the full 780-measurement grid is queued.
+- **The kernel-runtime grid has not been run on a SECOND HOST.**  The quiet-machine
+  re-run §57.7 reports is done and sealed — ``kernelperf-step0/receipts/m5_quick_base.json``,
+  120 controls, floor 0.977–1.044 — so what remains outstanding is cross-host
+  reproduction on redwood and mkt1, whose transports §56 staged.  (This bullet was
+  drafted before §57.7 was amended with the quiet re-run and said the quiet run was
+  owed as well; it was not.)
+- **The blocker-1 heavy sweep is single-host, not owed.**  Its FIRST run was
+  quarantined as tree-contaminated — launched against the live tree, which was then
+  edited mid-run, 480 of 780 records, retained with its diagnosis under
+  ``blocker1-legacy-soundness/receipts/superseded/``.  It was then re-run in full
+  against the PINNED base worktree at ``a8f2954``, and §57.4's verdicts stand on
+  that clean **780-measurement** grid (``receipts/base_heavy.json``, sealed), not on
+  the lean single-shape sweep — which §57.4 in fact declares FALSE, and whose
+  replacement is where the ``i = 1`` correction comes from.  What is owed is a second
+  host.  (Drafted before §57.4 was amended; it said the pinned-base grid was
+  "queued".)
 - **No blocker other than 1 is touched**, and the Phase-8 cutover verdict is
   unchanged.
 
