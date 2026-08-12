@@ -477,7 +477,22 @@ def _derive_auto_decisions(
         surviving_prefix_end=last_reduction_position,
     )
     root_scope = last_reduction_position == 0
-    if root_scope:
+    # An affine tile over a non-dense receiver is illegal: lifting the tile loop
+    # (OUTERMOST, or CHILD_OF the root on the regblock arm) stops the nest
+    # visiting a compressed result level's parent prefix in lexicographic order,
+    # so the assembled position array is malformed.  ``Scheduler.apply_schedule``
+    # already refuses exactly this for an explicitly requested schedule; that
+    # check reads ``schedule.tiles`` and so is vacuous on the automatic origin,
+    # which chooses its tiles here and in
+    # ``Scheduler._apply_tiling_heuristics`` instead.
+    #
+    # This condition and the one in ``_apply_tiling_heuristics`` are the SAME
+    # rule stated in the two layers that independently decide it -- the legacy
+    # mutation and this typed re-derivation.  They must move together: if only
+    # the mutation is changed, the recorded plan stops matching the derived
+    # decisions and every affected cell fails ``auto_tile_decision`` instead of
+    # reaching its real disposition.
+    if root_scope or not dense_output:
         derived_tiles: Tuple[LoopTile, ...] = ()
     else:
         placement = (

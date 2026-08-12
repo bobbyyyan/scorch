@@ -864,6 +864,37 @@ class Scheduler:
         return False
 
     @staticmethod
+    def _has_proven_non_dense_receiver(cin: CIN) -> bool:
+        """Is the FINAL result receiver provably NOT dense?
+
+        ``_has_dense_output`` cannot answer this once a workspace has been
+        inserted: it walks the ``ForAll`` chain looking for a ``TensorAssign``,
+        and insertion puts a ``Where`` there, so past that point it answers
+        ``False`` for *every* receiver -- dense ones included.  Anything using it
+        as a post-insertion legality guard therefore silently disables itself
+        everywhere rather than firing where it means to.
+
+        The receiver the tiling-legality question is about is the single
+        non-``Workspace`` result tensor.  The polarity here is deliberate: this
+        returns ``True`` only when there is exactly one such receiver *and* its
+        format is known and non-dense.  Anything unrecognized answers ``False``
+        and leaves the existing behaviour alone, so the guard can only ever
+        subtract tiling from a shape it has positively identified.
+        """
+
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1:
+            return False
+        result_format = receivers[0].format
+        if result_format is None:
+            return False
+        return not result_format.is_dense()
+
+    @staticmethod
     def _extract_loop_chain(cin: CIN) -> Tuple[List[IndexVar], CIN]:
         loop_order: List[IndexVar] = []
         body: CIN = cin
@@ -3401,6 +3432,26 @@ class Scheduler:
         # available through ``Schedule``, but must not silently change default
         # schedules such as reduction-innermost SDDMM.
         if not cin.inserted_workspace:
+            return cin
+        # An affine tile over a non-dense result is illegal, and the scheduler
+        # already says so -- ``apply_schedule`` refuses exactly this composition
+        # for an explicitly requested schedule ("Explicit affine tiling currently
+        # requires a dense result tensor; tiled sparse-output assembly is
+        # unsupported").  That check reads ``schedule.tiles``, which is empty on
+        # the automatic origin, so it is vacuous precisely where the automatic
+        # heuristic then goes on to choose tiles itself.  The automatic path was
+        # constructing the artifact the explicit path declares unsupported, and
+        # nothing downstream re-checked it.
+        #
+        # The illegality is not theoretical.  Strip-mining a dense prefix loop and
+        # lifting the tile loop (OUTERMOST, or CHILD_OF the root on the regblock
+        # arm) stops the nest visiting a compressed result level's parent prefix
+        # in lexicographic order, so the assembled position array is malformed.
+        #
+        # Byte-neutral wherever tiling is legal, by construction: the guard cannot
+        # fire on a dense receiver, and it answers "not proven" -- leaving
+        # behaviour unchanged -- for any receiver shape it does not recognize.
+        if Scheduler._has_proven_non_dense_receiver(cin):
             return cin
         regblock_enabled = scheduler_policy.regblock_enabled
         tile_width = (
