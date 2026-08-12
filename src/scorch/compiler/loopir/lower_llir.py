@@ -131,6 +131,7 @@ from ..torch_cpp_abi import (
 from ...utils import dtype_to_c_datatype
 from .parallel_chunk_assembly import (
     PARALLEL_CHUNK_RUNTIME_SPELLINGS,
+    ROWS_PER_THREAD as PARALLEL_CHUNK_ROWS_PER_THREAD,
     ParallelChunkAssemblyContext,
     build_parallel_chunk_assembly,
     parallel_chunk_generated_names,
@@ -8648,6 +8649,17 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         if self._dense_prefix != 1 or len(levels) < 2:
             return None
         if any(level.kind is not LevelKind.COMPRESSED for level in levels[1:]):
+            return None
+        if self.shapes[self.result_symbol][0] < 2 * PARALLEL_CHUNK_ROWS_PER_THREAD:
+            # ``scorch_nthreads`` cannot exceed one at this extent for ANY
+            # operand -- its row term alone forces the answer -- so the gate
+            # could only ever cost this kernel and never pay it.  Declining at
+            # COMPILE time is what makes that cost exactly zero: a runtime gate
+            # still leaves the parallel arm in the function, and an unexecuted
+            # arm is not free (``ttm-parallel-singlepass/DUPLICATION.md``
+            # measures 8-34% for one, and 3-55% for routing the serial arm
+            # through a shared body instead).  This is the shape of gate
+            # ``CLAUDE.md`` asks for: provably inert where it must not act.
             return None
         if self.prefix_depth < 1 or self.loops[0].kind is not _DENSE:
             # A STORED loop above a dense result prefix level iterates the

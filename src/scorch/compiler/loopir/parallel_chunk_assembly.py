@@ -26,31 +26,36 @@ buffers would not reproduce lexicographic order.  Per-CHUNK buffers do, whatever
 the schedule did and whichever thread ran what, so dynamic load balancing costs
 nothing in ordering.
 
-WHY BOTH ARMS SHARE ONE BODY.  The nest is emitted ONCE, as a lambda both arms
-call: whole-range with the shared result vectors for the serial arm, once per
-chunk with that chunk's private buffers for the parallel one.  This is not
-tidiness.  The first build of this transformation gave each arm its own copy,
-and that was measured to slow the arm that RUNS by up to 34% -- with the other
-copy never executed -- because the optimizer's per-function budgets are then
-spent on both.  A source-level ablation isolated it: stubbing the unexecuted
-arm's body out, with the gate still in place, recovered the base's time exactly
-at all twelve configurations, so the cost is the second copy and not the branch
-(``ttm-parallel-singlepass/DUPLICATION.md``).  Sharing the body is what makes
-the serial arm cost nothing, and it also makes "both arms compute the same
-thing" true by construction rather than by test.
+WHAT THE SERIAL PATH COSTS, WHICH IS THE HARD PART.  Three structures were
+measured, because the obvious argument -- "the serial arm is the base's nest
+character for character, so it is inert" -- is false.  A byte-identical arm is
+not a byte-identical kernel.
 
-The buffer parameters are ``auto&`` and both call sites pass the same types, so
-the generic lambda has exactly one instantiation.
+  * Arm-local copy of the nest in each arm: the arm that RUNS is up to 34%
+    slower, with the other copy never executed, because the optimizer's
+    per-function budgets are spent on both.
+  * Serial arm routed through a shared body instead: 3-55% slower, WORSE, and
+    ``__restrict__`` on the parameters recovers none of it.  The cost is not
+    aliasing between the buffers; it is that passing them by reference makes
+    them escape, so an append-heavy drain can no longer keep a vector's
+    internals in registers.
+  * Serial arm keeping the original inline nest over the function's own locals,
+    with the shared body used by the PARALLEL arm only -- which pays the escape
+    either way, its buffers being chunk elements.  This is what is emitted.
+
+``ttm-parallel-singlepass/DUPLICATION.md`` holds those measurements.  What
+remains of the cost is removed at COMPILE time rather than paid: an outer extent
+below ``2 * ROWS_PER_THREAD`` can never reach two threads for any operand, so
+those programs are declined before anything is emitted and keep today's kernel
+exactly.
 
 WHY THE SERIAL ARM IS A REAL BRANCH.  At ``scorch_nthreads == 1`` an OpenMP
 region is not merely inert, it costs 4-10% -- measured -- and the low-density
 wins this family already holds are exactly the saving from paying neither a
 counting pass nor a region.  So the gate is a runtime ``if`` whose ``else`` arm
-is one call over the whole range, with no pragma anywhere on it, no chunk buffer
-constructed and nothing to merge afterwards.  An OpenMP ``if()`` clause was
-rejected for this: a false clause still enters the runtime and still outlines
-the body, which would make inertness an empirical claim instead of a structural
-one.
+carries no pragma, no chunk buffer and no merge.  An OpenMP ``if()`` clause was
+rejected for the same reason: a false clause still enters the runtime and still
+outlines the body.
 
 The design this implements is ``FIX_DESIGN.md`` in the ttm-density-mechanism
 ledger; ``ttm-parallel-singlepass/`` holds this one's measurements.
@@ -94,6 +99,20 @@ GENERATED_NAMES: Tuple[str, ...] = (
 
 #: The prefix of every per-chunk buffer name.
 CHUNK_BUFFER_PREFIX = "_chunk_"
+
+#: ``SCORCH_ROWS_PER_THREAD`` from ``scorch_policy.h``.  ``scorch_nthreads`` is
+#: ``clamp(min(rows / SCORCH_ROWS_PER_THREAD, work / grain), 1, hw)``, so an
+#: outer extent below twice this can never yield more than one thread FOR ANY
+#: OPERAND -- the row term alone forces the answer.  The extent is a compile-time
+#: constant (the kernel is built per shape and the ABI validates it against one),
+#: so those programs can be declined before anything is emitted, which is the
+#: only way for the gate to cost a kernel that can never use it exactly nothing.
+#:
+#: A per-host autotune may lower the macro in ``scorch_policy_tuned.h``.  That
+#: can only make this test decline a program the runtime would have
+#: parallelized -- a forgone optimization, never a wrong kernel -- because
+#: declining emits today's serial code unchanged.
+ROWS_PER_THREAD = 16
 
 #: Anything the transformation copies structurally.
 _DetachedT = TypeVar("_DetachedT")
@@ -508,20 +527,17 @@ def build_parallel_chunk_assembly(
                 ">", _var("_assembly_threads", llir.DataType.INT), _literal(1)
             ),
             then_body=_parallel_branch(context, policy),
-            # The serial arm is ONE CALL: the whole row range, straight into the
-            # shared result vectors, so there is no chunk buffer to construct
-            # and nothing to merge afterwards.  No pragma appears anywhere on
-            # this path -- inertness at one thread stays structural -- and
-            # because the body it calls is the same object the parallel arm
-            # calls, the function holds one copy of the nest rather than two.
-            else_body=[
-                _body_call(
-                    context,
-                    _literal(0),
-                    _detach(policy.rows),
-                    [_var(name) for name in chunked_vector_names(context)],
-                )
-            ],
+            # The serial arm keeps the ORIGINAL nest, inline, over the enclosing
+            # function's own result vectors.  Routing it through the shared body
+            # instead was measured to cost 3-55% here, and __restrict__ on the
+            # parameters does not recover any of it (restrict/base 1.60 at the
+            # worst point): the cost is not aliasing between the buffers, it is
+            # that passing them by reference makes them ESCAPE, so an
+            # append-heavy drain can no longer keep a vector's internals in
+            # registers.  The parallel arm pays that either way -- its buffers
+            # are chunk elements, reached by reference whatever we do -- so the
+            # shared body is used there and only there.
+            else_body=list(statements),
         ),
     ]
 
