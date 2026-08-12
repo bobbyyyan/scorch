@@ -129,6 +129,12 @@ from ..torch_cpp_abi import (
     TorchCppKernelABI,
 )
 from ...utils import dtype_to_c_datatype
+from .parallel_chunk_assembly import (
+    PARALLEL_CHUNK_RUNTIME_SPELLINGS,
+    ParallelChunkAssemblyContext,
+    build_parallel_chunk_assembly,
+    parallel_chunk_generated_names,
+)
 from .nodes import (
     AppendEntry,
     BinaryExpr,
@@ -8608,6 +8614,68 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 f"{self.workspace_decl.name}_base{level}",
                 owner,
             )
+        chunked = self.parallel_chunk_context()
+        if chunked is not None:
+            assembly_owner = "the parallel chunk assembly"
+            for name in (
+                *PARALLEL_CHUNK_RUNTIME_SPELLINGS,
+                *parallel_chunk_generated_names(chunked),
+            ):
+                self._reserve_generated_name(name, assembly_owner)
+
+    # -- parallel chunk assembly ----------------------------------------------
+
+    def parallel_chunk_context(self) -> Optional[ParallelChunkAssemblyContext]:
+        """This result's chunked-assembly configuration, or ``None`` to stay serial.
+
+        Admission is entirely structural.  What it needs is a dense level 0
+        driven by the outermost loop with every remaining level compressed
+        under it, because that is exactly the correspondence that makes
+        "concatenate the chunks in outer-loop order" reproduce the required
+        lexicographic assembly.  Everything else keeps emitting what it emits
+        today; a declined optimization is a correct kernel, not a fail-open.
+
+        A dense prefix DEEPER than one is declined here rather than guessed
+        at.  Its first compressed level's position array is indexed by a
+        FLATTENED dense cell, so the pre-size, the per-chunk starting index
+        and the shift range become products of the dense extents.  The
+        mechanism generalizes; that index derivation needs its own statement
+        and its own measurement, and shipping it unmeasured alongside the
+        family this was built for would make the result harder to attribute.
+        """
+
+        levels = self.result_decl.levels
+        if self._dense_prefix != 1 or len(levels) < 2:
+            return None
+        if any(level.kind is not LevelKind.COMPRESSED for level in levels[1:]):
+            return None
+        if self.prefix_depth < 1 or self.loops[0].kind is not _DENSE:
+            # A STORED loop above a dense result prefix level iterates the
+            # operand's stored coordinates, which do not partition the dense
+            # extent, so chunking it would not partition the result either.
+            return None
+        if self._owns_stored_prefix_assembly(0):
+            return None
+        if _needs_stored_prefix_final_catch_up(self, self._dense_prefix):
+            return None
+        if (
+            self.panel is not None
+            or self.relayout is not None
+            or self.result_tile is not None
+            or self.parallel is not None
+        ):
+            # Already None for this family; checked rather than assumed,
+            # because each would own part of the same assembly.
+            return None
+        return ParallelChunkAssemblyContext(
+            result_name=self.result_decl.name,
+            shared_position_level=1,
+            compressed_levels=tuple(range(1, len(levels))),
+            value_ctype=dtype_to_c_datatype(
+                _SCALAR_TO_TORCH[self.result_decl.dtype]
+            ).value,
+            index_ctype=llir.DataType.INT.value,
+        )
 
     # -- names ---------------------------------------------------------------
 
@@ -9165,6 +9233,17 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             # A stored prefix stops at its last stored coordinate instead of at
             # the prefix's extent, so the cells past it are still open.
             statements.extend(_stored_prefix_final_statements(self, self._dense_prefix))
+        chunked = self.parallel_chunk_context()
+        if chunked is not None:
+            # The gate is emitted HERE, upstream of the completion checkpoint,
+            # rather than as a managed pass.  ``_OrderedKeyExpectedBody`` mirrors
+            # this family's body from exactly these statements and models one
+            # transformation -- the dynamic-vector rewrite -- so emitting the
+            # branch in the target keeps the whole emitted body verified with no
+            # new modelling, and leaves the frozen production pass order alone.
+            gated = build_parallel_chunk_assembly(statements, chunked)
+            if gated is not None:
+                return [llir.BlankLine(), *gated]
         return statements
 
 

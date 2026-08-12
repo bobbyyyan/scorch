@@ -257,6 +257,141 @@ static inline void scorch_zero_dense(T* __restrict__ p, int64_t n) {
   }
 }
 
+// ####################################
+// Parallel single-pass sparse assembly
+// ####################################
+//
+// The generated single-pass sparse builders append into std::vector in outer-
+// loop order, which is sequential by construction. These helpers let a builder
+// keep that one-pass strategy and still run in parallel: each CHUNK of the
+// outer dense loop appends into its own private buffers, and the buffers are
+// concatenated afterwards in chunk order, which is outer-loop order.
+//
+// Chunks rather than threads own the buffers deliberately. Under a dynamic
+// schedule one thread may take a low row range and then a high one, so
+// concatenating per-THREAD buffers would not reproduce the required
+// lexicographic order; concatenating per-CHUNK buffers does, whatever the
+// schedule did, so load balancing costs nothing in ordering.
+
+// Rows per output chunk. The width is scorch_chunk's dynamic-schedule width,
+// but never so narrow that the chunk COUNT exceeds ~SCORCH_CHUNKS_PER_THREAD
+// per worker: here each chunk owns its own output buffers, so the count is an
+// allocation budget as well as a load-balancing knob, and scorch_chunk's
+// SCORCH_CHUNK_MAX clamp is a schedule bound that would otherwise let the
+// buffer count grow without limit in `rows`.
+inline int64_t scorch_chunk_rows(long rows, long work,
+                                 long grain_default = SCORCH_GRAIN_DEFAULT) {
+  const int nt = scorch_nthreads(work, rows, grain_default);
+  int64_t width = static_cast<int64_t>(scorch_chunk(rows, work, grain_default));
+  const int64_t budget = static_cast<int64_t>(nt) * SCORCH_CHUNKS_PER_THREAD;
+  if (budget > 0) {
+    const int64_t floor_width = (static_cast<int64_t>(rows) + budget - 1) / budget;
+    if (width < floor_width) {
+      width = floor_width;
+    }
+  }
+  return width < 1 ? 1 : width;
+}
+
+// The exclusive upper row of one chunk.
+inline int64_t scorch_chunk_end(int64_t begin, int64_t width, int64_t rows) {
+  const int64_t end = begin + width;
+  return end < rows ? end : rows;
+}
+
+// `chunks` empty private buffers. Returned by value; `auto` at the call site.
+template <typename T>
+inline std::vector<std::vector<T>> scorch_chunk_buffers(int64_t chunks) {
+  if (chunks < 0) {
+    throw std::out_of_range("negative chunk count");
+  }
+  return std::vector<std::vector<T>>(static_cast<size_t>(chunks));
+}
+
+// Grow a position array to `count` slots, preserving what it already holds.
+// scorch_vector_set's append path is sequential-only; once the array is
+// pre-sized every write inside the region takes its checked in-range store, so
+// disjoint chunk workers may write their own slots concurrently.
+template <typename T>
+inline void scorch_presize_positions(std::vector<T>& positions, int64_t count) {
+  if (count < 0) {
+    throw std::out_of_range("negative position count");
+  }
+  const auto wanted = static_cast<typename std::vector<T>::size_type>(count);
+  if (positions.size() < wanted) {
+    positions.resize(wanted, T(0));
+  }
+}
+
+// Append every chunk's entries, in chunk order. The exact total is reserved
+// first so the concatenation is one pass with no reallocation.
+template <typename T>
+inline void scorch_concat_chunks(std::vector<T>& out,
+                                 const std::vector<std::vector<T>>& parts) {
+  size_t total = out.size();
+  for (const auto& part : parts) {
+    total += part.size();
+  }
+  out.reserve(total);
+  for (const auto& part : parts) {
+    out.insert(out.end(), part.begin(), part.end());
+  }
+}
+
+// Append each chunk's position entries after its leading zero, shifted by the
+// running total of that chunk's child coordinates. Chunk c's local positions
+// count into its own child buffer, so the shift is the number of child
+// coordinates every earlier chunk contributed.
+template <typename P, typename C>
+inline void scorch_concat_chunk_positions(
+    std::vector<P>& out,
+    const std::vector<std::vector<P>>& position_parts,
+    const std::vector<std::vector<C>>& child_parts) {
+  if (position_parts.size() != child_parts.size()) {
+    throw std::out_of_range("chunk position/child buffer count mismatch");
+  }
+  size_t total = out.size();
+  for (const auto& part : position_parts) {
+    total += part.empty() ? 0 : part.size() - 1;
+  }
+  out.reserve(total);
+  int64_t base = 0;
+  for (size_t chunk = 0; chunk < position_parts.size(); chunk++) {
+    const auto& part = position_parts[chunk];
+    for (size_t entry = 1; entry < part.size(); entry++) {
+      out.push_back(static_cast<P>(static_cast<int64_t>(part[entry]) + base));
+    }
+    base += static_cast<int64_t>(child_parts[chunk].size());
+  }
+}
+
+// Add each chunk's running coordinate base to the dense-indexed position slots
+// that chunk wrote. The first compressed level's position array is indexed by
+// the outer dense loop, so it is shared and pre-sized rather than chunked; only
+// its values are chunk-local counts. Chunk c wrote slots (lo, hi], where lo/hi
+// are its own row range, so the shift range is exact rather than searched for.
+template <typename P, typename C>
+inline void scorch_shift_chunk_positions(
+    std::vector<P>& positions,
+    const std::vector<std::vector<C>>& child_parts,
+    int64_t width,
+    int64_t rows) {
+  int64_t base = 0;
+  for (size_t chunk = 0; chunk < child_parts.size(); chunk++) {
+    const int64_t begin = static_cast<int64_t>(chunk) * width;
+    const int64_t end = scorch_chunk_end(begin, width, rows);
+    if (base != 0) {
+      for (int64_t slot = begin + 1; slot <= end; slot++) {
+        positions.at(static_cast<typename std::vector<P>::size_type>(slot)) =
+            static_cast<P>(
+                static_cast<int64_t>(
+                    positions[static_cast<size_t>(slot)]) + base);
+      }
+    }
+    base += static_cast<int64_t>(child_parts[chunk].size());
+  }
+}
+
 
 
 // ####################################

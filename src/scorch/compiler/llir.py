@@ -203,6 +203,10 @@ class DataType(Enum):
     CONSTEXPR_INT = "constexpr int"
 
     CONST_AUTO_REF = "const auto&"
+    # A mutable compiler-deduced borrow. The parallel chunk assembly binds each
+    # chunk's private output buffer under the shared vector's own spelling, so
+    # the copied loop body needs no rewriting at all.
+    AUTO_REF = "auto&"
 
     @classmethod
     def std_vector_type(cls, dtype: DataType) -> DataType:
