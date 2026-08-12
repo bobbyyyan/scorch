@@ -420,6 +420,9 @@ class LLIRLowerer:
                 indent_level,
             )
 
+        elif type(ir) is llir.LambdaDef:
+            return self.lower_lambda_def(cast(llir.LambdaDef, ir), indent_level)
+
         elif type(ir) is llir.IfThenElse:
             return self.lower_conditional(ir, indent_level)
 
@@ -1028,6 +1031,37 @@ class LLIRLowerer:
                 + loop_text
             )
         return pragma_text + "\n" + loop_text
+
+    def lower_lambda_def(self, ir: llir.LambdaDef, indent_level: int = 0) -> str:
+        """``auto NAME = [&](PARAMS) { BODY };``
+
+        The reference capture is unconditional and deliberate: this node exists
+        so two call sites can share one body, and every name the body reads that
+        is not a parameter is a kernel local it must see by reference.
+        """
+
+        self._validate_direct_entry(ir)
+        if type(ir) is not llir.LambdaDef:
+            raise CodegenError(
+                "lambda emission requires an exact LLIR LambdaDef; got "
+                f"{type(ir).__name__}"
+            )
+        if type(ir.params) not in (list, tuple):
+            raise CodegenError("LLIR LambdaDef.params must be a list or tuple")
+        for param in ir.params:
+            if type(param) is not llir.Var:
+                raise CodegenError("LLIR LambdaDef.params must hold exact LLIR Vars")
+        self._validate_statement_sequence(ir.body, "LLIR LambdaDef.body")
+        parameters = ", ".join(self._lower_typed_var(param) for param in ir.params)
+        return "\n".join(
+            [
+                self.lower_llir(
+                    f"auto {ir.var.name} = [&]({parameters}) {{", indent_level
+                ),
+                self.lower_llir(ir.body, indent_level + 1),
+                self.lower_llir("};", indent_level),
+            ]
+        )
 
     def lower_conditional(self, ir: llir.IfThenElse, indent_level: int = 0) -> str:
         self._validate_direct_entry(ir)

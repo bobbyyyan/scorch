@@ -323,18 +323,59 @@ inline void scorch_presize_positions(std::vector<T>& positions, int64_t count) {
   }
 }
 
-// Append every chunk's entries, in chunk order. The exact total is reserved
-// first so the concatenation is one pass with no reallocation.
+// Chunk c's destination offset, and the exact total. O(chunks), never O(nnz).
+template <typename T>
+inline std::vector<size_t> scorch_chunk_offsets(
+    size_t begin, const std::vector<std::vector<T>>& parts) {
+  std::vector<size_t> offsets(parts.size() + 1);
+  offsets[0] = begin;
+  for (size_t chunk = 0; chunk < parts.size(); chunk++) {
+    offsets[chunk + 1] = offsets[chunk] + parts[chunk].size();
+  }
+  return offsets;
+}
+
+// Append every chunk's entries, in chunk order.
+//
+// This copy is the whole price of the single-pass strategy -- it replaces
+// legacy's redundant counting pass -- so it has to be cheap in the regime that
+// buys the parallelism. Sizing the destination once and then copying chunks
+// into disjoint slices makes the copy itself parallel; a reserve-and-append
+// loop cannot be, and measured serially it eats a large part of what the
+// parallel assembly wins back. Below SCORCH_MEMSET_GRAIN_BYTES the region would
+// cost more than the copy, so it stays a straight-line memcpy chain.
 template <typename T>
 inline void scorch_concat_chunks(std::vector<T>& out,
-                                 const std::vector<std::vector<T>>& parts) {
-  size_t total = out.size();
-  for (const auto& part : parts) {
-    total += part.size();
+                                 const std::vector<std::vector<T>>& parts,
+                                 int threads = 1) {
+  const size_t begin = out.size();
+  const std::vector<size_t> offsets = scorch_chunk_offsets(begin, parts);
+  const size_t total = offsets.back();
+  if (total == begin) {
+    return;
   }
-  out.reserve(total);
-  for (const auto& part : parts) {
-    out.insert(out.end(), part.begin(), part.end());
+  out.resize(total);
+  T* const destination = out.data();
+  const int64_t bytes =
+      static_cast<int64_t>(total - begin) * static_cast<int64_t>(sizeof(T));
+  const int64_t count = static_cast<int64_t>(parts.size());
+  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
+#pragma omp parallel for num_threads(threads) schedule(dynamic)
+    for (int64_t chunk = 0; chunk < count; chunk++) {
+      const std::vector<T>& part = parts[static_cast<size_t>(chunk)];
+      if (!part.empty()) {
+        std::memcpy(destination + offsets[static_cast<size_t>(chunk)],
+                    part.data(), part.size() * sizeof(T));
+      }
+    }
+    return;
+  }
+  for (int64_t chunk = 0; chunk < count; chunk++) {
+    const std::vector<T>& part = parts[static_cast<size_t>(chunk)];
+    if (!part.empty()) {
+      std::memcpy(destination + offsets[static_cast<size_t>(chunk)], part.data(),
+                  part.size() * sizeof(T));
+    }
   }
 }
 
@@ -346,22 +387,55 @@ template <typename P, typename C>
 inline void scorch_concat_chunk_positions(
     std::vector<P>& out,
     const std::vector<std::vector<P>>& position_parts,
-    const std::vector<std::vector<C>>& child_parts) {
+    const std::vector<std::vector<C>>& child_parts,
+    int threads = 1) {
   if (position_parts.size() != child_parts.size()) {
     throw std::out_of_range("chunk position/child buffer count mismatch");
   }
-  size_t total = out.size();
-  for (const auto& part : position_parts) {
-    total += part.empty() ? 0 : part.size() - 1;
+  const size_t begin = out.size();
+  const size_t count = position_parts.size();
+  // Each chunk contributes its entries after the leading zero, at a destination
+  // offset and a value shift that are both prefix sums over the chunks.
+  std::vector<size_t> offsets(count + 1);
+  std::vector<int64_t> shifts(count + 1);
+  offsets[0] = begin;
+  shifts[0] = 0;
+  for (size_t chunk = 0; chunk < count; chunk++) {
+    const size_t entries =
+        position_parts[chunk].empty() ? 0 : position_parts[chunk].size() - 1;
+    offsets[chunk + 1] = offsets[chunk] + entries;
+    shifts[chunk + 1] =
+        shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
   }
-  out.reserve(total);
-  int64_t base = 0;
-  for (size_t chunk = 0; chunk < position_parts.size(); chunk++) {
-    const auto& part = position_parts[chunk];
-    for (size_t entry = 1; entry < part.size(); entry++) {
-      out.push_back(static_cast<P>(static_cast<int64_t>(part[entry]) + base));
+  const size_t total = offsets.back();
+  if (total == begin) {
+    return;
+  }
+  out.resize(total);
+  P* const destination = out.data();
+  const int64_t bytes =
+      static_cast<int64_t>(total - begin) * static_cast<int64_t>(sizeof(P));
+  const int64_t chunks = static_cast<int64_t>(count);
+  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
+#pragma omp parallel for num_threads(threads) schedule(dynamic)
+    for (int64_t chunk = 0; chunk < chunks; chunk++) {
+      const size_t index = static_cast<size_t>(chunk);
+      const std::vector<P>& part = position_parts[index];
+      P* slot = destination + offsets[index];
+      for (size_t entry = 1; entry < part.size(); entry++) {
+        *slot++ =
+            static_cast<P>(static_cast<int64_t>(part[entry]) + shifts[index]);
+      }
     }
-    base += static_cast<int64_t>(child_parts[chunk].size());
+    return;
+  }
+  for (int64_t chunk = 0; chunk < chunks; chunk++) {
+    const size_t index = static_cast<size_t>(chunk);
+    const std::vector<P>& part = position_parts[index];
+    P* slot = destination + offsets[index];
+    for (size_t entry = 1; entry < part.size(); entry++) {
+      *slot++ = static_cast<P>(static_cast<int64_t>(part[entry]) + shifts[index]);
+    }
   }
 }
 
@@ -375,20 +449,42 @@ inline void scorch_shift_chunk_positions(
     std::vector<P>& positions,
     const std::vector<std::vector<C>>& child_parts,
     int64_t width,
-    int64_t rows) {
-  int64_t base = 0;
-  for (size_t chunk = 0; chunk < child_parts.size(); chunk++) {
-    const int64_t begin = static_cast<int64_t>(chunk) * width;
-    const int64_t end = scorch_chunk_end(begin, width, rows);
-    if (base != 0) {
+    int64_t rows,
+    int threads = 1) {
+  const size_t count = child_parts.size();
+  std::vector<int64_t> shifts(count + 1);
+  shifts[0] = 0;
+  for (size_t chunk = 0; chunk < count; chunk++) {
+    shifts[chunk + 1] =
+        shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
+  }
+  if (static_cast<int64_t>(positions.size()) < rows + 1) {
+    throw std::out_of_range("position array was not pre-sized for the chunks");
+  }
+  P* const slots = positions.data();
+  const int64_t chunks = static_cast<int64_t>(count);
+  const int64_t bytes = (rows + 1) * static_cast<int64_t>(sizeof(P));
+  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
+#pragma omp parallel for num_threads(threads) schedule(dynamic)
+    for (int64_t chunk = 1; chunk < chunks; chunk++) {
+      const int64_t begin = chunk * width;
+      const int64_t end = scorch_chunk_end(begin, width, rows);
+      const int64_t base = shifts[static_cast<size_t>(chunk)];
       for (int64_t slot = begin + 1; slot <= end; slot++) {
-        positions.at(static_cast<typename std::vector<P>::size_type>(slot)) =
-            static_cast<P>(
-                static_cast<int64_t>(
-                    positions[static_cast<size_t>(slot)]) + base);
+        slots[slot] =
+            static_cast<P>(static_cast<int64_t>(slots[slot]) + base);
       }
     }
-    base += static_cast<int64_t>(child_parts[chunk].size());
+    return;
+  }
+  // Chunk 0's base is zero, so its slots already hold the global count.
+  for (int64_t chunk = 1; chunk < chunks; chunk++) {
+    const int64_t begin = chunk * width;
+    const int64_t end = scorch_chunk_end(begin, width, rows);
+    const int64_t base = shifts[static_cast<size_t>(chunk)];
+    for (int64_t slot = begin + 1; slot <= end; slot++) {
+      slots[slot] = static_cast<P>(static_cast<int64_t>(slots[slot]) + base);
+    }
   }
 }
 

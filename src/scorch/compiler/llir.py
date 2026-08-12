@@ -1259,6 +1259,31 @@ class ForLoopAuto(Stmt):
     body: List[Stmt]
 
 
+@dataclass(frozen=False)
+class LambdaDef(Stmt):
+    """``auto NAME = [&](PARAMS) { BODY };`` -- one body, several call sites.
+
+    This exists so a generated kernel can run ONE loop nest under two different
+    calling conventions without holding two copies of it. That is not a
+    formatting preference: emitting the same nest twice was measured to slow the
+    copy that runs by up to 34%, with the second copy never executed, because
+    the optimizer's per-function budgets are then spent on both
+    (``~/.cache/scorch-codex/ttm-parallel-singlepass/DUPLICATION.md``). A
+    parallel/serial gate whose two arms share a body therefore has to share it
+    structurally.
+
+    Parameters typed ``DataType.AUTO_REF`` make this a C++14 generic lambda.
+    When every call site passes the same argument types -- which is the case
+    this node is for, a shared body called once per chunk and once for the whole
+    range -- that is a single instantiation, so the "one body" property is
+    preserved rather than merely intended.
+    """
+
+    var: Var
+    params: List[Var]
+    body: List[Stmt]
+
+
 class WhileLoop(Stmt):
     """A while loop statement in C/C++."""
 

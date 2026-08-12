@@ -26,23 +26,34 @@ buffers would not reproduce lexicographic order.  Per-CHUNK buffers do, whatever
 the schedule did and whichever thread ran what, so dynamic load balancing costs
 nothing in ordering.
 
-WHY THE COPIED BODY IS NOT REWRITTEN.  Each chunk's private buffers are bound as
-C++ references *under the shared vectors' own spellings*, so the parallel
-branch's loop body is a detached structural copy of the serial branch's with
-zero edits.  "Both branches compute the same thing" is then a property of the
-construction rather than a claim needing its own test, and the downstream
-name-keyed ``DYNAMIC_VECTOR_ACCESS`` rewrite lands identically on both.
+WHY BOTH ARMS SHARE ONE BODY.  The nest is emitted ONCE, as a lambda both arms
+call: whole-range with the shared result vectors for the serial arm, once per
+chunk with that chunk's private buffers for the parallel one.  This is not
+tidiness.  The first build of this transformation gave each arm its own copy,
+and that was measured to slow the arm that RUNS by up to 34% -- with the other
+copy never executed -- because the optimizer's per-function budgets are then
+spent on both.  A source-level ablation isolated it: stubbing the unexecuted
+arm's body out, with the gate still in place, recovered the base's time exactly
+at all twelve configurations, so the cost is the second copy and not the branch
+(``ttm-parallel-singlepass/DUPLICATION.md``).  Sharing the body is what makes
+the serial arm cost nothing, and it also makes "both arms compute the same
+thing" true by construction rather than by test.
 
-WHY THE SERIAL BRANCH IS A REAL BRANCH.  At ``scorch_nthreads == 1`` the region
-is not merely inert, it costs 4-10% -- measured -- and the low-density wins this
-family already holds are exactly the saving from paying neither a counting pass
-nor a region.  So the gate is a runtime ``if`` whose ``else`` arm is the
-unmodified serial statement list, containing no pragma anywhere.  An OpenMP
-``if()`` clause was rejected for this: a false clause still enters the runtime
-and still forces the body to be outlined, which would make inertness an
-empirical claim instead of a structural one.
+The buffer parameters are ``auto&`` and both call sites pass the same types, so
+the generic lambda has exactly one instantiation.
 
-The design this implements is ``FIX_DESIGN.md`` in the ledger above.
+WHY THE SERIAL ARM IS A REAL BRANCH.  At ``scorch_nthreads == 1`` an OpenMP
+region is not merely inert, it costs 4-10% -- measured -- and the low-density
+wins this family already holds are exactly the saving from paying neither a
+counting pass nor a region.  So the gate is a runtime ``if`` whose ``else`` arm
+is one call over the whole range, with no pragma anywhere on it, no chunk buffer
+constructed and nothing to merge afterwards.  An OpenMP ``if()`` clause was
+rejected for this: a false clause still enters the runtime and still outlines
+the body, which would make inertness an empirical claim instead of a structural
+one.
+
+The design this implements is ``FIX_DESIGN.md`` in the ttm-density-mechanism
+ledger; ``ttm-parallel-singlepass/`` holds this one's measurements.
 """
 
 from __future__ import annotations
@@ -78,6 +89,7 @@ GENERATED_NAMES: Tuple[str, ...] = (
     "_assembly_chunk",
     "_assembly_lo",
     "_assembly_hi",
+    "_assembly_body",
 )
 
 #: The prefix of every per-chunk buffer name.
@@ -221,46 +233,47 @@ def is_transformable(loop: llir.ForLoop) -> bool:
     return _policy_expressions(loop) is not None
 
 
-def _chunk_prologue(
+def _body_lambda(
+    outer: llir.ForLoop,
     context: ParallelChunkAssemblyContext,
-    policy: _PolicyExpressions,
-) -> List[llir.Stmt]:
-    """Per-chunk buffer borrows and counter re-initialization.
+) -> llir.LambdaDef:
+    """The ONE copy of the assembly nest, parameterized by row range and buffers.
 
-    Four scalars are re-initialized, and only one takes a value that differs
-    from its serial initializer: the shared level's ``_pos_index`` starts at the
-    chunk's first row rather than at zero, which is exactly what makes the
-    existing catch-up loop correct within a chunk.
+    Emitting the nest twice -- once per arm of the gate -- was measured to slow
+    the arm that runs by up to 34%, with the other copy never executed, because
+    the optimizer's per-function budgets are then spent on both.  A source-level
+    ablation isolated it: stubbing the unexecuted arm's body out, with the gate
+    left in place, recovered the base's time exactly, so the cost is the second
+    copy and not the branch (``DUPLICATION.md`` in the ledger).  Both arms
+    therefore call one lambda.
+
+    The buffer parameters are ``auto&``, so this is a generic lambda; both call
+    sites pass the same types, so it is one instantiation and the "one body"
+    property is real rather than intended.  Four scalars are re-initialized per
+    call, and only one takes a value that differs from its serial initializer:
+    the shared level's ``_pos_index`` starts at the call's first row, which is
+    exactly what makes the existing catch-up loop correct over a sub-range.
     """
 
     result = context.result_name
-    statements: List[llir.Stmt] = []
-    for name in chunked_vector_names(context):
-        statements.append(
-            llir.VarInit(
-                var=_var(name, llir.DataType.AUTO_REF),
-                value=llir.ArrayAccess(
-                    array=_var(buffer_name(name)),
-                    index=_int64("_assembly_chunk"),
-                ),
-            )
-        )
+    prologue: List[llir.Stmt] = []
     for level in context.compressed_levels:
         if level == context.shared_position_level:
             continue
-        # A chunk-local position array carries its own leading zero, exactly as
-        # the shared one does at the body root; the drain reads it with .back().
-        statements.append(
+        # A chunk-local position array needs its own leading zero.  For the
+        # whole-range call the shared array already carries one, and rewriting
+        # slot zero with zero is idempotent, so one spelling serves both.
+        prologue.append(
             llir.FunctionCallStmt(
                 name="scorch_vector_set",
                 args=[_var(f"{result}{level}_pos"), _literal(0), _literal(0)],
             )
         )
     for level in context.compressed_levels:
-        statements.append(
+        prologue.append(
             llir.VarInit(var=_int64(f"p{result}{level}"), value=_literal(0))
         )
-        statements.append(
+        prologue.append(
             llir.VarInit(
                 var=_int64(f"{result}{level}_pos_index"),
                 value=(
@@ -270,14 +283,50 @@ def _chunk_prologue(
                 ),
             )
         )
-    return statements
+
+    ranged = _detach(outer)
+    ranged.init = llir.VarInit(
+        var=cast(llir.VarInit, ranged.init).var,
+        value=_int64("_assembly_lo"),
+    )
+    ranged.cond = llir.BinOp(
+        "<", cast(llir.BinOp, ranged.cond).left, _int64("_assembly_hi")
+    )
+
+    params = [_int64("_assembly_lo"), _int64("_assembly_hi")]
+    params.extend(
+        _var(name, llir.DataType.AUTO_REF) for name in chunked_vector_names(context)
+    )
+    return llir.LambdaDef(
+        var=_var("_assembly_body", llir.DataType.AUTO),
+        params=params,
+        body=[*prologue, ranged],
+    )
+
+
+def _body_call(
+    context: ParallelChunkAssemblyContext,
+    low: llir.Expr,
+    high: llir.Expr,
+    buffers: List[llir.Expr],
+) -> llir.FunctionCallStmt:
+    return llir.FunctionCallStmt(name="_assembly_body", args=[low, high, *buffers])
 
 
 def _merge_statements(
     context: ParallelChunkAssemblyContext,
     policy: _PolicyExpressions,
 ) -> List[llir.Stmt]:
-    """Concatenate the per-chunk buffers into the shared result vectors."""
+    """Concatenate the per-chunk buffers into the shared result vectors.
+
+    Every helper takes the assembly thread count.  This copy is the whole price
+    of keeping the single-pass strategy -- it stands in for legacy's counting
+    pass -- and once the compute term has been cut by the thread count a SERIAL
+    merge is a large fraction of what is left, so the merge is parallel over
+    chunks too.  Each helper falls back to a straight-line copy below
+    ``SCORCH_MEMSET_GRAIN_BYTES``, where the region would cost more than the
+    copy.
+    """
 
     result = context.result_name
     shared = context.shared_position_level
@@ -292,6 +341,7 @@ def _merge_statements(
                 _var(buffer_name(f"{result}{shared}_crd")),
                 _int64("_assembly_width"),
                 _detach(policy.rows),
+                _var("_assembly_threads", llir.DataType.INT),
             ],
         )
     ]
@@ -304,6 +354,7 @@ def _merge_statements(
                         _var(f"{result}{level}_pos"),
                         _var(buffer_name(f"{result}{level}_pos")),
                         _var(buffer_name(f"{result}{level}_crd")),
+                        _var("_assembly_threads", llir.DataType.INT),
                     ],
                 )
             )
@@ -313,6 +364,7 @@ def _merge_statements(
                 args=[
                     _var(f"{result}{level}_crd"),
                     _var(buffer_name(f"{result}{level}_crd")),
+                    _var("_assembly_threads", llir.DataType.INT),
                 ],
             )
         )
@@ -322,6 +374,7 @@ def _merge_statements(
             args=[
                 _var(f"{result}_values"),
                 _var(buffer_name(f"{result}_values")),
+                _var("_assembly_threads", llir.DataType.INT),
             ],
         )
     )
@@ -329,11 +382,10 @@ def _merge_statements(
 
 
 def _parallel_branch(
-    outer: llir.ForLoop,
     context: ParallelChunkAssemblyContext,
     policy: _PolicyExpressions,
 ) -> List[llir.Stmt]:
-    """The whole parallel arm: buffers, the chunk region, then the merge."""
+    """Buffers, the chunk region, then the merge.  Carries no copy of the nest."""
 
     result = context.result_name
     width = _int64("_assembly_width")
@@ -345,10 +397,7 @@ def _parallel_branch(
             var=width,
             value=llir.FunctionCall(
                 name="scorch_chunk_rows",
-                args=[
-                    _detach(policy.rows),
-                    _detach(policy.work),
-                ],
+                args=[_detach(policy.rows), _detach(policy.work)],
             ),
         ),
         llir.VarInit(
@@ -356,9 +405,7 @@ def _parallel_branch(
             value=llir.BinOp(
                 "/",
                 llir.BinOp(
-                    "-",
-                    llir.Add(_detach(policy.rows), _detach(width)),
-                    _literal(1),
+                    "-", llir.Add(_detach(policy.rows), _detach(width)), _literal(1)
                 ),
                 _detach(width),
             ),
@@ -387,35 +434,21 @@ def _parallel_branch(
         )
     )
 
-    body_loop = cast(llir.ForLoop, _detach(outer))
-    body_loop.init = llir.VarInit(
-        var=cast(llir.VarInit, body_loop.init).var,
-        value=_int64("_assembly_lo"),
-    )
-    body_loop.cond = llir.BinOp(
-        "<",
-        cast(llir.BinOp, body_loop.cond).left,
-        _int64("_assembly_hi"),
-    )
-
+    low = _int64("_assembly_lo")
     chunk_body: List[llir.Stmt] = [
-        llir.VarInit(
-            var=_int64("_assembly_lo"),
-            value=llir.BinOp("*", _detach(chunk), _detach(width)),
-        ),
-        llir.VarInit(
-            var=_int64("_assembly_hi"),
-            value=llir.FunctionCall(
+        llir.VarInit(var=low, value=llir.BinOp("*", _detach(chunk), _detach(width))),
+        _body_call(
+            context,
+            _detach(low),
+            llir.FunctionCall(
                 name="scorch_chunk_end",
-                args=[
-                    _int64("_assembly_lo"),
-                    _detach(width),
-                    _detach(policy.rows),
-                ],
+                args=[_detach(low), _detach(width), _detach(policy.rows)],
             ),
+            [
+                llir.ArrayAccess(array=_var(buffer_name(name)), index=_detach(chunk))
+                for name in chunked_vector_names(context)
+            ],
         ),
-        *_chunk_prologue(context, policy),
-        body_loop,
     ]
 
     # "dynamic" is OpenMP's chunk-size-one dynamic schedule.  One iteration is
@@ -423,16 +456,19 @@ def _parallel_branch(
     # SCORCH_CHUNKS_PER_THREAD per worker, so the schedule needs no chunking of
     # its own.  The thread count is spelled exactly as the legacy pragma spells
     # it, from the same derivation, so the two kernels open on the same gate.
-    region = llir.ForLoop(
-        init=llir.VarInit(var=chunk, value=_literal(0)),
-        cond=llir.BinOp("<", _detach(chunk), _detach(chunks)),
-        update=llir.Increment(var=cast(llir.Var, _detach(chunk))),
-        body=chunk_body,
-        omp_parallel_for=True,
-        omp_schedule="dynamic",
-        omp_num_threads=f"scorch_nthreads({policy.work_text}, {policy.rows_text})",
+    statements.append(
+        llir.ForLoop(
+            init=llir.VarInit(var=chunk, value=_literal(0)),
+            cond=llir.BinOp("<", _detach(chunk), _detach(chunks)),
+            update=llir.Increment(var=_detach(chunk)),
+            body=chunk_body,
+            omp_parallel_for=True,
+            omp_schedule="dynamic",
+            omp_num_threads=(
+                f"scorch_nthreads({policy.work_text}, {policy.rows_text})"
+            ),
+        )
     )
-    statements.append(region)
     statements.extend(_merge_statements(context, policy))
     return statements
 
@@ -459,26 +495,33 @@ def build_parallel_chunk_assembly(
     if policy is None:
         return None
     return [
+        _body_lambda(outer, context),
         llir.VarInit(
             var=_var("_assembly_threads", llir.DataType.INT),
             value=llir.FunctionCall(
                 name="scorch_nthreads",
-                args=[
-                    _detach(policy.work),
-                    _detach(policy.rows),
-                ],
+                args=[_detach(policy.work), _detach(policy.rows)],
             ),
         ),
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">", _var("_assembly_threads", llir.DataType.INT), _literal(1)
             ),
-            then_body=_parallel_branch(outer, context, policy),
-            # The serial arm is TODAY'S statement list, unmodified.  Its
-            # inertness at one thread is therefore structural: there is no
-            # pragma anywhere in it, and the chunk buffers are declared inside
-            # the branch that is not taken.
-            else_body=list(statements),
+            then_body=_parallel_branch(context, policy),
+            # The serial arm is ONE CALL: the whole row range, straight into the
+            # shared result vectors, so there is no chunk buffer to construct
+            # and nothing to merge afterwards.  No pragma appears anywhere on
+            # this path -- inertness at one thread stays structural -- and
+            # because the body it calls is the same object the parallel arm
+            # calls, the function holds one copy of the nest rather than two.
+            else_body=[
+                _body_call(
+                    context,
+                    _literal(0),
+                    _detach(policy.rows),
+                    [_var(name) for name in chunked_vector_names(context)],
+                )
+            ],
         ),
     ]
 

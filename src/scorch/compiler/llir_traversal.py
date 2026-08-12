@@ -93,6 +93,7 @@ SUPPORTED_LLIR_STATEMENT_NODE_TYPES: Tuple[Type[llir.Stmt], ...] = (
     llir.GuardedCallStmt,
     llir.ForLoop,
     llir.ForLoopAuto,
+    llir.LambdaDef,
     llir.WhileLoop,
     llir.IfThenElse,
 )
@@ -1025,6 +1026,8 @@ class LLIRWalker:
             self.visit_for_loop(cast(llir.ForLoop, node), path)
         elif node_type is llir.ForLoopAuto:
             self.visit_for_loop_auto(cast(llir.ForLoopAuto, node), path)
+        elif node_type is llir.LambdaDef:
+            self.visit_lambda_def(cast(llir.LambdaDef, node), path)
         elif node_type is llir.WhileLoop:
             self.visit_while_loop(cast(llir.WhileLoop, node), path)
         elif node_type is llir.IfThenElse:
@@ -1413,6 +1416,12 @@ class LLIRWalker:
     def visit_for_loop_auto(self, node: llir.ForLoopAuto, path: LLIRPath) -> None:
         self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.array, path + ("array",))
+        self._walk_statements(node.body, path + ("body",))
+
+    def visit_lambda_def(self, node: llir.LambdaDef, path: LLIRPath) -> None:
+        self._walk_var_child(node.var, path + ("var",))
+        for index, param in enumerate(node.params):
+            self._walk_var_child(param, path + ("params", str(index)))
         self._walk_statements(node.body, path + ("body",))
 
     def visit_while_loop(self, node: llir.WhileLoop, path: LLIRPath) -> None:
@@ -1842,6 +1851,8 @@ class LLIRRewriter:
             return self.rewrite_for_loop(cast(llir.ForLoop, node), path)
         if node_type is llir.ForLoopAuto:
             return self.rewrite_for_loop_auto(cast(llir.ForLoopAuto, node), path)
+        if node_type is llir.LambdaDef:
+            return self.rewrite_lambda_def(cast(llir.LambdaDef, node), path)
         if node_type is llir.WhileLoop:
             return self.rewrite_while_loop(cast(llir.WhileLoop, node), path)
         if node_type is llir.IfThenElse:
@@ -2459,6 +2470,21 @@ class LLIRRewriter:
         return llir.ForLoopAuto(
             var=var,
             array=array,
+            body=cast(List[llir.Stmt], body),
+        )
+
+    def rewrite_lambda_def(
+        self, node: llir.LambdaDef, path: LLIRPath
+    ) -> llir.LambdaDef:
+        var = self._rewrite_var_child(node.var, path + ("var",))
+        params = [
+            self._rewrite_var_child(param, path + ("params", str(index)))
+            for index, param in enumerate(node.params)
+        ]
+        body = self._rewrite_statements(node.body, path + ("body",))
+        return llir.LambdaDef(
+            var=var,
+            params=params,
             body=cast(List[llir.Stmt], body),
         )
 
