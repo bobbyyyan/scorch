@@ -31966,3 +31966,131 @@ Reference: harnesses in the new ledger take a ledger root as ``$1`` and default 
 their own location; the staged trees are ``redwood:/scratch/bobbyy/scorch-refactor-tip``
 (pinned worktree, git-backed) and ``mkt1:/scr/bobbyy/refactor-crosshost/scorch-tip``
 (archive, rebuild via the retained ``mkt_crosshost.sbatch``).
+
+## The kernel-runtime gate, blocker 1 fixed, and the census comparand corrected (2026-08-11; supersedes every preceding prompt)
+
+Follows inherited committed tip ``a8f2954``.  **Origin is still ``a3b8d1e``**;
+nothing pushed, amended, squashed, reordered or discarded, and no ``git stash``
+was run.  Unlike the previous three milestones, this one **does change production
+files**: ``src/scorch/compiler/scheduler.py`` and
+``src/scorch/compiler/loop_plan_legality.py``.  Nothing else in ``src/`` is
+touched, nothing is wired into dispatch, and the neutrality suite's invariant
+holds — ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` still have zero
+non-test callers.
+
+**What this milestone lands.**  Bobby's two decisions, acted on in the order the
+prompt specified: the kernel-runtime harness first (the gating dependency for
+both), then blocker 1, then the dense-domain seam's reach and semantics.  Review
+§57 owns the detail.
+
+**1. The first gate on this branch that measures an emitted kernel's runtime.**
+Both pipelines converge on ``_load_validated_prepared_kernel`` then
+``module.evaluate``; the harness patches that one loader, runs each production
+entry once, and captures the exact module and argument tuple production used.
+ABBA-interleaved, auto-calibrated reps, two same-binary A/A controls per
+configuration, one disposable subprocess per configuration.
+
+**2. Blocker 1 is FIXED, and the objection that closed it was measurable and
+false.**  Legacy on the fourteen seam cells: the twelve TTM cells raise
+``TensorIndexError`` on the public route and **SEGFAULT** on legacy's own lowering,
+in both arms at every extent, dtype and density.  Only ``ddd ijk->ik [dd]`` is
+sound.  The fix applies the legality rule the scheduler ALREADY states for
+explicit schedules (``scheduler.py:2994``) to the automatic origin, which was
+vacuously exempt from it.  It required **both** layers — the legacy mutation and
+``loop_plan_legality._derive_auto_decisions``, which independently re-derives the
+same heuristic to verify the plan.
+
+Measured on pinned base/candidate worktrees: **24 cell-arms move to ADMITTED, 0
+admitted lost, 0 unclassified, arm-invariant**, nothing else in 1139 moves; the
+newly admitted cells are **720/720** correct against a dense reference with
+well-formed storage; production emission changes on **104 TTM case-arms and
+nowhere else**, and **104/104 of those were already broken** — **52 segfaults
+become zero**.
+
+**3. Kernel runtime, reported honestly.**  Re-run on a quiet machine, A/A floor
+**0.977–1.044** over 120 controls: the typed route wins **1.14–1.75×** at density
+0.001 and **loses 1.25–2.8×** at density 0.05 on the same TTM cells; every
+reduction and the forced-sparse control are neutral.  **"The typed route emits
+better code" does not hold as a general performance claim.**  Single-host; a
+second host is owed.  Separately, **the tile fix is runtime-NEUTRAL**: base vs
+candidate spans 0.970–1.036 on all 44 configurations, inside the floor.
+
+**4. TWO CORRECTIONS to the census's comparand, and they matter for duty 1.**
+§55.5's flagship "2,218 against 2,845" is drawn from the **empty-Schedule()** row,
+which §56.5 itself rules out; on the default-dispatch row legacy emits **1,993**,
+fewer than typed, with no second pass to delete.  And the default-dispatch
+comparand is not production: ``legacy_generated_cpp`` with no requested schedule
+**never runs the auto-scheduler** (``pipeline.py:594``), while ``scorch.einsum``
+does — and for matmul production often resolves a PREBUILT kernel and emits no
+code at all.  On production's own entry an empty ``Schedule()`` IS identity (6/6
+reductions, 72/78 overall).  **Neither census column faithfully models production
+dispatch.**  The dense-receiver shadow pilot's membership — 105 or 112 — must be
+re-derived against production's actual emission before anyone acts on it.
+
+**5. The dense-domain seam: reach measured, semantics fixed, NOT implemented.**  A
+unique sentinel isolates the compressed-prefix rule at **58 cells, arm-invariant**
+(the corpus names six — a ~10× understatement), and **relaxing it admits ZERO**:
+56 of 58 land at the ordered-key target's own require, so the work is in
+``lower_llir.py``, not CIN.  The multi-level guard semantics are stated in writing
+before building, per Bobby's instruction, at
+``compressed-prefix-reach/DENSE_DOMAIN_ASSEMBLY_SEMANTICS.md``.
+
+**6. The suite, with a control, and eleven locks updated.**  Partitioned into 8
+file-disjoint groups per §55's protocol: **base 6309/0 failures** (reproducing
+§55's recorded 6,309/6,294/15 exactly) and **candidate 6309/11**.  All eleven are
+locks that encoded the OLD decision — eight assert the blocker-1 cells stay
+blocked, three assert plan-shape tiles for non-dense receivers.  None demonstrates
+working behaviour: the ``sd`` one locks a tile whose kernel returns **wrong
+values** on the unmodified tree (max abs error up to 5.76 vs a dense reference),
+and the ``dsd`` one names a program that fails to build on both trees.  All
+eleven updated with their justification measured; the two ``TTM dds`` cells moved
+``AUTO_TILE_BLOCKED``→``MIGRATED`` so the 20-name matrix total is unchanged; a new
+lock pins that a DENSE receiver keeps its tile.  A latent defect fixed in passing:
+the row-scope lock parametrized ``b_fmt`` and then hardcoded ``"dd"``.  **One
+coverage loss is recorded in the test rather than dropped** — the permuted
+``mode_order`` candidate-order property is no longer observable through its
+program.
+
+**Two method errors worth not repeating.**  (a) Running the suite as ONE process
+produced **565 phantom failures**, all ``Fatal Python error: Aborted`` in
+``_execute_child`` — the macOS fork-after-threads abort; every failing test passes
+alone.  §55 gate 6 partitions for this reason.  (b) The first partitioned script
+used ``mapfile``, absent in macOS bash 3.2, and reported ``tests 0 failures 0`` —
+a green total over an empty set.  Both runs are quarantined under
+``receipts/suite/superseded/`` with diagnoses.  General rule: correctness runs
+tolerate CPU contention, not fork contention; timing runs tolerate neither; and
+measurements go against a PINNED worktree, never the tree being edited.
+
+**The confirming suite is GREEN: candidate 6319 tests / 0 failures / 6304 passed**
+after the updates, against base 6309 / 0.  The node set was diffed rather than the
+total trusted: **8 removed** (exactly the reversed-decision seam locks) and **18
+added** (the fixed ``b_fmt`` parametrization over both arms, the two ``TTM dds``
+cells joining ``MIGRATED``, and the two new locks).  Step 1b is fully gated.
+
+**Not addressed, and stated rather than folded in.**  The
+kernel-runtime grid has not been re-run on a quiet machine or cross-host, so
+§57.7's numbers are provisional and single-host.  The blocker-1 heavy sweep
+against the pinned base is owed (its first run was quarantined as
+tree-contaminated).  The dense-domain seam is not implemented.  No blocker other
+than 1 is touched and the Phase-8 cutover verdict is unchanged.
+
+## What the next session should do
+
+1. **Finish and read the candidate suite.**  It is the one gate on the tile fix
+   that was still running.  If it is green, the fix has: reach measured,
+   correctness 720/720, production emission characterized cell by cell with zero
+   regressions, and 52 segfaults removed.
+2. **Re-run the kernel-runtime grid on a quiet machine, then on redwood and
+   mkt1.**  The density-dependent TTM regression (up to 2.9× slower at 0.05) is
+   the most important open number on the branch and it is currently single-host
+   and contended.  Transports are staged (§56).
+3. **Re-derive the shadow pilot's membership against production emission**, not
+   against either census column.  §57.3 shows both columns diverge from production
+   in different directions and neither is what a cutover moves.
+4. **Implement the dense-domain seam in the TARGET layer.**  §57.8 shows the CIN
+   rule buys nothing alone.  Scope out the subset independently blocked by the
+   hierarchical-compressed-operand rule (``lower_llir.py:1703``).
+5. **Consider whether the tile fix should be committed and pushed.**  It is the
+   first production change on this branch in four milestones, it is measured, and
+   it strictly improves failure modes — but it is Bobby's call, and it changes
+   emitted code for a family of TTM shapes.

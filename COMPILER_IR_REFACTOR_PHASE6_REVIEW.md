@@ -12237,3 +12237,370 @@ manifests), ``provenance/`` (digests, the sbatch script, the full Slurm job log)
 ``compare/`` (``compare_hosts.py`` and ``comparand_structure.py``, both taking the
 ledger root as ``$1`` and defaulting to their own location — never a hardcoded
 path — with their outputs retained), and ``SHA256SUMS``.
+
+## 57. The kernel-runtime gate, blocker 1 reopened and fixed, and two corrections to the census's comparand (2026-08-11)
+
+This section opens at inherited committed tip ``a8f2954``.  Bobby made two
+decisions that this session acts on and does not relitigate: the dense-domain
+assembly seam is ADMITTED under a structural guard, and blocker 1 is to be FIXED
+in the layer where it is wrong rather than preserved for neutrality.  His words on
+the second: "it's okay to have different emitted code, but the new emitted code
+must be strictly correct and more performant than legacy on a wide variety of
+problem sizes."
+
+That changes the gate for these families.  Byte-identical emission is no longer
+the primary standard for them; strict correctness plus measured *kernel runtime*
+is.  ``CLAUDE.md`` has been updated to record this, since it is the first thing a
+fresh session reads.
+
+### 57.1 The gate that never existed: a kernel-runtime harness
+
+Every performance gate in §§49–56 measured **compile-only latency**, which measures
+the compiler.  §55.5's claim that the typed route emits "a better kernel" is an
+INSPECTION claim from a character count, and §55.9 duty 2 says it "should be
+*run*, not read".  It is now runnable.
+
+Both pipelines converge on one seam — ``_load_validated_prepared_kernel`` then
+``module.evaluate(*module_args)`` — so the harness patches that single loader,
+runs each production entry ONCE, and captures the exact module and argument tuple
+production used rather than reconstructing them.  Timing is ABBA-interleaved with
+auto-calibrated reps, and every configuration carries **two same-binary A/A
+noise-floor controls**, one per side, per the repo convention that perf gates are
+never calibrated against a fixed ratio constant.  Crash isolation is not
+boilerplate: one disposable subprocess per configuration, because the very first
+comparand the harness was pointed at segfaults.
+
+**A trap worth recording.**  Every compile-only census harness builds options with
+``from_environment(environ={})``.  That is correct for them and part of why they
+reproduce across three hosts, but it pins ``executable_search_path`` to
+``/bin:/usr/bin``, and ``ninja`` lives in the conda env.  Anything that BUILDS must
+use the real environment.
+
+### 57.2 CORRECTION: §55.5's flagship example is drawn from the wrong comparand
+
+§55.5 reports ``ss ij->j [s]`` as typed 2,218 characters against legacy's 2,845,
+"deleting legacy's intermediate ``T0_crd_vec``/``T_val_vec`` materialization and
+its second pass".  Measured at the frontier's own extents:
+
+| surface | chars | has ``T0_crd_vec``/``T_val_vec`` |
+| --- | --- | --- |
+| typed | 2,218 | — |
+| legacy under empty ``Schedule()`` | 2,845 | yes |
+| legacy under **default dispatch** | **1,993** | **no** |
+
+The 2,845 is the **empty-Schedule()** row — the comparand §56.5 itself rules out
+for cutover reasoning.  On the default-dispatch row legacy emits *fewer*
+characters than typed and there is no second pass to delete.  The argument as
+written does not survive its own choice of comparand.
+
+### 57.3 The default-dispatch comparand is not runnable, and not production
+
+Legacy's default-dispatch source for that cell declares ``std::vector<float>
+C_values;`` and then executes ``C_values[pC0] += A_val[pA1]`` against it, never
+growing it, while ``C0_crd`` grows by ``emplace_back``.  A zero-length vector,
+indexed and written on the first iteration.  It **segfaults at every size tried**.
+Nothing on this branch had ever executed it, because the census is compile-only
+and §50.6's soundness measurements went through the public ``scorch.einsum``
+route.
+
+**And it is not what production runs.**  ``legacy_generated_cpp`` with
+``requested_schedule=None`` takes its ``else`` branch (``pipeline.py:594``) —
+``normalize_cin`` then lower — and **never runs the auto-scheduler**, which
+production's ``scorch.einsum`` does.  For this cell production emits 2,848
+characters with a COO workspace; the "default dispatch" column emits 1,996 with no
+workspace and the out-of-bounds write.  Driving the *public* route under both
+option sets emits byte-identical source on 6 of 6 reductions and 72 of 78 cases
+across TTM and matmul — so on production's own entry point an empty ``Schedule()``
+IS identity, and §55.5's "662 of 1139" is a property of a test-only entry.
+
+This does not simply restore the 112.  For **matmul**, production frequently
+resolves a PREBUILT kernel and emits no generated code at all
+(``MM ds x ds -> ds``, ``MM ds x dd -> dd``), which neither column describes.  The
+defensible statement is: **neither census column is a faithful model of production
+dispatch, and which is closer depends on the family.**  A dense-receiver shadow
+pilot's membership — 105 or 112 — should be re-derived against production's actual
+emission before it is acted on.
+
+### 57.4 Blocker 1: legacy is broken on twelve of the fourteen cells
+
+§52.7 closed blocker 1 partly because changing the heuristic "changes default
+generated code" that every user gets.  Nobody had measured that code.  Membership
+was re-derived from the sealed frontier receipt (never from prose): 14 arm-0 / 12
+arm-1, exactly §55.3's four groups.
+
+The **heavy** sweep — five shapes (ragged, unit and singleton extents) × two
+dtypes × both automatic arms × three densities, one disposable subprocess per
+configuration, **780 measurements** against the pinned base:
+
+| cells | public route | legacy's lowering of the same CIN |
+| --- | --- | --- |
+| 11 of the 12 ``TTM * -> dds`` | **0/60 SOUND** each | **0/60** — SIGSEGV |
+| ``TTM ddd x ss -> dds`` | **12/60 SOUND** | 0/60 — SIGSEGV |
+| ``ddd ijk->k [d]`` | 0/30 (``TypeError``) | **30/30 SOUND** |
+| ``ddd ijk->ik [dd]`` | **30/30 SOUND** | 30/30 SOUND |
+
+Totals: ``bare_cin`` is **720 segfaults / 60 sound**; ``public`` is 672
+``TensorIndexError``, 42 SOUND, 36 non-compiling, 30 ``TypeError``.
+
+**A CORRECTION to this section's own first draft, which the lean sweep caused.**
+It claimed all twelve TTM cells fail "at every extent, dtype, density and arm".
+That is drawn from ONE shape and is false for ``TTM ddd x ss -> dds``, which is
+sound at 12 of 60 — and **all twelve sound configurations are at shape
+``[1, 4, 5, 3]``, i.e. outer extent ``i = 1``**, across every density, both dtypes
+and both arms.  This is §52.8 → §55.4 repeating: a lean sweep missing
+configuration-dependence a heavy one finds.
+
+The mechanism CONFIRMS the illegality argument rather than weakening it.  The tile
+is illegal because hoisting ``j_out`` above ``i`` destroys the ``(i, j)``
+lexicographic order the ``dds`` receiver's compressed level is assembled in.  At
+``i = 1`` there is no order to destroy, so legacy is accidentally correct exactly
+where the illegality cannot manifest, and broken everywhere else.
+
+**The gap this created, and its closure.**  §57.6's affected-cell correctness run
+used a single shape, ``(10,12,14)×(14,8)``, which is not ``i = 1`` — so for those
+twelve accidentally-correct configurations the candidate's PUBLIC-route behaviour
+was initially unverified, and a failure there would have been a genuine
+correct→broken regression.  It was then measured directly, all twelve
+configurations on both trees:
+
+| | SOUND |
+| --- | --- |
+| base ``a8f2954`` | **12/12** |
+| candidate | **12/12** |
+
+No regression.  The reason is the same mechanism: at ``i = 1`` the guard removes a
+tile that was harmless because there was no ordering for it to break, and the
+untiled kernel is correct as well.  So the fix is correct→correct exactly where
+legacy was accidentally correct, and broken→broken everywhere else.
+
+Setting that cell aside, the §52.7 objection survives for one cell and half of
+another, and both have dense receivers where the fix is inert by construction.
+
+### 57.5 The fix, and why it needed two layers
+
+``apply_schedule`` already refuses an affine tile over a non-dense result for an
+explicitly requested schedule (``scheduler.py:2994``, "tiled sparse-output
+assembly is unsupported").  That check reads ``schedule.tiles``, which is empty on
+the automatic origin — so it is vacuous exactly where the automatic heuristic then
+chooses tiles itself.  The automatic path was constructing the artifact the
+explicit path forbids, and nothing re-checked it.
+
+Two false starts, both caught by measurement:
+
+- ``_has_dense_output`` is unusable as a post-insertion guard.  It walks the
+  ``ForAll`` chain to a ``TensorAssign``, and workspace insertion puts a ``Where``
+  there, so past that point it answers **False for every receiver** — using it
+  disabled all automatic tiling and broke ``ddd ijk->ik [dd]``, which had been
+  SOUND.  Replaced by ``_has_proven_non_dense_receiver``, which reads the single
+  non-``Workspace`` receiver and fires only on a proven non-dense format.
+- **The heuristic is duplicated.**  ``loop_plan_legality._derive_auto_decisions``
+  independently re-derives it to verify the plan.  Fixing only the scheduler landed
+  all twelve cells on ``InvalidSchedule/auto_tile_decision``.  The two layers must
+  move together, and each now carries a comment saying so.
+
+### 57.6 What the fix measures, on pinned base and candidate worktrees at ``a8f2954``
+
+| gate | result |
+| --- | --- |
+| frontier, 1139 cells × both arms | **24 cell-arms** ``unsupported_schedule_auto_family`` → ADMITTED; **0 admitted lost**, **0 unclassified**, arm-invariant; nothing else moved.  248/652/239 → 260/640/239, base reproducing §55.2 exactly |
+| correctness of the newly admitted | **720/720** — 12 cells × 5 shapes × 2 dtypes × 2 arms × 3 densities, all executing, all matching a dense reference, all with well-formed assembled storage |
+| production emission, 506 case-arms | 104 changed, **all TTM**; nothing else in the corpus moved |
+| were the 104 correct before? | **104/104 broken → broken. Zero regressions.** Zero were correct on either tree |
+| failure mode of the 104 | base **52 SIGSEGV** / 44 ``TensorIndexError`` / 4 ``RuntimeError`` / 4 build failure → candidate **0 SIGSEGV** / 44 / 4 / 32 build failure / 24 ``IndexError`` |
+
+**52 segfaults become zero.**  The emission change is not neutral and is not a
+regression: it is a strictly better failure mode on cells that never worked, plus
+twelve cells the typed route can now compile correctly in both arms — which also
+retires §52.7's second cost, that this would be the first arm-variant migrated
+family.  It is not; both arms admit identically.
+
+The candidate's ``IndexError`` is unstructured, and that is stated rather than
+hidden.  It arises on the LEGACY path, which has no structured-diagnostic contract
+at all (§55.6 records 140 cells raising bare ``ValueError`` on default dispatch
+today); the fail-closed gate governs the typed route, where the candidate frontier
+measures **0 unclassified**.
+
+### 57.7 Kernel runtime: real wins, and a real regression
+
+A/A noise floor across the grid: **0.946–1.046**, typically within ±2%.  Ratios are
+legacy-time ÷ typed-time, so above 1 means the typed route is faster.
+
+Re-run on a QUIET machine (nothing else scheduled), which tightened the floor to
+**0.977–1.044** over 120 controls and reproduced the contended run's pattern and
+magnitudes:
+
+- **Wins**: ``TTM dss x ss -> dss`` at density 0.001 — **1.749×** and 1.487×;
+  ``TTM dss x dd -> dss`` 1.164×; ``ss ij->j [s]`` 1.138–1.202×; ``ds ij->j [s]``
+  1.162–1.205×.
+- **Regressions**: the same TTM cells at density 0.05 — **0.359×** and **0.398×**,
+  i.e. the typed kernel is up to **2.8× slower**, plus 0.804× at a third shape.
+- **Neutral**: every rank-3/4 reduction, all of ``sd ij->j``, and the forced-sparse
+  ``dd ij->j [s]`` control at 0.999–1.006 — the sanity check that the harness
+  reports A/A as A/A.
+
+The pattern is density.  **"The typed route emits better code" does not hold as a
+general performance claim**; it holds at low density and inverts as density rises.
+Reported as a finding rather than tuned around.  Still single-host: a second host
+is owed.
+
+**The tile-legality fix itself is runtime-NEUTRAL.**  Base against candidate on
+the same grid: typed median ratios span **0.970–1.036**, entirely inside the
+combined A/A floor of 0.961–1.044, on all 44 configurations, and legacy's own
+ratios move no further.  The fix buys correctness and costs no measured runtime.
+
+### 57.8 Step 2a: the compressed-prefix rule reaches 58 cells, and admits none
+
+A unique sentinel code (``SENTINEL_compressed_prefix_domain``) was installed in a
+throwaway worktree — necessary because the rule shares
+``unsupported_sparse_output_domain`` with nine other ``_fail`` sites in the same
+file — and the 1139-cell frontier re-run in both arms.
+
+- **58 cells, arm-invariant**, and the sentinel isolates that rule and nothing
+  else: zero cells moved for any other reason.  The corpus names six.  That is a
+  ~10× understatement, larger than blocker 2's 2.5× (§55.2).
+- Families: ttm 32, rank4 10, degenerate2 5, rank6 4, rank3 3, rank2 1, rank5 1,
+  union2 1, nonadd-combiner 1 — including a rank-6 cell, a union key and a
+  non-additive combiner, none of which the declared envelope names.
+- **Relaxing the rule admits ZERO cells.**  56 of the 58 land at the ordered-key
+  target's own require; 2 still carry the sentinel at a second prefix level.  The
+  CIN rule is entirely shadowed by a second gate, so the work is in
+  ``lower_llir.py``, not CIN.  Any cost estimate that stops at the CIN rule is
+  wrong by construction.
+
+This is §54.2's lesson in the opposite direction: there a CIN probe under-counted
+because a second gate hid cells; here it shows the rule buys nothing alone.
+
+### 57.9 The dense-domain assembly semantics, stated before building
+
+Recorded in full at ``compressed-prefix-reach/DENSE_DOMAIN_ASSEMBLY_SEMANTICS.md``.
+For a compressed result level driven by a dense domain, with ``S(L)`` the levels
+strictly below it:
+
+1. **Some level in ``S(L)`` is compressed** — the runtime result-side counter
+   already emitted by ``_parent_append_statements``:
+   ``if (C{L+1}_pos.back() < pC{L+1}) { C{L}_crd.push_back(coord); ++pC{L}; }``.
+2. **All of ``S(L)`` dense, extents statically nonzero** — "non-empty below" is
+   statically TRUE (``levels.py:1110-1128``: dense storage materializes every cell
+   including ones the stream never touched), so the guard is a tautology and the
+   correct emission is an **unconditional append**.  The consequence, stated
+   rather than discovered: ``ds ij->i [s]`` appends one entry per row of the dense
+   domain and its compressed level becomes fully dense.  §54.9 flagged exactly
+   this; it is forced by the structure-not-values rule, and is the property
+   ``:2181`` already locks for ``dd ij->j [s]``.
+3. **All of ``S(L)`` dense, some extent may be zero** — a **compile-time** extent
+   predicate, with existing precedent in the B2 family's ``_suffix_guard``
+   (``C1_size > 0``, ``lower_llir.py:10544``), never a runtime counter.
+
+Never a value test, in any case.  No operand-side ``A_pos[i+1] > A_pos[i]``
+predicate is introduced: no codegen site emits one today, and the result-side
+counter answers the same question with machinery already in the tree.
+
+### 57.9a The suite, its control, and eleven locks that encoded the old decision
+
+**Two suite runs were void before a real one existed, and both were method
+errors worth recording.**
+
+1. Run as ONE monolithic pytest process over ~6,300 nodes, the suite reported
+   **565 failures** — every one ``Fatal Python error: Aborted`` inside
+   ``subprocess.py`` ``_execute_child``, i.e. the macOS fork-after-threads abort
+   in the PARENT, triggered once the JIT starts forking a build per kernel in a
+   process that has accumulated torch/OpenMP threads.  Each failing test PASSES
+   run alone.  §55 gate 6 ran the suite in **8 file-disjoint partitions**; that
+   is the branch's protocol and ignoring it produced 565 phantom failures.
+2. The first partitioned attempt used ``mapfile``, which macOS bash 3.2 lacks, so
+   it enumerated zero files and reported ``tests 0  failures 0`` — a green-looking
+   total over an empty set.  A harness that can report success without running
+   anything is worse than one that crashes.
+
+Both are quarantined under ``blocker1-tilefix/receipts/suite/superseded/`` with
+their diagnoses, rather than deleted.
+
+**The controlled result, partitioned, one tree at a time:**
+
+| | tests | failures | passed | skipped |
+| --- | --- | --- | --- | --- |
+| base ``a8f2954`` | 6309 | **0** | 6294 | 15 |
+| candidate, before the test updates | 6309 | **11** | 6283 | 15 |
+| candidate, after the test updates | 6319 | **0** | 6304 | 15 |
+
+The node count moved, so it was diffed as a SET rather than trusted as a total —
+a bigger number with zero failures can hide a silently deleted test.  Measured
+over the JUnit XMLs: **8 removed, 18 added.**  The 8 are exactly the seam locks
+that encoded the reversed decision (``test_auto_tile_blocked_cells_keep_their_schedule_code``
+×4, ``test_the_auto_tile_neighbours_stay_blocked_on_blocker_one`` ×4) and nothing
+else.  The 18 are 8 from the row-scope lock's now-honoured ``b_fmt`` × both arms,
+6 from the two ``TTM dds`` cells joining ``MIGRATED`` (arm-source-identity and
+arm-invariant compilation), 2 for the seam-is-empty successor and 2 for the new
+dense-receiver neutrality lock.
+
+Base reproduces §55's recorded 6,309 / 6,294 / 15 exactly, which is what makes
+the candidate's 11 attributable.  **Running the base suite as a control was owed
+from the first attempt and was not done then**; no candidate suite number means
+anything without it.
+
+**None of the eleven demonstrates working behaviour that the change broke.**
+
+- **Eight are the blocker-1 seam locks** —
+  ``test_auto_tile_blocked_cells_keep_their_schedule_code`` (×4) and
+  ``test_the_auto_tile_neighbours_stay_blocked_on_blocker_one`` (×4).  They assert
+  the cells STAY at ``unsupported_schedule_auto_family``, which is §52.7's
+  decision.  The first's own docstring anticipated the move: "If a
+  workspace+tile composition is ever implemented, this lock moves to whatever
+  still occupies the seam rather than being deleted."
+- **Three are plan-shape locks in ``test_loop_plan.py``**, and both were measured
+  rather than assumed.  ``test_auto_origin_derives_workspace_storage_from_the_workspace_axis``
+  asserts a tile on ``j`` for an **``sd``** receiver; executing that program on the
+  unmodified tree, ``einsum('kij->kj', A_ddd, format='sd')`` returns **wrong
+  values at every shape tried** — (4,5,6), (8,3,7), (2,9,4), max abs error 3.33 /
+  2.10 / 5.76 against a dense reference.  The test only ever inspected the PLAN,
+  so it locked a tile whose emitted kernel silently computed the wrong answer.
+  ``test_auto_origin_candidate_order_ignores_physical_mode_permutation`` (×2)
+  asserts three tiles for a **``dsd``** receiver, a program that fails to build on
+  BOTH trees.
+
+**What the updates do.**  The two ``TTM dds`` cells MOVE from
+``AUTO_TILE_BLOCKED`` into ``MIGRATED`` (9→11, 2→0), so the census's 20-name
+matrix total is unchanged.  The blocked-cell lock is replaced by a successor that
+asserts the seam is empty for that matrix and names the two cells that still
+occupy it over the frontier — ``ddd ijk->k [d]`` and ``ddd ijk->ik [dd]``, both
+DENSE receivers.  A new ``test_dense_receivers_keep_their_automatic_tile`` locks
+the neutrality half directly: a dense receiver must keep exactly the tile it had.
+
+**A latent test defect fixed in passing**: the row-scope lock parametrized
+``b_fmt`` over four formats and then hardcoded ``"dd"`` in the call, so all four
+cases exercised the same program.  It now uses ``b_fmt``, over both arms.
+
+**One coverage LOSS, recorded rather than dropped.**  The permutation test's real
+purpose is that candidate enumeration follows LOGICAL access order rather than a
+permuted physical ``mode_order`` — it guards a regression in which the derived
+twin walked ``storage_index_ids``.  That property is no longer observable through
+that program, because the tiles whose order it compared are no longer derived for
+a non-dense receiver.  Reconstructing it needs a DENSE receiver that still tiles
+under a permuted operand ``mode_order``; the obvious candidate
+(``ddd ijk->ik [dd]`` with a permuted operand) is refused earlier by
+``result_storage_order``.  It is written into the test as an open item.
+
+### 57.10 What this section does not do
+
+- **Nothing is pushed, and nothing wires the typed route into dispatch.**
+  ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` still have zero
+  non-test callers and the neutrality suite still passes.
+- **The dense-domain assembly seam is NOT implemented** — only its reach measured
+  and its semantics fixed in writing.
+- **The kernel-runtime grid has not been re-run on a quiet machine or on a second
+  host.**  The §57.7 numbers are provisional and single-host.  Stated as
+  outstanding rather than assumed.
+- **The blocker-1 heavy sweep against the pinned base is owed** — its first run
+  was quarantined as tree-contaminated (launched against the live tree, which was
+  then edited mid-run).  §57.4's verdicts stand on the clean single-shape sweep
+  and the standalone reproductions; the full 780-measurement grid is queued.
+- **No blocker other than 1 is touched**, and the Phase-8 cutover verdict is
+  unchanged.
+
+**Evidence ledgers** (each with ``SHA256SUMS`` and harnesses taking a ledger root
+as ``$1``): ``~/.cache/scorch-codex/kernelperf-step0/`` (runtime harness and
+grid), ``blocker1-legacy-soundness/`` (the fourteen cells' legacy verdicts),
+``blocker1-tilefix/`` (pinned base/candidate worktrees, frontier, differential,
+production emission, affected-cell correctness), and
+``compressed-prefix-reach/`` (sentinel probe, relaxed probe, reach and semantics
+documents).
