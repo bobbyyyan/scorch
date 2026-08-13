@@ -12826,8 +12826,19 @@ The cost is one ``O(nnz_out)`` memcpy per array in place of legacy's full
 recompute — strictly cheaper than the counting pass it replaces, on the evidence
 above — gated on the same ``scorch_nthreads > 1`` condition so the serial path is
 provably untouched at ``nthreads = 1`` and the low-density wins are preserved by
-construction.  Bobby chose this option on 2026-08-12.  **It is not built in this
-section.**
+construction.
+
+This option is selected BY the standard Bobby set for this branch, not by a
+separate instruction from him.  That standard is **"more performant than legacy
+on a wide variety of problem sizes"**, not "not worse" — the kernel-runtime
+standard §54.8 records for Phase 7 and ``CLAUDE.md`` states for migrated
+families — together with ``CLAUDE.md``'s rule that a gate must be *provably*
+inert on the shapes it must not act on.  Applied to §58.6's three columns the
+standard eliminates the other two by measurement: unconditional adoption
+surrenders the 1.18–1.47x single-pass advantage AND destroys the low-density
+wins, and gated adoption preserves the wins but reaches only parity where the
+regression is.  Only the third can be better than both existing kernels, so it
+is the one the standard leaves.  **It is not built in this section.**
 
 ### 58.8 The dense-domain semantics, re-derived operand-side
 
@@ -12929,3 +12940,284 @@ unlike §57.9 the rule does not need ``:2181`` to license anything.
 prediction, three-column ablation, ``MECHANISM.md``, ``ABLATION.md``) and
 ``dense-domain-semantics/`` (the seam-state capture over all 58 cells), plus the
 amended ``compressed-prefix-reach/``.
+
+## 59. The TTM parallel single-pass assembly, built — and three structural claims the measurements overturned (2026-08-12)
+
+Opens at committed tip ``4a21c57``.  §58.7's fix is BUILT: three production
+commits, ``git diff 4a21c57..HEAD -- src/`` is 967 insertions across six files.
+Nothing is wired into dispatch; ``compile_cin_via_loopir`` and
+``execute_cin_via_loopir`` keep zero non-test callers.
+
+**The verdict, up front: NOT SHIPPABLE as it stands.**  The §57.7 regression is
+inverted on three of its four cell-shapes ON THE M5, and the cross-host run
+(§59.9) does not reproduce it: on redwood the fix beats legacy on 8 of 16
+parallel configurations instead of 13, and **two configurations are slower than
+the BASE SERIAL kernel**, which is a regression this change introduces and is
+disqualifying on its own under the branch's standard.  The single-host claim was
+the thing most likely to be wrong and it was; §56 discharged a single-host
+caveat about ROUTING, and this is the first time the branch has measured KERNEL
+RUNTIME on a second host.
+
+The section is longer than the result needs because **four structural arguments
+this work made were refuted by its own measurements** -- three of them its own
+design's, one of them ``ABLATION.md``'s -- and each refutation is load-bearing
+for whatever is built next.
+
+### 59.1 What was built
+
+The design is sealed at ``ttm-density-mechanism/FIX_DESIGN.md`` — the file
+``ABLATION.md`` referenced and that did not exist — written before any
+production code and carrying four falsifiable predictions.
+
+Per-CHUNK, not per-thread, output buffers.  Each chunk of the outer dense loop
+appends into its own buffers exactly as the serial builder does; the buffers are
+concatenated in chunk order, which is outer-loop order, which is the required
+lexicographic order because the outer loop binds result level 0 and every
+compressed level sits under it.  Chunks rather than threads own the buffers so
+that a dynamic schedule cannot reorder the output: one thread may take a low row
+range and then a high one, so per-thread buffers would not reproduce the order
+while per-chunk buffers do, whatever the schedule did.  Load balancing is
+therefore kept rather than traded away.
+
+The first compressed level's ``_pos`` array is shared and pre-sized rather than
+chunked, because it is indexed by the outer loop over a statically known range;
+every chunk writes a disjoint slice and only its VALUES need the merge's offset.
+``owns_two_phase_output()`` stays False and the hard coupling at
+``lower_llir.py:14504`` is untouched — this is a THIRD assembly strategy, not
+two-phase output.  Admission is structural (§59.6).
+
+### 59.2 REFUTED: "byte-identical serial arm" does not mean inert
+
+``FIX_DESIGN.md`` argued the gate's inertness at ``scorch_nthreads == 1`` would
+be structural rather than empirical, because the serial arm would be today's
+statement list unmodified, with no pragma on it.  That argument is wrong.
+
+Measured: the first build was **up to 34% SLOWER than the base** at
+``nthreads == 1``, on shapes where the gate never opens and the arm that runs is
+the base's nest character for character.  The penalty grew with the work the
+kernel did — ruling out a fixed prologue cost — and at one configuration it
+turned a 0.971 tie with legacy into a 0.926 loss.
+
+A three-column source-level ablation isolated it, the same method ``ABLATION.md``
+used on legacy's pragmas: a third column built from the candidate's own emitted
+source with the PARALLEL arm's body replaced by an unreachable ``throw``, gate
+still present, second copy of the nest gone.  **``stubbed`` tracks ``base`` at
+all twelve one-thread configurations**, to within 0.017 and usually 0.005,
+including the two worst points where both sit at 0.75 and 0.81 against the
+candidate.  So the duplicated body is essentially the whole penalty and the gate
+is essentially free.
+
+Two consequences.  A ``scorch_assembly_threads`` helper, written to keep
+``omp_get_num_procs()`` off the serial path, was **deleted**: the same ablation
+shows the gate including that call is free, so it was mechanism introduced
+against a hypothesis the measurement had just refuted.  And the general lesson,
+recorded so it is not relearned: byte-identical *emission* is a real gate;
+byte-identical *fragments inside a changed function* carry none of the same
+guarantee.  A path that must stay neutral needs a runtime measurement, not an
+argument from the source diff.
+
+### 59.3 REFUTED: sharing the body between both arms is worse, and it is not aliasing
+
+The obvious repair — emit the nest once as a lambda both arms call — was built,
+and measured **worse**: up to 55% slower than the base at one thread, against
+duplication's 34%.
+
+``__restrict__`` on the shared body's reference parameters recovers **none** of
+it (``restrict/base`` 1.60 at the worst point), which rules out aliasing between
+the buffers and leaves the real cause: passing them by reference makes them
+ESCAPE, so an append-heavy drain can no longer keep a vector's internals in
+registers.  ``__restrict__`` promises non-aliasing, not non-escape.
+
+What ships: the serial arm keeps the ORIGINAL inline nest over the function's
+own locals, and the shared body is used by the PARALLEL arm only — which pays
+the escape either way, its buffers being elements of a chunk vector reached by
+reference whatever we do.  ``LambdaDef`` earns its place on one arm and not the
+other.
+
+### 59.4 The residual removed at compile time, not paid
+
+``scorch_nthreads`` is ``clamp(min(rows/ROWS_PER_THREAD, work/grain), 1, hw)``,
+so an outer extent below ``2 * ROWS_PER_THREAD`` cannot reach two threads FOR
+ANY OPERAND — the row term alone forces it.  That extent is a compile-time
+constant: the kernel is built per shape and the ABI validates it against one.
+Those programs are now declined **before anything is emitted** and emit
+byte-identically to the base.
+
+This is what makes the cost exactly zero rather than merely small, and §59.2 is
+the proof that the distinction matters.  It is also the gate shape ``CLAUDE.md``
+asks for — provably inert where it must not act — established by construction
+rather than by a threshold that happens to hold.  On the corpus it removes the
+ten worst one-thread configurations outright: ``(16,256,256,32)`` has 16 rows
+and now emits the base's kernel character for character at every density.
+
+### 59.5 The M5 result, scored against the predictions written first
+
+Candidate ``691b46b``, base ``4a21c57``, pinned detached worktrees; four columns
+from source through one JIT loader in one process against one preamble;
+ABBA-interleaved; per-column A/A control per configuration.  **All 30
+configurations agree on output storage — both index arrays and values — and
+match the dense reference, before any ratio was computed.**  A/A floor
+0.944–1.117.  Receipt ``ttm-parallel-singlepass/receipts/fix_ablate_m5_final.json``.
+
+| cell | shape | d | ``nthr`` | §57.7 | **now** |
+| --- | --- | --- | --- | --- | --- |
+| ``dss x ss`` | (64,128,64,128) | 0.05 | 4 | 0.360 | **1.123** |
+| ``dss x dd`` | (64,128,64,128) | 0.05 | 4 | 0.389 | **0.967** |
+| ``dss x ss`` | (32,64,128,64) | 0.05 | 2 | 0.790 | **1.370** |
+| ``dss x dd`` | (32,64,128,64) | 0.05 | 2 | 0.941 | **1.374** |
+
+**13 of 16 parallel configurations beat legacy** (1.032–1.610), and the candidate
+is faster than the base serial column at every one of them (1.23x–3.16x).  Both
+of those statements are M5-only; §59.9 measures what happens to them on x86.
+
+- **P1** (4 threads, [1.10, 1.35]): all four ``dss x ss`` in band (1.114–1.209);
+  ``dss x dd`` gives 1.341 in band and **0.707 / 0.755 / 0.967 MISS**.
+- **P2** (2 threads, [1.30, 1.45]): five of eight in or above band, three below
+  but still beating legacy.  No configuration below 1.00.
+- **P3** (speedup over base ≥ 2.6 at four threads): met on ``dss x ss``
+  (2.85–3.16), **missed on every ``dss x dd``** (2.25–2.40).
+- **P4** (one thread, inside the A/A floor): nine of fourteen clean; two real
+  misses at (64,128,64,128) d=0.001 (+3.6%, +4.1%); three nominal misses of
+  +0.4%, +0.6% and +2.5% are on shapes whose emission is byte-identical to the
+  base, so those two columns are the same source and those rows are A/A
+  controls rather than measurements.
+
+### 59.6 CORRECTION to ABLATION.md: the single-pass advantage is not uniform
+
+``FIX_DESIGN.md`` chose to keep the single-pass strategy on ``ABLATION.md``'s
+finding that it is "1.18–1.47x FASTER than legacy's serial two-pass".  That
+finding was measured at two densities, 0.001 and 0.05.  Across five densities
+the ``legacy_serial / typed_base`` column says it **inverts**:
+
+| cell | shape | d | ``legacy_serial/base`` | ``legacy/typed`` |
+| --- | --- | --- | --- | --- |
+| ``dss x dd`` | (64,128,64,128) | 0.005 | **0.857** | 0.707 |
+| ``dss x dd`` | (64,128,64,128) | 0.01 | **0.953** | 0.755 |
+| ``dss x dd`` | (64,128,64,128) | 0.05 | 1.175 | 0.967 |
+| ``dss x dd`` | (64,128,64,128) | 0.2 | 1.561 | 1.341 |
+
+With a dense second operand at mid density, legacy's counting pass is *cheaper*
+than the single pass, before any parallelism is involved.  The three losing
+configurations are exactly the three where the typed route starts from that
+strategy deficit — so they are not a defect of the parallelization.  Legacy also
+scales better on that cell (2.84–2.91x against the candidate's 2.25–2.40x)
+because its fill pass writes into exactly-sized buffers and has almost no serial
+tail, while the candidate pays chunk-buffer growth plus a merge whose
+destination sizing is serial.
+
+Stated plainly: **on ``TTM dss x dd -> dss`` at (64,128,64,128) and d in
+[0.005, 0.05] the typed route still loses to legacy, by 3% to 29%.**  It lost by
+up to 70% before.  Nothing regressed against the base at any parallel
+configuration.
+
+### 59.7 Admission, and what is byte-neutral
+
+The parallel arm is emitted only when the result's dense prefix is exactly one
+with every remaining level compressed, the outermost prefix loop is a
+``DenseFor`` binding result level 0, no stored-prefix assembly is owned, no
+panel/relayout/result-tile is attached, the outer extent can reach two threads,
+and a work estimate is derivable by the same ``sparse_pos_work_expr`` legacy's
+pragma uses — so both kernels open on the SAME gate at the same operands.
+
+A dense prefix deeper than one is declined rather than guessed at: its first
+compressed level's position array is indexed by a FLATTENED dense cell, so the
+pre-size, the per-chunk starting index and the shift range become products of
+the dense extents.  The mechanism generalizes; that derivation needs its own
+statement and its own measurement.
+
+Emission census over the corpus: **16 cell-shapes byte-identical**, 4 gated —
+exactly §58.4's four TTM cell-shapes — each with exactly one ``#pragma omp``, a
+serial arm that is the base's nest **verbatim** and carries no pragma, and a
+shared parallel body that matches the base's nest; 2 typed-refused, unchanged.
+
+### 59.8 Frontier (host-independent)
+
+The 1138-cell extended frontier, both automatic arms, on base and candidate:
+**0 lost, 0 gained, 0 route changed, 0 unclassified, 0 NEW arm-variance.**  Three
+cells are arm-variant on BOTH sides — inherited, identical sets — and the gate
+compares against the base rather than treating inherited state as this change's
+failure.
+
+### 59.8a The suite, and the node-set diff that earned its keep
+
+Eight file-disjoint partitions in fresh processes, base and candidate, 16 runs.
+**6319 node ids on each side, 0 lost, 0 added.**  The node-set diff — rather
+than the totals, which matched — caught **one regression**:
+``test_walker_and_rewriter_cover_every_declared_node`` went passed → failure,
+because ``llir.LambdaDef`` had been added to
+``SUPPORTED_LLIR_STATEMENT_NODE_TYPES`` without a sample and an expected
+emission in the traversal suite's coverage set.  That test exists to fail
+exactly then, and the totals alone would have shown 6319 both sides with a
+single failure buried in one partition's exit code.  Fixed in the test commit;
+the file now passes 435/435 and the new family's own file 34/34.
+
+### 59.9 CROSS-HOST: redwood does not reproduce the M5, and that is the verdict
+
+Transport per §56: source archives of the two pinned commits, extension built
+**in place** in each tree so ``PYTHONPATH`` resolves both ``scorch`` and
+``scorch_ops`` inside the measured tree — redwood's shared env carries
+``scorch_ops`` from an unrelated ``perf/spmm-fastpath`` checkout, so the
+confound is excluded by construction and then asserted by the harness.  Both
+hosts independently computed a manifest digest over every ``src/**/*.py`` and
+agree: ``0d88487e…`` base, ``73199fdb…`` candidate.  Nothing pushed; redwood's
+checkout and env untouched.  Machine quiet (load average 0.44); A/A floor
+0.981–1.012; all 30 configurations agree on storage and reference.  Receipt
+``receipts/fix_ablate_redwood.json``.  redwood is 32 procs to the M5's 18.
+
+|  | M5 | redwood |
+| --- | --- | --- |
+| parallel: beats legacy | **13/16** | **8/16** |
+| parallel: ``legacy/typed`` | 0.707–1.610 | **0.343–1.376** |
+| parallel: ``base/typed`` | 1.23–3.16 | **0.65–2.50** |
+| serial arm: ``base/typed`` | 0.960–1.009 | **0.985–1.018** |
+| serial arm: ``legacy/typed`` | 0.989–2.531 | 1.106–1.900 |
+
+**What holds on both.**  The serial path.  redwood's ``base/typed`` at one
+thread is 0.985–1.018 over all fourteen configurations — TIGHTER than the M5's —
+so the compile-time decline and the inline serial arm are neutral on x86 and the
+M5's two 3.6%/4.1% residuals do not reproduce (redwood's worst is 1.5%).  The
+low-density wins over legacy survive intact, 1.106–1.900.  Correctness holds
+everywhere.
+
+**What does not hold.**  Parallel scaling is far weaker on x86: ``base/typed``
+at four threads is 1.07–2.50 against 2.25–3.16.  Both hosts pick the SAME thread
+count — ``scorch_nthreads`` is capped by ``rows/16`` at these shapes — so this is
+not a policy difference.  And **two configurations regress against the BASE**:
+``dss x dd`` (32,64,128,64) at d=0.005 and d=0.01 measure 0.647 and 0.766, so
+the parallel path is 1.5x and 1.3x slower than the serial kernel it replaced.
+The headline cell ``dss x ss`` (64,128,64,128) d=0.05 goes 1.123 → **0.954**.
+
+**Diagnosis.**  The gate asks *is there enough work to be worth threads*.  The
+measurements say the question is *is there enough work to be worth threads AND
+per-chunk buffers AND a concatenation*, and the second has a different answer on
+a different host at a different shape.  At (32,64,128,64) the chunk width is 4
+rows, so a small problem gets 8 buffer sets, and on x86 their allocation, growth
+and concatenation cost more than two threads buy.  The gate admits cases the
+transformation cannot pay for.
+
+That is fixable, and the fix is not a constant to tune.  It needs a second
+condition with the same "provably cannot fire" character the extent test has,
+derived from the merge's cost rather than from the thread count.  Fitting a
+threshold to these sixteen points is the overfitting ``CLAUDE.md`` forbids, so
+it is left as a stated defect.
+
+### 59.10 What this section does not do
+
+- **mkt1 is not run.**  Two hosts, not three.
+- **The fix is not shippable and is not proposed for shipping.**  Two x86
+  configurations regress against the base; that is disqualifying on its own,
+  independently of legacy.
+- **``TTM dss x dd -> dss`` at (64,128,64,128), d in [0.005, 0.05], loses to
+  legacy on both hosts.**  §59.6 measures why on the M5 and it is a strategy
+  question, not a parallelism one; no attempt was made to tune around it.
+- The M5's two ``nthreads == 1`` residuals of 3.6% and 4.1% are bounded,
+  explained and not removed; they do not reproduce on x86.
+- The dense-domain seam, the merged-domain seam, the shadow pilot's membership
+  and every blocker other than 1 are untouched; the Phase-8 cutover verdict is
+  unchanged.
+
+**Evidence ledger**: ``ttm-parallel-singlepass/`` with ``SHA256SUMS`` —
+``RESULT.md``, ``DUPLICATION.md``, the four-column timing harness, the
+duplication ablation, the emission census, the frontier pair and its diff, the
+partitioned suite runner and its node-set differ, and the predictions scorer.
+The design it is measured against is ``ttm-density-mechanism/FIX_DESIGN.md``.
