@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
 from .cin_analysis import CINAnalysis, analyze_cin
 from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
+from .sparse_assembly import is_assembly_strategy
 
 if TYPE_CHECKING:
     from .cin import IndexStmt
@@ -205,7 +206,18 @@ class ResultTile:
 
 @dataclass(frozen=True)
 class LoopPlan:
-    """A verified scheduling decision expressed only with stable identities."""
+    """A verified scheduling decision expressed only with stable identities.
+
+    ``assembly`` records which sparse-output assembly strategy the result is
+    built with -- one traversal or two, distributed across workers or not.  The
+    right choice depends on the operands' formats and density, so it is a
+    scheduling decision rather than a property of the lowering class that hosts
+    the program.  ``None`` records *no* strategy decision and defers to the
+    target's own per-receiver choice; it is not a synonym for
+    ``single_pass_serial``.  The token names assembly structure only: thread
+    counts, chunk widths, pragma spelling and the runtime gate are target
+    decisions and never appear in a plan.
+    """
 
     loop_order: Tuple[IndexId, ...]
     tiles: Tuple[LoopTile, ...] = ()
@@ -214,6 +226,7 @@ class LoopPlan:
     result_tile: Optional[ResultTile] = None
     parallel_loop: Optional[LoopRef] = None
     workspace: Optional[WorkspaceInsertion] = None
+    assembly: Optional[str] = None
     auto_policy: Optional[AutoOriginPolicy] = None
     provenance: str = "explicit"
     tag: str = ""
@@ -441,6 +454,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "result_tile",
             "parallel_loop",
             "workspace",
+            "assembly",
             "auto_policy",
             "provenance",
             "tag",
@@ -593,6 +607,12 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError(
                 "LoopPlan dense workspace insertion stores exactly one axis"
             )
+    if typed_plan.assembly is not None and not is_assembly_strategy(
+        typed_plan.assembly
+    ):
+        raise VerificationError(
+            "LoopPlan.assembly must be a recorded sparse assembly strategy or None"
+        )
     if typed_plan.auto_policy is not None:
         _validate_auto_policy_structure(typed_plan.auto_policy)
     if type(typed_plan.provenance) is not str or not typed_plan.provenance:

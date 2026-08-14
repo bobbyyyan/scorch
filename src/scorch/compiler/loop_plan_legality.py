@@ -33,6 +33,10 @@ from .loop_plan import (
     WorkspaceInsertion,
 )
 from ..format import LevelType
+from .sparse_assembly import (
+    DEFAULT_SERIAL_STRATEGY,
+    partitionable_receiver_levels,
+)
 
 
 @dataclass(frozen=True)
@@ -1487,6 +1491,58 @@ def _verify_relayout_shape(  # noqa: C901
         )
 
 
+def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
+    """Prove one recorded sparse-assembly strategy legal for this receiver.
+
+    The authoritative refusal, with a structured code, for every plan reaching
+    the typed route from either origin.  ``Scheduler.apply_schedule`` states the
+    same rule earlier on the explicit surface so a user's request is refused
+    before any work happens; both call the one predicate in
+    :mod:`scorch.compiler.sparse_assembly`, so the two boundaries cannot drift on
+    the rule -- only on which exception carries it.  Two duplicated copies of one
+    scheduling rule drifting apart is the defect that cost twelve cells when the
+    automatic tile heuristic was fixed in only one of its two layers.
+
+    Two obligations.  Every strategy except the always-legal serial one needs the
+    shared receiver contract -- a dense level zero with every level below it
+    compressed -- because that correspondence is what lets the assembly be split
+    by outer cell at all.  And a recorded strategy owns the result's assembly, so
+    it cannot compose with a panel, a relayout, a result tile or an explicit
+    parallel loop, each of which owns part of the same assembly.
+
+    Extents, densities and thread counts are deliberately absent: whether a legal
+    strategy pays is cost, and cost is not legality.
+    """
+
+    strategy = plan.assembly
+    if strategy is None or strategy == DEFAULT_SERIAL_STRATEGY:
+        return
+    result = _unique_result(facts, ("plan", "assembly"))
+    if not partitionable_receiver_levels(result.level_types):
+        _unsupported(
+            "unsupported_schedule_assembly",
+            f"assembly strategy {strategy!r} requires a result whose level zero "
+            "is dense with every level below it compressed",
+            ("plan", "assembly"),
+            symbol_id=result.tensor_id,
+        )
+        return
+    if (
+        plan.panel_bounds
+        or plan.relayout is not None
+        or plan.result_tile is not None
+        or plan.parallel_loop is not None
+        or any(tile.parallel for tile in plan.tiles)
+    ):
+        _invalid(
+            "invalid_schedule_assembly",
+            f"assembly strategy {strategy!r} owns the result's assembly and its "
+            "own parallel policy; it cannot compose with a panel, relayout, "
+            "result tile, or explicit parallel loop",
+            ("plan", "assembly"),
+        )
+
+
 def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     """Prove one structurally valid plan legal for its analyzed normalized CIN."""
 
@@ -1500,3 +1556,4 @@ def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     _verify_panel(facts, plan, state, parallel)
     _verify_result_tile(facts, plan, state, parallel)
     _verify_relayout(facts, plan, parallel)
+    _verify_assembly(facts, plan)

@@ -115,8 +115,14 @@ from typing import (
     cast,
 )
 
+from ...format import LevelType
 from ..diagnostics import VerificationError
 from ..identity import IndexId
+from ..sparse_assembly import (
+    PARALLEL_ASSEMBLY_STRATEGIES,
+    TWO_PASS_STRATEGIES,
+    partitionable_receiver_levels,
+)
 from ..loop_plan import (
     MAX_AFFINE_TILE_WIDTH,
     LoopPart,
@@ -133,7 +139,9 @@ from ..loop_plan import (
 )
 from .build import LoopIRBuilder
 from .nodes import (
+    LEVEL_KIND_TO_LEVEL_TYPE,
     AppendEntry,
+    AssemblyStrategy,
     BinaryExpr,
     Block,
     CursorValue,
@@ -2735,6 +2743,21 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
             "automatic plans must carry the versioned origin policy "
             "verified at the LoopPlan boundary",
         )
+    # ``plan.assembly`` is admitted on an automatic plan as an ATTESTED decision,
+    # the same standing this contract already gives the cost-model loop order:
+    # recorded, verified legal for the receiver at the plan boundary, and not
+    # re-derived.  It is admitted rather than refused because the alternative was
+    # measured and does not work -- the strategies apply only to sparse-output
+    # programs, every one of those needs an accumulation workspace, and
+    # ``WorkspaceInsertion`` is an automatic-provenance decision the explicit path
+    # cannot record, so refusing it here made three of the four strategies
+    # unreachable on all 24 legal cells.
+    #
+    # The automatic ORIGIN still chooses no strategy: nothing in the cost model
+    # writes this field, so an ordinary automatic compilation records ``None`` and
+    # target lowering makes its own per-receiver choice, byte for byte as before.
+    # A recorded strategy therefore always came from a caller, which is what makes
+    # this a contract and not an unverified degree of freedom.
     if (
         plan.panel_bounds
         or plan.relayout is not None
@@ -3157,7 +3180,99 @@ def _chain_provenance(
     return tuple(_loop_provenance(node) for node in ordered)
 
 
+def select_assembly_strategy(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Consume the plan's ``assembly`` fact exactly once.
+
+    Runs last, on the fully scheduled program, and stamps the recorded strategy
+    as the program's :class:`AssemblyStrategy` -- the same shape
+    :func:`select_parallel_loop` uses for the parallel-loop fact, and for the
+    same reason: the decision is program semantics that target lowering
+    consumes, not a target annotation.
+
+    ``None`` consumes nothing and leaves ``program.assembly`` unset, which is
+    what keeps an automatically scheduled program emitting exactly the kernel it
+    emitted before this field existed.
+
+    The legality this pass owns is the half decidable from the plan and the
+    receiver: a strategy that distributes or splits the assembly needs the
+    shared receiver contract, and it cannot compose with a decision that owns
+    part of the same assembly.  The program-side half -- whether the outer loop
+    binds the receiver's dense level 0, whether a stored prefix is assembled,
+    whether a work estimate is derivable -- is proved by target lowering, where
+    its inputs live.  Neither half consults an extent or a density: that is
+    cost, and cost is not legality.
+    """
+
+    verify_program(program)
+    checked = _validate_plan_for_pass(plan)
+    strategy = checked.assembly
+    if strategy is None:
+        if program.assembly is not None:
+            _fail(
+                "invalid_schedule_assembly",
+                "a program already carrying an assembly strategy cannot be "
+                "paired with a plan that has no assembly fact",
+            )
+        return program
+    if program.assembly is not None:
+        _fail(
+            "invalid_schedule_assembly",
+            "the scheduled program already carries an assembly strategy; "
+            "the plan fact would not be consumed exactly once",
+        )
+    if strategy in PARALLEL_ASSEMBLY_STRATEGIES or strategy in TWO_PASS_STRATEGIES:
+        for symbol in program.outputs:
+            decl = next(
+                (decl for decl in program.tensors if decl.symbol == symbol), None
+            )
+            if decl is None:
+                _fail(
+                    "invalid_schedule_assembly",
+                    "an assembly strategy names a result that is not declared",
+                )
+            levels = tuple(
+                LEVEL_KIND_TO_LEVEL_TYPE.get(level.kind) for level in decl.levels
+            )
+            if any(level is None for level in levels) or not (
+                partitionable_receiver_levels(cast(Tuple[LevelType, ...], levels))
+            ):
+                _fail(
+                    "unsupported_schedule_assembly",
+                    f"assembly strategy {strategy!r} requires a result whose "
+                    "level zero is dense with every level below it compressed; "
+                    f"{decl.name!r} does not have one",
+                )
+        if (
+            checked.panel_bounds
+            or checked.relayout is not None
+            or checked.result_tile is not None
+            or checked.parallel_loop is not None
+        ):
+            _fail(
+                "unsupported_schedule_assembly",
+                f"assembly strategy {strategy!r} owns the result's assembly and "
+                "cannot compose with a panel, relayout, result tile, or explicit "
+                "parallel loop, each of which owns part of the same assembly",
+            )
+    stamped = replace(program, assembly=AssemblyStrategy(strategy))
+    verify_program(stamped)
+    return stamped
+
+
 def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Apply every supported plan decision, then stamp the assembly strategy.
+
+    The assembly fact is consumed at the single exit rather than at each of the
+    family-specific returns below, so no family can forget it.
+    """
+
+    return select_assembly_strategy(
+        _apply_schedule_decisions(program, plan),
+        plan,
+    )
+
+
+def _apply_schedule_decisions(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
     """Apply the supported plan decisions without constructing the carrier.
 
     Plan tiles apply in plan order; the family gate has already required
@@ -3324,6 +3439,7 @@ def _verify_scheduled_loopir(
         base_relayouts
         or base_result_tiles
         or base_program.parallel is not None
+        or base_program.assembly is not None
         or type(base_leaf) is WorkspaceRegion
         or type(base_leaf) is SparseWorkspaceRegion
         or type(base_leaf) is TiledReduce
@@ -3336,7 +3452,7 @@ def _verify_scheduled_loopir(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
             "loops, panels, dense or sparse workspace regions, staging regions, "
-            "result-tile regions, or a parallel selection",
+            "result-tile regions, a parallel selection, or an assembly strategy",
         )
 
     replayed = (

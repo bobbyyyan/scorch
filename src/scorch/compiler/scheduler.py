@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -60,6 +60,11 @@ from .loop_plan import (
     WorkspaceInsertion,
     entity_display_names,
     verify_loop_plan,
+)
+from .sparse_assembly import (
+    SPARSE_ASSEMBLY_STRATEGIES,
+    is_assembly_strategy,
+    partitionable_receiver_levels,
 )
 from scorch.format import LevelType
 
@@ -371,6 +376,15 @@ class Schedule:
     tuple order, making placement deterministic for multi-axis tiling.
     ``parallel_loop`` may name a logical loop or a generated ``*_out``/``*_in``
     loop. The full representation, rather than the human tag, is the cache key.
+
+    ``assembly`` requests one sparse-output assembly strategy by name -- one
+    traversal or two, distributed across workers or not
+    (``SPARSE_ASSEMBLY_STRATEGIES`` lists them).  Which one is fastest depends
+    on the operands' formats and density rather than on the receiver alone, so
+    it is a schedule decision like the others.  ``None`` requests nothing and
+    leaves the compiler its own per-receiver choice; it is not a synonym for
+    ``"single_pass_serial"``.  A strategy the receiver cannot support is
+    refused rather than silently downgraded.
     """
 
     loop_order: Optional[Tuple[str, ...]] = None
@@ -378,6 +392,7 @@ class Schedule:
     relayout: Optional[RelayoutSpec] = None
     tag: str = ""
     parallel_loop: Optional[str] = None
+    assembly: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.loop_order is not None:
@@ -427,6 +442,11 @@ class Schedule:
                 raise ValueError("Schedule.parallel_loop must be a non-empty string")
         if type(self.tag) is not str:
             raise TypeError("Schedule.tag must be a string")
+        if self.assembly is not None and not is_assembly_strategy(self.assembly):
+            raise ValueError(
+                "Schedule.assembly must name a sparse assembly strategy "
+                f"({', '.join(SPARSE_ASSEMBLY_STRATEGIES)}) or be None"
+            )
 
     @property
     def cache_key(self) -> str:
@@ -466,13 +486,48 @@ def _stored_schedule_fields(
     return state
 
 
+def _assembly_diagnostic(code: str, strategy: str, reason: str) -> Tuple[str, object]:
+    """One structured assembly refusal, spelled the way the plan boundary spells it.
+
+    The explicit surface refuses earlier than the plan legality boundary does, and
+    a refusal without a structured code is not a refusal this branch's
+    fail-closed gate can count.  Building the diagnostic here rather than
+    importing the boundary's private helpers keeps the module dependency one-way.
+    """
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    message = f"stage=Schedule: {code} at schedule/assembly: {strategy!r} {reason}"
+    return message, LoopPlanDiagnostic(
+        code=code,
+        message=f"{strategy!r} {reason}",
+        path=("schedule", "assembly"),
+        stage="schedule",
+        pass_name="apply_schedule",
+    )
+
+
+def _unsupported_assembly(strategy: str, reason: str) -> NoReturn:
+    message, diagnostic = _assembly_diagnostic(
+        "unsupported_schedule_assembly", strategy, reason
+    )
+    raise UnsupportedFeature(message, diagnostics=(diagnostic,))
+
+
+def _invalid_assembly(strategy: str, reason: str) -> NoReturn:
+    message, diagnostic = _assembly_diagnostic(
+        "invalid_schedule_assembly", strategy, reason
+    )
+    raise InvalidSchedule(message, diagnostics=(diagnostic,))
+
+
 def _validate_schedule_structure(schedule: object) -> Schedule:
     """Revalidate a frozen public schedule at every compiler use boundary."""
 
     state = _stored_schedule_fields(
         schedule,
         Schedule,
-        ("loop_order", "tiles", "relayout", "tag", "parallel_loop"),
+        ("loop_order", "tiles", "relayout", "tag", "parallel_loop", "assembly"),
         "Schedule",
     )
     loop_order = state["loop_order"]
@@ -480,6 +535,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     relayout = state["relayout"]
     tag = state["tag"]
     parallel_loop = state["parallel_loop"]
+    assembly = state["assembly"]
     if loop_order is not None and type(loop_order) is not tuple:
         raise InvalidSchedule("Schedule.loop_order must be an owned tuple or None")
     if type(tiles) is not tuple:
@@ -490,6 +546,10 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
         raise InvalidSchedule("Schedule.tag must be an exact str")
     if parallel_loop is not None and type(parallel_loop) is not str:
         raise InvalidSchedule("Schedule.parallel_loop must be an exact str or None")
+    if assembly is not None and not is_assembly_strategy(assembly):
+        raise InvalidSchedule(
+            "Schedule.assembly must name a sparse assembly strategy or be None"
+        )
 
     checked_tiles = []
     for position, tile in enumerate(tiles):
@@ -536,6 +596,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             relayout=checked_relayout,
             tag=tag,
             parallel_loop=parallel_loop,
+            assembly=assembly,
         )
     except (TypeError, ValueError) as error:
         raise InvalidSchedule("Schedule has invalid stored values") from error
@@ -684,6 +745,7 @@ def _build_loop_plan(
         relayout=relayout,
         result_tile=result_tile,
         parallel_loop=parallel_loop,
+        assembly=schedule.assembly,
         provenance=provenance,
         tag=schedule.tag,
     )
@@ -797,6 +859,7 @@ def materialize_legacy_schedule(
             if plan.parallel_loop is not None
             else None
         ),
+        assembly=plan.assembly,
     )
     rendered_panel_bounds = {
         _render_loop_ref(bound.loop, index_names): (
@@ -893,6 +956,72 @@ class Scheduler:
         if result_format is None:
             return False
         return not result_format.is_dense()
+
+    @staticmethod
+    def _require_legal_assembly_request(cin: CIN, schedule: Schedule) -> None:
+        """State the explicit path's assembly-strategy legality rules.
+
+        The explicit path states its own legality rules and the automatic origin
+        is then held to them -- the ordering §57.5's blocker-1 fix established,
+        after fixing only one of two duplicated layers landed twelve cells on the
+        wrong code.  There are two rules, and both are structural:
+
+        1. every strategy except the always-legal serial one needs the shared
+           receiver contract -- a dense level zero with every level below it
+           compressed -- because that is the correspondence that lets the
+           assembly be split by outer cell at all;
+        2. a requested strategy owns the result's assembly, so it cannot compose
+           with a panel tile, a relayout, or an explicit parallel loop, each of
+           which owns part of the same assembly.
+
+        A request that cannot be honoured is REFUSED rather than silently
+        downgraded to the default: a user who asks for a strategy and gets
+        another one has no way to know.  That is the difference between this and
+        the target's own choice, which declines silently because declining there
+        means "keep emitting exactly what you emit today".
+
+        The refusals carry the same structured codes the plan legality boundary
+        raises (``unsupported_schedule_assembly`` /
+        ``invalid_schedule_assembly``), and the receiver rule itself is the one
+        shared predicate rather than a restatement of it -- the two boundaries
+        differ in WHEN they refuse, never in WHAT they refuse.
+
+        Extents, densities and thread counts are deliberately absent.  Whether a
+        legal strategy pays is cost, and cost is the selector's question.
+        """
+
+        strategy = schedule.assembly
+        if strategy is None or strategy == "single_pass_serial":
+            return
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1 or receivers[0].format is None:
+            _unsupported_assembly(
+                strategy,
+                "requires exactly one result tensor with a known format",
+            )
+        levels = tuple(receivers[0].format.get_level_types())
+        if not partitionable_receiver_levels(levels):
+            _unsupported_assembly(
+                strategy,
+                "requires a result whose level zero is dense with every level "
+                f"below it compressed; {receivers[0].get_name()!r} is not one",
+            )
+        if (
+            any(tile.kind == "panel" for tile in schedule.tiles)
+            or schedule.relayout is not None
+            or schedule.parallel_loop is not None
+            or any(tile.parallel for tile in schedule.tiles)
+        ):
+            _invalid_assembly(
+                strategy,
+                "owns the result's assembly and its own parallel policy; it "
+                "cannot compose with a sparse panel tile, an operand relayout, "
+                "or an explicit parallel loop selection",
+            )
 
     @staticmethod
     def _extract_loop_chain(cin: CIN) -> Tuple[List[IndexVar], CIN]:
@@ -2886,6 +3015,20 @@ class Scheduler:
             and schedule.relayout is None
             and schedule.parallel_loop is None
         )
+        # ``assembly`` is deliberately NOT part of this test, and that was
+        # measured rather than assumed.  Treating a schedule that carries one as
+        # explicit makes three of the four strategies unreachable: they apply
+        # only to sparse-output programs, every such program needs an
+        # accumulation workspace, and ``WorkspaceInsertion`` is an
+        # automatic-provenance decision that the explicit path has no way to
+        # record -- so the explicit route produced a CIN with a workspace and a
+        # plan without the fact, and all 24 legal cells failed
+        # ``unsupported_program_shape`` / ``sparse_parent_dominance``.  A
+        # requested strategy therefore rides on the automatic plan as an
+        # ATTESTED decision, exactly as the cost-model loop order does: recorded,
+        # legality-verified, and not re-derived.  The origin still chooses
+        # nothing, so an automatic request without one records ``None`` and emits
+        # today's kernel byte for byte.
         if not is_identity and cin.get_workspace_accesses():
             raise NotImplementedError(
                 "CIN with an existing workspace supports only an empty auto Schedule"
@@ -3029,6 +3172,7 @@ class Scheduler:
                 "Explicit affine tiling currently requires a dense result tensor; "
                 "tiled sparse-output assembly is unsupported"
             )
+        Scheduler._require_legal_assembly_request(cin, schedule)
 
         parallel_names = [tile.index_var for tile in schedule.tiles if tile.parallel]
         if schedule.parallel_loop is not None:
@@ -3168,6 +3312,7 @@ class Scheduler:
                 options,
                 costs,
                 tag=schedule.tag,
+                assembly=schedule.assembly,
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -3542,8 +3687,17 @@ class Scheduler:
         *,
         tag: str,
         require_complete_plan: bool,
+        assembly: Optional[str] = None,
     ) -> Tuple[CIN, LoopPlan]:
-        """Apply one automatic order and verify the plan that records it."""
+        """Apply one automatic order and verify the plan that records it.
+
+        ``assembly`` is the sparse-output assembly strategy the public schedule
+        REQUESTED, carried onto the automatic plan as an attested decision -- the
+        same standing the cost-model loop order has: recorded, legality-verified
+        at the plan boundary, and not re-derived.  The automatic origin itself
+        chooses no strategy, so an ordinary automatic compilation records ``None``
+        here and emits exactly the kernel it emitted before the field existed.
+        """
 
         auto_tiles: List[LoopTile] = []
         auto_workspace: List[WorkspaceInsertion] = []
@@ -3562,6 +3716,7 @@ class Scheduler:
                 loop_order=tuple(index_var.index_id for index_var in logical_order),
                 tiles=tuple(auto_tiles),
                 workspace=auto_workspace[0] if auto_workspace else None,
+                assembly=assembly,
                 auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
                 provenance="auto",
                 tag=tag,
@@ -3579,6 +3734,7 @@ class Scheduler:
         scheduler_policy: Optional[SchedulerPolicy] = None,
         tag: str = "",
         require_complete_plan: bool = False,
+        assembly: Optional[str] = None,
     ) -> Tuple[CIN, LoopPlan]:
         """Originate one verified automatic plan at a plan-producing boundary.
 
@@ -3619,6 +3775,7 @@ class Scheduler:
                 policy,
                 tag=tag,
                 require_complete_plan=require_complete_plan,
+                assembly=assembly,
             )
         except InvalidSchedule as refusal:
             if not Scheduler._refused_for_order_legality(refusal) or [
@@ -3639,6 +3796,7 @@ class Scheduler:
                     policy,
                     tag=tag,
                     require_complete_plan=require_complete_plan,
+                    assembly=assembly,
                 )
             except (InvalidSchedule, UnsupportedFeature, VerificationError):
                 raise refusal

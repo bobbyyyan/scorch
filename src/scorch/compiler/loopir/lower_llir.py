@@ -129,6 +129,14 @@ from ..torch_cpp_abi import (
     TorchCppKernelABI,
 )
 from ...utils import dtype_to_c_datatype
+from ..sparse_assembly import (
+    DEFAULT_SERIAL_STRATEGY,
+    TWO_PASS_STRATEGIES,
+    UNSUPPORTED_ASSEMBLY_HOST,
+    UNSUPPORTED_ASSEMBLY_STRATEGY,
+    compressed_levels_of,
+    partitionable_receiver_levels,
+)
 from .parallel_chunk_assembly import (
     PARALLEL_CHUNK_RUNTIME_SPELLINGS,
     ROWS_PER_THREAD as PARALLEL_CHUNK_ROWS_PER_THREAD,
@@ -138,6 +146,7 @@ from .parallel_chunk_assembly import (
 )
 from .nodes import (
     AppendEntry,
+    AssemblyStrategy,
     BinaryExpr,
     BinaryOp,
     Block,
@@ -150,6 +159,7 @@ from .nodes import (
     Expr,
     FloatConst,
     IndexValue,
+    LEVEL_KIND_TO_LEVEL_TYPE,
     LevelDecl,
     LevelKind,
     Load,
@@ -248,6 +258,7 @@ _LOOPIR_GRAPH_NODE_TYPES = (
     WorkspaceRegion,
 )
 _LOOPIR_GRAPH_ENUM_TYPES = (
+    AssemblyStrategy,
     BinaryOp,
     LevelKind,
     MergeMode,
@@ -335,10 +346,28 @@ _BINARY_TO_CXX: Dict[BinaryOp, str] = {
     BinaryOp.MUL: "*",
 }
 
-_LEVEL_KIND_TO_LEVEL_TYPE: Dict[LevelKind, LevelType] = {
-    LevelKind.DENSE: LevelType.DENSE,
-    LevelKind.COMPRESSED: LevelType.COMPRESSED,
-}
+#: One definition, in ``nodes.py`` beside the enum it translates.  This alias
+#: keeps every existing use site unchanged while removing the second copy.
+_LEVEL_KIND_TO_LEVEL_TYPE: Dict[LevelKind, LevelType] = LEVEL_KIND_TO_LEVEL_TYPE
+
+
+def _partitionable_receiver(decl: TensorDecl) -> bool:
+    """The shared assembly receiver contract, evaluated on a declared result.
+
+    One translation from level kinds to the core level types the shared
+    predicate is written over, and a level kind with no translation (COORDINATE,
+    SINGLETON) answers False rather than defaulting -- those kinds are declared
+    so their disposition is explicit, and silently treating one as dense or
+    compressed is exactly the fail-open this codebase forbids.
+    """
+
+    kinds = tuple(level.kind for level in decl.levels)
+    if any(kind not in LEVEL_KIND_TO_LEVEL_TYPE for kind in kinds):
+        return False
+    return partitionable_receiver_levels(
+        tuple(LEVEL_KIND_TO_LEVEL_TYPE[kind] for kind in kinds)
+    )
+
 
 _CPP_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TARGET_RESERVED_NAMES = frozenset(
@@ -5488,10 +5517,71 @@ class _TargetLowering:
 
         return statements
 
-    def owns_two_phase_output(self) -> bool:
-        """Whether the shared compressed-Where pass owns this result's assembly."""
+    # -- assembly strategy ----------------------------------------------------
 
-        return False
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        """Every assembly strategy this family can emit.
+
+        Every family emits a single-pass serial builder, so that strategy is
+        never refused.  A family that can emit more overrides this.  A requested
+        strategy outside the list fails closed with
+        ``unsupported_assembly_host`` rather than being silently downgraded --
+        insurance for a family added later, and a gate requires it to be
+        unreachable over the legal domain.
+        """
+
+        return (DEFAULT_SERIAL_STRATEGY,)
+
+    def default_assembly(self) -> str:
+        """The strategy this family chooses when the plan records none.
+
+        This is today's choice, named.  It is the seam a selector replaces: the
+        automatic origin records no strategy (§ the auto replay contract), so
+        every automatically scheduled program lands here and emits exactly what
+        it emitted before the field existed.
+
+        Unlike :meth:`assembly_strategy`, this may decline a *legal* strategy
+        because it does not pay -- an outer extent too small to reach two
+        threads, for instance.  That is cost, it is deliberately here rather
+        than in the legality predicates, and it is what the selector inherits.
+        """
+
+        return DEFAULT_SERIAL_STRATEGY
+
+    def assembly_strategy(self) -> str:
+        """The strategy this program is assembled with.
+
+        The plan's recorded strategy if it has one, else this family's default.
+        A recorded strategy this family cannot emit fails closed; a recorded
+        strategy is never quietly replaced by the default, because a caller who
+        asked for one strategy and got another has no way to find out.
+        """
+
+        requested = self.program.assembly
+        if requested is None:
+            return self.default_assembly()
+        strategy = requested.value
+        if strategy not in self.supported_assemblies():
+            _fail(
+                UNSUPPORTED_ASSEMBLY_HOST,
+                f"assembly strategy {strategy!r} is legal for this result but "
+                f"{type(self).__name__} emits only "
+                f"{', '.join(self.supported_assemblies())}",
+            )
+        return strategy
+
+    def owns_two_phase_output(self) -> bool:
+        """Whether the shared compressed-Where pass owns this result's assembly.
+
+        Answered from the resolved strategy rather than from the class, which is
+        the whole point of the change: which assembly a program gets is a
+        scheduling decision, and a virtual returning a constant per class cannot
+        express one.  The hard coupling in ``lower_loopir_to_llir`` still
+        requires this to agree exactly with whether the pass took ownership; only
+        the value is now a function of the plan.
+        """
+
+        return self.assembly_strategy() in TWO_PASS_STRATEGIES
 
     def compressed_where_pass_spec(
         self, compile_options: CompileOptions
@@ -5499,6 +5589,60 @@ class _TargetLowering:
         """The two-phase pass configuration for families that own one."""
 
         return None
+
+    def _two_phase_spec(
+        self,
+        compile_options: CompileOptions,
+        workspace_decl: SparseWorkspaceDecl,
+    ) -> Optional[CompressedWhereOpenMPPassSpec]:
+        """The shared two-phase configuration, derived from this receiver.
+
+        One definition for every family that can host the strategy.  ``None``
+        when the resolved strategy is not a two-pass one, which keeps the hard
+        coupling in :func:`lower_loopir_to_llir` exact: the shared pass takes
+        ownership if and only if the family claims it, and both answers come
+        from the same resolved strategy instead of from the class.
+
+        ``compressed_levels`` is DERIVED from the receiver rather than hardcoded.
+        The shared pass validates that it is exactly ``(1, ..., rank-1)`` and is
+        generic in the arity throughout -- legacy drives it with two levels on
+        these programs already -- so deriving it is what the pass was always
+        written to accept.
+        """
+
+        strategy = self.assembly_strategy()
+        if strategy not in TWO_PASS_STRATEGIES:
+            return None
+        from ..compressed_where_openmp_pass import CompressedWhereOpenMPContext
+
+        if not _partitionable_receiver(self.result_decl):
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                f"assembly strategy {strategy!r} requires a result whose level "
+                "zero is dense with every level below it compressed; "
+                f"{self.result_decl.name!r} does not have one",
+            )
+        levels = compressed_levels_of(
+            tuple(
+                LEVEL_KIND_TO_LEVEL_TYPE[level.kind]
+                for level in self.result_decl.levels
+            )
+        )
+        torch_dtype = _SCALAR_TO_TORCH[workspace_decl.dtype]
+        return CompressedWhereOpenMPPassSpec(
+            CompressedWhereOpenMPContext(
+                result_name=self.result_decl.name,
+                # The managed pass must not be able to mutate the SymbolId
+                # that keys this lowering's verified program state.
+                result_id=SymbolId(self.result_symbol.value),
+                compressed_levels=levels,
+                result_assembler=self.result_assembler(),
+                workspace_name=workspace_decl.name,
+                workspace_ctype=dtype_to_c_datatype(torch_dtype).value,
+                compile_options=compile_options,
+                parallel=strategy == "two_pass_parallel",
+            )
+        )
 
     # -- panel completion ----------------------------------------------------
 
@@ -8624,52 +8768,103 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             ):
                 self._reserve_generated_name(name, assembly_owner)
 
-    # -- parallel chunk assembly ----------------------------------------------
+    # -- assembly strategy ----------------------------------------------------
 
-    def parallel_chunk_context(self) -> Optional[ParallelChunkAssemblyContext]:
-        """This result's chunked-assembly configuration, or ``None`` to stay serial.
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        """The two single-pass strategies, and only those, because that is what
+        is proven correct here.
 
-        Admission is entirely structural.  What it needs is a dense level 0
-        driven by the outermost loop with every remaining level compressed
-        under it, because that is exactly the correspondence that makes
-        "concatenate the chunks in outer-loop order" reproduce the required
-        lexicographic assembly.  Everything else keeps emitting what it emits
-        today; a declined optimization is a correct kernel, not a fail-open.
+        Both two-pass strategies were built, driven through the shared pass on
+        this family, and then REFUSED on the evidence.  Three obstacles were
+        measured in order, and the third is the one that stops it:
 
-        A dense prefix DEEPER than one is declined here rather than guessed
-        at.  Its first compressed level's position array is indexed by a
-        FLATTENED dense cell, so the pre-size, the per-chunk starting index
-        and the shift range become products of the dense extents.  The
-        mechanism generalizes; that index derivation needs its own statement
-        and its own measurement, and shipping it unmeasured alongside the
-        family this was built for would make the result harder to attribute.
+        1. the shared pass recognized result writes only in legacy's
+           ``push_back``/indexed-assign vocabulary while this family emits
+           ``emplace_back`` and ``scorch_vector_set`` directly, so the count
+           pass kept appending and its counters stayed zero.  FIXED in
+           ``result_write_pass``, which now recognizes both vocabularies and
+           fails closed on an unrecognized result write instead of passing it to
+           the C++ compiler;
+        2. this family's completion checkpoint refused any body change it does
+           not model.  FIXED by scoping it to the owner whose contract it
+           verifies;
+        3. **the rebuilt position arrays are wrong.**  With the first two closed,
+           a ``dss`` receiver executes and produces ``compressed mode 2 position
+           array must be nondecreasing``, and a ``ds`` receiver produces a
+           coordinate range outside its own extent.  The two-phase path rebuilds
+           positions from ``_count`` prefix sums indexed by the phase loop
+           variable, while this family closes positions through a catch-up over
+           the dense prefix; for a stored outer loop the loop variable is a
+           POSITION rather than a row coordinate, and the two do not coincide.
+
+        Offering a strategy that miscompiles would be worse than refusing it, so
+        the family lists what it can emit and a request for the others fails
+        closed with ``unsupported_assembly_host``.  Closing (3) is a bounded
+        piece of work with its own correctness obligation, and it is stated in
+        the ledger rather than guessed at here.
         """
 
-        levels = self.result_decl.levels
-        if self._dense_prefix != 1 or len(levels) < 2:
-            return None
-        if any(level.kind is not LevelKind.COMPRESSED for level in levels[1:]):
-            return None
-        if self.shapes[self.result_symbol][0] < 2 * PARALLEL_CHUNK_ROWS_PER_THREAD:
-            # ``scorch_nthreads`` cannot exceed one at this extent for ANY
-            # operand -- its row term alone forces the answer -- so the gate
-            # could only ever cost this kernel and never pay it.  Declining at
-            # COMPILE time is what makes that cost exactly zero: a runtime gate
-            # still leaves the parallel arm in the function, and an unexecuted
-            # arm is not free (``ttm-parallel-singlepass/DUPLICATION.md``
-            # measures 8-34% for one, and 3-55% for routing the serial arm
-            # through a shared body instead).  This is the shape of gate
-            # ``CLAUDE.md`` asks for: provably inert where it must not act.
-            return None
+        return (DEFAULT_SERIAL_STRATEGY, "single_pass_chunk_parallel")
+
+    def default_assembly(self) -> str:
+        """Today's choice for this family, named and unchanged.
+
+        The chunked single pass wherever it is legal AND worth its buffers, the
+        serial single pass otherwise.  The second conjunct is the COST half, and
+        it is deliberately here rather than in :meth:`chunk_assembly_legal`:
+
+        * an outer extent below ``2 * ROWS_PER_THREAD`` can never reach two
+          threads for ANY operand -- ``scorch_nthreads``'s row term alone forces
+          the answer -- so a gate there could only cost this kernel and never pay
+          it.  Declining at COMPILE time is what makes that cost exactly zero
+          rather than merely small: a runtime gate still leaves the parallel arm
+          in the function, and an unexecuted arm is not free
+          (``ttm-parallel-singlepass/DUPLICATION.md`` measures 8-34% for one arm
+          and 3-55% for routing the serial arm through a shared body).
+
+        A program is still *legal* at that extent -- it assembles correctly from
+        one chunk -- so an explicit request for the chunked strategy is honoured
+        there.  Keeping the two answers separate is what lets a selector replace
+        this method without touching legality.
+        """
+
+        if self.chunk_assembly_legal() and self.shapes[self.result_symbol][0] >= (
+            2 * PARALLEL_CHUNK_ROWS_PER_THREAD
+        ):
+            return "single_pass_chunk_parallel"
+        return DEFAULT_SERIAL_STRATEGY
+
+    # -- parallel chunk assembly ----------------------------------------------
+
+    def chunk_assembly_legal(self) -> bool:
+        """Whether this program CAN be assembled from per-chunk buffers.
+
+        Structural, extent-free, and about correctness only.  What it needs is a
+        dense level 0 driven by the outermost loop with every remaining level
+        compressed under it, because that is exactly the correspondence that
+        makes "concatenate the chunks in outer-loop order" reproduce the required
+        lexicographic assembly.
+
+        A dense prefix DEEPER than one is declined rather than guessed at.  Its
+        first compressed level's position array is indexed by a FLATTENED dense
+        cell, so the pre-size, the per-chunk starting index and the shift range
+        become products of the dense extents.  The mechanism generalizes; that
+        index derivation needs its own statement and its own measurement, and
+        shipping it unmeasured alongside the family this was built for would make
+        the result harder to attribute.
+        """
+
+        if self._dense_prefix != 1 or not _partitionable_receiver(self.result_decl):
+            return False
         if self.prefix_depth < 1 or self.loops[0].kind is not _DENSE:
             # A STORED loop above a dense result prefix level iterates the
             # operand's stored coordinates, which do not partition the dense
             # extent, so chunking it would not partition the result either.
-            return None
+            return False
         if self._owns_stored_prefix_assembly(0):
-            return None
+            return False
         if _needs_stored_prefix_final_catch_up(self, self._dense_prefix):
-            return None
+            return False
         if (
             self.panel is not None
             or self.relayout is not None
@@ -8678,7 +8873,34 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         ):
             # Already None for this family; checked rather than assumed,
             # because each would own part of the same assembly.
+            return False
+        return True
+
+    def parallel_chunk_context(self) -> Optional[ParallelChunkAssemblyContext]:
+        """This result's chunked-assembly configuration, or ``None`` to stay serial.
+
+        ``None`` when the resolved strategy is not the chunked one.  A REQUESTED
+        chunked strategy that is not legal here fails closed with
+        ``unsupported_assembly_strategy`` -- the caller asked for a kernel this
+        program cannot express, and answering with a different kernel would be
+        unobservable to them.  An UNREQUESTED one simply declines, which is how
+        every receiver outside the domain keeps emitting exactly what it emits
+        today.
+        """
+
+        if self.assembly_strategy() != "single_pass_chunk_parallel":
             return None
+        if not self.chunk_assembly_legal():
+            if self.program.assembly is None:
+                return None
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                "single_pass_chunk_parallel needs the outermost loop to be a "
+                "dense loop binding the result's dense level zero, with every "
+                "level below it compressed, no stored-prefix assembly, and no "
+                "panel, relayout or result tile attached",
+            )
+        levels = self.result_decl.levels
         return ParallelChunkAssemblyContext(
             result_name=self.result_decl.name,
             shared_position_level=1,
@@ -9599,30 +9821,42 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
 
     # -- emission ---------------------------------------------------------------
 
-    def owns_two_phase_output(self) -> bool:
-        return True
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        """Two-phase parallel only, and that was measured rather than assumed.
+
+        The obvious claim -- that every family can also emit the single-pass
+        serial builder, since that is what it emits before the shared pass takes
+        ownership -- is FALSE for this family.  Requesting ``single_pass_serial``
+        or ``two_pass_serial`` here fails ``sparse_workspace_completion_lost``:
+        this family's own completion validator
+        (:meth:`complete_sparse_workspace`) requires the assembled function to
+        carry the two-phase parallel shape, so its body is not a standalone
+        serial builder that the pass happens to replace.
+
+        ``two_pass_serial`` is rejected by the same validator for the same reason
+        -- measured, not assumed: eliding the two regions changes the assembled
+        shape and ``complete_sparse_workspace`` refuses it
+        ("the assembled function must exactly match ...").
+
+        Listing only what is emittable makes the refusal honest -- a caller gets
+        ``unsupported_assembly_host``, naming the host, instead of an internal
+        completion failure.  Widening it means teaching that validator the other
+        shapes, which is a separate change with its own correctness obligation.
+        """
+
+        return ("two_pass_parallel",)
+
+    def default_assembly(self) -> str:
+        """Today's choice for this family, named and unchanged: two-phase parallel."""
+
+        return "two_pass_parallel"
 
     def compressed_where_pass_spec(
         self, compile_options: CompileOptions
-    ) -> CompressedWhereOpenMPPassSpec:
+    ) -> Optional[CompressedWhereOpenMPPassSpec]:
         """The shared production two-phase configuration for this family."""
 
-        from ..compressed_where_openmp_pass import CompressedWhereOpenMPContext
-
-        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
-        return CompressedWhereOpenMPPassSpec(
-            CompressedWhereOpenMPContext(
-                result_name=self.result_decl.name,
-                # The managed pass must not be able to mutate the SymbolId
-                # that keys this lowering's verified program state.
-                result_id=SymbolId(self.result_symbol.value),
-                compressed_levels=(1,),
-                result_assembler=self.result_assembler(),
-                workspace_name=self.workspace_decl.name,
-                workspace_ctype=dtype_to_c_datatype(torch_dtype).value,
-                compile_options=compile_options,
-            )
-        )
+        return self._two_phase_spec(compile_options, self.workspace_decl)
 
     def _sparse_value(self, expr: Expr) -> llir.Expr:
         """Lower the insertion value: every admitted cursor is aligned."""
@@ -14264,6 +14498,22 @@ def _ordered_key_expected_checkpoint(
     """Build the detached exact post-pipeline body before callbacks can run."""
 
     if type(lowering) is not _OrderedKeySparseWorkspaceLowering:
+        return None
+    if lowering.owns_two_phase_output():
+        # The checkpoint's contract is "the managed pipeline did not change this
+        # family's body beyond the one transformation the mirror models" -- the
+        # dynamic-vector rewrite.  When the plan selects a two-pass strategy the
+        # pipeline is SUPPOSED to change the body: the shared pass takes
+        # ownership of allocation, both phase loops, final assembly and the
+        # return, and its own ownership contract is the one in force -- the hard
+        # coupling below plus the pass's ``applied`` bit, which fail closed
+        # together if ownership is ambiguous in either direction.
+        #
+        # This is a scoping of two owners' two contracts, keyed on the same bit
+        # the coupling already keys on, not a loosening of either.  Teaching the
+        # mirror to re-derive the two-phase transformation instead would be a
+        # second implementation of the shared pass whose only job is to agree
+        # with the first, which is more code and strictly less verification.
         return None
     try:
         expected = _OrderedKeyExpectedBody(body).build()

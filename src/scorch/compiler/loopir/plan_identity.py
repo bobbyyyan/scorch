@@ -90,7 +90,14 @@ from ..loop_plan import (
     verify_loop_plan,
 )
 
-CANONICAL_PLAN_SCHEMA = "scorch.loopplan.canonical.v1"
+#: v1 -> v2: the plan records its sparse-output assembly strategy.  The strategy
+#: selects which kernel is emitted for the same program, so it is schedule
+#: content and enters every identity derived from the plan -- the canonical dump,
+#: the provenance-free schedule digest, and the strangler request identity.  The
+#: key is present with a ``null`` value on a plan that records no strategy, so
+#: every plan's bytes move once and "no decision" stays distinguishable from
+#: "serial by decision".
+CANONICAL_PLAN_SCHEMA = "scorch.loopplan.canonical.v2"
 CANONICAL_REQUEST_SCHEMA = "scorch.loopir.request.v2"
 _MAX_RUNTIME_EXTENT = 2**63 - 1
 _MAX_CANONICAL_CIN_DEPTH = 512
@@ -517,6 +524,7 @@ def _plan_payload(
             if verified.parallel_loop is None
             else _loop_ref_payload(verified.parallel_loop, index_map)
         ),
+        "assembly": verified.assembly,
         "workspace": (
             None
             if verified.workspace is None

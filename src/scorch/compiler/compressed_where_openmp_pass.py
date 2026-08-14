@@ -123,6 +123,20 @@ class CompressedWhereOpenMPContext:
     policy: CompressedWhereOpenMPPolicy = COMPRESSED_WHERE_OPENMP_POLICY
     traversal: LLIRTraversalContext = COMPRESSED_WHERE_OPENMP_TRAVERSAL_CONTEXT
     compile_options: Optional["CompileOptions"] = None
+    #: Whether the two phase loops carry an OpenMP region.  ``True`` is the only
+    #: configuration production had before assembly strategy became a scheduling
+    #: decision, and it stays the default so every existing caller is unchanged.
+    #:
+    #: ``False`` emits the same two passes with no region at all -- the
+    #: ``legacy_serial`` column ``ttm-density-mechanism/ABLATION.md`` built by
+    #: deleting two pragma lines from emitted text, which measured FASTER than
+    #: the single pass at mid density with a dense operand (0.857/0.953) before
+    #: any parallelism.  It is a real strategy with a measured win region, and
+    #: eliding the region is the only way to emit it: an OpenMP ``if()`` clause
+    #: still enters the runtime through ``__kmpc_serialized_parallel`` and still
+    #: outlines the body, and an unconditional pragma at one thread costs 4-10%,
+    #: which is the whole margin this strategy exists to keep.
+    parallel: bool = True
 
 
 @dataclass(frozen=True)
@@ -949,10 +963,19 @@ def _parallel_policy_decision(
 
 @dataclass(frozen=True)
 class _PhaseLoop:
-    """One configured phase loop and the policy decision that configured it."""
+    """One configured phase loop and the policy decision that configured it.
+
+    ``preamble`` holds statements the phase must emit immediately BEFORE its
+    loop.  Only the serial strategy uses it, and only for the per-worker
+    workspace view: the parallel strategy carries that statement inside the
+    region as ``pre_parallel_body``, which has no meaning without a region.
+    Keeping it here rather than adding a field to ``llir.ForLoop`` keeps the
+    LLIR schema, its traversal and its codegen untouched.
+    """
 
     loop: llir.ForLoop
     policy: _ParallelPolicyDecision
+    preamble: Tuple[llir.Stmt, ...] = ()
 
 
 def _build_phase_loop(
@@ -976,6 +999,37 @@ def _build_phase_loop(
         grain=context.policy.flop_grain if flop_work else None,
         traversal=context.traversal,
     )
+    if not context.parallel:
+        # The serial two-pass strategy: the same two phases with no region.
+        #
+        # The per-worker workspace view CANNOT stay in ``pre_parallel_body``.
+        # Codegen emits that field only inside the split-region branch or the
+        # atomic branch; on the plain-loop path it is silently DROPPED
+        # (``codegen.py`` ForLoop emission), which would delete the view from a
+        # kernel that needs it.  The typed route refuses that shape outright
+        # ("ForLoop pre/post parallel statements would not be emitted by
+        # codegen"), so the mistake fails closed rather than miscompiling -- but
+        # the strategy still has to place the statement somewhere real.
+        #
+        # ``pre_parallel_body`` means "once per worker, before the work-shared
+        # loop".  With one worker that is exactly "once, before the loop", so the
+        # view is emitted as an ordinary statement ahead of the phase loop and
+        # the semantics are unchanged.  ``omp_num_threads`` and
+        # ``omp_chunk_expr`` are cleared with the flag for the same reason: the
+        # same validator refuses a thread count codegen would not emit.
+        return _PhaseLoop(
+            loop=llir.ForLoop(
+                init=header.init,
+                cond=header.cond,
+                update=header.update,
+                body=body,
+                omp_parallel_for=False,
+            ),
+            policy=decision,
+            preamble=(
+                (_workspace_view_statement(context),) if workspace_hoisted else ()
+            ),
+        )
     pre_parallel_body: Optional[List[llir.Stmt]] = (
         [_workspace_view_statement(context)] if workspace_hoisted else None
     )
@@ -1585,6 +1639,13 @@ def _build_transformed_statements(
         result.extend(
             _count_and_offset_statements(context, loop_bound, loop_bound_type)
         )
+        # ONE view for the whole function, not one per phase: both phases run in
+        # the same scope with no region between them, so emitting each phase's
+        # preamble would declare ``wksp`` twice and the kernel would not compile.
+        # The parallel strategy has the opposite requirement -- one view per
+        # worker, inside each region -- which is why the statement lives in
+        # ``pre_parallel_body`` there and here it does not.
+        result.extend(count_phase.preamble)
         result.append(count_phase.loop)
         result.extend(_prefix_sum_statements(context, loop_bound, loop_bound_type))
         result.extend(

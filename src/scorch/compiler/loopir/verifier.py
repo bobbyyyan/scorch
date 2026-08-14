@@ -126,12 +126,16 @@ import math
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple, cast
 
+from ...format import LevelType
 from ..identity import IndexId, SymbolId
+from ..sparse_assembly import partitionable_receiver_levels
 from .nodes import (
     AppendEntry,
+    AssemblyStrategy,
     BinaryExpr,
     BinaryOp,
     Block,
+    LEVEL_KIND_TO_LEVEL_TYPE,
     CursorId,
     CursorValue,
     DenseFor,
@@ -2980,5 +2984,51 @@ def verify_program(program: object) -> None:
             )
         if program.parallel is not None:
             _check_parallel_selection(ctx, program)
+        _check_assembly_strategy(ctx, program)
     finally:
         _leave(ctx, program)
+
+
+def _check_assembly_strategy(ctx: "_Context", program: LoopProgram) -> None:
+    """Require a recorded assembly strategy to be legal for this receiver.
+
+    Two obligations, both structural.  The field must be an exact
+    :class:`AssemblyStrategy` or ``None`` -- a forged string would otherwise
+    reach target lowering and be compared against enum members that never
+    match.  And a strategy that distributes or splits the assembly requires the
+    receiver contract every such strategy shares: level 0 dense with every level
+    below it compressed, so the first compressed level's position array is
+    indexed by the outer loop over a statically known range.  ``None`` and the
+    always-legal serial strategy impose nothing.
+
+    Extents, densities and thread counts are deliberately absent: this is
+    legality, and whether a legal strategy *pays* is a separate question owned
+    by target lowering's own choice and, next, by a selector.
+    """
+
+    strategy = program.assembly
+    if strategy is None:
+        return
+    if type(strategy) is not AssemblyStrategy:
+        _fail(
+            "malformed_state",
+            "program.assembly",
+            "assembly must be an AssemblyStrategy or None",
+        )
+    if strategy is AssemblyStrategy.SINGLE_PASS_SERIAL:
+        return
+    for position, symbol in enumerate(program.outputs):
+        decl = ctx.tensors[symbol]
+        levels = tuple(
+            LEVEL_KIND_TO_LEVEL_TYPE.get(level.kind) for level in decl.levels
+        )
+        if any(level is None for level in levels) or not (
+            partitionable_receiver_levels(cast(Tuple[LevelType, ...], levels))
+        ):
+            _fail(
+                "unsupported_assembly_strategy",
+                f"program.outputs[{position}]",
+                f"assembly strategy {strategy.value!r} requires a receiver with "
+                "a dense level zero and every level below it compressed; "
+                f"output {decl.name!r} does not have one",
+            )

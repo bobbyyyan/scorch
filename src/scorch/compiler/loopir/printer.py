@@ -75,7 +75,13 @@ from .verifier import verify_program
 # ``key_dimensions`` (a list) instead of ``drain_dimension``,
 # ``sparse_workspace_insert`` carries ``coords`` instead of ``coord``, and
 # ``sparse_workspace_drain_for`` carries ``indices`` instead of ``index``.
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v11"
+#
+# v12 gives the program an ``assembly`` field beside ``parallel``: the recorded
+# sparse-output assembly strategy, on the same terms as the parallel selection.
+# It selects which kernel one program emits, so it is program semantics and
+# enters the canonical form; ``null`` records that no strategy was chosen and
+# target lowering keeps its own per-receiver choice.
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v12"
 
 
 class _CanonicalIds:
@@ -613,6 +619,7 @@ def canonical_program_dump(program: LoopProgram) -> str:
             if program.parallel is None
             else _serialize_parallel(program.parallel, ids)
         ),
+        "assembly": (None if program.assembly is None else program.assembly.value),
     }
     return json.dumps(
         payload,

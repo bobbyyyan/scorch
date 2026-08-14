@@ -46,6 +46,18 @@ if TYPE_CHECKING:
 
 ResultWriteMode = Literal["count", "fill"]
 
+#: The vector-append member calls this compiler emits for a result array.  Two
+#: spellings, both meaning "append one entry", produced by two different
+#: lowerings: the legacy CIN lowerer emits ``push_back`` and the LoopIR
+#: ordered-key target emits ``emplace_back`` directly (its drain never goes
+#: through the dynamic-vector rewrite that would produce one from an indexed
+#: assign).  This pass was written against the first spelling only, so the second
+#: passed through unrewritten -- the count pass kept appending and its counters
+#: stayed zero, against declarations the surrounding transform had already
+#: dropped.  Recognizing both is what makes the two-phase strategy available to
+#: more than the one family whose body happens to use legacy's vocabulary.
+APPEND_METHODS: Tuple[str, ...] = ("push_back", "emplace_back")
+
 RESULT_WRITE_TRAVERSAL_CONTEXT = LLIRTraversalContext(
     stage="LLIR rewrite",
     pass_name="rewrite_result_writes",
@@ -241,6 +253,7 @@ class _ResultWriteRewriter(LLIRRewriter):
         self._leaf = context.compressed_levels[-1]
         self._mode = context.mode
         self._value_pointer_type = context.value_pointer_type
+        self._context = context
         self._identity = LLIRRewriter(context.traversal)
 
     def rewrite_statement_sequence(
@@ -364,11 +377,22 @@ class _ResultWriteRewriter(LLIRRewriter):
                 return ()
         return (node,)
 
+    @staticmethod
+    def _append_target(name: str) -> Optional[str]:
+        """The array a vector-append call appends to, or ``None``."""
+
+        for method in APPEND_METHODS:
+            suffix = f".{method}"
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return None
+
     def _rewrite_call_statement(
         self, node: llir.FunctionCallStmt, path: LLIRPath
     ) -> Sequence[llir.Stmt]:
+        appended = self._append_target(node.name)
         for index, level in enumerate(self._compressed_levels):
-            if node.name != f"{self._result_name}{level}_crd.push_back":
+            if appended != f"{self._result_name}{level}_crd":
                 continue
             if self._mode == "count":
                 return (llir.Increment(self._phase_state("_cnt", level)),)
@@ -395,7 +419,7 @@ class _ResultWriteRewriter(LLIRRewriter):
                 )
             return replacements
 
-        if node.name == f"{self._result_name}_values.push_back":
+        if appended == f"{self._result_name}_values":
             if self._mode == "count":
                 return ()
             value = node.args[0] if node.args else llir.Literal(0)
@@ -412,7 +436,50 @@ class _ResultWriteRewriter(LLIRRewriter):
             if self._mode == "fill":
                 return (node,)
             return ()
+        if node.name == "scorch_vector_set" and node.args:
+            # The position close, in the spelling the LoopIR targets emit
+            # directly.  The indexed-assign spelling is dropped by
+            # ``_rewrite_assign_statement`` below; this is the same statement
+            # reaching the same fate through a different vocabulary.  Both
+            # phases rebuild every position array from the exact prefix sums, so
+            # a running close inside either phase is dead at best and a write to
+            # a dropped declaration at worst.
+            target = node.args[0]
+            if type(target) is llir.Var and any(
+                target.name == f"{self._result_name}{level}_pos"
+                for level in self._compressed_levels
+            ):
+                return ()
+        if self._touches_result_storage(node.name):
+            _raise_result_write_error(
+                self._context,
+                code="unsupported_result_write_statement",
+                message=(
+                    f"statement {node.name!r} writes result storage in a "
+                    f"{self._mode} phase and this pass does not recognize it; "
+                    "an unrecognized result write would reach the C++ compiler "
+                    "against declarations the two-phase transform has dropped"
+                ),
+                path=path,
+                value=node.name,
+            )
         return (node,)
+
+    def _touches_result_storage(self, name: str) -> bool:
+        """Whether a call statement names one of this result's own arrays.
+
+        The guard is deliberately narrow: only the result's OWN position,
+        coordinate and value arrays.  A call touching one of those in a count or
+        fill phase either has a rewrite here or is a defect; anything else in the
+        body -- operand reads, workspace calls, the drain's sort -- is none of
+        this pass's business and passes through as before.
+        """
+
+        arrays = [f"{self._result_name}_values"]
+        for level in self._compressed_levels:
+            arrays.append(f"{self._result_name}{level}_pos")
+            arrays.append(f"{self._result_name}{level}_crd")
+        return any(name.startswith(f"{array}.") for array in arrays)
 
     def _rewrite_var_init_statement(
         self, node: llir.VarInit, path: LLIRPath

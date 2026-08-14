@@ -74,8 +74,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
+from ...format import LevelType
 from ..identity import IndexId, SymbolId
 
 
@@ -192,6 +193,19 @@ class LevelKind(Enum):
     COMPRESSED = "compressed"
     COORDINATE = "coordinate"
     SINGLETON = "singleton"
+
+
+#: The vocabulary correspondence between a LoopIR level kind and the core tensor
+#: model's level type, in one place.  Two independent copies of it already
+#: existed (one per direction) and a third was about to be written; a mapping
+#: between two enums is vocabulary, so it belongs beside the enum that needs
+#: translating.  Only the two executable kinds appear: ``COORDINATE`` and
+#: ``SINGLETON`` are declared so their disposition is explicit, and every
+#: consumer must fail closed on their absence rather than defaulting.
+LEVEL_KIND_TO_LEVEL_TYPE: Dict[LevelKind, LevelType] = {
+    LevelKind.DENSE: LevelType.DENSE,
+    LevelKind.COMPRESSED: LevelType.COMPRESSED,
+}
 
 
 @unique
@@ -1158,6 +1172,25 @@ class ParallelSelection(LoopIRNode):
     intent: ParallelIntent
 
 
+@unique
+class AssemblyStrategy(Enum):
+    """How a sparse result is assembled, target-neutrally.
+
+    One traversal or two, distributed across workers or not.  The member values
+    are the same tokens the public schedule and the ``LoopPlan`` record, defined
+    once in :mod:`scorch.compiler.sparse_assembly`; this enum is the typed form
+    the program carries.  The names describe assembly *structure* only —
+    OpenMP spelling, thread counts, chunk widths and runtime gates are target
+    decisions and appear nowhere in LoopIR, exactly as they appear nowhere in
+    :class:`ParallelSelection`.
+    """
+
+    SINGLE_PASS_SERIAL = "single_pass_serial"
+    SINGLE_PASS_CHUNK_PARALLEL = "single_pass_chunk_parallel"
+    TWO_PASS_SERIAL = "two_pass_serial"
+    TWO_PASS_PARALLEL = "two_pass_parallel"
+
+
 @dataclass(frozen=True)
 class LoopProgram(LoopIRNode):
     """One executable LoopIR program: declarations plus a top-level block.
@@ -1167,6 +1200,14 @@ class LoopProgram(LoopIRNode):
     lowering keeps its legacy structural derivation; the field is part of
     program semantics (canonically serialized, verified, erased with the
     schedule), never a target annotation.
+
+    ``assembly`` optionally carries the program's sparse-output assembly
+    strategy, on the same terms and for the same reason: which of the four
+    strategies is fastest depends on the operands rather than on the lowering
+    class, so it is a recorded scheduling decision.  ``None`` means no strategy
+    decision was recorded and target lowering keeps its own per-receiver choice,
+    which is why an automatically scheduled program emits exactly what it
+    emitted before this field existed.
     """
 
     node_id: LoopIRNodeId
@@ -1176,3 +1217,4 @@ class LoopProgram(LoopIRNode):
     outputs: Tuple[SymbolId, ...]
     body: Block
     parallel: Optional[ParallelSelection] = None
+    assembly: Optional[AssemblyStrategy] = None
