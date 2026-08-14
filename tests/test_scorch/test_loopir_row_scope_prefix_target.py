@@ -35,7 +35,9 @@ rule therefore cannot measure this family's reach, and
 ``test_the_csr_receiver_cells_are_gated_at_the_target_not_at_cin`` states that
 as an executable fact.
 
-No representation change: canonical v11 stands, no node kind is added, and
+No representation change from this family: it adds no node kind and no schedule
+identity of its own (the canonical schema later moved to v12 when the program
+gained its assembly-strategy fact, which is not this family's change), and
 blocker 3 adds NO scheduler change.  That is precise in two halves rather than
 one: the ordered-key half's automatic plan was already legal under the forced
 order, and the bound-prefix half consumes blocker 2's existing plan repair

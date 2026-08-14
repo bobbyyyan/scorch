@@ -527,7 +527,7 @@ def test_canonical_dump_is_arm_stable_and_erases_to_base():
             kernel.lowering.program
         )
     assert dumps[0] == dumps[1]
-    assert '"schema":"scorch.loopir.canonical.v11"' in dumps[0]
+    assert '"schema":"scorch.loopir.canonical.v12"' in dumps[0]
     assert '"kind":"position_load"' in dumps[0]
 
 

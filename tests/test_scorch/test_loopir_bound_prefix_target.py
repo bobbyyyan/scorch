@@ -10,7 +10,8 @@ already-complete result prefix and no workspace region participates.  Neither
 workspace node can express such an accumulator (``WorkspaceDecl`` is bound to a
 ``TileId``, ``SparseWorkspaceDecl`` requires one or more key dimensions), so it
 is an LLIR local exactly as every other family's reduction accumulator is, and
-canonical v11 stands.
+this family adds no node kind and no canonical schema change of its own (the
+schema later moved to v12 for the program's assembly-strategy fact).
 
 Two changes gate together, and this module locks both halves and the gating:
 
