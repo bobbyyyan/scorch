@@ -6949,14 +6949,14 @@ rejection, rank equality, injected post-densification failure atomicity
 for both dense and sparse receivers, and non-aliasing of the produced
 values.
 
-Focused counts reproduce exactly: the UNION battery collects **76**, the
-dense-suffix battery **22**, the single-cursor battery **56**; run
+Focused counts reproduce exactly: the UNION test file collects **76**, the
+dense-suffix file **22**, the single-cursor file **56**; run
 together they are **154 passed**.
 
 Two documentation defects were found:
 
-1. §39.1 records the B3 battery as ``44`` and §39.7 as ``45``.  The B3
-   multi-compressed battery collects **43** tests, at ``607d3e1`` and at
+1. §39.1 records the B3 test file as ``44`` and §39.7 as ``45``.  The B3
+   multi-compressed file collects **43** tests, at ``607d3e1`` and at
    the inherited tip alike; the range never touched that file.
 2. The headline focused memberships "498 LoopIR tests and 123
    runtime/stage tests" name no file set and no command, and the
@@ -6964,7 +6964,7 @@ Two documentation defects were found:
    manifest entries lie under it).  ``498`` is reproducible only by
    guessing a membership; ``123`` could not be reproduced from any
    documented file set.  They are recorded here as **unreproducible**,
-   not as gates.
+   not as evidence anything has to pass.
 
 **No concrete defect was found inside the reviewed range.**
 
@@ -7028,8 +7028,8 @@ a new rank-1 conversion file).
 Census v10 records, for every declared cell and in both automatic arms,
 the LoopIR outcome and exact fail-closed code, whether legacy generates
 C++, whether the legacy kernel executes soundly with well-formed
-identity-ordered storage, and public reachability.  Legacy comparands
-execute through an independently keyed direct build, because the
+identity-ordered storage, and public reachability.  The legacy side
+executes through an independently keyed direct build, because the
 low-level ``lower_and_exec_cin`` wrapper cannot wrap multi-compressed
 sparse outputs (the pre-existing limitation recorded in §39.2).  Each
 cell runs in its own process so a native crash records a receipt instead
@@ -7046,15 +7046,16 @@ cell; the four groups contain 12 + 14 + 13 + 15 cells.
 - **Compressed-parent/dense-leaf co-operands** — ``ss*sd`` and its
   commuted, f64, rank-3, rank-4, ragged and empty forms — sit at
   ``unsupported_program_shape`` in both arms.  Legacy generates *and*
-  executes them with well-formed storage, so this family **is**
-  byte-parity gateable when migrated.  ``ss+sd`` keeps
+  executes them with well-formed storage, so this family **can** be
+  checked by byte parity when migrated.  ``ss+sd`` keeps
   ``unsupported_union_with_dense`` and ``sd`` copy keeps
   ``unsupported_sparse_output_domain``.
 - **Multiple dense prefixes and interleaved dense levels** — ``dds``,
   ``sds``, ``dds+dds`` at ``unsupported_sparse_output``; ``ddss``,
   ``ddss+ddss`` at ``unsupported_program_shape``.  These inputs can now
   be *built* (§41.2a) but their legacy execution produces malformed
-  storage, so a future migration must gate on the oracle, not parity.
+  storage, so a future migration must check against the oracle, not
+  parity.
 - **Multi-compressed reduction/TTM** — §41.4.
 
 Two further pre-existing public-route defects were characterized, both
@@ -7073,7 +7074,7 @@ outside this milestone's scope and neither introduced by it:
   This defect is pre-existing and latent — fixing the input conversion
   is what made it reachable.
 
-### 41.4 The reduction/TTM comparand is not byte-parity gateable
+### 41.4 The reduction/TTM family cannot be checked by byte parity
 
 Eight reduction cells — ``sss@dd`` TTM at f32 and f64, ``dss@dd`` TTM,
 ``ss@dd`` and ``ss@ss`` into ``ss``, two ``ds``-output nests, and a
@@ -7084,17 +7085,16 @@ module loads; the crash is inside ``evaluate``.  A standalone
 reproduction is retained as an executable receipt.
 
 This is a concrete instance of the memory-safety failure ``lower_cin.py``
-already attributes to the sparse-reduction comparand.  It settles the
-gating question in advance: the reduction/TTM family **can never be
-gated on byte parity** and must use the LoopIR oracle and PyTorch
-differentials.
+already attributes to the legacy sparse-reduction route.  It settles the
+question in advance: the reduction/TTM family **can never be checked by
+byte parity** and must use the LoopIR oracle and PyTorch differentials.
 
-The crash is confined to the legacy *generic comparand* route driven
-directly by the census.  Production dispatch is unaffected:
-``scorch.matmul`` over ``ss``x``ss`` and ``ds``x dense both return
-results matching ``torch.matmul``.  The LoopIR route rejects these
-nests at ``unsupported_sparse_output`` (TTM and rank-general
-reductions), ``unsupported_sparse_output_domain`` (``ss@dd``),
+The crash is confined to the generic legacy route the census drives
+directly.  Production dispatch is unaffected: ``scorch.matmul`` over
+``ss``x``ss`` and ``ds``x dense both return results matching
+``torch.matmul``.  The LoopIR route rejects these nests at
+``unsupported_sparse_output`` (TTM and rank-general reductions),
+``unsupported_sparse_output_domain`` (``ss@dd``),
 ``unsupported_sparse_output_reduction`` and ``unsupported_program_shape``
 (the ``ds``-output nests) — arm-invariantly.
 
@@ -7116,8 +7116,8 @@ sniffing, rendered-name or regex routing, and no operation-specific
 target hack: canonical CSR keeps its own dedicated family because
 ``(DENSE, COMPRESSED)`` is not a rank-1 result.
 
-The legacy comparand is honest here, so the gate is the B1/B3
-discipline:
+Legacy is an honest thing to compare against here, so the standard is the
+B1/B3 one:
 
 - **byte parity** with ``legacy_generated_cpp`` over **20 cells** —
   ``s`` copy, ``s+s`` union, ``s*s`` intersection, ``s*d`` and the
@@ -7135,18 +7135,18 @@ discipline:
 - the rank-1 dense output and the ``ss`` copy, ``ss+ss``, ``ss*dd`` and
   ``ds+ds`` rank>=2 families are byte-unchanged.
 
-The 93-test battery adds honest identity-ordered storage carrying the
+The 93-test file adds honest identity-ordered storage carrying the
 exact ordered support, cancellation retaining a stored explicit zero,
 canonical empty storage, repeated byte-stable execution, and the
 single-compressed-level source shape (no ``C1_*`` arrays, no dense-size
 initializer).
 
-**Recorded seam move.**  Three inherited locks asserted that rank-1
-compressed outputs stay at ``unsupported_sparse_output``.  That seam now
-belongs to the admitted family, so each lock moves to the neighbour that
-still occupies it — a single compressed level under two or more dense
-parents, which the one-dense-prefix rule excludes — and names the move
-in place.
+**Recorded move of locks on a refused shape.**  Three inherited locks
+asserted that rank-1 compressed outputs stay at
+``unsupported_sparse_output``.  That refusal now belongs to the admitted
+family, so each lock moves to the neighbour that still carries it — a
+single compressed level under two or more dense parents, which the
+one-dense-prefix rule excludes — and names the move in place.
 
 **Production reachability.**  The family is reachable through public
 ``scorch.einsum``: ``i->i`` over a compressed vector and ``i,i->i`` over
@@ -7166,15 +7166,15 @@ family's shape.
 
 ### 41.6 Verification
 
-All gates ran in the ``scorch`` conda environment; evidence is under
+Everything below ran in the ``scorch`` conda environment; evidence is under
 ``~/.cache/scorch-codex/phase7-envelope-session/``.
 
-- **Focused batteries**: the widened conversion file **64 passed**, the
-  rank-1 conversion file **18 passed**, the rank-1 assembly battery
-  **93 passed**, the three updated seam files **181 passed**, the
-  eight-file LoopIR battery **758 passed** before the seam update (its
-  5 failures were exactly the obsolete rank-1 seam assertions).  That
-  eight-file run is an exploratory red receipt, not a final gate.  The
+- **Focused test files**: the widened conversion file **64 passed**, the
+  rank-1 conversion file **18 passed**, the rank-1 assembly file
+  **93 passed**, the three updated refusal-lock files **181 passed**, the
+  eight-file LoopIR set **758 passed** before the locks were updated (its
+  5 failures were exactly the obsolete rank-1 assertions).  That
+  eight-file run is an exploratory red receipt, not a final result.  The
   reported conversion-adjacent **214 passed** result has no retained command
   or file membership and is therefore not independently reproducible.
 - **Schedule audit** at the new tip: **46 admitted / 40 rejected / 0
@@ -7199,9 +7199,9 @@ All gates ran in the ``scorch`` conda environment; evidence is under
   ``ss*sd`` built by the widened conversion, ``dss`` copy, and
   ``matmul`` over ``ss``x``ss``) match the dense reference and are
   byte-stable across three rounds.
-- **Activating paired compile latency**: 200 warmups and
+- **Paired compile latency on the newly reachable shapes**: 200 warmups and
   2,000 interleaved samples per cell, in both orderings, over the three
-  newly activating rank-1 cells plus the shared ``ss`` intersection
+  newly reachable rank-1 cells plus the shared ``ss`` intersection
   control.  Every metric is inside the 1.10 budget: the worst
   within-run LoopIR/legacy ratio is **1.04189** in the primary ordering
   and **1.06632** in the order-flipped control.  The rank-1 union cell
@@ -7223,19 +7223,19 @@ Four pre-existing public-conversion defects are closed, one coherent
 compiler family is migrated at byte parity in both automatic arms with a
 production caller, and the compatibility envelope is censused with exact
 arm-invariant codes.  Release behaviour is unchanged: the schedule audit
-is equal to its retained baseline, every sealed capture surface is
+is equal to its retained baseline, every checksummed capture surface is
 byte-identical (modulo two process-dependent cache-key characters), and
 static findings are at exact base/candidate parity.
 
 **Phase-7 does not exit on this milestone.**  Two declared families
 remain, each with a precise blocker recorded in §41.3-§41.4: the
 compressed-parent/dense-leaf co-operands (blocked on the assembly
-target's leaf envelope, and byte-parity gateable when unblocked), and
-the multi-compressed reduction/TTM family (blocked on an unusable legacy
-comparand that segfaults, so permanently oracle-gated).  Multiple dense
-prefixes remain rejected as well.  No Phase-8 inventory was started, no
-cutover, cache, selector or dispatch change was made, and no legacy code
-was deleted.
+target's leaf envelope, and checkable by byte parity when unblocked), and
+the multi-compressed reduction/TTM family (blocked on a legacy route that
+segfaults and is therefore unusable as a comparison, so permanently
+checked against the oracle).  Multiple dense prefixes remain rejected as
+well.  No Phase-8 inventory was started, no cutover, cache, selector or
+dispatch change was made, and no legacy code was deleted.
 
 ## 42. Phase-7 compatibility-envelope rigorous review corrections (2026-08-07)
 
@@ -7255,10 +7255,10 @@ evidence claims needed correction:
 - the compatibility census contains **54**, not 55, cells: 12 + 14 + 13 +
   15, with zero arm divergence;
 - the retained **214 passed** line has neither a command nor file membership
-  and is not independently reproducible, so it is not an authoritative gate;
-- the retained 758-pass/5-failure pre-seam run is an exploratory red receipt:
-  all five failures are the obsolete rank-1 seam assertions moved by the
-  milestone, not a final green battery;
+  and is not independently reproducible, so it does not settle anything;
+- the retained 758-pass/5-failure run predating the lock updates is an
+  exploratory red receipt: all five failures are the obsolete rank-1
+  assertions the milestone moved, not a final green result;
 - the inherited latency evidence is a same-tip LoopIR-versus-legacy paired
   comparison in two orders, not cross-revision A/B/A or self-A/A evidence;
 - full-tree base/candidate parity is **15 Black findings**, **47 Flake8
@@ -7298,7 +7298,7 @@ Fresh probes found three runtime boundary defects and one evidence gap:
    validates key types first; ``c806db4`` locks both outer-format and
    nested-level attacks.
 
-The inherited rank-1 battery also lacked direct oracle coverage, genuinely
+The inherited rank-1 test file also lacked direct oracle coverage, genuinely
 stored-zero operands, and zero-extent execution. ``efa78fe`` adds all three:
 every admitted family runs through the production LoopIR oracle; copy,
 intersection, and union consume and retain hand-built stored zeros; and
@@ -7309,7 +7309,7 @@ No LoopIR node, canonical/request/schedule identity, LoopIR pipeline route, or
 valid generated C++ changed in these corrections. The public runtime
 ``to_sparse`` conversion route deliberately changed for the corrected formats.
 
-### 42.3 Deferred compatibility seam
+### 42.3 Deferred compatibility gap
 
 Input-format ownership is now closed, but a returned ``STensor`` still exposes
 its retained format through ``tensor.format``. A caller using
@@ -7325,11 +7325,12 @@ at this one conversion call site.
 Evidence is retained under
 ``~/.cache/scorch-codex/phase7-envelope-review-efa78fe/``. Full-tree static
 parity between base ``a606e11`` and candidate ``c806db4``, the 54-cell census,
-schedule audit, captures, and paired latency are green under the corrected
+schedule audit, captures, and paired latency all pass under the corrected
 interpretations above. The final focused files collect **111**
-public-conversion tests and **103** rank-1 assembly tests; the adjacent seam
-membership contains **181**. All are included in the exact-tip suite below.
-The exact-tip same-revision LoopIR-versus-legacy latency rerun uses 200 warmups
+public-conversion tests and **103** rank-1 assembly tests; the adjacent
+refusal-lock membership contains **181**. All are included in the exact-tip
+suite below.
+The exact-tip same-revision LoopIR-versus-legacy latency re-run uses 200 warmups
 and 2,000 interleaved samples per cell in both orders; its worst ratio is
 **1.06301** (rank-1 copy p95), inside the 1.10 target. This is paired two-order
 evidence, not A/B/A or A/A.
