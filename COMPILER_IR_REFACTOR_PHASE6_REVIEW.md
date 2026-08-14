@@ -8023,7 +8023,7 @@ reproduces:
   metadata, spec, dtype, device, layout, index, name, shape, permutation and
   value boundaries.  Every one reports a ``scorch.exceptions`` error with
   **no rendering hook fired**.
-- **The declared-open read seam is genuinely confined.**  Two tensors built
+- **The declared-open read boundary is genuinely confined.**  Two tensors built
   from one caller format do not share it; corrupting a returned tensor's own
   format damages only that tensor; and the prebuilt matmul resolution memo is
   provably not reachable -- after ``matmul``, no result-side format object is
@@ -8046,11 +8046,11 @@ reproduces:
 
 - The ``phase7-closure-session`` ledger verifies **540/540** from scratch.
 - The historical §39 ``phase7-assembly-session`` ledger verifies **224/225**
-  and **was not resealed**.  The mechanism is now proven rather than inferred:
-  the manifest digest for ``tip-at-docs.txt`` equals the SHA-256 of that
-  file's *first line only*, and a second line was appended about 25 seconds
-  after the manifest was written.  The failed entry, both digests and the
-  timestamps are retained in this milestone's ledger.
+  and **its manifest was not rewritten**.  The mechanism is now proven rather
+  than inferred: the manifest digest for ``tip-at-docs.txt`` equals the SHA-256
+  of that file's *first line only*, and a second line was appended about 25
+  seconds after the manifest was written.  The failed entry, both digests and
+  the timestamps are retained in this milestone's ledger.
 - The 54-cell execution census carried forward from ``bb76e26`` is
   **disclosed and correct**: an independent re-run of all 54 cells at
   ``52d43cc``, one fresh subprocess per cell, reproduced the retained
@@ -8060,7 +8060,7 @@ reproduces:
 - The historical latency harnesses still lack separate process-exit receipts;
   that is restated, not repaired.
 
-Two evidence inaccuracies are recorded rather than resealed.
+Two evidence inaccuracies are recorded rather than re-checksummed.
 ``target-membership-proof/summary.json`` carries a single ``revision`` key of
 ``b91b773`` beside the ``398 passed``/``520 passed`` compiler memberships,
 which actually executed at ``1a550d4``; §44.5 states the memberships
@@ -8142,15 +8142,15 @@ schedule-identity change, and no CSR shortcut, rendered-name discovery, regex
 or format-string sniffing: the admission is expressed through level and domain
 identities alone.
 
-**The legacy comparand is dishonest for this family, and that is proven, not
-asserted.**  Its catch-up is emitted as ``for (; C2_pos_index < j; C2_pos_index++)``
--- bounded by the innermost dense loop variable alone -- so for a ``2x3``
-prefix it produces a 4-entry position array where 7 are required.  The
-production LoopIR oracle, by contrast, already assembles the correct
-``(0, 3, 4, 8, 11, 13, 16)``.  The gate is therefore the oracle plus the dense
-PyTorch reference, never byte parity, and a dedicated test pins the legacy
-malformation directly from its generated source so the choice cannot silently
-decay.
+**Legacy is a dishonest thing to compare this family against, and that is
+proven, not asserted.**  Its catch-up is emitted as
+``for (; C2_pos_index < j; C2_pos_index++)`` -- bounded by the innermost dense
+loop variable alone -- so for a ``2x3`` prefix it produces a 4-entry position
+array where 7 are required.  The production LoopIR oracle, by contrast, already
+assembles the correct ``(0, 3, 4, 8, 11, 13, 16)``.  Correctness is therefore
+checked against the oracle plus the dense PyTorch reference, never byte parity,
+and a dedicated test pins the legacy malformation directly from its generated
+source so the choice cannot silently decay.
 
 **What "migrated" does and does not mean here, stated exactly.**  The LoopIR
 route -- CIN admission, routing, target lowering, scheduling/oracle, erasure
@@ -8180,17 +8180,17 @@ the *dynamic* stored-coordinate count of the compressed level above it, so a
 dense loop would have to sit below a stream loop, and a compressed ancestor
 that turns out not to materialize would need its speculative per-dense-cell
 position closes rolled back -- a semantics no existing node owns.  Its legacy
-comparand (census ``D9``) is recorded malformed *and* numerically wrong, so
-there is no honest comparand either.  The trailing-dense D10/D11 families
-(``sd+sd``, ``sdd``) keep ``unsupported_sparse_output_domain``: their parent
-coordinates come from a cursor rather than a dense loop, so the
+output (census ``D9``) is recorded malformed *and* numerically wrong, so there
+is nothing honest to compare against there either.  The trailing-dense D10/D11
+families (``sd+sd``, ``sdd``) keep ``unsupported_sparse_output_domain``: their
+parent coordinates come from a cursor rather than a dense loop, so the
 flattened-prefix model does not reach them.  Permuted compressed structure
 keeps its pre-existing pre-LoopIR ``InvalidSchedule`` rejection.
 
-### 45.5 Recorded seam moves
+### 45.5 Recorded moves of locks on refused shapes
 
-Four inherited seam locks named cells this milestone migrates and are moved to
-the neighbour that still occupies each seam, with the move named in place --
+Four inherited locks named cells this milestone migrates and are moved to
+the neighbour that is still refused there, with the move named in place --
 the §43.8 discipline.  Two of them are moving for the *second* time, and the
 comments record both hops.  A fifth lock, in
 ``test_loopir_dense_leaf_cooperand_target.py``, was found only by running the
@@ -8213,9 +8213,9 @@ result format changed code.
 rather than disguised.**  Implementing it means giving workspace allocation,
 reset, lifetime, producer reduction, drain and ordered result assembly
 explicit structured ownership in LoopIR -- a slice comparable in size to the
-whole B1 SpGEMM milestone -- and doing it on top of a legacy comparand that is
-memory-unsafe.  Delivering a partially verified workspace vertical would be
-worse than delivering none, so it was not started.
+whole B1 SpGEMM milestone -- and doing it on top of a legacy implementation
+that is memory-unsafe.  Delivering a partially verified workspace vertical
+would be worse than delivering none, so it was not started.
 
 What this milestone *does* contribute is a localized, independently verified
 root-cause map, which is strictly more than the inventory §43.5 left:
@@ -8254,13 +8254,12 @@ boundary with ``sparse_parent_dominance``, and every TTM form
 (``sss``/``dds``/``dss`` results, dense or sparse second factor) stops at
 ``unsupported_sparse_output``, with the dense-result control at
 ``unsupported_program_shape``.  The eight §41.4 cells still terminate with
-SIGSEGV under the legacy comparand and remain executable failure evidence
-only.
+SIGSEGV on the legacy route and remain executable failure evidence only.
 
 ### 45.7 Verification
 
-All gates ran in the ``scorch`` conda environment.  Evidence is retained under
-``~/.cache/scorch-codex/phase7-multiprefix-4ce6bca/``.
+Everything below ran in the ``scorch`` conda environment.  Evidence is retained
+under ``~/.cache/scorch-codex/phase7-multiprefix-4ce6bca/``.
 
 - **Exhaustive layout differential**, 1,584 cells x 2 automatic arms at ranks
   1-4, base ``52d43cc`` versus candidate, both trees isolated so the only
@@ -8271,8 +8270,9 @@ All gates ran in the ``scorch`` conda environment.  Evidence is retained under
   family whose legacy assembler is malformed.  Consequently the retained
   ``envelope/diff.txt`` ends in the harness-level text ``VERDICT: FAIL``: that
   verdict means "not every admitted candidate is byte-equal to legacy," not a
-  regression in this oracle-gated family.  The file is retained as expected
-  non-parity evidence and must not be described as a passing byte-parity gate.
+  regression in this family, whose correctness is checked against the oracle.
+  The file is retained as expected non-parity evidence and must not be
+  described as a passed byte-parity check.
 - **Execution sweeps**: a 120-case matrix (ranks 3-5, f32/f64, copy/mul/add,
   zero extents, singleton prefixes, both arms) and a 162-case matrix (mixed
   and commuted operands, random/ragged/empty/explicit-stored-zero fixtures,
@@ -8281,8 +8281,8 @@ All gates ran in the ``scorch`` conda environment.  Evidence is retained under
   the four pre-existing, unchanged ``ds``-copy cells.  The historical ledger
   retained the scripts but **not** their stdout, exit status, revision, or
   import-provenance receipts, and those scripts hard-code the active checkout;
-  these counts therefore remain claims pending the provenance-correct rerun in
-  the subsequent exact-tip review, not self-contained historical gates.
+  these counts therefore remain claims pending the provenance-correct re-run in
+  the subsequent exact-tip review, not self-contained historical evidence.
 - **Independent multi-seed randomized oracle sweep**: **560/560 checks over
   five seeds**, spanning seven layouts (``dds``, ``ddss``, ``ddds``,
   ``dddss`` plus the inherited ``dss``/``sss``/``ss`` controls), MUL and ADD,
@@ -8339,23 +8339,23 @@ All gates ran in the ``scorch`` conda environment.  Evidence is retained under
   ``tests/test_scorch/test_loopir_cin_lowering.py``, a member of partition 4,
   which therefore ran at ``a1582a9``.
 
-  **This gate earned its keep again.**  Partition 4 initially failed
-  ``test_unsupported_sparse_output_layout``: a *sixth* inherited seam lock,
-  and the *third* successive occupant of that particular lock, asserting
-  ``unsupported_sparse_output`` for the ``dds`` copy this milestone admits.
-  Neither the layout differential nor the census could have caught it -- both
-  compare compiler outcomes, not test expectations.  ``a1582a9`` moves it to
-  the interleaved ``sds`` neighbour and names the move in place.
-- **Activating paired two-order compile latency: NOT SATISFIED ON THIS HOST,
-  and not claimed as a pass.**  An immediately preceding alternating A/A
-  control on the same idle host is tight -- p50 0.9843-1.0001, p95
-  0.9819-0.9990 across all four shapes -- so the harness and the host's
-  short-timescale stability are sound.  The paired LoopIR-versus-legacy run
-  (200 warmups / 2,000 samples, alternating) nevertheless measures
-  ``mp_dds_mul`` **1.1213/1.1268**, ``mp_dds_add`` **1.0661/1.0716**,
-  ``mp_ddss_mul`` **1.0886/1.1072** and the shared control ``b3_ss_mul``
-  **1.1065/1.1135** at p50/p95 -- three of four over the declared 1.10
-  ceiling.
+  **Running the suite was worth it again.**  Partition 4 initially failed
+  ``test_unsupported_sparse_output_layout``: a *sixth* inherited lock on a
+  refused shape, and the *third* successive occupant of that particular lock,
+  asserting ``unsupported_sparse_output`` for the ``dds`` copy this milestone
+  admits.  Neither the layout differential nor the census could have caught it
+  -- both compare compiler outcomes, not test expectations.  ``a1582a9`` moves
+  it to the interleaved ``sds`` neighbour and names the move in place.
+- **Paired two-order compile latency on the shapes production reaches: NOT
+  SATISFIED ON THIS HOST, and not claimed as a pass.**  An immediately
+  preceding alternating A/A control on the same idle host is tight -- p50
+  0.9843-1.0001, p95 0.9819-0.9990 across all four shapes -- so the harness and
+  the host's short-timescale stability are sound.  The paired
+  LoopIR-versus-legacy run (200 warmups / 2,000 samples, alternating)
+  nevertheless measures ``mp_dds_mul`` **1.1213/1.1268**, ``mp_dds_add``
+  **1.0661/1.0716**, ``mp_ddss_mul`` **1.0886/1.1072** and the shared control
+  ``b3_ss_mul`` **1.1065/1.1135** at p50/p95 -- three of four over the declared
+  1.10 ceiling.
 
   **The attribution is measured, not asserted.**  The same harness run against
   an isolated **base ``52d43cc``** tree on the same host measures ``b3_ss_mul``
@@ -8366,10 +8366,10 @@ All gates ran in the ``scorch`` conda environment.  Evidence is retained under
   +/-0.018 band.  So this Apple M5 host carries a LoopIR-versus-legacy offset
   the declared 1.10 target was not calibrated for; §44.4's passing receipt
   (``b3_ss_mul`` 1.0909/1.0961) was produced on an unloaded Redwood x86 host.
-  The honest statement is that **the gate is outstanding and must be re-run on
-  unloaded Redwood before any Phase-7 exit**, and that on the evidence
-  available the migration itself does not account for the crossing.  The
-  failed percentiles are reported, not averaged away.
+  The honest statement is that **this measurement is outstanding and must be
+  re-run on unloaded Redwood before any Phase-7 exit**, and that on the
+  evidence available the migration itself does not account for the crossing.
+  The failed percentiles are reported, not averaged away.
 - **The five protected tracked files** retain their recorded SHA-256 values;
   origin remains ``58e8565``; nothing was pushed, amended, squashed or
   reordered; only explicit paths were staged, and every unrelated tracked and
@@ -8382,13 +8382,13 @@ Criterion by criterion.
 *Migrated families complete over their proven envelopes.*  The
 multiple-dense-prefix family is, over ranks 3-5, f32/f64, copy/intersection/
 ordered-union, mixed and commuted operands, ragged/empty/zero-extent/
-explicit-stored-zero fixtures and cancellation, in both automatic arms, gated
-on the LoopIR oracle and the dense PyTorch reference because its legacy
-comparand is provably malformed.
+explicit-stored-zero fixtures and cancellation, in both automatic arms, checked
+against the LoopIR oracle and the dense PyTorch reference because its legacy
+counterpart is provably malformed.
 
 *Every neighbour carries a stable fail-closed code.*  Yes, in both arms, with
-the moves recorded: six inherited seam locks relocated to the neighbour that
-still occupies each seam, and 144 arm-instances of ``dds`` neighbours whose
+the moves recorded: six inherited locks relocated to the neighbour that is
+still refused there, and 144 arm-instances of ``dds`` neighbours whose
 code sharpens from ``unsupported_sparse_output`` to
 ``unsupported_sparse_output_domain``.  ``sds`` keeps
 ``unsupported_sparse_output``; ``sd``/``sdd`` keep
@@ -8411,14 +8411,14 @@ excluded.  The other -- multi-compressed reduction/TTM -- is **not
 implemented**.  §45.6 states why and hands over four exact, independently
 reproduced root-cause sites instead of an inventory.
 
-*The activating paired latency receipt.*  **Outstanding, not passed.**  Three
-of four shapes cross the 1.10 ceiling on this host -- but so do two of three
-INHERITED shapes measured on an isolated base ``52d43cc`` tree on the same
-host, and the shared control's candidate-minus-base delta is +0.0052 p50 /
-+0.0114 p95, inside the A/A control's own band.  The crossing is a property of
-this host's LoopIR-versus-legacy baseline, not of the migration; the gate must
-be re-run on unloaded Redwood before Phase-7 exit, and until then it counts
-against exit.
+*The paired latency measurement on the shapes production reaches.*
+**Outstanding, not passed.**  Three of four shapes cross the 1.10 ceiling on
+this host -- but so do two of three INHERITED shapes measured on an isolated
+base ``52d43cc`` tree on the same host, and the shared control's
+candidate-minus-base delta is +0.0052 p50 / +0.0114 p95, inside the A/A
+control's own band.  The crossing is a property of this host's
+LoopIR-versus-legacy baseline, not of the migration; it must be re-run on
+unloaded Redwood before Phase-7 exit, and until then it counts against exit.
 
 **Phase 7 therefore does not exit on this milestone.**  No Phase-8 inventory
 was started, no cutover, cache, selector or default-dispatch change was made,
@@ -8426,9 +8426,9 @@ and no legacy code was deleted.  The milestone's contribution is nonetheless
 concrete: one declared cluster closed at oracle strength, two publicly
 reachable runtime ownership defects fixed, one carried-forward evidence
 receipt independently re-derived rather than trusted, two evidence
-inaccuracies recorded rather than resealed, and the remaining cluster reduced
-from "blocked, needs its own vertical" to four named lines of code with a
-reproduced public consequence.
+inaccuracies recorded rather than re-checksummed, and the remaining cluster
+reduced from "blocked, needs its own vertical" to four named lines of code with
+a reproduced public consequence.
 
 ## 46. Exact-tip review corrections and cross-host closure (2026-08-09)
 
