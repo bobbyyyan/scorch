@@ -9092,7 +9092,7 @@ Every §48 contract was re-derived from the code and from live probes.
   domains, a cyclic producer block, a drain inside the producer, and a direct
   ``run_program`` call on a truncated key — each with a domain error and a
   precise path.
-- **The sealed evidence verifies**: 501/501, 213/213 and 56/56 manifest
+- **The checksummed evidence verifies**: 501/501, 213/213 and 56/56 manifest
   entries, and ``FINAL_STATE_SHA256SUMS`` binds both committed documentation
   files at their current content.
 
@@ -9101,14 +9101,15 @@ opens no fix commit before the vertical.
 
 ### 49.2 The frontier, derived rather than re-read
 
-§48.3 was explicit that the committed 16-cell census is a representative
-frontier, not an exhaustive one.  Before touching any code this milestone
-derived a **143-cell** frontier from semantic identities — every rank-2 and
-rank-3 receiver layout crossed with every result subset, rank-3 results with
-mixed dense/compressed layouts, rank-4 reductions, four second-factor layouts
-crossed with three TTM result layouts, commuted operands, permuted
-contractions, and the migrated SpGEMM/SpMM controls — recording the exact
-route (exception class plus defect code) for each in both automatic arms.
+§48.3 was explicit that the committed 16-cell census is a representative survey
+of the boundary, not an exhaustive one.  Before touching any code this milestone
+derived a **143-cell** frontier — the survey matrix of programs the compiler is
+measured over — from semantic identities: every rank-2 and rank-3 receiver layout
+crossed with every result subset, rank-3 results with mixed dense/compressed
+layouts, rank-4 reductions, four second-factor layouts crossed with three TTM
+result layouts, commuted operands, permuted contractions, and the migrated
+SpGEMM/SpMM controls — recording the exact route (exception class plus defect
+code) for each in both automatic arms.
 
 The frontier is **arm-invariant at all 143 cells, before and after**.
 
@@ -9249,18 +9250,18 @@ that can expose a cross-region segment merge.
    key domain and a rank-0 key is a different construction, not a degenerate
    instance.  A LoopIR-only automatic-plan repair is therefore **necessary but
    provably not sufficient**: on its own it moves the failure from LoopPlan to
-   a later LoopIR seam and migrates nothing.  The two must be gated together.
-   Sections 47.5/47.7/48.3 are corrected accordingly: the repair is neither a
-   Phase-8 dispatch decision (§47) nor sufficient on its own (§48).
+   a later refusal inside LoopIR and migrates nothing.  The two must land
+   together.  Sections 47.5/47.7/48.3 are corrected accordingly: the repair is
+   neither a Phase-8 dispatch decision (§47) nor sufficient on its own (§48).
 3. **Row-scope dense prefixes at rank >= 3.**  A DENSE result prefix level
-   bound by a STORED loop needs the row-scope catch-up against a *dynamic*
-   parent count at depth.  It is rejected up front with
+   bound by a STORED loop needs the row-scope catch-up against a parent count
+   only known at run time.  It is rejected up front with
    ``unsupported_sparse_output_domain``, which names the actual violation.
-   One inherited seam lock moved here (§49.7).
+   One inherited lock on a refused shape moved here (§49.7).
 
 ### 49.6 Verification
 
-All gates ran in the ``scorch`` conda environment.
+Everything below ran in the ``scorch`` conda environment.
 
 - **Compiled public differential: 520 checks, 8 failures, and every failure is
   blocker 1.**  Each migrated cell is executed through the real JIT path and
@@ -9273,10 +9274,10 @@ All gates ran in the ``scorch`` conda environment.
   at ``unsupported_schedule_auto_family``.  The harness retains that raw
   nonzero receipt and a separate exit-0 characterization asserts the blocked
   set is exactly those and nothing else.
-- **The legacy comparand is not a gate for this family**, and that is
+- **Legacy is not a usable comparison for this family**, and that is
   deliberate: every migrated cell is one the legacy assembler rejects,
-  corrupts, or terminates on.  Correctness is gated on the LoopIR oracle plus
-  the dense PyTorch reference.  Byte parity is asserted only where it is
+  corrupts, or terminates on.  Correctness is checked against the LoopIR oracle
+  plus the dense PyTorch reference.  Byte parity is asserted only where it is
   meaningful — that the K = 1 families' generated sources did not move.
 - **Representation unchanged.**  No node kind, no canonical schema change
   (v11 stands), no request- or schedule-identity change.  ``plan_identity``
@@ -9285,32 +9286,32 @@ All gates ran in the ``scorch`` conda environment.
 - **No default dispatch, cache, selector or fallback change**, and no legacy
   code removed.
 
-### 49.7 Recorded seam moves
+### 49.7 Recorded moves of locks on refused shapes
 
-One inherited seam lock named a cell this milestone migrates.
+One inherited lock named a cell this milestone migrates.
 ``test_loopir_multi_compressed_target.py``'s ``ttm_reduction`` cell asserted
 ``unsupported_sparse_output`` for ``TTM sss x dd -> sss``; it is moved to the
-neighbour that still occupies the seam — the same TTM with a ``dss`` result,
+neighbour that is still refused there — the same TTM with a ``dss`` result,
 whose DENSE prefix level is bound by the receiver's STORED level — and the move
 is named in place.  The census itself is rewritten around the three-way split
 (9 migrated / 2 auto-tile blocked / 5 reorder blocked) with its
 explicit-order controls updated to the sharpened codes, and it keeps the
 "representative, not exhaustive" statement §48.3 insisted on.
 
-### 49.8 The full suite earned its keep again, and two more corrections
+### 49.8 The full suite was worth running again, and two more corrections
 
 The clean detached full non-performance suite found **seven failures the
 frontier differential and the census could not have found** -- both of those
 compare compiler outcomes, not test expectations.  All seven were this
 milestone's own defects, and all are corrected:
 
-- **A seventh inherited seam lock** (``2456bbc``).
+- **A seventh inherited lock on a refused shape** (``2456bbc``).
   ``test_loopir_pipeline_execution.py``'s ``sparse_output_root`` cell asserted
   ``unsupported_sparse_output`` for a rank-1 sparse result reduced over an
   OUTER dense loop.  The ordered-key workspace now lowers that shape, because
   a workspace owns ordering and a key coordinate driven by a dense domain is
   therefore ordinary rather than unassemblable.  The lock moves to the
-  neighbour that still occupies the seam -- a sparse-output root with no
+  neighbour that is still refused -- a sparse-output root with no
   reduction below its coordinates, so there is no key to drain and no stored
   stream to assemble from -- verified arm-invariant at
   ``unsupported_sparse_output_domain``.
@@ -9342,13 +9343,13 @@ of one.
 ordered-key family over its declared envelope: ``(prefix, K)`` splits of
 (0,1), (0,2), (0,3), (1,1), (1,2) and (2,1), dense and compressed second
 factors, commuted operands, f32/f64, both automatic arms,
-singleton/ragged/empty/zero extents, stored zeros and cancellation, gated on
-the LoopIR oracle and the dense PyTorch reference because the legacy comparand
-for these cells rejects, corrupts or terminates.
+singleton/ragged/empty/zero extents, stored zeros and cancellation, checked
+against the LoopIR oracle and the dense PyTorch reference because legacy on
+these cells rejects, corrupts or terminates.
 
 *Every neighbour carries a stable fail-closed code.*  Yes, arm-invariantly at
-all 143 frontier cells, with two seam locks moved and named in place and 45
-diagnostics sharpened.
+all 143 frontier cells, with two locks on refused shapes moved and named in
+place and 45 diagnostics sharpened.
 
 *Representation unchanged.*  Yes.  No node kind, no canonical schema change
 (v11 stands), no request- or schedule-identity change.
@@ -9361,27 +9362,27 @@ cache, selector or fallback change.
 *The declared matrix is closed.*  **No.**  Seven of the sixteen
 representatives remain, behind the three blockers of §49.5.
 
-*The activating paired latency receipt.*  **Not applicable, and that is proven
-rather than asserted.**  Every pre-existing activating generated source is
-byte-identical between base and candidate, so there is nothing to re-measure
-for them.  The newly admitted families have no honest comparand -- legacy
-either rejects them or returns malformed storage -- and default dispatch is
-unchanged, so no production path was activated.  No timing run was
-manufactured.
+*The paired latency measurement.*  **Not applicable, and that is proven
+rather than asserted.**  Every pre-existing generated source a measurement
+would have to cover is byte-identical between base and candidate, so there is
+nothing to re-measure for them.  The newly admitted families have nothing
+honest to compare against -- legacy either rejects them or returns malformed
+storage -- and default dispatch is unchanged, so no production path was
+activated.  No timing run was manufactured.
 
 **Phase 7 is NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
 default-dispatch change was made; no fallback was weakened and no legacy code
 deleted.
 
-## 50. The ordered workspace completion seal, the legacy-comparand correction, and eight record fixes (2026-08-10)
+## 50. The ordered workspace completion boundary closed, the legacy-comparison correction, and eight record fixes (2026-08-10)
 
-This milestone opens at inherited committed tip ``692a450`` and reviews
+This milestone starts from inherited committed tip ``692a450`` and reviews
 ``5571c82..692a450``.  It lands no new compiler capability: it closes a
 **silent-correctness hole in the ordered-key completion boundary**, corrects a
-**false claim about the legacy comparand** that runs through §49 and the
-committed suite, and corrects **eight statements in the inherited record**.
-Origin remains ``58e8565``; nothing was pushed, amended, squashed or reordered;
-the five protected tracked files hash exactly as recorded.
+**false claim about the legacy route the migrated cells are compared against**
+that runs through §49 and the committed suite, and corrects **eight statements in
+the inherited record**.  Origin remains ``58e8565``; nothing was pushed, amended,
+squashed or reordered; the five protected tracked files hash exactly as recorded.
 
 Sections 49.1-49.9 are preserved above as written.  Where this section
 contradicts them, this section is correct.
@@ -9422,7 +9423,7 @@ That argument was not being checked.
 **Measured rather than argued.**  The committed eighteen-case tamper matrix was
 replayed against a detached worktree at the inherited tip, each case asserting
 that its tamper actually landed: **18 of 18 were ACCEPTED**.  Replayed against
-the sealed tip, **18 of 18 are rejected** with
+this milestone's tip, **18 of 18 are rejected** with
 ``sparse_workspace_completion_lost``.  The dropped-insertion case was taken all
 the way through JIT build and execution on the inherited tip: it built, it ran,
 and it returned **zero stored entries and an all-zero dense result**
@@ -9430,7 +9431,7 @@ and it returned **zero stored entries and an all-zero dense result**
 receipts are ``probes/inherited-escapes.stdout.txt`` and
 ``probes/sealed-escapes.stdout.txt``.
 
-### 50.2 The seal
+### 50.2 What the closure is
 
 The reference is now the **whole assembled body**, captured before the pass
 manager is called and compared once, by ``_exact_sparse_completion_matches``,
@@ -9441,9 +9442,9 @@ could share mutable state with a hostile first pass.
 ``_lower_loopir_to_llir_owned`` owns the reference and both ends of the
 comparison, immediately around the pass-manager call.
 
-### 50.3 The metadata-alias escape, and the detaching mirror that closes it
+### 50.3 The metadata-alias escape, and the detached copy that closes it
 
-The first draft of this seal built the reference by re-running the shared
+The first draft of this closure built the reference by re-running the shared
 ``rewrite_dynamic_vector_accesses`` pass over the pre-pipeline body.  That is
 right in structure and **wrong in ownership**.  The shared LLIR rewriter
 deliberately carries ``TensorAccessMetadata`` across *by reference*
@@ -9454,17 +9455,17 @@ frozen provenance object.  A hostile post-pass write to
 accepted its own corruption.  Reproduced: with the role of the one carried
 access flipped in the final graph, the compile **succeeded**.
 
-The fix is ``_OrderedKeyExpectedBody``, a narrow target-owned detaching
-rewriter that in one traversal:
+The fix is ``_OrderedKeyExpectedBody``, a narrow target-owned rewriter that
+builds a fully detached copy in one traversal:
 
 - deep-detaches every node, every mutable container, every
   ``TensorAccessMetadata`` and every ``AccessId``/``SymbolId``/``IndexId``
   inside one;
-- mirrors exactly the transformations this target's own emission can undergo --
+- reproduces exactly the transformations this target's own emission can undergo --
   the consecutive coordinate-store deduplication, the appending result-vector
   store, and the checked position store -- reading the shared pass's own frozen
-  ``DynamicVectorAccessConfig`` rather than restating its policy, so the mirror
-  cannot drift from the pass it mirrors;
+  ``DynamicVectorAccessConfig`` rather than restating its policy, so the copy
+  cannot drift from the pass it reproduces;
 - refuses, with the completion defect code, the two shapes this target never
   emits and whose handling in the shared pass needs machinery this boundary
   deliberately does not carry: a dynamic-vector declaration below the body
@@ -9496,9 +9497,10 @@ arrays (36 + 28 + 18 across the grid).  The field-value kinds reachable from an
 emitted body are exactly ``None``, ``bool``/``int``/``float``/``str``,
 ``DataType``/``AssignOp``/``TensorAccessRole``, ``TensorAccessMetadata``,
 ``list``, ``tuple`` and the 36 concrete LLIR node types -- which is exactly the
-mirror's accepted set.  Anything outside it is refused rather than guessed at.
+detached copy's accepted set.  Anything outside it is refused rather than guessed
+at.
 
-### 50.4 Compiler latency: the draft was not robustly green, the seal is
+### 50.4 Compiler latency: the draft was not robustly green, the closure is
 
 The ceiling for a compile-only integrity boundary on this branch is **1.10**.
 The draft two-pass construction measured p50/mean **1.093-1.098** with one p95
@@ -9508,7 +9510,7 @@ Two changes bought the margin, neither of them a weakening of the check:
 
 1. **One traversal instead of three.**  The shared pass runs a declaration
    walk and then a rewrite walk, each with full per-node revalidation; the
-   detaching mirror does one pass with an exact-type dispatch and an
+   detaching copy does one pass with an exact-type dispatch and an
    ``object.__new__`` plus ``__dict__`` copy per node.
 2. **The shared comparator's hot loop was rewritten, semantics preserved.**
    ``_exact_sparse_completion_matches`` now dispatches on exact type through
@@ -9531,7 +9533,7 @@ build 3.7-4.3% and comparison 4.2-5.0% of a compile, against 4.0-4.7% and
 candidate is this tree.  Each measurement is a fresh subprocess importing
 exactly one source tree and timing the same 40-cell ordered-key compile-only
 grid (no JIT, no C++ compiler); 20 rounds, alternating the within-round order,
-4 warmups and 21 samples per process, plus a base-against-base A/A control in
+4 warmups and 21 samples per process, plus a base-against-base control in
 every round.  The per-round statistic is the median of that process's samples,
 and ``min`` variants repeat the whole calculation on the fastest sample.
 
@@ -9547,7 +9549,7 @@ base-first mean 1.0584, candidate-first mean 1.0531, a 0.5% spread that sits
 inside the A/A floor, so the ordering is not carrying the result.  **Every
 declared statistic is at or below 1.10, the largest being 1.0729.**
 
-### 50.5 The attack matrix, re-run against the final design
+### 50.5 The tampering matrix, re-run against the final design
 
 Every case below is a committed test.  Each requires ``LoopIRTargetError`` with
 ``sparse_workspace_completion_lost``, and each asserts that its tamper actually
@@ -9583,14 +9585,14 @@ uses no serialization, and it is renamed accordingly.)
 All of these pass, together with **all 40 normal reduction/TTM compile cells**
 in both automatic arms.
 
-### 50.6 The legacy comparand: nine of twenty are sound, and that was never true of "none"
+### 50.6 The legacy route the cells are compared against: nine of twenty are sound, and that was never true of "none"
 
 §49.6 and the committed suite's module docstring both stated that "every
 migrated cell is one the legacy assembler rejects, corrupts, or terminates on",
-and §49.9 used that to declare the activating paired-latency receipt "not
-applicable".  **Independent measurement contradicts it.**  Every one of the
-twenty migrated cells generates legacy C++ in both automatic arms -- the
-generator never refuses -- and for nine of them that C++ is *sound*.
+and §49.9 used that to declare the paired-latency measurement "not applicable".
+**Independent measurement contradicts it.**  Every one of the twenty migrated
+cells generates legacy C++ in both automatic arms -- the generator never refuses
+-- and for nine of them that C++ is *sound*.
 
 Measured in twenty disposable processes per arm, each with ``RLIMIT_CPU`` and
 ``RLIMIT_CORE`` set and a wall-clock timeout:
@@ -9625,15 +9627,16 @@ The nine locks are semantic parity -- runtime and storage -- never byte parity,
 and the suite asserts the non-identity so the two can never be conflated.
 
 **Consequence for the latency claim.**  §49.9's "not applicable, and that is
-proven" is half right and half wrong.  It is right that every *pre-existing
-activating* generated source is byte-identical between base and candidate, so
-those need no re-measurement.  It is wrong that "the newly admitted families
-have no honest comparand": nine of them do.  What is true is narrower and is
-what this section claims: default dispatch is unchanged, so no production path
-was activated, and a runtime comparison against the nine sound legacy kernels
-would measure two different kernels, not a regression.  Source parity being
-unavailable is **not** a reason to skip compiler-latency measurement, and this
-milestone does not skip it -- §50.4 measures it and §50.8 records it.
+proven" is half right and half wrong.  It is right that every *pre-existing*
+generated source that a measurement would have to cover is byte-identical
+between base and candidate, so those need no re-measurement.  It is wrong that
+"the newly admitted families have no honest comparand": nine of them do.  What is
+true is narrower and is what this section claims: default dispatch is unchanged,
+so no production path was activated, and a runtime comparison against the nine
+sound legacy kernels would measure two different kernels, not a regression.
+Source parity being unavailable is **not** a reason to skip compiler-latency
+measurement, and this milestone does not skip it -- §50.4 measures it and §50.8
+records it.
 
 ### 50.7 Eight corrections to the inherited record
 
@@ -9648,25 +9651,25 @@ milestone does not skip it -- §50.4 measures it and §50.8 records it.
    ``raw-run-a9c9aca-predecessor.stdout.txt``, which holds the eight ``[FAIL]``
    lines and the summary line and **no exit-code receipt and no complete
    stdout** -- so it is not the "retained raw nonzero receipt" §49.6 and the
-   sealed ``FINAL_STATE.md`` describe.  The honest statement is: the final
+   checksummed ``FINAL_STATE.md`` describe.  The honest statement is: the final
    characterized differential is 568/0, and the earlier 520/8 run is partially
    retained.
-3. **Sealed ``FINAL_STATE`` manifests bind the documentation blobs of their own
-   moment.**  ``phase7-cluster2-review-e13ecba/FINAL_STATE_SHA256SUMS`` already
-   fails to verify against the current
+3. **Checksummed ``FINAL_STATE`` manifests bind the documentation blobs of their
+   own moment.**  ``phase7-cluster2-review-e13ecba/FINAL_STATE_SHA256SUMS``
+   already fails to verify against the current
    ``COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` and
    ``COMPILER_IR_REFACTOR_HANDOFF.md``, because ``5571c82`` and ``692a450``
    rewrote them.  That is correct behaviour for a historical manifest and a
    defect in how they are described: a manifest binding a mutable repository
-   file is a record of that file *at seal time*, never a claim about its
-   current content.  This milestone's own append will retire
+   file is a record of that file *at the time it was written*, never a claim
+   about its current content.  This milestone's own append will retire
    ``phase7-orderedkey-vertical``'s document entries the same way.
 4. **Several inherited receipts are not exact-tip.**  The ordered-key
-   vertical's own neutrality summary says so in its own note: the source
-   captures and the schedule audit ran at ``0a960f3``, not at the final tip;
-   the full-suite partitions split across ``0a960f3`` and ``60cbc06``.  Those
-   are defensible splits with a stated argument, and they are **not** exact-tip
-   receipts.  They must not be cited as such.
+   vertical's own summary of the unchanged-C++ check says so in its own note:
+   the source captures and the schedule audit ran at ``0a960f3``, not at the
+   final tip; the full-suite partitions split across ``0a960f3`` and
+   ``60cbc06``.  Those are defensible splits with a stated argument, and they
+   are **not** exact-tip receipts.  They must not be cited as such.
 5. **The differential's stored-operand-zeros arm did not use a stored-zero
    operand.**  In ``ordered_key_differential.py``'s ``run_reduction_cell``, the
    ``stored_zeros=True`` path builds ``st`` and ``nonzero_dense`` and then
@@ -9701,7 +9704,7 @@ milestone does not skip it -- §50.4 measures it and §50.8 records it.
 8. **The evidence ledger for this milestone is
    ``~/.cache/scorch-codex/orderedkey-completion-seal/``.**  It is a new
    directory; it does not extend ``phase7-orderedkey-vertical``, whose
-   manifests stay valid for what they sealed.
+   manifests stay valid for what they covered.
 9. **"Origin remains ``58e8565``" is false, and was already false before this
    session opened.**  ``git ls-remote origin
    refs/heads/refactor/compiler-ir-phase3-std-move-call`` returns
@@ -9717,9 +9720,9 @@ milestone does not skip it -- §50.4 measures it and §50.8 records it.
 
 ### 50.8 Verification
 
-All gates ran in the ``scorch`` conda environment on the Apple M5 development
-machine, with exact revision, import-path and clean-worktree provenance
-recorded beside each receipt in the ledger named in 50.7.8.
+Everything below ran in the ``scorch`` conda environment on the Apple M5
+development machine, with exact revision, import-path and clean-worktree
+provenance recorded beside each receipt in the ledger named in 50.7.8.
 
 - **Ordered-key target file**: the complete file, **228 selected, 228 passed**
   (up from 161 inherited), including the subprocess-isolated characterization.
@@ -9731,19 +9734,20 @@ recorded beside each receipt in the ledger named in 50.7.8.
   passed**.
 - **Adversarial probes**: the complete matrix of §50.5 -- **33 passed** as the
   completion-integrity slice of the target file.
-- **Legacy differential battery**: twenty cells x two arms in disposable
+- **Legacy differential runs**: twenty cells x two arms in disposable
   processes, producing the disposition table of §50.6.
-- **Release neutrality**: the 20-source corpus, the 42-source ``ss@dd`` grid,
-  and the 86-case schedule audit, captured base-vs-candidate.  **All 20 corpus
-  sources and all 42 grid sources are byte-identical**, and the audit is
-  identical at ``total=86 admitted=46 rejected=40 nonidentical=0``.
-- **Statics**: Black, Flake8 and mypy over ``src`` and ``tests`` in both trees,
-  plus ``git diff --check`` (clean).  mypy is **byte-identical** between the
-  arms (140 errors in 11 files, none in a changed file).  Flake8 and Black
-  differ only by findings in files that **exist solely in the working tree and
-  are untracked** -- three F401s in untracked benchmark/GPU test modules and
+- **The generated C++ is unchanged**: the 20 sample programs, the 42-case
+  ``ss@dd`` grid, and the 86-case schedule audit, captured base against
+  candidate.  **All 20 corpus sources and all 42 grid sources are
+  byte-identical**, and the audit is identical at ``total=86 admitted=46
+  rejected=40 nonidentical=0``.
+- **Type check and linters**: Black, Flake8 and mypy over ``src`` and ``tests``
+  in both trees, plus ``git diff --check`` (clean).  mypy is **byte-identical**
+  between the arms (140 errors in 11 files, none in a changed file).  Flake8 and
+  Black differ only by findings in files that **exist solely in the working tree
+  and are untracked** -- three F401s in untracked benchmark/GPU test modules and
   four untracked ``test_spmm_*`` modules Black would reformat.  Restricted to
-  tracked files both gates are identical, and both changed files are clean
+  tracked files both are identical, and both changed files are clean
   under Flake8 and unchanged under Black.  The one pre-existing tracked Black
   finding (``src/scorch/prebuilt_kernels.py``) reproduces at base.
 - **Paired compile-only latency**: the table in §50.4.
@@ -9775,12 +9779,12 @@ per 50.7.7: 116 defect codes and 27 loop-plan diagnostics, arm-invariant.
 *Representation unchanged.*  Yes.  No node kind, no canonical schema change
 (v11 stands), no request- or schedule-identity change.
 
-*Release behaviour unchanged.*  Yes: the source corpus, the wide grid and the
+*Release behaviour unchanged.*  Yes: the sample programs, the wide grid and the
 schedule audit are byte-identical between base and candidate, and no dispatch,
 cache, selector or fallback changed.
 
 *Compiler latency within the declared ceiling.*  Yes, and measured rather than
-waived -- see §50.4 and §50.8.
+skipped -- see §50.4 and §50.8.
 
 *The declared matrix is closed.*  **No.**  The three blockers of §49.5 stand
 untouched: workspace-plus-tile plan composition, the automatic-origin reorder
