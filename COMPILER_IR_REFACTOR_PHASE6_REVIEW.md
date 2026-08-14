@@ -15014,3 +15014,556 @@ output directory, and a five-partition run leaves about 680 MB of compiled kerne
 there.  Those are build scratch on exactly the footing worktrees are, they are not
 reproducible by a later session, and they are now excluded by path.  The logs, the
 JUnit XML, the file lists, the exit codes and ``provenance.json`` are the evidence.
+
+## 63. The result-write guard's postcondition, built and measured; and what a real census says about migrating the recognizer (2026-08-14)
+
+Bobby picked from ``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md`` on **2026-08-14**:
+**option F-strong first, then option E** — reversing an E-first choice he had made
+earlier the same day, after the ordering argument was put to him.  The argument is
+worth recording because it is the reason the order is what it is: F-strong is a
+postcondition that depends on nobody registering anything, while E is a migration
+across scores of sites in two lowering pipelines, one of which ships, and it
+leaves the tree half-marked for its whole duration.  Landing F-strong first means
+E's rollout window is covered from its first commit rather than after its last.
+
+This section is F-strong, landed and proven, plus the measured groundwork for E.
+**E itself is not built.**
+
+### 63.1 What the check is, and the mechanism that makes it well formed
+
+``result_write_pass`` turned a serial assembly body into a counting body and a
+filling body, and decided "does this statement write result storage" by matching
+the callee name.  A recognizer built that way can only refuse a shape somebody
+anticipated, which is why §61.4 could record two shapes it structurally cannot
+see: a free function receiving a result array as an ARGUMENT (the compiler
+already emits four, in ``loopir/parallel_chunk_assembly``), and
+``llir.MemberCallStmt``, which the rewriter never dispatches.
+
+The check added here asks the opposite question, of the pass's OUTPUT rather than
+its input: **does any reference to the result's own removed storage survive?**
+That is a question about names rather than about statement shapes, so a spelling
+nobody anticipated is caught by construction.
+
+The prompt for this session asked one thing to be resolved before promoting the
+prototype, and it is the right thing to ask.  The fill phase legitimately EMITS
+stores into the result's storage — ``_ResultWriteRewriter._store`` is their one
+constructor — so "no result-storage reference survives" cannot be read
+literally.  **The mechanism that separates the two is that the vocabularies are
+disjoint by spelling, and the disjointness is a property of the pass's
+constructors rather than of a list the check maintains:**
+
+- everything the pass CONSTRUCTS is either an exactly-sized pointer suffixed
+  ``_data`` (``{R}_values_data``, ``{R}{L}_crd_data``, ``{R}{L}_pos_data``, all
+  three built only by ``_store``) or a count/fill state scalar (``_cnt{L}``,
+  ``_pos{L}``, ``_prev{L}``, ``_base{L}``, built only by ``_phase_state`` and
+  ``_phase_index``);
+- everything it is supposed to have REMOVED is a bare vector name
+  (``{R}_values``, ``{R}{L}_pos``, ``{R}{L}_crd``) or a running cursor into one
+  (``p{R}{L}``).
+
+So the check is exact membership in the bare set, and it **exempts nothing**.
+The pass's own emissions fall outside the set because of how they are spelled,
+not because they are on an allow-list.  That is what stops the separation
+rotting: were a later edit to make the pass construct a bare-name reference,
+this check would report it rather than wave it through.
+
+**Is that sound, or does it merely happen to work?**  Sound, and for a reason
+that is not the prototype's reason.  Two things had to be established.
+
+- **The prototype's zero was not evidence for this check's zero.**
+  ``residual_writes()`` visits only ``llir.Stmt`` nodes — it returns early on
+  anything that is not one — and descends seven named body fields.  So it
+  entered no expression at all, and never saw ``_hoisted_ptr_decls`` or an
+  ``IfThenElse``'s ``then_body_list``.  The promoted check subclasses the
+  compiler's own ``LLIRWalker``, which reaches expression positions, reaches
+  every body region, and fails closed on an unsupported node type.  Measured on
+  the legacy route, the walk it performs enters **12,482 ``Var``, 2,060
+  ``ArrayAccess``, 1,188 ``BinOp``, 408 ``MemberAccess`` and 176
+  ``FunctionCall``** nodes the prototype never looked at.
+- **A surviving READ is a defect too, so the literal rule is not over-refusal.**
+  This was the open worry: ``{R}{L}_crd.size`` as an index and
+  ``{R}{L}_pos.back`` in the boundary condition are legal in the pass's INPUT, so
+  a rule that refuses any mention might refuse a legal program.  It does not, and
+  the argument comes from the code rather than from the measurement:
+  ``compressed_where_openmp_pass._should_drop_prefix_statement`` drops the
+  ``VarDecl`` for ``{R}_values``, ``{R}{L}_pos`` and ``{R}{L}_crd``, the
+  ``DirectInit`` for ``{R}{L}_pos``, and the ``VarInit`` for ``p{R}{L}``.  In the
+  region this pass's output lands in **those names do not exist**, so a reference
+  to one is a dangling reference whether it reads or writes.  The check therefore
+  reports the position and does not try to decide from the member name which it
+  is.
+
+One place the check is deliberately **narrower** for the cursors than for the
+arrays, and the asymmetry has a reason.  An array's declaration is always
+dropped, so any reference to one dangles.  A cursor can be BOUND locally by the
+header of the loop that walks it — ``for (pC1 = 0; pC1 < n; pC1++)`` — and
+``ForLoop.init``/``update`` are also positions the rewriter structurally cannot
+reach, since they are rewritten as loop fields rather than dispatched through
+``rewrite_statement_sequence_member``.  So a cursor is checked as an
+``Increment`` or ``VarInit`` sequence member, which are exactly the two forms the
+pass has a rewrite for, and not wherever its name appears.  **That is the F-weak
+prototype's cursor coverage, kept rather than widened**; the first draft of this
+check widened it and refused a legitimately loop-bound cursor, which is how the
+distinction was found.
+
+Refusals are structured: ``residual_result_storage_reference``, naming every
+surviving reference with its node type, field, spelling and path, because the
+postcondition's known weakness is diagnosis — it reports that something survived
+rather than which input statement was misunderstood.
+
+### 63.2 The measurement before promotion, and the control that makes a zero mean something
+
+A postcondition reporting "none" over a whole matrix is indistinguishable from a
+postcondition that never looks.  So the same walker was run over the pass's
+INPUT as well as its output, on every invocation.  Driven over the full
+1,139-record survey matrix in both automatic arms, against a clean detached
+worktree pinned at ``bd6af52``:
+
+| route | cell-arms reaching the pass | pass invocations | references on the INPUT, per mode | surviving in the OUTPUT |
+| --- | --- | --- | --- | --- |
+| legacy | 102 | 204 | 968 | **0** |
+| ``two_pass_parallel`` | 2 | 4 | 12 | **0** |
+| ``two_pass_serial`` | 0 | 0 | — | — |
+
+The three counts reproduce §61.4's exactly.  The legacy input breakdown, per
+mode: **266** bare-array ``Var``, **364** position-cursor ``Var``, **58**
+``{R}{L}_crd.push_back``, **120** ``{R}{L}_crd.size``, **58**
+``{R}{L}_pos.back``, **102** ``ArrayAccess`` carrying the ``RESULT_WRITE``
+marker.  Every one is gone from the output, in both modes.  The 178 reads per
+mode are the ones §63.1's worry was about, and they are the reason it is settled
+rather than assumed.
+
+``two_pass_serial`` reaching the pass zero times is reported by the control's own
+warning line rather than as a bare "none", so a route that never exercises the
+check cannot read as a route that passed it.
+
+### 63.3 What the promoted check flagged that the prototype did not — three findings
+
+The prompt said that anything the promoted version flags and the prototype did
+not is a finding to report rather than a threshold to adjust.  It flagged three,
+all in the pass's own test file, and **all three are real**.  None is reachable
+on the survey matrix; each was an existing test asserting the fail-open.
+
+1. **A result write inside an identity-only loop region survives.**
+   ``_IDENTITY_ONLY_REGIONS`` keeps ``before_parallel_body`` and
+   ``_hoisted_ptr_decls`` un-rewritten because the legacy transform never
+   descended into them.  A result write there reaches the count body against a
+   dropped declaration, which is the §60.6-stage-2 defect in a region nobody had
+   named.  ``test_legacy_control_flow_regions_are_transformed_and_detached``
+   asserted that ``Result1_crd[pResult1] = ...`` survives in both regions.
+2. **A result write inside a nested ``llir.Function`` body survives.**
+   ``rewrite_function`` is an identity rewrite.  Same class as 1.
+   ``Function`` is not among the ten statement types §61.4 measured reaching this
+   pass, so it is unreachable today.
+   ``test_function_body_is_identity_only_and_detached`` asserted it survives.
+3. **A foreign ``RESULT_WRITE`` marker does not license this result's storage
+   name.**  ``_is_result_value_target`` decides by logical identity, which is
+   right, so a marker naming a different tensor is correctly not rewritten.  But
+   the NAME is what codegen emits, and that declaration is gone, so retaining the
+   statement emits a dangling reference.
+   ``test_result_value_matching_uses_stable_identity_not_rendered_name`` built
+   the contradictory pairing — this result's storage name carrying a foreign
+   marker — and asserted ``Result_values[pResult1] = value;`` is emitted.
+
+**So §61.4's two structural narrownesses are four.**  Gaps A and B are the two it
+recorded; findings 1 and 2 are two more regions where an unrecognized result
+write is retained rather than refused, and they are not spelling problems — they
+are places the rewriter declines to descend into.  §63.3a records a fifth thing
+the check found, which is not a gap but a refusal that moved earlier.
+
+Each test keeps the property it was proving and loses no coverage.  Findings 1
+and 2 are re-probed with the workspace drain's ``.sort``, which count mode drops
+everywhere the rewriter descends — so surviving still proves the region was left
+alone — and which is not result storage.  Finding 3 uses a foreign physical name,
+which is what production emits, since one generated function spells one result's
+storage one way.
+
+Twelve tests are added, taking the pass's test file from **44 to 56**: the three
+shapes above as refusals, the two §61.4 gap shapes, the cell that separates
+F-weak from F-strong, a surviving read, the surviving marker in both modes, the
+cursor asymmetry in both directions, the ``RawStmt`` whole-identifier boundary in
+both directions, the defect-code lock, and — the one that would catch this check
+being wrong in the other direction — that the fill phase's own ``_store`` output
+is accepted rather than flagged.
+
+### 63.3a A fourth finding, of a different kind: one attack-matrix refusal moved earlier
+
+The full suite found one more, and it is not a fail-open the check closed — it is
+a refusal that now happens two passes sooner.  It is recorded separately because
+the disposition is different and because it changes a **seam lock**, which §0.1
+defines as a test asserting that a named program is refused at a named error
+code.
+
+``test_two_phase_pass_context_cannot_mutate_program_result_identity``
+(``test_loopir_parallel_workspace_target.py``) is an attack-matrix test: it
+corrupts the result ``SymbolId`` inside the pass context, adding 4,000,000 to it,
+and asserted the compile fails closed at ``sparse_workspace_completion_lost``.
+
+What the tamper does, mechanically: ``_is_result_value_target`` matches the
+workspace drain's value store by ``tensor_id``, so a corrupted ``SymbolId`` means
+that store is no longer recognized and ``C_values`` survives the count rewrite —
+against a declaration the surrounding transform has already dropped.  The
+postcondition sees that residue in the pass's own output and refuses at
+``residual_result_storage_reference``, naming the surviving reference and its path
+(``Var.name = 'C_values'`` at ``root/[12]/body/[3]/var/array``), **before** the
+sparse-workspace completion boundary downstream notices the same corruption.
+
+Both are structured refusals, so the tamper still fails closed; the earlier one
+is the better diagnosis, since it names what survived at the pass that produced
+it rather than reporting a completion mismatch two passes later.
+
+**The completion boundary is not left unlocked, and this was checked rather than
+assumed.**  ``sparse_workspace_completion_lost`` is asserted **38 times across
+four test files**.  Exactly one of the 38 is preempted; the other 37 pass
+unchanged — including the test immediately above this one, whose tamper lands in
+``rewrite_dynamic_vector_accesses``, five positions after ``RESULT_WRITE`` in the
+frozen pass order, so the postcondition cannot reach it.  The base run at
+``bd6af52`` passes the preempted test, the candidate at ``7b21b4c`` failed it,
+and the updated assertion at ``4852c47`` passes: the failure is this change's and
+the fix is this change's.
+
+The test now asserts the earlier code and its docstring records why the code
+moved, so a later reader finds the reason at the assertion rather than having to
+reconstruct it.
+
+### 63.4 Where the new defect code is locked, and why not where the prompt said
+
+The prompt said to add the new code to ``PRODUCTION_SUBSET_DEFECT_CODES`` in
+``tests/test_scorch/test_loopir_verifier.py``, "in the SAME commit — that test
+asserts set equality against the codes the verifier raises and fails in both
+directions".  The second half is true and the first half would break it.  That
+set is built by
+``re.findall(r'_fail\(\s*"([a-z_]+)"', source)`` over
+``scorch/compiler/loopir/verifier.py`` — it is the **LoopIR verifier's** code
+surface and nothing else.  None of ``result_write_pass``'s existing codes is in
+it, including ``unsupported_result_write_statement``; adding one would fail the
+equality in the "expected but not found" direction.
+
+So the discipline the prompt wants is implemented where it belongs.
+``test_result_write_pass_defect_codes_are_the_locked_set`` asserts set equality
+over the ``code="..."`` occurrences in ``result_write_pass.py``, which is
+**eleven** codes: eight context validations, the scalar-root refusal, the
+input-side ``unsupported_result_write_statement``, and the new
+``residual_result_storage_reference``.  It fails in both directions, in the same
+commit, and it is the first time this pass's refusal surface has been locked at
+all.
+
+### 63.5 The proof
+
+Everything below was measured from clean detached worktrees at asserted commits,
+per §62.5.  Base ``bd6af52``, candidate ``4852c47``.
+
+**Emitted C++ is byte-identical, on all four columns.**
+
+| column | result |
+| --- | --- |
+| production dispatch, 506 case-arms, both arms | 412 emitted; **0** emission differences, 0 outcome differences |
+| the 20-source corpus, legacy's own lowering chain | 20/20 identical |
+| the 42-case ``ss@dd`` grid | 42/42 identical |
+| the 86-case explicit-schedule audit | identical; **0** differing ``legacy_sha256`` |
+
+That is the stronger of the two available arguments, and the weaker one also
+holds: the check either raises or returns, so it cannot alter a byte unless it
+fires, and it fires zero times over the whole matrix.
+
+**The frontier is unchanged and clean.**  1,139 records over 1,138 distinct
+``(family, name)`` keys, both automatic arms, at each of ``bd6af52`` and
+``4852c47``: 0 lost, 0 gained, and **every field of every record equal** —
+``arm0``, ``arm1`` and ``arm_invariant``.  520 ADMITTED, 19 distinct refusal
+codes, **zero unclassified**, and zero occurrences of
+``residual_result_storage_reference``.
+
+**Static checks are identical.**  Over ``src``: 140 mypy errors in 11 files, 9
+flake8 findings, 1 ``black`` reformat — the same at both commits, none of them in
+either file this section changed, and ``result_write_pass.py`` carries zero mypy
+findings.  Over ``src tests``, the neutrality harness compared 146 mypy lines, 47
+flake8 lines and both ``black`` streams: identical.
+
+**The protected-file check, both ways.**
+``statics/check_protected_files.py`` at the clean checkout: PASS / PASS, exit 0.
+On the live repository: PASS / FAIL, exit 0 with the printed explanation, which
+is §62.6's expected state while the CUDA project is in flight.  Check 1 is the
+obligation and it is git-derived: all five tracked blobs at ``4852c47`` equal
+those at the branch point ``a3b8d1e``.  The neutrality harness independently
+reproduced §62.6's **working-tree** column digit for digit on all five, which is
+what proves this session did not touch them.
+
+**The suite ran in 8 file-disjoint partitions**, each a fresh process with its
+own ``TMPDIR``, ``XDG_CACHE_HOME`` and ``TORCH_EXTENSIONS_DIR``, over the 92 test
+files a clean checkout at ``4852c47`` enumerates.  **6,392 tests, 0 failures, 0 errors, 15 skipped, 6,377 passed**, every partition
+exit 0.  The base tree at ``bd6af52`` was run the same way for comparison —
+**6,380 tests, 0 failures, 15 skipped** — because a pass count alone cannot
+tell two runs apart: a file that stopped being collected and a file that gained a
+test cancel out, and both totals read as clean.  So the two runs are compared by
+**node set**, and the eight partition file lists are asserted equal first, since
+the round-robin grouping reshuffles if the file count differs and then partition
+N in one run is not partition N in the other.
+
+| | |
+| --- | --- |
+| partition file lists | identical, all 8 |
+| nodes in both | 6,380 |
+| **base only** | **0** — nothing stopped being collected |
+| **candidate only** | **12** — exactly this section's new tests, each named in the receipt |
+| **outcome changes on shared nodes** | **0** |
+| failed or errored, either side | 0 |
+
+The 12 land in partition 6, which is where ``test_result_write_pass.py`` falls in
+the sorted file list, and the counts confirm it independently: partition 6 is
+1,022 at the base and 1,034 at the candidate, every other partition equal.  The
+comparison harness was itself self-tested in both directions before being trusted
+— identical inputs reconcile, and an injected removed node plus an injected
+outcome change are both caught and named.  That self-test found a real defect in
+it: the first version read a case's outcome in document order, so a node carrying
+both ``skipped`` and ``failure`` reported the softer one; precedence is now
+explicit.
+
+### 63.6 Groundwork for E: a census of the emission sites, with a definition
+
+§7 of the options document cites "emission-site counts (73 / 38 / 26 / 12)" for
+``loopir/lower_llir.py``, ``torch_cpp_abi.py``, ``cin_lowerer.py`` and
+``iter_lattice.py``, described as "dotted result-array name constructions".  That
+phrasing does not say which of several different things is counted, and the four
+numbers cannot be reproduced without knowing.  Three questions it leaves open,
+each of which changes the total: operands have ``_values``/``_pos``/``_crd``
+arrays too and are built by the same idiom; a constructed NAME is not always a
+reference that can carry metadata; and a dotted name is a call, not a variable.
+
+``harness/result_array_sites.py`` counts them by parsing rather than grepping,
+and reports a breakdown whose definition is written into the receipt: an f-string
+whose trailing literal ends in ``_values``/``_pos``/``_crd`` (optionally plus
+``_index``/``_data``, optionally plus ``.member``) with at least one
+interpolation, classified result / operand / tensor-agnostic from the spellings
+it interpolates, and marked taggable when the nearest enclosing call is
+``llir.Var`` or ``llir.ArrayAccess`` — the only two nodes that carry
+``tensor_access``.  Measured at ``bd6af52``:
+
+| file | result-array constructions | of those, taggable | of those, dotted | all tensors |
+| --- | --- | --- | --- | --- |
+| ``loopir/lower_llir.py`` | 96 | 41 | 36 | 104 |
+| ``torch_cpp_abi.py`` | **0** | 0 | 0 | 33 |
+| ``cin_lowerer.py`` | 25 | 15 | 9 | 28 |
+| ``iter_lattice.py`` | 13 | 7 | 6 | 14 |
+| **total** | **134** | **63** | **51** | **179** |
+
+Two things in that table matter more than the totals.
+
+- **``torch_cpp_abi.py`` has no result-specific construction sites at all.**  Its
+  33 sites build storage names polymorphically, from ``self.name`` and from a
+  ``name`` loop variable, so the same code serves operands and results.  The
+  document's 38 is a count of storage-array constructions there regardless of
+  tensor; both numbers are defensible counts of different things, which is the
+  problem with an undefined one.  For E this file needs no per-result marking:
+  whatever marks a tensor's arrays here has to be driven by the descriptor.
+- **The work is 63 sites, not 134, and the other 51 are a different change.**
+  Only ``llir.Var`` and ``llir.ArrayAccess`` carry ``tensor_access``.  The 51
+  dotted sites are 31 ``llir.FunctionCall`` and 20 ``llir.FunctionCallStmt``
+  names with the receiver spelled inside them, so there is no ``Var`` to tag.
+  Making those a type query means restructuring them into
+  ``MemberCall``/``MemberCallStmt`` with a tagged base — which changes the node
+  shape codegen renders and therefore is the part of E that can move a shipped
+  byte.  Every other part cannot.
+
+### 63.7 Groundwork for E: all seven validators stay shut, and that is a result
+
+§62.7 records that what option E "does need is the seven traversal validators
+that currently refuse the metadata to admit it".  Read against the code, **none
+of the seven should open, and E needs no validator change at all.**  The reason
+is that LLIR already encodes a coherent role-position discipline, and every one
+of the seven is a position where a ``RESULT_WRITE`` marker would be a false
+statement about what the node does.
+
+| line | the position | why it stays shut |
+| --- | --- | --- |
+| ``1033`` | a ``Var`` inside an assignment INDEX | an index is a read of a coordinate or position value, not a write |
+| ``1058`` | an ``ArrayAccess`` inside an assignment INDEX | same; and this is a fast-path bailout, not a refusal — see below |
+| ``1107`` | an assignment-target ``Var`` (a scalar/member store) | a scalar store is not a store into the result's STORAGE; marking ``pC1 = ...`` would mark the cursor |
+| ``1172`` | an assignment ``MemberAccess`` root | a field store, which no lowering emits for a result write |
+| ``1195`` | the ``array`` field of an assignment ``ArrayAccess`` | **the important one** — the ``ArrayAccess`` ITSELF already admits the marker, so the fact has a home; opening the array ``Var`` too would create two places to put one fact, and the disagreement between them is exactly the contradiction §63.3's finding 3 refuses |
+| ``1467`` | an ``AddressOf.operand`` ``Var`` | taking the address of result storage is not a write through it; it hands the storage to something else, which ``RESULT_WRITE`` would misdescribe |
+| ``1530`` | a ``Var`` inside an ``AddressOf.operand`` ``ArrayAccess`` index | an index again |
+
+The discipline is visible rather than inferred, and ``:1058`` is what shows it.
+Returning ``-1`` there does not refuse: it reruns the authoritative validator,
+``_validate_address_of_index_impl``, and that one **does** admit
+``ArrayAccess.tensor_access`` — but only with role ``INPUT_READ``, refusing
+``RESULT_WRITE`` explicitly.  Meanwhile the two positions that admit
+``RESULT_WRITE`` (``:1130``–``:1139`` on the constructor fast path,
+``:1200``–``:1204`` authoritatively) are the same position, the assignment-target
+``ArrayAccess``, validated with ``expected_role=RESULT_WRITE``.  So LLIR's rule
+is: **an index position takes ``INPUT_READ``, an indexed store takes
+``RESULT_WRITE``, and nothing else takes either.**  That is not an obstacle E has
+to clear; it is the shape E should follow.
+
+And the two gap positions need no change either: a ``FunctionCallStmt`` argument
+and a ``MemberCallStmt.base`` are not validated against metadata at all, which
+the options document already noted as convenient.  So the marking E needs is
+open on every position it actually wants, today.
+
+### 63.7a The question E has to answer first, and it is a design decision for Bobby
+
+Neither the options document nor §62.7 raises it, and it is upstream of writing
+any code: **``TensorAccessMetadata`` describes an ACCESS, and a reference to a
+whole storage vector is not one.**
+
+The marker carries ``access_id``, ``tensor_id``, ``index_ids`` and ``role``, and
+its own docstring says what they are for — "``access_id`` records occurrence
+provenance; transformations that select every access to a logical tensor/index
+tuple match ``tensor_id`` and ``index_ids`` instead".  Every use of it today fits
+that: ``_is_result_value_target`` matches the workspace drain's **element**
+store, an ``ArrayAccess`` at a particular index, and the ``INPUT_READ`` markers
+the index validators admit are element reads.
+
+The 63 sites E would mark are not element accesses.  They are ``llir.Var`` nodes
+naming ``{R}{L}_crd``, ``{R}{L}_pos`` and ``{R}_values`` — the vectors
+themselves, handed to an append, a ``size()``, a helper, or used as the ``array``
+field of a subscript whose index lives in a sibling node.  So marking one raises
+a question with no default answer:
+
+- **What are its ``index_ids``?**  There is no index.  ``()`` is structurally
+  legal — verified: ``TensorAccessMetadata`` accepts an empty tuple, an
+  assignment-target ``ArrayAccess`` accepts a marker carrying one, and a bare
+  ``Var`` carries one at construction with no validator objecting.  But an empty
+  tuple currently means "an access at no indices", and a transformation that
+  "selects every access to a logical tensor/index tuple" would now also select
+  these.  Whether that is a widening of the role or an abuse of it is the
+  question.
+- **What is its ``access_id``?**  It records occurrence provenance for one
+  access.  Sixty-three references to the same vector are not sixty-three
+  accesses.
+- **Is ``RESULT_WRITE`` even the right role for a reference that only READS the
+  vector?**  ``{R}{L}_crd.size`` is a read, and the receiver ``Var`` E would tag
+  is the same node whether the call appends or measures.  A single role cannot
+  say both, and ``INPUT_READ`` plainly does not mean "reads the result".
+
+Three shapes the answer could take, stated without preference:
+
+1. **A third role** — a storage-reference role distinct from ``INPUT_READ`` and
+   ``RESULT_WRITE``, which is honest about what the node is and requires the
+   validators to decide where a *storage reference* may appear (a separate
+   question from where a *write* may).
+2. **A separate field**, leaving ``tensor_access`` for element accesses and
+   giving a vector reference its own typed marker.  Costs a field on ``Var``;
+   avoids widening a meaning three passes already depend on.
+3. **Widen ``RESULT_WRITE`` deliberately**, defining it as "names this result's
+   storage" rather than "writes one element of it", and re-reading every existing
+   consumer against the new definition.  ``_is_result_value_target`` is the one
+   that matters, and it also matches ``tensor_id``, so it would need to
+   distinguish the two kinds — which is where the saved work comes back.
+
+**This is why no site was marked in this session.**  Marking 63 references under a
+guessed answer produces metadata that is wrong in a way nothing would catch: the
+postcondition checks that references do not survive, not that a marker is
+truthful.  §63.3's third finding is the small version of the same hazard — a
+marker and a name disagreeing — and it took a postcondition to notice.
+
+### 63.8 Four harness defects found while proving the above
+
+All four are in inherited harnesses, all four were found by running them, and all
+four are fixed in this session's ledger copy rather than in the sealed original.
+
+1. **``compare_release_neutrality.py`` crashed on the protected-file column.**
+   ``_read_hashes`` skips blank lines but not comments, and §62.6 moved the
+   canonical baseline into the repository *with a long ``#`` header*.  It raised
+   ``ValueError: not enough values to unpack`` — **after** the four emission
+   columns had been compared and printed, which is the worst place for a crash,
+   because the report looks complete.
+2. **The same file's second protected-file question read the wrong directory.**
+   It gated on ``pathlib.Path(os.environ.get("SCORCH_WORKTREE", "")).is_dir()``,
+   and ``Path("")`` is ``.``, whose ``is_dir()`` is True — so an unset variable
+   hashed five repository-relative paths against whatever directory the harness
+   was invoked from and printed five ``DIFFERS  (got missing)``, which reads
+   exactly like the five protected files having been tampered with.  Its
+   docstring was also stale in a way that mattered: it still said the recorded
+   baseline holds working-tree digests, which §62.6 made false.
+3. **``run_suite_partitions.sh`` wrote its output into the tree it was
+   measuring.**  It resolves ``$TREE`` but not ``$OUT``, and ``cd "$TREE"``
+   happens before the partition loop, so a relative ``$OUT`` created a directory
+   in the caller's cwd and then wrote every partition's files — including a
+   ``TORCH_EXTENSIONS_DIR`` full of compiled kernels — inside the measured
+   worktree.  **§62.5's provenance guard is what caught it**, refusing the next
+   run for a dirty tree in one entry; without the guard the run would have been
+   measuring a tree carrying its own scratch.  ``$OUT`` is now resolved before
+   the ``cd``.
+4. **§62.9's fix to ``seal_ledger.sh`` exists in one copy and not the shared
+   one.**  The four exclusions that keep a suite run's 680 MB of compiled kernels
+   out of a seal are in
+   ``~/.cache/scorch-codex/assembly-strategy/seal_ledger.sh`` and are absent from
+   ``~/.cache/scorch-codex/seal_ledger.sh``, which is the copy a new ledger
+   naturally reaches for and whose own header says never to hardcode a ledger
+   path.  A new ledger following that advice would have sealed thousands of
+   ``.so`` files.  This is §62.6's diagnosis recurring on a different file: a
+   thing that exists in a dozen copies has no owner.  This ledger copied the
+   fixed one; the shared one is still wrong and is **not** this section's to fix,
+   because overwriting a script other ledgers were sealed with would invalidate
+   their seals.
+
+### 63.9 What this section does not do
+
+- **Option E is not built.**  §63.6 and §63.7 are its measured groundwork and
+  nothing more.  No site is marked, no validator is changed, and
+  ``_touches_result_storage`` still keys on the callee name.  The name matcher
+  stays, and the cross-check that would refuse on a disagreement between the name
+  matcher and a type query **is not built either**, because with nothing marked
+  it would have nothing to disagree about.
+- **The 63 taggable sites are all unmarked.**  So is every one of the 51 dotted
+  sites.  A later session inherits a tree that is not half-marked; it is
+  unmarked, with the census that says where the work is.
+- **The four gaps stay unreachable.**  The two §61.4 recorded and the two §63.3
+  found are all refused rather than retained now, and none of them is reachable
+  on the survey matrix by either route.  The check's value on this matrix is
+  entirely prospective, which is the same thing §61.4 said about the input-side
+  guard — and which §60.7's ``unsupported_assembly_host`` is the counter-example
+  to, having been predicted to fire zero times and fired 58.
+- **Nothing about the two-pass assembly strategies changed.**  §60.6 stage 3's
+  position reconstruction, ``two_pass_serial``'s missing host,
+  ``scorch_concat_chunks``'s value-initializing ``resize``, the four-strategy
+  runtime grid and teaching the auto-scheduler to choose are all untouched, and
+  the runtime grid is still NOT RUN on any host.
+- **``_find_serial_coordinate``'s silent ``None`` is still open** (§61.4, and
+  §5 of the options document).  In fill mode a ``None`` emits no parent
+  coordinate store at all, silently.  The postcondition added here is the right
+  SHAPE of check for it — it inspects the output — but it asserts that nothing
+  survived, not that something is present, so it does not catch a missing write.
+  That remains a separate check nobody has built.
+- **No option other than F-strong was built**, and F-weak specifically was not:
+  the distinction is the point, and §63.2's argument-shaped test is the cell that
+  separates them.
+- **The LoopIR package is still wired to nothing.**
+  ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+  callers and the test proving ``import scorch`` never loads the package still
+  passes.
+- **mkt1 is still not run.**  Owed since §59.
+- Sections 1 through 34 are still in their original wording; §0 is the dictionary
+  for them.  The dense-domain seam, the merged-domain UNION/INTERSECTION
+  decision, the shadow pilot's membership and every blocker other than 1 are
+  untouched, and the Phase-8 cutover verdict is unchanged.
+
+**Evidence ledger**: a new one,
+``~/.cache/scorch-codex/result-write-guard/``, sealed over **312 files**
+(``SHA256SUMS`` itself hashes to ``e968fa99176d5b50…``, and
+``shasum -a 256 -c SHA256SUMS`` verifies every entry).  ``CLOSEOUT.md`` is the
+index from each claim here to the receipt that carries it.  The seal holds **zero**
+compiled artifacts: the three suite runs leave 2.6 GB of build scratch under their
+output directories and it is excluded by path, which is why the seal script was
+copied from ``assembly-strategy/`` rather than from the shared location (§63.8's
+fourth defect).
+
+Three new harnesses: ``fstrong_residue.py`` (the postcondition implemented
+independently, so it could be measured against an unmodified tree before
+promotion, with the F-weak prototype reproduced beside it and the input-side
+control), ``result_array_sites.py`` (§63.6's census) and
+``compare_suite_nodes.py`` (the node-set comparison, self-tested in both
+directions).  Copied in and patched:
+``compare_release_neutrality.py`` and ``run_suite_partitions.sh``, for the
+defects in §63.8; ``tree_provenance.py``/``.sh``, ``release_neutrality.sh`` and
+``run_frontier_pinned.sh`` unchanged.  Receipts: ``fstrong_{legacy,typed_*}_tip``
+and ``…_promoted`` (six, before and after promotion),
+``release_neutrality/`` (four emission columns, the static checks, the
+protected-file pair, ``REPORT.txt``), ``frontier/`` (both trees and the
+field-by-field diff), ``suite_4852c47/`` and ``suite_bd6af52/`` (both trees, 8
+partitions each) with ``suite_node_comparison.txt``, ``suite_7b21b4c/`` (the
+superseded run whose partition 7 carries §63.3a's failure), and
+``result_array_sites.json``.  Every
+harness takes a tree root as ``$1`` and the expected commit as a required
+argument.

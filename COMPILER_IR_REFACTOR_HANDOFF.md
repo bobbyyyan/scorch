@@ -32727,3 +32727,186 @@ stays NO-GO.
    ``protected-hashes.txt``.**  Use ``statics/check_protected_files.py`` from the
    tree; the ledger copies are the old working-tree digests and a clean checkout
    differs from all five.
+
+## The result-write guard's postcondition built and proven, and a real census for the recognizer migration (2026-08-14; supersedes every preceding prompt)
+
+Follows committed tip ``bd6af52`` and adds two commits: one production change and
+this record.  **Origin is still ``a3b8d1e``**; nothing pushed.  Review §63 owns
+the detail; the evidence ledger is new, at
+``~/.cache/scorch-codex/result-write-guard/``.
+
+**Bobby picked F-strong first, then E**, on 2026-08-14, reversing an E-first
+choice he had made earlier the same day after the ordering argument was put to
+him: F-strong depends on nobody registering anything, while E is a migration
+across scores of sites in two pipelines, one of which ships, and it leaves the
+tree half-marked for its whole duration.  Landing F-strong first covers E's
+rollout window from its first commit rather than after its last.  **F-strong is
+landed.  E is not built** — §63.6 and §63.7 are its measured groundwork.
+
+**1. THIS SESSION CHANGED PRODUCTION CODE.**  The first commit to touch ``src/``
+since ``d9efcf8``.  ``4852c47`` adds a postcondition to
+``result_write_pass``: after the rewrite, no reference to the result's own removed
+storage may survive in the output.  Emitted C++ is byte-identical on all four
+columns — production dispatch's 506 case-arms with 412 emitting, the 20-source
+corpus, the 42-case ``ss@dd`` grid, and the 86-case audit with zero differing
+``legacy_sha256`` — measured between clean detached worktrees at asserted commits
+``bd6af52`` and ``4852c47``.  ``compile_cin_via_loopir`` and
+``execute_cin_via_loopir`` still have zero callers outside tests.
+
+The suite ran in 8 file-disjoint partitions on **both** trees: **6,392 tests, 0
+failures, 15 skipped** at ``4852c47`` against **6,380 / 0 / 15** at ``bd6af52``,
+every partition exit 0.  Compared by NODE SET rather than by count — 0 base-only,
+**12** candidate-only (this session's new tests, each named), 0 outcome changes on
+the 6,380 shared nodes, and the eight partition file lists asserted equal first.
+The frontier is unchanged field-for-field over all 1,139 records in both arms,
+with 0 unclassified.
+
+**2. THE MECHANISM, BECAUSE IT IS THE PART WORTH INHERITING.**  "No result storage
+survives" cannot be read literally — the fill phase legitimately stores INTO the
+result.  What separates the two is that the vocabularies are **disjoint by
+spelling**: everything the pass constructs is a ``_data`` pointer or a
+count/fill state scalar, everything it removes is a bare vector name or a
+``p{R}{L}`` cursor.  So the check exempts nothing; the pass's own output falls
+outside the watched set because of how it is spelled.  If a later edit makes the
+pass construct a bare-name reference, the check reports it rather than waving it
+through, which is what stops the separation rotting.
+
+**3. A SURVIVING READ IS A DEFECT, AND THIS IS WHY THE LITERAL RULE IS SAFE.**
+The worry was over-refusal: ``{R}{L}_crd.size`` as an index and
+``{R}{L}_pos.back`` in the boundary condition are legal in the pass's INPUT.
+``compressed_where_openmp_pass._should_drop_prefix_statement`` drops the
+declarations of exactly these names, so in the pass's output they do not exist and
+a reference to one dangles whether it reads or writes.  Settled from the code, and
+also measured: **968 references exist on the pass's input per mode** — including
+178 of those very reads — and **none survives**, over 204 invocations.
+
+**4. §61.4's TWO NARROWNESSES ARE FOUR.**  The promoted check flagged three things
+the F-weak prototype did not, all real, all previously asserted as correct by the
+pass's own tests.  Two are new gap classes: a result write inside an
+**identity-only loop region** (``before_parallel_body``, ``_hoisted_ptr_decls``)
+and one inside a **nested ``llir.Function`` body** — regions the rewriter
+deliberately does not descend into, so a write there is retained rather than
+refused.  The third is a foreign ``RESULT_WRITE`` marker on this result's storage
+NAME: correctly not rewritten, and fatal to retain, because the name is what
+codegen emits.  Each test keeps the property it proved, re-probed with the
+workspace drain's ``.sort``; each old shape became a refusal test.  44 tests to
+56.
+
+**4a. AND ONE ATTACK-MATRIX REFUSAL MOVED EARLIER, which is a seam-lock change.**
+``test_two_phase_pass_context_cannot_mutate_program_result_identity`` corrupts the
+result ``SymbolId``; that stops ``_is_result_value_target`` recognizing the drain's
+value store, so ``C_values`` survives, and the postcondition refuses at
+``residual_result_storage_reference`` **before** the completion boundary reports
+``sparse_workspace_completion_lost``.  Still fail-closed, and the earlier refusal
+names the surviving reference.  Checked rather than assumed: that code is asserted
+**38 times across four files** and exactly one is preempted — the sibling test's
+tamper lands in ``rewrite_dynamic_vector_accesses``, five positions after
+``RESULT_WRITE``, so it is out of reach.  The base passes the preempted test, the
+pre-fix candidate failed it, the final commit passes it.  **If you add a check to
+an early pass, expect it to preempt a later seam lock, and count how many
+assertions reach that code before you decide the lock is intact.**
+
+**5. THE PROMPT'S DEFECT-CODE INSTRUCTION HAD A WRONG PREMISE, AND THE NEXT ONE
+SHOULD NOT REPEAT IT.**  ``PRODUCTION_SUBSET_DEFECT_CODES`` in
+``test_loopir_verifier.py`` is built from ``_fail("...")`` literals in
+``loopir/verifier.py`` — it is the LoopIR **verifier's** code surface only.  None
+of ``result_write_pass``'s codes belongs in it, and adding one fails the equality
+in the "expected but not found" direction.  The pass's eleven codes are now locked
+by ``test_result_write_pass_defect_codes_are_the_locked_set``, in the pass's own
+test file, failing in both directions.  **A pass outside ``loopir/verifier.py``
+needs its own lock, not an entry in that set.**
+
+**6. THE CENSUS FOR E, WITH A DEFINITION, AND IT DISAGREES WITH THE DOCUMENT.**
+The options document's "73 / 38 / 26 / 12" has no stated definition and cannot be
+reproduced.  Parsed rather than grepped, at ``bd6af52``: **134** result-array name
+constructions across the four files (lower_llir 96, ``torch_cpp_abi`` **0**,
+cin_lowerer 25, iter_lattice 13), out of 179 storage-array constructions for all
+tensors.  Two things matter more than the totals.  ``torch_cpp_abi.py`` has **no
+result-specific sites** — its 33 build names polymorphically from ``self.name``
+and a loop variable, serving operands and results alike.  And **the work is 63
+sites, not 134**: only ``llir.Var`` and ``llir.ArrayAccess`` carry
+``tensor_access``, and the other 51 are dotted callee names (31 ``FunctionCall``,
+20 ``FunctionCallStmt``) with the receiver inside the name, so there is no ``Var``
+to tag.  Making those a type query means restructuring them into
+``MemberCall``/``MemberCallStmt`` — **that is the only part of E that can move a
+shipped byte.**
+
+**7. ALL SEVEN VALIDATORS SHOULD STAY SHUT, so E needs no validator change.**
+§62.7 said E needs the seven to admit the metadata.  Read against the code, every
+one of the seven is a position where a ``RESULT_WRITE`` marker would be a false
+statement: four are index positions (reads), one is a scalar/member store (not
+storage), two are ``AddressOf`` operands (handing storage over, not writing
+through it).  LLIR already encodes the discipline: an index position admits
+``INPUT_READ`` and explicitly refuses ``RESULT_WRITE``
+(``_validate_address_of_index_impl``), and the assignment-target ``ArrayAccess``
+admits ``RESULT_WRITE`` (``:1130``–``:1139``, ``:1200``–``:1204``).  ``:1195`` in
+particular must stay shut *because* the enclosing ``ArrayAccess`` already admits
+the marker — two homes for one fact is the contradiction item 4's third finding
+refuses.  The two gap positions are unvalidated against metadata already.  **The
+marking E wants is open on every position it wants, today.**
+
+**8. AND THERE IS A QUESTION UPSTREAM OF WRITING ANY OF E, which is Bobby's.**
+``TensorAccessMetadata`` describes an ACCESS — its own docstring says
+``access_id`` "records occurrence provenance" and that transformations match
+``tensor_id`` and ``index_ids`` to "select every access to a logical
+tensor/index tuple".  The 63 sites E would mark are **not** element accesses:
+they are ``Var`` nodes naming the vectors themselves, handed to an append, a
+``size()``, or a helper.  So a marker on one has no honest ``index_ids`` (``()``
+is structurally legal — verified — but currently means "an access at no
+indices"), no honest ``access_id``, and no honest role, since the same receiver
+``Var`` serves ``{R}{L}_crd.push_back`` and ``{R}{L}_crd.size`` and one role
+cannot say both.  Three possible shapes — a third role, a separate field, or
+widening ``RESULT_WRITE`` deliberately and re-reading its consumers — are laid
+out in §63.7a with no preference.  **No site was marked this session for exactly
+this reason**: metadata guessed wrong is wrong in a way nothing catches, because
+the postcondition checks that references do not survive, not that a marker tells
+the truth.
+
+## What the next session should do
+
+0. **Get §63.7a answered before writing any of E.**  It is one question — what a
+   marker on a whole-vector reference means — and every one of the 63 sites
+   depends on it.
+1. **Then build E on the 63 taggable sites, and do the typed route first.**
+   ``loopir/lower_llir.py``'s 41 cannot change anything that ships.
+   ``cin_lowerer.py``'s 15 and ``iter_lattice.py``'s 7 are legacy and DO ship: the
+   metadata is compile-time only and ``codegen`` never reads ``tensor_access``,
+   which is also ``compare=False``, so the emitted C++ should not move by one
+   byte — **prove it, do not assert it**, with ``harness/release_neutrality.sh``
+   from the ledger and both automatic arms.  ``harness/result_array_sites.py``
+   prints the site list; the receipt has every line number.
+2. **Decide what to do about the 51 dotted sites before touching them.**  They are
+   the part of E that changes node shape, so either they keep the name matcher
+   permanently — which is a legitimate answer, since the receiver is right there
+   in the name and the postcondition stands behind it — or restructuring them into
+   ``MemberCallStmt`` has to clear the same four emission columns.  That is a
+   design question, and it is Bobby's.
+3. **Then switch ``_touches_result_storage`` to a metadata query, keeping the name
+   matcher beside it and refusing on disagreement.**  Not before: with nothing
+   marked, a cross-check has nothing to disagree about.  Put it over the full
+   traversal, not inside ``_rewrite_call_statement`` — a check there never sees a
+   ``MemberCallStmt``, which is gap B's mechanism reproduced.  **Do not remove the
+   name matcher** until every site is marked and the frontier runs clean.
+4. **Everything the guard cannot answer is still open**, and one of them is a
+   silent-correctness hazard: ``_find_serial_coordinate`` returning ``None`` in
+   fill mode emits **no parent coordinate store at all**, silently (§61.4, and §5
+   of the options document).  The postcondition is the right shape of check —
+   it inspects the output — but it asserts nothing survived, not that something is
+   present.  58 of 58 on the survey matrix, so it never fires; it needs its own
+   check.
+5. **The two-pass assembly strategies are untouched and unchanged**: §60.6 stage
+   3's position reconstruction, ``two_pass_serial``'s missing host,
+   ``scorch_concat_chunks``'s value-initializing ``resize``, the four-strategy
+   runtime grid (still NOT RUN on any host) and teaching ``default_assembly()`` to
+   choose.  Note that item 2 of the previous prompt's list still interacts with the
+   guard: making the two-pass strategies work brings the chunk merge's four
+   argument-shaped result writes in front of the recognizer — and now the
+   postcondition catches them even if the recognizer does not.
+6. **Pass the expected commit to every harness**, and resolve every output path to
+   an absolute one before any ``cd``.  §63.8 records four inherited-harness
+   defects found this session, one of which wrote a suite run's compiled kernels
+   into the tree it was measuring; §62.5's provenance guard is what caught it.
+7. **Copy ``seal_ledger.sh`` from ``assembly-strategy/``, not from
+   ``~/.cache/scorch-codex/``.**  The shared one lacks §62.9's four exclusions and
+   would seal a suite run's 680 MB of ``.so`` files.
+8. **mkt1 is still owed**, since §59.
