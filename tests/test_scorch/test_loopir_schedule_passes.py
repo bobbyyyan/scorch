@@ -310,7 +310,7 @@ def test_sparse_workspace_print_and_canonical_forms_are_structurally_active():
     assert "drained(w0)" in rendered
 
     canonical = canonical_program_dump(scheduled)
-    assert '"schema":"scorch.loopir.canonical.v11"' in canonical
+    assert '"schema":"scorch.loopir.canonical.v12"' in canonical
     assert '"kind":"sparse_workspace_region"' in canonical
     assert '"kind":"sparse_workspace_insert"' in canonical
     assert '"kind":"sparse_workspace_drain_for"' in canonical

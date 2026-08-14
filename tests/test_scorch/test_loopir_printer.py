@@ -135,16 +135,22 @@ def test_canonical_dump_omits_display_names():
 
 
 def test_canonical_dump_carries_schema_version():
-    # v8: the Phase-6 parallel slice added the program-level abstract
+    # v12: the program's sparse-output assembly strategy joins ``parallel`` as a
+    # program-level scheduling fact, after v11 widened the sparse-workspace
+    # family to an ordered key domain.  v8 added the program-level abstract
     # parallel selection, after v7 added the compact result-tile kinds
     # (result_tile_region, tiled_reduce), v6 the staged-operand kinds, v5
     # the sparse coordinate-window kinds, v4 the workspace node kinds, and
     # v3 the affine-split kinds.
     payload = json.loads(canonical_program_dump(build_matvec()))
-    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v11"
+    assert payload["schema"] == CANONICAL_SCHEMA == "scorch.loopir.canonical.v12"
     assert payload["inputs"] == [0, 1]
     assert payload["outputs"] == [2]
     assert payload["body"]["kind"] == "block"
+    # A program with no recorded strategy serializes the key with a null value,
+    # so "no decision" stays distinguishable from "serial by decision" and every
+    # program's canonical bytes move exactly once.
+    assert payload["assembly"] is None
 
 
 def test_printer_renders_the_complete_program():
