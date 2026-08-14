@@ -9793,10 +9793,11 @@ deleted.
 
 ## 51. Exact-tip review of the post-assembly window: one defect, five claims re-derived, and a corrected origin record (2026-08-10)
 
-This section opens at inherited committed tip ``a3b8d1e`` and reviews
+This section starts from inherited committed tip ``a3b8d1e`` and reviews
 ``dcc2701..a3b8d1e`` -- the production commit ``895fca3`` and its test commit
 ``a3b8d1e``.  It lands one compiler change: the completion boundary's single
-structural comparison **moves to the far side of the completion window**, which
+structural comparison **moves to the far side of the completion window**, the span
+in which assembly and the completion stages can still change the function, which
 closes a class ``895fca3``'s identity requirements leave open.  It also corrects
 the recorded origin state, which was wrong in both of the last two sections.
 
@@ -9823,15 +9824,15 @@ is why reading that file has produced the wrong answer twice.  Loose refs
 override it; ``ls-remote`` is the only honest source.
 
 Two consequences are worth stating plainly.  The ordered-key vertical, the
-completion seal and the post-assembly window are **published, not local-only** --
-the standing "all LOCAL-ONLY" note is obsolete.  And the push at 15:25:13
+completion boundary and the post-assembly window are **published, not local-only**
+-- the standing "all LOCAL-ONLY" note is obsolete.  And the push at 15:25:13
 happened *after* the previous session recorded ``statics/origin-ls-remote.txt``
 as ``692a450`` at 15:03, so that receipt was accurate when written and stale
 within the hour.  Nothing here pushes; origin is left exactly where it is.
 
 ### 51.2 What the previous session actually completed, and what it did not
 
-It ended mid-gate, so the record needed establishing by inspection rather than
+It ended mid-check, so the record needed establishing by inspection rather than
 by reading its own summary.
 
 **The full suite did finish, and it is green at the exact tip.**  Partition 5
@@ -9844,16 +9845,16 @@ errors, 14 skipped**, every partition exiting 0, the aggregate stamping revision
 precedent was needed this time.
 
 **No documentation commit exists.**  The committed review ends at §50.9 and the
-committed handoff's last section is the completion seal.  Drafts of a §51 and a
-handoff section exist only in the previous session's scratchpad; every number in
+committed handoff's last section is the completion boundary.  Drafts of a §51 and
+a handoff section exist only in the previous session's scratchpad; every number in
 them was treated as unverified here and re-derived, and two of their claims did
 not survive (§51.5).
 
-**The ledger was never sealed.**  Only ``fullsuite/SHA256SUMS`` exists, covering
-55 files in that one subdirectory; it verifies clean.  There is no manifest over
-the ledger as a whole.
+**The evidence folder was never checksummed.**  Only ``fullsuite/SHA256SUMS``
+exists, covering 55 files in that one subdirectory; it verifies clean.  There is
+no manifest over the folder as a whole.
 
-**Four gates never ran at this tip.**  ``latency/`` holds the two drivers and no
+**Four checks never ran at this tip.**  ``latency/`` holds the two drivers and no
 receipts.  ``attacks/`` holds the probe and no output.  ``legacy/`` holds only
 the quick census; the full sweep exists solely in the scratchpad, timestamped
 14:36, i.e. sixteen minutes before the 14:52 commits, so it describes an
@@ -9862,7 +9863,7 @@ artifact copied into the ledger at 14:59 -- **an intermediate-revision receipt
 in a final-tip directory**, which is exactly the relabelling this review is
 required not to accept.
 
-### 51.3 The seal's reference must be captured before the pass manager, and that is not why the comparison must be
+### 51.3 The reference must be captured before the pass manager, and that is not why the comparison must be
 
 Re-derived from the code rather than from §50.2.  Two independent reasons, and
 they license different things.
@@ -9953,11 +9954,12 @@ Every one of these was re-derived from the schema or by measurement.  Two are
 stated wrongly in the scratchpad draft, and one of the two is stated wrongly in
 a way that would matter.
 
-**1. The detaching mirror reproduces the shared pass.**  Stands.  On an
-independently constructed 28-cell x 2-arm grid, ``_OrderedKeyExpectedBody``'s
-output is **structurally identical to ``rewrite_dynamic_vector_accesses``'s on
-56 of 56 cases**.  The draft's "136/136" is a different grid; the substance is
-the same and the count is grid-dependent, so this section states its own.
+**1. The detached copy the boundary compares against reproduces the shared
+pass.**  Stands.  On an independently constructed 28-cell x 2-arm grid,
+``_OrderedKeyExpectedBody``'s output is **structurally identical to
+``rewrite_dynamic_vector_accesses``'s on 56 of 56 cases**.  The draft's "136/136"
+is a different grid; the substance is the same and the count is grid-dependent,
+so this section states its own.
 
 **2. ``ForLoop.update`` and bare ``Assign`` positions.**  Needs correcting.
 Read literally, "the only bare-``Assign`` field position" is false: **no field
@@ -9967,8 +9969,8 @@ mentioning ``Assign`` is ``Assign.var: AssignmentTarget``, which is the
 assignment's own target.  The defensible form -- and the one the committed test
 ``test_for_loop_update_is_the_only_non_sequence_assign_position`` already uses --
 is that ``ForLoop.update`` is the only position that can hold an ``Assign``
-outside a statement sequence.  That is what makes the mirror's "sequences only"
-rule equal the shared pass's "not ``update``" rule.  Empirically, across the
+outside a statement sequence.  That is what makes the detached copy's "sequences
+only" rule equal the shared pass's "not ``update``" rule.  Empirically, across the
 grid, every ``ForLoop.update`` is an ``Increment`` (180 occurrences) and **none
 targets a dynamic vector**, so the rules never diverge in practice either.
 
@@ -10019,23 +10021,24 @@ and an explicit ``Schedule`` inserts no workspace -- so settling §49.5's
 untested "its target shape is supported" requires suppressing tile selection
 while keeping automatic workspace insertion, which is a probe, not a compile.
 Blockers 2 and 3 and the rank-6/non-ADD/COO frontier extension are untouched.
-The declared 748-cell frontier is therefore neither re-run at this tip nor
+The declared 748-cell frontier -- the survey matrix of programs this branch
+measures the compiler over -- is therefore neither re-run at this tip nor
 extended, and §51.2 records why the inherited receipt cannot be relabelled as
 exact-tip.
 
 ### 51.7 Compiler latency: moving the comparison is free, and that is measured
 
 The ceiling for a compile-only integrity boundary on this branch is **1.10**.
-The inherited seal added a comparison and measured p50/mean 1.0558-1.0560 with a
-max of 1.0729.  This change adds none -- it relocates the one comparison -- so
-the prediction is a null result, and a null result is what a paired measurement
-has to be able to show.
+The inherited boundary added a comparison and measured p50/mean 1.0558-1.0560
+with a max of 1.0729.  This change adds none -- it relocates the one comparison --
+so the prediction is a null result, and a null result is what a paired
+measurement has to be able to show.
 
 Base is a detached worktree at ``a3b8d1e``; the candidate is this tree.  Each
 measurement is a fresh subprocess importing exactly one source tree and timing
 the same 40-cell ordered-key compile-only grid (no JIT, no C++ compiler); 20
 rounds, alternating the within-round order, 4 warmups and 21 samples per
-process, plus a base-against-base A/A control in every round.  The per-round
+process, plus a base-against-base control in every round.  The per-round
 statistic is the median of that process's samples, and the pooled variants
 repeat the calculation on the fastest sample.
 
@@ -10077,14 +10080,15 @@ requiring exactly one comparator entry per compile in both arms.
 
 ### 51.9 Verification
 
-All gates ran in the ``scorch`` conda environment.  Base is a detached worktree
-at ``a3b8d1e``; the candidate is this tree.
+Everything below ran in the ``scorch`` conda environment.  Base is a detached
+worktree at ``a3b8d1e``; the candidate is this tree.
 
-- **Release neutrality against ``a3b8d1e``: byte-identical.**  The 20-source
-  corpus 20/20 and the 42-source ``ss@dd`` grid 42/42 identical, with no
-  differing file; the 86-case schedule audit ``total=86 admitted=46 rejected=40
-  nonidentical=0`` on both sides and identical between them.  Flake8 (47 lines)
-  and mypy (146 lines) hash-identical between base and candidate.  Black reports
+- **The generated C++ is unchanged from ``a3b8d1e``.**  Compiling the 20 sample
+  programs gives 20 of 20 identical files and the 42-case ``ss@dd`` grid gives 42
+  of 42, with no differing file; the 86-case run through the explicit scheduling
+  path reports ``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides
+  and is identical between them.  Flake8 (47 lines) and mypy (146 lines) are
+  hash-identical between base and candidate.  Black reports
   ``15 files would be reformatted, 137 files would be left unchanged`` on **both**
   sides -- the only stream that differs is Black's stderr, and it differs solely
   by worktree path prefix and parallel-worker ordering, with neither changed file
@@ -10109,7 +10113,7 @@ at ``a3b8d1e``; the candidate is this tree.
 - **No default dispatch, cache, selector or fallback change**, and no legacy code
   removed.
 
-Four gates are **not** claimed at this tip and are recorded as absent rather
+Four checks are **not** claimed at this tip and are recorded as absent rather
 than inherited: the 748-cell frontier differential, the crash-isolated legacy
 extent/dtype/density census, the compiled public differential over the twenty
 migrated cells, and the erasure/oracle differential.  §51.2 records why the
@@ -10134,7 +10138,8 @@ artifacts, and no dispatch, cache, selector or fallback change.
 remain behind the three blockers of §49.5, as sharpened by §50 and unchanged
 here.
 
-*The activating paired latency receipt.*  Present and declared in full below.
+*The paired latency measurement this change requires.*  Present and declared in
+full below.
 
 **Phase 7 is NO-GO**, on exactly the three standing blockers.  No Phase-8
 inventory, cutover, cache, selector or default-dispatch change was made; no
@@ -10214,14 +10219,17 @@ two-test-file split §49.8 established the precedent for.
 
 ## 52. The ABI signature across the completion window, the extended frontier, the legacy census, and blocker 1 decided (2026-08-11)
 
-This section opens at inherited committed tip ``ab0c19f`` and reviews
+This section starts from inherited committed tip ``ab0c19f`` and reviews
 ``a3b8d1e..ab0c19f`` — the production commit ``807f7ff``, its test commit
 ``f2ac9d0``, and the two documentation commits ``d725676`` and ``ab0c19f``.  It
 lands one compiler change: the completion boundary's single structural
 comparison now covers the assembled function's **whole stored state** rather
-than its body alone, which closes a class §51's move leaves open.  It also runs
-three of the four gates §51.9 recorded as absent, reproduces the declared
-frontier at the exact tip and extends it by 391 cells, and **decides blocker 1**.
+than its body alone, which closes a class §51's move leaves open.  The window
+here is the span between capturing the reference body and emitting C++, in which
+a change to the function could otherwise go unnoticed.  The section also runs
+three of the four checks §51.9 recorded as absent, reproduces the declared
+frontier — the survey matrix of programs this branch measures the compiler over —
+at the exact tip and extends it by 391 cells, and **decides blocker 1**.
 
 Sections 49, 50 and 51 are preserved above as written.  Where this section
 contradicts them, this section is correct.
@@ -10287,12 +10295,13 @@ completion does its work by rewriting *nested* loop bodies in place
 So the identity requirement cannot detect that a stage ran, and a fused
 workspace-plus-tile plan would satisfy it.  What fails closed for such a plan is
 the **structural comparison**, because those in-place nested rewrites are not in
-the reference.  That is the gate a fused replay contract has to extend
-deliberately — and extending it means teaching the detaching mirror to reproduce
-a *second* shared completion stage, with all of the drift risk §50.3 had to
-solve once for ``rewrite_dynamic_vector_accesses``.  That cost belongs in
-blocker 1's decision, and 52.7 takes it there.  The identity requirement is kept
-for what it does prove: no stage substituted a different function object.
+the reference.  That is the check a fused replay contract has to extend
+deliberately — and extending it means teaching the detached copy the boundary
+compares against to reproduce a *second* shared completion stage, with all of the
+drift risk §50.3 had to solve once for ``rewrite_dynamic_vector_accesses``.  That
+cost belongs in blocker 1's decision, and 52.7 takes it there.  The identity
+requirement is kept for what it does prove: no stage substituted a different
+function object.
 
 **3. Should the exact-root requirement live in codegen for every family?  No,
 and that is measured rather than argued.**  Handing codegen a ``Function``
@@ -10326,15 +10335,15 @@ exactly the four declared fields, so an added field cannot ride along unread.
 
 ### 52.4 The window matrix, re-run and extended: seventeen classes, no gaps
 
-Each class patches the last completion stage (or, where stated, assembly or a
-managed pass), asserts its tamper actually landed, and counts every consultation
-of a forged ``__class__``/``__eq__``/``__hash__``/``__reduce_ex__``.
+Each class tampers with the last completion stage (or, where stated, with
+assembly or a managed pass), asserts its tamper actually landed, and counts every
+consultation of a forged ``__class__``/``__eq__``/``__hash__``/``__reduce_ex__``.
 
 *The six inherited classes* (§51.4) — new function sharing the body list, a
 shared-list element swapped for a twin, an in-place ``Comment`` rewrite inside a
 verified statement, a statement duplicated inside the ordered drain, a
-``Function`` subclass from assembly, and a dense-receiver plan that must find the
-gate inert — behave exactly as §51.4 requires, unchanged.
+``Function`` subclass from assembly, and a dense-receiver plan on which the check
+must do nothing — behave exactly as §51.4 requires, unchanged.
 
 *The four new classes.*  A completion stage that mutates ``assembled.args`` in
 place: **refused** (it was refused before only downstream, as a
@@ -10358,8 +10367,8 @@ reordering and renaming variants are refused.  And a pass that walks the caller'
 frame to rewrite the reference *and* the body consistently **compiles**.  That is
 not a closable gap: code that can read and write the checker's own locals defeats
 any in-process boundary, and a digest held in a closure is frame-reachable too.
-It is the boundary's stated threat-model limit, and stating it is the honest
-alternative to a check that would only look stronger.
+It is the limit of what this boundary can defend against, and stating it is the
+honest alternative to a check that would only look stronger.
 
 **Zero foreign hook invocations across all seventeen classes**, and all 40
 normal reduction/TTM compile cells still compile in both arms.
@@ -10426,7 +10435,7 @@ stronger grounds than the original statement had.
 the automatic arm at ``InvalidSchedule/sparse_parent_dominance``.  Under their
 own DECLARED order, six reach ``unsupported_sparse_output_domain`` and two —
 ``sss ijk->ij`` and ``ssd ijk->ij`` — reach ``LoopIRTargetError/
-unsupported_program_shape``, which is the three-way gate §49.5 predicted, now
+unsupported_program_shape``, which is the three-way split §49.5 predicted, now
 observed rather than argued.
 
 **``sss ijk->j`` is a different construction**, exactly as claimed: under order
@@ -10470,25 +10479,25 @@ the ``AppendEntry`` then reads.  That is a materially smaller and better-founded
 change than a second rank-general target, and it is the finding that should
 govern the next session's estimate.
 
-**The LoopIR-only repair has a seam, and unlike the tile it is not pinned.**
-``Scheduler.auto_schedule_plan`` is the plan-producing automatic origin whose own
-docstring records that release dispatch does not consume it, so a repair there
-cannot change legacy default generated code.  And the legality layer treats the
-loop **order** differently from the tiles: ``_verify_auto_workspace_decision``
-and ``_verify_tiling_capabilities`` require the recorded workspace and tiles to
-equal a re-derived decision exactly — which is why §51.11's tile suppression was
-refused at ``auto_tile_decision`` — whereas the order is checked only for
-*legality* (``_verify_storage_order``'s result-storage and
-sparse-parent-dominance rules).  A repaired legal order is therefore not
-refused the way the suppressed tile was.  The forced reorder itself is one block
-in ``Scheduler.select_loop_order`` that moves the last free variable to the
-innermost position when no free variable follows the last reduction; for these
-cells that is precisely what puts a compressed parent below its child.
+**The LoopIR-only repair has somewhere to live, and unlike the tile it is not
+pinned.**  ``Scheduler.auto_schedule_plan`` is the plan-producing automatic
+origin whose own docstring records that release dispatch does not consume it, so
+a repair there cannot change legacy default generated code.  And the legality
+layer treats the loop **order** differently from the tiles:
+``_verify_auto_workspace_decision`` and ``_verify_tiling_capabilities`` require
+the recorded workspace and tiles to equal a re-derived decision exactly — which
+is why §51.11's tile suppression was refused at ``auto_tile_decision`` — whereas
+the order is checked only for *legality* (``_verify_storage_order``'s
+result-storage and sparse-parent-dominance rules).  A repaired legal order is
+therefore not refused the way the suppressed tile was.  The forced reorder itself
+is one block in ``Scheduler.select_loop_order`` that moves the last free variable
+to the innermost position when no free variable follows the last reduction; for
+these cells that is precisely what puts a compressed parent below its child.
 
 **None of this is built.**  The family, the target extension and the repair are
 not in this tip, and no partial work toward them is committed.  What is recorded
-is the re-derivation, the exact five-cell reach, the host, the seam, and the
-schema conclusion checked against the representation.
+is the re-derivation, the exact five-cell reach, the host, where the repair
+belongs, and the schema conclusion checked against the representation.
 
 ### 52.7 Blocker 1, decided: TTM ``dds`` is not migratable under this origin
 
@@ -10497,10 +10506,10 @@ the legal ``CHILD_OF`` placement with stated arm-variance, and recording TTM
 ``dds`` as unmigratable.  It is decided here, against the fused contract, on four
 costs — one of which §51.11 could not have priced.
 
-1. **The fused contract needs a second detaching mirror.**  52.2.2 measured that
-   result-tile completion works by rewriting nested loop bodies in place, and
-   that the gate which refuses it is the structural comparison, not the identity
-   requirement.  A fused contract therefore has to teach
+1. **The fused contract needs a second detached copy to compare against.**
+   52.2.2 measured that result-tile completion works by rewriting nested loop
+   bodies in place, and that what refuses it is the structural comparison, not the
+   identity requirement.  A fused contract therefore has to teach
    ``_OrderedKeyExpectedBody`` to reproduce ``_complete_result_tile_impl``'s
    rewrites as faithfully as it already reproduces
    ``rewrite_dynamic_vector_accesses`` — the exact problem §50.3 had to solve
@@ -10510,7 +10519,7 @@ costs — one of which §51.11 could not have priced.
 2. **It would be the first arm-variant migrated family.**  The non-regblock
    OUTERMOST placement is illegal, not unimplemented: it hoists ``j_out`` above
    ``i`` while a ``dds`` receiver's streamed compressed level must be appended in
-   lexicographic ``(i, j)`` order.  Every milestone on this branch has gated on
+   lexicographic ``(i, j)`` order.  Every milestone on this branch has required
    arm-invariance, and 52.5 confirms the only arm-variant cells in 1139 are
    dense-receiver neighbours outside the envelope.  A single-arm family cannot be
    declared complete over an envelope, which is the exit-audit question it would
@@ -10529,13 +10538,13 @@ exactly as long as the automatic origin emits an affine tile for a ``dds``
 receiver against a ``kl`` factor while the tile heuristic lives in a layer shared
 with legacy default dispatch.  Making it reachable *without* arm-variance means
 changing that heuristic, which changes default generated code — a Phase-8
-question, not a refactor-neutrality one.  If Phase 8 ever revisits the heuristic,
-this becomes reachable on its merits; until then the honest record is a closed
-decision rather than an open blocker.
+question, not a question about whether this refactor changes what ships.  If
+Phase 8 ever revisits the heuristic, this becomes reachable on its merits; until
+then the honest record is a closed decision rather than an open blocker.
 
-### 52.8 The absent gates: three of four run
+### 52.8 The absent checks: three of four run
 
-§51.9 recorded four gates as absent.  Three ran here.  The fourth — the
+§51.9 recorded four checks as absent.  Three ran here.  The fourth — the
 compiled public differential over the twenty migrated cells, and the
 erasure/oracle differential it carries — is reported in 52.9.
 
@@ -10562,10 +10571,10 @@ measurements.**
   of the cell, and the committed characterization test's assertion that the
   unsound set is exactly those eleven is valid at its own fixture extents rather
   than universally.  The remaining eight are unsound at 0 of 6.
-- One further scoping note, stated rather than glossed: the driver gives the
-  unsound-claimed cells the lean sweep (arm 0, f32 only), so **§50.6's
-  "arm-invariant" for the unsound eleven is not re-confirmed by this sweep**; it
-  is re-confirmed for the ten sound cells, which ran both arms.
+- One further scoping note: the driver gives the unsound-claimed cells the lean
+  sweep (arm 0, f32 only), so **§50.6's "arm-invariant" for the unsound eleven is
+  not re-confirmed by this sweep**; it is re-confirmed for the ten sound cells,
+  which ran both arms.
 
 **A genuine stored-zero fixture.**  Two exist in the committed suite and both
 were re-run.  ``test_stored_compressed_zero_survives_both_arms_and_dtypes``
@@ -10581,13 +10590,14 @@ exercised in any form.  The harness used here builds the operand structure from 
 fully stored, zero-free tensor and then zeroes a deterministic stride of the
 stored values, asserting that a zero really is stored.
 
-**Release neutrality against ``ab0c19f``: byte-identical.**  The 20-source corpus
-20/20 and the 42-source ``ss@dd`` grid 42/42 identical with no differing file;
-the 86-case schedule audit ``total=86 admitted=46 rejected=40 nonidentical=0``
-on both sides and identical between them.  mypy is hash-identical between the
-arms at 146 lines — **140 errors in 11 files, none in a changed file**.  Flake8
-differs only by three F401s in modules that exist solely in the working tree and
-are untracked.  Black is 15 findings / 137 clean on base and 19 / 174 on the
+**The generated C++ is unchanged from ``ab0c19f``.**  Compiling the 20 sample
+programs gives 20 of 20 identical files and the 42-case ``ss@dd`` grid gives 42
+of 42, with no differing file; the 86-case run through the explicit scheduling
+path reports ``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides
+and is identical between them.  mypy is hash-identical between the arms at 146
+lines — **140 errors in 11 files, none in a changed file**.  Flake8 differs only
+by three F401s in modules that exist solely in the working tree and are
+untracked.  Black is 15 findings / 137 clean on base and 19 / 174 on the
 candidate; the four extra reformat targets are all untracked ``test_spmm_*``
 modules, the tracked reformat sets are identical, and neither changed file
 appears in either list.  ``git diff --check`` exits 0 and the five protected
@@ -10595,9 +10605,9 @@ files hash exactly as recorded.
 
 ### 52.9 Verification
 
-All gates ran in the ``scorch`` conda environment on the Apple M5 development
-machine.  Base is a detached worktree at ``ab0c19f``; the candidate is this tree,
-and the suite ran in a clean detached worktree at the exact tip.
+Everything below ran in the ``scorch`` conda environment on the Apple M5
+development machine.  Base is a detached worktree at ``ab0c19f``; the candidate
+is this tree, and the suite ran in a clean detached worktree at the exact tip.
 
 - **Complete non-performance suite at the exact tip**, eight file-disjoint
   partitions in fresh processes: **6,095 selected nodes, 6,081 passed, 14
@@ -10616,7 +10626,7 @@ and the suite ran in a clean detached worktree at the exact tip.
   with the suite.)
 - **Compiled public differential over the twenty migrated cells, and the
   erasure/oracle differential it carries: 648 checks, zero failures.**  This is
-  the third and fourth of §51.9's four absent gates.  Every cell is executed
+  the third and fourth of §51.9's four absent checks.  Every cell is executed
   through the real JIT path and checked four ways — exact ``(pos, crd)`` level
   storage against the scheduled-program oracle, scheduled-versus-erased oracle
   equality, stored value agreement, and a dense PyTorch reference — across both
@@ -10627,16 +10637,17 @@ and the suite ran in a clean detached worktree at the exact tip.
   this session added; each of those asserts that a zero really is stored before
   it measures anything, and all twenty asserts passed.
 - **Crash-isolated legacy census: 666 measurements**, detailed in 52.8.
-- **Release neutrality against ``ab0c19f``: byte-identical** — corpus 20/20 and
-  grid 42/42 with no differing file, schedule audit ``total=86 admitted=46
-  rejected=40 nonidentical=0`` on both sides and identical between them.
-- **Statics.**  mypy on the candidate is **140 errors in 11 files, none in a
-  changed file**, and hash-identical to base at 146 lines.  Flake8 differs
-  between the arms only by three F401s in untracked working-tree-only modules.
-  Black is 15/137 on base and 19/174 on the candidate, the four extra reformat
-  targets all untracked ``test_spmm_*`` modules; restricted to tracked files the
-  sets are identical and neither changed file appears.  ``git diff --check``
-  exits 0; the five protected tracked files hash exactly as recorded.
+- **The generated C++ is unchanged from ``ab0c19f``** — 20 of 20 sample programs
+  and 42 of 42 grid cases with no differing file, schedule audit ``total=86
+  admitted=46 rejected=40 nonidentical=0`` on both sides and identical between
+  them.
+- **Type check and linters.**  mypy on the candidate is **140 errors in 11 files,
+  none in a changed file**, and hash-identical to base at 146 lines.  Flake8
+  differs between the arms only by three F401s in untracked working-tree-only
+  modules.  Black is 15/137 on base and 19/174 on the candidate, the four extra
+  reformat targets all untracked ``test_spmm_*`` modules; restricted to tracked
+  files the sets are identical and neither changed file appears.  ``git diff
+  --check`` exits 0; the five protected tracked files hash exactly as recorded.
 - **Representation unchanged.**  No node kind, no canonical schema change (v11
   stands), no request- or schedule-identity change.
 - **No default dispatch, cache, selector or fallback change**, and no legacy code
@@ -10647,7 +10658,7 @@ boundary on this branch is **1.10**.  Base is a detached worktree at ``ab0c19f``
 the candidate is the final tip.  Each measurement is a fresh subprocess importing
 exactly one source tree and timing the same 40-cell ordered-key compile-only grid
 (no JIT, no C++ compiler); 20 rounds, alternating the within-round order, 4
-warmups and 21 samples per process, plus a base-against-base A/A control in every
+warmups and 21 samples per process, plus a base-against-base control in every
 round.  The machine was otherwise idle.
 
 | statistic | min | p50 | mean | p95 | max |
@@ -10662,7 +10673,7 @@ base-first mean 0.9960, candidate-first mean 1.0041, a 0.8% spread inside the A/
 floor.
 
 **Every declared statistic is at or below 1.10, the largest being 1.0959** — and
-the two rows disagree in a way that should be stated rather than averaged away.
+the two rows disagree, so both are given rather than averaged together.
 On the median statistic the result is a clean null and *better* than the
 inherited candidate: A/B mean 1.0001 against A/A 0.9988, with the A/B maximum
 1.0145 below the A/A maximum 1.0363.  The **per-round** min-of-samples row shows
@@ -10674,18 +10685,18 @@ anywhere is 1.0959 against a 1.10 ceiling — inside it, but with less headroom
 than the inherited 1.0729.
 
 One avoidable constant was identified and **not** taken, because taking it would
-have invalidated the suite and latency runs above with no gate budget left to
-re-run them: ``assemble_function`` now calls ``self._validate()`` and then
+have invalidated the suite and latency runs above with no time left to re-run
+them: ``assemble_function`` now calls ``self._validate()`` and then
 ``signature()``, which validates again, so it performs one redundant validation
 per assembly.  Removing that line is safe (``signature()`` validates before doing
 anything, and the body type-check does not depend on it) and is the first thing
-the next session should do, re-gating suite and latency behind it.
+the next session should do, re-running suite and latency behind it.
 
 ### 52.10 Phase-7 exit audit, re-run
 
 *Migrated families complete over their proven envelopes.*  Yes over the declared
-envelope, and now on stronger evidence for the legacy-comparand half: the ten
-sound cells match a sound legacy route at 60 of 60 configurations each.  The
+envelope, and now on stronger evidence for the legacy half of the comparison: the
+ten sound cells match a sound legacy route at 60 of 60 configurations each.  The
 extension shows rank-6 splits up to ``(0, 5)`` are *admitted*, which is not the
 same as proven, and this section does not claim them.
 
@@ -10698,9 +10709,9 @@ three-way, not two-way.
 *Representation unchanged.*  Yes.  No node kind, no canonical schema change (v11
 stands), no request- or schedule-identity change.
 
-*Release behaviour unchanged.*  Yes, and measured: corpus 20/20 and grid 42/42
-byte-identical, the 86-case audit identical, zero native artifacts, and no
-dispatch, cache, selector or fallback change.
+*Release behaviour unchanged.*  Yes, and measured: 20 of 20 sample programs and
+42 of 42 grid cases byte-identical, the 86-case audit identical, zero native
+artifacts, and no dispatch, cache, selector or fallback change.
 
 *Compiler latency within the declared ceiling.*  See 52.9.
 
@@ -10718,15 +10729,15 @@ was deleted.
 - **Blocker 2 is not built.**  52.6 re-derives it, fixes its migration
   accounting at five reachable cells, identifies
   ``_MultiCompressedAssemblyLowering`` as the host and
-  ``Scheduler.auto_schedule_plan`` as the repair seam, and settles the schema
-  question against the node definitions — but the family, the target extension
-  and the plan repair are not in this tip.  They must still be gated together,
-  for the reason §49.5 gives.
+  ``Scheduler.auto_schedule_plan`` as where the repair belongs, and settles the
+  schema question against the node definitions — but the family, the target
+  extension and the plan repair are not in this tip.  They must still land
+  together, for the reason §49.5 gives.
 - **Blocker 3 is untouched.**  Row-scope dense prefixes at rank >= 3 — a DENSE
   result level bound by a STORED loop, needing the row-scope catch-up against a
-  dynamic parent count at depth — is where §49.5 left it.
-- **No cross-host run.**  Every gate here is the Apple M5 machine.  Scorch does
-  not use MKT as a routine CPU test target, and nothing in this change is
+  parent count only known at run time — is where §49.5 left it.
+- **No cross-host run.**  Every measurement here is the Apple M5 machine.  Scorch
+  does not use MKT as a routine CPU test target, and nothing in this change is
   platform-dependent, but the record should not imply a second host confirmed it.
 
 ## 53. Blocker 2 built: the rank-0 ordered key, its host, and a repaired plan origin (2026-08-11)
