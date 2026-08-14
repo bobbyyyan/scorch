@@ -11661,19 +11661,19 @@ host, and no cross-host run exists.
 
 ## 55. The extended frontier, the eleven cells' arm-invariance, and a read-only Phase-8 cutover census (2026-08-11)
 
-This section opens at inherited committed tip ``6e8e09c`` and **runs the two
+This section starts from committed tip ``6e8e09c`` and **runs the two
 measurements §54.8 named as the next session's opening duties**, then draws the
 read-only Phase-8 cutover/fallback census they are inputs to.  It lands **no
-production change**: ``git diff 6e8e09c..HEAD -- src/ csrc/`` is empty, so
-release neutrality is proven by construction and confirmed by measurement rather
-than argued.
+production change**: ``git diff 6e8e09c..HEAD -- src/ csrc/`` is empty, so the
+generated C++ cannot have changed, and the measurement confirms it rather than
+arguing it.
 
 It also corrects five inherited or prompted claims: the tip's distance from
-origin (55.1), the size of blocker 1's seam (55.3), the measured reach of blocker
-2's repair (55.2), the number of configuration-dependent legacy cells and the
-mechanism behind them (55.4), and the mechanism §53.8 gives for legacy's
-unstructured refusal (55.6).  Sections 49 through 54 are preserved above as
-written.  Where this section contradicts them, this section is correct.
+origin (55.1), the size of blocker 1's refusal boundary (55.3), the measured
+reach of blocker 2's repair (55.2), the number of configuration-dependent legacy
+cells and the mechanism behind them (55.4), and the mechanism §53.8 gives for
+legacy's unstructured refusal (55.6).  Sections 49 through 54 are preserved above
+as written.  Where this section contradicts them, this section is correct.
 
 ### 55.1 The inherited state, re-established by inspection
 
@@ -11696,10 +11696,12 @@ Evidence ledger: ``~/.cache/scorch-codex/phase8-census-frontier-ext/`` (new).
 
 ### 55.2 The 1139-cell frontier extension, run at last
 
-It had been first on the sacrifice list for three consecutive milestones.  It was
-run here against two pinned detached worktrees — base ``bb7f391`` and final
-``6e8e09c`` — with the harness's import-origin assertion active, reading **both**
-LoopPlan exits out of ``LoopPlanDiagnostic.code`` and never message text.
+The frontier is the survey matrix of programs this branch measures the compiler
+over, and extending it had been first on the list of measurements each session
+declared it would skip — for three milestones running.  It was run here against
+two pinned detached worktrees — base ``bb7f391`` and final ``6e8e09c`` — with the
+harness's import-origin assertion active, reading **both** LoopPlan exits out of
+``LoopPlanDiagnostic.code`` and never message text.
 
 | | cells | admitted | defect codes | loop-plan | unclassified | arm-variant |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -11754,7 +11756,7 @@ d -> s`` is a **three-operand vector contraction**, and the remaining ten are
 Blocker 2 admitted twelve cells nobody knew it admitted, in families the declared
 envelope never names, and no differential covers any of them.
 
-One closure the census supplies for those twelve, since it bears on how much they
+One thing the census settles for those twelve, since it bears on how much they
 matter: **they are exactly the twelve quadrant-B cells of 55.5** — the typed
 route admits each one and legacy **refuses** it outright.  The two sets were
 compared as sets and are identical.  So blocker 2's hidden reach carries no
@@ -11767,7 +11769,7 @@ running for blocker 3 -- it needed running for blocker 2, one milestone earlier,
 and the cost of three deferrals is that a repair's admitted set was understated
 by a factor of two and a half for two milestones.
 
-### 55.3 The blocker-1 seam is fourteen cells, not six
+### 55.3 The blocker-1 refusal boundary is fourteen cells, not six
 
 §52.7 decided blocker 1 closed on the ground, among others, that "it buys two
 census cells".  §54.8 and the handoff prompt then instruct the next session to
@@ -11788,9 +11790,9 @@ Zero of them are in the extension.  The fourteen are four groups:
   cells" are the two of these four that appear in the 20-cell legacy census; the
   frontier sees all four.
 - ``TTM sds x {dd,ss,ds,sd} -> dds`` — the four blocker 3 newly delivers to the
-  seam, which is the increment §54.8 correctly identifies.
+  boundary, which is the increment §54.8 correctly identifies.
 - ``TTM ddd x {dd,ss,ds,sd} -> dds`` — four all-dense-operand cells that were
-  already at the seam and are named in neither §52.7 nor §54.8.
+  already refused there and are named in neither §52.7 nor §54.8.
 - ``ddd ijk->k [d]`` and ``ddd ijk->ik [dd]`` — arm 0 only; both are
   arm-variant, which is why arm 1 counts 12.
 
@@ -11863,10 +11865,10 @@ exist, and "fallback" means what legacy does for the cells the typed route
 refuses.  Nothing here creates either.
 
 The census runs all 1139 frontier cells, compile-only, in both automatic arms,
-through **three** columns: the typed route under the automatic origin; the legacy
-comparand under the same empty ``Schedule()``; and the legacy comparand under
-**no requested schedule at all**, which is what production default dispatch
-actually executes and therefore what a fallback would actually run.
+through **three** columns: the typed route under the automatic origin; legacy
+under the same empty ``Schedule()``; and legacy under **no requested schedule at
+all**, which is what production default dispatch actually executes and therefore
+what a fallback would actually run.
 
 **The four cutover quadrants, against legacy DEFAULT dispatch:**
 
@@ -11893,10 +11895,10 @@ the typed route emit the same C++?**  Over the 496 admitted cell-arms:
 | legacy under the same empty ``Schedule()`` | **112** | **344** | 40 |
 | legacy under default dispatch | 105 | 351 | 40 |
 
-**So a cutover is a byte-neutral no-op on 112 of 496 admitted cell-arms and a
-deliberate change of emitted code on 344.**  The differences are structural, not
-cosmetic: on ``ss ij->j [s]`` the typed route emits 2,218 characters where legacy
-emits 2,845, draining the workspace straight into the result and deleting
+**So a cutover changes nothing in the emitted C++ on 112 of 496 admitted
+cell-arms and deliberately changes it on 344.**  The differences are structural,
+not cosmetic: on ``ss ij->j [s]`` the typed route emits 2,218 characters where
+legacy emits 2,845, draining the workspace straight into the result and deleting
 legacy's intermediate ``T0_crd_vec``/``T_val_vec`` materialization and its second
 pass.  That is a better kernel, and the repository already knows it — 
 ``test_loopir_sparse_workspace_target`` asserts ``cpp_source != legacy_cpp`` for
@@ -11917,7 +11919,7 @@ The consequence for Phase 8 is sharp, and it is the census's main product:
 > "generated-code equivalence" warrant does not cover it.**  Those families need
 > per-family correctness evidence (which the 1,944-check differential supplies
 > for the migrated ones and for nothing else) and per-family *performance*
-> evidence (which no gate on this branch has ever collected, because compile-only
+> evidence (which nothing on this branch has ever collected, because compile-only
 > latency measures the compiler, not the kernel).
 
 **Two further census facts, recorded because they are cheap to state and
@@ -11933,8 +11935,8 @@ expensive to rediscover.**
   ``UnsupportedFeature``, and 21 go the other way from ``ValueError`` to
   ``EMITS``.  This is characterization of a surface, not a regression — but it
   means the empty-``Schedule()`` harness measures a route that differs from
-  release default dispatch on more than half the frontier, and neutrality
-  arguments should not move between the two surfaces.
+  release default dispatch on more than half the frontier, and an argument that
+  nothing shipped changes should not move between the two surfaces.
 
 ### 55.6 Carried item (a), decided: the unstructured refusal is not repair-induced
 
@@ -11970,18 +11972,18 @@ in the lock itself.
 
 ### 55.7 Verification
 
-All gates ran in the ``scorch`` conda environment on the Apple M5 development
-machine.  **No production file changed**, which is the strongest form of the
-release-neutrality claim and is stated first because it makes several gates
-confirmatory rather than load-bearing.
+Everything below ran in the ``scorch`` conda environment on the Apple M5
+development machine.  **No production file changed**, which is the strongest form
+of the claim that nothing shipped changes, and is stated first because it makes
+several checks confirmatory rather than load-bearing.
 
-**Release neutrality against ``6e8e09c``: byte-identical, and this time proven
-twice over.**  ``git diff 6e8e09c..3b6b24f -- src/ csrc/`` is **empty**, so
-identical source cannot produce different output; the measurement is
-confirmation, not the argument.  Both arms are clean detached worktrees.  The
-20-source corpus is 20/20 with no differing file, the 42-source ``ss@dd`` grid is
-42/42 with no differing file, and the 86-case schedule audit reports
-``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides and is
+**The generated C++ is unchanged from ``6e8e09c``, and this time proven twice
+over.**  ``git diff 6e8e09c..3b6b24f -- src/ csrc/`` is **empty**, so identical
+source cannot produce different output; the measurement is confirmation, not the
+argument.  Both arms are clean detached worktrees.  Compiling the 20 sample
+programs gives 20 of 20 identical files, the 42-case ``ss@dd`` grid gives 42 of
+42 identical files, and the 86-case run through the explicit scheduling path
+reports ``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides and is
 identical between them.  mypy is **hash-identical** (146 lines, same SHA-256) and
 so is flake8 (47 lines, same SHA-256).  black's stdout is identical and empty;
 its stderr differs **only in the tree-path prefix** — the same 15 pre-existing
@@ -12034,12 +12036,12 @@ this session changes, because this session changed no production behaviour.
 what a measurement-only change looks like, and running the suite is what
 distinguishes the two rather than asserting it.
 
-**Gates 1 and 2 are read out of those same JUnit XMLs** rather than from a
+**Checks 1 and 2 are read out of those same JUnit XMLs** rather than from a
 separate invocation, which is stricter: the suite ran every module exactly once
-at one revision, so the two gates cannot disagree with the suite total.  Gate 1,
+at one revision, so the two cannot disagree with the suite total.  Check 1,
 the five target files — both hosts, the row-scope module, the bound-prefix module
 and the rank-2 row-scope precedent: **522 nodes, 521 passed, 0 failed, 0 errors,
-1 skipped** (§54.6's 495/494/1 plus this session's 27).  Gate 2, the eleven
+1 skipped** (§54.6's 495/494/1 plus this session's 27).  Check 2, the eleven
 adjacent memberships: **1,180 nodes, 1,180 passed, 0 failed, 0 errors, 0
 skipped** — identical to §54.6, as it must be for an unchanged production tree.
 
@@ -12054,7 +12056,7 @@ this branch is **1.10**.  Base is the detached worktree at ``6e8e09c``; the cand
 the final code tip ``3b6b24f``.  Each measurement is a fresh subprocess importing exactly
 one source tree and timing the same 40-cell ordered-key compile-only grid (no JIT, no C++
 compiler); 20 rounds alternating the within-round order, 4 warmups and 21 samples per
-process, plus a base-against-base A/A control in every round.  The grid checksum is
+process, plus a base-against-base control in every round.  The grid checksum is
 asserted equal across all three measurements of every round -- **141162 over 40 cells, in
 all 60 measurements**, the same value §54.6 recorded, which is what an unchanged
 production tree requires.  It ran ALONE: the suite, the census and the sweep had all
@@ -12077,12 +12079,12 @@ largest anywhere is 1.0301.**  Headroom against the ceiling is ~6.7%.
 correspondingly simple.**  On both rows the A/B maximum sits *below* its A/A counterpart
 (1.0133 against 1.0301; 1.0124 against 1.0259), and the A/B mean is **0.9993** -- below
 unity.  That is exactly what should happen, because **the two trees' ``src/`` are
-byte-identical**: this comparison is structurally an A/A, and what it measures is this
-machine's noise floor rather than a cost of this change.  It is reported that way rather
-than presented as a passed cost gate.  Its value to the next session is the calibration:
-on this host, a 40-cell compile-only grid carries roughly +-1.5% round-to-round noise at
-the median and about +-1.3% at the min-of-samples statistic, so any future A/B under
-about 1.03 is indistinguishable from nothing.
+byte-identical**: this comparison is structurally the same binary against itself, and
+what it measures is this machine's noise floor rather than a cost of this change.  It is
+reported that way rather than presented as a cost check that passed.  Its value to the
+next session is the calibration: on this host, a 40-cell compile-only grid carries
+roughly +-1.5% round-to-round noise at the median and about +-1.3% at the min-of-samples
+statistic, so any future A/B under about 1.03 is indistinguishable from nothing.
 
 ### 55.8 Phase-7 exit audit, re-run against this tip
 
@@ -12100,8 +12102,8 @@ differential covers at all**, which is admission and not verified correctness �
 the strongest form the question has ever been answered in** — over **1139**
 cells rather than 748, in both automatic arms, reading both LoopPlan exits: 652
 defect codes, 239 loop-plan diagnostics, **zero unclassified**, and no loop-plan
-cell carrying a ``defect`` attribute.  The fourteen cells at blocker 1's seam
-each keep a structured code.
+cell carrying a ``defect`` attribute.  The fourteen cells refused at blocker 1's
+boundary each keep a structured code.
 
 *Representation unchanged.*  **Yes.**  v11 stands; no node kind, no canonical
 schema, no request- or schedule-identity change — trivially, because no
@@ -12112,9 +12114,9 @@ production file changed.
 produce different output; the corpus, grid and audit confirm it.
 
 *Compiler latency within the declared ceiling.*  **Yes** — see 55.7.  The
-comparison is structurally an A/A (the two trees' ``src/`` are byte-identical),
-so what it measures is this machine's noise floor rather than a cost of this
-change, and it is reported that way.
+comparison is structurally the same binary against itself (the two trees'
+``src/`` are byte-identical), so what it measures is this machine's noise floor
+rather than a cost of this change, and it is reported that way.
 
 *The declared matrix is closed.*  **Yes**, unchanged from §54.7: blocker 2 built,
 blocker 3 built, blocker 1 closed by decision.  55.3's correction resizes the
@@ -12135,20 +12137,21 @@ the question it was commissioned to answer.  Three findings block it, each
 measured here:
 
 1. **The cutover is not equivalence-preserving where it matters.**  Of 496
-   admitted cell-arms it is byte-neutral on **112** — essentially exactly the
-   dense receivers — and changes emitted code on **344**.  Every sparse-receiver
-   family is on the changed side.  The branch's warrant is generated-code
-   equivalence; for those families a cutover forfeits it deliberately, and would
-   need per-family correctness evidence (the differential covers the migrated
-   families and **113 admitted cells have none**) plus per-family **kernel**
-   performance evidence, which **no gate on this branch has ever collected** —
-   compile-only latency measures the compiler, not the emitted kernel.
+   admitted cell-arms it changes nothing in the emitted C++ on **112** —
+   essentially exactly the dense receivers — and changes it on **344**.  Every
+   sparse-receiver family is on the changed side.  The branch's warrant is
+   generated-code equivalence; for those families a cutover forfeits it
+   deliberately, and would need per-family correctness evidence (the differential
+   covers the migrated families and **113 admitted cells have none**) plus
+   per-family **kernel** performance evidence, which **nothing on this branch has
+   ever collected** — compile-only latency measures the compiler, not the emitted
+   kernel.
 2. **The fallback cannot be certified.**  703 of 1139 cells would fall back to
    legacy.  Legacy's behaviour there is characterized for 21 cells, and 55.4
    shows four of those are **data-dependent** — sound on a sparse draw, unsound
    at the same shape on a denser one.  A fallback census cannot establish
    soundness for such cells by any finite sweep; it can only fail to refute it.
-3. **One host.**  Every gate in §§49-55 is the Apple M5 machine, and the
+3. **One host.**  Every check in §§49-55 is the Apple M5 machine, and the
    cross-host run is blocked on interactive authentication rather than declined
    (55.10).  A decision about release behaviour on a generated-code-equivalence
    branch should not rest on one host, and this is the fourth consecutive
@@ -12168,7 +12171,7 @@ evidence that does not exist yet.
   one.  The census is read-only and the two commits are test and documentation.
 - **Blocker 1 stays closed by decision.**  55.3 resizes its hole from the numbers
   §52.7 and §54.8 state; it does not reopen the decision.
-- **The dense-domain assembly seam is untouched**, as instructed: ``ds ij->i``,
+- **The dense-domain assembly refusal is untouched**, as instructed: ``ds ij->i``,
   ``dss ijk->i`` and ``TTM sds x * -> dss`` stay refused, and whether a
   COMPRESSED result level may be driven by a dense domain remains a design
   decision for Bobby.
@@ -12187,8 +12190,8 @@ evidence that does not exist yet.
 
 ## 56. The cross-host run: three hosts, zero divergence, and the comparand the cutover question turns on (2026-08-11)
 
-This section opens at inherited committed tip ``c13b45c`` and takes **carried
-item (b)** — the cross-host run that §§52–55 recorded as blocked rather than
+This section starts from committed tip ``c13b45c`` and takes **carried item
+(b)** — the cross-host run that §§52–55 recorded as blocked rather than
 declined.  Bobby unblocked both ``redwood`` and the MKT allocation, so it ran.
 It is a **read-only measurement session**: no production file changed, no
 dispatch, cache, selector or fallback was touched, no legacy code deleted, and
@@ -12197,19 +12200,20 @@ no cutover or shadow pilot was started.
 Sections 49 through 55 are preserved above as written.  Where this section
 contradicts them, this section is correct.
 
-### 56.1 What the single-host caveat actually was
+### 56.1 What the single-host limit actually was
 
-Every gate in §§49–55 ran on one machine — the Apple M5.  §54.8 stated the limit
+Every check in §§49–55 ran on one machine — the Apple M5.  §54.8 stated the limit
 plainly ("one further limit that no amount of local work removes"), and §55.9
 promoted it to the top of the next session's duties on the grounds that if the
 1139-cell dispositions and the byte-equivalence split fail to reproduce on
 another host, "that is the most important thing anyone could learn about this
 branch".
 
-The caveat is not idle worry.  The frontier and census read their dispositions
-off exception types and defect codes produced by a Python compiler pipeline, and
-the equivalence census compares *generated C++ text*.  Anything host-dependent
-in that chain — dictionary or set iteration order leaking into emitted names, a
+The concern is not idle.  The frontier — the survey matrix of programs this
+branch measures the compiler over — and the census read their dispositions off
+exception types and defect codes produced by a Python compiler pipeline, and the
+equivalence census compares *generated C++ text*.  Anything host-dependent in
+that chain — dictionary or set iteration order leaking into emitted names, a
 ``torch`` version changing a dtype or shape inference result, a platform branch
 in the ABI or policy layer, floating-point formatting in an emitted literal —
 would show up as a different code or a different digest.
@@ -12232,7 +12236,7 @@ the dependency the pipeline actually consults for dtypes, shapes and the
 extension ABI, and an eight-minor-version gap is a far more aggressive test than
 a second Linux box would have been.
 
-### 56.3 Provenance, established rather than asserted
+### 56.3 Provenance: how we know all three hosts measured the same source
 
 - **The measured source is the same source on all three.**  ``redwood`` runs a
   pinned detached ``git worktree`` at ``c13b45c``, clean; ``mkt1`` runs a
@@ -12284,15 +12288,15 @@ worth stating separately, because each was previously single-host:
 - The four cutover quadrants **A 228 / B 20 / C 703 / D 188** reproduce exactly.
 - The **662-cell** empty-``Schedule()``-is-not-identity result reproduces exactly,
   including its per-transition breakdown.
-- The byte-equivalence split reproduces exactly on **both** comparands.
+- The byte-equivalence split reproduces exactly on **both** comparison baselines.
 
-**The single-host caveat carried by §§49–55 and named as duty 1 by §55.9 is
-discharged.**  Generated-code equivalence on this branch is not an artifact of
-the M5, of macOS, of clang, of arm64, or of one torch version.
+**The single-host limit carried by §§49–55 and named as duty 1 by §55.9 is
+therefore removed.**  Generated-code equivalence on this branch is not an
+artifact of the M5, of macOS, of clang, of arm64, or of one torch version.
 
-### 56.5 A correction that the second comparand forces: the number is 105, and the set is exact
+### 56.5 A correction the second comparison baseline forces: the number is 105, and the set is exact
 
-§55.5 reports the byte-equivalence split against two comparands, in a table, and
+§55.5 reports the byte-equivalence split against two baselines, in a table, and
 both numbers reproduce on all three hosts:
 
 | comparand | byte-identical | different | legacy refuses |
@@ -12311,9 +12315,9 @@ That is the wrong row for that conclusion, **by §55.5's own rule**.  The same
 section establishes that an empty ``Schedule()`` is not identity on the legacy
 path — it changes legacy's outcome on 662 of 1139 cells — and concludes that
 "neutrality arguments must not migrate between that surface and release default
-dispatch".  A cutover changes what **default dispatch** emits.  So the
-cutover-relevant comparand is the second row, and the honest headline number is
-**105**, not 112.
+dispatch".  A cutover changes what **default dispatch** emits.  So the row a
+cutover turns on is the second, and the honest headline number is **105**, not
+112.
 
 Measured, the correction makes the finding **stronger and exact** rather than
 weaker.  Exactly **7 cell-arms** separate the two rows, and the reverse direction
@@ -12328,8 +12332,8 @@ is empty (nothing is default-identical without being empty-identical):
 | ``matmul MM ds x dd -> dd`` arm1 | dd |
 
 **The two cells §55.5 had to name as exceptions to its own dense-receiver rule
-are exactly the sparse-receiver members of the 7.**  Drop to the correct
-comparand and they drop out with it:
+are exactly the sparse-receiver members of the 7.**  Drop to the correct row and
+they drop out with it:
 
 - the **112** has receiver formats ``{d: 87, dd: 21, ss: 2, ds: 2}`` — **4
   sparse-receiver cell-arms**, which is why §55.5 needed the word "essentially"
@@ -12339,7 +12343,7 @@ comparand and they drop out with it:
 
 So the census's main product should be stated without the hedge:
 
-> **Against the comparand a cutover actually moves, the typed route is
+> **Against the baseline a cutover actually moves, the typed route is
 > byte-identical to legacy on exactly the dense-receiver cell-arms — 105 of 496 —
 > and on no sparse-receiver cell-arm at all.**
 
@@ -12368,7 +12372,7 @@ strength of an empty-``Schedule()`` byte match.
   never this working tree, and both independently reproduce the same ``src/``
   manifest digest.
 - **The Phase-8 cutover verdict is unchanged: NO-GO.**  56.4 removes the
-  single-host caveat, which was a *reason to distrust the census*, not one of the
+  single-host limit, which was a *reason to distrust the census*, not one of the
   census's reasons to refuse a cutover.  Those are untouched: 703 fallback cells
   resting on a legacy characterized for 21, four of them data-dependent; 344
   cell-arms whose emitted code changes; and no kernel-runtime harness anywhere on
@@ -12380,8 +12384,7 @@ strength of an empty-``Schedule()`` byte match.
   the three census harnesses were.  The sweep's value is a claim about *legacy's*
   soundness, which 55.4 has already shown is data-dependent and therefore not
   certifiable by adding hosts; the full suite is a claim about *this tree*, worth
-  running on x86 but not a census input.  Both are stated as not run rather than
-  folded into the reproduction claim.
+  running on x86 but not a census input.  Both are stated as not run.
 - **Latency was not measured cross-host**, and should not be read into these
   runs: wall-clock differed widely (frontier 10.6 s on redwood; the whole MKT job
   1m56s) and nothing here is a paired A/B.
