@@ -14,6 +14,161 @@ explicit schedules through `CompileOptions`/`CompilationContext`.  It builds
 on the Phase-5 review (`COMPILER_IR_REFACTOR_PHASE5_REVIEW.md`, including
 its §8 corrections) and leaves the closed Phase-3.5/4/5 reviews unchanged.
 
+## 0. What the words in this document mean (added 2026-08-13)
+
+Sections 1 through 60 were written across many sessions and grew a private
+vocabulary along the way.  A rewording pass on 2026-08-13 rewrote some of those
+sections in plain English and deliberately left others alone.  This section is
+the dictionary for the parts left alone, and for the file and key names on disk,
+which keep the old words permanently because renaming them would break the
+record they are part of.
+
+That pass changed prose only.  It changed no number, no claim, no code
+identifier, no test name and no cross-reference, and it fixed nothing: where a
+sentence looked wrong it was left wrong and reported to Bobby separately.  These
+documents are a dated record of what was measured, and a rewording pass that
+quietly became a content revision would destroy the only thing they are for.
+
+### 0.1 The vocabulary
+
+| word | what it means |
+| --- | --- |
+| gate | a check a milestone has to pass, run once and reported with its numbers |
+| green | every check in a named set passed |
+| release neutrality | proof that a change does not alter the C++ that ships to users: a fixed set of programs is compiled before and after the change and the generated source compared byte for byte |
+| the frontier | the survey matrix of programs the compiler is measured over, each compiled in both automatic scheduler settings, recording what the new pipeline accepts and what it refuses and with which error.  The sealed receipt holds 1,139 records over 1,138 distinct programs; §60.10 explains the one duplicate.  §52.5 first ran it at that size, and §55.2 ran the same matrix against two pinned trees |
+| cell | one program of that matrix — an operand format combination, an einsum expression, and a result format (see 0.2) |
+| cell-arm | one cell compiled under one of the two automatic scheduler settings, so a count in cell-arms is up to twice the same count in cells |
+| arm, arm 0, arm 1 | the two automatic scheduler settings every frontier and census run covers.  Arm 0 is register blocking off and arm 1 is register blocking on — ``CompileOptions.with_regblock_enabled(False)`` and ``(True)``, the two halves of the production ``regblock_dual`` path |
+| arm-invariant | produces the same result in both of those settings |
+| the declared 748 | the original 748-cell subset of the matrix, the one the earlier milestones measured and quoted their numbers over |
+| the extension | the 391 cells added to the matrix later, across five axes the record names; 748 plus 391 is the 1139 the later sections use |
+| receiver | the result tensor a program assembles into.  A "dense receiver" is one whose result format is all dense, which needs no assembly and no workspace drain; a "sparse receiver" has at least one compressed result level, which is where the new pipeline's own assembly code lives |
+| seam | a boundary rule that refuses a whole class of programs, and by extension the code site that raises the refusal |
+| seam lock | a test asserting that a named program is still refused, at a named error code |
+| ledger | an evidence folder under ``~/.cache/scorch-codex/`` (0.3 lists them) |
+| sealed | written into a ledger together with a ``SHA256SUMS`` file, so a later session can prove the file it reads is the file that was written |
+| receipt | one JSON file of raw per-record results inside a ledger.  Sections quote them, and where a section and its receipt disagree the receipt is the record |
+| typed route | the new compiler pipeline — normalized CIN, then ``LoopPlan``, then LoopIR, then LLIR — entered through ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` |
+| legacy | the old pipeline, the one that ships today |
+| comparand | whatever a measurement compares the typed route against.  Which one is chosen matters: legacy under an empty ``Schedule()``, legacy under no requested schedule at all, and production's own ``scorch.einsum`` entry are three different comparands that disagree, and §§55.5, 56.5, 57.2 and 57.3 are largely about that |
+| census | a compile-only sweep over many cells recording an outcome per cell rather than timing anything |
+| quadrant A/B/C/D | the four combinations of "the new pipeline accepts or refuses" against "the old pipeline emits or refuses", tabulated in §55.5 |
+| probe | a throwaway experiment, often in a scratch worktree with a sentinel error code installed, run to measure how far a rule reaches |
+| battery | the dedicated test file that proves one migrated family end to end |
+| corpus, grid | fixed sets of programs reused across milestones so numbers stay comparable: the 20-source corpus, the 42-source ``ss@dd`` grid, the 86-case schedule audit, the production emission corpus |
+| lean sweep, heavy sweep | a narrower or wider grid of measurement configurations.  Twice on this branch a lean sweep missed configuration-dependent behaviour that the heavy version found (§52.8 corrected by §55.4, and §57.4's own first draft) |
+| A/A control | the same binary measured against itself on the same grid, which is how the noise floor is established.  Every performance claim on this branch is judged against its own A/A control rather than a fixed ratio |
+| oracle | the LoopIR interpreter, used as an independent semantic reference for what a program should compute |
+| differential | a test that runs two routes on real tensors and compares their results |
+| erasure | ``erase_schedule``, which undoes an applied schedule; a family is expected to erase back to the program it started from |
+| envelope | the set of program families a milestone claims to have migrated and proven, as against the ones it merely admits |
+| fail closed | refuse with a structured, named error instead of continuing.  Standard vocabulary, kept |
+| GO, NO-GO | the verdict of a phase-exit audit, which is six named questions here |
+| the sacrifice list | measurements a session declared it was not going to run, with its reasons; the frontier extension sat on it for three milestones |
+| carried item | an owed measurement handed from one session to the next, lettered (a), (b) |
+| attack matrix | a list of deliberate tampering attempts, each one a committed test that must fail closed and must also prove its tamper landed |
+| the seal | §50.2, where the ordered-workspace completion contract was fixed and recorded |
+| protected tracked files | five files a session must leave alone; their hashes are checked against ``statics/protected-hashes.txt`` before and after |
+| strangler migration | building the new pipeline beside the old one and moving families over one at a time, rather than switching everything at once |
+
+### 0.2 How a cell is named, and what the three blockers are
+
+A cell name is the program, spelled the way the harnesses spell it.
+``ss ij->j [s]`` is a rank-2 operand compressed in both modes, reduced over
+``i``, into a result whose one mode is compressed.  ``d`` is a dense level and
+``s`` a compressed one, so ``ddd ijk->ik [dd]`` is an all-dense rank-3 operand
+into an all-dense rank-2 result.  Multi-operand programs are written out:
+``TTM dss x ss -> dss`` is a tensor-times-matrix contraction, ``MM ds x ds ->
+ds`` a matrix multiply, ``3-factor sss x d x d -> s`` a three-operand
+contraction, and ``ss+ss ij->i [s]`` and ``ss*ss ij->i [s]`` are a union and an
+intersection of two operands.  Family names (``rank3``, ``rank4``,
+``degenerate2``, ``matmul``, ``ttm``, ``union2``, ``nonadd-combiner``) are the
+harness's own grouping and appear as the ``family`` field of every receipt.
+
+Blockers 1, 2 and 3 are referred to by number hundreds of times.  They are the
+three named obstacles §49.5 left standing:
+
+1. **Blocker 1** — a program whose automatic plan carries both a sparse
+   accumulation workspace and an affine tile.  No replay contract exists for
+   that combination, so it stops at ``unsupported_schedule_auto_family``.  Its
+   family is ``TTM * -> dds``.  §52.7 closed it by decision; §55.3 measured its
+   real size; §57.4 and §57.5 reopened and fixed it in the layer where the tile
+   was illegal.
+2. **Blocker 2** — a reduction whose ordered workspace key is empty (``K == 0``,
+   scalar accumulation), which the representation had no node for.  Blocked at
+   ``sparse_parent_dominance`` through the automatic reorder.  Built in §53.
+3. **Blocker 3** — a dense result prefix level bound by a stored loop, which
+   needs the row-scope catch-up against a parent count only known at run time.
+   Refused up front with ``unsupported_sparse_output_domain``.  Built in §54.
+
+### 0.3 The words that live on disk and cannot be renamed
+
+Evidence folders and the keys inside their receipts keep the old vocabulary
+permanently: a section can be reworded, a sealed file cannot.  Ledgers sit under
+``~/.cache/scorch-codex/``; the ones the recent sections read are
+``phase8-census-frontier-ext/`` (the frontier extension, the census, the heavy
+legacy sweep, the suite and latency runs), ``crosshost-phase8-census/`` (the
+same three censuses re-run on ``redwood`` and ``mkt1``),
+``orderedkey-completion-seal/``, ``orderedkey-abi-signature-window/``,
+``orderedkey-postassembly-window/``, ``boundprefix-blocker2/``,
+``kernelperf-step0/`` (the first kernel-runtime harness),
+``blocker1-legacy-soundness/``, ``blocker1-tilefix/``,
+``compressed-prefix-reach/``, ``dense-domain-semantics/``,
+``ttm-density-mechanism/``, ``ttm-parallel-singlepass/`` and
+``assembly-strategy/``.  Every harness in them takes a tree root or ledger root
+as ``$1``.
+
+The recorded outcome of one cell is its ``route``, and the words in that field
+are the ones the tables use:
+
+- ``ADMITTED`` — the typed route compiled the program;
+- ``EMITS`` — legacy produced generated source for it;
+- a refusal, recorded as its exception class plus a defect code, for example
+  ``LoopIRTargetError/unsupported_assembly_host``;
+- ``unclassified`` — a refusal carrying no structured code, which is the thing
+  the fail-closed gate counts and requires to be zero.
+
+Receipt field names worth knowing before reading a table: ``family`` and
+``name`` identify the cell; ``arm0``/``arm1`` and ``arm`` carry the scheduler
+setting; ``arm_invariant``, ``kind`` (``defect_code``, ``loop_plan_diagnostic``,
+``unclassified``) and ``carries_defect_attr`` carry the disposition;
+``typed_digest``, ``typed_chars``, ``legacy_default``, ``legacy_default_same``,
+``legacy_empty`` and ``legacy_empty_same`` carry the byte-equivalence
+comparison; ``loopir_failed`` and ``loopir_ref_mismatch`` carry the heavy
+sweep's correctness result; ``storage_agrees``, ``ref_match``, ``ratios``,
+``aa``, ``aa_min``, ``aa_max`` and ``nthreads`` carry the runtime grids.  In the
+test suite's own 20-name matrix the labels are ``MIGRATED``,
+``AUTO_TILE_BLOCKED`` and their siblings.
+
+### 0.4 What the rewording pass rewrote, and what it left as it is
+
+Left in the original vocabulary on purpose, and covered by the table above
+instead:
+
+- the superseded sections of ``COMPILER_IR_REFACTOR_HANDOFF.md``.  That file is
+  an append-only log; its older entries are historical record and the tail is
+  current status.
+- ``HANDOFF.md``, the older and separate file.
+- ``COMPILER_IR_REFACTOR_PHASE3_5_REVIEW.md``,
+  ``COMPILER_IR_REFACTOR_PHASE4_REVIEW.md`` and
+  ``COMPILER_IR_REFACTOR_PHASE5_REVIEW.md``, all closed.
+
+Rewriting closed history is not worth the risk of disturbing a number.
+``NEXT_SESSION_PROMPT.md`` was stale and superseded, and was deleted rather than
+reworded.
+
+What the pass did rewrite, in this order: ``COMPILER_IR_REFACTOR_DESIGN.md`` in
+full; this file from §60 backwards toward §1; and the current tail of
+``COMPILER_IR_REFACTOR_HANDOFF.md``.  Each step is its own commit, so
+``git log --oneline -- COMPILER_IR_REFACTOR_PHASE6_REVIEW.md`` shows how far it
+got, and any section still written in the old vocabulary is one the pass did not
+reach.  The check that it changed nothing but words is
+``docs-plain-english/harness/doc_invariants.py``, which extracts every number,
+code span, identifier, section reference and table shape from a document and
+compares the sets before and after; its captures and their comparison output are
+sealed beside it.
+
 ## Verdict
 
 **The Phase-6 explicit-schedule vertical milestone is complete for the
