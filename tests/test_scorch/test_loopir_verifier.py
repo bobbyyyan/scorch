@@ -724,6 +724,8 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "parallel_race",
     # Physical position-load code added by the Phase-7 mixed-operand slice.
     "position_load_mismatch",
+    # Assembly-strategy legality code added by the Phase-7 assembly slice.
+    "unsupported_assembly_strategy",
 }
 
 
