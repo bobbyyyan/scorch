@@ -591,6 +591,285 @@ class _ResultWriteRewriter(LLIRRewriter):
         return self._identity.rewrite_function(node, path)
 
 
+@dataclass(frozen=True)
+class _ResidueFinding:
+    """One surviving reference to storage the pass was supposed to remove."""
+
+    node_type: str
+    field: str
+    spelling: str
+    kind: str
+    path: LLIRPath
+
+    def describe(self) -> str:
+        location = "/".join(str(part) for part in self.path)
+        return f"{self.node_type}.{self.field} = {self.spelling!r} ({self.kind}) at {location}"
+
+
+class _ResultStorageResidueWalker(LLIRWalker):
+    """Find every surviving reference to this result's own bare storage.
+
+    This is the pass's postcondition, and it asks a different question than
+    ``_touches_result_storage`` does.  That guard asks, of an input statement,
+    "is this a result write I know how to rewrite" -- so it can only refuse a
+    shape someone anticipated, and a helper receiving a result array as an
+    ARGUMENT or a ``MemberCallStmt`` on one is invisible to it.  This asks, of
+    the OUTPUT, "does any reference to the removed storage survive" -- which is
+    a question about names, not about statement shapes, so a spelling nobody
+    anticipated is caught by construction.
+
+    **Why "no result storage survives" is well formed rather than vacuous.**
+    The fill phase legitimately emits stores INTO the result's storage;
+    ``_ResultWriteRewriter._store`` is their one constructor.  What separates
+    those from residue is that the two vocabularies are disjoint by spelling:
+
+    * every reference this pass CONSTRUCTS is either an exactly-sized pointer
+      suffixed ``_data`` (``_store``'s three array names) or a count/fill state
+      scalar (``_cnt{L}``, ``_pos{L}``, ``_prev{L}``, ``_base{L}``, from
+      ``_phase_state`` and ``_phase_index``);
+    * every reference it is supposed to have REMOVED is a bare vector name
+      (``{R}_values``, ``{R}{L}_pos``, ``{R}{L}_crd``) or a running cursor into
+      one (``p{R}{L}``).
+
+    So this check exempts nothing.  The pass's own emissions fall outside the
+    watched set because of how they are spelled, not because they are on an
+    allow-list -- which is what keeps the separation from rotting: were a later
+    edit to make the pass construct a bare-name reference, this check would
+    report it rather than wave it through.
+
+    The two removed vocabularies are checked at different breadths, and
+    ``_check_cursor_statement`` gives the reason: an array name is checked
+    wherever it appears, a cursor only where the pass has a rewrite for it.
+
+    **Why a surviving READ is a defect too, not an over-refusal.**  The
+    surrounding transform removes the declarations of exactly these names from
+    the region this output lands in -- ``compressed_where_openmp_pass``'s
+    ``_should_drop_prefix_statement`` drops the ``VarDecl`` for ``{R}_values``,
+    ``{R}{L}_pos`` and ``{R}{L}_crd``, the ``DirectInit`` for ``{R}{L}_pos``
+    and the ``VarInit`` for ``p{R}{L}``.  In the pass's output those names do
+    not exist, so a reference to one is a dangling reference whether it reads
+    or writes.  ``{R}{L}_crd.size`` as an index and ``{R}{L}_pos.back`` in the
+    boundary condition are both legal in the INPUT and both a defect in the
+    output, and the check reports the position rather than trying to decide
+    from the member name which it is.
+
+    Subclassing the shared walker rather than descending named body fields is
+    deliberate: it reaches expression positions as well as statements, reaches
+    every body region the walker knows including ``_hoisted_ptr_decls`` and an
+    ``IfThenElse``'s ``then_body_list``, and fails closed on an LLIR node type
+    the walker does not support instead of silently not descending into it.
+    """
+
+    def __init__(self, context: ResultWriteContext) -> None:
+        super().__init__(context.traversal)
+        self._result_id = context.result_id
+        arrays = {f"{context.result_name}_values"}
+        for level in context.compressed_levels:
+            arrays.add(f"{context.result_name}{level}_pos")
+            arrays.add(f"{context.result_name}{level}_crd")
+        self._arrays = frozenset(arrays)
+        self._cursors = frozenset(
+            f"p{context.result_name}{level}" for level in context.compressed_levels
+        )
+        self.findings: List[_ResidueFinding] = []
+
+    def _flag(
+        self,
+        node: llir.Node,
+        path: LLIRPath,
+        field: str,
+        spelling: str,
+        kind: str,
+    ) -> None:
+        self.findings.append(
+            _ResidueFinding(
+                node_type=type(node).__name__,
+                field=field,
+                spelling=spelling,
+                kind=kind,
+                path=path,
+            )
+        )
+
+    def _check_name(
+        self, node: llir.Node, path: LLIRPath, field: str, value: object
+    ) -> None:
+        """One name field, in either spelling a reference to an array takes.
+
+        Exact membership catches a plain reference.  A ``{name}.`` prefix
+        catches the spelling that carries its receiver inside the name --
+        ``Result1_crd.push_back`` writing, ``Result1_crd.size`` reading -- and
+        this pass sees both in ``FunctionCallStmt.name``, in
+        ``FunctionCall.name`` and, in at least one lowering, inside a ``Var``
+        name.  The prefix must include the dot: the pass's own
+        ``{R}{L}_crd_data`` pointers share the bare name's first characters and
+        are not references to it.
+        """
+
+        if type(value) is not str:
+            return
+        if value in self._arrays:
+            self._flag(node, path, field, value, "bare result array")
+            return
+        for name in self._arrays:
+            if value.startswith(f"{name}."):
+                self._flag(
+                    node,
+                    path,
+                    field,
+                    value,
+                    f"reference to the removed {name}",
+                )
+                return
+
+    def _check_cursor_statement(
+        self, node: llir.Node, path: LLIRPath, var: object
+    ) -> None:
+        """A running position cursor bumped or initialized as a statement.
+
+        The cursors are checked in these two statement positions only, and NOT
+        wherever their name appears, which is the one place this check is
+        narrower than it is for the arrays.  The reason is a real difference
+        between the two: an array's declaration is always dropped by the
+        surrounding transform, so any reference to one is dangling, whereas a
+        cursor can be BOUND locally by the header of the loop that walks it
+        (``for (pC1 = 0; pC1 < n; pC1++)``), and a reference to a
+        locally-bound cursor is well formed.  A loop header is also a position
+        the rewriter structurally cannot reach, since ``ForLoop.init`` and
+        ``ForLoop.update`` are rewritten as loop fields rather than dispatched
+        through ``rewrite_statement_sequence_member``.
+
+        ``Increment`` and ``VarInit`` as sequence members are exactly the two
+        forms the pass DOES have a rewrite for -- ``_rewrite_increment_statement``
+        turns the bump into ``_pos{L}`` in fill mode and drops it in count, and
+        ``_rewrite_var_init_statement`` drops the declaration -- so one
+        surviving there means the fill body's position bookkeeping never
+        advances, which is silent wrongness rather than dead code.  This is the
+        same coverage the F-weak prototype had for the cursors, kept
+        deliberately rather than widened.
+        """
+
+        if path and path[-1] in ("init", "update"):
+            return
+        name = getattr(var, "name", None)
+        if type(name) is str and name in self._cursors:
+            self._flag(node, path, "var", name, "running position cursor")
+
+    def _check_metadata(self, node: llir.Node, path: LLIRPath) -> None:
+        """The typed axis: this result's ``RESULT_WRITE`` marker surviving.
+
+        ``_is_result_value_target`` already recognizes the workspace drain's
+        value store by this marker rather than by name, so a marked reference
+        surviving the rewrite is residue by the pass's own definition: in count
+        mode the store should have been dropped, and in fill mode the
+        replacement ``_store`` builds carries no metadata at all.
+        """
+
+        metadata = getattr(node, "tensor_access", None)
+        if type(metadata) is not llir.TensorAccessMetadata:
+            return
+        if metadata.role is not llir.TensorAccessRole.RESULT_WRITE:
+            return
+        if metadata.tensor_id != self._result_id:
+            return
+        self._flag(
+            node,
+            path,
+            "tensor_access",
+            llir.TensorAccessRole.RESULT_WRITE.value,
+            "surviving result-write marker",
+        )
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        node_type = type(node)
+        if node_type is llir.Var:
+            self._check_name(node, path, "name", cast(llir.Var, node).name)
+            self._check_metadata(node, path)
+        elif node_type is llir.ArrayAccess:
+            self._check_metadata(node, path)
+        elif node_type is llir.FunctionCall:
+            self._check_name(node, path, "name", cast(llir.FunctionCall, node).name)
+        elif node_type is llir.FunctionCallStmt:
+            self._check_name(node, path, "name", cast(llir.FunctionCallStmt, node).name)
+        elif node_type is llir.QualifiedName:
+            qualified = cast(llir.QualifiedName, node)
+            self._check_name(node, path, "name", qualified.name)
+            self._check_name(node, path, "namespace", qualified.namespace)
+        elif node_type is llir.FixedStackArrayDecl:
+            self._check_name(
+                node, path, "name", cast(llir.FixedStackArrayDecl, node).name
+            )
+        elif node_type is llir.Increment:
+            self._check_cursor_statement(node, path, cast(llir.Increment, node).var)
+        elif node_type is llir.VarInit:
+            self._check_cursor_statement(node, path, cast(llir.VarInit, node).var)
+        elif node_type is llir.RawStmt:
+            code = cast(llir.RawStmt, node).code
+            if type(code) is str:
+                for name in self._arrays:
+                    if _mentions_identifier(code, name):
+                        self._flag(node, path, "code", name, "verbatim C++ mention")
+        # ``Comment`` carries prose, and a comment naming an array writes
+        # nothing; refusing one would be a formatting rule wearing a
+        # correctness check's clothes.  ``Function.name`` is the enclosing
+        # definition's own name.  ``MemberAccess``/``MemberCall``/
+        # ``MemberCallStmt``'s ``member`` is validated to be a bare
+        # identifier, so a dotted receiver cannot hide there, and the receiver
+        # itself is a child expression this hook reaches on its own -- which
+        # is how a ``MemberCallStmt`` on a result array is caught even though
+        # the rewriter never dispatches that statement type.
+
+
+def _mentions_identifier(text: str, name: str) -> bool:
+    """Whether ``text`` uses ``name`` as a whole identifier."""
+
+    start = 0
+    while True:
+        found = text.find(name, start)
+        if found < 0:
+            return False
+        before = text[found - 1] if found else ""
+        after_index = found + len(name)
+        after = text[after_index] if after_index < len(text) else ""
+        if not (before.isalnum() or before == "_") and not (
+            after.isalnum() or after == "_"
+        ):
+            return True
+        start = found + 1
+
+
+def _assert_no_surviving_result_storage(
+    value: LLIRRewriteValueT,
+    context: ResultWriteContext,
+) -> None:
+    """Refuse an output that still references the storage the pass removed.
+
+    The refusal names every surviving reference and where it sits, because the
+    postcondition's known weakness is diagnosis: it reports that something
+    survived rather than which input statement was misunderstood.
+    """
+
+    walker = _ResultStorageResidueWalker(context)
+    walker.walk(cast(LLIRValue, value))
+    if not walker.findings:
+        return
+    described = "; ".join(finding.describe() for finding in walker.findings[:8])
+    if len(walker.findings) > 8:
+        described += f"; ... {len(walker.findings) - 8} more"
+    _raise_result_write_error(
+        context,
+        code="residual_result_storage_reference",
+        message=(
+            f"{len(walker.findings)} reference(s) to result {context.result_name}'s "
+            f"own storage survive the {context.mode} rewrite; the surrounding "
+            "two-phase transform has dropped those declarations, so each one "
+            f"is a dangling reference in the generated C++: {described}"
+        ),
+        path=walker.findings[0].path,
+        value=walker.findings[0].spelling,
+    )
+
+
 def rewrite_result_writes(
     value: LLIRRewriteValueT,
     context: ResultWriteContext,
@@ -608,6 +887,12 @@ def rewrite_result_writes(
     function can preserve the caller's root category.  Count/fill composition
     and a first-level special position-boundary conditional are outside the
     supported production contract.
+
+    Every return path is checked against the pass's postcondition: no reference
+    to the result's own removed storage may survive in the output.  That check
+    is what makes the pass fail closed on a result write it did not recognize,
+    independently of whether any recognizer was taught the spelling --
+    ``_ResultStorageResidueWalker`` explains why.
     """
 
     checked_context = _validate_context(context)
@@ -628,5 +913,9 @@ def rewrite_result_writes(
                 path=("root",),
                 value=value,
             )
-        return cast(LLIRRewriteValueT, rewritten[0])
-    return rewriter.rewrite(value)
+        scalar_result = cast(LLIRRewriteValueT, rewritten[0])
+        _assert_no_surviving_result_storage(scalar_result, checked_context)
+        return scalar_result
+    result = rewriter.rewrite(value)
+    _assert_no_surviving_result_storage(result, checked_context)
+    return result

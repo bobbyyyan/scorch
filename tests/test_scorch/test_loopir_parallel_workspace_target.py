@@ -1182,7 +1182,34 @@ def test_malformed_metadata_keys_fail_at_completion(monkeypatch, malformed_key):
 
 
 def test_two_phase_pass_context_cannot_mutate_program_result_identity(monkeypatch):
-    """The pass receives a detached result SymbolId, never the program key."""
+    """The pass receives a detached result SymbolId, never the program key.
+
+    This tamper is now caught EARLIER than it used to be, and the moved code is
+    the point of this docstring.  It corrupts the ``SymbolId``
+    ``result_write_pass`` matches the workspace drain's value store by, so
+    ``_is_result_value_target`` stops recognizing that store and ``C_values``
+    survives the count rewrite unrewritten -- against a declaration the
+    surrounding two-phase transform has already dropped.  The pass's own
+    postcondition sees that residue in its output and refuses at
+    ``residual_result_storage_reference``, before the sparse-workspace
+    completion boundary further downstream gets to notice the same corruption
+    as ``sparse_workspace_completion_lost``.
+
+    Both are structured refusals, so the tamper still fails closed; the earlier
+    one names the surviving reference and its path, which is the better
+    diagnosis for a defect created two passes upstream of where it used to
+    surface.
+
+    The completion boundary is NOT left unlocked by this change.
+    ``sparse_workspace_completion_lost`` is asserted 38 times across four test
+    files, 37 of which are untouched -- including
+    ``test_two_phase_final_pass_cannot_defeat_the_completion_boundary``
+    directly above, whose tamper lands in ``rewrite_dynamic_vector_accesses``,
+    five positions AFTER ``RESULT_WRITE`` in the frozen pass order, so the
+    postcondition cannot preempt it.
+    """
+
+    from scorch.compiler.llir_traversal import LLIRTraversalError
 
     import scorch.compiler.llir_pass_manager as pass_manager
 
@@ -1200,7 +1227,7 @@ def test_two_phase_pass_context_cannot_mutate_program_result_identity(monkeypatc
         "run_compressed_where_openmp",
         hostile_context,
     )
-    with pytest.raises(LoopIRTargetError) as error:
+    with pytest.raises(LLIRTraversalError) as error:
         compile_cin_via_loopir(
             build_spgemm_cin(),
             (4, 5),
@@ -1208,7 +1235,9 @@ def test_two_phase_pass_context_cannot_mutate_program_result_identity(monkeypatc
             compile_options=auto_options(False),
         )
     assert state["mutated"]
-    assert error.value.defect.code == "sparse_workspace_completion_lost"
+    assert error.value.diagnostic.code == "residual_result_storage_reference"
+    # The refusal names what survived, which is the whole reason to prefer it.
+    assert "C_values" in error.value.diagnostic.message
 
 
 def test_completion_actual_shares_nothing_with_reference(monkeypatch):

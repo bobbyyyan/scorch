@@ -518,12 +518,14 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
         cond=llir.BinOp("<", _var("pResult1"), _var("limit")),
         update=llir.Increment(_var("pResult1", llir.DataType.INT64)),
         body=[conditional],
-        before_parallel_body=[
-            llir.Assign(
-                _access("Result1_crd", _var("pResult1")),
-                _var("before"),
-            )
-        ],
+        # The two identity-only regions are probed with the workspace drain's
+        # sort rather than with a result write.  The sort is dispatched by
+        # ``_rewrite_call_statement`` and DROPPED in count mode, so surviving
+        # here proves the region really was left alone -- and it is not result
+        # storage, so it does not collide with the pass's postcondition.  A
+        # result write in either region is refused; see
+        # ``test_identity_only_regions_refuse_a_surviving_result_write``.
+        before_parallel_body=[llir.FunctionCallStmt("workspace.sort", [])],
         pre_parallel_body=[
             llir.Assign(
                 _access("Result1_crd", _var("pResult1")),
@@ -540,12 +542,7 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
     setattr(
         loop,
         "_hoisted_ptr_decls",
-        [
-            llir.Assign(
-                _access("Result1_crd", _var("pResult1")),
-                _var("hoisted"),
-            )
-        ],
+        [llir.FunctionCallStmt("workspace.sort", [])],
     )
     source: List[llir.Stmt] = [loop]
     source_snapshot = _structural_snapshot(source)
@@ -577,19 +574,17 @@ def test_legacy_control_flow_regions_are_transformed_and_detached() -> None:
         _var("_cnt1", llir.DataType.INT)
     )
 
+    # Both identity-only regions kept a statement count mode drops everywhere
+    # else, which is what "the legacy transform never descended into these"
+    # means, and both are fresh objects rather than the input's lists.
     assert rewritten_loop.before_parallel_body is not None
-    before = cast(llir.Assign, rewritten_loop.before_parallel_body[0])
-    assert type(before.var) is llir.ArrayAccess
-    assert cast(llir.Var, cast(llir.ArrayAccess, before.var).array).name == (
-        "Result1_crd"
-    )
+    before = cast(llir.FunctionCallStmt, rewritten_loop.before_parallel_body[0])
+    assert type(before) is llir.FunctionCallStmt
+    assert before.name == "workspace.sort"
+    assert rewritten_loop.before_parallel_body is not loop.before_parallel_body
     hoisted = cast(List[llir.Stmt], getattr(rewritten_loop, "_hoisted_ptr_decls"))
-    assert type(hoisted[0]) is llir.Assign
-    hoisted_target = cast(llir.Assign, hoisted[0]).var
-    assert type(hoisted_target) is llir.ArrayAccess
-    assert cast(llir.Var, cast(llir.ArrayAccess, hoisted_target).array).name == (
-        "Result1_crd"
-    )
+    assert type(hoisted[0]) is llir.FunctionCallStmt
+    assert cast(llir.FunctionCallStmt, hoisted[0]).name == "workspace.sort"
 
     assert _structural_snapshot(source) == source_snapshot
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
@@ -628,18 +623,17 @@ def test_none_and_empty_optional_loop_regions_preserve_their_shape() -> None:
 
 
 def test_function_body_is_identity_only_and_detached() -> None:
-    def result_write(value: str) -> llir.Assign:
-        return llir.Assign(
-            _access("Result1_crd", _var("pResult1")),
-            _var(value),
-        )
-
+    # Probed with the drain's sort for the same reason the identity-only loop
+    # regions are: count mode drops it everywhere the rewriter descends, so
+    # surviving proves ``rewrite_function`` did not descend, and it is not
+    # result storage.  A result write inside a nested function body is refused;
+    # see ``test_nested_function_body_refuses_a_surviving_result_write``.
     source: List[llir.Stmt] = [
         llir.Function(
             return_type=llir.DataType.VOID,
             name="nested",
             args=[],
-            body=[result_write("function")],
+            body=[llir.FunctionCallStmt("workspace.sort", [])],
         ),
     ]
 
@@ -965,23 +959,31 @@ def test_scalar_one_for_one_replacement_preserves_root_category() -> None:
 
 
 def test_result_value_matching_uses_stable_identity_not_rendered_name() -> None:
-    source: List[llir.Stmt] = [
-        llir.Assign(
-            _result_value_access(
-                _var("pResult1"),
-                tensor_id=SymbolId(_RESULT_ID.value + 1),
-            ),
-            _var("value"),
-        )
-    ]
+    # A RESULT_WRITE marker naming a DIFFERENT tensor is not this result's
+    # value store and passes through.  The physical name is another tensor's
+    # too, which is what production emits: one generated function spells one
+    # result's storage one way, so a foreign tensor cannot also be called
+    # ``Result_values``.  The contradictory pairing -- this result's storage
+    # name carrying a foreign marker -- is refused instead, because the name
+    # is what codegen emits and that declaration is gone; see
+    # ``test_foreign_marker_on_this_results_storage_name_is_refused``.
+    foreign = llir.ArrayAccess(
+        array=_var("Other_values", llir.DataType.PTR_FLOAT32),
+        index=_var("pOther1"),
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(702),
+            tensor_id=SymbolId(_RESULT_ID.value + 1),
+            index_ids=(_RESULT_INDEX_ID,),
+            role=llir.TensorAccessRole.RESULT_WRITE,
+        ),
+    )
+    source: List[llir.Stmt] = [llir.Assign(foreign, _var("value"))]
 
     rewritten = rewrite_result_writes(source, _context("fill"))
 
     assert _structural_snapshot(rewritten) == _structural_snapshot(source)
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(rewritten))
-    assert _cpp(cast(List[llir.Stmt], rewritten)) == (
-        "Result_values[pResult1] = value;"
-    )
+    assert _cpp(cast(List[llir.Stmt], rewritten)) == ("Other_values[pOther1] = value;")
 
 
 def test_result_value_matching_ignores_physical_name_when_identity_matches() -> None:
@@ -1019,3 +1021,330 @@ def test_malformed_rvalue_assignment_target_fails_at_result_write_boundary() -> 
     assert diagnostic.path == ("root", "[0]", "var")
     assert diagnostic.stage == RESULT_WRITE_TRAVERSAL_CONTEXT.stage
     assert diagnostic.pass_name == RESULT_WRITE_TRAVERSAL_CONTEXT.pass_name
+
+
+# -- The postcondition: no reference to the removed storage may survive -------
+#
+# These lock the check the pass runs over its own OUTPUT.  It asks a different
+# question than ``_touches_result_storage`` does: that guard asks of an input
+# statement "is this a result write I recognize", so it can only refuse a shape
+# somebody anticipated, while this asks of the output "did a reference to the
+# removed storage survive", which is a question about names rather than about
+# statement shapes.  The two tests named ``..._f_weak_...`` are the pair that
+# separates the two versions of the postcondition described in
+# ``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md``: both shapes are invisible to
+# an enumeration of known write forms and both are caught here.
+
+
+def _residue_diagnostic(
+    statements: List[llir.Stmt], mode: _Mode = "count"
+) -> LLIRTraversalError:
+    with pytest.raises(LLIRTraversalError) as raised:
+        rewrite_result_writes(statements, _context(mode))
+    assert raised.value.diagnostic.code == "residual_result_storage_reference"
+    assert raised.value.diagnostic.stage == RESULT_WRITE_TRAVERSAL_CONTEXT.stage
+    assert raised.value.diagnostic.pass_name == RESULT_WRITE_TRAVERSAL_CONTEXT.pass_name
+    return raised.value
+
+
+def test_postcondition_accepts_every_rewrite_the_pass_produces() -> None:
+    """The fill phase stores INTO the result, and that is not residue.
+
+    This is the check's whole well-formedness question.  ``_store`` emits
+    ``{R}{L}_crd_data`` / ``{R}_values_data`` / ``{R}{L}_pos_data``, which share
+    the bare names' leading characters, so a prefix rule rather than an
+    exact-plus-dot rule would refuse the pass's own output on every fill.
+    """
+
+    for mode in cast(Tuple[_Mode, ...], ("count", "fill")):
+        rewritten = rewrite_result_writes(_single_level_serial_writes(), _context(mode))
+        emitted = _cpp(cast(List[llir.Stmt], rewritten))
+        assert "Result_values_data" in emitted or mode == "count"
+        assert "Result1_crd[" not in emitted
+        assert "Result_values[" not in emitted
+
+
+def test_free_function_taking_a_result_array_as_an_argument_is_refused() -> None:
+    """Gap A: the property is argument-shaped and the input guard reads the callee.
+
+    ``loopir/parallel_chunk_assembly`` already emits four statements of this
+    shape.  ``_touches_result_storage`` matches ``FunctionCallStmt.name``
+    against the array prefixes, and ``scorch_concat_chunks`` starts with none
+    of them, so the input guard passes it through; it survives, and the
+    postcondition is what sees it.
+    """
+
+    error = _residue_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "scorch_concat_chunks",
+                [_var("Result_values"), _var("chunks")],
+            )
+        ]
+    )
+    assert "Result_values" in error.diagnostic.message
+
+
+def test_argument_shaped_result_write_is_invisible_to_f_weak() -> None:
+    """The one cell that separates the two versions of the postcondition.
+
+    An enumeration of known write forms recognizes ``scorch_vector_set`` by its
+    first argument and knows nothing of ``scorch_concat_chunks``, so the same
+    statement above would survive it as unflagged residue.  Asserted here as
+    the property of the enumeration rather than of any code that ships: the
+    callee is not an append spelling and not the one registered helper.
+    """
+
+    residue = llir.FunctionCallStmt(
+        "scorch_concat_chunks",
+        [_var("Result_values"), _var("chunks")],
+    )
+    assert not residue.name.endswith((".push_back", ".emplace_back"))
+    assert residue.name != "scorch_vector_set"
+    assert not residue.name.startswith("Result_values.")
+    # ...and yet the postcondition refuses it, on the argument alone.
+    _residue_diagnostic([residue])
+
+
+def test_member_call_statement_on_a_result_array_is_refused() -> None:
+    """Gap B: ``MemberCallStmt`` is never dispatched by the rewriter.
+
+    ``rewrite_statement_sequence_member`` names ``Assign``, ``Increment``,
+    ``FunctionCallStmt``, ``VarInit`` and ``IfThenElse``; a ``MemberCallStmt``
+    falls to the identity path, so the input guard -- which runs inside
+    ``_rewrite_call_statement`` -- is never offered it.  The postcondition runs
+    over the whole traversal instead of inside one handler, so it reaches the
+    receiver as a child expression.
+    """
+
+    error = _residue_diagnostic(
+        [
+            llir.MemberCallStmt(
+                base=_var("Result1_crd"),
+                member="push_back",
+                args=[_var("coordinate")],
+            )
+        ]
+    )
+    assert "Result1_crd" in error.diagnostic.message
+
+
+def test_identity_only_regions_refuse_a_surviving_result_write() -> None:
+    """A region the rewriter declines to descend into is not a safe hiding place.
+
+    ``_IDENTITY_ONLY_REGIONS`` keeps ``before_parallel_body`` and
+    ``_hoisted_ptr_decls`` un-rewritten because the legacy transform never
+    descended into them.  A result write there survives into the count body
+    against a declaration the surrounding transform has dropped, which is the
+    same defect an unrecognized spelling causes.  Unreachable on the survey
+    matrix -- measured zero -- and refused rather than retained.
+    """
+
+    def result_write() -> llir.Assign:
+        return llir.Assign(_access("Result1_crd", _var("pResult1")), _var("coordinate"))
+
+    for region in ("before_parallel_body", "_hoisted_ptr_decls"):
+        loop = llir.ForLoop(
+            init=None,
+            cond=_var("guard"),
+            update=llir.Increment(_var("row", llir.DataType.INT64)),
+            body=[],
+        )
+        setattr(loop, region, [result_write()])
+        error = _residue_diagnostic([loop])
+        assert region in error.diagnostic.message
+
+
+def test_nested_function_body_refuses_a_surviving_result_write() -> None:
+    """``rewrite_function`` is identity, so a result write in a body survives.
+
+    Same class as the identity-only loop regions.  ``Function`` is not among
+    the statement types the survey matrix presents to this pass, so this is
+    unreachable today and refused rather than retained.
+    """
+
+    error = _residue_diagnostic(
+        [
+            llir.Function(
+                return_type=llir.DataType.VOID,
+                name="nested",
+                args=[],
+                body=[
+                    llir.Assign(
+                        _access("Result1_crd", _var("pResult1")),
+                        _var("coordinate"),
+                    )
+                ],
+            )
+        ]
+    )
+    assert "Result1_crd" in error.diagnostic.message
+
+
+def test_foreign_marker_on_this_results_storage_name_is_refused() -> None:
+    """A foreign ``RESULT_WRITE`` marker does not license this result's name.
+
+    ``_is_result_value_target`` decides by logical identity, so this statement
+    is correctly NOT rewritten as the value store.  But the name is what
+    codegen emits, and ``Result_values``'s declaration is gone, so retaining it
+    would emit a dangling reference.  The refusal is the postcondition's, not
+    the recognizer's.
+    """
+
+    contradictory = llir.ArrayAccess(
+        array=_var("Result_values", llir.DataType.PTR_FLOAT32),
+        index=_var("index"),
+        tensor_access=llir.TensorAccessMetadata(
+            access_id=AccessId(702),
+            tensor_id=SymbolId(_RESULT_ID.value + 1),
+            index_ids=(_RESULT_INDEX_ID,),
+            role=llir.TensorAccessRole.RESULT_WRITE,
+        ),
+    )
+    error = _residue_diagnostic([llir.Assign(contradictory, _var("value"))], "fill")
+    assert "Result_values" in error.diagnostic.message
+
+
+def test_surviving_result_write_marker_is_refused_in_both_modes() -> None:
+    """The typed axis, which is how the drain's value store is recognized.
+
+    A marked reference must survive neither mode: count drops the store and
+    fill replaces it with a ``_store`` that carries no metadata.  Reached here
+    through a statement type the rewriter does not dispatch, so the marker is
+    the only thing left to see it by.
+    """
+
+    for mode in cast(Tuple[_Mode, ...], ("count", "fill")):
+        error = _residue_diagnostic(
+            [
+                llir.MemberCallStmt(
+                    base=_result_value_access(_var("index")),
+                    member="assign",
+                    args=[_var("value")],
+                )
+            ],
+            mode,
+        )
+        assert "result_write" in error.diagnostic.message
+
+
+def test_a_read_of_removed_storage_is_refused_because_it_dangles() -> None:
+    """A surviving READ is a defect too, which is why the rule is not shape-based.
+
+    ``compressed_where_openmp_pass._should_drop_prefix_statement`` drops the
+    declarations of ``{R}_values``, ``{R}{L}_pos``, ``{R}{L}_crd`` and
+    ``p{R}{L}``, so in this pass's output those names do not exist and a read
+    of one is as dangling as a write.  ``{R}{L}_crd.size`` as an index and
+    ``{R}{L}_pos.back`` in a condition are both legal in the INPUT -- 178 of
+    them per mode over the survey matrix -- and the pass removes every one.
+    """
+
+    surviving_read = llir.Assign(
+        _var("scratch"),
+        llir.FunctionCall("Result1_crd.size", []),
+    )
+    error = _residue_diagnostic([surviving_read])
+    assert "Result1_crd.size" in error.diagnostic.message
+
+
+def test_the_position_cursor_is_checked_where_the_pass_rewrites_it() -> None:
+    """Cursors are narrower than arrays, and the loop header is why.
+
+    An array's declaration is always dropped, so any reference to one dangles.
+    A cursor can be bound locally by the header of the loop that walks it, and
+    ``ForLoop.init``/``update`` are also positions the rewriter structurally
+    cannot reach.  So a cursor is checked as an ``Increment`` or ``VarInit``
+    sequence member -- the two forms the pass has a rewrite for -- and not
+    wherever its name appears.  This is the F-weak prototype's cursor coverage,
+    kept rather than widened.
+    """
+
+    # A loop header binding its own cursor is accepted.
+    header_bound = llir.ForLoop(
+        init=llir.VarInit(
+            _var("pResult1", llir.DataType.INT64),
+            llir.Literal(0, data_type=llir.DataType.INT64),
+        ),
+        cond=llir.BinOp("<", _var("pResult1"), _var("limit")),
+        update=llir.Increment(_var("pResult1", llir.DataType.INT64)),
+        body=[],
+    )
+    rewrite_result_writes([header_bound], _context("count"))
+
+    # The same bump as a sequence member IS dispatched, and fill mode rewrites
+    # it to ``_pos1`` rather than keeping it, so it never survives there.
+    dispatched = rewrite_result_writes(
+        [llir.Increment(_var("pResult1", llir.DataType.INT64))], _context("fill")
+    )
+    assert dispatched == [llir.Increment(_var("_pos1", llir.DataType.INT))]
+
+    # Where it is NOT dispatched -- an identity-only region -- it survives, and
+    # then the fill body's positions never advance.  That is residue.
+    undispatched = llir.ForLoop(
+        init=None,
+        cond=_var("guard"),
+        update=llir.Increment(_var("row", llir.DataType.INT64)),
+        body=[],
+        before_parallel_body=[llir.Increment(_var("pResult1", llir.DataType.INT64))],
+    )
+    error = _residue_diagnostic([undispatched], "fill")
+    assert "pResult1" in error.diagnostic.message
+
+
+def test_verbatim_cpp_mentioning_removed_storage_is_refused() -> None:
+    """``RawStmt`` holds C++ text, so the check reads it as text.
+
+    The boundary rule is whole-identifier, and both directions matter: the
+    pass's own ``Result1_crd_data`` pointer shares the bare name's leading
+    characters and must NOT match, or every fill body would refuse itself.
+    """
+
+    error = _residue_diagnostic([llir.RawStmt("Result1_crd.push_back(coordinate)")])
+    assert "Result1_crd" in error.diagnostic.message
+
+    # A longer identifier that merely contains the name is not a reference to
+    # it.  ``Result1_crd_data`` is the pass's own pointer; ``myResult1_crd`` and
+    # ``Result1_crds`` are unrelated names.
+    for accepted in (
+        "Result1_crd_data[_base1 + _pos1] = coordinate",
+        "myResult1_crd = 0",
+        "Result1_crds.clear()",
+        "int Result_valuesize = 0",
+    ):
+        rewrite_result_writes([llir.RawStmt(accepted)], _context("count"))
+
+
+def test_result_write_pass_defect_codes_are_the_locked_set() -> None:
+    """Lock the pass's structured refusal surface, failing in both directions.
+
+    This is the analogue of
+    ``test_loopir_verifier.test_defect_codes_are_the_documented_production_subset``
+    for this pass.  That set is the LoopIR VERIFIER's -- it is built from
+    ``_fail("...")`` occurrences in ``loopir/verifier.py`` -- so none of this
+    pass's codes belong in it, and adding one there would fail the equality it
+    asserts.  This is where they are locked instead.
+    """
+
+    import re
+
+    import scorch.compiler.result_write_pass as pass_module
+
+    source = open(pass_module.__file__).read()
+    found = set(re.findall(r"code=\"([a-z_]+)\"", source))
+    assert found == {
+        # Context validation.
+        "invalid_result_write_context",
+        "invalid_result_write_traversal_context",
+        "invalid_result_write_compile_options",
+        "invalid_result_write_name",
+        "invalid_result_write_id",
+        "invalid_compressed_levels",
+        "invalid_result_write_mode",
+        "invalid_result_write_value_pointer_type",
+        # Root-category preservation.
+        "unsupported_scalar_result_write_root",
+        # The input-side guard: a call naming result storage with no rewrite.
+        "unsupported_result_write_statement",
+        # The postcondition: a reference to removed storage survived.
+        "residual_result_storage_reference",
+    }
