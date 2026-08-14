@@ -13807,10 +13807,26 @@ a real gap in what a family can emit:
 | **2. Frontier**, 1,138 cells x both arms, base and candidate | **PASS.** 0 lost, 0 gained, 0 route changed, 0 unclassified either side, 3 arm-variant both sides (inherited, identical sets), **0 NEW arm-variance**; admitted 260 both sides |
 | **3. Correctness per (strategy, cell)** | **PASS** for every pair that can be emitted.  32 configurations (2 TTM cells x 2 shapes x 2 densities x **2 dtypes** x both arms), 96 executed strategy runs: ``AUTO``, ``S1`` and ``P1`` agree **bit-identically** on every index array and every value — not ``allclose`` — and match the dense reference to 6.26e-07.  ``P2`` verified bit-identical on its own family's cell.  Extents were chosen so ``P1``'s runtime condition genuinely fires |
 | **4. Refusals enumerated at their exact codes** | **PASS**, with §60.7's prediction missed.  Over 1,130 cells x 4 strategies x both arms — 9,040 compilations — **zero refusals lack a structured code** |
+| **5. Suite** | **RAN, and it caught four real defects.**  8 file-disjoint partitions per side, node set DIFFED rather than totals trusted.  Base ``cae4f11`` 6,353 nodes / 0 failures; candidate ``b9f0e2a`` 6,380 / **4 failures**, every one a stale assertion the schema bump left behind, +27 nodes / −0.  All four are closed at the tip — three by ``ce5acba``, the fourth by a two-line addition a concurrent session has not yet committed.  §61.1 owns the numbers and the re-run |
 | **6. Schema** | **PASS.** v12 and plan-v2 declared, identity and cache-key consequences recorded in §60.4 and locked by tests |
-| **5. Suite** | **IN FLIGHT, not a result.**  8 file-disjoint partitions per side, base and candidate, node set to be DIFFED rather than totals trusted.  Base partition 0 is green (513 passed / 14 skipped / 0 failed); the remaining fifteen runs are owed.  Command: ``run_suite_partitioned.sh <tree> <outdir> 8`` then ``suite_node_diff.py <base_outdir> <cand_outdir>`` |
 | **7. Runtime grid, four strategies, three hosts** | **NOT RUN** (§60.9) |
-| **8. ``scorch_ops`` built at both tips and compared** | **NOT RUN**, and this section adds nothing to ``csrc/`` (§60.9) |
+| **8. ``scorch_ops`` built at both tips and compared** | **PASS**, run in §61.3 rather than here.  This section adds nothing to ``csrc/``, so the obligation it inherited was §59's ``header.h`` +231, and that is the span §61.3 measured: ``a8f2954`` against the current tip |
+
+**Why row 1 says 1,130 and row 2 says 1,138**, since the two rows sweep the same
+matrix and an unexplained count difference is how the wrong 112 travelled three
+milestones.  The sealed receipt holds **1,139 records**.  ``frontier_diff.py``
+keys them by ``(family, name)`` and gets **1,138**, because one cell is registered
+twice inside a single family (§60.10: ``('rank4-mixed', 'ssss ijkl->l [d]')``,
+since ``"d" + "s"*0`` and ``"s"*0 + "d"`` spell the same one-character format).
+``strategy_emission.py`` dedupes with ``if name in out: continue``, keying on the
+**name alone**, and gets **1,130**, because nine program names occur in more than
+one family: ``ssss ijkl->ijl [sss]``, ``ssss ijkl->ikl [sss]``,
+``ssss ijkl->jkl [sss]``, ``ssss ijkl->kl [ss]``, ``ssss ijkl->l [d]``,
+``ssss ijkl->l [s]``, ``ssssss ijklmn->lmn [sss]``, ``ssssss ijklmn->mn [ss]``
+and ``ssssss ijklmn->n [s]``.  1,139 − 1 = 1,138 and 1,139 − 9 = 1,130; both
+numbers are right for the key each harness uses, and neither loses coverage,
+because the collapsed records carry identical routes in both arms.  Enumerated by
+re-running the cell builder (§61.4) rather than reasoned about.
 
 How much can be emitted, over the 24 frontier cells that are both partitionable
 and admitted, in both arms (48 cell-arms per strategy):
@@ -13832,20 +13848,19 @@ region-elided shape yet.
 
 ### 60.9 What this section does not do
 
-- **The suite check is not finished.**  Eight partitions per side at ~13 minutes
-  each; base partition 0 passed and the other fifteen runs are outstanding.  The
-  node-set diff is the part that matters — it has caught a real regression the
-  totals hid twice — so no claim about the suite is made here beyond that one
-  green partition.
+- **The suite check was in flight when this section was written and is now
+  closed** — §61.1 has the numbers, the node-set diff and the four defects it
+  caught.  Read that rather than this bullet.
 - **The runtime oracle grid is NOT run, on any host.**  Check 7 and the whole of
   step 5 are outstanding.  The grid is the next milestone's input and it should
   not be taken until ``two_pass_serial`` has a family that can host it, because
   two of its four columns would be empty.
-- **``scorch_ops`` is not built at both tips and compared.**  This section adds
-  nothing to ``src/scorch/csrc/`` — ``git diff cae4f11..HEAD -- src/scorch/csrc/``
-  is empty — so the obligation is unchanged from §59: the ``header.h`` +231 that
-  ``ops.cpp:1`` includes and pyproject's ``depends`` lists is still covered by one
-  argument ("the typed route has zero callers") when it needs two.  Still owed.
+- **``scorch_ops`` built at both tips and compared: also closed, in §61.3.**
+  This section adds nothing to ``src/scorch/csrc/`` — ``git diff cae4f11..HEAD --
+  src/scorch/csrc/`` is empty — so the obligation it inherited was §59's
+  ``header.h`` +231, and §61.3 measured that span (``a8f2954`` against the tip) on
+  the two arguments ``DESIGN.md``'s P-M8 asks for: byte-identical assembly, and a
+  guardrail grid inside its own A/A floor.  No longer owed.
 - **mkt1 is still not run.**  Owed since §59.
 - **The merge's serial tail is not closed.**  ``scorch_concat_chunks`` still sizes
   its destination with ``resize``, which value-initializes before the parallel
@@ -13928,3 +13943,494 @@ in the design, and it is a hypothesis until the grid scores it.
 the two-phase probe and its dumped sources, the emission/neutrality census, the
 cross-strategy correctness run, the frontier pair and its diff, and the
 partitioned suite.  Every harness takes a tree root as ``$1``.
+
+## 61. The four checks §60 left open: the shipped C++, the header, the suite, and the silent-acceptance audit (2026-08-13)
+
+No production code changed in this section.  The last commit to touch ``src/`` is
+still ``d9efcf8``, §60's own; everything since is tests and documentation.
+``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+callers.  What this section does is finish four measurements §60 owed and fix the
+documentation defects the plain-English pass reported without fixing.
+
+**The verdict, up front.**  All four close, and one of them was worth the
+trouble.  The shipped C++ is unchanged, proven this time through the entry point
+users actually hit rather than through a test-only one.  The ``header.h`` block
+compiled into the shipping extension is inert, on two independent arguments
+rather than one.  The suite caught four real defects, every one bookkeeping the
+schema bump missed.  And ``result_write_pass``'s silent-acceptance path cannot be
+reached by the old pipeline — not because the fix happened to cover it, but
+because the pass that produces the unrecognized spellings runs five positions
+later in a frozen, validated pass order.
+
+### 61.1 The suite: four failures, all bookkeeping, and two counts that needed explaining
+
+Eight file-disjoint partitions per side in fresh processes, each with its own
+``TMPDIR``, ``XDG_CACHE_HOME`` and ``TORCH_EXTENSIONS_DIR``, node sets compared
+as SETS rather than totals trusted:
+
+| | test files | nodes | failures | skipped | partitions exiting 0 |
+| --- | --- | --- | --- | --- | --- |
+| base ``cae4f11`` | 91 | **6,353** | **0** | 15 | 8 of 8 |
+| candidate ``b9f0e2a`` | 92 | **6,380** | **4** | 15 | 5 of 8 (0, 6, 7 failed) |
+
+**The node-set diff: +27, −0.**  All 27 are in
+``tests/test_scorch/test_sparse_assembly_strategy.py``, the one file ``b9f0e2a``
+adds, and they are enumerated in the receipt rather than counted.  Nothing was
+removed, so there is no moved-or-renamed accounting to do.
+
+**A property of this split worth knowing before comparing two runs.**  The
+grouping is a round-robin over the sorted file list, so 91 files and 92 files
+produce DIFFERENT partitions: every file after the inserted one moves.  The base
+and candidate runs are therefore comparable on the union of their partitions —
+the totals and the node set — and **not** partition by partition.  Nothing here
+relies on a per-partition comparison, and a future session should not make one.
+
+**Why the base collects 6,353 where §59.8a recorded 6,319.**
+§59.8a measured at ``691b46b``.  Commit ``6c61de2``, which lands after it, adds
+``tests/test_scorch/test_loopir_parallel_chunk_assembly.py``, and that file
+collects **34** nodes on the base worktree: 6,319 + 34 = 6,353.  The suspicion
+that the measuring checkouts had picked up untracked test files from the separate
+CUDA project is **wrong** — ``git status`` in both worktrees is empty, the
+harness enumerates 91 files at the base and 92 at the candidate, and no CUDA
+test module appears in either partition's file list.  The base is a clean
+``cae4f11`` and the comparison was measuring the right thing.
+
+**The four failures, and a correction to how they were attributed.**
+
+| test | assertion | disposition |
+| --- | --- | --- |
+| ``test_loopir_mixed_operand_target::test_canonical_dump_is_arm_stable_and_erases_to_base`` | ``"schema":"scorch.loopir.canonical.v11"`` | fixed at HEAD by ``ce5acba`` |
+| ``test_loopir_parallel_workspace_target::test_completed_target_owns_the_pipeline_route[False]`` | same string | fixed at HEAD by ``ce5acba`` |
+| ``test_loopir_parallel_workspace_target::test_completed_target_owns_the_pipeline_route[True]`` | same string | fixed at HEAD by ``ce5acba`` |
+| ``test_loopir_verifier::test_defect_codes_are_the_documented_production_subset`` | ``unsupported_assembly_strategy`` missing from ``PRODUCTION_SUBSET_DEFECT_CODES`` | fix present in the working tree, **not committed** |
+
+The first three were said to be assertions ``ce5acba`` "missed".  It did not:
+``ce5acba`` changes exactly those two files and exactly those two assertions.
+The failures are an artefact of the CANDIDATE WORKTREE being pinned at
+``b9f0e2a``, which is two commits BEFORE ``ce5acba`` — so the suite ran against a
+tree that predated its own fix.  That is worth recording as a method defect
+rather than a code one: a measuring checkout pinned behind the tip reports
+failures the tip does not have, and the four-failure result was carried forward
+as a candidate defect until someone checked which commit the worktree held.  The
+pinned-worktree discipline this branch runs on is right; pinning behind the tip
+you are trying to characterize is not part of it.
+
+**The v11 sweep.**  No LoopIR-schema ``v11`` string remains anywhere in ``src/``
+or ``tests/``.  The ``v11`` matches that do remain — in ``test_gpu_spmm.py`` and
+``test_spmm_cuda_mkt_runners.py`` — belong to the separate CUDA project's
+"selector v11" naming and have nothing to do with the canonical schema.
+
+**The re-run.**  Five partitions at the current tip, not three: 0, 6 and 7
+because that is where the four failures were, plus **2 and 4** because ``ce5acba``
+also rewrote a module docstring in each of those groups and a changed test file
+has twice broken a coverage test somewhere else.  The file count is asserted at
+92 before anything runs, since the grouping is a round-robin over the sorted file
+list and a changed count reshuffles every partition.  Each partition gets a fresh
+``TORCH_EXTENSIONS_DIR``, so every kernel recompiles instead of hitting a cache
+that could mask a codegen change — which is why these runs are slower than the
+originals.
+
+| partition | result |
+| --- | --- |
+| 0 | **exit 0** — 532 passed, 14 skipped |
+| 2 | **exit 0** — 968 passed, 1 skipped |
+| 4 | **exit 0** — 1,032 passed |
+| 6 | **exit 1** — 1 failed, 1,021 passed |
+| 7 | **exit 0** — 799 passed |
+| total | 4,368 tests, **1 failure**, 15 skipped |
+
+**Three of the four failures are gone**, which is what "``ce5acba`` already fixed
+them" predicts and is the check that the attribution above is right rather than a
+story.  The node set over partitions 0, 6 and 7 is **2,367 on ``b9f0e2a`` and
+2,367 at the tip, 0 added and 0 removed**, so the three commits between them
+neither added nor lost a test — diffed as a set, because that is the half which
+has twice caught a regression the totals hid.
+
+The one remaining failure is
+``test_defect_codes_are_the_documented_production_subset``, at exactly the
+expected assertion.  With the concurrent session's two-line addition applied **to
+the measuring worktree only** and reverted afterwards, that file runs **207
+passed, exit 0**.  So the tip is green the moment that change lands and not
+before, and this section does not claim a green suite until it does.
+
+### 61.2 Release neutrality, proven through the entry point users hit
+
+This is the one check here that could have found a real problem.  §60's headline
+neutrality result (check 1) drove ``compile_cin_via_loopir`` — the NEW pipeline —
+so it proves the new pipeline's own emission is unchanged and says **nothing**
+about legacy's.  That distinction stopped being academic with this milestone,
+because ``d9efcf8`` was the first change on this branch to touch three files the
+OLD pipeline runs through:
+
+| file | added lines | how legacy reaches it |
+| --- | --- | --- |
+| ``compressed_where_openmp_pass.py`` | +63 | imported at ``cin_lowerer.py:48``, run at ``:3909`` |
+| ``scheduler.py`` | +164 | shared; ``Scheduler.auto_schedule`` is legacy's own entry |
+| ``result_write_pass.py`` | +71 | run twice by ``compressed_where_openmp_pass`` |
+
+So "the typed route has no callers, therefore users cannot be affected" no longer
+covers the change.  Measured against ``cae4f11`` from two pinned detached
+worktrees, four emission columns in descending order of how close each is to what
+a user gets:
+
+| column | what it drives | arms | result |
+| --- | --- | --- | --- |
+| **production dispatch** | ``scorch.einsum`` / ``scorch.matmul`` under production's own default options, capturing what the pipeline hands the JIT at ``ops._lower_generated_llir`` | **both** | **506 case-arms, 412 producing generated code: 0 emission differences, 0 outcome differences** |
+| 20-source corpus | ``Scheduler.auto_schedule`` → ``CINLowerer`` → ``LLIRLowerer``, legacy's real lowering chain | arm 0 | **20 of 20 byte-identical** |
+| 42-case ``ss@dd`` grid | same chain, through the benchmark driver | arm 0 | **42 of 42 byte-identical** |
+| 86-case explicit-schedule audit | ``compare_generated_sources``, the test-only entry | environment default | ``total=86 admitted=46 rejected=40 nonidentical=0`` on both sides, **0 differing fields**, including 0 differing ``legacy_sha256`` |
+
+The arms column is there rather than assumed.  The corpus and the grid are the
+Phase-3 byte-gate captures and have always been built with
+``regblock_override=False``, so they are arm 0 only; that is what makes them
+comparable to every earlier capture in the chain, and it is why the
+both-arms obligation is discharged by the production column rather than by them.
+
+The first column is the one that answers the question, and §57.3 is why: the
+test-only ``legacy_generated_cpp`` entry emits *different source for the same
+program* than production does, so a comparison through it cannot settle a release
+question.  The spy point is downstream of all three changed files by
+construction: ``_lower_generated_llir`` renders the FINAL LLIR to C++
+(``ops.py:141``), and that LLIR has already been through ``scheduler.py``'s
+``auto_schedule`` and through ``CINLowerer``, which is what runs
+``compressed_where_openmp_pass`` and, inside it, ``result_write_pass`` twice.
+Whatever those three files could have changed is in the captured string.  The base column's outcome breakdown is recorded rather than
+summarized — 412 ``EMITTED``, 80 ``IndexError``, 6 ``TensorStorageError``, 4
+``TensorIndexError``, 4 ``NO-EMISSION`` — and the candidate reproduces it case
+for case, with every emitting case's SHA-256 equal.
+
+The four ``NO-EMISSION`` records are worth naming, because they reproduce §57.3's
+claim from a different harness: they are ``MM ds x ds -> ds`` and
+``MM ds x dd -> dd``, both arms — the two matmul cells §57.3 said resolve a
+PREBUILT hand-written kernel and generate no code at all, which is exactly why
+neither census column describes matmul.
+
+**Static checks, at the repo's own scope and then wider.**  ``mypy src``,
+``flake8 src`` and ``black --check src`` are what ``pre-commit.sh`` runs, so they
+are reported first and separately:
+
+- **mypy**: 146 lines on both sides, **140 errors in 11 files on both**.  Two
+  lines differ and both are consequences of adding code rather than findings:
+  "checked 62 source files" becomes 63 (``sparse_assembly.py`` is new) and the
+  ``scheduler.py`` import note moves from line 64 to line 69.
+- **flake8 src**: 9 lines on both sides.  One line moves —
+  ``Scheduler._apply_schedule_legacy``'s ``C901`` from ``:2936`` to ``:3079`` —
+  and its complexity is **41 on both**, so the +164 lines did not make that
+  function more complex.
+- **black --check src**: identical, one pre-existing file (``prebuilt_kernels.py``)
+  on both sides.
+
+Over ``src`` **and** ``tests``, two findings appear that are not in the base, and
+both are in the test file ``b9f0e2a`` added:
+``test_sparse_assembly_strategy.py`` carries a flake8 ``E741`` (ambiguous
+variable name ``l``) and is not ``black``-clean.  Neither is inside the repo's
+own gate, which is ``src``-only, and neither is a release question — they are
+recorded because they are real and because the branch's own new code should not
+be the thing that fails a linter.
+
+**The five protected tracked files, and a defect in how they have been checked.**
+The five are byte-identical between the two pinned checkouts, which is the
+release question, and the live working tree still hashes exactly as
+``phase8-census-frontier-ext/statics/protected-hashes.txt`` records, which is the
+leave-them-alone obligation.  Both pass.  But the first comparison this session
+wrote compared a *checkout* against that recorded file and reported all five as
+differing, and the reason is worth recording: **those recorded digests are the
+WORKING TREE's, including the separate CUDA project's uncommitted edits, not the
+committed blobs.**  The committed blobs are identical at ``3b6b24f``, ``cae4f11``
+and the current tip.  So a clean checkout necessarily differs from the recorded
+baseline, and "the five protected tracked files hash exactly as recorded" is a
+claim about the working tree only.  Any future session comparing a pinned
+worktree against that file will get five spurious failures.
+
+### 61.3 The ``header.h`` block compiled into the shipping extension is inert, on two arguments
+
+§59 appended 231 lines to ``src/scorch/csrc/header.h``.  ``ops.cpp`` includes
+that header on line 1 and ``pyproject.toml`` lists it in ``depends``, so the
+``scorch_ops`` extension every user loads is rebuilt by the change.  Every
+neutrality argument on this branch has been "the typed route has zero callers",
+and that argument does not reach a header baked into the shipping binary.
+``DESIGN.md``'s P-M8 says so in advance: from here on, inertness in production
+needs two arguments.  Both are now on record.  The span measured is
+``a8f2954`` (before the header change) against the current tip, which is wider
+than ``cae4f11``..tip and is the right span, since ``git diff cae4f11..HEAD --
+src/scorch/csrc/`` is empty and ``git diff a8f2954..HEAD -- src/scorch/csrc/`` is
+exactly the +231 with **zero deletions**.
+
+**Argument one, machine code.**  The block defines **eight** functions — two
+plain ``inline`` (``scorch_chunk_rows``, ``scorch_chunk_end``) and six
+``template ... inline`` — and calls two that already existed
+(``scorch_nthreads``, ``scorch_chunk``).  With no call site in the translation
+unit an ``inline`` function has no definition to emit and a template is never
+instantiated, so the compiler should emit nothing for any of the eight.  Measured
+rather than argued:
+``ops.cpp`` compiled to assembly at both tips with identical flags and from a
+RELATIVE source path is **byte-identical** — 211,608 lines each, one SHA-256
+(``73aab5677b562d34…``) — and each of the eight names appears **zero times in
+either assembly**.
+
+The built ``.so`` is a weaker comparand because setuptools bakes each tree's
+ABSOLUTE source path into it, so it is compared structurally:
+
+| | base ``a8f2954`` | candidate |
+| --- | --- | --- |
+| exported symbols | 39 | **39, identical set** |
+| ``__TEXT`` segment | 491,520 | **491,520** |
+| file size | 722,784 | **722,784** |
+| ``__TEXT,__const`` | — | **identical digest** |
+| ``__TEXT,__text`` | 105,231 words | **924 differ** |
+
+Those 924 are enumerated rather than waved at.  **Every one is the immediate of
+an ``add xN, xN, #imm`` whose register operands are identical**, with the
+immediate larger in the candidate by 6 (507 of them), 12 (298) or 18 (119) —
+string-pool offsets, shifted because the two trees' absolute paths differ in
+length.  **Zero differing words are anything else**: no opcode and no register
+operand differs anywhere in the text section.
+
+(One footnote on the artefacts: after the comparison, both extensions needed
+``install_name_tool -change /opt/llvm-openmp/lib/libomp.dylib
+@rpath/libomp.dylib`` to load on this host, applied identically to both.  The
+digests in the receipt are the pre-patch ones.)
+
+**Argument two, runtime.**  The prebuilt SpMM / GCN guardrail grid against both
+built extensions: 18 configurations — three row counts (1,024 / 16,384 / 65,536)
+× three free dimensions (32 / 128 / 512) × two average degrees (8 / 64) — timing
+the prebuilt CSR-by-dense SpMM and the fused feature-major
+``sparse_linear_fm``.  Degree rather than density, because real graphs hold
+degree roughly constant as they grow and a fixed density at 65,536 rows needs a
+4.3e9-element dense intermediate the native allocation bound refuses.  Six runs
+per side in alternating ABBA rounds, 90 samples per side per configuration,
+six threads.
+
+A first attempt is recorded because it failed as a check rather than as a
+measurement: one ABBA round with a median statistic gave a same-binary control
+spanning **0.6358–1.1202**, a floor so wide it could not have failed, and
+"0 of 18 outside the floor" against it would have been a check that cannot
+fail.  More rounds plus a min-of-samples statistic tightened it.
+
+| | base/candidate ratio | same-binary floor | outside |
+| --- | --- | --- | --- |
+| SpMM, min-of-samples | 0.9186–1.0448 | 0.9622–1.0908 | **1 of 18** |
+| SpMM, median | 0.9650–1.0430 | 0.9095–1.0636 | 0 of 18 |
+| fused, min-of-samples | 0.9174–1.0443 | 0.8768–1.1950 | 0 of 18 |
+| fused, median | 0.9472–1.0216 | 0.9258–1.0584 | 0 of 18 |
+
+The one configuration outside is the **smallest in the grid** — 1,024 rows,
+degree 8, free dimension 32, 8,156 stored entries — at 0.9186 on the
+min-of-samples statistic and inside the floor on the median.  Since argument one
+proves the two binaries hold the same instructions, that reading cannot be a code
+difference, and rather than say so it was tested: the identical grid was re-run
+with **both sides pointing at the base tree**, a true A/A run.
+
+| A/A run (base against base) | ratio | outside |
+| --- | --- | --- |
+| SpMM, min-of-samples | 0.9584–1.0488 | 0 of 18 |
+| SpMM, median | 0.9523–1.0225 | 0 of 18 |
+| fused, min-of-samples | **0.9281**–1.0484 | 0 of 18 |
+| fused, median | **0.9486**–1.0108 | **2 of 18**, one of them the same 1,024-row configuration at 0.9486 |
+
+So the same binary against itself produces excursions of the same size on the
+same configurations, and flags that 1,024-row cell too.  The A/B readings lie
+inside what A/A does on this grid.  **Both arguments agree: the header block is
+inert in production, and ``DESIGN.md``'s P-M8 is MET** — its two clauses were
+"the extension's emitted machine code is unchanged" and "the guardrail grid is
+inside its A/A floor", and this is the first time on this branch that "inert in
+production" rests on two arguments rather than on "the typed route has zero
+callers" alone.
+
+### 61.4 ``result_write_pass``'s silent-acceptance path: the old pipeline cannot reach it
+
+§60.6 stage 2 found that ``result_write_pass`` recognized result writes in
+legacy's vocabulary only, passed the LoopIR targets' spellings through
+unrewritten, and so **failed open** — handing statements it did not understand to
+the external C++ compiler.  Both spellings are now recognized and an unrecognized
+one raises ``unsupported_result_write_statement``.  The open question was whether
+that closed the hole only for the new pipeline's spellings, since
+``compressed_where_openmp_pass`` is shared and legacy runs it on release default
+dispatch.  **The gap is empty for legacy, and the reason is stronger than "the
+fix covered it".**
+
+**The structural reason.**  Legacy's LLIR pass order is frozen in
+``CURRENT_LLIR_PASSES`` and ``run_production_pipeline`` validates the order
+against it before executing any user program work:
+
+1. ``COMPRESSED_WHERE_OPENMP`` — 2. ``RESULT_WRITE`` — 3. ``SPARSE_PREFETCH`` —
+4. ``DENSE_POINTER_HOIST`` — 5. ``SINGLE_ITERATION_LOOP_ELIMINATION`` —
+6. ``LOOP_INVARIANT_FACTOR_HOIST`` — 7. ``DYNAMIC_VECTOR_ACCESS``
+
+``emplace_back`` and ``scorch_vector_set`` are exactly what pass 7 *produces*
+(``dynamic_vector_access_pass``'s config: ``append_method="emplace_back"``,
+``checked_set_function="scorch_vector_set"``).  It runs five positions after
+``RESULT_WRITE``, and it is the only caller.  So the two spellings that caused
+the silent acceptance do not exist yet when legacy runs the pass, for every
+program, by construction rather than by coincidence.
+
+**The measurement.**  ``_ResultWriteRewriter`` was wrapped so every statement it
+inspects is recorded with the branch it took, and every rewritten body re-walked
+for a RESIDUAL result write — a statement still writing the result's own storage
+after the pass claims to have rewritten or removed it, which is the actual
+defect: the count pass keeps appending while its counters stay zero, against
+declarations the surrounding transform dropped.  Driven over the whole
+1,139-record survey matrix in both automatic arms — 2,278 lowerings through
+``Scheduler.auto_schedule`` → ``CINLowerer`` → ``LLIRLowerer``, legacy's own
+production chain:
+
+- **102 cell-arms reach the pass**, over 51 distinct programs in 8 families —
+  counted in cell-arms: ttm 54, rank3 26, matmul 12, and 2 each (one program per
+  family, both arms) for rank4-mixed, mttkrp, ttmc, four-factor and sddmm.  Each
+  cell-arm invokes the pass twice, count and fill, for 204 invocations.
+- The complete inventory of result-storage-shaped statements legacy presents, and
+  what each became:
+
+| form | count | disposition |
+| --- | --- | --- |
+| ``Assign ArrayAccess`` carrying ``RESULT_WRITE`` metadata (the workspace drain's value store) | 102 | dropped in count, rewritten in fill |
+| ``FunctionCallStmt *.sort`` (the drain) | 102 | dropped in count, kept in fill |
+| ``Assign ArrayAccess C2_crd`` | 58 | rewritten |
+| ``Assign ArrayAccess C2_pos`` | 58 | dropped |
+| ``IfThenElse`` on the ``C{L}_pos.back()`` position boundary | 58 | rewritten |
+| ``Assign ArrayAccess C1_crd`` | 44 | rewritten |
+| ``Assign ArrayAccess C1_pos`` | 4 | dropped |
+
+- **Zero residual result writes**, over all 204 invocations.
+- **Zero ``emplace_back``, zero ``scorch_vector_set``**, as the pass order
+  predicts.
+- The new fail-closed guard fired **zero times**.  Its value on this matrix is
+  entirely prospective, which is the same lesson §60.7 records about
+  ``unsupported_assembly_host`` predicted to fire zero times and firing 58 — in
+  the opposite direction.
+
+**One branch the inventory could not see, probed separately.**
+``_rewrite_if_statement`` REPLACES the position-boundary conditional rather than
+descending into it, so the statements inside its ``then_body`` never reach the
+inventory — and legacy's ``push_back`` appends live exactly there.  In fill mode
+that branch calls ``_find_serial_coordinate``, which searches the ``then_body``
+for a ``.push_back`` and returns ``None`` if it finds none; on ``None`` the fill
+body emits **no parent coordinate store at all**, silently.  Probed: the
+``then_body`` is exactly ``[FunctionCallStmt C1_crd.push_back]`` on all 58
+occurrences in each mode, and ``_find_serial_coordinate`` found a coordinate on
+**58 of 58** fill-mode calls.  The hazard exists in the code and never fires on
+this matrix.
+
+**The typed side, for comparison.**  ``two_pass_parallel`` reaches the pass on
+**2 cell-arms** (``MM ds x ds -> ds``, both arms — the 2 of §60.8's emission
+table) and presents the same indexed-assign vocabulary legacy does, plus
+``wksp.insert_unchecked``, which correctly passes through as none of the pass's
+business; zero residual writes.  ``two_pass_serial`` reaches the pass **0
+times**, since no family hosts it.  So after §60.6 stage 3 refused the
+ordered-key family's two-pass request, **the widened vocabulary is exercised by
+nothing on the frontier today**.  The fix is right and it is forward-looking; it
+is not currently load-bearing.
+
+**Two structural narrownesses recorded and NOT fixed**, both unreachable on this
+matrix and neither a production bug today:
+
+1. **The guard keys on the callee NAME where the property is argument-shaped.**
+   ``_touches_result_storage`` asks whether the statement's name starts with
+   ``{R}_values.``, ``{R}{L}_pos.`` or ``{R}{L}_crd.``, which catches member
+   calls on the result's own arrays.  A FREE function taking a result array as an
+   ARGUMENT is not caught: ``scorch_vector_set`` is handled only when its first
+   argument is a ``Var`` named ``{R}{L}_pos``, so
+   ``scorch_vector_set(C_values, …)`` or any other helper receiving a result
+   array would pass through silently, exactly as ``emplace_back`` used to.
+2. **``llir.MemberCallStmt`` is never inspected as a result write at all.**
+   ``rewrite_statement_sequence_member`` dispatches ``Assign``, ``Increment``,
+   ``FunctionCallStmt``, ``VarInit`` and ``IfThenElse``; a
+   ``MemberCallStmt(base=Var("C1_crd"), member="push_back")`` falls to the
+   identity path and the guard, which only runs inside
+   ``_rewrite_call_statement``, never sees it.  Legacy does build
+   ``MemberCallStmt`` elsewhere (``dense_pointer_hoist_pass``,
+   ``schedule_lowerer``, ``cin_lowerer``) but never on a result array at this
+   point in the pipeline — measured: **zero** ``MemberCallStmt`` inspected on
+   either route.
+
+One candidate gap was dismissed on inspection rather than left open: statements
+nested inside an *unrecognized* ``IfThenElse`` ARE still rewritten, because
+``rewrite_statement_sequence`` re-dispatches each returned statement through
+``_rewrite_stmt``, which descends into its bodies.  Conditional nesting is not a
+hole.
+
+### 61.5 The frontier's three cell counts, reconciled
+
+Enumerated while the probe had the cell builder loaded, because §60.8's table
+used 1,130 in one row and 1,138 in the next with no explanation and §60.10
+explains a different pair.  The matrix holds **1,139 records**, over **1,138**
+distinct ``(family, name)`` keys and **1,130** distinct names.  The full
+reconciliation and the nine cross-family name collisions are recorded at §60.8.
+
+### 61.6 Documentation defects fixed, and the one that could not be resolved cleanly
+
+The plain-English pass reported eleven problems it deliberately did not fix.  Ten
+are fixed: the two unsubstituted ``@@TIP@@`` placeholders in §55.8 are
+``3b6b24f`` (verified: ``git diff 6e8e09c..3b6b24f -- src/ csrc/`` is empty, as
+that subsection claims); §60's heading and the handoff's tail entry are re-dated
+**2026-08-13**, the day the work happened, from the 2026-08-14 both carried —
+a date later than §59's and later than the day itself; §58.3's
+``lower_llir.py:14504`` and §60.6's ``:14595`` now carry the symbol alongside the
+number (``_lower_loopir_to_llir_owned``'s ``assemble_body`` closure, the
+``compressed_output_parallel != lowering.owns_two_phase_output()`` comparison),
+because both were right when written and the number will drift again; §60.8's
+checks are reordered 1–8; §57.9a's "three ... and both" is resolved (three failing
+nodes across two distinct tests, one parametrized); §50.7's title says **nine**
+corrections, which is what it lists; §60.8's 1,130-versus-1,138 is explained;
+§52.9's malformed "1.0(-0.07)%" is **0.9993**, recovered from the same
+subsection's own pooled figure three paragraphs above; and the B3 test-file count
+is **43**, which §41.1 had already measured at ``607d3e1`` and a fresh
+re-collection at that commit reproduces — §38.3's 44, §39.1's 44 and §39.7's 45
+now say so, and §39.7's 1220 total is flagged as unreconciled by 2 rather than
+silently adjusted.
+
+Forward pointers are added at the superseded claims, and the sweep for others is
+recorded as a table in **§0.5** rather than as scattered notes.
+
+**The one that could not be cleaned up, only corrected.**  §35.1's "the one 1.14
+p95 reading sits inside the demonstrated 3.4–4.4% base-vs-base drift band" puts
+the reading and the band in different units, and **the retained receipt carries
+the same error in its own verdict line** — so this is a correction to the
+evidence, not only to the prose.  What the receipt supports, from its own
+numbers: 3.4–4.4% is the A/A control (p50 1.0345 / mean 1.0344 / p95 1.0442) and
+1.1401 is ``cand-second/base`` on p95, which is **outside** it.  The p95 column is
+where that grid is unstable — the candidate's three runs give 6.0332, 7.1918 and
+6.8818 ms, a 1.19x spread against itself — so 1.1401 sits inside the candidate's
+own run-to-run p95 spread and p95 is not a statistic that evidence can calibrate
+to better than about ±19%.  The claim that survives is the p50 and mean one:
+0.983–1.000 and 0.994–1.027, both at or below the A/A control.  §35.1 now says
+that instead.
+
+### 61.7 What this section does not do
+
+- **No production change.**  ``src/`` is untouched since ``d9efcf8``;
+  ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+  callers and the test proving ``import scorch`` never loads the LoopIR package
+  still passes.
+- **The two structural narrownesses in §61.4 are recorded, not fixed.**  Neither
+  is reachable on the survey matrix by either route, and fixing the first means
+  deciding what a result-write guard should key on, which is a design question
+  rather than a repair.
+- **The runtime oracle grid over the four strategies is still NOT RUN on any
+  host**, and should not be until ``two_pass_serial`` has a family that can host
+  it — two of four columns would be empty.  ``scorch_concat_chunks``'s
+  value-initializing ``resize`` still stands, so ``P1``'s eventual column will be
+  measured on a kernel with a known serial tail.
+- **mkt1 is still not run.**  Owed since §59.
+- **The uncommitted fix to ``test_loopir_verifier.py`` is not committed here.**
+  It belongs to a concurrent session; this section measures with it and without
+  it and reports both, and the tip is not green until it lands.
+- The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the
+  shadow pilot's membership and every blocker other than 1 are untouched; the
+  Phase-8 cutover verdict is unchanged.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/assembly-strategy/``, resealed over
+**344 files** (``SHA256SUMS`` itself hashes to ``824c5d8aea6c64c7…``, and
+``shasum -a 256 -c SHA256SUMS`` verifies every entry).  ``CLOSEOUT.md`` is the
+index from each claim in this section to the receipt that carries it.  New this
+section: ``receipts/release_neutrality/`` (four emission columns, the
+static checks, ``REPORT.txt``), ``receipts/csrc_inertness/`` (both assemblies,
+both symbol tables, ``TEXT_SECTION_ANALYSIS.txt``),
+``receipts/prebuilt_guardrail_m5.json`` and ``…_m5_AA.json`` (the guardrail grid
+and its true A/A control), ``receipts/result_write_reach_*.json`` and
+``result_write_boundary_legacy.json`` (the silent-acceptance audit), and
+``receipts/suite_cand_head/`` (the re-run).  New harnesses:
+``release_neutrality.sh``, ``compare_release_neutrality.py``,
+``csrc_inertness.sh``, ``prebuilt_guardrail.py``, ``result_write_reach.py``,
+``result_write_boundary_probe.py`` and ``run_suite_partitions.sh``.  Every one
+takes a tree root as ``$1``.

@@ -32456,3 +32456,112 @@ stays NO-GO.
    one place it replaces, and the oracle grid is its input.
 6. Deferred as before: the refusal on dense-domain assembly (§58.8–58.10), the
    merged-domain UNION / INTERSECTION decision, the shadow pilot's membership (§57.3).
+
+## The four open checks closed, and a measuring checkout that was pinned behind its own fix (2026-08-13; supersedes every preceding prompt)
+
+Follows committed tip ``67201e5`` — that is ``482c6af`` plus the fourteen
+plain-English rewording commits — and adds two documentation commits of its own.
+**Origin is still ``a3b8d1e``**; nothing pushed.  **No production code changed**: the
+last commit to touch ``src/`` is still ``d9efcf8``, §60's own, and
+``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero callers outside
+tests.  Review §61 owns the detail; the evidence index is
+``~/.cache/scorch-codex/assembly-strategy/CLOSEOUT.md``.
+
+**1. THE C++ THAT SHIPS IS UNCHANGED, and this time it was checked where users are.**
+§60's neutrality result drove the NEW pipeline, so it said nothing about the old one —
+and ``d9efcf8`` was the first change on this branch to touch three files the old
+pipeline runs through (``compressed_where_openmp_pass.py``, ``scheduler.py``,
+``result_write_pass.py``).  Measured against ``cae4f11`` from two pinned checkouts,
+through ``scorch.einsum``/``scorch.matmul`` under production's own options: **506
+case-arms, 412 producing generated code, zero emission differences, zero outcome
+differences.**  Plus 20 of 20 sample programs, 42 of 42 grid cases, and the 86-case
+schedule audit identical in every field.  ``mypy``, ``flake8`` and ``black`` over
+``src`` are identical once tree paths and line numbers are normalized — same 140
+mypy errors in the same 11 files, and ``_apply_schedule_legacy``'s complexity is 41
+on both sides.  The five protected files are identical between the checkouts.
+
+**2. THE HEADER BAKED INTO THE SHIPPING BINARY IS INERT, on two arguments.**  §59
+added 231 lines to ``src/scorch/csrc/header.h``, which ``ops.cpp`` includes on line 1,
+so the extension every user loads was rebuilt and nobody had checked it.  Built at
+``a8f2954`` and at the tip: ``ops.cpp``'s assembly is **byte-identical** from a
+relative source path, none of the eight added names appears in either assembly, the
+exported symbol tables match (39), and ``__TEXT`` and the file size match exactly.
+The text sections differ in 924 of 105,231 words and **every one is a string-pool
+offset** — an ``add xN, xN, #imm`` with identical registers, shifted 6, 12 or 18
+bytes because setuptools bakes each tree's absolute path in.  The prebuilt SpMM/GCN
+grid (18 configurations, 6 runs a side) lands inside what a same-binary A/A run does
+on the same grid, including on the one configuration that flagged.
+
+**3. THE SUITE CAUGHT FOUR REAL DEFECTS, and the way they were attributed was wrong.**
+Base ``cae4f11`` is **6,353 nodes / 0 failures**; candidate ``b9f0e2a`` is 6,380 with
+**4 failures**, node set +27 / −0 with all 27 in the one test file that commit adds.
+Three of the four assert the old ``canonical.v11`` schema string — and they were
+**already fixed at the tip by ``ce5acba``**.  The candidate worktree was pinned at
+``b9f0e2a``, two commits BEFORE that fix, so the suite ran against a tree that
+predated its own repair.  That is a method defect worth remembering: a measuring
+checkout behind the tip reports failures the tip does not have.  Re-run at the tip
+over five partitions — 0, 6 and 7 where the failures were, plus 2 and 4 because
+``ce5acba`` also touched a docstring in each of those groups — **4,368 tests, 1
+failure**: the three v11 assertions pass and the node set over 0/6/7 is 2,367 both
+sides, 0 added and 0 removed.  The one left needs
+``unsupported_assembly_strategy`` added to ``PRODUCTION_SUBSET_DEFECT_CODES``; a
+concurrent session has that in the working tree and has not committed it.  Applied
+to the measuring worktree only, that file runs **207 passed, exit 0** — so **the
+tip is green the moment that lands and not before**.  §59's 6,319 versus this 6,353
+is also explained: ``6c61de2`` lands after §59's measurement and adds a test file
+collecting 34 nodes.  The checkouts are clean; they had not picked up
+CUDA-project test files.
+
+**4. THE SILENT-ACCEPTANCE HOLE CANNOT BE REACHED BY THE OLD PIPELINE.**  §60.6 found
+``result_write_pass`` failing open on statement forms it did not recognize, and the
+open question was whether legacy could reach the same path, since the pass is shared
+with release default dispatch.  It cannot, for a structural reason rather than
+because the fix happened to cover it: ``RESULT_WRITE`` is position 2 in the frozen
+``CURRENT_LLIR_PASSES`` order and ``DYNAMIC_VECTOR_ACCESS`` — the only thing that
+produces ``emplace_back`` and ``scorch_vector_set`` — is position 7, and
+``run_production_pipeline`` validates that order before running anything.  Measured
+over the whole 1,139-record matrix in both arms through legacy's own lowering chain:
+102 cell-arms reach the pass, seven statement forms, **zero residual result writes**,
+zero of either new spelling, and the new fail-closed guard fires **zero times**.  Two
+structural narrownesses are recorded and not fixed (the guard keys on the callee name
+where the property is argument-shaped; ``MemberCallStmt`` is never inspected as a
+result write) — neither reachable on this matrix by either route.
+
+**5. THE DOCUMENTATION DEFECTS.**  Ten of eleven fixed, including the two ``@@TIP@@``
+placeholders (``3b6b24f``), the dates on §60 and this section's predecessor, §50.7's
+title, §60.8's check order and its unexplained 1,130-versus-1,138 (three different
+keys over 1,139 records, all reconciled), §52.9's malformed A/A value (``0.9993``),
+and the B3 test-file count (**43**, re-collected at ``607d3e1``).  Forward pointers
+now sit at every superseded claim, indexed in a new **§0.5** table.  The eleventh —
+§35.1's "1.14 sits inside the 3.4–4.4% drift band" — is a units error **in the
+retained receipt as well as the prose**, so it is corrected rather than tidied: the
+p50/mean claim survives, the p95 one does not, and the reason is written down.
+
+**Not addressed.**  The runtime oracle grid over the four strategies is still **NOT
+RUN on any host**, and should not be until ``two_pass_serial`` has a family that can
+host it.  ``scorch_concat_chunks``'s value-initializing ``resize`` still stands.
+mkt1 still not run.  The two-pass position reconstruction on the ordered-key family
+is still diagnosed and refused rather than fixed.  The dense-domain seam, the
+merged-domain UNION/INTERSECTION decision, the shadow pilot's membership and every
+blocker other than 1 are untouched; Phase-8 cutover stays NO-GO.
+
+## What the next session should do
+
+1. **Land the ``test_loopir_verifier.py`` two-line addition** if the concurrent
+   session has not, and re-run partition 6.  It is the only thing standing between
+   here and a clean suite, and §61.1 has already measured that it closes the failure.
+2. **Give ``two_pass_serial`` a family that can host it, or delete its emission
+   support.**  Unchanged from §60: the shared pass supports the region-elided form and
+   no family's completion contract accepts it, which is unverified production code.
+3. **Fix the two-pass position reconstruction on the ordered-key family** (§60.6 stage
+   3).  Positions rebuilt from ``_count`` prefix sums indexed by the phase loop
+   variable versus closed by a dense-prefix catch-up.  Unlocks ``two_pass_parallel``
+   on 22 more cell-arms and ``two_pass_serial`` on 44.
+4. **Only then run the oracle grid**, four strategies x the legal corpus x three
+   hosts, scoring P-M7a..f from ``DESIGN.md`` §8 and especially **P-M7c**, the
+   ``M/E`` hypothesis.
+5. **Then the selector.**  ``default_assembly()`` is the one place it replaces.
+6. If you write a new protected-file check, do not compare a pinned worktree against
+   ``phase8-census-frontier-ext/statics/protected-hashes.txt``: those digests are the
+   working tree's, uncommitted CUDA-project edits included, and a clean checkout
+   differs from all five.
