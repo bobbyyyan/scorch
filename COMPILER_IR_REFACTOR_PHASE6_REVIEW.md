@@ -12393,37 +12393,37 @@ manifests), ``provenance/`` (digests, the sbatch script, the full Slurm job log)
 ledger root as ``$1`` and defaulting to their own location — never a hardcoded
 path — with their outputs retained), and ``SHA256SUMS``.
 
-## 57. The kernel-runtime gate, blocker 1 reopened and fixed, and two corrections to the census's comparand (2026-08-11)
+## 57. The kernel-runtime measurement, blocker 1 reopened and fixed, and two corrections to what the census compares against (2026-08-11)
 
-This section opens at inherited committed tip ``a8f2954``.  Bobby made two
-decisions that this session acts on and does not relitigate: the dense-domain
-assembly seam is ADMITTED under a structural guard, and blocker 1 is to be FIXED
-in the layer where it is wrong rather than preserved for neutrality.  His words on
-the second: "it's okay to have different emitted code, but the new emitted code
-must be strictly correct and more performant than legacy on a wide variety of
-problem sizes."
+Starts from committed tip ``a8f2954``.  Bobby made two decisions that this
+session acts on and does not relitigate: the refusal on dense-domain assembly is
+lifted under a structural guard, and blocker 1 is to be FIXED in the layer where
+it is wrong rather than preserved so that the shipped C++ stays unchanged.  His
+words on the second: "it's okay to have different emitted code, but the new
+emitted code must be strictly correct and more performant than legacy on a wide
+variety of problem sizes."
 
-That changes the gate for these families.  Byte-identical emission is no longer
-the primary standard for them; strict correctness plus measured *kernel runtime*
-is.  ``CLAUDE.md`` has been updated to record this, since it is the first thing a
-fresh session reads.
+That changes what these families have to prove.  Byte-identical emission is no
+longer the primary standard for them; strict correctness plus measured *kernel
+runtime* is.  ``CLAUDE.md`` has been updated to record this, since it is the first
+thing a fresh session reads.
 
-### 57.1 The gate that never existed: a kernel-runtime harness
+### 57.1 The measurement that never existed: a kernel-runtime harness
 
-Every performance gate in §§49–56 measured **compile-only latency**, which measures
-the compiler.  §55.5's claim that the typed route emits "a better kernel" is an
-INSPECTION claim from a character count, and §55.9 duty 2 says it "should be
-*run*, not read".  It is now runnable.
+Every performance check in §§49–56 measured **compile-only latency**, which
+measures the compiler.  §55.5's claim that the typed route emits "a better
+kernel" is an INSPECTION claim from a character count, and §55.9 duty 2 says it
+"should be *run*, not read".  It is now runnable.
 
-Both pipelines converge on one seam — ``_load_validated_prepared_kernel`` then
+Both pipelines converge on one point — ``_load_validated_prepared_kernel`` then
 ``module.evaluate(*module_args)`` — so the harness patches that single loader,
 runs each production entry ONCE, and captures the exact module and argument tuple
 production used rather than reconstructing them.  Timing is ABBA-interleaved with
-auto-calibrated reps, and every configuration carries a same-binary A/A
-noise-floor control **on each timed column**, per the repo convention that perf
-gates are never calibrated against a fixed ratio constant.  Crash isolation is not
-boilerplate: one disposable subprocess per configuration, because the very first
-comparand the harness was pointed at segfaults.
+auto-calibrated reps, and every configuration carries a same-binary control **on
+each timed column** to establish the noise floor, per the repo convention that a
+performance claim is never judged against a fixed ratio constant.  Crash
+isolation is not boilerplate: one disposable subprocess per configuration,
+because the very first baseline the harness was pointed at segfaults.
 
 **CORRECTION to this subsection, made when the receipts were re-read.**  "Two
 controls, one per side" is wrong, and wrong in a way that does not reconcile with
@@ -12441,7 +12441,7 @@ reproduce across three hosts, but it pins ``executable_search_path`` to
 ``/bin:/usr/bin``, and ``ninja`` lives in the conda env.  Anything that BUILDS must
 use the real environment.
 
-### 57.2 CORRECTION: §55.5's flagship example is drawn from the wrong comparand
+### 57.2 CORRECTION: §55.5's flagship example is drawn from the wrong baseline
 
 §55.5 reports ``ss ij->j [s]`` as typed 2,218 characters against legacy's 2,845,
 "deleting legacy's intermediate ``T0_crd_vec``/``T_val_vec`` materialization and
@@ -12453,14 +12453,14 @@ its second pass".  Measured at the frontier's own extents:
 | legacy under empty ``Schedule()`` | 2,845 | yes |
 | legacy under **default dispatch** | **1,993** | **no** |
 
-The 2,845 is the **empty-Schedule()** row — the comparand §56.5 itself rules out
-for cutover reasoning.  On the default-dispatch row legacy emits *fewer*
+The 2,845 is the **empty-Schedule()** row — the baseline §56.5 itself rules out
+for reasoning about a cutover.  On the default-dispatch row legacy emits *fewer*
 characters than typed and there is no second pass to delete.  The argument as
-written does not survive its own choice of comparand.
+written does not survive its own choice of baseline.
 
 **AMENDED BY §57.3, which was measured after this subsection was drafted, and
 which partly rehabilitates §55.5.**  The sentence above rests on §56.5's ruling
-that default dispatch is the comparand a cutover moves.  §57.3 then measured
+that default dispatch is what a cutover would move.  §57.3 then measured
 production itself and found that ruling too strong: for this very cell
 **production emits 2,848 characters WITH a COO workspace**, i.e. within three
 characters of the 2,845 row and carrying the materialization the 2,845 row is
@@ -12472,11 +12472,11 @@ What survives is narrower and still worth recording: §55.5 reached the right ro
 for the wrong reason, having never checked which row production emits, and the
 1,993 column shows that "typed deletes a second pass" is not a property of legacy
 in general.  What does NOT survive is the claim that §55.5's argument fails
-BECAUSE of its comparand.  §57.3's own conclusion is the governing one — neither
-census column faithfully models production dispatch, and which is closer depends
-on the family.
+BECAUSE of the row it drew on.  §57.3's own conclusion is the governing one —
+neither census column faithfully models production dispatch, and which is closer
+depends on the family.
 
-### 57.3 The default-dispatch comparand is not runnable, and not production
+### 57.3 The default-dispatch baseline is not runnable, and not production
 
 Legacy's default-dispatch source for that cell declares ``std::vector<float>
 C_values;`` and then executes ``C_values[pC0] += A_val[pA1]`` against it, never
@@ -12511,9 +12511,9 @@ generated code" that every user gets.  Nobody had measured that code.  Membershi
 was re-derived from the sealed frontier receipt (never from prose): 14 arm-0 / 12
 arm-1, exactly §55.3's four groups.
 
-The **heavy** sweep — five shapes (ragged, unit and singleton extents) × two
-dtypes × both automatic arms × three densities, one disposable subprocess per
-configuration, **780 measurements** against the pinned base:
+The **heavy** sweep — the wide grid, five shapes (ragged, unit and singleton
+extents) × two dtypes × both automatic arms × three densities, one disposable
+subprocess per configuration, **780 measurements** against the pinned base:
 
 | cells | public route | legacy's lowering of the same CIN |
 | --- | --- | --- |
@@ -12530,8 +12530,8 @@ It claimed all twelve TTM cells fail "at every extent, dtype, density and arm".
 That is drawn from ONE shape and is false for ``TTM ddd x ss -> dds``, which is
 sound at 12 of 60 — and **all twelve sound configurations are at shape
 ``[1, 4, 5, 3]``, i.e. outer extent ``i = 1``**, across every density, both dtypes
-and both arms.  This is §52.8 → §55.4 repeating: a lean sweep missing
-configuration-dependence a heavy one finds.
+and both arms.  This is §52.8 → §55.4 repeating: a narrow sweep missing
+configuration-dependence a wide one finds.
 
 The mechanism CONFIRMS the illegality argument rather than weakening it.  The tile
 is illegal because hoisting ``j_out`` above ``i`` destroys the ``(i, j)``
@@ -12557,15 +12557,16 @@ untiled kernel is correct as well.  So the fix is correct→correct exactly wher
 legacy was accidentally correct, and broken→broken everywhere else.
 
 Setting that cell aside, the §52.7 objection survives for one cell and half of
-another, and both have dense receivers where the fix is inert by construction.
+another, and both have dense receivers where the fix does nothing by
+construction.
 
 ### 57.5 The fix, and why it needed two layers
 
 ``apply_schedule`` already refuses an affine tile over a non-dense result for an
 explicitly requested schedule (``scheduler.py:2994``, "tiled sparse-output
 assembly is unsupported").  That check reads ``schedule.tiles``, which is empty on
-the automatic origin — so it is vacuous exactly where the automatic heuristic then
-chooses tiles itself.  The automatic path was constructing the artifact the
+the automatic origin — so it does nothing exactly where the automatic heuristic
+then chooses tiles itself.  The automatic path was constructing the artifact the
 explicit path forbids, and nothing re-checked it.
 
 Two false starts, both caught by measurement:
@@ -12583,7 +12584,7 @@ Two false starts, both caught by measurement:
 
 ### 57.6 What the fix measures, on pinned base and candidate worktrees at ``a8f2954``
 
-| gate | result |
+| check | result |
 | --- | --- |
 | frontier, 1139 cells × both arms | **24 cell-arms** ``unsupported_schedule_auto_family`` → ADMITTED; **0 admitted lost**, **0 unclassified**, arm-invariant; nothing else moved.  248/652/239 → 260/640/239, base reproducing §55.2 exactly |
 | correctness of the newly admitted | **720/720** — 12 cells × 5 shapes × 2 dtypes × 2 arms × 3 densities, all executing, all matching a dense reference, all with well-formed assembled storage |
@@ -12610,12 +12611,12 @@ family.  It is not; both arms admit identically.
 The candidate's ``IndexError`` is unstructured, and that is stated rather than
 hidden.  It arises on the LEGACY path, which has no structured-diagnostic contract
 at all (§55.6 records 140 cells raising bare ``ValueError`` on default dispatch
-today); the fail-closed gate governs the typed route, where the candidate frontier
-measures **0 unclassified**.
+today); the requirement to refuse with a structured code governs the typed route,
+where the candidate frontier measures **0 unclassified**.
 
 ### 57.7 Kernel runtime: real wins, and a real regression
 
-A/A noise floor across the grid: **0.896–1.046** over 120 same-binary controls.
+Noise floor across the grid: **0.896–1.046** over 120 same-binary controls.
 119 of the 120 span 0.946–1.046 and are typically within ±2%; the outlier is a
 single contended excursion — ``sss ijk->ik [ss]`` (256,128,64) at d=0.05,
 ``legacy_empty`` column, **0.896** — in a record whose status is OK, so it is part
@@ -12636,7 +12637,7 @@ magnitudes:
   i.e. the typed kernel is up to **2.8× slower**, plus 0.804× at a third shape.
 - **Neutral**: every rank-3/4 reduction, all of ``sd ij->j``, and the forced-sparse
   ``dd ij->j [s]`` control at 0.999–1.006 — the sanity check that the harness
-  reports A/A as A/A.
+  reports a same-binary comparison as one.
 
 The pattern is density.  **"The typed route emits better code" does not hold as a
 general performance claim**; it holds at low density and inverts as density rises.
@@ -12653,7 +12654,7 @@ is owed.
 
 **The tile-legality fix itself is runtime-NEUTRAL.**  Base against candidate on
 the same grid: typed median ratios span **0.970–1.036**, entirely inside the
-combined A/A floor of 0.961–1.044, on the **40 of 44** configurations the typed
+combined noise floor of 0.961–1.044, on the **40 of 44** configurations the typed
 route compiles, and legacy's own ratios move no further.  The fix buys correctness
 and costs no measured runtime.  The remaining four are ``ss ij->j [d]`` at both
 shapes and both densities, which the typed route REFUSES on both trees, so no
@@ -12675,12 +12676,12 @@ file — and the 1139-cell frontier re-run in both arms.
   non-additive combiner, none of which the declared envelope names.
 - **Relaxing the rule admits ZERO cells.**  56 of the 58 land at the ordered-key
   target's own require; 2 still carry the sentinel at a second prefix level.  The
-  CIN rule is entirely shadowed by a second gate, so the work is in
+  CIN rule is entirely shadowed by a second check, so the work is in
   ``lower_llir.py``, not CIN.  Any cost estimate that stops at the CIN rule is
   wrong by construction.
 
 This is §54.2's lesson in the opposite direction: there a CIN probe under-counted
-because a second gate hid cells; here it shows the rule buys nothing alone.
+because a second check hid cells; here it shows the rule buys nothing alone.
 
 ### 57.9 The dense-domain assembly semantics, stated before building
 
@@ -12697,8 +12698,8 @@ strictly below it:
    correct emission is an **unconditional append**.  The consequence, stated
    rather than discovered: ``ds ij->i [s]`` appends one entry per row of the dense
    domain and its compressed level becomes fully dense.  §54.9 flagged exactly
-   this; it is forced by the structure-not-values rule, and is the property
-   ``:2181`` already locks for ``dd ij->j [s]``.
+   this; it is forced by the rule that structure, not values, decides what is
+   stored, and it is the property ``:2181`` already locks for ``dd ij->j [s]``.
 3. **All of ``S(L)`` dense, some extent may be zero** — a **compile-time** extent
    predicate, with existing precedent in the B2 family's ``_suffix_guard``
    (``C1_size > 0``, ``lower_llir.py:10544``), never a runtime counter.
@@ -12720,8 +12721,8 @@ all.
    ``subprocess.py`` ``_execute_child``, i.e. the macOS fork-after-threads abort
    in the PARENT, triggered once the JIT starts forking a build per kernel in a
    process that has accumulated torch/OpenMP threads.  Each failing test PASSES
-   run alone.  §55 gate 6 ran the suite in **8 file-disjoint partitions**; that
-   is the branch's protocol and ignoring it produced 565 phantom failures.
+   run alone.  §55's check 6 ran the suite in **8 file-disjoint partitions**;
+   that is the branch's protocol and ignoring it produced 565 phantom failures.
 2. The first partitioned attempt used ``mapfile``, which macOS bash 3.2 lacks, so
    it enumerated zero files and reported ``tests 0  failures 0`` — a green-looking
    total over an empty set.  A harness that can report success without running
@@ -12752,13 +12753,13 @@ artifact to quarantine, because its failure was to enumerate nothing.  Saying
 
 The node count moved, so it was diffed as a SET rather than trusted as a total —
 a bigger number with zero failures can hide a silently deleted test.  Measured
-over the JUnit XMLs: **8 removed, 18 added.**  The 8 are exactly the seam locks
-that encoded the reversed decision (``test_auto_tile_blocked_cells_keep_their_schedule_code``
+over the JUnit XMLs: **8 removed, 18 added.**  The 8 are exactly the locks that
+encoded the reversed decision (``test_auto_tile_blocked_cells_keep_their_schedule_code``
 ×4, ``test_the_auto_tile_neighbours_stay_blocked_on_blocker_one`` ×4) and nothing
 else.  The 18 are 8 from the row-scope lock's now-honoured ``b_fmt`` × both arms,
 6 from the two ``TTM dds`` cells joining ``MIGRATED`` (arm-source-identity and
-arm-invariant compilation), 2 for the seam-is-empty successor and 2 for the new
-dense-receiver neutrality lock.
+arm-invariant compilation), 2 for the successor lock asserting the boundary is
+empty and 2 for the new dense-receiver neutrality lock.
 
 Base reproduces §55's recorded 6,309 / 6,294 / 15 exactly, which is what makes
 the candidate's 11 attributable.  **Running the base suite as a control was owed
@@ -12767,7 +12768,7 @@ anything without it.
 
 **None of the eleven demonstrates working behaviour that the change broke.**
 
-- **Eight are the blocker-1 seam locks** —
+- **Eight are the blocker-1 locks** —
   ``test_auto_tile_blocked_cells_keep_their_schedule_code`` (×4) and
   ``test_the_auto_tile_neighbours_stay_blocked_on_blocker_one`` (×4).  They assert
   the cells STAY at ``unsupported_schedule_auto_family``, which is §52.7's
@@ -12788,8 +12789,8 @@ anything without it.
 **What the updates do.**  The two ``TTM dds`` cells MOVE from
 ``AUTO_TILE_BLOCKED`` into ``MIGRATED`` (9→11, 2→0), so the census's 20-name
 matrix total is unchanged.  The blocked-cell lock is replaced by a successor that
-asserts the seam is empty for that matrix and names the two cells that still
-occupy it over the frontier — ``ddd ijk->k [d]`` and ``ddd ijk->ik [dd]``, both
+asserts nothing is left blocked for that matrix and names the two cells that still
+are over the frontier — ``ddd ijk->k [d]`` and ``ddd ijk->ik [dd]``, both
 DENSE receivers.  A new ``test_dense_receivers_keep_their_automatic_tile`` locks
 the neutrality half directly: a dense receiver must keep exactly the tile it had.
 
@@ -12811,11 +12812,13 @@ under a permuted operand ``mode_order``; the obvious candidate
 
 - **Nothing is pushed, and nothing wires the typed route into dispatch.**
   ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` still have zero
-  non-test callers and the neutrality suite still passes.
-- **The dense-domain assembly seam is NOT implemented** — only its reach measured
+  non-test callers, and the suite proving that importing scorch never loads the
+  LoopIR package still passes.
+- **The dense-domain assembly boundary is NOT moved** — only its reach measured
   and its semantics fixed in writing.
 - **The kernel-runtime grid has not been run on a SECOND HOST.**  The quiet-machine
-  re-run §57.7 reports is done and sealed — ``kernelperf-step0/receipts/m5_quick_base.json``,
+  re-run §57.7 reports is done and recorded with its checksums —
+  ``kernelperf-step0/receipts/m5_quick_base.json``,
   120 controls, floor 0.977–1.044 — so what remains outstanding is cross-host
   reproduction on redwood and mkt1, whose transports §56 staged.  (This bullet was
   drafted before §57.7 was amended with the quiet re-run and said the quiet run was
@@ -12825,11 +12828,11 @@ under a permuted operand ``mode_order``; the obvious candidate
   edited mid-run, 480 of 780 records, retained with its diagnosis under
   ``blocker1-legacy-soundness/receipts/superseded/``.  It was then re-run in full
   against the PINNED base worktree at ``a8f2954``, and §57.4's verdicts stand on
-  that clean **780-measurement** grid (``receipts/base_heavy.json``, sealed), not on
-  the lean single-shape sweep — which §57.4 in fact declares FALSE, and whose
-  replacement is where the ``i = 1`` correction comes from.  What is owed is a second
-  host.  (Drafted before §57.4 was amended; it said the pinned-base grid was
-  "queued".)
+  that clean **780-measurement** grid (``receipts/base_heavy.json``, checksummed),
+  not on the single-shape lean sweep — which §57.4 in fact declares FALSE, and
+  whose replacement is where the ``i = 1`` correction comes from.  What is owed is
+  a second host.  (Drafted before §57.4 was amended; it said the pinned-base grid
+  was "queued".)
 - **No blocker other than 1 is touched**, and the Phase-8 cutover verdict is
   unchanged.
 
@@ -12843,11 +12846,11 @@ documents).
 
 ## 58. The TTM regression's mechanism, and the dense-domain semantics re-derived operand-side (2026-08-12)
 
-Opens at committed tip ``ed4ce50`` (§57's work, committed in four pieces plus the
-correction commit).  Two things land: the §57.7 TTM regression is explained, and
-§57.9's dense-domain semantics are replaced with an operand-side derivation.  No
-production file changes in this section — ``git diff ed4ce50..HEAD -- src/`` is
-empty — and nothing is wired into dispatch.
+Starts from committed tip ``ed4ce50`` (§57's work, committed in four pieces plus
+the correction commit).  Two things land: the §57.7 TTM regression is explained,
+and §57.9's dense-domain semantics are replaced with a derivation taken from the
+operand side.  No production file changes in this section — ``git diff
+ed4ce50..HEAD -- src/`` is empty — and nothing is wired into dispatch.
 
 ### 58.1 The regression is one kernel, not two
 
@@ -12880,8 +12883,8 @@ The two-phase parallel assembly is a SHARED LLIR pass,
 does is decided by one virtual: ``_TargetLowering.owns_two_phase_output()``
 returns False (``lower_llir.py:5484``) and exactly one LoopIR family overrides it
 — ``_ParallelSparseWorkspaceLowering`` (``:9511``), and only for
-``compressed_levels=(1,)``.  ``lower_llir.py:14504`` hard-couples the two so a
-mismatch fails closed.  The regressing cells are hosted by
+``compressed_levels=(1,)``.  ``lower_llir.py:14504`` couples the two so hard that
+a mismatch fails closed.  The regressing cells are hosted by
 ``_OrderedKeySparseWorkspaceLowering``, which never overrides it, and their
 ``dss`` receiver has TWO compressed levels.  Legacy's ``cin_lowerer`` runs the
 same shared pass on the same programs and gets ``_count1`` AND ``_count2``, so
@@ -12908,9 +12911,9 @@ Legacy's pragma requests ``num_threads(scorch_nthreads(A1_pos[A0_size], A0_size)
 and ``scorch_policy.h:123`` defines that as
 ``min(rows/SCORCH_ROWS_PER_THREAD, work/SCORCH_GRAIN_DEFAULT)`` clamped to
 ``[1, omp_get_num_procs()]``, with the constants 16 and 500.  **Legacy's own
-parallelism is gated, and the gate opens with density.**  Evaluated on the real
-operands, that thread count orders all eight measurements monotonically and
-without exception:
+parallelism is conditional, and the condition is met as density rises.**
+Evaluated on the real operands, that thread count orders all eight measurements
+monotonically and without exception:
 
 | ``scorch_nthreads`` | §57.7 ratios |
 | --- | --- |
@@ -12967,7 +12970,7 @@ pass, is the whole of the typed route's low-density win.
 Opting the family into the existing shared pass — the obvious move, and the one
 §58.3 makes look easy — is the WRONG target, and the ablation is what shows it.
 It would surrender the 1.18–1.47x single-pass advantage and merely TIE legacy at
-high density, and unconditionally adopted it would turn the 1.44–1.79x low-density
+high density, and adopted unconditionally it would turn the 1.44–1.79x low-density
 wins into ties, since ``nthreads = 1`` is exactly where the counting pass buys
 nothing.  Bobby's standard for this branch is "more performant than legacy on a
 wide variety of problem sizes", not "not worse".
@@ -12979,21 +12982,22 @@ and the receiver's compressed level 1 sits under ``i``, so per-thread buffers
 concatenated in ``i`` order reproduce the required lexicographic assembly exactly.
 The cost is one ``O(nnz_out)`` memcpy per array in place of legacy's full
 recompute — strictly cheaper than the counting pass it replaces, on the evidence
-above — gated on the same ``scorch_nthreads > 1`` condition so the serial path is
+above — under the same ``scorch_nthreads > 1`` condition, so the serial path is
 provably untouched at ``nthreads = 1`` and the low-density wins are preserved by
 construction.
 
-This option is selected BY the standard Bobby set for this branch, not by a
-separate instruction from him.  That standard is **"more performant than legacy
+This option follows from the standard Bobby set for this branch, not from a
+separate instruction of his.  That standard is **"more performant than legacy
 on a wide variety of problem sizes"**, not "not worse" — the kernel-runtime
 standard §54.8 records for Phase 7 and ``CLAUDE.md`` states for migrated
-families — together with ``CLAUDE.md``'s rule that a gate must be *provably*
-inert on the shapes it must not act on.  Applied to §58.6's three columns the
-standard eliminates the other two by measurement: unconditional adoption
-surrenders the 1.18–1.47x single-pass advantage AND destroys the low-density
-wins, and gated adoption preserves the wins but reaches only parity where the
-regression is.  Only the third can be better than both existing kernels, so it
-is the one the standard leaves.  **It is not built in this section.**
+families — together with ``CLAUDE.md``'s rule that a runtime condition must be
+*provably* never true on the shapes it must not act on.  Applied to §58.6's three
+columns the standard eliminates the other two by measurement: adopting the shared
+pass unconditionally surrenders the 1.18–1.47x single-pass advantage AND destroys
+the low-density wins, and adopting it under a condition preserves the wins but
+reaches only parity where the regression is.  Only the third can be better than
+both existing kernels, so it is the one the standard leaves.  **It is not built in
+this section.**
 
 ### 58.8 The dense-domain semantics, re-derived operand-side
 
@@ -13001,7 +13005,8 @@ is the one the standard leaves.  **It is not built in this section.**
 level.  The question Bobby's decision asks — did the operand have anything here —
 is about the OPERAND's structure under the coordinate.  Rewritten at
 ``compressed-prefix-reach/DENSE_DOMAIN_ASSEMBLY_SEMANTICS.md``, with §57.9's
-version quarantined beside it under its diagnosis.  Three measured errors:
+version kept beside it and marked superseded with the reason.  Three measured
+errors:
 
 1. **Wrong answer on the motivating cell.**  ``ds ij->i [s]`` is rank-1 so ``S(L)``
    is empty, so case 2 appends unconditionally and the result densifies.  The
@@ -13020,24 +13025,24 @@ version quarantined beside it under its diagnosis.  Three measured errors:
    ``C1_pos`` and no ``pC1``.  The machinery is structurally unavailable in exactly
    the case case 2 was covering.
 
-### 58.9 Derivability over all 58 cells, and two that are not in this seam
+### 58.9 Derivability over all 58 cells, and two the rule does not cover
 
 Method: ``lower_cin._fail`` instrumented to snapshot the raising frame's locals —
 ``domains``, ``lhs_index_ids``, ``result_levels``, ``prefix``, ``key_rank``,
 ``position`` — for all 58 cells driven through the real lowering.  Not modelled
 from cell names.
 
-**The seam is 56 cells, not 58.**  The refused level's actual domain kind is DENSE
-on 56, **UNION** on ``ss+ss ij->i [s]`` and **INTERSECTION** on
+**The refusal covers 56 cells, not 58.**  The refused level's actual domain kind
+is DENSE on 56, **UNION** on ``ss+ss ij->i [s]`` and **INTERSECTION** on
 ``ss*ss ij->i [s]``.  The rule's condition is ``domain_kind is not
 DomainKind.SPARSE``, which lumps three kinds into one refusal.  This explains
 rather than merely records §57.8's leftover: relaxing to admit DENSE left exactly
 those two carrying the sentinel because relaxing DENSE admits neither UNION nor
-INTERSECTION.  They are a separate merged-domain seam and a separate decision, so
-this document does not owe them a rule — and extending to them by analogy would
-have been wrong specifically in the intersection case, whose non-emptiness is not
-a function of the streams' extents and cannot be answered by a position bound at
-all.
+INTERSECTION.  They are a separate refusal over merged domains and a separate
+decision, so this document does not owe them a rule — and extending to them by
+analogy would have been wrong specifically in the intersection case, whose
+non-emptiness is not a function of the streams' extents and cannot be answered by
+a position bound at all.
 
 **45 of the 56 need no new machinery.**  They have a compressed result level below
 the refused one, so the existing result-side counter answers exactly (ttm 32,
@@ -13051,7 +13056,7 @@ intervening dense level makes the child's range contiguous.  No cell in the 58 i
 undecidable.  §57.9's case 2 — the unconditional append — applies to **none** of
 the 58 cells it was written for.
 
-### 58.10 The predicate priced, against an admitted sibling
+### 58.10 What the predicate costs, measured against an admitted sibling
 
 ``ss ij->i [s]`` is ADMITTED today and is the exact structural sibling of
 ``ds ij->i [s]``: same family, same ``(1, 0)`` split, same result shape, differing
@@ -13084,21 +13089,22 @@ unlike §57.9 the rule does not need ``:2181`` to license anything.
   callers.
 - **The TTM fix is specified, not built**, and the cross-host re-proof it will need
   is not run.  The kernel-runtime grid is still single-host.
-- **The dense-domain seam is specified, not built** — this is a semantics document
-  and a derivability proof, not an implementation plan.
-- **The merged-domain seam (UNION, INTERSECTION) is named and left to Bobby.**
+- **The dense-domain refusal is specified, not built** — this is a semantics
+  document and a proof that every case is derivable, not an implementation plan.
+- **The refusal over merged domains (UNION, INTERSECTION) is named and left to
+  Bobby.**
 - No blocker other than 1 is touched; the Phase-8 cutover verdict is unchanged; the
   shadow pilot's membership is still un-re-derived.
 
 **Evidence ledgers**, each with ``SHA256SUMS`` and harnesses taking a tree root as
 ``$1``: ``ttm-density-mechanism/`` (source dump, pragma census, thread-count
 prediction, three-column ablation, ``MECHANISM.md``, ``ABLATION.md``) and
-``dense-domain-semantics/`` (the seam-state capture over all 58 cells), plus the
+``dense-domain-semantics/`` (the state at the refusal over all 58 cells), plus the
 amended ``compressed-prefix-reach/``.
 
 ## 59. The TTM parallel single-pass assembly, built — and three structural claims the measurements overturned (2026-08-12)
 
-Opens at committed tip ``4a21c57``.  §58.7's fix is BUILT: three production
+Starts from committed tip ``4a21c57``.  §58.7's fix is BUILT: three production
 commits, ``git diff 4a21c57..HEAD -- src/`` is 967 insertions across six files.
 Nothing is wired into dispatch; ``compile_cin_via_loopir`` and
 ``execute_cin_via_loopir`` keep zero non-test callers.
@@ -13108,21 +13114,22 @@ inverted on three of its four cell-shapes ON THE M5, and the cross-host run
 (§59.9) does not reproduce it: on redwood the fix beats legacy on 8 of 16
 parallel configurations instead of 13, and **two configurations are slower than
 the BASE SERIAL kernel**, which is a regression this change introduces and is
-disqualifying on its own under the branch's standard.  The single-host claim was
-the thing most likely to be wrong and it was; §56 discharged a single-host
-caveat about ROUTING, and this is the first time the branch has measured KERNEL
-RUNTIME on a second host.
+disqualifying on its own under the standard this branch works to.  The
+single-host claim was the thing most likely to be wrong and it was; §56 removed a
+single-host caveat about ROUTING, and this is the first time the branch has
+measured KERNEL RUNTIME on a second host.
 
 The section is longer than the result needs because **four structural arguments
 this work made were refuted by its own measurements** -- three of them its own
-design's, one of them ``ABLATION.md``'s -- and each refutation is load-bearing
-for whatever is built next.
+design's, one of them ``ABLATION.md``'s -- and each refutation matters for
+whatever is built next.
 
 ### 59.1 What was built
 
-The design is sealed at ``ttm-density-mechanism/FIX_DESIGN.md`` — the file
-``ABLATION.md`` referenced and that did not exist — written before any
-production code and carrying four falsifiable predictions.
+The design is recorded with its checksum at
+``ttm-density-mechanism/FIX_DESIGN.md`` — the file ``ABLATION.md`` referenced and
+that did not exist — written before any production code and carrying four
+predictions measurement could contradict.
 
 Per-CHUNK, not per-thread, output buffers.  Each chunk of the outer dense loop
 appends into its own buffers exactly as the serial builder does; the buffers are
@@ -13139,34 +13146,34 @@ chunked, because it is indexed by the outer loop over a statically known range;
 every chunk writes a disjoint slice and only its VALUES need the merge's offset.
 ``owns_two_phase_output()`` stays False and the hard coupling at
 ``lower_llir.py:14504`` is untouched — this is a THIRD assembly strategy, not
-two-phase output.  Admission is structural (§59.6).
+two-phase output.  What is admitted is decided structurally (§59.6).
 
 ### 59.2 REFUTED: "byte-identical serial arm" does not mean inert
 
-``FIX_DESIGN.md`` argued the gate's inertness at ``scorch_nthreads == 1`` would
-be structural rather than empirical, because the serial arm would be today's
-statement list unmodified, with no pragma on it.  That argument is wrong.
+``FIX_DESIGN.md`` argued that the runtime condition would provably cost nothing
+at ``scorch_nthreads == 1``, because the serial arm would be today's statement
+list unmodified, with no pragma on it.  That argument is wrong.
 
 Measured: the first build was **up to 34% SLOWER than the base** at
-``nthreads == 1``, on shapes where the gate never opens and the arm that runs is
-the base's nest character for character.  The penalty grew with the work the
-kernel did — ruling out a fixed prologue cost — and at one configuration it
+``nthreads == 1``, on shapes where the condition is never true and the arm that
+runs is the base's nest character for character.  The penalty grew with the work
+the kernel did — ruling out a fixed prologue cost — and at one configuration it
 turned a 0.971 tie with legacy into a 0.926 loss.
 
 A three-column source-level ablation isolated it, the same method ``ABLATION.md``
 used on legacy's pragmas: a third column built from the candidate's own emitted
-source with the PARALLEL arm's body replaced by an unreachable ``throw``, gate
-still present, second copy of the nest gone.  **``stubbed`` tracks ``base`` at
-all twelve one-thread configurations**, to within 0.017 and usually 0.005,
-including the two worst points where both sit at 0.75 and 0.81 against the
-candidate.  So the duplicated body is essentially the whole penalty and the gate
-is essentially free.
+source with the PARALLEL arm's body replaced by an unreachable ``throw``,
+condition still present, second copy of the nest gone.  **``stubbed`` tracks
+``base`` at all twelve one-thread configurations**, to within 0.017 and usually
+0.005, including the two worst points where both sit at 0.75 and 0.81 against the
+candidate.  So the duplicated body is essentially the whole penalty and the
+condition itself is essentially free.
 
 Two consequences.  A ``scorch_assembly_threads`` helper, written to keep
 ``omp_get_num_procs()`` off the serial path, was **deleted**: the same ablation
-shows the gate including that call is free, so it was mechanism introduced
+shows the condition including that call is free, so it was mechanism introduced
 against a hypothesis the measurement had just refuted.  And the general lesson,
-recorded so it is not relearned: byte-identical *emission* is a real gate;
+recorded so it is not relearned: byte-identical *emission* is a real check;
 byte-identical *fragments inside a changed function* carry none of the same
 guarantee.  A path that must stay neutral needs a runtime measurement, not an
 argument from the source diff.
@@ -13199,17 +13206,18 @@ Those programs are now declined **before anything is emitted** and emit
 byte-identically to the base.
 
 This is what makes the cost exactly zero rather than merely small, and §59.2 is
-the proof that the distinction matters.  It is also the gate shape ``CLAUDE.md``
-asks for — provably inert where it must not act — established by construction
-rather than by a threshold that happens to hold.  On the corpus it removes the
-ten worst one-thread configurations outright: ``(16,256,256,32)`` has 16 rows
-and now emits the base's kernel character for character at every density.
+the proof that the distinction matters.  It is also the shape ``CLAUDE.md`` asks
+a condition like this to have — provably never true where it must not act —
+established by construction rather than by a threshold that happens to hold.  On
+the corpus it removes the ten worst one-thread configurations outright:
+``(16,256,256,32)`` has 16 rows and now emits the base's kernel character for
+character at every density.
 
 ### 59.5 The M5 result, scored against the predictions written first
 
 Candidate ``691b46b``, base ``4a21c57``, pinned detached worktrees; four columns
 from source through one JIT loader in one process against one preamble;
-ABBA-interleaved; per-column A/A control per configuration.  **All 30
+ABBA-interleaved; one same-binary control per column per configuration.  **All 30
 configurations agree on output storage — both index arrays and values — and
 match the dense reference, before any ratio was computed.**  A/A floor
 0.944–1.117.  Receipt ``ttm-parallel-singlepass/receipts/fix_ablate_m5_final.json``.
@@ -13234,7 +13242,7 @@ of those statements are M5-only; §59.9 measures what happens to them on x86.
 - **P4** (one thread, inside the A/A floor): nine of fourteen clean; two real
   misses at (64,128,64,128) d=0.001 (+3.6%, +4.1%); three nominal misses of
   +0.4%, +0.6% and +2.5% are on shapes whose emission is byte-identical to the
-  base, so those two columns are the same source and those rows are A/A
+  base, so those two columns are the same source and those rows are same-binary
   controls rather than measurements.
 
 ### 59.6 CORRECTION to ABLATION.md: the single-pass advantage is not uniform
@@ -13265,14 +13273,15 @@ Stated plainly: **on ``TTM dss x dd -> dss`` at (64,128,64,128) and d in
 up to 70% before.  Nothing regressed against the base at any parallel
 configuration.
 
-### 59.7 Admission, and what is byte-neutral
+### 59.7 What is admitted, and what emits byte-identically
 
 The parallel arm is emitted only when the result's dense prefix is exactly one
 with every remaining level compressed, the outermost prefix loop is a
 ``DenseFor`` binding result level 0, no stored-prefix assembly is owned, no
 panel/relayout/result-tile is attached, the outer extent can reach two threads,
 and a work estimate is derivable by the same ``sparse_pos_work_expr`` legacy's
-pragma uses — so both kernels open on the SAME gate at the same operands.
+pragma uses — so both kernels turn parallel on the SAME condition at the same
+operands.
 
 A dense prefix deeper than one is declined rather than guessed at: its first
 compressed level's position array is indexed by a FLATTENED dense cell, so the
@@ -13280,20 +13289,22 @@ pre-size, the per-chunk starting index and the shift range become products of
 the dense extents.  The mechanism generalizes; that derivation needs its own
 statement and its own measurement.
 
-Emission census over the corpus: **16 cell-shapes byte-identical**, 4 gated —
-exactly §58.4's four TTM cell-shapes — each with exactly one ``#pragma omp``, a
-serial arm that is the base's nest **verbatim** and carries no pragma, and a
-shared parallel body that matches the base's nest; 2 typed-refused, unchanged.
+Emission census over the corpus: **16 cell-shapes byte-identical**, 4 carrying
+the new condition — exactly §58.4's four TTM cell-shapes — each with exactly one
+``#pragma omp``, a serial arm that is the base's nest **verbatim** and carries no
+pragma, and a shared parallel body that matches the base's nest; 2 typed-refused,
+unchanged.
 
 ### 59.8 Frontier (host-independent)
 
-The 1138-cell extended frontier, both automatic arms, on base and candidate:
+The 1138-cell extended frontier — the survey matrix of programs this branch
+measures the compiler over — in both automatic arms, on base and candidate:
 **0 lost, 0 gained, 0 route changed, 0 unclassified, 0 NEW arm-variance.**  Three
-cells are arm-variant on BOTH sides — inherited, identical sets — and the gate
-compares against the base rather than treating inherited state as this change's
-failure.
+cells are arm-variant on BOTH sides — inherited, identical sets — and the
+comparison is against the base rather than treating inherited state as this
+change's failure.
 
-### 59.8a The suite, and the node-set diff that earned its keep
+### 59.8a The suite, and the regression the node-set diff caught
 
 Eight file-disjoint partitions in fresh processes, base and candidate, 16 runs.
 **6319 node ids on each side, 0 lost, 0 added.**  The node-set diff — rather
@@ -13342,13 +13353,13 @@ not a policy difference.  And **two configurations regress against the BASE**:
 the parallel path is 1.5x and 1.3x slower than the serial kernel it replaced.
 The headline cell ``dss x ss`` (64,128,64,128) d=0.05 goes 1.123 → **0.954**.
 
-**Diagnosis.**  The gate asks *is there enough work to be worth threads*.  The
-measurements say the question is *is there enough work to be worth threads AND
-per-chunk buffers AND a concatenation*, and the second has a different answer on
-a different host at a different shape.  At (32,64,128,64) the chunk width is 4
+**Diagnosis.**  The condition asks *is there enough work to be worth threads*.
+The measurements say the question is *is there enough work to be worth threads
+AND per-chunk buffers AND a concatenation*, and the second has a different answer
+on a different host at a different shape.  At (32,64,128,64) the chunk width is 4
 rows, so a small problem gets 8 buffer sets, and on x86 their allocation, growth
-and concatenation cost more than two threads buy.  The gate admits cases the
-transformation cannot pay for.
+and concatenation cost more than two threads buy.  The condition lets through
+cases the transformation cannot pay for.
 
 That is fixable, and the fix is not a constant to tune.  It needs a second
 condition with the same "provably cannot fire" character the extent test has,
@@ -13379,46 +13390,49 @@ The design it is measured against is ``ttm-density-mechanism/FIX_DESIGN.md``.
 
 ## 60. Assembly strategy made a scheduling decision — and three of this design's own claims refuted (2026-08-14)
 
-Opens at committed tip ``cae4f11``.  Bobby's directive: *"we need to make sure
-our refactored compiler support compiling code for all valid strategies. then
-whether to use single pass or two pass etc. whatever becomes a scheduling
-decision that our autoscheduler should handle."*  He authorized the canonical
-schema bump with the identity and cache-key changes it carries, and changing
-legacy's emission "as long as we are always moving in a better direction".
+This section starts from committed tip ``cae4f11``.  Bobby's instruction: *"we
+need to make sure our refactored compiler support compiling code for all valid
+strategies. then whether to use single pass or two pass etc. whatever becomes a
+scheduling decision that our autoscheduler should handle."*  He authorized the
+canonical schema bump together with the identity and cache-key changes it
+carries, and authorized changing legacy's emission "as long as we are always
+moving in a better direction".
 
 Two production commits, ``d9efcf8`` and ``b9f0e2a``; ``git diff cae4f11..HEAD --
 src/`` is 1,074 insertions across twelve files, one of them new
 (``sparse_assembly.py``, 166 lines).  **``src/scorch/csrc/`` is untouched**, so
 the shipping ``scorch_ops`` extension is bit-unchanged by this section — the
-csrc obligation §60.9 records is the one §59's header inherited, not a new one.
-Nothing is pushed; ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep
-zero non-test callers.
+csrc work §60.9 still lists as owed is the piece §59's header change left
+behind, not a new one.  Nothing is pushed; ``compile_cin_via_loopir`` and
+``execute_cin_via_loopir`` keep zero non-test callers.
 
-**The verdict, up front.**  The representation, the legality/cost separation, the
-explicit primitive and the structured refusals are BUILT and gated.  Emission
-completeness is **partial and measured**: two of the four strategies are
-emittable and proven bit-exact on the family the measurements are about, the
-third is emittable only on the family that already owned it, and the fourth has
-no host at all.  Three claims this section's own design made were refuted by its
-own measurements, and one premise it inherited from §58.3 was refuted too.
+**The verdict, up front.**  The representation, the split between legality and
+cost, the explicit primitive and the structured refusals are BUILT, each behind
+the checks that constrain it.  How much can actually be emitted is **partial and
+measured**: two of the four strategies emit and are proven bit-exact on the
+family the measurements are about, the third emits only on the family that
+already owned it, and the fourth has no family that can host it at all.  Three
+claims this section's own design made were refuted by its own measurements, and
+one premise it inherited from §58.3 was refuted too.
 
-### 60.1 The design, sealed before any code
+### 60.1 The design, recorded before any code
 
 ``~/.cache/scorch-codex/assembly-strategy/DESIGN.md``, written at ``cae4f11``
 before any production change, with its SHA-256 and the tip recorded in
-``provenance/design_tip.txt`` so every prediction below is verifiably
-pre-registered.  It names the four strategies, factors them, gives a legality
-domain and a refusal code per pair, specifies the representation, records the
-countability taxonomy for the next milestone's selector, and states nine
-measurements with a falsifiable prediction each.
+``provenance/design_tip.txt`` so every prediction below can be checked to have
+been made in advance.  It names the four strategies, separates them into the two
+bits that distinguish them, gives a legality domain and a refusal code per pair,
+specifies the representation, records how cheaply the output size can be known
+for the next milestone's selector, and states nine measurements each with a
+prediction that measurement could contradict.
 
 Three corrections it had to make to the inherited record before relying on it:
 
 - **``FIX_DESIGN.md`` exists.**  The task statement said ``ABLATION.md`` "still
   ends by pointing at a ``FIX_DESIGN.md`` that was never written".  It was
-  written — 22,191 bytes, in ``ttm-density-mechanism/SHA256SUMS``, recorded by
-  §59.1.  The premise "this prevents a third missing design" rests on one
-  instance, not two.
+  written — 22,191 bytes, listed in ``ttm-density-mechanism/SHA256SUMS``, and
+  recorded by §59.1.  The premise "this prevents a third missing design" rests on
+  one instance, not two.
 - **967 lines across six files is the diff from ``4a21c57``, not from
   ``a8f2954``.**  From ``a8f2954`` it is 1,034 across eight; the extra two are
   §57's blocker-1 tile fix, which is the direct precedent for this milestone's
@@ -13429,19 +13443,19 @@ Three corrections it had to make to the inherited record before relying on it:
   ``loop_plan_legality._derive_auto_decisions`` (``:376``) — the pair §57.5
   measured as duplicated.
 
-### 60.2 The 2x2: confirmed as an inventory, REFUTED as an orthogonal product
+### 60.2 The 2x2: right as an inventory, REFUTED as a product of two flags
 
 The four are exactly four emission forms distinguished by two bits, and each has
-a measured win region, so naming them as a 2x2 is right.  Treating them as a
-*product of two independent flags* is wrong three times over, and the design
-says so before building:
+a measured region where it wins, so listing them as a 2x2 is right.  Treating
+them as a *product of two independent flags* is wrong three times over, and the
+design says so before building:
 
 1. **The parallelism bit is not a feature added to a serial form.**  ``P1``
-   emits a runtime gate whose ``else`` arm is ``S1``'s nest verbatim, while
+   emits a runtime condition whose ``else`` arm is ``S1``'s nest verbatim, while
    ``P2``'s pragma is unconditional and at one thread still enters and tears down
-   a region for **4–10%** (``ABLATION.md`` §3).  So "``P1`` with the gate closed"
-   is ``S1`` and "``P2`` at one thread" is **not** ``S2``.  A product would
-   predict the second equality; measurement refutes it.
+   a region for **4–10%** (``ABLATION.md`` §3).  So "``P1`` with the condition
+   false" is ``S1``, and "``P2`` at one thread" is **not** ``S2``.  A product
+   would predict the second equality; measurement refutes it.
 2. **The axes carry no independent legality.**  All three non-serial strategies
    share ONE receiver contract, and it is the same predicate two implementations
    had reached independently: the two-phase pass enforces
@@ -13459,18 +13473,19 @@ nonsense state gets added later.
 
 ### 60.3 Legality is not cost, and the extent test moved
 
-§59.9 diagnosed the chunk gate as asking "is there enough work to be worth
+§59.9 diagnosed the chunk condition as asking "is there enough work to be worth
 threads" when the question is "…worth threads AND per-chunk buffers AND a
 concatenation".  Under this architecture those are two predicates in two places,
 and separating them is the substance of the change:
 
 - **LEGALITY** — can this receiver be assembled this way at all?  Structural,
   provable, **extent-free**, refused with a code.  ``PARTITIONABLE`` plus, for
-  the chunked strategy, four program conditions that are genuinely about
-  expressibility (a ``DenseFor`` outer binding result level 0, no stored-prefix
-  assembly, no panel/relayout/result-tile, a derivable work estimate).
+  the chunked strategy, four program conditions that are genuinely about whether
+  the form can be expressed (a ``DenseFor`` outer binding result level 0, no
+  stored-prefix assembly, no panel/relayout/result-tile, a derivable work
+  estimate).
 - **COST** — should we?  A named ``default_assembly()`` per family, which is
-  today's choice and the single seam a selector replaces.
+  today's choice and the single place a selector would replace.
 
 **The reclassification this forces, and it is the one that matters.**  §59.4's
 ``2 * ROWS_PER_THREAD`` compile-time decline is COST, not legality: a 16-row
@@ -13481,8 +13496,8 @@ extent is now honoured, because it is legal.  A test locks both sides, since a
 test that only checked the decline would have been satisfied by leaving the rule
 where it was.
 
-No constant is tuned in this section.  §59.7's gate keeps its legality half; its
-cost half is now a named function the selector inherits.
+No constant is tuned in this section.  §59.7's condition keeps its legality half;
+its cost half is now a named function the selector inherits.
 
 ### 60.4 Representation: two fields, two schemas, and the identity they carry
 
@@ -13498,7 +13513,7 @@ never a target annotation" (``nodes.py:1165``).  So:
 
 Bobby authorized the bump as "v11 → v12".  That is right for the LoopIR schema
 and it is not the whole of it: **two** schemas move, and this section records
-both rather than performing the one he named.
+both rather than performing only the one he named.
 
 | schema | before | after |
 | --- | --- | --- |
@@ -13506,14 +13521,15 @@ both rather than performing the one he named.
 | ``plan_identity.CANONICAL_PLAN_SCHEMA`` | ``…loopplan.canonical.v1`` | **``…v2``** |
 | ``CANONICAL_REQUEST_SCHEMA`` | ``…request.v2`` | unchanged; its *bytes* move |
 
-Identity consequences, stated here rather than discovered by a gate:
-``canonical_plan_dump``, ``plan_schedule_digest`` and ``loopir_request_identity``
-change for every plan, because ``"assembly":null`` joins the payload — deliberate,
-so "no decision" stays distinguishable from "serial by decision".
-``Schedule.cache_key`` changes for every schedule and **does** reach production,
-costing one cold cache and no behavioural change, because a key is only ever
-compared with keys from the same build and a v11 dump differs from a v12 dump in
-its ``"schema"`` field before it differs anywhere else.
+What that does to identity, stated here rather than left for a check to
+discover: ``canonical_plan_dump``, ``plan_schedule_digest`` and
+``loopir_request_identity`` change for every plan, because ``"assembly":null``
+joins the payload — deliberate, so "no decision" stays distinguishable from
+"serial by decision".  ``Schedule.cache_key`` changes for every schedule and
+**does** reach production, costing one cold cache and no change in behaviour,
+because a key is only ever compared with keys from the same build and a v11 dump
+differs from a v12 dump in its ``"schema"`` field before it differs anywhere
+else.
 
 The tokens and ``PARTITIONABLE`` have exactly ONE definition, in the new
 ``sparse_assembly`` module, which the four layers that need the rule import.
@@ -13530,24 +13546,26 @@ unambiguous: **all 24 legal cells failed** ``unsupported_program_shape`` /
 ``sparse_parent_dominance``.
 
 The mechanism.  The strategies apply only to sparse-output programs; every such
-program needs an accumulation workspace; and ``WorkspaceInsertion`` is an
-automatic-provenance decision that the explicit path has no way to record
-(``loop_plan.py``: "explicit schedules express workspace lifetime through tile
+program needs an accumulation workspace; and ``WorkspaceInsertion`` is a decision
+only the automatic path can record, since the explicit path has no way to express
+it (``loop_plan.py``: "explicit schedules express workspace lifetime through tile
 accumulation instead").  Routing a strategy request down the explicit path
 therefore produced a CIN carrying a workspace and a plan without the fact.
 
-What ships instead: a requested strategy rides on the **automatic** plan as an
-ATTESTED decision — exactly the standing ``_check_auto_plan_family`` already
-gives the cost-model loop order, which is "verified complete and legal, not
-re-derived".  The automatic **origin** still chooses nothing, so an ordinary
-automatic compilation records ``None``; a recorded strategy always came from a
-caller, which is what makes it a contract rather than an unverified degree of
-freedom.  Byte-neutrality is untouched by the correction.
+What ships instead: a requested strategy rides on the **automatic** plan as a
+decision the replay contract verifies — exactly what the standing
+``_check_auto_plan_family`` already does for the cost model's loop order, which
+is "verified complete and legal, not re-derived".  The automatic **origin** still
+chooses nothing, so an ordinary automatic compilation records ``None``; a
+recorded strategy always came from a caller, which is what makes it a contract
+rather than an unverified degree of freedom.  Byte-neutrality is untouched by the
+correction.
 
-A second fail-open the same measurement exposed: ``Schedule()`` is the automatic
-marker, so a schedule carrying **only** ``assembly`` looks empty to every
-field-by-field test and its request was silently dropped.  A caller would have
-received the default kernel with no way to find out.  Locked by a test.
+The same measurement exposed a second way the code could pass a request through
+without acting on it: ``Schedule()`` is the automatic marker, so a schedule
+carrying **only** ``assembly`` looks empty to every field-by-field test and its
+request was silently dropped.  A caller would have received the default kernel
+with no way to find out.  Locked by a test.
 
 ### 60.6 REFUTED, inherited: generalizing the two-phase opt-in is NOT wiring
 
@@ -13567,8 +13585,8 @@ transformation, so it refuses every other change, including one the pass is
 supposed to make.  Reading that failure as "the pass no-op'd" would have been the
 natural inference and it would have been wrong.  Fixed by scoping the checkpoint
 to the owner whose contract it verifies — keyed on the same bit the coupling
-already keys on, which is a scoping of two owners' two contracts, not a loosening
-of either.  Teaching the mirror to re-derive the two-phase transformation instead
+already keys on, which scopes two owners' two contracts rather than loosening
+either.  Teaching the mirror to re-derive the two-phase transformation instead
 would be a second implementation of the shared pass, which ``FIX_DESIGN.md`` §3.2
 already rejected for this exact reason.
 
@@ -13612,7 +13630,7 @@ two-pass request there fails closed with ``unsupported_assembly_host``.
 ``DESIGN.md`` §4.3 introduced ``unsupported_assembly_host`` as "fail-closed
 insurance for a family added later" and P-M2 predicted it would fire **zero**
 times over the legal domain.  It fires **58 of 192** cell-arms, and every one is
-a real host gap:
+a real gap in what a family can emit:
 
 - ``_ParallelSparseWorkspaceLowering`` cannot emit either single-pass strategy or
   the region-elided two-pass one.  Measured, not assumed: its own
@@ -13621,25 +13639,25 @@ a real host gap:
   pass happens to replace.  An earlier draft listed ``single_pass_serial`` there
   on exactly that (wrong) reasoning and the cell failed
   ``sparse_workspace_completion_lost``; listing only what is emittable is what
-  makes the refusal name the host instead of surfacing an internal completion
+  makes the refusal name the family instead of surfacing an internal completion
   failure.
 - ``_RowScopeSparseWorkspaceLowering`` emits only its serial default.
 
-### 60.8 What the gates measure
+### 60.8 What the checks measure
 
-| gate | result |
+| check | result |
 | --- | --- |
 | **1. Automatic-origin byte-neutrality vs ``cae4f11``** | **PASS.** 1,130 cells x both arms, compile-only: **zero** differing emissions, zero differing refusal codes |
 | **2. Frontier**, 1,138 cells x both arms, base and candidate | **PASS.** 0 lost, 0 gained, 0 route changed, 0 unclassified either side, 3 arm-variant both sides (inherited, identical sets), **0 NEW arm-variance**; admitted 260 both sides |
-| **3. Correctness per (strategy, cell)** | **PASS** for every emittable pair.  32 configurations (2 TTM cells x 2 shapes x 2 densities x **2 dtypes** x both arms), 96 executed strategy runs: ``AUTO``, ``S1`` and ``P1`` agree **bit-identically** on every index array and every value — not ``allclose`` — and match the dense reference to 6.26e-07.  ``P2`` verified bit-identical on its own family's cell.  Extents were chosen so ``P1``'s runtime gate genuinely opens |
+| **3. Correctness per (strategy, cell)** | **PASS** for every pair that can be emitted.  32 configurations (2 TTM cells x 2 shapes x 2 densities x **2 dtypes** x both arms), 96 executed strategy runs: ``AUTO``, ``S1`` and ``P1`` agree **bit-identically** on every index array and every value — not ``allclose`` — and match the dense reference to 6.26e-07.  ``P2`` verified bit-identical on its own family's cell.  Extents were chosen so ``P1``'s runtime condition genuinely fires |
 | **4. Refusals enumerated at their exact codes** | **PASS**, with §60.7's prediction missed.  Over 1,130 cells x 4 strategies x both arms — 9,040 compilations — **zero refusals lack a structured code** |
 | **6. Schema** | **PASS.** v12 and plan-v2 declared, identity and cache-key consequences recorded in §60.4 and locked by tests |
 | **5. Suite** | **IN FLIGHT, not a result.**  8 file-disjoint partitions per side, base and candidate, node set to be DIFFED rather than totals trusted.  Base partition 0 is green (513 passed / 14 skipped / 0 failed); the remaining fifteen runs are owed.  Command: ``run_suite_partitioned.sh <tree> <outdir> 8`` then ``suite_node_diff.py <base_outdir> <cand_outdir>`` |
 | **7. Runtime grid, four strategies, three hosts** | **NOT RUN** (§60.9) |
 | **8. ``scorch_ops`` built at both tips and compared** | **NOT RUN**, and this section adds nothing to ``csrc/`` (§60.9) |
 
-Emission completeness over the 24 partitionable-and-admitted frontier cells, both
-arms (48 cell-arms per strategy):
+How much can be emitted, over the 24 frontier cells that are both partitionable
+and admitted, in both arms (48 cell-arms per strategy):
 
 | strategy | emitted | refused, and why |
 | --- | --- | --- |
@@ -13650,22 +13668,23 @@ arms (48 cell-arms per strategy):
 
 Nine cells emit all four strategies' *sources*, and on all nine the four are
 byte-DISTINCT — so the representation reaches emission rather than being
-decorative.  ``two_pass_serial`` has no host: its shared-pass support exists
-(``CompressedWhereOpenMPContext.parallel``, with the workspace view relocated out
-of ``pre_parallel_body`` because codegen silently drops that field on a
-non-parallel loop — §60.10), and no family's completion contract accepts the
+decorative.  ``two_pass_serial`` has nothing that can host it: the shared pass
+supports it (``CompressedWhereOpenMPContext.parallel``, with the workspace view
+relocated out of ``pre_parallel_body`` because codegen silently drops that field
+on a non-parallel loop — §60.10), and no family's completion contract accepts the
 region-elided shape yet.
 
 ### 60.9 What this section does not do
 
-- **The suite gate is not finished.**  Eight partitions per side at ~13 minutes each;
-  base partition 0 passed and the other fifteen runs are outstanding.  The node-set
-  diff is the part that matters — it has caught a real regression the totals hid
-  twice — so no suite claim is made here beyond that one green partition.
-- **The runtime oracle grid is NOT run, on any host.**  Gate 7 and the whole of
+- **The suite check is not finished.**  Eight partitions per side at ~13 minutes
+  each; base partition 0 passed and the other fifteen runs are outstanding.  The
+  node-set diff is the part that matters — it has caught a real regression the
+  totals hid twice — so no claim about the suite is made here beyond that one
+  green partition.
+- **The runtime oracle grid is NOT run, on any host.**  Check 7 and the whole of
   step 5 are outstanding.  The grid is the next milestone's input and it should
-  not be taken until ``two_pass_serial`` has a host, because two of its four
-  columns would be empty.
+  not be taken until ``two_pass_serial`` has a family that can host it, because
+  two of its four columns would be empty.
 - **``scorch_ops`` is not built at both tips and compared.**  This section adds
   nothing to ``src/scorch/csrc/`` — ``git diff cae4f11..HEAD -- src/scorch/csrc/``
   is empty — so the obligation is unchanged from §59: the ``header.h`` +231 that
@@ -13685,7 +13704,7 @@ region-elided shape yet.
   shadow pilot's membership and every blocker other than 1 are untouched; the
   Phase-8 cutover verdict is unchanged.
 
-### 60.10 Defects found and recorded rather than folded in
+### 60.10 Defects found and recorded, not fixed here
 
 - **``codegen.py`` silently drops ``pre_parallel_body`` / ``post_parallel_body``
   on a non-parallel ``ForLoop``**, and ``before_parallel_body`` when there is no
@@ -13693,9 +13712,9 @@ region-elided shape yet.
   atomic branch.  The typed route refuses that shape
   (``lower_llir.py:12745``, ``:12775``) so this milestone is protected and the
   serial two-pass relocates the statement instead; legacy is not protected, and
-  the house rule is fail closed.  Left as a stated defect because a
-  ``CodegenError`` where text is silently dropped today is a legacy-visible
-  change needing its own neutrality argument.
+  the house rule is fail closed.  Left as a stated defect because raising a
+  ``CodegenError`` where text is silently dropped today would change what legacy
+  emits, which needs its own proof that nothing shipped changes.
 - **The frontier enumerates 1,139 cells over 1,138 distinct ones, and both
   numbers in the record are right.**  §55.2 says 1139 and §59.8 says 1138; the
   sealed receipt holds 1,139 records and ``frontier_diff.py`` keys them by
@@ -13710,7 +13729,7 @@ region-elided shape yet.
   exactly that shape.  Recorded because a census that silently misattributes is
   worse than one that crashes.
 
-### 60.11 The countability taxonomy, recorded for the next milestone's selector
+### 60.11 How cheaply the output size can be known, recorded for the next milestone's selector
 
 Derivable from the iteration lattice, and **not built into a selector here**.  The
 question is how expensive it is to learn the exact output sizes without producing
@@ -13731,16 +13750,16 @@ pass's price is the whole trade:
 ``TTM dss x ss -> dss`` is C2; ``TTM dss x dd -> dss`` is **C1**, because a dense
 second operand makes the per-``(i,j)`` count the full ``l`` extent whenever the
 ``k`` stream is non-empty.  That is the same axis on which the two cells' measured
-ratios diverge, which is the first evidence the taxonomy has predictive content.
+ratios diverge, which is the first evidence these classes predict anything.
 
 **A second axis the measurements demand, offered as a hypothesis and not a
-finding.**  Countability alone does not explain ``RESULT.md``'s five-density
+finding.**  These classes alone do not explain ``RESULT.md``'s five-density
 inversion (``legacy_serial/base`` runs 0.857 → 0.953 → 1.175 → 1.561 as density
-rises on one cell whose countability class never changes).  The candidate
-mechanism: the single pass's extra cost is ``std::vector`` growth traffic, which
-scales with emitted **entries**, while the counting pass's extra cost is
-recompute, which scales with **merge steps**.  So the sign of ``S2`` against
-``S1`` should be ordered by ``M/E = merge steps / emitted entries`` — for TTM,
+rises on one cell whose class never changes).  The candidate mechanism: the
+single pass's extra cost is ``std::vector`` growth traffic, which scales with
+emitted **entries**, while the counting pass's extra cost is recompute, which
+scales with **merge steps**.  So the sign of ``S2`` against ``S1`` should be
+ordered by ``M/E = merge steps / emitted entries`` — for TTM,
 ``nnz(A) / stored_ij`` — which is ≈1.2, ≈4 and ≈13 at those densities and orders
 all four measurements monotonically with a crossover between 1.2 and 4.  If it
 holds, the selector's rule is analytic and needs no fitted constant beyond a
@@ -13748,7 +13767,7 @@ crossover the oracle locates.  It is prediction P-M7c, it is the riskiest claim
 in the design, and it is a hypothesis until the grid scores it.
 
 **Evidence ledger**: ``~/.cache/scorch-codex/assembly-strategy/`` with
-``SHA256SUMS`` — ``DESIGN.md`` (sealed pre-registration, digest in
+``SHA256SUMS`` — ``DESIGN.md`` (recorded in advance, digest in
 ``provenance/``), ``FINDINGS.md`` (M1 and M9a scored), the legality reach census,
 the two-phase probe and its dumped sources, the emission/neutrality census, the
 cross-strategy correctness run, the frontier pair and its diff, and the
