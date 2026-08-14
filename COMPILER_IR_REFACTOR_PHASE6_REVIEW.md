@@ -169,6 +169,28 @@ code span, identifier, section reference and table shape from a document and
 compares the sets before and after; its captures and their comparison output are
 sealed beside it.
 
+### 0.5 Claims a later section overturned (added 2026-08-13)
+
+Every section here is dated and records what was measured on its day, so a claim
+that a later section refuted still reads as current if you land on it directly.
+That is not hypothetical: §56 caught the number 112 travelling three milestones
+because the section that produced it never said it had been superseded.  A
+forward pointer now sits at each site below.  This list is the index.
+
+| where | the claim | what replaced it |
+| --- | --- | --- |
+| §49.6 | "every migrated cell is one the legacy assembler rejects, corrupts, or terminates on" | §50.6: the legacy generator refuses none of the twenty and **nine are sound** |
+| §49.6 | the differential is "520 checks, 8 failures" | §50.7 item 2: those are the predecessor run's numbers; this milestone's receipt is **568 / 0** |
+| §55.5 | ``ss ij->j [s]`` typed 2,218 against legacy 2,845, "a better kernel" | §57.2, §57.3 and §57.7: three separate corrections — the baseline, its runnability, and the performance claim |
+| §55.5 | 112 byte-identical cell-arms, hence a 112-cell dense-receiver shadow pilot | corrected twice.  §56.5: the row a cutover turns on is default dispatch, so the number is **105** and the 7 cell-arms between the rows are enumerated.  Then §57.3: **neither** census column models production dispatch, so 105 is not simply right either and the membership must be re-derived against production's own emission before it is acted on |
+| §56.5 | "a dense-receiver shadow pilot is 105 cell-arms, not 112" | §57.3: the ruling it rests on is too strong — the default-dispatch column is not runnable and is not production — so 105 is the right correction to §55.5's *reasoning* and not the final membership |
+| §57.7 | "the pattern is density" | §58.5: the variable is the thread count legacy's own pragma requests |
+| §38.3, §39.1, §39.7 | the B3 test file collects 44 / 44 / 45 | §41.1: it collects **43**, re-confirmed 2026-08-13 at ``607d3e1`` |
+| §§47–55, sixteen sites | "v11 stands", "no canonical schema change" | §60.4: the LoopIR schema moved **v11 → v12** and the plan schema **v1 → v2**.  Each of those sites was true when written; none is pointered individually, because the schema is one fact and this row is the pointer |
+| §52.7 | blocker 1 closed by decision | §57.4, §57.5: reopened and fixed in the layer where the tile was illegal |
+| §58.7 | keep the single pass and parallelize it, "better than either existing kernel" | §59.5, §59.6, §59.9: built, and **not shippable** — two x86 configurations regress against the base |
+| §58.3 | the two-phase opt-in is a one-bit gap — "only the LoopIR-side opt-in is missing" | §60.6: refuted in three measured stages; true of the level arity, false of the statement vocabulary, and the third stage miscompiles |
+
 ## Verdict
 
 **The Phase-6 explicit-schedule vertical milestone is complete for the
@@ -5860,8 +5882,28 @@ it:
 The B1 A/B/A latency measurement on the shapes the change reaches (200
 warmups / 2,000 samples, candidate–base–candidate plus a base A/A
 control) is neutral: p50 ratios 0.995–1.000, mean 0.997–1.027, and the
-one 1.14 p95 reading sits inside the demonstrated 3.4–4.4% base-vs-base
-drift band.  Evidence is under
+one 1.14 p95 reading is not attributable to the change.
+
+**CORRECTED 2026-08-13.  This sentence originally read "sits inside the
+demonstrated 3.4–4.4% base-vs-base drift band", which puts the reading and
+the band in different units: 1.14 is a ratio, +14%, and a 3.4–4.4% band
+cannot contain it.**  The receipt
+(``phase6-b1b2-review2-907ceb8/latency/ratio-summary.txt``) carries the same
+error in its own verdict line, so this is a correction to the receipt as well
+as to the prose.  What the receipt does support, from its own numbers.  The A/A
+control is p50 **1.0345**, mean **1.0344**, p95 **1.0442**, which is where
+"3.4–4.4%" comes from — so the band is real, and 1.1401 is +14% and sits outside
+it.  What the 1.1401 *is* inside is the candidate's own run-to-run spread on that
+statistic: its three runs give p95 6.0332, 7.1918 and 6.8818 ms, a **1.19x spread
+against itself**, and its p95 ratio against one fixed base runs 0.9564, 1.1401
+and 1.0448.  A statistic that varies by 19% between repeats of the same binary
+cannot resolve a 14% reading, so p95 on this 2,000-sample compile-only grid
+supports no verdict either way.  The stable statistics are the claim: p50 and
+mean.  (One more number moves with this: the sentence above says p50 ratios
+"0.995–1.000", which is the two pairings against the first base run; the third
+pairing, ``cand-third/base-second``, is 0.9830, so the full p50 range in the
+receipt is 0.983–1.000.  Still neutral, and still at or below the A/A control.)
+Evidence is under
 `~/.cache/scorch-codex/phase6-b1b2-review2-907ceb8/` with its checksums.
 
 ### 35.2 Audit of what is compared against, and layer assignment
@@ -6486,7 +6528,9 @@ At code/test tip ``a06ea1a``:
 
 - broad LoopIR plus LoopPlan/options/request identity: **904 passed**
   (751 + 153);
-- dedicated B3 test file: **44 passed**; the mixed-load file's one
+- dedicated B3 test file: **44 passed** — *superseded: §41.1 measured that file
+  at* **43** *collected tests, and a 2026-08-13 re-collection at ``607d3e1``
+  reproduces 43.  Read 43 here*; the mixed-load file's one
   concurrent JIT termination and the row-scope file's one concurrent
   JIT termination both passed in isolated re-runs;
 - deterministic census: **32 cells / 0 divergence**; randomized
@@ -6539,7 +6583,9 @@ sparse assembly rather than start cutover or Phase 8.
 The ``370425d``/``a06ea1a``/``3570b29`` correction range was
 independently reviewed from the diffs before any new work.  Every
 committed reproduction is green at the inherited tip: the B3 test file
-(44, including the rank-four pre-pass mutation census and the no-op
+(44 — *superseded: the file collects* **43**, *per §41.1 and a 2026-08-13
+re-collection at ``607d3e1``*; including the rank-four pre-pass mutation census
+and the no-op
 dynamic-vector byte-identity lock), the mixed-operand, oracle, and
 row-scope files (143 combined, covering both Mapping mutation
 attacks, deep oracle-input ownership, and verify-before-callback
@@ -6732,7 +6778,10 @@ environment; evidence under
 ``~/.cache/scorch-codex/phase7-assembly-session/``):
 
 - full 15-file LoopIR sweep: **1220 passed / 0 failed**
-  (includes 56 single-cursor, 62 union, 45 B3, 77 mixed+conversion);
+  (includes 56 single-cursor, 62 union, 45 B3, 77 mixed+conversion) — *the "45
+  B3" is superseded: that file collects* **43** *at this very tip ``607d3e1``,
+  per §41.1 and a 2026-08-13 re-collection.  The 1220 total is not re-derived
+  here, so treat it as unreconciled by 2 rather than as confirmed*;
 - pure-LoopIR membership (12 files): **1401 passed**; options/
   plan-identity membership: **153 passed**;
 - repeated compiled public differentials (three rounds × five cells,
@@ -9278,7 +9327,10 @@ that can expose a cross-region segment merge.
 Everything below ran in the ``scorch`` conda environment.
 
 - **Compiled public differential: 520 checks, 8 failures, and every failure is
-  blocker 1.**  Each migrated cell is executed through the real JIT path and
+  blocker 1.**  *(Superseded: §50.7 item 2 shows 520/8 are the numbers of the
+  **predecessor** run at ``a9c9aca``; the retained receipt for this milestone is
+  **568 checks / 0 failures**.  Read §50.7 item 2.)*  Each migrated cell is
+  executed through the real JIT path and
   checked four ways — exact ``(pos, crd)`` level storage against the
   scheduled-program oracle, scheduled-versus-erased oracle equality, stored
   value agreement, and a dense PyTorch reference — across both automatic arms,
@@ -9293,6 +9345,15 @@ Everything below ran in the ``scorch`` conda environment.
   corrupts, or terminates on.  Correctness is checked against the LoopIR oracle
   plus the dense PyTorch reference.  Byte parity is asserted only where it is
   meaningful — that the K = 1 families' generated sources did not move.
+
+  > **REFUTED BY §50.6.**  "Every migrated cell is one the legacy assembler
+  > rejects, corrupts, or terminates on" is false, and §50.6 measured it: the
+  > legacy generator never refuses any of the twenty, and for **nine of them the
+  > generated C++ is sound** — same sparse storage, same values as the LoopIR
+  > route.  The eleven that are unsound fail in three named classes.  §49.9 used
+  > this claim to declare the paired-latency measurement "not applicable";
+  > §50.6's closing paragraph restates what survives of that.  Read §50.6, not
+  > this bullet.
 - **Representation unchanged.**  No node kind, no canonical schema change
   (v11 stands), no request- or schedule-identity change.  ``plan_identity``
   digests ``(cin, plan, result_shape, inputs, compile_options)``, never the
@@ -9652,7 +9713,7 @@ Source parity being unavailable is **not** a reason to skip compiler-latency
 measurement, and this milestone does not skip it -- §50.4 measures it and §50.8
 records it.
 
-### 50.7 Eight corrections to the inherited record
+### 50.7 Nine corrections to the inherited record
 
 1. **"Three local commits follow inherited documentation tip ``5571c82``"**
    (handoff, ordered-key vertical section).  There are **eight**: ``a9c9aca``,
@@ -10697,7 +10758,10 @@ inherited candidate: A/B mean 1.0001 against A/A 0.9988, with the A/B maximum
 1.0145 below the A/A maximum 1.0363.  The **per-round** min-of-samples row shows
 a consistent ~6-7% offset the A/A control does not show — but the **pooled**
 fastest-sample statistic, which is the same idea computed over all rounds at once
-and the one §51.7 declared, is 1.0009 against 1.0(-0.07)% for A/A.  The honest
+and the one §51.7 declared, is 1.0009 against **0.9993** for A/A — that is
+−0.07%, and the malformed "1.0(-0.07)%" this sentence carried until 2026-08-13
+was an attempt to write both forms at once.  The value is the one this
+subsection already states three paragraphs above.  The honest
 reading is a null result with one noisy per-round variant, and the largest number
 anywhere is 1.0959 against a 1.10 ceiling — inside it, but with less headroom
 than the inherited 1.0729.
@@ -11941,6 +12005,26 @@ pass.  That is a better kernel, and the repository already knows it —
 ``test_loopir_sparse_workspace_target`` asserts ``cpp_source != legacy_cpp`` for
 such a family on purpose.
 
+> **CORRECTED BY §57.2 AND §57.3, AND THE CORRECTION IS NOT SIMPLE.**  Three
+> things about this paragraph moved.  (1) The 2,845 is legacy under an empty
+> ``Schedule()``; legacy under **default dispatch** emits 1,993 for the same
+> cell, *fewer* than typed and with no second pass to delete — so "typed deletes
+> a second pass" is not a property of legacy in general (§57.2).  (2) The
+> default-dispatch column turns out not to be runnable at all: it indexes a
+> zero-length ``std::vector`` and **segfaults at every size tried**, and it is
+> not what production runs either (§57.3).  For this cell production emits
+> **2,848** characters *with* the workspace materialization, within three
+> characters of the 2,845 row — so the row this paragraph drew on is the
+> production-faithful one, reached for the wrong reason.  (3) "That is a better
+> kernel" is an INSPECTION claim from a character count.  §57.7 ran it: the
+> typed route wins at low density and **loses by up to 2.8x** at higher density,
+> and §58.5 identifies the variable as the thread count legacy's own pragma
+> requests, not density.  The governing statement is §57.3's: **neither census
+> column faithfully models production dispatch, and which is closer depends on
+> the family.**  The 112 in the table above should be re-derived against
+> production's actual emission before it is acted on — §56 caught that exact
+> number propagating three milestones, and §57.3's dense-receiver figure is 105.
+
 **The structure of the 112 is the finding.**  They are, essentially exactly, the
 **dense-receiver** cells: 60 ``degenerate2``, 32 ``rank3``, 12 ``rank2`` and 8
 ``matmul`` arms, every one with an all-dense result format except
@@ -12125,7 +12209,7 @@ statistic, so any future A/B under about 1.03 is indistinguishable from nothing.
 
 ### 55.8 Phase-7 exit audit, re-run against this tip
 
-The GO is re-derived here, not inherited.  Each answer is against ``@@TIP@@``.
+The GO is re-derived here, not inherited.  Each answer is against ``3b6b24f``.
 
 *Migrated families complete over their proven envelopes.*  **Yes**, and
 unchanged: no production file differs from ``6e8e09c``, so the 1,944-check
@@ -12147,7 +12231,7 @@ schema, no request- or schedule-identity change — trivially, because no
 production file changed.
 
 *Release behaviour unchanged.*  **Yes, by construction and by measurement.**
-``git diff 6e8e09c..@@TIP@@ -- src/ csrc/`` is empty, so identical source cannot
+``git diff 6e8e09c..3b6b24f -- src/ csrc/`` is empty, so identical source cannot
 produce different output; the corpus, grid and audit confirm it.
 
 *Compiler latency within the declared ceiling.*  **Yes** — see 55.7.  The
@@ -12392,6 +12476,20 @@ On the correct surface there are none.  The practical consequence is for
 §55.9 duty 2: **a dense-receiver shadow pilot is 105 cell-arms, not 112**, and
 the four ``matmul`` sparse-receiver arms must not be carried into it on the
 strength of an empty-``Schedule()`` byte match.
+
+> **QUALIFIED BY §57.3.**  The ruling this subsection rests on — that default
+> dispatch is what a cutover would move — turns out to be too strong.  §57.3
+> measured production itself and found the default-dispatch column is **not
+> runnable** (it indexes a zero-length ``std::vector`` and segfaults) and not what
+> production executes, while for ``ss ij->j [s]`` production emits 2,848
+> characters *with* the workspace materialization the empty-``Schedule()`` row
+> carries.  Worse for both columns: for **matmul**, production frequently
+> resolves a prebuilt kernel and generates no code at all, which neither column
+> describes.  So "105, not 112" is the right correction to §55.5's reasoning and
+> is **not** the final membership.  §57.3's conclusion governs: neither census
+> column faithfully models production dispatch, and the pilot's membership has to
+> be re-derived against production's own emission.  Still un-re-derived as of
+> §61.
 
 ### 56.6 What this section does not do
 
@@ -12815,8 +12913,10 @@ anything without it.
   decision.  The first's own docstring anticipated the move: "If a
   workspace+tile composition is ever implemented, this lock moves to whatever
   still occupies the seam rather than being deleted."
-- **Three are plan-shape locks in ``test_loop_plan.py``**, and both were measured
-  rather than assumed.  ``test_auto_origin_derives_workspace_storage_from_the_workspace_axis``
+- **Three are plan-shape locks in ``test_loop_plan.py``** — two distinct tests,
+  one of them parametrized over both arms, which is why three nodes fail and two
+  programs were measured.  Both were measured rather than assumed.
+  ``test_auto_origin_derives_workspace_storage_from_the_workspace_axis``
   asserts a tile on ``j`` for an **``sd``** receiver; executing that program on the
   unmodified tree, ``einsum('kij->kj', A_ddd, format='sd')`` returns **wrong
   values at every shape tried** — (4,5,6), (8,3,7), (2,9,4), max abs error 3.33 /
@@ -12923,13 +13023,26 @@ The two-phase parallel assembly is a SHARED LLIR pass,
 does is decided by one virtual: ``_TargetLowering.owns_two_phase_output()``
 returns False (``lower_llir.py:5484``) and exactly one LoopIR family overrides it
 — ``_ParallelSparseWorkspaceLowering`` (``:9511``), and only for
-``compressed_levels=(1,)``.  ``lower_llir.py:14504`` couples the two so hard that
-a mismatch fails closed.  The regressing cells are hosted by
+``compressed_levels=(1,)``.  The ``assemble_body`` closure inside
+``_lower_loopir_to_llir_owned`` couples the two so hard that a mismatch fails
+closed — ``if compressed_output_parallel != lowering.owns_two_phase_output()``,
+at ``lower_llir.py:14504`` when this section was written and ``:14595`` by §60.6.
+The symbol is given because the line number has already moved twice and will
+again; both numbers were right on the day they were written.  The regressing cells are hosted by
 ``_OrderedKeySparseWorkspaceLowering``, which never overrides it, and their
 ``dss`` receiver has TWO compressed levels.  Legacy's ``cin_lowerer`` runs the
 same shared pass on the same programs and gets ``_count1`` AND ``_count2``, so
 the pass already supports two compressed levels; only the LoopIR-side opt-in is
 missing.
+
+> **REFUTED IN PART BY §60.6.**  "Only the opt-in is missing" is true of the
+> LEVEL ARITY and false of the STATEMENT VOCABULARY, and §60.6 measured it in
+> three stages: the ordered-key completion checkpoint refuses the change, the
+> pass then emits source that cannot compile because ``result_write_pass``
+> recognized legacy's spellings only, and with both closed the rebuilt positions
+> are **wrong**.  A two-pass request on that family now fails closed at
+> ``unsupported_assembly_host``.  §61.4 adds why legacy itself was never exposed
+> to the vocabulary hole.
 
 ### 58.4 Demonstrated over the corpus, not over the two measured cells
 
@@ -13428,7 +13541,7 @@ duplication ablation, the emission census, the frontier pair and its diff, the
 partitioned suite runner and its node-set differ, and the predictions scorer.
 The design it is measured against is ``ttm-density-mechanism/FIX_DESIGN.md``.
 
-## 60. Assembly strategy made a scheduling decision — and three of this design's own claims refuted (2026-08-14)
+## 60. Assembly strategy made a scheduling decision — and three of this design's own claims refuted (2026-08-13)
 
 This section starts from committed tip ``cae4f11``.  Bobby's instruction: *"we
 need to make sure our refactored compiler support compiling code for all valid
@@ -13618,8 +13731,11 @@ AND ``_count2``".  That is true of the **level arity** and false of the
 
 **Stage 1 — the completion checkpoint, not the pass.**  Forcing the opt-in, all
 six probed cells failed ``sparse_workspace_completion_lost``.  The message is
-``_require_ordered_key_completion_checkpoint``'s, **not** the ``:14595``
-coupling's — so the coupling passed, meaning the pass *did* take ownership.  The
+``_require_ordered_key_completion_checkpoint``'s, **not** that of the
+``compressed_output_parallel != lowering.owns_two_phase_output()`` coupling in
+``_lower_loopir_to_llir_owned``'s ``assemble_body`` closure (``:14595`` here,
+``:14504`` when §58.3 cited it) — so the coupling passed, meaning the pass *did*
+take ownership.  The
 checkpoint mirrors the body before any pass runs and models exactly one
 transformation, so it refuses every other change, including one the pass is
 supposed to make.  Reading that failure as "the pass no-op'd" would have been the

@@ -32341,7 +32341,7 @@ untouched; the Phase-8 cutover verdict is unchanged.
 6. **Re-derive the shadow pilot's membership against production emission** (§57.3).
    Still owed; both 105 and 112 are wrong, family by family.
 
-## Assembly strategy made a scheduling decision — and four refuted claims (2026-08-14; supersedes every preceding prompt)
+## Assembly strategy made a scheduling decision — and four refuted claims (2026-08-13; supersedes every preceding prompt)
 
 Follows committed tip ``cae4f11``.  **Origin is still ``a3b8d1e``**; nothing pushed.
 Two commits, ``d9efcf8`` (production) and ``b9f0e2a`` (tests); a docs commit follows.
@@ -32357,8 +32357,12 @@ checked to predate the work.
 canonical schemas moved — LoopIR **v11 → v12** and the plan **v1 → v2** — so
 ``Schedule.cache_key`` and every plan-derived identity change once, which Bobby authorized.
 ``owns_two_phase_output()`` answers from the resolved strategy instead of from the class,
-and the ``:14595`` coupling is respected rather than loosened: only the value on its
-right-hand side became a function of the plan.
+and the coupling is respected rather than loosened: only the value on its
+right-hand side became a function of the plan.  That coupling is the
+``compressed_output_parallel != lowering.owns_two_phase_output()`` comparison inside
+``_lower_loopir_to_llir_owned``'s ``assemble_body`` closure — ``lower_llir.py:14595``
+as of this entry, ``:14504`` when §58.3 cited it, and named by symbol here because
+the line number has already moved twice.
 
 **2. LEGALITY AND COST ARE NOW TWO PREDICATES IN TWO PLACES, and the extent test moved.**
 ``PARTITIONABLE`` (dense level 0, everything below compressed) is legality — structural,
