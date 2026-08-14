@@ -8436,7 +8436,7 @@ This section supersedes §45's continuation instructions.  The code/test tip is
 ``bb429f4``.  The review first re-read and adversarially exercised the complete
 ``52d43cc..372b0fc`` milestone; the flattened-dense-prefix target itself is
 sound over its declared envelope.  Four defects were instead found in shared
-validation and emission boundaries reached by the milestone, and each was
+validation and emission boundaries the milestone reaches, and each was
 fixed before any continuation work:
 
 1. ``c5657cc`` / ``625c04f`` align ``LevelFormat`` construction, ownership
@@ -8449,8 +8449,8 @@ fixed before any continuation work:
 2. ``bcdd10d`` / ``d50f446`` remove the redundant successful-path authority
    replay from merged ``PositionLoad`` emission.  The sealed-target and final
    graph checks remain authoritative, cold-path replay still owns its precise
-   diagnostics, and an activating count lock pins seal / nested-input lookup /
-   explicit replay at exactly **1 / 1 / 0**.
+   diagnostics, and a lock on a shape production actually reaches pins seal /
+   nested-input lookup / explicit replay at exactly **1 / 1 / 0**.
 3. ``6e9ef24`` / ``49a5758`` make level-mode validation use actual type/MRO
    state, not caller-controlled ``__class__`` attributes.  Real ``str`` and
    ``LevelFormat`` subclasses remain compatible; foreign lookalikes fail
@@ -8469,17 +8469,17 @@ work remain outside every commit.
 ### 46.1 Evidence corrections
 
 The historical evidence is not rewritten.  The §45 milestone has four
-code/test commits through ``a1582a9`` (not three), moved **six** seam locks
-(not five), and its retained non-parity envelope correctly ends in
-``VERDICT: FAIL`` because the twelve oracle-gated new admissions must differ
-from malformed legacy output.  The historical 120/162 scripts lacked their
-own revision, import, stdout and exit receipts.  Their exact-tip reruns now
-show the distinction that the old prose blurred:
+code/test commits through ``a1582a9`` (not three), moved **six** locks on
+refused shapes (not five), and its retained non-parity envelope correctly ends
+in ``VERDICT: FAIL`` because the twelve oracle-checked new admissions must
+differ from malformed legacy output.  The historical 120/162 scripts lacked
+their own revision, import, stdout and exit receipts.  Their exact-tip re-runs
+now show the distinction that the old prose blurred:
 
 - the raw 120-case harness exits **1**, with **116 PASS / 4 FAIL**; a separate
   exit-0 characterization proves the complete fail set is exactly
   ``ds(3,4)`` copy x ``{float32,float64}`` x both arms, each at the retained
-  ``unsupported_program_shape`` seam;
+  ``unsupported_program_shape`` refusal;
 - the wider harness exits 0 at **162/162**, and the randomized oracle/storage
   sweep exits 0 at **560/560 over five seeds**.
 
@@ -8518,7 +8518,7 @@ Evidence is retained under
   empty stderr and a clean detached source tree.  The 20-source corpus and
   42-source grid each regenerate byte-identically to the retained captures;
   their native-build sentinel directories remain empty.  The correctness
-  subledger seals 288 retained files (manifest SHA-256
+  sub-ledger checksums 288 retained files (manifest SHA-256
   ``0181d9c77ec1fee68cf3d6b95789731dd53806bb32c6649031286613190d5120``)
   and explicitly excludes worktrees, extension caches, pycache and native
   build products; all 288 entries verify.
@@ -8527,17 +8527,17 @@ Evidence is retained under
   Flake8 is raw-byte-identical at 47 inherited findings, and mypy is
   raw-byte-identical at 140 errors in 11 files plus two notes.  No Flake8 or
   mypy coordinate drift exists.  ``git diff --check`` is clean.
-- Redwood ran 200 warmups / 2,000 samples for seven activating or shared
-  control shapes.  A fresh alternating repeat is wholly inside 1.10 (worst
-  p50 **1.0960**, p95 **1.0986**) and its A/A control is tight (worst p50
-  **1.0059**, p95 **1.0136**).  The first and order-flipped runs retain
-  marginal crossings (worst **1.1131/1.1125**), so those runs are not averaged
-  away and the Redwood evidence remains mixed.
-- At the user's suggestion, Slurm job ``16596836`` repeated the gate on MKT
-  in job-local ``/scr/u/bobbyy`` storage (AMD EPYC 9334, four allocated CPUs,
-  no direct ``mkt1`` login).  Both candidate repeats are wholly inside 1.10,
-  worst **1.0960/1.0953** and **1.0950/1.0946** p50/p95; the A/A control is
-  inside **1.0013/1.0095**.  The seven emitted-source payloads are byte-equal
+- Redwood ran 200 warmups / 2,000 samples for seven shapes that either reach
+  the changed code or serve as shared controls.  A fresh alternating repeat is
+  wholly inside 1.10 (worst p50 **1.0960**, p95 **1.0986**) and its A/A control
+  is tight (worst p50 **1.0059**, p95 **1.0136**).  The first and order-flipped
+  runs retain marginal crossings (worst **1.1131/1.1125**), so those runs are
+  not averaged away and the Redwood evidence remains mixed.
+- At the user's suggestion, Slurm job ``16596836`` repeated the measurement on
+  MKT in job-local ``/scr/u/bobbyy`` storage (AMD EPYC 9334, four allocated
+  CPUs, no direct ``mkt1`` login).  Both candidate repeats are wholly inside
+  1.10, worst **1.0960/1.0953** and **1.0950/1.0946** p50/p95; the A/A control
+  is inside **1.0013/1.0095**.  The seven emitted-source payloads are byte-equal
   between MKT and Redwood and between ``d50f446`` and ``bb429f4``.  Failed
   setup attempts (missing native extension, then an incorrectly rooted
   package metadata build) remain in the ledger rather than being hidden; the
@@ -8553,8 +8553,8 @@ sparse-reduction/TTM workspace vertical.  Its four blockers remain at
 ``cin_lowerer.py:1923``/``:1930``.  No Phase-8 cutover, default-dispatch,
 selector or cache change was made, and no fallback or legacy implementation
 was removed.  Cross-host latency evidence now attributes §45's local crossing
-away from these emission-neutral corrections, but it cannot close the absent
-semantic vertical; Phase 7 therefore has no exit verdict yet.
+away from these corrections, which do not change what is emitted, but it cannot
+close the absent semantic vertical; Phase 7 therefore has no exit verdict yet.
 
 ## 47. The ordered workspace key domain, a fifth cluster-2 blocker, and a NO-GO (2026-08-09)
 
@@ -8649,15 +8649,15 @@ builtin-registration trap.
 
 All three reproduce at the tip.
 
-- **Six seam locks.**  Five ``Recorded seam move`` annotations were added in
-  ``52d43cc..a1582a9`` plus ``a1582a9``'s docstring move in
+- **Six locks on refused shapes.**  Five ``Recorded seam move`` annotations
+  were added in ``52d43cc..a1582a9`` plus ``a1582a9``'s docstring move in
   ``test_loopir_cin_lowering.py``.  The sixth annotation, in
   ``test_loopir_multi_dense_prefix_target.py``, is the *code-sharpening* cell
-  §45.5 describes separately, not a lock move — so the count is six, exactly
+  §45.5 describes separately, not a moved lock — so the count is six, exactly
   as §46.1 corrects it.
 - **The raw 120-case harness exits 1** with **116 PASS and exactly four
   failures**, all ``ds(3, 4)`` copy × ``{float32, float64}`` × both arms at
-  the retained ``unsupported_program_shape`` seam, stderr empty.  The wider
+  the retained ``unsupported_program_shape`` refusal, stderr empty.  The wider
   harness exits 0 at **162/162** and the randomized oracle/storage sweep exits
   0 at **560/560 over five seeds**.
 - **The 54-cell census** produces **46 records, 46 arm-invariant, eight
@@ -8742,12 +8742,12 @@ side.
 
 **It is deliberately not fixed here.**  ``Scheduler.apply_schedule`` is the
 single owner of Schedule-to-LoopPlan translation for *both* pipelines
-(``loopir/pipeline.py:250-280``), so there is no LoopIR-only divergence point.
-Legacy computes these reductions correctly from the reordered order today —
-verified against PyTorch on ``ss``/``ds``/``dd`` rank-2 and ``sss`` rank-3
-cells, maximum difference 2.4e-07 — so changing the order would change
-generated code on the default dispatch path.  That is a Phase-8 cutover
-decision, which this milestone is forbidden to make.
+(``loopir/pipeline.py:250-280``), so there is no point at which the LoopIR path
+alone could diverge.  Legacy computes these reductions correctly from the
+reordered order today — verified against PyTorch on ``ss``/``ds``/``dd`` rank-2
+and ``sss`` rank-3 cells, maximum difference 2.4e-07 — so changing the order
+would change generated code on the default dispatch path.  That is a Phase-8
+cutover decision, which this milestone is forbidden to make.
 
 The consequence is a **reachability split**, now pinned as a committed
 arm-invariant census (``test_loopir_reduction_ttm_census.py``, 25 tests):
@@ -8780,8 +8780,8 @@ Evidence retained under ``~/.cache/scorch-codex/phase7-cluster2-8b4b5fc/``.
   corpus and 42-source grid captures regenerate byte-for-byte against the
   ``bb429f4`` baseline from a clean detached candidate worktree, with the
   native-build sentinel holding zero artifacts exactly as the baseline
-  records.  This is the direct proof that the representation change is
-  emission-neutral.
+  records.  This is the direct proof that the representation change does not
+  alter what is emitted.
 - **Schedule audit: 46 admitted / 40 rejected / 0 non-identical**, its JSON
   **identical to the retained baseline** after removing only the commit field.
 - **Full static parity in isolated base/candidate worktrees**: Black **15
@@ -8830,9 +8830,9 @@ assembly, and public wrapping — is **not implemented**, and five of its twelve
 cells are unreachable behind a shared-scheduler blocker this milestone
 declines to touch.
 
-*The activating paired latency receipt.*  Not re-run.  This milestone's
-changes are proven emission-neutral by byte-identical generated sources, so
-there is no new activating shape to measure; §46.2's cross-host evidence
+*The paired latency measurement.*  Not re-run.  This milestone's changes are
+proven not to alter what is emitted, by byte-identical generated sources, so
+there is no newly reachable shape to measure; §46.2's cross-host evidence
 stands unchanged.
 
 **Phase 7 is NO-GO.**  No Phase-8 inventory, cutover, cache, selector or
@@ -8842,7 +8842,7 @@ default-dispatch change was made, and no legacy code was deleted.
 Cluster 2 needs three things, in order:
 
 1. **Schedule-pass admission** implementing the §47.5 anchoring rule.
-   ``apply_sparse_workspace`` still gates on ``len(workspace.axis_loops) == 1``
+   ``apply_sparse_workspace`` still requires ``len(workspace.axis_loops) == 1``
    and a rank-2 identity-ordered result.  The plan layer is already ready:
    ``WorkspaceInsertion.axis_loops`` is a tuple and the automatic scheduler
    already emits every free variable after the last reduction.
@@ -8857,9 +8857,9 @@ Cluster 2 needs three things, in order:
    key and every multi-compressed TTM result, plus ``:599`` for the rank-1-key
    TTM shape.
 
-And, separately gated, the five reorder-blocked cells require a decision about
-``Scheduler.select_loop_order``'s forced reorder that changes default-dispatch
-generated code.
+And, needing to land as its own separate decision, the five reorder-blocked
+cells require a choice about ``Scheduler.select_loop_order``'s forced reorder
+that changes default-dispatch generated code.
 
 ## 48. Rigorous review corrections to the ordered-key milestone (2026-08-09)
 
@@ -8927,7 +8927,7 @@ contraction has non-symmetric values.  Scheduled and erased oracle storage is
 exactly equal, the independently computed lexicographic entries agree, and
 provenance is producer loops followed by the composite drain identity.
 
-### 48.3 The committed census is a representative frontier, not an exhaustive cluster
+### 48.3 The committed census is a representative survey, not an exhaustive cluster
 
 The ``d6e32f0`` coverage assertion proved only that its own two lists contained
 12 names.  It omitted four of the six TTM layouts explicitly named by §45.6.
@@ -8943,16 +8943,16 @@ All eleven reachable representatives remain arm-invariant at their recorded
 later diagnostics.  The word "representative" is binding: a separate
 level-general audit already finds adjacent ``dss`` reduction and mixed
 ``ds``/``sd`` factor variants not enumerated by the 16-cell lock.  A migration
-must derive and expand that frontier; it must not treat the committed list as
+must derive and expand that survey; it must not treat the committed list as
 proof of format/rank exhaustiveness.
 
 The five automatic-origin failures are also not intrinsically unreachable.
 Committed controls supply legal explicit orders for ``sss ijk->ij`` and
 ``ss ij->i`` and reach later LoopIR target/lowering diagnostics.  A
 LoopIR-specific automatic-plan repair is therefore architecturally possible
-without changing legacy default emission, although it needs its own gated
-design.  Sections 47.5/47.7 were wrong to call this necessarily a Phase-8
-default-dispatch decision.
+without changing legacy default emission, although it needs its own design and
+has to land as its own decision.  Sections 47.5/47.7 were wrong to call this
+necessarily a Phase-8 default-dispatch decision.
 
 The blanket claim that legacy computes all five blocked reductions correctly
 is removed.  It contradicts the existing runtime lock that public
@@ -8970,7 +8970,7 @@ has independent restrictions in:
    admission and replay);
 2. both sparse-workspace LLIR target classes (rank-1 runtime spelling and
    two-level assembly); and
-3. family-dependent CIN admission/target gates.
+3. family-dependent CIN admission and target checks.
 
 There is no single ``lower_cin.py`` line that owns every remaining cell.
 For example, ``sss->jk`` reaches ``unsupported_schedule_auto_family`` and
@@ -8991,10 +8991,11 @@ C++ change is required.
 
 The prior ledger's README truthfully says its 120/162/560 and 54-cell
 correctness sweeps ran at inherited ``8b4b5fc``.  Sections 47.3/47.6 and the
-handoff incorrectly presented them as exact-candidate evidence even though
-``a1fc642`` changed oracle and erasure semantics.  This review reruns those
-gates at exact code tip ``e13ecba`` with clean-worktree/import provenance and
-keeps every raw nonzero receipt distinct from its characterization.
+handoff incorrectly presented them as evidence taken at the exact candidate
+tip even though ``a1fc642`` changed oracle and erasure semantics.  This review
+re-runs those checks at exact code tip ``e13ecba`` with clean-worktree/import
+provenance and keeps every raw nonzero receipt distinct from its
+characterization.
 
 - Format/value/CIN focus: **274 passed**.
 - Verifier/oracle/schedule/printer/workspace focus: **647 passed**.
@@ -9007,7 +9008,7 @@ keeps every raw nonzero receipt distinct from its characterization.
   eight SIGSEGV cells ``C1``--``C7``/``C13``, and zero timeouts.  Its raw
   wrapper still exits 1 solely because it compares ``C13`` and ``C2``
   lexicographically; the order-insensitive semantic characterization exits 0.
-- Neutrality: fresh 20-source corpus and 42-source grid captures are
+- Unchanged emission: fresh 20-source corpus and 42-source grid captures are
   byte-identical between ``cf8cd44`` and ``e13ecba`` and to the retained
   captures.  Both 86-case schedule audits are 46 admitted / 40 rejected / 0
   nonidentical and normalize byte-identically to the retained audit.
@@ -9023,27 +9024,29 @@ keeps every raw nonzero receipt distinct from its characterization.
 
 Evidence is retained under
 ``~/.cache/scorch-codex/phase7-cluster2-review-e13ecba/``.  The correctness,
-neutrality, and full-suite manifests verify 501/501, 213/213, and 56/56
+emission and full-suite manifests verify 501/501, 213/213, and 56/56
 entries respectively; the full-suite manifest digest is
 ``571e6b6767fb1bd5096a8b391dd115110100414d533c3bdd089e5da878135cb0``.
 
-Generated-source identity, not a new timing run, is the appropriate latency
-gate for these representation/validation corrections: no production target
-is newly activated.  The existing §46 cross-host receipts remain historical
-evidence; they are not relabelled as runs at this tip.  If the next semantic
-slice changes an activating target, use the MKT Slurm allocation as the
-preferred independent host when Redwood is loaded or unavailable, following
-the repository's ``/scr/u/bobbyy`` and no-direct-``mkt1`` rules.
+Generated-source identity, not a new timing run, is the right latency evidence
+for these representation and validation corrections: no production target
+becomes newly reachable.  The existing §46 cross-host receipts remain
+historical evidence; they are not relabelled as runs at this tip.  If the next
+semantic slice changes a target that production actually reaches, use the MKT
+Slurm allocation as the preferred independent host when Redwood is loaded or
+unavailable, following the repository's ``/scr/u/bobbyy`` and
+no-direct-``mkt1`` rules.
 
 ### 48.6 Disposition
 
 The ordered key domain is now a usable semantic foundation, including honest
 root-region erasure, but no rank-K LLIR target or public reduction/TTM family
 has landed.  **Phase 7 remains NO-GO.**  The next milestone should complete
-the semantic vertical across the expanded reachable frontier and, in
-parallel, make a separately gated decision for LoopIR automatic-origin repair.
-No Phase-8 cutover, default dispatch flip, cache/selector change, fallback
-weakening or legacy deletion is authorized before a genuine Phase-7 GO.
+the semantic vertical across the expanded reachable survey and, in
+parallel, decide on the LoopIR automatic-origin repair as its own separate
+change.  No Phase-8 cutover, default dispatch flip, cache/selector change,
+fallback weakening or legacy deletion is authorized before a genuine Phase-7
+GO.
 
 ## 49. The ordered-key semantic vertical: 33 newly admitted cells, three named blockers (2026-08-09)
 
