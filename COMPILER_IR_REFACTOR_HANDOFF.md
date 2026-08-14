@@ -32340,3 +32340,105 @@ untouched; the Phase-8 cutover verdict is unchanged.
 5. **Take the merged-domain decision** for the UNION and INTERSECTION cells.
 6. **Re-derive the shadow pilot's membership against production emission** (§57.3).
    Still owed; both 105 and 112 are wrong, family by family.
+
+## Assembly strategy made a scheduling decision — and four refuted claims (2026-08-14; supersedes every preceding prompt)
+
+Follows committed tip ``cae4f11``.  **Origin is still ``a3b8d1e``**; nothing pushed.
+Two commits, ``d9efcf8`` (production) and ``b9f0e2a`` (tests); a docs commit follows.
+``git diff cae4f11..HEAD -- src/`` is 1,074 insertions across twelve files, one new
+(``sparse_assembly.py``).  **``src/scorch/csrc/`` is untouched.**  Review §60 owns the
+detail; the sealed design is ``~/.cache/scorch-codex/assembly-strategy/DESIGN.md``, written
+before any code with its digest in ``provenance/design_tip.txt``.
+
+**1. WHAT IS BUILT.**  Assembly strategy is now a first-class scheduling decision:
+``LoopPlan.assembly`` records it, ``LoopProgram.assembly`` carries it into LoopIR on
+``LoopProgram.parallel``'s exact terms, ``Schedule.assembly`` requests it publicly.  Both
+canonical schemas moved — LoopIR **v11 → v12** and the plan **v1 → v2** — so
+``Schedule.cache_key`` and every plan-derived identity change once, which Bobby authorized.
+``owns_two_phase_output()`` answers from the resolved strategy instead of from the class,
+and the ``:14595`` coupling is respected rather than loosened: only the value on its
+right-hand side became a function of the plan.
+
+**2. LEGALITY AND COST ARE NOW TWO PREDICATES IN TWO PLACES, and the extent test moved.**
+``PARTITIONABLE`` (dense level 0, everything below compressed) is legality — structural,
+extent-free, refused with a code, and defined ONCE in ``sparse_assembly`` for the four
+layers that need it.  §59.4's ``2 * ROWS_PER_THREAD`` decline is COST: a 16-row receiver
+assembles correctly from one chunk, so it moved into a named ``default_assembly()``, which
+keeps every automatic kernel byte-identical AND is the single seam the selector replaces.
+An explicit request at a small extent is honoured.  **No constant is tuned.**
+
+**3. GATES.**  Byte-neutrality vs ``cae4f11``: 1,130 cells x both arms, **zero** differing
+emissions — the headline claim, and it is structural rather than empirical.  Frontier:
+1,138 cells both arms both trees, 0 lost / 0 gained / 0 route changed / 0 unclassified /
+**0 NEW arm-variance**.  Correctness: 32 configurations (2 dtypes, both arms, extents where
+the chunk gate genuinely opens), 96 executed strategy runs, ``AUTO``/``S1``/``P1``
+**bit-identical** on every index array and value, reference to 6.26e-07.  Refusals: 9,040
+compilations, **zero without a structured code**.
+
+**4. REFUTED (this design's own): an automatic plan carrying NO strategy makes three of the
+four unreachable.**  ``DESIGN.md`` §4.5 argued the origin should record nothing, to avoid a
+third copy of the receiver rule.  All 24 legal cells then failed
+``unsupported_program_shape``/``sparse_parent_dominance``: the strategies apply only to
+sparse-output programs, all of those need a workspace, and ``WorkspaceInsertion`` is an
+automatic-provenance decision the explicit path cannot record.  A requested strategy now
+rides on the automatic plan as an ATTESTED decision, the standing the cost-model loop order
+already has.  The origin still chooses nothing, so byte-neutrality is untouched.
+
+**5. REFUTED (inherited from §58.3 / MECHANISM.md §2): generalizing the two-phase opt-in is
+NOT wiring.**  Three measured stages.  (a) The ordered-key completion checkpoint refused any
+body change it does not model — scoped to the owner whose contract it verifies, keyed on the
+bit the coupling already uses.  (b) ``result_write_pass`` recognizes result writes only in
+legacy's vocabulary (``push_back``, indexed assign) while the LoopIR targets emit
+``emplace_back`` and ``scorch_vector_set``, so the count pass kept appending, its counters
+stayed zero, and it **failed open** — passing unrecognized result writes to the C++
+compiler.  Both vocabularies are now recognized and an unrecognized result write fails
+closed.  (c) **The rebuilt positions are wrong**: a ``dss`` receiver gives "compressed mode 2
+position array must be nondecreasing" and a ``ds`` one a coordinate outside its extent,
+because the two-phase path derives positions from ``_count`` prefix sums indexed by the phase
+loop variable while the family closes them through a dense-prefix catch-up.  Refused at
+compile time rather than shipped.
+
+**6. REFUTED (this design's own): ``unsupported_assembly_host`` is not unreachable.**  It
+fires 58 of 192 cell-arms, every one a real host gap.
+``_ParallelSparseWorkspaceLowering`` cannot emit either single-pass strategy or the
+region-elided two-pass one — measured: its own ``complete_sparse_workspace`` requires the
+two-phase parallel shape.
+
+**7. EMISSION COMPLETENESS IS PARTIAL, and the numbers are the report.**  Over the 24
+partitionable-and-admitted frontier cells x both arms: ``single_pass_serial`` 46/48,
+``single_pass_chunk_parallel`` 18/48 (26 correctly illegal — stored outer loop),
+``two_pass_parallel`` 2/48, ``two_pass_serial`` **0/48 — no host**.  Nine cells emit all four
+strategies and on all nine the four sources are byte-DISTINCT.
+
+**Not addressed.**  The runtime oracle grid is **NOT RUN on any host** — and should not be
+until ``two_pass_serial`` has a host, since two of four columns would be empty.  ``scorch_ops``
+is not built at both tips (this section adds nothing to ``csrc/``, so the obligation is §59's
+inherited ``header.h``).  mkt1 still not run.  ``scorch_concat_chunks``'s value-initializing
+``resize`` still stands, so ``P1``'s eventual oracle column is measured on a kernel with a
+known serial tail and closing that tail invalidates the column.  The dense-domain seam, the
+merged-domain decision, the shadow pilot's membership and every blocker other than 1 are
+untouched; Phase-8 cutover stays NO-GO.
+
+## What the next session should do
+
+1. **Give ``two_pass_serial`` a host, or delete its emission support.**  Right now the
+   shared pass supports the region-elided form and no family's completion contract accepts
+   it, which is unverified code.  Either teach one contract the shape (with its own
+   correctness run) or remove ``CompressedWhereOpenMPContext.parallel`` and record S2 as
+   designed-not-built.  Unverified production paths are what this branch keeps paying for.
+2. **Fix the two-pass position reconstruction on the ordered-key family** (§60.6 stage 3).
+   The diagnosis is specific: positions rebuilt from ``_count`` prefix sums indexed by the
+   phase loop variable versus closed by a dense-prefix catch-up, which disagree when the
+   outer loop is a stored stream.  That unlocks ``two_pass_parallel`` on 22 more cell-arms
+   and ``two_pass_serial`` on 44.
+3. **Only then run the oracle grid**, four strategies x the legal corpus x three hosts,
+   with same-binary A/A controls and the floor beside every ratio.  Score P-M7a..f from
+   ``DESIGN.md`` §8, especially **P-M7c**, the ``M/E`` hypothesis: it is the analytic rule a
+   selector could use instead of a fitted threshold, and it is the riskiest claim written
+   down.
+4. **Close the csrc/ neutrality gap** (§59's ``header.h``): build ``scorch_ops`` at both tips,
+   compare, and run the prebuilt guardrail grid.  "Inert in production" needs two arguments.
+5. **Then the selector**, which is the next milestone proper: ``default_assembly()`` is the
+   one seam it replaces, and the oracle grid is its input.
+6. Deferred as before: the dense-domain seam (§58.8–58.10), the merged-domain UNION /
+   INTERSECTION decision, the shadow pilot's membership (§57.3).
