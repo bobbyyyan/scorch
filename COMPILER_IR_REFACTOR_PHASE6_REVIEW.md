@@ -7444,21 +7444,21 @@ and the drain emits one entry per (surviving, outer contracted) pair.  Storage
 validation rejects that result rather than returning it.  It is characterized
 by an explicit test, not hidden.
 
-**Blast radius, measured.**  Both fixes are confined to the legacy route.  Over
-a 1,584-cell ``d``/``s`` layout enumeration at ranks 1-4 in both automatic
+**How far the fixes reach, measured.**  Both are confined to the legacy route.
+Over a 1,584-cell ``d``/``s`` layout enumeration at ranks 1-4 in both automatic
 arms, every LoopIR-admitted program is byte-identical: **0 regressions, 0
 newly rejected, 0 fail-closed code changes, 0 arm divergence**.  Legacy
 generated source changes for **506 cells**, and those cells have **zero
-overlap** with the 186 arm-instances that carry a byte-parity gate -- every one
-of them is rejected by the LoopIR route.  All four sealed capture surfaces
-regenerate byte-identically: corpus **20/20**, grid **42/42**, anchors
-**22/22**, heap **11/11**.
+overlap** with the 186 arm-instances that are required to be byte-identical to
+legacy -- every one of them is rejected by the LoopIR route.  All four
+checksummed capture surfaces regenerate byte-identically: corpus **20/20**,
+grid **42/42**, anchors **22/22**, heap **11/11**.
 
-### 43.3 The systemic returned-format mutability seam (``2626a04`` / ``221ff31``)
+### 43.3 The systemic returned-format mutability gap (``2626a04`` / ``221ff31``)
 
 §42.3 deferred this pending an audit of every public format exposure and every
 identity consumer.  That audit was performed across five independent surfaces
-and judged from three independent stances.  It found the seam **wider and
+and judged from three independent stances.  It found the gap **wider and
 worse** than §42.3 described.
 
 Wider: ``tensor.format`` is one of five retained-object exposures.
@@ -7476,7 +7476,7 @@ an unrelated call site or returning a bare ``torch.Tensor`` where an
 
 The audit also settled what must *not* be done.  Copy-on-read at
 ``STensor.format`` alone measured **+10% to +18%** on warm CSR-times-dense
-matmul against a +/-1% same-shape control, and would still not close the seam,
+matmul against a +/-1% same-shape control, and would still not close the gap,
 because the hostile object enters on the write side.  Making ``parse_format``
 always rebuild measured **+7.6%** on the same shape.  Native memory safety is
 already closed independently: every prebuilt entry point re-validates through
@@ -7542,7 +7542,8 @@ rendered-name or regex routing, or operation-specific target hack: the
 admission is expressed through the existing position and level identities
 alone.
 
-The legacy comparand is honest here, so the gate is the B1/B3 discipline:
+Legacy is an honest thing to compare against here, so the standard is the
+B1/B3 one:
 
 - **byte parity** over the 1,584-cell layout enumeration: **51 newly admitted
   cells (102 arm-instances)**, every one byte-identical to
@@ -7557,9 +7558,9 @@ The legacy comparand is honest here, so the gate is the B1/B3 discipline:
   coverage includes float32 and float64, 16 zero-extent cells and hand-built
   stored explicit zeros.  **103 of 103 non-boundary cells pass every check.**
 
-**Recorded seam move.**  ``ss*sd*dd`` -- a dense-factor widening over a
-dense-leaf co-operand -- moves from ``unsupported_program_shape`` into the
-admitted family at byte parity, joining the 3-ary intersection the target
+**One lock on a refused shape moves.**  ``ss*sd*dd`` -- a dense-factor widening
+over a dense-leaf co-operand -- moves from ``unsupported_program_shape`` into
+the admitted family at byte parity, joining the 3-ary intersection the target
 already carried.  ``ss+sd`` keeps ``unsupported_union_with_dense`` and ``sd``
 copy keeps ``unsupported_sparse_output_domain``.
 
@@ -7594,12 +7595,12 @@ deliberately left unchanged so the defective route stays unreachable.
 **Multi-compressed reduction/TTM.**  Unchanged at
 ``unsupported_sparse_output``, ``unsupported_sparse_output_domain``,
 ``unsupported_sparse_output_reduction`` and ``unsupported_program_shape``
-depending on the nest.  The legacy comparand still terminates with SIGSEGV, so
-this family can never claim byte parity and needs its own oracle-gated
-vertical with a workspace/result ownership audit.  §43.2(b) adds one concrete
-datum: the workspace *placement* defect it exposed -- a workspace rebuilt
-inside the second contraction loop -- is in the same machinery this slice
-would have to own.
+depending on the nest.  Legacy still terminates with SIGSEGV on these
+programs, so this family can never claim byte parity and needs its own
+oracle-checked vertical with a workspace/result ownership audit.  §43.2(b) adds
+one concrete datum: the workspace *placement* defect it exposed -- a workspace
+rebuilt inside the second contraction loop -- is in the same machinery this
+slice would have to own.
 
 ### 43.6 The regenerated compatibility census
 
@@ -7622,9 +7623,9 @@ all 54 arm-invariant** on their arm-resolved LoopIR and legacy source columns.
   also numerically wrong** against the dense reference: ``B11`` (``sd`` copy),
   ``D9`` (``sds`` copy), ``D10`` (``sd+sd``) and ``D11`` (``sdd`` copy).  The
   vacuous column had reported all of these as merely "executed".  This
-  strengthens, rather than weakens, the decision to gate the multiple-dense-
-  prefix and trailing-dense-output families on the oracle: their legacy
-  comparand is not just malformed, it is wrong.
+  strengthens, rather than weakens, the decision to check the multiple-dense-
+  prefix and trailing-dense-output families against the oracle: their legacy
+  counterpart is not just malformed, it is wrong.
 
 ### 43.7 Evidence corrections carried forward
 
@@ -7638,15 +7639,15 @@ all 54 arm-invariant** on their arm-resolved LoopIR and legacy source columns.
   public input-side boundaries retained caller-owned formats.  §43.3 closes
   them.
 - The "498 LoopIR / 123 runtime" memberships (§40.3), the "214 passed" line
-  and the "758 passed" pre-seam receipt remain unreproducible or exploratory
-  and are not gates.
+  and the "758 passed" pre-boundary receipt remain unreproducible or
+  exploratory and are not evidence anything has to pass.
 
 ### 43.8 Verification
 
-All gates ran in the ``scorch`` conda environment; evidence is retained under
-``~/.cache/scorch-codex/phase7-closure-session/``.
+Everything below ran in the ``scorch`` conda environment; evidence is retained
+under ``~/.cache/scorch-codex/phase7-closure-session/``.
 
-- **Focused batteries** at the tip: dense-universe cursor bounds **29
+- **Focused test files** at the tip: dense-universe cursor bounds **29
   passed**; sparse rank-1 reduction drains and the dense-leaf co-operand target
   together **202 passed**; the format-ownership boundary **17 passed**; the
   three inherited format/conversion files **147 passed**; the LLIR string
@@ -7688,21 +7689,21 @@ All gates ran in the ``scorch`` conda environment; evidence is retained under
   ``test_loopir_single_cursor_assembly_target.py``, a member of partition 1,
   which therefore ran at ``f45a7b1``.
 
-  **This gate earned its keep.**  Partition 1 initially failed two nodes:
+  **Running the suite was worth it.**  Partition 1 initially failed two nodes:
   ``test_adjacent_seams_stay_fail_closed[posload_co_operand-*]``.  That
-  inherited seam lock named ``ss * sd`` -- exactly the cell this milestone
+  inherited lock named ``ss * sd`` -- exactly the cell this milestone
   migrates -- so it asserted ``unsupported_program_shape`` for a program now
   admitted at byte parity.  The 1,584-cell layout differential could not have
   caught it, because that harness compares compiler outcomes and not test
-  expectations.  ``f45a7b1`` moves the lock to the neighbour that still
-  occupies the seam and names the move in place; partition 1 then passed
+  expectations.  ``f45a7b1`` moves the lock to the neighbour that is still
+  refused there and names the move in place; partition 1 then passed
   684/684.  The milestone's "every neighbour keeps its exact code" claim was
   incomplete by exactly one inherited lock until that commit.
-- **Activating paired two-order compile latency was not run**, for the same
-  reason: a thermally throttled host cannot produce an honest latency receipt.
-  The harness is retained with the three newly activating dense-leaf cells
-  (``dl_ss_sd_mul``, ``dl_sss_sdd_mul``, ``dl_ssss_sddd_mul``) plus the shared
-  ``b3_ss_mul`` control already declared.
+- **The paired two-order compile latency on the shapes production reaches was
+  not run**, for the same reason: a thermally throttled host cannot produce an
+  honest latency receipt.  The harness is retained with the three newly
+  reachable dense-leaf cells (``dl_ss_sd_mul``, ``dl_sss_sdd_mul``,
+  ``dl_ssss_sddd_mul``) plus the shared ``b3_ss_mul`` control already declared.
 - **The five protected tracked files** retain their recorded SHA-256 values;
   live and local origin remain ``58e8565``; nothing was pushed, amended,
   squashed or reordered; only explicit paths were staged.
@@ -7713,30 +7714,31 @@ Criterion by criterion.  *Migrated families complete over their proven
 envelopes*: the compressed-parent/dense-leaf co-operand family is, at byte
 parity in both automatic arms with oracle and PyTorch differentials and legacy
 storage identity.  *Every neighbour carries a stable fail-closed code*: yes, in
-both arms, with one recorded seam move (``ss*sd*dd``).  *Representation
-unchanged*: no node kinds, canonical schema, request identity, schedule
-identity or erasure changed.  *Release behaviour unchanged*: the schedule audit
-equals its baseline, every sealed capture surface is byte-identical, and no
-default dispatch, cache or selector changed.  *The declared matrix is closed*:
-**it is not.**
+both arms, with one recorded move of a lock on a refused shape (``ss*sd*dd``).
+*Representation unchanged*: no node kinds, canonical schema, request identity,
+schedule identity or erasure changed.  *Release behaviour unchanged*: the
+schedule audit equals its baseline, every checksummed capture surface is
+byte-identical, and no default dispatch, cache or selector changed.  *The
+declared matrix is closed*: **it is not.**
 
 Two declared families remain unmigrated, each with a precise blocker recorded
 in §43.5: multiple dense prefixes / interleaved dense levels (blocked on the
 dense catch-up counter and result position-vector sizing, and on the base
 target's shared one-dense-extent sizing defect), and multi-compressed
-reduction/TTM (blocked on a legacy comparand that segfaults, so permanently
-oracle-gated).
+reduction/TTM (blocked on a legacy route that segfaults, so permanently checked
+against the oracle instead).
 
-One gate remains outstanding: the activating paired two-order latency receipt
-could not be produced on a thermally throttled host, and is recorded as
-outstanding rather than as a pass.  The full suite did complete.
+One measurement remains outstanding: the paired two-order latency receipt on
+the shapes production reaches could not be produced on a thermally throttled
+host, and is recorded as outstanding rather than as a pass.  The full suite did
+complete.
 
 **Phase 7 therefore does not exit on this milestone.**  No Phase-8 inventory
 was started, no cutover, cache, selector or default-dispatch change was made,
 and no legacy code was deleted.  The milestone's own contribution is
 nonetheless larger than a family migration: two pre-existing silent-correctness
 defects in public operations are closed, the process-global half of the format
-seam is closed, and the census's numeric-soundness column -- which had never
+gap is closed, and the census's numeric-soundness column -- which had never
 actually run -- is now real.
 
 ## 44. Exact-tip review: retained ownership and target integrity (2026-08-08)
@@ -7754,17 +7756,18 @@ The 540-entry ``phase7-closure-session`` ledger verifies **540/540** from
 scratch.  The older §39 ``phase7-assembly-session`` ledger does not: its
 ``tip-at-docs.txt`` was changed about 25 seconds after ``SHA256SUMS`` was
 written, so that manifest now verifies **224/225**.  The changed file only records a Git
-tip and does not alter a code, test, capture or timing receipt; this is an
-evidence-sealing defect, not a code-result discrepancy.  The failed check,
-expected digest, actual digest and timestamps are retained in this review's
-ledger instead of silently resealing the old directory.
+tip and does not alter a code, test, capture or timing receipt; this is a defect
+in how the evidence was checksummed, not a code-result discrepancy.  The failed
+check, expected digest, actual digest and timestamps are retained in this
+review's ledger instead of silently re-checksumming the old directory.
 
 The inherited family migration itself remains sound over its stated envelope.
 Fresh review probes reproduced rank-1 and dense-suffix conversion, the
 ``PositionLoad`` UNION boundary, the 54-cell compatibility census and the
-sealed capture surfaces.  The review nevertheless found ownership gaps outside
-that envelope which could make retained runtime or compiler state diverge after
-validation.  They are fixed before any further Phase-7 representation work.
+checksummed capture surfaces.  The review nevertheless found ownership gaps
+outside that envelope which could make retained runtime or compiler state
+diverge after validation.  They are fixed before any further Phase-7
+representation work.
 
 ### 44.2 Runtime ownership corrections (``554fdaf`` through ``9bc8c91``)
 
@@ -7800,7 +7803,7 @@ scalar rendering, copy detachment and storage/layout identity.  The numeric
 payload remains intentionally observable and mutable under the repository's
 existing tensor semantics.
 
-One compatibility seam remains explicit: ``STensor.format``, ``layout``,
+One compatibility gap remains explicit: ``STensor.format``, ``layout``,
 ``metadata`` and ``storage`` still return the tensor's own nominally frozen
 Python value objects.  A caller using ``object.__setattr__`` can corrupt that
 same tensor.  This review closes cross-owner and post-validation retention; it
@@ -7873,10 +7876,10 @@ The final independent review did not stop there.  ``58fa714`` / ``730e59d``
 move the construction authority outside the forgeable target instance and
 cross-anchor its graph and cache snapshots to the retained instance fields.
 ``4913f46`` / ``2d9e93d`` make the same authority available during
-construction without accepting a second seal or an incomplete pre-seal
-record.  This closes the otherwise circular case in which rewriting both an
-instance cache and the instance's own purported snapshot could bless the
-rewrite.
+construction without accepting a second snapshot or an incomplete
+pre-construction record.  This closes the otherwise circular case in which
+rewriting both an instance cache and the instance's own purported snapshot
+could bless the rewrite.
 
 The last review pass found two additional fail-closed gaps in the optimized
 boundary itself.  First, ``type(x) is MappingProxyType`` did not prove that a
@@ -7895,7 +7898,7 @@ entries, truncated and oversized authorities, equal fresh mirrors, weak-ref
 lookalikes, cycles, malformed caches and ordinary graph mutations all fail
 with controlled target diagnostics in the final adversarial review.
 
-That boundary was correct, but the first exact unloaded-host latency rerun was
+That boundary was correct, but the first exact unloaded-host latency re-run was
 still marginal: the rank-2 dense-leaf and B3 paths were about 1.106 in both
 fixed orders, while an alternating run was 1.097 at p50 but 1.104 at p95.
 Profiling exposed one semantic duplicate rather than a reason to weaken the
@@ -7913,7 +7916,7 @@ The exact final Redwood alternating run at ``1a550d4`` (200 warmups /
 dense-leaf rank-2/3/4 ratios are respectively **1.0886/1.0991**,
 **1.0703/1.0748** and **1.0449/1.0452**; B3 is **1.0909/1.0961**.  B3's
 untrimmed mean ratio is 1.1097 because of isolated tail samples, so it is
-reported rather than silently averaged away; the declared gate is p50/p95.
+reported rather than silently averaged away; what was declared is p50/p95.
 An immediately adjacent same-tip alternating A/A control is 0.9994-1.0145 at
 p50 and 0.9996-1.0065 at p95, attributing that tail behavior to the host rather
 than a changed code path.  Every LoopIR source is byte-identical to its legacy
@@ -7983,8 +7986,8 @@ the migrated format matrix.  The two §43.5 clusters remain:
 1. multiple dense prefixes / interleaved dense output (``dds``, ``ddss`` and a
    separate ``sds`` decision), requiring a flattened dense-prefix counter and
    correctly sized position vectors; and
-2. multi-compressed reduction/TTM, requiring an oracle-gated workspace/result
-   vertical because the legacy comparand segfaults.
+2. multi-compressed reduction/TTM, requiring a workspace/result vertical
+   checked against the oracle, because the legacy route segfaults.
 
 **Phase 7 therefore remains open.**  No Phase-8 cutover, default-dispatch,
 selector, cache or fallback change was made, and no legacy implementation was
