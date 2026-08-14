@@ -190,6 +190,10 @@ forward pointer now sits at each site below.  This list is the index.
 | §52.7 | blocker 1 closed by decision | §57.4, §57.5: reopened and fixed in the layer where the tile was illegal |
 | §58.7 | keep the single pass and parallelize it, "better than either existing kernel" | §59.5, §59.6, §59.9: built, and **not shippable** — two x86 configurations regress against the base |
 | §58.3 | the two-phase opt-in is a one-bit gap — "only the LoopIR-side opt-in is missing" | §60.6: refuted in three measured stages; true of the level arity, false of the statement vocabulary, and the third stage miscompiles |
+| §60.7 | ``unsupported_assembly_host`` "fires **58 of 192** cell-arms" | §62.4(a): it fires **100 of 192**, which is what §60.8's own per-strategy table in the next subsection already sums to.  Where 58 came from could not be determined.  §60.7's point — that P-M2's prediction of zero was wrong and every firing is a real gap — is unaffected and made stronger |
+| §60.8 | "nine cells emit all four strategies' *sources*, and on all nine the four are byte-DISTINCT" | §62.4(b): nine cells emit **two**, the two single-pass strategies, and on all nine in both arms the two are byte-distinct.  "All four" was impossible as written, since the table two sentences earlier records ``two_pass_serial`` emitting 0 of 48.  The conclusion it draws is what the corrected numbers support |
+| §60.8 | "nine program names occur in more than one family" | §62.4(c): **eight** do.  The ninth, ``ssss ijkl->l [d]``, occurs twice inside ``rank4-mixed``, which is the duplicate §60.10 explains separately.  Nine records collapse and eight names are cross-family; the 1,139 − 9 = 1,130 arithmetic is right either way.  Root cause was a mislabelled receipt key, now fixed |
+| §61.2, and every milestone reporting "the five protected tracked files hash exactly as recorded" | the recorded digests are a baseline a clean checkout can be compared against | §62.6: they are the WORKING TREE's, CUDA-project edits included, so the claim is about the working tree only.  The canonical copy now lives in the repository at ``statics/protected-hashes.txt`` and the check has two halves that answer different questions.  The past claims are true as stated and are left standing |
 
 ## Verdict
 
@@ -13788,6 +13792,11 @@ insurance for a family added later" and P-M2 predicted it would fire **zero**
 times over the legal domain.  It fires **58 of 192** cell-arms, and every one is
 a real gap in what a family can emit:
 
+**Superseded — see §62.4(a).**  Re-measured from a checkout whose commit was
+asserted, the count is **100 of 192**, which is what the per-strategy table in
+§60.8 below already sums to.  The bullets that follow are right about which
+families cannot emit what; only the total is wrong.
+
 - ``_ParallelSparseWorkspaceLowering`` cannot emit either single-pass strategy or
   the region-elided two-pass one.  Measured, not assumed: its own
   ``complete_sparse_workspace`` requires the assembled function to carry the
@@ -13828,6 +13837,14 @@ numbers are right for the key each harness uses, and neither loses coverage,
 because the collapsed records carry identical routes in both arms.  Enumerated by
 re-running the cell builder (§61.4) rather than reasoned about.
 
+**Partly superseded — see §62.4(c).**  The arithmetic is right and the nine names
+are the right nine, but only **eight** of them occur in more than one family.  The
+ninth, ``ssss ijkl->l [d]``, occurs twice inside ``rank4-mixed`` — the duplicate
+the paragraph above and §60.10 both describe separately.  The list came from a
+receipt key that computed "names appearing more than once" and was named
+``names_appearing_in_more_than_one_family``; the harness now emits both counts
+under their own names.
+
 How much can be emitted, over the 24 frontier cells that are both partitionable
 and admitted, in both arms (48 cell-arms per strategy):
 
@@ -13840,7 +13857,11 @@ and admitted, in both arms (48 cell-arms per strategy):
 
 Nine cells emit all four strategies' *sources*, and on all nine the four are
 byte-DISTINCT — so the representation reaches emission rather than being
-decorative.  ``two_pass_serial`` has nothing that can host it: the shared pass
+decorative.  (**Superseded — see §62.4(b).**  Nine cells emit **two**, the two
+single-pass strategies, and on all nine in both arms the two are byte-distinct.
+"All four" contradicts the table directly above, which records
+``two_pass_serial`` emitting 0 of 48.  The conclusion stands on the corrected
+numbers.)  ``two_pass_serial`` has nothing that can host it: the shared pass
 supports it (``CompressedWhereOpenMPContext.parallel``, with the workspace view
 relocated out of ``pre_parallel_body`` because codegen silently drops that field
 on a non-parallel loop — §60.10), and no family's completion contract accepts the
@@ -14142,6 +14163,13 @@ baseline, and "the five protected tracked files hash exactly as recorded" is a
 claim about the working tree only.  Any future session comparing a pinned
 worktree against that file will get five spurious failures.
 
+**Acted on — see §62.6.**  The baseline is recomputed from a clean checkout, the
+canonical copy now lives in the repository at ``statics/protected-hashes.txt``
+rather than in seventeen ledger copies, and the check is two checks that answer
+different questions: a git-derived one that reads no stored digest and cannot
+drift, and the snapshot one.  Do not compare a pinned worktree against a ledger
+copy; run ``statics/check_protected_files.py`` from the tree.
+
 ### 61.3 The ``header.h`` block compiled into the shipping extension is inert, on two arguments
 
 §59 appended 231 lines to ``src/scorch/csrc/header.h``.  ``ops.cpp`` includes
@@ -14332,6 +14360,10 @@ matrix and neither a production bug today:
    argument is a ``Var`` named ``{R}{L}_pos``, so
    ``scorch_vector_set(C_values, …)`` or any other helper receiving a result
    array would pass through silently, exactly as ``emplace_back`` used to.
+   **Less hypothetical than this reads — see §62.7.**
+   ``loopir/parallel_chunk_assembly.py`` already emits four such statements
+   today, and all four would pass the guard silently; the only thing keeping them
+   away from it is that they belong to a different assembly strategy.
 2. **``llir.MemberCallStmt`` is never inspected as a result write at all.**
    ``rewrite_statement_sequence_member`` dispatches ``Assign``, ``Increment``,
    ``FunctionCallStmt``, ``VarInit`` and ``IfThenElse``; a
@@ -14405,7 +14437,10 @@ that instead.
 - **The two structural narrownesses in §61.4 are recorded, not fixed.**  Neither
   is reachable on the survey matrix by either route, and fixing the first means
   deciding what a result-write guard should key on, which is a design question
-  rather than a repair.
+  rather than a repair.  **That design space is now written down** —
+  ``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md``, ten options with a table over the
+  three gaps that have actually occurred, summarized in §62.7.  It is waiting for
+  Bobby, not for work.
 - **The runtime oracle grid over the four strategies is still NOT RUN on any
   host**, and should not be until ``two_pass_serial`` has a family that can host
   it — two of four columns would be empty.  ``scorch_concat_chunks``'s
@@ -14414,7 +14449,9 @@ that instead.
 - **mkt1 is still not run.**  Owed since §59.
 - **The uncommitted fix to ``test_loopir_verifier.py`` is not committed here.**
   It belongs to a concurrent session; this section measures with it and without
-  it and reports both, and the tip is not green until it lands.
+  it and reports both, and the tip is not green until it lands.  **It landed —
+  see §62.1**, verified complete rather than merely sufficient, and the tip is
+  green unconditionally.
 - The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the
   shadow pilot's membership and every blocker other than 1 are untouched; the
   Phase-8 cutover verdict is unchanged.
@@ -14434,3 +14471,546 @@ and its true A/A control), ``receipts/result_write_reach_*.json`` and
 ``csrc_inertness.sh``, ``prebuilt_guardrail.py``, ``result_write_reach.py``,
 ``result_write_boundary_probe.py`` and ``run_suite_partitions.sh``.  Every one
 takes a tree root as ``$1``.
+
+## 62. The tip is green, every §60 measurement re-taken from an asserted commit, and three numbers §60's own data does not support (2026-08-14)
+
+**No production code changed in this section either.**  The last commit to touch
+``src/`` is still ``d9efcf8``, §60's own — ``git diff d9efcf8..HEAD -- src/`` is
+empty — and ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero
+callers outside tests.  What this section does is land the test fix §61.1 was
+waiting on, re-take every §60 measurement from a checkout whose commit is
+asserted rather than assumed, put the protected-file baseline on a footing that
+means what it says, and record the design space for the result-write guard so
+Bobby can choose from it.
+
+**The verdict, up front.**  The tip is green, unconditionally.  Every §60
+measurement that could move was re-taken and every one reproduces, most of them
+record for record.  But the provenance problem §61.1 found was smaller than the
+one that was there: **no §60 receipt records a commit at all**, the one receipt
+that names its tree names the live repository mid-edit, and every §60 receipt is
+timestamped before the commits it describes.  Three §60 numbers turn out not to
+be supported by §60's own data — the count of host refusals, the count of
+strategies nine cells emit, and the count of cross-family names — and in all
+three cases §60's conclusion survives the correction.
+
+### 62.1 The tip is green, and the fix is complete rather than sufficient
+
+``PRODUCTION_SUBSET_DEFECT_CODES`` in ``test_loopir_verifier.py`` is asserted
+equal to the set of ``_fail("...")`` string literals in
+``loopir/verifier.py`` — the test reads the module's own source and compares
+sets, so **the list is scoped to codes the verifier itself raises and to nothing
+else**.  That is read off the test's definition, not inferred: the assertion is
+``found == PRODUCTION_SUBSET_DEFECT_CODES`` over
+``re.findall(r'_fail\(\s*"([a-z_]+)"', source)``.  Both directions bite, so a
+code that does not belong makes the test fail just as loudly as a missing one.
+
+So **one entry is correct**.  ``d9efcf8`` adds exactly one verifier defect code,
+``unsupported_assembly_strategy`` (``verifier.py:3029``).  Reproduced directly:
+the verifier raises 85 distinct codes and the list now holds the same 85, with
+nothing missing and nothing extra.
+
+The milestone's other structured refusal codes are correctly absent, and there
+are **three of them, not one** — the task statement's "two new codes" undercounts
+what ``sparse_assembly.py`` declares:
+
+| code | raised by | belongs in this list? |
+| --- | --- | --- |
+| ``unsupported_assembly_strategy`` (``:106``) | ``loopir/verifier.py:3029`` | **yes**, and now listed |
+| ``unsupported_assembly_host`` (``:111``) | ``loopir/lower_llir.py:5566`` | no — not a verifier defect |
+| ``unsupported_schedule_assembly`` (``:103``) | ``scheduler.py:512``, ``loop_plan_legality.py:1523``, ``loopir/schedule_passes.py:3240`` | no |
+| ``invalid_schedule_assembly`` (``:99``) | ``scheduler.py:519``, ``loop_plan_legality.py:1538``, ``loopir/schedule_passes.py:3212`` | no |
+
+The comment style matches the file's convention — each entry names the slice that
+introduced it, and the new one reads "Assembly-strategy legality code added by
+the Phase-7 assembly slice", against the preceding "Physical position-load code
+added by the Phase-7 mixed-operand slice".
+
+**The sweep for other codes that belong in a documented list and are missing.**
+``PRODUCTION_SUBSET_DEFECT_CODES`` is the only enumerated code list in the
+repository — no other test or module holds one — so no other code is missing from
+one.  Two things are worth recording rather than leaving implicit.
+``unsupported_result_write_statement`` (``result_write_pass.py:456``) is §60.6's
+new fail-closed code and belongs to no list either.  And of the four codes above,
+**the tracked record named only two before this section**:
+``unsupported_assembly_host`` and ``unsupported_assembly_strategy`` appear in the
+review, while ``invalid_schedule_assembly`` and ``unsupported_schedule_assembly``
+appear **zero times** in the review, the handoff or the design document.  Both are
+documented in the ledger's ``DESIGN.md`` and nowhere in git, so until this table
+the tracked record described half of the milestone's structured refusals.
+Recording them is the smallest fix that makes it complete.
+
+**The suite at the tip.**  Five partitions, not three: 0, 6 and 7 because that is
+where the four failures were, plus **3 and 4** because this session's own lint
+commit changed test files in those two groups.  The file count is asserted at 92
+before anything runs, and the tree's commit is asserted too, which is §62.5's
+subject.
+
+Two notes on how they were run, stated rather than left to be inferred.
+Partitions 0, 3, 4 and 6 ran sequentially in one invocation; **partition 7 ran
+concurrently with partition 6**, in its own process with its own ``TMPDIR``,
+``XDG_CACHE_HOME``, ``TORCH_EXTENSIONS_DIR`` and receipt directory.  The isolation
+the house rule requires is per process, and partitions are file-disjoint, so
+concurrency changes wall-clock and nothing else.  And the rate is worth recording
+for whoever runs this next: partition 6's first file,
+``codegen/test_regblock_dual_path.py``, spent about twenty minutes compiling
+kernels one at a time — there is no ``ccache`` on this host, and the session
+fixture gives every run a fresh extension directory — and the remaining ten files
+in that group finished in about three.  A rate extrapolated from the first minutes
+of that partition overestimates it by an order of magnitude.
+
+| partition | result | duration |
+| --- | --- | --- |
+| 0 | **exit 0** — 532 passed, 14 skipped | 15:20 |
+| 3 | **exit 0** — 529 passed | 1:18 |
+| 4 | **exit 0** — 1,032 passed | 8:29 |
+| 6 | **exit 0** — 1,022 passed | 23:10 |
+| 7 | **exit 0** — 799 passed | 23:16 |
+| total | **3,928 tests, 0 failures, 0 errors, 14 skipped** | |
+
+**All five partitions exit 0 and all four previously failing nodes pass**, named
+individually rather than inferred from a total:
+
+| node | partition | result |
+| --- | --- | --- |
+| ``test_loopir_mixed_operand_target::test_canonical_dump_is_arm_stable_and_erases_to_base`` | 0 | PASSED |
+| ``test_loopir_parallel_workspace_target::test_completed_target_owns_the_pipeline_route[False]`` | 7 | PASSED |
+| ``test_loopir_parallel_workspace_target::test_completed_target_owns_the_pipeline_route[True]`` | 7 | PASSED |
+| ``test_loopir_verifier::test_defect_codes_are_the_documented_production_subset`` | 6 | PASSED |
+
+**Three of the four failures were already fixed at the tip, confirmed rather than
+repeated.**  §61.1 attributed them to ``ce5acba`` and to a measuring worktree
+pinned two commits behind it; all three pass here, at a checkout whose commit is
+asserted to be the tip.  The fourth,
+``test_defect_codes_are_the_documented_production_subset``, passes with the
+two-line addition committed.  §61.1 said the tip would be green the moment that
+landed; it landed and it is.
+
+The partitions are comparable to §61.1's re-run as node SETS, not merely as
+totals, and the comparison is valid here in a way §61.1 warned it was not between
+its own base and candidate: both runs enumerate **92** test files, so the
+round-robin produces identical groupings, and the four partitions both runs cover
+(0, 4, 6 and 7) hold byte-identical file lists.
+
+**The node-set diff: 3,399 nodes on both sides, 0 added and 0 removed.**  Diffed
+as a set, because that is the half which has twice caught a regression the totals
+hid.  Partition 6 is the sharpest reading: §61.1 recorded it as 1 failed / 1,021
+passed and it is now 1,022 passed, so the same 1,022 nodes are there and the one
+failure is gone.
+
+The five-partition totals are **not** comparable to §61.1's 4,368, and the reason
+is the partition sets rather than anything about the tests: §61.1 ran 0, 2, 4, 6, 7
+and this ran 0, 3, 4, 6, 7.  The comparison above is over the four they share.
+
+**One mistake in this session, and the check added earlier in it caught it.**
+Because partition 7 was launched separately to overlap with partition 6, the
+sequential invocation *also* reached partition 7 when partition 6 finished, so the
+same group ran twice.  While clearing about 680 MB of compiled kernels out of the
+ledger — the per-partition ``TMPDIR`` trees, which are build scratch and not
+evidence — that second, redundant run's temp root was deleted underneath it.  It
+was at 90% and started failing, and it was then terminated.  Its partial log and
+its truncated ``F`` were **deleted rather than sealed**, because a truncated log in
+an evidence folder is worse than no log.
+
+Two things are worth taking from it.  The partition-7 result above is the
+standalone run, which finished cleanly — 799 passed, exit 0, 23:16 — **before any
+deletion**, so nothing here rests on the damaged one.  And the harness refused to
+report a total for the incomplete set, in the words of the assertion added earlier
+in this same session (§62.5): *"5 partitions selected but 4 junit files exist.  No
+total is printed, because a partial or empty run must not read as a clean one."*
+Without it the run would have printed a clean-looking four-partition total under a
+five-partition heading, which is exactly the shape of the ``mapfile`` defect the
+harness header has warned about since it was written.  The check earned its keep
+against its own author within the hour.
+
+**What the suite run does NOT cover, and the targeted check that closes it.**  The
+partitions ran at ``01ae768``.  Three commits land after it — a repository-root
+markdown file and the two files under ``statics/`` — so the suite result is a
+statement about ``01ae768``, not literally about the tip.  Rather than argue that a
+markdown file cannot affect a test, the question was narrowed and measured.  Five
+tracked test files enumerate directories at all, found by grepping the tracked test
+set for ``iterdir``, ``os.listdir``, ``os.walk``, ``glob`` and ``rglob``:
+``test_llir_string_budget.py`` (scoped to ``src/scorch/compiler/*.py``),
+``test_resources.py`` (scoped to two directories under ``src/scorch/csrc``),
+``test_loopir_neutrality.py``, ``test_loopir_spike_neutrality.py`` and
+``packaging/smoke_install.py``, which the suite's own file pattern
+(``test_*.py``) does not collect.  The four the suite does collect were run at the
+tip, in a fresh process with its own temp roots: **58 passed, exit 0** — and that
+set includes ``test_loopir_neutrality.py``, the test proving ``import scorch``
+never loads the LoopIR package, so the neutrality obligation is checked at the tip
+rather than inherited from the partition run.  Package discovery is
+``where = ["src"]`` with ``include = ["scorch", "scorch.*"]``, so a top-level
+``statics/`` directory is outside it, and the same run repeats the protected-file
+check both ways (PASS/PASS).  That is the scope of the check and it is stated
+rather than generalized: it is four files, not the 3,928 tests above.
+
+**And the repo's own gate, at the tip, reproduces §61.2's numbers exactly.**
+``black --check src``, ``flake8 src`` and ``mypy src`` are what ``pre-commit.sh``
+runs: **1** file would be reformatted (``prebuilt_kernels.py``, pre-existing), **9**
+flake8 lines, and **140 mypy errors in 11 files over 63 source files**.  Those are
+the same three numbers §61.2 recorded at ``67201e5``, which is the cheapest
+available confirmation that nothing in this section reached ``src``.
+
+### 62.2 What §60's receipts actually record about which tree they came from
+
+§61.1 found the suite comparison taken from a candidate worktree pinned at
+``b9f0e2a``.  Bobby's instruction was to assume nothing and find out exactly what
+was affected.  What the receipts say, read out of the files:
+
+| receipt | written | names a tree | names a commit | which tree |
+| --- | --- | --- | --- | --- |
+| ``legality_reach_base.json`` | 17:31:57 | no | **no** | not recoverable |
+| ``two_phase_probe_base.json`` | 17:33:55 | no | **no** | not recoverable |
+| ``two_phase_probe_nocheckpoint.json`` | 17:34:48 | no | **no** | not recoverable |
+| ``frontier/frontier_base.json`` | 18:03:28 | yes, in the log | no | ``worktrees/base`` |
+| ``frontier/frontier_candidate.json`` | 18:03:35 | yes, in the log | no | **the live repository** |
+| ``strategy_emission.json`` | 18:13:06 | no | **no** | not recoverable |
+| ``strategy_correctness_m5.json`` | 18:13:25 | no | **no** | not recoverable |
+| ``suite_base/``, ``suite_cand/`` | later | yes | no | ``cae4f11``, ``b9f0e2a`` |
+| §61.4's ``result_write_*`` | later | yes | no | ``cand_head`` (``67201e5``) |
+
+**Not one §60 receipt records a commit.**  That is the finding, and the two
+consequences below both follow from it rather than from carelessness in any single
+run.
+
+**The frontier's candidate side was measured against the live repository.**
+``receipts/frontier.log`` line 17 is ``=== candidate: /Users/bobby/scorch ===``
+followed by ``pinned: /Users/bobby/scorch/src/scorch/__init__.py``.  The
+inherited runner asserts that ``import scorch`` resolves inside the tree it was
+handed, and it did — the path was the one it was given.  The check passed while
+measuring the one tree the branch's rules forbid, which is the defect §57
+quarantined, repeated in §60 and not noticed.  It is not a theoretical
+contamination: the live tree's ``src/scorch/__init__.py`` carries
+``from .gpu import (...)`` and ``src/scorch/gpu.py`` is **untracked**, so
+``import scorch`` from that tree executes a module present in no commit.
+
+**Every §60 receipt predates the commits it describes.**  ``d9efcf8`` was
+committed at 18:28:59 and ``b9f0e2a`` at 18:29:15; the latest §60 receipt is
+18:13:25, and ``worktrees/cand`` was not created until 20:36.  No other
+assembly-strategy worktree exists or ever did.  So the candidate side of every
+§60 measurement was the live working tree with the change uncommitted, and whether
+its content equalled ``b9f0e2a``'s cannot be established from anything on disk.
+
+That is not a claim the numbers were wrong.  It is the statement that the receipts
+cannot establish them, which is the same thing as owing the measurement.
+
+### 62.3 The re-measurement, claim by claim
+
+Two pinned detached worktrees, each asserted before anything ran: base
+``worktrees/base`` at ``cae4f11``, candidate ``worktrees/tip_01ae768`` at
+``01ae768``.  ``src/`` is unchanged since ``d9efcf8``, so ``01ae768`` is the same
+production code ``b9f0e2a`` was — the tip is both a properly pinned candidate and
+the right one.
+
+| §60 claim | verdict |
+| --- | --- |
+| check 1, byte-neutrality, 1,130 cells x both arms | **RE-MEASURED, identical.** ``NEUTRAL``, zero differing, and the per-cell rows compare equal to the original for all four strategies |
+| check 2, frontier, 1,138 cells x both arms | **RE-MEASURED, byte-identical.** 0 lost, 0 gained, 0 route changed, 0 unclassified, 3 arm-variant both sides, 0 new; both JSONs hash to ``83ac0d0d…``, the same digest as the original pair |
+| check 3, correctness, 32 configurations / 96 runs | **RE-MEASURED, identical.** ``ALL AGREE``, ``storage_differs`` empty, worst reference error ``6.255130688970212e-07`` to the last digit, all 32 records equal |
+| check 4, refusals over 9,040 compilations | **RE-MEASURED, identical.** Every per-strategy code histogram equal; zero refusals without a structured code |
+| check 5, suite | **RE-RUN at the tip.** §62.1 |
+| check 6, schema | stands; locked by tests the suite runs |
+| check 7, runtime grid | still NOT RUN, as §60.9 says |
+| check 8, ``scorch_ops`` at both tips | stands and carries forward: ``git diff a8f2954..HEAD -- src/scorch/csrc/`` is still exactly §59's +231 with zero deletions, and ``csrc/`` is unchanged between ``67201e5``, the tree §61.3 measured, and the tip |
+| M1, legality reach | **RE-MEASURED, identical** — and also run at ``cae4f11``, where it gives the same answer, because the census reads the receiver format off the result ``TensorVar`` and attributes hosts by patching ``__init__``, importing nothing this milestone added.  Its missing provenance never put it at risk, which is worth knowing rather than assuming |
+| §60.6 stage 1, six cells fail ``sparse_workspace_completion_lost`` | **RE-MEASURED, identical** — 6 of 6, whole record equal |
+| §60.6 stage 2, cells reach ``applied`` with ``_count1``/``_count2`` | **RE-MEASURED, identical** — 6 of 6, whole record equal |
+| §60.6 stage 3, the two-pass positions are wrong | **not re-run and not owed** — a diagnosis behind a compile-time refusal, and the refusal is re-measured at 46 and 48 cell-arms |
+| §60.8's emission table | **RE-MEASURED, identical** — 46 / 18 / 2 / 0 with the same refusal codes and counts |
+| the 1,139 / 1,138 / 1,130 reconciliation | **RE-MEASURED, confirmed**, duplicate included |
+| §61.4's reach and boundary audits | **RE-MEASURED, identical** — 102 cell-arms, 204 invocations, zero residual writes, and the typed route's 2 and 0 |
+| §60.7, host refusals **58** of 192 | **CONTRADICTED**, §62.4 |
+| §60.8, nine cells emit **all four** strategies | **CONTRADICTED in part**, §62.4 |
+| §60.8, nine names in more than one family | **CONTRADICTED in part**, §62.4 |
+| §60.5, all 24 legal cells fail with no token on the plan | **CANNOT BE RE-ESTABLISHED**, below |
+| §60.10's three recorded defects | stand; code-inspection and enumeration findings, re-read at this tip |
+| §60.11's C0/C1/C2 classes and the M/E hypothesis | stand as analysis, and the grid that would score them is still not run |
+
+**One measurement is unrecoverable, and it is a refutation rather than a result.**
+§60.5's "all 24 legal cells failed ``unsupported_program_shape`` /
+``sparse_parent_dominance``" describes what happened when a requested strategy was
+routed down the explicit path — the design ``DESIGN.md`` §4.5 argued for and this
+milestone abandoned.  No commit contains that routing, so there is nothing to run
+and the number cannot be reproduced.  What it is evidence *for* — that a requested
+strategy has to ride on the automatic plan — is what ships, and checks 1 and 4
+measure the shipped shape over 1,130 cells in both arms.  Saying so is better than
+quietly dropping it.
+
+**One new measurement, which the record only argued.**  §60.6 stage 1 says the
+completion checkpoint was fixed "by scoping the checkpoint to the owner whose
+contract it verifies".  The sealed probes show the base tree failing with the
+checkpoint enabled and succeeding with it disabled; neither shows the fix working.
+Run at the tip with the checkpoint **enabled and scoped**, all six probed cells
+reach ``applied``, with the same ``_count1``/``_count2`` arrays, pragma counts and
+``torch::empty`` counts the checkpoint-disabled run produced on the base tree.
+
+**And the probe ran in one arm, against the house rule.**
+``two_phase_probe.py`` called ``FE.auto_options(False)`` as a constant, so every
+§60.6 stage-1 and stage-2 number is an **arm-0** number and the record does not say
+so.  The arm is now a parameter, defaulting to 0 so the inherited invocation still
+reproduces the sealed receipt byte for byte, and all three configurations were run
+in both arms: base with the checkpoint on (6 of 6 refused), base with it off (6 of
+6 applied), and the tip with it on and scoped (6 of 6 applied).  **Every one is
+arm-invariant**, so §60.6's stages hold in both settings — which is the useful
+result, since the alternative would have been a milestone conclusion resting on
+half the domain.
+
+### 62.4 Three numbers §60 reports that its own data does not support
+
+**(a) ``unsupported_assembly_host`` fires 100 of 192 cell-arms, not 58.**
+§60.8's own per-strategy table sums to 100 — 2 for ``single_pass_serial``, 4 for
+``single_pass_chunk_parallel``, 46 for ``two_pass_parallel``, 48 for
+``two_pass_serial`` — so §60.7 and §60.8 disagree with each other inside one
+section, and the table is the half that reproduces.  By the family that refuses,
+which is what §60.7's two bullets are about:
+
+| host family | cell-arms | which strategies |
+| --- | --- | --- |
+| ``_OrderedKeySparseWorkspaceLowering`` | 88 | 44 ``two_pass_parallel`` + 44 ``two_pass_serial`` |
+| ``_ParallelSparseWorkspaceLowering`` | 6 | 2 each on ``single_pass_serial``, ``single_pass_chunk_parallel``, ``two_pass_serial`` |
+| ``_RowScopeSparseWorkspaceLowering`` | 6 | 2 each on ``single_pass_chunk_parallel``, ``two_pass_parallel``, ``two_pass_serial`` |
+
+Where 58 came from could not be determined.  It appears in no receipt and no log,
+and neither ``58`` in that sense nor ``192`` at all appears in ``DESIGN.md`` or
+``FINDINGS.md``.  Rather than invent a mechanism: the origin is unknown and the
+measured value is 100.  §60.7's point is untouched and made stronger — P-M2
+predicted the code would fire zero times, and it fires nearly twice as often as
+§60.7 claimed.
+
+**(b) Nine cells emit TWO strategies' sources, not four, and the two are
+byte-distinct.**  Over the 24 partitionable-and-admitted cells in both arms, 15
+emit exactly one strategy and 9 emit exactly two — ``single_pass_serial`` and
+``single_pass_chunk_parallel``.  On all nine, in both arms, the two emitted
+sources have different SHA-256 digests.  The nine are
+``TTM dsd x {dd,ds,sd,ss} -> dss``, ``TTM dss x {dd,ds,sd,ss} -> dss`` and
+``dss ijk->ik [ds]``.
+
+"All four" was impossible as written, and by the table two sentences earlier in
+the same subsection: ``two_pass_serial`` emits 0 of 48.  §60.8's conclusion — that
+the representation reaches emission rather than being decorative — is what the
+corrected numbers support, on nine cells, in both arms, for two strategies.
+
+**(c) Eight program names occur in more than one family, not nine.**  The nine
+names §60.8 lists are the nine whose duplicate records collapse when keying by
+name, and that arithmetic is right: 1,139 − 9 = 1,130.  But one of them,
+``ssss ijkl->l [d]``, occurs twice inside ``rank4-mixed`` alone — it is the
+intra-family duplicate §60.10 explains separately, since ``"d" + "s"*0`` and
+``"s"*0 + "d"`` spell the same one-character format.  The other eight really do
+span two families: five across ``rank4``/``rank4-mixed`` and three across
+``rank6``/``rank6-mixed``.  So nine records collapse and eight names are
+cross-family, and §60.8 attributes all nine to the cross-family mechanism.
+
+**The root cause is a mislabelled receipt key, and it is fixed.**
+``result_write_reach.py`` computed "names appearing more than once" and emitted it
+under the key ``names_appearing_in_more_than_one_family``; §60.8 copied the key's
+name.  The harness now emits two correctly named keys,
+``names_with_more_than_one_record`` (nine) and ``names_in_more_than_one_family``
+(eight), and the receipt was re-run so the evidence no longer carries the
+misleading label.
+
+### 62.5 The rule: state the commit, and refuse the tree that is not it
+
+This branch has now measured the wrong tree twice — a live tree being edited
+(§57, quarantined) and a checkout pinned behind the tip (§61.1) — and §62.2 shows
+the first of those happened again in §60 without being noticed.  Both times a
+check ran and passed: the harness asserted that ``import scorch`` resolved inside
+the tree it was handed.  **That proves the right path and says nothing about which
+commit the path held**, which is why it caught neither.
+
+The rule, so a future session inherits it rather than rediscovering it:
+
+> **A measuring script states the commit it believes it is reading, and refuses to
+> run if the tree holds anything else.**  It also refuses a dirty tree, because a
+> file edited after checkout is not that commit, and a tree on a branch, because
+> the live repository is the tree someone is editing and a branch tip moves under
+> a long measurement.  The expected commit is a required argument: passing ``ANY``
+> records without asserting and warns loudly on every run, and leaving it off is
+> an error.  Every run writes the commit it read into a provenance file beside the
+> receipt, so a later session reads which tree produced a number instead of
+> inferring it from a directory name or a timestamp.
+
+``harness/tree_provenance.py`` implements it and its docstring is the reasoning;
+``harness/tree_provenance.sh`` is the shell half, written for the bash 3.2 macOS
+ships.  **Every** harness in the ledger now takes the expected commit as a
+required argument — the four §60 harnesses, §61's four, the suite runner, the two
+shell harnesses, and a new ``run_frontier_pinned.sh`` that wraps the inherited
+frontier runner rather than editing a script sealed in another ledger.
+
+Verified against both historical defects rather than asserted:
+
+- pointed at the live repository, the guard refuses it for being dirty in 125
+  entries **and** for being on a branch;
+- pointed at ``worktrees/cand`` while expecting ``01ae768``, it refuses and names
+  both commits and the subject line of the one it found;
+- every patched harness refuses a mismatched commit, and refuses an omitted one;
+- the three shell harnesses exit 3 before doing any work.
+
+Two adjacent defects were found while doing this and are fixed in the same place.
+The first version of the shell helper hit bash 3.2's refusal to expand an empty
+array under ``set -u``, aborted the suite run before it measured anything, and —
+because the invocation piped to ``tail`` — reported success; the suite runner now
+refuses to print a total when the number of partitions or the number of collected
+tests is zero, which is the same family of defect as the ``mapfile`` one its
+header already warns about.  And four harnesses hardcoded another ledger's path
+to import a cell builder; each is now overridable through an environment variable
+with the old path as its default, which is the fourth time that defect has been
+caught on this branch.
+
+### 62.6 The protected-file baseline, recomputed and given an owner
+
+§61.2 found that the recorded digests are the **working tree's**, CUDA-project
+edits included, so "the five protected tracked files hash exactly as recorded" has
+been verifying that the working tree had not changed since a snapshot rather than
+that the five tracked files were unmodified.  Measured rather than repeated:
+
+- the live tree reproduces the old baseline **digit for digit on all five paths**,
+  so all five differences are the CUDA edits and nothing else;
+- a clean detached checkout at ``01ae768`` reproduces the **committed blob** on all
+  five;
+- the five committed blobs are byte-identical at every commit from origin
+  ``a3b8d1e`` through ``01ae768``, so the refactor has not touched them.
+
+| file | recorded baseline (working tree) | clean checkout at ``01ae768`` |
+| --- | --- | --- |
+| ``.gitignore`` | ``301c1e74df278c81…`` | ``d3d3db3e72190eb5…`` |
+| ``pyproject.toml`` | ``191c3372a43e545b…`` | ``50d2455303b6d442…`` |
+| ``src/scorch/__init__.py`` | ``5e2f22c75cfc7b3a…`` | ``432bae3293ca1e1a…`` |
+| ``tests/packaging/smoke_install.py`` | ``f18264fc2a590955…`` | ``b82cb29c3d2166cf…`` |
+| ``tests/test_scorch/test_resources.py`` | ``3d8092cb19d63fbb…`` | ``19bc160d48d514f2…`` |
+
+**Where the canonical copy lives, decided: in the repository, at
+``statics/protected-hashes.txt``.**  The old baseline existed in seventeen copies
+under ``~/.cache/scorch-codex/`` — sixteen byte-identical and one differing only
+by a comment line — and in none in the tree.  A file that exists in seventeen
+places has no owner, which is most of how it drifted.  Ledger copies are snapshots
+of the tracked one from now on.
+
+**What the check now means**, written into the baseline file's own header so the
+meaning travels with it.  ``statics/check_protected_files.py`` runs two checks
+that answer different questions and reports both:
+
+1. **git-derived**, and it reads no stored digest, so it cannot drift: the five
+   tracked blobs at HEAD against the same five at a reference commit, defaulting
+   to the branch point.  This is the obligation.
+2. **the snapshot**: the five files on disk against the recorded digests.  A clean
+   checkout passes; the live repository fails while the CUDA edits are present,
+   and that failure is the correct report rather than a defect.
+
+Verified both ways: clean checkout PASS/PASS, exit 0; live tree PASS/FAIL, exit 1
+with all five listed and a printed explanation of how to read the pair.
+``--write`` refuses to regenerate from a tree with uncommitted edits to a
+protected file, which is how the old baseline came to hold working-tree digests.
+
+Past milestones' "hashes exactly as recorded" claims are true as stated *about the
+working tree* and are left standing.  The correction sits where the current record
+explains the check, which is that header and this subsection.
+
+### 62.7 The result-write guard: a design space, not a repair
+
+§61.7 records that fixing the first of ``result_write_pass``'s two structural
+narrownesses "means deciding what a result-write guard should key on, which is a
+design question rather than a repair".
+``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md``, tracked at the repository root, is
+that design space, written for Bobby to choose from and changing no production
+code.
+
+Ten options, each with what it catches, what it misses, whether it fails open or
+closed on a form nobody anticipated, its cost in files and lines and whether it
+needs a schema bump or can change emitted C++, and whether it can be adopted
+incrementally.  Then the table, run against the three gaps that actually occurred,
+with **two columns per gap**: whether the option would have caught it blind, on
+the day the code arrived, and whether it catches it once described.  The second
+column is trivially green for the reactive options, which is why both are there.
+
+Two findings from that research belong in this record because they change what the
+gaps mean:
+
+- **The argument-shaped gap is not hypothetical.**
+  ``loopir/parallel_chunk_assembly.py`` already emits four argument-shaped result
+  writes — ``scorch_shift_chunk_positions(C{shared}_pos, …)`` at ``:357``,
+  ``scorch_concat_chunk_positions(C{L}_pos, …)`` at ``:371`` and
+  ``scorch_concat_chunks`` on ``C{L}_crd`` and ``C_values`` at ``:382`` and
+  ``:392``.  All four would pass ``_touches_result_storage`` silently.  The only
+  thing keeping them away from the guard is that they belong to a different
+  assembly strategy: ``owns_two_phase_output()`` is
+  ``assembly_strategy() in TWO_PASS_STRATEGIES`` (``lower_llir.py:5584``), and the
+  chunk merge is single-pass.  Making the two-pass strategies work is item 2 and 3
+  on this branch's own next-session list.
+- **Making result storage typed needs no schema bump, and is partly built.**
+  ``Var`` and ``ArrayAccess`` already carry ``tensor_access``
+  (``llir.py:366``, ``:950``), ``TensorAccessRole`` already has ``RESULT_WRITE``,
+  and ``result_write_pass`` already matches the drain's value store by metadata
+  rather than by name (``:323``).  LLIR has no canonical schema string at all —
+  the v11→v12 bump §60.4 records is LoopIR's.  What that option does need is the
+  seven traversal validators that currently refuse the metadata to admit it, and
+  the document lists them by line.
+
+### 62.8 The lint on this branch's own test files
+
+§61.2 recorded two findings in ``test_sparse_assembly_strategy.py`` and left them.
+Measured over the fourteen test files ``git diff a3b8d1e..HEAD -- tests/`` names,
+there were **five flake8 findings and two ``black`` diffs**, and every one is this
+branch's own — the origin versions of every file it edits are clean.  §61.2 saw
+two of them because a base-versus-candidate static diff can only see what the
+candidate *added*, and the other three arrived in commits that were already in
+that comparison's base.
+
+Fixed: four ``E741`` on ``l`` across two files, each with a targeted
+``# noqa: E741`` rather than a rename, because ``l`` is the correct index name for
+``C[i,j,l] += A[i,j,k] * B[k,l]`` and matches every other TTM site in the tree;
+one ``F401`` on ``SchedulePassError`` in the TTM census, whose only use ``eda3a07``
+removed with the ``AUTO_TILE_BLOCKED`` case; and ``black`` on two files, pure
+reflow.  All fourteen files are now clean under both.  The 38 flake8 findings across 13 files and the 14 ``black`` diffs in test files
+this branch never touched are left alone and counted, because they predate
+``a3b8d1e`` and are not this branch's to fix.
+
+### 62.9 What this section does not do
+
+- **No production change.**  ``src/`` is untouched since ``d9efcf8``;
+  ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+  callers and the test proving ``import scorch`` never loads the LoopIR package
+  still passes.
+- **No change to the result-write guard.**  §62.7 is a document.  The two
+  narrownesses are still open, still unreachable, and now better described.
+- **The two-pass strategies still do not work** beyond ``two_pass_parallel``'s 2 of
+  48 cell-arms, and ``two_pass_serial`` still has no host.  §60.6 stage 3
+  diagnosed why and the refusal is re-measured here, not lifted.
+- **The runtime oracle grid over the four strategies is still NOT RUN on any
+  host**, and should not be until ``two_pass_serial`` has a host — two of its four
+  columns would be empty and a third is about to change, since
+  ``scorch_concat_chunks``'s value-initializing ``resize`` still stands.
+- **The auto-scheduler still chooses no strategy.**  ``default_assembly()`` is
+  still the one place a selector would replace.
+- **mkt1 is still not run.**  Owed since §59.
+- **Sections 1 through 34 are still in their original wording.**  §0 is the
+  dictionary for them.
+- The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the shadow
+  pilot's membership and every blocker other than 1 are untouched; the Phase-8
+  cutover verdict is unchanged.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/assembly-strategy/``, resealed over
+**413 files** (``SHA256SUMS`` itself hashes to ``9efe3abc55ee653d…``, and
+``shasum -a 256 -c SHA256SUMS`` verifies every entry).  ``PROVENANCE_AUDIT.md`` is
+the per-claim audit behind §§62.2–62.4 and ``CLOSEOUT.md`` gained a section
+pointing at it.  New receipts: ``frontier_repin/`` (both trees, the diff and
+``provenance.json``), ``strategy_emission_repin.json``,
+``strategy_correctness_m5_repin.json``, ``legality_reach_repin.json``,
+``two_phase_probe_base_repin.json``,
+``two_phase_probe_nocheckpoint_repin.json``, ``two_phase_probe_tip.json``, the six
+``two_phase_probe_*_arm{0,1}`` receipts, ``result_write_reach_legacy_tip.json``,
+``result_write_reach_typed_two_pass_{parallel,serial}_tip.json``,
+``result_write_boundary_legacy_tip.json``, ``suite_tip_01ae768/`` and
+``suite_tip_01ae768_p7/``, and ``final_tip/`` — the protected-file check both ways
+and the four tracked tests that enumerate paths or assert LoopIR neutrality, 58
+passed, with the commit in its ``provenance.json`` rather than in its name, since a
+directory named after the tip stops being true the moment this paragraph is edited.  New
+harnesses: ``tree_provenance.py``, ``tree_provenance.sh`` and
+``run_frontier_pinned.sh``; eleven existing harnesses gained a required
+expected-commit argument.  Every one takes a tree root as ``$1``.
+
+``seal_ledger.sh`` also gained four exclusions, because the first reseal of this
+session sealed **5,716** files rather than 344: the suite harness leaves each
+partition's ``TMPDIR``, ``XDG_CACHE_HOME`` and ``TORCH_EXTENSIONS_DIR`` under the
+output directory, and a five-partition run leaves about 680 MB of compiled kernels
+there.  Those are build scratch on exactly the footing worktrees are, they are not
+reproducible by a later session, and they are now excluded by path.  The logs, the
+JUnit XML, the file lists, the exit codes and ``provenance.json`` are the evidence.

@@ -32565,3 +32565,165 @@ blocker other than 1 are untouched; Phase-8 cutover stays NO-GO.
    ``phase8-census-frontier-ext/statics/protected-hashes.txt``: those digests are the
    working tree's, uncommitted CUDA-project edits included, and a clean checkout
    differs from all five.
+
+## The tip is green, §60 re-measured from asserted commits, and the guard design space laid out (2026-08-14; supersedes every preceding prompt)
+
+Follows committed tip ``02daa56`` and adds five commits: one test fix, one lint
+pass, one tracked protected-file baseline plus its checker, one design document,
+and this record.  **Origin is still ``a3b8d1e``**; nothing pushed.  **No production
+code changed**: the last commit to touch ``src/`` is still ``d9efcf8``, §60's own,
+and ``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero callers
+outside tests.  Review §62 owns the detail; the evidence index is
+``~/.cache/scorch-codex/assembly-strategy/CLOSEOUT.md`` and the per-claim
+provenance audit is ``PROVENANCE_AUDIT.md`` beside it.
+
+**1. THE TIP IS GREEN, unconditionally.**  ``PRODUCTION_SUBSET_DEFECT_CODES`` is
+asserted equal to the set of ``_fail("...")`` literals in ``loopir/verifier.py``,
+so it tracks the codes the verifier raises and nothing else — read off the test's
+own definition, and both directions bite.  ``d9efcf8`` adds exactly one such code,
+so **one entry is the complete fix**; the milestone's other three structured
+refusal codes are raised by the scheduler, the legality check and the LoopIR
+target, and adding any of them would fail the test in the other direction.  The
+verifier raises 85 codes and the list now holds the same 85.  Five partitions at
+the tip — 0, 6, 7 where the four failures were, plus 3 and 4 because this
+session's lint commit touched test files there — **3,928 tests, 0 failures, 14 skipped, all five exit 0**, and all four previously failing nodes named individually as PASSED.  The three
+``canonical.v11`` assertions ``ce5acba`` had already fixed pass here at a checkout
+whose commit is asserted, and node sets over the four partitions shared with
+§61.1's re-run are compared as sets, which is valid this time because both runs
+enumerate 92 files and the shared partitions hold identical file lists.
+
+**2. THE PROVENANCE PROBLEM WAS BIGGER THAN THE STALE PIN.**  §61.1 found one
+measuring checkout pinned two commits behind the tip.  The audit found that **no
+§60 receipt records a commit at all**, that the one receipt naming its tree names
+``/Users/bobby/scorch`` — the live repository, mid-edit, whose
+``src/scorch/__init__.py`` imports an **untracked** ``gpu.py`` that exists in no
+commit — and that **every §60 receipt is timestamped before the commits it
+describes** (latest receipt 18:13:25; ``d9efcf8`` committed 18:28:59;
+``worktrees/cand`` not created until 20:36).  So §60's candidate side was the live
+uncommitted tree, and the frontier run repeated the exact defect §57 quarantined
+while its import-origin check passed, because the path was right and only the
+commit was wrong.
+
+**3. EVERY §60 MEASUREMENT RE-TAKEN, AND THEY ALL REPRODUCE.**  Two pinned
+detached worktrees with the commit asserted, ``cae4f11`` against ``01ae768``:
+byte-neutrality identical per cell for all four strategies; the frontier
+**byte-identical**, both JSONs at the same digest as the original pair; correctness
+identical to the last digit of the reference error; every refusal-code histogram
+equal; the legality census equal over all 1,139 records — and also equal at
+``cae4f11``, because it imports nothing this milestone added, so its missing
+provenance never put it at risk; both two-phase probes equal; §60.8's emission
+table 46 / 18 / 2 / 0 with the same codes; §61.4's reach and boundary audits equal,
+including the typed route's 2 and 0.  ``csrc/`` is unchanged between the tree
+§61.3 measured and the tip, so that claim carries forward.
+
+**One measurement is unrecoverable, and it is a refutation rather than a result.**
+§60.5's "all 24 legal cells failed" measured a design that was abandoned; no
+commit contains the routing, so there is nothing to run.  What it was evidence for
+is what ships, and checks 1 and 4 measure that over 1,130 cells in both arms.
+
+**One new measurement the record only argued**: at the tip, with the completion
+checkpoint **enabled and scoped**, all six probed cells reach ``applied``.  The
+sealed probes only showed the base tree failing with it on and succeeding with it
+off.
+
+**4. THREE §60 NUMBERS ARE NOT SUPPORTED BY §60'S OWN DATA.**  Each conclusion
+survives; each number is corrected.
+(a) ``unsupported_assembly_host`` fires **100** of 192 cell-arms, not 58 — §60.8's
+own table already sums to 100, so §60.7 and §60.8 disagreed inside one section.
+Where 58 came from could not be determined and is not guessed at.
+(b) Nine cells emit **TWO** strategies' sources, not four, and the two are
+byte-distinct in both arms; ``two_pass_serial`` emits 0 of 48, so four was
+impossible as written.
+(c) **Eight** program names occur in more than one family, not nine: the ninth,
+``ssss ijkl->l [d]``, occurs twice inside ``rank4-mixed``.  Root cause is a
+mislabelled receipt key in ``result_write_reach.py`` that §60.8 copied; the key is
+now two correctly named keys and the receipt was re-run.
+
+**5. THE RULE, so this cannot happen a third time.**  A measuring script states
+the commit it believes it is reading and refuses to run if the tree holds anything
+else, is dirty, or is on a branch.  The expected commit is a **required** argument;
+``ANY`` records without asserting and warns loudly on every run; leaving it off is
+an error.  Every run writes the commit into a provenance file beside the receipt.
+``harness/tree_provenance.py`` implements it, ``tree_provenance.sh`` is the bash-3.2
+shell half, and ``run_frontier_pinned.sh`` wraps the inherited frontier runner
+without editing another ledger's sealed script.  Eleven existing harnesses gained
+the argument.  Verified against both historical defects: the live tree is refused
+for being dirty **and** on a branch, and ``worktrees/cand`` is refused when
+``01ae768`` is expected, naming both commits.  Two adjacent defects fixed in the
+same place: the suite runner now refuses to print a total when the partition count
+or the test count is zero (the first version of the shell helper aborted before
+measuring and reported success), and four harnesses' hardcoded ledger paths are
+now overridable — the fourth time that defect has been caught here.
+
+**6. THE PROTECTED-FILE BASELINE IS RECOMPUTED AND HAS AN OWNER.**  The old
+digests are the working tree's, so all five differ from a clean checkout —
+measured, not repeated: the live tree reproduces the old baseline digit for digit,
+a clean checkout at ``01ae768`` reproduces the committed blob, and the five blobs
+are byte-identical from ``a3b8d1e`` through the tip.  The canonical copy now lives
+**in the repository** at ``statics/protected-hashes.txt``; it existed in seventeen
+ledger copies and none in the tree, and a file with seventeen copies has no owner.
+``statics/check_protected_files.py`` runs two checks and reports both: a
+git-derived one that reads no stored digest and cannot drift, and the snapshot one.
+Clean checkout PASS/PASS exit 0; live tree PASS/FAIL exit 1, which is the correct
+report while the CUDA edits are in flight.  Past claims are true about the working
+tree and are left standing.
+
+**7. THE GUARD DESIGN SPACE IS A DOCUMENT, NOT A CHANGE.**
+``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md`` lays out ten options with catch sets,
+fail-open-or-closed behaviour, concrete cost, and incremental adoptability, then a
+table over the three gaps that actually occurred with two columns each — blind and
+once-known.  Two research findings change what the gaps mean:
+``parallel_chunk_assembly.py`` **already emits four argument-shaped result writes**
+that the guard cannot see, separated from it only by belonging to a different
+assembly strategy; and making result storage typed needs **no schema bump**,
+because ``Var`` and ``ArrayAccess`` already carry ``tensor_access``,
+``RESULT_WRITE`` already exists, and the pass already uses it for one of the three
+arrays.  Bobby decides; a later session builds.
+
+**8. THE LINT.**  Five flake8 findings and two ``black`` diffs across the fourteen
+test files this branch touches, all of them this branch's own — the origin versions
+are clean.  §61.2 saw two because a base-versus-candidate static diff can only see
+what the candidate added.  Fixed with four targeted ``# noqa: E741``, one dead
+import removed, and ``black`` on two files.  The 38 pre-existing findings across 13 files, and 14
+black-unclean files, all in test files this branch never touched, are counted and
+left.
+
+**Not addressed.**  The runtime oracle grid over the four strategies is still
+**NOT RUN on any host** and should not be until ``two_pass_serial`` has a host.
+``scorch_concat_chunks``'s value-initializing ``resize`` still stands.  mkt1 still
+not run.  The two-pass position reconstruction on the ordered-key family is still
+diagnosed and refused rather than fixed.  The two ``result_write_pass``
+narrownesses are still open by design.  Sections 1–34 keep their original wording.
+The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the shadow
+pilot's membership and every blocker other than 1 are untouched; Phase-8 cutover
+stays NO-GO.
+
+## What the next session should do
+
+1. **Read ``COMPILER_IR_RESULT_WRITE_GUARD_OPTIONS.md`` §4's table and take Bobby's
+   choice.**  It is the one thing waiting on him rather than on work.  Do not
+   build an option he has not picked, and do not build the closing paragraph's
+   opinion by default.
+2. **Fix the two-pass position reconstruction on the ordered-key family** (§60.6
+   stage 3).  Positions rebuilt from ``_count`` prefix sums indexed by the phase
+   loop variable versus closed by a dense-prefix catch-up.  Unlocks
+   ``two_pass_parallel`` on 22 more cell-arms and ``two_pass_serial`` on 44.  Note
+   §62.7: doing this brings the chunk merge's four argument-shaped result writes
+   closer to a pass that cannot see them, so item 1 and item 2 interact.
+3. **Give ``two_pass_serial`` a family that can host it, or delete its emission
+   support.**  Unchanged from §60 and §61: the shared pass supports the
+   region-elided form and no family's completion contract accepts it, which is
+   unverified production code.
+4. **Only then run the oracle grid**, four strategies x the legal corpus x three
+   hosts, scoring P-M7a..f from ``DESIGN.md`` §8 and especially **P-M7c**, the
+   ``M/E`` hypothesis.  Close ``scorch_concat_chunks``'s ``resize`` first or accept
+   that ``P1``'s column expires.
+5. **Then the selector.**  ``default_assembly()`` is the one place it replaces.
+6. **Pass the expected commit to every harness you run.**  It is a required
+   argument now, and ``ANY`` is not a default — it warns on every line of output.
+   If you write a new harness, source ``harness/tree_provenance.sh`` before you
+   measure anything.
+7. **Do not compare a pinned worktree against a ledger copy of
+   ``protected-hashes.txt``.**  Use ``statics/check_protected_files.py`` from the
+   tree; the ledger copies are the old working-tree digests and a clean checkout
+   differs from all five.
