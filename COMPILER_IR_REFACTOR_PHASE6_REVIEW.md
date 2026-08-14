@@ -13479,7 +13479,7 @@ a real host gap:
 | **3. Correctness per (strategy, cell)** | **PASS** for every emittable pair.  32 configurations (2 TTM cells x 2 shapes x 2 densities x **2 dtypes** x both arms), 96 executed strategy runs: ``AUTO``, ``S1`` and ``P1`` agree **bit-identically** on every index array and every value — not ``allclose`` — and match the dense reference to 6.26e-07.  ``P2`` verified bit-identical on its own family's cell.  Extents were chosen so ``P1``'s runtime gate genuinely opens |
 | **4. Refusals enumerated at their exact codes** | **PASS**, with §60.7's prediction missed.  Over 1,130 cells x 4 strategies x both arms — 9,040 compilations — **zero refusals lack a structured code** |
 | **6. Schema** | **PASS.** v12 and plan-v2 declared, identity and cache-key consequences recorded in §60.4 and locked by tests |
-| **5. Suite** | 8 file-disjoint partitions, base and candidate, node set diffed |
+| **5. Suite** | **IN FLIGHT, not a result.**  8 file-disjoint partitions per side, base and candidate, node set to be DIFFED rather than totals trusted.  Base partition 0 is green (513 passed / 14 skipped / 0 failed); the remaining fifteen runs are owed.  Command: ``run_suite_partitioned.sh <tree> <outdir> 8`` then ``suite_node_diff.py <base_outdir> <cand_outdir>`` |
 | **7. Runtime grid, four strategies, three hosts** | **NOT RUN** (§60.9) |
 | **8. ``scorch_ops`` built at both tips and compared** | **NOT RUN**, and this section adds nothing to ``csrc/`` (§60.9) |
 
@@ -13503,6 +13503,10 @@ region-elided shape yet.
 
 ### 60.9 What this section does not do
 
+- **The suite gate is not finished.**  Eight partitions per side at ~13 minutes each;
+  base partition 0 passed and the other fifteen runs are outstanding.  The node-set
+  diff is the part that matters — it has caught a real regression the totals hid
+  twice — so no suite claim is made here beyond that one green partition.
 - **The runtime oracle grid is NOT run, on any host.**  Gate 7 and the whole of
   step 5 are outstanding.  The grid is the next milestone's input and it should
   not be taken until ``two_pass_serial`` has a host, because two of its four

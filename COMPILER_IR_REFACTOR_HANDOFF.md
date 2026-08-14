@@ -32410,7 +32410,10 @@ partitionable-and-admitted frontier cells x both arms: ``single_pass_serial`` 46
 ``two_pass_parallel`` 2/48, ``two_pass_serial`` **0/48 — no host**.  Nine cells emit all four
 strategies and on all nine the four sources are byte-DISTINCT.
 
-**Not addressed.**  The runtime oracle grid is **NOT RUN on any host** — and should not be
+**Not addressed.**  The suite gate is **IN FLIGHT**: base partition 0 is green
+(513 passed / 14 skipped / 0 failed) and the other fifteen partition runs, plus the
+node-set diff, are owed — finish those before trusting anything here.  The runtime
+oracle grid is **NOT RUN on any host** — and should not be
 until ``two_pass_serial`` has a host, since two of four columns would be empty.  ``scorch_ops``
 is not built at both tips (this section adds nothing to ``csrc/``, so the obligation is §59's
 inherited ``header.h``).  mkt1 still not run.  ``scorch_concat_chunks``'s value-initializing
