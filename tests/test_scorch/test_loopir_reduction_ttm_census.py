@@ -66,7 +66,6 @@ from scorch.compiler.loop_plan_legality import InvalidSchedule
 from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
-from scorch.compiler.loopir.schedule_passes import SchedulePassError
 from scorch.compiler.scheduler import Schedule
 from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
 

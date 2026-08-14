@@ -94,7 +94,9 @@ def auto_options(regblock_enabled=False, *, jit=False):
 def ttm_cin(a_fmt, b_fmt, c_fmt, dtype=_F32, names=("i", "j", "k", "l")):
     """``C[i,j,l] += A[i,j,k] * B[k,l]`` -- tensor times matrix."""
 
-    i, j, k, l = (IndexVar(name) for name in names)
+    # ``l`` is the contraction's own index name, so E741 is silenced rather than
+    # renamed: every other TTM site in the tree spells it the same way.
+    i, j, k, l = (IndexVar(name) for name in names)  # noqa: E741
     a = TensorVar("A", fmt=a_fmt, dtype=dtype)[i, j, k]
     b = TensorVar("B", fmt=b_fmt, dtype=dtype)[k, l]
     c = TensorVar("C", fmt=c_fmt, dtype=dtype)[i, j, l]
@@ -559,7 +561,7 @@ _PARALLEL_SHAPE = (64, 128, 64, 128)
 
 
 def _operands(a_fmt, b_fmt, shape, density, seed=20260812):
-    i, j, k, l = shape
+    i, j, k, l = shape  # noqa: E741 -- the contraction's own index names
     a_dense = random_dense((i, j, k), seed, density)
     b_dense = random_dense((k, l), seed + 7, min(1.0, density + 0.3))
     return (
@@ -670,7 +672,7 @@ def test_an_empty_operand_assembles_the_same_empty_result(monkeypatch):
     """The chunk whose rows are all empty must contribute nothing, not a gap."""
 
     shape = _PARALLEL_SHAPE
-    i, j, k, l = shape
+    i, j, k, l = shape  # noqa: E741 -- the contraction's own index names
     a_dense = torch.zeros((i, j, k), dtype=_F32)
     b_dense = random_dense((k, l), 3, 0.5)
     operands = (sparse(a_dense, "dss", "A"), sparse(b_dense, "dd", "B"))

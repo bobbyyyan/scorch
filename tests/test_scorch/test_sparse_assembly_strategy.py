@@ -100,7 +100,9 @@ def auto_options(regblock_enabled=False, *, assembly=None, jit=False):
 def ttm_cin(a_fmt, b_fmt, c_fmt, dtype=_F32):
     """``C[i,j,l] += A[i,j,k] * B[k,l]`` -- the family the strategies were measured on."""
 
-    i, j, k, l = (IndexVar(name) for name in ("i", "j", "k", "l"))
+    # ``l`` is the contraction's own index name, so E741 is silenced rather than
+    # renamed: every other TTM site in the tree spells it the same way.
+    i, j, k, l = (IndexVar(name) for name in ("i", "j", "k", "l"))  # noqa: E741
     a = TensorVar("A", fmt=a_fmt, dtype=dtype)[i, j, k]
     b = TensorVar("B", fmt=b_fmt, dtype=dtype)[k, l]
     c = TensorVar("C", fmt=c_fmt, dtype=dtype)[i, j, l]
@@ -237,8 +239,7 @@ def test_a_requested_strategy_reaches_the_program_as_a_typed_fact():
     assert kernel.schedule is not None
     assert kernel.schedule.plan.assembly == "single_pass_chunk_parallel"
     assert (
-        kernel.schedule.program.assembly
-        is AssemblyStrategy.SINGLE_PASS_CHUNK_PARALLEL
+        kernel.schedule.program.assembly is AssemblyStrategy.SINGLE_PASS_CHUNK_PARALLEL
     )
     assert '"assembly":"single_pass_chunk_parallel"' in kernel.program_dump
 
@@ -423,9 +424,7 @@ def test_a_strategy_cannot_compose_with_a_decision_that_owns_the_same_assembly()
     part of the result's assembly, so a strategy cannot be composed with one."""
 
     with pytest.raises((InvalidSchedule, UnsupportedFeature)) as raised:
-        composed = Schedule(
-            assembly="single_pass_chunk_parallel", parallel_loop="i"
-        )
+        composed = Schedule(assembly="single_pass_chunk_parallel", parallel_loop="i")
         Scheduler.apply_schedule(
             ttm_cin("dss", "ss", "dss"),
             composed,
@@ -508,9 +507,7 @@ def test_the_plan_round_trips_through_the_legacy_schedule_seam():
         index_var.index_id for index_var in Scheduler.get_index_variables(cin)
     )
     for strategy in (None, *SPARSE_ASSEMBLY_STRATEGIES):
-        plan = verify_loop_plan(
-            cin, LoopPlan(loop_order=order, assembly=strategy)
-        )
+        plan = verify_loop_plan(cin, LoopPlan(loop_order=order, assembly=strategy))
         schedule, _bounds, _relayout, _result_tile = materialize_legacy_schedule(
             cin, plan
         )
