@@ -26,6 +26,15 @@ from .cin import (
 from ..format import LevelType
 from .iterator import ModeIterator
 
+# Short names for the statement-level result-storage marker's vocabulary.  Spelled
+# from ``llir`` rather than imported from ``cin_lowerer``, which imports this
+# module.
+RESULT_VALUES = llir.ResultStorageArray.VALUES
+RESULT_POS = llir.ResultStorageArray.POS
+RESULT_CRD = llir.ResultStorageArray.CRD
+STORAGE_READ = llir.ResultStorageDirection.READ
+STORAGE_WRITE = llir.ResultStorageDirection.WRITE
+
 
 @dataclass(frozen=False)
 class LatticePoint:
@@ -674,6 +683,11 @@ class LatticePoint:
                                     name=f"{result_tensor_name}{child_level}_crd.size",
                                     args=[],
                                 ),
+                                result_storage=lattice.cin_lowerer._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_POS, child_level, STORAGE_WRITE),
+                                    (RESULT_CRD, child_level, STORAGE_READ),
+                                ),
                             )
                         ],
                     )
@@ -1137,6 +1151,10 @@ class IterationLattice:
                         tensor_access=result_metadata,
                     ),
                     value=llir.Var(name="_accum", type=llir.DataType.NO_TYPE),
+                    result_storage=self.cin_lowerer._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_WRITE),
+                    ),
                 )
             )
             sorted_result_ivars = result_tensor_access.get_sorted_index_vars()
@@ -1156,6 +1174,10 @@ class IterationLattice:
                         value=llir.Var(
                             name=level_iv.name,
                             type=llir.DataType.NO_TYPE,
+                        ),
+                        result_storage=self.cin_lowerer._result_storage(
+                            result_tensor_access,
+                            (RESULT_CRD, level_idx, STORAGE_WRITE),
                         ),
                     )
                 )
@@ -1271,6 +1293,16 @@ class IterationLattice:
                                                 type=llir.DataType.INT,
                                             )
                                         ],
+                                        result_storage=(
+                                            self.cin_lowerer._result_storage(
+                                                result_tensor_access,
+                                                (
+                                                    RESULT_CRD,
+                                                    level - 1,
+                                                    STORAGE_WRITE,
+                                                ),
+                                            )
+                                        ),
                                     ),
                                     llir.Increment(
                                         var=llir.Var(
@@ -1279,6 +1311,10 @@ class IterationLattice:
                                         )
                                     ),
                                 ],
+                                result_storage=self.cin_lowerer._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_POS, level, STORAGE_READ),
+                                ),
                             )
                         )
                 # Assemble pos array for this compressed level:
@@ -1314,6 +1350,12 @@ class IterationLattice:
                                     name=f"{result_tensor_name}{level}_crd.size",
                                     args=[],
                                 ),
+                                result_storage=self.cin_lowerer._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_POS, level, STORAGE_WRITE),
+                                    (RESULT_CRD, level - 1, STORAGE_READ),
+                                    (RESULT_CRD, level, STORAGE_READ),
+                                ),
                             )
                         )
                         assembled_pos_array = True
@@ -1338,6 +1380,11 @@ class IterationLattice:
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
                                 args=[],
+                            ),
+                            result_storage=self.cin_lowerer._result_storage(
+                                result_tensor_access,
+                                (RESULT_POS, level, STORAGE_WRITE),
+                                (RESULT_CRD, level, STORAGE_READ),
                             ),
                         )
                     )

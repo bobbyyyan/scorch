@@ -26,6 +26,7 @@ from .iter_lattice import IterationLattice
 from .iterator import (
     collect_mode_position_arrays,
 )
+from .identity import SymbolId
 from .llir import AssignOp, DataType
 from .diagnostics import (
     CompileOptionsDiagnostic,
@@ -93,6 +94,20 @@ _SPARSE_POSITION_DISCOVERY_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="collect_sparse_position_arrays",
 )
+
+# Short names for the statement-level result-storage marker's vocabulary; the
+# fully qualified enum members bury the fact each marking site is stating.
+RESULT_VALUES = llir.ResultStorageArray.VALUES
+RESULT_POS = llir.ResultStorageArray.POS
+RESULT_CRD = llir.ResultStorageArray.CRD
+STORAGE_READ = llir.ResultStorageDirection.READ
+STORAGE_WRITE = llir.ResultStorageDirection.WRITE
+
+#: One ``(array, level, direction)`` triple.  ``level`` is ``None`` for the value
+#: vector, which has no level.
+ResultStorageTriple = Tuple[
+    llir.ResultStorageArray, Optional[int], llir.ResultStorageDirection
+]
 
 
 @dataclass(frozen=True)
@@ -548,6 +563,35 @@ class CINLowerer:
             role=role,
         )
 
+    @staticmethod
+    def _result_storage(
+        tensor_access: TensorAccess,
+        *references: ResultStorageTriple,
+    ) -> Optional[llir.ResultStorageMetadata]:
+        """One statement's result-storage marker, over the references given.
+
+        ``None`` for a workspace target, mirroring ``_tensor_access_metadata``
+        and for the same reason: a workspace's own arrays are not the result's,
+        so a marker naming them would be a marker about the wrong tensor.
+
+        A marker describes the references in the statement's OWN expression
+        fields -- its target, index, value, condition and call arguments -- and
+        not those in a nested statement body, which carries its own.  Without
+        that rule the position-boundary conditional and the append inside it
+        would both describe the append's coordinate write and neither could be
+        checked against the statement it sits on.
+        """
+
+        if tensor_access.is_workspace():
+            return None
+        return llir.ResultStorageMetadata(
+            tensor_id=SymbolId(tensor_access.tensor_id.value),
+            references=tuple(
+                llir.ResultStorageReference(array, level, direction)
+                for array, level, direction in references
+            ),
+        )
+
     def lower_CIN(self, cin: CIN) -> Union[llir.Stmt, List[llir.Stmt], llir.Expr]:
         if _is_index_stmt_instance(cin):
             return self.lower_IndexStmt(cast(IndexStmt, cin))
@@ -749,6 +793,10 @@ class CINLowerer:
                                 name=last_ivar.name,
                                 type=llir.DataType.NO_TYPE,
                             ),
+                            result_storage=self._result_storage(
+                                self.result_tensor_access,
+                                (RESULT_CRD, level, STORAGE_WRITE),
+                            ),
                         )
                     )
 
@@ -780,6 +828,10 @@ class CINLowerer:
                                         value=llir.Var(
                                             name=defined_ivar.name,
                                             type=llir.DataType.NO_TYPE,
+                                        ),
+                                        result_storage=self._result_storage(
+                                            self.result_tensor_access,
+                                            (RESULT_CRD, level, STORAGE_WRITE),
                                         ),
                                     )
                                 )
@@ -1172,6 +1224,10 @@ class CINLowerer:
                             ),
                         ),
                         value=workspace_key_component(i),
+                        result_storage=self._result_storage(
+                            result_tensor_access,
+                            (RESULT_CRD, i, STORAGE_WRITE),
+                        ),
                     )
                 )
             # A_values[pA0] = it.second;
@@ -1196,6 +1252,10 @@ class CINLowerer:
                             type=loop_var.type,
                         ),
                         member="second",
+                    ),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_WRITE),
                     ),
                 )
             )
@@ -1306,6 +1366,14 @@ class CINLowerer:
             )
 
             # int* T0_crd = T0_crd_tensor.data_ptr<int>();
+            #
+            # DELIBERATELY UNMARKED.  ``T`` is the intermediate COO tensor this
+            # method builds, not the declared result, so its coordinate array is
+            # not the result's storage and a marker naming it would be a marker
+            # about the wrong tensor.  Review section 63.6's census bucketed this
+            # site as "result" because ``intermediate_tensor_var`` is on its
+            # marker list; for counting a search space that is defensible, for
+            # marking it would be false.
             assembly_stmts.append(
                 llir.VarInit(
                     var=llir.Var(
@@ -1462,8 +1530,14 @@ class CINLowerer:
                                     tensor_access=result_value_metadata,
                                 ),
                                 value=wksp_var,
+                                result_storage=self._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_VALUES, None, STORAGE_WRITE),
+                                ),
                             ),
                         ],
+                        # The guard tests the WORKSPACE scalar against zero, so
+                        # the conditional itself names no result storage.
                     )
                 )
             elif level_type == LevelType.COMPRESSED:
@@ -1483,10 +1557,18 @@ class CINLowerer:
                                         type=llir.DataType.INT64,
                                     )
                                 ],
+                                result_storage=self._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_CRD, level, STORAGE_WRITE),
+                                ),
                             ),
                             llir.FunctionCallStmt(
                                 name=f"{result_tensor_name}_values.push_back",
                                 args=[wksp_var],
+                                result_storage=self._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_VALUES, None, STORAGE_WRITE),
+                                ),
                             ),
                             llir.Increment(
                                 var=llir.Var(
@@ -1513,12 +1595,20 @@ class CINLowerer:
                                         type=llir.DataType.INT64,
                                     )
                                 ],
+                                result_storage=self._result_storage(
+                                    result_tensor_access,
+                                    (RESULT_CRD, lvl, STORAGE_WRITE),
+                                ),
                             )
                         )
                 push_stmts.append(
                     llir.FunctionCallStmt(
                         name=f"{result_tensor_name}_values.push_back",
                         args=[wksp_var],
+                        result_storage=self._result_storage(
+                            result_tensor_access,
+                            (RESULT_VALUES, None, STORAGE_WRITE),
+                        ),
                     )
                 )
                 stmts.append(
@@ -1647,6 +1737,13 @@ class CINLowerer:
                                     llir.Sizeof(data_type=wksp_write_ctype),
                                 ),
                             ],
+                            # A free function receiving the result's value
+                            # storage through an ``AddressOf`` -- the
+                            # argument-shaped write no name matcher can see.
+                            result_storage=self._result_storage(
+                                result_tensor_access,
+                                (RESULT_VALUES, None, STORAGE_WRITE),
+                            ),
                         ),
                     ]
 
@@ -1680,6 +1777,10 @@ class CINLowerer:
                             type=llir.DataType.NO_TYPE,
                         ),
                         op=AssignOp.ASSIGN,
+                        result_storage=self._result_storage(
+                            result_tensor_access,
+                            (RESULT_VALUES, None, STORAGE_WRITE),
+                        ),
                     )
                 )
 
@@ -1777,6 +1878,10 @@ class CINLowerer:
                         ),
                     ),
                     op=AssignOp.ADD_ASSIGN,
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_WRITE),
+                    ),
                 )
             )
 
@@ -1902,6 +2007,10 @@ class CINLowerer:
                     name=f"{wksp.get_name()}_value",
                     type=llir.DataType.NO_TYPE,
                 ),
+                result_storage=self._result_storage(
+                    result_tensor_access,
+                    (RESULT_VALUES, None, STORAGE_WRITE),
+                ),
             )
         )
 
@@ -1923,6 +2032,10 @@ class CINLowerer:
                     name=f"{wksp_access.get_index_vars()[0].name}",
                     type=llir.DataType.NO_TYPE,
                 ),
+                result_storage=self._result_storage(
+                    result_tensor_access,
+                    (RESULT_CRD, level, STORAGE_WRITE),
+                ),
             )
         )
 
@@ -1943,6 +2056,10 @@ class CINLowerer:
                     value=llir.Var(
                         name=f"{parent_index_var.name}",
                         type=llir.DataType.NO_TYPE,
+                    ),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_CRD, level - 1, STORAGE_WRITE),
                     ),
                 )
             )
@@ -2001,8 +2118,21 @@ class CINLowerer:
                                             type=llir.DataType.INT64,
                                         )
                                     ],
+                                    result_storage=self._result_storage(
+                                        result_tensor_access,
+                                        (RESULT_CRD, level - 1, STORAGE_WRITE),
+                                    ),
                                 ),
                             ],
+                            # This is the position-boundary conditional
+                            # ``result_write_pass._rewrite_if_statement``
+                            # recognizes and REPLACES rather than descending
+                            # into, so its own marker covers only the
+                            # ``{R}{L}_pos`` read in its condition.
+                            result_storage=self._result_storage(
+                                result_tensor_access,
+                                (RESULT_POS, level, STORAGE_READ),
+                            ),
                         )
                     )
             # Assemble pos array for this compressed level:
@@ -2030,6 +2160,15 @@ class CINLowerer:
                             value=llir.FunctionCall(
                                 name=f"{result_tensor_name}{level}_crd.size",
                                 args=[],
+                            ),
+                            # One statement, three references, two directions:
+                            # it writes this level's position array and reads two
+                            # coordinate arrays' sizes to do it.
+                            result_storage=self._result_storage(
+                                result_tensor_access,
+                                (RESULT_POS, level, STORAGE_WRITE),
+                                (RESULT_CRD, level - 1, STORAGE_READ),
+                                (RESULT_CRD, level, STORAGE_READ),
                             ),
                         )
                     )
@@ -2068,6 +2207,14 @@ class CINLowerer:
                         value=llir.FunctionCall(
                             name=f"{result_tensor_name}{level}_crd.size",
                             args=[],
+                        ),
+                        # ``{R}{L}_pos_index`` is a scalar index into the
+                        # position array, not the array, so it is not one of the
+                        # three storage vectors and the marker does not name it.
+                        result_storage=self._result_storage(
+                            result_tensor_access,
+                            (RESULT_POS, level, STORAGE_WRITE),
+                            (RESULT_CRD, level, STORAGE_READ),
                         ),
                     )
                 )
