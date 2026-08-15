@@ -1702,3 +1702,84 @@ def test_the_values_pointer_declaration_stays_unmarked() -> None:
             "_complete_result_tile_impl's hand-built reference for it is unmarked, "
             "so marking this side alone refuses a program that compiles today"
         )
+
+
+#: The result ABI's statements that name result storage with no dotted member and
+#: stay unmarked, with the reason.  Empty, and that is the point: a bare storage
+#: name is what the guard's callee-name match structurally cannot see -- review
+#: section 61.4's gap A -- so an unmarked one passes through silently.
+_UNMARKED_BARE_ABI_WRITES: Dict[str, str] = {}
+
+
+def test_the_result_abi_leaves_no_bare_storage_name_unmarked() -> None:
+    """Gap A, closed in the assembler and kept closed.
+
+    Why this is a separate check from everything above: the statement-marker census
+    lists ``torch_cpp_abi.py`` among its files and reports ZERO result references in
+    it, because that file builds every storage name from ``self.name`` and a level
+    number and the census cannot attribute a polymorphic name.  So the census cannot
+    see an unmarked result write inside the assembler, which is the file gap A lives
+    in.  This reads the file directly.
+
+    Only the BARE shape is required to be marked.  A DOTTED member call is one the
+    existing callee-name match already sees, so an unmarked one is refused rather
+    than accepted; and a ``VarDecl`` cannot carry the field, while a ``VarInit``
+    declaring the vector or a pointer to it neither reads nor writes the storage's
+    contents.
+    """
+
+    tree = dict(_SOURCES)["compiler/torch_cpp_abi.py"]
+    assembler = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ResultTensorAssembler"
+    )
+    unmarked: List[str] = []
+    bare_marked = 0
+    for function in assembler.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call):
+                continue
+            statement_class = ast.unparse(call.func).rsplit(".", 1)[-1]
+            if statement_class not in MARKER_CARRYING_TYPES:
+                continue
+            spellings: Set[str] = set()
+            for child in ast.walk(call):
+                if not isinstance(child, ast.JoinedStr):
+                    continue
+                pieces: List[str] = []
+                for part in child.values:
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        pieces.append(part.value)
+                    else:
+                        pieces.append("{}")
+                text = "".join(pieces)
+                if any(
+                    text.endswith(tail) or f"{tail}." in text
+                    for tail in ("_values", "_pos", "_crd")
+                ):
+                    spellings.add(text)
+            if not spellings:
+                continue
+            if statement_class == "VarInit" or any("." in s for s in spellings):
+                continue  # DECLARATION or DOTTED; see the docstring
+            key = f"{function.name}:{call.lineno}"
+            if any(keyword.arg == "result_storage" for keyword in call.keywords):
+                bare_marked += 1
+            elif key not in _UNMARKED_BARE_ABI_WRITES:
+                unmarked.append(f"{key} {statement_class} {sorted(spellings)}")
+
+    assert bare_marked == 2, (
+        "expected the two bare-name result writes the assembler emits -- the "
+        f"position sentinel and the dense zero fill -- and found {bare_marked}"
+    )
+    assert not unmarked, (
+        "the result ABI emits a statement naming result storage with no dotted "
+        "member and no marker.  The guard's callee-name match cannot see a bare "
+        "name, so this is review section 61.4's gap A: mark it from the "
+        "assembler's result_id, and mark whatever completion reference is built "
+        "for it, or register it in _UNMARKED_BARE_ABI_WRITES with the reason:\n  "
+        + "\n  ".join(sorted(unmarked))
+    )

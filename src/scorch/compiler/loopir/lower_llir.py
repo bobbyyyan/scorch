@@ -14202,6 +14202,14 @@ def _complete_result_tile_impl(
             (RESULT_VALUES, None, STORAGE_WRITE),
         ),
     )
+    # DELIBERATELY UNMARKED, matching the emitted side.  This DECLARES
+    # ``{R}_values`` as a pointer rather than reading or writing the storage's
+    # contents, and its value expression names ``{R}_values_torch``, a different
+    # thing; ``ResultStorageArray``'s docstring excludes the two-phase pass's
+    # ``_data`` pointers and the ``p{R}{L}`` cursor on the same ground.  The
+    # reason for the emitted side is at ``ResultTensorAssembler``'s own
+    # construction of it; both sides stay silent, because the comparison below is
+    # for equality and marking one alone would refuse a program that compiles.
     expected_result_pointer_init = llir.VarInit(
         var=llir.Var(
             f"{result_name}_values",
