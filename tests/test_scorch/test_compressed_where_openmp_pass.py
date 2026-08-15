@@ -35,6 +35,28 @@ from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
 )
 
 
+def _result_marker(name: str) -> llir.ResultStorageMetadata:
+    """The marker a production lowering attaches to one hand-built append.
+
+    Derived from the callee name, so a fixture cannot claim something its own
+    statement does not say.  Every emitting lowering attaches one now, so a
+    fixture without one builds a body the compiler no longer emits and the
+    result-write recognizer refuses it.
+    """
+
+    receiver = name.split(".", 1)[0]
+    if receiver.endswith("_values"):
+        reference = llir.ResultStorageReference(
+            llir.ResultStorageArray.VALUES, None, llir.ResultStorageDirection.WRITE
+        )
+    else:
+        level = int(receiver[len("Result") : -len("_crd")])
+        reference = llir.ResultStorageReference(
+            llir.ResultStorageArray.CRD, level, llir.ResultStorageDirection.WRITE
+        )
+    return llir.ResultStorageMetadata(tensor_id=SymbolId(1), references=(reference,))
+
+
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
     return llir.Var(name=name, type=data_type)
 
@@ -106,8 +128,16 @@ def _ds_work_body(
     body.extend(
         [
             llir.FunctionCallStmt("wksp.insert", [_var("value")]),
-            llir.FunctionCallStmt("Result1_crd.push_back", [_var("column")]),
-            llir.FunctionCallStmt("Result_values.push_back", [_var("value")]),
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("column")],
+                result_storage=_result_marker("Result1_crd.push_back"),
+            ),
+            llir.FunctionCallStmt(
+                "Result_values.push_back",
+                [_var("value")],
+                result_storage=_result_marker("Result_values.push_back"),
+            ),
         ]
     )
     return body
@@ -131,8 +161,16 @@ def _structured_ds_work_body() -> List[llir.Stmt]:
         end_init("A1_pos", "pA0", "pA1"),
         end_init("B1_pos", "pB0", "pB1"),
         llir.FunctionCallStmt("wksp.insert", [_var("value")]),
-        llir.FunctionCallStmt("Result1_crd.push_back", [_var("column")]),
-        llir.FunctionCallStmt("Result_values.push_back", [_var("value")]),
+        llir.FunctionCallStmt(
+            "Result1_crd.push_back",
+            [_var("column")],
+            result_storage=_result_marker("Result1_crd.push_back"),
+        ),
+        llir.FunctionCallStmt(
+            "Result_values.push_back",
+            [_var("value")],
+            result_storage=_result_marker("Result_values.push_back"),
+        ),
     ]
 
 
@@ -750,15 +788,31 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
             _var("pResult2", llir.DataType.INT64),
         ),
         then_body=[
-            llir.FunctionCallStmt("Result1_crd.push_back", [_var("parent_coordinate")])
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("parent_coordinate")],
+                result_storage=_result_marker("Result1_crd.push_back"),
+            )
         ],
     )
     body: List[llir.Stmt] = [
         _workspace_init(),
-        llir.FunctionCallStmt("Result1_crd.push_back", [_var("row_coordinate")]),
+        llir.FunctionCallStmt(
+            "Result1_crd.push_back",
+            [_var("row_coordinate")],
+            result_storage=_result_marker("Result1_crd.push_back"),
+        ),
         boundary,
-        llir.FunctionCallStmt("Result2_crd.push_back", [_var("leaf_coordinate")]),
-        llir.FunctionCallStmt("Result_values.push_back", [_var("value")]),
+        llir.FunctionCallStmt(
+            "Result2_crd.push_back",
+            [_var("leaf_coordinate")],
+            result_storage=_result_marker("Result2_crd.push_back"),
+        ),
+        llir.FunctionCallStmt(
+            "Result_values.push_back",
+            [_var("value")],
+            result_storage=_result_marker("Result_values.push_back"),
+        ),
     ]
 
     result = transform_compressed_where_for_openmp(
@@ -1489,6 +1543,7 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
             llir.FunctionCallStmt(
                 "Result1_crd.push_back",
                 [_var("parent_coordinate")],
+                result_storage=_result_marker("Result1_crd.push_back"),
             )
         ],
     )
@@ -1499,11 +1554,13 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
                 llir.FunctionCallStmt(
                     "Result1_crd.push_back",
                     [_var("row_coordinate")],
+                    result_storage=_result_marker("Result1_crd.push_back"),
                 ),
                 boundary,
                 llir.FunctionCallStmt(
                     "Result2_crd.push_back",
                     [_var("leaf_coordinate")],
+                    result_storage=_result_marker("Result2_crd.push_back"),
                 ),
             ]
         )
@@ -1619,10 +1676,14 @@ def test_workspace_clear_mutations_are_structured_frozen_and_byte_exact() -> Non
                     _workspace_init(),
                     llir.FunctionCallStmt("wksp.insert", [_var("value")]),
                     llir.FunctionCallStmt(
-                        "Result1_crd.push_back", [_var("row_coordinate")]
+                        "Result1_crd.push_back",
+                        [_var("row_coordinate")],
+                        result_storage=_result_marker("Result1_crd.push_back"),
                     ),
                     llir.FunctionCallStmt(
-                        "Result2_crd.push_back", [_var("leaf_coordinate")]
+                        "Result2_crd.push_back",
+                        [_var("leaf_coordinate")],
+                        result_storage=_result_marker("Result2_crd.push_back"),
                     ),
                 ]
             )
@@ -2286,7 +2347,11 @@ def test_legacy_prefix_and_work_body_filters_are_top_level_only() -> None:
 def test_nested_control_flow_and_statement_containers_follow_legacy_scopes() -> None:
     def writes(marker: str) -> List[llir.Stmt]:
         return [
-            llir.FunctionCallStmt("Result1_crd.push_back", [_var(marker)]),
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var(marker)],
+                result_storage=_result_marker("Result1_crd.push_back"),
+            ),
             llir.FunctionCallStmt("wksp.insert", [_var(marker)]),
         ]
 

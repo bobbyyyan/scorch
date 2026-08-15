@@ -94,6 +94,28 @@ from scorch.compiler.sparse_prefetch_pass import (  # type: ignore[import-untype
 )
 
 
+def _result_marker(name: str) -> llir.ResultStorageMetadata:
+    """The marker a production lowering attaches to one hand-built append.
+
+    Derived from the callee name, so a fixture cannot claim something its own
+    statement does not say.  Every emitting lowering attaches one now, so a
+    fixture without one builds a body the compiler no longer emits and the
+    result-write recognizer refuses it.
+    """
+
+    receiver = name.split(".", 1)[0]
+    if receiver.endswith("_values"):
+        reference = llir.ResultStorageReference(
+            llir.ResultStorageArray.VALUES, None, llir.ResultStorageDirection.WRITE
+        )
+    else:
+        level = int(receiver[len("Result") : -len("_crd")])
+        reference = llir.ResultStorageReference(
+            llir.ResultStorageArray.CRD, level, llir.ResultStorageDirection.WRITE
+        )
+    return llir.ResultStorageMetadata(tensor_id=_RESULT_ID, references=(reference,))
+
+
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
     return llir.Var(name=name, type=data_type)
 
@@ -193,10 +215,12 @@ def _compressed_source() -> List[llir.Stmt]:
                 llir.FunctionCallStmt(
                     "Result1_crd.push_back",
                     [_var("column")],
+                    result_storage=_result_marker("Result1_crd.push_back"),
                 ),
                 llir.FunctionCallStmt(
                     "Result_values.push_back",
                     [_var("value")],
+                    result_storage=_result_marker("Result_values.push_back"),
                 ),
             ]
         )
