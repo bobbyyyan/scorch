@@ -33115,3 +33115,188 @@ rejects it. Pass harness flags literally.
 8. **Copy ``seal_ledger.sh`` from a ledger that has §62.9's exclusions**, not from
    ``~/.cache/scorch-codex/``. Still unfixed, for §63.8's reason.
 9. **mkt1 is still owed**, since §59.
+
+## Option E completed, gap A had TWO instances, and a per-pass test that fails for a mechanism nobody has written (2026-08-15; supersedes every preceding prompt)
+
+Follows committed tip ``62c88c2`` and adds six commits, candidate ``e25fb2d``.
+**Origin is still ``a3b8d1e``**; nothing pushed. Review §65 owns the detail; the
+evidence ledger is new, at ``~/.cache/scorch-codex/abi-result-identity/``.
+
+**Bobby chose, on 2026-08-15**: protect the statement markers with a fast per-pass
+test in the normal suite rather than a standing re-run of the survey, then finish
+option E by building the per-result identity ``torch_cpp_abi.py`` lacked. Both are
+done. **OPTION E IS COMPLETE** — §65.7 states exactly what that means and what it
+excludes.
+
+**1. THE BIGGEST RESULT: GAP A HAD TWO INSTANCES IN PRODUCTION, NOT ONE, AND §64.6
+NAMES ONE.** Found by cross-checking the statement-marker census's own mark-site
+enumeration against the tree rather than by reading §64.6. Of the 76 census mark
+sites naming one of the three real storage arrays, **four** carried no marker at the
+base, not the one §64.6 predicted. The two it does not name are both in
+``_complete_result_tile_impl``: ``scorch_zero_dense(C_values, C_capacity)``, a free
+function WRITING the value vector through an argument — the position sentinel's exact
+shape — and the ``C_values`` pointer declaration, which is a declaration rather than
+an access and stays unmarked with the reason at both ends. **The census could not
+have found this**: it lists ``torch_cpp_abi.py`` among its files and reports ZERO
+result references in it, because that file's names are polymorphic over operands and
+results. A new sweep reads the file directly: **unmarked bare-name result writes in
+the result ABI, 2 → 0**. A test now asserts that count, so a third instance fails
+rather than going unnamed. **The procedure lesson: check a completeness claim against
+an enumeration of the sites, not against the section that last discussed them.**
+
+**2. THE DESCRIPTOR.** ``ResultTensorAssembler`` takes an optional ``result_id`` and
+exposes ``result_storage_marker()``, so marking is a capability of the assembler
+rather than one statement's special case. The typed route's lowering hands over a
+rebuilt ``SymbolId``; the legacy route builds the assembler from a ``TensorVar``
+whose identity IS a name, hands over nothing, and emits exactly what it emitted
+before — which is what keeps this off the shipping path.
+
+**3. THE TRAP DID NOT FIRE, AND BOTH PAIRS ARE LOCKED.** Each marked statement the
+ABI emits has a hand-built completion reference compared to it FOR EQUALITY, so
+marking one side alone turns a program that compiles today into a refusal. Tests
+assert the two markers equal for both pairs. Mutation: unmarking either side, marking
+either side with the wrong array or the wrong direction, dropping ``result_id=`` from
+either ``result_assembler()`` override, sharing the identity object instead of
+rebuilding it, and marking the pointer declaration that must stay unmarked — **all
+caught**. Two of those survived earlier versions of the tests and are the ones a
+behavioural probe structurally cannot see; both needed a static closure test.
+
+**4. WIDENING THE NAME MATCHER TO ARGUMENT POSITIONS: MEASURED, THEN DECLINED.** Over
+all four route/strategy columns the population is EMPTY — 532 ``FunctionCallStmt`` in
+the region the guard owns and **zero** passing a result storage array as a ``Var``
+argument. So it adds no coverage, exactly as the dotted matcher's own 612 calls and 0
+hits add none. And a widened matcher **refuses an unmarked statement it matches** —
+the two argument-shaped unmarked statements anybody has found being the two of item 1,
+so the widening would have caused the failure this change removes, twice.
+
+**5. THE PROTECTIVE TEST, AND IT IS PROVEN BY MUTATION.**
+``tests/test_scorch/test_result_storage_marker_mechanisms.py``: **55 tests, ~1.5s**.
+Four detectors read the tree — generic field readers over an ``llir`` type (25 found),
+constructions of a marker-carrying statement type copying a declared field off an
+existing node (41 found, 26 threading and 15 not), every ``LLIRRewriter`` subclass
+walked from the live class hierarchy (6 found), and the result ABI's own bare storage
+names — each locked against a 47-entry registry by set equality **in both
+directions**. 20 probes drive every threading rebuild.
+
+**It fails for a SEVENTH mechanism, which was the requirement worth being honest
+about**: deleting each of the 14 distinct ``result_storage=`` pass-through spellings
+in ``src`` one at a time — together covering all 21 occurrences — gives **14 caught, 0
+survived**; adding a new field reader, a new unthreaded rebuild, a new
+``LLIRRewriter`` subclass, or a new bare-name ABI write each fails the matching
+detector; and a stale registry key or an off-by-one construction count fails the
+reverse direction. **What it cannot do** is in its own module docstring: the static
+detectors are syntactic, and ``parallel_chunk_assembly`` was invisible to them until
+the scanner learned to see through ``cast(T, x).field``.
+
+**6. THIRTEEN REBUILDS TAUGHT RATHER THAN RECORDED.** §64.3's twelve pass-throughs
+plus ``compressed_where_openmp_pass``'s workspace-insert rename — excluded there
+because a workspace target is unmarked, included here because it runs at position 1
+of the frozen order, immediately before ``RESULT_WRITE``, and is the one rebuild whose
+drop the guard itself would see. The reason to teach rather than record: the SIXTH
+mechanism of exactly that description is what ``9d85e27`` had to fix. Three
+window-bound rebuilds stay unthreaded with a sharper reason than §64.3 gave — one
+``VarInit`` becomes THREE and its two carried values go to different ones, so a
+preserved marker would be a guess and ``_require_truthful_marker`` would refuse it.
+
+**7. §64.3'S "SIXTH MECHANISM, NOT TAUGHT" IS A MISREADING OF §64.3.** That sixth
+mechanism IS the panel comparator and ``9d85e27`` taught it (``lower_llir.py:6054``).
+The deliberately-blind one is ``codegen._validate_exact_codegen_tree``, which recurses
+``vars(value)`` and so DOES visit the field and must go on doing nothing with it. **The
+cost is now stated at its registry entry**: it gives the marker no coverage, and what
+catches a forged marker is ``_validate_result_storage_metadata`` upstream. A tree-wide
+sweep finds **no untaught comparator of that family anywhere**.
+
+**8. THE LABEL COUNTS, AND THE FINDING THE PROMPT PREDICTED.** Legacy unchanged at
+8,237 constructed / 764 arriving / 648 recognized. Typed default constructs 346 →
+**548**, two-pass 18 → **22**, with **arriving unchanged at 0 / 8 / 0**. Structural,
+not a defect: *arriving* is measured at ``rewrite_result_writes``, the new markers sit
+in the function PROLOGUE, and the typed default assembly invokes that pass zero times.
+So the readers had to be found by counting, and there are two.
+``completion_reader_reach.py``: the sparse-completion comparator's marker branch goes
+**1,916 → 2,498 (+582)** across 324 ordered-key completion comparisons, every other
+counter +0, all six compile-outcome classes identical. The ZERO FILL's reader is the
+result-tile completion, which the automatic matrix does not reach at all (panel
+comparator marker reads: 0 in both columns), so it was measured on the corpus that
+does schedule a result tile: **74 completions both trees, marker reads 0 → 3, 124
+tests pass both**. The same tables reconcile §64.4's 324 / 2 / 2 attribution exactly.
+
+**9. AND THAT MEASUREMENT WAS WRONG THE FIRST TIME, WHICH MATTERS MORE THAN THE
+NUMBER.** The first version drove ``compile_cin_via_loopir`` with **no requested
+schedule**; the census drives an **empty ``Schedule()``**, and §0's dictionary records
+that those disagree. The wrong comparand admits **194** cell-arms where the census
+admits **520** and reported **ZERO** calls to every completion reader — from which the
+tempting conclusion is that the new marker is read by nothing. **Whenever a probe's
+admitted count does not match the census's, fix the comparand before reading anything
+else out of it.** The harness now takes ``--comparand`` naming both.
+
+**10. THE PROOF.** Release neutrality PROVEN on all four emission columns (506
+case-arms / 412 emitted, 20/20, 42/42, 86-case audit 46 admitted / 40 rejected, 0
+differing anywhere), and the legacy emission digest ``051fb7d7…`` over 2,000 cell-arms
+and 6,496,962 bytes is the same one §64.4 recorded. The 1,139-record census receipts
+are **byte-identical** (``sha256 83ac0d0d…``): 260 admitted, 0 lost, 0 gained, 0 route
+changed, 0 unclassified, 3 arm-variant both sides, ``GATE: PASS``. Statics at baseline
+at both scopes. ``marker_leak`` reproduces §64.3: positions 2–5 carry 7,341 markers in
+and out, position 6 changes 4,710 statement types and loses none, all ten swept sites
+drop **zero**. Marking sites 84 → 101, pass-throughs 8 → 21, first-time attachments 73
+→ 77. Protected files: check 1 PASS on both trees, check 2 FAIL on the live tree
+(§62.6's expected CUDA-project state) and PASS on both pinned checkouts.
+
+**The suite, 8 file-disjoint partitions per tree, all sixteen exit 0**: base **6,426
+tests / 0 failures / 0 errors / 15 skipped**, candidate **6,481 / 0 / 0 / 15**. By
+node set: **6,426 in both, 0 base-only, 55 candidate-only** (all in the new test
+file, verified from the junit rather than the printed excerpt, which truncates at
+40), **0 outcome changes on shared nodes**. ``compare_suite_nodes.py`` prints
+``VERDICT: MISMATCH`` and that is its partition-list precondition, not the tests: the
+candidate adds a test file, so the count goes 92 → 93 and the round-robin regroups
+all eight lists. Its node-set comparison is global and unaffected. **That gate's
+stated precondition cannot hold for any change that adds a test file** — read the
+node sets.
+
+**11. FIVE PROCEDURE DEFECTS, ALL FOUND BY RUNNING THINGS.** (a) the comparand of item
+9. (b) ``run_frontier_pinned.sh``'s ``$4`` is the harness **FILE**
+(``frontier_ext2.py``), not the directory its header's "harness path" suggests. (c)
+both pinned wrappers call the provenance guard **before** activating conda, so its
+import check dies on ``ModuleNotFoundError: torch`` and aborts — correct fail-closed
+behaviour, so activate the env in the caller. (d) ``black -q src`` silently applies
+the pre-existing ``prebuilt_kernels.py`` reformat; use ``black --check`` on a tree
+whose baseline is not clean. (e) item 1's cross-check is four lines over the census
+receipt and nobody had run it.
+
+**12. THE MEASUREMENT RESTART RULE WAS EXERCISED TWICE, AND BOTH TIMES CORRECTLY.**
+Item 1's finding arrived while the 8-partition suites were running against a commit it
+superseded; the runs were killed, their partial output moved out of the receipts, and
+everything re-measured from a fresh pin. A comment-only edit later did the same thing
+and got the same treatment. **A commit you are about to make invalidates a measurement
+in flight even when the diff is a comment** — the cost of restarting is an hour and the
+cost of reporting a number from the wrong tree is the whole record.
+
+## What the next session should do
+
+1. **The two-pass work, in dependency order** — what Bobby chose to follow E, and E is
+   now done. §60.6 stage 3's position reconstruction first (it compiles, runs, and
+   produces WRONG POSITIONS, and is why ``two_pass_serial`` has no host and
+   ``two_pass_parallel`` reaches only 2 cell-arms); then ``scorch_concat_chunks``'s
+   value-initializing ``resize``; only then the four-strategy runtime grid; only then
+   teaching ``default_assembly()`` to choose.
+2. **Keep the new test honest when you add a mechanism.** If a detector fires on
+   something you wrote, classify it with a reason rather than widening the detector. If
+   you widen a detector, re-run the mutation sweep — the sweep is what makes the test
+   protective rather than documentary.
+3. **The gate gap is narrowed, not closed** (§65.10). Nothing yet fails because a
+   COMPILED PROGRAM lost a marker on the legacy route; §65.3's test fails because a
+   MECHANISM did. A legacy-route equivalent of the completion comparison's fail-closed
+   check would close it, and it is a design question.
+4. **Do not remove the name matcher**, and now there are two reasons: §64.4 measured
+   that it matches nothing in production, and §65.6a measured that widening it would
+   have over-refused twice.
+5. **The three dotted ``.reserve`` calls in the result ABI are unmarked by decision.**
+   If you ever make one reach ``result_write_pass``, it will be REFUSED as an unmarked
+   write rather than accepted — which is fail-closed and correct, and worth knowing
+   before you are surprised by it.
+6. **Pass the expected commit to every harness**, activate the conda env before the
+   provenance guard runs, and resolve every ``TMPDIR`` and tool cache outside both the
+   measured tree and the sealed directory.
+7. **Copy ``seal_ledger.sh`` from a ledger that has §62.9's exclusions** —
+   ``statement-marker/`` or ``abi-result-identity/`` — not from
+   ``~/.cache/scorch-codex/``. Still unfixed, for §63.8's reason.
+8. **mkt1 is still owed**, since §59.
