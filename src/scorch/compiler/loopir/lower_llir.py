@@ -14184,11 +14184,22 @@ def _complete_result_tile_impl(
     # fill.  Require the one exact ABI-generated top-level call and reject
     # every nested or altered physical zero effect before invoking the
     # unchanged legacy compatibility remover.
+    # The completion reference for a statement the ABI emits, so it carries the
+    # marker the ABI puts on it -- ``scorch_zero_dense`` takes the result's value
+    # vector as an ARGUMENT, which the callee-name match cannot see, and writes
+    # it, which the syntax cannot say.  Both sides move together: mark one and
+    # the equality comparison below refuses a program that compiles today.  The
+    # identity comes from the same lowering that hands it to the assembler in
+    # ``result_assembler``.
     expected_zero = llir.FunctionCallStmt(
         name="scorch_zero_dense",
         args=(
             llir.Var(f"{result_name}_values", pointer_type),
             llir.Var(f"{result_name}_capacity", llir.DataType.INT64),
+        ),
+        result_storage=_result_storage_marker(
+            lowering.result_symbol,
+            (RESULT_VALUES, None, STORAGE_WRITE),
         ),
     )
     expected_result_pointer_init = llir.VarInit(

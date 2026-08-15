@@ -1287,7 +1287,9 @@ def _assembler(result_id: object = None) -> object:
     )
 
 
-def _position_sentinel_markers(assembler: object) -> List[object]:
+def _position_sentinel_markers(
+    assembler: object,
+) -> List[Optional[llir.ResultStorageMetadata]]:
     """The markers on the ``C{L}_pos[0] = 0`` sentinels the assembler emits."""
 
     return [
@@ -1326,8 +1328,9 @@ def test_the_abi_marks_its_position_sentinel_from_the_identity() -> None:
 
     markers = _position_sentinel_markers(_assembler(SymbolId(7)))
 
-    assert markers and all(marker is not None for marker in markers)
+    assert markers
     for marker in markers:
+        assert marker is not None
         assert type(marker) is llir.ResultStorageMetadata
         assert marker.tensor_id == SymbolId(7)
         assert marker.writes() is True
@@ -1479,3 +1482,223 @@ def test_every_result_assembler_hands_over_an_identity_or_is_registered() -> Non
         "register the site in _IDENTITY_FREE_ASSEMBLERS with the reason it has "
         "no identity to hand over:\n  " + "\n  ".join(sorted(unclassified))
     )
+
+
+#: Every statement the ABI emits that a lowering ALSO hand-builds as a completion
+#: reference, and the marker both sides must carry.  The comparison between them is
+#: for equality, so a marker on one side alone turns a program that compiles today
+#: into a refusal.  ``reference_site`` is ``module::function::local`` naming the
+#: hand-built side, asserted below to pass ``result_storage=``.
+_PAIRED_COMPLETION_REFERENCES = (
+    (
+        "the level-index position sentinel: C{L}_pos[0] = 0, which the "
+        "dynamic-vector pass rewrites into scorch_vector_set",
+        (llir.ResultStorageArray.POS, 1, True),
+        "compiler/loopir/lower_llir.py" "::_completed_position_init_statement",
+    ),
+    (
+        "the dense-result zero fill: scorch_zero_dense(C_values, C_capacity), a "
+        "free function writing the value vector through an ARGUMENT",
+        (llir.ResultStorageArray.VALUES, None, True),
+        "compiler/loopir/lower_llir.py::_complete_result_tile_impl::expected_zero",
+    ),
+)
+
+
+#: How the reference side spells the array and the direction, for the AST check.
+_ARRAY_SPELLINGS = {
+    "RESULT_VALUES": llir.ResultStorageArray.VALUES,
+    "RESULT_POS": llir.ResultStorageArray.POS,
+    "RESULT_CRD": llir.ResultStorageArray.CRD,
+}
+_DIRECTION_SPELLINGS = {
+    "STORAGE_WRITE": True,
+    "STORAGE_READ": False,
+}
+
+
+def _reference_triples_at(site: str) -> List[Tuple[object, object, object]]:
+    """The ``(array, level, writes)`` triples a hand-built reference passes.
+
+    Read off the source, because both reference builders sit inside functions that
+    need a whole LoopIR plan to call.  The level is returned as ``None`` when it is
+    a variable rather than a literal, which is the case for the position sentinel,
+    whose level is its argument.
+    """
+
+    module, _, rest = site.partition("::")
+    function, _, local = rest.partition("::")
+    tree = dict(_SOURCES)[module]
+    triples: List[Tuple[object, object, object]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != function:
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            if ast.unparse(call.func).rsplit(".", 1)[-1] not in MARKER_CARRYING_TYPES:
+                continue
+            if local and not any(
+                isinstance(parent, ast.Assign)
+                and parent.value is call
+                and any(
+                    isinstance(target, ast.Name) and target.id == local
+                    for target in parent.targets
+                )
+                for parent in ast.walk(node)
+            ):
+                continue
+            marker = [k.value for k in call.keywords if k.arg == "result_storage"]
+            assert marker, (
+                f"{site} builds a completion reference without a result-storage "
+                "marker.  Its emitted counterpart carries one and the two are "
+                "compared for EQUALITY, so this refuses a program that compiles "
+                "today"
+            )
+            for element in ast.walk(marker[0]):
+                if not isinstance(element, ast.Tuple) or len(element.elts) != 3:
+                    continue
+                array, level, direction = element.elts
+                if (
+                    not isinstance(array, ast.Name)
+                    or array.id not in _ARRAY_SPELLINGS
+                    or not isinstance(direction, ast.Name)
+                    or direction.id not in _DIRECTION_SPELLINGS
+                ):
+                    continue
+                triples.append(
+                    (
+                        _ARRAY_SPELLINGS[array.id],
+                        level.value if isinstance(level, ast.Constant) else None,
+                        _DIRECTION_SPELLINGS[direction.id],
+                    )
+                )
+    return triples
+
+
+def _emitted_marker(
+    assembler: object, callee: str
+) -> Optional[llir.ResultStorageMetadata]:
+    """The marker on the one statement the assembler emits with this callee."""
+
+    emitted = [
+        statement
+        for statement in assembler.emit_value_array_init()  # type: ignore[attr-defined]
+        if type(statement) is llir.FunctionCallStmt and statement.name == callee
+    ]
+    assert len(emitted) == 1, f"expected one {callee}, found {len(emitted)}"
+    marker = emitted[0].result_storage
+    assert marker is None or type(marker) is llir.ResultStorageMetadata
+    return marker
+
+
+def _dense_assembler(result_id: object = None) -> object:
+    """An all-dense receiver, which is the branch that emits the zero fill."""
+
+    import torch
+
+    from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+        ResultTensorAssembler,
+    )
+    from scorch.format import LevelType  # type: ignore[import-untyped]
+
+    return ResultTensorAssembler(
+        name="C",
+        level_types=(LevelType.DENSE, LevelType.DENSE),
+        dtype=torch.float32,
+        result_id=result_id,
+    )
+
+
+def test_the_dense_zero_fill_is_marked_on_both_sides() -> None:
+    """The SECOND instance of gap A's shape, and section 64.6 named only the first.
+
+    ``scorch_zero_dense(C_values, C_capacity)`` is a free function that WRITES the
+    result's value vector through an argument: the callee-name match cannot see it,
+    and the syntax cannot say the argument is written.
+    ``_complete_result_tile_impl`` hand-builds the completion reference for it and
+    compares the two for equality, so both sides carry the same marker or a program
+    that compiles today is refused.
+
+    Both sides are checked against the same declared triple: the emitted side by
+    driving the assembler, the reference side by reading the triple it passes.
+    """
+
+    triple = (llir.ResultStorageArray.VALUES, None, True)
+
+    assert _emitted_marker(_dense_assembler(), "scorch_zero_dense") is None
+    emitted = _emitted_marker(_dense_assembler(SymbolId(7)), "scorch_zero_dense")
+    assert emitted == _dense_assembler(SymbolId(7)).result_storage_marker(  # type: ignore[attr-defined]
+        triple
+    )
+    assert emitted.tensor_id == SymbolId(7)
+    assert [
+        (reference.array, reference.level, reference.direction)
+        for reference in emitted.references
+    ] == [(llir.ResultStorageArray.VALUES, None, llir.ResultStorageDirection.WRITE)]
+
+    assert _reference_triples_at(
+        "compiler/loopir/lower_llir.py::_complete_result_tile_impl::expected_zero"
+    ) == [triple]
+
+
+def test_the_position_sentinel_reference_declares_a_position_write() -> None:
+    """The sentinel's reference triple, read off the source.
+
+    ``test_both_sides_of_the_position_completion_carry_the_same_marker`` compares
+    the two markers directly; this adds what that cannot see, which is that the
+    reference is spelled from the position array and a write rather than reaching
+    the right value some other way.  Its level is the builder's argument, so the
+    level reads as ``None`` here.
+    """
+
+    assert _reference_triples_at(
+        "compiler/loopir/lower_llir.py::_completed_position_init_statement"
+    ) == [(llir.ResultStorageArray.POS, None, True)]
+
+
+#: Statements the result ABI emits that reference result storage by name and must
+#: stay UNMARKED, with the reason.  Locked in this direction too, because the
+#: completion comparison is symmetric: marking one of these while its hand-built
+#: reference stays unmarked refuses a program that compiles today, exactly as the
+#: reverse does.
+_UNMARKED_ABI_STATEMENTS = {
+    "C_values pointer declaration": (
+        "DECLARES C_values as a pointer into the Torch tensor.  It neither reads "
+        "nor writes the storage's contents, and its value expression names "
+        "C_values_torch, a different thing.  ResultStorageArray's docstring "
+        "excludes the two-phase pass's _data pointers and the p{R}{L} cursor on "
+        "the same ground.  _complete_result_tile_impl hand-builds the completion "
+        "reference for this statement and leaves it unmarked to match"
+    ),
+}
+
+
+def test_the_values_pointer_declaration_stays_unmarked() -> None:
+    """A declaration is not an access, and both sides agree by staying silent.
+
+    The mutation this closes: marking this statement while
+    ``_complete_result_tile_impl``'s ``expected_result_pointer_init`` stays
+    unmarked makes the two differ and refuses a program that compiles today.  The
+    completion comparison is symmetric, so the unmarked direction needs a lock as
+    much as the marked one does.
+    """
+
+    assert "C_values pointer declaration" in _UNMARKED_ABI_STATEMENTS
+    for assembler in (_dense_assembler(), _dense_assembler(SymbolId(7))):
+        declarations = [
+            statement
+            for statement in assembler.emit_value_array_init()  # type: ignore[attr-defined]
+            if type(statement) is llir.VarInit
+            and type(statement.var) is llir.Var
+            and statement.var.name == "C_values"
+        ]
+        assert len(declarations) == 1, len(declarations)
+        assert declarations[0].result_storage is None, (
+            "the result value pointer's DECLARATION gained a marker.  It is not an "
+            "access -- see _UNMARKED_ABI_STATEMENTS -- and "
+            "_complete_result_tile_impl's hand-built reference for it is unmarked, "
+            "so marking this side alone refuses a program that compiles today"
+        )

@@ -1266,6 +1266,17 @@ class ResultTensorAssembler:
                     ),
                 )
             )
+            # DELIBERATELY UNMARKED, and it is a vocabulary question rather than
+            # an oversight.  This DECLARES ``{R}_values`` as a pointer into the
+            # Torch tensor; it neither reads nor writes the storage's contents,
+            # and its value expression names ``{R}_values_torch``, a different
+            # thing.  ``ResultStorageArray``'s docstring excludes the two-phase
+            # pass's ``_data`` pointers and the ``p{R}{L}`` cursor on the same
+            # ground, so a marker here would claim an access the statement does
+            # not make.  ``_complete_result_tile_impl`` hand-builds its
+            # completion reference for this statement, so leaving it unmarked
+            # also keeps the two sides in agreement without needing the
+            # vocabulary widened first.
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
@@ -1290,6 +1301,16 @@ class ResultTensorAssembler:
             # outputs — where the serial memset was a big fraction of runtime — and
             # falls back to a single memset below SCORCH_MEMSET_GRAIN_BYTES. Takes
             # the element count; it computes the byte span internally.
+            #
+            # MARKED, when this assembler was given an identity.  A free
+            # function taking the result's value vector as an ARGUMENT is
+            # exactly the shape the callee-name match cannot see -- review
+            # section 61.4's gap A -- and the syntax cannot say the argument is
+            # written, so the direction is declared here.  This is the second
+            # instance of that shape in the tree; section 64.6 named only the
+            # position sentinel.  ``_complete_result_tile_impl`` hand-builds the
+            # completion reference for this statement, so both sides move
+            # together, as they do for the sentinel.
             stmts.append(
                 llir.FunctionCallStmt(
                     name="scorch_zero_dense",
@@ -1300,6 +1321,9 @@ class ResultTensorAssembler:
                         ),
                         res_capacity_var,
                     ],
+                    result_storage=self.result_storage_marker(
+                        (llir.ResultStorageArray.VALUES, None, True)
+                    ),
                 )
             )
         elif self.known_nnz_var:
