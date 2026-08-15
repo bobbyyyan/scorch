@@ -655,6 +655,21 @@ class LatticePoint:
                     name=f"{result_tensor_name}{child_level}_pos_index",
                     type=llir.DataType.INT,
                 )
+                # Hoisted and narrowed rather than spelled inline, because this
+                # method reads its result access off an optional attribute and
+                # the surrounding code does so unnarrowed; building the marker
+                # here keeps the new call site typed without changing the
+                # existing lines' shape.
+                catch_up_lowerer = lattice.cin_lowerer
+                catch_up_marker = (
+                    None
+                    if catch_up_lowerer is None or result_tensor_access is None
+                    else catch_up_lowerer._result_storage(
+                        result_tensor_access,
+                        (RESULT_POS, child_level, STORAGE_WRITE),
+                        (RESULT_CRD, child_level, STORAGE_READ),
+                    )
+                )
                 stmts.append(
                     llir.ForLoop(
                         init=None,
@@ -683,11 +698,7 @@ class LatticePoint:
                                     name=f"{result_tensor_name}{child_level}_crd.size",
                                     args=[],
                                 ),
-                                result_storage=lattice.cin_lowerer._result_storage(
-                                    result_tensor_access,
-                                    (RESULT_POS, child_level, STORAGE_WRITE),
-                                    (RESULT_CRD, child_level, STORAGE_READ),
-                                ),
+                                result_storage=catch_up_marker,
                             )
                         ],
                     )

@@ -268,18 +268,261 @@ class _ResultWriteRewriter(LLIRRewriter):
     def rewrite_statement_sequence_member(
         self, node: llir.Stmt, path: LLIRPath
     ) -> Sequence[llir.Stmt]:
+        """Recognize first, over every statement type; then dispatch a rewrite.
+
+        The two steps are deliberately separate, and the separation is the
+        point.  Before this, recognition lived INSIDE
+        ``_rewrite_call_statement``, so it could only ever see the statement
+        types the dispatch below already names -- which is the whole mechanism
+        of review section 61.4's gap B: a ``MemberCallStmt`` on a result array
+        falls to the identity path and no guard ever looks at it.  A marker on a
+        statement the pass never inspects is a marker that does nothing, so the
+        recognizer now runs over the full traversal and the rewrite dispatch is
+        a second, narrower thing.
+        """
+
+        recognized = self._recognized_result_storage(node, path)
+
         node_type = type(node)
+        replacement: Sequence[llir.Stmt]
         if node_type is llir.Assign:
-            return self._rewrite_assign_statement(cast(llir.Assign, node), path)
-        if node_type is llir.Increment:
-            return self._rewrite_increment_statement(cast(llir.Increment, node), path)
-        if node_type is llir.FunctionCallStmt:
-            return self._rewrite_call_statement(cast(llir.FunctionCallStmt, node), path)
-        if node_type is llir.VarInit:
-            return self._rewrite_var_init_statement(cast(llir.VarInit, node), path)
-        if node_type is llir.IfThenElse:
-            return self._rewrite_if_statement(cast(llir.IfThenElse, node), path)
-        return super().rewrite_statement_sequence_member(node, path)
+            replacement = self._rewrite_assign_statement(cast(llir.Assign, node), path)
+        elif node_type is llir.Increment:
+            replacement = self._rewrite_increment_statement(
+                cast(llir.Increment, node), path
+            )
+        elif node_type is llir.FunctionCallStmt:
+            replacement = self._rewrite_call_statement(
+                cast(llir.FunctionCallStmt, node), path
+            )
+        elif node_type is llir.VarInit:
+            replacement = self._rewrite_var_init_statement(
+                cast(llir.VarInit, node), path
+            )
+        elif node_type is llir.IfThenElse:
+            replacement = self._rewrite_if_statement(cast(llir.IfThenElse, node), path)
+        else:
+            replacement = super().rewrite_statement_sequence_member(node, path)
+
+        if recognized is not None and recognized.writes():
+            self._require_result_write_rewritten(node, replacement, path)
+        return replacement
+
+    def _recognized_result_storage(
+        self, node: llir.Stmt, path: LLIRPath
+    ) -> Optional[llir.ResultStorageMetadata]:
+        """This result's storage marker on one statement, or ``None``.
+
+        Three things happen here, and only the first is recognition.
+
+        The marker's ``tensor_id`` decides whether the statement is this
+        result's business at all.  A marker naming a DIFFERENT tensor is not
+        this result's and is not recognized -- section 63.3's third finding is
+        what happens when a foreign marker is allowed to license this result's
+        storage name.
+
+        A recognized marker is then checked for TRUTH against the statement it
+        sits on, because nothing else checks that a marker is not a lie and
+        section 63.3's third finding is the small version of that hazard.
+
+        Finally the name matcher is cross-checked.  It is kept rather than
+        replaced, and the disagreement that means something is one-directional:
+        ``_touches_result_storage`` is defined only on a ``FunctionCallStmt``'s
+        callee name, while the marker is defined on five statement types in any
+        position, so the marker legitimately says yes where the name matcher
+        says no -- that IS gap A being closed.  The reverse is a defect: the
+        name matcher seeing this result's storage where no marker names it means
+        a producing lowering omitted one, which is option E's known failure
+        mode.  The postcondition already catches the CONSEQUENCE, because an
+        unrecognized statement is not rewritten and its references survive; what
+        this adds is saying which statement and which recognizer disagreed.
+        """
+
+        marker = getattr(node, "result_storage", None)
+        recognized: Optional[llir.ResultStorageMetadata] = None
+        if type(marker) is llir.ResultStorageMetadata:
+            typed_marker = cast(llir.ResultStorageMetadata, marker)
+            if typed_marker.tensor_id == self._result_id:
+                recognized = typed_marker
+                self._require_truthful_marker(node, recognized, path)
+                self._require_no_tensor_conflict(node, recognized, path)
+
+        if type(node) is llir.FunctionCallStmt and self._touches_result_storage(
+            cast(llir.FunctionCallStmt, node).name
+        ):
+            if recognized is None:
+                _raise_result_write_error(
+                    self._context,
+                    code="unmarked_result_write_statement",
+                    message=(
+                        f"statement {cast(llir.FunctionCallStmt, node).name!r} names "
+                        f"result {self._result_name}'s own storage in its callee "
+                        "name, but carries no result-storage marker for that "
+                        "result; the emitting lowering has to attach one, because "
+                        "an unmarked result write is one this pass cannot "
+                        "recognize by type"
+                    ),
+                    path=path,
+                    value=cast(llir.FunctionCallStmt, node).name,
+                )
+        return recognized
+
+    def _require_truthful_marker(
+        self,
+        node: llir.Stmt,
+        marker: llir.ResultStorageMetadata,
+        path: LLIRPath,
+    ) -> None:
+        """Every reference the marker claims must be findable in the statement.
+
+        Deliberately ONE-DIRECTIONAL, and deliberately checked over the whole
+        statement including any nested body.  A reference the marker claims and
+        the statement does not spell is a lie and is refused.  A reference the
+        statement spells and the marker does not claim is NOT refused, because
+        a nested statement carries its own marker and this check would otherwise
+        demand that the enclosing one restate its children's facts -- which
+        would put one reference in two markers, the thing section 63.7's fifth
+        row warns against.  Including nested bodies can only make this more
+        permissive, never less, so it cannot refuse a truthful marker.
+
+        Direction is checked only where the statement's own spelling decides it.
+        A dotted member name does -- ``push_back`` writes, ``size`` reads -- so a
+        marker claiming a write on a ``.size`` call is refused.  An argument
+        position does not, which is section 3 of the design note's measurement
+        and the reason the marker carries the direction at all, so there the
+        marker is the only source of truth and this check does not second-guess
+        it.
+        """
+
+        finder = _ResultStorageNameFinder(
+            self._result_name, self._compressed_levels, self._context.traversal
+        )
+        finder.walk(cast(LLIRValue, node))
+        for reference in marker.references:
+            name = _result_storage_array_name(self._result_name, reference)
+            if name not in finder.mentioned:
+                _raise_result_write_error(
+                    self._context,
+                    code="untruthful_result_storage_marker",
+                    message=(
+                        f"a result-storage marker claims this statement "
+                        f"references {name!r}, which the statement does not "
+                        f"name anywhere; the marker describes "
+                        f"{[_result_storage_array_name(self._result_name, entry) for entry in marker.references]!r} "
+                        f"and the statement names {sorted(finder.mentioned)!r}"
+                    ),
+                    path=path,
+                    value=name,
+                )
+            written = finder.written_members.get(name)
+            if written is None:
+                continue
+            claims_write = reference.direction is llir.ResultStorageDirection.WRITE
+            if claims_write is not written:
+                _raise_result_write_error(
+                    self._context,
+                    code="untruthful_result_storage_marker",
+                    message=(
+                        f"a result-storage marker claims a "
+                        f"{reference.direction.value} of {name!r}, but the "
+                        "statement's own member spelling says otherwise"
+                    ),
+                    path=path,
+                    value=name,
+                )
+
+    def _require_no_tensor_conflict(
+        self,
+        node: llir.Stmt,
+        marker: llir.ResultStorageMetadata,
+        path: LLIRPath,
+    ) -> None:
+        """The statement marker and the target's access marker must agree.
+
+        The workspace drain's value store is the one statement that carries
+        both: ``RESULT_WRITE`` access provenance on its target ``ArrayAccess``,
+        saying which ELEMENT is written, and a statement marker saying which
+        storage VECTOR the statement names.  They describe different facts at
+        different granularity and neither is derivable from the other, so the
+        pair is allowed -- but a pair naming DIFFERENT tensors is exactly the
+        contradiction section 63.3's third finding refuses, and checking it here
+        is what makes the second home a check rather than a hazard.
+        """
+
+        if type(node) is not llir.Assign:
+            return
+        target = cast(llir.Assign, node).var
+        if type(target) is not llir.ArrayAccess:
+            return
+        access = cast(llir.ArrayAccess, target).tensor_access
+        if type(access) is not llir.TensorAccessMetadata:
+            return
+        if access.role is not llir.TensorAccessRole.RESULT_WRITE:
+            return
+        if access.tensor_id == marker.tensor_id:
+            return
+        _raise_result_write_error(
+            self._context,
+            code="result_storage_marker_tensor_conflict",
+            message=(
+                "this statement's result-storage marker names result "
+                f"{self._result_name} while its assignment target's access "
+                "metadata names a different tensor; one statement cannot write "
+                "two results' storage and one of the two markers is wrong"
+            ),
+            path=path,
+            value=access.tensor_id,
+        )
+
+    def _require_result_write_rewritten(
+        self,
+        node: llir.Stmt,
+        replacement: Sequence[llir.Stmt],
+        path: LLIRPath,
+    ) -> None:
+        """A recognized result write must not survive the rewrite unchanged.
+
+        This is what closes both of review section 61.4's structural
+        narrownesses, and it closes them by construction rather than by
+        spelling.  Nothing this pass CONSTRUCTS carries a result-storage marker
+        -- ``_store``, ``_phase_state`` and ``_phase_index`` are its only
+        builders and none sets the field -- so a marker naming this result with
+        a write, still present in what the rewrite returned, means the rewrite
+        left the statement alone.
+
+        Gap A arrives as a ``FunctionCallStmt`` whose callee name is a free
+        function, so ``_rewrite_call_statement`` falls through to ``(node,)``.
+        Gap B arrives as a ``MemberCallStmt``, which no branch above dispatches,
+        so it reaches the identity rewrite.  Both keep their marker and both are
+        refused here, naming the statement and its path -- which is the
+        diagnosis the postcondition cannot give, since it reports that a
+        reference survived rather than which statement was misunderstood.
+        """
+
+        for index, statement in enumerate(replacement):
+            surviving = getattr(statement, "result_storage", None)
+            if type(surviving) is not llir.ResultStorageMetadata:
+                continue
+            typed_surviving = cast(llir.ResultStorageMetadata, surviving)
+            if typed_surviving.tensor_id != self._result_id:
+                continue
+            if not typed_surviving.writes():
+                continue
+            _raise_result_write_error(
+                self._context,
+                code="unrewritten_result_write_statement",
+                message=(
+                    f"a {type(node).__name__} writes result "
+                    f"{self._result_name}'s own storage in a {self._mode} phase "
+                    "and this pass has no rewrite for it, so it survived "
+                    "unchanged; retaining it would emit a write against a "
+                    "declaration the two-phase transform has dropped.  It "
+                    f"references "
+                    f"{[_result_storage_array_name(self._result_name, entry) for entry in typed_surviving.references]!r}"
+                ),
+                path=path + (f"[{index}]",),
+                value=node,
+            )
 
     @staticmethod
     def _phase_state(prefix: str, level: int) -> llir.Var:
@@ -589,6 +832,114 @@ class _ResultWriteRewriter(LLIRRewriter):
 
     def rewrite_function(self, node: llir.Function, path: LLIRPath) -> llir.Function:
         return self._identity.rewrite_function(node, path)
+
+
+def _result_storage_array_name(
+    result_name: str, reference: llir.ResultStorageReference
+) -> str:
+    """The generated vector name one marker reference denotes.
+
+    One place spells the marker's three arrays as strings, and it is the same
+    spelling ``_touches_result_storage`` and ``_ResultStorageResidueWalker``
+    build, so the marker's vocabulary and the postcondition's cannot drift.
+    """
+
+    if reference.array is llir.ResultStorageArray.VALUES:
+        return f"{result_name}_values"
+    if reference.array is llir.ResultStorageArray.POS:
+        return f"{result_name}{reference.level}_pos"
+    return f"{result_name}{reference.level}_crd"
+
+
+class _ResultStorageNameFinder(LLIRWalker):
+    """Which of this result's storage vectors one statement actually names.
+
+    Used to check that a marker tells the truth about the statement it sits on.
+    It reaches the same name positions ``_ResultStorageResidueWalker`` does --
+    ``Var``, ``FunctionCall``, ``FunctionCallStmt``, ``QualifiedName``,
+    ``FixedStackArrayDecl`` and ``RawStmt`` -- because those are every position a
+    generated storage name can be spelled in.
+
+    ``written_members`` records the direction where the statement's own spelling
+    decides it: a dotted member name says which way the reference goes, so
+    ``C1_crd.push_back`` records ``True`` and ``C1_crd.size`` records ``False``.
+    A bare vector name in an argument position records nothing, because the node
+    shape genuinely does not say -- which is why the marker has to carry the
+    direction rather than have it derived.
+    """
+
+    #: ``std::vector`` members that mutate the vector, and members that read it.
+    #: A member outside both sets records no direction rather than guessing one.
+    _WRITE_MEMBERS = frozenset(
+        {"push_back", "emplace_back", "resize", "reserve", "clear", "insert", "assign"}
+    )
+    _READ_MEMBERS = frozenset(
+        {"size", "back", "front", "empty", "data", "at", "begin", "end", "capacity"}
+    )
+
+    def __init__(
+        self,
+        result_name: str,
+        compressed_levels: Sequence[int],
+        traversal: LLIRTraversalContext,
+    ) -> None:
+        super().__init__(traversal)
+        arrays = {f"{result_name}_values"}
+        for level in compressed_levels:
+            arrays.add(f"{result_name}{level}_pos")
+            arrays.add(f"{result_name}{level}_crd")
+        self._arrays = frozenset(arrays)
+        self.mentioned: set = set()
+        self.written_members: dict = {}
+
+    def _record(self, value: object) -> None:
+        if type(value) is not str:
+            return
+        if value in self._arrays:
+            self.mentioned.add(value)
+            return
+        for name in self._arrays:
+            prefix = f"{name}."
+            if value.startswith(prefix):
+                self.mentioned.add(name)
+                member = value[len(prefix) :]
+                if member in self._WRITE_MEMBERS:
+                    self.written_members[name] = True
+                elif member in self._READ_MEMBERS:
+                    self.written_members[name] = False
+                return
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        node_type = type(node)
+        if node_type is llir.Var:
+            self._record(cast(llir.Var, node).name)
+        elif node_type is llir.FunctionCall:
+            self._record(cast(llir.FunctionCall, node).name)
+        elif node_type is llir.FunctionCallStmt:
+            self._record(cast(llir.FunctionCallStmt, node).name)
+        elif node_type is llir.QualifiedName:
+            self._record(cast(llir.QualifiedName, node).name)
+        elif node_type is llir.FixedStackArrayDecl:
+            self._record(cast(llir.FixedStackArrayDecl, node).name)
+        elif node_type is llir.RawStmt:
+            code = cast(llir.RawStmt, node).code
+            if type(code) is str:
+                for name in self._arrays:
+                    if _mentions_identifier(code, name):
+                        self.mentioned.add(name)
+        elif node_type in (llir.MemberCall, llir.MemberCallStmt):
+            # The receiver is a child expression this hook reaches on its own;
+            # the member is a bare identifier, so the DIRECTION it decides has to
+            # be picked up here rather than from a dotted string.
+            member = getattr(node, "member", None)
+            base = getattr(node, "base", None)
+            if type(member) is str and type(base) is llir.Var:
+                name = cast(llir.Var, base).name
+                if name in self._arrays:
+                    if member in self._WRITE_MEMBERS:
+                        self.written_members[name] = True
+                    elif member in self._READ_MEMBERS:
+                        self.written_members[name] = False
 
 
 @dataclass(frozen=True)

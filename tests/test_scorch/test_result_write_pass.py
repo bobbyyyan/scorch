@@ -69,6 +69,40 @@ def _phase_index(level: int) -> llir.Add:
     )
 
 
+def _marker(
+    *references: Tuple[llir.ResultStorageArray, int | None, bool],
+    tensor_id: SymbolId = _RESULT_ID,
+) -> llir.ResultStorageMetadata:
+    """One statement's result-storage marker, spelled as production spells it.
+
+    Every hand-built result write in this file carries one, because every
+    production lowering now attaches one and the pass refuses a statement whose
+    callee name says result storage while no marker does.  A fixture without a
+    marker would be testing a program the compiler no longer emits.
+    """
+
+    return llir.ResultStorageMetadata(
+        tensor_id=tensor_id,
+        references=tuple(
+            llir.ResultStorageReference(
+                array,
+                level,
+                (
+                    llir.ResultStorageDirection.WRITE
+                    if writes
+                    else llir.ResultStorageDirection.READ
+                ),
+            )
+            for array, level, writes in references
+        ),
+    )
+
+
+_VALUES = llir.ResultStorageArray.VALUES
+_POS = llir.ResultStorageArray.POS
+_CRD = llir.ResultStorageArray.CRD
+
+
 def _fill_store(
     array_name: str,
     index: llir.Expr,
@@ -155,21 +189,32 @@ def _single_level_serial_writes() -> List[llir.Stmt]:
         llir.Assign(
             _result_value_access(_var("pResult1")),
             llir.BinOp("+", _var("left"), _var("right")),
+            result_storage=_marker((_VALUES, None, True)),
         ),
         llir.Assign(
             _access("Result1_crd", _var("pResult1")),
             _var("coordinate"),
+            result_storage=_marker((_CRD, 1, True)),
         ),
         llir.Assign(
             _access("Result1_pos", llir.Add(_var("row"), llir.Literal(1))),
             _var("pResult1"),
+            result_storage=_marker((_POS, 1, True)),
         ),
         llir.Increment(_var("pResult1", llir.DataType.INT64)),
         llir.FunctionCallStmt(
             "Result1_crd.push_back",
             [_var("pushed_coordinate")],
+            result_storage=_marker((_CRD, 1, True)),
         ),
-        llir.FunctionCallStmt("Result_values.push_back", []),
+        llir.FunctionCallStmt(
+            "Result_values.push_back",
+            [],
+            result_storage=_marker((_VALUES, None, True)),
+        ),
+        # The sort is on the WORKSPACE, so it names no result storage and
+        # carries no marker -- which is what makes the pass's rule over it
+        # ("keep in fill, drop in count") independent of this mechanism.
         llir.FunctionCallStmt("workspace.sort", []),
         llir.VarInit(
             _var("pResult1", llir.DataType.INT64),
@@ -190,6 +235,7 @@ def _multiple_level_serial_writes() -> List[llir.Stmt]:
             llir.FunctionCallStmt(
                 "Result1_crd.push_back",
                 [_var("parent_coordinate")],
+                result_storage=_marker((_CRD, 1, True)),
             ),
             llir.RawStmt("discarded_then"),
         ],
@@ -197,11 +243,15 @@ def _multiple_level_serial_writes() -> List[llir.Stmt]:
         cond_list=[_var("discarded_condition")],
         then_body_list=[[llir.RawStmt("discarded_branch")]],
         make_last_case_else=True,
+        # The conditional's own marker covers the read in its CONDITION; the
+        # append in its body carries its own.
+        result_storage=_marker((_POS, 2, False)),
     )
     return [
         llir.FunctionCallStmt(
             "Result1_crd.push_back",
             [_var("outer_coordinate")],
+            result_storage=_marker((_CRD, 1, True)),
         ),
         boundary,
         llir.Assign(
@@ -210,6 +260,10 @@ def _multiple_level_serial_writes() -> List[llir.Stmt]:
                 llir.FunctionCall("Result1_crd.size", []),
             ),
             _var("Result2_crd.size()"),
+            result_storage=_marker(
+                (_POS, 2, True),
+                (_CRD, 1, False),
+            ),
         ),
     ]
 
@@ -323,6 +377,7 @@ def test_fill_rewrite_preserves_each_canonical_value_pointer_type(
         llir.FunctionCallStmt(
             "Result_values.push_back",
             [_var("pushed_value", scalar_type)],
+            result_storage=_marker((_VALUES, None, True)),
         ),
     ]
 
@@ -658,6 +713,7 @@ def test_nested_list_and_tuple_roots_preserve_container_shapes() -> None:
                 llir.FunctionCallStmt(
                     "Result1_crd.push_back",
                     [_var("pushed")],
+                    result_storage=_marker((_CRD, 1, True)),
                 ),
             )
         ],
@@ -920,6 +976,7 @@ def test_count_and_fill_are_independent_not_composable() -> None:
             llir.FunctionCallStmt(
                 "Result1_crd.push_back",
                 [_var("coordinate")],
+                result_storage=_marker((_CRD, 1, True)),
             ),
             _context("fill"),
             2,
@@ -1347,4 +1404,288 @@ def test_result_write_pass_defect_codes_are_the_locked_set() -> None:
         "unsupported_result_write_statement",
         # The postcondition: a reference to removed storage survived.
         "residual_result_storage_reference",
+        # The typed recognizer, split from the rewrite dispatch.  These four are
+        # what closes review section 61.4's two structural narrownesses.
+        #
+        # A recognized result write whose statement type has no rewrite, so it
+        # survived unchanged.  This is the one that closes gap A (a free function
+        # taking a result array as an argument, which falls through
+        # ``_rewrite_call_statement``) and gap B (a ``MemberCallStmt``, which no
+        # branch dispatches at all).
+        "unrewritten_result_write_statement",
+        # The name matcher and the marker disagreeing in the direction that means
+        # something: a callee name says this result's storage and no marker does,
+        # so a producing lowering omitted one.
+        "unmarked_result_write_statement",
+        # A marker that lies about the statement it sits on.  Section 63.3's
+        # third finding is the small version of this hazard, and it took a
+        # postcondition to notice, because nothing checked a marker for truth.
+        "untruthful_result_storage_marker",
+        # A statement marker and its assignment target's access metadata naming
+        # different tensors -- the contradiction section 63.3's third finding
+        # refuses, checked at the one statement that legitimately carries both.
+        "result_storage_marker_tensor_conflict",
     }
+
+
+def _recognizer_diagnostic(
+    statements: List[llir.Stmt],
+    code: str,
+    mode: _Mode = "count",
+) -> LLIRTraversalError:
+    with pytest.raises(LLIRTraversalError) as raised:
+        rewrite_result_writes(statements, _context(mode))
+    assert raised.value.diagnostic.code == code
+    assert raised.value.diagnostic.stage == RESULT_WRITE_TRAVERSAL_CONTEXT.stage
+    assert raised.value.diagnostic.pass_name == RESULT_WRITE_TRAVERSAL_CONTEXT.pass_name
+    return raised.value
+
+
+def test_a_marked_argument_shaped_write_is_refused_at_the_statement() -> None:
+    """Gap A, closed at the statement instead of at the postcondition.
+
+    ``loopir/parallel_chunk_assembly`` emits four statements of this shape and
+    they now carry markers.  The name matcher cannot see them --
+    ``scorch_concat_chunks`` starts with none of the array prefixes -- and the
+    rewriter has no branch for them, so they survive their own rewrite.  The
+    recognizer sees the surviving marker and refuses, naming the statement and
+    its path, which is the diagnosis the postcondition cannot give: it reports
+    that a reference survived, not which statement was misunderstood.
+    """
+
+    error = _recognizer_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "scorch_concat_chunks",
+                [_var("Result_values"), _var("chunks")],
+                result_storage=_marker((_VALUES, None, True)),
+            )
+        ],
+        "unrewritten_result_write_statement",
+    )
+    assert "FunctionCallStmt" in error.diagnostic.message
+    assert "Result_values" in error.diagnostic.message
+    # The path names the statement, not just "somewhere in the output".
+    assert error.diagnostic.path[0] == "root"
+
+
+def test_a_marked_member_call_statement_is_refused_at_the_statement() -> None:
+    """Gap B, closed at the statement, and the reason recognition had to split.
+
+    ``rewrite_statement_sequence_member`` dispatches five statement types and
+    ``MemberCallStmt`` is not one of them, so it reaches the identity rewrite.
+    Had recognition stayed inside ``_rewrite_call_statement`` -- where the name
+    matcher lives -- a marker here would never be looked at, which is gap B's
+    mechanism reproduced one level up.  Recognition runs over the full
+    traversal, so it is.
+    """
+
+    error = _recognizer_diagnostic(
+        [
+            llir.MemberCallStmt(
+                base=_var("Result1_crd"),
+                member="push_back",
+                args=[_var("coordinate")],
+                result_storage=_marker((_CRD, 1, True)),
+            )
+        ],
+        "unrewritten_result_write_statement",
+    )
+    assert "MemberCallStmt" in error.diagnostic.message
+    assert "Result1_crd" in error.diagnostic.message
+
+
+def test_the_name_matcher_and_the_marker_are_cross_checked_one_way() -> None:
+    """A callee name saying result storage with no marker is a producer omission.
+
+    The disagreement worth refusing is one-directional.  The marker legitimately
+    says yes where the name matcher says no -- that IS gap A being closed, and
+    the test above is it.  The reverse means an emitting lowering did not attach
+    a marker, which is option E's known failure mode, so it is named here rather
+    than left for the postcondition to report as an anonymous residue.
+    """
+
+    error = _recognizer_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("coordinate")],
+            )
+        ],
+        "unmarked_result_write_statement",
+    )
+    assert "Result1_crd.push_back" in error.diagnostic.message
+
+    # A marker naming a DIFFERENT result does not satisfy the cross-check, for
+    # the same reason section 63.3's third finding gives: a foreign marker does
+    # not license this result's storage name.
+    _recognizer_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("coordinate")],
+                result_storage=_marker((_CRD, 1, True), tensor_id=SymbolId(4_000_700)),
+            )
+        ],
+        "unmarked_result_write_statement",
+    )
+
+
+def test_a_marker_that_lies_about_its_statement_is_refused() -> None:
+    """Nothing else checks that a marker tells the truth, so this does.
+
+    Two lies are refused: a reference to a vector the statement does not name at
+    all, and a direction the statement's own member spelling contradicts.  The
+    check is one-directional -- a reference the statement spells and the marker
+    omits is not refused, because a nested statement carries its own marker and
+    demanding the enclosing one restate its children's facts would put one
+    reference in two markers.
+    """
+
+    # Claims a coordinate write; the statement names no coordinate array.
+    error = _recognizer_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "scorch_concat_chunks",
+                [_var("Result_values"), _var("chunks")],
+                result_storage=_marker((_CRD, 1, True)),
+            )
+        ],
+        "untruthful_result_storage_marker",
+    )
+    assert "Result1_crd" in error.diagnostic.message
+
+    # Claims a write; the member spelling says the statement reads.
+    _recognizer_diagnostic(
+        [
+            llir.VarInit(
+                _var("count", llir.DataType.INT64),
+                llir.FunctionCall("Result1_crd.size", []),
+                result_storage=_marker((_CRD, 1, True)),
+            )
+        ],
+        "untruthful_result_storage_marker",
+    )
+
+    # And the truthful version of each is accepted rather than merely tolerated:
+    # a read-only marker on the same statement passes recognition, and the
+    # statement then reaches the postcondition, which is the layer that owns a
+    # surviving READ.
+    _residue_diagnostic(
+        [
+            llir.VarInit(
+                _var("count", llir.DataType.INT64),
+                llir.FunctionCall("Result1_crd.size", []),
+                result_storage=_marker((_CRD, 1, False)),
+            )
+        ]
+    )
+
+
+def test_a_statement_marker_conflicting_with_its_access_marker_is_refused() -> None:
+    """The one statement that carries two markers, and the check that pairs them.
+
+    The workspace drain's value store holds ``RESULT_WRITE`` access provenance
+    on its target -- which element -- and a statement marker -- which vector.
+    Both are true and neither is derivable from the other, so the pair is
+    allowed.  A pair naming DIFFERENT tensors is the contradiction section
+    63.3's third finding refuses, and refusing it here is what turns the second
+    home from a hazard into a check.
+    """
+
+    error = _recognizer_diagnostic(
+        [
+            llir.Assign(
+                _result_value_access(_var("pResult1"), tensor_id=SymbolId(4_000_700)),
+                _var("value"),
+                result_storage=_marker((_VALUES, None, True)),
+            )
+        ],
+        "result_storage_marker_tensor_conflict",
+    )
+    assert "different tensor" in error.diagnostic.message
+
+    # The agreeing pair is the production shape and is accepted.
+    rewrite_result_writes(
+        [
+            llir.Assign(
+                _result_value_access(_var("pResult1")),
+                _var("value"),
+                result_storage=_marker((_VALUES, None, True)),
+            )
+        ],
+        _context("count"),
+    )
+
+
+def test_recognition_is_independent_of_which_types_have_a_rewrite() -> None:
+    """The split, asserted as a property rather than as a consequence.
+
+    Every statement type the marker can sit on is offered to the recognizer,
+    including the one type the rewrite dispatch does not name.  Asserted by
+    marking each of the five and requiring the refusal -- if recognition were
+    still inside a per-type handler, ``MemberCallStmt`` would pass silently.
+    """
+
+    shapes: List[llir.Stmt] = [
+        llir.FunctionCallStmt(
+            "scorch_concat_chunks",
+            [_var("Result_values")],
+            result_storage=_marker((_VALUES, None, True)),
+        ),
+        llir.MemberCallStmt(
+            base=_var("Result1_crd"),
+            member="push_back",
+            args=[_var("coordinate")],
+            result_storage=_marker((_CRD, 1, True)),
+        ),
+    ]
+    for shape in shapes:
+        _recognizer_diagnostic([shape], "unrewritten_result_write_statement")
+
+    # And the rewrites that DO exist still fire, so the split moved recognition
+    # without moving the transformation: the marked append becomes a counter
+    # bump in count mode rather than a refusal.
+    rewritten = rewrite_result_writes(
+        [
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("coordinate")],
+                result_storage=_marker((_CRD, 1, True)),
+            )
+        ],
+        _context("count"),
+    )
+    assert [type(statement) for statement in rewritten] == [llir.Increment]
+
+
+def test_the_pass_constructs_no_marked_statement() -> None:
+    """Why a surviving marker means "not rewritten" and not "rewritten into".
+
+    ``_require_result_write_rewritten`` reads a surviving marker as proof the
+    rewrite left the statement alone.  That inference is only sound because the
+    pass's own constructors never set the field, so this asserts it over every
+    statement the pass produces from the full generated shapes rather than
+    trusting the three builders to stay that way.
+    """
+
+    def markers(value: object) -> List[object]:
+        found: List[object] = []
+        if isinstance(value, llir.Node):
+            marker = getattr(value, "result_storage", None)
+            if marker is not None:
+                found.append(marker)
+            for child in vars(value).values():
+                found.extend(markers(child))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                found.extend(markers(child))
+        return found
+
+    for mode in cast(Tuple[_Mode, ...], ("count", "fill")):
+        for source, levels in (
+            (_single_level_serial_writes(), (1,)),
+            (_multiple_level_serial_writes(), (1, 2)),
+        ):
+            rewritten = rewrite_result_writes(source, _context(mode, levels))
+            assert markers(rewritten) == []
