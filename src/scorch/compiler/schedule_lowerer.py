@@ -503,7 +503,13 @@ def _rewrite_stmt_access_sequence(
     *,
     _validated: bool = False,
 ) -> Tuple[LLIRStatementSequence, int]:
-    """Rewrite matching tensor accesses without parsing rendered C++ names."""
+    """Rewrite matching tensor accesses without parsing rendered C++ names.
+
+    The three call branches reconstruct their statement, so each threads
+    ``result_storage``, the statement-level result-storage marker
+    ``result_write_pass`` reads.  ``Assign``, ``VarInit`` and ``IfThenElse`` are
+    mutated in place here and keep theirs without help.
+    """
     if not _validated:
         LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(replacement)
         _TensorAccessRewritePreflight(
@@ -652,6 +658,7 @@ def _rewrite_stmt_access_sequence(
                 name=stmt.name,
                 template_args=stmt.template_args,
                 args=rewritten_args,
+                result_storage=stmt.result_storage,
             )
         elif isinstance(stmt, llir.MemberCallStmt):
             rewritten_base, base_count = _rewrite_expr_access(
@@ -674,6 +681,7 @@ def _rewrite_stmt_access_sequence(
                 member=stmt.member,
                 template_args=stmt.template_args,
                 args=rewritten_args,
+                result_storage=stmt.result_storage,
             )
         elif isinstance(stmt, llir.GuardedCallStmt):
             rewritten_cond, cond_count = _rewrite_expr_access(
@@ -693,6 +701,7 @@ def _rewrite_stmt_access_sequence(
                     name=stmt.call.name,
                     template_args=stmt.call.template_args,
                     args=rewritten_args,
+                    result_storage=stmt.call.result_storage,
                 ),
             )
         rewritten_stmts.append(rewritten_stmt)

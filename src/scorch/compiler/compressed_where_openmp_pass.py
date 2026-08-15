@@ -525,10 +525,17 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
                 )
             rewritten_call = cast(llir.FunctionCallStmt, self._identity.rewrite(call))
             if call.name == self._old:
+                # A rename, so the statement's result-storage marker travels
+                # with it.  The population is empty today -- this branch only
+                # renames a workspace insert, and a workspace target is
+                # deliberately unmarked -- but this pass sits at position 1 of
+                # the frozen LLIR order, immediately before ``RESULT_WRITE``,
+                # so it is the one rebuild whose drop the guard would see.
                 return llir.FunctionCallStmt(
                     name=self._new,
                     template_args=rewritten_call.template_args,
                     args=rewritten_call.args,
+                    result_storage=rewritten_call.result_storage,
                 )
             return rewritten_call
         if type(node) is llir.ForLoop:

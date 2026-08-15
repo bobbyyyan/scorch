@@ -500,11 +500,15 @@ def _replace_body_assignment(
     assignment: llir.Assign,
     variant_expression: llir.Expr,
 ) -> None:
+    # The same assignment with a hoisted-out invariant factor, so it carries
+    # the original's result-storage marker: same target, same direction, same
+    # arrays named by the target.  Dropping it would un-mark a result write.
     replacement = llir.Assign(
         var=assignment.var,
         value=variant_expression,
         op=assignment.op,
         cast=False,
+        result_storage=assignment.result_storage,
     )
     replacement.cast = assignment.cast
     rewritten_body: List[LLIRStatementValue] = list(

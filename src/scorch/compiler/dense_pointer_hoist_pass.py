@@ -589,6 +589,15 @@ def _rewrite_statement_references(
     and unsupported expression containers are deliberately omitted. The common
     rewrite performed before this function has still validated and detached all
     of them.
+
+    Every branch that RECONSTRUCTS a statement threads
+    ``result_storage`` -- the statement-level result-storage marker
+    ``result_write_pass`` reads -- because the reconstruction is the same
+    statement with rewritten operands.  The branches that mutate a field in
+    place need nothing.  The marker's population here is empty today, since this
+    pass runs after ``RESULT_WRITE`` in the frozen LLIR order, but a rebuild that
+    drops the field silently un-marks a result write and that is the one failure
+    mode option E has.
     """
 
     rewritten: List[LLIRStatementValue] = []
@@ -633,6 +642,7 @@ def _rewrite_statement_references(
                     context,
                     statement_path + ("args",),
                 ),
+                result_storage=call.result_storage,
             )
         elif type(statement) is llir.GuardedCallStmt:
             guarded_call = cast(llir.GuardedCallStmt, statement)
@@ -660,6 +670,7 @@ def _rewrite_statement_references(
                         context,
                         statement_path + ("call", "args"),
                     ),
+                    result_storage=guarded_callee.result_storage,
                 ),
             )
         elif type(statement) is llir.MemberCallStmt:
@@ -673,6 +684,7 @@ def _rewrite_statement_references(
                 ),
                 member=member_call.member,
                 template_args=member_call.template_args,
+                result_storage=member_call.result_storage,
                 args=_rewrite_expression_sequence(
                     member_call.args,
                     replacements,

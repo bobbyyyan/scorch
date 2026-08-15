@@ -3060,6 +3060,12 @@ class CINLowerer:
             elif isinstance(stmt, llir.VarInit):
                 stmt.value = CINLowerer._rewrite_expr_refs(stmt.value, replacements)
             elif isinstance(stmt, llir.MemberCallStmt):
+                # Rebuilds the same call with rewritten operands, so the
+                # statement's result-storage marker travels with it.  Both
+                # branches here reconstruct rather than mutate, which is what
+                # makes threading the field necessary: a rebuild that omits it
+                # silently un-marks a result write, and this file is on the
+                # legacy lowering chain that reaches ``result_write_pass``.
                 stmts[i] = llir.MemberCallStmt(
                     base=CINLowerer._rewrite_expr_refs(stmt.base, replacements),
                     member=stmt.member,
@@ -3068,6 +3074,7 @@ class CINLowerer:
                         CINLowerer._rewrite_expr_refs(arg, replacements)
                         for arg in stmt.args
                     ),
+                    result_storage=stmt.result_storage,
                 )
             elif isinstance(stmt, llir.FunctionCallStmt):
                 rewritten_name = stmt.name
@@ -3080,6 +3087,7 @@ class CINLowerer:
                         CINLowerer._rewrite_expr_refs(arg, replacements)
                         for arg in stmt.args
                     ],
+                    result_storage=stmt.result_storage,
                 )
             elif isinstance(stmt, llir.ForLoop):
                 CINLowerer._rewrite_val_refs(stmt.body, replacements)
