@@ -212,6 +212,45 @@ from .nodes import (
 )
 from .verifier import LoopIRVerificationError, verify_program
 
+# Short names for the statement-level result-storage marker's vocabulary.  Every
+# marking site in this file spells one or more ``(array, level, direction)``
+# triples, and at that density the fully qualified enum members bury the fact
+# each site is stating.
+RESULT_VALUES = llir.ResultStorageArray.VALUES
+RESULT_POS = llir.ResultStorageArray.POS
+RESULT_CRD = llir.ResultStorageArray.CRD
+STORAGE_READ = llir.ResultStorageDirection.READ
+STORAGE_WRITE = llir.ResultStorageDirection.WRITE
+
+#: One ``(array, level, direction)`` triple, the argument form the marking sites
+#: in this file use.  ``level`` is ``None`` for the value vector.
+ResultStorageTriple = Tuple[
+    llir.ResultStorageArray, Optional[int], llir.ResultStorageDirection
+]
+
+
+def _result_storage_marker(
+    result_symbol: SymbolId,
+    *references: ResultStorageTriple,
+) -> llir.ResultStorageMetadata:
+    """One statement's result-storage marker, over the references given.
+
+    The identity is REBUILT rather than shared, following the discipline
+    ``_detach_tensor_access_metadata`` applies to access provenance and that
+    ``result_id=SymbolId(self.result_symbol.value)`` follows elsewhere in this
+    file: a managed pass must own no program state, so nothing reachable from an
+    LLIR node aliases the plan's own identity object.
+    """
+
+    return llir.ResultStorageMetadata(
+        tensor_id=SymbolId(result_symbol.value),
+        references=tuple(
+            llir.ResultStorageReference(array, level, direction)
+            for array, level, direction in references
+        ),
+    )
+
+
 _LOOPIR_GRAPH_NODE_TYPES = (
     AppendEntry,
     BinaryExpr,
@@ -4077,6 +4116,22 @@ class _TargetLowering:
             ),
         )
 
+    def _result_storage(
+        self, *references: ResultStorageTriple
+    ) -> llir.ResultStorageMetadata:
+        """This result's statement marker, over the storage references given.
+
+        A marker describes the references in the statement's OWN expression
+        fields -- its target, its index, its value, its call arguments and its
+        condition -- and not those in a nested statement body.  A nested
+        statement carries its own marker, so the position-boundary conditional
+        marks only the ``{R}{L}_pos`` read in its condition while the append in
+        its ``then_body`` marks its own coordinate write.  Without that rule two
+        markers would describe one reference and neither could be checked.
+        """
+
+        return _result_storage_marker(self.result_symbol, *references)
+
     def _loop_logical_index(self, loop: _Loop) -> object:
         if loop.kind in (_TILE_OUTER, _TILE_INNER, _PANEL_OUTER):
             return loop.node.index
@@ -4399,9 +4454,25 @@ class _TargetLowering:
                 index=snapshot.index,
                 tensor_access=detached_metadata,
             )
+        # The one statement in the census that ALREADY carries a marker: its
+        # ``ArrayAccess`` target holds ``RESULT_WRITE`` access provenance, above.
+        # The statement marker is not a duplicate of that fact -- the access
+        # marker says which ELEMENT is written and carries the index identities,
+        # this says which storage VECTOR the statement names -- and neither is
+        # derivable from the other.  ``result_write_pass`` refuses the two if
+        # they name different tensors, which is what makes the pair a check
+        # rather than two places to put one fact.
+        value_write = self._result_storage((RESULT_VALUES, None, STORAGE_WRITE))
         if type(leaf) is StoreReduce:
-            return [llir.Assign(var=target, value=rhs, op=llir.AssignOp.ADD_ASSIGN)]
-        return [llir.Assign(var=target, value=rhs)]
+            return [
+                llir.Assign(
+                    var=target,
+                    value=rhs,
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    result_storage=value_write,
+                )
+            ]
+        return [llir.Assign(var=target, value=rhs, result_storage=value_write)]
 
     # -- merged-loop case machinery -------------------------------------------
 
@@ -4526,7 +4597,15 @@ class _TargetLowering:
             ),
             tensor_access=self._result_metadata(),
         )
-        stmts: List[llir.Stmt] = [llir.Assign(var=target, value=value)]
+        stmts: List[llir.Stmt] = [
+            llir.Assign(
+                var=target,
+                value=value,
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            )
+        ]
         if type(self.leaf) is AppendEntry:
             stmts.append(llir.Comment("Set coordinates"))
             stmts.append(
@@ -4542,6 +4621,9 @@ class _TargetLowering:
                         ),
                     ),
                     value=llir.Var(name=dimension_name, type=llir.DataType.NO_TYPE),
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                    ),
                 )
             )
             stmts.append(
@@ -4669,6 +4751,12 @@ class _TargetLowering:
             value=llir.FunctionCall(
                 name=f"{result_name}{level}_crd.size",
                 args=[],
+            ),
+            # One statement, two references with opposite directions: it writes
+            # the position array and reads the coordinate array's size to do it.
+            result_storage=self._result_storage(
+                (RESULT_POS, level, STORAGE_WRITE),
+                (RESULT_CRD, level, STORAGE_READ),
             ),
         )
 
@@ -5177,6 +5265,9 @@ class _TargetLowering:
                     ),
                 ),
                 op=llir.AssignOp.ADD_ASSIGN,
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
             ),
         ]
         for_loop = llir.ForLoop(
@@ -6621,13 +6712,60 @@ def _detach_tensor_access_metadata(
     )
 
 
+def _detach_result_storage_metadata(
+    metadata: llir.ResultStorageMetadata,
+) -> llir.ResultStorageMetadata:
+    """Copy a statement's result-storage marker so no managed pass owns it.
+
+    The same discipline ``_detach_tensor_access_metadata`` applies to access
+    provenance: the identity is rebuilt as a separate value, so an in-place
+    forged mutation of the emitted tree's marker after the managed passes cannot
+    also mutate the completion reference's copy.  The two enum members are
+    process-wide singletons the comparison side pins against an import-time
+    snapshot, so they are shared rather than rebuilt.
+    """
+
+    if type(metadata) is not llir.ResultStorageMetadata:
+        raise TypeError("result storage metadata must be exact")
+    tensor_id = _stored_identity_value(metadata.tensor_id, SymbolId)
+    if tensor_id is None or type(metadata.references) is not tuple:
+        raise TypeError("result storage metadata contains malformed state")
+    references: List[llir.ResultStorageReference] = []
+    for reference in metadata.references:
+        if type(reference) is not llir.ResultStorageReference:
+            raise TypeError("result storage references must be exact")
+        if (
+            type(reference.array) is not llir.ResultStorageArray
+            or type(reference.direction) is not llir.ResultStorageDirection
+            or (reference.level is not None and type(reference.level) is not int)
+        ):
+            raise TypeError("result storage reference contains malformed state")
+        references.append(
+            llir.ResultStorageReference(
+                reference.array,
+                reference.level,
+                reference.direction,
+            )
+        )
+    return llir.ResultStorageMetadata(
+        tensor_id=SymbolId(tensor_id),
+        references=tuple(references),
+    )
+
+
 def _capture_sparse_completion_enum_states() -> (
     Dict[Tuple[type, int], Tuple[Tuple[str, object], ...]]
 ):
     """Snapshot LLIR enum member state before any managed pass can mutate it."""
 
     snapshots: Dict[Tuple[type, int], Tuple[Tuple[str, object], ...]] = {}
-    for enum_type in (llir.AssignOp, llir.DataType, llir.TensorAccessRole):
+    for enum_type in (
+        llir.AssignOp,
+        llir.DataType,
+        llir.TensorAccessRole,
+        llir.ResultStorageArray,
+        llir.ResultStorageDirection,
+    ):
         for member in enum_type.__members__.values():
             state = object.__getattribute__(member, "__dict__")
             snapshots[(enum_type, id(member))] = tuple(
@@ -6735,6 +6873,107 @@ def _metadata_state_matches(
     )
 
 
+def _result_storage_state_matches(
+    actual: object,
+    expected: object,
+    validated_enum_states: Set[Tuple[type, int]],
+) -> bool:
+    """Compare two frozen statement-level result-storage markers exactly.
+
+    The marker is value state rather than owned tree structure, for the same
+    reason ``_metadata_state_matches``'s access provenance is: it is frozen, its
+    leaves are an identity and two enums, it cannot be mutated and cannot close
+    a cycle, and the production two-phase rewrite legitimately duplicates a work
+    body whose detached statements retain the same marker values.  So it is
+    compared by stored state and stays outside the fresh-ownership census.
+
+    Without this branch the comparator's final ``return False`` would reject
+    every statement carrying a marker, turning a program that compiles today
+    into a ``sparse_workspace_completion_lost`` refusal.  Its ``references``
+    tuple is compared here rather than pushed onto the work queue, which also
+    keeps a legitimately shared non-empty tuple out of the ownership census.
+    """
+
+    actual_state = object.__getattribute__(actual, "__dict__")
+    expected_state = object.__getattribute__(expected, "__dict__")
+    expected_fields = ("tensor_id", "references")
+    if (
+        type(actual_state) is not dict
+        or type(expected_state) is not dict
+        or len(actual_state) != len(expected_fields)
+        or len(expected_state) != len(expected_fields)
+        or any(type(key) is not str for key in actual_state)
+        or any(type(key) is not str for key in expected_state)
+        or any(field not in actual_state for field in expected_fields)
+        or any(field not in expected_state for field in expected_fields)
+    ):
+        return False
+    for side in (actual_state, expected_state):
+        if (
+            _stored_identity_value(side["tensor_id"], SymbolId) is None
+            or type(side["references"]) is not tuple
+        ):
+            return False
+    if _stored_identity_value(
+        actual_state["tensor_id"], SymbolId
+    ) != _stored_identity_value(expected_state["tensor_id"], SymbolId):
+        return False
+    actual_references = actual_state["references"]
+    expected_references = expected_state["references"]
+    if len(actual_references) != len(expected_references):
+        return False
+    reference_fields = ("array", "level", "direction")
+    for actual_reference, expected_reference in zip(
+        actual_references, expected_references
+    ):
+        if (
+            type(actual_reference) is not llir.ResultStorageReference
+            or type(expected_reference) is not llir.ResultStorageReference
+        ):
+            return False
+        actual_reference_state = object.__getattribute__(actual_reference, "__dict__")
+        expected_reference_state = object.__getattribute__(
+            expected_reference, "__dict__"
+        )
+        if (
+            type(actual_reference_state) is not dict
+            or type(expected_reference_state) is not dict
+            or len(actual_reference_state) != len(reference_fields)
+            or len(expected_reference_state) != len(reference_fields)
+            or any(field not in actual_reference_state for field in reference_fields)
+            or any(field not in expected_reference_state for field in reference_fields)
+        ):
+            return False
+        for field in ("array", "direction"):
+            actual_enum = actual_reference_state[field]
+            expected_enum = expected_reference_state[field]
+            if (
+                type(actual_enum)
+                is not (
+                    llir.ResultStorageArray
+                    if field == "array"
+                    else llir.ResultStorageDirection
+                )
+                or actual_enum is not expected_enum
+                or not _sparse_completion_enum_state_matches_once(
+                    cast(Enum, actual_enum), validated_enum_states
+                )
+            ):
+                return False
+        actual_level = actual_reference_state["level"]
+        expected_level = expected_reference_state["level"]
+        if actual_level is None or expected_level is None:
+            if actual_level is not None or expected_level is not None:
+                return False
+        elif (
+            type(actual_level) is not int
+            or type(expected_level) is not int
+            or actual_level != expected_level
+        ):
+            return False
+    return True
+
+
 _COMPLETION_SCALAR_TYPES = frozenset((bool, int, float, str))
 _COMPLETION_ENUM_TYPES = frozenset(
     (llir.AssignOp, llir.DataType, llir.TensorAccessRole)
@@ -6782,9 +7021,11 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
     enum_types = _COMPLETION_ENUM_TYPES
     identity_types = _COMPLETION_IDENTITY_TYPES
     metadata_type = llir.TensorAccessMetadata
+    result_storage_type = llir.ResultStorageMetadata
     read_state = object.__getattribute__
     enum_state_matches = _sparse_completion_enum_state_matches_once
     metadata_matches = _metadata_state_matches
+    result_storage_matches = _result_storage_state_matches
     while pending:
         actual_value, expected_value, depth = pop()
         value_type = type(actual_value)
@@ -6854,6 +7095,14 @@ def _exact_sparse_completion_matches(actual: object, expected: object) -> bool:
             # interned empty tuple, it cannot be mutated and cannot close a
             # cycle through its immutable leaf fields).
             if not metadata_matches(
+                actual_value, expected_value, validated_enum_states
+            ):
+                return False
+            continue
+        if value_type is result_storage_type:
+            # The statement-level result-storage marker, for the same reason and
+            # on the same terms as the access provenance above.
+            if not result_storage_matches(
                 actual_value, expected_value, validated_enum_states
             ):
                 return False
@@ -7519,6 +7768,9 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     name=f"{workspace_name}_value",
                     type=llir.DataType.NO_TYPE,
                 ),
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
             ),
             llir.Assign(
                 var=llir.ArrayAccess(
@@ -7529,12 +7781,15 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     index=counter_var,
                 ),
                 value=llir.Var(name=self.drain_name, type=llir.DataType.NO_TYPE),
+                result_storage=self._result_storage((RESULT_CRD, 1, STORAGE_WRITE)),
             ),
             llir.Increment(var=counter_var),
         ]
         return [
             llir.BlankLine(),
             llir.Comment("Lower consumer CIN"),
+            # The sort is on the WORKSPACE, not on the result, so it names no
+            # result storage and carries no marker.
             llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
             llir.ForLoopAuto(
                 var=iterator_var,
@@ -7559,8 +7814,14 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     llir.FunctionCallStmt(
                         name=f"{result_name}0_crd.push_back",
                         args=[llir.Var(name=self.row_name, type=llir.DataType.INT64)],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, 0, STORAGE_WRITE)
+                        ),
                     ),
                 ],
+                # The conditional's own marker covers its CONDITION only.  The
+                # append in its ``then_body`` is a statement and carries its own.
+                result_storage=self._result_storage((RESULT_POS, 1, STORAGE_READ)),
             ),
             llir.Assign(
                 var=llir.ArrayAccess(
@@ -7571,6 +7832,11 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     index=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
                 ),
                 value=llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+                result_storage=self._result_storage(
+                    (RESULT_POS, 1, STORAGE_WRITE),
+                    (RESULT_CRD, 0, STORAGE_READ),
+                    (RESULT_CRD, 1, STORAGE_READ),
+                ),
             ),
         ]
 
@@ -7662,6 +7928,9 @@ class _SparseWorkspaceLowering(_TargetLowering):
                             type=llir.DataType.NO_TYPE,
                         )
                     ],
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
                 ),
                 llir.FunctionCallStmt(
                     name=f"{result_name}1_crd.emplace_back",
@@ -7671,6 +7940,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
                             type=llir.DataType.NO_TYPE,
                         )
                     ],
+                    result_storage=self._result_storage((RESULT_CRD, 1, STORAGE_WRITE)),
                 ),
                 llir.Increment(
                     var=llir.Var(
@@ -7701,13 +7971,34 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 ),
                 llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
             ],
+            # ``scorch_vector_set(vector, index, value)`` WRITES its first
+            # argument.  The syntax cannot say that -- an argument position is
+            # exactly gap A -- so the direction is declared here rather than
+            # derived by the guard.
+            result_storage=self._result_storage(
+                (RESULT_POS, 0, STORAGE_WRITE),
+                (RESULT_CRD, 0, STORAGE_READ),
+            ),
         )
 
     def _completed_position_init_statement(
         self,
         level: int,
     ) -> llir.FunctionCallStmt:
-        """One checked position sentinel left by the dynamic-vector pass."""
+        """One checked position sentinel left by the dynamic-vector pass.
+
+        DELIBERATELY UNMARKED, and the reason is a boundary rather than an
+        oversight.  This builds the COMPLETION REFERENCE for a statement whose
+        actual side comes from ``ResultTensorAssembler.emit_level_indices_init``
+        in ``torch_cpp_abi``, and review section 63.6 measured that file as
+        having zero result-specific construction sites: its 33 storage-name
+        constructions are polymorphic over operands and results alike, built from
+        ``self.name`` and a ``name`` loop variable.  So the actual statement
+        carries no marker, the dynamic-vector rewrite carries none across, and a
+        marker here alone would make the two sides differ and fail the completion
+        comparison on a program that compiles today.  Marking the ABI needs a
+        descriptor-driven mechanism, which is a separate change.
+        """
 
         return llir.FunctionCallStmt(
             name="scorch_vector_set",
@@ -7805,6 +8096,13 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 ]
             expected_kernel_abi = self.kernel_abi()
             expected_row_tail = self._row_assembly_statements()
+            # This is the COMPLETION REFERENCE for the statement the dynamic
+            # vector pass rewrites, so its marker must be the one that rewrite
+            # carries across -- the marker on the ``Assign`` in
+            # ``_row_assembly_statements``, verbatim.  If the two ever disagree
+            # the completion comparison fails closed rather than accepting a
+            # differently-marked statement, which is why they are spelled from
+            # the same three references.
             expected_row_tail[-1] = llir.FunctionCallStmt(
                 name="scorch_vector_set",
                 args=[
@@ -7815,6 +8113,11 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
                     llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
                 ],
+                result_storage=self._result_storage(
+                    (RESULT_POS, 1, STORAGE_WRITE),
+                    (RESULT_CRD, 0, STORAGE_READ),
+                    (RESULT_CRD, 1, STORAGE_READ),
+                ),
             )
             expected_row_body: List[llir.Stmt] = [
                 *self._row_prologue_statements(),
@@ -7902,6 +8205,10 @@ class _SparseWorkspaceLowering(_TargetLowering):
                     ),
                 ),
                 value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+                result_storage=self._result_storage(
+                    (RESULT_POS, 0, STORAGE_WRITE),
+                    (RESULT_CRD, 0, STORAGE_READ),
+                ),
             ),
         ]
 
@@ -7953,6 +8260,21 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
                 ),
             ),
             value=llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
+            result_storage=self._row_close_result_storage(),
+        )
+
+    def _row_close_result_storage(self) -> llir.ResultStorageMetadata:
+        """The row close's marker, shared by the raw and the completed spelling.
+
+        The raw indexed assignment and the checked call are the same statement
+        before and after the dynamic-vector rewrite, which carries the marker
+        across, so the completion reference has to state the identical
+        references.  Spelling them once is what keeps the two from drifting.
+        """
+
+        return self._result_storage(
+            (RESULT_POS, 1, STORAGE_WRITE),
+            (RESULT_CRD, 1, STORAGE_READ),
         )
 
     def _completed_row_close_statement(self) -> llir.FunctionCallStmt:
@@ -7975,6 +8297,7 @@ class _RowScopeSparseWorkspaceLowering(_SparseWorkspaceLowering):
                 ),
                 llir.FunctionCall(name=f"{result_name}1_crd.size", args=[]),
             ],
+            result_storage=self._row_close_result_storage(),
         )
 
     def _row_catch_up_loop(self, bound: llir.Expr, *, completed: bool) -> llir.ForLoop:
@@ -8909,6 +9232,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 _SCALAR_TO_TORCH[self.result_decl.dtype]
             ).value,
             index_ctype=llir.DataType.INT.value,
+            result_id=SymbolId(self.result_symbol.value),
         )
 
     # -- names ---------------------------------------------------------------
@@ -9158,6 +9482,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                         llir.FunctionCallStmt(
                             name=f"{result_name}{level}_crd.push_back",
                             args=[coordinate],
+                            result_storage=self._result_storage(
+                                (RESULT_CRD, level, STORAGE_WRITE)
+                            ),
                         ),
                         llir.Increment(
                             var=llir.Var(
@@ -9166,6 +9493,11 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                             )
                         ),
                     ],
+                    # The condition reads this level's coordinate array through
+                    # ``.back()``; the append inside carries its own marker.
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_READ)
+                    ),
                 )
             )
         body.extend(
@@ -9181,6 +9513,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                             type=llir.DataType.NO_TYPE,
                         )
                     ],
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
                 ),
                 llir.FunctionCallStmt(
                     name=f"{result_name}{leaf_level}_crd.emplace_back",
@@ -9190,6 +9525,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                             type=llir.DataType.NO_TYPE,
                         )
                     ],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                    ),
                 ),
                 llir.Increment(
                     var=llir.Var(
@@ -9218,6 +9556,11 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                             name=f"{result_name}{level + 1}_crd.size", args=[]
                         ),
                     ],
+                    result_storage=self._result_storage(
+                        (RESULT_POS, level + 1, STORAGE_WRITE),
+                        (RESULT_CRD, level, STORAGE_READ),
+                        (RESULT_CRD, level + 1, STORAGE_READ),
+                    ),
                 )
             )
         return [
@@ -9367,6 +9710,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                     llir.FunctionCallStmt(
                         name=f"{result_name}{level}_crd.push_back",
                         args=[llir.Var(name=coord_name, type=llir.DataType.INT64)],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, level, STORAGE_WRITE)
+                        ),
                     ),
                     llir.Increment(
                         var=llir.Var(
@@ -9375,6 +9721,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                         )
                     ),
                 ],
+                result_storage=self._result_storage(
+                    (RESULT_POS, level + 1, STORAGE_READ)
+                ),
             ),
             llir.FunctionCallStmt(
                 name="scorch_vector_set",
@@ -9388,6 +9737,11 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                         name=f"{result_name}{level + 1}_crd.size", args=[]
                     ),
                 ],
+                result_storage=self._result_storage(
+                    (RESULT_POS, level + 1, STORAGE_WRITE),
+                    (RESULT_CRD, level, STORAGE_READ),
+                    (RESULT_CRD, level + 1, STORAGE_READ),
+                ),
             ),
         ]
 
@@ -9430,6 +9784,10 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 ),
                 llir.FunctionCall(name=f"{result_name}{level}_crd.size", args=[]),
             ],
+            result_storage=self._result_storage(
+                (RESULT_POS, level, STORAGE_WRITE),
+                (RESULT_CRD, level, STORAGE_READ),
+            ),
         )
 
     def complete_sparse_workspace(self, function: llir.Function) -> llir.Function:
@@ -10080,6 +10438,9 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
                         name=workspace_value_name,
                         type=llir.DataType.NO_TYPE,
                     ),
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
                 ),
                 llir.Assign(
                     var=llir.ArrayAccess(
@@ -10090,6 +10451,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
                         index=llir.Var(name=counter_name, type=llir.DataType.INT64),
                     ),
                     value=llir.Var(name=self.drain_name, type=llir.DataType.NO_TYPE),
+                    result_storage=self._result_storage((RESULT_CRD, 1, STORAGE_WRITE)),
                 ),
                 llir.Increment(
                     var=llir.Var(name=counter_name, type=llir.DataType.NO_TYPE)
@@ -10182,6 +10544,10 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             value=llir.FunctionCall(
                 name=f"{result_name}1_crd.size",
                 args=[],
+            ),
+            result_storage=self._result_storage(
+                (RESULT_POS, 1, STORAGE_WRITE),
+                (RESULT_CRD, 1, STORAGE_READ),
             ),
         )
 
@@ -10903,8 +11269,14 @@ class _DenseDomainMixedLowering(_TargetLowering):
                         llir.FunctionCallStmt(
                             name=f"{self.result_decl.name}0_crd.push_back",
                             args=[llir.Var(name=name, type=llir.DataType.INT64)],
+                            result_storage=self._result_storage(
+                                (RESULT_CRD, 0, STORAGE_WRITE)
+                            ),
                         ),
                     ],
+                    # The guard is over trailing dense LEVEL SIZES, not over any
+                    # result storage vector, so the conditional itself names none
+                    # and carries no marker.
                 )
             )
         if position + 1 < len(self.loops):
@@ -10915,6 +11287,14 @@ class _DenseDomainMixedLowering(_TargetLowering):
                 llir.FunctionCallStmt(
                     name=f"{self.result_decl.name}_values.emplace_back",
                     args=[self._lower_value(cast(AppendEntry, self.leaf).value)],
+                    # The argument's own leaves carry INPUT_READ access
+                    # provenance for the operands they load.  A recognizer that
+                    # asked only "does a child carry tensor_access" would see a
+                    # false positive here, which is why the statement marker is
+                    # its own field and the role is checked.
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
                 )
             )
         loop_var = llir.Var(name=name, type=llir.DataType.INT64)
@@ -10950,6 +11330,10 @@ class _DenseDomainMixedLowering(_TargetLowering):
                     ),
                 ),
                 value=llir.FunctionCall(name=f"{result_name}0_crd.size", args=[]),
+                result_storage=self._result_storage(
+                    (RESULT_POS, 0, STORAGE_WRITE),
+                    (RESULT_CRD, 0, STORAGE_READ),
+                ),
             ),
         ]
 
@@ -11561,6 +11945,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             llir.FunctionCallStmt(
                 name=f"{result_name}_values.emplace_back",
                 args=[llir.Var(name=accumulator.name, type=accumulator.type)],
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
             ),
             llir.Comment("Set coordinates"),
             llir.FunctionCallStmt(
@@ -11571,6 +11958,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                         type=llir.DataType.INT64,
                     )
                 ],
+                result_storage=self._result_storage(
+                    (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                ),
             ),
             llir.Increment(var=llir.Var(name=position_name, type=llir.DataType.INT64)),
         ]
@@ -11608,6 +11998,10 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         child_coordinate_count = llir.FunctionCall(
             name=f"{result_name}{level + 1}_crd.size", args=[]
         )
+        # The two coordinate reads reach this statement through Python locals
+        # rather than being nested in the constructor call, which changes nothing
+        # about where the marker goes: it is one keyword on the call below, in
+        # this same function.
         child_position_close = llir.FunctionCallStmt(
             name="scorch_vector_set",
             args=[
@@ -11618,6 +12012,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 child_position_index,
                 child_coordinate_count,
             ],
+            result_storage=self._result_storage(
+                (RESULT_POS, level + 1, STORAGE_WRITE),
+                (RESULT_CRD, level, STORAGE_READ),
+                (RESULT_CRD, level + 1, STORAGE_READ),
+            ),
         )
         return [
             llir.IfThenElse(
@@ -11635,6 +12034,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     llir.FunctionCallStmt(
                         name=f"{result_name}{level}_crd.push_back",
                         args=[llir.Var(name=coord_name, type=llir.DataType.INT64)],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, level, STORAGE_WRITE)
+                        ),
                     ),
                     llir.Increment(
                         var=llir.Var(
@@ -11643,6 +12045,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                         )
                     ),
                 ],
+                result_storage=self._result_storage(
+                    (RESULT_POS, level + 1, STORAGE_READ)
+                ),
             ),
             child_position_close,
         ]
@@ -11671,15 +12076,26 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 )
             value_store = cast(llir.Assign, leaf_stmts[0])
             coordinate_store = cast(llir.Assign, leaf_stmts[2])
+            # This converts the base class's two indexed stores into appends and
+            # keeps only their VALUES, discarding the targets -- including the
+            # ``RESULT_WRITE`` access provenance the base class put on the value
+            # store's ``ArrayAccess``.  So the statement marker here restates a
+            # fact the conversion drops rather than duplicating a surviving one.
             return [
                 llir.FunctionCallStmt(
                     name=f"{result_name}_values.emplace_back",
                     args=[value_store.value],
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
                 ),
                 leaf_stmts[1],
                 llir.FunctionCallStmt(
                     name=f"{result_name}{leaf_level}_crd.emplace_back",
                     args=[coordinate_store.value],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                    ),
                 ),
                 leaf_stmts[3],
             ]
@@ -11990,10 +12406,21 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 raw.var.index,
                 raw.value,
             ],
+            # This is the same statement as ``raw`` in a different spelling, so
+            # it carries ``raw``'s marker rather than a rebuilt one.  Asking the
+            # base builder for the fact keeps the two spellings from drifting.
+            result_storage=raw.result_storage,
         )
 
     def _checked_position_init_statement(self, level: int) -> llir.FunctionCallStmt:
-        """One checked position sentinel owned directly by this target."""
+        """One checked position sentinel owned directly by this target.
+
+        Unlike ``_completed_position_init_statement`` on the serial family, this
+        one is the EMITTED statement rather than a completion reference: it
+        replaces the assembler's own zero store in ``prepare_result_level_indices``
+        before any comparison, so there is no unmarked counterpart for it to
+        disagree with.
+        """
 
         return llir.FunctionCallStmt(
             name="scorch_vector_set",
@@ -12005,6 +12432,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 llir.Literal(value=0, data_type=llir.DataType.INT32),
                 llir.Literal(value=0, data_type=llir.DataType.INT32),
             ],
+            result_storage=self._result_storage((RESULT_POS, level, STORAGE_WRITE)),
         )
 
     def prepare_result_level_indices(
@@ -14364,10 +14792,19 @@ class _OrderedKeyExpectedBody:
             return self._node(assignment, llir.Assign, depth)
         name, position = matched
         value = cast(llir.Expr, self._value(assignment.value, depth + 1))
+        # This mirrors the conversion ``dynamic_vector_access_pass`` performs, so
+        # it has to carry the statement's marker across exactly as that pass
+        # does, or the reference and the emitted statement differ in the one
+        # field neither of them reads.
+        marker = assignment.result_storage
+        detached_marker = (
+            None if marker is None else _detach_result_storage_metadata(marker)
+        )
         if name.endswith(self._append_suffixes):
             return llir.FunctionCallStmt(
                 name=f"{name}.{self._append_method}",
                 args=[value],
+                result_storage=detached_marker,
             )
         return llir.FunctionCallStmt(
             name=self._checked_set_function,
@@ -14376,6 +14813,7 @@ class _OrderedKeyExpectedBody:
                 cast(llir.Expr, self._value(position, depth + 1)),
                 value,
             ],
+            result_storage=detached_marker,
         )
 
     def _value(self, value: object, depth: int) -> object:
@@ -14393,6 +14831,10 @@ class _OrderedKeyExpectedBody:
         if value_type is llir.TensorAccessMetadata:
             return _detach_tensor_access_metadata(
                 cast(llir.TensorAccessMetadata, value)
+            )
+        if value_type is llir.ResultStorageMetadata:
+            return _detach_result_storage_metadata(
+                cast(llir.ResultStorageMetadata, value)
             )
         if value_type in _CHECKPOINT_IDENTITY_FACTORIES:
             stored = _stored_identity_value(value, value_type)

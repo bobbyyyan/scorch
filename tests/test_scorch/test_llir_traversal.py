@@ -3822,3 +3822,258 @@ def test_member_call_stmt_default_arguments_are_empty_immutable_tuples() -> None
     assert type(first.args) is tuple
     assert type(second.args) is tuple
     assert first.args == second.args == ()
+
+
+#: The five statement types that may carry a result-storage marker.  The set is
+#: measured rather than chosen: ``harness/statement_marker_census.py`` at
+#: ``402f042`` finds 76 statements in the four lowering files that name one of the
+#: result's three storage vectors, and they are ``FunctionCallStmt`` 37,
+#: ``Assign`` 31, ``IfThenElse`` 6 and ``VarInit`` 2.  ``MemberCallStmt`` has zero
+#: sites today and is included because it is the gap the marker exists to close --
+#: ``result_write_pass.rewrite_statement_sequence_member`` never dispatches it, so
+#: a ``MemberCallStmt`` on a result array is retained unexamined.
+_RESULT_STORAGE_STATEMENT_TYPES = (
+    llir.Assign,
+    llir.VarInit,
+    llir.IfThenElse,
+    llir.FunctionCallStmt,
+    llir.MemberCallStmt,
+)
+
+
+def _result_storage(
+    tensor: int = 2,
+    array: llir.ResultStorageArray = llir.ResultStorageArray.CRD,
+    level: int = 1,
+    direction: llir.ResultStorageDirection = llir.ResultStorageDirection.WRITE,
+) -> llir.ResultStorageMetadata:
+    return llir.ResultStorageMetadata(
+        tensor_id=SymbolId(tensor),
+        references=(llir.ResultStorageReference(array, level, direction),),
+    )
+
+
+def _statement_pair(
+    statement_type: Type[llir.Stmt],
+    marker: llir.ResultStorageMetadata,
+) -> Tuple[llir.Stmt, llir.Stmt]:
+    """One unmarked statement and its marked twin, differing only in the marker."""
+
+    if statement_type is llir.Assign:
+        return (
+            llir.Assign(var=_var("target"), value=llir.Literal(1)),
+            llir.Assign(
+                var=_var("target"), value=llir.Literal(1), result_storage=marker
+            ),
+        )
+    if statement_type is llir.VarInit:
+        return (
+            llir.VarInit(var=_var("count"), value=llir.Literal(0)),
+            llir.VarInit(
+                var=_var("count"), value=llir.Literal(0), result_storage=marker
+            ),
+        )
+    if statement_type is llir.IfThenElse:
+        return (
+            llir.IfThenElse(cond=llir.Literal(1), then_body=[]),
+            llir.IfThenElse(cond=llir.Literal(1), then_body=[], result_storage=marker),
+        )
+    if statement_type is llir.FunctionCallStmt:
+        return (
+            llir.FunctionCallStmt("C1_crd.push_back", [llir.Literal(1)]),
+            llir.FunctionCallStmt(
+                "C1_crd.push_back", [llir.Literal(1)], result_storage=marker
+            ),
+        )
+    if statement_type is llir.MemberCallStmt:
+        return (
+            llir.MemberCallStmt(_var("C1_crd"), "push_back", args=[llir.Literal(1)]),
+            llir.MemberCallStmt(
+                _var("C1_crd"),
+                "push_back",
+                args=[llir.Literal(1)],
+                result_storage=marker,
+            ),
+        )
+    raise AssertionError(f"no pair builder for {statement_type.__name__}")
+
+
+@pytest.mark.parametrize(
+    "statement_type", _RESULT_STORAGE_STATEMENT_TYPES, ids=lambda t: t.__name__
+)
+def test_result_storage_marker_moves_no_structural_equality(
+    statement_type: Type[llir.Stmt],
+) -> None:
+    """A marked statement equals its unmarked twin, and dumps the same.
+
+    ``result_storage`` is declared ``compare=False, repr=False``, the same way
+    ``Var.tensor_access`` is, so that no equality-keyed decision anywhere in the
+    compiler changes and no dump has to be rebaselined.  That is asserted here
+    rather than argued from the decorators, because two of the five types are
+    ``frozen=True`` with hand-written constructors and one carries an explicit
+    ``__hash__``.
+    """
+
+    plain, marked = _statement_pair(statement_type, _result_storage())
+
+    assert plain == marked
+    assert marked.result_storage is not None
+    assert plain.result_storage is None
+    if type(plain).__repr__ is not object.__repr__:
+        assert repr(plain) == repr(marked)
+    if plain.__hash__ is not None:
+        assert hash(plain) == hash(marked)
+
+
+@pytest.mark.parametrize(
+    "statement_type", _RESULT_STORAGE_STATEMENT_TYPES, ids=lambda t: t.__name__
+)
+def test_result_storage_marker_survives_an_identity_rewrite(
+    statement_type: Type[llir.Stmt],
+) -> None:
+    """The marker survives ``LLIRRewriter``, which rebuilds every statement.
+
+    This is the property the whole mechanism rests on and it is not free.  Every
+    ``rewrite_*`` method reconstructs its statement from explicit fields, so a
+    field they do not thread through is silently dropped -- and
+    ``compressed_where_openmp_pass`` rewrites the entire work body through an
+    ``LLIRRewriter`` at position 1 of the frozen pass order, immediately before
+    ``RESULT_WRITE`` at position 2.  A marker lost there is a marker
+    ``result_write_pass`` never sees, on every program.
+    """
+
+    marker = _result_storage()
+    _, marked = _statement_pair(statement_type, marker)
+
+    rewritten = cast(llir.Stmt, LLIRRewriter(_CONTEXT).rewrite([marked])[0])
+
+    assert type(rewritten) is statement_type
+    assert rewritten is not marked
+    assert rewritten.result_storage == marker
+
+
+@pytest.mark.parametrize(
+    "statement_type", _RESULT_STORAGE_STATEMENT_TYPES, ids=lambda t: t.__name__
+)
+@pytest.mark.parametrize("operation", ("walk", "rewrite"))
+def test_forged_result_storage_marker_fails_closed(
+    statement_type: Type[llir.Stmt], operation: str
+) -> None:
+    """A marker of the wrong type is a structured refusal, not an exception."""
+
+    _, marked = _statement_pair(statement_type, _result_storage())
+    object.__setattr__(marked, "result_storage", object())
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        if operation == "walk":
+            LLIRWalker(_CONTEXT).walk([marked])
+        else:
+            LLIRRewriter(_CONTEXT).rewrite([marked])
+
+    assert raised.value.diagnostic.code == "invalid_result_storage_metadata"
+
+
+def test_result_storage_marker_refuses_a_malformed_shape_at_construction() -> None:
+    """The shape rules the marker's own constructor owns, each refused."""
+
+    with pytest.raises(TypeError):
+        llir.ResultStorageReference(
+            llir.ResultStorageArray.VALUES, 1, llir.ResultStorageDirection.WRITE
+        )
+    with pytest.raises(TypeError):
+        llir.ResultStorageReference(
+            llir.ResultStorageArray.CRD, None, llir.ResultStorageDirection.WRITE
+        )
+    with pytest.raises(TypeError):
+        llir.ResultStorageReference(
+            llir.ResultStorageArray.CRD, -1, llir.ResultStorageDirection.WRITE
+        )
+    with pytest.raises(TypeError):
+        llir.ResultStorageMetadata(tensor_id=SymbolId(1), references=())
+    with pytest.raises(TypeError):
+        llir.ResultStorageMetadata(tensor_id=1, references=())  # type: ignore[arg-type]
+    reference = llir.ResultStorageReference(
+        llir.ResultStorageArray.CRD, 1, llir.ResultStorageDirection.WRITE
+    )
+    with pytest.raises(TypeError):
+        llir.ResultStorageMetadata(
+            tensor_id=SymbolId(1), references=(reference, reference)
+        )
+    with pytest.raises(TypeError):
+        llir.FunctionCallStmt("f", result_storage="not metadata")  # type: ignore[arg-type]
+
+
+def test_result_storage_marker_answers_the_guard_question() -> None:
+    """``writes()`` is the whole consumer interface, and reads do not set it.
+
+    A statement can name result storage while only reading it, so the guard's
+    question -- does this statement write result storage -- is a quantifier over
+    the references rather than a property of the marker.  Eleven of the census's
+    76 statements hold a write and a read at once, which is why the direction
+    sits on each reference.
+    """
+
+    read_only = llir.ResultStorageMetadata(
+        tensor_id=SymbolId(2),
+        references=(
+            llir.ResultStorageReference(
+                llir.ResultStorageArray.CRD, 0, llir.ResultStorageDirection.READ
+            ),
+        ),
+    )
+    mixed = llir.ResultStorageMetadata(
+        tensor_id=SymbolId(2),
+        references=(
+            llir.ResultStorageReference(
+                llir.ResultStorageArray.POS, 1, llir.ResultStorageDirection.WRITE
+            ),
+            llir.ResultStorageReference(
+                llir.ResultStorageArray.CRD, 0, llir.ResultStorageDirection.READ
+            ),
+            llir.ResultStorageReference(
+                llir.ResultStorageArray.CRD, 1, llir.ResultStorageDirection.READ
+            ),
+        ),
+    )
+
+    assert read_only.writes() is False
+    assert mixed.writes() is True
+    assert _result_storage().writes() is True
+
+
+def test_result_storage_marker_carries_no_access_provenance() -> None:
+    """The marker owns exactly two fields, and neither is an access coordinate.
+
+    Review section 63.7a's three unanswerable questions -- what an ``access_id``
+    means for many references to one vector, what ``index_ids`` holds when there
+    is no index, and whether ``RESULT_WRITE`` describes a read -- are questions
+    about an ACCESS.  A statement is not one, so the marker asks none of them,
+    and this locks that rather than leaving it to a later reader to rediscover.
+    """
+
+    marker = _result_storage()
+    stored = object.__getattribute__(marker, "__dict__")
+
+    assert tuple(sorted(stored)) == ("references", "tensor_id")
+    assert not hasattr(marker, "access_id")
+    assert not hasattr(marker, "index_ids")
+    assert not hasattr(marker, "role")
+
+
+def test_result_storage_marker_is_invisible_to_codegen() -> None:
+    """A marked statement emits the same C++ as its unmarked twin.
+
+    ``codegen`` never reads the field, and its reflective pre-emission scan
+    (``_validate_exact_codegen_tree``) recurses ``vars()`` but ignores values
+    that are not LLIR nodes, strings or sequences -- which is how
+    ``tensor_access`` has always been invisible to it.  Proving that for the new
+    field is cheap and the alternative is trusting it.
+    """
+
+    lowerer = LLIRLowerer()
+    plain = llir.FunctionCallStmt("C1_crd.push_back", [_var("i")])
+    marked = llir.FunctionCallStmt(
+        "C1_crd.push_back", [_var("i")], result_storage=_result_storage()
+    )
+
+    assert lowerer.lower_llir(marked) == lowerer.lower_llir(plain)

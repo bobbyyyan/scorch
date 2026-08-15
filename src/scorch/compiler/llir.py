@@ -350,6 +350,147 @@ class TensorAccessMetadata:
             raise TypeError("TensorAccessMetadata.role must be a TensorAccessRole")
 
 
+class ResultStorageArray(Enum):
+    """One of the three storage vectors a compressed result is assembled into.
+
+    Exactly three, and the set is not a choice: it is the array list
+    ``result_write_pass._touches_result_storage`` builds and the watched set
+    ``result_write_pass._ResultStorageResidueWalker`` checks, so the marker's
+    vocabulary and the postcondition's are the same set by construction rather
+    than by two lists happening to agree.
+
+    Deliberately NOT members of this enum, each for a reason:
+
+    * ``{R}{L}_pos_index`` is a scalar index into the position array, not the
+      array.  The postcondition does not watch it, and a marker naming it would
+      claim a statement references result storage when it references a scalar.
+    * ``{R}{L}_crd_data``, ``{R}{L}_pos_data`` and ``{R}_values_data`` are the
+      two-phase pass's OWN output, the exactly-sized pointers its ``_store``
+      builds.  The postcondition's disjointness argument depends on those lying
+      outside the watched set.
+    * ``p{R}{L}``, the running position cursor, which the postcondition checks
+      at deliberately narrower breadth than the arrays because a cursor can be
+      legitimately bound by the header of the loop that walks it.
+    """
+
+    VALUES = "values"
+    POS = "pos"
+    CRD = "crd"
+
+
+class ResultStorageDirection(Enum):
+    """Which way one statement's reference to a result storage vector goes.
+
+    This exists because the direction cannot be derived by a consumer.  A dotted
+    member name decides it -- ``push_back`` writes, ``size`` reads -- and an
+    assignment-target subscript decides it, but a bare vector handed to a free
+    function does not: ``scorch_concat_chunks(C_values, _chunk_C_values, n)``
+    writes its first argument and nothing in the node shape says so.  So the
+    producing lowering declares the direction and the guard reads it.
+    """
+
+    READ = "read"
+    WRITE = "write"
+
+
+@dataclass(frozen=True)
+class ResultStorageReference:
+    """One statement's reference to one of one result's storage vectors.
+
+    ``level`` is the physical result level for a position or coordinate vector
+    and ``None`` for the value vector, which has no level.
+    """
+
+    array: ResultStorageArray
+    level: Optional[int]
+    direction: ResultStorageDirection
+
+    def __post_init__(self) -> None:
+        if type(self.array) is not ResultStorageArray:
+            raise TypeError("ResultStorageReference.array must be a ResultStorageArray")
+        if type(self.direction) is not ResultStorageDirection:
+            raise TypeError(
+                "ResultStorageReference.direction must be a ResultStorageDirection"
+            )
+        if self.array is ResultStorageArray.VALUES:
+            if self.level is not None:
+                raise TypeError(
+                    "ResultStorageReference.level must be None for the value vector"
+                )
+        elif type(self.level) is not int or self.level < 0:
+            raise TypeError(
+                "ResultStorageReference.level must be a non-negative exact int "
+                "for a position or coordinate vector"
+            )
+
+
+@dataclass(frozen=True)
+class ResultStorageMetadata:
+    """Which of one result's storage vectors a STATEMENT names, and how.
+
+    This is not :class:`TensorAccessMetadata` and deliberately not a widening of
+    it.  That type describes an ACCESS -- its docstring says ``access_id``
+    records occurrence provenance and that transformations selecting every
+    access to a logical tensor/index tuple match ``tensor_id`` and ``index_ids``
+    -- and a reference to a whole storage vector is not an access: there is no
+    index for ``index_ids`` to hold, and many references to one vector are not
+    many accesses.  A statement is not an access either, so a statement marker
+    asks neither question.
+
+    ``references`` is a tuple rather than one value because one statement can
+    name several vectors: ``{R}1_pos[{R}0_crd.size()] = {R}1_crd.size()`` names
+    three.  ``direction`` sits on each reference rather than on the marker
+    because that same statement writes one vector while reading two, so a single
+    role could not describe it.
+
+    The consumer's question -- does this statement write result storage -- is
+    answered by :meth:`writes`.
+    """
+
+    tensor_id: SymbolId
+    references: Tuple[ResultStorageReference, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.tensor_id) is not SymbolId:
+            raise TypeError("ResultStorageMetadata.tensor_id must be a SymbolId")
+        if type(self.references) is not tuple or not self.references:
+            raise TypeError(
+                "ResultStorageMetadata.references must be a non-empty tuple"
+            )
+        if any(
+            type(reference) is not ResultStorageReference
+            for reference in self.references
+        ):
+            raise TypeError(
+                "ResultStorageMetadata.references must contain only exact "
+                "ResultStorageReference values"
+            )
+        if len(set(self.references)) != len(self.references):
+            raise TypeError(
+                "ResultStorageMetadata.references must not repeat a reference"
+            )
+
+    def writes(self) -> bool:
+        """Whether the marked statement writes any of the result's storage."""
+
+        return any(
+            reference.direction is ResultStorageDirection.WRITE
+            for reference in self.references
+        )
+
+
+def _validated_result_storage(
+    metadata: Optional[ResultStorageMetadata], owner: str
+) -> Optional[ResultStorageMetadata]:
+    """One statement's optional result-storage marker, or ``None``."""
+
+    if metadata is None:
+        return None
+    if type(metadata) is not ResultStorageMetadata:
+        raise TypeError(f"{owner}.result_storage must be ResultStorageMetadata or None")
+    return metadata
+
+
 """
 Expression nodes
 """
@@ -511,8 +652,14 @@ class VarInit(Stmt):
     value: Expr
     op: str = "="
     cast: Optional[bool] = False
+    result_storage: Optional[ResultStorageMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self):
+        _validated_result_storage(self.result_storage, "VarInit")
         if self.cast:
             self.value = Cast(self.value, self.var.type)
 
@@ -565,8 +712,14 @@ class Assign(Stmt):
     value: Expr
     op: AssignOp = AssignOp.ASSIGN
     cast: bool = False
+    result_storage: Optional[ResultStorageMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
+        _validated_result_storage(self.result_storage, "Assign")
         _validate_assignment_target(self.var)
         if not isinstance(self.value, Expr):
             raise TypeError("Assign.value must be an LLIR Expr")
@@ -695,12 +848,18 @@ class FunctionCallStmt(Stmt):
     name: str
     template_args: Tuple[DataType, ...]
     args: Tuple[Expr, ...]
+    result_storage: Optional[ResultStorageMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __init__(
         self,
         name: str,
         args: Optional[Sequence[Expr]] = None,
         template_args: Optional[Sequence[DataType]] = None,
+        result_storage: Optional[ResultStorageMetadata] = None,
     ) -> None:
         if type(name) is not str or not name.strip():
             raise TypeError("FunctionCallStmt.name must be a non-empty string")
@@ -720,6 +879,11 @@ class FunctionCallStmt(Stmt):
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "template_args", normalized_template_args)
         object.__setattr__(self, "args", normalized_args)
+        object.__setattr__(
+            self,
+            "result_storage",
+            _validated_result_storage(result_storage, "FunctionCallStmt"),
+        )
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -898,6 +1062,11 @@ class MemberCallStmt(Stmt):
     member: str
     template_args: Tuple[DataType, ...]
     args: Tuple[Expr, ...]
+    result_storage: Optional[ResultStorageMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __init__(
         self,
@@ -905,6 +1074,7 @@ class MemberCallStmt(Stmt):
         member: str,
         template_args: Optional[Sequence[DataType]] = None,
         args: Optional[Sequence[Expr]] = None,
+        result_storage: Optional[ResultStorageMetadata] = None,
     ) -> None:
         if not isinstance(base, Expr):
             raise TypeError("MemberCallStmt.base must be an LLIR Expr")
@@ -934,6 +1104,11 @@ class MemberCallStmt(Stmt):
         object.__setattr__(self, "member", member)
         object.__setattr__(self, "template_args", normalized_template_args)
         object.__setattr__(self, "args", normalized_args)
+        object.__setattr__(
+            self,
+            "result_storage",
+            _validated_result_storage(result_storage, "MemberCallStmt"),
+        )
 
 
 @dataclass(frozen=True)
@@ -1305,6 +1480,15 @@ class IfThenElse(Stmt):
     then_body_list: Optional[List[List[Stmt]]] = None
 
     make_last_case_else: bool = False
+
+    result_storage: Optional[ResultStorageMetadata] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        _validated_result_storage(self.result_storage, "IfThenElse")
 
 
 @dataclass(frozen=True)

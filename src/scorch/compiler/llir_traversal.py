@@ -275,6 +275,161 @@ def _validate_tensor_access_metadata(
             )
 
 
+def _validate_result_storage_metadata(
+    metadata: object,
+    context: LLIRTraversalContext,
+    path: LLIRPath,
+) -> None:
+    """One statement's optional result-storage marker, validated by shape.
+
+    This checks everything decidable without knowing which tensor the marker's
+    ``SymbolId`` names: the types, a non-negative level for a position or
+    coordinate vector and ``None`` for the value vector, a non-empty reference
+    tuple, and no repeated reference.  Whether the marker tells the TRUTH about
+    the statement it sits on is a different question and cannot be answered
+    here, because turning ``(CRD, level 1)`` into the string ``{R}1_crd`` needs
+    the result's generated name.  ``result_write_pass`` holds both the name and
+    the identity and is where that check lives.
+    """
+
+    if metadata is None:
+        return
+    if type(metadata) is not llir.ResultStorageMetadata:
+        _raise_traversal_error(
+            context,
+            code="invalid_result_storage_metadata",
+            message="result_storage must be ResultStorageMetadata or None",
+            path=path,
+            value=metadata,
+        )
+    typed_metadata = cast(llir.ResultStorageMetadata, metadata)
+    metadata_state = object.__getattribute__(typed_metadata, "__dict__")
+    if type(metadata_state) is not dict or tuple(sorted(metadata_state)) != (
+        "references",
+        "tensor_id",
+    ):
+        _raise_traversal_error(
+            context,
+            code="invalid_result_storage_metadata",
+            message="ResultStorageMetadata must own exactly its declared fields",
+            path=path,
+            value=metadata,
+        )
+    tensor_id = metadata_state["tensor_id"]
+    if type(tensor_id) is not SymbolId:
+        _raise_traversal_error(
+            context,
+            code="invalid_result_storage_metadata",
+            message="ResultStorageMetadata.tensor_id must be a SymbolId",
+            path=path + ("tensor_id",),
+            value=tensor_id,
+        )
+    identity_state = object.__getattribute__(tensor_id, "__dict__")
+    if (
+        type(identity_state) is not dict
+        or tuple(identity_state) != ("value",)
+        or type(identity_state["value"]) is not int
+    ):
+        _raise_traversal_error(
+            context,
+            code="invalid_result_storage_metadata",
+            message="ResultStorageMetadata.tensor_id must own one exact integer value",
+            path=path + ("tensor_id", "value"),
+            value=tensor_id,
+        )
+    references = metadata_state["references"]
+    if type(references) is not tuple or not references:
+        _raise_traversal_error(
+            context,
+            code="invalid_result_storage_metadata",
+            message="ResultStorageMetadata.references must be a non-empty tuple",
+            path=path + ("references",),
+            value=references,
+        )
+    seen: List[object] = []
+    for index, reference in enumerate(references):
+        reference_path = path + ("references", f"[{index}]")
+        if type(reference) is not llir.ResultStorageReference:
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message=(
+                    "ResultStorageMetadata.references must contain only exact "
+                    "ResultStorageReference values"
+                ),
+                path=reference_path,
+                value=reference,
+            )
+        reference_state = object.__getattribute__(reference, "__dict__")
+        if type(reference_state) is not dict or tuple(sorted(reference_state)) != (
+            "array",
+            "direction",
+            "level",
+        ):
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message=("ResultStorageReference must own exactly its declared fields"),
+                path=reference_path,
+                value=reference,
+            )
+        array = reference_state["array"]
+        direction = reference_state["direction"]
+        level = reference_state["level"]
+        if type(array) is not llir.ResultStorageArray:
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message="ResultStorageReference.array must be a ResultStorageArray",
+                path=reference_path + ("array",),
+                value=array,
+            )
+        if type(direction) is not llir.ResultStorageDirection:
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message=(
+                    "ResultStorageReference.direction must be a "
+                    "ResultStorageDirection"
+                ),
+                path=reference_path + ("direction",),
+                value=direction,
+            )
+        if array is llir.ResultStorageArray.VALUES:
+            if level is not None:
+                _raise_traversal_error(
+                    context,
+                    code="invalid_result_storage_metadata",
+                    message=(
+                        "ResultStorageReference.level must be None for the value "
+                        "vector, which has no level"
+                    ),
+                    path=reference_path + ("level",),
+                    value=level,
+                )
+        elif type(level) is not int or level < 0:
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message=(
+                    "ResultStorageReference.level must be a non-negative exact int "
+                    "for a position or coordinate vector"
+                ),
+                path=reference_path + ("level",),
+                value=level,
+            )
+        key = (array, level, direction)
+        if key in seen:
+            _raise_traversal_error(
+                context,
+                code="invalid_result_storage_metadata",
+                message="ResultStorageMetadata.references must not repeat a reference",
+                path=reference_path,
+                value=reference,
+            )
+        seen.append(key)
+
+
 def _validate_assign_fields(
     node: llir.Assign,
     context: LLIRTraversalContext,
@@ -1224,6 +1379,9 @@ class LLIRWalker:
         self._walk_var_child(node.var, path + ("var",))
 
     def visit_var_init(self, node: llir.VarInit, path: LLIRPath) -> None:
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         self._walk_var_child(node.var, path + ("var",))
         self._walk_expr(node.value, path + ("value",))
 
@@ -1243,6 +1401,9 @@ class LLIRWalker:
 
     def visit_assign(self, node: llir.Assign, path: LLIRPath) -> None:
         _validate_assign_fields(node, self.context, path)
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         self._walk_assignment_target(node.var, path + ("var",))
         if not isinstance(node.value, llir.Expr):
             _raise_traversal_error(
@@ -1276,6 +1437,11 @@ class LLIRWalker:
     def visit_function_call_stmt(
         self, node: llir.FunctionCallStmt, path: LLIRPath
     ) -> None:
+        _validate_result_storage_metadata(
+            getattr(node, "result_storage", None),
+            self.context,
+            path + ("result_storage",),
+        )
         if type(node.name) is not str or not node.name.strip():
             _raise_traversal_error(
                 self.context,
@@ -1316,6 +1482,11 @@ class LLIRWalker:
         self._walk_expr_sequence(node.args, path + ("args",))
 
     def visit_member_call_stmt(self, node: llir.MemberCallStmt, path: LLIRPath) -> None:
+        _validate_result_storage_metadata(
+            getattr(node, "result_storage", None),
+            self.context,
+            path + ("result_storage",),
+        )
         base = getattr(node, "base", _MISSING_LLIR_FIELD)
         if not isinstance(base, llir.Expr):
             _raise_traversal_error(
@@ -1429,6 +1600,9 @@ class LLIRWalker:
         self._walk_statements(node.body, path + ("body",))
 
     def visit_if_then_else(self, node: llir.IfThenElse, path: LLIRPath) -> None:
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         if node.cond is not None:
             self._walk_expr(node.cond, path + ("cond",))
         self._walk_optional_statements(node.then_body, path + ("then_body",))
@@ -2142,11 +2316,15 @@ class LLIRRewriter:
         return llir.VarDecl(self._rewrite_var_child(node.var, path + ("var",)))
 
     def rewrite_var_init(self, node: llir.VarInit, path: LLIRPath) -> llir.VarInit:
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         rewritten = llir.VarInit(
             var=self._rewrite_var_child(node.var, path + ("var",)),
             value=self._rewrite_expr(node.value, path + ("value",)),
             op=node.op,
             cast=False,
+            result_storage=node.result_storage,
         )
         rewritten.cast = node.cast
         return rewritten
@@ -2241,11 +2419,15 @@ class LLIRRewriter:
                 path=path + ("value",),
                 value=node.value,
             )
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         rewritten = llir.Assign(
             var=self._rewrite_assignment_target(node.var, path + ("var",)),
             value=self._rewrite_expr(node.value, path + ("value",)),
             op=node.op,
             cast=False,
+            result_storage=node.result_storage,
         )
         rewritten.cast = node.cast
         return rewritten
@@ -2288,6 +2470,10 @@ class LLIRRewriter:
                 path=path + ("name",),
                 value=node.name,
             )
+        result_storage = getattr(node, "result_storage", None)
+        _validate_result_storage_metadata(
+            result_storage, self.context, path + ("result_storage",)
+        )
         template_args = self._validated_call_template_args(
             node,
             path,
@@ -2309,6 +2495,7 @@ class LLIRRewriter:
                 List[llir.Expr],
                 self._rewrite_expr_sequence(node.args, path + ("args",)),
             ),
+            result_storage=cast(Optional[llir.ResultStorageMetadata], result_storage),
         )
 
     def rewrite_member_call_stmt(
@@ -2323,6 +2510,10 @@ class LLIRRewriter:
                 path=path + ("base",),
                 value=base,
             )
+        result_storage = getattr(node, "result_storage", None)
+        _validate_result_storage_metadata(
+            result_storage, self.context, path + ("result_storage",)
+        )
         member = getattr(node, "member", _MISSING_LLIR_FIELD)
         if type(member) is not str or not member.isidentifier():
             _raise_traversal_error(
@@ -2376,6 +2567,7 @@ class LLIRRewriter:
             member=member,
             template_args=template_args,
             args=self._rewrite_expr_sequence(args, path + ("args",)),
+            result_storage=cast(Optional[llir.ResultStorageMetadata], result_storage),
         )
 
     def rewrite_guarded_call_stmt(
@@ -2503,6 +2695,9 @@ class LLIRRewriter:
     def rewrite_if_then_else(
         self, node: llir.IfThenElse, path: LLIRPath
     ) -> llir.IfThenElse:
+        _validate_result_storage_metadata(
+            node.result_storage, self.context, path + ("result_storage",)
+        )
         cond = (
             None
             if node.cond is None
@@ -2531,4 +2726,5 @@ class LLIRRewriter:
             cond_list=cast(Optional[List[llir.Expr]], cond_list),
             then_body_list=cast(Optional[List[List[llir.Stmt]]], then_body_list),
             make_last_case_else=node.make_last_case_else,
+            result_storage=node.result_storage,
         )

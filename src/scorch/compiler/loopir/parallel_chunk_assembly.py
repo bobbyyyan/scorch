@@ -67,6 +67,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, TypeVar, cast
 
 from .. import llir
+from ..identity import SymbolId
 from ..llir_traversal import LLIRRewriter, LLIRTraversalContext
 from ..parallel_marking_pass import (
     extract_loop_bound,
@@ -145,6 +146,12 @@ class ParallelChunkAssemblyContext:
     value_ctype: str
     #: C++ element spelling of every position/coordinate array (e.g. ``"int"``).
     index_ctype: str
+    #: The result's stable logical identity, for the statement-level
+    #: result-storage markers this module attaches.  Optional because the
+    #: transformation itself needs only the generated names, and a caller that
+    #: has no identity to give should produce unmarked statements rather than
+    #: a marker naming a tensor it guessed.
+    result_id: Optional[SymbolId] = None
 
 
 def buffer_name(vector_name: str) -> str:
@@ -174,6 +181,42 @@ def parallel_chunk_generated_names(
     return (
         *GENERATED_NAMES,
         *(buffer_name(name) for name in chunked_vector_names(context)),
+    )
+
+
+_WRITE = llir.ResultStorageDirection.WRITE
+
+
+def _result_storage(
+    context: ParallelChunkAssemblyContext,
+    *references: Tuple[
+        llir.ResultStorageArray, Optional[int], llir.ResultStorageDirection
+    ],
+) -> Optional[llir.ResultStorageMetadata]:
+    """One statement's result-storage marker, or ``None`` with no identity.
+
+    The four ``scorch_*`` calls this module emits hand a result vector to a free
+    function as an ARGUMENT, which is the shape ``result_write_pass``'s name
+    matcher structurally cannot see -- review section 62.7 records all four, and
+    the only thing keeping them away from that guard today is that the chunk
+    merge is a single-pass strategy and the two-phase pass runs on the two-pass
+    ones.  Their direction is also the case that proves a consumer cannot derive
+    one: ``scorch_concat_chunks(C_values, _chunk_C_values, n)`` writes argument 0
+    and reads argument 1, and the node shape says neither.  So each is declared
+    here.
+
+    The identity is rebuilt rather than shared, the discipline every stored
+    identity in the typed route follows.
+    """
+
+    if context.result_id is None:
+        return None
+    return llir.ResultStorageMetadata(
+        tensor_id=SymbolId(context.result_id.value),
+        references=tuple(
+            llir.ResultStorageReference(array, level, direction)
+            for array, level, direction in references
+        ),
     )
 
 
@@ -286,6 +329,10 @@ def _body_lambda(
             llir.FunctionCallStmt(
                 name="scorch_vector_set",
                 args=[_var(f"{result}{level}_pos"), _literal(0), _literal(0)],
+                result_storage=_result_storage(
+                    context,
+                    (llir.ResultStorageArray.POS, level, _WRITE),
+                ),
             )
         )
     for level in context.compressed_levels:
@@ -362,6 +409,10 @@ def _merge_statements(
                 _detach(policy.rows),
                 _var("_assembly_threads", llir.DataType.INT),
             ],
+            result_storage=_result_storage(
+                context,
+                (llir.ResultStorageArray.POS, shared, _WRITE),
+            ),
         )
     ]
     for level in context.compressed_levels:
@@ -375,6 +426,10 @@ def _merge_statements(
                         _var(buffer_name(f"{result}{level}_crd")),
                         _var("_assembly_threads", llir.DataType.INT),
                     ],
+                    result_storage=_result_storage(
+                        context,
+                        (llir.ResultStorageArray.POS, level, _WRITE),
+                    ),
                 )
             )
         statements.append(
@@ -385,6 +440,14 @@ def _merge_statements(
                     _var(buffer_name(f"{result}{level}_crd")),
                     _var("_assembly_threads", llir.DataType.INT),
                 ],
+                # Only argument 0 is result storage.  Argument 1 is the per-chunk
+                # buffer ``_chunk_{vector}``, a separate vector with its own
+                # declaration, so it is not a reference to the result's storage
+                # and the marker does not claim it.
+                result_storage=_result_storage(
+                    context,
+                    (llir.ResultStorageArray.CRD, level, _WRITE),
+                ),
             )
         )
     statements.append(
@@ -395,6 +458,10 @@ def _merge_statements(
                 _var(buffer_name(f"{result}_values")),
                 _var("_assembly_threads", llir.DataType.INT),
             ],
+            result_storage=_result_storage(
+                context,
+                (llir.ResultStorageArray.VALUES, None, _WRITE),
+            ),
         )
     )
     return statements
@@ -450,6 +517,14 @@ def _parallel_branch(
                 _var(f"{result}{context.shared_position_level}_pos"),
                 llir.Add(_detach(policy.rows), _literal(1)),
             ],
+            result_storage=_result_storage(
+                context,
+                (
+                    llir.ResultStorageArray.POS,
+                    context.shared_position_level,
+                    _WRITE,
+                ),
+            ),
         )
     )
 

@@ -151,10 +151,18 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
         value = self._rewrite_expr(node.value, path + ("value",))
         if matched is not None and node.op == llir.AssignOp.ASSIGN:
             vector_name, position = matched
+            # An indexed store becomes an append or a checked set, and the
+            # statement's result-storage marker travels with it.  Both target
+            # spellings this pass produces are the two that caused the fail-open
+            # in review section 60.6 stage 2, so keeping the marker attached is
+            # what stops a rewrite here from silently un-marking a result write.
+            # It also keeps this rewrite's output comparable to the completion
+            # references the sparse targets build, which spell the same call.
             if vector_name.endswith(self._config.append_suffixes):
                 return llir.FunctionCallStmt(
                     name=(f"{vector_name}.{self._config.append_method}"),
                     args=[value],
+                    result_storage=node.result_storage,
                 )
 
             return llir.FunctionCallStmt(
@@ -164,6 +172,7 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
                     self._rewrite_expr(position, path + ("var", "index")),
                     value,
                 ],
+                result_storage=node.result_storage,
             )
 
         rewritten = llir.Assign(
@@ -171,6 +180,7 @@ class _DynamicVectorAccessRewriter(LLIRRewriter):
             value=value,
             op=node.op,
             cast=False,
+            result_storage=node.result_storage,
         )
         rewritten.cast = node.cast
         return rewritten

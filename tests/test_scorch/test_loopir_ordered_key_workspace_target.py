@@ -3301,3 +3301,67 @@ def _reachable_nodes(root):
             found.append(value)
             stack.extend(object.__getattribute__(value, "__dict__").values())
     return found
+
+
+def test_completion_comparator_handles_the_result_storage_marker():
+    """A statement-level result-storage marker compares by value, not by identity.
+
+    ``_exact_sparse_completion_matches`` dispatches on an exhaustive type table
+    and returns ``False`` for anything it does not recognize, so a value type
+    added to a statement's stored state has to be taught to it or every marked
+    statement crossing this boundary turns a program that compiles today into a
+    ``sparse_workspace_completion_lost`` refusal.  ``compare=False`` does not
+    help: the comparator reads ``__dict__`` directly rather than using ``==``.
+
+    Both halves are asserted.  Equal markers on distinct objects match, and the
+    marker is exempt from the fresh-ownership census the way access provenance
+    is -- the two-phase rewrite legitimately duplicates a body whose detached
+    statements retain the same frozen marker.  And every field is load bearing:
+    a different tensor, level, direction or array must not match, or the
+    comparator would accept a marker that says something else.
+    """
+
+    from scorch.compiler.identity import SymbolId
+    from scorch.compiler.loopir.lower_llir import _exact_sparse_completion_matches
+
+    def marker(
+        tensor=7,
+        array=llir.ResultStorageArray.CRD,
+        level=1,
+        direction=llir.ResultStorageDirection.WRITE,
+    ):
+        return llir.ResultStorageMetadata(
+            tensor_id=SymbolId(tensor),
+            references=(llir.ResultStorageReference(array, level, direction),),
+        )
+
+    def statement(value=None):
+        return llir.FunctionCallStmt(
+            "C1_crd.push_back", args=[llir.Literal(1)], result_storage=value
+        )
+
+    shared = marker()
+    assert _exact_sparse_completion_matches(statement(), statement())
+    assert _exact_sparse_completion_matches(statement(marker()), statement(marker()))
+    assert _exact_sparse_completion_matches(statement(shared), statement(shared))
+
+    assert not _exact_sparse_completion_matches(statement(marker()), statement())
+    assert not _exact_sparse_completion_matches(statement(), statement(marker()))
+    assert not _exact_sparse_completion_matches(
+        statement(marker(tensor=7)), statement(marker(tensor=8))
+    )
+    assert not _exact_sparse_completion_matches(
+        statement(marker(level=1)), statement(marker(level=2))
+    )
+    assert not _exact_sparse_completion_matches(
+        statement(marker(direction=llir.ResultStorageDirection.WRITE)),
+        statement(marker(direction=llir.ResultStorageDirection.READ)),
+    )
+    assert not _exact_sparse_completion_matches(
+        statement(marker(array=llir.ResultStorageArray.CRD)),
+        statement(marker(array=llir.ResultStorageArray.POS)),
+    )
+
+    values = marker(array=llir.ResultStorageArray.VALUES, level=None)
+    assert _exact_sparse_completion_matches(statement(values), statement(values))
+    assert not _exact_sparse_completion_matches(statement(values), statement(marker()))
