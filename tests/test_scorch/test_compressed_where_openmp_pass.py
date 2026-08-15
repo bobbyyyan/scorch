@@ -38,10 +38,21 @@ from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
 def _result_marker(name: str) -> llir.ResultStorageMetadata:
     """The marker a production lowering attaches to one hand-built append.
 
-    Derived from the callee name, so a fixture cannot claim something its own
-    statement does not say.  Every emitting lowering attaches one now, so a
-    fixture without one builds a body the compiler no longer emits and the
-    result-write recognizer refuses it.
+    The array and the level are derived from the callee name, so a fixture
+    cannot claim something its own statement does not say.  Every emitting
+    lowering attaches a marker now, so a fixture without one builds a body the
+    compiler no longer emits and the result-write recognizer refuses it.
+
+    The direction is NOT derived: it is hardcoded ``WRITE``.  That is correct for
+    every call site this helper serves, because all of them are appends, and a
+    ``.push_back`` receiver settles the direction on its own.  **Do not copy
+    this helper to a fixture built around a free function.**  There the
+    direction genuinely cannot be recovered from the statement's shape --
+    ``scorch_concat_chunks(C_values, _chunk_C_values, n)`` writes its first
+    argument and a hypothetical reader of the same shape would not -- which is
+    why :class:`llir.ResultStorageDirection` exists and why the producing
+    lowering declares the direction rather than a consumer inferring it.  A
+    free-function fixture has to state the direction itself.
     """
 
     receiver = name.split(".", 1)[0]

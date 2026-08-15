@@ -358,9 +358,17 @@ class _ResultWriteRewriter(LLIRRewriter):
                         f"statement {cast(llir.FunctionCallStmt, node).name!r} names "
                         f"result {self._result_name}'s own storage in its callee "
                         "name, but carries no result-storage marker for that "
-                        "result; the emitting lowering has to attach one, because "
-                        "an unmarked result write is one this pass cannot "
-                        "recognize by type"
+                        "result, and an unmarked result write is one this pass "
+                        "cannot recognize by type.  Whoever built this statement "
+                        "has to attach one.  If it came from a lowering, mark it "
+                        "at the llir.Stmt constructor that builds it; if it is a "
+                        "hand-built test body -- which is the likelier reader of "
+                        "this message, because production's appends sit inside "
+                        "the position-boundary conditional where this callee-name "
+                        "match never sees them -- use the _result_marker helper "
+                        "in tests/test_scorch/test_compressed_where_openmp_pass.py "
+                        "or tests/test_scorch/test_llir_pass_manager.py, whose "
+                        "docstrings say what it can and cannot derive"
                     ),
                     path=path,
                     value=cast(llir.FunctionCallStmt, node).name,
