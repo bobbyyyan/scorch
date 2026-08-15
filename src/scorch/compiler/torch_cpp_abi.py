@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, cast
 import torch
 
 from . import llir
+from .identity import SymbolId
 from ..format import LevelType
 from ..utils import (
     dtype_to_c_datatype,
@@ -561,6 +562,20 @@ class ResultTensorAssembler:
     known_nnz_var: Optional[str] = None
     exact_dense_parent_positions: bool = False
     reserve_hint_var: Optional[str] = None
+    #: WHICH result this assembler is assembling, as a logical identity rather
+    #: than a name.  Every storage name in this class is built from ``self.name``
+    #: and a level number, which says what a statement touches and not whose
+    #: storage it is, and ``llir.ResultStorageMetadata`` needs the second.  So a
+    #: caller that holds an identity hands it over and this assembler can then
+    #: mark the statements it emits; a caller that holds none passes nothing and
+    #: every statement is emitted exactly as before.
+    #:
+    #: Optional rather than required because the two routes differ.  The typed
+    #: route's lowering owns a ``SymbolId`` for the result and passes it.  The
+    #: legacy route builds this from a ``TensorVar``, whose identity is a name,
+    #: and passes nothing -- so nothing legacy emits gains a marker, which is
+    #: what keeps this change off the shipping path.
+    result_id: Optional[SymbolId] = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -591,6 +606,52 @@ class ResultTensorAssembler:
             or not self.reserve_hint_var.isidentifier()
         ):
             raise TypeError("reserve hint variable must be an identifier or None")
+        if self.result_id is not None and type(self.result_id) is not SymbolId:
+            raise TypeError("result identity must be an exact SymbolId or None")
+
+    def result_storage_marker(
+        self,
+        *references: Tuple[llir.ResultStorageArray, Optional[int], bool],
+    ) -> Optional[llir.ResultStorageMetadata]:
+        """One emitted statement's result-storage marker, or ``None``.
+
+        This is the per-result identity this file did not have.  A storage name
+        here is ``f"{self.name}{level}_pos"`` and the like, which says which
+        vector a statement touches; ``result_write_pass`` needs to know whose
+        vector it is, and the name cannot say that.  With ``result_id`` set, this
+        answers it.
+
+        ``None`` when no identity was handed over, which is the legacy route, and
+        an unmarked statement is what that route emits today.  Returning ``None``
+        rather than refusing is deliberate: a marker is a claim about identity, and
+        a caller with no identity has no claim to make.
+
+        Each reference is ``(array, level, writes)`` -- ``level`` is ``None`` for
+        the value vector, which has none, and ``writes`` is carried rather than
+        derived because an argument position does not say which way a reference
+        goes.  See ``llir.ResultStorageDirection``.
+        """
+
+        if self.result_id is None:
+            return None
+        return llir.ResultStorageMetadata(
+            # Rebuilt rather than shared, the discipline every other marker
+            # builder in the compiler follows: nothing reachable from an emitted
+            # LLIR node aliases a caller's own identity object.
+            tensor_id=SymbolId(self.result_id.value),
+            references=tuple(
+                llir.ResultStorageReference(
+                    array,
+                    level,
+                    (
+                        llir.ResultStorageDirection.WRITE
+                        if writes
+                        else llir.ResultStorageDirection.READ
+                    ),
+                )
+                for array, level, writes in references
+            ),
+        )
 
     @property
     def levels(self) -> int:
@@ -1384,6 +1445,17 @@ class ResultTensorAssembler:
                     )
                 if not self._has_fixed_position_count(i):
                     # pos[0] = 0 for the append-built position vector.
+                    #
+                    # MARKED, when this assembler was given an identity, and this
+                    # is the statement that made the identity necessary.  The
+                    # dynamic-vector pass rewrites this indexed store into
+                    # ``scorch_vector_set(pos, 0, 0)`` and carries the marker
+                    # across; the serial sparse-workspace families compare that
+                    # rewrite against a completion reference they build
+                    # themselves, so the reference must carry the same marker or
+                    # the two sides differ and a program that compiles today
+                    # fails.  Both sides move together: this one and
+                    # ``lower_llir._completed_position_init_statement``.
                     stmts.append(
                         llir.Assign(
                             var=llir.ArrayAccess(
@@ -1394,6 +1466,9 @@ class ResultTensorAssembler:
                                 index=llir.Literal(0),
                             ),
                             value=llir.Literal(0),
+                            result_storage=self.result_storage_marker(
+                                (llir.ResultStorageArray.POS, i, True)
+                            ),
                         )
                     )
                 # int p<name><i> = 0

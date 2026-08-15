@@ -1262,3 +1262,220 @@ def test_a_rebuild_invents_no_marker(probe: str) -> None:
         f"{probe} produced a marker from an unmarked statement, so it is not "
         "threading the field but inventing one"
     )
+
+
+# --------------------------------------------------------------------------
+# The ABI's per-result identity, and the two sides that must move together
+# --------------------------------------------------------------------------
+
+
+def _assembler(result_id: object = None) -> object:
+    """One two-level CSR-shaped result assembler, optionally given an identity."""
+
+    import torch
+
+    from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
+        ResultTensorAssembler,
+    )
+    from scorch.format import LevelType  # type: ignore[import-untyped]
+
+    return ResultTensorAssembler(
+        name="C",
+        level_types=(LevelType.DENSE, LevelType.COMPRESSED),
+        dtype=torch.float32,
+        result_id=result_id,
+    )
+
+
+def _position_sentinel_markers(assembler: object) -> List[object]:
+    """The markers on the ``C{L}_pos[0] = 0`` sentinels the assembler emits."""
+
+    return [
+        statement.result_storage
+        for statement in assembler.emit_level_indices_init()  # type: ignore[attr-defined]
+        if type(statement) is llir.Assign
+        and type(statement.var) is llir.ArrayAccess
+        and type(statement.var.array) is llir.Var
+        and statement.var.array.name.endswith("_pos")
+    ]
+
+
+def test_the_abi_marks_nothing_without_an_identity() -> None:
+    """No identity, no marker -- which is what keeps the legacy route unchanged.
+
+    ``ResultTensorAssembler`` builds every storage name from ``self.name`` and a
+    level number, and a name says which vector a statement touches, not whose.
+    The legacy route builds this assembler from a ``TensorVar`` whose identity IS
+    a name, so it passes no ``SymbolId`` and nothing it emits gains a marker.
+    """
+
+    markers = _position_sentinel_markers(_assembler())
+
+    assert markers, "the fixture must reach at least one position sentinel"
+    assert all(marker is None for marker in markers)
+    assert (
+        _assembler().result_storage_marker(  # type: ignore[attr-defined]
+            (llir.ResultStorageArray.POS, 1, True)
+        )
+        is None
+    )
+
+
+def test_the_abi_marks_its_position_sentinel_from_the_identity() -> None:
+    """With an identity, the sentinel says whose position array it writes."""
+
+    markers = _position_sentinel_markers(_assembler(SymbolId(7)))
+
+    assert markers and all(marker is not None for marker in markers)
+    for marker in markers:
+        assert type(marker) is llir.ResultStorageMetadata
+        assert marker.tensor_id == SymbolId(7)
+        assert marker.writes() is True
+        assert [
+            (reference.array, reference.level, reference.direction)
+            for reference in marker.references
+        ] == [
+            (
+                llir.ResultStorageArray.POS,
+                1,
+                llir.ResultStorageDirection.WRITE,
+            )
+        ]
+
+
+def test_the_abi_rebuilds_the_identity_rather_than_sharing_it() -> None:
+    """Nothing reachable from an emitted node aliases the caller's identity.
+
+    The discipline every other marker builder in the compiler follows, and the
+    reason is that a managed pass must own no program state.
+    """
+
+    identity = SymbolId(7)
+    marker = _assembler(identity).result_storage_marker(  # type: ignore[attr-defined]
+        (llir.ResultStorageArray.POS, 1, True)
+    )
+
+    assert marker.tensor_id == identity
+    assert marker.tensor_id is not identity
+
+
+def test_the_abi_refuses_an_identity_that_is_not_a_symbol_id() -> None:
+    """Fail closed on the field, the way every other ABI field does."""
+
+    with pytest.raises(TypeError, match="result identity"):
+        _assembler(7)
+
+
+def test_both_sides_of_the_position_completion_carry_the_same_marker() -> None:
+    """THE TRAP, locked.
+
+    The serial sparse-workspace families compare an assembled function against a
+    completion reference they build themselves, FOR EQUALITY.  The assembler emits
+    ``C1_pos[0] = 0``; the dynamic-vector pass rewrites it into
+    ``scorch_vector_set(C1_pos, 0, 0)`` carrying its marker; and
+    ``_completed_position_init_statement`` reproduces that rewrite as the
+    reference.  Mark one side and not the other and the two differ, and a program
+    that compiles today becomes a ``sparse_workspace_completion_lost`` refusal.
+
+    So the two markers are asserted EQUAL here.  Changing either side's reference
+    triple, or its identity, or removing either marker, fails this test -- which
+    is the whole point of asserting it rather than reading the two sites and
+    believing they agree.
+
+    The reference side is driven unbound against a stub carrying only the two
+    attributes it reads, because building a real lowering costs a LoopIR plan and
+    several seconds and would prove nothing more.
+    """
+
+    from types import SimpleNamespace
+
+    from scorch.compiler.loopir.lower_llir import (  # type: ignore[import-untyped]
+        _SparseWorkspaceLowering,
+        _TargetLowering,
+    )
+
+    class _ReferenceSide:
+        result_symbol = SymbolId(7)
+        result_decl = SimpleNamespace(name="C")
+        _result_storage = _TargetLowering._result_storage
+
+    reference = _SparseWorkspaceLowering._completed_position_init_statement(
+        _ReferenceSide(), 1
+    )
+    emitted_markers = _position_sentinel_markers(_assembler(SymbolId(7)))
+
+    assert type(reference) is llir.FunctionCallStmt
+    assert reference.name == "scorch_vector_set"
+    assert reference.result_storage is not None
+    assert len(emitted_markers) == 1
+    assert reference.result_storage == emitted_markers[0], (
+        "the completion reference and the emitted statement carry different "
+        "result-storage markers, so the completion comparison will refuse a "
+        "program that compiles today.  Both sides move together or neither does"
+    )
+
+
+#: Where a ``ResultTensorAssembler`` is built without handing over an identity,
+#: and why that is right there.  Keyed by ``module::function``.
+_IDENTITY_FREE_ASSEMBLERS = {
+    "compiler/cin_lowerer.py::_result_tensor_abi_assembler": (
+        "the legacy route, whose result identity IS a name: it snapshots a "
+        "TensorVar, which has no SymbolId to hand over.  Nothing legacy emits "
+        "gains a marker, and that is what keeps the descriptor off the shipping "
+        "path -- measured, not assumed: 764 markers arrive at the guard on the "
+        "legacy route and the emission digest is unchanged"
+    ),
+}
+
+
+def test_every_result_assembler_hands_over_an_identity_or_is_registered() -> None:
+    """A construction that forgets ``result_id`` breaks the completion comparison.
+
+    The mutation this closes: dropping ``result_id=`` from one
+    ``result_assembler()`` override leaves the assembler emitting an UNMARKED
+    ``C{L}_pos[0] = 0`` while ``_completed_position_init_statement`` still marks
+    its reference, so the two sides differ and a program that compiles today
+    becomes a refusal.  Every behavioural test above builds its own assembler with
+    an explicit identity, so none of them can see that.  This can, and it also
+    covers an override written later.
+    """
+
+    unclassified = []
+    for module, tree in _SOURCES:
+        scope: List[str] = []
+
+        class _Visit(ast.NodeVisitor):
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                scope.append(node.name)
+                self.generic_visit(node)
+                scope.pop()
+
+            def _function(self, node: ast.AST) -> None:
+                scope.append(getattr(node, "name", "<lambda>"))
+                self.generic_visit(node)
+                scope.pop()
+
+            visit_FunctionDef = _function  # type: ignore[assignment]
+            visit_AsyncFunctionDef = _function  # type: ignore[assignment]
+
+            def visit_Call(self, node: ast.Call) -> None:
+                if ast.unparse(node.func).rsplit(".", 1)[-1] == (
+                    "ResultTensorAssembler"
+                ):
+                    hands_over = any(
+                        keyword.arg == "result_id" for keyword in node.keywords
+                    )
+                    if not hands_over:
+                        key = f"{module}::{'.'.join(scope)}"
+                        if key not in _IDENTITY_FREE_ASSEMBLERS:
+                            unclassified.append(f"{key} (line {node.lineno})")
+                self.generic_visit(node)
+
+        _Visit().visit(tree)
+
+    assert not unclassified, (
+        "a ResultTensorAssembler is built without handing over result_id.  Pass "
+        "the result's SymbolId so the statements it emits can be marked, or "
+        "register the site in _IDENTITY_FREE_ASSEMBLERS with the reason it has "
+        "no identity to hand over:\n  " + "\n  ".join(sorted(unclassified))
+    )

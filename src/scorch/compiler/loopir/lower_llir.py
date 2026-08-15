@@ -5553,6 +5553,10 @@ class _TargetLowering:
         )
 
     def result_assembler(self) -> ResultTensorAssembler:
+        # ``result_id`` is what lets the assembler mark the statements it emits.
+        # Rebuilt rather than shared, for ``_result_storage_marker``'s reason: a
+        # managed pass owns no program state, so nothing an emitted node can reach
+        # aliases the plan's own identity object.
         return ResultTensorAssembler(
             name=self.result_decl.name,
             level_types=tuple(
@@ -5560,6 +5564,7 @@ class _TargetLowering:
                 for level in self.result_decl.levels
             ),
             dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
+            result_id=SymbolId(self.result_symbol.value),
         )
 
     def result_size_inits(self) -> List[llir.Stmt]:
@@ -8039,17 +8044,32 @@ class _SparseWorkspaceLowering(_TargetLowering):
     ) -> llir.FunctionCallStmt:
         """One checked position sentinel left by the dynamic-vector pass.
 
-        DELIBERATELY UNMARKED, and the reason is a boundary rather than an
-        oversight.  This builds the COMPLETION REFERENCE for a statement whose
-        actual side comes from ``ResultTensorAssembler.emit_level_indices_init``
-        in ``torch_cpp_abi``, and review section 63.6 measured that file as
-        having zero result-specific construction sites: its 33 storage-name
-        constructions are polymorphic over operands and results alike, built from
-        ``self.name`` and a ``name`` loop variable.  So the actual statement
-        carries no marker, the dynamic-vector rewrite carries none across, and a
-        marker here alone would make the two sides differ and fail the completion
-        comparison on a program that compiles today.  Marking the ABI needs a
-        descriptor-driven mechanism, which is a separate change.
+        This is the COMPLETION REFERENCE for a statement whose actual side is
+        built by ``ResultTensorAssembler.emit_level_indices_init``: the assembler
+        emits ``{R}{L}_pos[0] = 0`` and the dynamic-vector pass rewrites it into
+        the ``scorch_vector_set`` spelling this reproduces.
+
+        THE TWO SIDES CARRY THE SAME MARKER, AND THEY HAVE TO.  The comparison is
+        for equality, so marking one side and not the other makes them differ and
+        turns a program that compiles today into a
+        ``sparse_workspace_completion_lost`` refusal.  What made that hard until
+        now is that the assembler built its storage names from ``self.name`` and a
+        level number, which says which vector a statement touches and not whose it
+        is, so it had nothing to put in a marker's ``tensor_id``.  It now takes an
+        optional ``result_id`` and marks that ``Assign`` itself, from the identity
+        this lowering hands it in :meth:`result_assembler`.
+
+        The reference and the emitted side are therefore spelled from the same
+        fact -- one storage array, one level, a write -- rather than from two lists
+        that happen to agree, which is the same discipline
+        ``_assembly_result_pos_set`` follows by asking its base builder for the
+        marker instead of rebuilding one.
+
+        Before this, the statement was the last unmarked result write in
+        production and nothing refused it: an unmarked statement is refused only
+        when the callee-name match sees this result's storage, and that match
+        looks for a DOTTED receiver, so the free function ``scorch_vector_set``
+        was structurally invisible to it -- review section 61.4's gap A.
         """
 
         return llir.FunctionCallStmt(
@@ -8062,6 +8082,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
                 llir.Literal(value=0, data_type=llir.DataType.INT32),
                 llir.Literal(value=0, data_type=llir.DataType.INT32),
             ],
+            result_storage=self._result_storage((RESULT_POS, level, STORAGE_WRITE)),
         )
 
     def _outer_row_loop(self, body: List[llir.Stmt]) -> llir.ForLoop:
@@ -12435,6 +12456,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             ),
             dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
             exact_dense_parent_positions=self._exact_dense_parent_positions(),
+            result_id=SymbolId(self.result_symbol.value),
         )
 
     def _assembly_result_pos_set(self, level: Optional[int] = None) -> llir.Stmt:
