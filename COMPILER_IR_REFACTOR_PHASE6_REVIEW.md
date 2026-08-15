@@ -16960,8 +16960,15 @@ is the node sets, not the verdict line.
   dense-domain seam, the merged-domain decision, the shadow pilot's membership and the
   Phase-8 cutover verdict are untouched.
 
-**Evidence ledger**: ``~/.cache/scorch-codex/abi-result-identity/``, sealed with a
-``seal_ledger.sh`` copied from ``statement-marker/`` so it carries §62.9's exclusions.
+**Evidence ledger**: ``~/.cache/scorch-codex/abi-result-identity/``, sealed over **331
+files and 9.0 MB** with a ``seal_ledger.sh`` copied from ``statement-marker/`` so it
+carries §62.9's exclusions.  ``SHA256SUMS`` itself hashes to ``cfa38241e46e2ca7…`` and
+``shasum -a 256 -c SHA256SUMS`` verifies all 331.  The seal holds **zero** compiled
+artifacts — checked before sealing, per §64.7's rule: the 4,554 ``.so`` and ``.o``
+files the suite's sixteen partitions left behind all sit under
+``receipts/suite_*/tmp<N>/torch/``, which the exclusions match by path, and the
+directory is 2.4 GB while the seal covers 9.0 MB.  ``CLOSEOUT.md`` indexes each claim
+here to the receipt that carries it.
 New harnesses: ``completion_reader_reach.py`` (which completion reader sees the marker,
 over the census's own comparand, with ``--comparand`` naming both because the first
 version used the wrong one), ``abi_result_storage_sweep.py`` (every statement the
