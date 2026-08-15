@@ -3385,3 +3385,112 @@ def test_completion_comparator_handles_the_result_storage_marker():
     values = marker(array=llir.ResultStorageArray.VALUES, level=None)
     assert _exact_sparse_completion_matches(statement(values), statement(values))
     assert not _exact_sparse_completion_matches(statement(values), statement(marker()))
+
+
+def test_panel_comparator_handles_the_result_storage_marker():
+    """The SECOND exhaustive comparator, which the marker's rollout first missed.
+
+    ``_TargetLowering._exact_panel_state_matches`` is the same shape as
+    ``_exact_sparse_completion_matches`` -- an exhaustive type table over stored
+    state with a fall-through ``return False`` -- and it has its own branch for
+    ``llir.TensorAccessMetadata`` for exactly the reason the test above gives.  It
+    was not given one for the result-storage marker, and the consequence was
+    measured rather than predicted: it returned ``False`` for two structurally
+    identical marked statements and ``True`` for the same pair unmarked, while its
+    sibling returned ``True`` for both.  Its callers turn ``False`` into a
+    structured refusal, so a marked statement reaching a panel-compared subtree
+    turned a program that compiled before the marker existed into a refusal.
+
+    The lesson worth keeping is not about panels.  A comparator of this shape is
+    fail-closed by construction, so adding a field to an LLIR statement breaks
+    every one of them, and there is more than one.  The test below is asserted
+    over all five marker-carrying statement types so a comparator taught for one
+    type but not another cannot pass it.
+    """
+
+    from scorch.compiler.identity import SymbolId
+    from scorch.compiler.loopir.lower_llir import _TargetLowering
+
+    matches = _TargetLowering._exact_panel_state_matches
+
+    def marker(
+        tensor=7,
+        array=llir.ResultStorageArray.CRD,
+        level=1,
+        direction=llir.ResultStorageDirection.WRITE,
+    ):
+        return llir.ResultStorageMetadata(
+            tensor_id=SymbolId(tensor),
+            references=(llir.ResultStorageReference(array, level, direction),),
+        )
+
+    def statement(value=None):
+        return llir.FunctionCallStmt(
+            "C1_crd.push_back", args=[llir.Literal(1)], result_storage=value
+        )
+
+    shared = marker()
+    assert matches(statement(), statement())
+    assert matches(statement(marker()), statement(marker()))
+    assert matches(statement(shared), statement(shared))
+
+    assert not matches(statement(marker()), statement())
+    assert not matches(statement(), statement(marker()))
+    assert not matches(statement(marker(tensor=7)), statement(marker(tensor=8)))
+    assert not matches(statement(marker(level=1)), statement(marker(level=2)))
+    assert not matches(
+        statement(marker(direction=llir.ResultStorageDirection.WRITE)),
+        statement(marker(direction=llir.ResultStorageDirection.READ)),
+    )
+    assert not matches(
+        statement(marker(array=llir.ResultStorageArray.CRD)),
+        statement(marker(array=llir.ResultStorageArray.POS)),
+    )
+
+    values = marker(array=llir.ResultStorageArray.VALUES, level=None)
+    assert matches(statement(values), statement(values))
+    assert not matches(statement(values), statement(marker()))
+
+    # Every marker-carrying statement type, so one taught type cannot stand in
+    # for the rest.  The set is derived from the schema rather than restated:
+    # whichever types declare the field are the types that must compare.
+    from typing import get_type_hints
+
+    from scorch.compiler.llir_traversal import SUPPORTED_LLIR_NODE_TYPES
+
+    carriers = {
+        node_type
+        for node_type in SUPPORTED_LLIR_NODE_TYPES
+        if "result_storage" in get_type_hints(node_type.__init__, vars(llir))
+    }
+    builders = {
+        llir.Assign: lambda kw: llir.Assign(
+            var=llir.Var("target", llir.DataType.NO_TYPE),
+            value=llir.Literal(1),
+            **kw,
+        ),
+        llir.VarInit: lambda kw: llir.VarInit(
+            var=llir.Var("count", llir.DataType.INT64), value=llir.Literal(0), **kw
+        ),
+        llir.IfThenElse: lambda kw: llir.IfThenElse(
+            cond=llir.Literal(1), then_body=[], **kw
+        ),
+        llir.FunctionCallStmt: lambda kw: llir.FunctionCallStmt(
+            "C1_crd.push_back", args=[llir.Literal(1)], **kw
+        ),
+        llir.MemberCallStmt: lambda kw: llir.MemberCallStmt(
+            llir.Var("C1_crd", llir.DataType.NO_TYPE),
+            "push_back",
+            args=[llir.Literal(1)],
+            **kw,
+        ),
+    }
+    assert set(builders) == carriers, (set(builders), carriers)
+    for node_type, build in builders.items():
+        assert matches(
+            build({"result_storage": marker()}), build({"result_storage": marker()})
+        ), node_type.__name__
+        assert not matches(
+            build({"result_storage": marker(tensor=7)}),
+            build({"result_storage": marker(tensor=8)}),
+        ), node_type.__name__

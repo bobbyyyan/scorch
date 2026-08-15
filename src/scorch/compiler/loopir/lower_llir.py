@@ -6051,6 +6051,58 @@ class _TargetLowering:
                 )
             finally:
                 active.remove(pair)
+        if type(actual) in (llir.ResultStorageMetadata, llir.ResultStorageReference):
+            # The statement-level result-storage marker and one of its references,
+            # on exactly the same terms as the access provenance above: frozen
+            # value state whose leaves are an identity, two enums, an int and
+            # ``None``, compared field by field rather than through ``__eq__``.
+            #
+            # WITHOUT THESE TWO BRANCHES the fall-through ``return False`` below
+            # rejects two structurally identical statements whenever one carries a
+            # marker, which turns a program that compiled before the marker
+            # existed into a structured refusal at whichever ``_fail`` the caller
+            # raises.  That was measured directly: this comparator returned
+            # ``False`` for a marked pair and ``True`` for the same pair unmarked,
+            # while its sibling ``_exact_sparse_completion_matches`` -- which was
+            # given its branch -- returned ``True`` for both.
+            #
+            # ``references`` is a tuple and the enum, identity, int and ``None``
+            # leaves all have branches above, so recursion finishes the job and
+            # this adds no new leaf rule.
+            actual_state = object.__getattribute__(actual, "__dict__")
+            expected_state = object.__getattribute__(expected, "__dict__")
+            # A distinct name from the ``field_names`` the metadata branch above
+            # binds: reusing it would widen that variable's inferred type and add
+            # a mypy finding, and the static baseline is a gate here.
+            marker_field_names: Tuple[str, ...] = (
+                ("tensor_id", "references")
+                if type(actual) is llir.ResultStorageMetadata
+                else ("array", "level", "direction")
+            )
+            expected_marker_names = tuple(sorted(marker_field_names))
+            if (
+                cls._exact_state_field_names(actual_state) != expected_marker_names
+                or cls._exact_state_field_names(expected_state) != expected_marker_names
+            ):
+                return False
+            if active is None:
+                active = set()
+            pair = (id(actual), id(expected))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                return all(
+                    cls._exact_panel_state_matches(
+                        actual_state[field_name],
+                        expected_state[field_name],
+                        active,
+                        depth + 1,
+                    )
+                    for field_name in marker_field_names
+                )
+            finally:
+                active.remove(pair)
         if isinstance(actual, llir.Node):
             actual_state = object.__getattribute__(actual, "__dict__")
             expected_state = object.__getattribute__(expected, "__dict__")
