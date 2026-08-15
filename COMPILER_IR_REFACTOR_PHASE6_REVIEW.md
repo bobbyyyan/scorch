@@ -15567,3 +15567,801 @@ superseded run whose partition 7 carries §63.3a's failure), and
 ``result_array_sites.json``.  Every
 harness takes a tree root as ``$1`` and the expected commit as a required
 argument.
+## 64. Option E built at statement level: 76 marked sites, the readers that had to be taught, and a control showing what three neutrality proofs cannot see (2026-08-14)
+
+Bobby decided on **2026-08-14**, after §63.7a was put to him, to mark the
+**statement** rather than the ``Var``.  That is a fourth shape §63.7a does not
+list, and it was chosen for two reasons: the guard's question is "does this
+statement write result storage", so the statement is the thing that has the
+answer; and a statement marker needs no ``Var`` to tag, which removes the
+restructuring of §63.6's 51 dotted sites — the one part of E that §63.9 said could
+move a shipped byte.  He also chose, the same day, that E comes first and the
+two-pass work follows it.
+
+**The premise was checked before any site was marked, and it held.**  Routing every
+result-storage reference outward to the statement constructor that would carry its
+marker: 113 of 145 reach one at their own site, 8 reach one through a Python local
+in the same function, 24 sit inside no LLIR constructor at all, and **zero escape
+their enclosing function**.  No site needed restructuring and none got any.
+
+E is built and is **not complete**: §64.6's marking gap stands, by design, with the
+reason written at the site.
+
+### 64.1 What the marker is, and why it is not ``TensorAccessMetadata`` widened
+
+Four new types in ``llir.py``.  ``ResultStorageArray`` (``VALUES``, ``POS``,
+``CRD``) is the same three-element vocabulary
+``result_write_pass._touches_result_storage`` builds and
+``_ResultStorageResidueWalker`` watches, so the marker's vocabulary and the
+postcondition's are one set by construction rather than two lists that happen to
+agree.  ``ResultStorageDirection`` is ``READ`` or ``WRITE``.
+``ResultStorageReference`` is one ``(array, level, direction)`` triple, with
+``level`` ``None`` for the value vector, which has none.
+``ResultStorageMetadata`` is a ``tensor_id`` and a non-empty tuple of references,
+and its whole consumer interface is ``writes()``.
+
+The field is declared on five statement types — ``VarInit`` (``llir.py:655``),
+``Assign`` (``:715``), ``FunctionCallStmt`` (``:851``), ``MemberCallStmt``
+(``:1065``) and ``IfThenElse`` (``:1484``) — as
+``Optional[ResultStorageMetadata]``, ``compare=False``, ``repr=False``.
+
+**§63.7a's three unanswerable questions are answered by not asking them.**  That
+section recorded that ``TensorAccessMetadata`` describes an ACCESS, so a marker on
+a whole-vector reference has no honest ``index_ids`` (there is no index), no honest
+``access_id`` (many references to one vector are not many accesses), and no honest
+single role (the same receiver serves ``{R}{L}_crd.push_back`` and
+``{R}{L}_crd.size``).  A statement is not an access either, so a statement marker
+carries none of those three fields.  It is a separate type rather than a widening,
+which leaves ``TensorAccessMetadata``'s meaning and the three passes that depend on
+it untouched.
+
+**Direction sits on each reference rather than on the marker, and that is measured
+rather than stylistic.**  One statement can write one vector while reading two:
+``{R}1_pos[{R}0_crd.size()] = {R}1_crd.size()`` names three.  Of the 76 mark sites,
+**18 carry more than one reference and 11 mix a read with a write**, so one role
+could not describe them.
+
+**And the direction has to be CARRIED rather than derived, which is also measured.**
+Of the 121 storage references, 55 are reads and 49 are writes the syntax settles —
+a dotted member says which (``push_back`` writes, ``size`` reads), and an undotted
+``Var`` used as the ``array`` of an assignment-target subscript writes.  The
+remaining **17 are argument positions where the syntax says nothing**:
+``scorch_concat_chunks(C_values, _chunk_C_values, n)`` writes its first argument and
+a hypothetical reader would not.  That is §61.4's gap A, and it is why
+``ResultStorageDirection`` exists.
+
+A checked detail behind the direction rule: over the four files §63.6 counted, the
+only ``std::vector`` members ever spelled on a result storage vector are ``size``
+(25), ``push_back`` (11), ``emplace_back`` (9) and ``back`` (6) — the 51 dotted result
+references, recomputed from the census's ``sites`` array — and all four are classified
+by ``_ResultStorageNameFinder``'s two member sets.  ``torch_cpp_abi.py`` additionally
+spells a fifth, ``reserve``, on the result's ``_values`` and ``_crd`` (``:1302``,
+``:1376``, ``:1478``), which ``_WRITE_MEMBERS`` also classifies — worth knowing
+because §64.6's open work is in that file, so whoever marks it inherits a member the
+census never enumerated.  A member outside both sets would record no direction rather
+than guessing one, and a tree-wide sweep finds no such member today.
+
+### 64.2 The census, its definition, and three counts reconciled
+
+The number of emission sites has been three different numbers in three sessions.
+This states the definition each uses and reconciles the two that can be reconciled.
+
+``harness/statement_marker_census.py`` reports two units, separately, because
+§63.6's own finding was that a count with no stated definition cannot be checked.
+
+- **REFERENCE** — §63.6's unit, reproduced verbatim: one f-string whose trailing
+  literal ends in ``_values``/``_pos``/``_crd`` (optionally plus
+  ``_index``/``_data``, optionally plus ``.member``) with at least one
+  interpolation, classified result / operand from the spellings it interpolates.
+- **MARK SITE** — the new unit: one syntactic ``llir.<Stmt subclass>(...)``
+  constructor call that would carry one marker, keyed ``(file, class, line)``.
+  Several references can route to one mark site, so this count is lower than the
+  reference count and is **not derivable from it**.  "``Stmt`` subclass" is not a
+  hardcoded list: ``llir.py`` is parsed and every class rooted to statement or
+  expression.
+
+At ``402f042``, over five files (§63.6's four plus ``parallel_chunk_assembly.py``):
+**195** interpolated storage-name sites, of which **145** are result references.
+The chain from there:
+
+| step | count |
+| --- | --- |
+| result references, five files | 145 |
+| of those, in §63.6's four files | **134** — reproducing §63.6 exactly |
+| ... which decomposes as taggable 63 + dotted 51 + inside no LLIR constructor 20 | 134 |
+| result references naming one of the **three real storage arrays** | **121** |
+| ... dropping 24 derived names: 19 ``{R}{L}_pos_index``, 2 ``crd_data``, 2 ``values_data``, 1 ``pos_data`` | |
+| mark sites those 121 collapse into | **76** |
+
+The 76 are ``FunctionCallStmt`` 37, ``Assign`` 31, ``IfThenElse`` 6, ``VarInit`` 2;
+by file ``lower_llir`` 43, ``cin_lowerer`` 20, ``iter_lattice`` 7,
+``parallel_chunk_assembly`` 6.  The unrestricted count — every result reference,
+derived names included — is **86** mark sites, which additionally reaches
+``ForLoop`` 4 and ``Increment`` 3, two statement types that do not carry the field
+at all.  86 is in the receipt as ``mark_unit.distinct_mark_sites``; **76 is not a
+recorded field** — it is recomputed from the receipt's ``sites`` array under the
+three-array restriction — and it is the one that matches the marker's own vocabulary
+and the number the design note's §4 fixes.
+
+**Counted independently from the tree rather than from the census**: ``src`` at the
+tip holds **84** ``result_storage=`` keyword arguments, of which **8 are pass-throughs
+inside passes** that preserve an existing marker rather than attaching one (five in
+``llir_traversal.py``, three in ``dynamic_vector_access_pass.py``), leaving **76
+markings** — ``lower_llir`` 44, ``cin_lowerer`` 19, ``iter_lattice`` 7,
+``parallel_chunk_assembly`` 6.  Three of those 76 also carry an existing marker across
+a rebuild rather than attaching a fresh one (``lower_llir.py:12464``, and
+``_store_statement``'s ``:14859`` and ``:14868``), so **73 sites attach a marker for
+the first time** — which is where this session's ledger got its "73", and it is a
+defensible count of a third thing rather than the error an earlier draft of this
+section took it for.
+
+The census's 76 and the tree's 76 agree in total while differing by one in two files,
+and that is a definitional difference rather than a missing mark.  The census
+identifies a statement by routing an f-string reference outward; a marking can be
+attached to a statement whose storage name was not built by an f-string at that site
+(``_store_statement``, ``lower_llir.py:14856`` and ``:14861``, builds the vector name
+from a matched local), and the census can count a site the marker deliberately leaves
+unmarked (the intermediate-COO ``VarInit`` of §64.6).  So the two are the same size and
+not the same set, and neither is the other's complement.  §64.6 names the deliberately
+unmarked sites, found by reading the code rather than by subtracting.
+
+**Why 76 can exceed §63.6's 63 without either being wrong.**  63 counted references
+that could carry ``tensor_access``, and only ``llir.Var`` and ``llir.ArrayAccess``
+have that field; every one of the 51 dotted references has an innermost
+``FunctionCall`` (31) or ``FunctionCallStmt`` (20), never a ``Var``, so none is
+taggable in that unit.  Under the statement unit they all count, because the
+enclosing statement exists regardless: 49 route to a statement constructor at
+their own site and 2 through a local.  **26 of the 76 mark sites are reached ONLY
+by dotted references** — drop them and the census reports 50, below 63 — and 6 more
+come from ``parallel_chunk_assembly.py``, which §63.6 never scanned.  In the other
+direction 20 references route nowhere and 43 references share 18 statements.
+Neither unit is a subset of the other.
+
+**§7's 149 still cannot be checked.**  It is "73 / 38 / 26 / 12", described only as
+"dotted result-array name constructions", and the document still states no
+definition, so it is recorded here as unreconciled rather than reconciled by
+guesswork.  Where the disagreement is largest is worth naming: ``torch_cpp_abi.py``
+at 38 against §63.6's **0** is the same file counted with and without the
+result/operand distinction, and §64.6 is what turns on it.
+
+Three definitional corrections the new unit needed, each of which moves a count:
+
+1. **``parallel_chunk_assembly.py`` is in scope** and was not among §63.6's four.
+   It holds the argument-shaped result writes gap A is about: §61.4's four in the
+   assembly epilogue, and six under this census once the prologue's
+   ``scorch_vector_set`` (``:286``) and ``scorch_presize_positions`` (``:447``) are
+   included.  Its sites
+   classify as result only once result ALIASES are resolved — the module binds
+   ``result = context.result_name`` and interpolates the local — which is why
+   §63.6 reported zero result sites there and this census reports 11.
+2. **A name wrapped in ``buffer_name(...)`` is not result storage.**  The per-chunk
+   buffers are spelled ``_chunk_{vector}``, are separate vectors with their own
+   declarations, and are correctly ignored by the postcondition.  Counting them would
+   raise the chunk-assembly reference count from 11 to 16 and leave its 6 mark sites
+   unchanged.
+3. **Direction is not always readable off the syntax**, and where it is not that is
+   §64.1's finding rather than a gap in the harness.
+
+**The census's file scope was never justified, and a tree-wide sweep says it is
+narrower than the tree.**  Nine files in ``src`` build a storage-array name by
+interpolation, not five.  The four outside the census were read.
+``result_write_pass.py`` (25) is the pass itself: 18 of its constructions BUILD the
+watched vocabulary — the watched set (``:721``–``:724``, ``:887``–``:890``,
+``:1017``–``:1020``), the name helper (``:848``–``:851``) and the matchers against it
+(``:594``, ``:607``, ``:638``, ``:665``, ``:692``, ``:746``) — and 7 build the
+two-phase pass's own ``_data`` pointers, which are deliberately outside it; none is an
+emitted statement.  ``schedule_lowerer.py`` (2) builds
+``{result}_values`` only to LOCATE an existing statement, on the dense
+heap-accumulation path where there are no compressed levels and this pass does not
+run.  ``compressed_where_openmp_pass.py`` (10) is eight matchers plus the two operand
+``_pos`` references (``:874``, ``:876``) built into the OpenMP work-estimate
+expression.
+``iterator.py`` (3) builds operand coordinate and position reads inside
+``ArrayAccess`` expressions.  None is a statement that writes result storage.  That
+is a reading of the code, and it also has a measured bound: the postcondition
+watches every position a bare result-storage name can be spelled in, expressions
+included, and §63.2 measured 968 references on the pass's input with **0 surviving**
+over 204 invocations, so nothing from those four files puts a result-storage
+reference into the region the pass owns.
+
+### 64.3 Four mechanisms read a statement field by field — and the classification in the commit message is looser than the code
+
+``compare=False`` hides a field from ``==`` and from ``hash``, but **not** from
+``__dict__``, not from ``dataclasses.fields`` and not from ``get_type_hints``.  Four
+mechanisms read statements that way and each had to be taught.  Commit ``9555016``'s
+own body says three of the four dispatch on an exhaustive type table and refuse what
+they do not recognize; read against the code the split is **two refusers and two
+droppers**, and the reason the looser count is nearly right is that one dropper's
+drop is *detected* by one refuser and therefore presents as a refusal.
+
+| # | mechanism | what an untaught one does |
+| --- | --- | --- |
+| 1 | ``llir_traversal.LLIRRewriter`` — rebuilds every statement from an explicit keyword list | **drops, silently, on the route that ships.** §64.4's frontier control measures where it is NOT silent: the same drop turns 328 of the frontier's 520 admitted cell-arms into ``sparse_workspace_completion_lost`` on the typed route. Taught by preserving the field in all five rewrite methods (``:2327``, ``:2430``, ``:2498``, ``:2570``, ``:2729``) |
+| 2 | ``lower_llir._exact_sparse_completion_matches`` — exhaustive type table over ``__dict__``, fall-through ``return False`` | **refuses**: four call sites turn ``False`` into ``sparse_workspace_completion_lost``. Taught with ``_result_storage_state_matches`` plus the import-time enum-state snapshot |
+| 3 | ``_OrderedKeyExpectedBody._value`` — exhaustive type table that RAISES | **refuses**: ``_OrderedKeyCheckpointError`` converted to the same code. It also had a drop site of its own in ``_store_statement`` |
+| 4 | ``dynamic_vector_access_pass._DynamicVectorAccessRewriter.rewrite_assign`` — overrides the base method, so #1's fix does not cover it | **drops — but #2 catches it**, because #2's expected side hand-builds the same ``scorch_vector_set`` statement WITH the marker, so ``None`` against a marker fails the type equality and refuses |
+
+So #1's is the only drop no refuser catches *on the legacy route*, and #1 is the one
+that is load-bearing everywhere: ``compressed_where_openmp_pass`` rewrites the whole
+work body through an ``LLIRRewriter`` at pipeline position 0, immediately before
+``RESULT_WRITE`` at position 1, so a marker it dropped is a marker the guard never
+sees.  §64.4 measures exactly that — and measures the other half too, which is that
+on the TYPED route #1's drop is caught, by row 2 and row 3 together, on 328 cell-arms.
+The two halves are the same drop seen by two different gates.
+
+**A fifth reader exists and is inert by construction.**
+``codegen.LLIRLowerer._validate_exact_codegen_tree`` recurses ``vars(value)``, so
+it does visit ``result_storage`` — but ``ResultStorageMetadata`` declares no base
+class, so it is not an ``llir.Node``, not a ``str`` and not a sequence, and the
+function falls off the end and does nothing.  ``codegen.py`` never mentions the
+field.  That is what byte-identical emission rests on, and
+``test_result_storage_marker_is_invisible_to_codegen`` locks it rather than
+trusting it.
+
+**A sixth mechanism of exactly shape #2 was NOT taught, and that was a regression.**
+``_TargetLowering._exact_panel_state_matches`` is the same exhaustive table with the
+same fall-through ``return False``, and it has its own branch for
+``TensorAccessMetadata`` for precisely this reason.  It got none for the marker.
+Called directly, it returned **``False`` for two structurally identical marked
+statements and ``True`` for the same pair unmarked**, while its taught sibling
+returned ``True`` for both — so a marked statement reaching a panel-compared
+subtree **would have turned** a program that compiled at ``402f042`` into a
+structured refusal.
+**Fixed here**, with the branch the ``TensorAccessMetadata`` case already
+establishes, and a test asserting both directions over all five marker-carrying
+statement types with the set derived from the schema rather than restated; the test
+fails without the production change.  Severity, measured rather than asserted: this
+comparator is called **zero times** across the 1,139-record matrix in both arms on
+the legacy route and on the typed route under default, ``two_pass_serial`` and
+``two_pass_parallel`` assembly — so it was a latent fail-closed regression waiting on
+the next panel-scheduled marking site, which is also why the suite was green on it.
+**That zero is scoped to the survey matrix under automatic scheduling**, and the
+scope matters here more than usual, because a panel is something an EXPLICIT schedule
+asks for: the 86-case explicit-schedule audit is a different corpus and was not
+instrumented for this, so "zero calls" bounds what the matrix reaches rather than what
+the compiler can reach.  The fix does not depend on the bound either way.
+
+**Twelve further pass-throughs are untaught, and all twelve are measured to drop
+nothing today.**  Twelve is a count under a stated definition, because the raw
+number of rebuilds is larger and most of them cannot matter: a tree-wide sweep of
+nine candidate functions finds **26** constructions that rebuild a marker-carrying
+statement type without the field, and only twelve of those rebuild a statement a
+lowering in this change actually marks — the call statements and the one ``Assign``
+that carry result-storage references.  The other fourteen rebuild storage-adjacent
+scalars no lowering marks.  (Four of the twelve are ``MemberCallStmt``, which nothing
+marks today either; they are counted in because they sit in the same rewriters, on
+the same bodies, and would carry a marker the moment gap B's shape is emitted.)
+
+| site | rebuilds | |
+| --- | --- | --- |
+| ``dense_pointer_hoist_pass._rewrite_statement_references`` | 3 | ``:627``, ``:654`` ``FunctionCallStmt``, ``:667`` ``MemberCallStmt`` |
+| ``single_iteration_loop_pass._rewrite_statement_references`` | 3 | ``:495``, ``:523``, ``:536`` |
+| ``schedule_lowerer._rewrite_stmt_access_sequence`` | 3 | ``:651``, ``:672``, ``:692`` |
+| ``cin_lowerer.CINLowerer._rewrite_val_refs`` | 2 | ``:3063`` ``MemberCallStmt``, ``:3076`` ``FunctionCallStmt`` — notable because it is in a file this change taught 19 marking sites in, and no hunk reaches it |
+| ``loop_invariant_factor_pass._replace_body_assignment`` | 1 | ``:503`` ``Assign``, and ``Assign`` is the type 31 of the 76 marks sit on |
+
+The other fourteen are excluded with a reason rather than by convenience.  One,
+``compressed_where_openmp_pass._WorkspaceInsertRewriter._rewrite_legacy_statement``
+``:528``, rebuilds only a workspace insert call, and a workspace target is
+deliberately unmarked.  The remaining thirteen — seven in
+``lower_llir.complete_panel``, three in ``parallel_chunk_assembly._body_lambda``,
+three in ``schedule_lowerer._window_sparse_loop`` — rebuild ``VarInit`` and
+``Assign`` nodes for loop-window bounds and ``p{R}{L}`` / ``{R}{L}_pos_index``
+cursors, which are storage-adjacent scalars the marker's vocabulary excludes by
+design (§64.6's second exclusion) and which no lowering marks.
+
+``harness/marker_leak.py`` answers both questions the twelve raise:
+
+| | |
+| --- | --- |
+| markers on the input of each managed pass, positions 2–6 (post-guard), legacy route | 7,341 / 7,341 / 7,341 / 7,341 / 7,339 (typed default 298 / 298 / 298 / 298 / 346; both two-pass strategies 10 / 10 / 10 / 10 / 0) |
+| markers on the OUTPUT of the same five, same invocations | identical to the input, **delta +0 for every one**, in total |
+| markers dropped at each of the ten probed sites, legacy and typed routes, three assembly strategies | **0** |
+
+Positions 2 to 5 preserve the markers by statement TYPE as well as in total.
+Position 6 does not, and the difference is the taught override doing its job rather
+than a loss: ``rewrite_dynamic_vector_accesses`` converts an indexed store into an
+append or a checked set, so on the legacy route its input carries ``Assign`` 5,241 /
+``FunctionCallStmt`` 1,066 / ``IfThenElse`` 1,032 and its output carries ``Assign``
+531 / ``FunctionCallStmt`` 5,776 / ``IfThenElse`` 1,032.  **4,710 markers change
+statement type and none is lost**, which is the clearest single piece of evidence
+that ``dynamic_vector_access_pass``'s three pass-throughs work.
+
+So every one of the twelve is latent rather than live.  Three of the ten probed
+sites are reached with a marker present somewhere in their arguments —
+``dense_pointer_hoist_pass`` (305 legacy calls, 94 marker-bearing; 116 typed, 102),
+``compressed_where_openmp_pass._WorkspaceInsertRewriter._rewrite_legacy_statement``
+(1,054 legacy calls, 40 marker-bearing) and ``lower_llir.complete_panel`` (194 typed
+calls, all 194 marker-bearing) — and all three drop none.  The second rebuilds only
+workspace insert calls, which are deliberately unmarked; the third is handed a whole
+``llir.Function``, so a marker being somewhere inside it says nothing about the
+loop-window ``VarInit`` nodes it actually rebuilds, which is why the probe's
+reachability column is an upper bound and its per-call delta is the answer.  The
+twelve are recorded rather than fixed because each changes behaviour only in a state
+that does not occur today, and because the honest statement about them is the
+measurement, not the patch.
+
+The recognizer's own refusal surface is locked by set equality in both directions
+in the pass's own test file, at **15** codes: eight context validations, the
+scalar-root refusal, the input-side ``unsupported_result_write_statement``,
+``residual_result_storage_reference``, and the four this change adds —
+``unmarked_result_write_statement``, ``untruthful_result_storage_marker``,
+``result_storage_marker_tensor_conflict`` and
+``unrewritten_result_write_statement``.  Not in
+``PRODUCTION_SUBSET_DEFECT_CODES``, for §63.4's reason.
+
+### 64.4 The three proofs are negative-shaped — so a control was run against all three, and they do not agree
+
+Byte-identical emission, an unchanged frontier and unchanged static checks are all
+**absences**.  The worry is that each holds just as well if the marker never reaches
+the guard at all, because a marker that never arrives changes nothing any of the
+three was built to measure.  Rather than argue about it, the untaught state was
+reinstated and the two gates that could see it were **re-measured against it** — the
+emission columns through ``marker_reach.py`` and the frontier through its own control
+harness.  The statics are the one leg that genuinely needs no measurement, and the
+reason is stated below rather than assumed.  **Two of the three are blind and one is
+not**, and which is which is the opposite of what the closeness-to-production
+ordering would suggest.
+
+Along the way one popular answer turns out to be wrong.  The tempting claim is that
+a dropped marker is LOUD because the cross-check in the recognizer is
+one-directional and REFUSES: the name matcher seeing this result's storage name on a
+statement carrying no marker raises ``unmarked_result_write_statement``.  **That
+particular answer is wrong** — its population is empty, as measured below.  A
+dropped marker IS loud, but at a different refusal, in a different pass, on the
+route that does not ship.
+
+``harness/marker_reach.py`` drives the same 1,139-record matrix in both automatic
+arms and counts three points on the chain — markers CONSTRUCTED by the lowering,
+markers ARRIVING on statements in the region handed to the guard, and markers
+RECOGNIZED by the guard's own recognizer (measured by wrapping
+``_recognized_result_storage``, not by re-implementing it) — plus the name matcher's
+calls and hits, every refusal code raised, and a running ``sha256`` over the emitted
+C++.  From a clean detached worktree at the tip with the commit asserted:
+
+| route | cell-arms reaching the pass | invocations | constructed | arriving | recognized | name-matcher calls | hits | refusals |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| legacy (shipping) | 102 | 204 | 8,237 | **764** | **648** | 612 | **0** | 0 |
+| typed, default assembly | 0 | 0 | 346 | 0 | 0 | 0 | 0 | 0 |
+| typed, ``two_pass_parallel`` | 2 | 4 | 18 | **8** | **8** | 12 | **0** | 0 |
+| typed, ``two_pass_serial`` | 0 | 0 | 18 | 0 | 0 | 0 | 0 | 0 |
+
+The three reach numbers reproduce §63.2's exactly.
+
+**The name matcher never matches anything in production.**  Over the whole matrix it
+is asked 612 times on the legacy route — ``wksp.insert`` 132 per mode,
+``wksp.insert_unchecked`` 72, ``wksp.sort`` 102 — and 12 times on
+``two_pass_parallel``, where the calls are ``wksp.insert_unchecked`` 4 and
+``wksp.sort`` 2 per mode and ``wksp.insert`` never appears.  Every call either route
+sees is a workspace call, and it hits **none**.  So
+``unmarked_result_write_statement``'s population over the survey matrix is EMPTY and
+its silence is evidence about nothing.
+
+``result_storage_marker_tensor_conflict`` is silent too — zero raises — but the
+receipt does not settle WHY, and the distinction matters because the two reasons are
+opposites.  What the harness counts is markers naming ANOTHER tensor arriving, which
+is 0 on both routes; but such a marker is never recognized, so it never reaches this
+refusal at all.  The refusal fires on the opposite pairing — a marker naming THIS
+result on a statement whose assignment target's access metadata names a different one
+— and nothing here counts that pairing's population.  Its silence is unexplained
+rather than explained.
+
+**The control.**  ``--untaught-rewriter`` reinstates the pre-fix ``LLIRRewriter``'s
+drop, stripping the marker off each node its five rewrite methods rebuild.  The strip
+runs AFTER the taught method, so the input-side validation those methods gained stays
+in place — a difference from the historical rewriter, stated because it is one, and
+measured inert: the same two ``LLIRTraversalError`` outcomes appear in both columns
+and every other outcome class is identical.  Same tree, same matrix, 7,923 markers
+stripped (5,709 ``Assign``, 1,124 ``FunctionCallStmt``, 1,090 ``IfThenElse``).  **On
+the legacy route — the one that ships — nothing notices:**
+
+| | taught | untaught control |
+| --- | --- | --- |
+| compile outcomes, all seven classes | ``OK`` 2000, ``IndexError`` 132, ``TypeError`` 8, ``NotImplementedError`` 24, ``UnsupportedFeature`` 96, ``ValueError`` 16, ``LLIRTraversalError`` 2 | **identical, class for class** |
+| emitted C++ | 2,000 cell-arms, 6,496,962 bytes, ``sha256 051fb7d7de4f4a7bd71f671e7d6dea63`` | **the same digest** |
+| cell-arms reaching the pass | 102 | 102 |
+| markers constructed | 8,237 | 8,237 |
+| name-matcher calls / hits | 612 / 0 | 612 / 0 |
+| refusals inside the pass, by code | none | **none** — entailed rather than informative: three of the four are reachable only from a recognized marker, which the control removes, and the fourth needs a name-matcher hit, of which there are none in either column |
+| **markers arriving at the guard** | **764** | **0** |
+| **markers recognized** | **648** | **0** |
+
+``two_pass_parallel`` gives the same reading at the same commit: 8 arriving and 8
+recognized taught, 0 and 0 untaught, with all five compile outcome classes and every
+refusal count identical, and the control stripping 18 markers.
+
+So the emission column — the gate closest to what a user gets — is **blind**.  It
+cannot tell a built migration from an inert one, and neither can the guard's own
+name matcher.  The static checks are blind for a simpler reason that needs no
+measurement: the untaught state is a runtime monkeypatch, so ``src`` is byte-identical
+and ``mypy``, ``flake8`` and ``black`` cannot see a difference in principle.
+
+**The frontier is NOT blind, and this is the part that was measured rather than
+argued because the argument would have got it wrong.**
+``harness/frontier_untaught_control.py`` runs the whole 1,139-record census with the
+same strip applied.  Against the taught census, over the same records in both arms:
+
+| | |
+| --- | --- |
+| records whose outcome changes | **164** (328 arm-results) |
+| admitted cell-arms | 520 taught → **192** untaught, **328 lost** |
+| the code every one of the 328 lands on | ``sparse_workspace_completion_lost`` |
+| families affected, counted by RECORD (each is two arm-results) | 12 — ``ttm`` 52, ``degenerate2`` 20, ``rank4`` 17, ``rank6`` 17, ``degenerate3`` 15, ``rank3`` 14, ``rank5`` 10, ``rank4-mixed`` 7, ``rank2`` 4, ``matmul`` 4, ``rank6-mixed`` 3, ``nonadd-combiner`` 1 |
+| unclassified | **0** — it still fails closed |
+
+So **a dropped marker is loud after all — 63% of the frontier's admitted cell-arms
+turn into a structured refusal — but not at the refusal the guard added.**  The
+mechanism is §64.3's rows 2 and 3 acting together, and the 328 are attributed rather
+than guessed by tallying every ``lower_llir._fail`` call with its message:
+
+| where the refusal is raised | count |
+| --- | --- |
+| the ordered workspace completion comparison | **324** |
+| the sparse-workspace completion comparison | 2 |
+| the row-scope sparse-workspace completion comparison | 2 |
+
+In the 324, row 3's builder — which WAS taught — constructs the expected body carrying
+the marker; in the other four the expected body is hand-built inline in the target
+lowering instead.  In every one of the 328, row 2's comparator finds the actual side
+has lost the marker, so the type equality fails and the stage refuses.  That is two
+refusers doing exactly what §64.3 says they do, and it is the measurement that makes
+the classification in that table load-bearing rather than descriptive.
+
+**Three consequences worth separating, because they point in different directions.**
+
+- **The gate closest to production is the blind one.**  Every one of those 328
+  refusals is on the TYPED route — the frontier is the LoopIR admission census, and
+  the completion comparator is typed-route code.  The typed pipeline has zero
+  non-test callers.  So on the path that actually ships, an untaught rewriter is
+  invisible to everything we measure; what catches it is the census of a pipeline
+  that does not run.  That is a real gap in the gate set, not a comfort.
+- **Which means the presence measurement is still the thing that says the migration
+  is built**, and it is the only one of the four that says so about the legacy route:
+  764 markers arrive and 648 are consumed, and both are 0 the moment a rewriter stops
+  carrying the field.
+- **And the frontier's sensitivity is worth keeping deliberately.**  It was not
+  designed as a marker gate; it catches this because one typed-route comparator fails
+  closed on an unrecognized value.  §64.3's sixth mechanism is the same shape and was
+  NOT taught, which is how a comparator of this family turns into a refusal in the
+  other direction.
+
+**The lesson generalizes past this change: when the thing migrated is metadata a
+later pass consumes, measure that it ARRIVES, and run your control against every gate
+rather than the one you trust most — here the four gates disagreed, and the two that
+matter most disagreed hardest.**
+
+**Two positive results with non-empty populations, which are the ones worth having.**
+``_require_truthful_marker`` checks every recognized marker against the statement it
+sits on — each claimed reference must be spelled somewhere in the statement, and
+where a dotted member decides the direction it must agree.  It runs on all **648**
+recognized markers and refuses none.  ``_require_result_write_rewritten`` runs on
+every recognized marker claiming a write, **532** of them, and none survived its
+rewrite unchanged.  Those are measured properties of this change rather than
+absences.
+
+**What the presence measurement does NOT show.**  116 of the 764 arriving markers —
+58 per mode, all on ``FunctionCallStmt`` — are never shown to the recognizer.
+Recording their paths says why: every one sits at ``.../then_body/[i]``, inside the
+position-boundary conditional, and ``_rewrite_if_statement`` rebuilds that
+conditional as a unit and discards its original body, so those appends are removed
+rather than examined.  They are correctly removed — the postcondition confirms no
+reference survives — but their markers are attached and never read, so the marker is
+not what makes those particular writes safe.
+
+### 64.5 The fixture cost, stated as a cost
+
+Making the recognizer type-driven broke hand-built test fixtures, and the bill came
+in two instalments.
+
+**79 tests** failed at ``1a0a440`` — that run's partition 4 records "79 failed, 953
+passed".  The killed run left only that summary, with no per-test detail, so the
+attribution to ``test_compressed_where_openmp_pass.py`` and
+``test_llir_pass_manager.py`` comes from the commit that fixed them: ``3cec25b``
+touches exactly those two files, and partition 4 is green at ``3cec25b`` with 1,032
+passed.  Their hand-built result appends carried no marker, they
+sit at a statement-sequence position where the name matcher does see them, and an
+unmarked name-matching statement is refused.  ``3cec25b`` marks them through a
+``_result_marker`` helper in each file serving **16 call sites** (14 and 2), every
+one a ``.push_back``.
+
+Worth recording because it explains the asymmetry: the fixtures' appends sit where
+the name matcher can see them and **production's do not** — §64.4 measured the
+matcher hitting nothing at all in production, because production's appends are
+nested inside the position-boundary conditional.  So the refusal that cost 79 tests
+is a refusal production never triggers.
+
+**Four more tests** were found by the suite run in §64.7, and they are a different
+class: readers of the node's declared shape rather than builders of a body.  Three
+are declared-field locks in ``test_codegen.py`` — on ``FunctionCallStmt``,
+``MemberCallStmt`` and ``Assign`` — asserting ``get_type_hints(...)`` equals an exact
+dict, which a new declared field makes one item bigger.  The fourth is the
+hand-written recursive comparator inside
+``test_the_expected_body_mirror_reproduces_the_shared_pass``, which fell through to
+``unknown ResultStorageMetadata``.  The two result-storage value types join its
+allow-list rather than being skipped, so the mirror is now checked to REPRODUCE the
+marker rather than to tolerate it; skipping the field would have been the smaller
+diff and would have left the mirror free to diverge from the shared pass on markers
+alone.
+
+**The counterweight, checked rather than asserted.**  Production pays none of this:
+the refusal fires zero times across the frontier in both arms, and §64.4 measures
+why.  And the fixtures were genuinely stale, which is the actual justification —
+production now attaches a marker at every one of those append sites, so a fixture
+without one exercised an input shape no producer emits.  The weaker argument, that
+the name matcher is scaffolding due for removal, is not the reason and should not be
+given as one; §64.4 is a reason to be careful about removing it, not a reason to.
+
+**One coverage asymmetry the failures exposed, now closed.**  Three of the five
+statement types that gained the field have a declared-field lock and caught it;
+``VarInit`` and ``IfThenElse`` have none, so for those two the addition was
+invisible.  ``_RESULT_STORAGE_STATEMENT_TYPES`` in ``test_llir_traversal.py`` is a
+hand-written tuple every parametrized marker test trusts, and nothing checked it
+against the schema.  A new test derives the set from ``get_type_hints`` over
+``SUPPORTED_LLIR_NODE_TYPES`` and locks it against that tuple in both directions,
+annotation included, so a sixth type gaining the field or one of the five losing it
+now fails.
+
+### 64.6 ``torch_cpp_abi`` is the one real marking gap, and it is a design question
+
+Three sites are deliberately unmarked.  Two carry the reason at the site —
+``cin_lowerer.py:1370`` and ``lower_llir.py:8042`` are the only two occurrences of
+"DELIBERATELY UNMARKED" in the tree — and the third's reason is recorded in
+``ResultStorageArray``'s docstring (``llir.py:362``–``366``) instead, because it is a
+statement about the marker's vocabulary rather than about that one site.
+
+1. **``cin_lowerer.py``, a ``VarInit`` for ``T{i}_crd``.**  ``T`` is the intermediate
+   COO tensor that method builds, not the declared result, so its coordinate array
+   is not the result's storage and a marker naming it would be about the wrong
+   tensor.  §63.6's census bucketed the site as result because
+   ``intermediate_tensor_var`` is on its marker list — defensible for counting a
+   search space, false for marking.
+2. **``parallel_chunk_assembly.py``, a ``VarInit`` for ``{R}{L}_pos_index``.**  A
+   scalar index into the position array, not the array.  ``ResultStorageArray``'s
+   docstring excludes ``_pos_index`` explicitly and the postcondition does not watch
+   it, so this is outside the marker's vocabulary by definition rather than a
+   markable site left unmarked.
+3. **``loopir/lower_llir.py``, ``_completed_position_init_statement``.**  This is the
+   real gap.
+
+The third builds ``scorch_vector_set(C{L}_pos, 0, 0)`` as the COMPLETION REFERENCE
+for a statement whose emitted side comes from
+``ResultTensorAssembler.emit_level_indices_init`` in ``torch_cpp_abi.py`` — the file
+§63.6 measured as having zero result-specific construction sites, because its 33
+storage-name constructions are polymorphic over operands and results alike, built
+from ``self.name`` and a ``name`` loop variable.  Marking only the reference side
+would make the two sides differ and fail the completion comparison on a program
+that compiles today.  One builder, reached from two completion-reference
+construction sites, which is where "two completion references are unmarked" comes
+from.
+
+**What happens at those two sites today, read out of the code: nothing refuses
+them.**  An unmarked statement is refused only when the name matcher sees this
+result's storage in its callee name, and ``_touches_result_storage`` matches only a
+DOTTED receiver (``name.startswith(f"{array}.")``).  The callee here is the free
+function ``scorch_vector_set``, so the matcher structurally cannot see it — §61.4's
+gap A, in production, unmarked and unrefused.  §64.4 says the same thing from the
+other side: the matcher hits nothing on the whole matrix.  The postcondition WOULD
+see the bare ``C{L}_pos`` name if this statement reached ``result_write_pass``'s
+output, since it watches expression positions too; it does not reach it, because
+the typed route's default assembly invokes the pass zero times.
+
+**Marking it needs a descriptor-driven mechanism**, because the ABI side builds
+storage names for operands and results with the same code and holds no per-result
+identity at those sites — ``torch_cpp_abi.py`` contains no occurrence of
+``tensor_id``, ``SymbolId`` or ``identity`` at all.  That is a separate change and a
+design question, so **option E is not complete and is not recorded as complete.**
+
+### 64.7 The proof
+
+Everything below was measured from clean detached worktrees at asserted commits, per
+§62.5.  Base ``402f042``, candidate ``9d85e27``.
+
+**Emitted C++ is byte-identical, on all four columns.**
+
+| column | result |
+| --- | --- |
+| production dispatch, 506 case-arms, both arms | 412 emitted; **0** emission differences, 0 outcome differences |
+| the 20-source corpus, legacy's own lowering chain | 20/20 identical |
+| the 42-case ``ss@dd`` grid | 42/42 identical |
+| the 86-case explicit-schedule audit | identical; **0** differing ``legacy_sha256`` |
+
+Independently corroborated: §64.4's emission digest over 2,000 emitting cell-arms
+and 6,496,962 bytes is the same at ``3cec25b`` and at ``9d85e27``, so the panel-comparator
+commit moved no byte either.
+
+**The frontier is unchanged and clean.**  1,139 records over 1,138 distinct
+``(family, name)`` keys, both automatic arms, at each of ``402f042`` and
+``9d85e27``: 0 lost, 0 gained, 0 route changed, no new arm variance, and **every
+field of every record equal**.  260 admitted cells (520 admitted cell-arms), 19
+distinct refusal codes, **zero unclassified**, and **zero occurrences of any of the
+five codes this change added** — the four the pass raises plus
+``invalid_result_storage_metadata`` in ``llir_traversal.py`` — across both arms at
+both commits.
+
+**Static checks are at baseline.**  Over ``src`` — the repo's own gate — 140 mypy
+errors in 11 files, 9 flake8 findings and one ``black`` reformat
+(``prebuilt_kernels.py``, pre-existing) at both commits.  ``flake8`` and ``black``
+are identical after normalizing paths and line numbers; ``mypy`` is identical in
+every finding but not byte-identical, because it embeds a line number in the TEXT of
+a pre-existing ``no-redef`` message in ``cin_lowerer.py``, so the same finding reads
+"already defined on line 1659" at the base and "1756" at the candidate.  That is
+reported rather than normalized away at either scope, because normalizing a tool's
+message body would hide a real second finding on the same line.  The neutrality
+harness's scope is worth stating precisely, since its report labels a section
+"``src tests``": it runs ``flake8`` and ``black`` over ``src tests`` — 47 flake8 lines,
+38 of them in ``tests/`` — and ``mypy`` over ``src`` only, so its 146 mypy lines
+reproduce the ``src``-scope result rather than adding coverage of the tests.
+
+**The protected-file check, both halves, and the second half is what proves this
+session's own hygiene.**  All five tracked blobs are identical between the two pinned
+checkouts.  The live-tree half is not in any neutrality report — ``SCORCH_WORKTREE``
+was unset, so column (b) reads SKIPPED in all four — so it was run separately with
+the repo's own ``statics/check_protected_files.py``, which is the tool §63's handoff
+says to use instead of a ledger copy of the baseline:
+
+| tree | check 1, git-derived | check 2, on-disk snapshot |
+| --- | --- | --- |
+| the live repository at ``9d85e27`` | **PASS** — all five tracked blobs equal those at the branch point ``a3b8d1e`` | FAIL — the working tree carries edits to all five |
+| the pinned tip checkout | **PASS** | PASS |
+
+Read as a pair: check 1 is the obligation and it passes, so none of this session's six
+commits touched any of the five; check 2's failure on the live tree is §62.6's
+expected state while the separate CUDA project is in flight, and its pass on the
+pinned checkout is what says the measured trees were clean.
+
+**The suite ran in 8 file-disjoint partitions** on both trees, each a fresh process
+with its own ``TMPDIR``, ``XDG_CACHE_HOME`` and ``TORCH_EXTENSIONS_DIR``, over the 92
+test files a clean checkout enumerates.
+
+| | base ``402f042`` | candidate ``9d85e27`` |
+| --- | --- | --- |
+| tests | 6,392 | **6,426** |
+| failures / errors | 0 / 0 | **0 / 0** |
+| skipped | 15 | 15 |
+| partitions exiting 0 | 8 of 8 | **8 of 8** |
+
+Compared by **node set** rather than by count, because a pass count is a scalar and
+two runs can match on it while testing different things — a file that stopped being
+collected and a file that gained a test cancel out.  The eight partition file lists
+are asserted equal first (12/12/12/12/11/11/11/11 = 92), since the round-robin
+regroups if the file count differs and then partition N in one run is not partition N
+in the other:
+
+| | |
+| --- | --- |
+| partition file lists | identical, all 8 |
+| nodes in both | **6,392** |
+| **base only** | **0** — nothing stopped being collected |
+| **candidate only** | **34** — every one a test this change adds, each named in the receipt |
+| **outcome changes on shared nodes** | **0** |
+| failed or errored, either side | 0 |
+
+The 34 land where they should and the per-partition counts confirm it independently:
+partition 5 goes 1,020 → 1,022 and partition 6 goes 1,034 → 1,066, every other
+partition equal to the test.  By file they are ``test_llir_traversal.py`` 25 (the
+five-way parametrized marker tests plus the derived declared-field lock),
+``test_result_write_pass.py`` 7 (the recognizer's new refusals) and
+``test_loopir_ordered_key_workspace_target.py`` 2 (the two comparators' marker tests).
+
+**And the base run is what makes the four failures this change's own.**  §63.3a
+established the three-point pattern: the base passes, the pre-fix candidate fails, the
+fixed candidate passes.  Here partition 5 is green at ``402f042`` with 1,020 passed,
+failed at ``3cec25b`` with 4 failed / 1,017 passed, and is green at ``9d85e27`` with
+1,022 passed.  So the four were introduced by the marker work rather than inherited,
+and they are fixed.
+
+**And the suite did its job.**  At ``3cec25b`` it found four failures — partition 5,
+exit 1, everything else green — which are §64.5's second instalment and §64.3's
+sixth mechanism's neighbours.  They were fixed by teaching the four readers, not by
+loosening them.  The one thing the suite could NOT find is §64.3's panel
+comparator, which is called zero times on this matrix; that took the tree-wide
+sweep and a direct call to find, which is the argument for doing both.
+
+**A fifth inherited-harness defect, in §63.8's third finding's family.**
+``run_frontier_pinned.sh`` set ``TMPDIR="${TREE}/.tmp"`` — inside the measured tree —
+and ``.tmp`` is not in the repository's ``.gitignore``, so anything left there makes
+the tree read dirty and the next run's provenance guard refuses it.  It has not
+bitten only because the directory ends up empty and git does not track empty
+directories, which is luck rather than design.  Fixed in this ledger's copy; the sealed
+originals are left alone, for §63.8's reason.  A ``statics_src.sh`` was also added,
+because §63.5's and this session's first pass's static comparisons were run by hand
+and so carried no provenance and were not re-runnable.
+
+**And then §62.9's defect reappeared on that brand-new harness, which is the more
+useful half of the finding.**  ``statics_src.sh``'s first version put its ``TMPDIR``
+and mypy's incremental cache under the RECEIPT directory rather than under the
+measured tree — the tree was safe, the receipt was not.  mypy's cache is 18 files, 16
+of them sqlite databases, and 79 MB per role, so a seal would have hashed **158 MB of
+build scratch**,
+which is exactly what §62.9's exclusions exist to prevent, on a path none of them
+matched.  Caught by checking what the seal would cover before running it rather
+than by reading it afterwards.  The harness now writes scratch to a sibling
+``scratch/`` directory and the seal excludes that plus the two shapes the first
+version left behind, so a stale copy cannot reintroduce it; what the seal covers is
+whatever ``SHA256SUMS`` records, and it is 23 MB rather than 181 MB.  **The rule that
+keeps generalizing is: resolve every scratch path
+— ``TMPDIR``, tool caches, extension caches — outside BOTH the tree you are
+measuring and the directory you are going to seal, and verify the seal's scope
+before you seal.**
+
+### 64.8 Two one-liners deliberately deferred, and why they were not made here
+
+Both are worth making.  Both were held because making them would have moved ``src``
+under measurements that had already started.  They are the first thing the next
+session should do, before its own verification.
+
+1. **``unmarked_result_write_statement``'s message names the wrong audience.**  It
+   says "the emitting lowering has to attach one", which is accurate for production
+   and invisible to someone hand-building a fixture — and that person is precisely
+   who the refusal catches, since §64.4 shows production never triggers it.  It
+   should point at the fixture helpers too.
+2. **The ``_result_marker`` fixture helpers hardcode ``direction=WRITE``.**  They
+   derive ``array`` and ``level`` from the callee name but fix the direction, which
+   is correct for all 16 sites they serve, since all 16 are appends.  It must not be
+   copied to a fixture built around a free function, where the direction genuinely
+   is not recoverable from the node shape — that is why ``ResultStorageDirection``
+   exists, and §64.1's 17 argument-undecidable references are the measurement.  The
+   helper's docstring should say so.
+
+### 64.9 What this section does not do
+
+- **Option E is not complete.**  §64.6's gap stands: two completion references at
+  the ``torch_cpp_abi`` boundary are unmarked, nothing refuses them, and marking
+  them needs a descriptor-driven mechanism nobody has designed.
+- **Twelve untaught pass-throughs are recorded, not fixed** (§64.3), each measured
+  to drop nothing on any route today.  They are one-word additions; the reason to
+  record rather than patch is that each changes behaviour only in a state that does
+  not occur, so the honest statement about them is the measurement.
+- **The gate gap §64.4 found is not closed.**  Nothing that measures the SHIPPING
+  path would have caught an untaught rewriter: the emission columns are blind to it,
+  the statics cannot see it, and the 328 refusals that do catch it are all on a
+  pipeline with zero non-test callers.  A legacy-route equivalent of the completion
+  comparison's fail-closed check, or promoting the presence measurement to a standing
+  gate, would fix that.  Neither is attempted here, and neither should be guessed at.
+- **The name matcher is not removed**, and §64.4 is a reason for care rather than a
+  reason to remove it: it currently matches nothing in production, so neither its
+  presence nor its silence is evidence, and the decision should rest on what it
+  catches in a fixture or a future lowering.
+- **``result_storage_marker_tensor_conflict``'s silence is unexplained** (§64.4).
+  Nothing here measures the population of the pairing it refuses, so "it never fires"
+  is an observation without a reason behind it.
+- **The 51 dotted sites are not restructured**, and no longer need to be.  They keep
+  their callee-name spelling and carry the marker on the enclosing statement.
+  Whether ``MemberCall``/``MemberCallStmt`` is still wanted for other reasons is
+  untouched and remains Bobby's.
+- **No runtime was measured.**  The change is compile-time only and the marker is
+  invisible to codegen; the four-strategy runtime grid is still NOT RUN on any host.
+- **Nothing about the two-pass assembly strategies changed.**  §60.6 stage 3's
+  position reconstruction, ``two_pass_serial``'s missing host — measured again here
+  as zero cell-arms reaching the pass — ``scorch_concat_chunks``'s
+  value-initializing ``resize``, the runtime grid and teaching
+  ``default_assembly()`` to choose are all untouched.
+- **``_find_serial_coordinate``'s silent ``None`` is still open** (§61.4, §63.9).  The
+  marker does not help: it says which vectors a statement names, not that a
+  statement which should exist does.
+- **The 116 arriving markers the recognizer never sees are not addressed** (§64.4).
+  They are correct today and the marker on them is dead weight; whether the
+  conditional's wholesale rewrite should instead descend is a separate question.
+- **mkt1 is still not run.**  Owed since §59.
+- **The LoopIR package is still wired to nothing.**  ``compile_cin_via_loopir`` and
+  ``execute_cin_via_loopir`` keep zero non-test callers and the test proving
+  ``import scorch`` never loads the package still passes.
+- **The shared ``seal_ledger.sh`` still lacks §62.9's exclusions**, for §63.8's
+  reason.
+- Sections 1 through 34 are still in their original wording; §0 is the dictionary
+  for them.  The dense-domain seam, the merged-domain decision, the shadow pilot's
+  membership and the Phase-8 cutover verdict are untouched.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/statement-marker/``, sealed over **921
+files and 25.0 MB** with its own ``seal_ledger.sh`` carrying §62.9's exclusions plus
+the four §64.7 adds.  ``SHA256SUMS`` itself hashes to ``2000279dbcac5931…`` and
+``shasum -a 256 -c SHA256SUMS`` verifies all 921.  The seal holds **zero** compiled
+artifacts: no ``.so``, no ``.o``, nothing under a partition's ``torch``/``xdg``/``tmp``
+scratch and nothing from the 158 MB of mypy cache, all excluded by path.
+``CLOSEOUT.md`` indexes each claim here to the receipt that carries it.  Two of its own numbers are corrected by
+§64.2.  New harnesses: ``statement_marker_census.py`` (the two-unit census),
+``probe_field_semantics.py``, ``frontier_fields_equal.py``, ``count_marks.py``,
+``marker_reach.py`` (the presence measurement and its untaught-rewriter control,
+with the emission digest), ``marker_leak.py`` (per-pass and per-site marker deltas)
+and ``statics_src.sh``.  Patched: ``run_frontier_pinned.sh``, for §64.7's harness
+defect.
