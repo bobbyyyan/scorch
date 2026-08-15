@@ -2805,6 +2805,12 @@ def test_the_expected_body_mirror_reproduces_the_shared_pass():
     same pre-pipeline body through both constructions and require structural
     equality, with enums compared by identity and provenance identities by
     stored value -- exactly what the comparator accepts.
+
+    The comparator compares the statement-level result-storage marker too, and
+    that is deliberate rather than incidental.  The marker is ``compare=False``,
+    so ``==`` would not see it and the mirror could drift from the shared pass on
+    markers alone without this test noticing.  Comparing it field by field is
+    what closes that.
     """
 
     from enum import Enum
@@ -2817,6 +2823,20 @@ def test_the_expected_body_mirror_reproduces_the_shared_pass():
     from scorch.compiler.loopir import lower_llir
 
     node_types = frozenset(SUPPORTED_LLIR_NODE_TYPES)
+    #: Typed values a statement can HOLD, as opposed to statements themselves.
+    #: Compared field by field like a node, because that is what makes the mirror
+    #: reproduce them rather than merely tolerate them: a type missing from this
+    #: set falls to the ``unknown`` arm below and the comparison reports a
+    #: divergence, and a type moved out of it would be silently unchecked.  The
+    #: two result-storage types are here for the second reason -- the mirror must
+    #: reproduce the marker the shared pass sees, not ignore it.
+    metadata_types = frozenset(
+        {
+            llir.TensorAccessMetadata,
+            llir.ResultStorageMetadata,
+            llir.ResultStorageReference,
+        }
+    )
 
     def differs(left, right, path=(), depth=0):
         if depth > 400:
@@ -2844,7 +2864,7 @@ def test_the_expected_body_mirror_reproduces_the_shared_pass():
             a = lower_llir._stored_identity_value(left, type(left))
             b = lower_llir._stored_identity_value(right, type(right))
             return [] if (a == b and a is not None) else [(path, f"id {a}/{b}")]
-        if type(left) is llir.TensorAccessMetadata or type(left) in node_types:
+        if type(left) in metadata_types or type(left) in node_types:
             left_state = object.__getattribute__(left, "__dict__")
             right_state = object.__getattribute__(right, "__dict__")
             if set(left_state) != set(right_state):

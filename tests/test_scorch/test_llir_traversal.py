@@ -4077,3 +4077,39 @@ def test_result_storage_marker_is_invisible_to_codegen() -> None:
     )
 
     assert lowerer.lower_llir(marked) == lowerer.lower_llir(plain)
+
+
+def test_exactly_five_statement_types_declare_the_result_storage_field() -> None:
+    """Which node types carry the marker, derived from the schema and locked.
+
+    ``_RESULT_STORAGE_STATEMENT_TYPES`` above is a hand-written tuple, and every
+    parametrized test in this file trusts it.  Nothing checked it against the
+    schema, and that gap is not hypothetical: three of the five types
+    (``FunctionCallStmt``, ``MemberCallStmt``, ``Assign``) have a declared-field
+    lock in ``test_codegen.py`` that caught the field being added, and
+    ``VarInit`` and ``IfThenElse`` have none, so for those two the addition was
+    invisible.  This closes it for all five at once, by deriving the set from
+    ``get_type_hints`` over the whole supported schema rather than restating it.
+
+    It fails in both directions: a sixth type gaining the field, or one of the
+    five losing it, breaks the equality.  The annotation is checked too, because
+    a field typed something other than ``Optional[ResultStorageMetadata]`` would
+    satisfy a set comparison while carrying a value the guard cannot read.
+    """
+
+    from typing import Optional as Opt
+    from typing import get_type_hints
+
+    declaring = {
+        node_type
+        for node_type in SUPPORTED_LLIR_NODE_TYPES
+        if "result_storage" in get_type_hints(node_type.__init__, vars(llir))
+    }
+
+    assert declaring == set(_RESULT_STORAGE_STATEMENT_TYPES)
+    for node_type in _RESULT_STORAGE_STATEMENT_TYPES:
+        hints = get_type_hints(node_type.__init__, vars(llir))
+        assert hints["result_storage"] == Opt[llir.ResultStorageMetadata], (
+            node_type.__name__,
+            hints["result_storage"],
+        )

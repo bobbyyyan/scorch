@@ -1873,6 +1873,10 @@ def test_function_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> No
         "name": str,
         "template_args": Tuple[llir.DataType, ...],
         "args": Tuple[llir.Expr, ...],
+        # The statement-level result-storage marker.  It is one of the node's
+        # declared fields and so belongs in this lock; it is ``compare=False``,
+        # which is why the equality assertions above are unaffected by it.
+        "result_storage": Optional[llir.ResultStorageMetadata],
     }
 
     with pytest.raises(FrozenInstanceError):
@@ -1950,6 +1954,7 @@ def test_member_call_stmt_is_frozen_typed_owned_and_structurally_equal() -> None
         "member": str,
         "template_args": Tuple[llir.DataType, ...],
         "args": Tuple[llir.Expr, ...],
+        "result_storage": Optional[llir.ResultStorageMetadata],
     }
 
     with pytest.raises(FrozenInstanceError):
@@ -2789,6 +2794,7 @@ def test_assign_target_is_narrowly_typed_frozen_and_structurally_equal() -> None
         "value": llir.Expr,
         "op": llir.AssignOp,
         "cast": bool,
+        "result_storage": Optional[llir.ResultStorageMetadata],
     }
 
     with pytest.raises(FrozenInstanceError):
