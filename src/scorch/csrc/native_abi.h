@@ -21,11 +21,11 @@
 // Cost of the ABI boundary
 //
 // These validators run on EVERY native call, and the CSR ones are O(nnz). Written
-// as branchy serial loops with a TORCH_CHECK per element they cost ~0.7-0.9 ns per
+// as branchy serial loops with a TORCH_CHECK per element they cost 1.29-1.82 ns per
 // nonzero — measured (redwood i9-14900K) at 1.2-2.0x the entire SpMM kernel on
 // narrow free dimensions, and, being serial, they put a hard Amdahl ceiling on
-// parallel speedup (spmm_csr_float_v2 scaled only 1.5-1.9x over 32 cores because of
-// this, against MKL's 4-15x).
+// parallel speedup (spmm_csr_float_v2 scaled only 1.5-4.0x over 32 cores because of
+// this, against MKL's 3.0-15.2x on the same cells).
 //
 // The screens below fix that without weakening a single check. Each folds every
 // violation into one OR / min / max accumulator, so the loop vectorizes and splits

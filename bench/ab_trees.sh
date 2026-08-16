@@ -11,6 +11,7 @@ BASE="${1:?base tree}"
 CAND="${2:?candidate tree}"
 OUT="${3:?out dir}"
 ROUNDS="${ROUNDS:-3}"
+DTYPE="${DTYPE:-float32}"
 PY="${PY:-python}"
 CELLS_FILE="${4:-}"
 mkdir -p "$OUT"
@@ -48,7 +49,7 @@ for r in $(seq 1 "$ROUNDS"); do
       if [ "$TREE_NAME" = base ]; then T="$BASE"; else T="$CAND"; fi
       for ARM in sc_off sc_balanced mkl32; do
         PYTHONPATH="$T/src" "$PY" "$T/bench/phase0_attrib.py" \
-          --matrix "$MAT" --n "$N" --arm "$ARM" --reps "$REPS" \
+          --matrix "$MAT" --n "$N" --arm "$ARM" --reps "$REPS" --dtype "$DTYPE" \
           --extra "{\"tree\":\"$TREE_NAME\",\"round\":$r}" 2>/dev/null \
           | grep '^ATTRIB ' | sed 's/^ATTRIB //' >> "$JSONL"
       done

@@ -8,8 +8,9 @@ Baseline arm is the faster of MKL's int32-index and int64-index CSR paths.*
 
 The losing cells are not bandwidth-bound, latency-bound, or launch-bound. They are
 bound by a **serial per-call input-validation pass in the native ABI boundary whose
-cost is proportional to `nnz` and independent of `N`**. It costs ~1.4–1.6 ns per
-nonzero, it does not parallelize, and it is charged on every `matmul`.
+cost is proportional to `nnz` and independent of `N`**. It costs **1.29–1.82 ns per
+nonzero** (measured across five cells spanning 0.43M–115M nonzeros), it does not
+parallelize, and it is charged on every `matmul`.
 
 The SpMM kernel itself is already faster than MKL on every cell measured, including
 the cells the previous study identified as needing a new kernel.
@@ -42,8 +43,9 @@ Two consequences worth stating plainly:
    per nonzero: column in `[0, cols)`, and within-row sortedness.
 
 Both run on every call, on both the row-pointer and the column-index array. Neither
-is parallel. Together: ~1.4–1.6 ns/nonzero, of which ~0.7–0.9 is (2) and ~0.6–0.7 is
-(1).
+is parallel. Together they measure at 1.29–1.82 ns/nonzero; feeding the STensor int32
+indices isolates part (1) at **0.37–0.93 ns/nonzero**, leaving **0.49–0.92** for (2).
+The spread tracks how much of the index array stays in cache.
 
 This was introduced by `1c83b5e` ("validate runtime and native ABI boundaries"), the
 commit two before the pinned baseline — so the entire 195-cell tiling study inherited
@@ -61,7 +63,7 @@ Three independent measurements agree on the size:
 |---|---|
 | the identical kernel + parallel skeleton, standalone with no torch (`bench/spmm_micro.cpp`) | 6–18x faster than the same kernel through `scorch.matmul` |
 | feeding the STensor int32 indices instead of int64 (no code change) | 1.20–1.95x faster, removing part (1) only |
-| gap ÷ nnz, across four matrices spanning 108K–36.8M nonzeros | 1.29, 1.48, 1.40, 1.42 ns/nnz — constant, i.e. per-nonzero |
+| gap ÷ nnz, across five matrices spanning 0.43M–115M nonzeros | 1.29, 1.48, 1.42, 1.53, 1.82 ns/nnz — near-constant, i.e. per-nonzero |
 
 ## Roofline attribution
 
