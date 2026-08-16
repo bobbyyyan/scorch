@@ -253,6 +253,33 @@ def run_memo_suite():
         PASSES += 1
         print(f"  note  blind spot did not trigger here (still rejected): {exc}")
 
+    # Two operands whose coordinate tensors are VIEWS of one buffer map to the same
+    # memo key, since the key is the StorageImpl address. The recorded data_ptr is what
+    # keeps them apart; without it, validating one would vouch for the other.
+    nnz = M * deg
+    buf = np.zeros(2 * nnz, dtype=np.int32)
+    ok_crd = np.tile(np.arange(deg, dtype=np.int32), M)
+    bad_crd = ok_crd.copy()
+    bad_crd[deg], bad_crd[deg + 1] = bad_crd[deg + 1], bad_crd[deg]
+    buf[:nnz] = ok_crd
+    buf[nnz:] = bad_crd
+    shared_t = torch.from_numpy(buf)
+    pos32 = torch.from_numpy(np.arange(M + 1, dtype=np.int32) * deg)
+    val32 = torch.from_numpy(np.ones(nnz, dtype=np.float32))
+    Bz = torch.zeros((J, N), dtype=torch.float32).reshape(-1)
+
+    def call_view(view):
+        return ops.spmm_csr_float_v2(
+            result_shape=[M, N], A_shape=[M, J],
+            A_mode_indices=[[], [pos32, view]], A_values=val32,
+            B_shape=[J, N], B_mode_indices=[[], []], B_values=Bz)
+
+    v_ok, v_bad = shared_t[:nnz], shared_t[nnz:]
+    for rnd in range(3):
+        expect_ok(f"shared-storage valid view, round {rnd}", lambda: call_view(v_ok))
+        expect_raise(f"shared-storage invalid view, round {rnd}", "must be sorted",
+                     lambda: call_view(v_bad))
+
     # ...and the kill switch has to restore strict checking. Re-exec is the only way to
     # set it, since the flag is read once per process.
     import subprocess
