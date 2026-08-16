@@ -18,11 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    FrozenSet,
     List,
     Literal,
     NoReturn,
     Optional,
     Sequence,
+    Set,
     Tuple,
     cast,
 )
@@ -245,7 +247,11 @@ class _ResultWriteRewriter(LLIRRewriter):
         }
     )
 
-    def __init__(self, context: ResultWriteContext) -> None:
+    def __init__(
+        self,
+        context: ResultWriteContext,
+        mirror_cursor_levels: FrozenSet[int],
+    ) -> None:
         super().__init__(context.traversal)
         self._result_name = context.result_name
         self._result_id = context.result_id
@@ -255,6 +261,11 @@ class _ResultWriteRewriter(LLIRRewriter):
         self._value_pointer_type = context.value_pointer_type
         self._context = context
         self._identity = LLIRRewriter(context.traversal)
+        #: The levels whose coordinate writes are ALL appends, so ``p{R}{L}`` is
+        #: a mirror of the vector's size rather than the write cursor and its
+        #: bump is the append's own advance spelled again.  Scanned from the body
+        #: this rewriter is about to rewrite; see :class:`_CoordinateWriteForms`.
+        self._mirror_cursor_levels = mirror_cursor_levels
 
     def rewrite_statement_sequence(
         self, statements: LLIRStatementSequence, path: LLIRPath
@@ -621,9 +632,24 @@ class _ResultWriteRewriter(LLIRRewriter):
     def _rewrite_increment_statement(
         self, node: llir.Increment, path: LLIRPath
     ) -> Sequence[llir.Stmt]:
+        """Advance the fill cursor, unless the coordinate write already does.
+
+        ``_pos{L}`` counts the coordinates written to ``{R}{L}_crd`` in this
+        cell, so it must advance exactly once per coordinate.  Where the body's
+        only spelling of that write is an append, the append grows the vector and
+        the append's own rewrite carries the advance; this bump then maintains a
+        mirror of the same size and emitting it too would move the cursor twice
+        per entry, writing past the exactly-sized coordinate and value buffers.
+        Everywhere else -- an indexed assignment at this level, or no coordinate
+        write at all -- this bump is the advance and is rewritten to one.
+        :class:`_CoordinateWriteForms` is where that is decided, from the body.
+
+        Count mode drops it either way: a counting phase has no cursor.
+        """
+
         for level in self._compressed_levels:
             if node.var.name == f"p{self._result_name}{level}":
-                if self._mode == "fill":
+                if self._mode == "fill" and level not in self._mirror_cursor_levels:
                     return (llir.Increment(self._phase_state("_pos", level)),)
                 return ()
         return (node,)
@@ -950,6 +976,83 @@ class _ResultStorageNameFinder(LLIRWalker):
                         self.written_members[name] = False
 
 
+class _CoordinateWriteForms(LLIRWalker):
+    """How each compressed level's coordinate write is spelled in one body.
+
+    Two vocabularies reach this pass and they put the fill phase's cursor
+    advance in different statements:
+
+    * ``{R}{L}_crd.push_back(x)`` / ``.emplace_back(x)`` GROWS the vector, so
+      the write cursor is the vector's own size and the append is the advance.
+      A ``p{R}{L}++`` beside it maintains a mirror of that size, which the
+      rewrite has already replaced by ``_pos{L}`` as a value, so honouring it
+      as a second advance would move the cursor twice per entry.
+    * ``{R}{L}_crd[p{R}{L}] = x`` grows nothing, so ``p{R}{L}`` IS the write
+      cursor -- which is why the rewrite may discard the original index and
+      store at ``_base{L} + _pos{L}`` -- and the following ``p{R}{L}++`` is the
+      advance.
+
+    Both can appear in ONE body for one level, and then they are two entries
+    with one advance each rather than two spellings of one advance.  So the only
+    case where the explicit bump is redundant is a level whose coordinate writes
+    are ALL appends, which is what :meth:`mirror_only_levels` reports.
+    """
+
+    def __init__(
+        self,
+        result_name: str,
+        compressed_levels: Sequence[int],
+        traversal: LLIRTraversalContext,
+    ) -> None:
+        super().__init__(traversal)
+        self._result_name = result_name
+        self._compressed_levels = tuple(compressed_levels)
+        self.appended: Set[int] = set()
+        self.assigned: Set[int] = set()
+
+    def _level_of(self, array_name: Optional[str]) -> Optional[int]:
+        if array_name is None:
+            return None
+        for level in self._compressed_levels:
+            if array_name == f"{self._result_name}{level}_crd":
+                return level
+        return None
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        node_type = type(node)
+        if node_type is llir.FunctionCallStmt:
+            appended = _ResultWriteRewriter._append_target(
+                cast(llir.FunctionCallStmt, node).name
+            )
+            level = self._level_of(appended)
+            if level is not None:
+                self.appended.add(level)
+        elif node_type is llir.Assign:
+            level = self._level_of(
+                _ResultWriteRewriter._array_name(cast(llir.Assign, node).var)
+            )
+            if level is not None:
+                self.assigned.add(level)
+
+    def mirror_only_levels(self) -> FrozenSet[int]:
+        """Levels whose coordinate writes are all appends, so a bump is a mirror."""
+
+        return frozenset(self.appended - self.assigned)
+
+
+def _scan_coordinate_write_forms(
+    value: LLIRRewriteValueT,
+    context: ResultWriteContext,
+) -> FrozenSet[int]:
+    """The levels whose explicit cursor bump is the append's advance restated."""
+
+    scan = _CoordinateWriteForms(
+        context.result_name, context.compressed_levels, context.traversal
+    )
+    scan.walk(cast(LLIRValue, value))
+    return scan.mirror_only_levels()
+
+
 @dataclass(frozen=True)
 class _ResidueFinding:
     """One surviving reference to storage the pass was supposed to remove."""
@@ -1256,7 +1359,10 @@ def rewrite_result_writes(
 
     checked_context = _validate_context(context)
     LLIRWalker(checked_context.traversal).walk(cast(LLIRValue, value))
-    rewriter = _ResultWriteRewriter(checked_context)
+    rewriter = _ResultWriteRewriter(
+        checked_context,
+        _scan_coordinate_write_forms(value, checked_context),
+    )
 
     if isinstance(value, llir.Stmt):
         scalar_root: List[llir.Stmt] = [value]

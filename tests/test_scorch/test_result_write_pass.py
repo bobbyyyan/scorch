@@ -284,6 +284,58 @@ def test_count_rewrite_matches_legacy_single_level_structure() -> None:
     assert _cpp(rewritten) == "_cnt1++;\n_cnt1++;\nscratch = keep;"
 
 
+def _append_only_writes() -> List[llir.Stmt]:
+    """The ordered-key drain's vocabulary: append, then bump a mirror cursor.
+
+    ``emplace_back`` grows the vector, so the append IS the advance; the family
+    keeps ``pResult1`` as a mirror of the vector's size because its own
+    position-boundary conditional reads it.  Contrast
+    :func:`_single_level_serial_writes`, whose ``Result1_crd[pResult1] = x`` grows
+    nothing and whose bump therefore is the advance.
+    """
+
+    return [
+        llir.FunctionCallStmt(
+            "Result_values.emplace_back",
+            [_var("value")],
+            result_storage=_marker((_VALUES, None, True)),
+        ),
+        llir.FunctionCallStmt(
+            "Result1_crd.emplace_back",
+            [_var("coordinate")],
+            result_storage=_marker((_CRD, 1, True)),
+        ),
+        llir.Increment(_var("pResult1", llir.DataType.INT64)),
+    ]
+
+
+def test_an_append_only_body_advances_the_fill_cursor_once() -> None:
+    """One advance per appended coordinate, decided from the body.
+
+    Both statements mean "one more entry at level 1", so honouring both moved
+    ``_pos1`` twice per entry: every coordinate and value landed at twice its
+    offset, and the writes ran past buffers the counting phase had sized exactly.
+    The counting phase was right all along, which is why nothing that only
+    compiles could see it.
+    """
+
+    rewritten = rewrite_result_writes(_append_only_writes(), _context("fill"))
+
+    assert _cpp(rewritten) == (
+        "Result_values_data[_base1 + _pos1] = value;\n"
+        "Result1_crd_data[_base1 + _pos1] = coordinate;\n"
+        "_pos1++;"
+    )
+
+
+def test_an_append_only_body_counts_once_per_entry() -> None:
+    """The count phase is unchanged: it never had a cursor to advance twice."""
+
+    rewritten = rewrite_result_writes(_append_only_writes(), _context("count"))
+
+    assert _cpp(rewritten) == "_cnt1++;"
+
+
 def test_fill_rewrite_matches_legacy_single_level_structure() -> None:
     source = _single_level_serial_writes()
     expected: List[llir.Stmt] = [
