@@ -543,7 +543,18 @@ def test_a_drain_spanning_two_compressed_levels_refuses_the_two_pass(strategy):
     assert "closed by a prefix loop" in raised.value.defect.message
 
 
-def test_the_two_pass_strategies_reproduce_the_single_pass_storage():
+@pytest.mark.parametrize(
+    ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "shape"),
+    [
+        pytest.param("sss", "ds", "ijk", "ik", (5, 4), id="one-stored-prefix-loop"),
+        pytest.param(
+            "ssss", "dss", "ijkl", "ijl", (3, 4, 5), id="two-stored-prefix-loops"
+        ),
+    ],
+)
+def test_the_two_pass_strategies_reproduce_the_single_pass_storage(
+    operand_fmt, result_fmt, operand_indices, result_indices, shape
+):
     """Interchangeable means the same output tensor, index arrays included.
 
     The receiver's trailing coordinates are left EMPTY on purpose.  A stored
@@ -552,6 +563,13 @@ def test_the_two_pass_strategies_reproduce_the_single_pass_storage():
     prefix sum's tail; an input whose last rows are non-empty cannot tell a
     correct tail from a missing one.  The leading coordinates are empty for the
     same reason at the other end.
+
+    Two shapes, because the second prefix loop is where they differ.  ``ijk->ik``
+    has one stored prefix loop and a drain that assembles the only compressed
+    level.  ``ijkl->ijl`` has TWO stored prefix loops -- the second one binding a
+    compressed result level, which it closes with the position-boundary
+    conditional -- so its counting phase carries a count array per compressed
+    level and both are indexed by the outermost loop's coordinate.
     """
 
     from scorch.compiler.loopir.pipeline import execute_cin_via_loopir
@@ -559,19 +577,23 @@ def test_the_two_pass_strategies_reproduce_the_single_pass_storage():
 
     rows = 2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD
     generator = torch.Generator().manual_seed(20260816)
-    dense = torch.rand((rows, 5, 4), generator=generator, dtype=torch.float64)
+    operand_shape = (rows,) + shape
+    dense = torch.rand(operand_shape, generator=generator, dtype=torch.float64)
     dense = dense * (
-        torch.rand((rows, 5, 4), generator=generator, dtype=torch.float64) < 0.4
+        torch.rand(operand_shape, generator=generator, dtype=torch.float64) < 0.4
     )
     dense[:2] = 0.0
     dense[-3:] = 0.0
     dense = dense.to(_F32)
-    operand = STensor.from_torch(dense.clone(), "A").to_sparse("sss")
+    operand = STensor.from_torch(dense.clone(), "A").to_sparse(operand_fmt)
+    result_shape = (rows,) + tuple(
+        operand_shape[operand_indices.index(char)] for char in result_indices[1:]
+    )
 
     def storage(strategy):
         result = execute_cin_via_loopir(
-            reduction_cin("sss", "ds", "ijk", "ik"),
-            (rows, 4),
+            reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
+            result_shape,
             operand,
             compile_options=auto_options(assembly=strategy, jit=True),
         )[0]
@@ -586,12 +608,16 @@ def test_the_two_pass_strategies_reproduce_the_single_pass_storage():
     serial = storage("single_pass_serial")
     assert storage("two_pass_serial") == serial
     assert storage("two_pass_parallel") == serial
-    # And the assembled result is the reduction, not merely self-consistent.
+    # And the assembled result is the reduction, not merely self-consistent: the
+    # first compressed level's positions open at zero, stay there through the
+    # empty leading cells, and close at the entry count through the empty
+    # trailing ones.
     positions = serial[0][1][0]
     assert positions[0] == 0
     assert positions[1] == 0 and positions[2] == 0
     assert positions[-1] == positions[-2] == positions[-3] == positions[-4]
-    assert positions[-1] == len(serial[1])
+    if result_fmt == "ds":
+        assert positions[-1] == len(serial[1])
 
 
 def test_a_strategy_cannot_compose_with_a_decision_that_owns_the_same_assembly():
