@@ -665,8 +665,11 @@ def test_both_canonical_schemas_moved_and_the_plan_bytes_carry_the_strategy():
     content: it enters the plan's canonical form and therefore every identity
     derived from it."""
 
-    assert CANONICAL_SCHEMA == "scorch.loopir.canonical.v12"
-    assert CANONICAL_PLAN_SCHEMA == "scorch.loopplan.canonical.v2"
+    # Both have moved again since, for the accumulation structure that
+    # ``test_sparse_accumulator_structure.py`` owns; what this case locks is that
+    # the strategy is IN the canonical form, not which version it arrived at.
+    assert CANONICAL_SCHEMA == "scorch.loopir.canonical.v13"
+    assert CANONICAL_PLAN_SCHEMA == "scorch.loopplan.canonical.v3"
 
     cin = ttm_cin("dss", "ss", "dss")
     order = tuple(

@@ -1543,6 +1543,39 @@ def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
         )
 
 
+def _verify_accumulator(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
+    """Prove one recorded sparse accumulation structure legal for this result.
+
+    The authoritative refusal, with a structured code, for every plan reaching
+    the typed route from either origin, paired with the earlier statement of the
+    same rule on the explicit surface exactly as :func:`_verify_assembly` is.
+
+    One obligation, and it is the only one provable here: the structure is a
+    property of the workspace a SPARSE reduction accumulates through, and a dense
+    result has none.  The remaining refusals need facts this boundary does not
+    have -- the workspace's key rank, and whether the emitted body puts the
+    declaration where the two-phase transform can reach it -- so they live in
+    target lowering and in that pass, each where its input lives.
+
+    Extents and densities are deliberately absent: whether a legal structure pays
+    is cost, and cost is not legality.
+    """
+
+    structure = plan.accumulator
+    if structure is None:
+        return
+    result = _unique_result(facts, ("plan", "accumulator"))
+    if all(level is LevelType.DENSE for level in result.level_types):
+        _unsupported(
+            "unsupported_schedule_accumulator",
+            f"accumulation structure {structure!r} names the structure a sparse "
+            "reduction accumulates through; this result is dense and has no "
+            "sparse accumulation workspace",
+            ("plan", "accumulator"),
+            symbol_id=result.tensor_id,
+        )
+
+
 def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     """Prove one structurally valid plan legal for its analyzed normalized CIN."""
 
@@ -1557,3 +1590,4 @@ def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
     _verify_result_tile(facts, plan, state, parallel)
     _verify_relayout(facts, plan, parallel)
     _verify_assembly(facts, plan)
+    _verify_accumulator(facts, plan)

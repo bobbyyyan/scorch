@@ -131,6 +131,7 @@ from ..identity import IndexId, SymbolId
 from ..sparse_assembly import partitionable_receiver_levels
 from .nodes import (
     AppendEntry,
+    AccumulatorStructure,
     AssemblyStrategy,
     BinaryExpr,
     BinaryOp,
@@ -2985,6 +2986,7 @@ def verify_program(program: object) -> None:
         if program.parallel is not None:
             _check_parallel_selection(ctx, program)
         _check_assembly_strategy(ctx, program)
+        _check_accumulator_structure(ctx, program)
     finally:
         _leave(ctx, program)
 
@@ -3031,4 +3033,39 @@ def _check_assembly_strategy(ctx: "_Context", program: LoopProgram) -> None:
                 f"assembly strategy {strategy.value!r} requires a receiver with "
                 "a dense level zero and every level below it compressed; "
                 f"output {decl.name!r} does not have one",
+            )
+
+
+def _check_accumulator_structure(ctx: "_Context", program: LoopProgram) -> None:
+    """Require a recorded accumulation structure to be legal for this result.
+
+    Two obligations, both structural.  The field must be an exact
+    :class:`AccumulatorStructure` or ``None`` -- a forged string would otherwise
+    reach target lowering and be compared against enum members that never match.
+    And a structure is a property of the workspace a SPARSE reduction
+    accumulates through, so a wholly dense result cannot record one.
+
+    Extents and densities are deliberately absent: this is legality, and whether
+    a legal structure pays is owned by target lowering's own choice and, next, by
+    a selector.
+    """
+
+    structure = program.accumulator
+    if structure is None:
+        return
+    if type(structure) is not AccumulatorStructure:
+        _fail(
+            "malformed_state",
+            "program.accumulator",
+            "accumulator must be an AccumulatorStructure or None",
+        )
+    for position, symbol in enumerate(program.outputs):
+        decl = ctx.tensors[symbol]
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
+            _fail(
+                "unsupported_accumulator_structure",
+                f"program.outputs[{position}]",
+                f"accumulation structure {structure.value!r} names the structure "
+                "a sparse reduction accumulates through; the dense output "
+                f"{decl.name!r} has no sparse accumulation workspace",
             )

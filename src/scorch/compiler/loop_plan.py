@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
 from .cin_analysis import CINAnalysis, analyze_cin
 from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
+from .sparse_accumulator import is_accumulator_structure
 from .sparse_assembly import is_assembly_strategy
 
 if TYPE_CHECKING:
@@ -217,6 +218,16 @@ class LoopPlan:
     ``single_pass_serial``.  The token names assembly structure only: thread
     counts, chunk widths, pragma spelling and the runtime gate are target
     decisions and never appear in a plan.
+
+    ``accumulator`` records which structure a sparse reduction accumulates
+    through -- a list of the keys inserted, or a chain threaded through an array
+    indexed by the key.  Which one is faster depends on the density and on the
+    receiver's compressed extent, so it is a scheduling decision rather than
+    something an assembly transform may substitute on the way past.  ``None``
+    records *no* structure decision and leaves every existing layer choosing what
+    it chooses today; it is not a synonym for ``coordinate_list``.  This field is
+    distinct from ``workspace``, which records WHERE the automatic scheduler
+    inserted an accumulation workspace rather than WHICH structure holds it.
     """
 
     loop_order: Tuple[IndexId, ...]
@@ -227,6 +238,7 @@ class LoopPlan:
     parallel_loop: Optional[LoopRef] = None
     workspace: Optional[WorkspaceInsertion] = None
     assembly: Optional[str] = None
+    accumulator: Optional[str] = None
     auto_policy: Optional[AutoOriginPolicy] = None
     provenance: str = "explicit"
     tag: str = ""
@@ -438,6 +450,26 @@ def _validate_loop_placement(placement: object, path: str) -> LoopPlacement:
     return typed_placement
 
 
+def _validate_output_decision_tokens(plan: LoopPlan) -> None:
+    """Reject a forged token in either sparse-output decision.
+
+    Both fields are plain strings on the plan, so a value that is not one of the
+    recorded tokens would otherwise reach a layer that compares it against enum
+    members and silently matches nothing.  Each token set has exactly one
+    definition, imported here rather than restated.
+    """
+
+    if plan.assembly is not None and not is_assembly_strategy(plan.assembly):
+        raise VerificationError(
+            "LoopPlan.assembly must be a recorded sparse assembly strategy or None"
+        )
+    if plan.accumulator is not None and not is_accumulator_structure(plan.accumulator):
+        raise VerificationError(
+            "LoopPlan.accumulator must be a recorded sparse accumulation "
+            "structure or None"
+        )
+
+
 def _validate_loop_plan_structure(plan: object) -> LoopPlan:
     """Reject malformed typed fields before semantic plan verification."""
 
@@ -455,6 +487,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "parallel_loop",
             "workspace",
             "assembly",
+            "accumulator",
             "auto_policy",
             "provenance",
             "tag",
@@ -607,12 +640,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             raise VerificationError(
                 "LoopPlan dense workspace insertion stores exactly one axis"
             )
-    if typed_plan.assembly is not None and not is_assembly_strategy(
-        typed_plan.assembly
-    ):
-        raise VerificationError(
-            "LoopPlan.assembly must be a recorded sparse assembly strategy or None"
-        )
+    _validate_output_decision_tokens(typed_plan)
     if typed_plan.auto_policy is not None:
         _validate_auto_policy_structure(typed_plan.auto_policy)
     if type(typed_plan.provenance) is not str or not typed_plan.provenance:

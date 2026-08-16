@@ -97,7 +97,13 @@ from ..loop_plan import (
 #: key is present with a ``null`` value on a plan that records no strategy, so
 #: every plan's bytes move once and "no decision" stays distinguishable from
 #: "serial by decision".
-CANONICAL_PLAN_SCHEMA = "scorch.loopplan.canonical.v2"
+#:
+#: v2 -> v3: the plan records which structure holds a sparse reduction's
+#: accumulation, for the same reason and on the same terms.  The key is present
+#: with a ``null`` value on a plan that records no structure, so every plan's
+#: bytes move once more and "no decision" stays distinguishable from "coordinate
+#: list by decision".
+CANONICAL_PLAN_SCHEMA = "scorch.loopplan.canonical.v3"
 CANONICAL_REQUEST_SCHEMA = "scorch.loopir.request.v2"
 _MAX_RUNTIME_EXTENT = 2**63 - 1
 _MAX_CANONICAL_CIN_DEPTH = 512
@@ -525,6 +531,7 @@ def _plan_payload(
             else _loop_ref_payload(verified.parallel_loop, index_map)
         ),
         "assembly": verified.assembly,
+        "accumulator": verified.accumulator,
         "workspace": (
             None
             if verified.workspace is None

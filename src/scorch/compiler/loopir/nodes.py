@@ -1191,6 +1191,24 @@ class AssemblyStrategy(Enum):
     TWO_PASS_PARALLEL = "two_pass_parallel"
 
 
+@unique
+class AccumulatorStructure(Enum):
+    """Which structure holds a sparse reduction's accumulation, target-neutrally.
+
+    A list of the keys inserted, or a chain threaded through an array indexed by
+    the key.  The member values are the same tokens the public schedule and the
+    ``LoopPlan`` record, defined once in
+    :mod:`scorch.compiler.sparse_accumulator`; this enum is the typed form the
+    program carries.  The names describe accumulation *structure* only — the
+    container, its capacity, whether it is pooled per worker and how an insert is
+    spelled are target decisions and appear nowhere in LoopIR, exactly as they
+    appear nowhere in :class:`AssemblyStrategy`.
+    """
+
+    COORDINATE_LIST = "coordinate_list"
+    LINKED_LIST = "linked_list"
+
+
 @dataclass(frozen=True)
 class LoopProgram(LoopIRNode):
     """One executable LoopIR program: declarations plus a top-level block.
@@ -1208,6 +1226,15 @@ class LoopProgram(LoopIRNode):
     decision was recorded and target lowering keeps its own per-receiver choice,
     which is why an automatically scheduled program emits exactly what it
     emitted before this field existed.
+
+    ``accumulator`` optionally carries which structure holds a sparse
+    reduction's accumulation, on the same terms again.  Which structure is
+    faster depends on the density and on the receiver's compressed extent, so it
+    is a scheduling decision rather than something an assembly transform may
+    impose on the way past.  ``None`` means no structure decision was recorded
+    and every existing layer keeps choosing what it chooses today — including
+    the two-phase transform's substitution, which is why a program that records
+    nothing emits exactly what it emitted before this field existed.
     """
 
     node_id: LoopIRNodeId
@@ -1218,3 +1245,4 @@ class LoopProgram(LoopIRNode):
     body: Block
     parallel: Optional[ParallelSelection] = None
     assembly: Optional[AssemblyStrategy] = None
+    accumulator: Optional[AccumulatorStructure] = None

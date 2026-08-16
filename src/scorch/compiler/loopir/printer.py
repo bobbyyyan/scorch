@@ -81,7 +81,14 @@ from .verifier import verify_program
 # It selects which kernel one program emits, so it is program semantics and
 # enters the canonical form; ``null`` records that no strategy was chosen and
 # target lowering keeps its own per-receiver choice.
-CANONICAL_SCHEMA = "scorch.loopir.canonical.v12"
+#
+# v13 adds ``accumulator`` beside it: which structure holds a sparse reduction's
+# accumulation, a list of the keys inserted or a chain indexed by the key.  It
+# changes the emitted kernel's runtime by up to 1.57x (review section 67.3), so
+# it is a scheduling decision and enters the canonical form for the same reason;
+# ``null`` records that no structure was chosen and every existing layer keeps
+# choosing what it chooses today.
+CANONICAL_SCHEMA = "scorch.loopir.canonical.v13"
 
 
 class _CanonicalIds:
@@ -620,6 +627,9 @@ def canonical_program_dump(program: LoopProgram) -> str:
             else _serialize_parallel(program.parallel, ids)
         ),
         "assembly": (None if program.assembly is None else program.assembly.value),
+        "accumulator": (
+            None if program.accumulator is None else program.accumulator.value
+        ),
     }
     return json.dumps(
         payload,

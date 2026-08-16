@@ -130,6 +130,14 @@ from ..torch_cpp_abi import (
     TorchCppKernelABI,
 )
 from ...utils import dtype_to_c_datatype
+from ..sparse_accumulator import (
+    CHAINED_ACCUMULATOR_STRUCTURE,
+    DECLARED_ACCUMULATOR_STRUCTURE,
+    SPARSE_ACCUMULATOR_STRUCTURES,
+    UNSUPPORTED_ACCUMULATOR_HOST,
+    UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+    single_coordinate_key,
+)
 from ..sparse_assembly import (
     DEFAULT_SERIAL_STRATEGY,
     SPARSE_ASSEMBLY_STRATEGIES,
@@ -147,6 +155,7 @@ from .parallel_chunk_assembly import (
     parallel_chunk_generated_names,
 )
 from .nodes import (
+    AccumulatorStructure,
     AppendEntry,
     AssemblyStrategy,
     BinaryExpr,
@@ -304,6 +313,7 @@ _LOOPIR_GRAPH_NODE_TYPES = (
     WorkspaceRegion,
 )
 _LOOPIR_GRAPH_ENUM_TYPES = (
+    AccumulatorStructure,
     AssemblyStrategy,
     BinaryOp,
     LevelKind,
@@ -5686,6 +5696,80 @@ class _TargetLowering:
 
         return self.assembly_strategy() in TWO_PASS_STRATEGIES
 
+    # -- accumulation structure -----------------------------------------------
+
+    def supported_accumulators(self) -> Tuple[str, ...]:
+        """Every sparse accumulation structure this family can emit.
+
+        Empty by default, and that is the truthful answer for a family with no
+        sparse accumulation workspace: there is no structure to choose, so an
+        explicit request fails closed with ``unsupported_accumulator_host``
+        rather than being accepted and ignored.  A family that has one overrides
+        this with what it can actually emit.
+        """
+
+        return ()
+
+    def default_accumulator(self) -> Optional[str]:
+        """The structure this family chooses when the plan records none.
+
+        ``None``, on every family, and that is today's state stated rather than
+        dressed up: no family CHOOSES an accumulation structure.  Where the
+        shared two-phase pass fires it substitutes its own, and where it does not
+        the family's declaration stands.  ``None`` leaves both of those exactly
+        as they are, which is what makes an automatically scheduled program emit
+        the kernel it emitted before this field existed.
+
+        Naming a token here instead would mean re-deriving the pass's own trigger
+        in this layer, and a scheduling rule living in two layers is the defect
+        that cost twelve cells at review section 57.5.  This is the seam a
+        selector replaces, and section 67.3's numbers are what it should be built
+        on.
+        """
+
+        return None
+
+    def accumulator_structure(self) -> Optional[str]:
+        """The structure this program accumulates through.
+
+        The plan's recorded structure if it has one, else this family's default.
+        A recorded structure this family cannot emit fails closed; it is never
+        quietly replaced, because a caller who asked for one structure and got
+        another has no way to find out.
+        """
+
+        requested = self.program.accumulator
+        if requested is None:
+            return self.default_accumulator()
+        structure = requested.value
+        if structure not in self.supported_accumulators():
+            supported = ", ".join(self.supported_accumulators()) or "no structure"
+            _fail(
+                UNSUPPORTED_ACCUMULATOR_HOST,
+                f"accumulation structure {structure!r} is legal for this result "
+                f"but {type(self).__name__} emits {supported}",
+            )
+        return structure
+
+    def require_accumulator_without_two_phase(self) -> None:
+        """Refuse a structure only the two-phase transform could have produced.
+
+        Called once by the shared driver on every program the transform does NOT
+        own, so no family can forget it.  Without the transform the emitted
+        structure is whatever the family declared -- the coordinate list -- so a
+        request for the chained structure cannot be honoured and is refused here
+        rather than accepted and dropped.  A request for the coordinate list is
+        honoured, and honouring it happens to change nothing.
+        """
+
+        if self.accumulator_structure() == CHAINED_ACCUMULATOR_STRUCTURE:
+            _fail(
+                UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+                f"accumulation structure {CHAINED_ACCUMULATOR_STRUCTURE!r} is "
+                "produced by the two-phase assembly transform, and no two-phase "
+                "assembly owns this program's output",
+            )
+
     def compressed_where_pass_spec(
         self, compile_options: CompileOptions
     ) -> Optional[CompressedWhereOpenMPPassSpec]:
@@ -5718,12 +5802,33 @@ class _TargetLowering:
         dense level itself.  Omitting it -- which every family with a dense outer
         loop does -- leaves the pass deriving both facts from the loop header, so
         the emission is unchanged.
+
+        The resolved accumulation structure travels with it.  ``None`` -- no
+        decision -- leaves the pass substituting exactly where it substitutes
+        today, which is what keeps this byte-neutral; a recorded structure is
+        honoured or refused by the pass, which is the only layer that knows
+        whether the emitted body gives it a declaration to substitute.  The
+        chained structure additionally needs a single-component key, because its
+        chain lives in an array indexed by the key itself, and that fact lives
+        here.
         """
 
         strategy = self.assembly_strategy()
         if strategy not in TWO_PASS_STRATEGIES:
             return None
         from ..compressed_where_openmp_pass import CompressedWhereOpenMPContext
+
+        accumulator = self.accumulator_structure()
+        if accumulator == CHAINED_ACCUMULATOR_STRUCTURE and not single_coordinate_key(
+            len(workspace_decl.key_dimensions)
+        ):
+            _fail(
+                UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+                f"accumulation structure {accumulator!r} chains its occupancy "
+                "through an array indexed by the key, so it requires a key of "
+                f"exactly one component; {workspace_decl.name!r} has "
+                f"{len(workspace_decl.key_dimensions)}",
+            )
 
         if not _partitionable_receiver(self.result_decl):
             _fail(
@@ -5752,6 +5857,7 @@ class _TargetLowering:
                 compile_options=compile_options,
                 parallel=strategy == "two_pass_parallel",
                 outer_cell=outer_cell,
+                accumulator=accumulator,
             )
         )
 
@@ -7290,6 +7396,21 @@ class _SparseWorkspaceLowering(_TargetLowering):
 
     def _result_layout_requirement(self) -> str:
         return "an identity-ordered doubly-compressed result"
+
+    # -- accumulation structure -----------------------------------------------
+
+    def supported_accumulators(self) -> Tuple[str, ...]:
+        """The coordinate list, which is the only structure this family emits.
+
+        The receiver is doubly compressed, so no assembly strategy that could
+        substitute anything is legal for it: the two-phase transform never runs
+        here, and ``coo_workspace_1d`` declared inside the row loop is the whole
+        of what this family and its row-scope subclass emit.  Listing only that
+        makes a request for the chained structure name the host rather than
+        surface an internal failure somewhere downstream.
+        """
+
+        return (DECLARED_ACCUMULATOR_STRUCTURE,)
 
     def _validate_family_shape(self) -> None:
         def require(condition: bool, what: str) -> None:
@@ -9179,6 +9300,24 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             ):
                 self._reserve_generated_name(name, assembly_owner)
 
+    # -- accumulation structure -----------------------------------------------
+
+    def supported_accumulators(self) -> Tuple[str, ...]:
+        """Both, because this family emits one and hosts the pass that emits the
+        other.
+
+        Its own emission declares ``coo_workspace_1d`` (rank-1 key) or
+        ``coo_workspace`` (rank-K), which is the coordinate list; under a
+        two-pass strategy the shared transform can replace a declaration it can
+        reach with the chained one.  Whether it CAN reach it depends on the
+        emitted body, which is the pass's own fact and its own refusal, and
+        whether a two-pass strategy is even selected is checked once by the
+        shared driver -- so both halves of the program-side question are answered
+        where their inputs live rather than restated here.
+        """
+
+        return SPARSE_ACCUMULATOR_STRUCTURES
+
     # -- assembly strategy ----------------------------------------------------
 
     def supported_assemblies(self) -> Tuple[str, ...]:
@@ -10419,6 +10558,25 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
         """Today's choice for this family, named and unchanged: two-phase parallel."""
 
         return "two_pass_parallel"
+
+    # -- accumulation structure -----------------------------------------------
+
+    def supported_accumulators(self) -> Tuple[str, ...]:
+        """Only the chained structure, because the completion mirror requires it.
+
+        :meth:`complete_sparse_workspace` reconstructs the expected assembled
+        function from this family's own facts, and the reconstruction hard-codes
+        the per-worker pool, the ``make_view()`` borrow and ``insert_unchecked``.
+        Keeping the coordinate list would therefore fail
+        ``sparse_workspace_completion_lost`` -- an internal completion failure
+        rather than an answer to the caller's question.  Listing only what is
+        emittable makes the refusal name the host instead, exactly as this
+        family's assembly list does; widening it means teaching that validator
+        the other shape, which is a separate change with its own correctness
+        obligation.
+        """
+
+        return (CHAINED_ACCUMULATOR_STRUCTURE,)
 
     def compressed_where_pass_spec(
         self, compile_options: CompileOptions
@@ -15567,12 +15725,18 @@ def _lower_loopir_to_llir_owned(
         return LLIRRewriteArtifact(body_stmts)
 
     manager = LLIRPassManager.from_compile_options(compile_options)
+    compressed_where_pass_spec = lowering.compressed_where_pass_spec(compile_options)
+    if compressed_where_pass_spec is None:
+        # The one place every lowering passes through, so no family can forget
+        # it: with no two-phase transform owning this output, the emitted
+        # accumulation structure is whatever the family declared, and a request
+        # for the one only that transform produces has to be refused rather than
+        # accepted and dropped.
+        lowering.require_accumulator_without_two_phase()
     try:
         pipeline_result = manager.run_production_pipeline(
             LLIRStatementListArtifact(raw_statements),
-            compressed_where_pass_spec=lowering.compressed_where_pass_spec(
-                compile_options
-            ),
+            compressed_where_pass_spec=compressed_where_pass_spec,
             dense_pointer_pass_spec=DensePointerHoistPassSpec(
                 DensePointerHoistContext(
                     value_array_ctypes=lowering.value_array_ctypes()

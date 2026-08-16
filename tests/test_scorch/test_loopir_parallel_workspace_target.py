@@ -299,7 +299,7 @@ def test_completed_target_owns_the_pipeline_route(regblock_enabled):
     assert kernel.schedule is not None
     verify_scheduled_loopir(kernel.schedule)
     assert '"kind":"sparse_workspace_region"' in kernel.program_dump
-    assert '"schema":"scorch.loopir.canonical.v12"' in kernel.program_dump
+    assert '"schema":"scorch.loopir.canonical.v13"' in kernel.program_dump
     assert kernel.cpp_source == legacy_generated_cpp(
         build_spgemm_cin(),
         (4, 5),

@@ -140,6 +140,7 @@ from ..loop_plan import (
 from .build import LoopIRBuilder
 from .nodes import (
     LEVEL_KIND_TO_LEVEL_TYPE,
+    AccumulatorStructure,
     AppendEntry,
     AssemblyStrategy,
     BinaryExpr,
@@ -2758,6 +2759,10 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
     # target lowering makes its own per-receiver choice, byte for byte as before.
     # A recorded strategy therefore always came from a caller, which is what makes
     # this a contract and not an unverified degree of freedom.
+    #
+    # ``plan.accumulator`` is admitted on the same terms and for the same reason:
+    # the structure is a property of the accumulation workspace, so a plan
+    # carrying one must be the plan that records the insertion.
     if (
         plan.panel_bounds
         or plan.relayout is not None
@@ -3259,15 +3264,76 @@ def select_assembly_strategy(program: LoopProgram, plan: LoopPlan) -> LoopProgra
     return stamped
 
 
-def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
-    """Apply every supported plan decision, then stamp the assembly strategy.
+def select_accumulator_structure(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Consume the plan's ``accumulator`` fact exactly once.
 
-    The assembly fact is consumed at the single exit rather than at each of the
-    family-specific returns below, so no family can forget it.
+    Runs last, beside :func:`select_assembly_strategy` and for the same reason:
+    which structure a sparse reduction accumulates through changes the emitted
+    kernel, so it is program semantics that target lowering consumes rather than
+    a target annotation.
+
+    ``None`` consumes nothing and leaves ``program.accumulator`` unset, which is
+    what keeps every automatically scheduled program emitting exactly the kernel
+    it emitted before this field existed -- including, where the two-phase
+    transform fires, the chained structure that transform substitutes.
+
+    The legality this pass owns is the half decidable from the plan and the
+    result: a structure is a property of a sparse reduction's workspace, and a
+    dense result has none.  The remaining halves -- the workspace's key rank, and
+    whether the emitted body gives the transform a declaration to substitute --
+    are proved by target lowering and by that pass, where their inputs live.
+    Neither half consults an extent or a density: that is cost.
     """
 
-    return select_assembly_strategy(
-        _apply_schedule_decisions(program, plan),
+    verify_program(program)
+    checked = _validate_plan_for_pass(plan)
+    structure = checked.accumulator
+    if structure is None:
+        if program.accumulator is not None:
+            _fail(
+                "invalid_schedule_accumulator",
+                "a program already carrying an accumulation structure cannot be "
+                "paired with a plan that has no accumulator fact",
+            )
+        return program
+    if program.accumulator is not None:
+        _fail(
+            "invalid_schedule_accumulator",
+            "the scheduled program already carries an accumulation structure; "
+            "the plan fact would not be consumed exactly once",
+        )
+    for symbol in program.outputs:
+        decl = next((decl for decl in program.tensors if decl.symbol == symbol), None)
+        if decl is None:
+            _fail(
+                "invalid_schedule_accumulator",
+                "an accumulation structure names a result that is not declared",
+            )
+        if all(level.kind is LevelKind.DENSE for level in decl.levels):
+            _fail(
+                "unsupported_schedule_accumulator",
+                f"accumulation structure {structure!r} names the structure a "
+                "sparse reduction accumulates through; the dense result "
+                f"{decl.name!r} has no sparse accumulation workspace",
+            )
+    stamped = replace(program, accumulator=AccumulatorStructure(structure))
+    verify_program(stamped)
+    return stamped
+
+
+def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Apply every supported plan decision, then stamp the two output decisions.
+
+    The assembly and accumulator facts are consumed at the single exit rather
+    than at each of the family-specific returns below, so no family can forget
+    either.
+    """
+
+    return select_accumulator_structure(
+        select_assembly_strategy(
+            _apply_schedule_decisions(program, plan),
+            plan,
+        ),
         plan,
     )
 
@@ -3440,6 +3506,7 @@ def _verify_scheduled_loopir(
         or base_result_tiles
         or base_program.parallel is not None
         or base_program.assembly is not None
+        or base_program.accumulator is not None
         or type(base_leaf) is WorkspaceRegion
         or type(base_leaf) is SparseWorkspaceRegion
         or type(base_leaf) is TiledReduce
@@ -3452,7 +3519,8 @@ def _verify_scheduled_loopir(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
             "loops, panels, dense or sparse workspace regions, staging regions, "
-            "result-tile regions, a parallel selection, or an assembly strategy",
+            "result-tile regions, a parallel selection, an assembly strategy, or "
+            "an accumulation structure",
         )
 
     replayed = (

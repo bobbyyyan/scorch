@@ -4753,3 +4753,67 @@ def test_production_workspace_pool_construction_is_structured_and_byte_exact() -
     )
     assert _structural_snapshot(detached) == _structural_snapshot(first_block)
     assert _mutable_ir_ids(detached).isdisjoint(_mutable_ir_ids(first_block))
+
+
+# -- the refusal surface, locked in both directions ---------------------------
+
+#: Every structured code this pass can refuse with.  Locked as a SET so the check
+#: fails in both directions: a new refusal that nobody documented, and a code
+#: removed while a test still names it.
+COMPRESSED_WHERE_REFUSAL_CODES = {
+    # Context validation: the caller handed this pass something it cannot use.
+    "invalid_compressed_where_accumulator",
+    "invalid_compressed_where_compile_options",
+    "invalid_compressed_where_context",
+    "invalid_compressed_where_flop_grain",
+    "invalid_compressed_where_levels",
+    "invalid_compressed_where_outer_cell",
+    "invalid_compressed_where_policy",
+    "invalid_compressed_where_result_assembler",
+    "invalid_compressed_where_result_id",
+    "invalid_compressed_where_result_name",
+    "invalid_compressed_where_schedule",
+    "invalid_compressed_where_traversal_context",
+    "invalid_compressed_where_workspace_ctype",
+    "invalid_compressed_where_workspace_name",
+    "mismatched_compressed_where_result_assembler",
+    # Root validation: the LLIR handed to this pass is not the shape it takes.
+    "invalid_compressed_where_root_member",
+    "unsupported_compressed_where_root",
+    "invalid_workspace_insert_call_name",
+    # Receiver layout: compressed levels must be contiguous after dense zero.
+    "unsupported_compressed_where_layout",
+    # The accumulation structure the caller asked for, which this pass carries
+    # rather than chooses: the chained one is produced by hoisting a declaration
+    # out of the assembly loop, so a body with no such declaration cannot have
+    # it.  This pass is the only layer that knows, which is why the refusal is
+    # here and why it shares the vocabulary module's code rather than coining a
+    # pass-local one.
+    "unsupported_accumulator_structure",
+}
+
+
+def test_the_refusal_surface_is_exactly_the_documented_set():
+    """Lock the codes this pass can fail closed with, in both directions.
+
+    Scanned from the source rather than exercised one by one, because the
+    property is completeness: a refusal added without a name here, or a name kept
+    after its refusal was deleted, are both defects and a per-case test catches
+    neither.  Codes given as module constants are resolved through the module's
+    own namespace, so sharing a code with the vocabulary module does not hide it.
+    """
+
+    import re as _re
+
+    import scorch.compiler.compressed_where_openmp_pass as pass_module
+
+    source = open(pass_module.__file__).read()
+    found = set()
+    for literal, name in _re.findall(r'code=(?:"([a-z_]+)"|([A-Z_]+))', source):
+        if literal:
+            found.add(literal)
+            continue
+        resolved = getattr(pass_module, name)
+        assert type(resolved) is str, name
+        found.add(resolved)
+    assert found == COMPRESSED_WHERE_REFUSAL_CODES

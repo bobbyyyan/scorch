@@ -36,6 +36,10 @@ from .diagnostics import (
     VerificationError,
 )
 from .loop_plan import LoopPlan, ScheduledCIN, verify_scheduled_cin
+from .sparse_accumulator import (
+    CHAINED_ACCUMULATOR_STRUCTURE,
+    UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+)
 from .legacy_cin_adapter import (
     claim_legacy_cin_working_tree,
     legacy_cin_working_copy,
@@ -2911,6 +2915,7 @@ class CINLowerer:
             # instrumentation only brackets its existing execution.
             body_assembler = self._instrument_body_assembler(assemble_body)
 
+            self._require_accumulator_carried(recurse_result.compressed_where_pass_spec)
             try:
                 pipeline_result = self._llir_pass_manager.run_production_pipeline(
                     LLIRStatementListArtifact(recurse_result.statements),
@@ -2932,6 +2937,44 @@ class CINLowerer:
             return kernel_abi.assemble_function(body_stmts)
 
         return []
+
+    def _require_accumulator_carried(
+        self,
+        compressed_where_pass_spec: Optional[CompressedWhereOpenMPPassSpec],
+    ) -> None:
+        """Refuse a chained-accumulator request no transform here can honour.
+
+        The two-phase transform is the only thing on this route that produces the
+        chained structure, so with no pass configuration to hand it the request
+        the emitted kernel would be the declared coordinate list and the caller
+        would have no way to find out.  Refusing is the same treatment the typed
+        driver gives the same request, at this route's equivalent single point.
+
+        A request for the coordinate list needs nothing here: it is what this
+        route emits when the transform does not substitute.
+        """
+
+        plan = self.loop_plan
+        if plan is None or plan.accumulator != CHAINED_ACCUMULATOR_STRUCTURE:
+            return
+        if compressed_where_pass_spec is not None:
+            return
+        diagnostic = CINDiagnostic(
+            code=UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+            message=(
+                f"accumulation structure {CHAINED_ACCUMULATOR_STRUCTURE!r} is "
+                "produced by the two-phase assembly transform, and no two-phase "
+                "assembly owns this program's output"
+            ),
+            path=("plan", "accumulator"),
+            stage="legacy_cin_lowering",
+            pass_name="lower_IndexStmt",
+        )
+        raise UnsupportedFeature(
+            "stage=legacy CIN lowering: "
+            f"{UNSUPPORTED_ACCUMULATOR_STRUCTURE} at plan/accumulator",
+            diagnostics=(diagnostic,),
+        )
 
     def _apply_schedule_lowering(
         self,
@@ -4074,6 +4117,18 @@ class CINLowerer:
                             flop_grain=self._CG_FLOP_GRAIN,
                         ),
                         compile_options=self.compile_options,
+                        # The plan's decision, carried rather than re-derived.
+                        # ``None`` -- no plan, or a plan that records nothing --
+                        # leaves this pass substituting exactly where it
+                        # substitutes today, so the shipped kernel is unchanged.
+                        # Reading it here rather than at the schedule-lowering
+                        # seam is deliberate: that seam runs after this pass has
+                        # already transformed the body.
+                        accumulator=(
+                            None
+                            if self.loop_plan is None
+                            else self.loop_plan.accumulator
+                        ),
                     )
                 ),
             )

@@ -61,6 +61,10 @@ from .loop_plan import (
     entity_display_names,
     verify_loop_plan,
 )
+from .sparse_accumulator import (
+    SPARSE_ACCUMULATOR_STRUCTURES,
+    is_accumulator_structure,
+)
 from .sparse_assembly import (
     SPARSE_ASSEMBLY_STRATEGIES,
     is_assembly_strategy,
@@ -385,6 +389,16 @@ class Schedule:
     leaves the compiler its own per-receiver choice; it is not a synonym for
     ``"single_pass_serial"``.  A strategy the receiver cannot support is
     refused rather than silently downgraded.
+
+    ``accumulator`` requests one sparse accumulation structure by name -- a list
+    of the keys inserted, or a chain indexed by the key
+    (``SPARSE_ACCUMULATOR_STRUCTURES`` lists them).  Which one is faster depends
+    on the density and on the receiver's compressed extent, so it is a schedule
+    decision like the others.  ``None`` requests nothing and leaves every layer
+    its own choice -- which, where the two-phase assembly transform fires,
+    remains the chain it substitutes today; it is not a synonym for
+    ``"coordinate_list"``.  A structure this program cannot use is refused rather
+    than silently ignored.
     """
 
     loop_order: Optional[Tuple[str, ...]] = None
@@ -393,6 +407,7 @@ class Schedule:
     tag: str = ""
     parallel_loop: Optional[str] = None
     assembly: Optional[str] = None
+    accumulator: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.loop_order is not None:
@@ -446,6 +461,13 @@ class Schedule:
             raise ValueError(
                 "Schedule.assembly must name a sparse assembly strategy "
                 f"({', '.join(SPARSE_ASSEMBLY_STRATEGIES)}) or be None"
+            )
+        if self.accumulator is not None and not is_accumulator_structure(
+            self.accumulator
+        ):
+            raise ValueError(
+                "Schedule.accumulator must name a sparse accumulation structure "
+                f"({', '.join(SPARSE_ACCUMULATOR_STRUCTURES)}) or be None"
             )
 
     @property
@@ -521,13 +543,45 @@ def _invalid_assembly(strategy: str, reason: str) -> NoReturn:
     raise InvalidSchedule(message, diagnostics=(diagnostic,))
 
 
+def _accumulator_diagnostic(
+    code: str, structure: str, reason: str
+) -> Tuple[str, object]:
+    """One structured accumulation-structure refusal, spelled like the others."""
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    message = f"stage=Schedule: {code} at schedule/accumulator: {structure!r} {reason}"
+    return message, LoopPlanDiagnostic(
+        code=code,
+        message=f"{structure!r} {reason}",
+        path=("schedule", "accumulator"),
+        stage="schedule",
+        pass_name="apply_schedule",
+    )
+
+
+def _unsupported_accumulator(structure: str, reason: str) -> NoReturn:
+    message, diagnostic = _accumulator_diagnostic(
+        "unsupported_schedule_accumulator", structure, reason
+    )
+    raise UnsupportedFeature(message, diagnostics=(diagnostic,))
+
+
 def _validate_schedule_structure(schedule: object) -> Schedule:
     """Revalidate a frozen public schedule at every compiler use boundary."""
 
     state = _stored_schedule_fields(
         schedule,
         Schedule,
-        ("loop_order", "tiles", "relayout", "tag", "parallel_loop", "assembly"),
+        (
+            "loop_order",
+            "tiles",
+            "relayout",
+            "tag",
+            "parallel_loop",
+            "assembly",
+            "accumulator",
+        ),
         "Schedule",
     )
     loop_order = state["loop_order"]
@@ -536,6 +590,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     tag = state["tag"]
     parallel_loop = state["parallel_loop"]
     assembly = state["assembly"]
+    accumulator = state["accumulator"]
     if loop_order is not None and type(loop_order) is not tuple:
         raise InvalidSchedule("Schedule.loop_order must be an owned tuple or None")
     if type(tiles) is not tuple:
@@ -549,6 +604,11 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     if assembly is not None and not is_assembly_strategy(assembly):
         raise InvalidSchedule(
             "Schedule.assembly must name a sparse assembly strategy or be None"
+        )
+    if accumulator is not None and not is_accumulator_structure(accumulator):
+        raise InvalidSchedule(
+            "Schedule.accumulator must name a sparse accumulation structure "
+            "or be None"
         )
 
     checked_tiles = []
@@ -597,6 +657,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             tag=tag,
             parallel_loop=parallel_loop,
             assembly=assembly,
+            accumulator=accumulator,
         )
     except (TypeError, ValueError) as error:
         raise InvalidSchedule("Schedule has invalid stored values") from error
@@ -746,6 +807,7 @@ def _build_loop_plan(
         result_tile=result_tile,
         parallel_loop=parallel_loop,
         assembly=schedule.assembly,
+        accumulator=schedule.accumulator,
         provenance=provenance,
         tag=schedule.tag,
     )
@@ -860,6 +922,7 @@ def materialize_legacy_schedule(
             else None
         ),
         assembly=plan.assembly,
+        accumulator=plan.accumulator,
     )
     rendered_panel_bounds = {
         _render_loop_ref(bound.loop, index_names): (
@@ -1021,6 +1084,52 @@ class Scheduler:
                 "owns the result's assembly and its own parallel policy; it "
                 "cannot compose with a sparse panel tile, an operand relayout, "
                 "or an explicit parallel loop selection",
+            )
+
+    @staticmethod
+    def _require_legal_accumulator_request(cin: CIN, schedule: Schedule) -> None:
+        """State the explicit path's accumulation-structure legality rule.
+
+        One rule, and it is the only one provable without the emitted body: an
+        accumulation structure is a property of a SPARSE reduction's workspace,
+        and a dense result has no sparse accumulation workspace to hold.  So a
+        recorded structure requires exactly one result tensor with a known
+        format that is not dense.
+
+        Everything else this decision can be refused for needs a fact this
+        boundary does not have -- the workspace's key rank, and whether the
+        emitted body puts the declaration where the two-phase transform can
+        reach it -- so those refusals live in target lowering and in the pass,
+        each where its input lives.  The two boundaries differ in WHEN they
+        refuse, never in WHAT.
+
+        A request that cannot be honoured is REFUSED rather than ignored, for
+        the reason the assembly request is: a caller who asks for one structure
+        and gets another has no way to find out.
+
+        Extents and densities are deliberately absent.  Whether a legal
+        structure pays is cost, and cost is the selector's question.
+        """
+
+        structure = schedule.accumulator
+        if structure is None:
+            return
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1 or receivers[0].format is None:
+            _unsupported_accumulator(
+                structure,
+                "requires exactly one result tensor with a known format",
+            )
+        if receivers[0].format.is_dense():
+            _unsupported_accumulator(
+                structure,
+                "names the structure a sparse reduction accumulates through; "
+                f"{receivers[0].get_name()!r} is dense and has no sparse "
+                "accumulation workspace",
             )
 
     @staticmethod
@@ -3029,6 +3138,10 @@ class Scheduler:
         # legality-verified, and not re-derived.  The origin still chooses
         # nothing, so an automatic request without one records ``None`` and emits
         # today's kernel byte for byte.
+        #
+        # ``accumulator`` is out of the test for exactly the same reason: the
+        # structure is a property of the accumulation workspace, so a schedule
+        # carrying only one must reach the route that inserts the workspace.
         if not is_identity and cin.get_workspace_accesses():
             raise NotImplementedError(
                 "CIN with an existing workspace supports only an empty auto Schedule"
@@ -3173,6 +3286,7 @@ class Scheduler:
                 "tiled sparse-output assembly is unsupported"
             )
         Scheduler._require_legal_assembly_request(cin, schedule)
+        Scheduler._require_legal_accumulator_request(cin, schedule)
 
         parallel_names = [tile.index_var for tile in schedule.tiles if tile.parallel]
         if schedule.parallel_loop is not None:
@@ -3313,6 +3427,7 @@ class Scheduler:
                 costs,
                 tag=schedule.tag,
                 assembly=schedule.assembly,
+                accumulator=schedule.accumulator,
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -3688,6 +3803,7 @@ class Scheduler:
         tag: str,
         require_complete_plan: bool,
         assembly: Optional[str] = None,
+        accumulator: Optional[str] = None,
     ) -> Tuple[CIN, LoopPlan]:
         """Apply one automatic order and verify the plan that records it.
 
@@ -3697,6 +3813,10 @@ class Scheduler:
         at the plan boundary, and not re-derived.  The automatic origin itself
         chooses no strategy, so an ordinary automatic compilation records ``None``
         here and emits exactly the kernel it emitted before the field existed.
+
+        ``accumulator`` rides along on exactly the same terms and for exactly the
+        same reason: the structure applies only to sparse-output programs, whose
+        workspace insertion is a decision only the automatic path can record.
         """
 
         auto_tiles: List[LoopTile] = []
@@ -3717,6 +3837,7 @@ class Scheduler:
                 tiles=tuple(auto_tiles),
                 workspace=auto_workspace[0] if auto_workspace else None,
                 assembly=assembly,
+                accumulator=accumulator,
                 auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
                 provenance="auto",
                 tag=tag,
@@ -3735,6 +3856,7 @@ class Scheduler:
         tag: str = "",
         require_complete_plan: bool = False,
         assembly: Optional[str] = None,
+        accumulator: Optional[str] = None,
     ) -> Tuple[CIN, LoopPlan]:
         """Originate one verified automatic plan at a plan-producing boundary.
 
@@ -3776,6 +3898,7 @@ class Scheduler:
                 tag=tag,
                 require_complete_plan=require_complete_plan,
                 assembly=assembly,
+                accumulator=accumulator,
             )
         except InvalidSchedule as refusal:
             if not Scheduler._refused_for_order_legality(refusal) or [
@@ -3797,6 +3920,7 @@ class Scheduler:
                     tag=tag,
                     require_complete_plan=require_complete_plan,
                     assembly=assembly,
+                    accumulator=accumulator,
                 )
             except (InvalidSchedule, UnsupportedFeature, VerificationError):
                 raise refusal

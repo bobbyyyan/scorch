@@ -54,6 +54,13 @@ from .llir_pass_manager import (
 )
 from .result_write_pass import ResultWriteContext
 from .iterator import collect_mode_position_arrays, match_mode_position_access
+from .sparse_accumulator import (
+    CHAINED_ACCUMULATOR_STRUCTURE,
+    DECLARED_ACCUMULATOR_STRUCTURE,
+    SPARSE_ACCUMULATOR_STRUCTURES,
+    UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+    is_accumulator_structure,
+)
 from .torch_cpp_abi import ResultTensorAssembler
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype
@@ -179,6 +186,26 @@ class CompressedWhereOpenMPContext:
     #: could host this strategy, and which keeps every existing caller's emission
     #: unchanged.  See :class:`OuterCellDomain`.
     outer_cell: Optional[OuterCellDomain] = None
+    #: Which structure the accumulation workspace uses, when a caller has decided
+    #: (:mod:`scorch.compiler.sparse_accumulator` names them).
+    #:
+    #: ``None`` is NO decision and it means what this pass has always done:
+    #: replace a workspace declared as a direct child of the selected loop with a
+    #: per-worker pool of the chained structure, and leave a workspace declared
+    #: any deeper alone.  Every existing caller therefore emits what it emitted
+    #: before this field existed, byte for byte -- which is the whole reason the
+    #: default is ``None`` and not the token for what this pass would have picked.
+    #:
+    #: ``"coordinate_list"`` keeps the declaration where the caller put it, which
+    #: switches off the pool, the type substitution and the
+    #: ``insert`` -> ``insert_unchecked`` rename together, because inside this
+    #: pass those three are one bit.  It is always honourable.
+    #:
+    #: ``"linked_list"`` asks for the substitution; with no declaration to
+    #: substitute there is nothing this pass can do, so it fails closed with
+    #: ``unsupported_accumulator_structure``.  This pass is the only layer that
+    #: knows whether the emitted body has one, which is why the refusal is here.
+    accumulator: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -542,6 +569,18 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
         code="invalid_compressed_where_flop_grain",
         field="policy.flop_grain",
     )
+    accumulator = typed_context.accumulator
+    if accumulator is not None and not is_accumulator_structure(accumulator):
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_accumulator",
+            message=(
+                "accumulator must be one of "
+                f"{', '.join(SPARSE_ACCUMULATOR_STRUCTURES)} or None"
+            ),
+            path=("context", "accumulator"),
+            value=accumulator,
+        )
     return typed_context
 
 
@@ -779,11 +818,39 @@ def _should_drop_work_statement(
     return False, False
 
 
+def _substitutes_accumulator(context: CompressedWhereOpenMPContext) -> bool:
+    """Whether this pass replaces the declared accumulator with the chained one.
+
+    The decision, not this pass's preference.  ``None`` -- no decision -- keeps
+    the substitution, which is what every caller got before the field existed;
+    only an explicit request for the declared coordinate list turns it off.
+    """
+
+    return context.accumulator != DECLARED_ACCUMULATOR_STRUCTURE
+
+
 def _extract_work_body(
     for_loop: llir.ForLoop, context: CompressedWhereOpenMPContext
 ) -> Tuple[List[llir.Stmt], bool]:
+    """The phase body, and whether the accumulator declaration was hoisted out.
+
+    The hoist, the per-worker pool, the type substitution and the
+    ``insert`` -> ``insert_unchecked`` rename are one bit here, so reading the
+    decision once decides all four together.  Which structure a program
+    accumulates through moves the emitted kernel's runtime by up to 1.57x (review
+    section 67.3), so it is the caller's decision to make and this pass's job to
+    carry out -- it no longer imposes one on the way past.
+
+    Suppressing the substitution is not new capability.  A declaration left in
+    the phase loop's body is constructed once per iteration and is private to
+    that iteration by construction, which is exactly the shape 17 of the 21
+    admitted ordered-key cells already emit because their workspace is declared
+    one loop deeper (section 67.1).
+    """
+
     work_body: List[llir.Stmt] = []
-    workspace_hoisted = False
+    declaration_found = False
+    substitute = _substitutes_accumulator(context)
     first_level = context.compressed_levels[0]
     for statement in for_loop.body:
         drop, found_workspace = _should_drop_work_statement(
@@ -792,10 +859,29 @@ def _extract_work_body(
             first_compressed_level=first_level,
             workspace_name=context.workspace_name,
         )
-        workspace_hoisted = workspace_hoisted or found_workspace
+        declaration_found = declaration_found or found_workspace
+        if found_workspace and not substitute:
+            # Keeping the declaration is the whole of the suppression: with the
+            # statement still in the body there is nothing hoisted, so no pool is
+            # built, no view is borrowed and no insert is renamed.
+            drop = False
         if not drop:
             work_body.append(statement)
 
+    workspace_hoisted = declaration_found and substitute
+    if context.accumulator == CHAINED_ACCUMULATOR_STRUCTURE and not declaration_found:
+        _raise_compressed_where_error(
+            context,
+            code=UNSUPPORTED_ACCUMULATOR_STRUCTURE,
+            message=(
+                f"accumulation structure {CHAINED_ACCUMULATOR_STRUCTURE!r} is "
+                "produced by hoisting the accumulator declaration out of the "
+                f"assembly loop, and {context.workspace_name!r} is not declared "
+                "as a direct child of it"
+            ),
+            path=("context", "accumulator"),
+            value=context.accumulator,
+        )
     if workspace_hoisted:
         rewritten = _WorkspaceInsertRewriter(context).rewrite(work_body)
         return cast(List[llir.Stmt], rewritten), True

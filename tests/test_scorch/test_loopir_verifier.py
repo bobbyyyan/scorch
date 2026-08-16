@@ -726,6 +726,10 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "position_load_mismatch",
     # Assembly-strategy legality code added by the Phase-7 assembly slice.
     "unsupported_assembly_strategy",
+    # Accumulation-structure legality code added by the Phase-7 accumulator
+    # slice: a wholly dense result has no sparse accumulation workspace, so it
+    # cannot record which structure holds one.
+    "unsupported_accumulator_structure",
 }
 
 
