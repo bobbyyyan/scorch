@@ -1634,6 +1634,130 @@ def test_a_marker_that_lies_about_its_statement_is_refused() -> None:
     )
 
 
+def _drain_segment_conditional(claims_write: bool) -> llir.IfThenElse:
+    """The ordered-key drain's segment-open conditional, marker direction varied.
+
+    Its CONDITION reads ``Result1_crd.back()`` and its BODY appends to the same
+    array.  The read is this statement's own spelling; the append is the nested
+    statement's, and that statement carries its own marker for it.
+    """
+
+    return llir.IfThenElse(
+        cond=llir.BinOp("!=", llir.FunctionCall("Result1_crd.back", []), _var("j")),
+        then_body=[
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("j")],
+                result_storage=_marker((_CRD, 1, True)),
+            )
+        ],
+        result_storage=_marker((_CRD, 1, claims_write)),
+    )
+
+
+@pytest.mark.parametrize("mode", ["count", "fill"])
+def test_the_direction_half_reads_only_the_statements_own_spelling(
+    mode: _Mode,
+) -> None:
+    """Section 66.1 obstacle D: a nested append is not this statement's direction.
+
+    Before this, ``written_members`` was populated by a walk that descended into
+    nested bodies, so the append inside the body decided the direction of the
+    conditional ABOVE it and the check called the conditional's truthful READ
+    marker a lie.  The two halves are not symmetric: searching more places for a
+    MENTION can only find more names and refuse less, while reading a nested
+    statement's direction attributes that statement's fact to its parent.
+
+    Both directions are pinned here, because the loosening has to be
+    one-directional.  The truthful READ marker gets through the truthfulness
+    check and lands on the postcondition -- the layer that owns a surviving read
+    -- and the WRITE marker on the very same statement is still refused as the
+    lie it is, since nothing the statement itself spells says it writes.
+    """
+
+    _residue_diagnostic([_drain_segment_conditional(False)], mode)
+    _recognizer_diagnostic(
+        [_drain_segment_conditional(True)],
+        "untruthful_result_storage_marker",
+        mode,
+    )
+
+
+@pytest.mark.parametrize("mode", ["count", "fill"])
+def test_the_mention_half_still_searches_nested_bodies(mode: _Mode) -> None:
+    """A name spelled only in a nested body still satisfies the mention half.
+
+    This is the half the one-directional argument is actually true of, and
+    narrowing the direction half must not narrow it: the enclosing conditional
+    names no result array itself, and its marker is accepted rather than
+    refused for claiming one.
+    """
+
+    rewrite_result_writes(
+        [
+            llir.IfThenElse(
+                cond=llir.BinOp("<", _var("k"), _var("n")),
+                then_body=[
+                    llir.FunctionCallStmt(
+                        "Result1_crd.push_back",
+                        [_var("j")],
+                        result_storage=_marker((_CRD, 1, True)),
+                    )
+                ],
+                result_storage=_marker((_CRD, 1, False)),
+            )
+        ],
+        _context(mode),
+    )
+
+
+def test_a_write_spelling_still_refuses_a_read_marker() -> None:
+    """The mirror of the ``.size`` lie, at the statement's own level.
+
+    ``.size`` with a WRITE marker is refused above.  An append with a READ
+    marker is the same lie the other way round and is refused for the same
+    reason: the statement's own spelling contradicts the claim and nothing else
+    in the statement corroborates it.
+    """
+
+    _recognizer_diagnostic(
+        [
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [_var("j")],
+                result_storage=_marker((_CRD, 1, False)),
+            )
+        ],
+        "untruthful_result_storage_marker",
+    )
+
+
+@pytest.mark.parametrize("claims_write", [False, True])
+def test_a_statement_spelling_both_directions_corroborates_either_marker(
+    claims_write: bool,
+) -> None:
+    """Both spellings are true of the statement, so neither marker is a lie.
+
+    ``Result1_crd.push_back(Result1_crd.back())`` writes and reads the array in
+    one statement.  The old check kept one boolean per array and let whichever
+    spelling the walk reached last decide, which is a coin flip rather than a
+    check -- it could refuse either marker depending on traversal order.  The
+    direction sets record both, and a marker corroborated by at least one of the
+    statement's own spellings is not a lie.
+    """
+
+    rewrite_result_writes(
+        [
+            llir.FunctionCallStmt(
+                "Result1_crd.push_back",
+                [llir.FunctionCall("Result1_crd.back", [])],
+                result_storage=_marker((_CRD, 1, claims_write)),
+            )
+        ],
+        _context("count"),
+    )
+
+
 def test_a_statement_marker_conflicting_with_its_access_marker_is_refused() -> None:
     """The one statement that carries two markers, and the check that pairs them.
 

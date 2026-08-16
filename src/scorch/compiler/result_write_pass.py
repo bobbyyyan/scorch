@@ -394,23 +394,40 @@ class _ResultWriteRewriter(LLIRRewriter):
     ) -> None:
         """Every reference the marker claims must be findable in the statement.
 
-        Deliberately ONE-DIRECTIONAL, and deliberately checked over the whole
-        statement including any nested body.  A reference the marker claims and
-        the statement does not spell is a lie and is refused.  A reference the
+        Deliberately ONE-DIRECTIONAL.  A reference the marker claims and the
+        statement does not spell is a lie and is refused.  A reference the
         statement spells and the marker does not claim is NOT refused, because
         a nested statement carries its own marker and this check would otherwise
         demand that the enclosing one restate its children's facts -- which
         would put one reference in two markers, the thing section 63.7's fifth
-        row warns against.  Including nested bodies can only make this more
-        permissive, never less, so it cannot refuse a truthful marker.
+        row warns against.
 
-        Direction is checked only where the statement's own spelling decides it.
-        A dotted member name does -- ``push_back`` writes, ``size`` reads -- so a
+        THE TWO HALVES READ DIFFERENT AMOUNTS OF THE STATEMENT, and an earlier
+        version of this docstring got that wrong.  It said that including nested
+        bodies "can only make this more permissive, never less, so it cannot
+        refuse a truthful marker".  That is true of the MENTION half, which asks
+        only whether the name appears: more places searched, more names found,
+        fewer refusals.  It is false of the DIRECTION half, which asks which way
+        the reference goes: a nested statement's spelling is evidence about the
+        NESTED statement's marker, not about this one's, and reading it made the
+        check refuse a truthful marker.  Section 66.1 obstacle D is that
+        refusal, on the ordered-key drain's segment-open conditional -- its
+        condition reads ``{R}{L}_crd.back()``, which is this statement's own
+        spelling and matches its READ marker, while its body appends to the same
+        array, which is the body's own statement's fact.
+
+        So the mention half searches the whole statement, nested bodies
+        included, and the direction half reads only what the statement itself
+        spells.  Direction is checked only where that spelling decides it.  A
+        dotted member name does -- ``push_back`` writes, ``size`` reads -- so a
         marker claiming a write on a ``.size`` call is refused.  An argument
         position does not, which is section 3 of the design note's measurement
         and the reason the marker carries the direction at all, so there the
         marker is the only source of truth and this check does not second-guess
-        it.
+        it.  A statement that spells BOTH directions of one array itself
+        corroborates either marker, so neither is a lie; the previous code let
+        whichever spelling the walk reached last decide, which is a coin flip
+        rather than a check.
         """
 
         finder = _ResultStorageNameFinder(
@@ -433,22 +450,27 @@ class _ResultWriteRewriter(LLIRRewriter):
                     path=path,
                     value=name,
                 )
-            written = finder.written_members.get(name)
-            if written is None:
+            reads = name in finder.statement_reads
+            writes = name in finder.statement_writes
+            if not reads and not writes:
                 continue
             claims_write = reference.direction is llir.ResultStorageDirection.WRITE
-            if claims_write is not written:
-                _raise_result_write_error(
-                    self._context,
-                    code="untruthful_result_storage_marker",
-                    message=(
-                        f"a result-storage marker claims a "
-                        f"{reference.direction.value} of {name!r}, but the "
-                        "statement's own member spelling says otherwise"
-                    ),
-                    path=path,
-                    value=name,
-                )
+            corroborated = (claims_write and writes) or (not claims_write and reads)
+            if corroborated:
+                continue
+            spelled = "a write" if writes else "a read"
+            _raise_result_write_error(
+                self._context,
+                code="untruthful_result_storage_marker",
+                message=(
+                    f"a result-storage marker claims a "
+                    f"{reference.direction.value} of {name!r}, but the "
+                    f"statement's own member spelling says {spelled} and "
+                    "nothing in the statement itself corroborates the marker"
+                ),
+                path=path,
+                value=name,
+            )
 
     def _require_no_tensor_conflict(
         self,
@@ -894,12 +916,25 @@ class _ResultStorageNameFinder(LLIRWalker):
     ``FixedStackArrayDecl`` and ``RawStmt`` -- because those are every position a
     generated storage name can be spelled in.
 
-    ``written_members`` records the direction where the statement's own spelling
-    decides it: a dotted member name says which way the reference goes, so
-    ``C1_crd.push_back`` records ``True`` and ``C1_crd.size`` records ``False``.
+    ``mentioned`` covers the WHOLE statement, nested bodies included, because
+    the mention half only gets more permissive the more places it searches.
+
+    ``statement_reads`` and ``statement_writes`` record the direction where the
+    spelling decides it: a dotted member name says which way the reference goes,
+    so ``C1_crd.push_back`` records a write and ``C1_crd.size`` records a read.
     A bare vector name in an argument position records nothing, because the node
     shape genuinely does not say -- which is why the marker has to carry the
     direction rather than have it derived.
+
+    Unlike ``mentioned``, the two direction sets are recorded ONLY from the
+    statement the walk started at, not from statements nested inside it.  A
+    nested statement carries its own marker, so its spelling is evidence about
+    that marker and not about this one; reading it made the check refuse a
+    truthful marker on a conditional that reads an array in its condition and
+    appends to it in its body (section 66.1 obstacle D).  They are also sets
+    rather than one boolean per name, so a statement that spells both directions
+    of one array is recorded as spelling both instead of as whichever spelling
+    the walk happened to reach last.
     """
 
     #: ``std::vector`` members that mutate the vector, and members that read it.
@@ -924,7 +959,12 @@ class _ResultStorageNameFinder(LLIRWalker):
             arrays.add(f"{result_name}{level}_crd")
         self._arrays = frozenset(arrays)
         self.mentioned: set = set()
-        self.written_members: dict = {}
+        self.statement_reads: set = set()
+        self.statement_writes: set = set()
+        #: How many statements are open.  The walk starts at one statement, so a
+        #: depth above one means the node sits inside a NESTED statement, whose
+        #: spelling belongs to its own marker rather than to this one's.
+        self._statement_depth = 0
 
     def _record(self, value: object) -> None:
         if type(value) is not str:
@@ -936,15 +976,27 @@ class _ResultStorageNameFinder(LLIRWalker):
             prefix = f"{name}."
             if value.startswith(prefix):
                 self.mentioned.add(name)
-                member = value[len(prefix) :]
-                if member in self._WRITE_MEMBERS:
-                    self.written_members[name] = True
-                elif member in self._READ_MEMBERS:
-                    self.written_members[name] = False
+                self._record_direction(name, value[len(prefix) :])
                 return
+
+    def _record_direction(self, name: str, member: str) -> None:
+        """One member spelling's direction, from this statement only."""
+
+        if self._statement_depth > 1:
+            return
+        if member in self._WRITE_MEMBERS:
+            self.statement_writes.add(name)
+        elif member in self._READ_MEMBERS:
+            self.statement_reads.add(name)
+
+    def leave_node(self, node: llir.Node, path: LLIRPath) -> None:
+        if isinstance(node, llir.Stmt):
+            self._statement_depth -= 1
 
     def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
         node_type = type(node)
+        if isinstance(node, llir.Stmt):
+            self._statement_depth += 1
         if node_type is llir.Var:
             self._record(cast(llir.Var, node).name)
         elif node_type is llir.FunctionCall:
@@ -970,10 +1022,7 @@ class _ResultStorageNameFinder(LLIRWalker):
             if type(member) is str and type(base) is llir.Var:
                 name = cast(llir.Var, base).name
                 if name in self._arrays:
-                    if member in self._WRITE_MEMBERS:
-                        self.written_members[name] = True
-                    elif member in self._READ_MEMBERS:
-                        self.written_members[name] = False
+                    self._record_direction(name, member)
 
 
 class _CoordinateWriteForms(LLIRWalker):
