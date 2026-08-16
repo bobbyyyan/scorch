@@ -10,6 +10,8 @@ repository tolerance.  The dense-only shadow helper is deliberately not
 used anywhere here: sparse results are validated at the storage level.
 """
 
+import gc
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -781,13 +783,24 @@ def _find_outer_row_loop(statements):
     return None
 
 
-def _reachable_completion_owner_ids(root):
-    """Ids of every completion-owned aggregate or provenance value."""
+def _reachable_completion_owners(root):
+    """Every completion-owned aggregate or provenance value, as live objects.
+
+    Returns the objects, not their ``id()`` values, and the difference is the
+    whole point.  ``id()`` is an address CPython reuses: once an object is
+    freed, a later object can be handed the same address, so a set of ids that
+    outlives its objects cannot tell aliasing from address reuse.  Holding a
+    strong reference to every object returned here is what makes ``id()``
+    unique again, because two SIMULTANEOUSLY LIVE objects never share one.  A
+    caller comparing two graphs by identity must therefore keep both lists
+    alive across the comparison.
+    """
 
     from scorch.compiler import llir
     from scorch.compiler.identity import AccessId, IndexId, SymbolId
     from scorch.compiler.loopir.nodes import LoopIRNode
 
+    owners = []
     seen = set()
     pending = [root]
     while pending:
@@ -802,6 +815,7 @@ def _reachable_completion_owner_ids(root):
             if id(value) in seen:
                 continue
             seen.add(id(value))
+            owners.append(value)
         if (
             isinstance(value, (llir.Node, LoopIRNode))
             or type(value) is llir.TensorAccessMetadata
@@ -809,7 +823,13 @@ def _reachable_completion_owner_ids(root):
             pending.extend(vars(value).values())
         elif type(value) in (list, tuple):
             pending.extend(value)
-    return seen
+    return owners
+
+
+def _owner_ids(owners):
+    """Identity set of a live owner list, sound only while it is held."""
+
+    return {id(owner) for owner in owners}
 
 
 @pytest.mark.parametrize(
@@ -860,23 +880,33 @@ def test_pipeline_entry_header_mutation_fails_closed(monkeypatch, mutation):
 
 
 def test_completion_reference_owns_no_pipeline_entry_state(monkeypatch):
-    """The reconstructed reference shares nothing a pass could have touched."""
+    """The reconstructed reference shares nothing a pass could have touched.
+
+    Captured as OBJECTS and kept alive to the end.  The earlier version of
+    this test captured ``id()`` values and let the objects go, and the
+    completion reference is a temporary that dies as soon as the comparison
+    returns -- so its addresses were free for the final program's nodes to be
+    allocated at, and an intersection meant either aliasing or reuse with no
+    way to tell which.  It failed once that way in a full-partition run and
+    passed in isolation.  Holding all three lists across the comparison is
+    what makes an id intersection mean aliasing and nothing else.
+    """
 
     import scorch.compiler.llir_pass_manager as pass_manager
     from scorch.compiler.loopir import lower_llir as target
 
-    entry_ids = set()
+    entry_owners = []
     original_prefetch = pass_manager.insert_sparse_prefetch
 
     def capture_entry(statements, context):
-        entry_ids.update(_reachable_completion_owner_ids(list(statements)))
+        entry_owners.extend(_reachable_completion_owners(list(statements)))
         return original_prefetch(statements, context)
 
-    reference_ids = set()
+    reference_owners = []
     original_matches = target._exact_sparse_completion_matches
 
     def capture_reference(actual, expected):
-        reference_ids.update(_reachable_completion_owner_ids(expected))
+        reference_owners.extend(_reachable_completion_owners(expected))
         return original_matches(actual, expected)
 
     monkeypatch.setattr(pass_manager, "insert_sparse_prefetch", capture_entry)
@@ -891,11 +921,46 @@ def test_completion_reference_owns_no_pipeline_entry_state(monkeypatch):
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
         compile_options=auto_options(False),
     )
-    program_ids = _reachable_completion_owner_ids(kernel.lowering.program)
+    program_owners = _reachable_completion_owners(kernel.lowering.program)
+    entry_ids = _owner_ids(entry_owners)
+    reference_ids = _owner_ids(reference_owners)
+    program_ids = _owner_ids(program_owners)
     assert entry_ids and reference_ids and program_ids
     assert not (entry_ids & reference_ids)
     assert not (entry_ids & program_ids)
     assert not (reference_ids & program_ids)
+    # The three lists are still referenced here, which is the precondition the
+    # three assertions above are sound under.
+    assert entry_owners and reference_owners and program_owners
+
+
+def test_completion_owner_capture_outlives_its_root():
+    """The capture holds its objects, so their addresses cannot be reused."""
+
+    from scorch.compiler import llir
+
+    root = [llir.Increment(var=llir.Var("pC0", llir.DataType.INT))]
+    owners = _reachable_completion_owners(root)
+    witness = weakref.ref(root[0])
+    del root
+    gc.collect()
+    assert witness() is not None
+    assert id(witness()) in _owner_ids(owners)
+
+
+def test_completion_owner_ids_report_a_shared_node():
+    """A genuinely shared object still intersects, so the check can fail.
+
+    Making an identity test sound by keeping its objects alive is only worth
+    doing if it still detects the aliasing it exists to detect.
+    """
+
+    from scorch.compiler import llir
+
+    shared = llir.Var("pC0", llir.DataType.INT)
+    left = _reachable_completion_owners([llir.Increment(var=shared)])
+    right = _reachable_completion_owners([llir.Increment(var=shared)])
+    assert _owner_ids(left) & _owner_ids(right) == {id(shared)}
 
 
 def _first_tensor_access_metadata(root):

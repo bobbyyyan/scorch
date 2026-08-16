@@ -1252,17 +1252,20 @@ def test_completion_actual_shares_nothing_with_reference(monkeypatch):
 
     from scorch.compiler.loopir import lower_llir as target
     from tests.test_scorch.test_loopir_sparse_workspace_target import (
-        _reachable_completion_owner_ids,
+        _owner_ids,
+        _reachable_completion_owners,
     )
 
     captured = []
     original_matches = target._exact_sparse_completion_matches
 
     def capture_both(actual, expected):
+        # The owner LISTS are kept, not their id sets: an id set that outlives
+        # its objects cannot tell aliasing from a reused address.
         captured.append(
             (
-                _reachable_completion_owner_ids(actual),
-                _reachable_completion_owner_ids(expected),
+                _reachable_completion_owners(actual),
+                _reachable_completion_owners(expected),
             )
         )
         return original_matches(actual, expected)
@@ -1279,7 +1282,9 @@ def test_completion_actual_shares_nothing_with_reference(monkeypatch):
         compile_options=auto_options(False),
     )
     assert captured
-    for actual_ids, expected_ids in captured:
+    for actual_owners, expected_owners in captured:
+        actual_ids = _owner_ids(actual_owners)
+        expected_ids = _owner_ids(expected_owners)
         assert actual_ids and expected_ids
         assert not (actual_ids & expected_ids)
 
