@@ -16,6 +16,7 @@ from scorch.compiler.compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPPolicy,
     CompressedWhereOpenMPResult,
+    OuterCellDomain,
     transform_compressed_where_for_openmp,
 )
 from scorch.compiler.identity import AccessId, IndexId, SymbolId  # type: ignore[import-untyped]
@@ -2202,6 +2203,131 @@ def test_offset_family_preserves_exact_loop_bound_type(
     assert all(bound.tensor_access is None for bound in bounds)
     assert len({id(bound) for bound in bounds}) == len(bounds)
     assert all(bound is not source_bound for bound in bounds)
+
+
+def _emitted_cpp(result: CompressedWhereOpenMPResult) -> str:
+    return LLIRLowerer().lower_llir(result.statements)
+
+
+def test_the_outer_cell_domain_defaults_to_the_selected_loops_header() -> None:
+    """Stating the header's own facts changes nothing, byte for byte.
+
+    The pass reads the selected loop's header for two different facts -- which
+    cell an iteration assembles, and how many cells there are -- and for a loop
+    over a dense level they are the loop variable and its bound.  So the domain a
+    caller with a dense outer loop would state is exactly the derivation, and the
+    two must emit the same text; if they did not, every existing caller's kernel
+    would move the moment the field existed.
+    """
+
+    body = _ds_work_body()
+    derived = transform_compressed_where_for_openmp(
+        [_compatible_loop(body)], _context()
+    )
+    stated = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())],
+        replace(
+            _context(),
+            outer_cell=OuterCellDomain(
+                index=_var("row", llir.DataType.INT),
+                count=_var("A0_size", llir.DataType.INT64),
+            ),
+        ),
+    )
+
+    assert derived.applied is True
+    assert stated.applied is True
+    assert _emitted_cpp(stated) == _emitted_cpp(derived)
+
+
+def test_a_stated_outer_cell_domain_sizes_and_indexes_by_itself() -> None:
+    """A loop variable that is a POSITION cannot index a per-cell count array.
+
+    Every site that is about the receiver's cells moves to the stated domain --
+    the count array's length and subscript, the prefix sum's bound, the total
+    read-out and the first compressed position array's length -- while the two
+    phase loops keep the loop's own trip count, because the parallel policy's work
+    and row estimates are about iterations rather than cells.
+    """
+
+    result = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())],
+        replace(
+            _context(),
+            outer_cell=OuterCellDomain(
+                index=llir.ArrayAccess(
+                    array=_var("A0_crd", llir.DataType.PTR_INT),
+                    index=_var("row", llir.DataType.INT),
+                ),
+                count=_var("Result0_size", llir.DataType.INT64),
+            ),
+        ),
+    )
+    source = _emitted_cpp(result)
+
+    assert "std::vector<int> _count1((size_t)Result0_size, 0);" in source
+    assert "_count1[A0_crd[row]] = _cnt1;" in source
+    assert "std::vector<int64_t> _offset1((size_t)Result0_size + 1);" in source
+    assert "for (int _i = 0; _i < Result0_size; _i++) {" in source
+    assert "int64_t _total1 = _offset1[Result0_size];" in source
+    assert "int64_t _base1 = _offset1[A0_crd[row]];" in source
+    assert "for (int _i = 0; _i <= Result0_size; _i++) {" in source
+    # The phase loops still run the loop's own iterations, and the policy still
+    # sizes its team from the loop's bound rather than from the cell count.
+    count_loop, fill_loop = _phase_loops(result)
+    for loop in (count_loop, fill_loop):
+        assert cast(llir.Var, cast(llir.BinOp, loop.cond).right).name == "A0_size"
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        pytest.param("not a domain", id="wrong-type"),
+        pytest.param(
+            OuterCellDomain(index="row", count=_var("A0_size", llir.DataType.INT64)),
+            id="index-not-an-expression",
+        ),
+        pytest.param(
+            OuterCellDomain(index=_var("row", llir.DataType.INT), count="A0_size"),
+            id="count-not-a-var",
+        ),
+        pytest.param(
+            OuterCellDomain(
+                index=_var("row", llir.DataType.INT),
+                count=_var("not an identifier", llir.DataType.INT64),
+            ),
+            id="count-not-an-identifier",
+        ),
+        pytest.param(
+            OuterCellDomain(
+                index=_var("row", llir.DataType.INT),
+                count=_var("A0_size", llir.DataType.FLOAT32),
+            ),
+            id="count-not-an-integer",
+        ),
+        pytest.param(
+            OuterCellDomain(
+                index=_var("row", llir.DataType.INT),
+                count=llir.Var(name="A0_size", type=llir.DataType.INT64, is_ptr=True),
+            ),
+            id="count-a-pointer",
+        ),
+    ],
+)
+def test_an_invalid_outer_cell_domain_fails_closed(domain: object) -> None:
+    """The cell count is held to the result ABI's own contract, one layer earlier.
+
+    The allocation builder already refuses a bound that is not an exact integer
+    ``Var``, with a ``TypeError`` from three layers down.  Checking it here means
+    the refusal is this pass's structured diagnostic and names the field.
+    """
+
+    with pytest.raises(LLIRTraversalError) as raised:
+        transform_compressed_where_for_openmp(
+            [_compatible_loop(_ds_work_body())],
+            replace(_context(), outer_cell=cast(OuterCellDomain, domain)),
+        )
+    assert raised.value.diagnostic.code == "invalid_compressed_where_outer_cell"
 
 
 def test_first_top_level_compatible_loop_is_selected_and_suffix_is_discarded() -> None:

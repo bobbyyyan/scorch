@@ -78,6 +78,41 @@ class CompressedWhereOpenMPPolicy:
 COMPRESSED_WHERE_OPENMP_POLICY = CompressedWhereOpenMPPolicy()
 
 
+@dataclass(frozen=True)
+class OuterCellDomain:
+    """Which receiver cell one outer-loop iteration assembles, and how many exist.
+
+    A "cell" here is one segment of the first compressed level -- one entry of
+    ``{R}{first}_pos`` -- which for this pass's receiver shape is one coordinate
+    of the dense level zero.  The transform needs two facts about the loop it
+    replaces, and they are different facts that a dense loop happens to spell the
+    same way:
+
+    * ``index`` numbers the cell THIS iteration assembles.  It indexes
+      ``_count{L}`` in the count phase and ``_offset{L}`` in the fill phase.
+    * ``count`` is how many cells the receiver has.  It sizes ``_count{L}``,
+      bounds the prefix sum, reads out ``_total{L}`` and gives the first
+      compressed position array its length.
+
+    Neither is the loop's TRIP COUNT, which is what the parallel policy's work
+    and row estimates are about and which is always read from the loop header.
+
+    For a loop over a dense level the loop variable is the cell index and the
+    loop bound is the cell count, so a caller that supplies nothing gets exactly
+    that derivation.  For a loop over a STORED level the loop variable is a
+    position into an operand's coordinate array and the bound is that array's
+    length, so a caller with a stored outer loop states both instead.
+
+    ``index`` must be an expression over things in scope at the TOP of the loop
+    body -- the loop variable and function-scope arrays -- because the fill
+    phase's ``_base{L}`` loads are the body's first statements, ahead of any
+    coordinate the body itself resolves.
+    """
+
+    index: llir.Expr
+    count: llir.Var
+
+
 _RECOGNIZED_WORKSPACE_CTYPE_DATATYPES: Dict[str, str] = {
     "float": "float",
     "double": "double",
@@ -137,6 +172,13 @@ class CompressedWhereOpenMPContext:
     #: outlines the body, and an unconditional pragma at one thread costs 4-10%,
     #: which is the whole margin this strategy exists to keep.
     parallel: bool = True
+    #: How the selected loop's iterations number the receiver's cells, when the
+    #: loop header does not say.  ``None`` derives both facts from the header --
+    #: the loop variable as the cell index and its bound as the cell count --
+    #: which is the only configuration production had before a stored outer loop
+    #: could host this strategy, and which keeps every existing caller's emission
+    #: unchanged.  See :class:`OuterCellDomain`.
+    outer_cell: Optional[OuterCellDomain] = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +286,76 @@ def _validate_non_empty_string(
         )
 
 
+def _validate_outer_cell(context: CompressedWhereOpenMPContext) -> None:
+    """Refuse an outer-cell domain this pass could not emit correctly.
+
+    The cell count is held to the same contract the result ABI holds the first
+    compressed position bound to -- an exact plain ``Var`` of integer type -- so
+    a caller that gets it wrong is named by this pass rather than by a
+    ``TypeError`` from inside the allocation builder three layers down.
+    """
+
+    domain = context.outer_cell
+    if domain is None:
+        return
+    if type(domain) is not OuterCellDomain:
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message="outer_cell must be an immutable OuterCellDomain",
+            path=("context", "outer_cell"),
+            value=domain,
+        )
+    if not isinstance(domain.index, llir.Expr):
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message="the outer cell index must be an LLIR expression",
+            path=("context", "outer_cell", "index"),
+            value=domain.index,
+        )
+    count = domain.count
+    if type(count) is not llir.Var:
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message="the outer cell count must be an exact LLIR Var",
+            path=("context", "outer_cell", "count"),
+            value=count,
+        )
+    if type(count.name) is not str or not count.name.isidentifier():
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message="the outer cell count must name an identifier",
+            path=("context", "outer_cell", "count", "name"),
+            value=count.name,
+        )
+    if count.type not in (llir.DataType.INT, llir.DataType.INT64):
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message="the outer cell count must be INT or INT64",
+            path=("context", "outer_cell", "count", "type"),
+            value=count.type,
+        )
+    if (
+        count.is_ptr is not False
+        or count.is_restrict is not False
+        or count.tensor_access is not None
+    ):
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_outer_cell",
+            message=(
+                "the outer cell count cannot be a pointer, be restrict-qualified "
+                "or carry tensor provenance"
+            ),
+            path=("context", "outer_cell", "count"),
+            value=count,
+        )
+
+
 def _validate_context(context: object) -> CompressedWhereOpenMPContext:
     if type(context) is not CompressedWhereOpenMPContext:
         _raise_compressed_where_error(
@@ -339,6 +451,8 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
             path=("context", "compressed_levels"),
             value=levels,
         )
+
+    _validate_outer_cell(typed_context)
 
     try:
         result_assembler = typed_context.result_assembler
@@ -1060,7 +1174,7 @@ def _build_count_body(
     work_body: List[llir.Stmt],
     context: CompressedWhereOpenMPContext,
     *,
-    loop_var: str,
+    cell_index: llir.Expr,
     workspace_hoisted: bool,
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
@@ -1101,7 +1215,7 @@ def _build_count_body(
                     name=f"_count{level}",
                     type=llir.DataType.STD_VECTOR_C_INT,
                 ),
-                index=llir.Var(name=loop_var, type=llir.DataType.INT64),
+                index=_cell_index_expression(context, cell_index),
             ),
             value=llir.Var(name=f"_cnt{level}", type=llir.DataType.INT),
         )
@@ -1116,7 +1230,7 @@ def _build_fill_body(
     work_body: List[llir.Stmt],
     context: CompressedWhereOpenMPContext,
     *,
-    loop_var: llir.Var,
+    cell_index: llir.Expr,
     workspace_hoisted: bool,
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
@@ -1135,10 +1249,7 @@ def _build_fill_body(
                             name=f"_offset{level}",
                             type=llir.DataType.STD_VECTOR_INT,
                         ),
-                        index=llir.Var(
-                            name=loop_var.name,
-                            type=loop_var.type,
-                        ),
+                        index=_cell_index_expression(context, cell_index),
                     ),
                 ),
                 llir.VarInit(
@@ -1387,10 +1498,44 @@ def _workspace_pool_statements(
     ]
 
 
-def _loop_bound_reference(loop_bound: str, loop_bound_type: llir.DataType) -> llir.Var:
-    """Return one fresh typed reference to the selected outer-loop bound."""
+def _resolve_outer_cell(
+    context: CompressedWhereOpenMPContext,
+    for_loop: llir.ForLoop,
+    loop_bound: str,
+) -> OuterCellDomain:
+    """The cell numbering to emit against: the caller's, or the loop header's.
 
-    return llir.Var(name=loop_bound, type=loop_bound_type)
+    With no supplied domain both facts come from the header, which is what every
+    caller before a stored outer loop could host this strategy relied on: the
+    loop variable numbers the cell and the loop's bound counts them.
+    """
+
+    if context.outer_cell is not None:
+        return context.outer_cell
+    loop_var = cast(llir.VarInit, for_loop.init).var
+    loop_bound_type = cast(llir.Var, cast(llir.BinOp, for_loop.cond).right).type
+    return OuterCellDomain(
+        index=llir.Var(name=loop_var.name, type=loop_var.type),
+        count=llir.Var(name=loop_bound, type=loop_bound_type),
+    )
+
+
+def _cell_count_reference(cell_count: llir.Var) -> llir.Var:
+    """Return one fresh typed reference to the receiver's outer cell count."""
+
+    return llir.Var(name=cell_count.name, type=cell_count.type)
+
+
+def _cell_index_expression(
+    context: CompressedWhereOpenMPContext, cell_index: llir.Expr
+) -> llir.Expr:
+    """Return one fresh detached copy of the outer cell index expression.
+
+    Detached per use, so no two emitted statements share a subtree -- the same
+    rule every other builder in this pass follows.
+    """
+
+    return cast(llir.Expr, LLIRRewriter(context.traversal).rewrite(cell_index))
 
 
 def _count_reference(level: int) -> llir.Var:
@@ -1411,8 +1556,7 @@ def _prefix_index_reference() -> llir.Var:
 
 def _count_and_offset_statements(
     context: CompressedWhereOpenMPContext,
-    loop_bound: str,
-    loop_bound_type: llir.DataType,
+    cell_count: llir.Var,
 ) -> List[llir.Stmt]:
     statements: List[llir.Stmt] = []
     for level in context.compressed_levels:
@@ -1421,7 +1565,7 @@ def _count_and_offset_statements(
                 var=_count_reference(level),
                 args=(
                     llir.Cast(
-                        _loop_bound_reference(loop_bound, loop_bound_type),
+                        _cell_count_reference(cell_count),
                         llir.DataType.SIZE_T,
                     ),
                     llir.Literal(0, llir.DataType.INT),
@@ -1433,8 +1577,7 @@ def _count_and_offset_statements(
 
 def _prefix_sum_loop(
     level: int,
-    loop_bound: str,
-    loop_bound_type: llir.DataType,
+    cell_count: llir.Var,
 ) -> llir.ForLoop:
     return llir.ForLoop(
         init=llir.VarInit(
@@ -1444,7 +1587,7 @@ def _prefix_sum_loop(
         cond=llir.BinOp(
             "<",
             _prefix_index_reference(),
-            _loop_bound_reference(loop_bound, loop_bound_type),
+            _cell_count_reference(cell_count),
         ),
         update=llir.Increment(_prefix_index_reference()),
         body=[
@@ -1473,8 +1616,7 @@ def _prefix_sum_loop(
 
 def _prefix_sum_statements(
     context: CompressedWhereOpenMPContext,
-    loop_bound: str,
-    loop_bound_type: llir.DataType,
+    cell_count: llir.Var,
 ) -> List[llir.Stmt]:
     statements: List[llir.Stmt] = []
     for level in context.compressed_levels:
@@ -1485,7 +1627,7 @@ def _prefix_sum_statements(
                     args=(
                         llir.Add(
                             llir.Cast(
-                                _loop_bound_reference(loop_bound, loop_bound_type),
+                                _cell_count_reference(cell_count),
                                 llir.DataType.SIZE_T,
                             ),
                             llir.Literal(1, llir.DataType.INT),
@@ -1499,7 +1641,7 @@ def _prefix_sum_statements(
                     ),
                     value=llir.Literal(0, llir.DataType.INT),
                 ),
-                _prefix_sum_loop(level, loop_bound, loop_bound_type),
+                _prefix_sum_loop(level, cell_count),
             ]
         )
     statements.extend(
@@ -1507,7 +1649,7 @@ def _prefix_sum_statements(
             var=_total_reference(level),
             value=llir.ArrayAccess(
                 array=_offset_reference(level),
-                index=_loop_bound_reference(loop_bound, loop_bound_type),
+                index=_cell_count_reference(cell_count),
             ),
         )
         for level in context.compressed_levels
@@ -1517,13 +1659,12 @@ def _prefix_sum_statements(
 
 def _position_and_coordinate_allocations(
     context: CompressedWhereOpenMPContext,
-    loop_bound: str,
-    loop_bound_type: llir.DataType,
+    cell_count: llir.Var,
 ) -> List[llir.Stmt]:
     levels = context.compressed_levels
     first_level = levels[0]
     statements = context.result_assembler.emit_first_compressed_position_allocation(
-        _loop_bound_reference(loop_bound, loop_bound_type),
+        _cell_count_reference(cell_count),
         _offset_reference(first_level),
     )
     total_vars = tuple(_total_reference(level) for level in levels)
@@ -1598,13 +1739,13 @@ def _build_transformed_statements(
     context: CompressedWhereOpenMPContext,
     manager: LLIRPassManager,
 ) -> Tuple[List[llir.Stmt], Tuple[LLIRPassRunRecord, ...]]:
-    loop_var = cast(llir.VarInit, for_loop.init).var
-    loop_bound_type = cast(llir.Var, cast(llir.BinOp, for_loop.cond).right).type
+    outer_cell = _resolve_outer_cell(context, for_loop, loop_bound)
+    cell_count = outer_cell.count
     work_body, workspace_hoisted = _extract_work_body(for_loop, context)
     count_body, count_records = _build_count_body(
         work_body,
         context,
-        loop_var=loop_var.name,
+        cell_index=outer_cell.index,
         workspace_hoisted=workspace_hoisted,
         manager=manager,
     )
@@ -1612,7 +1753,7 @@ def _build_transformed_statements(
         fill_body, fill_records = _build_fill_body(
             work_body,
             context,
-            loop_var=loop_var,
+            cell_index=outer_cell.index,
             workspace_hoisted=workspace_hoisted,
             manager=manager,
         )
@@ -1643,9 +1784,7 @@ def _build_transformed_statements(
                     fill_phase.policy,
                 )
             )
-        result.extend(
-            _count_and_offset_statements(context, loop_bound, loop_bound_type)
-        )
+        result.extend(_count_and_offset_statements(context, cell_count))
         # ONE view for the whole function, not one per phase: both phases run in
         # the same scope with no region between them, so emitting each phase's
         # preamble would declare ``wksp`` twice and the kernel would not compile.
@@ -1654,14 +1793,8 @@ def _build_transformed_statements(
         # ``pre_parallel_body`` there and here it does not.
         result.extend(count_phase.preamble)
         result.append(count_phase.loop)
-        result.extend(_prefix_sum_statements(context, loop_bound, loop_bound_type))
-        result.extend(
-            _position_and_coordinate_allocations(
-                context,
-                loop_bound,
-                loop_bound_type,
-            )
-        )
+        result.extend(_prefix_sum_statements(context, cell_count))
+        result.extend(_position_and_coordinate_allocations(context, cell_count))
         result.extend(_value_allocation(context))
         result.append(fill_phase.loop)
         result.extend(_final_assembly(context))
