@@ -17938,8 +17938,9 @@ commits are in ``src/scorch/csrc/`` and the third is comments only.
   pilot's membership and every blocker other than 1 are untouched; the Phase-8
   cutover verdict is unchanged.
 
-**Evidence ledger**: ``~/.cache/scorch-codex/workspace-confound/`` with
-``SHA256SUMS`` — ``PREDICTIONS.md`` (the session prompt's own predictions, written
+**Evidence ledger**: ``~/.cache/scorch-codex/workspace-confound/``, sealed over
+**373 files** with zero compiled artifacts in the seal and every one verifying
+(``SHA256SUMS`` itself hashes to ``ca3f2c1abc680ee6…``) — ``PREDICTIONS.md`` (the session prompt's own predictions, written
 down before any number was quoted, and scored), ``CLOSEOUT.md``, the ablation grid
 and its summary, the worker-count mechanism run, the ``float64`` confirmation of
 §67.5, the two-host chunk-merge shape comparison and its source, the chunk-merge
