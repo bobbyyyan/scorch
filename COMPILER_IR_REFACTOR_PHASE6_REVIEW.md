@@ -17399,3 +17399,556 @@ pair with both comparators, the four-column emission comparison, release
 neutrality, the repo's own static gate at both commits, and the partitioned suite
 per side with its node-set comparison.  Every harness takes a tree root as ``$1``
 and an expected commit.
+
+## 67. The workspace substitution sized before the grid it would have biased, and the number says stop (2026-08-16)
+
+This section starts from committed tip ``c94858e`` and does the thing Bobby
+decided on 2026-08-15: before building the runtime comparison an assembly selector
+would be fitted to, MEASURE the confound §66.9 found, and stop on the number.
+
+Two production commits, ``5113e0c`` and ``51471a6``, one comment-only commit
+``8760b51`` correcting the second's own numbers, and one tests-only commit
+``aac50ca``.  ``git diff c94858e..8760b51 -- src/`` is 160 insertions and 73
+deletions across two files, ``result_write_pass.py`` and ``csrc/header.h``; the
+tests are 207 insertions and 13 deletions across three.  Nothing is pushed;
+``compile_cin_via_loopir`` and ``execute_cin_via_loopir`` keep zero non-test
+callers, and none of the five protected tracked files is touched by any of the
+four commits.
+
+**``src/scorch/csrc/`` IS touched this time**, which every section since §59 has
+been able to say it was not, so the shipping ``scorch_ops`` extension is rebuilt
+by this change and "the typed route has zero callers" no longer covers it.
+§61.3's two arguments are re-run rather than inherited (§67.9 check 7).
+
+**The verdict, up front.**  The confound is REAL and it is LARGE.  Over the four
+cells where the substitution fires, the workspace swap ALONE moves the emitted
+kernel's runtime between **0.872x and 1.574x**, and it is outside its own
+configuration's same-binary A/A floor on **56 of 64 configurations**.  On the
+cells where the substitution does not fire, the same two columns measure within 2%
+of each other, which is the apparatus checking itself.  The effect is not a
+constant offset: it changes SIGN with density and grows with the receiver's
+compressed extent.  On one configuration the swap accounts for the whole apparent
+penalty of ``two_pass_serial`` -- what the two-pass column reports today is 1.63x
+slower than the single pass, and with the CIN's own workspace kept it is a 3.4%
+tie.  A selector fitted to today's numbers would learn the swap and charge it to
+the strategy.  **So the layering fix comes first, on evidence, and this session
+does not build the four-strategy grid and does not touch ``default_assembly()``.**
+
+Three smaller things landed on the way: a guard of ours that refused a legal
+program, a test of ours that could not tell aliasing from a reused address, and a
+performance defect recorded and deferred since §59.
+
+### 67.1 The ablation could be built for BOTH two-pass strategies, which the session prompt doubted
+
+Three columns per configuration:
+
+| column | strategy | accumulation workspace |
+| --- | --- | --- |
+| ``a`` | ``single_pass_serial`` | the CIN's ``coo_workspace_1d`` |
+| ``b`` | the requested two-pass strategy | the transform's substituted per-worker pool of ``linked_list_workspace_1d`` |
+| ``c`` | the same two-pass strategy | the CIN's ``coo_workspace_1d``, substitution suppressed |
+
+``a`` against ``c`` is the strategy effect, ``b`` against ``c`` is the workspace
+effect, and ``a`` against ``b`` -- what a two-pass column reports today -- is both
+at once.
+
+Suppression is a probe and changes nothing in the tree.  It patches the
+transform's own "drop this statement" predicate,
+``compressed_where_openmp_pass._should_drop_work_statement``, to report the
+workspace ``VarInit`` as neither dropped nor found.  Inside the pass the pool, the
+type substitution and the ``insert`` → ``insert_unchecked`` rename are ONE BIT --
+``workspace_hoisted``, raised by that predicate's second return value at
+``:799-801`` -- so suppressing the drop suppresses all three, and no fourth thing
+comes with them.  Measured on the emitted C++ rather than assumed: with the probe
+installed, ``linked_list_workspace_1d`` disappears, ``coo_workspace_1d`` returns,
+``.insert_unchecked(`` becomes ``.insert(``, and the two-phase structure survives
+-- the emitted source still names the counting phase's ``_cnt`` state three times,
+against none under the single pass.  ``single_pass_serial`` emits
+character for character what it emits without the probe, which is the control
+that says the probe reaches nothing outside the two-phase transform.
+
+**The session prompt predicted suppression might not be legal for
+``two_pass_parallel``, "where per-worker pools may be required for correctness",
+and named ``two_pass_serial`` as the more likely place.  Measurement contradicts
+that, and the reason is structural.**  A workspace whose declaration STAYS in the
+phase loop's body is constructed once per iteration, and an object declared inside
+an OpenMP loop body is private to the iteration by construction -- there is
+nothing to share and so nothing to race.  The pool is required only because the
+transform HOISTS the declaration out of the loop; keeping it in place removes the
+need rather than violating it.  That is not a new shape either: it is exactly what
+17 of the 21 ordered-key cells the two-pass strategies admit already emit,
+because their workspace is declared one loop deeper and the transform never sees
+it -- 21 admitted of 22 hosted, the 22nd being the one rule 4 declines.  §66.5 measured those as
+bit-identical to ``single_pass_serial`` in both arms.
+
+So the ablation runs on all four substituting cells under both two-pass
+strategies, and it is the CONTROL that could not be built rather than the
+treatment: ``_ParallelSparseWorkspaceLowering``'s single cell cannot be
+suppressed, because its ``complete_sparse_workspace`` mirror reconstructs the
+expected assembled function with the pool, the ``make_view`` borrow and
+``insert_unchecked`` hard-coded (``lower_llir.py:10825-10963``, ``:11171``) and
+refuses anything else with ``sparse_workspace_completion_lost``.  The ordered-key
+family's own mirror is explicitly disabled under a two-pass strategy
+(``lower_llir.py:15175``), which is why the probe reaches its cells at all.
+
+### 67.2 Where the substitution fires, and the axis it cannot vary
+
+The trigger is not "at the top of" but "a direct child of": the predicate scans
+``for_loop.body`` without recursing, so a workspace declared one level deeper is
+invisible.  For the ordered-key family that means ``prefix_depth == 1``, and rule
+4 (§66.3) then forces a rank-2 receiver.  **The receiver format therefore cannot
+be varied across the cells the ablation is legal on -- it is ``ds`` for all four.
+That is a property of the trigger, not a choice this measurement made**, and it is
+the one axis the session prompt asked for that could not be provided.  What varies
+is the operand formats (``MM ss x ds``, ``sss``, ``dss``, ``sds``), the shape, the
+density, the dtype and both automatic arms.
+
+| cell | receiver | substitutes | inserts a product |
+| --- | --- | --- | --- |
+| ``MM ss x ds -> ds`` | ``ds`` | yes | yes |
+| ``sss ijk->ik [ds]`` | ``ds`` | yes | no |
+| ``dss ijk->ik [ds]`` | ``ds`` | yes | no |
+| ``sds ijk->ik [ds]`` | ``ds`` | yes | no |
+| ``TTM dss x ss -> dss`` | ``dss`` | **no** — carried as the control | yes |
+
+The TTM row is the apparatus's own check: its workspace sits one loop deeper, so
+the probe must leave it alone and columns ``b`` and ``c`` must come out the same
+program there.  **They do, on all 16 of its configurations: ``b``/``c`` spans
+0.9935x-1.0197x**, which is the width of an A/A control and is what says a ratio
+of 1.574 elsewhere is the substitution rather than the harness.
+
+### 67.3 The number, and the stopping rule it triggers
+
+M5, 80 configurations -- 5 cells x 2 shapes x 2 densities x ``f32`` x both
+automatic arms x both two-pass strategies -- 7 rounds each, reps auto-calibrated to
+a 25 ms block floor and shared across the three columns, ABBA-interleaved with the
+order reversed on odd rounds, min within a round and median across rounds, plus a
+same-binary A/A control per column per configuration.  Receipt
+``receipts/confound/m5_quick.json``.  **80 planned, 80 with a record, 0 missing.**
+
+| | band | n |
+| --- | --- | --- |
+| **workspace effect**, ``b``/``c`` | **0.872x - 1.574x** | 64 |
+| strategy effect, ``a``/``c`` | 0.620x - 8.015x | 64 |
+| what a two-pass column reports today, ``a``/``b`` | 0.614x - 7.175x | 64 |
+| the control cells, where the substitution does not fire | **0.9935x - 1.0197x** | 16 |
+
+**The workspace effect is outside its own configuration's A/A floor on 56 of the
+64 configurations the substitution fires on.**  The control row is the apparatus
+checking itself: on ``TTM dss x ss -> dss``, whose workspace is declared one loop
+deeper, columns ``b`` and ``c`` are the same program and measure within 2% of each
+other on all 16 configurations.
+
+It is not a constant offset.  It is monotone in two axes:
+
+| density | shape | ``b``/``c`` | n |
+| --- | --- | --- | --- |
+| 0.02 | square | 1.046 - 1.420 | 16 |
+| 0.02 | wide receiver (compressed extent 4,096) | **1.190 - 1.574** | 16 |
+| 0.2 | square | **0.872** - 1.053 | 16 |
+| 0.2 | wide receiver | 0.959 - 1.246 | 16 |
+
+So the substitution LOSES at low density, loses more the wider the receiver's
+compressed level, and at high density it WINS by as much as 13%.  A swap that can
+go either way by a factor of 1.8 end to end is a cost-model decision, not a
+detail.
+
+**The single row that makes the case.**  ``MM ss x ds -> ds``, wide receiver,
+density 0.02, arm 0, ``two_pass_serial``:
+
+| | median seconds ratio |
+| --- | --- |
+| what the two-pass column reports today (``a``/``b``) | 0.614 -- the two-pass strategy looks **1.63x slower** than the single pass |
+| the same comparison with the CIN's own workspace kept (``a``/``c``) | 0.966 -- **a 3.4% tie** |
+| the swap alone (``b``/``c``) | 1.574 |
+
+The whole apparent penalty of ``two_pass_serial`` on that configuration is the
+workspace swap.  A selector fitted to the first row would learn to avoid a
+strategy that is not slow.
+
+**The stopping rule, applied.**  The workspace effect is ABOVE the noise floor,
+by a wide margin and on 56 of 64 configurations.  So: stop, and the layering fix
+comes first, on evidence.  This session does not build the four-strategy grid and
+does not touch ``default_assembly()``.
+
+**What the number recommends, since the shape of the fix is not obvious from
+"stop crossing the layer".**  Because the effect changes SIGN, refusing to
+substitute is not free either: on the three reduction cells at density 0.2 the
+substituted structure is the faster one by 9-13%.  So the fix that follows from
+this measurement is not "never substitute" but "let the layer that owns the
+decision make it": which accumulation structure a program uses depends on density,
+on the receiver's compressed extent and (partly, see §67.4) on the worker count,
+and those are the inputs a cost model takes.  Removing the override is step one;
+what replaces it is a decision for Bobby, and the numbers above are what it should
+be made on.
+
+### 67.4 The mechanism, tested rather than inferred
+
+The substitution does three things at once, and one of them is an allocation that
+scales with the worker count: a pool of ``scorch_nthreads(...)``
+``linked_list_workspace_1d``, each eagerly allocating three arrays sized by the
+receiver's compressed extent, built per kernel call.  Under ``two_pass_serial``
+every entry but the first is allocated and never touched (§67.10).  That is the
+obvious explanation for an effect that grows with the receiver's extent, so it was
+tested rather than asserted: the same configurations were run with ONE worker,
+where the pool has exactly one entry, and with all of them.
+
+| cell | strategy | ``b``/``c`` at one worker | at all workers |
+| --- | --- | --- | --- |
+| ``MM ss x ds -> ds`` | serial | 1.160 | 1.183 |
+| ``MM ss x ds -> ds`` | parallel | 1.290 | 1.262 |
+| ``sss ijk->ik [ds]`` | serial | 0.982 | 0.980 |
+| ``sss ijk->ik [ds]`` | parallel | 1.051 | 1.065 |
+| ``dss ijk->ik [ds]`` | serial | 0.987 | 0.994 |
+| ``dss ijk->ik [ds]`` | parallel | 1.122 | **1.039** |
+| ``sds ijk->ik [ds]`` | serial | 0.969 | 0.998 |
+| ``sds ijk->ik [ds]`` | parallel | 1.159 | **1.025** |
+| ``TTM`` (control) | serial | 0.995 | 1.008 |
+| ``TTM`` (control) | parallel | 1.006 | 1.010 |
+
+**The hypothesis is refuted as the dominant term and confirmed as a component.**
+The effect does not collapse at one worker -- ``MM`` holds at 1.16-1.29 where the
+pool has a single entry -- so most of it is the accumulation structure itself.
+But two cells under ``two_pass_parallel`` shrink materially with more workers
+(1.122 → 1.039 and 1.159 → 1.025), which is the pool's per-call cost being
+amortised over work that actually uses it.  So the swap's cost has at least two
+independent parts, and that is one more reason it does not belong inside an
+assembly strategy.
+
+### 67.5 §66.5's 1-ulp difference is CONFIRMED, not inferred
+
+§66.5 attributed the 56 value-only differences on ``MM ss x ds -> ds`` to the
+substitution, on the reasoning that both structures accumulate at the coordinate
+with ``+=`` in insertion order, so the sum is not reordered, and what changes is
+the code the accumulation inlines into -- under ``-ffast-math -O3`` the compiler
+fuses the multiply-accumulate in one and not the other.  That was an explanation
+scored against a three-way census, not a demonstration.
+
+Suppressing the substitution makes the values BIT-IDENTICAL to
+``single_pass_serial``'s again, on **every one of the 64 substituting
+configurations**, while the substituted column differs on the same configurations
+-- and it is the same one cell, ``MM ss x ds -> ds``, that differs, exactly as
+§66.5's three-way table predicts.  The three reduction cells substitute and stay
+bit-identical because what they insert is a bare value; the TTM control inserts a
+product and stays bit-identical because it does not substitute.  At this grid's
+larger extents the difference reaches 3.81e-06 on up to 387,294 entries at
+``float32``, which is the same one-unit-in-the-last-place at those magnitudes.
+
+Confirmed at ``float64`` as well, on four further configurations -- both arms x
+both two-pass strategies on ``MM ss x ds -> ds`` at density 0.2: the substituted
+column differs on 54,530 values by at most 7.11e-15 and the suppressed column is
+bit-identical, every time.
+
+So the mechanism is measured rather than explained: the difference is the
+substitution's and nothing else's.  **Suppressing it is also the only way found so
+far to make the four strategies interchangeable on VALUES as well as on index
+arrays**, which is worth knowing before anyone decides how much a declared 1-ulp
+difference is worth.
+
+### 67.6 ``result_write_pass``'s marker truthfulness check refused a truthful marker
+
+§66.9's second defect, obstacle D in §66.1.  The check has two halves and they
+need different amounts of the statement, and it was running both off ONE walk.
+
+The MENTION half asks whether the marker's array appears in the statement at all,
+and its docstring's argument for walking nested bodies is correct: more places
+searched means more names found means fewer refusals, so nested bodies can only
+make that half more permissive.  The DIRECTION half asks which way the reference
+goes, and it read ``written_members`` populated by the same walk.  That is not
+safe, and the reason is a rule both marker builders already state in their own
+docstrings -- ``loopir/lower_llir.py:4131`` and ``cin_lowerer.py:574``: *a marker
+describes the references in the statement's OWN expression fields, not those in a
+nested statement body, which carries its own*.  A nested statement's spelling is
+evidence about the NESTED statement's marker.  Attributing it to the parent made
+the check call a truthful marker a lie.
+
+Measured at ``5113e0c``'s parent rather than argued from the review.  On the
+ordered-key drain's segment-open shape -- an ``IfThenElse`` whose condition reads
+``Result1_crd.back()`` and whose body appends to ``Result1_crd`` -- the check ran
+exactly backwards in both phases:
+
+| marker on the conditional | before | after |
+| --- | --- | --- |
+| READ, which is the truth | ``untruthful_result_storage_marker`` | passes the check, reaches the postcondition, which is the layer that owns a surviving read |
+| WRITE, which is a lie | passed the truthfulness check (refused later, and for an unrelated reason: ``unrewritten_result_write_statement``) | ``untruthful_result_storage_marker`` |
+
+Two changes in ``_ResultStorageNameFinder``.  Direction evidence is recorded only
+while no nested statement is open, tracked by counting open statements over the
+walker's own ``enter_node``/``leave_node`` hooks -- which reaches every way a
+nested statement can be entered, including a ``ForLoop``'s ``init`` and ``update``
+and a ``GuardedCallStmt``'s ``call``, none of which arrive through a statement
+sequence.  And the direction became two SETS rather than one boolean per array, so
+a statement that spells both directions of one array is recorded as spelling both.
+The old dict let whichever spelling the walk reached last decide, which is a coin
+flip rather than a check: on a statement spelling both, it could refuse either
+marker depending on traversal order.
+
+The refusal surface is unchanged where the statement's own spelling decides.  The
+rule is now stated as one sentence: **a marker is a lie when nothing the statement
+itself spells corroborates it.**  Seven new cases pin both directions of that, in
+both phases -- ``test_the_direction_half_reads_only_the_statements_own_spelling``
+(the truthful read accepted and the lying write on the identical statement
+refused), ``test_the_mention_half_still_searches_nested_bodies``,
+``test_a_write_spelling_still_refuses_a_read_marker`` (the mirror of the existing
+``.size``-with-a-WRITE-marker case), and
+``test_a_statement_spelling_both_directions_corroborates_either_marker``.  The
+existing refusal tests are unchanged and still pass.
+
+**The change is NOT one-directional, and saying so is the point.**  Narrowing the
+direction half's evidence makes the check more permissive where the statement's
+own spelling says nothing, and STRICTER where it says the opposite of a nested
+body: a marker claiming a WRITE on a statement that only reads at its own level
+used to pass whenever the walk happened to see the nested write last, and now it
+is refused.  That is the correct verdict -- the marker was lying -- but it means a
+production body carrying such a marker would move from emitting to refusing, so
+the claim that nothing real moves is a measurement and not an argument.  §67.9's
+emission and frontier rows are that measurement.
+
+The fix is unreachable from the two-pass path today, because rule 4 declines the
+shape that provokes it (§66.3).  It is fixed anyway: a guard that refuses a legal
+program is a defect whether or not anything currently walks into it, and the guard
+is ours.
+
+### 67.7 An identity test written over ``id()`` cannot tell aliasing from address reuse
+
+§66.9's fourth defect.  ``test_completion_reference_owns_no_pipeline_entry_state``
+built three sets of ``id()`` values -- the statements at pipeline entry, the freshly
+reconstructed completion reference, and the final program -- and asserted the sets
+do not pairwise intersect.  It then let the objects behind those ids die.  The
+completion reference is a temporary that is freed as soon as the comparison
+returns, so its addresses were free for the final program's nodes to be allocated
+at, and an intersection meant either aliasing or reuse with no way to tell which.
+It failed once that way in a full-partition run and passed in isolation.
+
+**And it failed again, on the BASE side of this section's own suite run**, at
+``c94858e``, in partition 1 of eight, on the intersection of the pipeline-entry
+ids with the completion reference's:
+
+    assert not (entry_ids & reference_ids)
+    E  assert not ({4554343664, 4554343856, 4554352784, ...} &
+                   {4554342464, 4554342992, 4554344384, ...})
+
+That is the second observed occurrence and the first one anybody watched happen on
+purpose.  It is also why the node-set comparison in §67.9 reports an outcome change
+on exactly one node: base FAILED, candidate passed, and that is the fix working
+rather than a difference to explain away.
+
+The property the test exists to establish is that the three object graphs share no
+object.  The helper now returns the objects rather than their ids and the test
+holds all three lists across the comparison, which makes ``id()`` unique again --
+two SIMULTANEOUSLY LIVE objects never share an address.  Two new cases carry the
+argument rather than leaving it in a comment:
+``test_completion_owner_capture_outlives_its_root`` holds a weak reference to a
+node, drops the root, collects, and requires the node to still be alive, which is
+the precondition the soundness rests on; and
+``test_completion_owner_ids_report_a_shared_node`` builds two graphs over one
+shared ``Var`` and requires the intersection to be exactly that ``Var``, so the
+check can still fail.
+
+The parallel target's ``test_completion_actual_shares_nothing_with_reference``
+reuses the same helper and follows it.  That one was already sound -- it compares
+both graphs inside one call, with both alive -- and stays so.
+
+### 67.8 The chunk merge's value-initializing resize, and why the parallel arm went with it
+
+§60.9 recorded it and every section since deferred it: ``scorch_concat_chunks``
+sized its destination with ``resize(total)``, which value-initializes
+``[begin, total)`` -- a whole pass of stores over a range the memcpy that follows
+overwrites in full.
+
+The redundant pass and the parallel copy turned out to be ONE choice, not two.
+The destination is a ``std::vector<T>`` the generated kernel declares and later
+MOVES into a tensor (``header.h:77``), so it cannot be given an allocator that
+default-initializes, and C++17 has no uninitialized resize.  ``resize(total)`` is
+precisely what buys the right to ``memcpy`` disjoint slices from an OpenMP region;
+growing with ``reserve`` plus one ``insert`` per chunk writes the destination once,
+because ``insert`` copy-constructs into raw storage, but the copies are then
+necessarily serial, since only the container may move its own size.  3N bytes
+against 2N, so the parallel copy has to divide its 2N by more than two before the
+extra pass pays for itself.
+
+Measured on two hosts, 144 points each -- nine total sizes from 1 KB to 32 MB x
+{2, 8, 32} chunks x {1, 2, 4, all} threads x {int, float}, ABBA-interleaved, min
+within a round and median across rounds, against a same-shape control whose floor
+is 0.97-1.03 at almost every point:
+
+| | Apple M5 | x86 (``redwood``) |
+| --- | --- | --- |
+| insert faster at | 97 of 144 points | 134 of 144 |
+| at ONE worker, where the parallel arm cannot fire | 35 of 36, 0.906x-1.595x | 36 of 36, 1.019x-3.683x |
+| at exactly the 256 KB gate, more than one worker | **3.2x-18.4x faster** | **2.4x-4.8x faster** |
+| resize-and-parallel wins | from 4 MB up, best 1.66x at 32 MB | only 16 MB over 32 chunks, and 32 MB; best 1.28x |
+
+The 256 KB row is the finding inside the finding: that is the smallest region the
+parallel arm fires on today, and there the OpenMP region costs more than the copy
+it parallelizes -- by up to 18x.  The gate was ``SCORCH_MEMSET_GRAIN_BYTES``,
+which is the threshold for ``scorch_zero_dense``'s pure memset and is a different
+operation.
+
+So no byte threshold provably avoids firing where it hurts -- the two hosts put
+the crossover in different places and disagree by more than the win -- and
+CLAUDE.md asks a runtime gate to be provably inert on the shapes it would hurt.
+The mechanism is removed rather than given a threshold that cannot be right on
+both hosts.  The cost is stated rather than hidden: a merge above 4 MB on the M5
+gives up as much as 1.66x, and recovering it needs a destination the generated
+kernel declares with an allocator that default-initializes, which is a codegen
+change and would move emitted bytes.  One regression is named and quantified: a
+1 KB total spread over 32 chunks is 0.897x-0.916x on the M5 -- twelve to eighteen
+nanoseconds, on 32-byte chunks where ``insert``'s per-chunk bookkeeping outweighs a
+zero-fill that fits in a cache-line burst -- and x86 does not show it
+(1.208x-1.439x on the same points).
+
+``scorch_chunk_offsets`` went with the region: a per-chunk destination-offset
+array existed only so the region could address disjoint slices, and it was a heap
+allocation per merge, which is material at the small end where a merge is tens of
+nanoseconds.  ``scorch_chunk_total`` replaces it.  The generated call text is
+unchanged -- ``threads`` is kept, unnamed -- so the emitter's locks on it hold.
+
+**And on the KERNEL, which is what Job 2 was asked to measure, it is NEUTRAL, not
+better.**  Two ``single_pass_chunk_parallel`` configurations of
+``TTM dss x ss -> dss`` -- the only strategy that calls the merge -- timed base
+against candidate through one JIT boundary per side, four ABBA rounds, with the
+chunked output verified bit-identical to ``single_pass_serial``'s on the same tree
+before anything was timed:
+
+| | base/candidate | same-tree A/A control |
+| --- | --- | --- |
+| 261,806 stored entries | 0.996 | 1.002 |
+| 505,548 stored entries | 1.002 | 1.006 |
+| band | 0.9959-1.0019 | 1.0017-1.0062 |
+
+The A/B ratios sit on the A/A floor.  The arithmetic says why: at 261,806 entries
+the two nnz-sized merges are about 1 MB each, the M5 saving at 1 MB and four
+workers is about 9 microseconds per array, and the kernel takes 1.48
+milliseconds -- so the whole change is around one percent of a kernel, under a
+floor of half a percent measured over two configurations.
+
+Both statements go in the record, because either one alone is misleading: the merge
+itself is 1.05x-18x faster across 288 points on two hosts, and the kernels measured
+are not measurably faster, because the merge is well under one percent of their
+time at the sizes this corpus reaches.  The value of the change is not a kernel
+number.  It is that the four-strategy grid can now be built on a merge whose cost
+is not about to move, which is the reason §66.10 gave for not building it, and that
+one of the four columns no longer carries a known defect into the selector's
+training data.  **Two configurations is a narrow grid and the wider one is owed**
+(§67.10).
+
+### 67.9 The proof
+
+Every check ran from a fresh detached worktree with its commit asserted before
+anything was measured (§62.5), and every harness takes a tree root as ``$1``.
+Which commit each check measured is stated, because two of the three production
+commits are in ``src/scorch/csrc/`` and the third is comments only.
+
+| check | result |
+| --- | --- |
+| **1. The ablation itself**, three columns x 5 cells x 2 shapes x 2 densities x ``f32`` x both arms x both two-pass strategies -- 80 configurations | **80 planned, 80 with a record, 0 missing.** Workspace effect 0.872x-1.574x over the 64 substituting configurations, outside its own A/A floor on 56 of them; the 16 control configurations span 0.9935x-1.0197x |
+| **2. Correctness inside the ablation**: every column against ``single_pass_serial``, whole output storage, bit for bit, plus a dense ``float64`` reference | **PASS.** 0 index-array differences anywhere, 0 structured refusals, 0 columns unstable under repetition, 0 arm-variant effects.  Values: column ``c`` bit-identical on all 64; column ``b`` differs only on ``MM ss x ds -> ds`` |
+| **3. Cross-strategy correctness**, the two TTM cells x four strategies x 2 shapes x 2 densities x 2 dtypes x both arms | **PASS.** 32 configurations, 160 executed strategy runs, **0 storage differences** -- every index array and every value bit-identical across all four strategies -- and every strategy within 6.26e-07 of a dense ``float64`` reference |
+| **4. Cross-strategy correctness over the whole legal domain**, 24 cells x 4 regimes x 2 densities x 2 dtypes x both arms, sharded four ways with a merge that refuses a missing shard | **PASS, and it reproduces §66.5 exactly.** 768 configurations, 3,168 executed strategy runs, **0 index-array differences**, 0 unclassified refusals, 0 rows without a baseline, worst dense-reference error 7.54e-07.  56 value-only differences, all on ``MM ss x ds -> ds``, worst 4.77e-07 -- the inherited declared difference §67.5 now explains, not a new one |
+| **5. Emission, all four strategy columns, pre-session base against candidate**, 1,130 cells x both arms | **PASS.** Automatic byte-neutrality **NEUTRAL** over all 1,130 cells in both arms, 0 differing.  Per-strategy admitted counts: ``single_pass_serial`` 502, ``single_pass_chunk_parallel`` 18, ``two_pass_serial`` **42**, ``two_pass_parallel`` **44** -- §66.4's counts, unchanged.  Every refusal carries a structured code.
+**And the four explicit columns are compared base-against-candidate, which the harness's own verdict does not do**: it runs the four columns on the candidate only, so it was run twice, once per tree, and the receipts joined on (request, cell, arm).  Result: 502 + 18 + 42 + 44 cell-arms emit on both sides and **every one is byte-identical -- 0 digests moved, 0 stopped emitting, 0 newly emitting, 0 refusal codes moved** |
+| **6. The frontier**, 1,139 records x both arms, base and candidate, field for field | **PASS on both comparators.** Field for field IDENTICAL over all 1,139 records (1,138 distinct keys, the one duplicate §60.10 explains, compared positionally): differing fields 0.  The gate's own reading: admitted 260 both sides, **0 lost, 0 gained, 0 route changed, 0 unclassified either side**, 3 arm-variant both sides (inherited, same set), 0 new arm-variance |
+| **7. The header block's inertness in the shipping extension**, §61.3's argument one re-run rather than inherited | **PASS, and no shipping byte moved.** ``ops.cpp`` compiled to assembly at both tips with identical flags from a relative source path is **byte-identical** -- 211,608 lines each, one SHA-256 ``73aab5677b562d34...``, which is the SAME digest §61.3 recorded.  Each of the block's function names appears **zero times in either assembly**: with no call site in the translation unit an ``inline`` function has no definition to emit and a template is never instantiated, so editing one changes nothing.  The built extensions carry an identical exported symbol table (39 symbols) and an identical ``__TEXT`` segment size (491,520).  Argument TWO, the prebuilt runtime guardrail grid, is a separate program and was run separately: 18 configurations (three row counts x three free dimensions x two degrees), 6 runs per side in alternating ABBA rounds, 15 reps, two statistics.  **SpMM 0 of 18 outside the combined same-binary floor on both statistics.  Fused 0 of 18 on the median and 2 of 18 on min-of-samples, both at the SMALLEST configuration in the grid** -- 1,024 rows, degree 8, 8,156 stored entries, ratios 0.9240 and 0.9242 against a floor whose low end is 0.9256.  That is the same cell §61.3 found outside on the same statistic and inside on the median, and whose own A/A run flagged it too; since argument one proves the two binaries hold the same instructions, it cannot be a code difference |
+| **8. Release neutrality**, whose two preamble-bearing columns are EXPECTED to differ after a ``header.h`` change | **PASS on every kernel-body column, DIFFERS on the two preamble columns, and the difference is confined.** Production dispatch 506 case-arms (412 emitting): 0 emission differences, 0 outcome differences.  86-case schedule audit: 0 nonidentical fields.  20-source corpus: 19 of 20 identical, the one differing file is ``preamble.cpp``.  42-case ``ss@dd`` grid: 21 of 42 identical -- every one of the 21 KERNEL files -- and all 21 differing files are ``*_preamble.cpp``.  The preamble diff is 128 lines in 8 hunks, all inside base lines 1283-1334, which is exactly the two edited functions and their comments; nothing outside that span differs |
+| **9. The suite**, 8 file-disjoint partitions per side, node sets diffed | **PASS on the candidate, and the BASE side reproduced the defect §67.7 fixes.** Base ``c94858e``: 6,498 nodes / **1 failure** / 0 errors / 15 skipped.  Candidate ``8760b51``: 6,507 / **0** / 0 / 15, all eight partitions exit 0.  By node set: 6,498 in both, **0 base-only, exactly 9 candidate-only** -- every one a test this section adds, named individually in the receipt -- and **1 outcome change on a shared node**: ``test_completion_reference_owns_no_pipeline_entry_state``, failure → passed.  Both sides collected the same 93 test files.  The comparator prints MISMATCH, correctly: it treats any outcome change as one, and this outcome change is the fix |
+| **10. The repo's own static gate over ``src``**, at both commits | **PASS as a comparison, RED as a gate, at both commits, exactly as §66.7 found.** ``mypy`` (146 lines) and ``flake8`` (9) byte-identical between the commits; ``black`` differs only in the tree path inside its one message (``prebuilt_kernels.py``).  All three exit non-zero at BOTH commits and none of it is in a file this section touches; every touched file is clean under all three |
+| **11. Protected tracked files, both ways** | **PASS.** No commit in ``c94858e..8760b51`` touches any of the five; the five tracked blobs at the tip equal the reference commit's; and the on-disk snapshot check passes on the clean detached checkout at the tip |
+| **12. The chunk merge's own shape comparison**, two hosts, 144 points each | **PASS as a measurement.** §67.8's table; A/A floor 0.97-1.03 at almost every point |
+| **13. Chunk-merge KERNEL runtime**, base against candidate, with the A/A control run by pointing both sides at the base tree | **NULL, and calibrated.** Two ``single_pass_chunk_parallel`` configurations, chunked output verified bit-identical to ``single_pass_serial``'s on the same tree before timing: base/candidate 0.9959-1.0019 against a same-tree A/A control of 1.0017-1.0062.  Two configurations is a narrow grid (§67.10) |
+
+### 67.10 Defects found and recorded, not fixed here
+
+- **``two_pass_serial`` allocates a per-worker pool it cannot use.**
+  ``_workspace_pool_statements`` is gated on ``workspace_hoisted`` alone
+  (``compressed_where_openmp_pass.py:1779``), never on ``context.parallel``, and
+  the serial phase loop still carries a live ``scorch_nthreads(...)`` policy, so a
+  serial kernel constructs ``scorch_nthreads`` × ``linked_list_workspace_1d`` --
+  three eager ``new[]`` arrays each, sized by the receiver's compressed extent --
+  and indexes entry 0 forever, because ``omp_get_thread_num()`` outside a region is
+  0.  §67.4 measures how much of the workspace effect this accounts for: not the
+  dominant term, but a visible one on two cells under ``two_pass_parallel``.
+  Sizing the serial pool at 1 would be byte-visible and is locked by no test found.
+- **The chunk-merge kernel grid is two configurations wide.**  §67.8's kernel
+  reading is a real A/A-calibrated null, but on two points of one cell; the
+  harness has a ``full`` grid (2 cells x 3 shapes x 2 densities x 2 dtypes x both
+  arms) that this session did not have the quiet machine to run, because the
+  ablation and the proof battery wanted it.  A null over two points is weaker
+  evidence than a null over forty-eight and is recorded as such.
+- **``scorch_concat_chunk_positions`` value-initializes for the same reason**
+  (``header.h``), and it is not changed here: what follows its resize is a
+  transforming loop rather than a memcpy, so ``insert`` cannot express it and the
+  trade is a different one that needs its own measurement.
+- **``two_pass_reach.py``'s ``force_ordered_key_two_pass`` is stale in a way that
+  reintroduces a fixed defect.**  Its replacement
+  ``compressed_where_pass_spec`` omits both the ``two_pass_assembly_legal()``
+  guard and ``self._outer_cell_domain()``, which is the capability §66.2 added, so
+  ``FORCE_ORDERED_KEY_TWO_PASS=1`` on this tip re-exposes obstacle A rather than
+  characterising it.  Nothing in this section uses it -- the ordered-key family's
+  ``supported_assemblies`` already returns every strategy
+  (``lower_llir.py:9217``), so ``Schedule(assembly=...)`` reaches two-pass
+  directly -- and the probe should be refreshed or retired before a later session
+  reaches for it.
+- **``prebuilt_guardrail.py`` ends with a stale block** that hardcodes
+  ``outside = []`` and then unconditionally prints "configurations OUTSIDE the
+  floor : 0 of 18", after the real per-statistic report.  A reader who stops at
+  the last line reads a check that cannot fail.
+- **The ledger seal's exclusions failed a FOURTH time, and this time the pattern
+  was changed rather than the position.**  §62.9 added exclusions, §66.9 added three
+  more for a suffixed extension-cache name, and this session hit it again from a
+  different direction: ``statics_src.sh`` writes its ``TMPDIR`` and mypy's
+  incremental cache to what it calls a sibling of the output directory, which for
+  an output directory of ``receipts/proofs`` is ``receipts/scratch`` -- 36 files and
+  158 MB of sqlite -- and the inherited exclusion was ``./scratch/*``, anchored at
+  the LEDGER ROOT.  Every previous fix added another position.  **The positions were
+  never the pattern; the names are.**  ``find -path`` matches with ``fnmatch`` and
+  no ``FNM_PATHNAME``, so ``*`` matches ``/`` and ``*/scratch/*`` is
+  depth-independent -- verified on this ledger's own 746-file nested pytest
+  ``TMPDIR`` rather than assumed.  The seal script now anchors every exclusion on
+  the directory NAME at any depth AND reads its own output back, refusing to
+  complete if any ``.so``, ``.o``, ``.dylib``, ``build.ninja``, mypy cache or
+  ``pytest-of-`` path is in it.  A seal that cannot fail was the whole problem.
+- **The 116 labels that arrive at ``result_write_pass`` and are never read**
+  (§64.4, §65.6c) are untouched.
+
+### 67.11 What this section does not do
+
+- **No four-strategy runtime grid.**  That is what the confound number decides,
+  and it decided against: §67.3's band is outside the noise floor, so a grid built
+  now would carry the swap into the selector's training data.
+- **No selector.**  ``default_assembly()`` is untouched on every family, so no
+  automatic compilation chooses a two-pass strategy.
+- **The layering defect is NOT fixed.**  This section sizes it.  §66.9 records
+  that both candidate fixes -- teaching the pass to pool the family's own
+  workspace type, or refusing to substitute -- need their own measurement, and the
+  ablation's third column is not a fix: it is a probe that patches a module
+  attribute from a harness, and the production question includes
+  ``_ParallelSparseWorkspaceLowering``'s completion mirror, which the probe cannot
+  reach.
+- **Rule 4 is not lifted, obstacle B is not closed, and the deeper position close
+  is not addressed** (§66.9).
+- **``scorch_concat_chunk_positions``'s resize stands** (§67.10).
+- **Nothing is wired into dispatch.**  ``compile_cin_via_loopir`` and
+  ``execute_cin_via_loopir`` keep zero non-test callers and the test proving
+  ``import scorch`` never loads the LoopIR package still passes.
+- **mkt1 is still not run.**  Owed since §59.  The confound measurement is M5-only
+  by design -- it is a sequencing input, not a shipping claim -- and the header
+  change's shape comparison ran on two hosts because that one picks a mechanism.
+- The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the shadow
+  pilot's membership and every blocker other than 1 are untouched; the Phase-8
+  cutover verdict is unchanged.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/workspace-confound/`` with
+``SHA256SUMS`` — ``PREDICTIONS.md`` (the session prompt's own predictions, written
+down before any number was quoted, and scored), ``CLOSEOUT.md``, the ablation grid
+and its summary, the worker-count mechanism run, the ``float64`` confirmation of
+§67.5, the two-host chunk-merge shape comparison and its source, the chunk-merge
+kernel runtime with its same-tree control, the cross-strategy correctness run and
+the sharded whole-domain differential with its merge, the four-column emission
+comparison built from two runs of the emission harness, the frontier pair with both
+comparators, release neutrality with the preamble diff, the repo's own static gate
+at both commits, the shipping extension's inertness, the protected-file check both
+ways, and the partitioned suite per side with its node-set comparison.  Every
+harness takes a tree root as ``$1`` and an expected commit, and the suppression in
+the ablation's third column is a probe that patches one module attribute — nothing
+in the tree implements it.

@@ -33411,3 +33411,102 @@ the grid.
 7. **Copy `seal_ledger.sh` from a ledger that has §62.9's exclusions** —
    `two-pass-position/` now has one too. The shared copy at `~/.cache/scorch-codex/` is still
    wrong.
+
+---
+
+# Slice: the workspace substitution sized, and the grid deliberately not built (2026-08-16)
+
+Review §67 is the full record. Starting tip `c94858e`, final tip `8760b51`, four
+commits, nothing pushed. Evidence: `~/.cache/scorch-codex/workspace-confound/`.
+
+**1. THE NUMBER, which is what this session was for.** Timing a two-pass strategy
+against the single pass on the four cells where the workspace declaration is a
+direct child of the replaced loop does not compare two assembly strategies. The
+two-phase transform replaces the CIN's `coo_workspace_1d` with a per-worker pool of
+`linked_list_workspace_1d` and rewrites `insert` to `insert_unchecked`, and that
+swap alone moves the emitted kernel's runtime **0.872x to 1.574x**, outside its own
+configuration's A/A floor on **56 of 64 configurations**. On the control cell,
+where the substitution does not fire, the same two columns agree to within 2%.
+**The effect changes SIGN with density** — the substitution loses by up to 57% at
+density 0.02 and wins by up to 13% at density 0.2 — and grows with the receiver's
+compressed extent. On one configuration the swap is the WHOLE apparent penalty of
+`two_pass_serial`: 1.63x slower than the single pass as reported today, a 3.4% tie
+with the CIN's own workspace kept.
+
+So: **the four-strategy runtime grid is NOT built, and `default_assembly()` is
+untouched.** A selector fitted to today's numbers would learn the swap.
+
+**2. THE HANDOFF'S OWN ITEM 3 IS WRONG ON ONE POINT, measured.** It says the
+choice is "teach the two-phase pass to pool the workspace the CIN chose, or refuse
+to substitute and lose the strategy on the four `ds` cells". Refusing does NOT lose
+the strategy: leaving the declaration in the loop body compiles under BOTH two-pass
+strategies on all four cells, executes, and is bit-identical to
+`single_pass_serial` on every index array AND every value. It is the shape 17 of
+the 22 admitted ordered-key cells already emit. A workspace declared inside an
+OpenMP loop body is private to the iteration by construction, so the pool is
+required only because the transform hoists the declaration out — keeping it in
+place removes the need rather than violating it.
+
+What the number adds to that choice: because the effect changes sign, *neither*
+"always substitute" nor "never substitute" is right. Which accumulation structure
+wins depends on density, on the receiver's compressed extent and partly on the
+worker count, which is a cost-model decision and belongs in the layer that owns it.
+
+**3. §66.5's 1-ULP DIFFERENCE IS CONFIRMED, not inferred.** Suppressing the
+substitution makes the values bit-identical to `single_pass_serial` on all 64
+substituting configurations at `float32` and on four more at `float64`, while the
+substituted column differs on the same configurations and only on the one
+product-inserting cell. Suppression is so far the only way found to make the four
+strategies interchangeable on values as well as on index arrays.
+
+**4. `scorch_concat_chunks`'s value-initializing resize IS FIXED** — handoff item
+1, owed since §59. The zero-fill and the parallel `memcpy` turned out to be one
+choice: `resize` is what makes the destination's size legal to write from a
+parallel region, and C++17 has no uninitialized resize for `std::vector`. Measured
+on two hosts over 144 points each, the reserve-plus-insert shape is faster at 97 of
+144 M5 points and 134 of 144 x86 points, and **3.2x-18.4x faster at exactly the
+256 KB gate** where the OpenMP region cost dwarfs the copy. No byte threshold is
+right on both hosts, so the region is removed rather than re-gated.
+**On the KERNEL it is neutral** — two chunk-parallel configurations sit on their own
+A/A floor — because the merge is under one percent of those kernels. Both halves are
+in §67.8. `src/scorch/csrc/` is touched for the first time since §59, so §61.3's
+two inertness arguments are re-run rather than inherited.
+
+**5. TWO OF OUR OWN CHECKS WERE WRONG, and both are fixed.** (a)
+`result_write_pass`'s marker truthfulness check read direction evidence from nested
+statement bodies, so it called the ordered-key drain's truthful READ marker a lie
+while letting a lying WRITE marker on the same statement through — measured, both
+directions, before and after. Direction now comes only from the statement's own
+spelling, and it is two sets rather than one boolean, so a statement spelling both
+directions corroborates either marker instead of being decided by traversal order.
+(b) `test_completion_reference_owns_no_pipeline_entry_state` compared sets of
+`id()` values after letting the objects die; it now holds the objects, with a test
+that the capture outlives its root and a positive control that a genuinely shared
+node still shows up.
+
+**6. HARNESS NOTES FOR THE NEXT SESSION.** `two_pass_reach.py`'s
+`force_ordered_key_two_pass` is now STALE in a way that reintroduces obstacle A —
+its replacement `compressed_where_pass_spec` omits `self._outer_cell_domain()`.
+Do not use `FORCE_ORDERED_KEY_TWO_PASS=1` on this tip; the ordered-key family's
+`supported_assemblies` already returns every strategy, so `Schedule(assembly=...)`
+reaches two-pass directly. And `prebuilt_guardrail.py` ends with a stale block that
+always prints "0 of 18 outside the floor" after the real report.
+
+## What the next session should do
+
+1. **The layering fix, on the evidence in §67.3.** Removing the override is step
+   one; what replaces it is a decision for Bobby, and the numbers say it needs to be
+   a decision rather than a constant. Note that the fix has two independent halves:
+   the ordered-key family, whose completion mirror is already disabled under a
+   two-pass strategy, and `_ParallelSparseWorkspaceLowering`, whose mirror hard-codes
+   the substituted shape and must be parameterized first.
+2. **Then the four-strategy runtime grid**, on a second host as well, and only
+   after the swap is out of the columns.
+3. **Then `default_assembly()`.**
+4. **The two completion mirrors** are still what stands between `two_pass_serial`
+   and 46 of 48.
+5. **Rule 4's obstacles B and E** are the remaining 2 cell-arms. D is now fixed
+   (§67.6) but rule 4 still declines the shape for B and E.
+6. **The chunk-merge kernel grid is two configurations wide**; the harness has a
+   `full` grid that wants a quiet machine.
+7. **mkt1 is still owed**, since §59.
