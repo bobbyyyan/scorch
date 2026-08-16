@@ -52,6 +52,21 @@ def _evict_narrowed(key: int) -> None:
     _narrowed.pop(key, None)
 
 
+def _version_of(index: torch.Tensor) -> int:
+    """The tensor's version counter, or -1 when it does not have one.
+
+    Tensors created under ``torch.inference_mode()`` have their version counter
+    disabled and reading ``_version`` RAISES on them, so this has to be asked rather
+    than assumed — otherwise every sparse matmul inside an inference-mode block would
+    fail. Such a tensor cannot report in-place mutation at all, which puts it in the
+    same position as the documented blind spot in native_abi.h's memo.
+    """
+    try:
+        return index._version
+    except RuntimeError:
+        return -1
+
+
 def _narrow_index(index: torch.Tensor) -> torch.Tensor:
     """int64 index tensor -> memoized int32 copy (or the original if not int64)."""
     if index.dtype != torch.int64:
@@ -59,8 +74,9 @@ def _narrow_index(index: torch.Tensor) -> torch.Tensor:
     if not _NARROW_CACHE_ON:
         return index
     key = id(index)
+    version = _version_of(index)
     hit = _narrowed.get(key)
-    if hit is not None and hit[0] == index._version:
+    if hit is not None and hit[0] == version:
         return hit[1]
     if index.numel():
         # One pass, not two: this runs once per tensor but on the full int64 array,
@@ -74,7 +90,7 @@ def _narrow_index(index: torch.Tensor) -> torch.Tensor:
             weakref.finalize(index, _evict_narrowed, key)
         except TypeError:  # not weak-referenceable; skip memoization entirely
             return narrowed
-    _narrowed[key] = (index._version, narrowed)
+    _narrowed[key] = (version, narrowed)
     return narrowed
 
 
