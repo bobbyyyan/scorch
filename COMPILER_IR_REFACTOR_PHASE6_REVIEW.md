@@ -16978,3 +16978,418 @@ result assembler emits that names result storage, classified by shape),
 it).  ``marker_reach.py`` gained the argument-position probe.  Nothing inherited was
 patched; the sealed originals in ``statement-marker/`` are left alone, for §63.8's
 reason.
+
+## 66. Two-pass assembly made correct on the ordered-key family: five obstacles, and four of them are not the one §60.6 named (2026-08-16)
+
+This section starts from committed tip ``d0503cf`` and does the job §60.6 stage 3
+left open: make the two two-pass assembly strategies produce correct output, so
+that a later session can choose between four working strategies instead of two.
+Before this, ``two_pass_parallel`` was admitted for 2 of the 48 program-settings of
+the legal domain and ``two_pass_serial`` for 0, both refused with
+``unsupported_assembly_host``.
+
+Three production commits, ``1be95d6``, ``72b0460`` and ``56d014b``, and two tests-only
+commits ``cb193a1`` and ``c1ccb10``.  ``git diff d0503cf..HEAD -- src/`` is 451 insertions
+and 74 deletions across three files; the tests are 393 insertions and 15 deletions
+across four.
+**``src/scorch/csrc/`` is untouched**, so the shipping ``scorch_ops`` extension is
+bit-unchanged.  Nothing is pushed; ``compile_cin_via_loopir`` and
+``execute_cin_via_loopir`` keep zero non-test callers.
+
+**The verdict, up front.**  Both two-pass strategies now emit and execute, over 42
+and 44 of the 48 program-settings, and their output is bit-identical to the same
+program's under ``single_pass_serial`` on **every index array of every cell in every
+input regime in both automatic scheduler settings**.  §60.6 stage 3 named one
+cause and there are five.  Two are fixed in the shared layers; three are confined
+to one program shape, which is now refused BY SHAPE with a structured code instead
+of by class.  One difference is declared rather than eliminated: on the single cell
+whose accumulation workspace the transform substitutes and whose inserted value is
+a product, the values differ by at most one unit in the last place.
+
+### 66.1 What the measurement found, against what §60.6 says
+
+§60.6 stage 3 diagnosed one cause: the two-phase transform rebuilds positions from
+``_count`` prefix sums indexed by the phase loop variable, and for a stored outer
+loop that variable is a position rather than a row coordinate.  That is real and it
+is obstacle A below.  It is not the only one, and it is not the one that mattered
+most.
+
+``harness/two_pass_reach.py`` forces the ordered-key family to claim both two-pass
+strategies — a probe, no production change — and compiles all four strategies over
+every frontier cell whose receiver is partitionable and whose program the typed
+route admits.  That is the 24 cells / 48 cell-arms §60.8 tabulates, and it is the
+whole legal domain, because every other receiver is refused earlier at the plan
+boundary.  Forced at ``d0503cf``, the two-pass strategies **COMPILED on 42 and 44 of
+48**.  So the refusal was not what stopped them, and a compile-only census could
+not have found what did.
+
+| # | what is wrong | which cells | layer |
+| --- | --- | --- | --- |
+| A | ``_count{L}`` is sized by the outer loop's trip count and indexed by its variable; for a loop over a STORED level that is a position rather than a prefix coordinate, so the first compressed level's position array gets the wrong length and the wrong index | the 13 stored-outer cells (26 cell-arms) | the shared two-phase transform |
+| B | every ``scorch_vector_set`` on a result position array is dropped, on the ground that "both phases rebuild every position array from the exact prefix sums".  Only the FIRST compressed level's array is rebuilt that way; deeper ones are allocated empty and must be filled | the 1 cell whose drain assembles two compressed levels (2 cell-arms) | ``result_write_pass`` |
+| C | the fill phase advances ``_pos{L}`` TWICE per appended coordinate — once from the append's own rewrite and once from this family's mirror bump ``p{R}{L}++`` | every ordered-key cell (44 cell-arms) | ``result_write_pass`` |
+| D | the marker truthfulness check's DIRECTION half reads evidence from nested statement bodies, so it refuses a TRUTHFUL marker on the drain's segment-open conditional | the same 1 cell (2 cell-arms), at compile time | ``result_write_pass`` |
+| E | that conditional READS ``{R}{L}_crd.back()``, and neither phase has a coordinate vector to read | the same 1 cell (2 cell-arms) | machinery nobody has written |
+
+C is the one that matters most.  It is on every ordered-key cell, the kernel
+compiles, the counting phase is right, and the fill phase then writes every
+coordinate and value at twice its offset -- past the end of buffers the counting
+phase sized exactly.
+
+``harness/reproduce_stage3_symptoms.py`` forces the family and EXECUTES, on a
+dense-outer cell where only C can apply and a stored-outer cell where both A and C
+do.  At ``d0503cf`` the process **aborts with SIGABRT before it can print
+anything**, which is what writing past an exactly-sized heap buffer does; at the
+candidate both cells run all three strategies to completion with identical entry
+counts and identical position-array tails.  §60.6's two reported messages -- the
+``dss`` receiver's "compressed mode 2 position array must be nondecreasing" and the
+``ds`` receiver's coordinate of 2,100,441,888 against a valid range of [0, 32) --
+are the same two defects caught by the storage validator on its inputs rather than
+by the allocator on these: C doubles every offset, and A reads a position array
+sized by a count of positions past its end.
+
+### 66.2 Which layer owns the fix, decided before the code and recorded
+
+``~/.cache/scorch-codex/two-pass-position/DESIGN.md``, written at ``d0503cf`` before
+any production change, with its digest and the tip in ``provenance/design_tip.txt``.
+
+**A is a missing capability in the shared transform.**  The pass reads the selected
+loop's header for two different facts and treats them as one: how many iterations
+the phase loops run, and how many *prefix cells* the receiver has — a prefix cell
+being one coordinate of its dense level zero, which is one entry of the first
+compressed level's position array and one segment of that level, and which is the
+same thing ``_stored_prefix_cell_total`` next door already counts.  (This is not §0's
+"cell", which is one program of the frontier matrix; counts of those are written
+"cell-arms" throughout.)  For a loop over a dense level the two facts coincide; for
+a loop over a stored level neither does.  So the context gained an explicit
+outer-cell domain — the expression numbering the prefix cell an iteration assembles,
+and how many there are — which DEFAULTS to today's derivation from the header.  The trip-count uses keep reading
+the header and did not move: a work estimate is about iterations, not cells.
+
+The two facts the transform cannot derive are supplied by the family, which has the
+verified program.  For a stored prefix loop the cell index is the coordinate that
+loop resolves, spelled as the subscript into the cursor's coordinate array rather
+than as the variable the body declares, because the fill phase's base loads are the
+body's first statements and an expression has no declaration to wait for.  The cell
+count is the same dimension extent the family's own catch-up numbers the same
+segments with, so the counting pass and the single pass cannot disagree about how
+many cells there are.
+
+Two framings were considered and rejected, and ``DESIGN.md`` §1 has the reasons:
+
+- *have the family supply a count array in the indexing the transform already
+  expects.*  It cannot.  The position array is indexed by the receiver's dense cell
+  over its full extent; a per-position count array has one entry per stored
+  coordinate and the empty cells between stored coordinates are absent from it, so
+  prefix-summing it cannot produce the position array.  That is not a second
+  implementation of the same rule, it is the wrong rule.
+- *refuse a stored outer loop as a legality refusal*, which is what
+  ``single_pass_chunk_parallel`` does.  The reason chunking refuses does not apply
+  here: chunking needs the outer loop to cut the dense extent into contiguous
+  ranges, because concatenating per-chunk buffers in chunk order is what reproduces
+  lexicographic order.  A two-pass assembly needs only that each iteration's cell
+  be identifiable and countable, and a compressed level's coordinates within one
+  segment are distinct and increasing, so each cell is visited at most once and the
+  prefix sum gives the cells never visited their equal positions for free — which is
+  exactly the catch-up the single pass emits by hand.  Refusing would have left 26
+  of 48 cell-arms permanently without a strategy they can express correctly.
+
+**C is in ``result_write_pass``, and it is decided per level from the body.**
+``_pos{L}`` counts the coordinates written to ``{R}{L}_crd``, so it must advance once
+per coordinate.  An append grows the vector, so the advance is the append's; an
+indexed assignment ``{R}{L}_crd[p{R}{L}] = x`` grows nothing, so the advance is the
+following bump.  Both can appear for one level in one body, and then they are two
+entries with one advance each — which is why the rule is not "an append means drop
+the bump".  The rule is: where the body's ONLY spelling of a level's coordinate
+write is an append, the explicit bump is that append's advance spelled again and is
+dropped.  Production legacy appends and does not bump, so it does not move; the
+indexed vocabulary does not append, so it does not move either.  The existing lock
+on the mixed body is what says the third case is unchanged.
+
+**B, D and E are declined, and refused by shape.**  All three are confined to a
+workspace drain that assembles more than one compressed result level.  E is not a
+rewrite of an existing statement: the drain's segment predicate compares
+COORDINATES, and a phase with no coordinate vector would need a scalar carrying the
+previous key component that nothing emits.  So the family declines that shape with
+``unsupported_assembly_strategy``, which is a legality refusal in the module's own
+sense — structural, provable, extent-free, compile-time — and it replaces what
+happens otherwise, which is the pass's own postcondition naming a dangling
+reference instead of the shape that caused it.
+
+### 66.3 The legality rule, and one coincidence it turns into a theorem
+
+The ordered-key family hosts both two-pass strategies when, and only when:
+
+1. the receiver is partitionable — level 0 dense, every level below compressed;
+2. there is an outermost prefix loop binding result level 0, so the pass replaces
+   the assembly's own loop rather than a producer's;
+3. that loop is dense, or stored on a compressed cursor level — the two cases whose
+   prefix-cell numbering and prefix-cell count can be spelled;
+4. every compressed level above the leaf is closed by a prefix loop rather than by
+   the drain, which is ``prefix_depth == len(levels) - 1``;
+5. no panel, relayout, result tile or parallel selection is attached.
+
+Rule 4 also settles what the design flagged as a coincidence.  When the workspace
+declaration sits at the top of the outer loop, the transform replaces it with a
+per-worker pool sized ``result_shape[compressed_levels[0]]``, which is the drained key's
+extent only if the receiver has rank 2.  A hoisted workspace means the region
+is directly inside the outermost loop, so ``prefix_depth == 1``; rule 4 then forces
+``len(levels) == 2``, and ``compressed_levels[0]`` IS the leaf.  The sizing is right by
+construction over the admitted domain rather than by luck.
+
+### 66.4 What moved
+
+Over the 48 cell-arms of the legal domain, compile-only, both automatic scheduler
+settings (``receipts/reach_cand.json`` against ``receipts/reach_base_forced.json``):
+
+| strategy | before | after | refused after, and why |
+| --- | --- | --- | --- |
+| ``single_pass_serial`` | 46 | **46** | 2 ``unsupported_assembly_host`` (the two-phase parallel family) |
+| ``single_pass_chunk_parallel`` | 18 | **18** | 26 ``unsupported_assembly_strategy`` (stored outer loop), 4 ``unsupported_assembly_host`` |
+| ``two_pass_serial`` | 0 | **42** | 2 ``unsupported_assembly_strategy`` (rule 4), 4 ``unsupported_assembly_host`` (row-scope 2, two-phase parallel 2) |
+| ``two_pass_parallel`` | 2 | **44** | 2 ``unsupported_assembly_strategy`` (rule 4), 2 ``unsupported_assembly_host`` (row-scope) |
+
+Over the whole 1,130-cell emission matrix in both arms — 9,040 cell-arms per the
+four columns — the same counts hold and **every refusal carries a structured code:
+0 of 9,040 lack one**.  1,968 cell-arms per two-pass column are
+``unsupported_schedule_assembly`` at the plan boundary, which is the non-partitionable
+receivers; the rest are the same pre-existing codes the single-pass columns refuse
+with.
+
+The 42 newly emitting cell-arms are, individually: ``MM ss x ds -> ds``,
+``dss ijk->ik [ds]``, ``sds ijk->ik [ds]``, ``sss ijk->ik [ds]``,
+``ssss ijkl->ijl [dss]``, and all sixteen
+``TTM {sss,dss,ssd,dsd} x {dd,ss,ds,sd} -> dss`` cells, each in both arms.  The 2 cell-arms that moved from
+``unsupported_assembly_host`` to ``unsupported_assembly_strategy`` are
+``ssss ijkl->ikl [dss]`` in both arms: rule 4 declines it, because its ``j`` index is
+reduced rather than assembled, so ``j`` is a producer loop and its drain covers both
+compressed levels.
+
+### 66.5 Correctness: the index arrays agree everywhere, and one cell's values do not
+
+``harness/strategy_correctness_reach.py`` executes every one of the 24 cells over
+four input regimes x two densities x two dtypes x both automatic scheduler
+settings, runs every strategy the cell can emit, and compares the whole output
+storage — every index array and every value, bit for bit, not ``allclose`` — against
+the same program under ``single_pass_serial``.  The regimes exist to break what a
+rebuilt position array gets wrong: ``empty_tail`` zeroes the last outer coordinates,
+so a stored prefix loop stops before the receiver's extent and every cell past it
+must still be closed; ``empty_head`` zeroes the first ones, so cell zero's position
+must be zero while the first stored coordinate is not; ``sparse_rows`` leaves three
+outer coordinates non-empty out of 48.  Extents clear ``2 * ROWS_PER_THREAD`` so the
+chunked strategy's runtime gate genuinely opens.
+
+**768 configurations, 3,168 executed strategy runs, 0 unclassified refusals, and
+every row had a baseline.**  Every strategy agrees with a dense ``float64`` reference
+to at worst 7.54e-07.
+
+**Zero index-array differences**, on every cell, in every regime, in both arms.
+That is the claim the position reconstruction had to earn and the claim ``allclose``
+on values cannot make: only the index arrays prove that a prefix sum reproduced the
+same lexicographic assembly a hand-written catch-up produces.
+
+**56 value-only differences, all on one cell.**  On ``MM ss x ds -> ds`` the two-pass
+values differ from the single pass's by at most 4.77e-07 at ``float32`` and 8.88e-16
+at ``float64`` — one unit in the last place at those magnitudes — on up to 29% and 35%
+of the entries respectively.  4 of that cell's 32 rows are bit-identical, and they
+are the sparsest regime at the lower density, where an output entry accumulates a
+single product and there is nothing to round differently.
+
+The cause is a substitution the two-phase transform has always made: when the
+workspace declaration sits at the top of the outer loop, it replaces it with a
+per-worker pool of ``linked_list_workspace_1d`` — legacy's own workspace — and
+rewrites ``insert`` to ``insert_unchecked``.  The ordered-key family declares a
+``coo_workspace_1d``.  Both accumulate at the coordinate with ``+=`` in insertion
+order, so the substitution does not reorder the sum; what it changes is the code
+the accumulation inlines into, and under ``-ffast-math -O3`` the compiler fuses the
+multiply-accumulate in one and not the other.
+
+``harness/workspace_substitution_census.py`` scores that explanation on all four
+combinations over the 22 ordered-key cells, and it separates cleanly:
+
+| | inserts a product | inserts a bare value |
+| --- | --- | --- |
+| **workspace substituted** | ``MM ss x ds -> ds`` — values differ | the three ``ijk->ik [ds]`` cells — bit-identical |
+| **workspace not substituted** | all sixteen ``TTM`` cells — bit-identical | ``ssss ijkl->ijl [dss]`` — bit-identical |
+
+A product alone does not do it and a substitution alone does not do it; the one cell
+that is both is the one cell that differs, and the four rows that accumulate a
+single term are bit-identical even there.  Recorded as a declared difference rather
+than tolerated silently: the four strategies are interchangeable on every index
+array everywhere, and on values everywhere except where the strategy also changes
+the accumulation structure.  That substitution is itself a finding and §66.9 records
+it.
+
+### 66.6 Why ``two_pass_serial`` had zero hosts and ``two_pass_parallel`` two, measured
+
+They are NOT the same gap, and the difference is not the OpenMP region.
+``harness/serial_two_pass_host_probe.py`` forces each of the two remaining families
+to claim every strategy and records what fails, in both arms:
+
+- **``_ParallelSparseWorkspaceLowering``** refuses ``two_pass_serial`` with
+  ``sparse_workspace_completion_lost``, and refuses both single-pass strategies with
+  the same code and the same message.  Its ``complete_sparse_workspace`` reconstructs
+  the expected assembled function from the verified program — with the pool, both
+  phase regions and the exact allocation interlude — and compares structurally, so
+  any shape but the one it models is refused, and eliding the two regions is such a
+  shape.  The gap is in that family's completion mirror.
+- **``_RowScopeSparseWorkspaceLowering``** refuses BOTH two-pass strategies the same
+  way, against its own mirror ("the checked position sentinel, both positional
+  catch-ups, and the canonical producer/drain row").
+
+So ``two_pass_serial``'s zero hosts were 44 cell-arms of the position and cursor
+defects this section fixes, plus 4 cell-arms of a different defect in a different
+layer: a family's completion mirror hard-coding its own assembled shape.
+``two_pass_parallel``'s two hosts were the one family whose mirror happens to model
+exactly that strategy.  Widening either mirror is a separate change with its own
+correctness obligation, and this section does not make it.
+### 66.7 The proof
+
+Every check ran from a fresh detached worktree with its commit asserted before
+anything was measured (§62.5's rule), and the harnesses take the tree root as
+``$1``.
+
+| check | result |
+| --- | --- |
+| **1. Cross-strategy correctness**, 24 cells x 4 regimes x 2 densities x 2 dtypes x both arms — 768 configurations, 3,168 executed strategy runs | **PASS on every index array**, 0 differences, and 0 unclassified refusals.  56 value-only differences on one cell, quantified and explained in §66.5.  Every strategy agrees with a dense ``float64`` reference to at worst 7.54e-07 |
+| **2. Reach**, all four strategies over the 48 cell-arms of the legal domain, compile-only, both arms | **PASS.** ``two_pass_serial`` 0 → **42**, ``two_pass_parallel`` 2 → **44**; the two single-pass columns unchanged at 46 and 18 |
+| **3. Refusals enumerated at their codes**, 1,130 cells x 4 strategies x both arms — 9,040 compilations | **PASS.** Zero refusals lack a structured code, either strategy, either arm |
+| **4. Emission, all four columns, base against candidate**, 1,130 cells x both arms | **PASS.** 502 + 18 + 2 cell-arms emit on both sides and every one is byte-identical; 0 digests differ; 0 stopped emitting; 42 + 42 newly emitting, named individually in §66.4 |
+| **5. Frontier**, 1,139 records x both arms, base and candidate | **PASS.** Field for field IDENTICAL over all 1,139: 0 lost, 0 gained, 0 route changed, 0 unclassified either side, 3 arm-variant both sides (inherited, same set), 0 new arm-variance, admitted 260 both sides |
+| **6. Release neutrality** | **PASS, PROVEN.** Production dispatch 506 case-arms (412 emitting) identical; 20-source corpus identical; 42-case ``ss@dd`` grid identical; 86-case schedule audit identical in every field; protected files identical between the checkouts |
+| **7. The repo's own static gate over ``src``** | **PASS as a comparison, RED as a gate, at both commits.** ``mypy src`` and ``flake8 src`` are byte-identical between base and candidate; ``black --check src`` differs only in the tree path inside its one message.  All three exit non-zero at BOTH commits — 140 mypy errors in 11 files, 9 flake8 findings, one unformatted file (``prebuilt_kernels.py``) — none of it in a file this section touches, and every touched file is clean under all three |
+| **8. Suite**, 8 file-disjoint partitions per side, node sets diffed | **PASS, and it caught four failures on the first candidate pass.**  Final: base ``d0503cf`` **6,481 nodes / 0 failures / 0 errors / 15 skipped**, candidate ``c1ccb10`` **6,498 / 0 / 0 / 15**, all sixteen partitions exit 0.  By node set: 6,481 in both, **0 base-only, exactly 17 candidate-only** — every one a test this section adds, named in the receipt — and **0 outcome changes on shared nodes** |
+| **9. Protected tracked files, both ways** | **PASS.** The git-derived check passes on the live repository and on both checkouts: the five tracked blobs at the tip equal the reference commit's, and no commit in this section touches any of them.  The on-disk snapshot check passes on the checkouts and fails on the live repository, which is the correct report while the separate CUDA project's edits are present |
+| **10. Thread invariance of the parallel two-pass**, 1/2/4/8 workers on three shapes including both stored-outer ones | **PASS.** Bit-identical to ``single_pass_serial`` at every team size.  The count phase writes ``_count{L}`` at ``crd[position]`` from every worker, and distinct positions carry distinct coordinates within one compressed segment, so the writes are disjoint -- varying the team size is how that argument gets checked rather than asserted |
+| **11. The suite comparator's own verdict** | **FIXED and self-tested.** The old check asserted per-partition file lists were equal, so adding one test file reshuffled every group and printed MISMATCH while the node-set reading was clean.  It now compares the files as sets over the whole run and reports the reshuffle as information; ``harness/compare_suite_nodes_selftest.py`` builds two synthetic runs and asserts both behaviours -- a reshuffle plus an added file reconciles, a dropped file fails |
+
+**Which commit each check measured.**  Checks 1-7, 9 and 10 ran against
+``56d014b``, the last production commit; both later commits add only tests and
+``git diff 56d014b..c1ccb10 -- src/`` is empty, so no emission or execution
+measurement can differ between them.  Check 8's candidate side ran at ``c1ccb10``,
+all eight partitions re-run there rather than six carried over from ``cb193a1``,
+because the tests are the thing it measures and a mixed-commit node set is the
+argument §62.5 exists to refuse.
+
+### 66.8 Predictions scored, including one this section's own design got wrong
+
+``DESIGN.md`` §3 states six predictions, written before the code.
+
+- **P1 MISSED on the arithmetic, right on the shape.**  It predicted 40 and 42
+  admitted cell-arms, on the assumption that BOTH ``ssss ijkl->{ikl,ijl} [dss]``
+  cells have a prefix of one and would therefore be declined by rule 4.  Only
+  ``ikl`` does: ``ijl`` assembles ``j`` rather than reducing it, so ``j`` is a
+  prefix loop and its drain covers one compressed level.  Measured 42 and 44.  The
+  refusal shape is what the prediction was about and that held; the count was
+  derived from an unchecked assumption about which cells have which nest, and the
+  census is what checked it.
+- **P2 HELD** for every index array, in every regime, in both arms.
+- **P3 REFUTED, and the refutation is the interesting part.**  It predicted the
+  workspace substitution is behaviour-preserving on every admitted cell.  It is
+  bit-preserving on 21 of 22 and 1-ulp-different on the one cell that both
+  substitutes and inserts a product.  §66.5 has the mechanism and the three-way
+  table that isolates it.
+- **P4 HELD.**  Release neutrality proven on all four emission columns.
+- **P5 HELD.**  The frontier census is field-for-field identical.
+- **P6 HELD.**  The two remaining host refusals are a family's completion mirror,
+  not the position reconstruction, and the probe in §66.6 is what says so.
+
+### 66.9 Defects found and recorded, not fixed here
+
+- **The assembly strategy substitutes the accumulation workspace.**  When the
+  workspace is declared at the top of the outer loop, the two-phase transform
+  replaces it with a per-worker pool of ``linked_list_workspace_1d`` and rewrites
+  ``insert`` to ``insert_unchecked``, whatever the workspace the CIN chose.  Which
+  accumulation structure a program uses is a decision the CIN makes -- dense or
+  COO-hashed -- so an assembly strategy silently replacing it crosses a layer.  It
+  is behaviour-preserving to within one unit in the last place today (§66.5) and
+  the pool's extent is right by construction over the admitted domain (§66.3), so
+  nothing is wrong at the moment; the layering is.  Fixing it means either
+  teaching the pass to pool the family's own workspace type or refusing to
+  substitute, and both need their own measurement.
+- **``result_write_pass``'s marker truthfulness check refuses a truthful
+  marker.**  The check is deliberately one-directional and walks nested statement
+  bodies for its MENTION half, on the stated ground that "including nested bodies
+  can only make this more permissive, never less".  That is true of the mention
+  half and false of the DIRECTION half, which reads ``written_members`` populated
+  from the same walk: the ordered-key drain's segment-open conditional truthfully
+  marks a READ of ``{R}{L}_crd`` in its condition and appends to the same array in
+  its body, and the check calls that a lie.  Obstacle D in §66.1.  It is
+  unreachable from the two-pass path now that rule 4 declines that shape, so
+  fixing it here would have had no measurable effect, and loosening a guard that
+  refuses lying markers needs its own proof that it still refuses every lie.
+- **Only the FIRST compressed level's position array is rebuilt from the prefix
+  sums**, and ``result_write_pass`` drops every position close as though all of
+  them were.  Deeper levels are allocated empty and filled by the fill phase, so a
+  body whose deeper close is a ``scorch_vector_set`` rather than the
+  position-boundary conditional loses it.  Obstacle B.  No production body has
+  that shape today, and rule 4 keeps it that way.
+- **A phase with no coordinate vector cannot evaluate a predicate that reads
+  one.**  Obstacle E, the reason rule 4 exists.  Closing it means either
+  synthesizing a scalar that carries the previous key component through both
+  phases, or changing the family's own single-pass predicate to compare against
+  such a scalar instead of ``{R}{L}_crd.back()`` -- which would change what the
+  typed route emits for those cells.
+- **The suite caught four failures on the first candidate pass, and that is what it
+  is for.**  Three were source-text locks in ``test_llir_string_budget.py``, which
+  reads this pass's own source and asserts that the offset family's bounds come from
+  a typed reference builder rather than interpolated text; the builder was renamed,
+  because the number of receiver cells is a different fact from the loop's bound, so
+  the locks follow it.  The fourth is the one worth recording as a defect in the test
+  rather than in the code: ``test_completion_reference_owns_no_pipeline_entry_state``
+  asserts that two sets of ``id()`` values do not intersect, and ``id()`` is a reused
+  address, so a freed object's id can reappear as a live one's.  It failed once in a
+  full-partition run, passed in isolation, passed with its whole file, passed in the
+  re-run at the next commit, and this section changes nothing that family touches.
+  **An identity test written over ``id()`` sets cannot distinguish aliasing from
+  address reuse**, and this is the first time it has reported the difference.
+- **Two harness defects, both caught by running things.**  Running the eight suite
+  partitions in parallel -- one invocation per partition, same output directory,
+  which is what makes the suite an hour instead of three -- has all eight merge one
+  ``provenance.json``, and one reader saw a half-written file, so its guard aborted
+  with "nothing was measured".  That is fail-closed and correct and it cost a
+  re-run; the harness now writes one provenance file per invocation.  And one of
+  the four sharded correctness
+  processes died without writing a receipt and without a traceback, so its shard
+  was silently absent from the merge until the merge refused to proceed without
+  it.  Re-running it cost nothing, because the JIT extension cache is keyed by
+  source; the reason it is recorded is that a sharded run whose merge does not
+  demand every shard would have reported a clean verdict over three quarters of
+  the grid.
+
+### 66.10 What this section does not do
+
+- **No performance measurement of any kind, deliberately.**  ``scorch_concat_chunks``
+  still sizes its destination with a value-initializing ``resize``, so one of the
+  four columns moves the moment that is fixed; timing four strategies before that
+  is timing a number that is about to change.  §60.9 owns that finding and it is
+  unfixed.
+- **No selector.**  ``default_assembly()`` is untouched on every family, so no
+  automatic compilation chooses a two-pass strategy and the emission of every
+  automatically scheduled program is byte-unchanged.  Teaching the autoscheduler
+  to choose is the step after honest numbers, not before them.
+- **The two families whose completion mirror hard-codes their assembled shape are
+  not widened** (§66.6), so ``two_pass_serial`` keeps 4 refused cell-arms and
+  ``two_pass_parallel`` 2.
+- **The drain that assembles more than one compressed level is refused, not
+  supported** (§66.3 rule 4).  Two cell-arms, one cell, three named obstacles
+  behind one structured refusal.
+- **The 116 labels that arrive at ``result_write_pass`` and are never read**
+  (§64.4, §65.6c) are untouched.
+- **Nothing is wired into dispatch.**  ``compile_cin_via_loopir`` and
+  ``execute_cin_via_loopir`` keep zero non-test callers and the test proving
+  ``import scorch`` never loads the LoopIR package still passes.
+- **mkt1 is still not run.**  Owed since §59.
+- The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the shadow
+  pilot's membership and every blocker other than 1 are untouched; the Phase-8
+  cutover verdict is unchanged.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/two-pass-position/`` with
+``SHA256SUMS`` — ``DESIGN.md`` (written in advance, digest in ``provenance/``),
+the reach census before and after, the sharded cross-strategy correctness run and
+its merge, the workspace-substitution census, the thread-invariance run, the
+stage-3 symptom reproduction at both commits, the serial-host probe, the frontier
+pair with both comparators, the four-column emission comparison, release
+neutrality, the repo's own static gate at both commits, and the partitioned suite
+per side with its node-set comparison.  Every harness takes a tree root as ``$1``
+and an expected commit.

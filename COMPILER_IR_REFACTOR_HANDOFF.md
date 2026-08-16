@@ -33300,3 +33300,112 @@ cost of reporting a number from the wrong tree is the whole record.
    ``statement-marker/`` or ``abi-result-identity/`` — not from
    ``~/.cache/scorch-codex/``. Still unfixed, for §63.8's reason.
 8. **mkt1 is still owed**, since §59.
+
+## Two-pass assembly made correct, and §60.6's single cause was one of five (2026-08-16; supersedes every preceding prompt)
+
+Tip `c1ccb10`, 75 commits ahead of origin `a3b8d1e`, nothing pushed, everything green.
+Review section 66 is the record; `~/.cache/scorch-codex/two-pass-position/` is the ledger
+(`DESIGN.md` written before the code, digest in `provenance/`).
+
+**1. THE JOB IS DONE AND THE DIAGNOSIS IT STARTED FROM WAS INCOMPLETE.** `two_pass_serial`
+goes 0 → **42** of 48 program-settings and `two_pass_parallel` 2 → **44**, and both produce
+output bit-identical to `single_pass_serial`'s on **every index array of every cell in every
+input regime in both arms**. §60.6 stage 3 named one cause — the count array indexed by a
+position rather than a coordinate — and forcing the family to claim the strategies at
+`d0503cf` showed the kernels already COMPILED on 42 and 44 of 48, so the refusal was never
+what stopped them. Five obstacles, in the order they bite: (A) the cell numbering, the one
+§60.6 named, 26 cell-arms; (B) only the FIRST compressed level's positions come from the
+prefix sums while every position close is dropped as though all of them did, 2 cell-arms;
+(C) **the fill phase advances its cursor twice per appended coordinate, 44 cell-arms** —
+this is the one that mattered, it is on every cell, the kernel compiles, and the counting
+phase is right, so nothing compile-only could see it; (D) the marker truthfulness check
+refuses a truthful marker, 2 cell-arms; (E) the drain's segment predicate reads a
+coordinate vector neither phase has, 2 cell-arms.
+
+**2. A AND C ARE FIXED IN THE SHARED LAYERS; B, D AND E ARE REFUSED BY SHAPE.** The
+two-phase transform now takes an explicit outer-cell domain — which cell an iteration
+assembles and how many cells there are — defaulting to the loop header's own derivation, so
+every existing caller emits the same bytes. `result_write_pass` now decides per level, from
+the body, which statement carries the cursor advance. B, D and E are all confined to a drain
+that assembles more than one compressed result level, and the family declines exactly that
+shape with `unsupported_assembly_strategy` naming the reason, instead of letting the pass's
+postcondition report a dangling reference.
+
+**3. ONE DECLARED DIFFERENCE, WITH ITS MECHANISM MEASURED.** On `MM ss x ds -> ds` the
+two-pass values differ from the single pass's by one unit in the last place (4.77e-07 at
+f32, 8.88e-16 at f64) while every index array agrees. The two-phase transform substitutes
+the accumulation workspace when it is declared at the top of the outer loop — legacy's
+`linked_list_workspace_1d` pool for the family's `coo_workspace_1d` — and under
+`-ffast-math` the compiler fuses the multiply-accumulate in one and not the other. The
+three-way census separates it: substituted + product differs, substituted alone does not,
+product alone does not, and the rows where an entry accumulates a single term are
+bit-identical even on the differing cell. **Which accumulation workspace a program uses is a
+CIN decision, so a strategy replacing it is a layering defect** — behaviour-preserving to
+1 ulp today, and worth fixing on purpose rather than by accident.
+
+**4. `two_pass_serial`'s ZERO HOSTS AND `two_pass_parallel`'s TWO WERE DIFFERENT GAPS.**
+Measured by forcing both remaining families: `_ParallelSparseWorkspaceLowering` refuses the
+serial two-pass with `sparse_workspace_completion_lost` — the same code and message it gives
+the single-pass strategies — because its completion mirror reconstructs the assembled
+function WITH both regions and the pool. `_RowScopeSparseWorkspaceLowering` refuses both
+two-pass strategies against its own mirror. Neither is the position reconstruction; both are
+a family's mirror hard-coding its own assembled shape, and widening either is its own change.
+
+**5. NEUTRALITY, ON EVERY COLUMN THAT EXISTED BEFORE.** Release neutrality PROVEN:
+production dispatch 506 case-arms (412 emitting) identical, the 20-source corpus, the
+42-case `ss@dd` grid and the 86-case schedule audit identical in every field. All four
+requested-strategy columns compared cell-arm by cell-arm over 1,130 cells x both arms: 502 +
+18 + 2 emit on both sides and **every one is byte-identical**, 0 digests differ, 0 stopped
+emitting. The frontier census is **field-for-field identical over all 1,139 records**, 0
+unclassified either side. `default_assembly()` is untouched on every family, which is why
+none of that moved.
+
+**6. THE SUITE COMPARATOR'S CRY-WOLF VERDICT IS FIXED.** The previous session recorded that
+`compare_suite_nodes.py` prints `VERDICT: MISMATCH` whenever a test file is added, because
+it asserted the per-partition file lists were equal and the round-robin regroups. It now
+compares collected files as SETS over the whole run — a file the base collected and the
+candidate did not fails, an added file is reported — and `compare_suite_nodes_selftest.py`
+asserts both behaviours against synthetic runs, since this session's own two sides have
+equal file counts and cannot exercise the reshuffle.
+
+**7. THE SUITE CAUGHT FOUR FAILURES AND ONE OF THEM IS A DEFECT IN A TEST.** Three were
+source-text locks in `test_llir_string_budget.py`, which reads the two-phase pass's own
+source and asserts its offset-family bounds come from a typed builder rather than
+interpolated text; the builder was renamed and the locks follow it. The fourth,
+`test_completion_reference_owns_no_pipeline_entry_state`, asserts two sets of `id()` values
+do not intersect — and `id()` is a reused address, so a freed object's id can reappear as a
+live one's. It failed once in a full-partition run, passed in isolation, passed with its
+whole file, and passed in the re-run at the next commit; nothing here touches that family.
+**That test cannot distinguish aliasing from address reuse.**
+
+**8. PROCEDURE, TWO ITEMS.** (a) Invoking `run_suite_partitions.sh` once per partition with
+the same output directory runs the eight partitions in PARALLEL and still gives each its own
+`TMPDIR`, `XDG_CACHE_HOME` and `TORCH_EXTENSIONS_DIR`; the harness's own loop is sequential
+and takes hours. (b) The correctness grid needs ~480 JIT builds, so it shards by cell
+(`SHARDS`/`SHARD`, one extension cache each) and the merge REFUSES unless every shard's
+receipt is present and its own summary matches the merge's recomputation — which is how a
+shard that died without a traceback was noticed instead of silently dropping a quarter of
+the grid.
+
+## What the next session should do
+
+1. **`scorch_concat_chunks`'s value-initializing `resize`, then the runtime grid.** That is
+   the order §60.9 and this section both name: the resize zeroes memory the parallel `memcpy`
+   immediately overwrites, so one of the four columns moves the moment it is fixed, and
+   timing four strategies before that is timing a number about to change. All four strategies
+   now emit and are proven correct, so the grid finally has four non-empty columns.
+2. **Then `default_assembly()`**, which is the one place a selector replaces, and not before
+   there are honest numbers for the four columns.
+3. **Decide the workspace substitution on purpose** (item 3). Either teach the two-phase pass
+   to pool the workspace the CIN chose, or refuse to substitute and lose the strategy on the
+   four `ds` cells. Both need a measurement; today's 1-ulp difference is declared, not fixed.
+4. **The two completion mirrors** (item 4) are what stands between `two_pass_serial` and 46 of
+   48. Parameterize the mirror by the resolved strategy rather than loosening it.
+5. **Rule 4's three obstacles** (B, D, E) are the remaining 2 cell-arms. E is the real one and
+   it needs a scalar carrying the previous key component through both phases, or a different
+   predicate in the family's own single-pass emission — which changes what the typed route
+   emits for those cells.
+6. **mkt1 is still owed**, since §59.
+7. **Copy `seal_ledger.sh` from a ledger that has §62.9's exclusions** —
+   `two-pass-position/` now has one too. The shared copy at `~/.cache/scorch-codex/` is still
+   wrong.
