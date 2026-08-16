@@ -419,6 +419,181 @@ def _matmul_cin(a_fmt, b_fmt, c_fmt):
     return statement
 
 
+# -- the two-pass strategies: cells are numbered by coordinate ----------------
+
+
+def test_a_stored_outer_loop_numbers_two_pass_cells_by_coordinate():
+    """The count array is per RECEIVER CELL, and a position is not a cell.
+
+    ``sss ijk->ik [ds]``'s outermost loop walks the operand's stored level zero,
+    so its loop variable is a position into ``A0_crd`` and its bound is that
+    array's length.  The first compressed level's position array has one entry per
+    coordinate of the receiver's dense level zero, over its full extent.  Sizing
+    the counts by the loop's trip count and indexing them by its variable -- which
+    is what the pass did when both facts came from the loop header -- produced a
+    position array of the wrong length, indexed by the wrong thing.
+    """
+
+    source = compile_cin_via_loopir(
+        reduction_cin("sss", "ds", "ijk", "ik"),
+        (2, 4),
+        (((2, 3, 4), _F32),),
+        compile_options=auto_options(assembly="two_pass_serial"),
+    ).cpp_source
+
+    # Sized and swept by the receiver's own extent, indexed by the coordinate the
+    # stored loop resolves.
+    assert "std::vector<int> _count1((size_t)C0_size, 0);" in source
+    assert "_count1[A0_crd[pA0]] = _cnt1;" in source
+    assert "std::vector<int64_t> _offset1((size_t)C0_size + 1);" in source
+    assert "for (int _i = 0; _i < C0_size; _i++) {" in source
+    assert "int64_t _total1 = _offset1[C0_size];" in source
+    assert (
+        "torch::Tensor C1_pos_torch = torch::empty({(int64_t)(C0_size + 1)}, "
+        "torch::kInt);" in source
+    )
+    assert "int64_t _base1 = _offset1[A0_crd[pA0]];" in source
+    # And never by the loop's own position bound, which is the defect's signature.
+    assert "_count1((size_t)pA0_end" not in source
+    assert "_count1[pA0]" not in source
+    assert "_offset1[pA0]" not in source
+
+
+def test_a_dense_outer_loop_numbers_two_pass_cells_by_its_loop_variable():
+    """The dense case is the loop header's own derivation, unchanged.
+
+    A loop over the receiver's dense level zero has a loop variable that IS the
+    cell index and a bound that IS the cell count, so the family states exactly
+    what the pass would have derived and the emission is the one legacy has always
+    produced for this shape.
+    """
+
+    source = compile_cin_via_loopir(
+        ttm_cin("dss", "dd", "dss"),
+        (4, 5, 3),
+        (((4, 5, 6), _F32), ((6, 3), _F32)),
+        compile_options=auto_options(assembly="two_pass_serial"),
+    ).cpp_source
+
+    assert "std::vector<int> _count1((size_t)A0_size, 0);" in source
+    assert "std::vector<int> _count2((size_t)A0_size, 0);" in source
+    assert "_count1[i] = _cnt1;" in source
+    assert "_count2[i] = _cnt2;" in source
+    assert "int64_t _base1 = _offset1[i];" in source
+    assert "int64_t _base2 = _offset2[i];" in source
+
+
+def test_the_two_pass_fill_advances_its_cursor_once_per_coordinate():
+    """One advance per appended coordinate, not one per spelling of the advance.
+
+    This family appends with ``emplace_back`` -- which grows the vector, so the
+    append is the advance -- and also bumps its own mirror cursor ``pC{L}``, which
+    the rewrite replaces by ``_pos{L}`` as a value.  Honouring both moved the
+    cursor twice per entry, so every coordinate and value landed at twice its
+    offset and the write ran past the exactly-sized buffers.  The counting pass
+    was unaffected, which is why a compile-only census could not see it.
+    """
+
+    rank2 = compile_cin_via_loopir(
+        reduction_cin("sss", "ds", "ijk", "ik"),
+        (2, 4),
+        (((2, 3, 4), _F32),),
+        compile_options=auto_options(assembly="two_pass_serial"),
+    ).cpp_source
+    assert rank2.count("_pos1++;") == 1
+
+    rank3 = compile_cin_via_loopir(
+        ttm_cin("dss", "dd", "dss"),
+        (4, 5, 3),
+        (((4, 5, 6), _F32), ((6, 3), _F32)),
+        compile_options=auto_options(assembly="two_pass_serial"),
+    ).cpp_source
+    # One for the drained leaf coordinate, one for the parent coordinate the
+    # position-boundary conditional appends.
+    assert rank3.count("_pos2++;") == 1
+    assert rank3.count("_pos1++;") == 1
+
+
+@pytest.mark.parametrize("strategy", TWO_PASS_STRATEGIES)
+def test_a_drain_spanning_two_compressed_levels_refuses_the_two_pass(strategy):
+    """``unsupported_assembly_strategy``: legal receiver, wrong program, again.
+
+    ``ssss ijkl->ikl [dss]`` has a partitionable receiver and a prefix of one, so
+    its workspace drain assembles BOTH compressed levels.  It opens a new segment
+    at the upper level by comparing the drained key against
+    ``C1_crd.back()`` -- a read of the coordinate vector, which neither phase of a
+    two-pass assembly has, since both write into preallocated buffers.  A prefix
+    loop instead closes that level with the position-boundary conditional the
+    shared pass rewrites in both phases, so the shape that works is one where
+    every compressed level above the leaf is closed by a prefix loop.
+
+    Refusing by shape is what keeps this from surfacing as the pass's own
+    postcondition failure, which names a dangling reference rather than the
+    program shape that caused it.
+    """
+
+    with pytest.raises(lower_llir_module.LoopIRTargetError) as raised:
+        compile_cin_via_loopir(
+            reduction_cin("ssss", "dss", "ijkl", "ikl"),
+            (2, 4, 5),
+            (((2, 3, 4, 5), _F32),),
+            compile_options=auto_options(assembly=strategy),
+        )
+    assert raised.value.defect.code == "unsupported_assembly_strategy"
+    assert "closed by a prefix loop" in raised.value.defect.message
+
+
+def test_the_two_pass_strategies_reproduce_the_single_pass_storage():
+    """Interchangeable means the same output tensor, index arrays included.
+
+    The receiver's trailing coordinates are left EMPTY on purpose.  A stored
+    prefix loop stops at its last stored coordinate, so the single pass closes the
+    cells past it with one final catch-up while the two-pass gets them from the
+    prefix sum's tail; an input whose last rows are non-empty cannot tell a
+    correct tail from a missing one.  The leading coordinates are empty for the
+    same reason at the other end.
+    """
+
+    from scorch.compiler.loopir.pipeline import execute_cin_via_loopir
+    from scorch.stensor import STensor
+
+    rows = 2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD
+    generator = torch.Generator().manual_seed(20260816)
+    dense = torch.rand((rows, 5, 4), generator=generator, dtype=torch.float64)
+    dense = dense * (
+        torch.rand((rows, 5, 4), generator=generator, dtype=torch.float64) < 0.4
+    )
+    dense[:2] = 0.0
+    dense[-3:] = 0.0
+    dense = dense.to(_F32)
+    operand = STensor.from_torch(dense.clone(), "A").to_sparse("sss")
+
+    def storage(strategy):
+        result = execute_cin_via_loopir(
+            reduction_cin("sss", "ds", "ijk", "ik"),
+            (rows, 4),
+            operand,
+            compile_options=auto_options(assembly=strategy, jit=True),
+        )[0]
+        return (
+            tuple(
+                tuple(tuple(int(x) for x in part.tolist()) for part in mode)
+                for mode in result.storage.index.mode_indices
+            ),
+            tuple(result.storage.value.tolist()),
+        )
+
+    serial = storage("single_pass_serial")
+    assert storage("two_pass_serial") == serial
+    assert storage("two_pass_parallel") == serial
+    # And the assembled result is the reduction, not merely self-consistent.
+    positions = serial[0][1][0]
+    assert positions[0] == 0
+    assert positions[1] == 0 and positions[2] == 0
+    assert positions[-1] == positions[-2] == positions[-3] == positions[-4]
+    assert positions[-1] == len(serial[1])
+
+
 def test_a_strategy_cannot_compose_with_a_decision_that_owns_the_same_assembly():
     """A panel, a relayout, a result tile or an explicit parallel loop each own
     part of the result's assembly, so a strategy cannot be composed with one."""

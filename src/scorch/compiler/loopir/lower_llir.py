@@ -55,6 +55,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from enum import Enum
 from types import FunctionType, MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -131,6 +132,7 @@ from ..torch_cpp_abi import (
 from ...utils import dtype_to_c_datatype
 from ..sparse_assembly import (
     DEFAULT_SERIAL_STRATEGY,
+    SPARSE_ASSEMBLY_STRATEGIES,
     TWO_PASS_STRATEGIES,
     UNSUPPORTED_ASSEMBLY_HOST,
     UNSUPPORTED_ASSEMBLY_STRATEGY,
@@ -211,6 +213,11 @@ from .nodes import (
     WorkspaceRegion,
 )
 from .verifier import LoopIRVerificationError, verify_program
+
+if TYPE_CHECKING:
+    # Imported for annotations only, matching how the two-phase pass's context is
+    # imported at its one use site rather than at module scope.
+    from ..compressed_where_openmp_pass import OuterCellDomain
 
 # Short names for the statement-level result-storage marker's vocabulary.  Every
 # marking site in this file spells one or more ``(array, level, direction)``
@@ -5690,6 +5697,7 @@ class _TargetLowering:
         self,
         compile_options: CompileOptions,
         workspace_decl: SparseWorkspaceDecl,
+        outer_cell: Optional["OuterCellDomain"] = None,
     ) -> Optional[CompressedWhereOpenMPPassSpec]:
         """The shared two-phase configuration, derived from this receiver.
 
@@ -5704,6 +5712,12 @@ class _TargetLowering:
         generic in the arity throughout -- legacy drives it with two levels on
         these programs already -- so deriving it is what the pass was always
         written to accept.
+
+        ``outer_cell`` states how the outer loop's iterations number the
+        receiver's cells, for a family whose outer loop does not iterate the
+        dense level itself.  Omitting it -- which every family with a dense outer
+        loop does -- leaves the pass deriving both facts from the loop header, so
+        the emission is unchanged.
         """
 
         strategy = self.assembly_strategy()
@@ -5737,6 +5751,7 @@ class _TargetLowering:
                 workspace_ctype=dtype_to_c_datatype(torch_dtype).value,
                 compile_options=compile_options,
                 parallel=strategy == "two_pass_parallel",
+                outer_cell=outer_cell,
             )
         )
 
@@ -9167,40 +9182,163 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
     # -- assembly strategy ----------------------------------------------------
 
     def supported_assemblies(self) -> Tuple[str, ...]:
-        """The two single-pass strategies, and only those, because that is what
-        is proven correct here.
+        """All four, with the two-pass pair legal on the programs it is correct on.
 
-        Both two-pass strategies were built, driven through the shared pass on
-        this family, and then REFUSED on the evidence.  Three obstacles were
-        measured in order, and the third is the one that stops it:
+        Five obstacles stood between this family and the two-pass strategies, and
+        they were measured in order rather than reasoned about
+        (``~/.cache/scorch-codex/two-pass-position/DESIGN.md`` has the receipts).
+        Two are closed in the shared layers:
 
-        1. the shared pass recognized result writes only in legacy's
-           ``push_back``/indexed-assign vocabulary while this family emits
-           ``emplace_back`` and ``scorch_vector_set`` directly, so the count
-           pass kept appending and its counters stayed zero.  FIXED in
-           ``result_write_pass``, which now recognizes both vocabularies and
-           fails closed on an unrecognized result write instead of passing it to
-           the C++ compiler;
-        2. this family's completion checkpoint refused any body change it does
-           not model.  FIXED by scoping it to the owner whose contract it
-           verifies;
-        3. **the rebuilt position arrays are wrong.**  With the first two closed,
-           a ``dss`` receiver executes and produces ``compressed mode 2 position
-           array must be nondecreasing``, and a ``ds`` receiver produces a
-           coordinate range outside its own extent.  The two-phase path rebuilds
-           positions from ``_count`` prefix sums indexed by the phase loop
-           variable, while this family closes positions through a catch-up over
-           the dense prefix; for a stored outer loop the loop variable is a
-           POSITION rather than a row coordinate, and the two do not coincide.
+        1. the count array is sized by the outer loop's trip count and indexed by
+           its variable, which for a loop over a STORED level is a position
+           rather than a coordinate.  Closed by giving the shared two-phase pass
+           an explicit outer-cell domain, which this family states below;
+        2. the fill phase advanced its cursor twice per appended coordinate --
+           once from the append's own rewrite and once from this family's mirror
+           bump ``p{R}{L}++``.  Closed in ``result_write_pass``, which now decides
+           from the body which statement carries the advance.
 
-        Offering a strategy that miscompiles would be worse than refusing it, so
-        the family lists what it can emit and a request for the others fails
-        closed with ``unsupported_assembly_host``.  Closing (3) is a bounded
-        piece of work with its own correctness obligation, and it is stated in
-        the ledger rather than guessed at here.
+        The remaining three are confined to a drain that assembles more than one
+        compressed result level, and :meth:`two_pass_assembly_legal` declines
+        exactly that shape with ``unsupported_assembly_strategy``: the drain's
+        segment-open conditional reads ``{R}{L}_crd.back()``, and a phase with no
+        coordinate vector cannot read it; the position close that conditional
+        relies on is dropped by ``result_write_pass`` although only the FIRST
+        compressed level's positions come from the prefix sums; and the marker
+        truthfulness check refuses that conditional's own truthful marker because
+        its direction half reads evidence from nested statement bodies.
+
+        Two earlier obstacles were already closed before this: the pass
+        recognized result writes only in legacy's ``push_back``/indexed-assign
+        vocabulary, and this family's completion checkpoint refused any body
+        change it does not model.
         """
 
-        return (DEFAULT_SERIAL_STRATEGY, "single_pass_chunk_parallel")
+        return SPARSE_ASSEMBLY_STRATEGIES
+
+    def two_pass_assembly_legal(self) -> bool:
+        """Whether this program CAN be assembled by counting first.
+
+        Structural, extent-free, and about correctness only -- the same split the
+        chunked strategy's own predicate keeps.  What the two-pass needs is
+        weaker than what chunking needs in one respect and stronger in another.
+
+        Weaker: chunking requires the outermost loop to cut the dense extent into
+        CONTIGUOUS ranges, because concatenating per-chunk buffers in chunk order
+        is what reproduces lexicographic order, and a stored stream does not
+        partition an extent.  The two-pass needs only that each iteration's cell
+        be identifiable and countable, and a stored prefix loop's coordinates are
+        distinct and increasing within its one segment, so each cell is visited at
+        most once and the prefix sum gives the cells it never visits their equal
+        positions for free -- which is exactly the catch-up the single pass emits
+        by hand.
+
+        Stronger: every compressed level above the leaf must be closed by a
+        prefix loop rather than by the drain.  A prefix loop closes it with the
+        position-boundary conditional the shared pass understands in both phases;
+        the drain instead compares the drained key against
+        ``{R}{L}_crd.back()``, which neither phase has a coordinate vector to
+        read.
+        """
+
+        levels = self.result_decl.levels
+        if self._dense_prefix != 1 or not _partitionable_receiver(self.result_decl):
+            return False
+        if self.prefix_depth < 1:
+            # A region owning the program root leaves the producer's own loops at
+            # the top level, and the shared pass replaces the FIRST compatible
+            # top-level loop -- which would be a producer loop, not the assembly.
+            return False
+        if self.prefix_depth != len(levels) - 1:
+            return False
+        outer = self.loops[0]
+        if outer.kind is _SPARSE:
+            cursor = outer.cursors[0]
+            if (
+                self.decls[cursor.tensor].levels[cursor.level].kind
+                is not LevelKind.COMPRESSED
+            ):
+                # Only a compressed cursor level guarantees coordinates that are
+                # distinct and increasing, which is what makes one cell one
+                # iteration.  No other kind is executable today; checked rather
+                # than assumed.
+                return False
+        elif outer.kind is not _DENSE:
+            return False
+        if (
+            self.panel is not None
+            or self.relayout is not None
+            or self.result_tile is not None
+            or self.parallel is not None
+        ):
+            # Already None for this family; checked rather than assumed,
+            # because each would own part of the same assembly.
+            return False
+        return True
+
+    def _outer_cell_domain(self) -> "OuterCellDomain":
+        """How this program's outermost loop numbers the receiver's cells.
+
+        The cell count is the same dimension extent
+        :meth:`_assembly_catch_up_bound` numbers the same segments with, so the
+        counting pass and the single pass cannot disagree about how many there
+        are.  The cell index is the loop's coordinate: its variable for a dense
+        loop, and the coordinate that loop resolves for a stored one -- spelled as
+        the subscript into the cursor's coordinate array rather than as the
+        variable the body declares, because the fill phase's base loads are the
+        body's first statements and an expression has no declaration to wait for.
+        """
+
+        from ..compressed_where_openmp_pass import OuterCellDomain
+
+        outer = self.loops[0]
+        count = self._loop_bound_var(outer)
+        if outer.kind is _DENSE:
+            index: llir.Expr = llir.Var(
+                name=self._loop_var_name(outer),
+                type=llir.DataType.INT64,
+            )
+        else:
+            cursor = outer.cursors[0]
+            index = llir.ArrayAccess(
+                array=self._cursor_crd_array(cursor),
+                index=llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
+                ),
+            )
+        return OuterCellDomain(index=index, count=count)
+
+    def compressed_where_pass_spec(
+        self, compile_options: CompileOptions
+    ) -> Optional[CompressedWhereOpenMPPassSpec]:
+        """The shared two-phase configuration, with this family's cell numbering.
+
+        ``None`` when the resolved strategy is not a two-pass one.  A REQUESTED
+        two-pass strategy this program cannot express fails closed with
+        ``unsupported_assembly_strategy``, naming the shape -- the same treatment
+        :meth:`parallel_chunk_context` gives an illegal chunked request, and for
+        the same reason: answering a caller with a different kernel than the one
+        they asked for is unobservable to them.  An UNREQUESTED one cannot arrive,
+        because :meth:`default_assembly` never chooses a two-pass strategy.
+        """
+
+        if self.assembly_strategy() not in TWO_PASS_STRATEGIES:
+            return None
+        if not self.two_pass_assembly_legal():
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                "a two-pass assembly needs a result whose level zero is dense "
+                "with every level below it compressed, an outermost loop "
+                "binding that dense level, every compressed level above the "
+                "leaf closed by a prefix loop rather than by the workspace "
+                "drain, and no panel, relayout or result tile attached",
+            )
+        return self._two_phase_spec(
+            compile_options,
+            self.workspace_decl,
+            self._outer_cell_domain(),
+        )
 
     def default_assembly(self) -> str:
         """Today's choice for this family, named and unchanged.
