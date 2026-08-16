@@ -284,11 +284,66 @@ def run_memo_suite():
         print(f"  FAIL  SCORCH_ABI_VALIDATE_MEMO=0 did not restore checking: {out!r}")
 
 
+def run_inference_mode_suite():
+    """Tensors made under torch.inference_mode() have their version counter DISABLED,
+    and reading it raises. Both memos key on that counter, so both have to ask rather
+    than assume — otherwise every sparse matmul inside an inference-mode block fails.
+    """
+    print("\n[inference_mode] version counters are disabled in here")
+    global PASSES
+    with torch.inference_mode():
+        probe = torch.from_numpy(np.arange(4, dtype=np.int64))
+        try:
+            _ = probe._version
+            print("  note  _version did not raise on this torch build")
+        except RuntimeError:
+            PASSES += 1
+            print("  ok    _version raises, so the guards are load-bearing here")
+
+        M, deg, J, N = 512, 4, 512, 8
+        pos = np.arange(M + 1, dtype=np.int64) * deg
+        crd = np.tile(np.arange(deg, dtype=np.int64), M)
+        val = np.ones(M * deg)
+        # native validator + its memo, three times so the memo path is taken
+        for i in range(3):
+            expect_ok(f"native validator under inference_mode, call {i}",
+                      lambda: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, crd, val)))
+
+        # and the python-side narrowing memo, through the public API
+        try:
+            import scipy.sparse
+            import scorch
+            sp = scipy.sparse.csr_matrix(
+                (val.astype(np.float32), crd.astype(np.int32),
+                 pos.astype(np.int32)), shape=(M, J))
+            t = torch.sparse_csr_tensor(
+                torch.from_numpy(sp.indptr.astype(np.int64)),
+                torch.from_numpy(sp.indices.astype(np.int64)),
+                torch.from_numpy(sp.data), size=sp.shape)
+            A = scorch.STensor.from_torch(t)
+            B = torch.ones(J, N)
+            for i in range(3):
+                out = scorch.matmul(A, B)
+            ref = sp.astype(np.float64) @ np.ones((J, N))
+            err = float(np.abs(out.numpy() - ref).max() / max(np.abs(ref).max(), 1e-30))
+            if err < 1e-4:
+                PASSES += 1
+                print(f"  ok    scorch.matmul under inference_mode, relerr {err:.1e}")
+            else:
+                FAILS.append("inference_mode matmul accuracy")
+                print(f"  FAIL  scorch.matmul under inference_mode relerr {err:.1e}")
+        except Exception as exc:  # noqa: BLE001
+            FAILS.append("inference_mode matmul")
+            print(f"  FAIL  scorch.matmul under inference_mode: "
+                  f"{type(exc).__name__}: {exc}")
+
+
 run_suite(64, 4, "serial screen")            # 256 nnz
 run_suite(40000, 16, "parallel screen")      # 640000 nnz, above the grain
 run_sortedness_suite(64, 4, "sortedness, serial")
 run_sortedness_suite(20000, 8, "sortedness, parallel")
 run_memo_suite()
+run_inference_mode_suite()
 
 print(f"\n{PASSES} passed, {len(FAILS)} failed")
 if FAILS:
