@@ -359,16 +359,37 @@ inline size_t scorch_chunk_total(size_t begin,
 //
 // So the first shape moves 3N bytes and the second 2N, and the parallel copy has
 // to divide its 2N by more than two before the extra pass pays for itself. It
-// does not, over the range these merges actually reach. Measured on both hosts,
-// nine total sizes from 1 KB to 32 MB x {2, 8, 32} chunks x {1, 2, 4, all}
-// threads x {int, float}, ABBA-interleaved against a same-shape control: the
-// insert shape is faster at almost every point, by 1.05x-1.7x on Apple M5 below
-// 4 MB and by up to 18x at the 256 KB gate where the region cost dwarfs the
-// copy, and by 1.08x-4.8x nearly everywhere on x86. The resize-and-parallel
-// shape wins only in a narrow high-size band and only on one host at a time --
-// M5 above 4-8 MB by up to 1.45x, x86 essentially nowhere below 16 MB -- so no
-// byte threshold provably avoids firing where it hurts, and the mechanism is
-// removed rather than given a gate that cannot be right on both hosts.
+// does not, over the range these merges actually reach.
+//
+// Measured rather than argued, on two hosts, 144 points each: nine total sizes
+// from 1 KB to 32 MB x {2, 8, 32} chunks x {1, 2, 4, all} threads x {int, float},
+// ABBA-interleaved, min within a round and median across rounds, against a
+// same-shape control whose floor is 0.97-1.03 at almost every point.
+//
+//   * the insert shape is faster at 97 of 144 points on an Apple M5 and 134 of
+//     144 on x86;
+//   * at ONE worker, where the parallel arm cannot fire at all, it is faster at
+//     35 of 36 M5 points (0.906x-1.595x) and 36 of 36 x86 points
+//     (1.019x-3.683x) -- that band is pure redundant zeroing removed;
+//   * at exactly the 256 KB gate with more than one worker, which is the
+//     smallest region the parallel arm fires on today, it is 3.2x-18.4x faster
+//     on the M5 and 2.4x-4.8x on x86: the OpenMP region costs more than the copy
+//     it parallelizes;
+//   * the resize-and-parallel shape wins only high and only on one host at a
+//     time -- from 4 MB up on the M5, best 1.66x at 32 MB, and on x86 only at
+//     16 MB over 32 chunks and at 32 MB, best 1.28x.
+//
+// No byte threshold therefore provably avoids firing where it hurts, which is
+// what CLAUDE.md asks a runtime gate to be, so the mechanism is removed rather
+// than given a gate that cannot be right on both hosts. The cost is stated: a
+// merge above 4 MB on the M5 gives up as much as 1.66x. Recovering it needs a
+// destination the generated kernel declares with an allocator that
+// default-initializes, which is a codegen change.
+//
+// One regression, quantified: a 1 KB total spread over 32 chunks is 0.897x-0.916x
+// on the M5 -- 32-byte chunks, where insert's per-chunk bookkeeping outweighs a
+// zero-fill that fits in a cache line burst. Twelve to eighteen nanoseconds, and
+// x86 does not show it (1.208x-1.439x on the same points).
 //
 // `threads` is kept, unnamed: the generated call site passes the assembly thread
 // count and its text is locked by the emitter's tests.
