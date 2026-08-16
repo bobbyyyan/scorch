@@ -323,58 +323,75 @@ inline void scorch_presize_positions(std::vector<T>& positions, int64_t count) {
   }
 }
 
-// Chunk c's destination offset, and the exact total. O(chunks), never O(nnz).
+// How many entries the chunks hold in total. O(chunks), never O(nnz).
+//
+// This replaces a per-chunk destination-offset ARRAY, which existed only so an
+// OpenMP region could memcpy disjoint slices. The merge no longer has that
+// region (see scorch_concat_chunks), and the array was a heap allocation per
+// merge -- material at the small end, where a merge is tens of nanoseconds.
 template <typename T>
-inline std::vector<size_t> scorch_chunk_offsets(
-    size_t begin, const std::vector<std::vector<T>>& parts) {
-  std::vector<size_t> offsets(parts.size() + 1);
-  offsets[0] = begin;
-  for (size_t chunk = 0; chunk < parts.size(); chunk++) {
-    offsets[chunk + 1] = offsets[chunk] + parts[chunk].size();
+inline size_t scorch_chunk_total(size_t begin,
+                                 const std::vector<std::vector<T>>& parts) {
+  size_t total = begin;
+  for (const std::vector<T>& part : parts) {
+    total += part.size();
   }
-  return offsets;
+  return total;
 }
 
 // Append every chunk's entries, in chunk order.
 //
 // This copy is the whole price of the single-pass strategy -- it replaces
-// legacy's redundant counting pass -- so it has to be cheap in the regime that
-// buys the parallelism. Sizing the destination once and then copying chunks
-// into disjoint slices makes the copy itself parallel; a reserve-and-append
-// loop cannot be, and measured serially it eats a large part of what the
-// parallel assembly wins back. Below SCORCH_MEMSET_GRAIN_BYTES the region would
-// cost more than the copy, so it stays a straight-line memcpy chain.
+// legacy's redundant counting pass -- so it has to be cheap.
+//
+// The destination is grown with reserve plus one insert per chunk, and the point
+// is what that does NOT do. `out` is a std::vector<T> the generated kernel
+// declares and later MOVES into a tensor, so it cannot be given an allocator
+// that default-initializes, and C++17 has no uninitialized resize. That leaves
+// exactly two shapes:
+//
+//   * resize(total) value-initializes [begin, total) -- a whole pass of stores
+//     over a range the copy then overwrites in full -- and buys the right to
+//     memcpy disjoint slices from an OpenMP region;
+//   * reserve(total) plus one insert per chunk writes the destination ONCE,
+//     because insert copy-constructs into raw storage, but the copies are
+//     necessarily serial: only the container may move its own size.
+//
+// So the first shape moves 3N bytes and the second 2N, and the parallel copy has
+// to divide its 2N by more than two before the extra pass pays for itself. It
+// does not, over the range these merges actually reach. Measured on both hosts,
+// nine total sizes from 1 KB to 32 MB x {2, 8, 32} chunks x {1, 2, 4, all}
+// threads x {int, float}, ABBA-interleaved against a same-shape control: the
+// insert shape is faster at almost every point, by 1.05x-1.7x on Apple M5 below
+// 4 MB and by up to 18x at the 256 KB gate where the region cost dwarfs the
+// copy, and by 1.08x-4.8x nearly everywhere on x86. The resize-and-parallel
+// shape wins only in a narrow high-size band and only on one host at a time --
+// M5 above 4-8 MB by up to 1.45x, x86 essentially nowhere below 16 MB -- so no
+// byte threshold provably avoids firing where it hurts, and the mechanism is
+// removed rather than given a gate that cannot be right on both hosts.
+//
+// `threads` is kept, unnamed: the generated call site passes the assembly thread
+// count and its text is locked by the emitter's tests.
+//
+// scorch_concat_chunk_positions below still value-initializes for the same
+// reason, and it is NOT changed here: what follows its resize is a transforming
+// loop rather than a memcpy, so insert cannot express it and the trade is a
+// different one that needs its own measurement.
 template <typename T>
 inline void scorch_concat_chunks(std::vector<T>& out,
                                  const std::vector<std::vector<T>>& parts,
-                                 int threads = 1) {
+                                 int = 1) {
   const size_t begin = out.size();
-  const std::vector<size_t> offsets = scorch_chunk_offsets(begin, parts);
-  const size_t total = offsets.back();
+  const size_t total = scorch_chunk_total(begin, parts);
   if (total == begin) {
     return;
   }
-  out.resize(total);
-  T* const destination = out.data();
-  const int64_t bytes =
-      static_cast<int64_t>(total - begin) * static_cast<int64_t>(sizeof(T));
-  const int64_t count = static_cast<int64_t>(parts.size());
-  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
-#pragma omp parallel for num_threads(threads) schedule(dynamic)
-    for (int64_t chunk = 0; chunk < count; chunk++) {
-      const std::vector<T>& part = parts[static_cast<size_t>(chunk)];
-      if (!part.empty()) {
-        std::memcpy(destination + offsets[static_cast<size_t>(chunk)],
-                    part.data(), part.size() * sizeof(T));
-      }
-    }
-    return;
-  }
-  for (int64_t chunk = 0; chunk < count; chunk++) {
-    const std::vector<T>& part = parts[static_cast<size_t>(chunk)];
+  // One allocation for the whole merge; without it the insert chain reallocates
+  // geometrically and copies what it has already appended.
+  out.reserve(total);
+  for (const std::vector<T>& part : parts) {
     if (!part.empty()) {
-      std::memcpy(destination + offsets[static_cast<size_t>(chunk)], part.data(),
-                  part.size() * sizeof(T));
+      out.insert(out.end(), part.begin(), part.end());
     }
   }
 }
