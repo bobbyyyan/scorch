@@ -17343,7 +17343,13 @@ argument §62.5 exists to refuse.
   re-run at the next commit, and this section changes nothing that family touches.
   **An identity test written over ``id()`` sets cannot distinguish aliasing from
   address reuse**, and this is the first time it has reported the difference.
-- **Two harness defects, both caught by running things.**  Running the eight suite
+- **Three harness defects, all caught by running things.**  The ledger's seal
+  excludes compiled output by path, and a run that wrote its extension cache to
+  ``torch_cand`` rather than ``torch`` did not match the pattern, so ten
+  ``build.ninja`` files were sealed until the seal was read back and checked -- the
+  same defect §62.9 exists to prevent, arriving from a name this ledger chose
+  itself.  The patterns now cover a suffixed name and one extra directory level,
+  and the seal is 398 files with zero compiled artifacts.  Running the eight suite
   partitions in parallel -- one invocation per partition, same output directory,
   which is what makes the suite an hour instead of three -- has all eight merge one
   ``provenance.json``, and one reader saw a half-written file, so its guard aborted

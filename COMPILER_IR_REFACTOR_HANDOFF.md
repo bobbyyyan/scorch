@@ -33303,7 +33303,9 @@ cost of reporting a number from the wrong tree is the whole record.
 
 ## Two-pass assembly made correct, and §60.6's single cause was one of five (2026-08-16; supersedes every preceding prompt)
 
-Tip `c1ccb10`, 75 commits ahead of origin `a3b8d1e`, nothing pushed, everything green.
+Last commit that changes what the compiler does: `56d014b`; last that changes a test:
+`c1ccb10`; with this record the branch is 77 commits ahead of origin `a3b8d1e`.  Nothing
+pushed, everything green.
 Review section 66 is the record; `~/.cache/scorch-codex/two-pass-position/` is the ledger
 (`DESIGN.md` written before the code, digest in `provenance/`).
 
