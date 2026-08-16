@@ -734,7 +734,7 @@ def test_workspace_pool_construction_is_structured_with_legacy_fallback() -> Non
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()
     pool_helpers = compressed_source.split("def _workspace_pool_type", 1)[1].split(
-        "def _loop_bound_reference", 1
+        "def _resolve_outer_cell", 1
     )[0]
 
     assert pool_helpers.count("llir.RawStmt(") == 1
@@ -1312,7 +1312,7 @@ def test_first_compressed_position_allocation_is_structured() -> None:
         )
         == 1
     )
-    assert "_loop_bound_reference(loop_bound, loop_bound_type)" in position_allocations
+    assert "_cell_count_reference(cell_count)" in position_allocations
     assert "_offset_reference(first_level)" in position_allocations
     for opaque_spelling in (
         "{first_level}_pos_torch",
@@ -1872,8 +1872,7 @@ def test_compressed_offset_family_is_structured() -> None:
     count_args = count_fields["args"].elts
     assert len(count_args) == 2
     assert ast.unparse(count_args[0]) == (
-        "llir.Cast(_loop_bound_reference(loop_bound, loop_bound_type), "
-        "llir.DataType.SIZE_T)"
+        "llir.Cast(_cell_count_reference(cell_count), llir.DataType.SIZE_T)"
     )
     assert ast.unparse(count_args[1]) == "llir.Literal(0, llir.DataType.INT)"
 
@@ -1884,7 +1883,7 @@ def test_compressed_offset_family_is_structured() -> None:
     offset_args = offset_fields["args"].elts
     assert len(offset_args) == 1
     assert ast.unparse(offset_args[0]) == (
-        "llir.Add(llir.Cast(_loop_bound_reference(loop_bound, loop_bound_type), "
+        "llir.Add(llir.Cast(_cell_count_reference(cell_count), "
         "llir.DataType.SIZE_T), llir.Literal(1, llir.DataType.INT))"
     )
 
@@ -1896,7 +1895,7 @@ def test_compressed_offset_family_is_structured() -> None:
     )
     assert ast.unparse(loop_fields["cond"]) == (
         "llir.BinOp('<', _prefix_index_reference(), "
-        "_loop_bound_reference(loop_bound, loop_bound_type))"
+        "_cell_count_reference(cell_count))"
     )
     assert ast.unparse(loop_fields["update"]) == (
         "llir.Increment(_prefix_index_reference())"
@@ -1923,7 +1922,7 @@ def test_compressed_offset_family_is_structured() -> None:
     assert ast.unparse(total_fields["var"]) == "_total_reference(level)"
     assert ast.unparse(total_fields["value"]) == (
         "llir.ArrayAccess(array=_offset_reference(level), "
-        "index=_loop_bound_reference(loop_bound, loop_bound_type))"
+        "index=_cell_count_reference(cell_count))"
     )
 
     base_initializers: list[dict[str, ast.expr]] = []
@@ -1974,16 +1973,16 @@ def test_compressed_offset_family_is_structured() -> None:
     assert ast.unparse(array_fields["name"]) == "f'_offset{level}'"
     assert ast.unparse(array_fields["type"]) == "llir.DataType.STD_VECTOR_INT"
 
+    # The subscript is the outer cell index, and it is no longer a reference to
+    # the loop variable: a loop over a STORED level has a variable that is a
+    # position, so the caller states which cell an iteration assembles and the
+    # pass detaches a fresh copy of that expression per use.  What this locks is
+    # unchanged in kind -- the subscript is built by the pass's own typed builder
+    # rather than by interpolating text -- and the builder is the one place a
+    # detached copy is made.
     index = access_fields["index"]
-    assert _is_llir_constructor(index, "Var")
     assert isinstance(index, ast.Call)
-    index_fields = {
-        keyword.arg: keyword.value
-        for keyword in index.keywords
-        if keyword.arg is not None
-    }
-    assert ast.unparse(index_fields["name"]) == "loop_var.name"
-    assert ast.unparse(index_fields["type"]) == "loop_var.type"
+    assert ast.unparse(index) == "_cell_index_expression(context, cell_index)"
 
 
 def test_no_direct_assign_target_reintroduces_a_string_expression() -> None:
