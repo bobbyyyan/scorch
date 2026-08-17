@@ -330,7 +330,8 @@ struct AbiNarrowEntry {
 // a CSR matrix validated through the prebuilt path is validated for a JIT kernel too.
 enum AbiCheckKind : int64_t {
   AbiCheckBounds = 1,      // every coordinate in [0, extent)
-  AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range, sorted
+  AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range and,
+                           // when required, strictly increasing inside each span
   AbiCheckLex = 3,         // coordinate levels ascend lexicographically
   AbiCheckSpans = 4,       // positions alone: non-decreasing and within [0, nnz]
 };
@@ -1291,7 +1292,7 @@ inline void validate_jit_tensor(
     TORCH_CHECK(pos[0] == 0, argument_name(op, argument),
                 " compressed level ", level, " must start at position 0");
     // Same three checks the CSR view runs — spans partition [0, nnz], coordinates in
-    // range, coordinates sorted within a span — so the same screen and the same memo
+    // range, coordinates strictly increasing within a span — so the same screen and memo
     // family serve both. (Sharing is within one module: see the note on abi_memo_clear
     // for why each loaded kernel carries its own maps.)
     AbiStructEntry level_memo;

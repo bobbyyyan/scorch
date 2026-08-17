@@ -242,6 +242,143 @@ def test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry():
         ops.einsum("ij,ij->ij", left, right, format="oo")
 
 
+# --------------------------------------------------------------------------- #
+# The generated path's COMPRESSED-level rejections.
+#
+# Before these, the only assertion in the whole suite that reached a JIT validator
+# was the COO one above. The compressed-level checks -- coordinate bounds, strictly
+# increasing coordinates inside a span, the span partition -- had no test anywhere,
+# on either host, even though every generated kernel runs them on every input on
+# every call. That gap matters on this branch specifically: ``utils.py`` substitutes
+# ``native_abi.h``'s TEXT into the preamble, so the validator is recompiled inside
+# each generated kernel rather than linked from ``scorch_ops``. A screen correct in
+# the extension and wrong in a generated kernel would pass every other test here.
+#
+# Mutating an index has to reach the array the kernel reads. ``STensor.index`` and
+# ``storage.mode_indices`` both return FRESH tensors per access, so writing through
+# either lands in a temporary and the kernel never sees it -- which reads exactly
+# like an accepted invalid input. The real arrays are ``storage.index._mode_indices``,
+# which is what the COO test above writes through too.
+# --------------------------------------------------------------------------- #
+def _compressed_vectors():
+    """Two compressed vectors and the generated einsum that multiplies them.
+
+    ``einsum('i,i->i')`` has no prebuilt symbol, so this goes through the generic
+    pipeline and the kernel's ``evaluate()`` opens with a ``validate_jit_tensor``
+    per operand.
+    """
+    left_dense = torch.zeros(12)
+    left_dense[0::2] = torch.arange(1.0, 7.0)
+    right_dense = torch.zeros(12)
+    right_dense[0:5] = 2.0
+    left = STensor.from_torch(left_dense).to_sparse("s")
+    right = STensor.from_torch(right_dense).to_sparse("s")
+    return left, right
+
+
+def _multiply(left, right):
+    return ops.einsum("i,i->i", left, right, format="s")
+
+
+def test_jit_abi_accepts_a_canonical_compressed_operand():
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+
+def test_jit_abi_rejects_an_out_of_range_compressed_coordinate():
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+    coordinates = left.storage.index._mode_indices[0][1]
+    before = coordinates.tolist()
+    coordinates[2] = 10**6
+    assert coordinates.tolist() != before, "the write did not reach the kernel's array"
+
+    with pytest.raises(RuntimeError, match=r"is outside \[0, 12\)"):
+        _multiply(left, right)
+
+
+def test_jit_abi_rejects_a_duplicate_compressed_coordinate():
+    """A duplicate is legal under a non-decreasing contract and a violation here.
+
+    This is the case that distinguishes the ported branchless screen, which counts
+    non-increases, from the upstream one it came from, which counts descents. With
+    upstream's comparison the screen sees no descent, reports the input clean, and
+    the serial loop that would have caught it never runs.
+    """
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+    coordinates = left.storage.index._mode_indices[0][1]
+    before = coordinates.tolist()
+    coordinates[2] = int(coordinates[1])
+    assert coordinates.tolist() != before, "the write did not reach the kernel's array"
+
+    with pytest.raises(RuntimeError, match="must be strictly increasing"):
+        _multiply(left, right)
+
+
+def test_jit_abi_rejects_a_descent_inside_a_compressed_span():
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+    coordinates = left.storage.index._mode_indices[0][1]
+    first, second = int(coordinates[1]), int(coordinates[2])
+    coordinates[1], coordinates[2] = second, first
+    assert int(coordinates[1]) > int(coordinates[2])
+
+    with pytest.raises(RuntimeError, match="must be strictly increasing"):
+        _multiply(left, right)
+
+
+def test_jit_abi_rejects_a_broken_compressed_span():
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+    positions = left.storage.index._mode_indices[0][0]
+    positions[-1] = int(positions[-1]) + 5
+
+    with pytest.raises(RuntimeError, match="invalid compressed span"):
+        _multiply(left, right)
+
+
+def test_jit_abi_rejects_a_compressed_level_not_starting_at_zero():
+    left, right = _compressed_vectors()
+    assert _multiply(left, right).values.tolist() == [2.0, 4.0, 6.0]
+
+    positions = left.storage.index._mode_indices[0][0]
+    positions[0] = 1
+
+    with pytest.raises(RuntimeError, match="must start at position 0"):
+        _multiply(left, right)
+
+
+def test_jit_abi_rejects_a_violation_at_the_second_compressed_level():
+    """Two compressed levels, with level 0 left canonical.
+
+    A DCSR operand exercises ``validate_jit_tensor``'s per-level loop and per-level
+    memo, and puts the violation under a level that is itself fine -- so a verdict
+    cached for one level cannot vouch for the next.
+    """
+    dense = torch.zeros(6, 8)
+    for row in range(6):
+        for column in (0, 3, 6):
+            dense[row, column] = float(row + column + 1)
+    left = STensor.from_torch(dense).to_sparse("ss")
+    right = torch.ones(8, 4)
+    assert ops.matmul(left, right).to_dense().sum().item() == pytest.approx(468.0)
+
+    levels = left.storage.index._mode_indices
+    assert len(levels) == 2
+    coordinates = levels[1][1]
+    # Position 10 sits inside a span rather than at its start, so a non-increase
+    # there is a violation rather than a legal row boundary.
+    coordinates[10] = int(coordinates[9])
+
+    with pytest.raises(RuntimeError, match="must be strictly increasing"):
+        ops.matmul(left, right)
+
+
 def test_jit_abi_uses_physical_extents_for_rectangular_mode_order():
     source = torch.tensor([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0]])
     tensor = STensor.from_torch(source, mode_order=[1, 0])
