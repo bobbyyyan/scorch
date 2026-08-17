@@ -71,28 +71,179 @@ inline int abi_scan_threads(int64_t n) {
 }
 
 // --------------------------------------------------------------------------- //
+// Structural screens
+//
+// Each screen replaces a serial loop carrying a TORCH_CHECK per element by folding
+// every violation into one OR accumulator, so the loop vectorizes and splits across
+// threads. They are deliberately CONSERVATIVE: a screen may report trouble on a valid
+// input, never pass an invalid one. The caller's original serial loop therefore stays
+// the sole source of diagnostics, and a screen that was merely pessimistic costs one
+// wasted walk and proceeds.
+// --------------------------------------------------------------------------- //
+
+// Coordinates are int32, so any limit past INT32_MAX admits every representable
+// coordinate. Saturating keeps the comparison in int32 and can only make a screen
+// more permissive, which the caller's serial loop re-checks exactly.
+inline int32_t abi_saturate_limit(int64_t limit) {
+  return limit > (int64_t)std::numeric_limits<int32_t>::max()
+             ? std::numeric_limits<int32_t>::max()
+             : (int32_t)limit;
+}
+
+// "every coordinate lies in [0, limit)"
+inline bool abi_screen_bounds(const int32_t* crd, int64_t n, int64_t limit) {
+  if (n <= 0) return false;
+  const int32_t lim = abi_saturate_limit(limit);
+  int bad = 0;
+  const int nt = abi_scan_threads(n);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
+    if (nt > 1)
+#endif
+  for (int64_t p = 0; p < n; ++p) {
+    const int32_t c = crd[p];
+    bad |= (c < 0) | (c >= lim);
+  }
+  return bad != 0;
+}
+
+// "positions do not decrease and stay within [0, nnz]", for the callers that validate
+// a position array on its own. O(rows) rather than O(nnz), but a TORCH_CHECK per row
+// is what made it show up at all.
+inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
+  int bad = 0;
+  const int32_t nnz32 = (int32_t)nnz;  // callers check nnz <= INT_MAX first
+  for (int64_t i = 1; i < count; ++i) {
+    bad |= (pos[i] < pos[i - 1]) | (pos[i] > nnz32);
+  }
+  return bad != 0;
+}
+
+// "positions partition [0, nnz] without decreasing, every coordinate lies in
+// [0, limit), and — when required — coordinates ascend inside each parent's span."
+//
+// Both coordinate tests run as FLAT loops over the whole coordinate array rather than
+// nested per-parent loops. A per-parent loop cannot vectorize usefully when spans are
+// short: a 39-nonzero FEM row spends more on vector peeling and tail than on the
+// eight-wide body, ~3.5 cycles per nonzero, i.e. the check cost more than the SpMM it
+// was guarding.
+//
+// Bounds do not care about span structure at all. Sortedness does, but only through
+// one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal exactly when p
+// is the first position of a span. So count every descent flat, count the descents
+// that sit on a span boundary (O(parent_count)), and compare.
+inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
+                                  int64_t parent_count, int64_t nnz, int64_t limit,
+                                  bool require_sorted) {
+  int bad = 0;
+  const int32_t nnz32 = (int32_t)nnz;  // callers check nnz <= INT_MAX first
+  for (int64_t parent = 0; parent < parent_count; ++parent) {
+    const int32_t start = pos[parent], end = pos[parent + 1];
+    bad |= (start < 0) | (end < start) | (end > nnz32);
+  }
+  if (bad || nnz <= 0) return bad != 0;
+
+  const int32_t lim = abi_saturate_limit(limit);
+  const int32_t c0 = crd[0];
+  bad |= (c0 < 0) | (c0 >= lim);
+  const int nt = abi_scan_threads(nnz);
+  if (!require_sorted) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
+    if (nt > 1)
+#endif
+    for (int64_t p = 1; p < nnz; ++p) {
+      const int32_t c = crd[p];
+      bad |= (c < 0) | (c >= lim);
+    }
+    return bad != 0;
+  }
+
+  int64_t desc = 0;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
+    reduction(+ : desc) if (nt > 1)
+#endif
+  for (int64_t p = 1; p < nnz; ++p) {
+    const int32_t c = crd[p];
+    bad |= (c < 0) | (c >= lim);
+    desc += (crd[p - 1] > c);
+  }
+  int64_t allowed = 0;
+  for (int64_t parent = 1; parent < parent_count; ++parent) {
+    const int32_t p = pos[parent];
+    if (p == pos[parent - 1]) continue;  // empty span: same boundary, already counted
+    if (p > 0 && p < nnz) allowed += (crd[p - 1] > crd[p]);
+  }
+  // `allowed` can only ever be a subset of `desc`, so a mismatch means some span is
+  // internally unsorted.
+  bad |= (desc != allowed);
+  return bad != 0;
+}
+
+// "COO coordinates ascend lexicographically across levels"
+inline bool abi_screen_lex(const std::vector<const int32_t*>& levels, int64_t n) {
+  if (levels.empty() || n <= 1) return false;
+  const size_t depth = levels.size();
+  const int32_t* const* lv = levels.data();
+  int bad = 0;
+  const int nt = abi_scan_threads(n);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
+    if (nt > 1)
+#endif
+  for (int64_t p = 1; p < n; ++p) {
+    int cmp = 0;  // first level that differs decides, exactly as the serial loop does
+    for (size_t l = 0; l < depth && cmp == 0; ++l) {
+      const int32_t a = lv[l][p - 1], b = lv[l][p];
+      cmp = (b > a) - (b < a);
+    }
+    bad |= (cmp < 0);
+  }
+  return bad != 0;
+}
+
+// --------------------------------------------------------------------------- //
 // Validation memo
 //
-// The structural scans are O(nnz) and were being redone on every call for index
-// arrays that had not changed since the last call. That is the single largest cost in
-// a narrow-free-dimension SpMM: on reddit at N=16 it is ~9 ms of index re-reading
-// against a 29 ms kernel. A tensor's indices do not change between calls, so the
-// verdict is cached.
+// Two things were being redone on every native call for index arrays that had not
+// changed since the last one:
 //
-// Recycling safety. The key is the StorageImpl address, and the entry holds a
-// weak_intrusive_ptr to that StorageImpl. A weak reference keeps the StorageImpl's
-// own allocation alive even after its data is released, so while an entry exists its
-// key address CANNOT be reused by a different StorageImpl -- an expired weak pointer
-// is therefore proof that the entry is stale, and a live one is proof that this is
-// the same storage we validated. data_ptr, nbytes and the version counter are also
-// recorded, so an in-place resize or any mutation routed through torch invalidates.
+//   1. The O(nnz) structural scans. On reddit at N=16 that is ~9 ms of index
+//      re-reading against a 29 ms kernel.
+//   2. The int64 -> int32 narrowing, which allocates and fills a fresh array every
+//      call. Worse than its own cost: because the narrowed array is new each time,
+//      nothing downstream of it can be memoized either.
+//
+// A tensor's indices do not change between calls, so both are cached. Caching (2) is
+// what lets (1) hit at all on the JIT path, where operands arrive as int64.
+//
+// Recycling safety. Entries are keyed on the array's data_ptr and hold a
+// weak_intrusive_ptr to the owning StorageImpl. A weak reference keeps the
+// StorageImpl's own allocation alive after its data is released, so while an entry
+// exists no *different* StorageImpl can occupy the address recorded in `storage` --
+// an expired weak pointer is therefore proof the entry is stale, and a live one plus
+// an equal `storage` address is proof this is the array that was validated. nbytes,
+// numel and the version counter are compared too, so a resize or any mutation routed
+// through torch invalidates. Keying on data_ptr rather than on the StorageImpl means
+// two distinct views of one storage get an entry each instead of evicting each other
+// on every call.
 //
 // What this does NOT catch: a write straight through a shared raw buffer (numpy
 // writing into memory a torch tensor aliases) does not bump the version counter, so a
 // buffer corrupted that way can now reach a kernel unchecked. That is a deliberate
-// trade, made because the per-call scan cost is what stands between this kernel and
-// MKL. SCORCH_ABI_VALIDATE_MEMO=0 restores strict per-call validation.
+// trade, made because the per-call scan cost is what stands between these kernels and
+// MKL. SCORCH_ABI_VALIDATE_MEMO=0 restores strict per-call validation, narrowing
+// included.
+//
+// One consequence worth stating: the narrowed array is now SHARED between calls, so a
+// kernel that wrote through its input index pointers would corrupt every later call
+// rather than a private copy. No generated or prebuilt kernel does -- input index
+// arrays are read-only by construction, and a test pins that they come back unchanged
+// -- but codegen does hand them out as `int*` rather than `const int*`, so this is
+// checked rather than guaranteed by the type.
 // --------------------------------------------------------------------------- //
+
 // A tensor's version counter, or 0 when it does not track one. Inference-mode tensors
 // have their counter disabled and current_version() throws on them, so this must be
 // asked rather than assumed — a `with torch.inference_mode():` block would otherwise
@@ -104,26 +255,38 @@ inline uint32_t abi_version_of(const torch::Tensor& t) {
              : 0u;
 }
 
-struct AbiMemoEntry {
-  // Holds the coordinate storage's weakcount. While this is alive the StorageImpl's
-  // own allocation cannot be freed, so the map key (that StorageImpl's address)
-  // cannot be handed to a different StorageImpl. An expired weak pointer is thus
-  // proof of staleness, and a live one proof of identity.
-  c10::weak_intrusive_ptr<c10::StorageImpl> storage_alive;
-  const void* crd_data = nullptr;
-  const void* pos_data = nullptr;
-  int64_t crd_nbytes = 0;
-  int64_t pos_nbytes = 0;
+// Identity of one index array, precise enough that a cached verdict about it can be
+// trusted. See the recycling-safety note above for why these fields and no others.
+struct AbiArrayId {
+  c10::weak_intrusive_ptr<c10::StorageImpl> alive;
+  const void* storage = nullptr;  // compared, never dereferenced
+  const void* data = nullptr;
+  int64_t nbytes = 0;
   int64_t numel = 0;
-  int64_t rows = 0;
-  int64_t cols = 0;
-  uint32_t crd_version = 0;
-  uint32_t pos_version = 0;
-  bool require_sorted = false;
+  uint32_t version = 0;
 
-  AbiMemoEntry()
-      : storage_alive(c10::intrusive_ptr<c10::StorageImpl>()) {}  // null weak ref
+  AbiArrayId() : alive(c10::intrusive_ptr<c10::StorageImpl>()) {}  // null weak ref
 };
+
+inline AbiArrayId abi_identify(const torch::Tensor& t) {
+  AbiArrayId id;
+  auto* impl = t.storage().unsafeGetStorageImpl();
+  // reclaim_copy takes a borrowed pointer and returns an owning ref; the temporary
+  // strong ref drops at the end of the statement, leaving only the weakcount.
+  id.alive = c10::weak_intrusive_ptr<c10::StorageImpl>(
+      c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(impl));
+  id.storage = impl;
+  id.data = t.data_ptr();
+  id.nbytes = (int64_t)t.storage().nbytes();
+  id.numel = t.numel();
+  id.version = abi_version_of(t);
+  return id;
+}
+
+inline bool abi_same_array(const AbiArrayId& a, const AbiArrayId& b) {
+  return a.storage == b.storage && a.data == b.data && a.nbytes == b.nbytes &&
+         a.numel == b.numel && a.version == b.version;
+}
 
 inline bool abi_memo_enabled() {
   static const bool on = [] {
@@ -138,71 +301,150 @@ inline std::mutex& abi_memo_mutex() {
   return m;
 }
 
-inline std::unordered_map<const void*, AbiMemoEntry>& abi_memo_map() {
-  static std::unordered_map<const void*, AbiMemoEntry> m;
+// The int32 copy made for an int64 caller array, held strongly so it outlives the
+// call that made it. It dies with its source: when the source storage goes, the weak
+// reference expires and the sweep below drops the entry and the copy with it.
+struct AbiNarrowEntry {
+  AbiArrayId source;
+  torch::Tensor narrowed;
+
+  bool live() const { return !source.alive.expired(); }
+};
+
+// Which family of structural check a cached verdict belongs to. It is params[0] of
+// every entry, because entries are keyed on an array address and two different checks
+// over the same array would otherwise be indistinguishable: a one-level COO view
+// records {extent, nnz} for "coordinates in range" and the lexicographic check over
+// that same single level would record {extent, nnz} for "coordinates ascend", and one
+// would silently satisfy the other. Within a family, matching params SHOULD share —
+// a CSR matrix validated through the prebuilt path is validated for a JIT kernel too.
+enum AbiCheckKind : int64_t {
+  AbiCheckBounds = 1,      // every coordinate in [0, extent)
+  AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range, sorted
+  AbiCheckLex = 3,         // coordinate levels ascend lexicographically
+  AbiCheckSpans = 4,       // positions alone: non-decreasing and within [0, nnz]
+};
+
+// A verdict that some arrays are structurally valid, together with the shape
+// parameters the verdict is conditional on. Comparing `params` is what keeps a
+// verdict about (rows, cols) from being reused for a different logical shape over the
+// same buffers.
+struct AbiStructEntry {
+  std::vector<AbiArrayId> arrays;
+  std::vector<int64_t> params;
+
+  void add(const torch::Tensor& t) { arrays.push_back(abi_identify(t)); }
+
+  bool live() const {
+    for (const auto& a : arrays) {
+      if (a.alive.expired()) return false;
+    }
+    return true;
+  }
+
+  bool same(const AbiStructEntry& other) const {
+    if (arrays.size() != other.arrays.size() || params != other.params) return false;
+    for (size_t i = 0; i < arrays.size(); ++i) {
+      if (!abi_same_array(arrays[i], other.arrays[i])) return false;
+    }
+    return true;
+  }
+};
+
+inline std::unordered_map<const void*, AbiNarrowEntry>& abi_narrow_map() {
+  static std::unordered_map<const void*, AbiNarrowEntry> m;
   return m;
 }
 
-// Everything a cached verdict depends on. Compared field-by-field on lookup, so a
-// resize (data_ptr / nbytes), a torch-level in-place write (version), or a different
-// logical shape all miss.
-inline AbiMemoEntry abi_memo_describe(const torch::Tensor& positions,
-                                      const torch::Tensor& coordinates, int64_t rows,
-                                      int64_t cols, bool require_sorted) {
-  AbiMemoEntry e;
-  auto* impl = coordinates.storage().unsafeGetStorageImpl();
-  // reclaim_copy takes a borrowed pointer and returns an owning ref; the temporary
-  // strong ref drops at the end of the statement, leaving only the weakcount.
-  e.storage_alive = c10::weak_intrusive_ptr<c10::StorageImpl>(
-      c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(impl));
-  e.crd_data = coordinates.data_ptr();
-  e.pos_data = positions.data_ptr();
-  e.crd_nbytes = (int64_t)coordinates.storage().nbytes();
-  e.pos_nbytes = (int64_t)positions.storage().nbytes();
-  e.numel = coordinates.numel();
-  e.rows = rows;
-  e.cols = cols;
-  e.crd_version = abi_version_of(coordinates);
-  e.pos_version = abi_version_of(positions);
-  e.require_sorted = require_sorted;
-  return e;
+inline std::unordered_map<const void*, AbiStructEntry>& abi_struct_map() {
+  static std::unordered_map<const void*, AbiStructEntry> m;
+  return m;
 }
 
-inline bool abi_memo_same(const AbiMemoEntry& a, const AbiMemoEntry& b) {
-  return a.crd_data == b.crd_data && a.pos_data == b.pos_data &&
-         a.crd_nbytes == b.crd_nbytes && a.pos_nbytes == b.pos_nbytes &&
-         a.numel == b.numel && a.rows == b.rows && a.cols == b.cols &&
-         a.crd_version == b.crd_version && a.pos_version == b.pos_version &&
-         a.require_sorted == b.require_sorted;
+// Reclaims dead entries and keeps the map bounded. Called before every insert, and it
+// sweeps EVERY time rather than only when the map is full, because a narrow entry owns
+// an int32 copy of its source array: waiting for 4096 entries to accumulate would hold
+// 4096 dead index arrays, which on graph-scale operands is hundreds of megabytes. An
+// insert only happens on a miss — once per newly seen array — so an O(entries)
+// weak-pointer sweep there is not on any hot path. Wholesale clearing is the backstop
+// for a program holding more live arrays than the bound allows.
+template <typename Entry>
+inline void abi_bound_map(std::unordered_map<const void*, Entry>& map) {
+  for (auto it = map.begin(); it != map.end();) {
+    if (!it->second.live()) it = map.erase(it);
+    else ++it;
+  }
+  if (map.size() >= (size_t)SCORCH_ABI_MEMO_MAX) map.clear();
 }
 
-// True when this exact CSR index pair has already been validated and still exists
+// The int32 copy of this array, if one was already made and both still exist
 // unchanged.
-inline bool abi_memo_hit(const void* key, const AbiMemoEntry& want) {
+inline bool abi_narrow_lookup(const AbiArrayId& want, torch::Tensor& out) {
   if (!abi_memo_enabled()) return false;
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
-  auto& map = abi_memo_map();
-  auto it = map.find(key);
+  auto& map = abi_narrow_map();
+  auto it = map.find(want.data);
   if (it == map.end()) return false;
-  if (it->second.storage_alive.expired()) {  // stale: that storage is gone
+  if (!it->second.live()) {  // stale: that storage is gone
     map.erase(it);
     return false;
   }
-  return abi_memo_same(it->second, want);
+  if (!abi_same_array(it->second.source, want)) return false;
+  out = it->second.narrowed;
+  return true;
 }
 
-inline void abi_memo_store(const void* key, AbiMemoEntry e) {
+inline void abi_narrow_store(AbiArrayId source, torch::Tensor narrowed) {
   if (!abi_memo_enabled()) return;
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
-  auto& map = abi_memo_map();
-  if (map.size() >= (size_t)SCORCH_ABI_MEMO_MAX) {
-    for (auto it = map.begin(); it != map.end();) {
-      if (it->second.storage_alive.expired()) it = map.erase(it);
-      else ++it;
-    }
-    if (map.size() >= (size_t)SCORCH_ABI_MEMO_MAX) map.clear();
+  auto& map = abi_narrow_map();
+  abi_bound_map(map);
+  const void* key = source.data;
+  AbiNarrowEntry entry;
+  entry.source = std::move(source);
+  entry.narrowed = std::move(narrowed);
+  map.insert_or_assign(key, std::move(entry));
+}
+
+// True when exactly these arrays, under exactly these parameters, have already been
+// validated and still exist unchanged.
+inline bool abi_struct_hit(const AbiStructEntry& want) {
+  if (!abi_memo_enabled() || want.arrays.empty()) return false;
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  auto& map = abi_struct_map();
+  auto it = map.find(want.arrays[0].data);
+  if (it == map.end()) return false;
+  if (!it->second.live()) {  // stale: that storage is gone
+    map.erase(it);
+    return false;
   }
-  map.insert_or_assign(key, std::move(e));
+  return it->second.same(want);
+}
+
+inline void abi_struct_store(AbiStructEntry entry) {
+  if (!abi_memo_enabled() || entry.arrays.empty()) return;
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  auto& map = abi_struct_map();
+  abi_bound_map(map);
+  const void* key = entry.arrays[0].data;
+  map.insert_or_assign(key, std::move(entry));
+}
+
+// Drops every cached verdict and every narrowed copy held by THIS module. The maps
+// are inline function-local statics and Python dlopens extension modules with
+// RTLD_LOCAL, so the prebuilt extension and each JIT-compiled kernel carry their own.
+// Every module amortizes over its own calls, which is all that is needed; the cost is
+// that a tensor used on both paths is narrowed once per module. Exposed so tests can
+// force the cold path and so a caller under memory pressure can reclaim the copies.
+inline void abi_memo_clear() {
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  abi_narrow_map().clear();
+  abi_struct_map().clear();
+}
+
+inline size_t abi_memo_size() {
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  return abi_narrow_map().size() + abi_struct_map().size();
 }
 
 }  // namespace scorch_native
@@ -378,6 +620,13 @@ inline torch::Tensor checked_index_tensor(torch::Tensor index,
               argument, " length exceeds the current int32 native bound");
 
   if (index.scalar_type() == torch::kInt64) {
+    // Already narrowed this array? Then both the scan and the allocate-and-fill below
+    // are re-deriving a known answer, and — because the answer is the same tensor
+    // rather than a fresh copy — every structural memo downstream of it can hit.
+    const AbiArrayId want = abi_identify(index);
+    torch::Tensor cached;
+    if (abi_narrow_lookup(want, cached)) return cached;
+
     const int64_t* data = index.data_ptr<int64_t>();
     const int64_t n = index.numel();
     // Screen: "every element is int32-representable" is exactly "min >= INT32_MIN
@@ -413,6 +662,7 @@ inline torch::Tensor checked_index_tensor(torch::Tensor index,
       }
     }
     index = index.to(torch::kInt32);
+    abi_narrow_store(want, index);
   }
   return index;
 }
@@ -554,76 +804,17 @@ inline CsrInputView checked_csr_view(
   TORCH_CHECK(pos[0] == 0, argument_name(op, argument),
               " positions[0] must be 0, got ", pos[0]);
 
-  // Screen the whole index structure branchlessly, then fall back to the serial
-  // loop below only if something looks wrong (see the note at the top of this
-  // file). `col_lim` saturates at INT32_MAX: coordinates are int32, so when cols
-  // exceeds that every coordinate is in range and the screen is merely
-  // conservative, which the fallback handles.
-  const int32_t col_lim =
-      cols > (int64_t)std::numeric_limits<int32_t>::max()
-          ? std::numeric_limits<int32_t>::max()
-          : (int32_t)cols;
-  const int32_t nnz32 = (int32_t)nnz;  // nnz <= INT_MAX checked above
+  // Already validated this exact index pair under this exact shape? Then the O(rows)
+  // and O(nnz) structural scans are re-deriving a known answer. Every O(1) check above
+  // and below still runs on every call; only the scans are memoized.
+  AbiStructEntry memo_want;
+  memo_want.add(coordinates);
+  memo_want.add(positions);
+  memo_want.params = {AbiCheckCompressed, rows, cols, nnz, require_sorted ? 1 : 0};
+  const bool memo_valid = abi_struct_hit(memo_want);
 
-  // Already validated this exact index pair? Then the O(rows) and O(nnz) structural
-  // scans below are re-deriving a known answer. Every O(1) check above and below still
-  // runs on every call; only the scans are memoized.
-  const void* memo_key = coordinates.storage().unsafeGetStorageImpl();
-  const AbiMemoEntry memo_want =
-      abi_memo_describe(positions, coordinates, rows, cols, require_sorted);
-  const bool memo_valid = abi_memo_hit(memo_key, memo_want);
-
-  int bad = 0;
-  if (!memo_valid) {
-    for (int64_t row = 0; row < rows; ++row) {
-      const int32_t start = pos[row], end = pos[row + 1];
-      bad |= (start < 0) | (end < start) | (end > nnz32);
-    }
-  }
-  // Both coordinate checks run as FLAT loops over the whole coordinate array rather
-  // than nested per-row loops. A per-row loop cannot vectorize usefully when rows are
-  // short — a 39-nonzero FEM row spends more on vector peeling and tail than on the
-  // eight-wide body, which measured at ~3.5 cycles per nonzero, i.e. the check cost
-  // more than the SpMM it was guarding.
-  //
-  // The bounds test does not care about row structure at all. Sortedness does, but
-  // only through one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal
-  // exactly when p is the first position of a row. So count every descent flat, count
-  // the descents that sit on a row boundary (O(rows)), and compare. `allowed` can only
-  // ever be a subset of `desc`, so a mismatch means some row is internally unsorted.
-  if (!memo_valid && !bad && nnz > 0) {
-    const int32_t c0 = crd[0];
-    bad |= (c0 < 0) | (c0 >= col_lim);
-    const int nt = abi_scan_threads(nnz);
-    int64_t desc = 0;
-    if (require_sorted) {
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) \
-    reduction(| : bad) reduction(+ : desc) if (nt > 1)
-#endif
-      for (int64_t p = 1; p < nnz; ++p) {
-        const int32_t c = crd[p];
-        bad |= (c < 0) | (c >= col_lim);
-        desc += (crd[p - 1] > c);
-      }
-      int64_t allowed = 0;
-      for (int64_t row = 1; row < rows; ++row) {
-        const int32_t p = pos[row];
-        if (p == pos[row - 1]) continue;  // empty row: same boundary, already counted
-        if (p > 0 && p < nnz) allowed += (crd[p - 1] > crd[p]);
-      }
-      bad |= (desc != allowed);
-    } else {
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
-    if (nt > 1)
-#endif
-      for (int64_t p = 1; p < nnz; ++p) {
-        const int32_t c = crd[p];
-        bad |= (c < 0) | (c >= col_lim);
-      }
-    }
-  }
+  const bool bad = !memo_valid && abi_screen_compressed(pos, crd, rows, nnz, cols,
+                                                        require_sorted);
   if (bad) {
     int32_t previous = 0;
     for (int64_t row = 0; row < rows; ++row) {
@@ -650,7 +841,7 @@ inline CsrInputView checked_csr_view(
   // Record only after every check has passed, so a rejected input is never cached as
   // valid — including the case where the screen flagged nothing but the terminal
   // position check above threw.
-  if (!memo_valid) abi_memo_store(memo_key, memo_want);
+  if (!memo_valid) abi_struct_store(std::move(memo_want));
   return CsrInputView(logical_shape, positions, coordinates, values);
 }
 
@@ -692,31 +883,54 @@ inline CooInputView checked_coo_view(
                 " length must equal values nnz (", nnz, "), got ",
                 mode_indices[level][0].numel());
     const int32_t* crd = mode_indices[level][0].data_ptr<int32_t>();
-    for (int64_t p = 0; p < nnz; ++p) {
-      TORCH_CHECK(crd[p] >= 0 && crd[p] < logical_shape[level],
-                  argument_name(op, argument), " coordinate ", crd[p],
-                  " at level ", level, " position ", p, " is outside [0, ",
-                  logical_shape[level], ")");
+    // Memoized per level rather than once for the whole view, so that a rejection is
+    // still reported by the same check in the same order as before: an out-of-range
+    // coordinate at level 0 must be raised before a dtype problem at level 1.
+    AbiStructEntry level_memo;
+    level_memo.add(mode_indices[level][0]);
+    level_memo.params = {AbiCheckBounds, logical_shape[level], nnz};
+    const bool level_known = abi_struct_hit(level_memo);
+    if (!level_known && abi_screen_bounds(crd, nnz, logical_shape[level])) {
+      for (int64_t p = 0; p < nnz; ++p) {
+        TORCH_CHECK(crd[p] >= 0 && crd[p] < logical_shape[level],
+                    argument_name(op, argument), " coordinate ", crd[p],
+                    " at level ", level, " position ", p, " is outside [0, ",
+                    logical_shape[level], ")");
+      }
     }
+    if (!level_known) abi_struct_store(std::move(level_memo));
     coordinates.push_back(mode_indices[level][0]);
   }
 
   if (require_lexicographic_order && nnz > 1) {
-    for (int64_t p = 1; p < nnz; ++p) {
-      bool greater = false;
-      bool different = false;
-      for (size_t level = 0; level < coordinates.size(); ++level) {
-        const int32_t* crd = coordinates[level].data_ptr<int32_t>();
-        if (crd[p] != crd[p - 1]) {
-          greater = crd[p] > crd[p - 1];
-          different = true;
-          break;
-        }
-      }
-      TORCH_CHECK(!different || greater, argument_name(op, argument),
-                  " COO coordinates must be lexicographically ordered; order ",
-                  "decreases at position ", p);
+    AbiStructEntry lex_memo;
+    lex_memo.params.push_back(AbiCheckLex);
+    std::vector<const int32_t*> crd_levels;
+    crd_levels.reserve(coordinates.size());
+    for (const auto& coordinate : coordinates) {
+      lex_memo.add(coordinate);
+      crd_levels.push_back(coordinate.data_ptr<int32_t>());
     }
+    lex_memo.params.push_back(nnz);
+    const bool lex_known = abi_struct_hit(lex_memo);
+    if (!lex_known && abi_screen_lex(crd_levels, nnz)) {
+      for (int64_t p = 1; p < nnz; ++p) {
+        bool greater = false;
+        bool different = false;
+        for (size_t level = 0; level < coordinates.size(); ++level) {
+          const int32_t* crd = coordinates[level].data_ptr<int32_t>();
+          if (crd[p] != crd[p - 1]) {
+            greater = crd[p] > crd[p - 1];
+            different = true;
+            break;
+          }
+        }
+        TORCH_CHECK(!different || greater, argument_name(op, argument),
+                    " COO coordinates must be lexicographically ordered; order ",
+                    "decreases at position ", p);
+      }
+    }
+    if (!lex_known) abi_struct_store(std::move(lex_memo));
   }
   return CooInputView(logical_shape, coordinates, values);
 }
@@ -859,14 +1073,21 @@ inline void validate_csr_segments(
               ": values nnz exceeds the current int32 native bound");
   const int32_t* pos = positions.data_ptr<int32_t>();
   TORCH_CHECK(pos[0] == 0, op, ": crow_indices[0] must be 0, got ", pos[0]);
-  for (int64_t i = 1; i < positions.numel(); ++i) {
-    TORCH_CHECK(pos[i] >= pos[i - 1] && pos[i] <= nnz, op,
-                ": invalid crow_indices entry ", pos[i], " at position ", i,
-                " for nnz ", nnz);
+  AbiStructEntry memo;
+  memo.add(positions);
+  memo.params = {AbiCheckSpans, positions.numel(), nnz};
+  const bool known = abi_struct_hit(memo);
+  if (!known && abi_screen_spans(pos, positions.numel(), nnz)) {
+    for (int64_t i = 1; i < positions.numel(); ++i) {
+      TORCH_CHECK(pos[i] >= pos[i - 1] && pos[i] <= nnz, op,
+                  ": invalid crow_indices entry ", pos[i], " at position ", i,
+                  " for nnz ", nnz);
+    }
   }
   TORCH_CHECK(pos[positions.numel() - 1] == nnz, op,
               ": terminal crow index must equal values nnz (", nnz, "), got ",
               pos[positions.numel() - 1]);
+  if (!known) abi_struct_store(std::move(memo));
 }
 
 inline void validate_attention_inputs(
@@ -895,19 +1116,36 @@ inline void validate_attention_inputs(
   const int32_t* pos = positions.data_ptr<int32_t>();
   const int32_t* crd = coordinates.data_ptr<int32_t>();
   TORCH_CHECK(pos[0] == 0, op, ": crow_indices[0] must be 0, got ", pos[0]);
-  for (int64_t row = 0; row < sequence; ++row) {
-    TORCH_CHECK(pos[row] >= 0 && pos[row + 1] >= pos[row] &&
-                    pos[row + 1] <= coordinates.numel(),
-                op, ": invalid CSR mask span for row ", row);
+  // Spans and coordinate bounds, with no sortedness requirement — exactly what the
+  // compressed screen does with require_sorted false. Both serial loops stay put and
+  // run in their original order, so a mask with several defects still reports the
+  // same one it always did.
+  AbiStructEntry memo;
+  memo.add(coordinates);
+  memo.add(positions);
+  memo.params = {AbiCheckCompressed, sequence, sequence, coordinates.numel(), 0};
+  const bool known = abi_struct_hit(memo);
+  const bool bad = !known && abi_screen_compressed(pos, crd, sequence,
+                                                   coordinates.numel(), sequence,
+                                                   /*require_sorted=*/false);
+  if (bad) {
+    for (int64_t row = 0; row < sequence; ++row) {
+      TORCH_CHECK(pos[row] >= 0 && pos[row + 1] >= pos[row] &&
+                      pos[row + 1] <= coordinates.numel(),
+                  op, ": invalid CSR mask span for row ", row);
+    }
   }
   TORCH_CHECK(pos[sequence] == coordinates.numel(), op,
               ": terminal crow index must equal col_indices nnz (",
               coordinates.numel(), "), got ", pos[sequence]);
-  for (int64_t p = 0; p < coordinates.numel(); ++p) {
-    TORCH_CHECK(crd[p] >= 0 && crd[p] < sequence, op, ": column coordinate ",
-                crd[p], " at position ", p, " is outside [0, ", sequence,
-                ")");
+  if (bad) {
+    for (int64_t p = 0; p < coordinates.numel(); ++p) {
+      TORCH_CHECK(crd[p] >= 0 && crd[p] < sequence, op, ": column coordinate ",
+                  crd[p], " at position ", p, " is outside [0, ", sequence,
+                  ")");
+    }
   }
+  if (!known) abi_struct_store(std::move(memo));
 }
 
 // Generic entry validation emitted at the beginning of every JIT evaluate().
@@ -995,12 +1233,19 @@ inline void validate_jit_tensor(
                     " coordinate levels have inconsistent nnz");
       }
       const int32_t* crd = mode_indices[level][0].data_ptr<int32_t>();
-      for (int64_t p = 0; p < count; ++p) {
-        TORCH_CHECK(crd[p] >= 0 && crd[p] < extent,
-                    argument_name(op, argument), " coordinate ", crd[p],
-                    " at level ", level, " position ", p,
-                    " is outside [0, ", extent, ")");
+      AbiStructEntry level_memo;
+      level_memo.add(mode_indices[level][0]);
+      level_memo.params = {AbiCheckBounds, extent, count};
+      const bool level_known = abi_struct_hit(level_memo);
+      if (!level_known && abi_screen_bounds(crd, count, extent)) {
+        for (int64_t p = 0; p < count; ++p) {
+          TORCH_CHECK(crd[p] >= 0 && crd[p] < extent,
+                      argument_name(op, argument), " coordinate ", crd[p],
+                      " at level ", level, " position ", p,
+                      " is outside [0, ", extent, ")");
+        }
       }
+      if (!level_known) abi_struct_store(std::move(level_memo));
       coordinate_levels.push_back(mode_indices[level][0]);
       continue;
     }
@@ -1034,48 +1279,79 @@ inline void validate_jit_tensor(
     const int32_t* crd = coordinates.data_ptr<int32_t>();
     TORCH_CHECK(pos[0] == 0, argument_name(op, argument),
                 " compressed level ", level, " must start at position 0");
-    for (int64_t parent = 0; parent < storage_count; ++parent) {
-      TORCH_CHECK(pos[parent] >= 0 && pos[parent + 1] >= pos[parent] &&
-                      pos[parent + 1] <= coordinates.numel(),
-                  argument_name(op, argument), " invalid compressed span at level ",
-                  level, " parent ", parent);
-      for (int32_t p = pos[parent]; p < pos[parent + 1]; ++p) {
-        TORCH_CHECK(crd[p] >= 0 && crd[p] < extent,
-                    argument_name(op, argument), " coordinate ", crd[p],
-                    " at compressed level ", level, " position ", p,
-                    " is outside [0, ", extent, ")");
-        if (p > pos[parent]) {
-          TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
-                      " coordinates decrease at compressed level ", level,
-                      " position ", p);
+    // Same three checks the CSR view runs — spans partition [0, nnz], coordinates in
+    // range, coordinates sorted within a span — so the same screen and the same memo
+    // family serve both. (Sharing is within one module: see the note on abi_memo_clear
+    // for why each loaded kernel carries its own maps.)
+    AbiStructEntry level_memo;
+    level_memo.add(coordinates);
+    level_memo.add(positions);
+    level_memo.params = {AbiCheckCompressed, storage_count, extent,
+                         coordinates.numel(), 1};
+    const bool level_known = abi_struct_hit(level_memo);
+    if (!level_known && abi_screen_compressed(pos, crd, storage_count,
+                                              coordinates.numel(), extent,
+                                              /*require_sorted=*/true)) {
+      for (int64_t parent = 0; parent < storage_count; ++parent) {
+        TORCH_CHECK(pos[parent] >= 0 && pos[parent + 1] >= pos[parent] &&
+                        pos[parent + 1] <= coordinates.numel(),
+                    argument_name(op, argument), " invalid compressed span at level ",
+                    level, " parent ", parent);
+        for (int32_t p = pos[parent]; p < pos[parent + 1]; ++p) {
+          TORCH_CHECK(crd[p] >= 0 && crd[p] < extent,
+                      argument_name(op, argument), " coordinate ", crd[p],
+                      " at compressed level ", level, " position ", p,
+                      " is outside [0, ", extent, ")");
+          if (p > pos[parent]) {
+            TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
+                        " coordinates decrease at compressed level ", level,
+                        " position ", p);
+          }
         }
       }
     }
     TORCH_CHECK(pos[storage_count] == coordinates.numel(),
                 argument_name(op, argument), " compressed level ", level,
                 " terminal position must equal coordinate count");
+    // Recorded only after every check on this level has passed, so an input rejected
+    // by the terminal-position check above is never cached as valid.
+    if (!level_known) abi_struct_store(std::move(level_memo));
     storage_count = coordinates.numel();
   }
+  AbiStructEntry lex_memo;
+  bool lex_known = true;  // nothing to record unless the check below actually runs
   if (all_coordinate && storage_count > 1) {
-    for (int64_t p = 1; p < storage_count; ++p) {
-      bool greater = false;
-      bool different = false;
-      for (const auto& coordinate : coordinate_levels) {
-        const int32_t* crd = coordinate.data_ptr<int32_t>();
-        if (crd[p] != crd[p - 1]) {
-          greater = crd[p] > crd[p - 1];
-          different = true;
-          break;
+    lex_memo.params.push_back(AbiCheckLex);
+    std::vector<const int32_t*> crd_levels;
+    crd_levels.reserve(coordinate_levels.size());
+    for (const auto& coordinate : coordinate_levels) {
+      lex_memo.add(coordinate);
+      crd_levels.push_back(coordinate.data_ptr<int32_t>());
+    }
+    lex_memo.params.push_back(storage_count);
+    lex_known = abi_struct_hit(lex_memo);
+    if (!lex_known && abi_screen_lex(crd_levels, storage_count)) {
+      for (int64_t p = 1; p < storage_count; ++p) {
+        bool greater = false;
+        bool different = false;
+        for (const auto& coordinate : coordinate_levels) {
+          const int32_t* crd = coordinate.data_ptr<int32_t>();
+          if (crd[p] != crd[p - 1]) {
+            greater = crd[p] > crd[p - 1];
+            different = true;
+            break;
+          }
         }
+        TORCH_CHECK(!different || greater, argument_name(op, argument),
+                    " COO coordinates must be lexicographically ordered; order ",
+                    "decreases at position ", p);
       }
-      TORCH_CHECK(!different || greater, argument_name(op, argument),
-                  " COO coordinates must be lexicographically ordered; order ",
-                  "decreases at position ", p);
     }
   }
   TORCH_CHECK(values.numel() == storage_count, argument_name(op, argument),
               " values length must equal validated physical storage size ",
               storage_count, ", got ", values.numel());
+  if (!lex_known) abi_struct_store(std::move(lex_memo));
 }
 
 inline void validate_jit_result_shape(

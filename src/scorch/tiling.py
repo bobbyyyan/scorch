@@ -83,7 +83,6 @@ import torch
 import scorch_ops as _ops
 
 from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec
-from .prebuilt_kernels import _narrowed_mode_indices
 
 # ---------------------------------------------------------------------------
 # Autotune level state (thread-local override over a process-global default).
@@ -519,16 +518,13 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
-    # Narrowed (memoized int32) indices, same as the v2 route in prebuilt_kernels:
-    # the tiled kernels index with int32 too, so handing them int64 arrays would pay
-    # the same per-call O(nnz) cast on the native side of every call.
     return [
         result_shape,
         a.shape,
-        _narrowed_mode_indices(a),
+        a._native_mode_indices(),
         a.values,
         b.shape,
-        _narrowed_mode_indices(b),
+        b._native_mode_indices(),
         b.values,
         Jc,
         nthreads,
@@ -539,10 +535,10 @@ def _tileijk_args(a, b, result_shape, Nc, Jc, nthreads):
     return [
         result_shape,
         a.shape,
-        _narrowed_mode_indices(a),
+        a._native_mode_indices(),
         a.values,
         b.shape,
-        _narrowed_mode_indices(b),
+        b._native_mode_indices(),
         b.values,
         Nc,
         Jc,
