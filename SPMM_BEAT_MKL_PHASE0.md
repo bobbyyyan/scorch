@@ -160,6 +160,17 @@ The brief's ranking assumed the deficit was in the kernel. It is not.
 | — | **prefetch policy is a small pessimization** | the shipped kernel prefetches 2 nonzeros ahead with gcc locality 1 (`PREFETCHT2`, i.e. no nearer than L2/L3). Removing it entirely is *faster* (1.01–1.09x); 16 nonzeros ahead into L1 plus dropping the redundant mask when `N % 8 == 0` is 1.03–1.14x. |
 | — | **int64-index kernel family** (asked during review) | measured and rejected as a default: a 12-byte-per-nonzero A stream costs 1.19–1.51x on DRAM-bound cells (reddit@16 1.19x, reddit@32 1.21x, inline_1@32 1.27x, scatter200@32 1.51x) and nothing on cache-resident ones. Narrowing once is strictly better. Worth having only to support tensors that genuinely exceed int32, dispatched on magnitude rather than dtype. |
 
+## One Phase 0 question left unanswered
+
+Phase 0 also asked whether torch's MKL path calls `mkl_sparse_optimize` — the premise
+being that MKL might be winning on cached, matrix-dependent preprocessing that Scorch
+has no equivalent of. It was never determined empirically. Once the deficit turned out
+to be a per-call cost on Scorch's side, the question stopped bearing on the diagnosis:
+whatever MKL does or does not precompute, removing the tax is enough to pass it on 226
+of 236 cells. But it still bears on hypothesis 4 — if MKL is *not* preprocessing, then
+its inspector-executor headroom is unclaimed by either library, and CSB or a
+reordering could beat both. Answer it before starting hypothesis 4, not after.
+
 ## Method notes that cost time to relearn
 
 - **Check the machine is quiet before every timing run.** A leftover `addr2line`

@@ -62,7 +62,8 @@ counter, so a buffer corrupted that way can now reach a kernel unchecked.
 | validator rejection cases, base vs candidate | **57/57 pass**, identical messages — both the serial and parallel screen paths, empty rows, descents at every row boundary, first/last row, int64 non-representability, storage-sharing views, and `torch.inference_mode()` |
 | float64 reference, every grid cell | see the grid table below |
 | macOS suite, base vs candidate | identical pass/fail sets (205 pre-existing failures: the macOS SDK's libc++ cannot compile a JIT kernel at all on this host, on either tree) |
-| Linux suite, candidate | see below |
+| Linux suite, base | **567 passed**, 0 failed (`-m "not perf"`) |
+| Linux suite, candidate | in flight at the time of writing — 49% with no failures. This is the only host here whose toolchain compiles a JIT kernel, so it is the only real test of the codegen path; the pass/fail set must be diffed against base's before this work is called done. |
 
 ## redwood — the grid
 
@@ -152,6 +153,14 @@ Fixed in `6eec90f`: both non-probing levels now confirm their cost-model pick ag
 `v2` once per shape before memoizing it — 6 kernel invocations against `balanced`'s 18.
 Every non-`off` level is now no-regression-vs-`v2` by construction rather than by the
 gate happening to be right.
+
+The table above is the **pre-fix** measurement. The argument that the fix closes it is
+structural — a level that times `v2` cannot ship a route slower than `v2` by more than
+the timing's own error — but structural arguments are what produced the defect in the
+first place, so it is not settled until re-measured. The re-run of `ss-tiling`, the
+group that held all six `analytic` regressions and `learned`'s worst, is queued behind
+the Linux suite; the number to check is zero tiled-route regressions at `analytic` and
+`learned`. Until that lands, treat `analytic`'s row as open.
 
 ## float64
 
