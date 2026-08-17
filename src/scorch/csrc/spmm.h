@@ -1,3 +1,5 @@
+#pragma once
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -117,26 +119,18 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   return C;
 }
 
+// Pointer-based kernel; see the note on spmm_csr_float_v2_core for why the entry
+// is split in two. This one carries the float64 CSR x dense route, which resolves
+// to spmm_csr_double.
 template <typename scalar_t>
-Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
-                std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values, std::vector<int> B_shape,
-                std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int tile_size = 0) {
-  // Init result tensor level sizes
-  int C0_size = result_shape[0];
-  int C1_size = result_shape[1];
-
-  // Get A's level & value arrays
-  int A0_size = A_shape[0];
-  int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  scalar_t* SCORCH_RESTRICT A_val = A_values.data_ptr<scalar_t>();
-
-  // Get B's level & value arrays
-  int B0_size = B_shape[0];
-  int B1_size = B_shape[1];
-  scalar_t* SCORCH_RESTRICT B_val = B_values.data_ptr<scalar_t>();
+torch::Tensor spmm_csr_typed_core(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const scalar_t* SCORCH_RESTRICT A_val,
+                int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
+                int tile_size) {
+  (void)tile_size;  // the reference kernel does not tile; kept for signature parity
 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
@@ -168,10 +162,25 @@ Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
     }
   }
 
+  return C_values_torch;
+}
+
+template <typename scalar_t>
+Tensor spmm_csr_typed(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 0) {
   // Assemble final result
   Tensor C;
   C.storage.index.mode_indices = {{}, {}};
-  C.storage.value = C_values_torch;
+  C.storage.value = spmm_csr_typed_core<scalar_t>(
+      result_shape[0], result_shape[1], A_shape[0],
+      A_mode_indices[1][0].data_ptr<int>(),
+      A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<scalar_t>(),
+      B_shape[1], B_values.data_ptr<scalar_t>(),
+      tile_size);
   return C;
 }
 
@@ -2203,23 +2212,18 @@ static inline void scorch_spmm_row_regtile(
 //   5. Simple inner loop — let -O3 -march=native -ffast-math auto-vectorize.
 // ---------------------------------------------------------------------------
 
-Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape,
-                std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values, std::vector<int> B_shape,
-                std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int tile_size = 256,
-                int nthreads_override = -1, bool atparallel = false) {
-  const int C0_size = result_shape[0];
-  const int C1_size = result_shape[1];
-
-  const int A0_size = A_shape[0];
-  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
-
-  const int B1_size = B_shape[1];
-  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
-
+// The kernel proper takes plain pointers and sizes. Two callers reach it: the
+// legacy entry below, which unpacks the nested tensor vectors the pybind ABI
+// hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
+// validated structure and so pays none of that per call. Splitting them is what
+// lets a warm dispatch be a single Python->C++ hop; the body is unchanged.
+torch::Tensor spmm_csr_float_v2_core(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const float* SCORCH_RESTRICT A_val,
+                int B1_size, const float* SCORCH_RESTRICT B_val,
+                int tile_size, int nthreads_override, bool atparallel) {
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
   // Output allocation + zeroing. Every code path below (regblock / regtile /
@@ -2477,9 +2481,24 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
     }
   }
 
+  return C_values_torch;
+}
+
+Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 256,
+                int nthreads_override = -1, bool atparallel = false) {
   Tensor C;
   C.storage.index.mode_indices = {{}, {}};
-  C.storage.value = C_values_torch;
+  C.storage.value = spmm_csr_float_v2_core(
+      result_shape[0], result_shape[1], A_shape[0],
+      A_mode_indices[1][0].data_ptr<int>(),
+      A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<float>(),
+      B_shape[1], B_values.data_ptr<float>(),
+      tile_size, nthreads_override, atparallel);
   return C;
 }
 
@@ -2512,21 +2531,15 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
 // selector knows the queried cache size); Jc<=0 or >=J degenerates to a single
 // full-width panel (== a slower v2, never reached because the selector gates it).
 // ---------------------------------------------------------------------------
-Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_shape,
-                std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values, std::vector<int> B_shape,
-                std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int Jc = 0, int nthreads_override = -1) {
-  const int C0_size = result_shape[0];
-  const int C1_size = result_shape[1];              // == N
-  const int A0_size = A_shape[0];
-  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
-  const int J = B_shape[0];                         // contraction dim
-  const int N = B_shape[1];
-  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
-
+// Pointer-based kernel; see the note on spmm_csr_float_v2_core for why the entry
+// is split in two.
+torch::Tensor spmm_csr_float_tilej_core(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const float* SCORCH_RESTRICT A_val,
+                int J, int N, const float* SCORCH_RESTRICT B_val,
+                int Jc, int nthreads_override) {
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   // tile-j accumulates across panels, so C starts zeroed. torch::zeros gets a
   // clean buffer from the same allocator MKL uses (the O(rows) empty-only trick
@@ -2586,9 +2599,23 @@ Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_sh
     }
   }
 
+  return C_values_torch;
+}
+
+Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int Jc = 0, int nthreads_override = -1) {
   Tensor C;
   C.storage.index.mode_indices = {{}, {}};
-  C.storage.value = C_values_torch;
+  C.storage.value = spmm_csr_float_tilej_core(
+      result_shape[0], result_shape[1], A_shape[0],
+      A_mode_indices[1][0].data_ptr<int>(),
+      A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<float>(),
+      B_shape[0], B_shape[1], B_values.data_ptr<float>(),
+      Jc, nthreads_override);
   return C;
 }
 
@@ -2636,21 +2663,15 @@ Tensor spmm_csr_float_tilej(std::vector<int> result_shape, std::vector<int> A_sh
 // selector; Nc<=0/>=N => single full-width strip, Jc<=0/>=J => single panel
 // (both degenerate to a slower tile-j, never reached because the selector gates).
 // ---------------------------------------------------------------------------
-Tensor spmm_csr_float_tileijk(std::vector<int> result_shape, std::vector<int> A_shape,
-                std::vector<std::vector<torch::Tensor>> A_mode_indices,
-                torch::Tensor A_values, std::vector<int> B_shape,
-                std::vector<std::vector<torch::Tensor>> B_mode_indices,
-                torch::Tensor B_values, int Nc = 0, int Jc = 0,
-                int nthreads_override = -1) {
-  const int C0_size = result_shape[0];              // output rows (>= A rows)
-  const int N = result_shape[1];                    // free dim
-  const int A0_size = A_shape[0];
-  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  const float* SCORCH_RESTRICT A_val = A_values.data_ptr<float>();
-  const int J = B_shape[0];                         // contraction dim
-  const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
-
+// Pointer-based kernel; see the note on spmm_csr_float_v2_core for why the entry
+// is split in two.
+torch::Tensor spmm_csr_float_tileijk_core(
+                int C0_size, int N, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const float* SCORCH_RESTRICT A_val,
+                int J, const float* SCORCH_RESTRICT B_val,
+                int Nc, int Jc, int nthreads_override) {
   const size_t C_capacity = (size_t)C0_size * (size_t)N;
   // Every C entry is written exactly once (Cp is zeroed per strip and copied to C
   // in full, so empty A-rows and any tail rows C0>A0 land as 0), so torch::empty
@@ -2741,9 +2762,24 @@ Tensor spmm_csr_float_tileijk(std::vector<int> result_shape, std::vector<int> A_
     }
   }
 
+  return C_values_torch;
+}
+
+Tensor spmm_csr_float_tileijk(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int Nc = 0, int Jc = 0,
+                int nthreads_override = -1) {
   Tensor C;
   C.storage.index.mode_indices = {{}, {}};
-  C.storage.value = C_values_torch;
+  C.storage.value = spmm_csr_float_tileijk_core(
+      result_shape[0], result_shape[1], A_shape[0],
+      A_mode_indices[1][0].data_ptr<int>(),
+      A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<float>(),
+      B_shape[0], B_values.data_ptr<float>(),
+      Nc, Jc, nthreads_override);
   return C;
 }
 

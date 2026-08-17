@@ -5,6 +5,7 @@
 #include "native_abi.h"
 #include "spmm.h"
 #include "kernels.h"
+#include "plan.h"
 
 namespace scorch {
 namespace py = pybind11;
@@ -571,6 +572,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Drop every cached index-validation verdict and narrowed index copy");
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
           "Number of live entries across both ABI validation memos");
+
+    // A resolved CSR x dense product (see plan.h). Built once per (operand,
+    // free dimension) by scorch.plan and then invoked directly, so a repeated
+    // matmul is one Python->C++ hop instead of a full re-resolution. `run`
+    // returns None rather than raising when the call is outside what the plan
+    // was built for; the caller falls back to the ordinary dispatch.
+    py::class_<scorch_native::SpmmCsrPlan>(m, "SpmmCsrPlan")
+      .def("run", &scorch_native::SpmmCsrPlan::run,
+           "Serve this product, or return None to defer to the ordinary path",
+           py::arg("a_values"), py::arg("b"), py::arg("nthreads") = -1,
+           py::arg("atparallel") = false)
+      .def_property_readonly("kind", &scorch_native::SpmmCsrPlan::kind)
+      .def_property_readonly("rows", &scorch_native::SpmmCsrPlan::rows)
+      .def_property_readonly("cols", &scorch_native::SpmmCsrPlan::cols)
+      .def_property_readonly("nnz", &scorch_native::SpmmCsrPlan::nnz)
+      .def_property_readonly("free_dim", &scorch_native::SpmmCsrPlan::free_dim)
+      .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served);
+    m.def("make_spmm_csr_plan", &scorch_native::make_spmm_csr_plan,
+          "Build a CSR x dense plan, or None when one cannot serve this shape",
+          py::arg("kind"), py::arg("A_shape"), py::arg("A_mode_indices"),
+          py::arg("A_values"), py::arg("free_dim"), py::arg("panel_free") = 0,
+          py::arg("panel_contraction") = 0);
 
     py::class_<Tensor>(m, "Tensor")
       .def_readonly("storage", &Tensor::storage);

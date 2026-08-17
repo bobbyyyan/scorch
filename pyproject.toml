@@ -41,6 +41,7 @@ depends = [
     "src/scorch/csrc/header.h",
     "src/scorch/csrc/kernels.h",
     "src/scorch/csrc/native_abi.h",
+    "src/scorch/csrc/plan.h",
     "src/scorch/csrc/prebuilt_types.h",
     "src/scorch/csrc/scorch_policy.h",
     "src/scorch/csrc/spmm.h",
