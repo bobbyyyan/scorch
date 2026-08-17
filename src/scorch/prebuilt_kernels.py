@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union, List
-import weakref
 
 import torch
 import scorch_ops as native_ops
@@ -19,91 +17,13 @@ if TYPE_CHECKING:
 KernelFn = Callable[..., Any]
 
 
-# --------------------------------------------------------------------------- #
-# Narrowed-index cache
-#
-# The prebuilt kernels index with int32. An STensor built from the int64 arrays
-# scipy and torch.sparse_csr_tensor hand a user therefore pays an O(nnz) cast on the
-# native side of EVERY call (native_abi.h checked_index_tensor). Measured on redwood
-# that cast plus the representability scan it guards is ~0.6-0.7 ns per nonzero — on
-# reddit at N=16, 80 ms against a 30 ms kernel.
-#
-# A tensor's indices do not change between calls, so narrow once and keep the result
-# for as long as the original lives. Keyed on the index tensor's identity and
-# invalidated by its `_version`, so an in-place mutation is not served stale. The
-# representability test below is exactly the one checked_index_tensor performs; when
-# it fails we hand the int64 tensor to the native validator unchanged so the error
-# still names the offending element.
-#
-# Cost: an int32 copy of each index array, i.e. +50% on top of the int64 arrays the
-# caller already holds. It replaces a same-size allocation that was happening on
-# every call, so peak memory does not grow, but steady-state does. Set
-# SCORCH_NARROW_INDEX_CACHE=0 to keep the old per-call cast.
-# --------------------------------------------------------------------------- #
-_INT32_MIN = -(2 ** 31)
-_INT32_MAX = 2 ** 31 - 1
-_NARROW_CACHE_ON = os.environ.get("SCORCH_NARROW_INDEX_CACHE", "1") != "0"
-# id(tensor) -> (version, narrowed). weakref.finalize evicts the entry when the key
-# tensor dies, so a recycled id can never serve another tensor's narrowed copy.
-_narrowed: dict = {}
-
-
-def _evict_narrowed(key: int) -> None:
-    _narrowed.pop(key, None)
-
-
-def _version_of(index: torch.Tensor) -> int:
-    """The tensor's version counter, or -1 when it does not have one.
-
-    Tensors created under ``torch.inference_mode()`` have their version counter
-    disabled and reading ``_version`` RAISES on them, so this has to be asked rather
-    than assumed — otherwise every sparse matmul inside an inference-mode block would
-    fail. Such a tensor cannot report in-place mutation at all, which puts it in the
-    same position as the documented blind spot in native_abi.h's memo.
-    """
-    try:
-        return index._version
-    except RuntimeError:
-        return -1
-
-
-def _narrow_index(index: torch.Tensor) -> torch.Tensor:
-    """int64 index tensor -> memoized int32 copy (or the original if not int64)."""
-    if index.dtype != torch.int64:
-        return index
-    if not _NARROW_CACHE_ON:
-        return index
-    key = id(index)
-    version = _version_of(index)
-    hit = _narrowed.get(key)
-    if hit is not None and hit[0] == version:
-        return hit[1]
-    if index.numel():
-        # One pass, not two: this runs once per tensor but on the full int64 array,
-        # and on a 115M-nonzero graph a second pass is another 0.9 GB of reads.
-        lo, hi = torch.aminmax(index)
-        if int(lo) < _INT32_MIN or int(hi) > _INT32_MAX:
-            return index  # let the native validator report which element
-    narrowed = index.to(torch.int32)
-    if hit is None:
-        try:
-            weakref.finalize(index, _evict_narrowed, key)
-        except TypeError:  # not weak-referenceable; skip memoization entirely
-            return narrowed
-    _narrowed[key] = (version, narrowed)
-    return narrowed
-
-
-def _narrowed_mode_indices(tensor: "STensor") -> List[List[torch.Tensor]]:
-    return [
-        [_narrow_index(index) for index in level]
-        for level in tensor._native_mode_indices()
-    ]
-
-
-def clear_narrowed_index_cache() -> None:
-    """Drop every memoized int32 index copy (tests, and memory-pressure escapes)."""
-    _narrowed.clear()
+# The int64 -> int32 index narrowing this module used to memoize in Python now lives
+# where every caller reaches it: native_abi.h's checked_index_tensor. Keeping it here
+# only covered the prebuilt kernels, and it handed the native validator a fresh int32
+# tensor on every call, which stopped the structural verdict about that tensor from
+# being memoized as well. `scorch_ops.abi_memo_clear()` is the replacement for the old
+# clear_narrowed_index_cache(), and SCORCH_ABI_VALIDATE_MEMO=0 now disables narrowing
+# and structural caching together (SCORCH_NARROW_INDEX_CACHE is gone).
 
 
 @dataclass(frozen=True)
@@ -332,7 +252,7 @@ def execute_prebuilt_binary_kernel(
     args = [result_shape]
     for tensor in [a, b]:
         args.append(tensor.shape)  # type: ignore[arg-type]
-        args.append(_narrowed_mode_indices(tensor))  # type: ignore[arg-type]
+        args.append(tensor._native_mode_indices())  # type: ignore[arg-type]
         args.append(tensor.values)  # type: ignore[arg-type]
 
     start_time = time.time()

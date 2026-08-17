@@ -560,6 +560,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     bind_fused_spmm_variants(m);
     bind_sddmm_variants(m);
 
+    // The ABI validation memo, reachable from Python so tests can force the cold
+    // path and so a caller under memory pressure can drop the narrowed int32 copies.
+    // Scope: THIS extension's memo only. native_abi.h holds its maps in inline
+    // function-local statics, and Python dlopens extension modules with RTLD_LOCAL,
+    // so every JIT-compiled kernel carries its own copy. Each amortizes over its own
+    // calls, which is all the fix needs; the cost is that a tensor used by both a
+    // prebuilt and a generated kernel is narrowed once per module.
+    m.def("abi_memo_clear", &scorch_native::abi_memo_clear,
+          "Drop every cached index-validation verdict and narrowed index copy");
+    m.def("abi_memo_size", &scorch_native::abi_memo_size,
+          "Number of live entries across both ABI validation memos");
+
     py::class_<Tensor>(m, "Tensor")
       .def_readonly("storage", &Tensor::storage);
     py::class_<TensorStorage>(m, "TensorStorage")

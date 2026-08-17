@@ -311,6 +311,204 @@ def run_memo_suite():
         print(f"  FAIL  SCORCH_ABI_VALIDATE_MEMO=0 did not restore checking: {out!r}")
 
 
+def native_dense(out, M, N):
+    """The flat values of a scorch_ops.Tensor result, as an (M, N) numpy array."""
+    return out.storage.value.numpy().reshape(M, N)
+
+
+def run_narrow_suite(M=512, deg=8):
+    """The int64 -> int32 narrowing is memoized now. Does it stay correct?
+
+    The narrowed array is handed to the kernel instead of a fresh copy, so it is now
+    SHARED across calls. Three things have to hold: repeated calls agree with a float64
+    reference, a mutation through torch is not served a stale copy, and an array that
+    cannot be narrowed still names its first offending element every single time
+    rather than only before something got cached.
+    """
+    global PASSES
+    N, J = 8, M
+    print(f"\n[narrowing memo] M={M} deg={deg} nnz={M*deg}")
+    pos, crd, val = banded(M, deg)
+
+    def dense_ref(pos_, crd_, val_):
+        ref = np.zeros((M, J), dtype=np.float64)
+        for row in range(M):
+            for p in range(pos_[row], pos_[row + 1]):
+                ref[row, crd_[p]] += val_[p]
+        return ref @ np.ones((J, N))
+
+    ref = dense_ref(pos, crd, val)
+    p64 = torch.from_numpy(pos.astype(np.int64))
+    c64 = torch.from_numpy(crd.astype(np.int64))
+    v32 = torch.from_numpy(val.astype(np.float32))
+
+    def call():
+        return ops.spmm_csr_float_v2(
+            result_shape=[M, N], A_shape=[M, J],
+            A_mode_indices=[[], [p64, c64]], A_values=v32,
+            B_shape=[J, N], B_mode_indices=[[], []],
+            B_values=torch.ones((J, N), dtype=torch.float32).reshape(-1))
+
+    for i in range(3):
+        out = call()
+        err = float(np.abs(native_dense(out, M, N) - ref).max() / max(np.abs(ref).max(), 1e-30))
+        if err < 1e-4:
+            PASSES += 1
+            print(f"  ok    int64 indices, call {i}: relerr {err:.1e}")
+        else:
+            FAILS.append(f"narrowed int64 call {i}")
+            print(f"  FAIL  int64 indices, call {i}: relerr {err:.1e}")
+
+    # The caller's arrays must come back untouched: the kernel receives the narrowed
+    # copy as `int*`, and it is now shared, so a write through it would corrupt every
+    # later call rather than a private copy.
+    if (p64.numpy() == pos.astype(np.int64)).all() and \
+       (c64.numpy() == crd.astype(np.int64)).all():
+        PASSES += 1
+        print("  ok    caller's int64 index arrays unchanged by the call")
+    else:
+        FAILS.append("caller index arrays mutated")
+        print("  FAIL  caller's int64 index arrays were mutated")
+
+    # A torch-level in-place write must invalidate the cached copy. Reordering one
+    # row's two columns keeps the matrix valid and changes nothing about the sum, so
+    # move a nonzero to a different column instead and check the result follows.
+    moved = crd.copy()
+    moved[0] = (crd[0] + 1) % J
+    while moved[0] == crd[0]:  # deg == J would make this a no-op
+        moved[0] = (moved[0] + 1) % J
+    c64.copy_(torch.from_numpy(moved.astype(np.int64)))
+    # copy_ can leave a row unsorted; only compare when the write kept it valid.
+    row0 = moved[pos[0]:pos[1]]
+    if (np.diff(row0) >= 0).all():
+        ref2 = dense_ref(pos, moved, val)
+        out = call()
+        err = float(np.abs(native_dense(out, M, N) - ref2).max() / max(np.abs(ref2).max(), 1e-30))
+        if err < 1e-4:
+            PASSES += 1
+            print(f"  ok    in-place index edit invalidates the narrowed copy "
+                  f"(relerr {err:.1e})")
+        else:
+            FAILS.append("stale narrowed copy after in-place edit")
+            print(f"  FAIL  in-place index edit served a stale copy: relerr {err:.1e}")
+
+    # Not representable as int32, and rejected on EVERY call rather than only the
+    # first: narrowing is memoized, so a verdict must never be cached for an array
+    # that failed. (The logical extent stays inside the int32 bound here, or the
+    # shape check would fire before narrowing is reached.)
+    huge = crd.astype(np.int64).copy()
+    huge[len(huge) // 2] = 2 ** 31
+    for i in range(2):
+        expect_raise(f"int64 out of int32 range, call {i}", "cannot be represented",
+                     lambda: ops.spmm_csr_float_v2(
+                         **csr_args(M, J, N, pos, huge, val, idtype=np.int64)))
+
+    # The memo is observable, and clearing it must not change any verdict.
+    size_before = ops.abi_memo_size()
+    ops.abi_memo_clear()
+    if ops.abi_memo_size() == 0 and size_before > 0:
+        PASSES += 1
+        print(f"  ok    abi_memo_clear() emptied {size_before} entries")
+    else:
+        FAILS.append("abi_memo_clear")
+        print(f"  FAIL  abi_memo_size {size_before} -> {ops.abi_memo_size()}")
+    out = call()
+    ref3 = dense_ref(pos, c64.numpy(), val)
+    err = float(np.abs(native_dense(out, M, N) - ref3).max() / max(np.abs(ref3).max(), 1e-30))
+    if err < 1e-4:
+        PASSES += 1
+        print(f"  ok    cold memo after clear, relerr {err:.1e}")
+    else:
+        FAILS.append("cold memo after clear")
+        print(f"  FAIL  cold memo after clear: relerr {err:.1e}")
+
+
+def run_reclaim_suite(rounds=40, M=2000, deg=8):
+    """A narrowed copy must not outlive its source array.
+
+    Each narrow entry owns an int32 copy, so an entry for a dead tensor is retained
+    memory. The Python cache this replaced evicted on the source's death via
+    weakref.finalize; the native memo instead sweeps expired weak references before
+    every insert. Churning through distinct tensors must therefore leave the memo
+    bounded, not growing one entry per tensor ever seen.
+    """
+    global PASSES
+    print(f"\n[memo reclaim] {rounds} distinct tensors, M={M} deg={deg}")
+    ops.abi_memo_clear()
+    sizes = []
+    for r in range(rounds):
+        pos, crd, val = banded(M, deg)
+        crd = (crd + r) % M               # a distinct buffer every round
+        order = np.argsort(crd.reshape(M, deg), axis=1)
+        crd = np.take_along_axis(crd.reshape(M, deg), order, axis=1).reshape(-1)
+        ops.spmm_csr_float_v2(**csr_args(M, M, 4, pos, crd, val, idtype=np.int64))
+        sizes.append(ops.abi_memo_size())
+    # Every tensor is dead by the next round, so the memo must not track `rounds` of
+    # them. A handful of entries per live operand is expected; a linear climb is not.
+    if sizes[-1] <= 12:
+        PASSES += 1
+        print(f"  ok    memo bounded across {rounds} dead tensors "
+              f"(size {sizes[0]} -> {sizes[-1]})")
+    else:
+        FAILS.append("memo retains dead entries")
+        print(f"  FAIL  memo grew to {sizes[-1]} entries over {rounds} dead tensors "
+              f"(sizes {sizes[:3]}...{sizes[-3:]})")
+
+
+def run_coo_suite(M=256, nnz=2048):
+    """The COO bounds and lexicographic-order checks are screened and memoized too."""
+    print(f"\n[COO screens] M={M} nnz={nnz}")
+    rng = np.random.default_rng(11)
+    rows = np.sort(rng.integers(0, M, size=nnz))
+    cols = np.zeros(nnz, dtype=np.int64)
+    start = 0
+    for r in range(M):  # lexicographic within each row
+        end = start
+        while end < nnz and rows[end] == r:
+            end += 1
+        if end > start:
+            cols[start:end] = np.sort(rng.choice(M, size=end - start, replace=False))
+        start = end
+    val = np.ones(nnz)
+
+    def coo_args(r, c, extent=M):
+        return dict(
+            result_shape=[M, M], A_shape=[M, extent],
+            A_mode_indices=[[torch.from_numpy(r.astype(np.int32))],
+                            [torch.from_numpy(c.astype(np.int32))]],
+            A_values=torch.from_numpy(val.astype(np.float32)),
+            B_shape=[extent, M],
+            B_mode_indices=[[torch.from_numpy(r.astype(np.int32))],
+                            [torch.from_numpy(c.astype(np.int32))]],
+            B_values=torch.from_numpy(val.astype(np.float32)))
+
+    for i in range(3):  # first call cold, the rest served by the memo
+        expect_ok(f"valid COO, call {i}",
+                  lambda: ops.spmspm_coo_float(**coo_args(rows, cols)))
+
+    oob = cols.copy()
+    oob[nnz // 2] = M
+    expect_raise("COO coordinate out of range", "is outside",
+                 lambda: ops.spmspm_coo_float(**coo_args(rows, oob)))
+
+    unordered = rows.copy()
+    unordered[nnz // 2], unordered[nnz // 2 + 1] = (
+        unordered[nnz // 2 + 1] + 1, unordered[nnz // 2])
+    expect_raise("COO rows not lexicographic", "lexicographically ordered",
+                 lambda: ops.spmspm_coo_float(**coo_args(unordered, cols)))
+
+    # A descent in the LAST level only — the level-0 array is still ascending, so this
+    # is the case a per-level check would miss and only the lex check catches.
+    inner = cols.copy()
+    same = np.flatnonzero(np.diff(rows) == 0)
+    if len(same):
+        p = int(same[len(same) // 2])
+        inner[p], inner[p + 1] = max(inner[p], inner[p + 1]), min(inner[p], inner[p + 1])
+        if inner[p] > inner[p + 1]:
+            expect_raise("COO descent inside one row", "lexicographically ordered",
+                         lambda: ops.spmspm_coo_float(**coo_args(rows, inner)))
+
+
 def run_inference_mode_suite():
     """Tensors made under torch.inference_mode() have their version counter DISABLED,
     and reading it raises. Both memos key on that counter, so both have to ask rather
@@ -370,6 +568,9 @@ run_suite(40000, 16, "parallel screen")      # 640000 nnz, above the grain
 run_sortedness_suite(64, 4, "sortedness, serial")
 run_sortedness_suite(20000, 8, "sortedness, parallel")
 run_memo_suite()
+run_narrow_suite()
+run_reclaim_suite()
+run_coo_suite()
 run_inference_mode_suite()
 
 print(f"\n{PASSES} passed, {len(FAILS)} failed")
