@@ -341,6 +341,15 @@ What changed:
   order serially, and the sparse-softmax and sparse-attention entry points walked their
   position and coordinate arrays per call.
 
+One risk this created and the check that clears it: deleting the Python cache moves the
+one-time narrowing from argument-building into the *first* kernel call, so if the tiling
+selector timed a first call it would charge the narrowing to whichever candidate ran
+first and pick the other. It does not — `_confirm_vs_v2` and the `balanced`/`max` ladder
+probe both invoke each candidate once as a warmup before timing it, and both candidates
+come from the same module and so share one memo, so the narrowing lands in a warmup and
+never inside a measurement. `time_dict["eval_time"]` still includes the narrowing on a
+tensor's first call and not after, exactly as it did when the Python cache did the work.
+
 Two details worth knowing:
 
 - **Verdicts are memoized per check family, not per array.** A cached "these

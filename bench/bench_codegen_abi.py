@@ -67,6 +67,7 @@ def build_csr(name, M, J, deg, seed=0):
                     z["data"].astype(np.float32), int(z["shape"][0]),
                     int(z["shape"][1]))
     rng = np.random.default_rng(seed)
+    deg = min(deg, J)
     if name == "band":  # contiguous columns: the cheap-locality end
         cols = np.concatenate([((np.arange(deg) + i) % J) for i in range(M)])
         cols = np.sort(cols.reshape(M, deg), axis=1).reshape(-1)
@@ -97,6 +98,11 @@ def main():
                     default=["band", "scatter", "pubmed", "bcsstk17"])
     ap.add_argument("--ns", nargs="+", type=int, default=[8, 32, 128])
     ap.add_argument("--rows", type=int, default=20000)
+    # Separate from --rows because to_sparse("ss") lowers through a filter-zeros kernel
+    # that materializes a dense rows x cols intermediate: a square 100k operand asks for
+    # 10^10 elements and is rejected outright. nnz (= rows * deg) is what the ABI walk
+    # costs, so keep the column count small and grow the row count instead.
+    ap.add_argument("--cols", type=int, default=0, help="0 = square")
     ap.add_argument("--deg", type=int, default=24)
     ap.add_argument("--reps", type=int, default=11)
     ap.add_argument("--inner", type=int, default=3)
@@ -121,7 +127,8 @@ def main():
 
     rows_out = []
     for name in args.matrices:
-        indptr, indices, data, M, J = build_csr(name, args.rows, args.rows, args.deg)
+        indptr, indices, data, M, J = build_csr(
+            name, args.rows, args.cols or args.rows, args.deg)
         nnz = int(indices.size)
         t_csr = torch.sparse_csr_tensor(torch.from_numpy(indptr).to(idtype),
                                         torch.from_numpy(indices).to(idtype),
