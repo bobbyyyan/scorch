@@ -60,6 +60,15 @@ CELLS = [
 ]
 
 
+# Compute-dominated cells (--big). Dispatch is noise here; they exist to show that
+# splitting the kernel entry into a wrapper plus a pointer-based core, which a plan
+# calls directly, did not cost the kernel anything.
+BIG_CELLS = [
+    (50000, 32, 128),
+    (20000, 64, 256),
+]
+
+
 def build(rows, deg, seed=0):
     rng = np.random.default_rng(seed)
     cols = np.concatenate(
@@ -88,6 +97,15 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--tag", default="cand")
+    ap.add_argument("--arms", default="all",
+                    help="comma-separated subset of matmul,aa,kernel,torch,decline,"
+                         "mixed,plan. "
+                         "One arm per process removes arm-to-arm interference, which "
+                         "matters when comparing two trees whose arm SETS differ: the "
+                         "thread team and allocator a cell inherits depend on what ran "
+                         "before it, so an extra arm in one tree biases the others.")
+    ap.add_argument("--big", action="store_true",
+                    help="append two compute-dominated cells (kernel refactor check)")
     ap.add_argument("--profile", action="store_true",
                     help="cProfile the smallest cell instead of timing the grid")
     args = ap.parse_args()
@@ -95,6 +113,12 @@ def main():
     import scorch
     import scorch_ops
     from scorch.stensor import STensor
+
+    try:
+        from scorch.plan import plans_of
+    except ImportError:  # a tree from before call plans existed, for A/B
+        def plans_of(_tensor):
+            return {}
 
     torch.set_num_threads(args.threads)
 
@@ -124,11 +148,13 @@ def main():
 
     print(f"# tag={args.tag} threads={args.threads} reps={args.reps} "
           f"inner={args.inner}")
-    print(f"{'cell':>18s} {'kernel_us':>10s} {'matmul_us':>10s} {'over_us':>8s} "
-          f"{'share':>6s} {'floor':>6s} {'torch_us':>9s} {'relerr':>9s}")
+    print(f"{'cell':>18s} {'kernel_us':>10s} {'plan_us':>8s} {'matmul_us':>10s} "
+          f"{'over_us':>8s} {'share':>6s} {'floor':>6s} {'declin_us':>9s} "
+          f"{'mixed_us':>8s} {'torch_us':>9s} {'relerr':>9s}")
 
+    cells = CELLS + (BIG_CELLS if args.big else [])
     out = []
-    for rows, deg, N in CELLS:
+    for rows, deg, N in cells:
         indptr, cols, data = build(rows, deg)
         t = torch.sparse_csr_tensor(torch.from_numpy(indptr), torch.from_numpy(cols),
                                     torch.from_numpy(data), size=(rows, rows))
@@ -149,6 +175,48 @@ def main():
         def call_torch():
             return torch.sparse.mm(t, B)
 
+        # The installed plan, invoked directly: matmul_us - plan_us is what Python
+        # still costs once a plan is serving (the type tests, the dict lookup and
+        # the thread-count read). None when plans are disabled or declined.
+        plan = None
+        nt = torch.get_num_threads()
+        for _ in range(3):
+            scorch.matmul(A, B)
+        for candidate in plans_of(A).values():
+            if candidate.free_dim == N:
+                plan = candidate
+
+        def call_plan():
+            return plan.run(A._storage._value, B, nt, True)
+
+        # A right-hand operand a plan must decline on every call: same shape and dtype
+        # as B, so the lookup hits, but not contiguous, so the plan has to refuse and
+        # let the ordinary path materialize it. Two arms, because the cost differs and
+        # so does the remedy:
+        #
+        #   decline -- its own operand, so nothing else ever installs a plan that
+        #              serves. This is a call site a plan can never help, and after
+        #              plan.MAX_FRUITLESS_DECLINES refusals the plan withdraws itself,
+        #              so the steady state should be what it was before plans existed.
+        #   mixed   -- shares the operand with the `matmul` arm, which is serving the
+        #              contiguous B under the same key thousands of times. The plan is
+        #              earning its keep, so it is deliberately NOT withdrawn, and these
+        #              calls pay the refusal. Bounded and net-positive for the site,
+        #              but it is the one path where plans cost more than they save.
+        #
+        # A separate STensor over the same CSR arrays gives `decline` its own plan
+        # cache: plans live on the operand, so two wrappers of one matrix are
+        # independent.
+        Bt = B.T.contiguous().T
+        assert not Bt.is_contiguous() or N == 1
+        A_lonely = STensor.from_torch(t)
+
+        def call_decline():
+            return scorch.matmul(A_lonely, Bt)
+
+        def call_mixed():
+            return scorch.matmul(A, Bt)
+
         ref = torch.sparse.mm(
             torch.sparse_csr_tensor(torch.from_numpy(indptr), torch.from_numpy(cols),
                                     torch.from_numpy(data.astype(np.float64)),
@@ -164,7 +232,15 @@ def main():
             call_matmul(); call_kernel(); call_torch()
 
         arms = {"matmul": call_matmul, "aa": call_matmul,
-                "kernel": call_kernel, "torch": call_torch}
+                "kernel": call_kernel, "torch": call_torch,
+                "decline": call_decline, "mixed": call_mixed}
+        if plan is not None and plan.run(A._storage._value, B, nt, True) is not None:
+            arms["plan"] = call_plan
+        if args.arms != "all":
+            wanted = set(args.arms.split(","))
+            arms = {k: v for k, v in arms.items() if k in wanted}
+            if "matmul" not in arms:  # the floor and overhead columns need a baseline
+                arms["matmul"] = call_matmul
         acc = {k: [] for k in arms}
         for _ in range(args.reps):
             order = list(arms)
@@ -172,16 +248,20 @@ def main():
             for k in order:
                 acc[k].append(timed(arms[k], args.inner))
         us = {k: statistics.median(v) * 1e6 for k, v in acc.items()}
+        for absent in ("plan", "kernel", "torch", "decline", "mixed", "aa"):
+            us.setdefault(absent, float("nan"))
         floor = abs(us["aa"] / us["matmul"] - 1.0) * 100
         over = us["matmul"] - us["kernel"]
         label = f"{rows}x{deg}@{N}"
-        print(f"{label:>18s} {us['kernel']:10.1f} {us['matmul']:10.1f} {over:8.1f} "
-              f"{over / us['matmul'] * 100:5.1f}% {floor:5.2f}% {us['torch']:9.1f} "
-              f"{relerr:9.2e}")
+        print(f"{label:>18s} {us['kernel']:10.1f} {us['plan']:8.1f} "
+              f"{us['matmul']:10.1f} {over:8.1f} "
+              f"{over / us['matmul'] * 100:5.1f}% {floor:5.2f}% {us['decline']:9.1f} "
+              f"{us['mixed']:8.1f} {us['torch']:9.1f} {relerr:9.2e}")
         out.append(dict(tag=args.tag, rows=rows, deg=deg, N=N,
                         kernel_us=us["kernel"], matmul_us=us["matmul"],
                         overhead_us=over, floor_pct=floor, torch_us=us["torch"],
-                        relerr=relerr))
+                        plan_us=us["plan"], decline_us=us["decline"],
+                        mixed_us=us["mixed"], relerr=relerr))
 
     med = statistics.median([r["overhead_us"] for r in out])
     print(f"\nmedian overhead {med:.1f} us over {len(out)} cells "

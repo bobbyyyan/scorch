@@ -387,7 +387,194 @@ doing resolution and marshalling in C++, so a warm call is a single Python→C++
 is where `torch.sparse.mm` gets its number from. What has changed is that it is no longer
 worth 33 µs; it is worth the last ~4 µs on cells under ~20 µs.
 
-## The JIT codegen path
+### Lever 5: the call plan
+
+Built, and it closes the gap. A repeated CSR × dense product now runs through a
+**native call plan** — a `SpmmCsrPlan` (`src/scorch/csrc/plan.h`) holding everything the
+dispatch used to re-derive: the resolved kernel, the tiling selector's memoized verdict
+and its panel widths, the validated and narrowed index arrays, the tile clamp, the
+shapes. `plan.run(values, B, nthreads, atparallel)` runs O(1) screens and calls the
+kernel straight through, returning the 2-D result. A warm `scorch.matmul` is then a dict
+probe and one Python→C++ hop.
+
+Three pieces:
+
+- **The kernel entries are split.** `spmm_csr_float_v2`, `spmm_csr_float_tilej`,
+  `spmm_csr_float_tileijk` and the typed reference kernel each become a thin wrapper
+  over a pointer-based core, and the wrapper keeps the exact signature and behaviour it
+  had. The legacy entry unpacks the nested `vector<vector<Tensor>>` the pybind ABI hands
+  over and calls the core; a plan calls the core with pointers it already holds. The
+  kernel bodies are untouched — the diff moves the first fourteen and last four lines of
+  each function.
+- **`scorch/plan.py` decides when a plan is worth having.** A plan is installed on the
+  *second* sighting of a `(sparse operand, B shape, B dtype)`, so a program that wraps a
+  fresh `STensor` per call never pays for one it cannot reuse. It is built from what the
+  ordinary dispatch just decided, so first-call semantics — the selector's probe, its
+  measurements, its structured errors — are unchanged. At most 8 per operand.
+- **A plan may always decline.** `run` returns `None` — never an error — when anything
+  about the call is outside what it was built for: a non-contiguous or wrongly-strided
+  operand, another device, a non-strided layout, a lazy `conj`/`neg` view, a values array
+  of the wrong length, or index arrays written since (it records the source arrays' data
+  pointers and version counters, the same evidence the ABI memo uses). The caller then
+  takes the ordinary path, which produces the canonical result or the canonical error.
+  Each screen is *required* for correctness — drop the contiguity test and a planned call
+  returns a wrong answer — while being over-conservative only ever costs speed, and that
+  asymmetry is why the design leans on declining. `STensor._set_state` — the funnel every
+  in-place structural change goes through — drops plans outright; any autotune policy
+  change retires them by moving a generation counter that is part of every key; and a
+  plan that refuses everything withdraws itself (see the refusal cost below).
+
+Measured on redwood, **one arm per process** (see the method note below), base = the
+tree at `ba59040`, four alternating rounds of 9 reps × 300 calls:
+
+| cell | `matmul` before | after | gain | plans-off / before | residual Python |
+|---|---|---|---|---|---|
+| M=64 deg=2 N=1 | 12.6 | **2.1** | **5.95x** | 1.025 | **0.5** |
+| M=256 deg=2 N=4 | 13.0 | **2.8** | **4.64x** | 0.996 | **0.5** |
+| M=500 deg=4 N=8 | 13.7 | **3.9** | **3.50x** | 1.024 | **0.5** |
+| M=500 deg=4 N=32 | 16.5 | **9.2** | **1.81x** | 1.036 | **0.4** |
+| M=2000 deg=8 N=8 | 22.1 | **11.4** | **1.94x** | 0.996 | **0.6** |
+| M=2000 deg=8 N=32 | 25.8 | **15.6** | **1.66x** | 1.024 | **0.7** |
+| M=2000 deg=8 N=128 | 48.5 | **37.3** | **1.30x** | 1.060 | **0.5** |
+| M=20000 deg=24 N=32 | 142.7 | **131.1** | **1.09x** | 1.120 | 2.1 |
+| M=20000 deg=24 N=128 | 392.4 | **366.5** | **1.07x** | 0.988 | 3.7 |
+| M=20000 deg=64 N=256 | 1933.2 | **1867.2** | **1.04x** | 1.014 | 1.0 |
+| M=50000 deg=32 N=128 | 1574.7 | **1508.6** | **1.04x** | 0.995 | 10.3 |
+
+Geomean 1.86x over the eleven cells.
+
+The last column is what remains of the dispatch: `matmul` minus a direct `plan.run` on
+the same operands, differenced *within* one process because that is the only way the two
+can be compared without cross-process drift (so those two numbers come from the multi-arm
+run, not the single-arm columns beside them). It is **0.4–0.7 µs** on every cell whose
+kernel is small — against 43 µs before any of this work and 9.6 µs after levers 1–4. On
+the four largest cells it is a difference of two large medians and reads 1–10 µs of
+nothing in particular; the small cells are where this quantity means anything.
+
+**Against `torch.sparse.mm`, end to end, scorch is now faster on every cell** — measured
+in one process with both arms and the same arm set in both trees:
+
+| cell | scorch before | scorch now | `torch.sparse.mm` | before | now |
+|---|---|---|---|---|---|
+| M=64 deg=2 N=1 | 12.2 | **2.2** | 7.4 | 1.65x slower | **3.35x faster** |
+| M=256 deg=2 N=4 | 12.7 | **3.0** | 7.7 | 1.65x slower | **2.62x faster** |
+| M=500 deg=4 N=8 | 14.0 | **4.2** | 8.8 | 1.59x slower | **2.12x faster** |
+| M=500 deg=4 N=32 | 17.8 | **7.7** | 13.8 | 1.29x slower | **1.78x faster** |
+| M=2000 deg=8 N=8 | 21.4 | **10.9** | 15.9 | 1.34x slower | **1.46x faster** |
+| M=2000 deg=8 N=32 | 27.4 | **16.4** | 38.9 | 1.42x faster | **2.37x faster** |
+| M=2000 deg=8 N=128 | 57.1 | **43.0** | 117.7 | 2.06x faster | **2.73x faster** |
+| M=20000 deg=24 N=32 | 165.3 | **131.4** | 364.3 | 2.20x faster | **2.77x faster** |
+| M=20000 deg=24 N=128 | 397.1 | **375.1** | 1887.1 | 4.75x faster | **5.03x faster** |
+
+The four small cells carry a torch-arm cross-tree disagreement of 0.5–2.5%, so their
+ratios are solid; three of the larger cells disagree by 8–39% and their exact ratios
+should be read as approximate.
+
+**Nothing regressed, and here is what that rests on.** Two neutrality questions, each
+measured as its own single-arm A/B:
+
+- *Did splitting the kernel entry cost the kernel anything?* The legacy pybind entry,
+  called directly with a pre-built argument list: **geomean 1.0115, range 0.981–1.060**
+  over the eleven cells, against a round-to-round spread on the base arm of 0.9–46% on
+  the same cells. No effect resolvable.
+- *Did the plan machinery slow the path it cannot help?* With installation disabled —
+  the same binary, `SCORCH_DISPATCH_PLAN=0` — **geomean 1.0245, range 0.988–1.120**, and
+  four of eleven cells below 1.0. The one 1.120 cell read 1.009 in a previous run of the
+  same comparison, so it is run-level noise rather than an effect.
+
+**What a refused call costs, and why that needed a different measurement.** A plan
+returns nothing when the call is outside what it was built for, and the ordinary path
+then runs. The commonest cause by far is a right-hand operand with the planned shape and
+dtype but the wrong memory: `B.T`, a column slice, any strided view. Two facts make the
+cross-tree A/B useless for pricing that:
+
+- Such a call is **1.2–25x more expensive than the servable one at baseline, with no
+  plans in the picture at all** — the path calls `.contiguous()` (170 µs for a 1 MB
+  operand on redwood) and the kernel then reads a freshly allocated cold buffer instead
+  of a cache-warm one. On `2000x8@128` that is 30 µs contiguous against 315 µs sliced.
+  Pre-existing, unrelated to this work, and worth its own look.
+- The refusal itself is a few hundred nanoseconds, so it sits inside a much larger
+  number that differs between two builds for reasons of its own.
+
+So this one is measured **in one process**, flipping `scorch.plan.set_enabled` between
+arms — the binary never changes, and `ops.matmul` reads that flag through a list index
+that everything else hangs off, so the arms differ by the refusal and nothing else.
+Interleaved, median of 11 rounds × 300 calls, on both hosts. Cost of a refused call
+above the same call with the machinery inert:
+
+| | redwood | M5 |
+|---|---|---|
+| plan withdrawn (a site a plan can never serve) | **+0.4–0.7 µs**, 1.01–1.04x | **+0.2–0.4 µs**, 1.01–1.04x |
+| plan kept alive by serving another operand | **+1.2–1.4 µs**, 1.03–1.09x | **+0.4–0.9 µs**, 1.02–1.07x |
+
+Read against the 14–37 µs those calls cost at baseline. This is the one path where plans
+cost more than they save, it is bounded, and it is stated rather than averaged away. Two
+cells above 20000 rows are dominated by per-call allocation of a 2.5 MB operand and read
+±300 µs run to run; only the small cells mean anything here.
+
+**Three defects this created, all found and fixed before it shipped.**
+
+*A performance one.* The installer originally read the tiling selector's verdict on
+*every* call rather than on the call that installs. Reading it hashes a signature over the
+index arrays — `.item()` calls, microseconds — and that made the ordinary path **1.53x
+slower** (12.4 → 19.4 µs on the smallest cell) whenever a plan was not in play: a
+single-use operand, a declined call, or plans switched off. The fix moved the read to the
+dispatch site, which is also where the correctness defect below had to be fixed.
+
+*A permanent tax on call sites a plan cannot help.* A plan that refuses every call still
+charged for the refusal, for the life of the operand. Now a plan that has served nothing
+after `MAX_FRUITLESS_DECLINES` refusals withdraws itself, which halved the figure in the
+table above (redwood 0.85 → 0.5 µs), and the detection is free: `matmul` returns
+immediately when a plan serves, so reaching the installer with the key still present *is*
+a decline. A plan that has ever served is never withdrawn, so a site mixing servable and
+unservable operands at one shape keeps its plan. Passing the lookup key from the probe to
+the installer, rather than building it twice, took the declining case down with it
+(1.44–1.80 → 1.18–1.40 µs).
+
+*Two things plans broke that had nothing to do with them.* `copy.deepcopy` and `pickle`
+on an `STensor` raised `TypeError: cannot pickle 'scorch_ops.SpmmCsrPlan' object` as soon
+as the operand had been multiplied twice; both work on the tree before plans.
+`STensor.__getstate__` now omits the plan cache, which covers `pickle`, `deepcopy` and
+`copy.copy` in one method, since Python routes all three through `__reduce_ex__`. A plan
+is memoized work rather than state, so the duplicate builds its own on its second use.
+
+*A correctness one*, caught by one of the tests above rather than by review. The installer
+also read the verdict from the wrong place. The selector's memo holds an entry for any
+`(operand, free dimension)` it has ever probed, and that entry outlives the conditions that
+produced it: the same operand at a narrower free dimension, or on a host whose LLC swallows
+B, fails the O(1) eligibility gate and is served by v2 without the memo being consulted at
+all. Reading the memo from the installer — which sees every call — therefore built a plan
+that ran tile-j while the ordinary path ran v2. Both answers are correct arithmetic; they
+differ in the last bits (4.8e-06 on a 400×400 float32 product), which is exactly what a
+path advertised as indistinguishable may not do. The fix reads the verdict at the dispatch
+site, inside the branch where a tiled kernel actually served the call, and defaults to v2
+everywhere else. Two tests now pin it: one that a tiled verdict *is* carried into the plan
+on a shape that passes the gate, and one that a memo entry the gate rejects leaves the plan
+on v2 and bit-identical to the ordinary path.
+
+**Three method notes worth keeping**, each earned by getting it wrong first.
+
+*One arm per process.* The first version of this measurement ran all arms in one process
+and reported the shared kernel arm 1.26–1.53x slower in the new tree and the plans-off path
+50% slower. Both were artefacts: the new tree has an extra arm, so the arm *sets* differed,
+and which arm precedes a cell decides the thread team and allocator state it inherits. One
+arm per process removed the first entirely and left the second at 1.02. Interleaving arms
+defends against drift over time; it does not defend against two trees having different arm
+sets.
+
+*Prefer one process to two trees when the effect is sub-microsecond.* Everything the
+cross-tree A/B could say about the refusal cost was noise, because a refused call is
+dominated by an operand copy that has nothing to do with plans. Flipping a runtime flag
+between arms in one process resolved 0.2 µs cleanly. The cross-tree design is only forced
+where the *binary* differs; where a flag can switch the behaviour, one process is strictly
+better evidence.
+
+*Check that a benchmark arm is measuring the case it is named after.* The decline arm
+originally shared its sparse operand with the `matmul` arm, so the same key was being
+served thousands of times by one arm while refusing the other — which means it measured the
+mixed case and could never have exercised the withdrawal it was supposed to test. Giving it
+its own operand split the two cases apart, and both are now reported. An arm that shares
+mutable per-operand state with another arm is measuring their interaction, not itself.
 
 Everything above is the prebuilt route. Generated kernels reach the same header by a
 different door — CINLowerer emits one `scorch_native::validate_jit_tensor` per
@@ -533,6 +720,27 @@ with the memo off.
   dispatch levers.** They were measured at `14e3ea6`/`6eec90f`; nothing in them is
   invalidated, but every small-cell ratio in them now understates scorch by ~33 µs of
   per-call Python.
+- **Call plans cover one operation.** `SpmmCsrPlan` serves CSR × dense with a dense
+  output — the drop-in float32 SpMM and the float64 reference kernel, plus the two tiled
+  kernels the selector can choose. SpMV, SpGEMM, COO operands, sparse outputs, the fused
+  bias/act and Linear kernels and everything on the generated-kernel route get no plan and
+  are byte-unchanged. The plan machinery costs them a dict probe on a `__dict__` that has
+  no plans in it.
+- **Lever 5's timings are redwood only, like levers 1–4.** Its *tests* run on both hosts
+  (63 on redwood, 61 + 2 skipped on the M5 — the two skips need a generated kernel, which
+  that toolchain cannot build), and they include the bitwise comparison against every
+  legacy symbol a plan can stand in for, so correctness is confirmed on both. The
+  microsecond figures are not.
+- **A defect found along the way and left alone, because it is not this work's.**
+  `scorch.matmul` raises on a CSR operand whose mode order has been permuted — the shape
+  says (48, 32) while the stored indices are still the original row-major CSR, and prebuilt
+  resolution keys on the format string and the rank, never on the mode order, so it picks
+  the row-major kernel and that kernel's ABI guard rejects the shapes it is handed. It
+  fails closed, but with a kernel-level `RuntimeError` rather than a structured scorch
+  error, and it does so identically on both hosts and on the tree before any of this work.
+  Fixing it means teaching prebuilt resolution about mode order, which is a change to
+  release dispatch; it is recorded here rather than folded in. A test pins the current
+  behaviour so plans cannot quietly change it.
 
 ## Method
 
