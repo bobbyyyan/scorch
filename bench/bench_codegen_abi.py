@@ -97,6 +97,13 @@ def main():
                     default=["band", "scatter", "pubmed", "bcsstk17"])
     ap.add_argument("--ns", nargs="+", type=int, default=[8, 32, 128])
     ap.add_argument("--rows", type=int, default=20000)
+    # Columns default to rows, which is what upstream's copy hardcoded. They have to be
+    # separable on this branch: the dcsr_dd route builds A via to_sparse("ss"), which
+    # evaluates a generated kernel, and that kernel's allocation bound is checked
+    # against the DECLARED extent product rather than the nonzero count -- so a square
+    # 100000 x 100000 matrix refuses at 1e10 elements no matter how sparse it is. Making
+    # J independent reaches the 2.4M-nonzero regime with M * J under the bound.
+    ap.add_argument("--cols", type=int, default=None)
     ap.add_argument("--deg", type=int, default=24)
     ap.add_argument("--reps", type=int, default=11)
     ap.add_argument("--inner", type=int, default=3)
@@ -136,7 +143,8 @@ def main():
 
     rows_out = []
     for name in args.matrices:
-        indptr, indices, data, M, J = build_csr(name, args.rows, args.rows, args.deg)
+        cols = args.cols if args.cols is not None else args.rows
+        indptr, indices, data, M, J = build_csr(name, args.rows, cols, args.deg)
         nnz = int(indices.size)
         t_csr = torch.sparse_csr_tensor(torch.from_numpy(indptr).to(idtype),
                                         torch.from_numpy(indices).to(idtype),
