@@ -74,6 +74,10 @@ operands it is slower than the code it replaced.
 | macOS suite, base vs candidate | **identical failure sets** — 208 failures on each, the same 208 test IDs, `comm` empty in both directions. Candidate passes 374 against base's 365, i.e. exactly the 9 new tests. The 208 are pre-existing and unrelated: the macOS SDK's libc++ cannot compile a generated kernel at all on this host, on any tree — every error is a `ninja` failure inside `is_trivially_copyable.h` / `strong_order.h` |
 | Linux suite, candidate with the JIT change *and* the dispatch levers | **582 passed, 14 skipped, 0 failed** (full suite, perf tests included). This is the only host whose toolchain compiles a generated kernel, so it is the only real test of the JIT validator. Collection is 596 against base's 587 — the 9 new tests and nothing dropped — and the skip count is unchanged, so no test silently became a skip |
 | Linux suite, base and candidate before the JIT change | **567 passed**, 14 skipped, 0 failed on each (`-m "not perf"`, measured on an earlier tree with fewer tests collected) |
+| Linux suite, with the call plan (lever 5) | **652 passed, 14 skipped, 0 failed** — 582 before, so exactly the 70 new plan tests and nothing dropped or turned into a skip |
+| macOS suite, with the call plan | **208 failed, 442 passed, 16 skipped**, and the failure set is still the same 208 test IDs as base (`comm` empty in both directions). 442 against base's 374: the 68 plan tests that run on this host |
+| plan vs every legacy symbol it stands in for, bitwise | `spmm_csr_float_v2` (at 3 thread counts), `spmm_csr_float_tilej` (3 panel widths), `spmm_csr_float_tileijk` (3 panel pairs) and the float64 reference kernel, plus a shape × density × dtype grid through `matmul` — **exact equality, atol=rtol=0**, not `assert_close` |
+| plan tests under both thread-policy arms | 4 combinations of `SCORCH_MATCH_HOST_THREADS` × `SCORCH_ATPARALLEL_PIPELINE`, all pass |
 
 ## redwood — the grid
 
@@ -424,63 +428,83 @@ Three pieces:
   change retires them by moving a generation counter that is part of every key; and a
   plan that refuses everything withdraws itself (see the refusal cost below).
 
-Measured on redwood, **one arm per process** (see the method note below), base = the
-tree at `ba59040`, four alternating rounds of 9 reps × 300 calls:
+Measured on **both hosts**, **one arm per process** (see the method notes below), base =
+the tree at `e72217b`, three alternating rounds of 9 reps × 300 calls. Both hosts ran the
+committed code; the M5's base tree is `git archive HEAD` built in place, so the two trees
+differ by lever 5 and nothing else.
 
-| cell | `matmul` before | after | gain | plans-off / before | residual Python |
-|---|---|---|---|---|---|
-| M=64 deg=2 N=1 | 12.6 | **2.1** | **5.95x** | 1.025 | **0.5** |
-| M=256 deg=2 N=4 | 13.0 | **2.8** | **4.64x** | 0.996 | **0.5** |
-| M=500 deg=4 N=8 | 13.7 | **3.9** | **3.50x** | 1.024 | **0.5** |
-| M=500 deg=4 N=32 | 16.5 | **9.2** | **1.81x** | 1.036 | **0.4** |
-| M=2000 deg=8 N=8 | 22.1 | **11.4** | **1.94x** | 0.996 | **0.6** |
-| M=2000 deg=8 N=32 | 25.8 | **15.6** | **1.66x** | 1.024 | **0.7** |
-| M=2000 deg=8 N=128 | 48.5 | **37.3** | **1.30x** | 1.060 | **0.5** |
-| M=20000 deg=24 N=32 | 142.7 | **131.1** | **1.09x** | 1.120 | 2.1 |
-| M=20000 deg=24 N=128 | 392.4 | **366.5** | **1.07x** | 0.988 | 3.7 |
-| M=20000 deg=64 N=256 | 1933.2 | **1867.2** | **1.04x** | 1.014 | 1.0 |
-| M=50000 deg=32 N=128 | 1574.7 | **1508.6** | **1.04x** | 0.995 | 10.3 |
+| cell | redwood before | after | gain | M5 before | after | gain |
+|---|---|---|---|---|---|---|
+| M=64 deg=2 N=1 | 12.3 | **2.1** | **6.01x** | 8.1 | **1.2** | **6.69x** |
+| M=256 deg=2 N=4 | 12.4 | **2.7** | **4.64x** | 9.4 | **2.5** | **3.76x** |
+| M=500 deg=4 N=8 | 13.5 | **3.8** | **3.57x** | 13.0 | **5.8** | **2.21x** |
+| M=500 deg=4 N=32 | 16.5 | **6.7** | **2.45x** | 20.5 | **12.5** | **1.64x** |
+| M=2000 deg=8 N=8 | 21.3 | **10.8** | **1.97x** | 32.4 | **22.4** | **1.45x** |
+| M=2000 deg=8 N=32 | 26.1 | **15.0** | **1.73x** | 47.4 | **35.9** | **1.32x** |
+| M=2000 deg=8 N=128 | 49.8 | **37.3** | **1.34x** | 100.4 | **92.6** | 1.08x |
+| M=20000 deg=24 N=32 | 142.1 | **124.7** | 1.14x | 283.5 | **275.3** | 1.03x |
+| M=20000 deg=24 N=128 | 403.6 | **364.4** | 1.11x | 965.0 | 1026.3 | 0.94x |
+| M=20000 deg=64 N=256 | 1966.6 | **1867.0** | 1.05x | 5985.9 | **5830.5** | 1.03x |
+| M=50000 deg=32 N=128 | 1599.8 | **1499.9** | 1.07x | 4377.0 | **4349.4** | 1.01x |
+| **geomean** | | | **1.95x** | | | **1.61x** |
 
-Geomean 1.86x over the eleven cells.
+**The four cells above ~500 µs say nothing either way, and the control arm is how we know.**
+A plan removes ~10 µs of Python; those cells' kernels run for 1–6 ms, so the effect is ~1%
+and the cross-process spread at that size is ±5% on the M5. The M5's one sub-1.0 cell is
+the clearest case: the **plans-off** arm, where the machinery is a single list index and
+cannot touch the kernel, moves with the plans-on arm in every round (973/991, 1014/1004,
+1010/1026 µs). That is a tree-to-tree offset on that cell, not something a plan did. The
+measurable effect is on cells under ~100 µs, and there it is 1.3–6.7x on both hosts.
 
-The last column is what remains of the dispatch: `matmul` minus a direct `plan.run` on
-the same operands, differenced *within* one process because that is the only way the two
-can be compared without cross-process drift (so those two numbers come from the multi-arm
-run, not the single-arm columns beside them). It is **0.4–0.7 µs** on every cell whose
-kernel is small — against 43 µs before any of this work and 9.6 µs after levers 1–4. On
-the four largest cells it is a difference of two large medians and reads 1–10 µs of
-nothing in particular; the small cells are where this quantity means anything.
+**What remains of the dispatch once a plan serves** is `matmul` minus a direct `plan.run`
+on the same operands, differenced *within* one process: **0.4–0.7 µs** on every cell whose
+kernel is small, against 43 µs before any of this work and 9.6 µs after levers 1–4. A warm
+planned call is also **faster than calling the prebuilt kernel directly through its own
+pybind entry** — 2.1 µs against 2.5 on redwood, 1.2 against 1.7 on the M5, consistently
+across every round on both hosts — because the plan skips the nested
+`vector<vector<Tensor>>` unpacking and the validation that entry performs.
 
-**Against `torch.sparse.mm`, end to end, scorch is now faster on every cell** — measured
-in one process with both arms and the same arm set in both trees:
+**Against `torch.sparse.mm`, end to end, scorch is now faster on every cell of both
+hosts** — both arms in one process, same arm set in both trees:
 
-| cell | scorch before | scorch now | `torch.sparse.mm` | before | now |
-|---|---|---|---|---|---|
-| M=64 deg=2 N=1 | 12.2 | **2.2** | 7.4 | 1.65x slower | **3.35x faster** |
-| M=256 deg=2 N=4 | 12.7 | **3.0** | 7.7 | 1.65x slower | **2.62x faster** |
-| M=500 deg=4 N=8 | 14.0 | **4.2** | 8.8 | 1.59x slower | **2.12x faster** |
-| M=500 deg=4 N=32 | 17.8 | **7.7** | 13.8 | 1.29x slower | **1.78x faster** |
-| M=2000 deg=8 N=8 | 21.4 | **10.9** | 15.9 | 1.34x slower | **1.46x faster** |
-| M=2000 deg=8 N=32 | 27.4 | **16.4** | 38.9 | 1.42x faster | **2.37x faster** |
-| M=2000 deg=8 N=128 | 57.1 | **43.0** | 117.7 | 2.06x faster | **2.73x faster** |
-| M=20000 deg=24 N=32 | 165.3 | **131.4** | 364.3 | 2.20x faster | **2.77x faster** |
-| M=20000 deg=24 N=128 | 397.1 | **375.1** | 1887.1 | 4.75x faster | **5.03x faster** |
+| cell | redwood before | now | M5 before | now |
+|---|---|---|---|---|
+| M=64 deg=2 N=1 | 1.64x slower | **3.53x faster** | 5.00x slower | **1.20x faster** |
+| M=256 deg=2 N=4 | 1.64x slower | **2.75x faster** | 2.56x slower | **1.50x faster** |
+| M=500 deg=4 N=8 | 1.64x slower | **2.25x faster** | 1.14x slower | **2.09x faster** |
+| M=500 deg=4 N=32 | 1.03x slower | **1.40x faster** | 1.12x slower | **1.41x faster** |
+| M=2000 deg=8 N=8 | 1.49x slower | **1.29x faster** | 2.95x faster | **4.34x faster** |
+| M=2000 deg=8 N=32 | 1.36x faster | **1.78x faster** | 3.35x faster | **4.43x faster** |
+| M=2000 deg=8 N=128 | 1.50x faster | **3.10x faster** | 2.87x faster | **3.17x faster** |
+| M=20000 deg=24 N=32 | 1.92x faster | **3.37x faster** | 12.49x faster | **12.50x faster** |
+| M=20000 deg=24 N=128 | 3.96x faster | **5.45x faster** | 8.79x faster | **8.99x faster** |
+| M=20000 deg=64 N=256 | 3.67x faster | **4.01x faster** | 9.93x faster | **9.87x faster** |
+| M=50000 deg=32 N=128 | 4.57x faster | **5.15x faster** | 6.34x faster | **6.64x faster** |
 
-The four small cells carry a torch-arm cross-tree disagreement of 0.5–2.5%, so their
-ratios are solid; three of the larger cells disagree by 8–39% and their exact ratios
-should be read as approximate.
+The smallest cell went from **5.0x slower to 1.2x faster** on the M5 and from 1.64x slower
+to 3.53x faster on redwood. Read the ratios only within a host and within a process: the
+torch arm's own cross-tree drift is 0.2–1.4% on ten of the eleven M5 cells but 31–54% on
+four redwood cells, so those four redwood ratios are approximate. And read *absolute*
+microseconds only from the single-arm runs — on `2000x8@32`, `matmul` reads 15.0 µs alone
+and 31.7 µs in the process it shares with the torch arm, which is the same arm-interference
+effect the method notes describe.
 
 **Nothing regressed, and here is what that rests on.** Two neutrality questions, each
-measured as its own single-arm A/B:
+measured as its own single-arm A/B on both hosts:
 
 - *Did splitting the kernel entry cost the kernel anything?* The legacy pybind entry,
-  called directly with a pre-built argument list: **geomean 1.0115, range 0.981–1.060**
-  over the eleven cells, against a round-to-round spread on the base arm of 0.9–46% on
-  the same cells. No effect resolvable.
-- *Did the plan machinery slow the path it cannot help?* With installation disabled —
-  the same binary, `SCORCH_DISPATCH_PLAN=0` — **geomean 1.0245, range 0.988–1.120**, and
-  four of eleven cells below 1.0. The one 1.120 cell read 1.009 in a previous run of the
-  same comparison, so it is run-level noise rather than an effect.
+  called directly with a pre-built argument list, plans off in both trees: **redwood
+  geomean 1.016** (0.956–1.069), **M5 geomean 1.049** (1.006–1.123). Both sit inside the
+  cross-process spread these cells show on a byte-identical control arm, and the redwood
+  figure straddles 1.0.
+- *Did the plan machinery slow the path it cannot help?* With installation disabled — the
+  same binary, `SCORCH_DISPATCH_PLAN=0`, which costs one list index — **redwood geomean
+  1.008** (0.966–1.046) and **M5 geomean 1.028** (0.977–1.068). Gating the probe on that
+  flag is what earned this: with the probe ungated the M5 read 1.019 against a ~1% floor,
+  and passing the lookup key from the probe to the installer took redwood from 1.020 to
+  1.008.
+- *And the site a plan can never serve?* Its own single-arm A/B, with the withdrawal doing
+  the work: **redwood geomean 1.012**, **M5 geomean 1.029** over the cells with N > 1.
 
 **What a refused call costs, and why that needed a different measurement.** A plan
 returns nothing when the call is outside what it was built for, and the ordinary path
@@ -512,14 +536,28 @@ cost more than they save, it is bounded, and it is stated rather than averaged a
 cells above 20000 rows are dominated by per-call allocation of a 2.5 MB operand and read
 ±300 µs run to run; only the small cells mean anything here.
 
-**Three defects this created, all found and fixed before it shipped.**
+**Four defects this created, all found and fixed before it shipped.** One was caught by a
+test, one by review, and two only by measuring — which is the argument for measuring.
 
-*A performance one.* The installer originally read the tiling selector's verdict on
-*every* call rather than on the call that installs. Reading it hashes a signature over the
-index arrays — `.item()` calls, microseconds — and that made the ordinary path **1.53x
-slower** (12.4 → 19.4 µs on the smallest cell) whenever a plan was not in play: a
-single-use operand, a declined call, or plans switched off. The fix moved the read to the
-dispatch site, which is also where the correctness defect below had to be fixed.
+*A correctness one*, caught by one of the tests above. The installer read the tiling
+selector's verdict from the wrong place. The selector's memo holds an entry for any
+`(operand, free dimension)` it has ever probed, and that entry outlives the conditions that
+produced it: the same operand at a narrower free dimension, or on a host whose LLC swallows
+B, fails the O(1) eligibility gate and is served by v2 without the memo being consulted at
+all. Reading the memo from the installer — which sees every call — therefore built a plan
+that ran tile-j while the ordinary path ran v2. Both answers are correct arithmetic; they
+differ in the last bits (4.8e-06 on a 400×400 float32 product), which is exactly what a
+path advertised as indistinguishable may not do. The fix reads the verdict at the dispatch
+site, inside the branch where a tiled kernel actually served the call, and defaults to v2
+everywhere else. Two tests now pin it: one that a tiled verdict *is* carried into the plan
+on a shape that passes the gate, and one that a memo entry the gate rejects leaves the plan
+on v2 and bit-identical to the ordinary path.
+
+*A performance one.* The installer also read that verdict on *every* call rather than on
+the call that installs. Reading it hashes a signature over the index arrays — `.item()`
+calls, microseconds — and that made the ordinary path **1.53x slower** (12.4 → 19.4 µs on
+the smallest cell) whenever a plan was not in play: a single-use operand, a declined call,
+or plans switched off. Moving the read to the dispatch site fixed both defects at once.
 
 *A permanent tax on call sites a plan cannot help.* A plan that refuses every call still
 charged for the refusal, for the life of the operand. Now a plan that has served nothing
@@ -537,20 +575,6 @@ as the operand had been multiplied twice; both work on the tree before plans.
 `STensor.__getstate__` now omits the plan cache, which covers `pickle`, `deepcopy` and
 `copy.copy` in one method, since Python routes all three through `__reduce_ex__`. A plan
 is memoized work rather than state, so the duplicate builds its own on its second use.
-
-*A correctness one*, caught by one of the tests above rather than by review. The installer
-also read the verdict from the wrong place. The selector's memo holds an entry for any
-`(operand, free dimension)` it has ever probed, and that entry outlives the conditions that
-produced it: the same operand at a narrower free dimension, or on a host whose LLC swallows
-B, fails the O(1) eligibility gate and is served by v2 without the memo being consulted at
-all. Reading the memo from the installer — which sees every call — therefore built a plan
-that ran tile-j while the ordinary path ran v2. Both answers are correct arithmetic; they
-differ in the last bits (4.8e-06 on a 400×400 float32 product), which is exactly what a
-path advertised as indistinguishable may not do. The fix reads the verdict at the dispatch
-site, inside the branch where a tiled kernel actually served the call, and defaults to v2
-everywhere else. Two tests now pin it: one that a tiled verdict *is* carried into the plan
-on a shape that passes the gate, and one that a memo entry the gate rejects leaves the plan
-on v2 and bit-identical to the ordinary path.
 
 **Three method notes worth keeping**, each earned by getting it wrong first.
 
@@ -726,11 +750,12 @@ with the memo off.
   bias/act and Linear kernels and everything on the generated-kernel route get no plan and
   are byte-unchanged. The plan machinery costs them a dict probe on a `__dict__` that has
   no plans in it.
-- **Lever 5's timings are redwood only, like levers 1–4.** Its *tests* run on both hosts
-  (63 on redwood, 61 + 2 skipped on the M5 — the two skips need a generated kernel, which
-  that toolchain cannot build), and they include the bitwise comparison against every
-  legacy symbol a plan can stand in for, so correctness is confirmed on both. The
-  microsecond figures are not.
+- **Lever 5 is measured on both hosts**, unlike levers 1–4: its base tree is small enough
+  to reproduce locally (`git archive HEAD` built in place), which the earlier levers'
+  container-VM problem had made impossible. Its tests run on both too — 70 on redwood, 68
+  + 2 skipped on the M5, the skips needing a generated kernel that toolchain cannot build
+  — including the bitwise comparison against every legacy symbol a plan can stand in for.
+  What is *not* two-host is everything above lever 5 in this document.
 - **A defect found along the way and left alone, because it is not this work's.**
   `scorch.matmul` raises on a CSR operand whose mode order has been permuted — the shape
   says (48, 32) while the stored indices are still the original row-major CSR, and prebuilt
