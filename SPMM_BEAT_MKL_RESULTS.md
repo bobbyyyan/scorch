@@ -1,9 +1,11 @@
 # CSR × dense SpMM vs MKL — before and after
 
 *Branch `perf/spmm-beat-mkl`, based on `04f321d`. The grid below was measured at
-`14e3ea6`; `6eec90f` fixed the selector and `d9450ca` extended the same fix to the JIT
-codegen path afterwards. Hosts: **redwood** (Intel i9-14900K, 8 P + 16 E cores, 36 MB
-L3, PyTorch 2.5.1 + MKL 2022.1) and **M5** (Apple, 6 P + 12 E cores, PyTorch 2.13.0).
+`14e3ea6`; `6eec90f` fixed the selector, `d9450ca` extended the same fix to the JIT
+codegen path, and `ba59040` cut the Python dispatch cost the grid was still paying —
+all three land after the grid was taken. Hosts: **redwood** (Intel i9-14900K, 8 P + 16
+E cores, 36 MB L3, PyTorch 2.5.1 + MKL 2022.1) and **M5** (Apple, 6 P + 12 E cores,
+PyTorch 2.13.0).
 **Every headline number is float32 through the prebuilt route**; float64 and the JIT
 codegen path have their own sections and their own, weaker, conclusions. Read
 `SPMM_BEAT_MKL_PHASE0.md` first for the attribution that led here.*
@@ -35,14 +37,19 @@ Three parts, none of which removes a check:
    released, so while an entry exists its key address cannot be reused by a different
    `StorageImpl`: an expired weak pointer is proof of staleness, a live one proof of
    identity. `data_ptr`, `nbytes` and the version counter are recorded too.
-3. **The int64→int32 narrowing is memoized per tensor** in `prebuilt_kernels`, so the
-   cast happens once instead of once per call.
+3. **The int64→int32 narrowing is memoized per tensor**, so the cast happens once
+   instead of once per call. This now lives in `checked_index_tensor`, the one place
+   every caller reaches — it started as a Python cache in `prebuilt_kernels`, which
+   covered only the prebuilt route and, by handing the validator a fresh tensor each
+   call, kept the structural memo from ever hitting on the JIT route. That cache is
+   deleted; see the JIT section.
 
 Deliberate trade, made on Bobby's call: a write straight through a raw buffer a
 tensor aliases (numpy writing into shared memory) does not bump torch's version
 counter, so a buffer corrupted that way can now reach a kernel unchecked.
-`SCORCH_ABI_VALIDATE_MEMO=0` restores strict per-call validation;
-`SCORCH_NARROW_INDEX_CACHE=0` restores the per-call cast.
+`SCORCH_ABI_VALIDATE_MEMO=0` restores strict per-call validation and per-call
+narrowing both — but read the JIT section before reaching for it, because on large
+operands it is slower than the code it replaced.
 
 ### Two things this refutes
 
@@ -261,8 +268,10 @@ the binding constraint and no kernel change can move it. Concretely on redwood:
 cora@32's kernel is 25 µs against MKL's whole 50 µs call — the kernel is 2x MKL and
 the cell still loses, because 48 µs of Python sits on top.
 
-That is a separable piece of work in `ops.py`'s general dispatch path, outside the
-file scope of this study, and it is the right next target for the small-cell regime.
+The Python half of that has since been fixed — 43 µs down to 9.7 µs, measured below.
+The native half (~52 µs inside `eval_time`) has not been touched and is the next
+target; the grid above and every ratio in it predates the dispatch fix, so the
+small-cell numbers there are pessimistic by roughly 33 µs per call.
 
 ### Where the Python dispatch cost actually is
 
@@ -293,25 +302,69 @@ and scorch still loses 27.0 to 11.6, entirely on dispatch.
 | `parse_format` | ~3% | called 3x per matmul on constant strings |
 | the kernel itself | **8%** | |
 
-So the ranked levers, cheapest first, all inside `ops.py` / `layout.py` / `storage.py`:
+### The dispatch fix, measured
 
-1. **Do not build an `STensor` for a dense `torch.Tensor` operand.** For
-   `matmul(sparse, dense_tensor)` the kernel needs only `b.shape`, an empty
-   mode-indices list, and `b.reshape(-1)`. `ops.py` already has an `_EMPTY_MODE_INDICES`
-   constant for exactly this shape of idea. Biggest single win.
-2. **Import `Mapping`/`Sequence` from `collections.abc`, or test concrete types.**
-   Mechanical, and worth ~1.2 µs a call.
-3. **Memoize the result `Layout`** on `(shape, dtype, format)` instead of re-deriving
-   and re-validating it, and memoize `parse_format` (a pure string function).
-4. **Memoize the marshalled argument list** per `(operand identity, N)`, invalidated by
-   the same version counters the ABI memo already uses. In a training loop everything
-   except the values buffer is identical call to call.
-5. The endgame, if 1–4 leave a gap: **one pybind entry that does resolution and
-   marshalling in C++**, so a warm call is a single Python→C++ hop. That is the shape
-   `torch.sparse.mm` gets its ~5–10 µs from.
+Four levers were implemented, all in the Python object layer, none in the kernel:
 
-None of this is measured as a fix yet — it is a measured diagnosis with an ordered
-plan.
+1. **Assemble a dense operand from cached immutable parts.** Everything about a dense
+   `STensor` except its values is a function of `(shape, dtype, device, name,
+   mode_order)`: the format, the empty per-mode index arrays, the layout, the metadata.
+   The first call builds them with the ordinary constructor and keeps them; later calls
+   with the same key reuse them and attach the new values buffer. Sharing is sound
+   because each part is a frozen dataclass and a dense tensor's mode-index arrays are
+   empty tuples. A test compares the cached and ordinary paths field by field.
+2. **`Mapping`/`Sequence` from `collections.abc`, not `typing`** — the same isinstance
+   check for 73 ns instead of 153 ns, ten times per matmul.
+3. **Memoize `parse_format` and `TensorLayout.from_physical_shape`**, both pure
+   functions of their arguments that were re-deriving and re-validating a value object
+   per call, plus `TensorFormat.__str__` and `.is_dense()` on the format itself.
+4. **Stop making copies nothing reads.** `STensor.values` returns `self._value.detach()`
+   and `_value` is already detached, so four of those allocations per matmul bought
+   nothing; internal callers now read `_raw_values`. And `execute_prebuilt_binary_kernel`
+   read the clock twice per call to fill a `time_dict` that nobody passed.
+
+Measured on redwood, base = the tree at `b4f8985`, candidate = the same tree plus the
+four levers. Both are the same compiled extension; only the Python differs. Arms
+alternate base, cand, base, cand for four rounds; the harness's `kernel` arm calls
+`spmm_csr_float_v2` directly with the argument list built once up front, and since that
+arm is identical C++ in both trees its agreement across trees is the validity check.
+
+| cell | kernel µs | `matmul` before | after | gain | dispatch before | after | `torch.sparse.mm` |
+|---|---|---|---|---|---|---|---|
+| M=64 deg=2 N=1 | 2.4 | 45.6 | 12.0 | **3.79x** | 43.1 | **9.7** | 8.6 |
+| M=256 deg=2 N=4 | 3.1 | 45.6 | 12.4 | **3.67x** | 42.4 | **9.4** | 8.8 |
+| M=500 deg=4 N=8 | 4.1 | 46.6 | 13.8 | **3.39x** | 42.4 | **9.6** | 10.4 |
+| M=500 deg=4 N=32 | 7.3 | 50.4 | 17.9 | **2.82x** | 43.5 | **10.1** | 14.4 |
+| M=2000 deg=8 N=8 | 14.7 | 56.4 | 21.3 | **2.65x** | 41.6 | **6.6** | 16.6 |
+| M=2000 deg=8 N=32 | 18.4 | 61.3 | 26.7 | **2.30x** | 43.6 | **8.2** | 41.3 |
+| M=2000 deg=8 N=128 | 41.7 | 85.2 | 55.9 | **1.52x** | 46.6 | **14.2** | 103.2 |
+| M=20000 deg=24 N=32 | 129.6 | 188.1 | 144.5 | **1.30x** | 64.4 | **16.6** | 346.1 |
+| M=20000 deg=24 N=128 | 508.9 | 432.6 | 530.2 | 0.82x | 62.3 | **27.4** | 1767.4 |
+
+Geomean 2.22x on `matmul`, and the dispatch cost itself drops from a flat 42–46 µs to
+6.6–10.1 µs on every cell whose kernel is small. It repeats: the smallest cell reads
+43.6 / 42.0 / 42.6 / 44.6 µs across the four base rounds against 9.6 / 9.9 / 9.5 / 9.7
+for the candidate. `cProfile` on that cell agrees with the wall clock — `matmul`
+cumulative time over 4000 calls falls 0.480 s to 0.128 s (3.75x against the measured
+3.79x), and `from_torch` falls from 65% of the call to 17%.
+
+**The last row is drift, not a regression.** Its shared `kernel` arm disagrees between
+the two trees by 37.7% — the largest mismatch in the run, against under 5% on seven of
+the nine cells — so that cell's `matmul` medians are dominated by kernel noise. Its
+dispatch component still falls 62.3 to 27.4 µs, in line with the rest.
+
+**This closes the gap that was the stated goal.** `torch.sparse.mm` pays 8.6 µs on the
+smallest cell; scorch now pays 9.7 µs of Python for the same job, and less than torch's
+own overhead on every larger cell. So the dispatch is no longer the binding constraint
+anywhere — what binds now is the ~52 µs on the native side of `eval_time`.
+
+What remains in those 9.7 µs, from the profile: property-chain traffic, mostly. One
+matmul does 18 `layout` reads, 14 `shape` reads, and 8 `dim()` calls, each a Python
+attribute hop through `_metadata`/`_storage`; the kernel call itself is 9% of the call
+and `from_torch` is 17%. Lever 5 from the original plan is still the endgame if this
+needs to go lower — **one pybind entry doing resolution and marshalling in C++**, so a
+warm call is a single Python→C++ hop, which is where `torch.sparse.mm` gets its number
+from. It is no longer urgent.
 
 ## The JIT codegen path
 
@@ -377,14 +430,51 @@ Note also that scorch's own format conversions already emit int32: `to_sparse("s
 does, and only operands handed in by a user through `from_torch`/scipy arrive as int64.
 That is the argument for narrowing at construction rather than at the boundary.
 
-**Measurement status: not yet taken.** `bench/bench_codegen_abi.py` is the harness —
-two routes (`matmul_wksp` with int64 operands and a sparse result, which charges
-narrowing plus scans; DCSR × dense through `matmul` with a dense result, which charges
-scans only), interleaved arms, an in-process A/A floor, and `torch.sparse.mm` as the
-cross-tree control. The A/B is against the tree at `b4f8985`. It has not been run:
-another user's job started on redwood, and this host cannot compile a generated kernel
-at all, so there is no second machine to fall back to. Correctness is measured — see
-below — but no speedup is claimed here yet.
+### What the JIT fix is worth
+
+`bench/bench_codegen_abi.py` is the harness — two routes (`matmul_wksp` with int64
+operands and a sparse result, which charges narrowing plus scans; DCSR × dense through
+`matmul` with a dense result, which charges scans only), interleaved arms, an in-process
+A/A floor, and `torch.sparse.mm` as the cross-tree control. Base is the tree at
+`b4f8985`. redwood only; this laptop cannot compile a generated kernel at all, so there
+is no second host for this one — the numbers below are single-machine and should be read
+as such.
+
+| route | matrix | M | nnz | N | before ms | after ms | gain | A/A floor | control |
+|---|---|---|---|---|---|---|---|---|---|
+| dcsr_dd | band | 100000 | 2.4M | 8 | 3.486 | 0.949 | **3.67x** | 42.3% | 1.9% |
+| dcsr_dd | band | 100000 | 2.4M | 32 | 3.865 | 1.799 | **2.15x** | 13.7% | 21.9% |
+| dcsr_dd | band | 100000 | 2.4M | 128 | 11.728 | 8.163 | **1.44x** | 15.6% | 13.4% |
+| dcsr_dd | band | 20000 | 480k | 8 | 0.761 | 0.335 | **2.27x** | 9.8% | 24.2% |
+| dcsr_dd | scatter | 100000 | 2.4M | 8 | 2.334 | 1.044 | **2.23x** | 25.3% | 39.1% |
+| dcsr_dd | scatter | 100000 | 2.4M | 32 | 3.818 | 1.782 | **2.14x** | 14.8% | 69.4% |
+| dcsr_dd | scatter | 20000 | 480k | 8 | 0.677 | 0.323 | **2.10x** | 10.1% | 0.5% |
+| dcsr_dd | scatter | 20000 | 480k | 32 | 3.130 | 1.300 | **2.41x** | 16.6% | 36.6% |
+| wksp_ds | (all 6 cells) | 20000 | 160k | 8–128 | 137.9–148.4 | 139.5–150.7 | 0.98–0.99x | 0.5–1.7% | 0.2–4.0% |
+
+Geomean 1.527x over the 18 cells; **9 of 18 clear both their own A/A floor and the
+cross-tree control spread**, and the ones that do not are dominated by noise rather than
+by a small effect — the `dcsr_dd` route's floors run 9–42% because the kernel it emits
+is itself variable at these sizes. Restricted to `dcsr_dd`, geomean is 1.899x
+(1.04–3.67x). Max relative error against the float64 reference across every cell and
+arm: 2.7e-07.
+
+**The workspace route gains nothing, and that is structural, not a failure.** All six
+`wksp_ds` cells land at 0.98–0.99x, consistently just below 1. Their calls take 138–151
+ms, essentially all of it sparse-output assembly, against ~0.1 ms of index validation
+for 160k nonzeros — so the fix is removing 0.07% of the call and the residual 1–2% is
+inside the 0.2–4.0% cross-tree control spread on five of the six. Nothing about this
+route is bandwidth- or validation-bound; it is bound by building a sparse result.
+
+**`SCORCH_ABI_VALIDATE_MEMO=0` is not a safe fallback.** The escape hatch runs the
+branchless screens with memoization disabled, and a third arm measured it: at 480k
+nonzeros screens-only is 1.2–1.5x slower than the memo, and at 2.4M nonzeros it is
+**4.3–6.4x slower** — slower even than the original serial validation it replaced (6.06
+ms against 3.49 ms on band@8). This is the same libgomp effect documented in the method
+section: a parallel screen spawns a thread team immediately before the kernel wants a
+differently shaped one, and the reshape costs more than the walk it saved. The variable
+is for diagnosing a suspected memo bug on small operands, not for running production
+with the memo off.
 
 ## Scope and gaps, stated plainly
 
@@ -407,6 +497,21 @@ below — but no speedup is claimed here yet.
 - **Only the drop-in float32 CSR×dense prebuilt symbol is tiled.** Fused bias/act
   SpMM, fused sparse Linear, SpMV and SpMSpM are unaffected by the selector, though
   they do all benefit from the validation fix.
+- **The dispatch levers are measured on redwood only.** The M5 numbers that led to them
+  are in the diagnosis above, and a local A/B was attempted and thrown away: a container
+  VM at ~50% of a core doubled the kernel arm. The levers are pure Python with no
+  platform-dependent behaviour, but "confirmed on both hosts" is not something this
+  document can claim for them.
+- **The dense-operand cache is bounded at 512 entries and never evicts.** The key is
+  `(shape, dtype, device, name, mode_order)`, so a program that calls `matmul` with a
+  dense operand of a new shape every time — a variable-length batch dimension, say —
+  fills it and then stops caching, falling back to the ordinary construction rather than
+  degrading. What it holds is a layout, a metadata record and an empty index tuple per
+  key, no values, so the ceiling is kilobytes.
+- **The grid, the selector re-measurement and the float64 table all predate the
+  dispatch levers.** They were measured at `14e3ea6`/`6eec90f`; nothing in them is
+  invalidated, but every small-cell ratio in them now understates scorch by ~33 µs of
+  per-call Python.
 
 ## Method
 
@@ -417,6 +522,12 @@ below — but no speedup is claimed here yet.
   byte-identical in both trees, so `|mkl_base/mkl_cand − 1|` is that cell's
   cross-process floor. Trees alternate base, cand, base, cand so drift hits both.
 - Compared against the **faster** of MKL's int32-index and int64-index arms.
+- For the dispatch A/B, where MKL is not in the picture, the control is the harness's
+  own **direct `spmm_csr_float_v2` call** with the argument list built once up front:
+  identical C++ in both trees, so its cross-tree agreement per cell says whether that
+  cell is trustworthy. Seven of nine agreed within 5%; the one that disagreed by 37.7%
+  is called out rather than averaged in. `torch.sparse.mm` runs in the same process as
+  the external reference point.
 - Every cell checked against a float64 reference.
 - Machine verified quiet before each run. This matters more than it sounds: a leftover
   `addr2line` pinning a single core added a flat ~8.6 ms to every arm of every cell,
