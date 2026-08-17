@@ -25,6 +25,15 @@ from .exceptions import (
 )
 from .format import TensorFormat, LevelFormat, LevelType
 from .layout import TensorLayout, TensorMetadata
+
+# Names only -- plan.py imports torch and the native extension, nothing from this
+# module, so there is no cycle. Imported as constants because _set_state runs on
+# every STensor construction and must not pay a function call for this.
+from .plan import (
+    PLANS_ATTR as _PLANS_ATTR,
+    SEEN_ATTR as _PLAN_SEEN_ATTR,
+    DECLINES_ATTR as _PLAN_DECLINES_ATTR,
+)
 from .storage import SparseStorage, TensorIndex
 from .utils import (
     parse_format,
@@ -306,6 +315,34 @@ class STensor:
         storage.validate()
         self._metadata = metadata
         self._storage = storage
+        # Every in-place structural change funnels through here (insert,
+        # change_mode_order, to_sparse, ...), so this is the one place a cached
+        # call plan describing the old structure has to be dropped. See plan.py;
+        # a plan would also decline on its own, having recorded the index arrays'
+        # identity and version, but dropping it releases the narrowed copy too.
+        state = self.__dict__
+        if _PLANS_ATTR in state or _PLAN_SEEN_ATTR in state:
+            state.pop(_PLANS_ATTR, None)
+            state.pop(_PLAN_SEEN_ATTR, None)
+            state.pop(_PLAN_DECLINES_ATTR, None)
+
+    def __getstate__(self) -> dict:
+        """The state to copy or serialize: everything except the plan cache.
+
+        A cached call plan lives in the native extension and cannot be pickled, so
+        without this an operand that had been multiplied twice could no longer be
+        deep-copied or pickled -- both work on an operand that has not. Dropping the
+        cache is also the right answer independent of that: a plan is memoized work,
+        not state, and the copy will build its own on its second use.
+
+        Python routes ``pickle``, ``copy.deepcopy`` and ``copy.copy`` through
+        ``__reduce_ex__``, which consults this, so one method covers all three.
+        """
+        state = dict(self.__dict__)
+        state.pop(_PLANS_ATTR, None)
+        state.pop(_PLAN_SEEN_ATTR, None)
+        state.pop(_PLAN_DECLINES_ATTR, None)
+        return state
 
     def insert(self, indices, values):
         """Insert values into the tensor.

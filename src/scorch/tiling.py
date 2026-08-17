@@ -83,6 +83,7 @@ import torch
 import scorch_ops as _ops
 
 from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec
+from .plan import invalidate_all as _plan_invalidate_all
 
 # ---------------------------------------------------------------------------
 # Autotune level state (thread-local override over a process-global default).
@@ -204,6 +205,9 @@ def set_autotune(level: str) -> None:
     """
     global _global_level
     _global_level = _validate_level(level)
+    # Cached call plans carry this selector's verdict, so a policy change retires
+    # them (scorch.plan.GENERATION).
+    _plan_invalidate_all()
 
 
 def get_autotune() -> str:
@@ -298,10 +302,12 @@ class autotune:
     def __enter__(self):
         self._prev = getattr(_tls, "level", None)
         _tls.level = self.level
+        _plan_invalidate_all()  # see set_autotune
         return self
 
     def __exit__(self, *exc):
         _tls.level = self._prev
+        _plan_invalidate_all()
         return False
 
     def __call__(self, fn):
@@ -515,6 +521,26 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
     if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None:
         return _eligible_learned(J, nnz, N, C)
     return _eligible(J, nnz, N, C)
+
+
+def decided(a, n: int, level: Optional[str] = None):
+    """The winner this selector has already memoized for ``a @ B`` at free dim ``n``,
+    as ``(kind, param)``, or ``None`` if it has not decided one.
+
+    A read of the memo, never a decision: no gate, no probe, no cost model, no
+    write. ``ops.matmul`` uses it to hand the memoized verdict to a call plan
+    (plan.py), so a planned call runs exactly the kernel the selector chose for
+    that shape — including its measured panel widths — without consulting the
+    selector again. ``None`` covers every case where the ordinary path would have
+    run v2: level off, an ineligible shape, or a first call whose probe has not
+    landed yet."""
+    if not _HAS_TILEJ:
+        return None
+    if level is None:
+        level = _current_level()
+    if level == "off":
+        return None
+    return _decision.get((_signature(a, int(n)), level))
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
@@ -908,6 +934,7 @@ def clear_autotune_cache() -> None:
     global _persist_cache, _cache_loaded
     _persist_cache = {}
     _cache_loaded = True
+    _plan_invalidate_all()  # see set_autotune
     path = _cache_path()
     if path:
         try:

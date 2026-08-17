@@ -30,9 +30,14 @@ from .compiler.scheduler import (
 from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
 from .layout import TensorSpec
+from .plan import ENABLED_CELL as _PLAN_ENABLED
+from .plan import GENERATION as _PLAN_GENERATION
+from .plan import PLANS_ATTR as _PLANS_ATTR
+from .plan import install as _plan_install
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
+from .tiling import decided as _tiling_decided
 from .tiling import _current_level as _tiling_current_level
 from .storage import TensorIndex
 from .stensor import STensor, _finalize_generated_mode_indices
@@ -196,6 +201,17 @@ _MATCH_HOST_THREADS = os.environ.get("SCORCH_MATCH_HOST_THREADS", "1") == "1"
 # tiny products (the SuiteSparse panel's 130-row cell) keep omp. On by default;
 # set SCORCH_ATPARALLEL_PIPELINE=0 to force the private-team launch.
 _ATPARALLEL_PIPELINE = os.environ.get("SCORCH_ATPARALLEL_PIPELINE", "1") == "1"
+
+# The same two composition hints, resolved once, for the planned dispatch: a plan
+# call passes them positionally, so binding them here keeps that path branchless.
+# `-1` is the kernel ABI's "no override", which is what the ordinary path passes
+# when host-thread matching is off.
+_PLAN_NTHREADS = torch.get_num_threads if _MATCH_HOST_THREADS else (lambda: -1)
+_PLAN_ATPARALLEL = _ATPARALLEL_PIPELINE and _MATCH_HOST_THREADS
+
+# `torch.Tensor`, bound once. The plan probe tests it on every matmul, and reading
+# it through the module is a global lookup plus an attribute lookup each time.
+_TENSOR = torch.Tensor
 
 # start_time = time.time()
 # # Register custom classes
@@ -513,6 +529,55 @@ def matmul_wksp(
     return result
 
 
+def _dispatch_tiled(a, b, resolved, nthreads, atparallel, time_dict):
+    """Run the adaptive tiling selector's choice, or report that v2 should run.
+
+    Returns ``(result_cpp, result_shape, plan_kind, plan_param)``, with the first two
+    ``None`` when the caller must run its ordinary v2 dispatch, and the last two
+    naming the kernel that *did* serve the call so a plan can reproduce it.
+
+    On the drop-in CSR@dense SpMM this routes the high-degree operand-over-LLC thrash
+    regime (reddit/products-class) to the column-panel kernel
+    ``spmm_csr_float_tilej``; v2 serves everything else byte-unchanged. Provably
+    no-regression: v2 is always the probe baseline, so the memoized choice is never
+    slower than v2 (see ``tiling.maybe_dispatch``). It only engages when the cheap
+    O(1) pre-filter says a shape can even benefit — no overhead on
+    GCN-small/AE/panel.
+    """
+    if resolved.symbol_name != "spmm_csr_float_v2":
+        return None, None, "v2", None
+    # Resolve the autotune level ONCE so is_candidate and maybe_dispatch see a
+    # consistent value (a context manager could exit between two lookups). Only
+    # touched on the v2 symbol -> other prebuilt kernels (bias_act/fused) stay
+    # byte-identical.
+    level = _tiling_current_level()
+    if not _tiling_is_candidate(a, b, level=level):
+        return None, None, "v2", None
+    result_shape = [a.shape[0], b.shape[1]]
+
+    def _v2_fn(nt):
+        rc, _ = execute_prebuilt_binary_kernel(
+            resolved.fn, a, b, nthreads=nt, atparallel=atparallel
+        )
+        return rc
+
+    disp = _tiling_maybe_dispatch(
+        a, b, result_shape, _v2_fn, nthreads, time_dict=time_dict, level=level
+    )
+    if disp is None:
+        return None, None, "v2", None
+    result_cpp, _ = disp
+    # A tiled kernel served this call. Read which one HERE and nowhere else: the
+    # memo is only authoritative where the selector actually ran. Reading it
+    # wherever an entry merely exists let a plan carry tile-j for a shape the gate
+    # had rejected, so the plan ran a different kernel than the ordinary path --
+    # caught by a test comparing the two bitwise.
+    verdict = _tiling_decided(a, b.shape[1], level=level)
+    if verdict is None:
+        return result_cpp, tuple(result_shape), "v2", None
+    return result_cpp, tuple(result_shape), verdict[0], verdict[1]
+
+
 def matmul(
     a: Union[torch.Tensor, STensor],
     b: Union[torch.Tensor, STensor],
@@ -610,6 +675,51 @@ def matmul(
     >>> torch.allclose(C.to_torch(), A_dense @ A_dense, atol=1e-3, rtol=1e-3)
     True
     """
+
+    # A repeated CSR x dense product is served by a plan: the resolution, the
+    # selector's verdict, the validated index structure and the kernel arguments
+    # were all settled on an earlier call and live in the native extension (see
+    # plan.py). What is left is a dict lookup and one Python->C++ hop.
+    #
+    # Deliberately the first thing this function does, and written as inline
+    # dict/attribute reads rather than a helper call, because everything below is
+    # what a plan exists to skip. The exact-type tests keep it off every other
+    # shape of call at the cost of two pointer comparisons: a torch.fx Proxy, an
+    # STensor right-hand operand, a dense left-hand operand and a sparse-sparse
+    # product all fail them and fall through unchanged. Keyword arguments are
+    # excluded wholesale -- output_format, use_cache, schedule and time_dict all
+    # change what the call means or what it must report.
+    # The same test decides whether a plan may serve this call and whether one may
+    # be installed for it at the end of the prebuilt branch, so it is made once.
+    # plan_a/plan_b are the caller's own objects: a plan is keyed on what the
+    # caller will pass again, never on an operand this function wrapped or relaid
+    # out, which is why the installer below also checks `a is plan_a`.
+    #
+    # `_PLAN_ENABLED[0]` comes first so that switching plans off leaves this whole
+    # paragraph -- and the installation below, which is what `plan_b is not None`
+    # tests for -- costing one list index. That is what makes the off state a
+    # control arm for measuring the on state rather than a different code path with
+    # its own overhead. Measured: with the probe ungated, the off state ran 2-4%
+    # slower than the tree before plans on the small cells of both hosts.
+    plan_a = plan_b = plan_key = None
+    if _PLAN_ENABLED[0] and not kwargs and type(a) is STensor and type(b) is _TENSOR:
+        plan_a, plan_b = a, b
+        # Built once and handed to the installer below, because every call that gets
+        # here needs it and it used to be built twice: hashing it means hashing a
+        # torch.Size and a dtype, which is most of what the probe costs on a call that
+        # has no plan to find.
+        plan_key = (b.shape, b.dtype, _PLAN_GENERATION[0])
+        plans = a.__dict__.get(_PLANS_ATTR)
+        if plans is not None:
+            plan = plans.get(plan_key)
+            # A miss means no plan for this free dimension; None back from `run`
+            # means a plan that declined (see plan.py). Both fall through.
+            if plan is not None:
+                served = plan.run(
+                    a._storage._value, b, _PLAN_NTHREADS(), _PLAN_ATPARALLEL
+                )
+                if served is not None:
+                    return served
 
     # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
     # behavior on the function itself so tracing never has to replace the
@@ -751,36 +861,9 @@ def matmul(
             if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
                 nthreads = torch.get_num_threads()
                 atparallel = _ATPARALLEL_PIPELINE
-            result_cpp = None
-            result_shape = None
-            # Adaptive tiling selector: on the drop-in CSR@dense SpMM, route the
-            # high-degree operand-over-LLC thrash regime (reddit/products-class) to
-            # the column-panel kernel spmm_csr_float_tilej; v2 serves everything
-            # else byte-unchanged. Provably no-regression: v2 is always the probe
-            # baseline, so the memoized choice is never slower than v2 (see
-            # tiling.maybe_dispatch). Only engages when the cheap O(1) pre-filter
-            # says a shape can even benefit — no overhead on GCN-small/AE/panel.
-            if resolved.symbol_name == "spmm_csr_float_v2":
-                # Resolve the autotune level ONCE so is_candidate and
-                # maybe_dispatch see a consistent value (a CM could exit between
-                # two lookups). Only touched on the v2 symbol -> other prebuilt
-                # kernels (bias_act/fused) stay byte-identical.
-                _lvl = _tiling_current_level()
-                if _tiling_is_candidate(a, b, level=_lvl):
-                    _rshape = [a.shape[0], b.shape[1]]
-
-                    def _v2_fn(nt):
-                        rc, _ = execute_prebuilt_binary_kernel(
-                            resolved.fn, a, b, nthreads=nt, atparallel=atparallel
-                        )
-                        return rc
-
-                    disp = _tiling_maybe_dispatch(
-                        a, b, _rshape, _v2_fn, nthreads, time_dict=time_dict, level=_lvl
-                    )
-                    if disp is not None:
-                        result_cpp, _ = disp
-                        result_shape = tuple(_rshape)
+            result_cpp, result_shape, _plan_kind, _plan_param = _dispatch_tiled(
+                a, b, resolved, nthreads, atparallel, time_dict
+            )
             if result_cpp is None:
                 result_cpp, result_shape = execute_prebuilt_binary_kernel(
                     resolved.fn,
@@ -797,7 +880,25 @@ def matmul(
             # result is default mode order with matching dtype (exactly what
             # to_torch() would have reconstructed).
             if resolved.output_format.is_dense():
-                return result_cpp.storage.value.reshape(result_shape)
+                out = result_cpp.storage.value.reshape(result_shape)
+                # Everything above is a function of the operands' structure and
+                # the free dimension, so a second call with the same pair need not
+                # repeat it: hand the resolution and the kernel that actually ran to
+                # a plan the next call can invoke directly (plan.py). `plan_b` is
+                # None unless plans are on and the caller passed a sparse STensor and
+                # a dense torch.Tensor with no keywords; `a is plan_a` fails when the
+                # operand was relaid out into a copy above, and a plan must describe
+                # the operand the caller holds, not one this function made.
+                if plan_b is not None and a is plan_a:
+                    _plan_install(
+                        a,
+                        plan_b,
+                        plan_key,
+                        resolved.symbol_name,
+                        _plan_kind,
+                        _plan_param,
+                    )
+                return out
             result = STensor(
                 shape=result_shape,
                 index=TensorIndex(
