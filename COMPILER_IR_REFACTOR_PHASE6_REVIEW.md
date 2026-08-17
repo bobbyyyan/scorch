@@ -17953,3 +17953,490 @@ ways, and the partitioned suite per side with its node-set comparison.  Every
 harness takes a tree root as ``$1`` and an expected commit, and the suppression in
 the ablation's third column is a probe that patches one module attribute — nothing
 in the tree implements it.
+
+## 68. The accumulation structure made a scheduling decision, and the confound measured away (2026-08-16)
+
+This section starts from committed tip ``7fc3f91`` and does what §67's number
+said to do: fix the layering, re-measure, stop.  Bobby's two decisions, 2026-08-16:
+which accumulation structure a program uses becomes a **scheduling decision**, the
+same ruling he made for assembly strategy; and this session does **not** build the
+four-strategy runtime comparison.
+
+Two production commits, ``705ad66`` and ``0f9b3b0``, and one tests-only commit
+``5f28a63`` that the suite caught.  ``git diff 7fc3f91..5f28a63 -- src/`` is 797
+insertions and 20 deletions across twelve files, one of them new
+(``sparse_accumulator.py``, 136 lines); the tests are 805 insertions and 9
+deletions across eight files, one of them new; ``statics/`` gains two files, 155
+lines.  **``src/scorch/csrc/`` is untouched** — the diff over it is empty — so the
+shipping ``scorch_ops`` extension is bit-unchanged and §61.3's obligation is not
+re-owed; the two extensions built from the two tips carry an identical exported
+symbol table (39 symbols) and an identical ``__TEXT`` segment (491,520 bytes)
+anyway.  Nothing is pushed; ``compile_cin_via_loopir`` and
+``execute_cin_via_loopir`` keep zero non-test callers, and none of the five
+protected tracked files is touched by any of the three commits.
+
+**Which commit each check measured**, because the last one arrived after most of
+them.  Everything that reads ``src`` — emission, the accumulation census, the
+frontier, release neutrality, correctness, the static gate — was measured at
+``0f9b3b0``, and ``git diff 0f9b3b0..5f28a63 -- src/`` is **empty**, so those
+numbers carry to the tip.  The suite was re-run at ``5f28a63`` on the side that
+changed; the base side stands at ``7fc3f91``, its own asserted commit.
+
+**The verdict, up front.**  Which structure a sparse reduction accumulates through
+is now recorded on the plan, the program and the public schedule, and both places
+that used to substitute one now read the decision instead of imposing it.
+Emission is byte-neutral: over 1,130 cells in both automatic arms, the automatic
+column and all four explicit strategy columns are identical to ``7fc3f91``'s — 0
+digests moved, 0 refusal codes moved — and the 1,139-record frontier is identical
+field for field.  The confound §67 measured is **gone from the comparison rather
+than from the machine**: the swap still costs what it cost (0.865x–1.571x, versus
+§67's 0.872x–1.574x), but the two columns of a strategy comparison now use the
+same accumulation structure on **80 of 80** configurations, where before they did
+so on 16 — the control cell only.  That is checked on the emitted source, per
+configuration, not inferred from a ratio.
+
+And the production column reproduces §67's monkeypatched probe **character for
+character** — on all 80 ablation configurations, and over the whole 1,130-cell
+census in both arms under both two-pass strategies.  So the number the fix is
+judged against is the number §67 measured.
+
+### 68.1 The constraint, verified before anything was designed
+
+The session prompt said to confirm from the code that the substitution is not
+only in the typed route, because if it is in the legacy one a change to what it
+chooses moves shipped bytes.  It is, and it was confirmed two ways rather than
+read from §67:
+
+1. **Statically.**  ``cin_lowerer.py:4064`` builds the ``CompressedWhereOpenMPPassSpec``
+   and ``llir_pass_manager.py:1263`` runs the pass.  That is the legacy
+   CIN → CINLowerer → LLIR route, which is what production dispatch uses.
+2. **By running it.**  ``test_schedule_generality.py::``
+   ``test_spgemm_default_workspace_and_sparse_assembly_are_unchanged`` compiles a
+   ``ds x ds -> ds`` SpGEMM through ``CINLowerer`` and asserts the emitted C++
+   carries ``std::vector<linked_list_workspace_1d``, two ``].make_view()``,
+   ``.insert_unchecked(`` and ``for (int _worker = 0``.  It passes at ``7fc3f91``.
+
+So the default had to be §60.4's: ``None`` means *no decision*, and here that has
+to keep meaning "substitute exactly where you substitute today".  **The awkward
+consequence is stated rather than hidden: the layer violation this section is
+about survives as the default until a selector replaces it, and only an explicit
+request changes anything.**  It is the only default that lands byte-neutral, and
+byte-neutrality is the gate.
+
+**A second hole, found while checking the first, and it is inherited.**  On the
+legacy route ``Schedule(assembly=...)`` is recorded in the plan and never acted
+on.  Measured: ``Scheduler.apply_schedule(spgemm, Schedule(assembly=s))`` followed
+by ``CINLowerer`` emits the identical 7,113-character kernel for all four
+strategies and for ``Schedule()`` — pool, ``insert_unchecked`` and two-phase
+structure included.  A caller asking for ``single_pass_serial`` on that route gets
+the two-phase pooled parallel kernel with no way to find out.  That is the
+assembly field's defect and §68.9 records it unfixed; this section's own field
+does not reproduce it, because the legacy lowerer reads the decision (§68.4).
+
+### 68.2 The token set, and the design question the prompt asked first
+
+``src/scorch/compiler/sparse_accumulator.py``, modelled on ``sparse_assembly.py``:
+one definition of the token set that every layer imports, legality separated from
+cost, and four structured refusal codes.  **Two tokens**:
+
+``coordinate_list``
+    The keys inserted are recorded as a list and the drain reads them in sorted
+    key order.  ``coo_workspace_1d<T,1>`` at a single-component key — a value
+    array indexed by the coordinate, a byte flag per coordinate, an append-only
+    list of the coordinates touched — and ``coo_workspace<T,K>`` at rank K, which
+    flattens the key and dedups through a hash map.  Both start at capacity 1024
+    and grow on demand, so construction costs nothing that scales with the
+    receiver.  This is what every family declares for itself.
+
+``linked_list``
+    Gustavson's accumulator: a value array and a ``next`` array, both indexed by
+    the coordinate and both sized to its full extent, with the coordinates touched
+    threaded through ``next`` as a chain the drain walks and sorts.  Insertion is
+    branchless and needs no bounds check.  This is what the two-phase transform
+    substitutes.
+
+Which container realizes ``coordinate_list`` follows from the workspace's key rank,
+a property of the program; there is no choice to make, and a token naming the
+container would be naming a C++ spelling.
+
+**The dense accumulator is not a member, and that is settled from the code.**  In
+LoopIR the dense and sparse accumulators are different node kinds —
+``WorkspaceDecl``/``WorkspaceRegion`` against
+``SparseWorkspaceDecl``/``SparseWorkspaceRegion`` — so asking a program carrying
+one to use the other means building a different program.  On the legacy side the
+CIN's ``dense`` flag selects a different lowering entirely, a per-worker slab with
+a ``memset`` per iteration that the lowerer pools itself, and
+``self._where_workspace_name`` — the name the transform substitutes — is assigned
+only in the non-dense branch, which the parallelization gate then requires.  The
+dense workspace never reaches the substitution.
+
+**Is "pooled" a separate axis?  No, and the reasoning is recorded because the
+four-way product looks plausible.**  §67.1 established that a workspace declared
+inside a parallel loop body is per-iteration private by construction, so a pool is
+never needed for correctness.  What makes pooling non-independent for these two
+structures is their construction cost: ``linked_list_workspace_1d(capacity)``
+allocates three arrays of the receiver's compressed extent and fills two of them
+(``header.h:821-838``, ``:724-730``), so constructing one per outer iteration is
+O(rows × extent) — asymptotically worse than the accumulation it serves.  That
+structure must be hoisted, and a hoisted object inside an OpenMP loop must be one
+per worker: **pooling is entailed by the structure rather than chosen beside it.**
+``coo_workspace_1d(1024)`` is constructed with a capacity independent of the
+receiver, so hoisting buys nothing and nothing pools it.
+
+Pooling is not universally determined by structure — the CIN's dense workspace is
+pooled by the lowerer with no assembly strategy involved — which is exactly why it
+is not folded into what a token *means*, only into what each token *entails*.
+Applying §60.2's test to the product {coordinate_list, linked_list} ×
+{per-iteration, pooled}: two cells have producers, a pooled coordinate list is
+§66.9's named-but-unbuilt candidate fix, and a per-iteration chained accumulator
+has no producer and no reason to want one.  §60.2's ruling on that shape was "an
+enumeration of tokens, not a product of booleans — a wider domain would need a
+cross-field rule to exclude nothing".  So: an enumeration of two, and a pooled
+coordinate list becomes a THIRD token when somebody builds it.
+
+**Legality, and the one rule the module states.**  ``single_coordinate_key(rank)``:
+the chain lives in an array indexed by the key itself, so a key of more than one
+component has no single array to index.  Structural, provable, extent-free — it
+requires the key to HAVE a bounded extent and never reads one.  A test tokenizes
+the module's source and requires the code (not the prose) to mention no extent, no
+density, no thread count and no measurement.
+
+### 68.3 Representation, and what it does to identity
+
+| field | type |
+| --- | --- |
+| ``LoopPlan.accumulator`` | ``Optional[str]``, one of two tokens |
+| ``LoopProgram.accumulator`` | ``Optional[AccumulatorStructure]`` |
+| ``Schedule.accumulator`` | ``Optional[str]`` — the public request |
+| ``CompressedWhereOpenMPContext.accumulator`` | ``Optional[str]`` — the pass input |
+
+Two canonical schemas move, and both are recorded rather than only the one:
+
+| schema | before | after |
+| --- | --- | --- |
+| ``printer.CANONICAL_SCHEMA`` | ``…canonical.v12`` | **``…canonical.v13``** |
+| ``plan_identity.CANONICAL_PLAN_SCHEMA`` | ``…loopplan.canonical.v2`` | **``…v3``** |
+| ``CANONICAL_REQUEST_SCHEMA`` | ``…request.v2`` | unchanged; its *bytes* move |
+
+Stated here rather than left for a check to discover: ``canonical_plan_dump``,
+``plan_schedule_digest`` and ``loopir_request_identity`` change for every plan,
+because ``"accumulator":null`` joins the payload — deliberate, so "no decision"
+stays distinguishable from "coordinate list by decision".  ``Schedule.cache_key``
+changes for every schedule and does reach production, costing one cold cache and
+no change in behaviour: a key is only ever compared with keys from the same build,
+and a v12 dump differs from a v13 dump in its ``"schema"`` field before it differs
+anywhere else.  Bobby authorized schema bumps generally when this work started; the
+bump is recorded, not re-asked.
+
+Legality is stated at the same two boundaries the assembly strategy uses, with the
+same split: ``Scheduler._require_legal_accumulator_request`` refuses early on the
+explicit surface and ``loop_plan_legality._verify_accumulator`` is the
+authoritative refusal for every plan reaching the typed route, and both state the
+one rule provable there — a structure is a property of a SPARSE reduction's
+workspace, and a dense result has none.  ``schedule_passes.select_accumulator_structure``
+consumes the plan fact exactly once, beside ``select_assembly_strategy`` and at
+the same single exit, so no family can forget it.
+
+### 68.4 Both substitution sites read the decision
+
+**The shared pass.**  ``CompressedWhereOpenMPContext.accumulator`` defaults to
+``None``, exactly as ``parallel: bool = True`` and ``outer_cell`` were added.
+``_extract_work_body`` reads it:
+
+* ``None`` — today's behaviour: substitute if the workspace declaration is a direct
+  child of the selected loop.  No byte moves.
+* ``"coordinate_list"`` — keep the declaration where the family put it.  The pool,
+  the type substitution and the ``insert`` → ``insert_unchecked`` rename are one
+  bit inside the pass (``workspace_hoisted``), so keeping the statement switches
+  off all three.  Always honourable.
+* ``"linked_list"`` — substitute; with no declaration to hoist there is nothing to
+  do, so it fails closed with ``unsupported_accumulator_structure``.  **The pass is
+  the only layer that has that fact**, which is why the refusal is there and not
+  predicted in the target — predicting it would be a second copy of the pass's own
+  trigger, and a scheduling rule in two layers is what cost twelve cells at §57.5.
+
+**The typed target** gains ``supported_accumulators()`` / ``default_accumulator()`` /
+``accumulator_structure()``, mirroring the assembly triple.  Per family:
+
+| family | ``supported_accumulators()`` | why |
+| --- | --- | --- |
+| ``_TargetLowering`` and every dense family | ``()`` | no sparse accumulator, so any request fails closed |
+| ``_SparseWorkspaceLowering``, ``_RowScopeSparseWorkspaceLowering`` | ``("coordinate_list",)`` | doubly-compressed receiver, the transform never runs, ``coo_workspace_1d`` is all they emit |
+| ``_OrderedKeySparseWorkspaceLowering`` | both | emits the coordinate list itself and hosts the transform that substitutes |
+| ``_ParallelSparseWorkspaceLowering`` | ``("linked_list",)`` | its ``complete_sparse_workspace`` mirror reconstructs the pooled shape and refuses anything else |
+
+``default_accumulator()`` returns ``None`` on every family, and that is today's
+state stated rather than dressed up: **no family chooses an accumulation
+structure.**  It is the seam a selector replaces, and §67.3's numbers are what it
+should be built on.
+
+One shared check in the driver, so no family can forget it: with no two-phase
+transform owning the output the emitted structure is the family's own coordinate
+list, so a ``linked_list`` request is refused with
+``unsupported_accumulator_structure`` rather than dropped.
+
+**The legacy lowerer** reads ``self.loop_plan.accumulator`` where it already builds
+the pass configuration — not at the schedule-lowering seam, which runs after the
+pass has already transformed the body — and refuses a chained request no transform
+on that route can honour at its single pipeline entry.
+
+Suppression is not new capability.  A declaration left in the phase loop's body is
+constructed once per iteration and is private to that iteration by construction,
+which is the shape 17 of the 21 admitted ordered-key cells already emit (§67.1).
+
+### 68.5 The re-measurement, and what "the confound is gone" actually means
+
+The ablation from ``~/.cache/scorch-codex/workspace-confound/`` re-run with the
+decision carried instead of monkeypatched, on the same grid: M5, 80 configurations
+— 5 cells × 2 shapes × 2 densities × ``f32`` × both automatic arms × both two-pass
+strategies — 7 rounds each, reps auto-calibrated to a 25 ms block floor and shared
+across the columns, ABBA-interleaved with the order reversed on odd rounds, min
+within a round and median across rounds, plus a same-binary A/A control per column
+per configuration.  **80 planned, 80 with a record, 0 missing.**  Five columns now
+rather than three:
+
+| column | strategy | accumulation structure |
+| --- | --- | --- |
+| ``a`` | ``single_pass_serial`` | no decision — the CIN's own coordinate list |
+| ``a'`` | ``single_pass_serial`` | ``coordinate_list``, explicitly |
+| ``b`` | the requested two-pass strategy | no decision — the transform's chained pool |
+| ``c`` | the same two-pass strategy | ``coordinate_list``, explicitly, **through production** |
+| ``p`` | the same two-pass strategy | §67's monkeypatch, compared on emission only, never timed |
+
+**The collapse is a byte-level identity, not a ratio, and that is stronger.**
+§67's confound was that the two columns of a strategy comparison used different
+accumulation structures with nothing in the caller's request saying so.  With the
+decision carried, the compared columns use the same structure by construction, and
+the construction is read off the emitted source per configuration:
+
+| | n |
+| --- | --- |
+| configurations with a record | 80 |
+| the substitution fires on | 64 |
+| the control cell, where it does not | 16 |
+| **the compared columns (``a``, ``c``) use the same accumulation structure** | **80 of 80** |
+| the old pair (``a``, ``b``) used the same structure | **16 of 80** — the control cell only |
+| an explicit ``coordinate_list`` request is a no-op on the single pass | 80 of 80 |
+| **column ``c`` reproduces §67's monkeypatched probe, character for character** | **80 of 80** |
+
+The ratios reproduce §67 to three digits, which is what says nothing about the two
+programs changed — only who decides which one runs:
+
+| | this section | §67.3 | n |
+| --- | --- | --- | --- |
+| workspace effect, ``b``/``c`` | **0.865x – 1.571x** | 0.872x – 1.574x | 64 |
+| strategy effect, ``a``/``c`` | 0.620x – 8.319x | 0.620x – 8.015x | 64 |
+| what a two-pass column reported before, ``a``/``b`` | 0.613x – 7.317x | 0.614x – 7.175x | 64 |
+| the control cells | 0.967x – 1.025x | 0.9935x – 1.0197x | 16 |
+| **the explicit no-op, ``a'``/``a``** | **0.984x – 1.027x, 0 of 80 outside its own A/A floor** | — | 80 |
+
+The workspace effect is outside its own configuration's A/A floor on **53 of the
+64** substituting configurations (§67: 56 of 64).  It is monotone in the same two
+axes:
+
+| density | shape | ``b``/``c`` | n |
+| --- | --- | --- | --- |
+| 0.02 | square | 1.052 – 1.411 | 16 |
+| 0.02 | wide receiver | **1.220 – 1.571** | 16 |
+| 0.2 | square | **0.865** – 1.096 | 16 |
+| 0.2 | wide receiver | 0.952 – 1.241 | 16 |
+
+The ``a'``/``a`` row is the apparatus checking itself: an explicit request for the
+structure the single pass already uses is the same program, so it must sit inside
+the noise floor, and it does on every one of the 80.
+
+**The single row §67.3 made its case on**, ``MM ss x ds -> ds``, wide receiver,
+density 0.02, arm 0, ``two_pass_serial``:
+
+| | median seconds ratio | §67.3 |
+| --- | --- | --- |
+| what the two-pass column reported before (``a``/``b``) | **0.613** | 0.614 |
+| with the structure held fixed (``a``/``c``) | **0.963** | 0.966 |
+| the swap alone (``b``/``c``) | 1.571 | 1.574 |
+
+**One thing this grid says that §67's framing does not, and the measurement wins.**
+The swap changes **which** strategy looks faster on **0 of the 64** configurations
+— every one keeps its sign — and only by how much: median 10.3%, worst 57.1%.
+§67.3's case was made on magnitude ("1.63x slower becomes a 3.4% tie") and that
+reading is exactly right.  A reading of it as "a selector would pick the wrong
+strategy" is not supported by this grid; what a cost model is fitted on is
+magnitudes, and a 10% median error with a 57% tail in the training target is the
+reason the layering came first.
+
+**§67.5's free result, re-run and unchanged.**  Correctness was checked on every
+column before any ratio, whole output storage bit for bit against column ``a``'s
+plus a dense ``float64`` reference:
+
+| column | storage identical to the single pass |
+| --- | --- |
+| ``a'`` explicit coordinate list on the single pass | **80 of 80** |
+| ``b`` the substituted column | 64 of 80 |
+| ``c`` the declared column | **80 of 80** |
+
+0 index-array differences anywhere, 0 columns unstable under repetition, worst
+error against the dense reference 2.047e-05 at ``float32``.  The 16 differing rows
+are all one cell, ``MM ss x ds -> ds``, in the substituted column only, worst
+3.815e-06 — the inherited 1-ulp difference §67.5 measured to the substitution, not
+a new one.
+
+### 68.6 The decision's own reach and refusal surface over the census
+
+A new census over the same 1,130-cell matrix in both arms, thirteen columns —
+1,130 × 2 × 13 = 29,380 compilations, plus the base's automatic column:
+
+| column | request | OK | ``…_accumulator_host`` | ``…_accumulator_structure`` | ``unsupported_schedule_accumulator`` |
+| --- | --- | --- | --- | --- | --- |
+| ``auto`` | nothing | 504 | 0 | 0 | 0 |
+| ``coord_only`` | ``coordinate_list`` | 312 | 42 | 0 | 366 |
+| ``chain_only`` | ``linked_list`` | 2 | 44 | 308 | 366 |
+| ``s1`` | ``single_pass_serial`` | 502 | 0 | 0 | 0 |
+| ``s1_coord`` | + ``coordinate_list`` | 312 | 40 | 0 | 366 |
+| ``s2`` | ``two_pass_serial`` | 42 | 0 | 0 | 0 |
+| ``s2_coord`` | + ``coordinate_list`` | **42** | 0 | 0 | 0 |
+| ``s2_chain`` | + ``linked_list`` | 8 | 2 | 34 | 0 |
+| ``p2`` | ``two_pass_parallel`` | 44 | 0 | 0 | 0 |
+| ``p2_coord`` | + ``coordinate_list`` | 42 | 2 | 0 | 0 |
+| ``p2_chain`` | + ``linked_list`` | 10 | 2 | 34 | 0 |
+
+**Zero unclassified refusals over all 29,380.**  Every column reconciles: 8 + 34 =
+42 and 10 + 34 = 44, the 34 being the cells whose workspace is declared one loop
+deeper so there is nothing for the transform to substitute.
+
+The column comparisons say what the decision does and does not move:
+
+| comparison | result |
+| --- | --- |
+| the automatic column, candidate against base | 0 digests moved, 0 emitting-only either side |
+| ``s2_coord`` against the base's monkeypatched probe | **0 digests moved, 0 emitting-only either side** |
+| ``p2_coord`` against the base's monkeypatched probe | **0 digests moved, 0 emitting-only either side** |
+| ``s2`` against ``s2_chain``, ``p2`` against ``p2_chain`` | 0 digests moved; 34 cell-arms move from emitting to ``unsupported_accumulator_structure`` |
+| ``s1`` against ``s1_coord`` | 0 digests moved; 190 cell-arms refuse, because a dense result has no sparse accumulator and some families have none at all |
+| ``s2`` against ``s2_coord``, ``p2`` against ``p2_coord`` | **8 digests moved each** — exactly the four substituting cells in both arms |
+
+The last row is what says the suppression is not vacuous, and the four cells are
+exactly §67.2's table: ``MM ss x ds -> ds`` and the three ``ijk->ik [ds]``
+reductions.
+
+**One cell is strictly better than the probe, and it is the one §67.1 could not
+build.**  ``MM ds x ds -> ds`` is the parallel sparse-workspace family's cell.
+Under §67's monkeypatch it fails ``sparse_workspace_completion_lost`` — an internal
+completion failure — so ``p2_probe`` emits 42 of 44.  Under the production request
+it refuses with ``unsupported_accumulator_host``, naming the host, because that
+family lists only the chained structure.  Same two cell-arms, an honest refusal
+instead of an internal one.
+
+### 68.7 The proof
+
+Every check ran from a fresh detached worktree with its commit asserted before
+anything was measured (§62.5), and every harness takes a tree root as ``$1``.
+
+| check | result |
+| --- | --- |
+| **0. ``src/scorch/csrc/`` is untouched, so the shipping extension is not owed** | **PASS.** ``git diff 7fc3f91..0f9b3b0 -- src/scorch/csrc/`` is empty.  Checked rather than asserted: the two built extensions carry an identical exported symbol table (39 symbols) and an identical ``__TEXT`` segment (491,520) |
+| **1. Emission, all four strategy columns, base against candidate**, 1,130 cells × both arms | **PASS.** Automatic byte-neutrality **NEUTRAL** over all 1,130 cells in both arms, 0 differing.  Per-strategy admitted counts: ``single_pass_serial`` 502, ``single_pass_chunk_parallel`` 18, ``two_pass_serial`` **42**, ``two_pass_parallel`` **44** — §66.4's counts, unchanged.  The four explicit columns joined base-against-candidate on (request, cell, arm): 502 + 18 + 42 + 44 emit on both sides and **every one is byte-identical — 0 digests moved, 0 stopped emitting, 0 newly emitting, 0 refusal codes moved** |
+| **2. The accumulation decision's own census**, 13 columns × 1,130 cells × both arms | **PASS.** 29,380 compilations, **0 unclassified refusals**.  §68.6's table; the production ``coordinate_list`` column equals §67's monkeypatched probe over the whole census under both two-pass strategies |
+| **3. Correctness, the two TTM cells × four strategies** | **PASS.** 32 configurations, 160 executed strategy runs, **0 storage differences** — every index array and every value bit-identical — and every strategy within 6.255e-07 of a dense ``float64`` reference |
+| **4. Correctness over the whole legal domain**, 24 cells × 4 regimes × 2 densities × 2 dtypes × both arms, sharded four ways with a merge that refuses a missing shard | **PASS, and it reproduces §66.5 and §67.9 exactly.** 768 configurations, 3,168 executed strategy runs, **0 index-array differences**, 0 unclassified refusals, 0 rows without a baseline, worst dense-reference error 7.536e-07.  56 value-only differences, all on ``MM ss x ds -> ds``, worst 4.768e-07 — the inherited declared difference, not a new one |
+| **5. The ablation, re-measured with the decision carried** | **PASS.** §68.5.  80 planned, 80 with a record, 0 missing.  Compared columns share a structure on 80 of 80; the old pair on 16 of 80.  Column ``c`` reproduces the probe on 80 of 80 |
+| **6. The frontier**, 1,139 records × both arms, base and candidate, field for field | **PASS on both comparators.** Field for field IDENTICAL over all 1,139 records (1,138 distinct keys, the one duplicate §60.10 explains, compared positionally): differing fields 0.  The gate's own reading: admitted 260 both sides, **0 lost, 0 gained, 0 route changed, 0 unclassified either side**, 3 arm-variant both sides (inherited, same set), 0 new arm-variance |
+| **7. Release neutrality** | **PASS on every column, which §67 could not say.** Production dispatch 506 case-arms: 0 emission differences, 0 outcome differences.  20-source corpus: 20 of 20 identical.  42-case ``ss@dd`` grid: 42 of 42 identical.  86-case schedule audit: 0 nonidentical fields.  **RELEASE NEUTRALITY: PROVEN — every emission column byte-identical.**  §67's two preamble columns differed only because it edited ``header.h``; this section edits no ``csrc`` |
+| **8. The suite**, 8 file-disjoint partitions per side, node sets diffed | **PASS on both sides, and it caught the one thing the targeted runs did not.** Base ``7fc3f91``: 6,507 nodes / **0 failures** / 0 errors / 15 skipped, all eight partitions exit 0.  Candidate ``5f28a63``: 6,534 / **0** / 0 / 15, all eight exit 0.  By node set: 6,507 in both, **0 base-only, exactly 27 candidate-only** — every one a test this section adds — and **0 outcome changes on shared nodes**.  The candidate's FIRST run, at ``0f9b3b0``, had one failure: ``test_canonical_dump_is_arm_stable_and_erases_to_base`` asserts the canonical schema string inline, in a file the pre-commit targeted runs did not collect.  ``5f28a63`` follows the bump there and is tests-only.  The two sides collect different file counts by design — this section adds one test file — so the round-robin regroups and every partition list differs; the comparison is over node sets, which are keyed by node id, so a regrouping costs nothing |
+| **9. The repo's own static gate over ``src``**, at both commits | **PASS as a comparison, RED as a gate, at both commits, exactly as §66.7 and §67.9 found.** ``black`` 5 lines, ``mypy`` 146, ``flake8`` 9 at BOTH commits, all three exit non-zero at both, and every difference between them is a path, a line number or the source-file count.  ``mypy`` finds the same 140 errors in the same 11 files on both sides; ``flake8`` the same 9, including the two pre-existing ``F401``s in ``cin_lowerer.py`` and ``_apply_schedule_legacy``'s complexity 41.  None of it is in a file this section touches, and every touched file is clean under all three |
+| **10. Protected tracked files, both ways** | **PASS.** No commit in ``7fc3f91..0f9b3b0`` touches any of the five; the five blobs are byte-identical between the two pinned checkouts; the tracked snapshot check passes on the clean candidate checkout and reports the expected FAIL on the live repository, where the separate CUDA project's edits are present |
+| **11. The seal script's selftest, from the tracked copy** | **PASS.** Seven build-shaped paths excluded at four different depths, two evidence files sealed, and a compiled artifact outside every name exclusion still rejects the seal |
+
+### 68.8 What this section does not do
+
+- **No four-strategy runtime grid.**  Bobby decided explicitly that this session
+  fixes and stops.  The grid is the next session's, on two hosts.
+- **No selector, on either decision.**  ``default_assembly()`` is untouched on
+  every family and ``default_accumulator()`` returns ``None`` on every family, so
+  no automatic compilation chooses either.  They are the two places a selector
+  goes and they come last, after honest numbers exist for both.
+- **No density gate inside the transform.**  That was one of §66.9's four options
+  and Bobby rejected it: it leaves the layer violation in place by design and
+  encodes a density threshold in a layer that should not know about density.
+- **The default still substitutes.**  ``None`` means "do exactly what you do
+  today", which on the cells where the transform fires is the chained pool.  The
+  violation survives as the default; what changed is that it is now a decision a
+  caller can override and a selector can replace, rather than something imposed on
+  the way past.  Any other default moves a shipped byte (§68.1).
+- **The second host is not run.**  M5 only, by design: this is a confirmation that
+  the confound is out of the comparison, not a shipping performance claim.  mkt1
+  is still not run, owed since §59.
+- **Rule 4 is not lifted, obstacle B is not closed, and the deeper position close
+  is not addressed** (§66.9).
+- **The 116 labels that arrive at ``result_write_pass`` unread** (§64.4, §65.6c)
+  are untouched.
+- **``scorch_concat_chunk_positions``'s value-initializing resize stands**
+  (§67.10).
+- **Nothing is wired into dispatch.**  ``compile_cin_via_loopir`` and
+  ``execute_cin_via_loopir`` keep zero non-test callers and the test proving
+  ``import scorch`` never loads the LoopIR package still passes.
+- The dense-domain seam, the merged-domain UNION/INTERSECTION decision, the shadow
+  pilot's membership and every blocker other than 1 are untouched; the Phase-8
+  cutover verdict is unchanged.
+
+### 68.9 Defects found and recorded, not fixed here
+
+- **``Schedule(assembly=...)`` is silently dropped on the legacy route.**  Measured
+  in §68.1: all four strategies and ``Schedule()`` emit the identical
+  7,113-character kernel through ``CINLowerer``.  §60.5 fixed the silent drop on
+  the LoopIR route and locked it with a test; the legacy route has no such
+  consumer, and ``materialize_legacy_schedule`` faithfully round-trips a token
+  nothing then reads.  This section's own field does not reproduce it — the legacy
+  lowerer reads the accumulator decision and refuses what it cannot honour — but
+  the assembly field's hole is real and is left for whoever owns that field next.
+- **``two_pass_serial`` still allocates a per-worker pool it cannot use**
+  (§67.10), unchanged: ``_workspace_pool_statements`` is gated on
+  ``workspace_hoisted`` alone and never on ``context.parallel``.  An explicit
+  ``coordinate_list`` request now avoids the pool entirely on those cells, which
+  is a way around the defect rather than a fix for it.
+- **§67's own ``run_proofs.sh`` passes the wrong harness to the frontier
+  wrapper.**  The wrapper ends in ``exec python "$HARNESS"``, so ``$HARNESS`` is
+  the python census; §67's copy passed ``run_frontier.sh`` and its log carries the
+  resulting ``SyntaxError: invalid syntax`` at ``set -euo pipefail`` twice.  That
+  section's frontier receipts came from a separate invocation, so its numbers
+  stand, but the broken line stayed in the script and this session inherited it by
+  copying.  Fixed in this ledger's copy, with the reason in a comment.
+- **This session's own accumulator census was wrong on its first run, and the
+  refusal codes caught it.**  It passed the string ``"auto"`` into
+  ``Schedule(assembly=...)``, which is not a strategy token, so the base column
+  raised ``ValueError`` before compiling anything and the comparison read "504
+  cell-arms emit only on the candidate".  Visible because those refusals carried no
+  code; fixed, and the unclassified-refusal scan now covers every column including
+  the base's.
+- **The partitioned suite's own totals block cries wolf when the eight partitions
+  are invoked in parallel.**  Each invocation runs ONE partition but its totals
+  block globs ``part*.xml`` across the shared output directory, so it refuses to
+  print a total whenever a sibling has already written one — seven of eight on a
+  COMPLETE run, with the message "REPORTED NOTHING: 1 partitions selected but N
+  junit files exist".  The refusal is fail-closed and correct in intent, and in
+  this arrangement it fires on a clean run, which is the same "a check that cries
+  wolf is worse than no check" the node comparator's own header records.  The
+  per-partition exit codes and JUnit files are the real signal and they are clean;
+  this ledger's runner computes the totals once over all eight instead, and the
+  inherited script is left as it is because other ledgers are sealed with it.
+- **The order of two honest refusals is request-dependent.**  On the row-scope
+  family's two cell-arms an unqualified ``linked_list`` request is refused by
+  ``accumulator_structure()`` with ``unsupported_accumulator_host`` before
+  ``assembly_strategy()`` can refuse it with ``unsupported_assembly_host``.  Both
+  name the host and both are correct; which one a caller sees depends on which
+  request they made.  Recorded because a later census that keys on the code alone
+  would read it as a change.
+
+**Evidence ledger**: ``~/.cache/scorch-codex/workspace-decision/``, sealed over
+**419 files** with zero compiled artifacts in the seal and every one verifying
+(``SHA256SUMS`` itself hashes to ``01f6175b708d6a73…``) — ``DESIGN.md`` (written at ``7fc3f91`` before any production
+change, its digest and the tip in ``provenance/design_tip.txt``),
+``PREDICTIONS.md`` (the seven scored, one refuted as expected), ``CLOSEOUT.md``,
+the re-measured ablation with its five columns and its summary, the accumulation
+census over 29,380 compilations, the cross-strategy correctness run and the
+sharded whole-domain differential with its merge, the four-column emission
+comparison built from two runs of the emission harness, the frontier pair with
+both comparators, release neutrality, the repo's own static gate at both commits,
+the two built extensions' shape comparison, the protected-file check both ways,
+and the partitioned suite per side with its node-set comparison.  Every harness
+takes a tree root as ``$1`` and an expected commit, and the suppression in the
+ablation's third column is now a production request rather than a probe — the
+probe is kept only to prove the two emit the same program.

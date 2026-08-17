@@ -33510,3 +33510,84 @@ always prints "0 of 18 outside the floor" after the real report.
 6. **The chunk-merge kernel grid is two configurations wide**; the harness has a
    `full` grid that wants a quiet machine.
 7. **mkt1 is still owed**, since §59.
+
+# Slice: the accumulation structure made a scheduling decision (2026-08-16)
+
+Review §68 is the full record. Starting tip `7fc3f91`, final tip `5f28a63`, three
+commits, nothing pushed. Evidence: `~/.cache/scorch-codex/workspace-decision/`.
+
+**1. WHAT LANDED.** Which structure a sparse reduction accumulates through is now
+recorded on the plan, the program and the public schedule, and the two places that
+used to substitute one read the decision instead of imposing it. One new module,
+`sparse_accumulator.py`, holds the vocabulary once: two tokens, `coordinate_list`
+(what every family declares — `coo_workspace_1d` at a rank-1 key,
+`coo_workspace<T,K>` above) and `linked_list` (Gustavson's chain, what the
+two-phase transform substitutes). Legality is one predicate, `single_coordinate_key`,
+and cost is nowhere in the module — a test tokenizes the source and requires the
+code to mention no extent, density, thread count or measurement.
+
+**2. POOLING IS NOT A SECOND AXIS, and the reasoning is in §68.2.** The chained
+structure's constructor allocates and fills arrays of the receiver's compressed
+extent, so it must be hoisted out of the assembly loop and therefore, under a
+region, be one per worker: pooling is entailed by the structure, not chosen beside
+it. Of the four cells a {structure} x {pooled} product would admit, two have
+producers, a pooled coordinate list is §66.9's named-but-unbuilt fix, and a
+per-iteration chained accumulator has none. Enumeration, not product — §60.2's
+ruling on the same shape. The dense accumulator is a different LoopIR node kind and
+a different legacy lowering, so it is not in this set.
+
+**3. `None` STILL MEANS SUBSTITUTE, and that is deliberate and awkward.** The
+transform runs on the pipeline that SHIPS — `cin_lowerer.py:4064` builds its
+configuration, `llir_pass_manager.py:1263` runs it, and an existing suite case
+asserts the pooled shape in a legacy `ds x ds -> ds` emission. So "no decision" has
+to keep meaning "do exactly what you do today" or a shipped byte moves. The layer
+violation survives as the default until a selector replaces it; what changed is
+that a caller can now override it and a selector can now replace it.
+
+**4. THE CONFOUND IS OUT OF THE COMPARISON, and the proof is bytes rather than a
+ratio.** Re-running §67's ablation with the decision carried: the two columns of a
+strategy comparison use the same accumulation structure on **80 of 80**
+configurations, where before they did on 16 — the control cell only. The swap
+itself still costs 0.865x-1.571x (§67: 0.872x-1.574x) and the production column
+reproduces §67's monkeypatched probe **character for character** on all 80 and over
+the whole 1,130-cell census. §67.5's free result holds: with the coordinate list
+kept, storage is bit-identical to `single_pass_serial` on all 80.
+
+**5. ONE THING THE GRID SAYS THAT §67's FRAMING DOES NOT.** The swap changes WHICH
+strategy looks faster on **0 of 64** configurations — every one keeps its sign. It
+changes by how much: median 10.3%, worst 57.1%. §67.3's case was made on magnitude
+and is exactly right; a reading of it as "a selector would pick the wrong strategy"
+is not supported by this grid. A cost model is fitted on magnitudes, which is why
+the layering still had to come first.
+
+**6. THE SEAL SCRIPT HAS AN OWNER**, at `statics/seal_ledger.sh`, with
+`statics/seal_ledger_selftest.sh` beside it — the §62.6 fix for the §62.9/63.8/66.9/67.10
+class. Past ledgers' copies are deliberately not overwritten.
+
+**7. HARNESS NOTES FOR THE NEXT SESSION.** (a) §67's `run_proofs.sh` passes
+`run_frontier.sh` where the wrapper wants `frontier_ext2.py`; its log carries the
+`SyntaxError` twice and its frontier receipts came from a separate invocation.
+Fixed in this ledger's copy. (b) Running the eight suite partitions as eight
+parallel invocations makes each one's own totals block refuse to print, seven of
+eight, on a CLEAN run; read the per-partition exit codes, and this ledger's runner
+computes the totals once over all eight. (c) `Schedule(assembly=...)` is silently
+DROPPED on the legacy route — all four strategies emit the identical
+7,113-character kernel through `CINLowerer` — which is the assembly field's hole,
+not this one's.
+
+## What the next session should do
+
+1. **The four-strategy runtime grid**, on two hosts, with the accumulation
+   structure held fixed by an explicit `Schedule(accumulator=...)` on every column.
+   That is now expressible and byte-verified; it was not before.
+2. **Then `default_assembly()` and `default_accumulator()`** — the two seams a
+   selector replaces, in that order, and only on the grid's numbers.
+3. **`_ParallelSparseWorkspaceLowering`'s completion mirror** still hard-codes the
+   pooled shape, which is why that family lists only `linked_list`. Parameterizing
+   it is what would let the coordinate list be measured there too.
+4. **The other completion mirror** is still what stands between `two_pass_serial`
+   and 46 of 48.
+5. **Rule 4's obstacles B and E** are the remaining 2 cell-arms.
+6. **The chunk-merge kernel grid is two configurations wide**; the harness has a
+   `full` grid that wants a quiet machine.
+7. **mkt1 is still owed**, since §59.
