@@ -146,9 +146,17 @@ def test_model_absent_falls_back_to_analytic(monkeypatch):
     out = scorch.matmul(A_st, B_st)
     out = out if isinstance(out, torch.Tensor) else out.to_torch()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
-    # analytic gate: eligible scattered shape -> tiled (same as analytic level)
+    # analytic gate: eligible scattered shape -> the analytic COST MODEL picks tiled,
+    # then the one-shot v2-confirm has the last word. On this tiny synthetic shape v2
+    # wins, so assert the model's pick separately from the confirm's verdict rather
+    # than asserting a route the confirm is entitled to overrule.
     kinds = {v[0] for v in T._decision.values()}
-    assert kinds <= {"tilej", "tileijk"}
+    assert kinds <= {"tilej", "tileijk", "v2"}
+    T._decision.clear()
+    monkeypatch.setattr(T, "_CONFIRM_TILED", False)
+    scorch.matmul(A_st, B_st)
+    unconfirmed = {v[0] for v in T._decision.values()}
+    assert unconfirmed and unconfirmed <= {"tilej", "tileijk"}, T._decision
 
 
 def test_foreign_machine_model_rejected(tmp_path, monkeypatch):
@@ -205,7 +213,10 @@ def test_v2_floor_keeps_v2_when_no_predicted_advantage(tmp_path, monkeypatch):
 
 
 def test_learned_routes_tilej_when_model_predicts_it(tmp_path, monkeypatch):
+    """The model's ARGMIN must be tile-j. Measured separately from the confirm, which
+    is entitled to overrule it — and does here, since these shapes are tiny."""
     _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
+    monkeypatch.setattr(T, "_CONFIRM_TILED", False)
     T._llc_bytes = 131072
     A_st, B_st, ref = _make_eligible()
     scorch.set_autotune("learned")
@@ -214,6 +225,27 @@ def test_learned_routes_tilej_when_model_predicts_it(tmp_path, monkeypatch):
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
     kinds = {v[0] for v in T._decision.values()}
     assert kinds == {"tilej"}, T._decision
+
+
+def test_learned_confirms_inside_the_analytic_gate(tmp_path, monkeypatch):
+    """The confirm must fire even for a pick the ANALYTIC gate would also have made.
+
+    Restricting it to the widened-only region left a hole exactly where the model was
+    confident and wrong: inline_1 at N=512 is eligible and scattered, so no confirm ran
+    and the model's tile-ijk pick shipped at 0.385x of untiled. Over a 236-cell grid
+    that hole was 3 of learned's 4 regressions. Here the shape passes the ordinary
+    gate, the model insists on tile-j, and the confirm must still overrule it to v2."""
+    _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
+    T._llc_bytes = 131072
+    A_st, B_st, _ = _make_eligible()
+    assert T._eligible(int(A_st.shape[1]),
+                       int(A_st.storage._mode_indices[1][1].numel()),
+                       int(B_st.shape[1]), T.query_llc())
+    assert T._scattered(A_st, int(A_st.shape[1]))
+    T._decision.clear()
+    scorch.set_autotune("learned")
+    scorch.matmul(A_st, B_st)
+    assert {v[0] for v in T._decision.values()} == {"v2"}, T._decision
 
 
 # --------------------------------------------------------------------------- #

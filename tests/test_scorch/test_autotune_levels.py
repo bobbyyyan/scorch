@@ -473,16 +473,42 @@ def test_all_levels_bit_correct_on_eligible_shape():
         assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3), f"level={lvl}"
 
 
-def test_analytic_routes_tiled_and_off_routes_none():
+def test_analytic_cost_model_picks_tiled(monkeypatch):
+    """With the confirm disabled, analytic's COST MODEL must still choose a tiled
+    kernel for an eligible scattered shape. Kept separate from the confirm so a change
+    to either is attributable: this pins the model, the test below pins the confirm."""
+    monkeypatch.setattr(T, "_CONFIRM_TILED", False)
     T._llc_bytes = 131072
     A_st, B_st, _ = _make_eligible()
-
-    # analytic tiles an eligible scattered shape (no probe).
     T._decision.clear()
     scorch.set_autotune("analytic")
     scorch.matmul(A_st, B_st)
     kinds = {v[0] for v in T._decision.values()}
     assert kinds and kinds <= {"tilej", "tileijk"}, T._decision
+
+
+def test_analytic_confirms_its_pick_against_v2():
+    """analytic must MEASURE its cost-model pick against v2 once and keep the faster.
+
+    On these tiny synthetic shapes v2 wins, so the recorded decision is "v2" — which is
+    the whole point of the confirm. Before it existed, analytic committed to the model's
+    pick unmeasured and shipped tiled-route regressions up to 0.373x of untiled on a
+    236-cell grid. Asserting only "a decision was recorded" would pass even with the
+    confirm removed, so this asserts the confirm's OUTCOME differs from the unconfirmed
+    cost-model pick on a shape where tiling loses."""
+    T._llc_bytes = 131072
+    A_st, B_st, _ = _make_eligible()
+
+    T._decision.clear()
+    scorch.set_autotune("analytic")
+    scorch.matmul(A_st, B_st)
+    confirmed = {v[0] for v in T._decision.values()}
+    assert confirmed == {"v2"}, T._decision
+
+
+def test_off_routes_none():
+    T._llc_bytes = 131072
+    A_st, B_st, _ = _make_eligible()
 
     # off never even records a decision (short-circuits to pure v2).
     T._decision.clear()

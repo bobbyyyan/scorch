@@ -195,7 +195,7 @@ def main():
         A = torch.sparse_csr_tensor(
             torch.from_numpy(csr.indptr.astype(it)),
             torch.from_numpy(csr.indices.astype(it)),
-            torch.from_numpy(csr.data.astype(np.float32)),
+            torch.from_numpy(csr.data.astype(npdt)),
             size=csr.shape,
         )
 

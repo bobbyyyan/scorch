@@ -45,7 +45,7 @@ decision made for an *already-eligible* shape changes.
 | Level | Behavior |
 |-------|----------|
 | `off` | No tiling. Short-circuits to the pure `v2` baseline — the cheapest possible path. |
-| `analytic` | **Default.** A measurement-free cost-model pick (tile-j at base width, or tile-ijk at wide N). No probe, no kernel timing at dispatch. |
+| `analytic` | **Default.** A cost-model pick (tile-j at base width, or tile-ijk at wide N), then **one confirming measurement against `v2`** before the pick is memoized — 6 kernel invocations, against `balanced`'s 18. No width search. |
 | `balanced` | First-call **micro-probe** over `{v2, tile-j@{base,/2,/4,/8}, tile-ijk}`, memoized in-process. `v2` is always a candidate, so it is never slower than `v2`. |
 | `max` | `balanced` probe **plus a persistent on-disk cache** (per machine), so the search is paid once ever, amortized across processes and runs. |
 | `learned` | **Experimental.** An offline-trained gradient-boosted-tree cost model predicts each candidate's runtime in O(1). **Falls back to `analytic`** when no per-machine model file is installed. |
@@ -53,20 +53,30 @@ decision made for an *already-eligible* shape changes.
 A few distinctions worth internalizing:
 
 `analytic` vs `learned`
-: Both are *measurement-free* — neither times a kernel at dispatch. `analytic`
-  uses a hand-written DRAM-byte cost model; `learned` uses a trained model over
-  the same candidate set. `learned` silently degrades to `analytic` unless a
-  model has been trained and installed for your machine.
+: Both pick a candidate from a cost model rather than searching, then confirm that
+  one pick against `v2`. `analytic` uses a hand-written DRAM-byte model; `learned`
+  uses a trained model over the same candidate set. `learned` silently degrades to
+  `analytic` unless a model has been trained and installed for your machine.
+
+  Neither used to confirm, and that was a real defect rather than a design
+  trade-off: over a 236-cell grid on redwood, `analytic` shipped six tiled-route
+  regressions — worst 0.373x of untiled on `audikw_1` at N=128, against a 1.9%
+  noise floor — and `learned` four, while `balanced` (same gate, but it times
+  `v2`) had none. The gate cannot be tightened out of it with the features
+  available: the span proxy reads 0.823 on a matrix that loses (`crankseg_1`) and
+  0.823 on one that wins (`mouse_gene`).
 
 `balanced` vs `max`
 : Same first-call probe. `max` adds a persistent JSON cache so the probe cost is
   amortized across process restarts, not just within one process.
 
 The `v2` floor
-: In `balanced`/`max`, `v2` is a *timed* candidate; in `learned`, the model must
-  predict a tiled kernel beats `v2` by a margin. This floor is what makes the
-  whole ladder no-regression even when the cheap analytic pre-filter is
-  imprecise.
+: In `balanced`/`max`, `v2` is a *timed* candidate. In `analytic`/`learned` the
+  cost model must first predict that a tiled kernel wins, and then that single
+  pick is *timed* against `v2` once per shape and discarded if it loses. Either
+  way the route that gets memoized has been measured to be no slower than not
+  tiling, so the whole ladder is no-regression by construction rather than by the
+  cheap pre-filter happening to be right.
 
 :::{warning}
 `learned` is Phase 2 and only partially landed. Treat it as experimental: without
@@ -165,7 +175,7 @@ the legacy `SCORCH_TILING*` vars map on; else the built-in default `analytic`.
 | `SCORCH_TILING_DEG_FLOOR` / `_NIJK_MIN` / `_LOC_MIN` | Gate knobs (defaults 64 / 512 / 0.3). |
 | `SCORCH_AUTOTUNE_MODEL=<path>` / `=0` | Learned model path override / disable. |
 | `SCORCH_AUTOTUNE_WIDEN=0` | Learned: revert to the analytic gate (default is widened). |
-| `SCORCH_AUTOTUNE_CONFIRM=1` | Learned: always one-shot `v2`-confirm a tiled pick. |
+| `SCORCH_AUTOTUNE_CONFIRM=0` | Skip the one-shot `v2`-confirm that `analytic` and `learned` now always perform. For A/B measurement only — it restores a configuration that is known to regress up to 2.68x. |
 | `SCORCH_AUTOTUNE_MARGIN` | Learned `v2`-floor margin (default `0.03`). |
 
 Set a level for a whole run without touching code:

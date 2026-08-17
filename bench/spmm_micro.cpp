@@ -581,6 +581,84 @@ MK(v_ilp8d16,8, 16, 3, true)
 MK64(v_base64, 2, 2, 1, false)
 MK64(v_nm_d16_64, 2, 16, 3, true)
 
+// --------------------------------------------------------------------------- //
+// TWO-ROW BLOCKED whole-SpMM driver. Same work-stealing skeleton; rows are consumed
+// in pairs inside a stolen chunk, with a single-row tail when the chunk is odd.
+//
+// Two effects are in play and they need separating in the results. On matrices whose
+// consecutive rows share columns (structural/FEM: adjacent-row overlap 0.81-0.89) a
+// shared column costs one B-row load instead of two. On SHORT-row matrices (graphs at
+// degree 6-16) the win is different and does not need any overlap at all: the per-row
+// prologue and the output store are amortised over two rows.
+// --------------------------------------------------------------------------- //
+template <int PFD, int PFH, bool NOMASK>
+static void spmm_2r(const CSR &a, const float *RESTRICT B, int N, float *RESTRICT C,
+                    int nthreads, int chunk) {
+  const int nvec = (N + 7) / 8;
+  const int ml = N - 8 * (nvec - 1);
+  const __m256i mask = lane_mask(ml);
+  const bool full = NOMASK && (N % 8 == 0);
+  std::atomic<int> next_row{0};
+  const int M = (int)a.M;
+  const int *RESTRICT pos = a.pos.data();
+  const int *RESTRICT crd = a.crd.data();
+  const float *RESTRICT val = a.val.data();
+
+#pragma omp parallel num_threads(nthreads)
+  {
+    while (true) {
+      const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
+      if (start >= M) break;
+      const int end = std::min(start + chunk, M);
+      int i = start;
+      for (; i + 1 < end; i += 2) {
+        const int p0 = pos[i], p1 = pos[i + 1], q1 = pos[i + 2];
+        float *RESTRICT C0 = C + (size_t)i * (size_t)N;
+        float *RESTRICT C1 = C0 + (size_t)N;
+        if (N > 32) {
+          row_wide_2r<PFD, PFH>(crd, val, B, N, C0, C1, p0, p1, p1, q1);
+          continue;
+        }
+        switch (nvec) {
+#define CASE2R(NV)                                                                    \
+  case NV:                                                                            \
+    if (full)                                                                         \
+      row_narrow_2r<NV, PFD, PFH, true>(crd, val, B, N, C0, C1, p0, p1, p1, q1, mask); \
+    else                                                                              \
+      row_narrow_2r<NV, PFD, PFH, false>(crd, val, B, N, C0, C1, p0, p1, p1, q1, mask);\
+    break;
+          CASE2R(1) CASE2R(2) CASE2R(3) CASE2R(4)
+#undef CASE2R
+          default: break;
+        }
+      }
+      for (; i < end; i++) {  // odd tail row in this chunk
+        const int p0 = pos[i], p1 = pos[i + 1];
+        float *RESTRICT Ci = C + (size_t)i * (size_t)N;
+        if (p0 == p1) { memset(Ci, 0, sizeof(float) * N); continue; }
+        if (N > 32) { row_wide<2, PFD, PFH>(crd, val, B, N, Ci, p0, p1); continue; }
+        switch (nvec) {
+#define CASE1R(NV)                                                                   \
+  case NV:                                                                           \
+    if (full) row_narrow<NV, 2, PFD, PFH, true>(crd, val, B, N, Ci, p0, p1, mask);   \
+    else row_narrow<NV, 2, PFD, PFH, false>(crd, val, B, N, Ci, p0, p1, mask);       \
+    break;
+          CASE1R(1) CASE1R(2) CASE1R(3) CASE1R(4)
+#undef CASE1R
+          default: break;
+        }
+      }
+    }
+  }
+}
+
+#define MK2R(NAME, PFD, PFH, NOMASK)                                              \
+  static void NAME(const CSR &a, const float *B, int N, float *C, int nt, int ch) { \
+    spmm_2r<PFD, PFH, NOMASK>(a, B, N, C, nt, ch);                                \
+  }
+MK2R(v_r2, 2, 1, false)
+MK2R(v_r2_d16, 16, 3, true)
+
 static Variant VARIANTS[] = {
     {"base", v_base},       {"aa", v_aa},           {"nopf", v_nopf},
     {"pfT0", v_pfT0},       {"pfT1", v_pfT1},       {"d8T0", v_d8T0},
@@ -589,6 +667,7 @@ static Variant VARIANTS[] = {
     {"nm_d16", v_nm_d16},   {"ilp1", v_ilp1},       {"ilp4", v_ilp4},
     {"ilp4d16", v_ilp4d16}, {"ilp8d16", v_ilp8d16},
     {"base64", v_base64},   {"nm_d16_64", v_nm_d16_64},
+    {"r2", v_r2},           {"r2_d16", v_r2_d16},
 };
 
 // --------------------------------------------------------------------------- //

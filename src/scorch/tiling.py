@@ -39,9 +39,12 @@ Autotune levels (the user-facing knob; see autotune-levels/00-design.md):
   execution speed. The GATE (below) is preserved and byte-neutral at EVERY level;
   only the decision made for an already-eligible shape changes.
     off       no tiling — is_candidate short-circuits to False (pure v2).
-    analytic  (DEFAULT) cost-model pick (tile-j@base / tile-ijk@wide-N), NO probe.
-              Still TILES eligible graphs -> reddit-class keeps ~97% of the win
-              with zero probe stall.
+    analytic  (DEFAULT) cost-model pick (tile-j@base / tile-ijk@wide-N), then ONE
+              v2-confirm before the pick is memoized: 6 kernel invocations against
+              balanced's 18. It used to commit unmeasured, which shipped six
+              tiled-route regressions over a 236-cell grid (worst 0.373x of untiled);
+              balanced, same gate but timing v2, had none. Still TILES eligible
+              graphs -> reddit-class keeps the win.
     balanced  first-call micro-probe over {v2, tile-j@{base,/2,/4,/8}, tile-ijk};
               memoized. v2 always a candidate -> never slower than v2.
     max       balanced probe + a PERSISTENT on-disk cache (per-machine) so the
@@ -58,6 +61,8 @@ Env (the Python API is primary; env is for override/CI):
   SCORCH_TILING_PROBE=0    legacy: maps to "analytic"; =1 maps to "balanced".
   SCORCH_LLC_BYTES=<n>     override the queried last-level cache size (gate knob).
   SCORCH_TILING_DEG_FLOOR / _NIJK_MIN / _LOC_MIN  gate knobs, unchanged at all levels.
+  SCORCH_AUTOTUNE_CONFIRM=0  skip the one-shot v2-confirm (restores the pre-2026-08
+                             unmeasured analytic/learned behaviour; for A/B only).
 """
 
 from __future__ import annotations
@@ -128,8 +133,11 @@ def _current_level() -> str:
 
 
 def _level_probes(level: str) -> bool:
-    """balanced/max measure candidates; analytic (and learned, until Phase 2's
-    model exists) pick analytically with no kernel measurement."""
+    """Does this level SEARCH the candidate ladder?
+
+    balanced/max time every candidate; analytic and learned pick one from a cost
+    model. Both kinds then measure the pick against v2 once (see maybe_dispatch), so
+    this is about search breadth, not about whether any kernel is timed."""
     return level in ("balanced", "max")
 
 
@@ -149,7 +157,8 @@ def set_autotune(level: str) -> None:
     level; only the decision made for an already-eligible shape changes:
 
     - ``"off"`` — no tiling; the pure default-kernel baseline.
-    - ``"analytic"`` — **default.** Cost-model pick, no kernel measurement.
+    - ``"analytic"`` — **default.** Cost-model pick, confirmed against the default
+      kernel once per shape, so it can never be slower than not tiling.
     - ``"balanced"`` — first-call micro-probe over the candidate kernels,
       memoized in-process; the default kernel is always a candidate, so the
       pick is never slower than the baseline.
@@ -960,6 +969,13 @@ _FEATURES = (
 )
 
 _LEARNED_MARGIN = float(os.environ.get("SCORCH_AUTOTUNE_MARGIN", "0.03"))
+# Confirming a tiled pick against v2 is now unconditional at every non-probing level
+# (see maybe_dispatch), so this is the ESCAPE HATCH rather than the opt-in it used to
+# be: SCORCH_AUTOTUNE_CONFIRM=0 restores the old unmeasured behaviour, which is what
+# the confirm's one-time cost is measured against.
+_CONFIRM_TILED = os.environ.get("SCORCH_AUTOTUNE_CONFIRM", "1") != "0"
+# Retained so existing callers and tests that force confirming on keep working; it no
+# longer changes behaviour, because confirming is the default.
 _LEARNED_CONFIRM = os.environ.get("SCORCH_AUTOTUNE_CONFIRM", "0") == "1"
 _CV_NSAMP = int(os.environ.get("SCORCH_TILING_CV_NSAMP", "4096"))
 # Gate policy for learned. DEFAULT = WIDEN (operand>C only, relax degree+locality).
@@ -968,10 +984,13 @@ _CV_NSAMP = int(os.environ.get("SCORCH_TILING_CV_NSAMP", "4096"))
 # DEG_FLOOR=64 EXCLUDES mid-degree scattered matrices (deg 16-64) where tiling genuinely
 # wins (scatter_deg50: tile-j 1.7x over v2). Widening catches those analytic
 # false-negatives; a tiled pick in the widened-only region (operand>C but analytic gate
-# rejects) is mandatorily CONFIRMED vs v2 (keep the faster) -> provably no-regression
-# there, while the analytic-eligible region trusts the model + v2-floor (measurement-free,
-# like the analytic level itself). Result: 0.972 (M5) / 0.977 (redwood) of oracle vs
-# analytic 0.876/0.879. SCORCH_AUTOTUNE_WIDEN=0 reverts to the analytic gate.
+# rejects) is CONFIRMED vs v2 (keep the faster) -> provably no-regression there.
+# The analytic-eligible region used to be exempt from that confirm, on the theory that
+# the model plus its v2 floor was reliable inside the gate; a 236-cell grid showed it
+# is not (inline_1 at N=512 passes the ordinary gate and the model still shipped
+# 0.385x of untiled), so the confirm is now unconditional. Result: 0.972 (M5) /
+# 0.977 (redwood) of oracle vs analytic 0.876/0.879. SCORCH_AUTOTUNE_WIDEN=0 reverts
+# to the analytic gate.
 _LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"
 
 
@@ -1225,9 +1244,11 @@ def _learned_decide(a, b, M, J, N, nnz, C, model):
 
 
 def _confirm_vs_v2(a, b, result_shape, kind, param, nt, v2_fn, nthreads):
-    """One-shot v2-confirm (opt-in, SCORCH_AUTOTUNE_CONFIRM=1): time {predicted winner,
-    v2} once each, keep the faster. Guarantees no-regression-vs-v2 at ~1/N-th the full
-    probe cost (only 2 candidates, not the whole ladder)."""
+    """One-shot v2-confirm: time {predicted winner, v2} once each, keep the faster.
+
+    Guarantees no-regression-vs-v2 for a level that does not run the full ladder probe,
+    at 6 kernel invocations (2 candidates x 1 warmup + 2 timed) against the probe's 18.
+    Memoized by the caller, so a shape pays this once."""
     if kind == "tilej":
         win = lambda: _ops.spmm_csr_float_tilej(
             *_tilej_args(a, b, result_shape, param, nt)
@@ -1325,16 +1346,16 @@ def maybe_dispatch(
             return _timed_dispatch(pc[0], pc[1])
 
     # "learned" (model present): predict every candidate's runtime in O(1) and argmin
-    # with a v2 floor — measurement-free (the 'analytic cost' promise). The gate was
-    # WIDENED above, so this skips the analytic _scattered pre-exclusion; the model +
-    # v2 floor handle the newly-admitted products/arxiv/FEM/banded shapes (they land
-    # on v2 unless the model predicts a real win). Memoized per (sig, level). Optional
-    # one-shot v2-confirm (SCORCH_AUTOTUNE_CONFIRM=1) measures {winner, v2} once.
+    # with a predicted v2 floor, then confirm that pick against v2 by measurement once.
+    # The gate was WIDENED above, so this skips the analytic _scattered pre-exclusion;
+    # the model plus the confirm handle the newly-admitted products/arxiv/FEM/banded
+    # shapes (they land on v2 unless a tiled kernel is measured to win). Memoized per
+    # (sig, level). SCORCH_AUTOTUNE_CONFIRM=0 removes the confirm, for A/B only.
     if learned_model is not None:
         # DEFAULT (not widened): apply the analytic locality gate first so banded/FEM/
         # low-degree shapes route to v2 exactly like analytic -> the model only decides
         # in the region where it is reliable (scattered high-degree: reddit/scatter/
-        # power-law -> big wins). No confirm needed for safety here.
+        # power-law -> big wins).
         if not _LEARNED_WIDEN and not _scattered(a, J):
             _decision[memo_key] = ("v2", None)
             return None
@@ -1344,8 +1365,14 @@ def maybe_dispatch(
         # (guaranteed no-regression; memoized). Data-driven: without this, redwood FEM
         # regressed to 0.72 of oracle. SCORCH_AUTOTUNE_CONFIRM=1 forces confirm always.
         if kind != "v2":
-            analytic_ok = _eligible(J, nnz, N, C) and _scattered(a, J)
-            if _LEARNED_CONFIRM or (_LEARNED_WIDEN and not analytic_ok):
+            # Confirm EVERY tiled pick, not just the ones in the widened-only region.
+            # Restricting the confirm to picks the analytic gate would have rejected
+            # left a hole exactly where the model is most confident and still wrong:
+            # inline_1 at N=512 passes the ordinary gate (eligible and scattered), so
+            # no confirm ran, and the model's tile-ijk pick shipped at 0.385x of
+            # untiled — the same cell and the same mistake analytic made. Measured over
+            # 236 cells, this hole accounted for 3 of learned's 4 regressions.
+            if _CONFIRM_TILED:
                 kind, param = _confirm_vs_v2(
                     a, b, result_shape, kind, param, nt, v2_fn, nthreads
                 )
@@ -1371,14 +1398,36 @@ def maybe_dispatch(
             ijk = (Nc, Jc_ijk)
 
     if not _level_probes(level):
-        # analytic (and learned, until Phase 2's model lands): eligibility implies
-        # tile-j > v2, so pick tile-j@base — or tile-ijk if the byte model (relayout
-        # included) says it is cheaper. No kernel measurement.
+        # analytic: the byte model picks tile-j@base, or tile-ijk when it says the
+        # relayout pays for itself.
         if ijk is not None and _ijk_beats_tilej_bytes(N, M, J, nnz, Jc, ijk[0], C):
-            _decision[memo_key] = ("tileijk", ijk)
+            kind, param = "tileijk", ijk
         else:
-            _decision[memo_key] = ("tilej", Jc)
-        return _timed_dispatch(_decision[memo_key][0], _decision[memo_key][1])
+            kind, param = "tilej", Jc
+        # ...and then that pick is CONFIRMED against v2, once, before being memoized.
+        #
+        # The premise this level used to rest on — "passing the gate implies tile-j
+        # beats v2, so nothing needs timing" — is false, and measurably so. Over a
+        # 236-cell grid on redwood, analytic shipped six tiled-route regressions, the
+        # worst a 2.68x slowdown (audikw_1 at N=128, 0.373x of untiled, against a 1.9%
+        # noise floor), while `balanced` — same gate, but it times v2 — had none. The
+        # gate cannot be tightened out of this with the features on hand: span proxy
+        # 0.823 both loses (crankseg_1) and wins (mouse_gene), and degree ~200 likewise
+        # (crankseg_1 loses, scatter200 wins).
+        #
+        # So the default level now measures, once per shape, and only two candidates:
+        # six kernel invocations against the eighteen a full ladder probe costs. That
+        # makes every non-off level no-regression-vs-v2 by construction rather than by
+        # the gate happening to be right. What still separates analytic from balanced
+        # is the search: analytic checks one width, balanced searches the ladder.
+        if _CONFIRM_TILED:
+            kind, param = _confirm_vs_v2(
+                a, b, result_shape, kind, param, nt, v2_fn, nthreads
+            )
+        _decision[memo_key] = (kind, param)
+        if kind == "v2":
+            return None
+        return _timed_dispatch(kind, param)
 
     # balanced/max first-call micro-probe: time every candidate, keep the fastest's
     # result. v2 is always a candidate -> the winner is never slower than v2. The
