@@ -128,9 +128,13 @@ def resolve_prebuilt_matmul(
     of_key = tuple(output_format) if isinstance(output_format, list) else output_format
     if of_key is not None and not isinstance(of_key, (str, tuple)):
         of_key = str(of_key)
+    # Keyed on str(format) rather than the TensorFormat object: str is memoized on the
+    # format now, so reading it is an attribute lookup, and CPython caches a string's
+    # hash -- whereas hashing the format itself recurses through its tuple of
+    # LevelFormat on every lookup, which measured no better than rebuilding the string.
     cache_key = (
         a.dim(), b.dim(), str(a.format), str(b.format),
-        of_key, a.values.dtype, b.values.dtype,
+        of_key, a._raw_values.dtype, b._raw_values.dtype,
     )
     cached = _resolve_matmul_cache.get(cache_key, _RESOLVE_MISS)
     if cached is not _RESOLVE_MISS:
@@ -250,23 +254,31 @@ def execute_prebuilt_binary_kernel(
         raise ValueError(f"Unsupported RHS rank for prebuilt matmul kernel: {b.dim()}")
 
     args = [result_shape]
-    for tensor in [a, b]:
+    for tensor in (a, b):
         args.append(tensor.shape)  # type: ignore[arg-type]
         args.append(tensor._native_mode_indices())  # type: ignore[arg-type]
-        args.append(tensor.values)  # type: ignore[arg-type]
+        args.append(tensor._raw_values)  # type: ignore[arg-type]
 
-    start_time = time.time()
     # nthreads/atparallel are only supplied for the drop-in SpMM (spmm_csr_float_v2,
     # the only kernel accepting nthreads_override/atparallel); the caller gates on
     # symbol_name. atparallel launches the SpMM on torch's intra-op pool so it
     # shares one warm team with the pipeline's torch epilogue.
+    #
+    # The clock is read only when someone asked for the timing. Two time.time() calls
+    # per matmul are not free next to a kernel that can finish in a couple of
+    # microseconds, and every caller that does not pass time_dict was paying them.
+    if time_dict is None:
+        if nthreads is not None:
+            return (
+                kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel),
+                result_shape,
+            )
+        return kernel_fn(*args), result_shape
+
+    start_time = time.time()
     if nthreads is not None:
         result_cpp = kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel)
     else:
         result_cpp = kernel_fn(*args)
-    end_time = time.time()
-
-    if time_dict is not None:
-        time_dict["eval_time"] = end_time - start_time
-
+    time_dict["eval_time"] = time.time() - start_time
     return result_cpp, result_shape

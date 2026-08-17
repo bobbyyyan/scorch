@@ -3,14 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import json
+
+# Mapping/Sequence come from collections.abc, not typing: these are used for
+# runtime isinstance checks on a per-call path, and typing's generic aliases
+# route isinstance through __subclasscheck__ at 153 ns against 73 ns for the
+# abc. `from __future__ import annotations` above means the annotations that
+# also use these names are never evaluated at runtime.
+from collections.abc import Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     List,
-    Mapping,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -334,17 +339,31 @@ class TensorFormat:
             ``True`` only when all modes are ``DENSE`` (an empty format is
             vacuously dense).
         """
-        return all(
-            [
+        # Derived once and stashed: a TensorFormat is immutable, and the op layer asks
+        # this three times per matmul. Written through object.__setattr__ because the
+        # dataclass is frozen; the field is not declared, so it takes no part in
+        # __eq__ or __hash__.
+        cached = self.__dict__.get("_is_dense")
+        if cached is None:
+            cached = all(
                 level_format.get_level_type() == LevelType.DENSE
                 for level_format in self._level_formats
-            ]
-        )
+            )
+            object.__setattr__(self, "_is_dense", cached)
+        return cached
 
     def __str__(self):
-        # return "TensorFormat({})".format(self._level_formats)
-        # return str(self._level_formats)
-        return ",".join([str(level_format) for level_format in self._level_formats])
+        # Memoized for the same reason as is_dense: immutable object, and this is on a
+        # per-call path (kernel resolution keys on it). A cached str is also cheaper to
+        # hash than the underlying tuple of LevelFormat, since CPython caches string
+        # hashes and hashing the tuple recurses through every level.
+        cached = self.__dict__.get("_str")
+        if cached is None:
+            cached = ",".join(
+                [str(level_format) for level_format in self._level_formats]
+            )
+            object.__setattr__(self, "_str", cached)
+        return cached
 
     def __repr__(self):
         return f"TensorFormat({str(self)!r})"
@@ -440,6 +459,28 @@ def _normalize_level_formats(
     return tuple(result)
 
 
+# parse_format is a pure function and TensorFormat is a frozen value object, so equal
+# inputs can share one instance instead of building a new one. `matmul` alone parses a
+# format three times per call, always on the same constant strings. Bounded because
+# nothing stops a caller generating format strings in a loop; the real key space is a
+# handful of layouts.
+_PARSE_CACHE: dict = {}
+_PARSE_CACHE_MAX = 512
+
+
 def parse_format(fmt: FormatInput) -> TensorFormat:
     """Canonical parser used by every public format-taking API."""
-    return fmt if isinstance(fmt, TensorFormat) else TensorFormat(fmt)
+    if isinstance(fmt, TensorFormat):
+        return fmt
+    # A list of aliases is a legal input and is not hashable; tuple it for the key.
+    key = tuple(fmt) if isinstance(fmt, list) else fmt
+    try:
+        cached = _PARSE_CACHE.get(key)
+    except TypeError:  # unhashable even as a key: parse it and do not cache
+        return TensorFormat(fmt)
+    if cached is not None:
+        return cached
+    parsed = TensorFormat(fmt)
+    if len(_PARSE_CACHE) < _PARSE_CACHE_MAX:
+        _PARSE_CACHE[key] = parsed
+    return parsed

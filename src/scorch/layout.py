@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 import math
-from typing import Any, Mapping, Optional, Sequence, Tuple, Union
+
+# Mapping/Sequence come from collections.abc, not typing: these are used for
+# runtime isinstance checks on a per-call path, and typing's generic aliases
+# route isinstance through __subclasscheck__ at 153 ns against 73 ns for the
+# abc. `from __future__ import annotations` above means the annotations that
+# also use these names are never evaluated at runtime.
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -101,6 +108,13 @@ def _parse_dtype(value: Union[str, torch.dtype], field: str) -> torch.dtype:
     raise TensorTypeError(f"{field} must be a torch.dtype, got {value!r}")
 
 
+# Shared TensorLayout instances, keyed by the arguments that produced them. Bounded so
+# a caller cycling through shapes cannot grow it without limit; the real key space for a
+# given model is a handful of (shape, format) pairs.
+_LAYOUT_CACHE: dict = {}
+_LAYOUT_CACHE_MAX = 4096
+
+
 @dataclass(frozen=True)
 class TensorLayout:
     """Canonical mapping between logical modes and their physical storage."""
@@ -163,14 +177,40 @@ class TensorLayout:
         permutation: Optional[Sequence[int]] = None,
         index_dtype: torch.dtype = torch.int32,
     ) -> "TensorLayout":
+        # Every STensor construction lands here, and a TensorLayout is a frozen value
+        # object that is never mutated after __post_init__ (the only object.__setattr__
+        # calls on one are inside it), so equal arguments can share one instance. On a
+        # small SpMM the normalize-and-validate work below is ~11% of the whole call,
+        # repeated identically on every iteration of a training loop.
+        #
+        # A key build that raises is not an error: an argument too malformed to hash is
+        # left to the normal path below, which reports it with the right exception type.
+        key = None
+        try:
+            key = (
+                tuple(physical_shape),
+                tensor_format,
+                None if permutation is None else tuple(permutation),
+                index_dtype,
+            )
+            cached = _LAYOUT_CACHE.get(key)
+        except TypeError:
+            key = None
+            cached = None
+        if cached is not None:
+            return cached
+
         physical = _normalize_shape(physical_shape, "physical_shape")
         order = _normalize_permutation(permutation, len(physical))
         logical = [0] * len(physical)
         for physical_mode, logical_mode in enumerate(order):
             logical[logical_mode] = physical[physical_mode]
-        return cls(
+        layout = cls(
             tuple(logical), physical, parse_format(tensor_format), order, index_dtype
         )
+        if key is not None and len(_LAYOUT_CACHE) < _LAYOUT_CACHE_MAX:
+            _LAYOUT_CACHE[key] = layout
+        return layout
 
     @property
     def rank(self) -> int:

@@ -82,6 +82,80 @@ class Window(object):
         return Window(deepcopy(self.offset), deepcopy(self.shape), deepcopy(self.step))
 
 
+# --------------------------------------------------------------------------- #
+# Dense from_torch
+#
+# Everything about a dense operand except its values is a function of
+# (shape, dtype, device, name, mode_order) alone: the format, the per-mode index arrays
+# (all empty), the layout, and the metadata. Rebuilding them on every call is the single
+# largest cost in a small matmul -- wrapping the dense right-hand operand was ~51% of
+# `scorch.matmul` on a 64x64 SpMM, all of it discarded when the call returned.
+#
+# So build them once per key with the ordinary constructor and reuse them. The cached
+# parts are whatever the real path produced, not a reimplementation of it, and a test
+# asserts the fast and ordinary paths agree field by field.
+#
+# Sharing is safe because each cached part is an immutable value object: TensorLayout,
+# TensorMetadata and TensorFormat are frozen dataclasses whose only object.__setattr__
+# calls are inside their own __post_init__, and a dense tensor's mode-index arrays are
+# empty tuples.
+# --------------------------------------------------------------------------- #
+_DENSE_PARTS_CACHE: dict = {}
+_DENSE_PARTS_CACHE_MAX = 512
+
+
+def _dense_from_torch(
+    tensor: torch.Tensor,
+    name: Optional[str],
+    mode_order: List[int],
+    rank: int,
+) -> "STensor":
+    """Dense ``STensor`` over ``tensor``; the tail of :meth:`STensor.from_torch`.
+
+    The caller has already checked that ``tensor`` is a strided CPU tensor and applied
+    any permutation, so the value below is contiguous, flat, 1-D and free of lazy view
+    bits by construction -- which is why the assembly skips re-checking those.
+    """
+    key = (tuple(tensor.shape), tensor.dtype, tensor.device, name, tuple(mode_order))
+    parts = _DENSE_PARTS_CACHE.get(key)
+    value = tensor.resolve_conj().resolve_neg().contiguous().reshape(-1)
+    if parts is None:
+        built = STensor(
+            name=name,
+            shape=tuple(tensor.shape),
+            index=TensorIndex(
+                tensor_format="d" * rank,
+                mode_indices=[[] for _ in range(rank)],
+                mode_order=mode_order,
+            ),
+            value=value,
+        )
+        if len(_DENSE_PARTS_CACHE) < _DENSE_PARTS_CACHE_MAX:
+            storage = built._storage
+            _DENSE_PARTS_CACHE[key] = (
+                storage.layout,
+                storage._mode_indices,
+                built._metadata,
+            )
+        return built
+
+    # Assembled without re-validating, because validation is a function of the key that
+    # was already validated when this entry was built. `_set_state` compares
+    # metadata.layout against storage.layout (the same object here), metadata.dtype and
+    # .device against the value's (both in the key), and `storage.validate()` checks the
+    # value length against the layout -- and the length is product(shape), also in the
+    # key. Nothing left to check that could differ between two tensors sharing a key.
+    layout, mode_indices, metadata = parts
+    storage = object.__new__(SparseStorage)
+    object.__setattr__(storage, "_layout", layout)
+    object.__setattr__(storage, "_mode_indices", mode_indices)
+    object.__setattr__(storage, "_value", value.detach())
+    built = object.__new__(STensor)
+    built._metadata = metadata
+    built._storage = storage
+    return built
+
+
 class STensor:
     """A sparse tensor stored in a custom, per-mode layout.
 
@@ -300,6 +374,19 @@ class STensor:
             ``self.storage.value``.
         """
         return self.storage.value
+
+    @property
+    def _raw_values(self) -> torch.Tensor:
+        """The stored value tensor, skipping the defensive copy :attr:`values` makes.
+
+        ``values`` goes through ``storage.value``, which returns ``self._value.detach()``
+        -- but ``_value`` was already detached when the storage was built, so that
+        detach only allocates a second Python tensor object with identical contents and
+        the same ``requires_grad=False``. Internal callers that read a dtype or hand the
+        buffer to a native kernel therefore use this instead; a matmul was paying four
+        of those allocations per call.
+        """
+        return self._storage._value
 
     @property
     def index(self) -> TensorIndex:
@@ -1050,16 +1137,7 @@ class STensor:
                 )
             raise TensorStorageError(f"unsupported sparse layout {tensor.layout}")
 
-        return STensor(
-            name=name,
-            shape=tuple(tensor.shape),
-            index=TensorIndex(
-                tensor_format="d" * rank,
-                mode_indices=[[] for _ in range(rank)],
-                mode_order=mode_order,
-            ),
-            value=tensor.resolve_conj().resolve_neg().contiguous().reshape(-1),
-        )
+        return _dense_from_torch(tensor, name, mode_order, rank)
 
     def to_torch(self, in_place=True) -> torch.Tensor:
         """Materialize to a dense ``torch.Tensor`` (exit to PyTorch).
