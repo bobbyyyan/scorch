@@ -1,9 +1,12 @@
 # CSR × dense SpMM vs MKL — before and after
 
-*Branch `perf/spmm-beat-mkl`, based on `04f321d`. Candidate = `14e3ea6`.
-Hosts: **redwood** (Intel i9-14900K, 8 P + 16 E cores, 36 MB L3, PyTorch 2.5.1 +
-MKL 2022.1) and **M5** (Apple, 6 P + 12 E cores, PyTorch 2.13.0). float32 unless
-stated. Read `SPMM_BEAT_MKL_PHASE0.md` first for the attribution that led here.*
+*Branch `perf/spmm-beat-mkl`, based on `04f321d`. The grid below was measured at
+`14e3ea6`; `6eec90f` fixed the selector and `d9450ca` extended the same fix to the JIT
+codegen path afterwards. Hosts: **redwood** (Intel i9-14900K, 8 P + 16 E cores, 36 MB
+L3, PyTorch 2.5.1 + MKL 2022.1) and **M5** (Apple, 6 P + 12 E cores, PyTorch 2.13.0).
+**Every headline number is float32 through the prebuilt route**; float64 and the JIT
+codegen path have their own sections and their own, weaker, conclusions. Read
+`SPMM_BEAT_MKL_PHASE0.md` first for the attribution that led here.*
 
 ## What changed
 
@@ -178,6 +181,30 @@ it pays the same tax and gets the same fix. Measured on the M5, 3 rounds:
 | band16@128 | 16.43 | 5.464 | 3.779 | **1.45x** | 0.5% |
 | scatter200@32 | 101.8 | 19.04 | 12.56 | **1.52x** | 1.5% |
 
+redwood, 3 rounds, against the faster MKL arm — and this is the part worth reading:
+
+| cell | MKL ms | base ms | cand ms | **gain** | cand vs MKL | was | floor |
+|---|---|---|---|---|---|---|---|
+| bcsstk17@32 | 0.131 | 0.697 | 0.220 | **3.17x** | 0.596x | 0.188x | 6.6% |
+| band16@128 | 7.840 | 13.07 | 10.59 | **1.23x** | 0.741x | 0.602x | 3.2% |
+| bcsstk17@128 | 1.160 | 1.822 | 1.328 | **1.40x** | 0.873x | 0.637x | 13.9% |
+| inline_1@32 | 42.93 | 104.9 | 45.13 | **2.33x** | 0.951x | 0.435x | 1.5% |
+| pubmed@32 | 0.211 | 0.539 | 0.217 | **2.48x** | 0.972x | 0.394x | 33.7% |
+| scatter200@32 | 4.524 | 12.35 | 4.169 | **2.96x** | 1.085x | 0.379x | 23.6% |
+
+Pooled vs MKL: **0.409x → 0.853x**. The gain is real and large (1.23–3.17x, and the two
+tightest floors — inline_1 at 1.5% and bcsstk17@32 at 6.6% — carry the biggest gains),
+but **float64 is still below MKL parity on 5 of 6 cells**. That is not the validation
+tax; it is that float64 resolves `prebuilt_spmm_csr_f64`, which has no register-blocked
+row kernel and no tiling route at all, so removing the tax exposes a plain kernel-quality
+gap that was previously hidden underneath it. float32 beats MKL on the same cells.
+
+Stated plainly: float32 CSR × dense is done, float64 is not. Two of these cells
+(pubmed@32 at a 33.7% floor, scatter200@32 at 23.6%) are too small to measure at 3
+rounds and their ratios should not be quoted without a longer run. The M5 table above
+is a comparison against torch's own float64 path, not MKL — ARM has no MKL — so it says
+nothing about parity.
+
 ## The kernel hypotheses, all measured
 
 The brief ranked five kernel hypotheses. With the tax gone, a 64-cell torch-free
@@ -236,6 +263,55 @@ the cell still loses, because 48 µs of Python sits on top.
 
 That is a separable piece of work in `ops.py`'s general dispatch path, outside the
 file scope of this study, and it is the right next target for the small-cell regime.
+
+### Where the Python dispatch cost actually is
+
+Measured on the M5 by differencing `scorch.matmul(A, B)` against the same
+`scorch_ops.spmm_csr_float_v2(*args)` call with the argument list built once up front,
+best of 3 batches of 2000–4000 calls:
+
+| cell | kernel µs | `matmul` µs | overhead | share | `torch.sparse.mm` µs |
+|---|---|---|---|---|---|
+| M=500 deg=4 N=8 | 5.8 | 27.0 | **21.2** | 78.5% | 11.6 |
+| M=2000 deg=8 N=32 | 31.6 | 57.9 | **26.3** | 45.4% | 146.0 |
+| M=2000 deg=8 N=128 | 65.1 | 94.4 | **29.3** | 31.0% | 236.7 |
+| M=20000 deg=24 N=32 | 267.6 | 297.4 | **29.8** | 10.0% | 3078.0 |
+| M=20000 deg=24 N=128 | 353.8 | 390.0 | **36.1** | 9.3% | 5569.5 |
+
+The overhead is nearly flat in problem size — 21 to 36 µs across a 60x range of kernel
+time — which is what makes it fatal only at the small end. The smallest cell is the
+one to look at: scorch's kernel is **half** MKL-free torch's whole call (5.8 vs 11.6 µs)
+and scorch still loses 27.0 to 11.6, entirely on dispatch.
+
+`cProfile` on that smallest cell, ranked by cumulative time, says where it goes:
+
+| cost | share of the call | what it is |
+|---|---|---|
+| `STensor.from_torch` | **60%** | wrapping the dense `B` operand in an `STensor` — building a `Layout`, a storage object, normalized mode-indices, and running `_validate_index_storage` — every single call, then discarding it |
+| `typing.__instancecheck__` | ~4% | 10 calls per matmul. `layout.py` and `storage.py` import `Mapping`/`Sequence` from `typing`, whose `isinstance` costs 153 ns against 73 ns for `collections.abc` and 33 ns for a concrete `(list, tuple)` |
+| `layout.from_physical_shape` + `__post_init__` | ~11% | re-deriving and re-validating a `Layout` for the result on every call |
+| `parse_format` | ~3% | called 3x per matmul on constant strings |
+| the kernel itself | **8%** | |
+
+So the ranked levers, cheapest first, all inside `ops.py` / `layout.py` / `storage.py`:
+
+1. **Do not build an `STensor` for a dense `torch.Tensor` operand.** For
+   `matmul(sparse, dense_tensor)` the kernel needs only `b.shape`, an empty
+   mode-indices list, and `b.reshape(-1)`. `ops.py` already has an `_EMPTY_MODE_INDICES`
+   constant for exactly this shape of idea. Biggest single win.
+2. **Import `Mapping`/`Sequence` from `collections.abc`, or test concrete types.**
+   Mechanical, and worth ~1.2 µs a call.
+3. **Memoize the result `Layout`** on `(shape, dtype, format)` instead of re-deriving
+   and re-validating it, and memoize `parse_format` (a pure string function).
+4. **Memoize the marshalled argument list** per `(operand identity, N)`, invalidated by
+   the same version counters the ABI memo already uses. In a training loop everything
+   except the values buffer is identical call to call.
+5. The endgame, if 1–4 leave a gap: **one pybind entry that does resolution and
+   marshalling in C++**, so a warm call is a single Python→C++ hop. That is the shape
+   `torch.sparse.mm` gets its ~5–10 µs from.
+
+None of this is measured as a fix yet — it is a measured diagnosis with an ordered
+plan.
 
 ## The JIT codegen path
 
@@ -307,7 +383,9 @@ below — but no speedup is claimed here yet.
   × dense resolves a different prebuilt symbol (`prebuilt_spmm_csr_f64`) and **gets no
   tiling at all**, but it goes through the same `bind_binary_kernel_with_tile` →
   `validate_binary_inputs` → `checked_csr_view` path, so it pays the same tax and
-  receives the same fix. Measured below rather than asserted.
+  receives the same fix. Measured, not asserted — and the answer is that the fix helps
+  float64 by 1.23–3.17x but leaves it **below MKL on 5 of 6 redwood cells** (0.853x
+  pooled). The headline claim in this document is float32 only.
 - **Index memory.** The narrowing memo holds an int32 copy alongside the caller's
   int64 arrays, i.e. +50% on index memory. It replaces a same-size allocation that was
   happening every call, so peak does not grow, but steady state does. An entry is
