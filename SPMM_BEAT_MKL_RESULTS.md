@@ -59,11 +59,12 @@ counter, so a buffer corrupted that way can now reach a kernel unchecked.
 | check | result |
 |---|---|
 | output bits vs `04f321d`, matrix × N × autotune level | **16/16 identical** (sha256 of the full result buffer) |
-| validator rejection cases, base vs candidate | **57/57 pass**, identical messages — both the serial and parallel screen paths, empty rows, descents at every row boundary, first/last row, int64 non-representability, storage-sharing views, and `torch.inference_mode()` |
+| validator rejection cases, base vs candidate | **73/73 pass**, identical messages — both the serial and parallel screen paths, empty rows, descents at every row boundary, first/last row, int64 non-representability, storage-sharing views, `torch.inference_mode()`, the narrowing memo (repeat calls, in-place edits, unrepresentable arrays rejected on *every* call, caller arrays returned unmutated), COO bounds and lexicographic order, and dead-entry reclamation |
 | float64 reference, every grid cell | see the grid table below |
-| macOS suite, base vs candidate | identical pass/fail sets (205 pre-existing failures: the macOS SDK's libc++ cannot compile a JIT kernel at all on this host, on either tree) |
-| Linux suite, base | **567 passed**, 0 failed (`-m "not perf"`) |
-| Linux suite, candidate | in flight at the time of writing — 49% with no failures. This is the only host here whose toolchain compiles a JIT kernel, so it is the only real test of the codegen path; the pass/fail set must be diffed against base's before this work is called done. |
+| macOS suite, base vs candidate | identical pass/fail sets, **205 failed / 365 passed** on both, including after the JIT change (the 205 are pre-existing: the macOS SDK's libc++ cannot compile a generated kernel at all on this host, on any tree — every error is inside `is_trivially_copyable.h` / `strong_order.h`) |
+| Linux suite, base | **567 passed**, 14 skipped, 0 failed (`-m "not perf"`) |
+| Linux suite, candidate before the JIT change | **567 passed**, 14 skipped, 0 failed — identical to base |
+| Linux suite, candidate with the JIT change | in flight. This is the only host whose toolchain compiles a generated kernel, so it is the only real test of the JIT validator; nothing about the codegen path is settled until this matches base's 567. |
 
 ## redwood — the grid
 
@@ -236,6 +237,70 @@ the cell still loses, because 48 µs of Python sits on top.
 That is a separable piece of work in `ops.py`'s general dispatch path, outside the
 file scope of this study, and it is the right next target for the small-cell regime.
 
+## The JIT codegen path
+
+Everything above is the prebuilt route. Generated kernels reach the same header by a
+different door — CINLowerer emits one `scorch_native::validate_jit_tensor` per
+right-hand-side operand at the top of every `evaluate()` — and that door had none of
+the fix applied to it. `validate_jit_tensor` walked the whole index structure in
+serial nested loops with a `TORCH_CHECK` per element, for coordinate levels, for
+compressed levels (spans, bounds, and sortedness), and for COO lexicographic order.
+Nothing was screened and nothing was memoized, so a generated kernel paid the full
+O(nnz) walk on every call.
+
+What changed:
+
+- **The narrowing is memoized in `checked_index_tensor`**, which is where every caller
+  reaches it. This is what unblocks the rest: the structural memo keys on array
+  identity, and a fresh int32 tensor per call could never match. The Python-side cache
+  in `prebuilt_kernels.py` is deleted — it only ever covered the prebuilt route, and it
+  was the thing handing the validator a new tensor each call.
+- **The structural checks are screened and memoized**, using the same branchless
+  accumulator screens as the CSR path, with every original serial loop left in place
+  verbatim as the diagnostic. `checked_csr_view`'s inline screen is factored out and
+  shared, so the CSR view and the JIT compressed level now run the same code.
+- **`checked_coo_view`, `validate_csr_segments` and `validate_attention_inputs`** got
+  the same treatment. They are not the JIT path, but they are the same defect in the
+  same layer: the COO view walked every level's coordinates and then the lexicographic
+  order serially, and the sparse-softmax and sparse-attention entry points walked their
+  position and coordinate arrays per call.
+
+Two details worth knowing:
+
+- **Verdicts are memoized per check family, not per array.** A cached "these
+  coordinates are in range" must not satisfy "these coordinates ascend" for a
+  one-level COO tensor, where both would otherwise record the same array and the same
+  two parameters. The family tag is `params[0]`.
+- **Each loaded module has its own memo.** The maps are inline function-local statics
+  in a header, and Python dlopens extension modules with `RTLD_LOCAL`, so the prebuilt
+  extension and every JIT-compiled kernel carry their own. Each amortizes over its own
+  calls, which is all the fix needs; the cost is that a tensor used on both paths is
+  narrowed once per module. `scorch_ops.abi_memo_clear()` clears the prebuilt
+  extension's only.
+
+**Why not compile the kernel for int64 and skip narrowing entirely?** It is a real
+option — kernels are already compiled per format and dtype, so index dtype could join
+the cache key — and it was measured, not argued. A 12-byte-per-nonzero A stream instead
+of 8 costs **1.19–1.51x on DRAM-bound cells** (reddit@16 1.19x, reddit@32 1.21x,
+inline_1@32 1.27x, scatter200@32 1.51x) and nothing on cache-resident ones. So it
+trades a one-time O(nnz) cast for a permanent per-call bandwidth tax; with the cast
+memoized, narrowing once wins for any tensor used more than once, which is every
+training loop. Where a dtype-parameterized kernel family IS the right answer is tensors
+that genuinely exceed int32 — today those fail closed with "cannot be represented as
+int32" — dispatched on measured magnitude rather than on the caller's declared dtype.
+Note also that scorch's own format conversions already emit int32: `to_sparse("ss")`
+does, and only operands handed in by a user through `from_torch`/scipy arrive as int64.
+That is the argument for narrowing at construction rather than at the boundary.
+
+**Measurement status: not yet taken.** `bench/bench_codegen_abi.py` is the harness —
+two routes (`matmul_wksp` with int64 operands and a sparse result, which charges
+narrowing plus scans; DCSR × dense through `matmul` with a dense result, which charges
+scans only), interleaved arms, an in-process A/A floor, and `torch.sparse.mm` as the
+cross-tree control. The A/B is against the tree at `b4f8985`. It has not been run:
+another user's job started on redwood, and this host cannot compile a generated kernel
+at all, so there is no second machine to fall back to. Correctness is measured — see
+below — but no speedup is claimed here yet.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
@@ -243,19 +308,15 @@ file scope of this study, and it is the right next target for the small-cell reg
   tiling at all**, but it goes through the same `bind_binary_kernel_with_tile` →
   `validate_binary_inputs` → `checked_csr_view` path, so it pays the same tax and
   receives the same fix. Measured below rather than asserted.
-- **The JIT codegen path still pays the full tax.** Generated kernels include the same
-  `native_abi.h` and validate the same way, but they receive their operands through
-  `ops.py`'s generic path rather than `prebuilt_kernels`, so they get no narrowing
-  memo — and because the narrowing then produces a fresh int32 tensor on every call,
-  the native memo cannot hit either. Fixing it properly means moving the narrowing
-  memo into `checked_index_tensor` itself, which would also let the Python-side cache
-  be deleted. Not done here: it is outside the file scope, and it would invalidate the
-  measurements in this document.
 - **Index memory.** The narrowing memo holds an int32 copy alongside the caller's
   int64 arrays, i.e. +50% on index memory. It replaces a same-size allocation that was
-  happening every call, so peak does not grow, but steady state does. Narrowing at
-  `STensor` construction and dropping the int64 arrays would instead *halve* index
-  memory and remove the cache entirely; that lives in `stensor.py`/`storage.py`.
+  happening every call, so peak does not grow, but steady state does. An entry is
+  dropped as soon as its source array dies — the sweep runs before every insert, not
+  only when the map fills, because otherwise 4096 dead graph-scale index arrays would
+  accumulate. Narrowing at `STensor` construction and dropping the int64 arrays would
+  instead *halve* index memory and remove the memo entirely; that lives in
+  `stensor.py`/`storage.py`. See the JIT section for why narrowing beats compiling the
+  kernel for int64.
 - **Only the drop-in float32 CSR×dense prebuilt symbol is tiled.** Fused bias/act
   SpMM, fused sparse Linear, SpMV and SpMSpM are unaffected by the selector, though
   they do all benefit from the validation fix.
