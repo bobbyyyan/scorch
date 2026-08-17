@@ -46,7 +46,7 @@ def csr_args(M, J, N, pos, crd, val, idtype=np.int32):
         result_shape=[M, N],
         A_shape=[M, J],
         A_mode_indices=[[], [torch.from_numpy(pos.astype(idtype)),
-                              torch.from_numpy(crd.astype(idtype))]],
+                             torch.from_numpy(crd.astype(idtype))]],
         A_values=torch.from_numpy(val.astype(np.float32)),
         B_shape=[J, N],
         B_mode_indices=[[], []],
@@ -684,7 +684,6 @@ def run_generated_kernel_suite():
       descends, for instance. So each case reads the array back and is reported as
       UNTESTED, not as a pass, when the write changed nothing.
     """
-    global PASSES
     from scorch import STensor, einsum, matmul
 
     print("\n[generated kernels] validate_jit_tensor, compiled inside the kernel")

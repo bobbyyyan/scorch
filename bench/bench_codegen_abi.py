@@ -110,7 +110,6 @@ def main():
     from scorch.stensor import STensor
     from scorch.ops import matmul_wksp
 
-
     memo = os.environ.get("SCORCH_ABI_VALIDATE_MEMO", "1")
     idtype = torch.int32 if args.index_dtype == "int32" else torch.int64
     print(f"# tag={args.tag} route={args.route} index_dtype={args.index_dtype} "
