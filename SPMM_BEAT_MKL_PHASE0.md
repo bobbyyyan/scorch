@@ -153,10 +153,10 @@ The brief's ranking assumed the deficit was in the kernel. It is not.
 |---|---|---|
 | — | **per-call ABI validation tax** (not in the original list) | **confirmed, dominant, 1.2–2.0x on losing cells** |
 | 1 | launch/thread policy for small work | not the cause. Single-thread is also slow, and the poor scaling is the tax's serial fraction. Worth revisiting only after the tax is gone. |
-| 2 | deeper ILP / multi-row register blocking | the narrow-k path's 2-nnz ILP is not the limiter: `ilp4`/`ilp8` measure at 0.94–1.11x, no consistent direction. Multi-row blocking still untested and still motivated by the 0.81–0.89 adjacent-row overlap. |
+| 2 | deeper ILP / multi-row register blocking | **both refuted.** Deeper ILP is a net loss (0.960–0.970 geomean over 64 cells, losing on 37–45). Multi-row blocking via a two-pointer merge is correct but 0.56–0.89x on every `N`: the reuse is real, but the merge's data-dependent branch costs more than the saved B load and halves the FMA ILP. See `SPMM_BEAT_MKL_RESULTS.md`. |
 | 3 | A-stream cache-pollution control (NTA hints) | the amplification it was meant to explain is the tax, not B re-fetching. Demoted; needs re-measurement on the fixed build before any work. |
-| 4 | cached preprocessing (CSB / reordering) | untouched. Still the only lever for reddit-class structure, but the premise (scorch far behind at narrow N) no longer holds. |
-| 5 | full-N-in-registers for N ≤ 64 | untouched. |
+| 4 | cached preprocessing (CSB / reordering) | untested, and now the *only* remaining route to the measured adjacent-row overlap, since 2b showed a runtime merge cannot pay for itself. |
+| 5 | full-N-in-registers for N ≤ 64 | **already implemented** — the narrow path holds the whole row in YMM for N ≤ 32, and N=64 is one 64-wide tile with 8 accumulators. |
 | — | **prefetch policy is a small pessimization** | the shipped kernel prefetches 2 nonzeros ahead with gcc locality 1 (`PREFETCHT2`, i.e. no nearer than L2/L3). Removing it entirely is *faster* (1.01–1.09x); 16 nonzeros ahead into L1 plus dropping the redundant mask when `N % 8 == 0` is 1.03–1.14x. |
 | — | **int64-index kernel family** (asked during review) | measured and rejected as a default: a 12-byte-per-nonzero A stream costs 1.19–1.51x on DRAM-bound cells (reddit@16 1.19x, reddit@32 1.21x, inline_1@32 1.27x, scatter200@32 1.51x) and nothing on cache-resident ones. Narrowing once is strictly better. Worth having only to support tensors that genuinely exceed int32, dispatched on magnitude rather than dtype. |
 

@@ -66,7 +66,123 @@ counter, so a buffer corrupted that way can now reach a kernel unchecked.
 
 ## redwood — the grid
 
-*(inserted when the run completes)*
+Four matrix sets, the same ones the 195-cell tiling study used, plus `N`=16 and 64 on
+`main` where that study had no coverage. 236 cells, 9 arms each, random-permutation
+interleaved, median of 11 rounds, per-cell A/A control.
+
+### Aggregate, vs the faster MKL arm
+
+| group | cells | `off` | `analytic` | `balanced` | `max` | `learned` | **best** |
+|---|---|---|---|---|---|---|---|
+| main **base** | 108 | 0.492 | 0.521 | 0.534 | 0.532 | 0.529 | 0.541 |
+| main **cand** | 108 | 1.470 | 1.623 | 1.703 | 1.686 | 1.667 | **1.729** |
+| ss-tiling **base** | 57 | 0.698 | 0.686 | 0.713 | 0.713 | 0.695 | 0.719 |
+| ss-tiling **cand** | 57 | 1.977 | 1.900 | 2.108 | 2.089 | 1.997 | **2.123** |
+| ss-quick **base** | 63 | 0.682 | 0.686 | 0.707 | 0.708 | 0.699 | 0.719 |
+| ss-quick **cand** | 63 | 1.541 | 1.556 | 1.643 | 1.635 | 1.616 | **1.676** |
+| wide **base** | 8 | 1.155 | 4.677 | 5.160 | 5.160 | 4.561 | 5.182 |
+| wide **cand** | 8 | 1.187 | 5.333 | 5.841 | 5.875 | 5.130 | **5.877** |
+
+**Pooled over 236 cells: 0.675x → 1.878x.** Scorch was losing to MKL by a third on
+average; it now beats it by 1.88x.
+
+The `off` row is the honest one for judging the kernel: with no selector at all,
+untiled scorch goes from 0.49–0.70x to 1.47–1.98x of MKL. The selector adds
+1.06–1.18x on top of that, and 4.9x on the wide-`B` grid where it fires on every cell.
+
+### Per-cell: the largest gains
+
+| cell | MKL ms | base ms | base/MKL | cand ms | cand/MKL | **gain** |
+|---|---|---|---|---|---|---|
+| ct20stif@16 | 0.710 | 4.364 | 0.163x | 0.323 | 2.196x | **13.49x** |
+| pdb1HYS@16 | 0.852 | 7.080 | 0.120x | 0.539 | 1.582x | **13.15x** |
+| consph@16 | 1.834 | 10.64 | 0.172x | 0.873 | 2.100x | **12.18x** |
+| pdb1HYS@32 | 1.537 | 7.653 | 0.201x | 0.731 | 2.104x | **10.47x** |
+| scatter200@16 | 2.075 | 9.795 | 0.212x | 0.945 | 2.196x | **10.37x** |
+| nd24k@16 | 6.014 | 48.53 | 0.124x | 4.724 | 1.273x | **10.27x** |
+| mouse_gene@16 | 6.382 | 48.80 | 0.131x | 4.886 | 1.306x | **9.99x** |
+| rma10@32 | 0.899 | 3.920 | 0.229x | 0.418 | 2.152x | **9.39x** |
+| cant@32 | 1.421 | 7.030 | 0.202x | 0.764 | 1.860x | **9.20x** |
+
+### Nothing regressed
+
+Gain distribution over all 236 cells: **geomean 2.782x, min 0.760x, max 13.49x.**
+Exactly one cell came out below 0.98x — `ash292@128`, whose own A/A noise floor in the
+candidate run is **24.7%**: a 2208-nonzero matrix at 43 µs is not measurable at this
+resolution, and the same matrix gains 1.21x at N=32 and 1.19x at N=512. Apart from
+that one unmeasurable cell, no cell is slower than base.
+
+The gain has a clean monotone shape in cell size, which is what a per-nonzero tax
+being removed should look like:
+
+| base `off` time | cells | gain geomean | min | max |
+|---|---|---|---|---|
+| < 50 µs | 11 | 1.127x | 0.574 | 1.451 |
+| 50–200 µs | 21 | 1.547x | 0.939 | 3.998 |
+| 0.2–2 ms | 42 | **3.628x** | 1.343 | 9.022 |
+| 2–50 ms | 115 | 3.039x | 1.073 | 10.83 |
+| > 50 ms | 47 | 2.184x | 1.007 | 9.559 |
+
+Small cells gain least because fixed per-call cost, not the tax, dominates them; very
+large cells gain less than the middle because the kernel's own work has taken over.
+
+### Correctness on the grid
+
+236 cells against a float64 reference: **max relative error 1.04e-06** (`gupta2@128`),
+median 1.31e-07.
+
+## The selector, re-measured on the fixed build
+
+Removing the tax made the selector's own defect *worse*, because the tax had been
+inflating both arms and masking it. Over the 236 cells, at the tiled routes:
+
+| level | tiled-route regressions | worst |
+|---|---|---|
+| `analytic` (was default) | **6** | 0.373x (audikw_1@128, floor 1.9%) |
+| `learned` | 4 | 0.385x (inline_1@512, floor 5.1%) |
+| `balanced` | **0** | — |
+| `max` | 0 | — |
+
+`balanced` picked `v2` on exactly the cells `analytic` lost on. The gate cannot be
+tightened out of this with the features on hand: the span proxy reads 0.823 on
+`crankseg_1` (loses) and 0.823 on `mouse_gene` (wins); degree is ~201 on `crankseg_1`
+(loses) and ~199 on `scatter200` (wins).
+
+Fixed in `6eec90f`: both non-probing levels now confirm their cost-model pick against
+`v2` once per shape before memoizing it — 6 kernel invocations against `balanced`'s 18.
+Every non-`off` level is now no-regression-vs-`v2` by construction rather than by the
+gate happening to be right.
+
+## float64
+
+float64 CSR × dense resolves a different prebuilt symbol (`prebuilt_spmm_csr_f64`) and
+**gets no tiling at all**, but goes through the same
+`bind_binary_kernel_with_tile` → `validate_binary_inputs` → `checked_csr_view` path, so
+it pays the same tax and gets the same fix. Measured on the M5, 3 rounds:
+
+| cell | reference ms | base ms | cand ms | **gain** | floor |
+|---|---|---|---|---|---|
+| pubmed@32 | 2.171 | 0.850 | 0.548 | **1.55x** | 0.4% |
+| bcsstk17@32 | 4.144 | 1.185 | 0.625 | **1.90x** | 1.5% |
+| bcsstk17@128 | 8.466 | 1.993 | 1.430 | **1.39x** | 1.7% |
+| band16@128 | 16.43 | 5.464 | 3.779 | **1.45x** | 0.5% |
+| scatter200@32 | 101.8 | 19.04 | 12.56 | **1.52x** | 1.5% |
+
+## The kernel hypotheses, all measured
+
+The brief ranked five kernel hypotheses. With the tax gone, a 64-cell torch-free
+variant grid (11 matrices × N=8…512, at 8 and 32 threads, each cell carrying its own
+A/A control — which came out at geomean 1.0000, median floor 0.13%) settles them:
+
+| hypothesis | verdict |
+|---|---|
+| **1. launch / thread policy for small work** | not the cause. Single-thread was slow too, and the poor scaling was Amdahl on the serial validator. What remains on small cells is dispatch, not launch. |
+| **2a. deeper ILP** | **refuted.** 4- and 8-nonzero ILP measure 0.960–0.970 geomean, losing on 37–45 of 64 cells. |
+| **2b. multi-row register blocking** | **refuted.** A two-pointer merge over consecutive rows is correct (relerr 1e-7) but 0.56–0.89x on every `N` tested. The reuse is real — adjacent-row overlap is 0.81–0.89 on exactly the matrices that lose — but a runtime merge cannot collect it: the data-dependent 3-way branch costs more than the saved B load, and it halves the FMA ILP the base kernel gets from 2-nonzero unrolling. Exploiting that overlap needs a *format* change (pre-merged / blocked columns), i.e. hypothesis 4. |
+| **3. prefetch / NTA hints** | the traffic amplification this targeted turned out to be the tax, not B re-fetching. The shipped prefetch (2 nonzeros ahead, `PREFETCHT2`) is mildly miscalibrated: 16 ahead into L1 plus dropping the redundant mask when `N%8==0` is +2.7% at 32 threads and +4.2% at 8. **Not shipped** — it regresses 3–6 of 64 cells beyond their floors (worst 0.949x), and which cells regress changes with thread count, so any static choice trades one regime for another. Reported, not tuned around. |
+| **4. cached preprocessing (CSB / reordering)** | untested, and now the *only* remaining route to the measured adjacent-row overlap, since 2b showed a runtime merge cannot pay for itself. |
+| **5. full-`N`-in-registers for `N` ≤ 64** | **already implemented.** The narrow path holds the whole output row in YMM accumulators for `N` ≤ 32, and at `N`=64 the wide path is a single 64-wide tile with 8 accumulators. Nothing to add. |
+
 
 ## M5 — second host
 
