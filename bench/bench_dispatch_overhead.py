@@ -18,8 +18,10 @@ Method
   cell's in-process noise floor. Nothing smaller than the floor counts.
 * ``kernel`` is the same native symbol the dispatch would have chosen, with its
   arguments hoisted out of the timed region.
-* ``torch`` is ``torch.sparse.mm``, unchanged by anything in this tree, so it doubles as
-  the cross-process control when comparing two trees.
+* ``torch`` is a whole ``torch.sparse.mm`` call, its dispatch and its kernel together --
+  an end-to-end reference point, not an overhead figure, so it is comparable to the
+  ``matmul`` arm and not to ``matmul - kernel``. Unchanged by anything in this tree, so
+  it doubles as the cross-process control when comparing two trees.
 * Every cell is checked against a float64 reference.
 
 Usage

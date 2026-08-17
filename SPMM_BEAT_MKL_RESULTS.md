@@ -259,7 +259,7 @@ against the same kernel run with no torch in the process (`bench/spmm_micro.cpp`
 
 | component | redwood | what it is |
 |---|---|---|
-| Python dispatch | ~48–61 µs | `ops.matmul`: normalization, `resolve_prebuilt_matmul`, the tiling gate, argument marshalling. `torch.sparse.mm` pays ~5–10 µs for the same job. |
+| Python dispatch | ~48–61 µs | `ops.matmul`: normalization, `resolve_prebuilt_matmul`, the tiling gate, argument marshalling. For scale: `torch.sparse.mm` completes its *entire* call — dispatch and kernel — in 5–17 µs on cells this size. |
 | native, beyond the kernel's own compute | ~52 µs | inside `eval_time`: pybind conversion of the nested tensor vectors, `torch::empty` for the output, the empty-row zeroing scan, the O(1) validation and memo lookup |
 
 So for any cell whose kernel runs in under ~200 µs, scorch's fixed per-call cost is
@@ -278,7 +278,7 @@ Measured on the M5 by differencing `scorch.matmul(A, B)` against the same
 `scorch_ops.spmm_csr_float_v2(*args)` call with the argument list built once up front,
 best of 3 batches of 2000–4000 calls:
 
-| cell | kernel µs | `matmul` µs | overhead | share | `torch.sparse.mm` µs |
+| cell | kernel µs | `matmul` µs | overhead | share | `torch.sparse.mm`, whole call µs |
 |---|---|---|---|---|---|
 | M=500 deg=4 N=8 | 5.8 | 27.0 | **21.2** | 78.5% | 11.6 |
 | M=2000 deg=8 N=32 | 31.6 | 57.9 | **26.3** | 45.4% | 146.0 |
@@ -352,18 +352,40 @@ the two trees by 37.7% — the largest mismatch in the run, against under 5% on 
 the nine cells — so that cell's `matmul` medians are dominated by kernel noise. Its
 dispatch component still falls 62.3 to 27.4 µs, in line with the rest.
 
-**This closes the gap that was the stated goal.** `torch.sparse.mm` pays 8.6 µs on the
-smallest cell; scorch now pays 9.7 µs of Python for the same job, and less than torch's
-own overhead on every larger cell. So the dispatch is no longer the binding constraint
-anywhere — what binds now is the ~52 µs on the native side of `eval_time`.
+**How far that leaves scorch from `torch.sparse.mm`, end to end.** The `torch` column
+above is torch's *whole* call — its dispatch and its kernel together — so it is not
+comparable to scorch's dispatch component. Comparing whole call against whole call:
 
-What remains in those 9.7 µs, from the profile: property-chain traffic, mostly. One
-matmul does 18 `layout` reads, 14 `shape` reads, and 8 `dim()` calls, each a Python
-attribute hop through `_metadata`/`_storage`; the kernel call itself is 9% of the call
-and `from_torch` is 17%. Lever 5 from the original plan is still the endgame if this
-needs to go lower — **one pybind entry doing resolution and marshalling in C++**, so a
-warm call is a single Python→C++ hop, which is where `torch.sparse.mm` gets its number
-from. It is no longer urgent.
+| cell | scorch total before | after | `torch.sparse.mm` total | before | after |
+|---|---|---|---|---|---|
+| M=64 deg=2 N=1 | 45.6 | 12.0 | 8.6 | 5.33x slower | **1.41x slower** |
+| M=256 deg=2 N=4 | 45.6 | 12.4 | 8.8 | 5.19x slower | **1.41x slower** |
+| M=500 deg=4 N=8 | 46.6 | 13.8 | 10.4 | 4.48x slower | **1.32x slower** |
+| M=500 deg=4 N=32 | 50.4 | 17.9 | 14.4 | 3.50x slower | **1.24x slower** |
+| M=2000 deg=8 N=8 | 56.4 | 21.3 | 16.6 | 3.40x slower | **1.28x slower** |
+| M=2000 deg=8 N=32 | 61.3 | 26.7 | 41.3 | 1.48x slower | **1.55x faster** |
+| M=2000 deg=8 N=128 | 85.2 | 55.9 | 103.2 | 1.21x faster | **1.85x faster** |
+| M=20000 deg=24 N=32 | 188.1 | 144.5 | 346.1 | 1.84x faster | **2.39x faster** |
+| M=20000 deg=24 N=128 | 432.6 | 530.2 | 1767.4 | 4.09x faster | **3.33x faster** |
+
+So the gap is closed in the sense that mattered — the fixed cost is no longer several
+times the entire call — but **the smallest cells are still 1.24–1.41x slower than
+`torch.sparse.mm` end to end**, down from 3.4–5.3x. The crossover moved from N=128 to
+N=32 at 2000 rows: scorch now wins from `2000x8@32` upward and loses below it. (The last
+row's before/after is the drift cell noted above; read its 4.09x and 3.33x as one number,
+not a change.)
+
+The arithmetic on the smallest cell says what is left to do: 12.0 µs is 2.4 µs of kernel
+plus 9.6 µs of Python, and torch does its *whole* job in 8.6. Scorch's Python alone still
+exceeds torch's entire call, so parity at the small end needs the Python under ~6 µs,
+which the levers cannot reach — they removed the redundant work, and what remains is the
+structure of the path itself. From the profile that is property-chain traffic: one matmul
+does 18 `layout` reads, 14 `shape` reads and 8 `dim()` calls, each an attribute hop
+through `_metadata`/`_storage`, with the kernel call 9% of the total and `from_torch`
+17%. **Lever 5 is therefore still the endgame for the small end** — one pybind entry
+doing resolution and marshalling in C++, so a warm call is a single Python→C++ hop, which
+is where `torch.sparse.mm` gets its number from. What has changed is that it is no longer
+worth 33 µs; it is worth the last ~4 µs on cells under ~20 µs.
 
 ## The JIT codegen path
 
