@@ -71,10 +71,9 @@ operands it is slower than the code it replaced.
 | output bits vs `04f321d`, matrix × N × autotune level | **16/16 identical** (sha256 of the full result buffer) |
 | validator rejection cases, base vs candidate | **73/73 pass**, identical messages — both the serial and parallel screen paths, empty rows, descents at every row boundary, first/last row, int64 non-representability, storage-sharing views, `torch.inference_mode()`, the narrowing memo (repeat calls, in-place edits, unrepresentable arrays rejected on *every* call, caller arrays returned unmutated), COO bounds and lexicographic order, and dead-entry reclamation |
 | float64 reference, every grid cell | see the grid table below |
-| macOS suite, base vs candidate | identical pass/fail sets, **205 failed / 365 passed** on both, including after the JIT change (the 205 are pre-existing: the macOS SDK's libc++ cannot compile a generated kernel at all on this host, on any tree — every error is inside `is_trivially_copyable.h` / `strong_order.h`) |
-| Linux suite, base | **567 passed**, 14 skipped, 0 failed (`-m "not perf"`) |
-| Linux suite, candidate before the JIT change | **567 passed**, 14 skipped, 0 failed — identical to base |
-| Linux suite, candidate with the JIT change | in flight. This is the only host whose toolchain compiles a generated kernel, so it is the only real test of the JIT validator; nothing about the codegen path is settled until this matches base's 567. |
+| macOS suite, base vs candidate | **identical failure sets** — 208 failures on each, the same 208 test IDs, `comm` empty in both directions. Candidate passes 374 against base's 365, i.e. exactly the 9 new tests. The 208 are pre-existing and unrelated: the macOS SDK's libc++ cannot compile a generated kernel at all on this host, on any tree — every error is a `ninja` failure inside `is_trivially_copyable.h` / `strong_order.h` |
+| Linux suite, candidate with the JIT change *and* the dispatch levers | **582 passed, 14 skipped, 0 failed** (full suite, perf tests included). This is the only host whose toolchain compiles a generated kernel, so it is the only real test of the JIT validator. Collection is 596 against base's 587 — the 9 new tests and nothing dropped — and the skip count is unchanged, so no test silently became a skip |
+| Linux suite, base and candidate before the JIT change | **567 passed**, 14 skipped, 0 failed on each (`-m "not perf"`, measured on an earlier tree with fewer tests collected) |
 
 ## redwood — the grid
 
