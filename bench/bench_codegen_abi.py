@@ -108,7 +108,23 @@ def main():
 
     import scorch
     from scorch.stensor import STensor
-    from scorch.ops import matmul_wksp
+
+    # The wksp_ds route calls matmul_wksp, which THIS branch removed in a37371c
+    # ("remove legacy workspace matmul") because production matmul/einsum scheduling
+    # now owns workspace insertion. Upstream's copy of this harness forked before that
+    # removal, so the import is route-local and refuses with a structured code rather
+    # than an ImportError at the top of main -- which would otherwise take the dcsr_dd
+    # route down with it, and dcsr_dd needs nothing from the workspace API.
+    matmul_wksp = None
+    if args.route == "wksp_ds":
+        try:
+            from scorch.ops import matmul_wksp  # type: ignore[no-redef]
+        except ImportError:
+            print("REFUSE unsupported_route_entry_point_removed: "
+                  "scorch.ops.matmul_wksp does not exist on this tree (removed in "
+                  "a37371c); the workspace question is measured through the "
+                  "production API by the section 67 harness instead")
+            return 3
 
     memo = os.environ.get("SCORCH_ABI_VALIDATE_MEMO", "1")
     idtype = torch.int32 if args.index_dtype == "int32" else torch.int64
