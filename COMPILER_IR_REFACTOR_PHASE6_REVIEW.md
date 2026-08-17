@@ -18427,7 +18427,7 @@ anything was measured (§62.5), and every harness takes a tree root as ``$1``.
 
 **Evidence ledger**: ``~/.cache/scorch-codex/workspace-decision/``, sealed over
 **419 files** with zero compiled artifacts in the seal and every one verifying
-(``SHA256SUMS`` itself hashes to ``01f6175b708d6a73…``) — ``DESIGN.md`` (written at ``7fc3f91`` before any production
+(``SHA256SUMS`` itself hashes to ``8b6e615b95f723fa…``) — ``DESIGN.md`` (written at ``7fc3f91`` before any production
 change, its digest and the tip in ``provenance/design_tip.txt``),
 ``PREDICTIONS.md`` (the seven scored, one refuted as expected), ``CLOSEOUT.md``,
 the re-measured ablation with its five columns and its summary, the accumulation
