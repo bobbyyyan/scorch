@@ -18440,3 +18440,185 @@ and the partitioned suite per side with its node-set comparison.  Every harness
 takes a tree root as ``$1`` and an expected commit, and the suppression in the
 ablation's third column is now a production request rather than a probe — the
 probe is kept only to prove the two emit the same program.
+
+## 69. The survey of what the compiler decides silently, and the interaction number that sizes the next grid (2026-08-16)
+
+Two scheduling decisions were made explicit in §60/§66 (assembly strategy) and §68
+(accumulation structure), and the second was found by accident, as a confound while
+measuring the first.  That is a sampling result.  This session went looking for the
+rest, and answered the one measurement question that decides how big the next grid
+has to be.
+
+The survey is a tracked document at the repository root:
+**`COMPILER_SILENT_DECISION_SURVEY.md`**, written at this tip.  It holds the census,
+the ranking, the interaction answer with its numbers, and an assessment of whether
+`src/scorch/tiling.py` is a plausible home for a compile-time chooser.  This section
+is a pointer plus the two numbers a later reader will come here for.
+
+### 69.1 The census
+
+A choice was counted only if it changes the emitted kernel's speed, has more than one
+legal answer for the same program, and is currently made without consulting the
+program's shape, its density, or the machine.  339 candidates were read stage by
+stage and each was then handed to a second reader instructed to refute it.  **132
+records qualify, at 124 distinct sites.**  Of those 124:
+
+- **109 were not among the eight starting points** the session prompt listed, which
+  is the survey's main result;
+- **95 have never been measured against their alternative at all**, 29 have a partial
+  or indirect number, and **0 have been measured properly on a grid**;
+- 109 are cheap to probe;
+- 115 fire on programs that ship today (50 legacy dispatch only, 64 on both routes,
+  1 in a prebuilt C++ kernel); 9 fire only on the caller-less typed route.
+
+The largest concentration is in the lowerers and the textually-inlined C++ headers
+(`lower_llir.py` 19, `cin_lowerer.py` 13, `header.h` 6, `scorch_policy.h` 2,
+`native_abi.h` 1) rather than in the scheduler (14) — consistent with the two known
+decisions, which also lived there.  The scheduler's choices are visible because they
+have a vocabulary; the lowerers' are invisible because they are spelled as literals.
+
+One line-number correction, per the standing rule that the code wins over the docs:
+`_select_index_vars_to_tile` is at **`scheduler.py:3594`**, with call sites at
+**`:3722`** and **`:3967`**.  `COMPILER_IR_REFACTOR_HANDOFF.md:26491` says `:3090`
+and the session prompt said `:3303`; both are stale.  Every other cited anchor
+(`lower_llir.py:5648`/`:9482`/`:10557`/`:5713`, `scorch_policy.h:91`) is correct at
+this tip.
+
+### 69.2 The interaction number
+
+**The two known decisions interact.**  The question was not whether the accumulation
+structure changes *which* assembly strategy is faster — §68.5 already answered that
+(0 of 64 winners change; magnitude only, median 10.3 %, worst 57.1 %).  The question
+was whether the strategies' relative *margins* move with the structure, which matters
+because the shipped SpMM selector is a learned cost model fitted to magnitudes rather
+than an argmax over winners.
+
+Over the fully crossed 2 × 2 in {`two_pass_serial`, `two_pass_parallel`} ×
+{`coordinate_list`, `linked_list`}, with
+`I = (b_P/c_P)/(b_S/c_S) = (b_P/b_S)/(c_P/c_S)` and both readings asserted to agree,
+on the 32 configurations where the substitution fires:
+
+| | |
+| --- | --- |
+| interaction `I` | **0.883× – 1.237×** |
+| median \|ln I\| | **4.4 %** |
+| worst \|ln I\| | **23.7 %** |
+| outside the four-measurement A/A null | **13 of 32** |
+| outside the conservative eight-measurement null | **7 of 32** |
+| faster two-pass strategy flips with structure | **0 of 32** |
+
+The control cell — TTM, where the transform substitutes nothing, so `b` and `c` are
+the same program and `I` must be 1 — spans 0.947×–1.014× with **0 of 8** outside
+either null.  The apparatus is clean.
+
+**The interaction is systematic and sorts on one axis: the receiver's compressed
+extent.**  `shape=square` (extent 256) has `I > 1` on 13/16, geomean **1.0565**;
+`shape=wide-workspace` (extent 4096) has `I > 1` on 1/16, geomean **0.9473**.
+Density splits 8/16 and 6/16 with geomeans 1.003 and 0.998, and **both automatic arms
+split in half** (6/16 and 8/16, geomeans 0.9933 and 1.0076) — the interaction is
+arm-invariant.  The compressed extent is already one of the two inputs §67.3 named as
+necessary to a cost model, so the dependence is not on a quantity nobody was going to
+collect.
+
+Caveat that should travel with the "0 flips" line: `two_pass_parallel` is 3–10× faster
+than `two_pass_serial` everywhere on this grid, so a ranking surviving a 24 %
+perturbation of a 3–10× gap is not evidence that rankings are stable in general.
+
+No new timing run was taken.  §68's sealed receipt already contained the crossed 2 × 2
+— `~/.cache/scorch-codex/workspace-decision/receipts/decision/m5_quick.json`, digest
+`74544810ac1a5ee5…`, verified against that ledger's `SHA256SUMS` before any number was
+read, measured at asserted-clean `0f9b3b0`.  `git diff 0f9b3b0..159d6e8 -- src/` is
+empty, so the numbers carry to this tip.
+
+**Consequence for the next grid: crossed, not additive.**  Four columns plus two would
+have been correct only under independence.
+
+### 69.3 The grid is six columns, not eight
+
+Measured by compiling, not by reading.  `probe_missing_cell.py` requests every
+(strategy, structure) pair over the five confound cells × both arms at a pinned
+worktree asserted clean at `159d6e8`, and records OK or the structured refusal.
+**Six of the eight columns have a producer.**  Both single-pass strategies refuse
+`linked_list` on 10 of 10 cell-arms with `unsupported_accumulator_structure`; the
+cause is `require_accumulator_without_two_phase` (`lower_llir.py:5754`), called by the
+shared driver at `:15735` whenever `compressed_where_pass_spec is None`.  Two
+incidental refusals are recorded so a later census keying on codes alone does not
+misread them: `single_pass_chunk_parallel` also refuses `coordinate_list` on 3 of 5
+cells with `unsupported_assembly_strategy`, and the TTM cell refuses `linked_list`
+under both two-pass strategies.
+
+### 69.4 Three findings that are not performance findings
+
+Recorded, not fixed, and flagged because their failure mode is wrong answers or silent
+behaviour rather than slow kernels.
+
+- **The scalar reduction accumulator is hardwired to `float`** whatever the tensors'
+  dtype (`iter_lattice.py:1141`), while `schedule_lowerer.py:1360` picks
+  `FLOAT32`/`FLOAT64` off the result pointer type one file over.  For an fp64 program
+  with a COO result this truncates every partial sum — a latent precision defect, not
+  a knob.
+- **A requested `single_pass_chunk_parallel` is silently downgraded to serial** with no
+  diagnostic (`parallel_chunk_assembly.py:588`) on structural conditions
+  `chunk_assembly_legal()` does not test, while the sibling `parallel_chunk_context()`
+  fails closed with `unsupported_assembly_strategy` for the same class of request.
+  Typed route only, so not shipping — but it is the "fail closed, zero unclassified"
+  rule with a hole in it.
+- **The parallel work estimate silently degrades to `-1`** on a variable-name mismatch
+  (`parallel_marking_pass.py:750`, again at `compressed_where_openmp_pass.py:1141`),
+  after which `scorch_nthreads` skips its `by_work` clamp and caps by `rows/16` alone —
+  the over-threading case `scorch_policy.h:19` records as 4–7× slower than PyTorch for
+  a hand-written kernel.  Reachable in production via `cin_lowerer.py:3828` and `:3976`.
+
+And two that make later measurements unsafe until settled: `#pragma unroll` is emitted
+in a spelling GCC ignores (`codegen.py:987`), so the unroll decision is a full unroll on
+the M5 and a no-op on the x86 host and no unroll measurement transfers between them; and
+the compiled-kernel cache key records only `platform.machine()` under `-march=native`
+(`compile_options.py:1244`), so an AVX-512 and an AVX2 `.so` file under one identity —
+inert on a single machine, wrong-binary on a shared `TORCH_EXTENSIONS_DIR` across a
+heterogeneous cluster.
+
+### 69.5 The highest-expected-value item, which is a port rather than a decision
+
+Every generated `evaluate()` revalidates its whole sparse index, serially, one
+`TORCH_CHECK` per element, on every call (`csrc/native_abi.h:742`, emitted for every
+input by `torch_cpp_abi.py:409`; no memoization and no fast screen exist on this
+branch).  The same pass on the prebuilt path was measured at **1.29–1.82 ns/nonzero**
+and, when removed, moved a 195-cell pooled result from 0.675× to 1.878× against MKL.
+The fix is commit `62a5a9e`; `git merge-base --is-ancestor 62a5a9e HEAD` returns
+non-zero and `git branch --contains 62a5a9e` lists only `perf/spmm-beat-mkl`.  Until it
+is ported, every runtime number taken on a generated kernel carries an O(nnz) serial
+term that has already inverted one study's sign.
+
+### 69.6 What this section does not do
+
+- **No production code changed.**  The only tracked file under `src/` differing from
+  `HEAD` is `src/scorch/__init__.py`, which belongs to the separate CUDA project and was
+  already modified before the session began.  Because `src/` is untouched, the emission,
+  census and release-neutrality obligations are satisfied by construction and were not
+  re-run.
+- **Nothing found was fixed**, including the items in §69.4 that are plainly wrong.  A
+  survey that repairs as it goes stops being comparable.
+- **No decision was made explicit, schedulable or configurable; no chooser was built or
+  extended; no default, threshold or heuristic moved.**
+- **The four-strategy grid was not built.**  §69.2 sizes it; it does not run it.
+- **The new pipeline stays unwired.**  `compile_cin_via_loopir` and
+  `execute_cin_via_loopir` still have zero non-test callers — 24 test modules and no
+  production module reference them at this tip.
+- **The interaction number is a sizing input, not a shipping claim.**  M5 only, one
+  sealed receipt, re-analysed rather than re-measured.
+- **The survey has a stated blind spot.**  Three decomposition-blind sweeps (all
+  hardcoded constants, all orderings and tie-breaks, all unconditional branches) and a
+  completeness critic did not run.  The 124 sites are what stage-by-stage reading found;
+  a constant invisible from inside its own stage could still be missing, and closing that
+  is the first thing a follow-up should do.
+
+**Evidence ledger**: `~/.cache/scorch-codex/decision-survey/`, sealed over **10 files**
+with zero compiled artifacts in the seal and every one verifying (`SHA256SUMS` itself
+hashes to `159d3e3215746cc9…`) — the two harnesses (`interaction.py`, which verifies the
+§68 receipt's digest against its `SHA256SUMS` and the provenance commit before reading a
+number, and `probe_missing_cell.py`, which is compile-only and times nothing), their
+three receipts, the four census files behind §69.1, and `provenance/tip.txt`.  The pinned
+worktree at `159d6e8` that both harnesses were run against is in the ledger and excluded
+from the seal, as git-backed scratch rather than evidence.  Both harnesses take a tree
+root as `$1`; the probe additionally takes an expected commit and refuses a dirty or
+mismatched tree.

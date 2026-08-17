@@ -33591,3 +33591,83 @@ not this one's.
 6. **The chunk-merge kernel grid is two configurations wide**; the harness has a
    `full` grid that wants a quiet machine.
 7. **mkt1 is still owed**, since §59.
+
+## The survey of silent decisions, and the interaction number (2026-08-16; supersedes every preceding prompt)
+
+**Status.** Tip `159d6e8`, 88 commits ahead of origin `a3b8d1e` before this slice,
+nothing pushed. **No production code changed.** This slice adds two tracked
+documents only: `COMPILER_SILENT_DECISION_SURVEY.md` at the repository root, and
+review **§69**, which points at it. The five modified files belonging to the
+separate CUDA project (`.gitignore`, `pyproject.toml`, `src/scorch/__init__.py`,
+`tests/packaging/smoke_install.py`, `tests/test_scorch/test_resources.py`) are
+untouched and still uncommitted, as they should be.
+
+**1. WHAT THE SURVEY FOUND.** A decision counts as silent if it changes the emitted
+kernel's speed, has more than one legal answer for the same program, and is made
+without consulting shape, density or the machine. 339 candidates read stage by
+stage, each verified by a second reader instructed to refute it: **132 qualifying
+records at 124 distinct sites**, of which **109 were not among the eight starting
+points**, **95 have never been measured at all**, **0 have been measured on a
+grid**, and 115 fire on programs that ship today. Full census, ranking and
+citations in the root document; §69.1 has the summary.
+
+**2. THE INTERACTION NUMBER.** Assembly strategy and accumulation structure
+**interact**: `I` spans **0.883×–1.237×**, median |ln I| **4.4 %**, worst **23.7 %**,
+outside the four-measurement A/A null on **13 of 32** and the conservative
+eight-measurement null on 7 of 32, with the faster two-pass strategy flipping on 0
+of 32. Control cell clean (0.947–1.014, 0 of 8 outside). It sorts on the receiver's
+compressed extent — square (256) `I > 1` on 13/16 geomean 1.0565, wide-workspace
+(4096) 1/16 geomean 0.9473 — and is **arm-invariant** (6/16 and 8/16, geomeans
+0.9933 / 1.0076). So **the next grid is crossed, not additive.** Re-analysed from
+§68's sealed receipt (digest verified first, measured at `0f9b3b0`;
+`git diff 0f9b3b0..159d6e8 -- src/` is empty). No new timing run.
+
+**3. THE GRID IS SIX COLUMNS, NOT EIGHT.** Compiled, not read: both single-pass
+strategies refuse `linked_list` on 10 of 10 cell-arms with
+`unsupported_accumulator_structure`, cause `require_accumulator_without_two_phase`
+(`lower_llir.py:5754`) via the shared driver at `:15735`. Item 1 of the previous
+slice's next-session list — the four-strategy grid — is therefore six columns,
+crossed on structure, with the receiver's compressed extent as the primary axis.
+
+**4. LINE-NUMBER CORRECTION.** `_select_index_vars_to_tile` is at
+**`scheduler.py:3594`**, call sites **`:3722`** and **`:3967`**. This file's own
+`:26491` says `:3090`; that is stale. Every other anchor checked was correct.
+
+**5. NOT FIXED, ON PURPOSE.** The fp64 scalar accumulator (`iter_lattice.py:1141`),
+the silent serial downgrade of a requested chunk assembly
+(`parallel_chunk_assembly.py:588`), the work estimate degrading to `-1`
+(`parallel_marking_pass.py:750`), the GCC-ignored `#pragma unroll` spelling
+(`codegen.py:987`), and the `-march=native` cache key (`compile_options.py:1244`).
+Written down and left alone; §69.4 has the details.
+
+**6. THE BLIND SPOT.** Three decomposition-blind sweeps (all constants, all
+orderings and tie-breaks, all unconditional branches) and a completeness critic did
+not run — they hit an account limit mid-run. The 124 sites are what stage-by-stage
+reading found. A constant invisible from inside its own stage is still missing.
+
+**7. LEDGER.** `~/.cache/scorch-codex/decision-survey/` — `interaction.py` (verifies
+the §68 receipt's digest against its `SHA256SUMS` and the provenance commit before
+reading a number), `probe_missing_cell.py` (compile-only, times nothing, asserts
+tree root and expected commit), their receipts, and the pinned worktree at
+`159d6e8`. Sealed with `statics/seal_ledger.sh`.
+
+## What the next session should do
+
+1. **Port `62a5a9e`** — the per-call O(nnz) index revalidation fix — from
+   `perf/spmm-beat-mkl`. It is not an ancestor of this branch. Measured at
+   1.29–1.82 ns/nonzero on the prebuilt path, where removing it moved a 195-cell
+   pooled result from 0.675× to 1.878×; the generated path still pays it, on every
+   call, in every kernel. Every runtime number taken before this lands is
+   contaminated.
+2. **Settle the two measurement hazards** (§69.4's last paragraph): the unroll
+   pragma spelling and the `-march=native` cache key. Each is under a hundred lines,
+   and until both are done a number from the M5 and a number from redwood are not
+   comparable for anything touching an unrolled or vectorized loop.
+3. **Then the crossed six-column grid**, two hosts, receiver compressed extent as
+   the primary axis, density secondary, both automatic arms.
+4. **Only then `default_assembly()` and `default_accumulator()`**, on the grid's
+   numbers — and read §7 of the root document first, which says why the shipped
+   `tiling.py` ladder is not a drop-in home and which parts of it should be reused
+   rather than rebuilt.
+5. Items 3–7 of the previous slice's list still stand: the two completion mirrors,
+   rule 4's obstacles B and E, the two-configuration chunk-merge grid, and mkt1.
