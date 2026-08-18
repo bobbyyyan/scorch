@@ -71,7 +71,7 @@ operands it is slower than the code it replaced.
 | output bits vs `04f321d`, matrix × N × autotune level | **16/16 identical** (sha256 of the full result buffer) |
 | validator rejection cases, base vs candidate | **73/73 pass**, identical messages — both the serial and parallel screen paths, empty rows, descents at every row boundary, first/last row, int64 non-representability, storage-sharing views, `torch.inference_mode()`, the narrowing memo (repeat calls, in-place edits, unrepresentable arrays rejected on *every* call, caller arrays returned unmutated), COO bounds and lexicographic order, and dead-entry reclamation |
 | float64 reference, every grid cell | see the grid table below |
-| macOS suite, base vs candidate | **identical failure sets** — 208 failures on each, the same 208 test IDs, `comm` empty in both directions. Candidate passes 374 against base's 365, i.e. exactly the 9 new tests. The 208 are pre-existing and unrelated: the macOS SDK's libc++ cannot compile a generated kernel at all on this host, on any tree — every error is a `ninja` failure inside `is_trivially_copyable.h` / `strong_order.h` |
+| macOS suite, base vs candidate | **identical failure sets** — 208 failures on each, the same 208 test IDs, `comm` empty in both directions. Candidate passes 374 against base's 365, i.e. exactly the 9 new tests. The 208 are pre-existing and unrelated — every error is a `ninja` failure inside `is_trivially_copyable.h` / `strong_order.h`. **Since fixed**: they were one hardcoded SDK path in `get_extra_cflags`, not a macOS limitation; see the toolchain note below |
 | Linux suite, candidate with the JIT change *and* the dispatch levers | **582 passed, 14 skipped, 0 failed** (full suite, perf tests included). This is the only host whose toolchain compiles a generated kernel, so it is the only real test of the JIT validator. Collection is 596 against base's 587 — the 9 new tests and nothing dropped — and the skip count is unchanged, so no test silently became a skip |
 | Linux suite, base and candidate before the JIT change | **567 passed**, 14 skipped, 0 failed on each (`-m "not perf"`, measured on an earlier tree with fewer tests collected) |
 | Linux suite, with the call plan (lever 5) | **652 passed, 14 skipped, 0 failed** — 582 before, so exactly the 70 new plan tests and nothing dropped or turned into a skip |
@@ -668,9 +668,10 @@ That is the argument for narrowing at construction rather than at the boundary.
 operands and a sparse result, which charges narrowing plus scans; DCSR × dense through
 `matmul` with a dense result, which charges scans only), interleaved arms, an in-process
 A/A floor, and `torch.sparse.mm` as the cross-tree control. Base is the tree at
-`b4f8985`. redwood only; this laptop cannot compile a generated kernel at all, so there
-is no second host for this one — the numbers below are single-machine and should be read
-as such.
+`b4f8985`. redwood only: at the time this ran, the laptop could not compile a generated
+kernel at all, so the numbers below are single-machine and should be read as such. That
+was a toolchain defect, since fixed (see the macOS note below), so a second host for
+this table is now possible and has not yet been run.
 
 | route | matrix | M | nnz | N | before ms | after ms | gain | A/A floor | control |
 |---|---|---|---|---|---|---|---|---|---|
@@ -707,6 +708,106 @@ section: a parallel screen spawns a thread team immediately before the kernel wa
 differently shaped one, and the reshape costs more than the walk it saved. The variable
 is for diagnosing a suspected memo bug on small operands, not for running production
 with the memo off.
+
+## Wrapping a matrix: the index validation
+
+The call plan above ends the prebuilt route's Python tax. Asking the same question of
+the generated route — is a warm `scorch.einsum` call also mostly Python? — found
+something bigger and simpler, and not on the dispatch path at all.
+
+`_validate_index_storage` runs on **every** `STensor` built over a compressed level:
+`from_torch`, `from_csr`, `to_sparse`, a relayout, and the result of every generated
+kernel. Its sortedness check — each parent's coordinates must ascend — was a Python
+loop over parents, and each iteration sliced a tensor, launched a comparison kernel and
+synced on `.item()`. That is **3.7 µs per row**, so 74 ms to wrap a 20,000-row CSR;
+`torch.sparse.mm` on the same matrix takes 3 ms. And it ran **twice** per construction,
+because `SparseStorage.__init__` validates and then `STensor._set_state` — which every
+constructor and every in-place structural change funnels through immediately afterwards
+— validated the same arrays again.
+
+Two changes, both in `src/scorch/storage.py`:
+
+1. **Vectorize the predicate.** Descents are allowed exactly at parent boundaries, so
+   the whole check is two whole-array kernels: `coordinates[1:] < coordinates[:-1]`,
+   then clear the entries that sit on a boundary (`positions[1:-1]`). Where it fails,
+   the offending parent is recovered with one `searchsorted` — so the exception still
+   names the same parent the loop named.
+2. **Do not walk twice.** `SparseStorage.__init__` records a stamp of what it validated
+   — `(data_ptr, _version, numel)` per index array and for the values — and
+   `_set_state` skips the second walk when the stamp still matches. Where it does not
+   match, the full check runs. The public `validate()` methods always re-run in full:
+   an explicit call asks for the work.
+
+### Both hosts, three arms, one process, one binary
+
+Neither change needs a separate build, so both are switchable at runtime and the
+switches are thrown outside the timed region. `loop2` is what shipped, `vec2` is the
+vectorized predicate still run twice, `vec1` is the version that ships now. Arms are
+visited in a fresh random order every round, the figure is the median of 9, and every
+arm's result is compared against the others before any of them is timed.
+
+| case | host | loop2 µs | vec2 µs | vec1 µs | total gain | of which the second walk |
+|---|---|---|---|---|---|---|
+| `from_torch` 128×4 | redwood | 920.3 | 79.5 | 53.2 | **17.3x** | 1.49x |
+| `from_torch` 128×4 | M5 | 555.9 | 45.1 | 28.4 | **19.6x** | 1.59x |
+| `from_torch` 1000×8 | redwood | 6,806.9 | 98.9 | 63.2 | **108x** | 1.56x |
+| `from_torch` 1000×8 | M5 | 4,171.1 | 64.5 | 39.2 | **106x** | 1.65x |
+| `from_torch` 20000×24 | redwood | 135,289 | 557.0 | 363.6 | **372x** | 1.53x |
+| `from_torch` 20000×24 | M5 | 83,040 | 631.1 | 352.0 | **236x** | 1.79x |
+| `from_torch` 100000×16 | redwood | 677,329 | 1,696.6 | 1,151.0 | **588x** | 1.47x |
+| `from_torch` 100000×16 | M5 | 424,822 | 1,620.4 | 961.0 | **442x** | 1.69x |
+| `to_sparse` "ds" 2000×2000 @1% | redwood | 23,833 | 3,218.1 | 2,924.7 | **8.1x** | 1.10x |
+| `to_sparse` "ds" 2000×2000 @1% | M5 | 15,018 | 2,474.0 | 2,263.2 | **6.6x** | 1.09x |
+
+The gain scales with rows because the cost it removes was per row: wrapping a
+100,000-row CSR went from **0.68 s to 1.2 ms** on redwood. `to_sparse` gains only
+6.6–8.1x because most of its call is a generated kernel building a sparse result, not
+validation — the same structural reason the workspace route gained nothing from the ABI
+fix. Deduplicating the walk is worth a flat 1.47–1.79x on top of the vectorization on
+`from_torch`, and 1.09–1.10x on `to_sparse`, on both hosts.
+
+### Why this is not a correctness risk
+
+A faster validator that accepts different storage is not a faster validator. The old
+implementation is kept **verbatim** as `reference_validate` in
+`tests/test_scorch/test_index_validation_equivalence.py`, and 59 differential tests
+compare `(exception type, message)` between the two over well-formed CSR/dense/COO/DCSR,
+per-parent descent naming, first-offending-parent precedence, descents that straddle a
+boundary, empty and single-entry parents, duplicate coordinates, malformed position
+arrays, out-of-range coordinates, wrong dtypes, nnz mismatches, degenerate extents, and
+a 24-seed fuzz sweep with four corruption modes. Three deliberately wrong versions of
+the vectorized check were each caught by that file before this shipped.
+
+Twelve more tests cover the stamp: construction validates exactly **once** (it was
+twice), an in-place write to any index array or a `resize_` of the values is still
+caught, storage assembled without going through the constructor is validated from
+scratch, and both public `validate()` methods still re-run the full check every time.
+The stamp deliberately over-reports: writing a value back over itself moves the version
+counter and buys a validation nobody needed, which costs speed and never correctness.
+
+What the stamp cannot see is a write through a raw pointer or a numpy view, which bumps
+no version counter. Neither could anything before it: validation happens when a tensor
+is built or reassembled, and such a write happens in between without telling anyone.
+
+### The macOS toolchain, which is why there are two hosts here
+
+Every measurement in the previous section is redwood-only, because this laptop could not
+compile a generated kernel **at all** — 208 tests failed on it, and `to_sparse` was
+unavailable. The cause was one line in `get_extra_cflags`: it pointed clang at the
+CommandLineTools SDK's libc++ headers by absolute path, while `xcode-select -p` on this
+host is Xcode. The compiler torch invokes is then Xcode's clang, and handing it another
+toolchain's libc++ fails inside the headers themselves — `reference to unresolved using
+declaration` in `<__type_traits/is_trivially_copyable.h>`. A flag-by-flag bisect
+isolated it: baseline, `-march=native`, `-ffast-math`, `-funroll-loops`, the OpenMP
+flags and the Homebrew libomp include all compile; the CommandLineTools include fails
+and the `xcrun --show-sdk-path` include succeeds.
+
+The prebuilt extension was never affected, because `scorch_build.py` does not add this
+flag — which is why the breakage looked for a long time like a codegen defect rather
+than a toolchain one. The fix resolves the SDK once per process via
+`xcrun --show-sdk-path`, falls back to the CommandLineTools path, and adds nothing at
+all if neither has the headers (a consistent toolchain finds its own libc++ without
+help; a wrong `-isystem` is worse than none). `SCORCH_MACOS_SDK` overrides it.
 
 ## Scope and gaps, stated plainly
 
