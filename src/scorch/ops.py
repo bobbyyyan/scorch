@@ -594,7 +594,58 @@ def matmul_wksp(
     return result
 
 
-def _dispatch_tiled(a, b, resolved, nthreads, atparallel, time_dict):
+def _composition_hints(resolved):
+    """Thread-count and pipelining hints for the drop-in CSR@dense SpMM.
+
+    Returns ``(nthreads, atparallel)``, both inert unless the resolved kernel is
+    ``spmm_csr_float_v2``.
+
+    Derived here and nowhere else because two callers dispatch this kernel family --
+    ``matmul`` and ``scorch.compile``'s fused SpMM+bias+act path -- and the tiling
+    selector memoizes a verdict measured against the baseline these hints configure,
+    then applies the same ``nthreads`` to the tiled kernels it picks. A second caller
+    deriving them differently would write verdicts the first cannot reproduce, and
+    would forfeit the host-thread match (pubmed 0.78 -> 1.15x, commit e795127).
+    """
+    if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
+        return torch.get_num_threads(), _ATPARALLEL_PIPELINE
+    return None, False
+
+
+def tiling_gate(a, b, resolved):
+    """Whether the tiling selector may serve this SpMM at all, and at which level.
+
+    Returns ``(level, may_serve)``, with ``level`` ``None`` when the resolved kernel is
+    not the drop-in SpMM.
+
+    Split out of ``_dispatch_tiled`` so a caller that has to build closures in order
+    to consult the selector can ask first and skip building them on the shapes the
+    gate declines — which is every GCN-small layer, every autoencoder layer, and
+    anything whose dense operand fits in cache. ``scorch.compile``'s fused path needs
+    that; ``matmul`` does not, and lets ``_dispatch_tiled`` call this itself.
+
+    The level is resolved exactly once, here, and handed back, so the gate and the
+    dispatch that follows it cannot be asked at two different levels — a
+    ``set_autotune`` context manager could otherwise exit between the two reads.
+    """
+    if resolved.symbol_name != "spmm_csr_float_v2":
+        return None, False
+    level = _tiling_current_level()
+    return level, _tiling_is_candidate(a, b, level=level)
+
+
+def _dispatch_tiled(
+    a,
+    b,
+    resolved,
+    nthreads,
+    atparallel,
+    time_dict,
+    baseline_fn=None,
+    baseline_tag="v2",
+    epilogue=None,
+    gate=None,
+):
     """Run the adaptive tiling selector's choice, or report that v2 should run.
 
     Returns ``(result_cpp, result_shape, plan_kind, plan_param)``, with the first two
@@ -604,30 +655,48 @@ def _dispatch_tiled(a, b, resolved, nthreads, atparallel, time_dict):
     On the drop-in CSR@dense SpMM this routes the high-degree operand-over-LLC thrash
     regime (reddit/products-class) to the column-panel kernel
     ``spmm_csr_float_tilej``; v2 serves everything else byte-unchanged. Provably
-    no-regression: v2 is always the probe baseline, so the memoized choice is never
-    slower than v2 (see ``tiling.maybe_dispatch``). It only engages when the cheap
-    O(1) pre-filter says a shape can even benefit — no overhead on
+    no-regression: the baseline is always a probe candidate, so the memoized choice
+    is never slower than it (see ``tiling.maybe_dispatch``). It only engages when the
+    cheap O(1) pre-filter says a shape can even benefit — no overhead on
     GCN-small/AE/panel.
+
+    ``baseline_fn`` / ``baseline_tag`` / ``epilogue`` default to the drop-in SpMM
+    comparison this function was written for. A caller with a different alternative
+    passes its own — see ``dispatch_tiled_fused``, which is how
+    ``scorch.compile``'s fused path enters. ``resolved`` always names the *untiled
+    SpMM* kernel either way, so the symbol gate and the composition hints are the
+    same question for both callers.
     """
-    if resolved.symbol_name != "spmm_csr_float_v2":
-        return None, None, "v2", None
-    # Resolve the autotune level ONCE so is_candidate and maybe_dispatch see a
-    # consistent value (a context manager could exit between two lookups). Only
-    # touched on the v2 symbol -> other prebuilt kernels (bias_act/fused) stay
+    # `gate` carries the symbol check, the autotune level resolved ONCE, and the O(1)
+    # pre-filter. A caller that already asked passes the answer in rather than paying
+    # for it twice; everyone else lets it be asked here. Nothing outside the v2 symbol
+    # is touched either way, so other prebuilt kernels (bias_act/fused) stay
     # byte-identical.
-    level = _tiling_current_level()
-    if not _tiling_is_candidate(a, b, level=level):
+    if gate is None:
+        gate = tiling_gate(a, b, resolved)
+    level, may_serve = gate
+    if not may_serve:
         return None, None, "v2", None
     result_shape = [a.shape[0], b.shape[1]]
 
-    def _v2_fn(nt):
-        rc, _ = execute_prebuilt_binary_kernel(
-            resolved.fn, a, b, nthreads=nt, atparallel=atparallel
-        )
-        return rc
+    if baseline_fn is None:
+
+        def baseline_fn(nt):
+            rc, _ = execute_prebuilt_binary_kernel(
+                resolved.fn, a, b, nthreads=nt, atparallel=atparallel
+            )
+            return rc
 
     disp = _tiling_maybe_dispatch(
-        a, b, result_shape, _v2_fn, nthreads, time_dict=time_dict, level=level
+        a,
+        b,
+        result_shape,
+        baseline_fn,
+        nthreads,
+        time_dict=time_dict,
+        level=level,
+        epilogue=epilogue,
+        baseline_tag=baseline_tag,
     )
     if disp is None:
         return None, None, "v2", None
@@ -637,10 +706,47 @@ def _dispatch_tiled(a, b, resolved, nthreads, atparallel, time_dict):
     # wherever an entry merely exists let a plan carry tile-j for a shape the gate
     # had rejected, so the plan ran a different kernel than the ordinary path --
     # caught by a test comparing the two bitwise.
-    verdict = _tiling_decided(a, b.shape[1], level=level)
+    verdict = _tiling_decided(a, b.shape[1], level=level, baseline_tag=baseline_tag)
     if verdict is None:
         return result_cpp, tuple(result_shape), "v2", None
     return result_cpp, tuple(result_shape), verdict[0], verdict[1]
+
+
+def dispatch_tiled_fused(
+    a, b, resolved_spmm, baseline_fn, baseline_tag, epilogue, gate=None
+):
+    """Consult the adaptive tiling selector on behalf of a fused SpMM + tail.
+
+    ``scorch.compile``'s only entry into the selector, and the reason
+    ``_dispatch_tiled`` takes a baseline at all. Sharing that function rather than
+    mirroring it is deliberate: the symbol gate, the autotune level resolved once,
+    the O(1) candidate pre-filter and — critically — the composition hints that
+    configure the tiled kernels all come from the same code, so the two callers
+    cannot drift into running the same kernel two different ways.
+
+    What legitimately differs is the alternative being measured against.
+    ``matmul``'s is the drop-in SpMM; a fused caller's is a kernel that folds
+    ``bias``/``relu`` into the SpMM's row epilogue and is therefore faster than the
+    drop-in SpMM plus a separate pass over the output. So the fused caller supplies
+    both its own ``baseline_fn`` and the ``epilogue`` the tiled kernels must run
+    out-of-line, and the verdict is memoized under ``baseline_tag``.
+
+    Returns ``_dispatch_tiled``'s 4-tuple; the first element is ``None`` when the
+    caller should run its own fused kernel.
+    """
+    nthreads, atparallel = _composition_hints(resolved_spmm)
+    return _dispatch_tiled(
+        a,
+        b,
+        resolved_spmm,
+        nthreads,
+        atparallel,
+        None,
+        baseline_fn=baseline_fn,
+        baseline_tag=baseline_tag,
+        epilogue=epilogue,
+        gate=gate,
+    )
 
 
 def matmul(
@@ -915,11 +1021,7 @@ def matmul(
     if use_cache:
         resolved = resolve_prebuilt_matmul(a, b, output_format=requested_output_format)
         if resolved is not None:
-            nthreads = None
-            atparallel = False
-            if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
-                nthreads = torch.get_num_threads()
-                atparallel = _ATPARALLEL_PIPELINE
+            nthreads, atparallel = _composition_hints(resolved)
             result_cpp, result_shape, _plan_kind, _plan_param = _dispatch_tiled(
                 a, b, resolved, nthreads, atparallel, time_dict
             )

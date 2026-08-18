@@ -6,7 +6,7 @@ import copy
 import operator
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.fx
@@ -357,9 +357,101 @@ def _jit_compile_fused(spec: FusionSpec, args: tuple) -> Callable:
     return _jit_runner
 
 
+# The elementwise tail each fused prebuilt kernel folds into its SpMM's row
+# epilogue, written out as a separate pass over a finished dense result. Needed only
+# when the adaptive tiling selector serves the SpMM instead: the tiled kernels
+# (spmm_csr_float_tilej / _tileijk) have no fused epilogue, so on that route the tail
+# runs out-of-line -- and is timed that way, against the fused kernel, before the
+# selector will route anything (see ops.dispatch_tiled_fused).
+#
+# The order of operations matches the fused kernels' own: add the bias, then clamp.
+# Both are in place on a buffer the tiled kernel just allocated, so nothing the
+# caller owns is touched.
+_TILED_TAILS: Dict[
+    Tuple[str, ...], Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+] = {
+    ("add",): lambda out, bias: out.add_(bias),
+    ("add", "relu"): lambda out, bias: out.add_(bias).relu_(),
+}
+
+
+def _fused_kernel_args(
+    result_shape: List[int], a: STensor, b: STensor, bias: torch.Tensor
+) -> tuple:
+    """The native fused kernel's argument list, written once.
+
+    Both the ordinary fused call and the baseline the tiling selector times against
+    need it, and they must be the same call or the selector is comparing against
+    something the library would not run."""
+    return (
+        result_shape,
+        list(a.shape),
+        a._native_mode_indices(),
+        a.values,
+        list(b.shape),
+        b._native_mode_indices(),
+        b.values,
+        bias,
+    )
+
+
+def _try_tiled_fused(
+    a: STensor,
+    b: STensor,
+    bias: torch.Tensor,
+    spmm_resolved: Any,
+    baseline_tag: str,
+    kernel_fn: Callable[..., Any],
+    tail: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    gate: tuple,
+) -> Optional[torch.Tensor]:
+    """Serve this fused SpMM+tail through the adaptive tiling selector, or decline.
+
+    Returns the finished dense result, or ``None`` to mean "run the fused kernel".
+
+    Without this, a fused graph could never reach the tiled kernels at all: the
+    selector is gated on the ``spmm_csr_float_v2`` symbol, and a fused graph resolves
+    to ``spmm_csr_bias_relu_float``, so ``scorch.compile`` silently opted every user
+    out of tiling. On a high-degree operand that overflows the last-level cache
+    (reddit/products-class) that is the difference between the tiled kernel and a
+    kernel thrashing on B.
+
+    The selector is handed the *fused* kernel as its baseline and this call's tail as
+    the epilogue every tiled candidate must also run, so it can only return a tiled
+    kernel measured to beat fusion on this shape, tail included.
+
+    `gate` is `ops.tiling_gate`'s answer, taken by the caller before it built anything,
+    so a declined shape never reaches this function: the closures below and the
+    composition hints cost nothing on the shapes the selector cannot help. What a
+    declined fused call does pay is the gate itself -- a symbol comparison, one
+    autotune-level read and the O(1) pre-filter, 0.5 us on an M5 -- which is exactly
+    what `ops.matmul` has paid on every prebuilt CSR@dense call since the selector
+    shipped, and no more.
+    """
+    n = a.shape[0]
+    k = b.shape[1]
+    result_shape = [n, k]
+
+    def _fused_baseline(_nthreads):
+        # The fused kernel takes no thread override, so it is timed exactly as it will
+        # run -- which is the point. Each arm is measured in the configuration it would
+        # actually be dispatched in: the tiled candidates with the composition hints,
+        # this one without, because there is nothing to hint at.
+        return kernel_fn(*_fused_kernel_args(result_shape, a, b, bias))
+
+    def _tail(result_cpp):
+        return tail(result_cpp.storage.value.view(n, k), bias)
+
+    served, _shape, _kind, _param = ops.dispatch_tiled_fused(
+        a, b, spmm_resolved, _fused_baseline, baseline_tag, _tail, gate
+    )
+    # `_tail` already turned a tiled result into the finished tensor.
+    return served
+
+
 def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
     """Try a native fused kernel, guarded by an eager-equivalent fallback."""
-    from .prebuilt_kernels import resolve_prebuilt_fused
+    from .prebuilt_kernels import resolve_prebuilt_fused, resolve_prebuilt_matmul
 
     prepared = _prebuilt_inputs(spec, args)
     if prepared is None:
@@ -376,6 +468,17 @@ def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
     fallback = _jit_compile_fused(spec, args)
     kernel_fn = resolved.fn
 
+    # Resolve the untiled SpMM once, here. `resolve_prebuilt_matmul` dispatches on
+    # operand ranks, formats and dtypes and nothing else -- every one of which
+    # `_prebuilt_inputs` re-checks on each call, pinning rank 2, "d,s" x "d,d" and
+    # float32 -- so this is exactly what a per-call resolve would return, without
+    # paying for one. `tail is None` (a fused kernel whose post-ops have no
+    # out-of-line equivalent here) declines the tiled route entirely.
+    tail = _TILED_TAILS.get(post_op_kinds)
+    spmm_resolved = (
+        resolve_prebuilt_matmul(a, b, output_format="dd") if tail is not None else None
+    )
+
     def _prebuilt_runner(call_args: tuple) -> Any:
         try:
             runtime_inputs = _prebuilt_inputs(spec, call_args)
@@ -390,15 +493,32 @@ def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
         result_shape = [n, k]
 
         try:
+            # Inside the existing guard on purpose: a selector fault gets the same
+            # treatment as a fused-kernel fault, the eager equivalent, rather than
+            # its own silent decline (which would hide the fault) or an escape
+            # (which would break a working graph).
+            #
+            # The gate is asked before anything is built, so a shape it declines --
+            # every GCN-small and autoencoder layer -- reaches the ordinary call below
+            # having allocated nothing: no closure, no argument tuple.
+            if spmm_resolved is not None and tail is not None:
+                gate = ops.tiling_gate(a_arg, b_arg, spmm_resolved)
+                if gate[1]:
+                    tiled = _try_tiled_fused(
+                        a_arg,
+                        b_arg,
+                        bias,
+                        spmm_resolved,
+                        resolved.symbol_name,
+                        kernel_fn,
+                        tail,
+                        gate,
+                    )
+                    if tiled is not None:
+                        return tiled
+
             result_cpp = kernel_fn(
-                result_shape,
-                list(a_arg.shape),
-                a_arg._native_mode_indices(),
-                a_arg.values,
-                list(b_arg.shape),
-                b_arg._native_mode_indices(),
-                b_arg.values,
-                bias,
+                *_fused_kernel_args(result_shape, a_arg, b_arg, bias)
             )
             return result_cpp.storage.value.view(n, k)
         except Exception:
