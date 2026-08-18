@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import weakref
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
@@ -321,6 +322,193 @@ _DENSE_PARTS_CACHE: dict = {}
 _DENSE_PARTS_CACHE_MAX = 512
 
 
+# --------------------------------------------------------------------------- #
+# The copy a non-contiguous dense operand needs
+#
+# `SparseStorage` holds a flat contiguous values array, so a dense operand that is a
+# transposed view -- `W.T`, `x.permute(1, 0)`, a strided slice -- must be materialized.
+# For a contiguous operand `.reshape(-1)` is a view and the STensor shares the caller's
+# buffer, which is what it has always done; for a non-contiguous one it is a full copy,
+# paid again on every call even when the operand has not changed since the last one.
+#
+# So remember it. The entry is keyed on the identity of the *base* tensor rather than the
+# view, because the view is a fresh object per call (`W.T` inside a loop) while its base is
+# the parameter that persists. Three things must hold for a hit, and the first is why a
+# reused allocator address cannot fool it:
+#
+#   * the weak reference still resolves to the same base object,
+#   * the base's version counter is unchanged -- torch shares one counter between a tensor
+#     and every view of it, so any in-place torch write through any of them is a miss,
+#   * the copy's own counter is unchanged, because the copy is handed out as the STensor's
+#     values and a write through those would otherwise be served to the next caller.
+#
+# Two STensors built from the same unmodified operand therefore share one values buffer,
+# where before they held separate copies. That is not a new kind of sharing: an STensor over
+# a *contiguous* operand has always shared the caller's buffer, and the result of a kernel
+# shares its values through `detach`. It does mean a write through one sibling's `.values`
+# is visible in the other until the next lookup notices the version move.
+#
+# What none of that sees is a write through a raw pointer or a numpy view, which bumps no
+# counter. Nothing in Scorch sees those -- index validation has the same blind spot, and so
+# does autograd -- but here the consequence is a stale *value* rather than a skipped check,
+# so it is said plainly: an operand mutated behind torch's back and then multiplied again
+# reads as unchanged. `SCORCH_MEMO_OPERAND_COPY=0` turns this off in the same binary, which
+# is also how it is measured.
+#
+# The retained copies are the other cost. Peak memory during a call does not change -- the
+# copy was always being made -- but steady state grows by one copy per live memoized
+# operand. Hence a small bound, and a sweep of entries whose base has died, so the bound
+# counts copies that are still reachable rather than corpses.
+#
+# A memo that cannot hit is a tax on every call, and `plan.py` met this exact problem
+# first: "a plan that declines costs the call it declined ... which is above the noise
+# floor and therefore a regression on any call site that repeats a product a plan cannot
+# serve." Measured here, an operand refilled in place every call -- a dataloader's buffer --
+# paid 1.11x on the smallest cell for a lookup that could never pay. So the same answer:
+# after enough consecutive misses with nothing served, stop consulting, which returns such a
+# call site to exactly what it cost before this existed.
+#
+# What is counted is the *stale* miss -- the key was present and the version had moved --
+# and not the cold miss, where the key was simply new. That distinction is the whole signal.
+# A changing operand produces a stale miss on every call; a program with more distinct
+# stable operands than the bound, or a deep model on its first forward, produces cold
+# misses and then hits. Counting all misses alike would withdraw the memo from the second
+# case, which is the case it exists for.
+# --------------------------------------------------------------------------- #
+_MEMO_OPERAND_COPY = [
+    os.environ.get("SCORCH_MEMO_OPERAND_COPY", "1") not in ("0", "false", "False")
+]
+_OPERAND_COPY_CACHE: dict = {}
+_OPERAND_COPY_CACHE_MAX = 16
+# Eight is enough because the streak resets on any hit, so this only fires when eight
+# stale misses arrive with nothing served in between. `plan.py` relies on the same
+# property: "a plan that helps most calls and declines the odd one is never touched." A
+# weight updated once per step and multiplied ten times within it never withdraws. The
+# trade is that the withdrawal is permanent and process-wide, so a program whose first
+# eight stale misses all precede its first hit loses the memo for good -- which costs it
+# the gain, not correctness, and is the direction to err in.
+_OPERAND_COPY_GIVE_UP = 8
+# [consecutive stale misses, insert attempts left before the next sweep]
+_OPERAND_COPY_STATE = [0, _OPERAND_COPY_CACHE_MAX]
+
+
+# Resolved once. An editable install whose extension has not been rebuilt will not have
+# the entry point and must keep building tensors, so its absence is a missing optimization
+# rather than an error -- the same arrangement as storage.py's validation screens.
+try:  # pragma: no cover - exercised by whichever branch this import takes
+    import scorch_ops as _native_ops
+
+    _NATIVE_TRANSPOSE = getattr(_native_ops, "scorch_transpose_2d_float", None)
+except Exception:
+    _NATIVE_TRANSPOSE = None
+
+
+def _contiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor.contiguous()``, using the cache-blocked kernel when that is what it is.
+
+    A transposed 2-D float32 operand is column-major, and `.contiguous()` on one runs
+    torch's element-scatter, which is several times below memory bandwidth. Scorch already
+    ships a cache-blocked transpose for exactly that shape (AVX2 8x8 / NEON 4x4, also
+    reachable as `scorch.fast_transpose`), and transposing the row-major view of a
+    column-major matrix *is* its contiguous copy -- the same floats in the same order, bit
+    for bit. Every other layout, dtype and rank still takes `.contiguous()`.
+
+    **Serial deliberately**, by passing the kernel's "no thread override". Not because a
+    threaded transpose is slow -- on a 2000x256 operand on a 32-core x86 it takes 19 us
+    against 73 us serial and 188 us for `.contiguous()` -- but because of what it does to
+    the kernel that runs next. Measured on that host, materializing this operand and then
+    running scorch's SpMM on it costs 321 us with torch's copy, 182 us with the serial
+    kernel, and **2681 us with the threaded one**, where the two pieces alone are 19 + 47.
+    Two threaded transposes back to back cost 66 us, and a threaded transpose followed by
+    `torch.sparse.mm` costs 423 against 361 for the pieces, so it is not the transpose and
+    it is not threading as such: it is an ATen parallel region opening immediately before
+    scorch's own team. This is the same neighbour effect the validation screens ran into
+    (see `csrc/native_abi.h`), an order of magnitude larger.
+
+    The serial path has no region to leave behind, and it still beats `.contiguous()` on
+    39 of the 40 shapes in the measured grid -- 2.0-7.8x on the small ones, and never worse
+    than 0.95x. What it gives up is the threaded win on very large operands (up to 2-3x of
+    the copy itself at 15M elements), where the neighbour cost is a smaller share of a much
+    bigger copy and threading might well pay. That crossover is not chased here: it would
+    mean picking a second threshold against an interaction that is measured but not
+    explained.
+    """
+    if (
+        _NATIVE_TRANSPOSE is not None
+        and tensor.dim() == 2
+        and tensor.dtype == torch.float32
+        and tensor.t().is_contiguous()
+    ):
+        return _NATIVE_TRANSPOSE(tensor.t(), -1)
+    return tensor.contiguous()
+
+
+def _remember_operand_copy(key, base: torch.Tensor, copy: torch.Tensor) -> None:
+    """Install an entry, dropping dead ones so the bound counts live copies.
+
+    The sweep runs on a countdown rather than on every full-cache insert: walking sixteen
+    weak references per call is itself the tax this is trying to avoid, and a copy whose
+    base died a few calls ago costs nothing but the memory it is about to release.
+    """
+    if len(_OPERAND_COPY_CACHE) >= _OPERAND_COPY_CACHE_MAX:
+        _OPERAND_COPY_STATE[1] -= 1
+        if _OPERAND_COPY_STATE[1] > 0:
+            return
+        _OPERAND_COPY_STATE[1] = _OPERAND_COPY_CACHE_MAX
+        for dead in [k for k, e in _OPERAND_COPY_CACHE.items() if e[0]() is None]:
+            del _OPERAND_COPY_CACHE[dead]
+        if len(_OPERAND_COPY_CACHE) >= _OPERAND_COPY_CACHE_MAX:
+            return
+    try:
+        held = weakref.ref(base)
+    except TypeError:  # not weak-referenceable, so there is nothing to hold on to
+        return
+    _OPERAND_COPY_CACHE[key] = (held, base._version, copy, copy._version)
+
+
+def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
+    """The flat contiguous values array for a dense operand, copying only when needed."""
+    if tensor.is_conj() or tensor.is_neg():
+        # Resolving produces a tensor whose relation to the caller's base is no longer the
+        # one the key describes, so this rare shape is left alone.
+        return tensor.resolve_conj().resolve_neg().contiguous().reshape(-1)
+    if tensor.is_contiguous():
+        return tensor.reshape(-1)
+    if not _MEMO_OPERAND_COPY[0] or _OPERAND_COPY_STATE[0] >= _OPERAND_COPY_GIVE_UP:
+        return _contiguous_copy(tensor).reshape(-1)
+    base = tensor._base if tensor._base is not None else tensor
+    key = (
+        id(base),
+        tensor.shape,
+        tensor.stride(),
+        tensor.storage_offset(),
+        tensor.dtype,
+    )
+    entry = _OPERAND_COPY_CACHE.get(key)
+    if entry is not None:
+        held, base_version, remembered, copy_version = entry
+        if (
+            held() is base
+            and base._version == base_version
+            and remembered._version == copy_version
+        ):
+            _OPERAND_COPY_STATE[0] = 0
+            return remembered
+        # The key was here and no longer answers: this operand is being changed under us.
+        _OPERAND_COPY_STATE[0] += 1
+        if _OPERAND_COPY_STATE[0] >= _OPERAND_COPY_GIVE_UP:
+            # Withdrawing and still holding the copies is the worst of both: retained
+            # blocks keep torch's caching allocator from handing the same warm one back
+            # for the copy about to be made, which measured as a further 1.6-5% on the
+            # small cells. Release them, and do not install this call's copy either --
+            # every later call takes the early return above.
+            _OPERAND_COPY_CACHE.clear()
+            return _contiguous_copy(tensor).reshape(-1)
+    copy = _contiguous_copy(tensor).reshape(-1)
+    _remember_operand_copy(key, base, copy)
+    return copy
+
+
 def _dense_from_torch(
     tensor: torch.Tensor,
     name: Optional[str],
@@ -335,7 +523,7 @@ def _dense_from_torch(
     """
     key = (tuple(tensor.shape), tensor.dtype, tensor.device, name, tuple(mode_order))
     parts = _DENSE_PARTS_CACHE.get(key)
-    value = tensor.resolve_conj().resolve_neg().contiguous().reshape(-1)
+    value = _flat_contiguous_values(tensor)
     if parts is None:
         built = STensor(
             name=name,

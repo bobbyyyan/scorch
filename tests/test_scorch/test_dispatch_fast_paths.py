@@ -17,6 +17,7 @@ import scorch
 from scorch import STensor, TensorFormat, TensorLayout, parse_format
 from scorch.format import LevelFormat
 import scorch.ops as ops_module
+import scorch.stensor as stensor_module
 from scorch.exceptions import CompileSpecError, TensorTypeError
 from scorch.ops import _einsum_cache_key, _logical_index_sizes, _validated_labels
 from scorch.stensor import _DENSE_PARTS_CACHE
@@ -316,3 +317,251 @@ def test_logical_index_sizes_survive_relayout():
     transposed.change_mode_order([1, 0])
     assert tuple(transposed.shape) == (7, 5)
     assert _logical_index_sizes([["i", "k"]], (transposed,)) == before
+
+
+# --------------------------------------------------------------------------- #
+# Materializing a non-contiguous dense operand
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def copy_arms(monkeypatch):
+    """Set the two levers explicitly per test, and start from an empty memo."""
+
+    def select(*, memo, native):
+        monkeypatch.setattr(stensor_module, "_MEMO_OPERAND_COPY", [memo])
+        monkeypatch.setattr(
+            stensor_module,
+            "_NATIVE_TRANSPOSE",
+            stensor_module._NATIVE_TRANSPOSE if native else None,
+        )
+        monkeypatch.setattr(stensor_module, "_OPERAND_COPY_CACHE", {})
+
+    return select
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (1, 9), (9, 1), (8, 8), (5, 37), (64, 3)])
+def test_transposed_operand_materializes_bit_identically(shape):
+    """The cache-blocked transpose has to be `.contiguous()`, not an approximation of it."""
+    torch.manual_seed(0)
+    base = torch.rand(*shape)
+    operand = base.T
+    assert not operand.is_contiguous() or shape[0] == 1 or shape[1] == 1
+    got = stensor_module._contiguous_copy(operand)
+    torch.testing.assert_close(got, operand.contiguous(), atol=0, rtol=0)
+    assert got.is_contiguous()
+    assert tuple(got.shape) == tuple(operand.shape)
+
+
+def test_every_other_layout_materializes_exactly_too():
+    """Whichever branch a layout takes, the copy has to equal `.contiguous()`.
+
+    The first four fall to `.contiguous()` -- wrong dtype, wrong rank, and two views whose
+    transpose is not itself contiguous. The last two do take the kernel, which is worth
+    pinning separately: both are column-major at a non-zero storage offset, and the kernel
+    reads through `data_ptr()`, so the offset has to land where it belongs.
+
+    Which of these lands where is not obvious from reading them. A column slice of a
+    transpose keeps transpose-contiguity and a row slice of one does not, so the two are
+    asserted below rather than assumed.
+    """
+    torch.manual_seed(0)
+    fallback = [
+        torch.rand(8, 8).double().T,  # not float32
+        torch.rand(4, 5, 6).permute(2, 0, 1),  # not 2-D
+        torch.rand(16, 8)[::2],  # strided rows, so the transpose is not contiguous
+        torch.rand(12, 6).T[2:5],  # a *row* slice of a transpose: also not contiguous
+    ]
+    kernel = [
+        torch.rand(8, 8).T[:, 1:5],  # a column slice of a transpose: offset 8
+        torch.rand(16, 6)[3:9].T,  # the transpose of a row slice: offset 18
+    ]
+    for operand in fallback:
+        assert not (
+            operand.dim() == 2
+            and operand.dtype == torch.float32
+            and operand.t().is_contiguous()
+        )
+    for operand in kernel:
+        assert operand.t().is_contiguous() and operand.storage_offset() > 0
+    for operand in fallback + kernel:
+        got = stensor_module._contiguous_copy(operand)
+        torch.testing.assert_close(got, operand.contiguous(), atol=0, rtol=0)
+
+
+def test_memo_serves_one_copy_for_a_repeated_operand(copy_arms):
+    """The point of it: the second call does not copy again."""
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(32, 8)
+    first = STensor.from_torch(base.T)
+    second = STensor.from_torch(base.T)
+    assert first.values.data_ptr() == second.values.data_ptr()
+    torch.testing.assert_close(first.values, base.T.reshape(-1), atol=0, rtol=0)
+
+
+def test_memo_is_not_consulted_when_it_is_off(copy_arms):
+    """The control arm has to be a real control: no sharing at all."""
+    copy_arms(memo=False, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(32, 8)
+    first = STensor.from_torch(base.T)
+    second = STensor.from_torch(base.T)
+    assert first.values.data_ptr() != second.values.data_ptr()
+    assert stensor_module._OPERAND_COPY_CACHE == {}
+
+
+def test_memo_misses_after_an_in_place_write_to_the_base(copy_arms):
+    """A torch write through any view of the base bumps the counter they share."""
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(16, 4)
+    before = STensor.from_torch(base.T)
+    base[0, 0] = 42.0
+    after = STensor.from_torch(base.T)
+    assert after.values.data_ptr() != before.values.data_ptr()
+    torch.testing.assert_close(after.values, base.T.reshape(-1), atol=0, rtol=0)
+    assert after.values[0].item() == 42.0
+
+
+def test_memo_misses_after_a_write_through_the_values_it_handed_out(copy_arms):
+    """The remembered copy *is* the STensor's values, so a write through those is a miss.
+
+    Without this the next caller would be served a buffer the previous one had scribbled
+    on. `detach` shares the version counter, which is what makes it visible here.
+    """
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(16, 4)
+    handed_out = STensor.from_torch(base.T)
+    handed_out.values[0] = -1.0
+    again = STensor.from_torch(base.T)
+    assert again.values[0].item() != -1.0
+    torch.testing.assert_close(again.values, base.T.reshape(-1), atol=0, rtol=0)
+
+
+def test_memo_does_not_keep_a_dead_operand_alive(copy_arms):
+    """It holds a weak reference, so a base that goes out of scope is collectable."""
+    import gc
+    import weakref
+
+    copy_arms(memo=True, native=True)
+    base = torch.rand(16, 4)
+    watch = weakref.ref(base)
+    STensor.from_torch(base.T)
+    assert len(stensor_module._OPERAND_COPY_CACHE) == 1
+    del base
+    gc.collect()
+    assert watch() is None
+    # The entry survives until an insert sweeps it, and it can never be a hit again.
+    entry = next(iter(stensor_module._OPERAND_COPY_CACHE.values()))
+    assert entry[0]() is None
+    for _ in range(stensor_module._OPERAND_COPY_CACHE_MAX + 2):
+        STensor.from_torch(torch.rand(16, 4).T)
+    assert len(stensor_module._OPERAND_COPY_CACHE) <= (
+        stensor_module._OPERAND_COPY_CACHE_MAX
+    )
+
+
+def test_memo_separates_views_that_share_a_base(copy_arms):
+    """Same base, different geometry: different entries, and each one correct."""
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(8, 10)
+    rows = STensor.from_torch(base[0:4].T)
+    other = STensor.from_torch(base[4:8].T)
+    assert rows.values.data_ptr() != other.values.data_ptr()
+    torch.testing.assert_close(rows.values, base[0:4].T.reshape(-1), atol=0, rtol=0)
+    torch.testing.assert_close(other.values, base[4:8].T.reshape(-1), atol=0, rtol=0)
+
+
+def test_contiguous_operands_are_untouched_by_any_of_this(copy_arms):
+    """A contiguous operand still shares the caller's buffer and is never remembered."""
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    dense = torch.rand(8, 8)
+    wrapped = STensor.from_torch(dense)
+    assert wrapped.values.data_ptr() == dense.data_ptr()
+    assert stensor_module._OPERAND_COPY_CACHE == {}
+
+
+@pytest.mark.parametrize("memo", [True, False])
+@pytest.mark.parametrize("native", [True, False])
+def test_matmul_against_a_transposed_operand_agrees_across_arms(
+    copy_arms, memo, native
+):
+    """Whatever the levers say, the product is the product."""
+    copy_arms(memo=memo, native=native)
+    torch.manual_seed(0)
+    dense = (torch.rand(40, 40) < 0.25).float()
+    A = STensor.from_torch(dense.to_sparse_csr())
+    base = torch.rand(12, 40)
+    reference = dense.double() @ base.T.double()
+    for _ in range(3):
+        out = scorch.matmul(A, base.T)
+        got = out if isinstance(out, torch.Tensor) else out.to_torch(in_place=False)
+        torch.testing.assert_close(got, reference.float(), atol=1e-3, rtol=1e-3)
+
+
+def _reset_memo(monkeypatch, **overrides):
+    monkeypatch.setattr(stensor_module, "_MEMO_OPERAND_COPY", [True])
+    monkeypatch.setattr(stensor_module, "_OPERAND_COPY_CACHE", {})
+    monkeypatch.setattr(
+        stensor_module,
+        "_OPERAND_COPY_STATE",
+        [0, stensor_module._OPERAND_COPY_CACHE_MAX],
+    )
+    for name, value in overrides.items():
+        monkeypatch.setattr(stensor_module, name, value)
+
+
+def test_memo_withdraws_after_repeated_stale_misses(monkeypatch):
+    """An operand refilled in place every call must stop being looked up.
+
+    Otherwise it pays for a memo that can never serve it -- measured at 1.11x of the
+    smallest cell before this existed. The retained copies go with the withdrawal, because
+    holding blocks the allocator cannot recycle was itself worth a further few percent.
+    """
+    _reset_memo(monkeypatch, _OPERAND_COPY_GIVE_UP=4)
+    base = torch.rand(16, 4)
+    for _ in range(2 + 4 * 2):
+        base[0, 0] += 0.0  # a torch in-place write, so the version counter moves
+        wrapped = STensor.from_torch(base.T)
+        torch.testing.assert_close(wrapped.values, base.T.reshape(-1), atol=0, rtol=0)
+    assert stensor_module._OPERAND_COPY_STATE[0] >= 4
+    assert stensor_module._OPERAND_COPY_CACHE == {}
+
+
+def test_a_hit_resets_the_withdrawal_counter(monkeypatch):
+    """One stable operand among changing ones has to keep the memo alive."""
+    _reset_memo(monkeypatch, _OPERAND_COPY_GIVE_UP=4)
+    stable = torch.rand(16, 4)
+    churning = torch.rand(16, 4)
+    STensor.from_torch(stable.T)  # cold miss, installs
+    for _ in range(20):
+        churning[0, 0] += 0.0
+        STensor.from_torch(churning.T)
+        hit = STensor.from_torch(stable.T)
+        torch.testing.assert_close(hit.values, stable.T.reshape(-1), atol=0, rtol=0)
+    assert stensor_module._OPERAND_COPY_STATE[0] < 4
+    assert stensor_module._OPERAND_COPY_CACHE != {}
+
+
+def test_cold_misses_do_not_count_toward_withdrawal(monkeypatch):
+    """A deep model's first forward is all cold misses, and it must keep the memo.
+
+    Counting every miss alike would withdraw here -- from exactly the workload the memo
+    exists for, one that will reuse each of these operands on the next call.
+    """
+    _reset_memo(monkeypatch, _OPERAND_COPY_GIVE_UP=4)
+    operands = [torch.rand(8, 4) for _ in range(20)]
+    for operand in operands:
+        STensor.from_torch(operand.T)
+    assert stensor_module._OPERAND_COPY_STATE[0] == 0
+    # And the second pass over the ones that fit is served from the memo.
+    served = 0
+    for operand in operands:
+        before = STensor.from_torch(operand.T).values.data_ptr()
+        after = STensor.from_torch(operand.T).values.data_ptr()
+        served += before == after
+    assert served >= 1
