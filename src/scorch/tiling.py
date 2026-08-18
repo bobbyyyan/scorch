@@ -76,7 +76,7 @@ import platform
 import subprocess
 import threading
 import time
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -127,8 +127,19 @@ _tls = threading.local()
 
 
 def _current_level() -> str:
-    """The effective level: a thread-local CM override if active, else global."""
-    lvl = getattr(_tls, "level", None)
+    """The effective level: a thread-local CM override if active, else global.
+
+    Read through ``__dict__.get`` rather than ``getattr(_tls, "level", None)``, and
+    not as a style choice: with no override active -- the overwhelmingly common case,
+    since an override only exists inside a ``set_autotune`` context manager --
+    ``getattr`` with a default raises and catches an AttributeError internally, which
+    costs 0.132 us against 0.029 us for the dict lookup (M5, 300k calls, minimum of
+    5 batches). Every prebuilt CSR@dense product reads this through ``tiling_gate``,
+    so the 0.10 us is on the dispatch path of every SpMM the library serves.
+
+    ``threading.local``'s ``__dict__`` is the per-thread mapping, so this returns
+    exactly what the ``getattr`` returned, in every thread, set or unset."""
+    lvl = _tls.__dict__.get("level")
     return lvl if lvl is not None else _global_level
 
 
@@ -446,6 +457,19 @@ _LOC_MIN = float(os.environ.get("SCORCH_TILING_LOC_MIN", "0.3"))
 _LOC_NSAMP = 64
 
 
+def _operand_over_cache(J: int, N: int, C: int) -> bool:
+    """Does the dense operand overflow the last-level cache?
+
+    The physics boundary both gates rest on -- if B fits in cache, streaming it costs
+    nothing extra and no tiling can help. Split out because it needs no nnz, which
+    lets ``is_candidate`` answer the 99% case (every GCN-small, autoencoder and
+    attention shape) on two int operations, without the attribute chain and the pybind
+    ``numel()`` call that reading nnz off the index arrays costs."""
+    if not _HAS_TILEJ:
+        return False
+    return J * 4 * N > C
+
+
 def _eligible(J: int, nnz: int, N: int, C: int) -> bool:
     """Cheap O(1) pre-filter: tile-j can only beat v2 when B thrashes the LLC
     (operand > C) AND there is enough per-column reuse (degree) to recover more
@@ -453,13 +477,17 @@ def _eligible(J: int, nnz: int, N: int, C: int) -> bool:
     well-ordered high-degree matrix (FEM) from a scattered one — that needs the
     locality proxy (_scattered), applied only after this passes. The level gate
     (off) is applied by the callers (is_candidate / maybe_dispatch) before here."""
-    if not _HAS_TILEJ:
-        return False
-    operand = J * 4 * N
-    if operand <= C:
-        return False
-    deg = nnz / max(1, J)
-    return deg > max(_DEG_FLOOR, 2.0 * operand / C)
+    return _operand_over_cache(J, N, C) and _degree_pays(J, nnz, N, C)
+
+
+def _degree_pays(J: int, nnz: int, N: int, C: int) -> bool:
+    """The nnz-dependent half of the analytic gate: is there enough per-column reuse
+    (degree) to recover more than the panel re-traffic costs?
+
+    Assumes the operand-over-cache boundary has already passed, so a caller that
+    tested it -- ``is_candidate`` does, to avoid reading nnz on the 99% that fail --
+    is not made to test it twice."""
+    return nnz / max(1, J) > max(_DEG_FLOOR, 2.0 * (J * 4 * N) / C)
 
 
 def _locality_ratio(a, J: int) -> float:
@@ -512,20 +540,28 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
         return False
     J = int(a.shape[1])
     N = int(b.shape[1])
-    nnz = int(a.storage._mode_indices[1][1].numel())
     C = query_llc()
+    # Answer the 99% here, BEFORE touching an index array: both gates below start with
+    # this same test, and nnz is only needed if it passes. Reading nnz costs an
+    # attribute chain plus a pybind numel() call -- about a quarter of this function --
+    # and every GCN-small / AE / attention shape fails on the two int operations above
+    # it. The gates re-test the boundary because maybe_dispatch also calls them with
+    # nnz already in hand for the signature.
+    if not _operand_over_cache(J, N, C):
+        return False
     # learned widens the gate (operand>C only) ONLY when opted-in (SCORCH_AUTOTUNE_WIDEN=1)
     # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
-    # widening) and only improves the within-gate pick. Either way the 99% (operand<=C)
-    # short-circuits to v2 at int-comparison cost.
+    # widening) and only improves the within-gate pick.
     if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None:
-        return _eligible_learned(J, nnz, N, C)
-    return _eligible(J, nnz, N, C)
+        return _eligible_learned(J, N, C)
+    nnz = int(a.storage._mode_indices[1][1].numel())
+    return _degree_pays(J, nnz, N, C)
 
 
-def decided(a, n: int, level: Optional[str] = None):
-    """The winner this selector has already memoized for ``a @ B`` at free dim ``n``,
-    as ``(kind, param)``, or ``None`` if it has not decided one.
+def decided(a, n: int, level: Optional[str] = None, baseline_tag: str = "v2"):
+    """The winner this selector has already memoized for ``a @ B`` at free dim ``n``
+    against baseline ``baseline_tag``, as ``(kind, param)``, or ``None`` if it has
+    not decided one.
 
     A read of the memo, never a decision: no gate, no probe, no cost model, no
     write. ``ops.matmul`` uses it to hand the memoized verdict to a call plan
@@ -540,7 +576,7 @@ def decided(a, n: int, level: Optional[str] = None):
         level = _current_level()
     if level == "off":
         return None
-    return _decision.get((_signature(a, int(n)), level))
+    return _decision.get((_signature(a, int(n)), level, baseline_tag))
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
@@ -754,21 +790,22 @@ def schedule_from_tuner_choice(
     )
 
 
-def _dispatch_decision(a, b, result_shape, kind, param, nt):
-    """Run the memoized winner. Returns (result_cpp, True) for a tiled kernel or
-    None (== 'use the caller's byte-identical v2 path') for kind 'v2'."""
+def _dispatch_decision(a, b, result_shape, kind, param, nt, epilogue=None):
+    """Run the memoized winner. Returns (result, True) for a tiled kernel or
+    None (== "use the caller's byte-identical baseline path") for kind 'v2'.
+
+    ``result`` is the native result object, or whatever ``epilogue`` returns when
+    the caller supplied one."""
     if kind == "tilej":
-        return (
-            _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt)),
-            True,
-        )
-    if kind == "tileijk":
+        out = _ops.spmm_csr_float_tilej(*_tilej_args(a, b, result_shape, param, nt))
+    elif kind == "tileijk":
         Nc, Jc = param
-        return (
-            _ops.spmm_csr_float_tileijk(*_tileijk_args(a, b, result_shape, Nc, Jc, nt)),
-            True,
+        out = _ops.spmm_csr_float_tileijk(
+            *_tileijk_args(a, b, result_shape, Nc, Jc, nt)
         )
-    return None  # v2
+    else:
+        return None  # v2
+    return (out if epilogue is None else epilogue(out)), True
 
 
 def _jc_ladder(base: int) -> list:
@@ -872,13 +909,20 @@ def _load_persist_cache() -> dict:
     return _persist_cache
 
 
-def _sig_key(sig: tuple) -> str:
-    return ",".join(str(x) for x in sig)
+def _sig_key(sig: tuple, baseline_tag: str = "v2") -> str:
+    """Persistent-cache key for a shape signature under one baseline.
+
+    The default baseline keeps its historical unprefixed key, so a cache written
+    before other baselines existed stays readable."""
+    key = ",".join(str(x) for x in sig)
+    return key if baseline_tag == "v2" else f"{baseline_tag}|{key}"
 
 
-def _persist_get(sig: tuple):
-    """Return a cached (kind, param) for this machine+signature, or None."""
-    entry = _load_persist_cache().get(_machine_id(), {}).get(_sig_key(sig))
+def _persist_get(sig: tuple, baseline_tag: str = "v2"):
+    """Return a cached (kind, param) for this machine+signature+baseline, or None."""
+    entry = (
+        _load_persist_cache().get(_machine_id(), {}).get(_sig_key(sig, baseline_tag))
+    )
     if entry is None:
         return None
     kind, param = entry[0], entry[1]
@@ -887,14 +931,14 @@ def _persist_get(sig: tuple):
     return (kind, param)
 
 
-def _persist_put(sig: tuple, kind: str, param) -> None:
+def _persist_put(sig: tuple, kind: str, param, baseline_tag: str = "v2") -> None:
     """Record a measured winner. Atomic (temp + os.replace), best-effort."""
     path = _cache_path()
     if not path:
         return
     cache = _load_persist_cache()
     stored = list(param) if isinstance(param, tuple) else param
-    cache.setdefault(_machine_id(), {})[_sig_key(sig)] = [kind, stored]
+    cache.setdefault(_machine_id(), {})[_sig_key(sig, baseline_tag)] = [kind, stored]
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp.{os.getpid()}"
@@ -1222,16 +1266,14 @@ def _degree_cv(a) -> float:
     return float(degs.std(unbiased=False).item() / m)
 
 
-def _eligible_learned(J: int, nnz: int, N: int, C: int) -> bool:
+def _eligible_learned(J: int, N: int, C: int) -> bool:
     """Widened gate for the learned level: keep ONLY the operand>C prefilter (the
     physics boundary -- B fits cache => no tiling helps -- and the cost boundary --
     operand>C => a >=16-36MB B-stream => a matmul big enough to absorb the O(1)
     prediction). Relax the degree floor + locality pre-exclusion; the model + v2 floor
     route the newly-admitted products/arxiv/FEM/banded shapes. Every sub-ms GCN-small/
     AE/attention shape fails operand>C at int-comparison cost => byte-neutral 99%."""
-    if not _HAS_TILEJ:
-        return False
-    return (J * 4 * N) > C
+    return _operand_over_cache(J, N, C)
 
 
 def _learned_decide(a, b, M, J, N, nnz, C, model):
@@ -1266,20 +1308,32 @@ def _learned_decide(a, b, M, J, N, nnz, C, model):
     return ("v2", None)
 
 
-def _confirm_vs_v2(a, b, result_shape, kind, param, nt, v2_fn, nthreads):
-    """One-shot v2-confirm: time {predicted winner, v2} once each, keep the faster.
+def _confirm_vs_baseline(
+    a, b, result_shape, kind, param, nt, baseline_fn, nthreads, epilogue=None
+):
+    """One-shot confirm: time {predicted winner, the caller's baseline} once each and
+    keep the faster.
 
-    Guarantees no-regression-vs-v2 for a level that does not run the full ladder probe,
-    at 6 kernel invocations (2 candidates x 1 warmup + 2 timed) against the probe's 18.
-    Memoized by the caller, so a shape pays this once."""
+    Guarantees no-regression against *that caller's own baseline* for a level that
+    does not run the full ladder probe, at 6 kernel invocations (2 candidates x 1
+    warmup + 2 timed) against the probe's 18. Memoized by the caller, so a shape
+    pays this once.
+
+    ``epilogue`` is timed as part of the tiled candidate. A caller whose baseline
+    folds an elementwise tail into the SpMM -- ``scorch.compile``'s fused
+    SpMM+bias+act -- must pay for that tail on the tiled side too, since the tiled
+    kernels have no fused epilogue and run it as a separate pass over the output.
+    Timing the bare tiled kernel against a fused baseline would credit the tiled
+    kernel with work it did not do."""
     if kind == "tilej":
-        win = lambda: _ops.spmm_csr_float_tilej(
+        run = lambda: _ops.spmm_csr_float_tilej(
             *_tilej_args(a, b, result_shape, param, nt)
         )
     else:
-        win = lambda: _ops.spmm_csr_float_tileijk(
+        run = lambda: _ops.spmm_csr_float_tileijk(
             *_tileijk_args(a, b, result_shape, param[0], param[1], nt)
         )
+    win = run if epilogue is None else (lambda: epilogue(run()))
 
     def _t(fn):
         fn()
@@ -1290,23 +1344,45 @@ def _confirm_vs_v2(a, b, result_shape, kind, param, nt, v2_fn, nthreads):
             best = min(best, time.perf_counter() - t0)
         return best
 
-    return (kind, param) if _t(win) < _t(lambda: v2_fn(nthreads)) else ("v2", None)
+    # The "v2" sentinel keeps its historical name at every level of this module and
+    # in the on-disk cache; it means "run the caller's own baseline path", which is
+    # the drop-in SpMM for `matmul` and the fused kernel for `scorch.compile`.
+    return (
+        (kind, param) if _t(win) < _t(lambda: baseline_fn(nthreads)) else ("v2", None)
+    )
 
 
 def maybe_dispatch(
     a,
     b,
     result_shape,
-    v2_fn,
+    baseline_fn,
     nthreads: Optional[int],
     time_dict: Optional[dict] = None,
     level: Optional[str] = None,
+    epilogue: Optional[Callable] = None,
+    baseline_tag: str = "v2",
 ):
-    """Return (result_cpp, used_tiled: bool) or None to signal 'use the caller's
-    normal v2 path'. Only ever returns a tiled kernel (tile-j / tile-ijk) when it
-    has been MEASURED (balanced/max probe) or picked by the cost model (analytic)
-    to be the right choice; v2 is always a probe candidate, so the memoized route
-    is never slower than v2 -> no regression by construction.
+    """Return (result, used_tiled: bool) or None to signal "use the caller's own
+    baseline path". Only ever returns a tiled kernel (tile-j / tile-ijk) when it
+    has been MEASURED (balanced/max probe, or the one-shot confirm) to beat
+    `baseline_fn` on this shape: the baseline is always a candidate, so the
+    memoized route is never slower than it -> no regression by construction.
+
+    `baseline_fn(nthreads)` is the caller's own alternative, and `baseline_tag`
+    names it. Two callers dispatch this kernel family and they are asking different
+    questions: `ops.matmul`'s baseline is the drop-in SpMM `spmm_csr_float_v2`,
+    while `scorch.compile`'s fused path baseline is a fused SpMM+bias+act kernel,
+    which folds the elementwise tail into the SpMM's row epilogue and so is faster
+    than the drop-in SpMM plus a separate pass. "tile-j beats the drop-in SpMM" does
+    NOT imply "tile-j plus a separate tail beats the fused kernel", so each verdict
+    is memoized under its own `baseline_tag`; sharing one entry would let either
+    caller run a kernel that lost its own comparison.
+
+    `epilogue`, when supplied, is applied to every tiled candidate's result -- inside
+    the timed region during the probe/confirm, and on the memoized dispatch -- and
+    its return value is what this function hands back. It exists so a fused caller's
+    tail is charged to the tiled side, which has no fused epilogue of its own.
 
     `level` selects the decision strategy for an eligible shape (off/analytic/
     balanced/max/learned); when None it is resolved from the current thread-local /
@@ -1337,7 +1413,7 @@ def maybe_dispatch(
     # branch. Either way the 99% (operand<=C) short-circuits to v2 here.
     learned_model = _load_learned_model() if level == "learned" else None
     if learned_model is not None and _LEARNED_WIDEN:
-        if not _eligible_learned(J, nnz, N, C):
+        if not _eligible_learned(J, N, C):
             return None
     elif not _eligible(J, nnz, N, C):
         return None
@@ -1345,14 +1421,15 @@ def maybe_dispatch(
     nt = nthreads if nthreads is not None else -1
     Jc = _panel_width(N, C)
     sig = _signature(a, N)
-    # Memoize per (signature, level): different levels can pick different winners
-    # (analytic->tile-j@base; balanced/max->probed width/kernel).
-    memo_key = (sig, level)
+    # Memoize per (signature, level, baseline): different levels can pick different
+    # winners (analytic->tile-j@base; balanced/max->probed width/kernel), and a
+    # different baseline is a different question (see the docstring).
+    memo_key = (sig, level, baseline_tag)
 
     def _timed_dispatch(kind, param):
         """Run the memoized winner, recording its wall time into time_dict."""
         t0 = time.perf_counter()
-        out = _dispatch_decision(a, b, result_shape, kind, param, nt)
+        out = _dispatch_decision(a, b, result_shape, kind, param, nt, epilogue)
         if time_dict is not None:
             time_dict["eval_time"] = time.perf_counter() - t0
         return out
@@ -1363,7 +1440,7 @@ def maybe_dispatch(
 
     # "max": a prior run may have already measured the winner for this machine.
     if level == "max":
-        pc = _persist_get(sig)
+        pc = _persist_get(sig, baseline_tag)
         if pc is not None:
             _decision[memo_key] = pc
             return _timed_dispatch(pc[0], pc[1])
@@ -1396,8 +1473,16 @@ def maybe_dispatch(
             # untiled — the same cell and the same mistake analytic made. Measured over
             # 236 cells, this hole accounted for 3 of learned's 4 regressions.
             if _CONFIRM_TILED:
-                kind, param = _confirm_vs_v2(
-                    a, b, result_shape, kind, param, nt, v2_fn, nthreads
+                kind, param = _confirm_vs_baseline(
+                    a,
+                    b,
+                    result_shape,
+                    kind,
+                    param,
+                    nt,
+                    baseline_fn,
+                    nthreads,
+                    epilogue,
                 )
         _decision[memo_key] = (kind, param)
         if kind == "v2":
@@ -1444,8 +1529,8 @@ def maybe_dispatch(
         # the gate happening to be right. What still separates analytic from balanced
         # is the search: analytic checks one width, balanced searches the ladder.
         if _CONFIRM_TILED:
-            kind, param = _confirm_vs_v2(
-                a, b, result_shape, kind, param, nt, v2_fn, nthreads
+            kind, param = _confirm_vs_baseline(
+                a, b, result_shape, kind, param, nt, baseline_fn, nthreads, epilogue
             )
         _decision[memo_key] = (kind, param)
         if kind == "v2":
@@ -1468,15 +1553,22 @@ def maybe_dispatch(
         out_holder[0] = r
         return best
 
+    def _tailed(fn):
+        """Charge the caller's elementwise tail to a tiled candidate's clock."""
+        return fn if epilogue is None else (lambda: epilogue(fn()))
+
     # Heterogeneous param slot (None | Jc int | (Nc,Jc) tuple) -> annotate `list`.
-    cands: list = [("v2", None, lambda: v2_fn(nthreads))]
+    # The baseline needs no `_tailed`: a fused baseline already folds its own tail.
+    cands: list = [("v2", None, lambda: baseline_fn(nthreads))]
     for jc in _jc_ladder(Jc):
         cands.append(
             (
                 "tilej",
                 jc,
-                lambda jc=jc: _ops.spmm_csr_float_tilej(
-                    *_tilej_args(a, b, result_shape, jc, nt)
+                _tailed(
+                    lambda jc=jc: _ops.spmm_csr_float_tilej(
+                        *_tilej_args(a, b, result_shape, jc, nt)
+                    )
                 ),
             )
         )
@@ -1485,8 +1577,10 @@ def maybe_dispatch(
             (
                 "tileijk",
                 ijk,
-                lambda: _ops.spmm_csr_float_tileijk(
-                    *_tileijk_args(a, b, result_shape, ijk[0], ijk[1], nt)
+                _tailed(
+                    lambda: _ops.spmm_csr_float_tileijk(
+                        *_tileijk_args(a, b, result_shape, ijk[0], ijk[1], nt)
+                    )
                 ),
             )
         )
@@ -1501,9 +1595,10 @@ def maybe_dispatch(
 
     _decision[memo_key] = (best_kind, best_param)
     if level == "max":
-        _persist_put(sig, best_kind, best_param)  # pay the search once EVER
+        # pay the search once EVER
+        _persist_put(sig, best_kind, best_param, baseline_tag)
     if best_kind == "v2":
-        return None  # caller runs v2 + populates time_dict itself
+        return None  # caller runs its own baseline + populates time_dict itself
     if time_dict is not None:
         time_dict["eval_time"] = best_t  # the winning kernel's measured time
     return best_out, True

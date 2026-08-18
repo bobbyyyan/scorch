@@ -938,7 +938,7 @@ def test_a_tiled_verdict_is_carried_into_the_plan():
         assert tiling.is_candidate(a, b), "the shape does not reach the selector"
         tiling._decision.clear()
         signature = tiling._signature(a, TILED_N)
-        tiling._decision[(signature, "balanced")] = ("tilej", 64)
+        tiling._decision[(signature, "balanced", "v2")] = ("tilej", 64)
 
         reference = as_tensor(matmul_without_plans(a, b))
         for _ in range(3):
@@ -986,7 +986,7 @@ def test_a_memo_entry_the_gate_rejects_leaves_the_plan_on_v2():
         # A stale winner for exactly this operand and free dimension. The ordinary
         # path never looks at it; neither may the plan.
         signature = tiling._signature(a, narrow)
-        tiling._decision[(signature, "balanced")] = ("tilej", 64)
+        tiling._decision[(signature, "balanced", "v2")] = ("tilej", 64)
 
         reference = as_tensor(matmul_without_plans(a, b))
         for _ in range(3):

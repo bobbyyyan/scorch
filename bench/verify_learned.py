@@ -34,8 +34,10 @@ from collect_autotune_data import (  # noqa: E402  (reuse builders + timing)
 LEVELS = ["off", "analytic", "balanced", "learned"]
 
 
-def _pick(sig_level):
-    d = T._decision.get(sig_level)
+def _pick(sig, level):
+    # The memo keys on (signature, level, baseline_tag); "v2" is the drop-in-SpMM
+    # baseline ops.matmul measures against.
+    d = T._decision.get((sig, level, "v2"))
     if d is None:
         return "v2"
     k, p = d
@@ -68,7 +70,7 @@ def bench_matrix(name, csr, N):
     meds = timed([lambda lvl=lvl: thunk(lvl) for lvl in LEVELS])
     t = dict(zip(LEVELS, meds))
     gf = {lvl: 2.0 * nnz * N / t[lvl] / 1e9 for lvl in LEVELS}
-    picks = {lvl: _pick((sig, lvl)) for lvl in LEVELS}
+    picks = {lvl: _pick(sig, lvl) for lvl in LEVELS}
     print(f"  N={N:5d} | "
           f"off {gf['off']:6.0f}  analytic {gf['analytic']:6.0f}  "
           f"balanced {gf['balanced']:6.0f}  learned {gf['learned']:6.0f} GF/s | "
