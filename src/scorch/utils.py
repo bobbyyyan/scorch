@@ -1,8 +1,10 @@
+import functools
 import glob
 import hashlib
 import math
 import os
 import platform
+import subprocess
 import time
 from collections import defaultdict, deque
 from importlib import resources
@@ -107,10 +109,60 @@ def _load_kernel(name: str, cpp_sources, functions, extra_cflags, extra_ldflags)
     return module
 
 
+@functools.lru_cache(maxsize=1)
+def _macos_libcxx_include() -> Optional[str]:
+    """The libc++ headers belonging to the SDK the active toolchain will use.
+
+    They have to come from the *active* developer directory. Pinning them to
+    CommandLineTools, which this used to do, breaks every generated kernel on a host
+    whose ``xcode-select -p`` is Xcode: the compiler torch invokes is then Xcode's
+    clang, and handing it a different toolchain's libc++ fails inside the headers
+    themselves ("reference to unresolved using declaration" in
+    ``<__type_traits/is_trivially_copyable.h>``). The prebuilt extension was never
+    affected because ``scorch_build.py`` does not add this flag, so the breakage
+    looked like a codegen defect rather than a toolchain one.
+
+    ``SCORCH_MACOS_SDK`` overrides the lookup. ``None`` means no candidate has the
+    headers, and then no flag is added at all -- clang's own default include path is
+    correct on a consistent toolchain, and a wrong ``-isystem`` is worse than none.
+
+    Cached because ``get_extra_cflags`` runs once per generic ``matmul``/``einsum``
+    call, and this spawns a process. A mid-process ``xcode-select`` switch therefore
+    is not picked up; set ``SCORCH_MACOS_SDK`` if that is ever wanted.
+    """
+    override = os.environ.get("SCORCH_MACOS_SDK")
+    if override:
+        candidates = [override]
+    else:
+        candidates = []
+        try:
+            found = subprocess.run(
+                ["xcrun", "--show-sdk-path"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if found.returncode == 0:
+                candidates.append(found.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass  # no xcrun, or it hung: fall through to the fixed location
+        candidates.append("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+
+    for sdk in candidates:
+        if not sdk:
+            continue
+        include = os.path.join(sdk, "usr", "include", "c++", "v1")
+        if os.path.isdir(include):
+            return include
+    return None
+
+
 def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     """Get platform-specific extra compiler flags for torch cpp_extension.
 
-    On macOS, adds the C++ standard library include path needed for compilation.
+    On macOS, adds the active SDK's C++ standard library include path needed
+    for compilation, plus the OpenMP flags.
 
     Args:
         base_flags: Base compiler flags to include. Defaults to ["-O3"].
@@ -123,9 +175,11 @@ def get_extra_cflags(base_flags: Optional[List[str]] = None) -> List[str]:
     flags = list(base_flags)
 
     if platform.system() == "Darwin":
-        # macOS needs explicit C++ stdlib include path for torch JIT compilation
-        sdk_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-        flags.append(f"-isystem{sdk_path}/usr/include/c++/v1")
+        # macOS needs an explicit C++ stdlib include path for torch's JIT compile,
+        # and it must be the active toolchain's (see _macos_libcxx_include).
+        libcxx = _macos_libcxx_include()
+        if libcxx is not None:
+            flags.append(f"-isystem{libcxx}")
 
         # OpenMP flags for macOS - use PyTorch's bundled libomp to avoid runtime conflicts
         flags.extend(["-Xpreprocessor", "-fopenmp"])
