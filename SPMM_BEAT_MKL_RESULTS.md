@@ -1295,6 +1295,225 @@ should look like, and it does not vanish at the kernel-bound end: 0.945 on the M
 - `einsum`'s own remaining bytecode -- kwargs handling, the schedule resolution, the
   operand type and rank checks -- is roughly 3 us of the M5's 13.6.
 
+## A transposed dense operand, and the two ways not to pay for it
+
+`SparseStorage` holds a flat contiguous values array, so `scorch.matmul(A, B)` with a
+non-contiguous `B` -- `W.T`, `x.permute(1, 0)`, a strided slice -- has to materialize a
+copy. For a contiguous operand `.reshape(-1)` is a view and the STensor shares the
+caller's buffer, which is what it has always done. For a non-contiguous one it is a full
+copy, paid again on every call even when the operand has not changed since the last one.
+
+Two independent things reduce that bill, and they answer different questions, so both
+shipped and both were measured crossed: **materialize it faster**, and **remember it**.
+
+### Materializing it faster, and a defect that turned up on the way
+
+A transposed 2-D float32 operand is column-major, and transposing the row-major view of a
+column-major matrix *is* its contiguous copy -- the same floats in the same order, bit for
+bit. Scorch already ships a cache-blocked transpose for that shape (AVX2 8x8 / NEON 4x4,
+public as `scorch.fast_transpose`), so `.contiguous()` can be replaced by it exactly.
+
+Doing that exposed a real defect in the shipped kernel. It launched with
+`at::parallel_for(0, ncblk, 1, ...)`, and a grain of 1 is ATen for "split whenever there
+is more than one iteration", so an 8 KiB transpose opened a thread team:
+
+| operand (col-major) | elements | `.contiguous()` | kernel serial | kernel threaded |
+|---|---|---|---|---|
+| 256x8 | 2 048 | 0.74 us | **0.32** | 9.95 |
+| 1024x32 | 32 768 | 10.12 | **3.84** | 11.91 |
+| 4096x64 | 262 144 | 84.54 | 66.08 | **32.40** |
+| 20000x784 | 15 680 000 | 9858 | 5665 | **2328** |
+
+Opening the team costs ~10 us at four torch threads and ~22 us at eight on an M5, and
+~2-3 us at four and ~18-20 us at thirty-two on the 32-core x86 -- against a serial
+transpose of that same data in 0.3-1.3 us. Nothing was bought with it, because below the
+threshold the serial kernel is not merely adequate: it is 2.0-7.8x faster than the
+`.contiguous()` scatter it replaces.
+
+So the kernel got a real grain, expressed in elements and converted to blocks because
+ATen's grain is in units of the iteration space.
+
+Choosing its value has one hard constraint. The kernel is **already shipped**, and
+`fast_transpose` / `sparse_linear` call it with the host thread count, so before this every
+shape with more than one column block ran threaded. Raising the grain can only move a shape
+from threaded to serial, so any shape it moves the wrong way is a regression in a path that
+has already been measured. Candidate rules were therefore replayed against both modes'
+times over the 40-shape grid (`R` in {8, 32, 64, 256, 784}, `C` in {64...20000}) on two
+hosts at two thread counts each -- 160 cells -- and scored first on how many shapes they
+made slower than always-threaded, and only then on what they bought.
+
+| rule | regressed, of 160 | worst | improved, per grid | geomean gain, per grid | max |
+|---|---|---|---|---|---|
+| fixed 65536 | 2 | 0.75x | 18, 18, 16, 18 | 2.55, 3.43, 1.35, 2.59 | 80x |
+| fixed 131072 | 5 | 0.55x | 19, 21, 16, 21 | 2.59, 3.56, 1.31, 2.68 | 80x |
+| 8192 x threads | 1 | 0.69x | 15, 18, 15, 25 | 2.42, 3.43, 1.37, 2.72 | 80x |
+| **max(32768, 4096 x threads)** | **0** | **1.00x** | 15, 15, 15, 21 | 2.42, 3.13, 1.37, 2.68 | 80x |
+
+(Grids in the order M5 at 4 and 8 threads, x86 at 4 and 32.)
+
+The floor is the work below which no pool size is worth a launch; above it the threshold
+grows with the pool, because the launch cost does. The rules that score better on average
+do buy a little more -- three or four extra shapes per grid, and a slightly higher geomean --
+and they pay for it by making two to five shapes up to 1.8x slower than what already
+ships. That is not a trade this gets to make, so the zero-regression rule wins and the
+difference is recorded rather than argued away.
+
+Three things about the choice are worth stating rather than hiding:
+
+* **Element count cannot separate every case.** `784x256` and `256x784` are the same
+  200 704 elements and want opposite modes, because the block geometry differs. So the rule
+  does not pick the better mode everywhere. Three M5 shapes stay threaded where serial
+  would have been 2-6x faster: at four threads they land within a few percent of
+  `.contiguous()` (0.92-0.98x), and at eight they fall to 0.61-0.89x of it. Each of them was
+  *worse* before this change, so that is forgone upside rather than a regression, and it is
+  left on the table rather than bought with one.
+* **The two hosts disagree, for a reason.** Per thread, opening the team costs ~2.7 us on
+  the M5 and ~0.6 us on the x86 -- a 4.5x difference -- so the ideal threshold differs by
+  host and no portable constant serves both. Closing that would mean calibrating the launch
+  cost once per process, which is a piece of work rather than a line, and is not done here.
+* **The zero-regression claim rests on a same-run replay**, where both modes are timed in
+  one interleaved process and the rule is then applied to those numbers. Comparing a fresh
+  run of the new build against the old grid instead shows nine "regressions" of up to 0.77x
+  -- every one of them at a shape where the rule picks the *same mode as before*, i.e. runs
+  the same code. Sub-10 us cells drift up to 31% between runs on that host. The controlled
+  comparison is the one to believe.
+
+The grid deliberately includes `C = 784`, the orientation `sparse_linear` hands the kernel
+(`fast_transpose` on an `[batch, 784]` input), and that path is where inertness matters most
+because its numbers are already recorded. Against the always-threaded kernel it shipped
+with, at eight threads on the M5:
+
+| batch | always-threaded | now | |
+|---|---|---|---|
+| 8 | 21.91 us | 0.62 | **35x faster** |
+| 32 | 22.38 | 2.07 | **10.8x faster** |
+| 64 | 23.22 | 24.00 | same mode, so same code |
+| 256 | 26.61 | 29.40 | same mode, so same code |
+| 784 | 82.77 | 86.21 | same mode, so same code |
+
+Two batch sizes get an order of magnitude and the other three run exactly the code they ran
+before -- the differences on those rows are run-to-run drift, not the change. So the AE path
+is improved or inert, measured rather than assumed. What it is *not* is optimal: at batch 64
+the kernel stays threaded at 24 us where serial would take 4.1 and `.contiguous()` takes
+14.7. That was true before this change too, and fixing it is what the per-host calibration
+above would buy.
+
+### And then the copy has to be serial, for a reason that is not about the copy
+
+Inside `matmul` the threaded kernel is a disaster, and not because it is slow. On the
+x86 host, with a `2000x256` operand:
+
+| | |
+|---|---|
+| threaded transpose, alone | 19.07 us |
+| scorch SpMM on an already-flat B, alone | 47.38 us |
+| torch `.contiguous()` + scorch SpMM | 321.18 us |
+| **threaded transpose + scorch SpMM** | **2681.01 us** |
+| serial transpose + scorch SpMM | **181.57 us** |
+
+The pair costs forty times the sum of its parts. It is not the transpose: two threaded
+transposes back to back cost 65.60 us. It is not threading as such: a threaded transpose
+followed by `torch.sparse.mm` costs 423 us against 361 for the pieces. What is expensive
+is an **ATen parallel region opening immediately before scorch's own team** -- the same
+neighbour effect the validation screens ran into (see the private-team section above), an
+order of magnitude larger.
+
+The serial path leaves no region behind, and it still beats `.contiguous()` on 39 of the 40
+grid shapes -- 2.0-7.8x on the small ones, never worse than 0.95x -- so that is what this
+call site uses. What it gives up is the threaded win on very large operands, where the
+neighbour cost is a smaller share of a much bigger copy and threading might well pay. That
+crossover is left open: closing it means understanding the interaction, not picking a
+second threshold against it. `fast_transpose` and `sparse_linear` are untouched and still
+pass the host thread count.
+
+### Remembering the copy
+
+The second lever holds the copy, keyed on the identity of the *base* tensor rather than the
+view -- the view is a fresh object per call (`W.T` inside a loop) while its base is the
+parameter that persists. Three things must hold for a hit:
+
+* the weak reference still resolves to the same base object, which is why a reused
+  allocator address cannot fool it,
+* the base's version counter is unchanged -- torch shares one counter between a tensor and
+  every view of it, so any in-place torch write through any of them is a miss,
+* the copy's own counter is unchanged, because the copy is handed out as the STensor's
+  values and a write through those would otherwise be served to the next caller.
+
+What none of that sees is a write through a raw pointer or a numpy view, which bumps no
+counter. Nothing in Scorch sees those and neither does autograd, but here the consequence
+is a stale *value* rather than a skipped check, so it is said plainly rather than buried:
+an operand mutated behind torch's back and then multiplied again reads as unchanged.
+`SCORCH_MEMO_OPERAND_COPY=0` turns it off in the same binary, which is also how it is
+measured.
+
+A memo that cannot hit is a tax on every call, and `plan.py` met this problem first. An
+operand refilled in place every call -- a dataloader's buffer -- paid **1.11x** on the
+smallest cell for a lookup that could never pay. Two fixes, both borrowed from there:
+after eight consecutive *stale* misses the memo stops being consulted, and the retained
+copies are released with it, because blocks the caching allocator cannot recycle were worth
+a further 1.6-5% on the small cells. What is counted is the stale miss -- key present,
+version moved -- and not the cold miss, because a deep model's first forward is all cold
+misses and it is exactly the workload the memo exists for. Any hit resets the streak, so a
+weight updated once per step and multiplied ten times within it never withdraws.
+
+### Both levers, both hosts, one process, one binary
+
+Both are runtime cells, so every arm here is the same binary and the same tree, visited in
+a fresh random order every round, with `plain` under a second name as the A/A control. Two
+scenarios, because they separate what the levers do: `stable` reuses one base (the memo
+hits), `changing` writes the base in place before each use (the memo always misses, and
+only the faster materialization can help). `bench/bench_operand_copy.py`.
+
+M5, 4 threads, median of 9:
+
+| scenario | cell | plain | A/A | xpose | memo | **both** |
+|---|---|---|---|---|---|---|
+| stable | 256x64 | 40.35 | 40.25 | 38.11 | 34.82 | **34.71 (1.16x)** |
+| stable | 2000x64 | 139.38 | 139.88 | 106.99 | 88.13 | **87.72 (1.59x)** |
+| stable | 2000x256 | 426.68 | 429.11 | 309.29 | 171.85 | **173.58 (2.46x)** |
+| stable | 20000x32 | 636.32 | 626.14 | 429.75 | 261.14 | **254.06 (2.50x)** |
+| changing | 256x64 | 47.48 | 46.79 | 44.25 | 46.60 | **44.46 (1.07x)** |
+| changing | 2000x64 | 177.91 | 179.45 | 142.67 | 176.25 | **149.57 (1.19x)** |
+| changing | 2000x256 | 476.02 | 482.42 | 382.18 | 481.05 | **382.04 (1.25x)** |
+| changing | 20000x32 | 683.43 | 684.10 | 496.75 | 694.64 | **497.34 (1.37x)** |
+
+redwood, 4 threads, median of 9:
+
+| scenario | cell | plain | A/A | xpose | memo | **both** |
+|---|---|---|---|---|---|---|
+| stable | 256x64 | 32.23 | 32.28 | 28.18 | 19.01 | **19.06 (1.69x)** |
+| stable | 2000x64 | 101.60 | 102.40 | 70.36 | 35.76 | **35.71 (2.85x)** |
+| stable | 2000x256 | 335.55 | 336.47 | 204.90 | 61.41 | **61.28 (5.48x)** |
+| stable | 20000x32 | 459.40 | 458.72 | 259.75 | 128.44 | **128.92 (3.56x)** |
+| changing | 256x64 | 38.64 | 38.71 | 34.78 | 38.69 | **34.81 (1.11x)** |
+| changing | 2000x64 | 113.23 | 111.56 | 81.47 | 111.66 | **83.25 (1.36x)** |
+| changing | 2000x256 | 429.52 | 429.47 | 264.91 | 435.41 | **269.97 (1.59x)** |
+| changing | 20000x32 | 532.90 | 531.87 | 289.69 | 535.26 | **289.86 (1.84x)** |
+
+Nothing regressed on either host. The A/A control sits within 0.0-1.5%. The memo-only arm
+lands within a few percent of `plain` in the `changing` scenario, which is the withdrawal
+working: it is what a lever that cannot pay is supposed to cost.
+
+One thing the first version of this bench got wrong, recorded because it is an easy
+mistake: the `changing` scenario originally cycled a pool of 32 operands against a memo
+bound of 16, on the theory that a pool larger than the bound would always miss. It does
+not -- the first sixteen keys stay resident, so exactly half the calls hit and the arm
+read as a partial win. Writing the base in place is what actually makes it miss.
+
+### What is left on the table here, measured and not claimed
+
+- **The threaded transpose for very large operands.** Serial gives up 2-3x of the copy
+  itself at 15M elements. Whether threading wins there once the neighbour cost is included
+  is unmeasured; it was measured at one shape only (`2000x256`), where it loses badly.
+- **A per-process launch-cost calibration** would let the grain suit both hosts instead of
+  taking the intersection. The per-thread cost differs 4.5x between them, which is the whole
+  reason a portable constant leaves 2-4x unclaimed at three M5 shapes.
+- **The memo's first few dozen calls** on a call site it cannot serve still pay for the
+  lookup before the withdrawal fires. Bounded and one-off, but not zero.
+- **`fast_transpose` is not uniformly better than `.contiguous()`** after the grain fix --
+  three shapes on the M5 sit within a few percent of it rather than above. They were far
+  worse before, so this is unfinished rather than regressed.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
