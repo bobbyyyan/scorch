@@ -40,6 +40,22 @@ from scorch.storage import (
 )
 
 
+@pytest.fixture(autouse=True, params=["native_screen", "no_screen"])
+def screen_mode(request, monkeypatch):
+    """Run this whole file twice: with the native screen, and without it.
+
+    `_validate_index_storage` consults a native screen (csrc/native_abi.h) that does
+    the bounds and sortedness passes in one fused loop and answers only "no violation
+    exists" or "go and look". If that is true, then every case below -- 59 of which
+    compare production against the frozen old implementation -- must reach an identical
+    verdict either way. Parametrizing the whole module is the cheap way to assert it:
+    any message, precedence or acceptance difference the screen introduces fails here.
+    """
+    if request.param == "no_screen":
+        monkeypatch.setattr(storage_module, "_NATIVE_SCREEN", None)
+    return request.param
+
+
 def reference_validate(
     layout: TensorLayout, mode_indices: IndexModes, values: torch.Tensor
 ) -> None:
@@ -602,3 +618,117 @@ def test_a_copied_tensor_still_rejects_broken_storage(validation_counter):
     internal[0], internal[1] = internal[1].clone(), internal[0].clone()
     with pytest.raises(TensorIndexError, match="sorted within parent"):
         revived._storage.validate_unless_already_checked()
+
+
+# --------------------------------------------------------------------------- #
+# The native screen's one-directional promise
+#
+# The screen may say "go and look" about perfectly good storage -- that only costs a
+# walk. What it must never do is clear something malformed, because the Python checks
+# it stands in for are then skipped. These tests only assert that direction, over the
+# same corruption shapes the differential corpus uses.
+# --------------------------------------------------------------------------- #
+
+
+def screen(positions, coordinates, extent):
+    if storage_module._NATIVE_SCREEN is None:
+        pytest.skip("extension has no screen entry point")
+    return storage_module._NATIVE_SCREEN(positions, coordinates, int(extent), True)
+
+
+def test_screen_clears_well_formed_storage():
+    """Otherwise it is not an optimization at all -- everything would take the slow
+    path and the tests below would pass vacuously."""
+    positions, coordinates, _ = csr_parts(64, 32, 3)
+    assert screen(positions, coordinates, 32) is False
+
+
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_screen_never_clears_an_unsorted_parent(width):
+    positions, coordinates, _ = csr_parts(16, 8, 4, width)
+    for parent in range(16):
+        broken = coordinates.clone()
+        start = parent * 4
+        broken[start], broken[start + 1] = coordinates[start + 1], coordinates[start]
+        assert screen(positions, broken, 8) is True, f"cleared parent {parent}"
+
+
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+@pytest.mark.parametrize("bad", [-1, 8, 9, 1000])
+def test_screen_never_clears_an_out_of_range_coordinate(width, bad):
+    positions, coordinates, _ = csr_parts(16, 8, 4, width)
+    for where in (0, 1, coordinates.numel() // 2, coordinates.numel() - 1):
+        broken = coordinates.clone()
+        broken[where] = bad
+        assert screen(positions, broken, 8) is True, f"cleared {bad} at {where}"
+
+
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_screen_never_clears_broken_positions(width):
+    positions, coordinates, _ = csr_parts(16, 8, 4, width)
+    for where in range(1, positions.numel()):
+        broken = positions.clone()
+        broken[where] = 0  # a decrease, unless it already was zero
+        if bool((broken[1:] >= broken[:-1]).all()):
+            continue
+        assert screen(broken, coordinates, 8) is True, f"cleared decrease at {where}"
+    beyond = positions.clone()
+    beyond[-1] = coordinates.numel() + 1
+    assert screen(beyond, coordinates, 8) is True
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_screen_never_clears_fuzzed_corruption(seed):
+    generator = torch.Generator().manual_seed(seed)
+    rows = int(torch.randint(1, 9, (1,), generator=generator).item())
+    cols = int(torch.randint(2, 9, (1,), generator=generator).item())
+    degree = int(torch.randint(2, min(cols, 4) + 1, (1,), generator=generator).item())
+    positions, coordinates, _ = csr_parts(rows, cols, degree, seed=seed)
+    if coordinates.numel() < 2:
+        pytest.skip("nothing to corrupt")
+    for mode in ("swap", "negate", "overflow", "shuffle"):
+        broken = coordinates.clone()
+        if mode == "swap":
+            broken[0], broken[1] = coordinates[1].clone(), coordinates[0].clone()
+        elif mode == "negate":
+            broken[0] = -1
+        elif mode == "overflow":
+            broken[-1] = cols
+        else:
+            broken = coordinates[
+                torch.randperm(coordinates.numel(), generator=generator)
+            ]
+        if torch.equal(broken, coordinates):
+            continue  # the corruption happened to be a no-op
+        # Only assert about corruption the Python validator itself rejects: a shuffle
+        # can land back on a legal arrangement, and the screen is not obliged to flag
+        # storage that is in fact well formed.
+        rejected = True
+        try:
+            _validate_index_storage(
+                layout_for("ds", (rows, cols)), ((), (positions, broken)),
+                torch.rand(coordinates.numel()),
+            )
+            rejected = False
+        except Exception:
+            pass
+        if rejected:
+            assert screen(positions, broken, cols) is True, f"cleared {mode} @{seed}"
+
+
+def test_the_screen_is_actually_being_consulted(monkeypatch):
+    """Pin the wiring: if the screen clears a level, the Python walks do not run."""
+    calls = []
+    real = storage_module._check_sorted_within_parents
+
+    def counting(positions, coordinates, mode):
+        calls.append(1)
+        return real(positions, coordinates, mode)
+
+    monkeypatch.setattr(storage_module, "_check_sorted_within_parents", counting)
+    positions, coordinates, values = csr_parts(32, 16, 3)
+    STensor.from_components((32, 16), "ds", [[], [positions, coordinates]], values)
+    if storage_module._NATIVE_SCREEN is None:
+        assert len(calls) == 1  # no screen: the Python walk is the only check
+    else:
+        assert calls == []  # screened clean: the Python walk was not needed

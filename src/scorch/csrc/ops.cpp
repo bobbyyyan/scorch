@@ -1,5 +1,6 @@
 #include "header.h"
 
+#include <limits>
 #include <string>
 
 #include "native_abi.h"
@@ -572,6 +573,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Drop every cached index-validation verdict and narrowed index copy");
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
           "Number of live entries across both ABI validation memos");
+
+    // The same fused structural pass, offered to Scorch's own Python-side validator.
+    //
+    // `_validate_index_storage` in storage.py runs on every STensor built over a
+    // compressed level -- from_torch, to_sparse, a relayout, and every generated
+    // kernel's result -- and its bounds and sortedness checks are separate whole-array
+    // torch operations: about five passes over the index arrays plus a bool temporary,
+    // which measured 304 us of the 385 us it took to wrap a 640k-nonzero result. This
+    // screen does the same work in ONE pass with no allocation.
+    //
+    // Same contract as every screen here: `true` means "this may be malformed, go and
+    // find out", `false` means "no violation exists". Conservative in that exact
+    // direction, so the Python caller can trust `false` and must re-run its own checks
+    // on `true` -- which is also what keeps every diagnostic message and its precedence
+    // byte-identical, since the Python path remains the only thing that reports.
+    //
+    // Anything unsupported -- a non-CPU or non-contiguous array, an index width that
+    // is not int32/int64, mismatched widths, a position array shorter than one entry --
+    // returns `true` so the caller simply does the work itself.
+    m.def("abi_screen_compressed_level",
+          [](const torch::Tensor& positions, const torch::Tensor& coordinates,
+             int64_t extent, bool require_sorted) -> bool {
+            try {
+              if (!positions.defined() || !coordinates.defined()) return true;
+              if (positions.device().type() != torch::kCPU ||
+                  coordinates.device().type() != torch::kCPU) return true;
+              if (!positions.is_contiguous() || !coordinates.is_contiguous()) return true;
+              if (positions.dtype() != coordinates.dtype()) return true;
+              const int64_t count = positions.numel();
+              if (count < 1) return true;
+              const int64_t parents = count - 1;
+              const int64_t nnz = coordinates.numel();
+              if (positions.dtype() == torch::kInt32) {
+                if (nnz > (int64_t)std::numeric_limits<int32_t>::max()) return true;
+                return scorch_native::abi_screen_compressed_typed<int32_t>(
+                    positions.data_ptr<int32_t>(), coordinates.data_ptr<int32_t>(),
+                    parents, nnz, extent, require_sorted);
+              }
+              if (positions.dtype() == torch::kInt64) {
+                return scorch_native::abi_screen_compressed_typed<int64_t>(
+                    positions.data_ptr<int64_t>(), coordinates.data_ptr<int64_t>(),
+                    parents, nnz, extent, require_sorted);
+              }
+              return true;
+            } catch (...) {
+              return true;  // never turn a validation into a crash
+            }
+          },
+          "Screen one compressed level: false = no violation, true = check it yourself",
+          py::arg("positions"), py::arg("coordinates"), py::arg("extent"),
+          py::arg("require_sorted") = true);
 
     // A resolved CSR x dense product (see plan.h). Built once per (operand,
     // free dimension) by scorch.plan and then invoked directly, so a repeated

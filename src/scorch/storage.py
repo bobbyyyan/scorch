@@ -27,6 +27,16 @@ from .format import FormatInput, LevelType, TensorFormat, parse_format
 from .layout import TensorLayout, validate_runtime_contract
 
 IndexModes = Tuple[Tuple[torch.Tensor, ...], ...]
+
+# Resolved once. The extension is built from this same tree, but an editable install
+# whose extension has not been rebuilt will not have the entry point, and validation
+# must keep working there -- so its absence is a missing optimization, not an error.
+try:  # pragma: no cover - exercised by whichever branch this import takes
+    import scorch_ops as _native_ops
+
+    _NATIVE_SCREEN = getattr(_native_ops, "abi_screen_compressed_level", None)
+except Exception:
+    _NATIVE_SCREEN = None
 _INDEX_DTYPES = (torch.int32, torch.int64)
 
 
@@ -327,6 +337,30 @@ def _check_coordinate_bounds(coordinate: torch.Tensor, extent: int, label: str) 
         )
 
 
+def _screen_compressed_level(
+    positions: torch.Tensor, coordinates: torch.Tensor, extent: int
+) -> bool:
+    """Ask the native extension whether this level might be malformed.
+
+    ``True`` means "check it yourself" -- either the screen found something or it
+    cannot serve this input, including when the extension is absent entirely. Only
+    ``False`` is a claim, and the claim is one-directional: no violation exists. That
+    asymmetry is what makes this safe to consult, and it is the screen's documented
+    contract in ``csrc/native_abi.h``, where it has been guarding the native call
+    boundary for the same checks.
+
+    Failing to ``True`` on any surprise keeps a validator a validator: the worst a
+    broken or missing screen can do is make construction as slow as it used to be.
+    """
+    screen = _NATIVE_SCREEN
+    if screen is None:
+        return True
+    try:
+        return bool(screen(positions, coordinates, int(extent), True))
+    except Exception:
+        return True
+
+
 def _check_sorted_within_parents(
     positions: torch.Tensor, coordinates: torch.Tensor, mode: int
 ) -> None:
@@ -451,8 +485,18 @@ def _validate_index_storage(
                 raise TensorIndexError(
                     f"compressed mode {mode} position array must start at zero"
                 )
-            if positions.numel() > 1 and bool(
-                torch.any(positions[1:] < positions[:-1]).item()
+            # One native pass stands in for the three whole-array torch checks
+            # below -- positions nondecreasing, coordinates in range, coordinates
+            # ascending inside each parent. It reports "no violation exists" or "go
+            # and look", never "this is fine" about something that is not, so when it
+            # clears the level the three checks below cannot fail and are skipped;
+            # when it does not, they run exactly as they always did and remain the
+            # only thing that reports. Diagnostics, and the order they fire in, are
+            # therefore unchanged either way. See csrc/native_abi.h.
+            suspect = _screen_compressed_level(positions, coordinates, extent)
+            if suspect and (
+                positions.numel() > 1
+                and bool(torch.any(positions[1:] < positions[:-1]).item())
             ):
                 raise TensorIndexError(
                     f"compressed mode {mode} position array must be nondecreasing"
@@ -463,8 +507,9 @@ def _validate_index_storage(
                     f"compressed mode {mode} terminal position {terminal} does not "
                     f"match coordinate count {coordinates.numel()}"
                 )
-            _check_coordinate_bounds(coordinates, extent, f"compressed mode {mode}")
-            _check_sorted_within_parents(positions, coordinates, mode)
+            if suspect:
+                _check_coordinate_bounds(coordinates, extent, f"compressed mode {mode}")
+                _check_sorted_within_parents(positions, coordinates, mode)
             parent_positions = coordinates.numel()
             continue
         coordinate = arrays[0]

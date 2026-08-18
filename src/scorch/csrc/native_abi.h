@@ -90,10 +90,24 @@ inline int32_t abi_saturate_limit(int64_t limit) {
              : (int32_t)limit;
 }
 
+// The same clamp for whichever integer width the index arrays actually use. The
+// screens below are templated over that width because Scorch's own storage keeps
+// int64 indices when a caller handed them in that way (torch's CSR does), and the
+// Python-side validator wants the same single fused pass the ABI boundary gets. The
+// int32 entry points keep their exact signatures and delegate, so every existing
+// caller is unchanged.
+template <typename T>
+inline T abi_limit_clamp(int64_t limit) {
+  return limit > (int64_t)std::numeric_limits<T>::max()
+             ? std::numeric_limits<T>::max()
+             : (T)limit;
+}
+
 // "every coordinate lies in [0, limit)"
-inline bool abi_screen_bounds(const int32_t* crd, int64_t n, int64_t limit) {
+template <typename T>
+inline bool abi_screen_bounds_typed(const T* crd, int64_t n, int64_t limit) {
   if (n <= 0) return false;
-  const int32_t lim = abi_saturate_limit(limit);
+  const T lim = abi_limit_clamp<T>(limit);
   int bad = 0;
   const int nt = abi_scan_threads(n);
 #ifdef _OPENMP
@@ -101,22 +115,31 @@ inline bool abi_screen_bounds(const int32_t* crd, int64_t n, int64_t limit) {
     if (nt > 1)
 #endif
   for (int64_t p = 0; p < n; ++p) {
-    const int32_t c = crd[p];
+    const T c = crd[p];
     bad |= (c < 0) | (c >= lim);
   }
   return bad != 0;
 }
 
+inline bool abi_screen_bounds(const int32_t* crd, int64_t n, int64_t limit) {
+  return abi_screen_bounds_typed<int32_t>(crd, n, limit);
+}
+
 // "positions do not decrease and stay within [0, nnz]", for the callers that validate
 // a position array on its own. O(rows) rather than O(nnz), but a TORCH_CHECK per row
 // is what made it show up at all.
-inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
+template <typename T>
+inline bool abi_screen_spans_typed(const T* pos, int64_t count, int64_t nnz) {
   int bad = 0;
-  const int32_t nnz32 = (int32_t)nnz;  // callers check nnz <= INT_MAX first
+  const T nnz_t = (T)nnz;  // callers check nnz fits the index width first
   for (int64_t i = 1; i < count; ++i) {
-    bad |= (pos[i] < pos[i - 1]) | (pos[i] > nnz32);
+    bad |= (pos[i] < pos[i - 1]) | (pos[i] > nnz_t);
   }
   return bad != 0;
+}
+
+inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
+  return abi_screen_spans_typed<int32_t>(pos, count, nnz);
 }
 
 // "positions partition [0, nnz] without decreasing, every coordinate lies in
@@ -132,19 +155,20 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 // one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal exactly when p
 // is the first position of a span. So count every descent flat, count the descents
 // that sit on a span boundary (O(parent_count)), and compare.
-inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
-                                  int64_t parent_count, int64_t nnz, int64_t limit,
-                                  bool require_sorted) {
+template <typename T>
+inline bool abi_screen_compressed_typed(const T* pos, const T* crd,
+                                        int64_t parent_count, int64_t nnz,
+                                        int64_t limit, bool require_sorted) {
   int bad = 0;
-  const int32_t nnz32 = (int32_t)nnz;  // callers check nnz <= INT_MAX first
+  const T nnz32 = (T)nnz;  // callers check nnz fits the index width first
   for (int64_t parent = 0; parent < parent_count; ++parent) {
-    const int32_t start = pos[parent], end = pos[parent + 1];
+    const T start = pos[parent], end = pos[parent + 1];
     bad |= (start < 0) | (end < start) | (end > nnz32);
   }
   if (bad || nnz <= 0) return bad != 0;
 
-  const int32_t lim = abi_saturate_limit(limit);
-  const int32_t c0 = crd[0];
+  const T lim = abi_limit_clamp<T>(limit);
+  const T c0 = crd[0];
   bad |= (c0 < 0) | (c0 >= lim);
   const int nt = abi_scan_threads(nnz);
   if (!require_sorted) {
@@ -153,7 +177,7 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
     if (nt > 1)
 #endif
     for (int64_t p = 1; p < nnz; ++p) {
-      const int32_t c = crd[p];
+      const T c = crd[p];
       bad |= (c < 0) | (c >= lim);
     }
     return bad != 0;
@@ -165,13 +189,13 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
     reduction(+ : desc) if (nt > 1)
 #endif
   for (int64_t p = 1; p < nnz; ++p) {
-    const int32_t c = crd[p];
+    const T c = crd[p];
     bad |= (c < 0) | (c >= lim);
     desc += (crd[p - 1] > c);
   }
   int64_t allowed = 0;
   for (int64_t parent = 1; parent < parent_count; ++parent) {
-    const int32_t p = pos[parent];
+    const T p = pos[parent];
     if (p == pos[parent - 1]) continue;  // empty span: same boundary, already counted
     if (p > 0 && p < nnz) allowed += (crd[p - 1] > crd[p]);
   }
@@ -179,6 +203,13 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
   // internally unsorted.
   bad |= (desc != allowed);
   return bad != 0;
+}
+
+inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
+                                  int64_t parent_count, int64_t nnz, int64_t limit,
+                                  bool require_sorted) {
+  return abi_screen_compressed_typed<int32_t>(pos, crd, parent_count, nnz, limit,
+                                              require_sorted);
 }
 
 // "COO coordinates ascend lexicographically across levels"
