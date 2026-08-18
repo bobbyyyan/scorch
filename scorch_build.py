@@ -5,7 +5,8 @@ from __future__ import annotations
 import glob
 import os
 import platform
-from typing import Any, Iterable
+import subprocess
+from typing import Any, Iterable, Optional
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, include_paths, library_paths
@@ -19,8 +20,68 @@ def _extend_unique(target: Any, attribute: str, values: Iterable[str]) -> None:
     setattr(target, attribute, current)
 
 
+def _dylib_install_name(path: str) -> Optional[str]:
+    """The install name recorded inside a dylib, or None if it cannot be read."""
+    try:
+        result = subprocess.run(
+            ["otool", "-D", path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    # otool -D prints the path it was given, then the install name.
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[-1] if len(lines) >= 2 else None
+
+
 class ScorchBuildExtension(BuildExtension):
     """Populate the platform-specific settings normally added by CppExtension."""
+
+    def build_extension(self, ext: Any) -> None:
+        """Link as usual, then make the OpenMP reference resolvable on macOS.
+
+        PyTorch ships its own ``libomp.dylib`` whose *install name* is
+        ``/opt/llvm-openmp/lib/libomp.dylib`` -- an absolute path from the machine
+        PyTorch was built on, which does not exist here. A Mach-O link records the
+        dependency's install name, not the path the linker was handed, so linking
+        against torch's copy produces an extension that asks the loader for
+        ``/opt/llvm-openmp`` and fails to import. The ``-rpath`` we pass cannot help:
+        an rpath only resolves references that are written ``@rpath/...``.
+
+        So the reference is rewritten after the link to the copy we actually linked
+        against. Doing it here rather than by hand means a fresh clone builds and
+        imports; the alternative was a manual ``install_name_tool`` step that every
+        rebuild silently needed and that failed as soon as the recorded path changed.
+        """
+        super().build_extension(ext)
+        if platform.system() != "Darwin" or ext.name != "scorch_ops":
+            return
+        torch_omp = os.path.join(os.path.dirname(torch.__file__), "lib", "libomp.dylib")
+        if not os.path.exists(torch_omp):
+            return
+        recorded = _dylib_install_name(torch_omp)
+        if not recorded or recorded == torch_omp:
+            return  # already resolvable, nothing to rewrite
+        built = self.get_ext_fullpath(ext.name)
+        if not os.path.exists(built):
+            return
+        try:
+            subprocess.run(
+                ["install_name_tool", "-change", recorded, torch_omp, built],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # A failed rewrite leaves exactly the extension we had before it, so the
+            # build should not die here -- the import error that follows is clearer.
+            pass
 
     def build_extensions(self) -> None:
         for extension in self.extensions:
