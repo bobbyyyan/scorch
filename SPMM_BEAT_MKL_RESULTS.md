@@ -1514,6 +1514,310 @@ read as a partial win. Writing the base in place is what actually makes it miss.
   three shapes on the M5 sit within a few percent of it rather than above. They were far
   worse before, so this is unfinished rather than regressed.
 
+## Fusion locked the selector out, and what it cost to let it back in
+
+`scorch.compile` traces `relu(scorch.matmul(a, b) + bias)` into one call on a native
+fused kernel — `spmm_csr_bias_relu_float`, which folds the bias add and the clamp into
+the SpMM's row epilogue and so beats the drop-in SpMM plus two torch passes. The
+adaptive tiling selector, meanwhile, is gated on the symbol name
+`spmm_csr_float_v2`. A fused graph resolves to a different symbol, so it never reached
+the gate: **`scorch.compile` silently opted every user out of tiling.** On a
+high-degree operand that overflows the last-level cache that is not a small thing —
+it is the difference between the column-panel kernel and a kernel thrashing on B.
+
+Measured on reddit (232,965 × 232,965, 114,848,857 nonzeros), the fused path was
+**1.4–2.4x slower than not fusing at all** on the M5 and **1.8–5.5x slower** on
+redwood, purely because fusing cost you the selector.
+
+### Two ways to compose them, one of them wrong
+
+The naive composition mirrors `ops._dispatch_tiled` inside the fused runner: same
+symbol check, same candidate gate, same untiled baseline handed to
+`tiling.maybe_dispatch`. It has two defects, and neither is visible from reading the
+mirror against the original.
+
+**The thread hints are not part of "the same baseline".** `ops.matmul` derives
+`nthreads = torch.get_num_threads()` and `atparallel = _ATPARALLEL_PIPELINE` on the v2
+symbol, and hands them both to the baseline *and* to the tiled kernels the selector
+picks. A mirror that passes neither compares `tilej(nthreads=None)` against
+`v2(atparallel=False)` while the ordinary path compares against `v2(atparallel=True)`.
+Same kernel, different configuration — and since the memo was keyed on
+`(signature, level)` and shared, whichever caller ran first wrote a verdict the other
+could not reproduce. It also forfeits the host-thread match on the tiled kernels
+themselves, the lever worth pubmed 0.78 → 1.15x in `e795127`.
+
+**"Is tile-j faster than v2" is the wrong question for a fused graph.** This is the
+worse defect. `_confirm_vs_baseline` — `_confirm_vs_v2` before this
+change — keeps the tiled pick iff it is *strictly* faster than the baseline, with no
+margin. Fusion saves a whole M×N
+read-modify-write pass: at N=16 on reddit, where the gate declines and both sides run
+untiled, fusing is 11% faster than not fusing (39043 µs against 43969). So a shape where tile-j
+beats v2 by less than that is a shape where routing the fused call to tile-j plus a
+separate tail is a **regression against the fused kernel you already had**. Routing on
+the v2 verdict gets reddit right by luck, because reddit's margin is ~2.4x; it does not
+get the gate boundary right.
+
+### The fix: the selector takes the caller's own baseline
+
+`tiling.maybe_dispatch` now accepts `baseline_fn`, an `epilogue`, and a
+`baseline_tag`:
+
+- **`baseline_fn`** is the caller's own alternative. `ops.matmul` passes the drop-in
+  SpMM; the fused path passes the fused kernel. The no-regression-by-construction
+  property — the baseline is always a probe candidate — now holds against whatever the
+  caller would otherwise have run, instead of against v2 specifically.
+- **`epilogue`** is applied to every tiled candidate *inside the timed region* of the
+  probe and the one-shot confirm, and on the memoized dispatch. The tiled kernels have
+  no fused epilogue, so the fused caller's tail runs out of line; timing a bare tiled
+  kernel against a fused baseline would credit it with work it did not do.
+- **`baseline_tag`** namespaces the decision memo and the `max` level's on-disk cache.
+  Two baselines are two questions and can legitimately disagree; sharing one entry
+  would let either caller run a kernel that lost its own comparison. The default
+  baseline keeps its historical unprefixed persistent-cache key, so caches written
+  before this change stay readable.
+
+Both callers then share `ops._dispatch_tiled` and one `ops._composition_hints`, so the
+first defect cannot recur by construction rather than by review. `ops.tiling_gate` is
+split out of `_dispatch_tiled` so a caller that must build closures to consult the
+selector can ask first and skip building them on the shapes the gate declines.
+
+### reddit, both hosts
+
+`bench/bench_fused_tiling.py`. Six arms interleaved in a fresh random order per round,
+minimum estimator, 3 rounds × 2 repeats. The "before" arm is `set_autotune("off")`,
+which short-circuits `is_candidate` so the fused path runs exactly the fused kernel it
+ran before this composition existed — same binary, same process, nothing to keep in
+sync. `off/on` is what the composition buys; `fus/unf` is whether fusing is still worth
+it once both sides can tile; `A/A` is the same arm twice, and nothing inside it counts.
+
+M5 (6 threads, 16 MiB LLC), level `balanced`:
+
+| nnz | N | fused_on µs | fused_off µs | unfused_on µs | off/on | fus/unf | A/A | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 114.8M | 32 | 47412 | 68923 | 48181 | **1.454** | 0.984 | 1.007 | tilej@65536 |
+| 114.8M | 64 | 87944 | 146238 | 90788 | **1.663** | 0.969 | 0.998 | tilej@32768 |
+| 114.8M | 128 | 166577 | 338492 | 171686 | **2.032** | 0.970 | 0.999 | tilej@32768 |
+| 114.8M | 256 | 333166 | 810096 | 341818 | **2.432** | 0.975 | 1.000 | tilej@8192 |
+| 57.5M | 32 | 26718 | 35599 | 26587 | **1.332** | 1.005 | 1.005 | tilej@65536 |
+| 57.5M | 64 | 50797 | 76428 | 54985 | **1.505** | 0.924 | 1.005 | tilej@32768 |
+| 57.5M | 128 | 92745 | 171651 | 96524 | **1.851** | 0.961 | 0.993 | tilej@16384 |
+| 57.5M | 256 | 183302 | 408467 | 195594 | **2.228** | 0.937 | 0.998 | tilej@16384 |
+
+redwood (24 threads, 36 MiB L3), level `balanced`:
+
+| nnz | N | fused_on µs | fused_off µs | unfused_on µs | off/on | fus/unf | A/A | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 114.8M | 32 | 38956 | 39170 | 49360 | 1.006 | 0.789 | 1.007 | *declined* |
+| 114.8M | 64 | 65398 | 114636 | 73607 | **1.753** | 0.888 | 0.993 | tilej@73728 |
+| 114.8M | 128 | 113925 | 373451 | 127849 | **3.278** | 0.891 | 1.003 | tilej@36864 |
+| 114.8M | 256 | 235926 | 1301570 | 258839 | **5.517** | 0.911 | 1.000 | tilej@18432 |
+| 57.5M | 32 | 19973 | 20178 | 27477 | 1.010 | 0.727 | 0.997 | *declined* |
+| 57.5M | 64 | 42820 | 60207 | 50807 | **1.406** | 0.843 | 1.000 | tilej@73728 |
+| 57.5M | 128 | 83499 | 189074 | 96125 | **2.264** | 0.869 | 1.001 | tilej@36864 |
+| 57.5M | 256 | 179690 | 640775 | 204650 | **3.566** | 0.878 | 1.004 | tilej@36864 |
+
+On cross-run reproducibility: a second M5 run on the final build read `off/on` of 1.669
+and 2.286 at N = 64 and 256, against 1.663 and 2.432 in the table. The within-run A/A
+floor is ±1%, so a 6% cross-run move on a 350 ms cell is the honest reproducibility of
+these cells and the third digit should not be read. The verdicts and the direction are
+stable; the magnitudes are "1.7x" and "2.3–2.4x", not 2.432.
+
+redwood's win is much larger — up to 5.5x — and its N=32 row is the neutrality control
+that fell out for free: reddit's B is 29.8 MB against a 36 MiB L3, so the gate declines
+and `off/on` reads 1.006 against an A/A floor of 1.007. Exactly neutral where the
+selector does not engage, on the second host.
+
+At N=16 the gate correctly declines on the M5 — reddit's B is 15 MB against a 16 MiB
+LLC — and `off/on` reads 1.004 against an A/A floor of 0.995, which is the neutrality
+result at the one cell where the same matrix both qualifies and does not.
+
+`fus/unf` is the number worth reading twice. Before this change it was `fused_off /
+unfused_on`: 1.43 at N=32 to 2.37 at N=256, i.e. **fusing made the call up to 2.4x
+slower**. After, it is 0.92–1.01 — fusing is now slightly *better* than not fusing,
+which is what it should always have been.
+
+### Every autotune level composes
+
+The tail and the baseline have to be threaded through each level's decision strategy,
+not only the ladder probe: `off` short-circuits at the gate, `analytic` and `learned`
+reach the one-shot confirm, `balanced` and `max` run the probe, and `max` additionally
+reads and writes the on-disk cache. reddit on the M5, `off/on`:
+
+| level | N=64 | N=256 | verdict at N=256 |
+|---|---|---|---|
+| analytic | 1.604 | 2.524 | tilej@16384 |
+| balanced | 1.641 | 2.514 | tilej@16384 |
+| max | 1.645 | 2.501 | tilej@16384 |
+| learned | 1.690 | 2.542 | tilej@8192 |
+
+### The out-of-line tail, and why one host is not enough to price it
+
+On the tiled route the bias and the clamp run as a separate pass over the M×N output,
+because the tiled kernels have no fused epilogue. The question was whether that
+residual is worth closing with a fused tiled kernel in `spmm.h`, and the prediction
+attached to it was "~5% of the call".
+
+**The mechanism is exactly as predicted, on both hosts.** The tail is linear in the free
+dimension (M5: 341 µs at N=32 to 2315 µs at N=256 — 8x N for 6.8x the cost) and does
+not move when nnz is halved at fixed M and N (M5: 341 → 384 at N=32, 2315 → 2396 at
+N=256; redwood: 8586 → 8524 at N=128). A per-output-element pass on both axes.
+
+**The magnitude is host-dependent, by a factor of ten.** As a share of the fused call:
+
+| N | M5 | redwood |
+|---|---|---|
+| 32 | 0.7% | 1.8% |
+| 64 | 0.7% | 3.0% |
+| 128 | 0.8% | 7.5% |
+| 256 | 0.7% | 7.2% |
+| 128, nnz÷2 | 1.2% | 10.2% |
+| 256, nnz÷2 | 1.3% | 9.5% |
+
+This is not an artifact and the reason is bandwidth, not scheduling. The tail moves
+~954 MB for reddit at N=256 — `add_` and `relu_` are two torch passes, each reading and
+writing the 238 MB output. 17.0 ms on redwood is ~56 GB/s, about 63% of a 14900K's
+dual-channel DDR5 peak; 2.3 ms on the M5 is ~412 GB/s. Both are what their machine can
+do. A bandwidth-bound output pass costs 7% of the call on x86 and 0.7% on a machine with
+seven times the bandwidth per unit of compute.
+
+Those are the tail timed standalone, on a cold buffer of its own, which is a proxy.
+The direct measurement is `fused_on` minus the winning tiled kernel run with no tail —
+the tail where it actually runs, on an output in whatever cache state the tiled kernel
+just left it. On redwood the two agree within ~10% in both directions: 2095 / 8101 /
+15318 µs in route at N = 64 / 128 / 256 against 1811 / 8222 / 17012 standalone, i.e.
+**3.2% / 7.2% / 6.5%** of the call. reddit's output is 238 MB at N=256, far past any
+cache, which is why the cold proxy is not optimistic here; on a shape whose output fits
+in cache it would be.
+
+**The direct arm does not work on the M5, and that is a property of the estimator, not
+of the machine.** It is a difference of two ~350 ms arms being used to measure a ~2.5 ms
+quantity, so a 1% error on either arm is ±40% of the answer — and it duly returned 139 µs
+at N=64 and 8370 µs at N=256 against a proxy of 636 and 2549. Those two numbers are not
+reported as results anywhere. The M5 figure rests on the standalone proxy, which *can*
+resolve it because it times the tail alone. The direct arm becomes the better estimator
+exactly when the tail is a large enough share to survive the subtraction, which on this
+grid means x86.
+
+So: **a fused tiled kernel is worth building, for x86.** Up to ~7% of a reddit-class
+fused call, well outside the A/A floor of 0.993–1.007. It is not in this change — it is
+C++ in `spmm.h`, both tiled kernels would need a notion of "last panel" to apply the
+epilogue while a row is still hot rather than in a final pass, and it needs its own
+grid — but it is a real opportunity and not noise. Recording the trap plainly, because
+it caught this document once: measured only on the M5, the tail reads as 0.7% and the
+conclusion is "not worth writing", which is wrong for every x86 host we ship on.
+
+Separately, what accounts for `fus/unf` landing below 1.00 — 0.92–1.01 on the M5,
+0.73–0.91 on redwood — is the opposite direction: the *unfused* arm materializes two
+temporaries (`out + bias` allocates, `relu` allocates) where the tiled fused route does
+one in-place `add_().relu_()` pass.
+
+### The lesson that outlives both numbers
+
+Neither the "~5%" prediction nor the "0.7%, not worth writing" refutation named a host.
+The tail is a bandwidth-bound quantity, so it never had a machine-independent value —
+and this repository's own convention says to name the host for every number and never
+average across them. The two failure shapes are worth separating, because they are
+caught by different disciplines: **reasoning from a mechanism without sizing it** is
+caught by measuring once, and **generalizing a size from one host** is caught only by
+measuring twice. The convention asks for both, which is why it asks for both.
+
+### What it costs the shapes it cannot help
+
+Every GCN-small layer, every autoencoder layer, and anything whose dense operand fits
+in cache is declined at the gate. Those must not be taxed.
+
+This is measured by isolation, not end to end, and deliberately: a declined
+consultation never launches a kernel, so it can be timed to a few nanoseconds, whereas
+the end-to-end difference on a 15–500 µs fused call is a fraction of a percent and
+drowns in the noise six interleaved OpenMP teams in one process produce. The first
+attempt did it end to end and returned an A/A floor of 0.85–1.06 on exactly these
+cells, which resolves nothing; that number is not reported anywhere as a result.
+
+`bench/bench_fused_tiling_declined.py`. `gate_us` is `ops.tiling_gate` alone — the same
+call `ops.matmul` makes on every prebuilt CSR×dense product; `added_us` is everything
+the composition adds to a fused call; `old_gate` is the gate as it stood before this
+work, replicated in the harness so both can be timed in one process against one binary.
+
+| shape | N | old_gate µs | gate µs | added µs | fused µs | added % | old/new |
+|---|---|---|---|---|---|---|---|
+| **M5** | | | | | | | |
+| cora-class | 16 | 0.484 | 0.348 | 0.358 | 27.4 | 1.31% | 1.391 |
+| citeseer-class | 16 | 0.484 | 0.347 | 0.354 | 28.5 | 1.24% | 1.395 |
+| pubmed-class | 16 | 0.483 | 0.346 | 0.354 | 82.2 | 0.43% | 1.396 |
+| arxiv-class | 128 | 0.576 | 0.529 | 0.550 | 5638.4 | 0.01% | 1.088 |
+| ae-class | 128 | 0.537 | 0.387 | 0.399 | 282.1 | 0.14% | 1.386 |
+| ae-wide | 256 | 0.528 | 0.387 | 0.397 | 563.8 | 0.07% | 1.362 |
+| **redwood** | | | | | | | |
+| cora-class | 16 | 0.595 | 0.357 | 0.358 | 17.2 | 2.08% | 1.667 |
+| citeseer-class | 16 | 0.601 | 0.352 | 0.364 | 19.6 | 1.86% | 1.707 |
+| pubmed-class | 16 | 0.606 | 0.355 | 0.360 | 51.8 | 0.69% | 1.710 |
+| arxiv-class | 128 | 0.731 | 0.638 | 0.651 | 11578.3 | 0.01% | 1.145 |
+| ae-class | 128 | 0.613 | 0.355 | 0.366 | 96.0 | 0.38% | 1.726 |
+| ae-wide | 256 | 0.610 | 0.356 | 0.367 | 283.1 | 0.13% | 1.712 |
+
+Two things to read off this. First, `added − gate` is 0.001–0.021 µs on every cell:
+after `ops.tiling_gate` was split out so the runner can ask before it builds anything,
+**the composition costs a declined fused call the gate and nothing more.** Second, the
+gate itself is now **1.09–1.73x cheaper than before**, on both hosts and on every cell,
+which is a saving on the dispatch path of every prebuilt CSR×dense product in the
+library, not only the fused ones. Three changes did that, all in the shared layer:
+
+- `_current_level()` read the thread-local override with `getattr(_tls, "level", None)`.
+  With no override active — the common case, since one only exists inside a
+  `set_autotune` context manager — that raises and catches an AttributeError
+  internally: **0.132 µs against 0.029 µs** for `_tls.__dict__.get("level")`, which
+  returns the identical value in every thread, set or unset.
+- `is_candidate` read nnz off the index arrays (an attribute chain plus a pybind
+  `numel()`) *before* the cache test that rejects 99% of shapes without needing it.
+  `_operand_over_cache` is now callable on its own, so the 99% answer on two int
+  operations.
+- `_eligible_learned` took an `nnz` argument it never used, which was the only reason
+  the widened gate needed it either.
+
+So the honest statement of the cost is: **1.2–2.1% of the fused SpMM call on the two
+smallest GCN graphs, 0.01–0.7% everywhere else**, all of it the selector's pre-filter,
+which is the same mechanism `ops.matmul` has paid on every prebuilt CSR×dense call
+since the selector shipped — and which is now 1.09–1.73x cheaper for both callers than
+it was this morning. Removing it entirely would need a memo keyed on operand identity,
+and the safe form of that (weak references plus version counters, as in the
+transposed-operand copy) costs more than the 0.35 µs it would save.
+
+### Correctness
+
+27 tests in `tests/test_scorch/test_fused_tiling_composition.py`.
+
+The load-bearing one is not the numeric comparison. On the tiled route a fused call
+must equal `matmul + bias + act` **bitwise**, because both sides run the same tiled
+SpMM and only a wrong tail can differ — but that assertion alone is vacuous, since if
+the fused graph fell back to its eager equivalent, that equivalent is `scorch.matmul`
+routing through the *same* tiled kernel plus the same tail, and produces identical
+bits. So every test that means to exercise a route says so out of band, through a spy
+on `ops.tiling_gate` and `ops.dispatch_tiled_fused` that records how far each call got.
+With the route disabled, **15 of the 27 fail**. With the spy's route assertions
+neutralized as well, only **10** do — so 5 of those 15 are caught by the spy alone, and
+would otherwise have passed against a fused call that never reached a tiled kernel.
+
+The rest: tile-ijk as well as tile-j; the bias-only kernel as well as bias+relu; that
+the in-place tail does not write through to an operand the caller still owns; that a
+declined shape returns bit-for-bit what a direct fused-kernel call returns and writes
+no verdict; that a verdict measured against the drop-in SpMM does **not** route a fused
+call (the second defect above, pinned by making the two tags disagree and checking
+which kernel ran); that a fused call going *first* writes only its own entry and leaves
+`matmul` to measure its own — the ordering no benchmark exercises, since `bench_gcn`'s
+`FRAMEWORK_ORDER` always runs the unfused arm first; that the tail is timed with every
+tiled candidate (3 invocations per candidate, none for the baseline); that every fused
+prebuilt kernel has exactly one out-of-line tail and no tail exists without a kernel
+behind it; that the gate shuts when the drop-in SpMM symbol is absent from the build,
+since `resolve_prebuilt_matmul` falls back through two other symbols and only the first
+is tiled; that a `max`-level fused verdict round-trips through a real cache file under
+the prefixed key and is *not* readable as the drop-in SpMM's; that one compiled graph
+re-called with different shapes stays correct and still reaches the selector, which is
+what makes resolving the untiled SpMM once at trace time sound — the resolution keys on
+ranks, formats and dtypes and nothing else, all of which are re-checked per call; that a
+dtype change on that same graph is caught by that re-check and falls back rather than
+running against a kernel resolved for a dtype it no longer has; and that SpMV-shaped
+(N=1), COO and float64 fused calls all decline without touching the selector.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
@@ -1532,9 +1836,22 @@ read as a partial win. Writing the base in place is what actually makes it miss.
   instead *halve* index memory and remove the memo entirely; that lives in
   `stensor.py`/`storage.py`. See the JIT section for why narrowing beats compiling the
   kernel for int64.
-- **Only the drop-in float32 CSR×dense prebuilt symbol is tiled.** Fused bias/act
-  SpMM, fused sparse Linear, SpMV and SpMSpM are unaffected by the selector, though
-  they do all benefit from the validation fix.
+- **Which paths reach the selector.** The drop-in float32 CSR×dense symbol, and — as
+  of the composition section above — `scorch.compile`'s traced fused SpMM+bias+act.
+  **`sparse_linear` / `sparse_linear_fm` still do not**, and that is a real remaining
+  instance of the same lockout: they are a separate prebuilt dispatch that never
+  consults the gate. Wiring them is not a copy of the traced-path fix. Their bias is
+  per output channel (`bias[:, None]`, broadcast along rows, not along the free
+  dimension), the activation includes `sigmoid`, the fused symbol is the same for every
+  activation so the memo tag must carry the activation rather than the symbol, and
+  `sparse_linear_fm` deliberately never builds an `STensor` for its dense operand —
+  which is what `resolve_prebuilt_matmul` needs. A survey of the 56 layer
+  configurations in the autoencoder figure (7 models × 4 layers × 2 sparsities) found
+  exactly one that the gate would admit: stl10 at 0.95 sparsity, layer 1, a 28 MB dense
+  operand against the M5's 16 MiB LLC. That survey used uniformly random column indices
+  at the right density rather than trained checkpoints, so treat it as a pointer, not a
+  result. Separate change, its own tail family, its own grid. SpMV and SpMSpM are
+  unaffected by the selector by shape, not by omission.
 - **The dispatch levers are measured on redwood only.** The M5 numbers that led to them
   are in the diagnosis above, and a local A/B was attempted and thrown away: a container
   VM at ~50% of a core doubled the kernel arm. The levers are pure Python with no
