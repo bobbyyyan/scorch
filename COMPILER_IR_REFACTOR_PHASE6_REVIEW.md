@@ -18622,3 +18622,693 @@ worktree at `159d6e8` that both harnesses were run against is in the ledger and 
 from the seal, as git-backed scratch rather than evidence.  Both harnesses take a tree
 root as `$1`; the probe additionally takes an expected commit and refuses a dirty or
 mismatched tree.
+
+## 70. The per-call sparse-index validation, ported to this branch, and what removing it does to two published magnitudes (2026-08-17)
+
+`COMPILER_SILENT_DECISION_SURVEY.md` ranked one item above the other 131: every
+generated `evaluate()` revalidated its whole sparse index on every call, serially, one
+`TORCH_CHECK` per element.  The fix existed on another branch and not on this one.
+Bobby's decision was to port it before running any of the survey's coverage sweeps,
+because that constant sits on both sides of every runtime ratio this branch has
+published, and a constant added to both sides of a ratio pulls the ratio toward 1.
+
+Ten commits, `a0775ae` through `21f21d3`.  Five are cherry-picks of
+`perf/spmm-beat-mkl`, two are this session's own tests, and three are repairs the port
+needed on this branch: a linter fix and two to the measurement harness, which could not
+run here as upstream wrote it.  `git diff ceca857..21f21d3` is 4,282 insertions and 83
+deletions across 20 files; **under `src/` it is 3 files, +692/-83**, namely
+`src/scorch/csrc/native_abi.h`, `src/scorch/csrc/ops.cpp` (+12) and
+`src/scorch/prebuilt_kernels.py` (+9 net).  Everything else is tests and measurement
+harnesses.  `src/` stopped changing at `740cb06`, so every receipt below that is stamped
+at `740cb06` still describes the shipped code exactly.  Nothing is pushed.  `compile_cin_via_loopir` and
+`execute_cin_via_loopir` still have zero non-test callers.
+
+**The verdict, up front.**  No check weakened, and that is now tested on the generated
+path rather than inherited from the prebuilt one — which matters, because the tests the
+fix arrives with do not touch a generated kernel at all.  The emitted C++ changes, in
+exactly one place: every generated kernel's preamble, because `native_abi.h`'s text *is*
+the preamble.  Every kernel body is byte-identical, all 21 in the grid capture and all
+1,130 in the four strategy-emission columns.  The shipping extension's assembly changes
+too, and the change is confined to the ported validators and the prebuilt kernels that
+inline them: of 1,223 named symbols, 1,137 identical, 54 differing only in a string-pool
+index, 32 changed and 0 removed.
+
+### 70.1 Which of the eighteen commits were ported, and which were left
+
+`perf/spmm-beat-mkl` sits 18 commits past the fork point `04f321d`, which is an
+ancestor of this branch.  Five were ported, in order, because each builds on the last:
+
+| upstream | here | what it is |
+| --- | --- | --- |
+| `62a5a9e` | `a0775ae` | the prebuilt path: branchless screens, the structural memo, a Python-side narrowing cache |
+| `6a65525` | `21b1011` | do not read a version counter that inference mode disabled |
+| `14e3ea6` | `2811dfc` | pin the memo's storage-sharing case |
+| `d9450ca` | `50fc709` | the same fix on the generated path; deletes the Python cache and moves narrowing into `checked_index_tensor` |
+| `8486f7f` | `7467165` | the harness for the generated path's ABI cost |
+
+Five more commits are this branch's own, not ports.  `19cc374` and `740cb06` are the
+generated-path tests §70.3 is about.  `70b86f2` makes the ported bench files pass the
+project's linter.  `cb09517` and `21f21d3` are repairs the harness needed to run here at
+all — it depends on a public entry point this branch deleted, and on a square shape this
+branch refuses; both are covered in §70.5.
+
+The order is not negotiable and the session prompt was right about why: `d9450ca`
+substantially rewrites what `62a5a9e` put in `native_abi.h` and moves logic out of
+`prebuilt_kernels.py` into it.  A consequence worth recording because it looks wrong
+otherwise: `src/scorch/tiling.py` nets to **no change at all** from the fork point.
+`62a5a9e` changes it by +8/-4 and `d9450ca` changes it back by +4/-8, so
+`git diff 04f321d..740cb06 -- src/scorch/tiling.py` is empty.
+
+Four code commits were deliberately left behind.  `6eec90f` is a real correctness fix
+to the shipped autotuner — `analytic`, the default level, committed to its cost model's
+pick without ever timing it, and shipped six tiled-route regressions, worst 0.373x of
+untiled — but it is orthogonal to this refactor.  Leaving it out is what made
+`tiling.py` need hand-resolution rather than a clean apply, which was the correct price.
+`ba59040`, `bbd4f7b` and `41e2958` are prebuilt-dispatch performance work across
+`format.py`, `layout.py`, `stensor.py`, `storage.py`, `ops.py` and a new `plan.py` /
+`plan.h`; none of it affects generated-kernel measurement.  `9b571ea`'s own message
+records four defects `41e2958` created and fixed before landing, one of them a cached
+plan that ran tile-j while the ordinary path ran v2 — correct arithmetic, different last
+bits, from a path advertised as indistinguishable.  That is a good enough reason on its
+own to leave that work where it is.
+
+Nine documentation commits were left as well, and one of them needs a note.
+`SPMM_BEAT_MKL_RESULTS.md` was created at `dd748df`, which is not in this chain, so
+`8486f7f`'s edit to it could not apply.  It is **not** ported: the version this chain
+would bring describes commits deliberately absent here, and copying it would assert
+things this branch does not contain.  Read it at
+`perf/spmm-beat-mkl:SPMM_BEAT_MKL_RESULTS.md`.  `SPMM_BEAT_MKL_PHASE0.md` *is* ported,
+because `62a5a9e` created it and it describes only the attribution measured at the fork
+point: the per-nonzero cost, on redwood, that motivates the whole change.
+
+**Three different figures for that cost exist upstream, and the prompt inherited the
+loosest.**  `SPMM_BEAT_MKL_PHASE0.md` says **1.29–1.82 ns per nonzero**, measured across
+five cells spanning 0.43M–115M nonzeros.  `62a5a9e`'s commit message rounds that to
+"~1.4-1.6 ns", which drops both extremes, and the session prompt quotes the rounded
+version.  The header comment `62a5a9e` adds to `native_abi.h` says a third thing,
+"~0.7-0.9 ns per nonzero".  Cite the document's range; it is the one with a method
+attached.
+
+### 70.2 The one deviation from upstream, and why the port would have been unsound without it
+
+This tree requires coordinates inside a compressed span to be **strictly increasing**.
+Upstream's requires only that they not decrease.  Commit `7fd9116` made that change
+here, so that a duplicate CSR entry cannot silently miscompute a merged kernel, and it
+is the only commit on this branch that had touched `native_abi.h` before today.
+
+Upstream's fast screen counts DESCENTS.  It rests on one observation: a descent at
+position `p` is legal exactly when `p` starts a span, so count descents over the whole
+coordinate array, count the ones sitting on span boundaries, and compare.  Under a
+strictly increasing contract that screen is **unsound**, and not marginally: a duplicate
+coordinate produces no descent, so the flat count equals the boundary count, the screen
+reports the input clean, and the serial loop whose `TORCH_CHECK` would have caught it
+never runs.  An independent brute-force check over the callers' real invariants
+(`pos[0] == 0`, `pos[parent_count] == nnz`, arbitrary interior positions) put the size
+of the hole at tens of thousands of invalid inputs accepted out of a few hundred
+thousand configurations, with the smallest witness being a single CSR row of two
+identical columns: `pos = (0, 2)`, `crd = (0, 0)`.
+
+The fix is to count NON-INCREASES instead — `crd[p-1] >= crd[p]` — in both the flat scan
+and the boundary tally it is compared against.  The trick and its soundness argument
+survive unchanged, because a non-increase at a span start is still legal and the
+boundary tally is still a subset of the flat count, so equality is still exactly "no
+violation".  The same check found that moving only one of the two comparisons is worse
+than moving neither: with only the boundary tally tightened, the count that should
+bound the other exceeds it, and the configuration accepts *more* invalid inputs than
+upstream's does while also flagging valid ones.  Both move together or neither does.
+
+**The deviation, measured.**  `740cb06`'s `native_abi.h` differs from upstream
+`d9450ca`'s by **53 lines across 9 hunks, 33 added and 20 removed**.  Of those, 29 are
+comments.  The 24 code lines are: three that rename `desc` to `nonincr`, the two
+comparisons that carry the whole deviation (`>` becomes `>=`, once in the flat scan and
+once in the boundary tally), and the two serial fallback `TORCH_CHECK`s — which are not
+new decisions at all, but `7fd9116`'s own text and diagnostics carried across the port
+verbatim.  So two operators are the deviation; everything else is a rename, a comment, or
+this tree's pre-existing contract.  `ops.cpp` and `prebuilt_kernels.py` are
+**byte-identical to upstream `d9450ca`'s**, digest for digest, so the deviation is
+confined to the one file that needed it.  Both `require_sorted=true` callers — `checked_csr_view` on the prebuilt route and
+`validate_jit_tensor`'s compressed level on the generated route — are exactly the two
+sites `7fd9116` made strict, and the one `require_sorted=false` caller, the CSR
+attention mask, never reaches the branch.
+
+### 70.3 No check weakened — and the generated path is now tested, not inherited
+
+Upstream's claim is that the screens are conservative by construction and hand off to
+the original serial loop, whose `TORCH_CHECK`s produce byte-identical diagnostics, so a
+screen may flag a valid input and never pass an invalid one.  On this branch that claim
+needed more evidence than it arrives with, for a reason specific to this tree.
+
+**`src/scorch/utils.py:59-63` builds the generated preamble by substituting
+`native_abi.h`'s CONTENTS in place of its `#include` line in `header.h`, raising if that
+include is not present exactly once.**  Confirmed from the code, and confirmed to be
+load-bearing by calling `jit_preamble_text()` in each tree: the preamble is **81,061
+characters over 1,980 lines before the port and 107,173 over 2,568 after**.  The line
+delta, 588, is exactly `native_abi.h`'s own net growth, which both `git --numstat`
+(+671/-83) and the confinement harness's own diff (+675/-87) put at 588 — so the whole
+change and nothing but the change lands in the preamble.
+So the validator is not linked into a generated kernel from `scorch_ops` — it is
+**recompiled inside every generated kernel**, by the JIT's compiler with the JIT's
+flags.  A screen correct in the extension and wrong in a generated kernel is a thing
+that can happen, and no test would have noticed.
+
+**The gap, which is the finding this session was told would outrank the performance
+win.**  `bench/test_abi_guards.py` arrives with 73 cases across four commits.  Every
+one of them calls `scorch_ops` directly — the file's own docstring says so — so all 73
+exercise the PREBUILT validator.  Not one drives `validate_jit_tensor` through a kernel
+that codegen emitted.  Worse, across the whole tracked suite on either branch exactly **two**
+tests reached a generated kernel at all, both in `tests/test_scorch/test_native_abi.py`:
+`test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry`, the single JIT-validator
+*rejection* assertion, which matches `"lexicographically ordered"`; and
+`test_jit_abi_uses_physical_extents_for_rectangular_mode_order`, which drives a generated
+kernel on valid input only and asserts a correct result, not a diagnostic.  Everything
+else in that module — including the `"strictly increasing"` assertion `7fd9116` added
+when it made this tree's contract strict — goes through the prebuilt path.  So
+`validate_jit_tensor`'s compressed-level rejections — coordinate bounds, ordering inside
+a span, the span partition, the level-starts-at-zero check — had **no test anywhere, on
+either host**, and the port rewrote all of them.  `7fd9116` itself changed the JIT
+validator and tested only the prebuilt one.  Upstream
+could not have closed this: its host cannot compile a generated kernel, which is where
+its 205 pre-existing failures come from.  This branch's host can.
+
+So the gap is closed, twice, and the answer is that no check weakened.
+
+*In the tracked suite,* `tests/test_scorch/test_native_abi.py` gains seven tests: six on
+a one-compressed-level operand through `einsum('i,i->i')`, one on a two-level DCSR
+operand through `matmul` — which exercises the per-level loop and the per-level memo,
+and puts the violation under a level that is itself canonical, so a verdict cached for
+one level cannot vouch for the next.  Neither route resolves to a prebuilt symbol, so
+both compile a kernel.  All seven pass on the ported tree **and on `ceca857`**, the tree
+before the port, run with `PYTHONPATH` pointed at a pinned pre-port worktree.  They
+assert this tree's exact diagnostic strings, so passing on both sides is the claim "no
+check weakened and the message is unchanged" stated as a test.  18 → 25 in that module.
+
+*In the guard suite,* 73 → 99.  Twelve new cases drive five invalid indices through each
+of two generated routes and demand the specific diagnostic.  Fourteen cover duplicates,
+which cannot exist upstream and are violations here, at both screen sizes — serial and
+parallel.  The one that matters most is a matrix where nearly every row boundary carries
+a duplicate and nothing is wrong: 60 of 63 boundaries at the serial size and 19,992 of
+19,999 at the parallel one.  That is the case that would break a screen counting
+non-increases *without* subtracting the ones on boundaries — it would reject a perfectly
+good matrix — and its first draft was silently skipped at both sizes by a fits-in-J
+guard, so the count is now printed and asserted non-zero.
+
+*Independently, as a differential.*  `harness/jit_rejection.py` drives eight cases
+through both generated routes on each tree and records the exception type and the full
+message.  16 (case × route) records, 13 raised, 2 returned, 1 skipped as not
+constructible, and **zero differences** between `ceca857` and `740cb06`: every result,
+every exception type and every message byte identical.
+
+**Two ways this evidence would have been worthless, both found by getting it wrong
+first.**  `STensor.index` and `storage.mode_indices` both hand back FRESH tensors on
+every access, so a mutation through either lands in a temporary the kernel never reads —
+and the call then succeeds, which from outside is indistinguishable from a validator
+that stopped checking.  The first probe this session ran reported three invalid indices
+"accepted" for exactly that reason, by a validator that was in fact fine.  The real
+arrays are `storage.index._mode_indices`.  And a mutation can be a no-op on the index it
+is handed: swapping a pair at a position that already descends changes nothing, and
+writing `pos[1]` on a length-2 position array writes the terminal rather than an
+interior span.  Every case now reads the array back and is reported as UNTESTED, never
+as a pass, when the write changed nothing.
+
+**Upstream's "this laptop cannot compile a generated kernel at all, on any tree" is
+false on this branch.**  It compiles and runs.  That is not a small correction: it is
+what makes the generated-path rejection differential possible at all, and it gives the
+generated-path performance claim a second host, which upstream's own scope note says it
+lacks.
+
+### 70.4 The byte-difference waiver, scoped the way §67 scoped its own
+
+`native_abi.h` reaches shipped bytes by two independent routes, and both had to be
+scoped rather than passed.
+
+**Route one, every generated translation unit.**  Release neutrality reports two
+columns differing and five passing.  The two are the corpus and the grid, and the
+differing files are all and only preambles: **19 of 20 corpus files identical, the one
+difference being `preamble.cpp`; 21 of 42 grid files identical, the 21 differences being
+exactly the 21 `grid_*_preamble.cpp`.  Every one of the 21 kernel files is byte-identical.**
+Zero base-only and zero candidate-only files in both columns.
+
+"The preamble differs" is not a waiver, so the confinement is checked rather than
+asserted.  `harness/preamble_confinement.py` reconstructs each tree's preamble from that
+tree's own three source files, confirms the reconstruction reproduces the captured
+preamble byte for byte on both trees, then decomposes both into their five regions:
+
+| region | verdict |
+| --- | --- |
+| `header.h` before the abi include | IDENTICAL |
+| the substituted `native_abi.h` | DIFFERS, 28 hunks |
+| `header.h` between the two includes | IDENTICAL |
+| the substituted `scorch_policy.h` | IDENTICAL |
+| `header.h` after the policy include | IDENTICAL |
+
+and then checks that the text the abi region gained and lost is the text the
+**committed** header gained and lost, as multisets of lines rather than as counts.  Zero
+lines appear in the committed diff and not in the preamble's.  Eight closing braces
+appear in the preamble's and not the committed one, balanced across the added and
+removed sides — one diff aligning a hunk boundary differently from the other, on the
+same text, which is why the test is "no line unique to one side" rather than "the counts
+match".  Verdict CONFINED.
+
+Three further columns say the same thing from other directions.  The production dispatch
+column — 506 case-arms through the public `scorch.einsum` / `scorch.matmul` entries under
+production's own options, which is the only column that answers the release question —
+is IDENTICAL, 0 emission and 0 outcome differences.  The 86-case explicit-schedule audit
+is identical field for field including `legacy_sha256`.  And all four strategy-emission
+columns reconcile with zero digest differences: `single_pass_serial` 502,
+`single_pass_chunk_parallel` 18, `two_pass_parallel` **44**, `two_pass_serial` **42** —
+the two counts the session prompt asked to hold, holding.  Those digests are of
+`kernel.cpp_source`, the kernel body without the preamble, so their being identical is
+an independent confirmation of the same fact.
+
+**Route two, the shipping extension.**  `ops.cpp:5` includes `native_abi.h` and calls
+into it, so §61.3's and §67.9's stored assembly digest necessarily moves.  It does, and
+what it becomes is recorded here: `clang++ -S` over `ops.cpp` under the fixed flags
+gives **`73aab5677b562d3465412c09a00a14a85e8306e2546baa6b2baba6bc4d9f0b51`** on `ceca857`
+— which reproduces the stored digest exactly, so the apparatus is the same one — and
+**`f947a4c8de1bb5931179d01c8261d0dee0e1a239e4e2389e1c37a830a8ce2f2e`** on `740cb06`.
+211,608 lines of assembly become 222,428.
+
+A digest that moved says nothing about *where*, so §61.3's precedent is followed and the
+delta is localized.  `harness/assembly_delta.py` splits both files into per-symbol blocks
+and compares them:
+
+| | |
+| --- | --- |
+| named symbols | base 1,223, candidate 1,314 |
+| identical | **1,137** |
+| differ only in a string-pool index | 54 |
+| genuinely changed | **32** |
+| present only in base | **0** |
+| present only in the candidate | 91 |
+
+Of the 32 changed, **16 are the ported validators themselves** and **16 are prebuilt
+kernels or their pybind wrappers, which inline a validator**.  Nothing outside those two
+sets changed.  Of the 91 new, 71 are the ported ABI code and the remaining 20 are the
+pybind11 machinery for the two new zero-argument module functions `abi_memo_size` and
+`abi_memo_clear` — their `module_::def<>` and `cpp_function::initialize<>`
+instantiations, their `ReadableFunctionSignature` statics, and the typeinfo for `void()`
+and `unsigned long()` function types, which no previous binding needed.  The exported
+symbol table grows by 11: eight guard variables and function-local statics for the memo
+maps, mutex and enable flag, one OpenMP reduction critical-section variable, and the two
+new functions.  `__TEXT` grows from 491,520 to 524,288 bytes, one page granule.
+
+**Getting that localization right took five normalizations, and each one is a way the
+report lies without it.**  Mach-O numbers `LBB`, `Ltmp`, `Lcst_begin`, `Lset` and
+`GCC_except_table` sequentially over the whole translation unit, so inserting any code
+renumbers every later one and splitting blocks on them pairs base's `Lcst_begin191` with
+the candidate's `Lcst_begin190`.  `_OUTLINED_FUNCTION_nn` and `.omp_outlined.nnn` do the
+same in the symbol *name*, which is how four `spmspm_csr<T>` regions first appeared as
+deleted.  `BBnnn_kk` and `lCPInnn_k` renumber their LEADING half, so a rule that folds
+the trailing number normalizes exactly the wrong one.  And the `.globl` /
+`; -- Begin function` preamble of a symbol lands at the END of the previous symbol's
+block, so shifting the emission order reports a change in code that did not change.
+Left uncorrected these read as 6,639, then 608, then 215, then 146 changed blocks —
+every intermediate number a plausible-looking overstatement of the same 32.
+
+### 70.5 Measurements
+
+**What is already established, and therefore not re-measured.**
+`SPMM_BEAT_MKL_RESULTS.md`'s JIT section already reports this fix on the generated path,
+with base at `b4f8985`, over 18 cells and two routes: geomean **1.527x**, restricted to
+the `dcsr_dd` route (DCSR × dense through `matmul`, a dense result, scans only) geomean
+**1.899x** spanning 1.04–3.67x, and all six `wksp_ds` cells (`matmul_wksp` with int64
+operands and a sparse result, narrowing plus scans) at **0.98–0.99x**.  9 of 18 clear both
+their own A/A floor and the cross-tree control spread; the `dcsr_dd` floors run 9–42%
+because the emitted kernel is itself variable at those sizes.  Max relative error against
+a float64 reference, every cell and arm: 2.7e-07.  The workspace route's null is
+structural and upstream explains it correctly — those calls take 138–151 ms of which
+essentially all is sparse-output assembly, against roughly 0.1 ms of validation for 160k
+nonzeros, so the fix removes 0.07% of the call.  `SCORCH_ABI_VALIDATE_MEMO=0` is measured
+there too and is **not** a safe fallback: screens without the memo run 1.2–1.5x slower
+than the memo at 480k nonzeros and 4.3–6.4x slower at 2.4M, worse than the serial
+validation it replaced, because a parallel screen spawns a thread team immediately before
+the kernel wants a differently shaped one.
+
+**So the gap is the second host.**  That section says, in its own words, "redwood only;
+this laptop cannot compile a generated kernel at all, so there is no second host for this
+one — the numbers below are single-machine and should be read as such."  On this branch
+that is false: generated kernels compile and run here.  So what this section adds is the
+second host, run with the same harness, plus the two magnitudes this branch published
+through the fog.
+
+**The second host, on the `dcsr_dd` route: 24 cells, geomean 1.403x, and every one of
+them clears both nulls.**  Same harness, run out of the candidate tree for both arms with
+`PYTHONPATH` selecting which tree's `scorch` is imported, so the instrument is fixed and
+the library is the variable.  Four matrices (`band`, `scatter`, `pubmed`, `bcsstk17`) ×
+three free dimensions (N = 8, 32, 128) × two nonzero counts.
+
+| band | cells | geomean | range |
+| --- | --- | --- | --- |
+| 2.4M nonzeros (100000 × 10000, degree 24) | 12 | **1.636x** | 1.269–1.944x |
+| 480k nonzeros (20000 × 20000, degree 24) | 12 | **1.203x** | 1.107–1.374x |
+| all | 24 | **1.403x** | 1.107–1.944x |
+
+A cell is only counted if it clears **both** nulls: its own in-process A/A floor, where
+each arm times a second identical copy of its own kernel interleaved with the first, and
+the cross-tree control, which is `torch.sparse.mm` timed in both arms — torch is
+byte-identical in both trees, so base-versus-candidate disagreement on that column is
+that cell's cross-process floor.  **24 of 24 clear both.**  A/A floors run 0.68–6.57%,
+the cross-tree control 0.05–6.30%, and **zero cells regress**.  Worst relative error
+against the float64 reference, over every cell and arm: 2.499e-07.
+
+Against redwood's `dcsr_dd` geomean of 1.899x over 1.04–3.67x, this host shows a
+**smaller effect measured far more confidently**: redwood's A/A floors ran 9–42% and only
+9 of its 18 cells cleared, where here the floors are roughly an order of magnitude
+tighter and everything clears.  The direction and the scaling both replicate — the effect
+grows with nonzero count, 1.203x at 480k against 1.636x at 2.4M, which is what a
+per-nonzero cost being removed predicts — so upstream's claim survives its first
+independent host, with the magnitude on this machine being the smaller number.
+
+**One route could not be measured here, and it fails closed rather than quietly
+vanishing.**  The harness's second route calls `scorch.ops.matmul_wksp`, which **this
+branch deleted** in `a37371c` (2026-07-14, "remove legacy workspace matmul") because
+production `matmul`/`einsum` scheduling now owns workspace insertion.  Upstream's copy
+forked from `04f321d`, before that removal, so it never met this.  All four
+(tree × band) invocations of that route now exit with the structured code
+`unsupported_route_entry_point_removed`; the comparison harness collects them and
+reports **0 unclassified refusals**.  The workspace question is not dropped, it changes
+instrument: §67's own harness already drives workspace-bearing `ds` results on this
+branch through the production API that now owns them, and that is what the next
+subsection re-takes.  Upstream's own reading of its `wksp_ds` null was that it is
+structural — those calls are bound by building a sparse result, not by validation — so
+nothing about the conclusion depends on the deleted entry point.
+
+**A second pre-existing refusal turned up on the way**, and it is worth recording because
+it is not about nonzero count at all.  Upstream's grid hardcodes J = M, so asking for
+100000 rows asks for a 100000 × 100000 operand.  On this branch the `dcsr_dd` route builds
+its operand through `to_sparse("ss")`, which evaluates a generated kernel, and that
+kernel's allocation bound is checked against the **declared extent product** rather than
+the nonzero count — so a 100000 × 100000 matrix refuses at 1e10 elements however sparse it
+is: `evaluate: result_shape element count 10000000000 exceeds the current native int32
+allocation bound`.  That is a correct fail-closed refusal, just one upstream's square grid
+never triggered.  Separating the column count reaches the same 2.4M nonzeros at
+100000 × 10000 with the product under the bound, which is the `r100k` row above.
+
+**§67's workspace confound and §68's interaction, re-taken.**  Both are ratios between
+columns measured *inside one tree*, so no cross-tree timing comparison is involved: run
+the same driver on the pre-port tree and on the ported tree and the two receipts are
+directly comparable.  `git diff 0f9b3b0..ceca857 -- src/` is empty, so the pre-port tree
+is byte-identical under `src/` to the tree §68 measured, which makes §68's sealed receipt
+a third, independent column.  All three carry the same apparatus — 80 rows, 7 rounds, a
+25 ms block floor, 6 threads, one host — and the two driver runs were strictly
+sequential, taking 19 min 26 s and 19 min 04 s back to back, because a second timing
+process on the same machine is a confound and not a speedup.
+
+One correction to the numbers this was set up against: the workspace band §68 actually
+recorded is **0.865–1.571x**, read back out of its own sealed receipt, not the 0.872–1.574x
+the session prompt carried.  The difference is immaterial to any conclusion, but the
+receipt is what the third column below reports.
+
+|  | base, validation per call | candidate, memoized | sealed §68 |
+| --- | --- | --- | --- |
+| §67 workspace effect, 64 configs | 0.884–1.561x | **0.834–1.572x** | 0.865–1.571x |
+| outside its own A/A floor | 54 | **57** | 53 |
+| §68 interaction I, 32 configs | 0.857–1.151x | **0.895–1.180x** | 0.883–1.237x |
+| median deviation | 4.74% | **6.09%** | 4.39% |
+| worst deviation | 16.72% | 18.02% | 23.72% |
+| outside the four-measurement null | 15 | 16 | 13 |
+| outside the conservative eight null | 10 | **15** | 7 |
+| faster-strategy flips | 0 | **0** | 0 |
+| square (extent 256) geomean | 1.0570 | 1.0685 | 1.0565 |
+| wide (extent 4096) geomean | 0.9450 | 0.9726 | 0.9473 |
+| arm 0 / arm 1 geomean | 1.0020 / 0.9968 | 1.0217 / 1.0171 | 0.9933 / 1.0076 |
+| control cell, workspace | 0.999–1.023x | 0.986–1.023x | 0.967–1.025x |
+| control cell, interaction | 0.994–1.017x | 0.999–1.023x | 0.947–1.014x |
+| control outside either null | 0 | 0 | 0 |
+
+**The apparatus reproduces itself.**  Before reading any change, the base column has to
+land where §68 landed, and on the aggregate statistics it does: workspace band 0.884–1.561
+against 0.865–1.571, square geomean 1.0570 against 1.0565, wide geomean 0.9450 against
+0.9473.  The control cell — the one whose workspace sits a loop deeper, so the transform
+cannot substitute it and the third column must come out identical to the second — is
+inside both nulls in all three columns, 0 of 80 every time.
+
+**The prediction holds: both magnitudes grew.**  §67's workspace spread, max over min,
+goes 1.766 → 1.884, and the count of configurations whose workspace effect exceeds their
+own A/A floor goes 54 → 57 of 64.  The growth is asymmetric — the band widens downward,
+0.884 → 0.834, while the top stays at 1.56–1.57.  §68's median interaction deviation goes
+**4.74% → 6.09%**, and the count outside the conservative eight-measurement null goes
+**10 → 15 of 32**, against the published 7.  So more than twice as many cells carry an
+interaction that survives the strict null than the published number admitted.  That is
+the finding that matters for a cost model: the effect the next grid has to fit is larger
+and broader than §69 could see.
+
+**One statistic went the other way, and it is worth being exact about why.**  The worst
+deviation is 18.02% in the candidate against the **published** 23.72% — a shrink.  Against
+the **same-session base** it grew, 16.72% → 18.02%.  Both are true, and the resolution is
+that "worst" is a maximum over 32 cells and it is not tracking the same cell: base's worst
+is `sds ijk->ik [ds]` wide-workspace at density 0.2, candidate's is the same cell at square
+/ 0.02, and §68's was `sss ijk->ik [ds]` square at 0.2.  Traced individually across the
+three runs, that last cell reads **23.72%, then 14.24%, then 0.86%** — a single cell moving
+by a factor of 27 across three measurements of two trees that are byte-identical under
+`src/` for the first two of them.  So the published "worst 23.7%" is a high draw from a
+max-of-32, not a magnitude, and it does not reproduce even without the port.  **Cite the
+median and the count outside the null, which are stable and both grew; do not fit anything
+to the worst cell.**  Reporting this as "the port shrank the worst case" would be wrong in
+the direction that flatters the port, which is why it is stated the other way round.
+
+**Nothing reverses, and arm-invariance survives.**  Faster-strategy flips are 0 in all
+three columns: the interaction changes how much the two decisions cost together, never
+which strategy is faster.  Both arms move together and by nearly the same amount
+(1.0020 → 1.0217 and 0.9968 → 1.0171), so the effect is still arm-invariant and the
+§69 finding stands.
+
+**And one thing that looks like a reordering is not.**  11 of 32 cells cross I = 1 between
+base and candidate, and the pattern looks systematic — five `wide-workspace` cells at
+density 0.02 move from below 1 to above it, across three cells and both arms.  But
+**zero of the 11 are outside the conservative null on both sides**: every crossing has at
+least one end inside the noise band, so no cell's interaction sign change is established.
+The aggregate shape split is preserved — square above 1, wide below — though the wide side
+moves from 0.9450 to 0.9726, most of the way to neutral.  The one crossing worth watching
+is `dss ijk->ik [ds]` square at 0.02 arm 0, which goes 0.9802 inside the null to 1.1430
+outside it: a cell that becomes significant only once the fog is removed, which is exactly
+the mechanism this port was meant to expose.  §69.3's conclusion that the grid must be
+crossed rather than factored is unchanged, and now rests on 15 significant cells instead
+of 7.
+
+### 70.6 The proof
+
+Everything below compares two pinned detached worktrees, `base-ceca857` and
+`cand-740cb06`, each built in place so the shared conda env keeps pointing at its own
+tree.  Every harness takes a tree root as `$1` and an expected commit, and
+`tree_provenance.py` refuses a dirty tree, a non-detached one, or a mismatched commit
+before anything runs.
+
+**The refusal census.**  1,139 records per tree over the rank-2 / rank-3 / rank-4-mixed
+frontier, six fields per record (`family`, `name`, `arm0`, `arm1`, `arm_invariant`,
+`declared`), compared field for field: **differing fields 0**, VERDICT IDENTICAL.  1,138
+distinct `(family, name)` keys with one genuine duplicate — `('rank4-mixed', 'ssss
+ijkl->l [d]')` appears twice and is compared positionally rather than deduplicated, so
+neither copy is dropped.  Admitted 260 on both sides, nothing lost, nothing gained, no
+route changed, **unclassified 0 on both sides**, and the same three arm-variant cells on
+both: `dsd ijk->k [d]`, `ddd ijk->k [d]`, `ddd ijk->ik [dd]`.  The two cells the
+automatic scheduler blocks but the declared order admits are the same two, with the same
+`SchedulePassError/unsupported_schedule_auto_family` code.  GATE PASS.
+
+**The two-pass correctness differential.**  768 configurations, 3,168 executed strategy
+runs, four shards, over the cells where a two-pass strategy is legal and against a
+float64 reference.  **Index-array differences: 0** — every position and coordinate array
+identical.  56 value-only differences, all in one cell, `MM ss x ds -> ds`, worst delta
+**4.768e-07**, which is float32 rounding from a different accumulation order and is the
+same cell and the same magnitude §68 recorded.  Worst reference error 7.536e-07.  No row
+without a baseline.  Refusals bucket identically to §68's — 672 of them across seven
+`unsupported_assembly_host` / `unsupported_assembly_strategy` keys — and
+**unclassified refusals: 0**.  Verdict `VALUES DISAGREE, INDEX ARRAYS AGREE`, which is
+the pre-existing verdict, unchanged.  Separately, `strategy_correctness.py` over 32
+configurations and 160 strategy runs is **ALL AGREE**, worst reference error 6.255e-07.
+
+**The suite, in eight file-disjoint groups per tree.**  Never one process: a single
+pytest process produced 565 spurious failures on an earlier milestone, because macOS
+aborts when a process that already has threads forks a compiler, and every generated
+kernel forks one.  So 94 test files are partitioned into 8 groups, each group a fresh
+process with its own `TMPDIR`, `XDG_CACHE_HOME` and `TORCH_EXTENSIONS_DIR` under the
+ledger rather than inside either tree, each writing its own JUnit XML, its own exit code
+and its own provenance record.  No `mapfile` — bash 3.2 does not have it.  The comparison
+is on node SETS, not counts, because equal totals with a renamed test would pass a count
+check.
+
+Result: **all 16 partition exits 0**, 0 failures and 0 errors on both trees, 15 skipped on
+both.  Node sets: base 6,534, candidate 6,541, **6,534 in both, base-only 0,
+candidate-only 7** — and the 7 are exactly the tests §70.3 added, by name.  **Outcome
+changes on shared nodes: 0.**  Every non-passing node on either side is a skip, and the
+same 15.  The 94 collected files partition identically on both trees, 12/12/12/12/12/12/11/11.
+VERDICT NODE SETS RECONCILE.  The base total, 6,534, is the number §68 recorded, so the
+pre-port tree is confirmed to be the tree §68 measured from the suite's side as well as
+from `git diff`'s.
+
+The partition wall-clocks were 2:02 to 29:49, which is the reason for the grouping: an
+even split by file count is very uneven by time, and the slowest group is the one full of
+generated kernels.
+
+**Static checks.**  `mypy`, `flake8` and `black` over `src`, run against each tree in
+turn.  All three exit 1 on **both** trees, and their output is identical: mypy 146 lines
+(140 errors in 11 files, of 64 source files checked), flake8 47 lines, black one file it
+would reformat.  So the honest statement is not that the tree is clean — it is not, and
+was not before — but that **the port introduces no new static finding, byte for byte**.
+Two of the identical findings sit in files the port touches, and both are pre-existing:
+`tiling.py:1228` and `:1232` E731, in a file that nets to zero change from the fork
+point, and mypy's missing `scorch_ops` stub in `tiling.py` and `prebuilt_kernels.py`,
+which is an artifact of typechecking a tree whose extension is built in place rather than
+installed into it.  black's one file is `prebuilt_kernels.py`, which the port modifies:
+its complaint is 48 lines across five regions — a `typing` import, a dict literal, the
+`_resolve_symbol` signature, a key tuple and `requested_format` — and comparing `black
+--diff` on the two trees shows those 48 lines identical apart from hunk offsets, so
+**the nine lines the port adds to that file are black-clean** and the complaint is
+entirely pre-existing.  black also emits a pre-existing warning on both trees that
+Python 3.11 cannot parse code formatted for 3.15, which is why the check runs `--fast`.
+
+Outside `src`, which `pre-commit.sh` does not scan, the three files this port adds or
+rewrites carried three flake8 findings.  One was this session's — an unused `global
+PASSES` in the new generated-kernel suite — and two were upstream's own, present in
+upstream's copies at shifted line numbers: `E303` in `bench_codegen_abi.py` and `E127` in
+`bench/test_abi_guards.py`.  All three are fixed, the two upstream ones by whitespace
+only.  All three files are now flake8-clean, and `tests/test_scorch/test_native_abi.py`
+is black-clean.  The two bench files are not black-clean and neither are upstream's
+copies; reformatting them wholesale would gratuitously diverge a ported file from its
+source, so that is left, and it is outside the project's declared gate either way.
+
+**The protected files, checked both ways.**  Five files in the working tree belong to a
+separate CUDA project and must never be committed: `.gitignore`, `pyproject.toml`,
+`src/scorch/__init__.py`, `tests/packaging/smoke_install.py`,
+`tests/test_scorch/test_resources.py`.  Git-derived check: all five are byte-identical
+between the two pinned checkouts, with matching digests, so no commit in the chain
+touched any of them — PASS.  Live check: all five still show as modified-and-uncommitted
+in the working tree, which is the state they must stay in.  `git diff --name-only
+740cb06` over the working tree lists exactly those five plus the two bench files this
+section's lint fix touched, and nothing else.
+
+**`native_abi.h` is not one of the protected files**, which is worth stating because it
+is the file this port rewrites and it sits two directories from
+`src/scorch/__init__.py`.  It is tracked, it is not on the list, and it belongs to this
+project.
+
+### 70.7 Findings recorded, not fixed
+
+**The generated path had no test coverage for the checks this port rewrote.**  Stated in
+§70.3 and repeated here because it is the finding, not a note: `validate_jit_tensor`'s
+compressed-level rejections had no test on either branch before this session.  Closed.
+Two adjacent validators, `validate_jit_extra_tensor` and `validate_jit_result_shape`,
+still have none.
+
+**Nothing automated runs `bench/test_abi_guards.py`.**  `git grep abi_guards` matches
+only the file itself.  It has no `test_` functions, runs its suites at import time and
+calls `sys.exit`, and lives under `bench/` where the project's `pytest tests` alias never
+looks.  99 cases that no gate can fail.  That is why the seven tests added in §70.3 went
+into the tracked suite instead of into it.
+
+**§69's sealed harness does not run under the project's documented environment.**
+`~/.cache/scorch-codex/decision-survey/harness/interaction.py` has an f-string at line
+457 that nests quotes of the same kind inside its expression — PEP 701, Python 3.12 and
+later.  The project's env is 3.11.15, so it raises `SyntaxError` on import there; it
+parses under this machine's system `python3`, which is 3.13, which is presumably how it
+was run.  A sealed evidence artifact that only runs under an interpreter the project does
+not document is a defect in the artifact.  Working around it here meant snapshotting the
+helper functions only, truncated at `def main(`.
+
+**Three different figures for the per-nonzero validation cost circulate upstream**, and
+the loosest is the one that propagated.  See §70.1.  Cite
+`SPMM_BEAT_MKL_PHASE0.md`'s 1.29–1.82 ns.
+
+**The survey attributes the generated-path fix to the wrong commit.**  It names
+`62a5a9e`; `62a5a9e` fixes the prebuilt path and `d9450ca` fixes the generated one.  The
+chain is five commits, not one.
+
+**`SCORCH_NARROW_INDEX_CACHE` does not exist after the port.**  `62a5a9e` added a
+Python-side narrowing cache with that switch; `d9450ca` deleted it and moved narrowing
+into `checked_index_tensor` on the C++ side.  The switch is gone, and anything documenting
+it as an escape hatch is stale.  `SCORCH_ABI_VALIDATE_MEMO=0` remains, and is the one that
+matters.
+
+**Upstream's scope note that "this laptop cannot compile a generated kernel at all, on
+any tree" is false on this branch.**  It compiles and runs, on both pinned trees.  That
+is what made the generated-path rejection differential and this section's second host
+possible.
+
+**The deliberate trade now extends to generated kernels, and is not re-decided here.**
+The memo keys on a data pointer, an owning storage address and torch's version counter.
+A write straight through a raw buffer that a tensor aliases — numpy into shared memory, a
+foreign library writing into a exported pointer — does not bump that counter, so a buffer
+corrupted that way can now reach a kernel unchecked where before every call revalidated.
+Before the port that exposure existed only on the prebuilt path; after it, it exists on
+the generated path too.  `SCORCH_ABI_VALIDATE_MEMO=0` restores strict per-call validation
+everywhere, including inside generated kernels, because the flag is read by the same code
+that is substituted into the preamble.  This is the trade upstream made deliberately and
+Bobby's instruction was to record the extension, not revisit it.
+
+**`STensor.index` and `storage.mode_indices` return fresh tensors per access.**  Not a
+defect in the port, and not something this session changed, but it is the reason the first
+generated-path probe reported three false accepts, and any future test that mutates an
+index must go through `storage.index._mode_indices` or it is testing nothing.  A
+write-through accessor, or a documented one, would remove a trap that has now cost one
+session an hour.
+
+**The `#pragma unroll` spelling GCC ignores does not bias this measurement**, and the
+survey's instruction not to fix it here is followed.  Structurally: `git diff
+ceca857..740cb06 --name-only -- src/scorch/compiler/` is empty, so before and after hand
+identical loop text and identical pragmas to the same compiler with the same flags —
+there is no within-host bias in either direction.  `native_abi.h` and `header.h` contain
+no `#pragma unroll` at all, so the term is not merely constant, it is absent from the
+changed text.  Cross-host it is one more term beside core count, memory bandwidth and
+what `-march=native` resolves to, and it is constant per host, so it shifts a host's
+absolute numbers without distorting a within-host A/B ratio.  Discharged for this
+measurement; still worth fixing where the survey found it.
+
+**Two pre-existing defects `9b571ea` records are restated, not fixed**, per instruction.
+`matmul` raises on a mode-order-permuted CSR, because prebuilt resolution keys on the
+format string and the rank and never on mode order.  And a non-contiguous right-hand
+operand costs 1.2–25× a contiguous one — 30 µs against 315 µs on 2000×8 at N=128 —
+because the path materializes it per call and the kernel then reads a cold buffer.  The
+second is a user-facing performance trap rather than a curiosity: a user who slices a
+tensor and passes the view gets a silent order-of-magnitude penalty with no diagnostic.
+Worth its own slice.
+
+### 70.8 What this section does not do
+
+It does not run the survey's coverage sweeps, which is what the port was for.  The
+1,139-cell census here is the refusal census used as a neutrality gate, not the coverage
+sweep over the 132 decisions.
+
+It does not build the six-column crossed grid §69.3 sized, and does not build a selector
+for either of the two known decisions.  §69's conclusion that the grid must be crossed
+rather than factored still stands and is still the next slice.
+
+It does not fix the other survey findings: float64 accumulation requested and silently
+performed in float32, a parallel chunk request silently downgraded, a work estimate
+degrading to -1, the `#pragma unroll` spelling GCC ignores, or the `.so` cache key that
+is blind to microarchitecture.  Each is a defect; none is this slice.
+
+It does not port `6eec90f`, `ba59040`, `bbd4f7b` or `41e2958`.  `6eec90f` in particular
+is a real correctness fix to the shipped default autotune level and should be ported, on
+its own, with its own measurement — the six tiled-route regressions it fixes, worst
+0.373x, are a shipping defect and leaving them is a decision to revisit, not an
+endorsement.
+
+It does not fix the two defects in the paragraph above.
+
+It does not wire the LoopIR pipeline into dispatch, caches or the selector.
+`compile_cin_via_loopir` and `execute_cin_via_loopir` still have zero non-test callers,
+and the neutrality suite still enforces that `import scorch` does not load the package.
+The Phase-8 cutover remains NO-GO on §54.8's terms; nothing here bears on it.
+
+It does not touch mkt1, the dense-domain seam, the UNION/INTERSECTION question, the shadow
+pilot's membership, or sections 1 through 34.
+
+It does not push.  Ten commits plus this section, local, on
+`refactor/compiler-ir-phase3-std-move-call`.
+
+**Evidence ledger**: `~/.cache/scorch-codex/abi-jit-port/`, sealed over **401 files** with
+zero compiled or cache paths in the seal and every one verifying.  38 harnesses, 362
+receipts, and `provenance/tip.txt`.  The two pinned worktrees are in the ledger and
+excluded from the seal, as git-backed scratch rather than evidence.  Every harness takes a
+tree root as `$1`; the ones that measure additionally take an expected commit and refuse a
+dirty, attached, or mismatched tree before doing anything — `run_codegen_abi.sh` and
+`run_retake.sh` both assert both trees up front, and their receipts carry the asserted
+provenance so a later reader can check the pairing rather than trust it.  Two harnesses in
+here are snapshots taken for this section rather than written for it: `interaction_sec69.py`
+(§69's, helper functions only, truncated at `def main(` — see §70.7 for why it could not be
+imported whole) and the `workspace-decision` drivers §67 and §68 used, so that the re-take
+runs the same formulas that produced the published numbers rather than a re-implementation.
+
+The digest of the seal that includes this section is recorded in the commit that follows
+it, which is the same two-step §68 used at `159d6e8`: the section has to exist before the
+ledger that contains it can be hashed.
