@@ -776,6 +776,50 @@ validation — the same structural reason the workspace route gained nothing fro
 fix. Deduplicating the walk is worth a flat 1.47–1.79x on top of the vectorization on
 `from_torch`, and 1.09–1.10x on `to_sparse`, on both hosts.
 
+### A third rung: one native pass instead of five torch passes
+
+Even vectorized, the check is five whole-array torch operations plus a bool temporary --
+about 15 MB of traffic to validate 2.56 MB of indices, which at 640,000 nonzeros measured
+**304 us of the 385 us** it took to wrap a generated kernel's sparse result. That is
+bandwidth, not overhead, so the only way to get it back is to stop making the passes.
+
+The pass already existed. `csrc/native_abi.h` has held a fused screen since the ABI
+boundary was fixed on this branch: positions-monotonicity, coordinate bounds and
+per-parent sortedness in **one loop**, thread-split, no allocation, using the same
+descents-minus-boundaries observation the Python version uses. It was only reachable
+from C++. Exposing it as `abi_screen_compressed_level` lets Scorch's own validator use
+it, and the screen's existing contract is exactly what makes that safe: it answers "no
+violation exists" or "go and look", never "this is fine" about something that is not.
+
+So the Python checks remain the only thing that ever reports, and the three O(1) checks
+around them -- position-array length, starts-at-zero, terminal-equals-nnz -- stay where
+they were, which keeps message *precedence* identical too. On a clean level the three
+whole-array walks are skipped because the screen has established they cannot fail; on a
+suspect level they run exactly as before.
+
+| case | loop2 | vec2 | vec1 | screen | this rung | cumulative |
+|---|---|---|---|---|---|---|
+| `from_torch` 128x4 | 511.7 us | 43.9 | 27.6 | **14.0** | 1.98x | **36.6x** |
+| `from_torch` 1000x8 | 3,888 | 64.1 | 39.5 | **17.3** | 2.28x | **225x** |
+| `from_torch` 20000x24 | 77,365 | 663.9 | 386.7 | **206.8** | 1.87x | **374x** |
+| `from_torch` 100000x16 | 391,295 | 1,804 | 1,012 | **626.0** | 1.62x | **625x** |
+| `to_sparse` "ds" 2000x2000 @1% | 14,173 | 2,857 | 2,573 | **2,444** | 1.05x | 5.8x |
+
+M5, four arms in one process, random order each round, median of 9, arms compared for
+agreement before timing. **redwood confirmation is pending** -- the box was in use by
+another measurement session when this landed, and these numbers are single-host until
+that runs. `to_sparse` gains little for the same structural reason as before: its call is
+mostly a generated kernel building a sparse result.
+
+Two incidental notes. The screens are now templated over index width, because Scorch
+keeps int64 indices when a caller hands them in that way and torch's CSR does exactly
+that; the int32 entry points are preserved as delegating wrappers, so all eight existing
+ABI call sites are unchanged. And an inline check in the *emitted* kernel would be
+cheaper still -- the previous coordinate is already in a register there -- but the
+assembly comes from the CIN lowerer, so it would change the emitted C++ for every
+sparse-output kernel and invalidate the byte-identical-emission gate, forcing a
+re-capture of every pinned corpus. That is not worth 80 us.
+
 ### Why this is not a correctness risk
 
 A faster validator that accepts different storage is not a faster validator. The old
@@ -787,6 +831,15 @@ boundary, empty and single-entry parents, duplicate coordinates, malformed posit
 arrays, out-of-range coordinates, wrong dtypes, nnz mismatches, degenerate extents, and
 a 24-seed fuzz sweep with four corruption modes. Three deliberately wrong versions of
 the vectorized check were each caught by that file before this shipped.
+
+The screen is held to the same standard, and by the same file: every one of those 59
+comparisons now runs **twice**, once with the screen and once without, so any acceptance,
+message or precedence difference it introduced would fail there. Further tests assert
+only the direction that matters -- it never clears an unsorted parent (every parent, both
+index widths), never clears an out-of-range coordinate (four bad values at four
+positions), never clears broken positions, and never clears fuzzed corruption that the
+Python validator itself rejects. One more pins the wiring, so this cannot quietly degrade
+into "always take the slow path" and pass vacuously.
 
 Twelve more tests cover the stamp: construction validates exactly **once** (it was
 twice), an in-place write to any index array or a `resize_` of the values is still
