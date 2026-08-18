@@ -2,6 +2,8 @@
 
 #include <torch/extension.h>
 
+#include <ATen/Parallel.h>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -36,12 +38,20 @@
 // proceeds. Observable behaviour is unchanged; only the valid path got faster.
 // --------------------------------------------------------------------------- //
 
-// Nonzeros per validation worker. Deliberately HIGH: with the memo below, a given
-// index array is scanned once rather than once per call, so the parallel path only
-// has to pay off on genuinely large arrays. Set it low and mid-sized inputs spawn a
-// small team (e.g. 6 workers for 428K nonzeros) immediately before the kernel spawns
-// its own 32 — a libgomp team reshape per call that measured as a 2-4x REGRESSION on
-// bcsstk17. One million nonzeros is ~4 MB, past any L3, where threads clearly win.
+// How many nonzeros a scan needs before it is worth splitting, on the ABI path.
+// Deliberately HIGH: with the memo below, a given index array is scanned about once
+// rather than once per call, so the split only has to pay off on genuinely large
+// arrays, and one million nonzeros is ~4 MB -- past any L3, where threads clearly win.
+//
+// Set it low and mid-sized inputs paid a parallel region right before the kernel opened
+// its own, which measured as a 2-4x REGRESSION on bcsstk17. That measurement stands;
+// the explanation once written here -- that the cost was libgomp reshaping the team --
+// does not, because nothing ever separated it from the cost of workers still spinning
+// after the scan returned. Since the screens moved onto torch's pool the mechanism is
+// gone either way, so this value is now a threshold and no longer a guard.
+//
+// Scorch's own validation path uses its own, lower threshold: see `_WRAP_GRAIN` in
+// storage.py, where every wrap scans fresh arrays and the memo does not apply.
 #ifndef SCORCH_ABI_VALIDATE_GRAIN
 #define SCORCH_ABI_VALIDATE_GRAIN 1048576L
 #endif
@@ -55,20 +65,56 @@
 
 namespace scorch_native {
 
-// Worker count for a validation scan: one worker per grain of nonzeros, capped by
-// the machine. Sized from the same work/grain shape as scorch_policy.h so a small
-// input stays serial instead of paying a team launch to read a few kilobytes.
-inline int abi_scan_threads(int64_t n) {
-#ifdef _OPENMP
-  if (n < SCORCH_ABI_VALIDATE_GRAIN) return 1;
-  const int64_t by_work = n / SCORCH_ABI_VALIDATE_GRAIN;
-  const int64_t hw = omp_get_num_procs();
-  return (int)(by_work < hw ? by_work : hw);
-#else
-  (void)n;
-  return 1;
-#endif
+// Turn "nonzeros per worker" into the grain_size ATen actually wants.
+//
+// ATen conflates two jobs in one number, and conflating them costs real time. Its
+// `parallel_reduce` splits when `n > grain_size`, and then -- see ParallelOpenMP.h --
+// opens `#pragma omp parallel` over the WHOLE thread pool and hands work to
+// `min(team, ceil(n / grain_size))` of those threads. So the region is opened at full
+// width whether one worker or all of them get work. Paying for a full-width region and
+// then using two of its threads is the worst of both.
+//
+// Splitting the number into the two jobs it was doing:
+//
+//   * `grain` stays the THRESHOLD -- below it the scan is not worth a region at all, so
+//     return a grain_size that makes ATen run inline.
+//   * above it, every thread in the region that was opened anyway gets a share.
+//
+// Measured on an M5 at four torch threads, 98,751 nonzeros: as a worker limit the grain
+// allowed 2 of the 4 threads and cost 106.0 us; splitting across all 4 cost 78.8 us, for
+// the same region. The threshold does the no-regression work and the width is then free.
+inline int64_t abi_split(int64_t n, int64_t grain) {
+  if (n < 1) return 1;
+  if (grain < 1) grain = 1;
+  // ATen splits on `n > grain_size`, so returning n itself is how you ask for serial.
+  if (n <= grain) return n;
+  const int64_t workers = at::get_num_threads();
+  if (workers <= 1) return n;
+  const int64_t per_worker = (n + workers - 1) / workers;
+  return per_worker < 1 ? 1 : per_worker;
 }
+
+// Every screen below splits its scan with `at::parallel_reduce` rather than a raw
+// `#pragma omp parallel for num_threads(...)`, so the work runs on TORCH'S thread pool
+// at TORCH'S thread count. That is not a stylistic preference; the raw pragma was
+// measurably wrong here.
+//
+// A screen runs between torch operations, so a private team is a team the next torch
+// operation has to live with. Asking libgomp for a width torch never asks for makes it
+// reshape the team on every crossing, and the workers it spins up keep spinning after
+// the scan returns (GOMP's default spin) with nothing to do but compete for cores.
+//
+// Measured on redwood (i9-14900K, 32 cores, torch at 32 threads, 480k nonzeros): the
+// scan itself got FASTER with a private team, 138.5 -> 72.6 us, while a 3.8 MB tensor
+// copy standing next to it went 121 -> 1157 us. Net 259.9 -> 1229.4 us, a 4.7x
+// regression bought with a 1.9x win. Sharing torch's pool removes the mechanism
+// instead of tuning the grain around it: no reshape, no extra spinners, and the host
+// program's thread budget is respected for free (`torch.set_num_threads` is the one
+// knob, as it is everywhere else in this extension).
+//
+// `grain` keeps its meaning -- nonzeros per worker -- and is passed straight through as
+// ATen's `grain_size`, which also gives the serial case for free: a range shorter than
+// one grain, or a screen called from inside an existing parallel region, runs inline.
 
 // --------------------------------------------------------------------------- //
 // Structural screens
@@ -105,19 +151,20 @@ inline T abi_limit_clamp(int64_t limit) {
 
 // "every coordinate lies in [0, limit)"
 template <typename T>
-inline bool abi_screen_bounds_typed(const T* crd, int64_t n, int64_t limit) {
+inline bool abi_screen_bounds_typed(const T* crd, int64_t n, int64_t limit,
+                                    int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
   if (n <= 0) return false;
   const T lim = abi_limit_clamp<T>(limit);
-  int bad = 0;
-  const int nt = abi_scan_threads(n);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
-    if (nt > 1)
-#endif
-  for (int64_t p = 0; p < n; ++p) {
-    const T c = crd[p];
-    bad |= (c < 0) | (c >= lim);
-  }
+  const int bad = at::parallel_reduce(
+      (int64_t)0, n, abi_split(n, grain), 0,
+      [&](int64_t begin, int64_t end, int partial) {
+        for (int64_t p = begin; p < end; ++p) {
+          const T c = crd[p];
+          partial |= (c < 0) | (c >= lim);
+        }
+        return partial;
+      },
+      [](int a, int b) { return a | b; });
   return bad != 0;
 }
 
@@ -156,9 +203,9 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 // is the first position of a span. So count every descent flat, count the descents
 // that sit on a span boundary (O(parent_count)), and compare.
 template <typename T>
-inline bool abi_screen_compressed_typed(const T* pos, const T* crd,
-                                        int64_t parent_count, int64_t nnz,
-                                        int64_t limit, bool require_sorted) {
+inline bool abi_screen_compressed_typed(
+    const T* pos, const T* crd, int64_t parent_count, int64_t nnz, int64_t limit,
+    bool require_sorted, int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
   int bad = 0;
   const T nnz32 = (T)nnz;  // callers check nnz fits the index width first
   for (int64_t parent = 0; parent < parent_count; ++parent) {
@@ -170,29 +217,41 @@ inline bool abi_screen_compressed_typed(const T* pos, const T* crd,
   const T lim = abi_limit_clamp<T>(limit);
   const T c0 = crd[0];
   bad |= (c0 < 0) | (c0 >= lim);
-  const int nt = abi_scan_threads(nnz);
   if (!require_sorted) {
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
-    if (nt > 1)
-#endif
-    for (int64_t p = 1; p < nnz; ++p) {
-      const T c = crd[p];
-      bad |= (c < 0) | (c >= lim);
-    }
+    bad |= at::parallel_reduce(
+        (int64_t)1, nnz, abi_split(nnz - 1, grain), 0,
+        [&](int64_t begin, int64_t end, int partial) {
+          for (int64_t p = begin; p < end; ++p) {
+            const T c = crd[p];
+            partial |= (c < 0) | (c >= lim);
+          }
+          return partial;
+        },
+        [](int a, int b) { return a | b; });
     return bad != 0;
   }
 
-  int64_t desc = 0;
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
-    reduction(+ : desc) if (nt > 1)
-#endif
-  for (int64_t p = 1; p < nnz; ++p) {
-    const T c = crd[p];
-    bad |= (c < 0) | (c >= lim);
-    desc += (crd[p - 1] > c);
-  }
+  const int64_t OUT_OF_BOUNDS = -1;  // a descent count is never negative
+  const int64_t desc = at::parallel_reduce(
+      (int64_t)1, nnz, abi_split(nnz - 1, grain), (int64_t)0,
+      // ATen hands every chunk the identity and combines the chunks afterwards, so
+      // `partial` is always 0 here and the sentinel can only arrive via the combiner.
+      [&](int64_t begin, int64_t end, int64_t partial) {
+        int local_bad = 0;
+        int64_t descents = 0;
+        // Reads crd[p - 1], which is in range because the scan starts at 1 and a
+        // chunk never begins before it.
+        for (int64_t p = begin; p < end; ++p) {
+          const T c = crd[p];
+          local_bad |= (c < 0) | (c >= lim);
+          descents += (crd[p - 1] > c);
+        }
+        return local_bad ? OUT_OF_BOUNDS : partial + descents;
+      },
+      [OUT_OF_BOUNDS](int64_t a, int64_t b) {
+        return (a == OUT_OF_BOUNDS || b == OUT_OF_BOUNDS) ? OUT_OF_BOUNDS : a + b;
+      });
+  if (desc == OUT_OF_BOUNDS) return true;
   int64_t allowed = 0;
   for (int64_t parent = 1; parent < parent_count; ++parent) {
     const T p = pos[parent];
@@ -214,24 +273,25 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
 
 // "COO coordinates ascend lexicographically across levels"
 template <typename T>
-inline bool abi_screen_lex_typed(const std::vector<const T*>& levels, int64_t n) {
+inline bool abi_screen_lex_typed(const std::vector<const T*>& levels, int64_t n,
+                                 int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
   if (levels.empty() || n <= 1) return false;
   const size_t depth = levels.size();
   const T* const* lv = levels.data();
-  int bad = 0;
-  const int nt = abi_scan_threads(n);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) reduction(| : bad) \
-    if (nt > 1)
-#endif
-  for (int64_t p = 1; p < n; ++p) {
-    int cmp = 0;  // first level that differs decides, exactly as the serial loop does
-    for (size_t l = 0; l < depth && cmp == 0; ++l) {
-      const T a = lv[l][p - 1], b = lv[l][p];
-      cmp = (b > a) - (b < a);
-    }
-    bad |= (cmp < 0);
-  }
+  const int bad = at::parallel_reduce(
+      (int64_t)1, n, abi_split(n - 1, grain), 0,
+      [&](int64_t begin, int64_t end, int partial) {
+        for (int64_t p = begin; p < end; ++p) {
+          int cmp = 0;  // first level that differs decides, as the serial loop does
+          for (size_t l = 0; l < depth && cmp == 0; ++l) {
+            const T a = lv[l][p - 1], b = lv[l][p];
+            cmp = (b > a) - (b < a);
+          }
+          partial |= (cmp < 0);
+        }
+        return partial;
+      },
+      [](int a, int b) { return a | b; });
   return bad != 0;
 }
 
@@ -668,25 +728,22 @@ inline torch::Tensor checked_index_tensor(torch::Tensor index,
     // Screen: "every element is int32-representable" is exactly "min >= INT32_MIN
     // and max <= INT32_MAX", so one branchless min/max reduction replaces n
     // TORCH_CHECKs. 0 is representable, so it is a safe reduction identity.
-    int64_t lo = 0, hi = 0;
-    const int nt = abi_scan_threads(n);
-    if (nt > 1) {
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nt) schedule(static) \
-    reduction(min : lo) reduction(max : hi)
-#endif
-      for (int64_t i = 0; i < n; ++i) {
-        const int64_t v = data[i];
-        lo = v < lo ? v : lo;
-        hi = v > hi ? v : hi;
-      }
-    } else {
-      for (int64_t i = 0; i < n; ++i) {
-        const int64_t v = data[i];
-        lo = v < lo ? v : lo;
-        hi = v > hi ? v : hi;
-      }
-    }
+    const std::pair<int64_t, int64_t> range = at::parallel_reduce(
+        (int64_t)0, n, abi_split(n, SCORCH_ABI_VALIDATE_GRAIN),
+        std::pair<int64_t, int64_t>(0, 0),
+        [&](int64_t begin, int64_t end, std::pair<int64_t, int64_t> partial) {
+          for (int64_t i = begin; i < end; ++i) {
+            const int64_t v = data[i];
+            if (v < partial.first) partial.first = v;
+            if (v > partial.second) partial.second = v;
+          }
+          return partial;
+        },
+        [](std::pair<int64_t, int64_t> a, std::pair<int64_t, int64_t> b) {
+          return std::pair<int64_t, int64_t>(std::min(a.first, b.first),
+                                            std::max(a.second, b.second));
+        });
+    const int64_t lo = range.first, hi = range.second;
     if (lo < (int64_t)std::numeric_limits<int32_t>::min() ||
         hi > (int64_t)std::numeric_limits<int32_t>::max()) {
       // Re-walk serially so the message still names the FIRST offending element.

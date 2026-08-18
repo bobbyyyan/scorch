@@ -594,7 +594,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // returns `true` so the caller simply does the work itself.
     m.def("abi_screen_compressed_level",
           [](const torch::Tensor& positions, const torch::Tensor& coordinates,
-             int64_t extent, bool require_sorted) -> bool {
+             int64_t extent, bool require_sorted, int64_t grain) -> bool {
             try {
               if (!positions.defined() || !coordinates.defined()) return true;
               if (positions.device().type() != torch::kCPU ||
@@ -609,12 +609,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 if (nnz > (int64_t)std::numeric_limits<int32_t>::max()) return true;
                 return scorch_native::abi_screen_compressed_typed<int32_t>(
                     positions.data_ptr<int32_t>(), coordinates.data_ptr<int32_t>(),
-                    parents, nnz, extent, require_sorted);
+                    parents, nnz, extent, require_sorted, grain);
               }
               if (positions.dtype() == torch::kInt64) {
                 return scorch_native::abi_screen_compressed_typed<int64_t>(
                     positions.data_ptr<int64_t>(), coordinates.data_ptr<int64_t>(),
-                    parents, nnz, extent, require_sorted);
+                    parents, nnz, extent, require_sorted, grain);
               }
               return true;
             } catch (...) {
@@ -627,12 +627,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           // Python thread for no reason.
           py::call_guard<py::gil_scoped_release>(),
           py::arg("positions"), py::arg("coordinates"), py::arg("extent"),
-          py::arg("require_sorted") = true);
+          py::arg("require_sorted") = true,
+          py::arg("grain") = SCORCH_ABI_VALIDATE_GRAIN);
 
     // "every coordinate of this level lies in [0, extent)". Same contract. Stands in
     // for a min() and a max() reduction plus two device syncs in storage.py.
     m.def("abi_screen_bounds_level",
-          [](const torch::Tensor& coordinates, int64_t extent) -> bool {
+          [](const torch::Tensor& coordinates, int64_t extent,
+             int64_t grain) -> bool {
             try {
               if (!coordinates.defined()) return true;
               if (coordinates.device().type() != torch::kCPU) return true;
@@ -641,11 +643,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               if (n == 0) return false;  // nothing to violate; matches storage.py
               if (coordinates.dtype() == torch::kInt32) {
                 return scorch_native::abi_screen_bounds_typed<int32_t>(
-                    coordinates.data_ptr<int32_t>(), n, extent);
+                    coordinates.data_ptr<int32_t>(), n, extent, grain);
               }
               if (coordinates.dtype() == torch::kInt64) {
                 return scorch_native::abi_screen_bounds_typed<int64_t>(
-                    coordinates.data_ptr<int64_t>(), n, extent);
+                    coordinates.data_ptr<int64_t>(), n, extent, grain);
               }
               return true;
             } catch (...) {
@@ -654,7 +656,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           "Screen one level's coordinate bounds: false = every coordinate is in range",
           py::call_guard<py::gil_scoped_release>(),
-          py::arg("coordinates"), py::arg("extent"));
+          py::arg("coordinates"), py::arg("extent"),
+          py::arg("grain") = SCORCH_ABI_VALIDATE_GRAIN);
 
     // "COO coordinates ascend lexicographically across the levels, in level order".
     //
@@ -668,7 +671,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // differs decides, so this is a lexicographic test over the levels in order, not a
     // per-level ordering test.
     m.def("abi_screen_lex_levels",
-          [](const std::vector<torch::Tensor>& levels, int64_t n) -> bool {
+          [](const std::vector<torch::Tensor>& levels, int64_t n,
+             int64_t grain) -> bool {
             try {
               if (levels.empty()) return false;
               if (n <= 1) return false;
@@ -685,14 +689,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 data.reserve(levels.size());
                 for (const auto& level : levels)
                   data.push_back(level.data_ptr<int32_t>());
-                return scorch_native::abi_screen_lex_typed<int32_t>(data, n);
+                return scorch_native::abi_screen_lex_typed<int32_t>(data, n, grain);
               }
               if (width == torch::kInt64) {
                 std::vector<const int64_t*> data;
                 data.reserve(levels.size());
                 for (const auto& level : levels)
                   data.push_back(level.data_ptr<int64_t>());
-                return scorch_native::abi_screen_lex_typed<int64_t>(data, n);
+                return scorch_native::abi_screen_lex_typed<int64_t>(data, n, grain);
               }
               return true;
             } catch (...) {
@@ -701,7 +705,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           "Screen COO lexicographic order: false = the coordinates ascend",
           py::call_guard<py::gil_scoped_release>(),
-          py::arg("levels"), py::arg("n"));
+          py::arg("levels"), py::arg("n"),
+          py::arg("grain") = SCORCH_ABI_VALIDATE_GRAIN);
 
     // A resolved CSR x dense product (see plan.h). Built once per (operand,
     // free dimension) by scorch.plan and then invoked directly, so a repeated
