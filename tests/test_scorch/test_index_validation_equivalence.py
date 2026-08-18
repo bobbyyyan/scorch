@@ -16,7 +16,9 @@ The reference is a frozen copy on purpose: it is what shipped, and it must not b
 refactored alongside the production code it exists to check.
 """
 
+import copy
 import math
+import pickle
 
 import pytest
 import torch
@@ -28,8 +30,11 @@ from scorch.exceptions import (
     TensorStorageError,
 )
 from scorch.format import LevelType
+from scorch import storage as storage_module
+from scorch.stensor import STensor
 from scorch.storage import (
     IndexModes,
+    SparseStorage,
     _check_coordinate_bounds,
     _validate_index_storage,
 )
@@ -404,3 +409,196 @@ def test_fuzzed_storage_agrees(seed):
                                                     generator=generator)]
             check_same(layout, ((), (positions, broken)), values,
                        f"fuzz {seed} {corrupt}")
+
+
+# --------------------------------------------------------------------------- #
+# Validating once instead of twice
+#
+# `SparseStorage.__init__` validates, and then `STensor._set_state` -- which every
+# constructor and every in-place structural change funnels through immediately
+# afterwards -- validated the same arrays again. The second walk is skipped when a
+# stamp of what was checked (`_validation_stamp`: data_ptr, version counter and numel
+# per array) still matches. These tests pin both halves of that: it really is skipped
+# when nothing changed, and it really is not skipped otherwise.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def validation_counter(monkeypatch):
+    """Counts calls to the real validator, which stays in force."""
+    calls = []
+    real = storage_module._validate_index_storage
+
+    def counting(layout, mode_indices, values):
+        calls.append(1)
+        return real(layout, mode_indices, values)
+
+    monkeypatch.setattr(storage_module, "_validate_index_storage", counting)
+    return calls
+
+
+def components_csr(rows=4, cols=4, degree=2, seed=1):
+    positions, coordinates, values = csr_parts(rows, cols, degree, seed=seed)
+    return (rows, cols), "ds", [[], [positions, coordinates]], values
+
+
+def test_construction_validates_exactly_once(validation_counter):
+    shape, fmt, indices, values = components_csr()
+    STensor.from_components(shape, fmt, indices, values)
+    assert len(validation_counter) == 1
+
+
+@pytest.mark.parametrize("rows,degree", [(1, 1), (4, 2), (64, 3)])
+def test_from_torch_validates_exactly_once(validation_counter, rows, degree):
+    positions, coordinates, values = csr_parts(rows, rows, degree, torch.int64)
+    csr = torch.sparse_csr_tensor(
+        positions.long(), coordinates.long(), values, size=(rows, rows)
+    )
+    STensor.from_torch(csr)
+    assert len(validation_counter) == 1
+
+
+def test_explicit_validate_always_re_runs_the_full_check(validation_counter):
+    shape, fmt, indices, values = components_csr()
+    tensor = STensor.from_components(shape, fmt, indices, values)
+    before = len(validation_counter)
+    tensor.validate()
+    tensor.validate()
+    assert len(validation_counter) == before + 2
+
+
+def test_storage_validate_always_re_runs_the_full_check(validation_counter):
+    positions, coordinates, values = csr_parts(4, 4, 2)
+    store = SparseStorage(
+        layout_for("ds", (4, 4)), values, mode_indices=[[], [positions, coordinates]]
+    )
+    before = len(validation_counter)
+    store.validate()
+    assert len(validation_counter) == before + 1
+
+
+def test_in_place_corruption_of_the_internal_arrays_is_still_caught():
+    positions, coordinates, values = csr_parts(4, 4, 2, seed=3)
+    tensor = STensor.from_components(
+        (4, 4), "ds", [[], [positions, coordinates]], values
+    )
+    internal = tensor._storage._mode_indices[1][1]
+    assert internal[0] < internal[1], "need an ascending pair to break"
+    internal[1] = internal[0] - 1 if internal[0] > 0 else 0
+    internal[0] = 3
+    # The stamp's version counter moved, so the skip does not apply.
+    with pytest.raises(TensorIndexError, match="sorted within parent"):
+        tensor._storage.validate_unless_already_checked()
+    with pytest.raises(TensorIndexError, match="sorted within parent"):
+        tensor.validate()
+
+
+def test_in_place_truncation_of_the_values_is_still_caught():
+    positions, coordinates, values = csr_parts(4, 4, 2, seed=4)
+    tensor = STensor.from_components(
+        (4, 4), "ds", [[], [positions, coordinates]], values
+    )
+    tensor._storage._value.resize_(3)
+    with pytest.raises(Exception) as excinfo:
+        tensor._storage.validate_unless_already_checked()
+    assert "nnz" in str(excinfo.value) or "value" in str(excinfo.value).lower()
+
+
+def test_unstamped_storage_is_validated_from_scratch(validation_counter):
+    """A storage assembled without going through ``__init__`` carries no verdict."""
+    positions, coordinates, values = csr_parts(4, 4, 2, seed=5)
+    broken = coordinates.clone()
+    broken[0], broken[1] = coordinates[1].clone(), coordinates[0].clone()
+    store = object.__new__(SparseStorage)
+    object.__setattr__(store, "_layout", layout_for("ds", (4, 4)))
+    object.__setattr__(store, "_mode_indices", ((), (positions, broken)))
+    object.__setattr__(store, "_value", values)
+    assert not hasattr(store, "_checked")
+    with pytest.raises(TensorIndexError):
+        store.validate_unless_already_checked()
+    assert len(validation_counter) == 1
+
+
+def test_a_passing_check_stamps_so_the_next_one_is_free(validation_counter):
+    positions, coordinates, values = csr_parts(4, 4, 2, seed=6)
+    store = object.__new__(SparseStorage)
+    object.__setattr__(store, "_layout", layout_for("ds", (4, 4)))
+    object.__setattr__(store, "_mode_indices", ((), (positions, coordinates)))
+    object.__setattr__(store, "_value", values)
+    store.validate_unless_already_checked()
+    store.validate_unless_already_checked()
+    assert len(validation_counter) == 1
+
+
+def test_structural_change_validates_its_new_storage_once(validation_counter):
+    shape, fmt, indices, values = components_csr(seed=7)
+    tensor = STensor.from_components(shape, fmt, indices, values)
+    before = len(validation_counter)
+    tensor.change_mode_order([1, 0])
+    # The relayout builds one new storage, which is validated when it is built and
+    # not again when the tensor adopts it.
+    assert len(validation_counter) - before == 1
+    tensor.validate()
+
+
+def test_the_stamp_covers_every_index_array():
+    """Not just the first: a two-array level and a two-level format both matter."""
+    coordinates = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32)
+    values = torch.tensor([4.0, 5.0])
+    tensor = STensor.from_coo(indices=coordinates, values=values, shape=(3, 3))
+    stamped = tensor._storage._checked
+    arrays = [a for level in tensor._storage._mode_indices for a in level]
+    assert len(stamped[0]) == len(arrays) and arrays
+    # Reading an array, however thoroughly, must not move the stamp.
+    for array in arrays:
+        _ = array + 0, array.sum(), array.tolist(), array.clone()
+    assert (
+        storage_module._validation_stamp(
+            tensor._storage._mode_indices, tensor._storage._value
+        )
+        == stamped
+    )
+    # Writing to any one of them must, even when the value written is the one that
+    # was already there -- the version counter cannot tell, and over-reporting a
+    # change only costs a validation that was not needed.
+    for index, array in enumerate(arrays):
+        original = array.clone()
+        array[0] = array[0]
+        moved = storage_module._validation_stamp(
+            tensor._storage._mode_indices, tensor._storage._value
+        )
+        assert moved != stamped, f"array {index} is not covered by the stamp"
+        array.copy_(original)
+
+
+@pytest.mark.parametrize("clone", ["pickle", "deepcopy", "copy"])
+def test_a_stamp_does_not_survive_being_copied(validation_counter, clone):
+    """Addresses and version counters are meaningless outside the process that took
+    them, so a copy must carry no verdict and must validate itself on first use."""
+    positions, coordinates, values = csr_parts(4, 4, 2, seed=8)
+    store = SparseStorage(
+        layout_for("ds", (4, 4)), values, mode_indices=[[], [positions, coordinates]]
+    )
+    assert hasattr(store, "_checked")
+    if clone == "pickle":
+        revived = pickle.loads(pickle.dumps(store))
+    elif clone == "deepcopy":
+        revived = copy.deepcopy(store)
+    else:
+        revived = copy.copy(store)
+    assert not hasattr(revived, "_checked")
+    before = len(validation_counter)
+    revived.validate_unless_already_checked()
+    assert len(validation_counter) == before + 1
+    assert hasattr(revived, "_checked")
+
+
+def test_a_copied_tensor_still_rejects_broken_storage(validation_counter):
+    """The copy validates for real, not just nominally."""
+    shape, fmt, indices, values = components_csr(seed=9)
+    tensor = STensor.from_components(shape, fmt, indices, values)
+    revived = copy.deepcopy(tensor)
+    internal = revived._storage._mode_indices[1][1]
+    internal[0], internal[1] = internal[1].clone(), internal[0].clone()
+    with pytest.raises(TensorIndexError, match="sorted within parent"):
+        revived._storage.validate_unless_already_checked()

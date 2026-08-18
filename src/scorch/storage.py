@@ -486,6 +486,36 @@ def _validate_index_storage(
         )
 
 
+def _validation_stamp(
+    mode_indices: IndexModes, value: torch.Tensor
+) -> Tuple[Tuple[Tuple[int, int, int], ...], Tuple[int, int, int]]:
+    """A cheap summary of everything ``_validate_index_storage`` reads.
+
+    Equal stamps mean the validator would reach the same verdict, so the answer can
+    be reused instead of recomputed -- and recomputing is O(nnz), which is why it is
+    worth summarizing at all.
+
+    Identity is not sufficient on its own: a tensor's contents can change in place
+    under a stable ``id``, and a freed tensor's address can be handed to a later one.
+    ``data_ptr`` pins the buffer, ``_version`` moves on every in-place torch
+    operation against it, and ``numel`` catches a ``resize_``. This is the same
+    triple, for the same reason, that a cached call plan records (see plan.py).
+
+    It does not see a write through a raw pointer or a numpy view, which bumps no
+    version counter. Neither does anything else in Scorch: validation happens when a
+    tensor is built or reassembled, and such a write happens in between without
+    telling anyone. The stamp is therefore exactly as strong as the check it skips.
+    """
+    return (
+        tuple(
+            (array.data_ptr(), array._version, array.numel())
+            for arrays in mode_indices
+            for array in arrays
+        ),
+        (value.data_ptr(), value._version, value.numel()),
+    )
+
+
 @dataclass(frozen=True, init=False, eq=False)
 class SparseStorage:
     """Frozen sparse/dense payload storage tied to one canonical layout."""
@@ -541,6 +571,10 @@ class SparseStorage:
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_mode_indices", normalized)
         object.__setattr__(self, "_value", owned_value)
+        # What was just validated, so that `STensor._set_state` -- which every
+        # constructor and every in-place structural change funnels through, right
+        # after this one -- does not walk the index arrays a second time.
+        object.__setattr__(self, "_checked", _validation_stamp(normalized, owned_value))
 
     @property
     def layout(self) -> TensorLayout:
@@ -576,7 +610,39 @@ class SparseStorage:
         return [list(arrays) for arrays in self._mode_indices]
 
     def validate(self) -> None:
+        """Re-run every structural invariant check, unconditionally."""
         _validate_index_storage(self._layout, self._mode_indices, self._value)
+        object.__setattr__(
+            self, "_checked", _validation_stamp(self._mode_indices, self._value)
+        )
+
+    def validate_unless_already_checked(self) -> None:
+        """Validate, unless these exact arrays have already passed unmutated.
+
+        For the internal path: a storage reaches ``STensor._set_state`` immediately
+        after ``SparseStorage.__init__`` validated it, and repeating an O(nnz) walk
+        over index arrays nothing has touched since is the single largest cost of
+        wrapping a large matrix (74 ms of the 78 ms it took to wrap a 20k-row CSR,
+        half of it this second walk). :func:`_validation_stamp` says whether the
+        verdict could possibly have changed; where it could, the full check runs.
+        """
+        current = _validation_stamp(self._mode_indices, self._value)
+        if getattr(self, "_checked", None) == current:
+            return
+        _validate_index_storage(self._layout, self._mode_indices, self._value)
+        object.__setattr__(self, "_checked", current)
+
+    def __getstate__(self) -> dict:
+        """The state to pickle or copy: everything except the validation stamp.
+
+        A stamp records buffer addresses and version counters in *this* process, so it
+        means nothing anywhere else. Dropping it makes an unpickled or copied storage
+        validate itself once on first use, which is the same thing that happens to
+        storage assembled any other way.
+        """
+        state = dict(self.__dict__)
+        state.pop("_checked", None)
+        return state
 
     def copy(self) -> "SparseStorage":
         indices = tuple(

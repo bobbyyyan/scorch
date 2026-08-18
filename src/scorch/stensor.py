@@ -293,7 +293,21 @@ class STensor:
         tensor._set_state(metadata, storage)
         return tensor
 
-    def _set_state(self, metadata: TensorMetadata, storage: SparseStorage) -> None:
+    def _set_state(
+        self,
+        metadata: TensorMetadata,
+        storage: SparseStorage,
+        *,
+        recheck_storage: bool = False,
+    ) -> None:
+        """Adopt ``metadata``/``storage`` after checking they agree and are sound.
+
+        ``recheck_storage`` forces the O(nnz) structural walk even when the storage
+        already carries a passing verdict for these exact arrays. Only the public
+        :meth:`validate` sets it: every other caller is handing over a storage that
+        ``SparseStorage.__init__`` validated moments earlier, and walking it again is
+        pure duplicated work (see ``validate_unless_already_checked``).
+        """
         if not isinstance(metadata, TensorMetadata):
             raise TensorTypeError("metadata must be TensorMetadata")
         if not isinstance(storage, SparseStorage):
@@ -312,7 +326,10 @@ class STensor:
                 f"metadata device {metadata.device} does not match values device "
                 f"{storage.value.device}"
             )
-        storage.validate()
+        if recheck_storage:
+            storage.validate()
+        else:
+            storage.validate_unless_already_checked()
         self._metadata = metadata
         self._storage = storage
         # Every in-place structural change funnels through here (insert,
@@ -550,9 +567,11 @@ class STensor:
 
         Re-runs metadata/storage agreement and sparse storage invariant checks.
         Returns ``None`` when the tensor is valid and raises a Scorch domain
-        exception otherwise.
+        exception otherwise. The structural checks are re-run in full, not taken
+        from the verdict the storage already carries -- an explicit call asks for
+        the work to be done.
         """
-        self._set_state(self._metadata, self._storage)
+        self._set_state(self._metadata, self._storage, recheck_storage=True)
 
     def to(self, device):
         """Move the tensor to a device.
