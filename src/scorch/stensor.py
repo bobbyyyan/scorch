@@ -85,6 +85,90 @@ def _finalize_generated_mode_indices(
     return finalized
 
 
+# --------------------------------------------------------------------------- #
+# Generated dense results
+#
+# A generated kernel's *dense* result is described completely by (physical shape, format,
+# mode order, name, dtype, device): the index -- every level dense, so every per-mode
+# array tuple is empty -- the layout, and the metadata. Only the values tensor differs
+# between calls, and rebuilding the rest was 7.3 us of the 19.4 us a warm 64x64
+# `einsum("ik,kj->ij", ..., format="dd")` spent in Python.
+#
+# This is the same trade as `_DENSE_PARTS_CACHE` above, made sound the same way: each
+# cached part is an immutable value object -- TensorIndex, TensorLayout and
+# TensorMetadata, whose only `object.__setattr__` calls are inside their own
+# constructors -- and a dense tensor's per-mode index arrays are empty tuples, so there
+# is nothing shared that a holder could write through.
+#
+# A *sparse* result keeps the ordinary path. Its index arrays are different arrays on
+# every call, so the index cannot be shared, and what is left to hold is the layout,
+# which `TensorLayout.from_physical_shape` already caches.
+#
+# Set the bound to 0 for a same-binary control arm: installation stops and every call
+# takes the ordinary path, which is what happened before this existed.
+# --------------------------------------------------------------------------- #
+_RESULT_PARTS_CACHE: dict = {}
+_RESULT_PARTS_CACHE_MAX = 512
+
+
+def _dense_result_parts(
+    shape: Tuple[int, ...],
+    tensor_format: TensorFormat,
+    mode_indices: Sequence[Sequence[torch.Tensor]],
+    mode_order: Optional[Sequence[int]],
+    name: Optional[str],
+    value: torch.Tensor,
+    adopt: bool,
+) -> Optional[Tuple[TensorIndex, TensorLayout, TensorMetadata]]:
+    """The constant parts of a dense generated result, or None to take the long way.
+
+    Declines unless the format is all-dense *and* the kernel handed back no index
+    arrays. The second condition is not redundant: an all-dense format requires zero
+    arrays per level, and it is `_normalize_mode_indices` inside the ordinary path that
+    enforces it, so a shortcut that assumed it would turn a fail-closed check into a
+    silent one.
+    """
+    if not tensor_format.is_dense():
+        return None
+    if any(arrays for arrays in mode_indices):
+        return None
+    # `adopt` is deliberately absent: it decides whether TensorIndex copies the arrays it
+    # is given, and an all-dense index has none, so the two settings build the same index.
+    key = (
+        tuple(shape),
+        tensor_format,
+        None if mode_order is None else tuple(mode_order),
+        name,
+        value.dtype,
+        value.device,
+    )
+    cached = _RESULT_PARTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Build the parts with the ordinary constructors, so what is cached is what the
+    # ordinary path produces rather than a second implementation of it.
+    index = TensorIndex(
+        tensor_format=tensor_format,
+        mode_indices=_finalize_generated_mode_indices(tensor_format, mode_indices),
+        mode_order=mode_order,
+        _adopt=adopt,
+    )
+    layout = TensorLayout.from_physical_shape(
+        shape, index.format, index.mode_order, index.index_dtype
+    )
+    metadata = TensorMetadata(
+        "tensor" if name is None else name,
+        value.dtype,
+        value.device,
+        layout,
+        False,
+    )
+    parts = (index, layout, metadata)
+    if len(_RESULT_PARTS_CACHE) < _RESULT_PARTS_CACHE_MAX:
+        _RESULT_PARTS_CACHE[key] = parts
+    return parts
+
+
 def _wrap_generated_result(
     shape: Tuple[int, ...],
     tensor_format: Any,
@@ -106,6 +190,12 @@ def _wrap_generated_result(
     every test still walks every generated result). The cheap per-array checks -- dtype,
     rank, contiguity, device, arity -- run either way. See that flag for why this follows
     `torch.sparse.check_sparse_tensor_invariants` rather than inventing a policy.
+
+    An **all-dense** result takes a shortcut: its index, layout and metadata are
+    constants of (shape, format, mode order, name, dtype, device), so they are built once
+    per key and shared. Only the values tensor differs between calls. See
+    `_dense_result_parts` for what it declines and why the "no index arrays" half of that
+    test is not redundant. A sparse result takes the ordinary path below.
 
     ``adopt`` takes the kernel's index arrays as they are rather than copying them;
     ``None`` means "whatever the process is configured for" (``_ADOPT_CELL``), and an
@@ -142,10 +232,30 @@ def _wrap_generated_result(
     # Accept either spelling of a format: callers pass a TensorFormat in most places
     # and a string in one, and `_finalize_generated_mode_indices` needs the parsed form.
     tensor_format = parse_format(tensor_format)
+    # One `.storage` hop rather than two: these are pybind property reads, and the pair
+    # of them was 0.6 us of a 7.3 us wrap.
+    result_storage = result_cpp.storage
+    kernel_mode_indices = result_storage.index.mode_indices
+    value = result_storage.value
+    parts = _dense_result_parts(
+        shape, tensor_format, kernel_mode_indices, mode_order, name, value, adopt
+    )
+    if parts is not None:
+        cached_index, cached_layout, cached_metadata = parts
+        # `_from_validated` skips the shape-against-storage check that `STensor.__init__`
+        # does; the layout was built from this same `shape` and the cache key contains it,
+        # so that check could only ever pass. `_set_state` still compares the metadata's
+        # layout, dtype and device against the storage's.
+        return STensor._from_validated(
+            cached_metadata,
+            SparseStorage(
+                cached_layout, value, index=cached_index, _trusted_index=True
+            ),
+        )
     index = TensorIndex(
         tensor_format=tensor_format,
         mode_indices=_finalize_generated_mode_indices(
-            tensor_format, result_cpp.storage.index.mode_indices
+            tensor_format, kernel_mode_indices
         ),
         mode_order=mode_order,
         _adopt=adopt,
@@ -159,9 +269,7 @@ def _wrap_generated_result(
     layout = TensorLayout.from_physical_shape(
         shape, index.format, index.mode_order, index.index_dtype
     )
-    storage = SparseStorage(
-        layout, result_cpp.storage.value, index=index, _trusted_index=True
-    )
+    storage = SparseStorage(layout, value, index=index, _trusted_index=True)
     if name is None:
         return STensor(shape=shape, storage=storage)
     return STensor(name=name, shape=shape, storage=storage)

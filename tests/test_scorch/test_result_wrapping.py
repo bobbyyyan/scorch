@@ -31,6 +31,7 @@ import pytest
 import torch
 
 import scorch
+import scorch.stensor as stensor_module
 import scorch.storage as storage_module
 from scorch import STensor
 from scorch.exceptions import TensorIndexError, TensorTypeError
@@ -353,3 +354,151 @@ def test_caller_supplied_arrays_are_always_walked():
             STensor.from_torch(csr)
     finally:
         storage_module._VALIDATE_KERNEL_RESULTS[0] = old
+
+
+# --------------------------------------------------------------------------- #
+# The cached parts of a dense result
+# --------------------------------------------------------------------------- #
+
+
+def dense_result(shape=(2, 3), fill=1.0):
+    """What a generated all-dense kernel hands back: values, and no index arrays."""
+    values = torch.full((shape[0] * shape[1],), fill, dtype=torch.float32)
+    return FakeKernelResult([[] for _ in shape], values)
+
+
+def observable(tensor):
+    """Everything a holder of this STensor can see about its structure."""
+    return dict(
+        shape=tuple(tensor.shape),
+        fmt=str(tensor.format),
+        name=tensor.name,
+        dtype=tensor.values.dtype,
+        device=tensor.values.device,
+        mode_order=tuple(tensor.storage.index.mode_order),
+        index_dtype=tensor.storage.layout.index_dtype,
+        logical=tuple(tensor.storage.layout.logical_shape),
+        physical=tuple(tensor.storage.layout.physical_shape),
+        mode_indices=[
+            [a.tolist() for a in level] for level in tensor._storage._mode_indices
+        ],
+        requires_grad=tensor.requires_grad,
+        values=tensor.values.tolist(),
+    )
+
+
+def without_result_parts_cache(monkeypatch):
+    """Turn the cache off the way a bench does: stop installing, and empty it."""
+    monkeypatch.setattr(stensor_module, "_RESULT_PARTS_CACHE_MAX", 0)
+    monkeypatch.setattr(stensor_module, "_RESULT_PARTS_CACHE", {})
+
+
+@pytest.mark.parametrize("name", [None, "C"])
+@pytest.mark.parametrize("mode_order", [None, [0, 1], [1, 0]])
+def test_dense_result_parts_match_the_ordinary_path(monkeypatch, name, mode_order):
+    """The shared index/layout/metadata must describe what the long way would build."""
+    with monkeypatch.context() as off:
+        without_result_parts_cache(off)
+        ordinary = _wrap_generated_result(
+            shape=(2, 3),
+            tensor_format="dd",
+            result_cpp=dense_result(),
+            mode_order=mode_order,
+            name=name,
+        )
+    # Twice, because the first call through the cached path is the one that fills it.
+    cached = [
+        _wrap_generated_result(
+            shape=(2, 3),
+            tensor_format="dd",
+            result_cpp=dense_result(),
+            mode_order=mode_order,
+            name=name,
+        )
+        for _ in range(2)
+    ]
+    for got in cached:
+        assert observable(got) == observable(ordinary)
+
+
+def test_dense_results_do_not_share_values_or_storage():
+    """Sharing the *description* must not turn into sharing the payload."""
+    first = _wrap_generated_result(
+        shape=(2, 3), tensor_format="dd", result_cpp=dense_result(fill=1.0)
+    )
+    second = _wrap_generated_result(
+        shape=(2, 3), tensor_format="dd", result_cpp=dense_result(fill=2.0)
+    )
+    assert first.storage is not second.storage
+    assert first.values.data_ptr() != second.values.data_ptr()
+    first.values[0] = 99.0
+    assert second.values[0].item() == 2.0
+
+
+def test_dense_result_parts_separate_shape_format_order_name_and_dtype():
+    """Each field of the key has to be a field of the key."""
+
+    def wrap(**overrides):
+        spec = dict(shape=(2, 3), tensor_format="dd", mode_order=None, name=None)
+        spec.update(overrides)
+        shape = spec["shape"]
+        values = torch.zeros(
+            shape[0] * shape[1], dtype=spec.pop("dtype", torch.float32)
+        )
+        return _wrap_generated_result(
+            result_cpp=FakeKernelResult([[] for _ in shape], values), **spec
+        )
+
+    base = observable(wrap())
+    assert observable(wrap(shape=(3, 2))) != base
+    assert observable(wrap(mode_order=[1, 0])) != base
+    assert observable(wrap(name="C")) != base
+    assert observable(wrap(dtype=torch.float64)) != base
+    # A different format at the same shape: still dense, so still the cached path.
+    assert observable(wrap(tensor_format="dd")) == base
+
+
+def test_dense_result_parts_decline_a_sparse_format():
+    """A sparse result's arrays differ per call, so it must take the ordinary path."""
+    positions = torch.tensor([0, 1, 2], dtype=torch.int32)
+    coordinates = torch.tensor([0, 1], dtype=torch.int32)
+    values = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    before = len(stensor_module._RESULT_PARTS_CACHE)
+    wrapped = _wrap_generated_result(
+        shape=(2, 2),
+        tensor_format="ds",
+        result_cpp=FakeKernelResult([[], [positions, coordinates]], values),
+    )
+    assert wrapped.shape == (2, 2)
+    assert len(stensor_module._RESULT_PARTS_CACHE) == before
+
+
+def test_dense_result_parts_decline_index_arrays_on_a_dense_level():
+    """A dense level may carry no arrays, and that check must stay a real one.
+
+    The shortcut could have inferred "dense format, therefore no arrays" from the format
+    alone. It does not, because it is `_normalize_mode_indices` inside the ordinary path
+    that enforces the arity -- so assuming it would convert a structured error into a
+    silently accepted tensor. Here the kernel "returns" an array for a dense mode.
+    """
+    stray = torch.tensor([0, 1], dtype=torch.int32)
+    values = torch.zeros(6, dtype=torch.float32)
+    with pytest.raises(TensorIndexError):
+        _wrap_generated_result(
+            shape=(2, 3),
+            tensor_format="dd",
+            result_cpp=FakeKernelResult([[stray], []], values),
+        )
+
+
+def test_einsum_dense_result_is_correct_and_repeatable():
+    """End to end: the same product three times, against torch, sharing cached parts."""
+    torch.manual_seed(0)
+    dense = (torch.rand(48, 48) < 0.2).float()
+    A = STensor.from_torch(dense.to_sparse_csr())
+    for _ in range(3):
+        B = torch.rand(48, 6)
+        out = scorch.einsum("ik,kj->ij", A, B, format="dd")
+        torch.testing.assert_close(
+            out.to_torch(in_place=False), dense @ B, atol=1e-3, rtol=1e-3
+        )
