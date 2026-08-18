@@ -1164,6 +1164,137 @@ than a toolchain one. The fix resolves the SDK once per process via
 all if neither has the headers (a consistent toolchain finds its own libc++ without
 help; a wrong `-isystem` is worse than none). `SCORCH_MACOS_SDK` overrides it.
 
+## A warm einsum, and the four constants it re-derived per call
+
+Everything above is `scorch.matmul` and the prebuilt kernels. `scorch.einsum` is the other
+front door -- the generic one, and the only one for SpGEMM, elementwise products and any
+format combination the prebuilt table misses. On a hit in its dispatch cache the whole
+scheduling pipeline is skipped, so the call should be four steps: look up the module, bind
+the operands, run the kernel, wrap the result.
+
+Four things in that sequence were being re-derived on every call and are constants of it.
+Measured on the M5, on a 64x64 CSR times a 64x4 dense with a dense result -- a call whose
+kernel runs in 1.6 us and whose Python was 25.8:
+
+| what | cost | why it was there |
+|---|---|---|
+| dispatch key | 2.4 us | the key rendered each operand's layout with `json.dumps` |
+| result wrap | 7.3 us | a dense result's index, layout and metadata rebuilt per call |
+| label validation | ~0.8 us | `isascii()`/`isalpha()` per label of the expression, per call |
+| index sizes | 0.7 us | the logical index -> size map built twice, to validate and to shape |
+| declined relayout | 1.0 us | a relayout requested into the order the result already had |
+
+**The dispatch key.** `_einsum_cache_key` called `layout.serialize()` per operand: 2.32 us
+of `json.dumps` to obtain a key for an in-process dict that only ever compares keys for
+equality. `TensorLayout` is a frozen dataclass over logical shape, physical shape, format,
+permutation and index dtype, so it hashes and it discriminates on exactly those fields --
+the JSON was never buying anything. The key now holds the layout itself, and a test pins
+the equivalence field by field, including a level's `bit_width` two value objects down.
+`_fill_value` is the one thing `to_dict()` carries that the key omits, and it is a
+`ClassVar`, so it cannot differ between instances. `matmul_wksp`'s own module cache was
+keyed the same way and is fixed the same way. 3.20 us -> 0.82 us for the whole key.
+
+**The result wrap.** A generated *dense* result is described completely by its physical
+shape, format, mode order, name, dtype and device: the index (every level dense, so every
+per-mode array tuple is empty), the layout, and the metadata. Only the values tensor
+differs between calls. Those three are now built once per key and shared, which is sound
+for the reason `_DENSE_PARTS_CACHE` is sound -- each is a frozen value object whose only
+`object.__setattr__` calls are inside its own constructor, and there are no index arrays to
+write through. 7.26 us -> 3.54 us. A *sparse* result keeps the ordinary path: its index
+arrays are different arrays every call, so there is nothing constant to hold but the
+layout, which `TensorLayout.from_physical_shape` already caches.
+
+The shortcut declines unless the format is all-dense **and** the kernel handed back no
+index arrays. The second condition is not redundant. An all-dense format requires zero
+arrays per level, and it is `_normalize_mode_indices` inside the ordinary path that
+enforces that, so a shortcut inferring it from the format would turn a fail-closed check
+into a silent one. A test drives a stray array into a dense level and requires the error.
+
+**The labels and the sizes.** Validating an expression's labels is a pure function of the
+expression string, so it is memoized -- but consulted in exactly the position the checks
+ran in, after the operand count/None/type checks, so a malformed call still raises the same
+exception it raised before. Two tests pin that precedence: `einsum("i&,kj->ij", B)` still
+reports the operand count and `einsum("i&,kj->ij", None, B)` still reports the None. The
+index-size map was built twice, once to validate and once to shape the result; the cached
+path now reuses the first unless an operand was relayouted in between, in which case it
+recomputes. A relayout permutes an operand's physical shape and its mode order together
+and so cannot change a logical index's size either -- but there is no reason to depend on
+that, and the test that says so exists because the comment claims it.
+
+**The declined relayout.** The cached path ended with `if _temp_mo: change_mode_order(...)`.
+Both orders are constants of the cache entry, and on the common path they are equal, so
+this called a method that validated the permutation, took a defensive copy of the result's
+own mode order and sorted it, all to discover there was nothing to do. Comparing the two
+constants instead costs nothing.
+
+### Both hosts, two trees, one binary
+
+None of these can be swapped at runtime -- three of them are the absence of code -- so the
+arms are two *trees* sharing one native binary and one JIT cache, run as subprocesses in a
+fresh random order every round, with `base` twice as the A/A control. The estimator is the
+minimum rather than the median because each arm is a fresh process and a median would
+measure how each one warmed. `bench/bench_einsum_dispatch.py`.
+
+M5, 4 threads, 5 rounds:
+
+| cell | base us | cand us | cand/base | A/A |
+|---|---|---|---|---|
+| spmm 64x4 N=4 -> dd | 25.78 | 13.71 | **0.532** | 0.999 |
+| spmm 64x4 N=64 -> dd | 27.25 | 15.08 | **0.554** | 1.009 |
+| spmm 256x8 N=8 -> dd | 51.21 | 36.26 | 0.708 | 0.956 |
+| spmm 256x8 N=64 -> dd | 51.63 | 37.04 | 0.717 | 0.977 |
+| spmm 2000x8 N=8 -> dd | 101.17 | 84.83 | 0.839 | 1.006 |
+| spmm 2000x8 N=64 -> dd | 163.07 | 147.76 | 0.906 | 1.002 |
+| spmm 20000x16 N=32 -> dd | 310.40 | 293.21 | 0.945 | 1.006 |
+| spmm 64x4 N=4 -> ds | 30.54 | 22.69 | 0.743 | 1.021 |
+| spmm 256x8 N=8 -> ds | 88.95 | 79.38 | 0.892 | 1.012 |
+| spmm 2000x8 N=64 -> ds | 445.07 | 437.00 | 0.982 | 1.002 |
+| spgemm 64x4 | 34.16 | 25.93 | 0.759 | 0.997 |
+| spgemm 512x8 | 316.47 | 305.94 | 0.967 | 1.001 |
+| mul 64x4 | 26.77 | 18.91 | 0.707 | 1.000 |
+| mul 2000x8 | 68.56 | 59.67 | 0.870 | 1.006 |
+| **geomean** | | | **0.781** | 0.999 |
+
+redwood, 4 threads, 5 rounds:
+
+| cell | base us | cand us | cand/base | A/A |
+|---|---|---|---|---|
+| spmm 64x4 N=4 -> dd | 54.25 | 28.73 | **0.530** | 0.997 |
+| spmm 64x4 N=64 -> dd | 58.56 | 32.26 | **0.551** | 0.997 |
+| spmm 256x8 N=8 -> dd | 62.13 | 34.52 | 0.556 | 0.998 |
+| spmm 256x8 N=64 -> dd | 72.45 | 44.89 | 0.620 | 0.984 |
+| spmm 2000x8 N=8 -> dd | 76.63 | 48.57 | 0.634 | 1.003 |
+| spmm 2000x8 N=64 -> dd | 107.21 | 76.93 | 0.718 | 0.996 |
+| spmm 20000x16 N=32 -> dd | 298.36 | 264.05 | 0.885 | 1.003 |
+| spmm 64x4 N=4 -> ds | 63.78 | 47.15 | 0.739 | 0.998 |
+| spmm 256x8 N=8 -> ds | 85.81 | 68.40 | 0.797 | 0.997 |
+| spmm 2000x8 N=64 -> ds | 249.74 | 232.07 | 0.929 | 1.029 |
+| spgemm 64x4 | 64.20 | 48.03 | 0.748 | 1.000 |
+| spgemm 512x8 | 154.84 | 134.71 | 0.870 | 1.030 |
+| mul 64x4 | 55.86 | 38.93 | 0.697 | 0.985 |
+| mul 2000x8 | 160.64 | 138.77 | 0.864 | 0.991 |
+| **geomean** | | | **0.712** | 1.000 |
+
+Nothing regressed on either host, and no cell sits inside its own A/A floor except the
+largest sparse-result one on the M5 (0.982 against a 1.002 control -- call that flat). The
+gain is largest where the fixed cost is most of the call, which is what a fixed-cost fix
+should look like, and it does not vanish at the kernel-bound end: 0.945 on the M5's
+20000x16 cell and 0.885 on redwood's.
+
+### What is left, measured and not claimed
+
+- A **sparse** result's wrap is still 9.4 us on the M5, of which 2.4 us is `TensorIndex`
+  and 1.2 us `_finalize_generated_mode_indices`. Both are genuine per-call work on arrays
+  that are new every call. The 0.8 us of `TensorMetadata` and 0.35 us of layout inside it
+  are constants and could be shared the same way; that is ~5% of a small sparse-result
+  call and is not done.
+- Wrapping the dense right-hand operand costs 1.4-1.6 us per call. It is already served
+  from `_DENSE_PARTS_CACHE`; what is left is the `STensor` assembly around the cached
+  parts. Not building an STensor for a dense operand at all is a larger change to
+  `einsum`'s interior.
+- `einsum`'s own remaining bytecode -- kwargs handling, the schedule resolution, the
+  operand type and rank checks -- is roughly 3 us of the M5's 13.6.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
