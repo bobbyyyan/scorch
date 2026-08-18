@@ -3262,8 +3262,52 @@ torch::Tensor scorch_transpose_2d_float(torch::Tensor src,
   // Access-pattern-bound, so threading mainly helps the wide (stl10) cases;
   // share torch's warm intra-op pool (the SAME pool the fused kernel consuming
   // this output runs on) when the caller passes the host thread count.
-  if (nthreads_override > 0 && ncblk > 1) {
-    at::parallel_for(0, ncblk, 1,
+  //
+  // The grain decides everything below full-size inputs. This used to pass 1, which is
+  // ATen for "split whenever there is more than one iteration", so an 8 KiB transpose
+  // opened a thread team. Opening one costs ~10 us at four torch threads and ~22 us at
+  // eight on an Apple M5, and ~2-3 us at four and ~18-20 us at thirty-two on a 32-core
+  // x86 -- against a serial transpose of that same data in 0.3-1.3 us. Nothing was bought
+  // with it: below the threshold the serial kernel is not merely adequate, it is 2.0-7.8x
+  // faster than the `.contiguous()` scatter it exists to replace, so staying serial gives
+  // up nothing at all.
+  //
+  // SCORCH_TRANSPOSE_PARALLEL_ELEMS is that threshold in elements, converted to blocks
+  // because ATen's grain is expressed in units of the iteration space: one column block is
+  // R*BS elements, so `parallel_for` splits exactly when the whole transpose exceeds the
+  // threshold, and each worker then gets at least that much work.
+  //
+  // The threshold has to clear one bar in particular. This kernel is already shipped and
+  // `fast_transpose` / `sparse_linear` call it with the host thread count, so every shape
+  // with more than one column block ran threaded before. Raising the grain can only move a
+  // shape from threaded to serial, so any shape it moves the wrong way is a regression in a
+  // path that has been measured. Candidate rules were therefore replayed against both
+  // modes' measured times over a 40-shape grid (R in {8,32,64,256,784}, C in {64..20000})
+  // on two hosts at two thread counts each -- 160 cells -- and scored on how many shapes
+  // they made slower than always-threaded.
+  //
+  // `max(32768, 4096 * threads)` is the rule that regresses nothing on any of the 160
+  // cells while improving 15-21 shapes per grid, geomean 1.37-3.13x and up to 80x on the
+  // small ones. The floor is the work below which no pool size is worth a launch; above it
+  // the threshold grows with the pool because the launch cost does. Fixed thresholds tuned
+  // for the best average instead (65536, 131072) do buy a little more -- three or four extra
+  // shapes per grid -- and pay for it by making two to five shapes up to 1.8x slower than
+  // what already ships, which is not a trade this gets to make.
+  //
+  // What this does not do is pick the better mode everywhere. On the M5 the worst shape
+  // lands within a few percent of `.contiguous()` at four threads and about 1.6x below it at
+  // eight, where a higher threshold would have fixed both. Element count alone cannot
+  // separate these cases -- 784x256 and 256x784 are the same 200704 elements and want
+  // opposite modes, because the block geometry differs -- and the two hosts want different
+  // constants anyway: per thread, opening the team costs ~2.7 us on the M5 against ~0.6 us
+  // on the x86. Suiting both would mean calibrating that cost once per process. Until then
+  // the rest is left on the table rather than bought with a regression.
+  const int64_t SCORCH_TRANSPOSE_PARALLEL_ELEMS =
+      std::max<int64_t>(32768, 4096 * (int64_t)at::get_num_threads());
+  const int64_t grain_blocks = std::max<int64_t>(
+      1, SCORCH_TRANSPOSE_PARALLEL_ELEMS / std::max<int64_t>(1, R * BS));
+  if (nthreads_override > 0) {
+    at::parallel_for(0, ncblk, grain_blocks,
                      [&](int64_t b0, int64_t b1) { do_cblks(b0, b1); });
   } else {
     do_cblks(0, ncblk);
