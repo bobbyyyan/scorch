@@ -1641,14 +1641,25 @@ which is what it should always have been.
 The tail and the baseline have to be threaded through each level's decision strategy,
 not only the ladder probe: `off` short-circuits at the gate, `analytic` and `learned`
 reach the one-shot confirm, `balanced` and `max` run the probe, and `max` additionally
-reads and writes the on-disk cache. reddit on the M5, `off/on`:
+reads and writes the on-disk cache. reddit, `off/on`, both hosts:
 
-| level | N=64 | N=256 | verdict at N=256 |
-|---|---|---|---|
-| analytic | 1.604 | 2.524 | tilej@16384 |
-| balanced | 1.641 | 2.514 | tilej@16384 |
-| max | 1.645 | 2.501 | tilej@16384 |
-| learned | 1.690 | 2.542 | tilej@8192 |
+| level | M5 N=64 | M5 N=256 | M5 verdict @256 | redwood N=64 | redwood N=256 | redwood verdict @256 |
+|---|---|---|---|---|---|---|
+| analytic | 1.604 | 2.524 | tilej@16384 | 1.530 | 4.485 | tilej@36864 |
+| balanced | 1.641 | 2.514 | tilej@16384 | 1.844 | 5.501 | tilej@18432 |
+| max | 1.645 | 2.501 | tilej@16384 | 1.985 | 5.308 | tilej@18432 |
+| learned | 1.690 | 2.542 | tilej@8192 | 1.572 | 4.988 | tilej@36864 |
+
+Every level composes and every level wins, on both hosts. The panel widths differ the
+way they should: `analytic` and `learned` take the byte model's base width while
+`balanced` and `max` search the ladder down from it, on both machines.
+
+**What this table does not support is a ranking between levels.** The redwood cells'
+own A/A controls span 0.915–1.067 — a floor of up to 8% — and each level ran in its own
+process, so comparing 1.530 against 1.985 is a cross-run comparison across a floor
+wider than the gap. The M5 cells are tighter (0.993–1.023) and their four levels sit
+within 5% of each other, which is also inside their floor. The claim here is "all four
+compose and deliver the win", not "max beats analytic".
 
 ### The out-of-line tail, and why one host is not enough to price it
 
@@ -1697,6 +1708,17 @@ reported as results anywhere. The M5 figure rests on the standalone proxy, which
 resolve it because it times the tail alone. The direct arm becomes the better estimator
 exactly when the tail is a large enough share to survive the subtraction, which on this
 grid means x86.
+
+**The precondition, which the level sweep then demonstrated by violating it.** The
+redwood in-route numbers above come from a run whose per-cell A/A controls were
+0.998–1.005. Re-running the same arm in the level sweep, where those controls were
+0.915–1.067, produced 38770 µs against a 17264 µs proxy in one cell, 3755 against 19828
+in another, and **−7050 µs** in a third — a negative tail, i.e. the bare tiled kernel
+timing slower than the same kernel plus a pass over its output. That is not a
+measurement of anything; it is the subtraction failing out loud, and it is the useful
+form of failure. So the rule the arm needs is explicit: **a difference-of-two-arms
+estimator is only readable when each arm's own A/A control is tight**, and a negative
+result is the check that catches it when it is not.
 
 So: **a fused tiled kernel is worth building, for x86.** Up to ~7% of a reddit-class
 fused call, well outside the A/A floor of 0.993–1.007. It is not in this change — it is
