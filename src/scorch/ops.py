@@ -1,7 +1,7 @@
 import copy
 import os
 import time
-from typing import Any, Union, Sequence, Optional, List, Tuple
+from typing import Any, Dict, Union, Sequence, Optional, List, Tuple
 
 import torch
 from torch.fx import Proxy
@@ -29,7 +29,7 @@ from .compiler.scheduler import (
 )
 from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
-from .layout import TensorSpec
+from .layout import TensorLayout, TensorSpec
 from .plan import ENABLED_CELL as _PLAN_ENABLED
 from .plan import GENERATION as _PLAN_GENERATION
 from .plan import PLANS_ATTR as _PLANS_ATTR
@@ -83,8 +83,22 @@ def _einsum_cache_key(
 
     def layout_contract(tensor: Any) -> Any:
         layout = getattr(tensor, "layout", None)
+        if isinstance(layout, TensorLayout):
+            # The layout *is* the contract. It is a frozen dataclass over logical shape,
+            # physical shape, format, permutation and index dtype, so the __eq__ and
+            # __hash__ it already has distinguish exactly what a dispatch key has to
+            # distinguish -- test_einsum_dispatch_key_discriminates_every_layout_field
+            # pins that against serialize() field by field. This cache is an in-process
+            # dict, so there is nothing the string bought: serializing to JSON to get a
+            # dict key cost 2.32 us per sparse operand on an M5 for no information at
+            # all, and 3.20 us for the whole key -- 7% of the smallest einsum there is.
+            return layout
         serialize = getattr(layout, "serialize", None)
         if callable(serialize):
+            # Not one of ours, but it offers its own canonical string, so keep keying on
+            # that rather than dropping to the weaker tensor-like contract below. Every
+            # `.layout` in this tree returns a TensorLayout, so this branch costs one
+            # failed isinstance on the hot path and is otherwise unreachable.
             return serialize()
         # Scheduling tools may use lightweight tensor-like objects. Preserve a
         # deterministic fallback without weakening real tensors' canonical key.
@@ -137,6 +151,66 @@ def _codegen_kernel_cache_key(
     if schedule is not None:
         key += f"|schedule:{schedule.cache_key}"
     return key
+
+
+# An einsum expression's labels are checked character by character on every call:
+# `isascii()`/`isalpha()` per label, a set per operand group, a set for the result, and a
+# membership test per result label. That is a pure function of the expression string --
+# the same ~2 us of it on every iteration of a training loop -- so memoize it. The memo is
+# consulted in exactly the position the checks ran in, after the operand count/None/type
+# checks, so a malformed call still raises the same exception it raised before.
+#
+# The bound exists for the reason the layout cache has one: a program that generates
+# expressions must not grow this without limit. Past the bound the checks simply run,
+# which is what happened before the memo, so a bench can set it to 0 for a same-binary
+# control arm.
+_EXPR_LABELS_CACHE: Dict[str, Tuple[List[List[str]], List[str]]] = {}
+_EXPR_LABELS_CACHE_MAX = 512
+
+
+def _validated_labels(
+    expression: str,
+    input_groups: Sequence[str],
+    result_expression: str,
+) -> Tuple[List[List[str]], List[str]]:
+    """Check an einsum expression's labels; return them split per operand and result.
+
+    ``input_groups`` and ``result_expression`` must be the two halves of ``expression``,
+    which is the memo key: the caller has already split it, and re-splitting here to
+    prove it would cost what the memo saves.
+    """
+    cached = _EXPR_LABELS_CACHE.get(expression)
+    if cached is not None:
+        # Fresh lists: callers downstream sort and rewrite what they get back.
+        return [list(group) for group in cached[0]], list(cached[1])
+    if any(
+        not group or not all(label.isascii() and label.isalpha() for label in group)
+        for group in input_groups
+    ):
+        raise CompileSpecError("einsum input labels must be non-empty ASCII letters")
+    if not result_expression or not all(
+        label.isascii() and label.isalpha() for label in result_expression
+    ):
+        raise CompileSpecError("einsum result labels must be non-empty ASCII letters")
+    if len(set(result_expression)) != len(result_expression):
+        raise CompileSpecError("einsum result labels must be unique")
+    input_labels = set("".join(input_groups))
+    unknown_result_labels = [
+        label for label in result_expression if label not in input_labels
+    ]
+    if unknown_result_labels:
+        raise CompileSpecError(
+            "einsum result labels must appear in an input; unknown labels: "
+            + ", ".join(unknown_result_labels)
+        )
+    input_index_strs = [list(group) for group in input_groups]
+    result_index_strs = list(result_expression)
+    if len(_EXPR_LABELS_CACHE) < _EXPR_LABELS_CACHE_MAX:
+        _EXPR_LABELS_CACHE[expression] = (
+            [list(group) for group in input_index_strs],
+            list(result_index_strs),
+        )
+    return input_index_strs, result_index_strs
 
 
 def _logical_index_sizes(
@@ -424,9 +498,11 @@ def matmul_wksp(
 
     # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
     result_shape = (a.shape[0], b.shape[1])
+    # The layouts are frozen value objects and this cache is a plain dict, so key on
+    # them directly; serializing each to JSON cost ~2.3 us per operand for nothing.
     _cache_key = (
-        a.layout.serialize(),
-        b.layout.serialize(),
+        a.layout,
+        b.layout,
         str(a.dtype),
         str(b.dtype),
         str(output_format),
@@ -1606,28 +1682,9 @@ def einsum(
             "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
             + ", ".join(invalid)
         )
-    if any(
-        not group or not all(label.isascii() and label.isalpha() for label in group)
-        for group in input_groups
-    ):
-        raise CompileSpecError("einsum input labels must be non-empty ASCII letters")
-    if not result_expression or not all(
-        label.isascii() and label.isalpha() for label in result_expression
-    ):
-        raise CompileSpecError("einsum result labels must be non-empty ASCII letters")
-    if len(set(result_expression)) != len(result_expression):
-        raise CompileSpecError("einsum result labels must be unique")
-    input_labels = set("".join(input_groups))
-    unknown_result_labels = [
-        label for label in result_expression if label not in input_labels
-    ]
-    if unknown_result_labels:
-        raise CompileSpecError(
-            "einsum result labels must appear in an input; unknown labels: "
-            + ", ".join(unknown_result_labels)
-        )
-    input_index_strs = [list(group) for group in input_groups]
-    result_index_strs = list(result_expression)
+    input_index_strs, result_index_strs = _validated_labels(
+        expression, input_groups, result_expression
+    )
     requested_output_format = kwargs.get("format")
     if requested_output_format is not None:
         requested_output_format = parse_format(requested_output_format)
@@ -1667,7 +1724,7 @@ def einsum(
                 "output_mode_order must be a permutation of the result modes"
             )
         output_mode_order = list(output_mode_order)
-    _logical_index_sizes(input_index_strs, tensors)
+    logical_index_sizes = _logical_index_sizes(input_index_strs, tensors)
     if not compile_only and any(isinstance(tensor, TensorSpec) for tensor in tensors):
         raise CompileSpecError(
             "TensorSpec has no runtime payload; pass compile_only=True or use STensor"
@@ -1744,13 +1801,25 @@ def einsum(
 
             # Set correct mode orders on input tensors
             cached_tensors = list(tensors)
+            _relayouted = False
             for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
                 if list(_t.mode_order) != _mo:
                     cached_tensors[_index] = _with_compiler_mode_order(_t, _mo)
+                    _relayouted = True
             tensors = tuple(cached_tensors)
 
-            # Compute result shape from expression + current tensor shapes
-            _idx_to_size = _logical_index_sizes(_input_idx_strs, tensors)
+            # Compute result shape from expression + current tensor shapes. Unless an
+            # operand was just relayouted this is the map the validating call above
+            # already built -- the same expression over the same tensors -- so reuse it
+            # rather than walking the operands again. A relayout permutes an operand's
+            # physical shape and its mode order together, so it cannot change a logical
+            # index's size either (test_logical_index_sizes_survive_relayout), but there
+            # is no reason to lean on that: recompute when one happened.
+            _idx_to_size = (
+                logical_index_sizes
+                if not _relayouted and _input_idx_strs == input_index_strs
+                else _logical_index_sizes(_input_idx_strs, tensors)
+            )
             _logical_result_shape = tuple(_idx_to_size[_s] for _s in _result_idx_strs)
             _result_mode_order = _temp_mo or list(range(len(_logical_result_shape)))
             _physical_result_shape = tuple(
@@ -1779,7 +1848,11 @@ def einsum(
             if "time_dict" in kwargs:
                 kwargs["time_dict"]["eval_time"] = _eval_time
 
-            if _temp_mo:
+            # Both orders are constants of this cache entry, so compare them here rather
+            # than calling a method that has to re-derive the same answer: it validates
+            # the permutation, takes a defensive copy of the result's own mode order and
+            # sorts it, all to discover there is nothing to do. 1.0 us of a 15 us call.
+            if _temp_mo and _temp_mo != _final_mo:
                 _result.change_mode_order(_final_mo)
 
             return _result
