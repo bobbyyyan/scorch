@@ -820,6 +820,38 @@ assembly comes from the CIN lowerer, so it would change the emitted C++ for ever
 sparse-output kernel and invalidate the byte-identical-emission gate, forcing a
 re-capture of every pinned corpus. That is not worth 80 us.
 
+### COO was worse than any of it
+
+The compressed path above sat next to something larger. The COO branch of the same
+validator called `.tolist()` on every mode's index array and then iterated over every
+**nonzero** in Python, building and comparing two tuples per iteration. The compressed
+loop that started all this was per *row*; this was per *nonzero*, and it cost a flat
+**0.365 us each**:
+
+| nnz | Python loop | native screen | speedup | us per nonzero |
+|---|---|---|---|---|
+| 997 | 375.2 us | **16.2 us** | 23.2x | 0.3763 -> 0.0162 |
+| 9,988 | 3,594.7 | **35.5** | 101.4x | 0.3599 -> 0.0035 |
+| 99,812 | 35,921.8 | **213.4** | 168.3x | 0.3599 -> 0.0021 |
+| 399,222 | 143,917.2 | **664.6** | 216.6x | 0.3605 -> 0.0017 |
+| 998,775 | **364,061.0** | **1,554.0** | **234.3x** | 0.3645 -> 0.0016 |
+
+Wrapping a million-nonzero COO tensor took **364 ms** and now takes 1.55 ms. For scale,
+the compressed path at 1.6M nonzeros costs 626 us, so before this the COO spelling of a
+comparable tensor was some 250x more expensive than the CSR one.
+
+`abi_screen_lex` was already in `native_abi.h` for the same check, unexposed, and it makes
+the same comparison the Python loop makes -- the first level that differs decides, every
+deeper level then irrelevant. That is the part worth testing rather than assuming, because
+a screen that consulted only the first level, or only the last, would pass a naive test:
+so the suite pins a descent that only the second level can see, a case where level 0
+decides and level 1 must not veto it, three-level ties, duplicates (not a descent, since
+the Python comparison is `<` and not `<=`), and single-level COO. The coordinate-bounds
+check went the same way, replacing a min reduction, a max reduction and two syncs.
+
+All three screens release the interpreter lock around the scan, since it is O(nnz),
+thread-split, and touches only tensor metadata and raw data.
+
 ### Why this is not a correctness risk
 
 A faster validator that accepts different storage is not a faster validator. The old
