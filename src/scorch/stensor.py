@@ -1,8 +1,9 @@
 from __future__ import annotations
+import os
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
-from typing import Optional, Tuple, Union, List
+from typing import Any, Optional, Tuple, Union, List
 
 import torch
 
@@ -44,6 +45,23 @@ from .utils import (
     _load_kernel,
 )
 
+# Whether `_wrap_generated_result` may take a kernel's index arrays instead of copying
+# them; see that function for what makes it safe and for the one call site that opts
+# out. `SCORCH_ADOPT_KERNEL_INDICES=0` turns it off, so the two states can be compared
+# in one binary.
+_ADOPT_KERNEL_INDICES = os.environ.get("SCORCH_ADOPT_KERNEL_INDICES", "1") not in (
+    "0",
+    "false",
+    "False",
+)
+
+# The same value in a mutable cell. `_wrap_generated_result` reads the cell rather than
+# taking the flag as a default argument, because a default argument is bound once when
+# the function is defined -- which would confine any measurement of what adoption is
+# worth to a comparison between two processes. Timing both states in one process is
+# strictly better evidence, and this is what makes it possible.
+_ADOPT_CELL = [_ADOPT_KERNEL_INDICES]
+
 
 def _finalize_generated_mode_indices(
     tensor_format: TensorFormat,
@@ -65,6 +83,88 @@ def _finalize_generated_mode_indices(
         repaired[last_written + 1 :] = repaired[last_written]
         finalized[level][0] = repaired
     return finalized
+
+
+def _wrap_generated_result(
+    shape: Tuple[int, ...],
+    tensor_format: Any,
+    result_cpp: Any,
+    mode_order: Optional[Sequence[int]] = None,
+    name: Optional[str] = None,
+    adopt: Optional[bool] = None,
+) -> "STensor":
+    """Turn a kernel's result into an STensor.
+
+    Every dispatch path that runs a kernel -- prebuilt or generated -- ends with the
+    same four steps: finish the zero-initialized trailing positions, describe the
+    arrays, build the storage, name the tensor. This was written out at nine call sites --
+    eight in ops.py and one in `STensor.to_sparse` -- which is nine chances to forget the
+    first step; it is one function now.
+
+    The result's index is declared *trusted*, so the O(nnz) structural walk is skipped
+    unless `storage._VALIDATE_KERNEL_RESULTS` is on (`tests/conftest.py` turns it on, so
+    every test still walks every generated result). The cheap per-array checks -- dtype,
+    rank, contiguity, device, arity -- run either way. See that flag for why this follows
+    `torch.sparse.check_sparse_tensor_invariants` rather than inventing a policy.
+
+    ``adopt`` takes the kernel's index arrays as they are rather than copying them;
+    ``None`` means "whatever the process is configured for" (``_ADOPT_CELL``), and an
+    explicit ``False`` opts a single call site out for good.
+    The copy exists so that a *caller* cannot invalidate a validated tensor by mutating
+    what it passed in, which does not apply to a buffer a kernel allocated for its own
+    output microseconds ago -- and Scorch already treats the result's *values* exactly
+    that way, sharing them through ``detach`` rather than cloning. Adopting and skipping
+    the walk are together worth 1.04-1.15x of a whole sparse-result ``einsum`` on both
+    hosts (``bench/bench_index_validation.py --what adopt``, three arms in one process).
+
+    Adopting is only sound where the kernel's output index arrays do not alias an
+    *input's*. Sharing index buffers between a result and its operand would be safe only
+    while nothing ever writes through an STensor's index arrays in place, which is not a
+    property this code establishes anywhere, so the rule is per call site and not a
+    global bet:
+
+    * **Generated kernels allocate their output arrays.** Every sparse output level in
+      the emitted C++ comes from a `torch::empty` sized from the counted extent
+      (`compiler/cin_lowerer.py`, the output-buffer block), so no generated result can
+      alias an operand. This is structural, not sampled.
+    * **Prebuilt kernels with a sparse result allocate too** -- `kernels.h` builds fresh
+      `C0_crd_torch` / `C1_pos_torch` tensors -- and the dense-output ones have no index
+      arrays at all.
+    * **SDDMM is the exception, and it is a real one.** `sddmm_coo_float_prebuilt`
+      assigns `D.storage.index.mode_indices = S_mode_indices` (`csrc/kernels.h`): its
+      result keeps the sparsity pattern of its operand and returns that operand's own
+      arrays. The copy is what makes that safe today, so `ops.einsum` passes
+      ``adopt=False`` at the SDDMM site. `test_sddmm_result_does_not_alias_its_operand`
+      fails if that opt-out is ever removed.
+    """
+    if adopt is None:
+        adopt = _ADOPT_CELL[0]
+    # Accept either spelling of a format: callers pass a TensorFormat in most places
+    # and a string in one, and `_finalize_generated_mode_indices` needs the parsed form.
+    tensor_format = parse_format(tensor_format)
+    index = TensorIndex(
+        tensor_format=tensor_format,
+        mode_indices=_finalize_generated_mode_indices(
+            tensor_format, result_cpp.storage.index.mode_indices
+        ),
+        mode_order=mode_order,
+        _adopt=adopt,
+    )
+    # Build the storage here rather than letting STensor do it, because this is the one
+    # construction site that may declare the index trusted: these arrays came out of our
+    # own codegen microseconds ago. `SparseStorage` then skips the O(nnz) structural walk
+    # unless `storage._VALIDATE_KERNEL_RESULTS` is on, which the test suite turns on. Going
+    # through `storage=` keeps that decision local -- STensor's public signature does not
+    # grow a way for a caller to declare their own arrays trusted.
+    layout = TensorLayout.from_physical_shape(
+        shape, index.format, index.mode_order, index.index_dtype
+    )
+    storage = SparseStorage(
+        layout, result_cpp.storage.value, index=index, _trusted_index=True
+    )
+    if name is None:
+        return STensor(shape=shape, storage=storage)
+    return STensor(name=name, shape=shape, storage=storage)
 
 
 class Window(object):
@@ -1565,17 +1665,17 @@ class STensor:
                 self.storage.value,
             )
 
-            new_tensor = STensor(
-                name=self.name,
+            # A generated result like any other: `module.evaluate` above just ran a
+            # kernel whose output levels codegen allocated with `torch::empty`. It went
+            # through the same four steps written out by hand until now, which also meant
+            # it was the one such result still copying its index arrays and still being
+            # walked in release.
+            new_tensor = _wrap_generated_result(
                 shape=self.shape,
-                index=TensorIndex(
-                    tensor_format=output_format,
-                    mode_indices=_finalize_generated_mode_indices(
-                        output_format, result_cpp.storage.index.mode_indices
-                    ),
-                    mode_order=self.storage.index.mode_order,
-                ),
-                value=result_cpp.storage.value,
+                tensor_format=output_format,
+                result_cpp=result_cpp,
+                mode_order=self.storage.index.mode_order,
+                name=self.name,
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import math
 
 # Mapping/Sequence come from collections.abc, not typing: these are used for
@@ -41,6 +42,59 @@ except Exception:
     _NATIVE_SCREEN = None
     _NATIVE_BOUNDS = None
     _NATIVE_LEX = None
+
+# How long a scan has to be before a screen splits it, for the screens *this* module
+# calls. The native call boundary keeps its own, higher value (SCORCH_ABI_VALIDATE_GRAIN,
+# a million) because a memo there means each array is scanned about once, so the scan is
+# not hot; here every wrap scans fresh arrays.
+#
+# The screens split with at::parallel_reduce, which opens a region at torch's full thread
+# width and then hands work to min(team, ceil(nnz / grain)) of those threads. So this
+# value does two things: below it the scan stays serial, and above it it bounds how many
+# workers share the array. Opening the region is the fixed cost -- ~3-5 us at four torch
+# threads, ~10-13 us at thirty-two -- and it is why the value cannot be small.
+#
+# 65536 cannot regress anything, and that is structural rather than lucky: below the
+# threshold no split happens, so the code is the same code it was. Measured over 9 cells
+# from 8k to 1.6M nonzeros x {4, 32} torch threads on redwood and {4, 8} on an M5, the five
+# sub-threshold cells span 0.2-3.8%, which is this measurement's noise floor rather than an
+# effect. The four cells that do split are all wins: 1.45-1.59x at 480k, 1.07-2.92x at 98k
+# COO, 2.95-8.54x at 1M COO.
+#
+# What fixes the value from below is that a *lower* threshold does regress, because there
+# the code genuinely differs: 16384 costs 2.5-3.6x at 20k nonzeros and 4096 costs 3.0-5.7x
+# at 8k, where the scan is a few microseconds and the region is 3-13 us.
+#
+# SCORCH_WRAP_VALIDATE_GRAIN overrides it, which is what lets the sweep run every value
+# against one binary.
+_WRAP_GRAIN = int(os.environ.get("SCORCH_WRAP_VALIDATE_GRAIN", 65536))
+# Whether the O(nnz) structural walk runs on index arrays *Scorch's own compiler just
+# emitted*. Off in release, on under test.
+#
+# This is PyTorch's design for the same problem, deliberately:
+# `torch.sparse.check_sparse_tensor_invariants` exists, defaults to disabled, and warns
+# that disabled means "memory errors (e.g. SEGFAULT) will occur when operating on a
+# sparse tensor which violates the invariants". The reasoning transfers exactly. Our
+# kernels take `data_ptr<int>()` and do unchecked pointer arithmetic, so a coordinate past
+# the extent is an out-of-bounds access in C++, not an exception -- which is why arrays a
+# *caller* supplies are always walked, no flag involved.
+#
+# A generated result is different in kind. Its index arrays were produced microseconds
+# earlier by our own codegen, which allocates every output level with `torch::empty` sized
+# from a counted extent and fills it; validating them re-derives a fact the compiler
+# already established. Measured, that re-derivation is 35-41% of a wrap.
+#
+# What the flag buys is that the fact stays checked where a mistake would be found. The
+# risk of trusting the compiler is a bug in lowering or a new codegen path producing a
+# malformed index that reaches a kernel as raw pointers, and the LoopIR migration is
+# actively changing that layer -- so `tests/conftest.py` turns this ON for the whole suite.
+# A compiler bug is then a structured error in CI rather than a segfault in someone's run.
+#
+# Mutable cell rather than a plain bool so a test or a benchmark can flip it in one
+# process; `SCORCH_VALIDATE_KERNEL_RESULTS=1` sets it at import.
+_VALIDATE_KERNEL_RESULTS = [
+    os.environ.get("SCORCH_VALIDATE_KERNEL_RESULTS", "0") not in ("0", "false", "False")
+]
 _INDEX_DTYPES = (torch.int32, torch.int64)
 
 
@@ -65,8 +119,17 @@ def _expected_level_arity(level_type: LevelType) -> int:
 
 
 def _normalize_mode_indices(
-    mode_indices: Sequence[Sequence[torch.Tensor]], tensor_format: TensorFormat
+    mode_indices: Sequence[Sequence[torch.Tensor]],
+    tensor_format: TensorFormat,
+    copy: bool = True,
 ) -> IndexModes:
+    """Validate one index array per level and return them as nested tuples.
+
+    ``copy=False`` adopts the caller's arrays instead of copying them, and is only for
+    arrays this process just produced and holds the sole reference to -- a kernel's
+    freshly allocated output. Every structural check still runs; the only thing that
+    changes is who owns the buffer. See ``TensorIndex.__init__``'s ``_adopt``.
+    """
     if isinstance(mode_indices, (str, bytes)) or not isinstance(mode_indices, Sequence):
         raise TensorTypeError("mode_indices must be a sequence with one entry per mode")
     if len(mode_indices) != tensor_format.get_order():
@@ -115,8 +178,11 @@ def _normalize_mode_indices(
                     f"mode_indices[{mode}][{slot}] must be contiguous"
                 )
             # Index coordinates are structural data.  Own an independent copy so
-            # caller mutation cannot invalidate a previously validated object.
-            normalized_arrays.append(index.detach().clone())
+            # caller mutation cannot invalidate a previously validated object -- unless
+            # the caller has handed over ownership outright (see `copy`).
+            normalized_arrays.append(
+                index.detach() if not copy else index.detach().clone()
+            )
         normalized.append(tuple(normalized_arrays))
     return tuple(normalized)
 
@@ -174,13 +240,24 @@ class TensorIndex:
         mode_indices: Sequence[Sequence[torch.Tensor]],
         mode_order: Optional[Sequence[int]] = None,
         index_dtype: Optional[torch.dtype] = None,
+        *,
+        _adopt: bool = False,
     ) -> None:
+        """Describe a format and its index arrays, copying the arrays.
+
+        ``_adopt`` is internal and takes the arrays as they are instead of copying
+        them. It is for one situation: arrays a kernel just allocated for its own
+        result, which nothing else references. Every validation below still runs.
+        Passing it for arrays a caller might still mutate, or that another tensor
+        shares, breaks this class's immutability -- which is why it is keyword-only,
+        underscored, and used in exactly one helper (`_wrap_generated_result`).
+        """
         if tensor_format is None:
             raise TensorIndexError(
                 "tensor_format is required; use TensorFormat() for a scalar"
             )
         tensor_format = parse_format(tensor_format)
-        normalized = _normalize_mode_indices(mode_indices, tensor_format)
+        normalized = _normalize_mode_indices(mode_indices, tensor_format, not _adopt)
         if mode_order is None:
             order = tuple(range(tensor_format.get_order()))
         else:
@@ -352,7 +429,7 @@ def _screen_bounds(coordinate: torch.Tensor, extent: int) -> bool:
     if screen is None:
         return True
     try:
-        return bool(screen(coordinate, int(extent)))
+        return bool(screen(coordinate, int(extent), _WRAP_GRAIN))
     except Exception:
         return True
 
@@ -368,7 +445,7 @@ def _screen_lex_levels(levels: Sequence[torch.Tensor], count: int) -> bool:
     if screen is None:
         return True
     try:
-        return bool(screen(list(levels), int(count)))
+        return bool(screen(list(levels), int(count), _WRAP_GRAIN))
     except Exception:
         return True
 
@@ -392,7 +469,7 @@ def _screen_compressed_level(
     if screen is None:
         return True
     try:
-        return bool(screen(positions, coordinates, int(extent), True))
+        return bool(screen(positions, coordinates, int(extent), True, _WRAP_GRAIN))
     except Exception:
         return True
 
@@ -619,6 +696,8 @@ class SparseStorage:
         layout: TensorLayout,
         value: torch.Tensor,
         mode_indices: Optional[Sequence[Sequence[torch.Tensor]]] = None,
+        *,
+        _trusted_index: bool = False,
         index: Optional[TensorIndex] = None,
     ) -> None:
         if not isinstance(layout, TensorLayout):
@@ -657,13 +736,21 @@ class SparseStorage:
         # Keep tensor metadata independent from the caller while retaining normal
         # tensor payload aliasing semantics for element updates.
         owned_value = value.detach()
-        _validate_index_storage(layout, normalized, owned_value)
+        # The cheap per-array checks -- dtype, rank, contiguity, device, one array per
+        # level -- have already run inside `_normalize_mode_indices` for every caller,
+        # trusted or not. They are O(1) each and adopting a kernel's arrays depends on
+        # them. What `_trusted_index` skips is only the O(nnz) structural walk.
+        if not _trusted_index or _VALIDATE_KERNEL_RESULTS[0]:
+            _validate_index_storage(layout, normalized, owned_value)
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_mode_indices", normalized)
         object.__setattr__(self, "_value", owned_value)
         # What was just validated, so that `STensor._set_state` -- which every
         # constructor and every in-place structural change funnels through, right
-        # after this one -- does not walk the index arrays a second time.
+        # after this one -- does not walk the index arrays a second time. For a trusted
+        # index with the flag off the stamp records "these arrays are not to be walked"
+        # rather than "these arrays were walked and passed"; both mean the same thing to
+        # every reader of it, and an explicit `.validate()` still forces the walk.
         object.__setattr__(self, "_checked", _validation_stamp(normalized, owned_value))
 
     @property

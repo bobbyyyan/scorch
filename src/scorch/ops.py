@@ -39,8 +39,7 @@ from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
 from .tiling import decided as _tiling_decided
 from .tiling import _current_level as _tiling_current_level
-from .storage import TensorIndex
-from .stensor import STensor, _finalize_generated_mode_indices
+from .stensor import STensor, _wrap_generated_result
 from .utils import (
     parse_format,
     topo_sort_characters,
@@ -351,15 +350,10 @@ def spmv(
         time_dict["eval_time"] = eval_time
     # m
 
-    result = STensor(
+    result = _wrap_generated_result(
         shape=result_shape,
-        index=TensorIndex(
-            mode_indices=_finalize_generated_mode_indices(
-                output_format, result_cpp.storage.index.mode_indices
-            ),
-            tensor_format=output_format,
-        ),
-        value=result_cpp.storage.value,
+        tensor_format=output_format,
+        result_cpp=result_cpp,
     )
 
     return result
@@ -515,15 +509,10 @@ def matmul_wksp(
         time_dict["eval_time"] = eval_time
     # print("Time taken for evaluate:", eval_time)
 
-    result = STensor(
+    result = _wrap_generated_result(
         shape=result_shape,
-        index=TensorIndex(
-            mode_indices=_finalize_generated_mode_indices(
-                output_format, result_cpp.storage.index.mode_indices
-            ),
-            tensor_format=output_format,
-        ),
-        value=result_cpp.storage.value,
+        tensor_format=output_format,
+        result_cpp=result_cpp,
     )
 
     return result
@@ -815,16 +804,10 @@ def matmul(
                 result_cpp, result_shape = execute_prebuilt_binary_kernel(
                     resolved.fn, a, b, time_dict=time_dict
                 )
-                result = STensor(
+                result = _wrap_generated_result(
                     shape=result_shape,
-                    index=TensorIndex(
-                        mode_indices=_finalize_generated_mode_indices(
-                            resolved.output_format,
-                            result_cpp.storage.index.mode_indices,
-                        ),
-                        tensor_format=resolved.output_format,
-                    ),
-                    value=result_cpp.storage.value,
+                    tensor_format=resolved.output_format,
+                    result_cpp=result_cpp,
                 )
                 if result.format.is_dense():
                     return result.to_torch()
@@ -899,16 +882,10 @@ def matmul(
                         _plan_param,
                     )
                 return out
-            result = STensor(
+            result = _wrap_generated_result(
                 shape=result_shape,
-                index=TensorIndex(
-                    mode_indices=_finalize_generated_mode_indices(
-                        resolved.output_format,
-                        result_cpp.storage.index.mode_indices,
-                    ),
-                    tensor_format=resolved.output_format,
-                ),
-                value=result_cpp.storage.value,
+                tensor_format=resolved.output_format,
+                result_cpp=result_cpp,
             )
         else:
             result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
@@ -1730,16 +1707,17 @@ def einsum(
                 B._native_mode_indices(),
                 B.values,
             )
-            return STensor(
+            return _wrap_generated_result(
                 shape=result_shape,
-                index=TensorIndex(
-                    mode_indices=_finalize_generated_mode_indices(
-                        S.format, result_cpp.storage.index.mode_indices
-                    ),
-                    tensor_format=S.format,
-                    mode_order=S.mode_order,
-                ),
-                value=result_cpp.storage.value,
+                tensor_format=S.format,
+                result_cpp=result_cpp,
+                mode_order=S.mode_order,
+                # The one wrap that must copy. SDDMM's result has S's sparsity pattern
+                # and the kernel returns S's own index arrays rather than a copy of them
+                # (`D.storage.index.mode_indices = S_mode_indices` in csrc/kernels.h),
+                # so adopting here would make the result share index buffers with its
+                # operand. Flip this only together with that kernel.
+                adopt=False,
             )
 
     # ── Fast dispatch cache ─────────────────────────────────────────────
@@ -1791,16 +1769,11 @@ def einsum(
             _result_cpp = _module.evaluate(*_args)
             _eval_time = time.time() - _t0
 
-            _result = STensor(
+            _result = _wrap_generated_result(
                 shape=_physical_result_shape,
-                index=TensorIndex(
-                    mode_indices=_finalize_generated_mode_indices(
-                        _output_fmt, _result_cpp.storage.index.mode_indices
-                    ),
-                    tensor_format=_output_fmt,
-                    mode_order=_temp_mo if _temp_mo else _final_mo,
-                ),
-                value=_result_cpp.storage.value,
+                tensor_format=_output_fmt,
+                result_cpp=_result_cpp,
+                mode_order=_temp_mo if _temp_mo else _final_mo,
             )
 
             if "time_dict" in kwargs:
@@ -2167,16 +2140,11 @@ def einsum(
     eval_time = end_time - start_time
     # print("Time taken for evaluate:", eval_time)
 
-    result = STensor(
+    result = _wrap_generated_result(
         shape=physical_result_shape,
-        index=TensorIndex(
-            mode_indices=_finalize_generated_mode_indices(
-                output_format, result_cpp.storage.index.mode_indices
-            ),
-            tensor_format=output_format,
-            mode_order=temp_mode_order if temp_mode_order else final_mode_order,
-        ),
-        value=result_cpp.storage.value,
+        tensor_format=output_format,
+        result_cpp=result_cpp,
+        mode_order=temp_mode_order if temp_mode_order else final_mode_order,
     )
 
     if "time_dict" in kwargs:
@@ -2327,15 +2295,10 @@ def lower_and_exec_cin(
     if "time_dict" in kwargs:
         kwargs["time_dict"]["eval_time"] = eval_time
 
-    result = STensor(
+    result = _wrap_generated_result(
         shape=tuple(result_shape),
-        index=TensorIndex(
-            mode_indices=_finalize_generated_mode_indices(
-                parse_format("dd"), result_cpp.storage.index.mode_indices
-            ),
-            tensor_format="dd",
-        ),
-        value=result_cpp.storage.value,
+        tensor_format="dd",
+        result_cpp=result_cpp,
     )
 
     return result
