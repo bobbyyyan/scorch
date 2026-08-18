@@ -586,6 +586,14 @@ arm per process removed the first entirely and left the second at 1.02. Interlea
 defends against drift over time; it does not defend against two trees having different arm
 sets.
 
+That "inherits the thread team it was handed" clause was inference when it was written. It
+is now measured directly: a screen that builds its own OpenMP team made a tensor copy
+standing next to it 9.5x slower, and made `torch.matmul` -- identical code, same process --
+1.12-1.33x slower, both documented below under the index validation. So an interleaved
+design does not merely fail to defend against this; each arm actively inherits the previous
+arm's damage, which inflates every arm and makes the ordering between them noise rather
+than biasing one of them.
+
 *Prefer one process to two trees when the effect is sub-microsecond.* Everything the
 cross-tree A/B could say about the refusal cost was noise, because a refused call is
 dominated by an operand copy that has nothing to do with plans. Flipping a runtime flag
@@ -703,11 +711,30 @@ route is bandwidth- or validation-bound; it is bound by building a sparse result
 branchless screens with memoization disabled, and a third arm measured it: at 480k
 nonzeros screens-only is 1.2–1.5x slower than the memo, and at 2.4M nonzeros it is
 **4.3–6.4x slower** — slower even than the original serial validation it replaced (6.06
-ms against 3.49 ms on band@8). This is the same libgomp effect documented in the method
-section: a parallel screen spawns a thread team immediately before the kernel wants a
-differently shaped one, and the reshape costs more than the walk it saved. The variable
-is for diagnosing a suspected memo bug on small operands, not for running production
-with the memo off.
+ms against 3.49 ms on band@8). A private thread team standing next to the kernel costs
+more than the walk it saves. The variable is for diagnosing a suspected memo bug on small
+operands, not for running production with the memo off.
+
+Two caveats on that paragraph, both added after the fact.
+
+*The mechanism was stated here as a team reshape — "a parallel screen spawns a team
+immediately before the kernel wants a differently shaped one" — and that was never
+measured.* What is measured, later in this document, is that the workers a private team
+spawns keep costing time after the scan returns: a tensor copy standing next to a screen
+went 121 → 1157 us, and `torch.matmul` on identical code in the same process ran
+1.12–1.33x slower in the build with private teams. That is a spin-after-return cost, not
+a construction cost, and nothing here separates the two. The numbers above do not depend
+on which it is, so they stand; the explanation should not have been asserted.
+
+*And that prediction was wrong.* This paragraph first said the memo-off ratios were
+"expected to be smaller" once the screens moved onto torch's pool. Re-measured on the same
+grid with the ATen screens, memo-off is still **1.76-3.18x** slower at N=8 (band 0.98 ->
+3.11 ms, scatter 0.87 -> 1.68, pubmed 0.86 -> 1.52, bcsstk17 0.91 -> 1.74), 1.19-2.73x at
+N=32, and within noise at N=128. The reason has nothing to do with threads, which is why
+reaching for one was a mistake here: without the memo a full O(nnz) scan runs on *every
+call* instead of once, and at N=8 the kernel it precedes is only about a millisecond. That
+is simply what removing a memo costs. The A/A floor on the memo-off arm reaches 20%, so
+treat the individual ratios as approximate; the direction is not in doubt at N=8 or N=32.
 
 ## Wrapping a matrix: the index validation
 
@@ -799,35 +826,180 @@ suspect level they run exactly as before.
 
 | case | host | loop2 | vec2 | vec1 | screen | this rung | cumulative |
 |---|---|---|---|---|---|---|---|
-| `from_torch` 128x4 | M5 | 511.7 us | 43.9 | 27.6 | **14.0** | 1.97x | **36.6x** |
-| `from_torch` 128x4 | redwood | 914.2 | 79.2 | 52.6 | **27.5** | 1.91x | **33.2x** |
-| `from_torch` 1000x8 | M5 | 3,888 | 64.1 | 39.5 | **17.3** | 2.28x | **225x** |
-| `from_torch` 1000x8 | redwood | 6,721 | 99.2 | 62.9 | **30.1** | 2.09x | **223x** |
-| `from_torch` 20000x24 | M5 | 77,365 | 663.9 | 386.7 | **206.8** | 1.87x | **374x** |
-| `from_torch` 20000x24 | redwood | 132,852 | 512.9 | 339.3 | **192.1** | 1.77x | **691x** |
-| `from_torch` 100000x16 | M5 | 391,295 | 1,804 | 1,012 | **626.0** | 1.62x | **625x** |
-| `from_torch` 100000x16 | redwood | 664,185 | 1,753 | 947.5 | **869.4** | 1.09x | **764x** |
-| `to_sparse` "ds" 2000x2000 @1% | M5 | 14,173 | 2,857 | 2,573 | **2,444** | 1.05x | 5.8x |
-| `to_sparse` "ds" 2000x2000 @1% | redwood | 23,356 | 3,039 | 2,913 | **2,729** | 1.07x | 8.6x |
+| `from_torch` 128x4 | M5 | 486.9 us | 42.7 | 27.3 | **12.9** | 2.12x | **37.8x** |
+| `from_torch` 128x4 | redwood | 943.6 | 78.7 | 51.9 | **26.6** | 1.95x | **35.4x** |
+| `from_torch` 1000x8 | M5 | 3,678 | 61.1 | 36.8 | **15.9** | 2.31x | **231x** |
+| `from_torch` 1000x8 | redwood | 7,034 | 98.2 | 62.1 | **29.1** | 2.13x | **242x** |
+| `from_torch` 20000x24 | M5 | 73,500 | 627.2 | 367.9 | **152.2** | 2.42x | **483x** |
+| `from_torch` 20000x24 | redwood | 139,398 | 504.3 | 272.6 | **187.8** | 1.45x | **742x** |
+| `from_torch` 100000x16 | M5 | 377,457 | 1,771 | 985.4 | **391.5** | 2.52x | **964x** |
+| `from_torch` 100000x16 | redwood | 694,491 | 1,208 | 1,070 | **376.3** | 2.84x | **1,846x** |
+| `to_sparse` "ds" 2000x2000 @1% | M5 | 13,558 | 2,441 | 2,228 | **2,166** | 1.03x | 6.3x |
+| `to_sparse` "ds" 2000x2000 @1% | redwood | 24,314 | 3,121 | 2,914 | **2,747** | 1.06x | 8.8x |
 
 Four arms in one process, random order each round, median of 9, arms compared for
-agreement before timing; redwood's box was quiet (load 0.16 before, 0.72 after).
-`to_sparse` gains little for the same structural reason as before: its call is mostly a
-generated kernel building a sparse result.
+agreement before timing. `to_sparse` gains little for the same structural reason as
+before: its call is mostly a generated kernel building a sparse result.
 
-**The last rung is much weaker on x86, and the reason is a constant tuned for a
-different caller.** 1.62x on the M5 against 1.09x on redwood at 1.6M nonzeros. The
-screens size their worker count from `SCORCH_ABI_VALIDATE_GRAIN`, one million nonzeros
-per worker, which is deliberately high *for the ABI path*: there a screen runs
-immediately before a kernel that wants a team of its own, and spawning a small team
-first measured as a 2-4x regression on bcsstk17. Nothing follows a scan on this path --
-validation happens while a tensor is being built, not before a kernel launch -- so at
-1.6M nonzeros `by_work` is 1 and the scan runs single-threaded on a 32-core machine
-while the torch operations it replaced were threaded. The grain is now a per-call-site
-parameter, defaulted so every ABI call site is unchanged; what the wrap path should use
-is a sweep (`bench/bench_index_validation.py --what grain`) and not yet settled, because
-a grain that is too low spawns a team to read a few kilobytes and is its own
-regression.
+These are the *final* figures. As first measured the last rung was weaker and wildly
+asymmetric between hosts -- 1.62x on the M5 against 1.09x on redwood, and a 100k-row wrap
+that still cost 869.4 us there -- and chasing that asymmetry is what turned up the defect
+below. Fixing it removed the asymmetry along with the cost: the same wrap is now 376.3 us
+on redwood, the last rung is 2.5-2.8x on both hosts, and x86 has gone from the worse host
+to the better one. The pre-fix numbers are not reproducible against this tree, which is
+why they are quoted here rather than tabulated.
+
+**The asymmetry above is what led here.** The screens sized their own worker count from
+`SCORCH_ABI_VALIDATE_GRAIN`, one million nonzeros per worker, so at 1.6M nonzeros the scan
+ran on one thread of a 32-core machine. Lowering that constant looked like the whole story.
+It was not.
+
+### A private thread team is not free, and the bill lands on the neighbours
+
+Lowering the grain on redwood made the wrap *slower*: 5.6x at 480k nonzeros and 6.6x at
+1.6M against leaving the scan serial. Two rounds of the sweep then disagreed with each
+other by 5.5x on identical settings, which is the signature of a harness measuring
+something other than what it names. Timing the scan alone -- on index arrays that already
+exist, so no clone and no 13-25 MB allocation in the loop -- separated the two effects:
+
+| redwood, 32 torch threads, 480k nonzeros | scan | the tensor copy next to it | total |
+|---|---|---|---|
+| screen serial | 138.5 us | ~121 us | 259.9 us |
+| screen parallel, private team | **72.6 us** | **~1157 us** | **1229.4 us** |
+
+The scan got 1.9x faster and the call got 4.7x slower. The screens were splitting their
+work with `#pragma omp parallel for num_threads(nt)`, which builds a team that is neither
+torch's team nor torch's width, and the cost of that lands on the code standing next to
+it: the victim here is a copy that our scan never touches. What the measurements pin down
+is *where* the time goes, not which of two mechanisms puts it there -- a team libgomp has
+to reshape because we asked for a width torch never asks for, or workers that keep
+spinning after the scan returns with nothing to do but compete for cores. Both are
+consistent with every number here and nothing below separates them, so the claim is the
+cost, not the cause. Because the sweep interleaved its arms, each arm inherited the
+previous arm's spinners, so every arm was inflated and the ordering between them was
+noise.
+
+The fix is not a better constant. It is to stop building a private team: every screen now
+splits with `at::parallel_reduce`, so the scan runs on torch's pool at torch's width.
+PyTorch's own source documents this hazard from the other side --
+`ATen/ParallelOpenMP.h` carries the comment *"can't use num_threads clause due to bugs in
+GOMP's thread pool"* -- and reading it settles what `grain` now means: a scan shorter than
+one grain stays serial, and past that the region opens at full width with work handed to
+`min(team, ceil(nnz / grain))` of those threads. So the constant is a threshold, not a
+worker count.
+
+Removing the private team is worth more than any grain ever was, on the same cell:
+
+| redwood, 4 torch threads, 1.6M nonzeros | private team | torch's pool |
+|---|---|---|
+| scan, serial grain | 974.8 us | **170.4 us** |
+| scan, split | 578.4 us | **132.8 us** |
+
+**The same defect was taxing the already-shipped ABI path, and the evidence for that is a
+column I did not put there for this purpose.** `bench/bench_codegen_abi.py` reports
+`torch_ms` -- the reference `torch.matmul`, identical code in both builds, timed in the
+same process. Two rounds, alternating builds, at N=128 where the A/A floor is tightest
+(0.04-1.5%):
+
+| matrix | `torch_ms`, private team | `torch_ms`, torch's pool | torch slower by |
+|---|---|---|---|
+| band | 0.8642 / 0.8940 | 0.6687 / 0.6744 | 1.29x / 1.33x |
+| scatter | 1.4715 / 1.5594 | 1.1490 / 1.1875 | 1.28x / 1.31x |
+| pubmed | 1.4939 / 1.5290 | 1.1755 / 1.1799 | 1.27x / 1.30x |
+| bcsstk17 | 1.5419 / 1.4665 | 1.1879 / 1.3052 | 1.30x / 1.12x |
+
+Our validators were making *PyTorch's own kernels* 12-33% slower in the same process. The
+generated-kernel time on that route improves 1.12-1.28x with the fix, but the `torch_ms`
+column is the cleaner evidence, because nothing about it is ours. Elsewhere in this
+repository the same mechanism has been paid for once already: matching
+`torch.get_num_threads()` in the drop-in SpMM is what fixed pubmed (0.78 -> 1.15x,
+commit e795127). That fix and this one are the same finding in two layers.
+
+### Choosing the threshold, and a second thing the first attempt got wrong
+
+With the teams gone, the remaining question is how long a scan has to be before splitting
+it is worth anything. The sweep through `from_torch` cannot answer it -- that call clones
+13-25 MB of index arrays at the sizes where the answer changes, and the same setting read
+141.5, 784.0 and 418.7 us across three runs, a 5.5x spread against an effect of a few
+percent to 3x. So the sweep moved onto `_validate_index_storage` over arrays that already
+exist: no clone, no allocation, nothing in the loop but the thing being swept
+(`bench/bench_index_validation.py --what scan`). The small cells held to 2% across all
+three of the earlier runs, which is what placed the variance in the allocations.
+
+That harness immediately showed the first attempt was leaving most of the win behind, for
+a reason worth stating precisely, because it is a property of ATen and not of this code.
+`at::parallel_reduce` splits when `n > grain_size`; it then opens `#pragma omp parallel`
+over **the whole thread pool** and gives work to `min(team, ceil(n / grain_size))` of
+those threads. The region is opened at full width whether one thread or all of them get
+work. So a grain used as a worker limit buys nothing and costs the difference:
+
+| M5, 4 torch threads, 98,751 nonzeros | grain as worker limit | grain as threshold only |
+|---|---|---|
+| workers given work | 2 of 4 | 4 of 4 |
+| scan | 106.0 us | **77.2 us** |
+
+Same region, same pool, 1.37x. The constant was doing two jobs and doing the second one
+badly, so it now does one: below it the scan stays serial, above it every thread in the
+region that was opened anyway gets a share (`abi_split` in `csrc/native_abi.h`).
+
+**65536 nonzeros is the threshold, and it is the largest-win value that regresses
+nothing.** Nine cells from 8k to 1.6M nonzeros, CSR and COO, at two torch thread counts
+per host, each with a torch operation interposed so the measurement sits in the context a
+wrap really runs in:
+
+| M5 (4 / 8 torch threads) | nnz | serial | threshold 65536 | ratio |
+|---|---|---|---|---|
+| csr 1000x8 | 8,000 | 4.85 / 4.82 | 4.79 / 4.83 | 1.01x / 1.00x |
+| csr 2000x10 | 20,000 | 8.22 / 7.95 | 8.28 / 7.97 | 0.99x / 1.00x |
+| csr 4000x8 | 32,000 | 12.43 / 11.99 | 12.51 / 12.19 | 0.99x / 0.98x |
+| csr 8000x8 | 64,000 | 31.15 / 46.64 | 32.34 / 47.01 | 0.96x / 0.99x |
+| csr 20000x24 | 480,000 | 133.99 / 137.48 | **84.07 / 108.56** | 1.59x / 1.27x |
+| csr 100000x16 | 1,600,000 | 221.95 / 233.42 | 218.88 / 232.76 | 1.01x / 1.00x |
+| coo | 19,250 | 23.15 / 23.01 | 22.99 / 22.93 | 1.01x / 1.00x |
+| coo | 98,751 | 115.74 / 127.44 | **77.17 / 119.37** | 1.50x / 1.07x |
+| coo | 998,775 | 1028.96 / 1045.79 | **330.13 / 348.31** | 3.12x / 3.00x |
+
+| redwood (4 / 32 torch threads) | nnz | serial | threshold 65536 | ratio |
+|---|---|---|---|---|
+| csr 1000x8 | 8,000 | 6.45 / 6.50 | 6.53 / 6.35 | 0.99x / 1.02x |
+| csr 2000x10 | 20,000 | 9.04 / 8.86 | 8.83 / 8.95 | 1.02x / 0.99x |
+| csr 4000x8 | 32,000 | 11.68 / 12.00 | 11.72 / 12.04 | 1.00x / 1.00x |
+| csr 8000x8 | 64,000 | 20.46 / 31.91 | 20.47 / 32.43 | 1.00x / 0.98x |
+| csr 20000x24 | 480,000 | 82.35 / 95.35 | **56.83 / 68.02** | 1.45x / 1.40x |
+| csr 100000x16 | 1,600,000 | 184.38 / 155.58 | 183.78 / 156.86 | 1.00x / 0.99x |
+| coo | 19,250 | 33.61 / 35.21 | 33.37 / 35.08 | 1.01x / 1.00x |
+| coo | 98,751 | 161.82 / 182.87 | **55.36 / 77.68** | 2.92x / 2.35x |
+| coo | 998,775 | 1640.95 / 1735.33 | **555.60 / 203.26** | 2.95x / **8.54x** |
+
+Read those two tables carefully, because most of their rows are not comparisons at all --
+and that is the strongest thing they say. **Any cell under 65,536 nonzeros runs identical
+code in both columns**, since the threshold is what decides whether to split and neither
+column splits below it. So the five sub-threshold rows -- 8,000 / 20,000 / 32,000 / 64,000
+and the 19,250-nonzero COO -- are a same-code control, and their spread *is* this harness's
+noise floor: 0.2-3.8% on the M5, 0.3-2.4% on redwood. The 3.8% at 64,000 nonzeros is the
+largest number in either table that looks like a regression and it cannot be one.
+
+That leaves four rows where the columns genuinely differ, and every one of them is a win:
+1.45-1.59x at 480k nonzeros, 1.07-2.92x at 98,751 COO, and 2.95-8.54x at 998,775 COO. The
+`csr 100000x16` row is the exception that proves the rule -- it reads flat because at 1.6M
+nonzeros the "serial" column exceeds the *ABI* threshold and splits too, so it is
+full-width against full-width.
+
+**So the threshold cannot regress anything by construction**, and the only open question was
+whether it is high enough. A lower one is not: 16384 costs 2.5-3.6x at 20,000 nonzeros and
+4096 costs 3.0-5.7x at 8,000, because below the threshold the scan is a few microseconds
+while opening a region is 3-13 us depending on pool width. Those are real regressions -- the
+code genuinely differs there -- which is what fixes 65536 from below.
+
+**One measured gap, left open rather than tuned away.** A single threshold in *nonzeros* is
+a compromise across screens whose per-element work differs: the COO lexicographic screen
+compares up to one coordinate per level per element and runs alongside a bounds screen per
+level, so its scan costs several times what a CSR coordinate scan costs at the same length.
+That moves its crossover down. At 19,250 nonzeros on redwood with four threads, a 4096
+threshold reads 21.28 us against 33.37 us at 65536 -- 1.58x that a per-screen threshold
+would capture and this one does not. It is one cell at one thread count, and a global 4096
+would cost 3.0-5.7x at 8,000 nonzeros to buy it, so the right fix is a threshold scaled by
+each screen's work per element, measured on its own grid. Not attempted here.
 
 Two incidental notes. The screens are now templated over index width, because Scorch
 keeps int64 indices when a caller hands them in that way and torch's CSR does exactly
@@ -848,22 +1020,28 @@ loop that started all this was per *row*; this was per *nonzero*, and it cost a 
 
 | nnz | host | Python loop | native screen | speedup | us per nonzero |
 |---|---|---|---|---|---|
-| 997 | M5 | 375.2 us | **16.2 us** | 23.2x | 0.3763 -> 0.0162 |
-| 997 | redwood | 433.1 | **30.6** | 14.1x | 0.4344 -> 0.0307 |
-| 9,988 | M5 | 3,594.7 | **35.5** | 101.4x | 0.3599 -> 0.0035 |
-| 9,988 | redwood | 4,028.2 | **55.1** | 73.2x | 0.4033 -> 0.0055 |
-| 99,812 | M5 | 35,921.8 | **213.4** | 168.3x | 0.3599 -> 0.0021 |
-| 99,812 | redwood | 41,777.4 | **538.1** | 77.6x | 0.4186 -> 0.0054 |
-| 399,222 | M5 | 143,917.2 | **664.6** | 216.6x | 0.3605 -> 0.0017 |
-| 399,222 | redwood | 169,052.3 | **1,436.2** | 117.7x | 0.4234 -> 0.0036 |
-| 998,775 | M5 | **364,061.0** | **1,554.0** | **234.3x** | 0.3645 -> 0.0016 |
-| 998,775 | redwood | **430,803.3** | **3,603.0** | **119.6x** | 0.4313 -> 0.0036 |
+| 997 | M5 | 366.8 us | **14.5 us** | 25.3x | 0.3679 -> 0.0145 |
+| 997 | redwood | 429.8 | **30.6** | 14.0x | 0.4311 -> 0.0307 |
+| 9,988 | M5 | 3,639.9 | **32.0** | 113.7x | 0.3644 -> 0.0032 |
+| 9,988 | redwood | 4,049.2 | **57.9** | 69.9x | 0.4054 -> 0.0058 |
+| 99,812 | M5 | 37,174.5 | **165.7** | 224.3x | 0.3724 -> 0.0017 |
+| 99,812 | redwood | 41,652.6 | **557.7** | 74.7x | 0.4173 -> 0.0056 |
+| 399,222 | M5 | 148,450.3 | **406.8** | 364.9x | 0.3718 -> 0.0010 |
+| 399,222 | redwood | 168,578.6 | **807.0** | 208.9x | 0.4223 -> 0.0020 |
+| 998,775 | M5 | **371,594.3** | **841.7** | **441.5x** | 0.3720 -> 0.0008 |
+| 998,775 | redwood | **426,684.6** | **3,041.0** | **140.3x** | 0.4272 -> 0.0030 |
 
-Wrapping a million-nonzero COO tensor took **364 ms** on the M5 and **431 ms** on
-redwood; it now takes 1.55 ms and 3.60 ms. For scale, the compressed path at 1.6M
-nonzeros costs 626 us, so before this the COO spelling of a comparable tensor was some
-250x more expensive than the CSR one. redwood's smaller factor is the same
-single-threaded-scan effect described above.
+Wrapping a million-nonzero COO tensor took **372 ms** on the M5 and **427 ms** on
+redwood; it now takes 0.84 ms and 3.04 ms.
+
+redwood's smaller factor is no longer the single-threaded-scan effect -- that is fixed --
+and it is worth being clear about what it is instead, because it changes what the number
+means. At these sizes the wrap is not scan-bound at all: `--what scan` times the same
+validation at 55-78 us for 98,751 nonzeros and 190-556 us for 998,775, against the 558 us
+and 3,041 us the whole `from_torch` costs. So four fifths of what is left is cloning and
+allocating 8-16 MB of index arrays, and redwood is simply slower at that than the M5. The
+validation is no longer the thing to optimize on this path; the copy is, which is what the
+adoption of kernel-owned arrays below is about.
 
 `abi_screen_lex` was already in `native_abi.h` for the same check, unexposed, and it makes
 the same comparison the Python loop makes -- the first level that differs decides, every
@@ -908,6 +1086,63 @@ counter and buys a validation nobody needed, which costs speed and never correct
 What the stamp cannot see is a write through a raw pointer or a numpy view, which bumps
 no version counter. Neither could anything before it: validation happens when a tensor
 is built or reassembled, and such a write happens in between without telling anyone.
+
+### Why validate at all, and where to stop
+
+Making the check cheap raised the prior question: why does Scorch validate index arrays
+when PyTorch appears not to? It does appear not to, and it isn't so.
+`torch.sparse.check_sparse_tensor_invariants` exists and is **disabled by default**, and
+PyTorch says what disabling costs, in a warning that shows up in this repository's own test
+output: *"Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which
+violates the invariants, but checks incur performance overhead."* So PyTorch's position is
+not that the checks are unnecessary; it is that they cost, that off is the default, and
+that off means memory corruption.
+
+The reasoning transfers directly. Our kernels take `data_ptr<int>()` and do unchecked
+pointer arithmetic, so a coordinate past its extent is an out-of-bounds read or write in
+C++, not an exception. Without the walk, a typo'd `indptr` handed to `from_torch` is a
+segfault rather than a `TensorIndexError` naming the mode.
+
+**What the checks were doing wrong was not existing -- it was not distinguishing who built
+the array.** For a caller's arrays the walk is the only thing between a mistake and
+corruption. For the index arrays of a *generated result* it re-derives what our own codegen
+just established: every sparse output level comes from a `torch::empty` sized from a counted
+extent and is filled by the kernel. That re-derivation was 35-41% of a `from_torch`-shaped
+wrap, and on a sparse-result `einsum` it is worth this much of the **whole call**, kernel
+included (M5, four torch threads, three arms in one process, random order, median of 9):
+
+| case | host | nnz | copy + walk | adopt + walk | adopt (ships) | total | walk alone |
+|---|---|---|---|---|---|---|---|
+| ds 200x4 | M5 | 800 | 52.83 us | 51.39 | **46.25** | 1.142x | 1.111x |
+| ds 200x4 | redwood | 800 | 92.01 | 87.57 | **81.62** | 1.127x | 1.073x |
+| ds 2000x8 | M5 | 16,000 | 329.00 | 315.50 | **305.60** | 1.077x | 1.032x |
+| ds 2000x8 | redwood | 16,000 | 152.37 | 143.39 | **133.09** | 1.145x | 1.077x |
+| ds 20000x16 | M5 | 320,000 | 810.44 | 787.87 | **711.70** | 1.139x | 1.107x |
+| ds 20000x16 | redwood | 320,000 | 1,276.69 | 1,242.17 | **1,225.85** | 1.041x | 1.013x |
+
+Both hosts, 1.04-1.15x off the whole call. Skipping the walk is the larger half of it
+everywhere except redwood's largest cell, where the kernel is 1.2 ms and both effects are
+small against it.
+
+So the line is drawn at provenance, following PyTorch's design rather than inventing one:
+
+* **Caller-supplied arrays are always walked.** `from_torch`, `from_csr`, `TensorIndex`,
+  `SparseStorage` with `mode_indices` -- no flag involved, in any build.
+* **Generated results are walked only when `storage._VALIDATE_KERNEL_RESULTS` is on**,
+  which `tests/conftest.py` turns on for the entire suite. Release skips it.
+* **The cheap per-array checks always run**, trusted or not: dtype, rank, contiguity,
+  device, one array per level. They are O(1) each, and they are what makes adopting a
+  kernel's arrays safe at all -- a strided or wrongly-typed array would be misread by
+  `data_ptr` arithmetic no matter who produced it.
+
+The honest risk is that a bug in lowering, in the scheduler, or in a new codegen path emits
+a malformed index that now reaches a kernel as raw pointers. The LoopIR migration is
+actively changing that layer, which is exactly why the flag is on in CI rather than
+removed: a codegen bug is then a structured error on whichever test first produces a bad
+result, instead of a segfault on someone's machine. Four tests pin the arrangement in both
+directions -- a malformed generated result raises with the flag on, constructs with it off
+(otherwise the flag saves nothing), still fails the cheap checks with it off, and a
+malformed *caller* array raises regardless.
 
 ### The macOS toolchain, which is why there are two hosts here
 
