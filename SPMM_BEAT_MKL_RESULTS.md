@@ -797,19 +797,37 @@ they were, which keeps message *precedence* identical too. On a clean level the 
 whole-array walks are skipped because the screen has established they cannot fail; on a
 suspect level they run exactly as before.
 
-| case | loop2 | vec2 | vec1 | screen | this rung | cumulative |
-|---|---|---|---|---|---|---|
-| `from_torch` 128x4 | 511.7 us | 43.9 | 27.6 | **14.0** | 1.98x | **36.6x** |
-| `from_torch` 1000x8 | 3,888 | 64.1 | 39.5 | **17.3** | 2.28x | **225x** |
-| `from_torch` 20000x24 | 77,365 | 663.9 | 386.7 | **206.8** | 1.87x | **374x** |
-| `from_torch` 100000x16 | 391,295 | 1,804 | 1,012 | **626.0** | 1.62x | **625x** |
-| `to_sparse` "ds" 2000x2000 @1% | 14,173 | 2,857 | 2,573 | **2,444** | 1.05x | 5.8x |
+| case | host | loop2 | vec2 | vec1 | screen | this rung | cumulative |
+|---|---|---|---|---|---|---|---|
+| `from_torch` 128x4 | M5 | 511.7 us | 43.9 | 27.6 | **14.0** | 1.97x | **36.6x** |
+| `from_torch` 128x4 | redwood | 914.2 | 79.2 | 52.6 | **27.5** | 1.91x | **33.2x** |
+| `from_torch` 1000x8 | M5 | 3,888 | 64.1 | 39.5 | **17.3** | 2.28x | **225x** |
+| `from_torch` 1000x8 | redwood | 6,721 | 99.2 | 62.9 | **30.1** | 2.09x | **223x** |
+| `from_torch` 20000x24 | M5 | 77,365 | 663.9 | 386.7 | **206.8** | 1.87x | **374x** |
+| `from_torch` 20000x24 | redwood | 132,852 | 512.9 | 339.3 | **192.1** | 1.77x | **691x** |
+| `from_torch` 100000x16 | M5 | 391,295 | 1,804 | 1,012 | **626.0** | 1.62x | **625x** |
+| `from_torch` 100000x16 | redwood | 664,185 | 1,753 | 947.5 | **869.4** | 1.09x | **764x** |
+| `to_sparse` "ds" 2000x2000 @1% | M5 | 14,173 | 2,857 | 2,573 | **2,444** | 1.05x | 5.8x |
+| `to_sparse` "ds" 2000x2000 @1% | redwood | 23,356 | 3,039 | 2,913 | **2,729** | 1.07x | 8.6x |
 
-M5, four arms in one process, random order each round, median of 9, arms compared for
-agreement before timing. **redwood confirmation is pending** -- the box was in use by
-another measurement session when this landed, and these numbers are single-host until
-that runs. `to_sparse` gains little for the same structural reason as before: its call is
-mostly a generated kernel building a sparse result.
+Four arms in one process, random order each round, median of 9, arms compared for
+agreement before timing; redwood's box was quiet (load 0.16 before, 0.72 after).
+`to_sparse` gains little for the same structural reason as before: its call is mostly a
+generated kernel building a sparse result.
+
+**The last rung is much weaker on x86, and the reason is a constant tuned for a
+different caller.** 1.62x on the M5 against 1.09x on redwood at 1.6M nonzeros. The
+screens size their worker count from `SCORCH_ABI_VALIDATE_GRAIN`, one million nonzeros
+per worker, which is deliberately high *for the ABI path*: there a screen runs
+immediately before a kernel that wants a team of its own, and spawning a small team
+first measured as a 2-4x regression on bcsstk17. Nothing follows a scan on this path --
+validation happens while a tensor is being built, not before a kernel launch -- so at
+1.6M nonzeros `by_work` is 1 and the scan runs single-threaded on a 32-core machine
+while the torch operations it replaced were threaded. The grain is now a per-call-site
+parameter, defaulted so every ABI call site is unchanged; what the wrap path should use
+is a sweep (`bench/bench_index_validation.py --what grain`) and not yet settled, because
+a grain that is too low spawns a team to read a few kilobytes and is its own
+regression.
 
 Two incidental notes. The screens are now templated over index width, because Scorch
 keeps int64 indices when a caller hands them in that way and torch's CSR does exactly
@@ -828,17 +846,24 @@ validator called `.tolist()` on every mode's index array and then iterated over 
 loop that started all this was per *row*; this was per *nonzero*, and it cost a flat
 **0.365 us each**:
 
-| nnz | Python loop | native screen | speedup | us per nonzero |
-|---|---|---|---|---|
-| 997 | 375.2 us | **16.2 us** | 23.2x | 0.3763 -> 0.0162 |
-| 9,988 | 3,594.7 | **35.5** | 101.4x | 0.3599 -> 0.0035 |
-| 99,812 | 35,921.8 | **213.4** | 168.3x | 0.3599 -> 0.0021 |
-| 399,222 | 143,917.2 | **664.6** | 216.6x | 0.3605 -> 0.0017 |
-| 998,775 | **364,061.0** | **1,554.0** | **234.3x** | 0.3645 -> 0.0016 |
+| nnz | host | Python loop | native screen | speedup | us per nonzero |
+|---|---|---|---|---|---|
+| 997 | M5 | 375.2 us | **16.2 us** | 23.2x | 0.3763 -> 0.0162 |
+| 997 | redwood | 433.1 | **30.6** | 14.1x | 0.4344 -> 0.0307 |
+| 9,988 | M5 | 3,594.7 | **35.5** | 101.4x | 0.3599 -> 0.0035 |
+| 9,988 | redwood | 4,028.2 | **55.1** | 73.2x | 0.4033 -> 0.0055 |
+| 99,812 | M5 | 35,921.8 | **213.4** | 168.3x | 0.3599 -> 0.0021 |
+| 99,812 | redwood | 41,777.4 | **538.1** | 77.6x | 0.4186 -> 0.0054 |
+| 399,222 | M5 | 143,917.2 | **664.6** | 216.6x | 0.3605 -> 0.0017 |
+| 399,222 | redwood | 169,052.3 | **1,436.2** | 117.7x | 0.4234 -> 0.0036 |
+| 998,775 | M5 | **364,061.0** | **1,554.0** | **234.3x** | 0.3645 -> 0.0016 |
+| 998,775 | redwood | **430,803.3** | **3,603.0** | **119.6x** | 0.4313 -> 0.0036 |
 
-Wrapping a million-nonzero COO tensor took **364 ms** and now takes 1.55 ms. For scale,
-the compressed path at 1.6M nonzeros costs 626 us, so before this the COO spelling of a
-comparable tensor was some 250x more expensive than the CSR one.
+Wrapping a million-nonzero COO tensor took **364 ms** on the M5 and **431 ms** on
+redwood; it now takes 1.55 ms and 3.60 ms. For scale, the compressed path at 1.6M
+nonzeros costs 626 us, so before this the COO spelling of a comparable tensor was some
+250x more expensive than the CSR one. redwood's smaller factor is the same
+single-threaded-scan effect described above.
 
 `abi_screen_lex` was already in `native_abi.h` for the same check, unexposed, and it makes
 the same comparison the Python loop makes -- the first level that differs decides, every
