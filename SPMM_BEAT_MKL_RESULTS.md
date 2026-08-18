@@ -760,7 +760,17 @@ arm's result is compared against the others before any of them is timed.
 | `to_sparse` "ds" 2000×2000 @1% | M5 | 15,018 | 2,474.0 | 2,263.2 | **6.6x** | 1.09x |
 
 The gain scales with rows because the cost it removes was per row: wrapping a
-100,000-row CSR went from **0.68 s to 1.2 ms** on redwood. `to_sparse` gains only
+100,000-row CSR went from **0.68 s to 1.2 ms** on redwood.
+
+**Where this does and does not show up.** It is a per-wrap cost, so it moves a workload
+bar only when the wrap is inside the timed region. In the two standing harnesses it is
+not: `bench_gcn.py` converts the adjacency to an `STensor` before `benchmark_fn` (see
+the comment at line 507), and `bench_sparse_autoencoder.py` builds its `STensor` dict
+before its timed loops. For those, this is a setup-cost win and must be reported
+separately rather than folded into a workload comparison. It is steady-state only for
+code that wraps inside its loop — a model that calls `from_torch`, `from_csr` or
+`to_sparse` per forward pass, or any interactive use where wrapping a large matrix at
+all was the thing that felt slow. `to_sparse` gains only
 6.6–8.1x because most of its call is a generated kernel building a sparse result, not
 validation — the same structural reason the workspace route gained nothing from the ABI
 fix. Deduplicating the walk is worth a flat 1.47–1.79x on top of the vectorization on
