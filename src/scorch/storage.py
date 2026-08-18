@@ -35,8 +35,12 @@ try:  # pragma: no cover - exercised by whichever branch this import takes
     import scorch_ops as _native_ops
 
     _NATIVE_SCREEN = getattr(_native_ops, "abi_screen_compressed_level", None)
+    _NATIVE_BOUNDS = getattr(_native_ops, "abi_screen_bounds_level", None)
+    _NATIVE_LEX = getattr(_native_ops, "abi_screen_lex_levels", None)
 except Exception:
     _NATIVE_SCREEN = None
+    _NATIVE_BOUNDS = None
+    _NATIVE_LEX = None
 _INDEX_DTYPES = (torch.int32, torch.int64)
 
 
@@ -329,12 +333,44 @@ class TensorIndex:
 def _check_coordinate_bounds(coordinate: torch.Tensor, extent: int, label: str) -> None:
     if coordinate.numel() == 0:
         return
+    # One native pass instead of a min reduction, a max reduction and two syncs. As
+    # everywhere here, only "no violation" is a claim: when the screen declines, the
+    # reductions run and report the range they found, so the message is unchanged.
+    if _screen_bounds(coordinate, extent) is False:
+        return
     minimum = int(coordinate.min().item())
     maximum = int(coordinate.max().item())
     if minimum < 0 or maximum >= extent:
         raise TensorIndexError(
             f"{label} contains coordinate range [{minimum}, {maximum}] outside [0, {extent})"
         )
+
+
+def _screen_bounds(coordinate: torch.Tensor, extent: int) -> bool:
+    """``False`` means every coordinate is in ``[0, extent)``. See ``_screen_...`` below."""
+    screen = _NATIVE_BOUNDS
+    if screen is None:
+        return True
+    try:
+        return bool(screen(coordinate, int(extent)))
+    except Exception:
+        return True
+
+
+def _screen_lex_levels(levels: Sequence[torch.Tensor], count: int) -> bool:
+    """``False`` means the COO coordinates ascend lexicographically across levels.
+
+    Same one-directional contract as the other screens. When this clears a tensor,
+    the Python loop below it -- which materializes every index array with ``tolist``
+    and then compares a tuple per nonzero -- is skipped entirely.
+    """
+    screen = _NATIVE_LEX
+    if screen is None:
+        return True
+    try:
+        return bool(screen(list(levels), int(count)))
+    except Exception:
+        return True
 
 
 def _screen_compressed_level(
@@ -439,7 +475,7 @@ def _validate_index_storage(
     if level_types and all(
         level_type == LevelType.COORDINATE for level_type in level_types
     ):
-        coordinate_values = []
+        coordinates_per_mode = []
         for mode, arrays in enumerate(mode_indices):
             coordinate = arrays[0]
             if coordinate.numel() != nnz:
@@ -450,7 +486,16 @@ def _validate_index_storage(
             _check_coordinate_bounds(
                 coordinate, layout.physical_shape[mode], f"COO mode {mode}"
             )
-            coordinate_values.append(coordinate.tolist())
+            coordinates_per_mode.append(coordinate)
+        # The Python loop below is the most expensive thing in this file: it
+        # materializes every mode's index array with `tolist` and then builds and
+        # compares two tuples per NONZERO -- 0.40 us each, so 159 ms to wrap a
+        # 400,000-nonzero COO tensor. The native screen makes the same comparison in
+        # one thread-split pass, and clears the tensor without allocating anything.
+        # Only when it declines does any of that happen, and then it reports.
+        if _screen_lex_levels(coordinates_per_mode, nnz) is False:
+            return
+        coordinate_values = [c.tolist() for c in coordinates_per_mode]
         for position in range(1, nnz):
             previous = tuple(
                 coordinate_values[mode][position - 1]

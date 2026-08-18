@@ -622,8 +622,86 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             }
           },
           "Screen one compressed level: false = no violation, true = check it yourself",
+          // The scan is O(nnz) and thread-split, and touches only tensor metadata and
+          // raw data, so holding the interpreter lock across it would stall every other
+          // Python thread for no reason.
+          py::call_guard<py::gil_scoped_release>(),
           py::arg("positions"), py::arg("coordinates"), py::arg("extent"),
           py::arg("require_sorted") = true);
+
+    // "every coordinate of this level lies in [0, extent)". Same contract. Stands in
+    // for a min() and a max() reduction plus two device syncs in storage.py.
+    m.def("abi_screen_bounds_level",
+          [](const torch::Tensor& coordinates, int64_t extent) -> bool {
+            try {
+              if (!coordinates.defined()) return true;
+              if (coordinates.device().type() != torch::kCPU) return true;
+              if (!coordinates.is_contiguous()) return true;
+              const int64_t n = coordinates.numel();
+              if (n == 0) return false;  // nothing to violate; matches storage.py
+              if (coordinates.dtype() == torch::kInt32) {
+                return scorch_native::abi_screen_bounds_typed<int32_t>(
+                    coordinates.data_ptr<int32_t>(), n, extent);
+              }
+              if (coordinates.dtype() == torch::kInt64) {
+                return scorch_native::abi_screen_bounds_typed<int64_t>(
+                    coordinates.data_ptr<int64_t>(), n, extent);
+              }
+              return true;
+            } catch (...) {
+              return true;
+            }
+          },
+          "Screen one level's coordinate bounds: false = every coordinate is in range",
+          py::call_guard<py::gil_scoped_release>(),
+          py::arg("coordinates"), py::arg("extent"));
+
+    // "COO coordinates ascend lexicographically across the levels, in level order".
+    //
+    // This one replaces the worst loop in the validator: the COO branch of
+    // `_validate_index_storage` called .tolist() on every mode's index array and then
+    // iterated over every NONZERO in Python, building two tuples per iteration. That
+    // measured 0.40 us per nonzero -- 159 ms to wrap a 400,000-nonzero COO tensor --
+    // and it is per nonzero, where the compressed loop it sat beside was per row.
+    //
+    // The comparison is the same one the Python loop performs: the first level that
+    // differs decides, so this is a lexicographic test over the levels in order, not a
+    // per-level ordering test.
+    m.def("abi_screen_lex_levels",
+          [](const std::vector<torch::Tensor>& levels, int64_t n) -> bool {
+            try {
+              if (levels.empty()) return false;
+              if (n <= 1) return false;
+              const auto width = levels.front().dtype();
+              for (const auto& level : levels) {
+                if (!level.defined()) return true;
+                if (level.device().type() != torch::kCPU) return true;
+                if (!level.is_contiguous()) return true;
+                if (level.dtype() != width) return true;
+                if (level.numel() < n) return true;  // never read past an array
+              }
+              if (width == torch::kInt32) {
+                std::vector<const int32_t*> data;
+                data.reserve(levels.size());
+                for (const auto& level : levels)
+                  data.push_back(level.data_ptr<int32_t>());
+                return scorch_native::abi_screen_lex_typed<int32_t>(data, n);
+              }
+              if (width == torch::kInt64) {
+                std::vector<const int64_t*> data;
+                data.reserve(levels.size());
+                for (const auto& level : levels)
+                  data.push_back(level.data_ptr<int64_t>());
+                return scorch_native::abi_screen_lex_typed<int64_t>(data, n);
+              }
+              return true;
+            } catch (...) {
+              return true;
+            }
+          },
+          "Screen COO lexicographic order: false = the coordinates ascend",
+          py::call_guard<py::gil_scoped_release>(),
+          py::arg("levels"), py::arg("n"));
 
     // A resolved CSR x dense product (see plan.h). Built once per (operand,
     // free dimension) by scorch.plan and then invoked directly, so a repeated

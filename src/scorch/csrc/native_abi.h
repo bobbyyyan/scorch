@@ -213,10 +213,11 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
 }
 
 // "COO coordinates ascend lexicographically across levels"
-inline bool abi_screen_lex(const std::vector<const int32_t*>& levels, int64_t n) {
+template <typename T>
+inline bool abi_screen_lex_typed(const std::vector<const T*>& levels, int64_t n) {
   if (levels.empty() || n <= 1) return false;
   const size_t depth = levels.size();
-  const int32_t* const* lv = levels.data();
+  const T* const* lv = levels.data();
   int bad = 0;
   const int nt = abi_scan_threads(n);
 #ifdef _OPENMP
@@ -226,12 +227,16 @@ inline bool abi_screen_lex(const std::vector<const int32_t*>& levels, int64_t n)
   for (int64_t p = 1; p < n; ++p) {
     int cmp = 0;  // first level that differs decides, exactly as the serial loop does
     for (size_t l = 0; l < depth && cmp == 0; ++l) {
-      const int32_t a = lv[l][p - 1], b = lv[l][p];
+      const T a = lv[l][p - 1], b = lv[l][p];
       cmp = (b > a) - (b < a);
     }
     bad |= (cmp < 0);
   }
   return bad != 0;
+}
+
+inline bool abi_screen_lex(const std::vector<const int32_t*>& levels, int64_t n) {
+  return abi_screen_lex_typed<int32_t>(levels, n);
 }
 
 // --------------------------------------------------------------------------- //

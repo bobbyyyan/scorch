@@ -53,6 +53,8 @@ def screen_mode(request, monkeypatch):
     """
     if request.param == "no_screen":
         monkeypatch.setattr(storage_module, "_NATIVE_SCREEN", None)
+        monkeypatch.setattr(storage_module, "_NATIVE_BOUNDS", None)
+        monkeypatch.setattr(storage_module, "_NATIVE_LEX", None)
     return request.param
 
 
@@ -732,3 +734,126 @@ def test_the_screen_is_actually_being_consulted(monkeypatch):
         assert len(calls) == 1  # no screen: the Python walk is the only check
     else:
         assert calls == []  # screened clean: the Python walk was not needed
+
+
+# --------------------------------------------------------------------------- #
+# COO: the lexicographic screen
+#
+# The Python loop this stands in for compared a tuple per NONZERO, so the screen has
+# to agree with it on the one thing tuple comparison does that a per-level test does
+# not: the first level that differs decides, and every deeper level is then irrelevant.
+# A screen that only looked at the last level, or only at the first, would still pass
+# a naive test -- so these cases are built to separate those.
+# --------------------------------------------------------------------------- #
+
+
+def lex(levels, count=None):
+    if storage_module._NATIVE_LEX is None:
+        pytest.skip("extension has no lexicographic screen")
+    n = levels[0].numel() if count is None else count
+    return storage_module._NATIVE_LEX(list(levels), int(n))
+
+
+def i32(values):
+    return torch.tensor(values, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_lex_screen_sees_a_descent_only_the_deeper_level_can_see(width):
+    """mode 0 ties, so only mode 1 reveals the descent."""
+    rows = torch.tensor([0, 0], dtype=width)
+    assert lex([rows, torch.tensor([3, 0], dtype=width)]) is True
+    assert lex([rows, torch.tensor([0, 3], dtype=width)]) is False
+
+
+def test_lex_screen_ignores_deeper_levels_once_a_level_decides():
+    """(1, 1) -> (2, 0) ascends: mode 0 decided, mode 1 must not veto it."""
+    assert lex([i32([1, 2]), i32([1, 0])]) is False
+    assert lex([i32([0, 0, 1, 2]), i32([0, 3, 1, 0])]) is False
+
+
+def test_lex_screen_treats_duplicates_as_ordered():
+    """Equal coordinates are not a descent, and the Python loop agrees (`<` not `<=`)."""
+    assert lex([i32([0, 0]), i32([1, 1])]) is False
+    assert lex([i32([0, 0, 0]), i32([2, 2, 2])]) is False
+
+
+def test_lex_screen_on_a_single_level():
+    assert lex([i32([0, 1, 5])]) is False
+    assert lex([i32([0, 5, 1])]) is True
+
+
+def test_lex_screen_three_levels_deep():
+    assert lex([i32([0, 0]), i32([1, 1]), i32([5, 2])]) is True
+    assert lex([i32([0, 0]), i32([1, 1]), i32([2, 5])]) is False
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_lex_screen_has_nothing_to_say_about_short_input(count):
+    assert lex([i32([5, 0]), i32([5, 0])], count) is False
+
+
+def test_lex_screen_declines_what_it_cannot_serve():
+    """Every decline is "go and look", so validation still happens."""
+    rows, cols = i32([0, 0]), i32([3, 0])
+    assert lex([rows.long(), cols]) is True  # mismatched widths
+    assert lex([rows, cols], 99) is True  # count past the arrays
+    assert lex([rows.float(), cols.float()]) is True  # unsupported dtype
+    assert lex([rows, cols.repeat(2)[::2]]) is True  # non-contiguous
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_coo_validation_agrees_with_the_oracle_over_fuzzed_input(seed):
+    """The differential comparison, on COO specifically, ordered and not."""
+    generator = torch.Generator().manual_seed(seed)
+    nnz = int(torch.randint(2, 40, (1,), generator=generator).item())
+    extent = int(torch.randint(2, 12, (1,), generator=generator).item())
+    rows = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
+    cols = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
+    order = sorted(range(nnz), key=lambda i: (int(rows[i]), int(cols[i])))
+    srows, scols = rows[order], cols[order]
+    values = torch.rand(nnz, generator=generator)
+    layout = layout_for("oo", (extent, extent))
+    check_same(layout, ((srows,), (scols,)), values, f"coo sorted {seed}")
+    check_same(layout, ((rows,), (cols,)), values, f"coo as-generated {seed}")
+    # A real descent at every position, in each level in turn. Level 1 is the case
+    # that matters most: it needs the level above it to tie, so a screen that stopped
+    # after the first level would miss it.
+    for spot in range(1, nnz):
+        if srows[spot - 1] > 0:
+            broken_rows = srows.clone()
+            broken_rows[spot] = srows[spot - 1] - 1  # decides at level 0
+            check_same(layout, ((broken_rows,), (scols,)), values,
+                       f"coo level-0 descent {seed} at {spot}")
+        if scols[spot - 1] > 0:
+            broken_rows, broken_cols = srows.clone(), scols.clone()
+            broken_rows[spot] = srows[spot - 1]  # tie at level 0 ...
+            broken_cols[spot] = scols[spot - 1] - 1  # ... descent at level 1
+            check_same(layout, ((broken_rows,), (broken_cols,)), values,
+                       f"coo level-1 descent {seed} at {spot}")
+
+
+def test_the_coo_screen_is_actually_being_consulted(monkeypatch):
+    """A cleared COO tensor must not materialize its index arrays at all."""
+    calls = []
+    real = torch.Tensor.tolist
+
+    def counting(self):
+        calls.append(1)
+        return real(self)
+
+    nnz, extent = 64, 16
+    generator = torch.Generator().manual_seed(5)
+    rows = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
+    cols = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
+    order = sorted(range(nnz), key=lambda i: (int(rows[i]), int(cols[i])))
+    rows, cols = rows[order], cols[order]
+    values = torch.rand(nnz, generator=generator)
+    monkeypatch.setattr(torch.Tensor, "tolist", counting)
+    _validate_index_storage(
+        layout_for("oo", (extent, extent)), ((rows,), (cols,)), values
+    )
+    if storage_module._NATIVE_LEX is None:
+        assert len(calls) >= 2  # no screen: both modes materialized
+    else:
+        assert calls == []  # screened clean: nothing materialized
