@@ -236,6 +236,25 @@ def run_cell(label, a_t, N, nthreads, rounds, reps):
             "ratio_vs_first": t[first_i] / bt,
             "ratio_vs_last": t[last_i] / bt,
         }
+    # Which way each rule votes, from the interleaved (position-free) times: the
+    # old rule ships any tiled candidate faster than the baseline as timed; the new
+    # one requires the win to exceed the gap between the two identical baseline
+    # arms. A disagreement is a cell where the old selector shipped a margin it
+    # could not distinguish from its own noise.
+    ti = rows["inter"]
+    t_first_i, t_last_i = ti[first_i], ti[last_i]
+    best_tiled_t = min(ti[i] for i in range(1, last_i))
+    old_rule = best_tiled_t < t_first_i
+    new_rule = tiling._clears_noise(best_tiled_t, t_first_i, t_last_i)
+    floor = max(t_first_i, t_last_i) / min(t_first_i, t_last_i)
+    margin = min(t_first_i, t_last_i) / best_tiled_t
+    out["rules"] = {"old": old_rule, "new": new_rule,
+                    "floor": floor, "margin": margin}
+    print(f"  floor {floor:.3f}  margin {margin:.3f}  "
+          f"old rule={'tiled' if old_rule else 'base'}  "
+          f"new rule={'tiled' if new_rule else 'base'}"
+          + ("   <-- RULES DISAGREE" if old_rule != new_rule else ""))
+
     flag = ""
     if out["seq"]["position_induced"]:
         flag = "  <-- POSITION-INDUCED PICK under the shipped scheme"
@@ -304,6 +323,18 @@ def main():
               f"{r['seq']['aa']:9.3f}{r['seq_rev']['aa']:9.3f}"
               f"{r['inter']['aa']:9.3f}{r['seq']['pick']:>16}"
               f"{r['inter']['pick']:>16}")
+    print(f"\n{'cell':<28}{'floor':>8}{'margin':>8}{'old':>7}{'new':>7}")
+    for r in results:
+        ru = r["rules"]
+        print(f"{r['label'] + '/' + str(r['N']):<28}{ru['floor']:8.3f}"
+              f"{ru['margin']:8.3f}{'tiled' if ru['old'] else 'base':>7}"
+              f"{'tiled' if ru['new'] else 'base':>7}"
+              + ("   DISAGREE" if ru['old'] != ru['new'] else ""))
+    n_dis = sum(1 for r in results if r["rules"]["old"] != r["rules"]["new"])
+    marg = sorted(r["rules"]["margin"] for r in results)
+    print(f"\nrules disagree: {n_dis}/{len(results)}   "
+          f"margin min {marg[0]:.3f} median {marg[len(marg) // 2]:.3f} "
+          f"max {marg[-1]:.3f}")
     n_ind = sum(1 for r in results if r["seq"]["position_induced"])
     n_flip = sum(1 for r in results if r["seq"]["pick"] != r["inter"]["pick"])
     print(f"\nposition-induced picks under the shipped scheme: "
