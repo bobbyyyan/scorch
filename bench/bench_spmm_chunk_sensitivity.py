@@ -69,6 +69,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import scorch_ops as SO  # noqa: E402
 
 KREF = 8  # SCORCH_SPMM_CHUNK_KREF: the k at which the machine term was read
+NULL_MIN_CELLS = 8  # below this a null group cannot set a floor; see the report below
 GRAIN_SPMM = 150000  # SCORCH_GRAIN_SPMM, the work threshold the generic rule uses
 
 
@@ -296,12 +297,30 @@ def main():
             f"cells where the rule FIRES: n={len(fires)} geomean {geo(fires):.3f}  "
             f"range {fires[0]:.3f}-{fires[-1]:.3f}"
         )
-        if noop:
+        # A floor is only a floor if enough cells drew it. The no-op group exists only
+        # where the gate is SHUT, so on a grid where the rule fires almost everywhere it
+        # can come out with a handful of cells and a spuriously tight range -- three
+        # cells spanning 1.002-1.004 once flagged five neutral cells as "below the
+        # floor". Under that threshold, say so and defer to the mechanism null, which is
+        # the one control that exists on every cell including the firing ones.
+        if len(noop) >= NULL_MIN_CELLS:
             below = [x for x in fires if x < noop[0]]
             print(
                 f"  firing cells below the no-op null's floor ({noop[0]:.3f}): "
                 f"{len(below)}"
             )
+        else:
+            print(
+                f"  no-op null has only {len(noop)} cells, too few to set a floor -- "
+                f"judge each firing cell against its own mechanism null instead"
+            )
+            for r in rows_out:
+                if not r["noop"] and r["mech"] > 0:
+                    net = r["vs_gen"] / r["mech"]
+                    print(
+                        f"    {r['name']:<18}k={r['k']:<4} vs_gen {r['vs_gen']:.3f} / "
+                        f"mech {r['mech']:.3f} = {net:.4f}"
+                    )
     allg = sorted(r["vs_gen"] for r in rows_out)
     print(
         f"whole grid: n={len(allg)} geomean {geo(allg):.3f}  "

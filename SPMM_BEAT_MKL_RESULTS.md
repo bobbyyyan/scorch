@@ -2173,14 +2173,32 @@ generic chunk, so everything routed through `sparse_linear` is untouched by
 construction. And the two regimes no grid cell covered — many rows at degree 3, and
 many rows at degree 25 — were then measured directly on the M5:
 
-| regime | rows | degree | k | vs generic |
-|---|---|---|---|---|
-| AE-shaped | 60,000 | 3 | 8–128 | 1.126–1.399 |
-| products-shaped | 2,449,029 | 25 | 8–128 | 0.998–1.044 |
+| regime | rows | degree | k | M5 Max | redwood |
+|---|---|---|---|---|---|
+| AE-shaped | 60,000 | 3 | 8–128 | 1.126–1.399, fires at every k | **1.558 / 1.431** at k=8/16, gated off above |
+| products-shaped | 2,449,029 | 25 | 8–128 | 0.998–1.044 | 0.998–1.001, net geomean **0.9996** |
 
-AE-shaped wins throughout. Products-shaped is neutral: it fires at every width and
-lands inside its own A/A band except at k=8, where 1.044 against an A/A of 1.004 is a
-small real win. Neither regresses.
+AE-shaped wins on both, and the hosts split for a reason worth stating: the
+load-balance cap is `rows / (threads * 16)`, which is 208 rows on the M5's 18 threads
+and 117 on redwood's 32. At k ≥ 32 that cap drops redwood's recommendation below twice
+the generic width, so the gate returns generic and the cell becomes a provable no-op —
+reading 1.002–1.004. The rule is served on one host and declines on the other, and
+where it declines it changes nothing, which is the safe direction for a gate to fail.
+
+Products-shaped fires at every width on both hosts and buys nothing on x86: netting
+each cell against its own mechanism null gives a geometric mean of 0.9996 over five
+widths, worst cell 0.998. That is neutral, not a regression, and it is the honest
+result for the regime — the rule's benefit is concentrated in the middle of the range
+and at this scale the steal stream it saves is already negligible against the work.
+
+Reading that took the mechanism null rather than the no-op null, and the harness said
+the wrong thing first. With the rule firing at every products-shaped width, the no-op
+group came out as three AE-shaped cells spanning 1.002–1.004, and against a floor that
+tight five neutral cells were reported as "below the null". A group of three does not
+set a floor. The harness now refuses to draw that conclusion below eight cells and
+prints each firing cell against its own mechanism null instead — which is the only
+control that exists on *every* cell, firing ones included, and which tracked `vs_gen`
+here to within 0.002 cell for cell.
 
 The fused Linear kernel's chunk is left generic, stated rather than defaulted: its
 workload is the autoencoder grid and it deserves its own measurement before adopting
@@ -2278,6 +2296,34 @@ amount of care about arm order substitutes for reading it.
   + 2 skipped on the M5, the skips needing a generated kernel that toolchain cannot build
   — including the bitwise comparison against every legacy symbol a plan can stand in for.
   What is *not* two-host is everything above lever 5 in this document.
+- **The chunk grid was measured in the instrumented build, not the one that ships.**
+  `SCORCH_TUNE_HOOKS` is what makes the override possible, and it also allocates the
+  workspace pool, adds a `force_workspace` branch per row, and turns two compile-time
+  predicates into runtime ones. Every ratio in that grid is between two arms of the
+  *same* instrumented binary, so the overhead is on both sides — and a constant per-row
+  cost added to both sides of a ratio moves it toward 1, which means the shipped build's
+  response is at least what is reported and not less. That is an argument, not a
+  measurement: no arm of the chunk grid ran in the binary that ships. Confirming it
+  would need two shipped builds differing only in `SCORCH_SPMM_CHUNK_MINRATIO`, which
+  reintroduces exactly the build-to-build variance the hook exists to remove.
+- **`K` is still one constant for both hosts.** The gate is what makes that defensible —
+  below twice the generic width the rule does not act, so a wrong `K` cannot do harm
+  there — but it is not the same thing as deriving `K` on the host. The implied-`K`
+  distributions do overlap across hosts, which is the condition originally set for one
+  constant; they also each span three orders of magnitude, so the overlap is weak
+  evidence. Measuring `K` at startup from a microbenchmark of a contended atomic against
+  a nonzero of work is the principled version and is not done.
+- **The two uncovered regimes are synthetic.** `syn__aeshape` and `syn__prodshape` place
+  uniform-random column indices at a fixed degree, so they have neither a real degree
+  distribution nor real locality, and duplicate columns within a row are left in (they
+  feed `spmm_csr_float_v2` directly, which validates no indices, and a repeated column
+  only re-reads a B row). They exist to put a measurement at the `(rows, nnz, k)` points
+  where the rule departs from generic and no real matrix in the grid does. Treat the
+  decisions as exact and the magnitudes as a pointer.
+- **The fused Linear kernel's chunk is unmeasured.** It keeps the generic width, stated
+  in the code rather than defaulted into. Adopting the rule there needs the autoencoder
+  grid, which is its workload, and would have to re-check the @0.99 ledger.
+
 - **A defect found along the way and left alone, because it is not this work's.**
   `scorch.matmul` raises on a CSR operand whose mode order has been permuted — the shape
   says (48, 32) while the stored indices are still the original row-major CSR, and prebuilt
