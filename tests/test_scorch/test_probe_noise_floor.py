@@ -386,15 +386,16 @@ def test_the_confirm_declines_a_candidate_slower_than_the_baseline():
 # the kernel gate and the selector gate must agree about the machine
 # ---------------------------------------------------------------------------
 def test_the_kernel_and_the_selector_read_the_same_cache_size():
-    """Both layers gate on the last-level cache; a disagreement is invisible.
+    """Two layers answer the same question about the machine; pin that they agree.
 
     `tiling.query_llc` decides whether a product is eligible for a tiled kernel at
-    all, and the kernels' own `scorch_llc_bytes` decides whether the wide path may
-    stream its stores. They query the same sysctl keys on macOS and the same sysfs
-    entries on Linux, and honour the same SCORCH_LLC_BYTES override, so they should
-    return one number -- but nothing enforced it, and neither layer would report a
-    disagreement. It would show up only as a product routed to a tiled kernel that
-    then declines to stream, or the reverse.
+    all, and `scorch_llc_bytes` is what a harness or a future kernel gate reads.
+    They query the same sysctl keys on macOS and the same sysfs entries on Linux,
+    honour the same SCORCH_LLC_BYTES override and fall back to the same per-platform
+    default -- but nothing enforced it, and neither layer would report a
+    disagreement. The fallbacks in fact differed (16 vs 36 MiB on Darwin) until this
+    test was written, which is exactly the case where agreement matters most: when
+    the query fails, the fallback is all the two have to agree on.
     """
     scorch_ops = pytest.importorskip("scorch_ops")
     if not hasattr(scorch_ops, "scorch_llc_bytes"):
@@ -418,6 +419,9 @@ def test_both_cache_queries_honour_the_same_override():
         [
             sys.executable,
             "-c",
+            # torch first: scorch_ops links libc10, and on Linux importing it
+            # first fails with "libc10.so: cannot open shared object file".
+            "import torch;"
             "import scorch_ops, scorch.tiling as t;"
             "print(scorch_ops.scorch_llc_bytes(), t.query_llc())",
         ],
