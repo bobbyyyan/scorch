@@ -593,6 +593,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
     }, "True if this build honours the SCORCH_* kernel A/B hooks");
 
+    // The chunk width the SpMM would pick for a given shape. Exposed so a
+    // calibration harness reports the formula's own choice rather than a Python
+    // restatement of it -- a second implementation of a rule is a second thing that
+    // can be wrong, and it would be wrong silently, in the direction that flatters
+    // whichever one the harness used.
+    m.def("scorch_spmm_chunk", &scorch_spmm_chunk,
+          "Rows per work-stealing chunk the SpMM would use for (rows, nnz, k, nthreads)",
+          py::arg("rows"), py::arg("nnz"), py::arg("k"), py::arg("nthreads"));
+
+    // The GENERIC chunk -- what the SpMM used before the SpMM-specific rule existed.
+    // A calibration harness needs it to answer the decision-relevant question, which
+    // is not "how far is the rule from a per-cell oracle" but "is the rule better
+    // than what it replaces".
+    m.def("scorch_chunk_generic", &scorch_chunk,
+          "Rows per chunk from the generic policy, for (rows, work, grain)",
+          py::arg("rows"), py::arg("work"), py::arg("grain"));
+
+    // The thread count the drop-in SpMM will actually run on. A harness that wants
+    // to know which width the chunk rule picks has to ask for this rather than use
+    // torch.get_num_threads(): omp_get_num_procs() reports 32 on a 24-physical-core
+    // part, so the two differ, and the difference silently reclassified cells.
+    m.def("scorch_spmm_nthreads", &scorch_spmm_nthreads,
+          "Threads the drop-in SpMM resolves to, for (work, rows, nthreads_override)",
+          py::arg("work"), py::arg("rows"), py::arg("nthreads_override"));
+
     // The same fused structural pass, offered to Scorch's own Python-side validator.
     //
     // `_validate_index_storage` in storage.py runs on every STensor built over a

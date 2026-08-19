@@ -141,11 +141,18 @@ inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRA
 }
 
 // Effective last-level cache in bytes, queried from the OS -- no hardcoded
-// constant. Same sources and the same SCORCH_LLC_BYTES override as
-// tiling.query_llc on the Python side, so a kernel gate and a selector gate never
-// disagree about the machine. Linux: the largest cache level in sysfs (L3 where
-// there is one). macOS: the P-cluster L2, which is the binding cache for SpMM on
-// Apple silicon (the SLC is not exposed). Cached on first call.
+// constant. Same sources, same SCORCH_LLC_BYTES override and same per-platform
+// fallback as tiling.query_llc on the Python side, so the two layers cannot
+// disagree about the machine; a test pins that they return one number. Linux: the
+// largest cache level in sysfs (L3 where there is one). macOS: the P-cluster L2,
+// which is the binding cache for SpMM on Apple silicon (the SLC is not exposed).
+// Cached on first call.
+//
+// The Python selector gates on this in production. No C++ kernel currently does:
+// the one that did -- a non-temporal-store gate on the wide path -- was measured
+// at 0.9972 against a 1.0315 null and removed (see scorch_spmm_row_regtile). This
+// stays because the selector's number has to be inspectable from a harness without
+// the harness restating how it is derived.
 inline long scorch_llc_bytes() {
   static const long cached = [] {
     if (const char* e = std::getenv("SCORCH_LLC_BYTES")) {
@@ -190,6 +197,34 @@ inline long scorch_llc_bytes() {
 #endif
   }();
   return cached;
+}
+
+// The thread count the drop-in SpMM actually runs on, given the caller's override.
+//
+// Extracted so there is ONE implementation. The SpMM used to compute this inline
+// and a calibration harness recomputed it in Python from torch.get_num_threads(),
+// which is not the same number: omp_get_num_procs() reports 32 on a 24-physical-
+// core part, so the harness attributed the kernel's chunk to a thread count the
+// kernel never used, and then classified cells as "the rule changed nothing" that
+// it had in fact changed. A restated policy is a second thing that can be wrong,
+// and it is wrong silently.
+//
+// override <= 0 means pure policy, which is what the standalone and panel paths
+// want. Otherwise adopt the host count to avoid a pipeline team reshape, bounded
+// two ways so a small product cannot regress: never past the row-parallelism
+// ceiling (a 130-row product at wide k clears the work floor but cannot feed 16
+// workers), and never below the policy count, so big graphs keep a higher one.
+inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override) {
+  const int policy_nt = scorch_nthreads(work, rows, SCORCH_GRAIN_SPMM);
+  int nthreads = policy_nt;
+  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
+    const long by_rows = rows / SCORCH_ROWS_PER_THREAD;
+    long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
+    const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
+    if (cand > hw) cand = hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
+  return nthreads;
 }
 
 // Adaptive schedule chunk: ~SCORCH_CHUNKS_PER_THREAD dynamic chunks per worker.

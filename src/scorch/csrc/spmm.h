@@ -2136,6 +2136,17 @@ static inline void scorch_spmm_row_regtile_partial(
 // L1-hot; B is streamed once total (each element used once per output row). The
 // ragged last tile (<64) uses the templated scorch_spmm_row_regtile_partial (see
 // above), K need not be a multiple of 64.
+// Ordinary stores, deliberately. Non-temporal stores (vmovntps) were tried here
+// behind a gate on C exceeding the last-level cache, on the theory that they skip
+// the read-for-ownership pass an ordinary store pays to bring a line it is about
+// to overwrite entirely. Measured on redwood over the 19 cells of a SuiteSparse/GCN
+// grid where such a gate fires (C from 41 MiB to 1199 MiB against a 36 MiB L3):
+// geometric mean 0.9972, range 0.975-1.028, against a 21-cell null of cells the
+// gate cannot touch that read 1.0315. The largest outputs -- where the effect
+// should have been biggest -- were the ones at or below 1.0. Whatever this part
+// does for a full-line write already costs what the read-for-ownership would have,
+// so there was nothing to skip. Not worth an alignment gate, a store fence and a
+// fault mode (vmovntps faults on a misaligned address and has no unaligned form).
 static inline void scorch_spmm_row_regtile(
     const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
     const float* SCORCH_RESTRICT B_val, int B1_size,
@@ -2210,6 +2221,91 @@ static inline void scorch_spmm_row_regtile(
   }
 }
 #endif
+
+// Rows per work-stealing chunk for SpMM.
+//
+// The generic scorch_chunk aims for a fixed number of dynamic chunks per worker
+// and clamps the width at SCORCH_CHUNK_MAX rows. It has no term for what the
+// stealing itself costs, and that is the dominant cost on a large short-row
+// matrix: every chunk is one atomic fetch_add on a line every worker is fighting
+// over, and those do not overlap. scircuit (171k rows, 5.6 nonzeros a row) hit the
+// 64-row clamp and so took 2672 steals of ~360 nonzeros each -- the atomics cost
+// more than the arithmetic, and the kernel ran at 0.68x of Intel MKL at k=8.
+//
+// A chunk trades two costs against each other:
+//   steal stream   (rows / chunk) * c        c = a contended atomic, wall clock
+//   tail           chunk * deg * k * w       w = one nonzero of work on one core
+// Minimising the sum gives
+//   chunk* = rows * sqrt(K * KREF / (nnz * k)),   K = c/w
+// K is a property of the machine -- the ratio of a contended atomic to a nonzero
+// of work -- not of the matrix; everything matrix-specific is already in rows,
+// nnz and k. KREF anchors it to the k at which K was measured.
+//
+// Two guards, both load-balance:
+//   * never below what scorch_chunk already picks. Where a 64-row chunk already
+//     carries plenty of work (reddit: 64 rows are 31k nonzeros) the generic value
+//     is right and this returns it unchanged.
+//   * never so wide that a worker would get fewer than SCORCH_SPMM_CHUNKS_MIN
+//     chunks, because past that the tail of one chunk costs more than the steals
+//     it saved. On a matrix small enough that 64 rows already breaks that bound,
+//     64 stands: there the whole product is a few microseconds and the steal
+//     stream is the only cost that matters.
+//
+// Measured on the redwood i9-14900K over 25 SuiteSparse/GCN matrices x k in
+// 8..512, kernel-only against MKL in the same process: 90 of 90 cells at or above
+// MKL (worst 1.007, geometric mean 1.333) where the generic chunk lost on 7 of 90
+// (worst 0.680, geometric mean 1.240). The residual against a per-cell oracle
+// chunk is a median 1.6% and at most 12%, and it tracks the SHAPE of the degree
+// distribution, which this formula cannot see -- see the note in tiling.py.
+#ifndef SCORCH_SPMM_CHUNK_K            // c/w on this host; see the calibration note
+#define SCORCH_SPMM_CHUNK_K 16
+#endif
+#ifndef SCORCH_SPMM_CHUNK_KREF         // the k at which SCORCH_SPMM_CHUNK_K was read
+#define SCORCH_SPMM_CHUNK_KREF 8
+#endif
+#ifndef SCORCH_SPMM_CHUNKS_MIN         // chunks per worker the tail term tolerates
+#define SCORCH_SPMM_CHUNKS_MIN 16
+#endif
+// Depart from the generic width only when the model asks for a width at least this
+// many times wider. Below that the model is not saying anything its own error bars
+// support: chunk* moves as sqrt(K), and K measured across cells on two hosts spans
+// roughly 11 to 3300 against the 16 written down here, so the recommended width
+// carries a factor-of-several uncertainty. A recommendation 6% wider than generic
+// (pubmed at k=32 asks for 68 against 64) is inside that, and acting on it is acting
+// on noise -- measured as the only cell on the M5 grid to fall below the null band
+// that no-op cells establish, at 0.916. Above the threshold the rule is a large win
+// on both hosts; below it, this makes the rule a provable no-op rather than a coin
+// flip, which is what the performance convention asks for when a lever only helps a
+// sub-regime.
+//
+// The grid rules out 1 (one cell below the null) and cannot separate 1.5 from 3: the
+// whole-grid geomean over that range is 1.138 to 1.114, inside the +-3.6% null band.
+// 2 is chosen as the middle of the range the data admits rather than the value that
+// maximizes this grid.
+#ifndef SCORCH_SPMM_CHUNK_MINRATIO
+#define SCORCH_SPMM_CHUNK_MINRATIO 2
+#endif
+inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
+  const long generic = (long)scorch_chunk(rows, nnz * k, SCORCH_GRAIN_SPMM);
+  if (rows <= 0 || nnz <= 0 || k <= 0 || nthreads <= 0) return (int)generic;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_CHUNK");
+    if (e && *e) { long f = std::atol(e); if (f > 0) return (int)f; } }
+#endif
+  const double ratio = (double)SCORCH_SPMM_CHUNK_K * (double)SCORCH_SPMM_CHUNK_KREF
+                       / ((double)nnz * (double)k);
+  long c = (long)((double)rows * std::sqrt(ratio));
+  if (c < generic) c = generic;
+  long cap = rows / ((long)nthreads * SCORCH_SPMM_CHUNKS_MIN);
+  if (cap < generic) cap = generic;
+  if (c > cap) c = cap;
+  const long per_worker = rows / (long)nthreads;      // every worker gets one
+  if (per_worker >= 1 && c > per_worker) c = per_worker;
+  if (c < 1) c = 1;
+  // Last: a recommendation too close to the generic width is not a recommendation.
+  if (c < (long)SCORCH_SPMM_CHUNK_MINRATIO * generic) c = generic;
+  return (int)c;
+}
 
 // spmm_csr_float_v2 — workspace-based direct accumulation with 2-nnz ILP
 //
@@ -2301,25 +2397,12 @@ torch::Tensor spmm_csr_float_v2_core(
   // policy count (the SuiteSparse panel's small cells stay byte-identical; a
   // forced 16 threads made a 130-row product 1.7x slower). max() keeps big
   // graphs on their (possibly >host) policy count so we never under-thread.
-  // nthreads_override<=0 => pure policy (the standalone/panel default).
-  const int policy_nt = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
-  int nthreads = policy_nt;
-  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
-    // Adopt the host thread count to avoid the pipeline team-reshape, but bound
-    // it two ways so the panel can't regress: (1) never beyond the row-
-    // parallelism ceiling by_rows = rows/ROWS_PER_THREAD — a 130-row product at
-    // wide K clears the work floor yet can't feed 16 workers, so cap at what the
-    // rows support; (2) never below the policy (max) so big graphs keep their
-    // possibly-higher policy count. This removes only the by_work throttle that
-    // starves tall-skinny GCN SpMM (many rows, narrow k), which is the reshape
-    // culprit, while keeping every protection that guards small/tiny products.
-    const long by_rows = (long)A0_size / SCORCH_ROWS_PER_THREAD;
-    long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
-    const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
-    if (cand > hw) cand = hw;
-    if (cand > (long)nthreads) nthreads = (int)cand;
-  }
-  const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
+  // nthreads_override<=0 => pure policy (the standalone/panel default). The rule
+  // itself lives in scorch_policy.h so a harness can ask for the same number
+  // instead of recomputing it; see scorch_spmm_nthreads.
+  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override);
+  const long nnz_total = A0_size > 0 ? (long)A1_pos[A0_size] : 0;
+  const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
 
   // Narrow-k register-blocked path (K<=16): hold the whole output row in YMM
@@ -2958,23 +3041,18 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
 
   const int kTile = (tile_size + 15) & ~15;
 
-  // Thread policy / schedule chunk — IDENTICAL to spmm_csr_float_v2 (see there for
-  // the full rationale): work = nnz*max(k,16), grain = SCORCH_GRAIN_SPMM; adopt
-  // the host thread count when the caller passes nthreads_override (avoids the
-  // pipeline team-reshape), bounded by the row-parallelism ceiling and floored at
-  // the policy count.
+  // Thread policy — the same rule as spmm_csr_float_v2, and now literally the same
+  // code (scorch_policy.h). It used to be a second copy annotated "IDENTICAL to
+  // spmm_csr_float_v2", which is a comment asserting a property nothing enforced.
   const int total_nnz = A1_pos[A0_size];
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
   const long work = (long)total_nnz * k_eff;
-  const int policy_nt = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
-  int nthreads = policy_nt;
-  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
-    const long by_rows = (long)A0_size / SCORCH_ROWS_PER_THREAD;
-    long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
-    const long hw = (long)omp_get_num_procs();
-    if (cand > hw) cand = hw;
-    if (cand > (long)nthreads) nthreads = (int)cand;
-  }
+  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override);
+  // Deliberately the GENERIC chunk, not the SpMM-specific rule the drop-in kernel
+  // uses. The fused kernel's workload is the sparse autoencoder grid, and the chunk
+  // rule has never been run against it -- so this is a gap to close with its own
+  // measurement, not a decision. Sharing the rule here on the strength of the
+  // drop-in kernel's grid would be extending a result past what was measured.
   const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
   std::atomic<int> next_row{0};
 
@@ -3051,6 +3129,10 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
           }
           #undef SCORCH_RB
         } else {
+          // Ordinary stores: the fused Linear folds bias and activation into the
+          // row epilogue, so it re-reads the row it just wrote and a non-temporal
+          // store would force that read back from memory. Whether a fused variant
+          // wants streaming is a separate question with a separate grid.
           scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
         }
 #elif defined(__ARM_NEON)
