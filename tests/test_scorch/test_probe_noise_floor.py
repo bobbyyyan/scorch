@@ -169,29 +169,74 @@ def test_no_candidate_holds_the_first_timed_slot_in_every_round():
     assert firsts[0] != firsts[1], "the start of each round must rotate"
 
 
-def test_the_minimum_over_rounds_is_returned():
-    # A candidate that is slow once and quick once is scored on the quick one, so
-    # a single descheduled call cannot condemn it.
-    state = {"n": 0}
+class FakeClock:
+    """A clock that advances only when a candidate "runs".
 
-    def alternating():
-        state["n"] += 1
-        if state["n"] == 2:
-            _spin(0.02)
+    Each candidate carries a per-call cost list, so one can be made slow on its
+    first timed call and quick afterwards -- the cold-start shape the rotation
+    exists to neutralize. Faking the clock rather than sleeping makes these exact
+    and instant; a test that spins on the wall clock to assert something about a
+    timing routine is measuring the machine it runs on, which is the thing this
+    file is about not doing.
+    """
 
-    def quick():
-        pass
+    def __init__(self, costs):
+        self.t = 0.0
+        self.costs = {i: list(c) for i, c in enumerate(costs)}
+        self.calls = []
 
-    times = tiling._interleaved_times([alternating, quick], rounds=3)
-    assert times[0] < 0.02
+    def fn(self, i):
+        def run():
+            self.calls.append(i)
+            seq = self.costs[i]
+            self.t += seq.pop(0) if len(seq) > 1 else seq[0]
+            return ("result", i)
+
+        return run
+
+    def fns(self):
+        return [self.fn(i) for i in sorted(self.costs)]
 
 
-def _spin(seconds):
-    import time
+@pytest.fixture
+def clocked(monkeypatch):
+    def make(costs):
+        clock = FakeClock(costs)
+        monkeypatch.setattr(tiling.time, "perf_counter", lambda: clock.t)
+        return clock
 
-    end = time.perf_counter() + seconds
-    while time.perf_counter() < end:
-        pass
+    return make
+
+
+def test_the_minimum_over_rounds_is_returned(clocked):
+    # A candidate slow once and quick once is scored on the quick one, so a single
+    # descheduled call cannot condemn it.
+    clock = clocked([[9.0, 1.0], [2.0], [2.0]])
+    times = tiling._interleaved_times(clock.fns(), rounds=2)
+    assert times[0] == pytest.approx(1.0)
+
+
+def test_a_cold_first_call_does_not_decide_the_winner(clocked):
+    """Candidate 0 is really the fastest but is slow the first time it is timed.
+
+    That is the shape the whole change is about: under the scheme that shipped,
+    the arm timed first ran on the coldest machine, and if one slow sample settled
+    it then the first-timed arm lost on position rather than on merit.
+    """
+    clock = clocked([[9.0, 1.0], [2.0], [2.0]])
+    times = tiling._interleaved_times(clock.fns(), rounds=2)
+    assert min(range(3), key=lambda i: times[i]) == 0
+
+
+def test_the_warmup_call_is_not_charged_to_any_candidate(clocked):
+    """The first call to each candidate is a warmup and must not be timed.
+
+    With three candidates each costing 1.0 per call and two rounds, every
+    candidate's reported time is one call's worth -- not two, and not three.
+    """
+    clock = clocked([[1.0], [1.0], [1.0]])
+    times = tiling._interleaved_times(clock.fns(), rounds=2)
+    assert times == [pytest.approx(1.0)] * 3
 
 
 # ---------------------------------------------------------------------------
