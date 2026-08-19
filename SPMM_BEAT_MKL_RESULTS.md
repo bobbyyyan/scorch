@@ -1840,6 +1840,126 @@ dtype change on that same graph is caught by that re-check and falls back rather
 running against a kernel resolved for a dtype it no longer has; and that SpMV-shaped
 (N=1), COO and float64 fused calls all decline without touching the selector.
 
+## The probe that decides whether a tiled kernel ships, and the two things it never measured
+
+`tiling.maybe_dispatch` is the routine that decides whether an SpMM runs on a tiled
+kernel or on the drop-in one. Its docstring claimed no-regression "by construction",
+on the grounds that the caller's baseline is always one of the candidates. Two things
+made that claim weaker than it reads.
+
+**Candidate order.** Each candidate was timed to completion before the next one
+started, and the baseline is always `cands[0]`. So the baseline was the one arm that
+never ran on a machine an earlier candidate had warmed — clocks still ramping, OpenMP
+team not yet settled. The one-shot confirm used by the default level had the same bug
+pointing the other way: it timed the tiled candidate first and the baseline second,
+biasing *towards* the baseline. Two routines, opposite biases, neither measured.
+
+**No floor.** Nothing measured the noise. A min of two timings per candidate decided a
+verdict that is then memoized for the life of the process, and at the `max` level
+written to a file for the life of the machine. A cell whose true margin sits inside the
+run-to-run spread got a permanent answer from a coin flip.
+
+### The instrument
+
+The baseline goes into the candidate list twice, first and last — the same function
+with the same arguments. Under a position-free scheme the two entries measure one
+number, so whatever gap opens between them is position, with no model of turbo ramp or
+thread settling in between. Three schemes run on the same list: what shipped, the same
+reversed, and interleaved with a rotating start.
+
+That the effect is real and not variance shows up in the reversal. redwood, `nd24k` at
+N=1024, ratio of the two identical baseline arms:
+
+| scheme | last/first |
+|---|---|
+| sequential, shipped order | 1.240 |
+| sequential, reversed | 0.924 |
+| interleaved | 1.112 |
+
+Reverse the order and the sign reverses. That is position. What survives interleaving —
+1.112 on that cell — is not; interleaving removes the bias and cannot remove the
+variance, which is why the fix needs both halves.
+
+### One correction to make first
+
+The first version of this harness spelled out the kernel's argument list by hand. That
+list takes `tile_size` before the thread count, so the call passed the thread count as
+a tile width and left `nthreads_override` at 0, selecting a different threading policy
+from the one `matmul` uses. On Apple silicon, where the workspace path is live because
+there is no AVX2, that crippled the baseline arm and inflated every tiled margin the
+harness reported: `nd3k` at N=512 read 3.27x and is really 1.026x. The corrected
+harness calls `execute_prebuilt_binary_kernel`, deriving the call from production
+rather than restating it, and the numbers below are all from after that fix. The
+uncorrected run said every gate-admitted cell wins by 2.1–4.2x and the defect was
+therefore unreachable. That was wrong, and wrong in the direction that would have
+closed the investigation.
+
+### Both hosts
+
+The rule that shipped accepts a tiled candidate if it beats the baseline as timed. The
+rule now shipping requires the win to exceed the gap between the two identical baseline
+arms. Over the matrices whose gate actually opens:
+
+| host | cells | rules disagree | margin min / median / max | A/A interleaved |
+|---|---|---|---|---|
+| M5, N=512, rounds=2 | 21 | **5** | 0.850 / 1.038 / 1.771 | 0.912–1.179 |
+| M5, N=512, rounds=8 | 21 | **4** | 0.820 / 1.003 / 1.744 | 0.939–1.088 |
+| redwood, N=128/512/1024, rounds=2 | 14 | **2** | 0.395 / 2.552 / 5.625 | 0.907–1.034 |
+
+The exposure is host-dependent, and the reason is the gate. redwood's last-level cache
+is 36 MiB against the M5's 16, so the eligibility test admits only products that
+overflow a much larger cache, and what it admits wins by a lot — median 2.55x. The M5's
+gate admits cells whose median margin is 1.038, which is inside the floor. Same code,
+same rule, and on one host it is adjudicating landslides while on the other it is
+adjudicating coin flips.
+
+### What the disagreements actually are
+
+Every one of them is inside its own cell's floor. Not one is a proven regression:
+
+| cell | floor | margin | proven-loss threshold | verdict |
+|---|---|---|---|---|
+| M5 r8 `ship_001` | 1.065 | 0.941 | 0.939 | inside, by 0.2pp |
+| M5 r2 `TSOPF_FS_b300` | 1.045 | 1.042 | 0.957 | inside, by 0.3pp |
+| redwood r2 `crankseg_1`/512 | 1.059 | 0.952 | 0.944 | inside, by 0.8pp |
+| M5 r8 `nd3k` | 1.055 | 0.999 | 0.948 | inside, by 5.1pp |
+| redwood r2 `crankseg_1`/1024 | 1.102 | 1.022 | 0.907 | inside, by 8.0pp |
+| M5 r2 `mixtank_new` | 1.179 | 1.037 | 0.848 | inside, by 14.2pp |
+
+So the claim is not that the old rule shipped measurable regressions. It is that in
+these cells the comparison cannot be resolved at all, the point estimate is often
+unfavourable — `ship_001` sits 6.3% slower on the point estimate and 0.2 percentage
+points from being provably so — and the old rule resolved them anyway from a single
+baseline sample, then memoized the answer. The new rule declines them.
+
+Nothing that is measurable moves. Every cell whose margin clears its floor keeps its
+verdict on both hosts, in both directions: the nine real M5 wins (1.05–1.74x), the
+eight real M5 losses (0.82–0.95), redwood's `inline_1` (0.54) and `audikw_1` (0.395)
+declines, and `reddit` at 3.671 / 5.625 / 5.248 for N=128 / 512 / 1024. The tile-j and
+tile-ijk ledgers elsewhere in this document rest on `reddit` and were produced through
+`scorch.matmul` rather than by naming the kernel, so they are unaffected by either the
+defect or the harness bug.
+
+### Cost
+
+The probe goes from 18 kernel invocations to 22: one more candidate, plus re-running
+the winner for its output instead of retaining every candidate's, because one dense
+output per candidate is 950 MB for `reddit` at N=1024. The confirm goes from 6 to 9.
+Paid once per shape.
+
+The floor requirement gets *less* conservative as the measurement improves, which is
+the right shape for it: at rounds=8 the M5's disagreement count falls from 5 to 4 and
+its A/A band narrows from 0.912–1.179 to 0.939–1.088. It is a tax on having measured
+badly, not a fixed tax.
+
+### Tests
+
+22 in `tests/test_scorch/test_probe_noise_floor.py`. Negative controls: all 22 fail
+against the pre-fix module, but 13 of those fail only because the new helpers do not
+exist, so the sharper control keeps every helper and the interleaving and weakens only
+the floor requirement back to "faster than the baseline, full stop" — 4 tests fail,
+and those 4 are what the floor itself buys.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
