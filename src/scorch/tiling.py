@@ -1325,6 +1325,27 @@ def _interleaved_times(fns, rounds: int = 2) -> list:
     unchanged: one warmup plus `rounds` timings per candidate, exactly what
     timing them one at a time spent.
 
+    What a rotation does NOT do is change any candidate's predecessor -- the cyclic
+    order is fixed, so only the absolute position moves. Where arms differ wildly in
+    cost, a slow neighbour is then a per-arm offset that survives every round rather
+    than variance, and a fresh permutation each round would be the right answer. It
+    is not the right answer here, for two reasons. The list is short and its arms are
+    the same product through different kernels, so they are within a few x of each
+    other. And with the baseline entered at both ends, the two control arms have
+    DIFFERENT predecessors -- one follows a baseline, one follows the candidate -- so
+    the spread between them, which is exactly the margin `_clears_noise` demands,
+    already carries one dose of whatever the neighbour effect is worth. A shuffle
+    would also make a dispatch decision nondeterministic across runs, and that
+    decision is memoized; a verdict that varies run to run is worse than one carrying
+    a bias the margin absorbs.
+
+    The magnitude is not guesswork in one direction only: on a chunk-width grid whose
+    arms DID differ 10x in cost, rotation against a fresh permutation was measured on
+    a settled machine and the rotated order came out clean -- 0.979-1.013 on cells
+    running provably identical code, against 1.001-1.051 shuffled. So the property is
+    real but its cost here was below the floor, and a rotation is not what voided that
+    grid. See the levers section of SPMM_BEAT_MKL_RESULTS.md for what did.
+
     Results are deliberately not returned. Retaining one output per candidate
     would multiply peak memory by the candidate count, and at a wide free
     dimension a single output is hundreds of megabytes -- reddit at N=1024 is
