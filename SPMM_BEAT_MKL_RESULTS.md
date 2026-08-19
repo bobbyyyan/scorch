@@ -1960,6 +1960,263 @@ exist, so the sharper control keeps every helper and the interleaving and weaken
 the floor requirement back to "faster than the baseline, full stop" — 4 tests fail,
 and those 4 are what the floor itself buys.
 
+## Four kernel levers: two ship, one is retired by its own null, one needed a gate
+
+Four changes to the SpMM row kernels and their work-stealing policy. They are
+numbered separately from the dispatch levers earlier in this document. Each is measured
+separately, because a lever measured only in combination cannot be attributed. The
+mask lever lives inside the AVX2/FMA guard and is x86-only by construction: there is
+nothing to measure on Apple silicon and nothing there to regress.
+
+All four are timed by flipping a `SCORCH_TUNE_HOOKS` switch **within one process
+against one binary**, following the existing `SCORCH_REGTILE_BASE` precedent. That
+removes build-to-build and process-to-process variance entirely. A
+`scorch_tune_hooks()` binding lets each harness refuse to run against a build where
+its hook is inert — otherwise both arms are the same code and the harness reports a
+difference of zero, which reads as "the change did nothing" rather than as "this
+measured nothing".
+
+### The control group, and why it matters more than any of the levers
+
+The narrow-k mask change applies only where `k % 8 == 0`. Ragged `k` keeps the mask
+and its code path is untouched, so **ragged `k` is a null**: whatever the instrument
+reports there is what it reports when the true effect is exactly zero.
+
+| group | n | geomean | 95% CI | worst A/A |
+|---|---|---|---|---|
+| `k % 8 == 0`, the mask is dropped | 32 | 1.0387 | 1.017–1.061 | 1.566 |
+| ragged `k`, code unchanged (**null**) | 24 | 1.0057 | 0.998–1.014 | 1.088 |
+
+The null behaves: 1.0057, essentially one. But applying a per-cell significance test
+— is this cell's ratio outside its own two-sample A/A control — to the null group
+returns **11 of 24 "significant" cells, a 46% false-positive rate**. At a few
+percent, per-cell verdicts from a single grid are not evidence, whichever direction
+they point.
+
+That retired two findings of my own:
+
+* **The mask lever's "3 proven per-cell regressions" are not findings.** They sit
+  inside the same band the null group populates.
+* **The chunk rule's blocker dissolved.** `ogbn-arxiv` at k=64 read 0.967 against an
+  A/A of 1.020 — a 3.4% regression on a real GCN graph at a real hidden width, which
+  is exactly what the performance convention refuses to ship. Re-measured at 61
+  rounds instead of 15 it reads **1.020 with an A/A of 1.007**. The sign flipped. One
+  grid at a few percent was not enough to condemn a cell, and it very nearly cost a
+  lever worth 1.35x on that host.
+
+What survives is the group comparison against the null: difference of log-ratios
+between the applying group and the null, **+0.0323 with a standard error of 0.0117**,
+so **+3.3% at 2.8 standard errors**.
+
+One cell in the applying group has an A/A of 1.566 — the instrument declaring, in
+its own words, that two identical arms came out 57% apart. It should not be averaged
+with cells whose A/A is 1.01. Dropping the single cell whose own A/A exceeds 1.10
+(`ct20stif` at k=24, which reported 1.404):
+
+| group | n | geomean | 95% CI |
+|---|---|---|---|
+| `k % 8 == 0`, A/A ≤ 1.10 | 31 | 1.0287 | 1.019–1.039 |
+| ragged `k` (**null**) | 24 | 1.0057 | 0.998–1.014 |
+
+**+2.3% at z = 3.4** — smaller than the headline and better resolved, because the
+discarded cell contributed almost all of the scatter. 2.3% is the number to quote.
+Screening on a cell's own A/A before pooling is not the same mistake as judging a
+cell by its A/A: it discards cells the instrument disclaims, rather than promoting
+cells whose ratio happens to exceed a badly calibrated threshold.
+
+### Kernel lever 1 — the cache size, queried instead of assumed
+
+The kernels had no notion of the last-level cache. `scorch_llc_bytes()` reads the
+same sources as `tiling.query_llc` — P-cluster L2 via sysctl on macOS, largest sysfs
+cache level on Linux, `SCORCH_LLC_BYTES` overriding both.
+
+As ported, its fallback was 8 MiB unconditionally against Python's 16 on Darwin and
+36 on Linux, so the comment claiming the two layers can never disagree about the
+machine was false in exactly the case that matters — a failed query is when the
+fallback is all they have to agree on. Fallbacks now match, and the agreement is a
+test rather than a comment, because a disagreement is otherwise invisible in both
+layers.
+
+With kernel lever 3 retired, no C++ kernel gates on this. It stays because the selector's
+number has to be inspectable from a harness without the harness restating how it is
+derived — the failure mode recorded under "Scope and gaps" below.
+
+### Kernel lever 2 — no mask where the last vector is full (x86 only) — **ships**
+
+`vmaskmovps` is 2 uops on the load side and cannot fold into the FMA as a memory
+operand; its store form is worse. At k=16 half of every row's B loads were masked
+for no reason. The row kernel is now templated on whether the last vector is full,
+so the shipped build has no branch — the predicate depends only on k, so it hoists.
+Worth **+2.3%** as above.
+
+Equivalence is by construction: with all eight lanes enabled a masked load is a load
+and a masked store is a store. But the widths where that argument applies were
+exactly the widths nothing was checking, so every k from 1 to 40 is now compared
+against a dense reference — both sides of all four instantiation boundaries and the
+crossing into the wide path above 32 — plus a check that a full final vector does
+not write past its own row, which with a contiguous row-major output would corrupt
+the next row silently.
+
+The ported prefetch-distance template parameter is dropped. It had been measured as
+a wash and left in place defaulted to the original distance, so it was an unused
+template dimension.
+
+### Kernel lever 3 — non-temporal stores on the wide path — **retired, by its own null**
+
+An ordinary store to a line about to be overwritten in full still pays a
+read-for-ownership. Skipping it should be worth something when C cannot stay in
+cache, so the gate was `k >= 64` (only the 64-wide tile loop streams), `k % 16 == 0`
+(a row is a whole number of 64-byte lines, so no line is shared with the empty-row
+pre-zeroing), C larger than the last-level cache, and — the condition the ported gate
+was missing — a 32-byte-aligned base, because `vmovntps` **faults** on a misaligned
+address and has no unaligned form to fall back on.
+
+Correctness was never the problem. Output was bit-identical in all 12 cells checked,
+and the gate fired exactly where predicted. Performance was the problem. The 40-cell
+grid splits by whether the gate can fire at all, and the cells it cannot touch are a
+null:
+
+| group | n | geomean | range |
+|---|---|---|---|
+| gate fires, streaming actually used | 19 | **0.9972** | 0.975–1.028 |
+| gate provably shut (**null**) | 21 | 1.0315 | 0.966–1.620 |
+
+The null reads *higher* than the effect, and the largest number in the whole table —
+1.620, `cop20k_A` at k=72 — is a cell where `72 % 16 != 0` and no streaming store is
+ever issued. Its own A/A is 1.106, the worst in the grid.
+
+The premise is refuted rather than merely unsupported: the biggest outputs, where
+skipping the read-for-ownership should matter most, are exactly the cells at or below
+1.0 — `thermal2` writing 1199 MiB against a 36 MiB L3 reads 0.978, and `ogbn-arxiv`
+reads 0.975–0.982 across three widths. Whatever this part does for a full-line write
+already costs what the read-for-ownership would have, so there was nothing to skip.
+
+Removed: the template parameter, the alignment gate, the store fence, the hook, and
+the harness. A retired lever leaves behind a comment on `scorch_spmm_row_regtile`
+saying ordinary stores are deliberate and what the measurement was, so the next
+reader does not re-derive the idea and re-measure it. This is the only one of the
+four that would have shipped on a plausible mechanism plus a correctness check.
+
+One near-miss worth recording. Placing the `_mm_sfence()` by matching surrounding
+context put it in `spmm_csr_linear_fused_float`, where `stream_c` is not declared.
+The M5 build was clean, because the whole block is inside the AVX2 guard — so **the
+M5 is a false negative for this entire class of error**, and only an x86 compile
+catches it. Anything keyed on surrounding context in `spmm.h` needs an explicit
+function check; the anchor text recurs in both kernels.
+
+### Kernel lever 4 — the work-stealing chunk width — **ships, behind a gate**
+
+The drop-in SpMM hands rows to workers in fixed chunks through one atomic counter.
+The generic width is a load-balance rule that knows only the row count and the total
+work, so it returns 64 for almost everything. Two costs actually trade off:
+
+    steal stream   (rows / chunk) * c        c = one contended atomic
+    tail           chunk * deg * k * w      w = one nonzero of work on one core
+
+Minimising the sum gives `chunk* = rows * sqrt(K * KREF / (nnz * k))`, where `K` is
+the ratio of a contended atomic to a nonzero of work — a property of the machine, not
+of the matrix, since everything matrix-specific is already in rows, nnz and k.
+
+`K` arrived as a literal 16 fitted on one host, which the performance convention does
+not allow shipping. It is also a **weak** parameter: `chunk*` moves as `sqrt(K)`, so
+being 4x wrong in K is 2x wrong in the width. Rather than sweep K — which compresses
+exactly the axis under calibration — the response surface was mapped directly by
+sweeping the width itself, and K back-solved from the winner. Across cells and both
+hosts the implied K spans roughly **3 to 23000** against the 16 written down.
+
+That span is the reason for a gate. A model whose parameter is uncertain by three
+orders of magnitude is not entitled to act on a recommendation 6% away from the
+status quo. `SCORCH_SPMM_CHUNK_MINRATIO 2` departs from the generic width only when
+the rule asks for at least twice it; below that, the rule returns the generic width
+and the emitted schedule is unchanged. The grid rules out a threshold of 1 and cannot
+separate 1.5 from 3 (whole-grid geomean 1.138 to 1.114, inside a ±3.6% null band), so
+2 is the middle of the range the data admits rather than the value that maximises
+this grid.
+
+Ten matrices — GCN graphs, SuiteSparse, and synthetic scatter and banded — crossed
+with k in 8, 16, 32, 64, on both hosts. Shuffled arm order, every compared quantity
+entered twice, and the override installed outside the timing window:
+
+| host | fires | firing geomean | firing range | no-op cells (**null**) | mechanism null |
+|---|---|---|---|---|---|
+| M5 Max (18 threads) | 19/40 | **1.273** | 0.951–2.309 | 0.997 (0.949–1.073) | 1.007 |
+| redwood (32 threads) | 15/40 | **1.346** | 0.993–2.154 | 1.003 (0.977–1.067) | 1.000 |
+
+Three nulls, not one, and they are what make the table readable:
+
+* **The mechanism null.** The rule's own chosen width, re-requested through the
+  override — identical width, identical kernel — over all 40 cells. 1.000 on redwood,
+  1.007 on the M5. Without it, "the override is the confound" stays a live hypothesis
+  for every number in the table.
+* **The no-op cells.** Where the gate returns the generic width the two arms run
+  provably identical code, so their spread is the floor. 25 such cells on redwood, 21
+  on the M5, reading 1.003 and 0.997.
+* **Zero firing cells below either floor.** The worst firing cell on each host —
+  0.993 on redwood, 0.951 on the M5 — sits inside the band its own no-op cells
+  populate. The M5's is `pubmed` at k=8, whose mechanism null reads 1.152, the worst
+  in that grid; that cell is not resolvable, in either direction.
+
+The two hosts fire on different cells, and that is the rule working rather than
+noise: the load-balance cap is `rows / (threads * 16)`, so the M5's 18 threads leave
+more headroom than redwood's 32 and admit smaller matrices.
+
+Inertness where it matters is provable by asking the rule instead of timing it. At
+the shapes existing published ledgers depend on, the rule returns the generic width
+for **reddit at every k from 8 to 256**, and likewise for `cora`, `mouse_gene`,
+`crankseg_1` and `nd24k` — so the tile-j and tile-ijk ledgers cannot move. It is
+*not* inert on `ogbn-products`, `ogbn-arxiv` up to k=128, or `pubmed`/`citeseer` at
+small k. I had reported the gate as making the rule a no-op on the sparse autoencoder
+grid too; that was wrong, and checking it against the rule rather than restating it
+is what caught it. Two things follow. The AE @0.99 ledger is safe for a
+different reason than I gave: `spmm_csr_linear_fused_float` deliberately keeps the
+generic chunk, so everything routed through `sparse_linear` is untouched by
+construction. And the two regimes no grid cell covered — many rows at degree 3, and
+many rows at degree 25 — were then measured directly on the M5:
+
+| regime | rows | degree | k | vs generic |
+|---|---|---|---|---|
+| AE-shaped | 60,000 | 3 | 8–128 | 1.126–1.399 |
+| products-shaped | 2,449,029 | 25 | 8–128 | 0.998–1.044 |
+
+AE-shaped wins throughout. Products-shaped is neutral: it fires at every width and
+lands inside its own A/A band except at k=8, where 1.044 against an A/A of 1.004 is a
+small real win. Neither regresses.
+
+The fused Linear kernel's chunk is left generic, stated rather than defaulted: its
+workload is the autoencoder grid and it deserves its own measurement before adopting
+a rule fitted on the drop-in path's.
+
+### A measurement that started too soon, and the control that caught it
+
+The first redwood chunk grid reported a whole-grid geomean of 1.571 against the
+generic width — inflated by about 40% against the 1.120 the corrected instrument
+gives. It is void, and its own control said so before I read the table: cells where
+the rule provably returns the generic width, so both arms run identical code, read
+**2.263, 2.034, 2.858 and 3.896**, and the A/A control between two identical arms
+reached **1.332**. An instrument reporting a 3.9x difference between two runs of the
+same code has disclaimed its own output. I read 1.332 as "small enough" and went on
+to interpret 1.05 ratios as findings.
+
+Re-measured on a settled machine the same four cells read 1.004, 1.001, 1.051 and
+1.001. The cause is not what I first blamed. I attributed it to the rotating arm
+order — `j = (i + r) % n` moves each arm's absolute position but never its
+predecessor, so with a chunk ladder whose arms differ 10x in cost the neighbour
+effect is a fixed per-arm offset, not variance. That is a real property of a rotation
+and worth knowing, but it is not what happened here: under rotation, with the same
+ladder present, the corrected harness reads 0.979–1.013 on those cells. Nor is it the
+other two defects the rewrite fixed. Mutating `os.environ` inside the timing window
+costs 0.3–0.4 µs against a 60 µs kernel, and `pop` is the dearer of the two, which is
+the wrong direction. Comparing min-over-two-arms against min-over-one is worth 4–8%,
+measured by computing both estimators from one run.
+
+What is left is the machine. That grid started within seconds of a 51-minute,
+24-thread test suite finishing, and the same harness code on a settled machine gives
+1.023–1.041 on the cells that read 2.26–3.90. So: **do not start a measurement
+immediately after a long saturating job**, and the queued re-measurement now waits
+for the suite and then sleeps five minutes. The general lesson is cheaper than the
+diagnosis, though: the A/A control had already reported the run unusable, and no
+amount of care about arm order substitutes for reading it.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
