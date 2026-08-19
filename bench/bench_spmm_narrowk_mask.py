@@ -57,7 +57,13 @@ def make_arms(M, J, pos, crd, val, N, nthreads):
 
     def call(masked: str):
         os.environ["SCORCH_SPMM_MASKED"] = masked
-        return SO.spmm_csr_float_v2(*shapes, nthreads, False)
+        # Keyword, not positional: the kernel takes `tile_size` before the thread
+        # count, so a positional pair silently sets the tile width to the thread
+        # count and leaves nthreads_override at 0, which is a different threading
+        # policy from the one production uses.
+        return SO.spmm_csr_float_v2(
+            *shapes, nthreads_override=nthreads, atparallel=False
+        )
 
     return call
 

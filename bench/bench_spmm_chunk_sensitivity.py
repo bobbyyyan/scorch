@@ -1,47 +1,63 @@
-"""How much does the SpMM's work-stealing chunk width matter, and is one constant
-for the machine term defensible on more than one host?
+"""Does the SpMM work-stealing chunk rule beat the generic width it replaces?
 
 `scorch_spmm_chunk` picks rows-per-chunk from
 
     chunk* = rows * sqrt(K * KREF / (nnz * k))
 
-clamped below by the generic chunk and above by a load-balance bound. Everything
-matrix-specific is in rows, nnz and k. K is the machine term -- the cost of one
-contended atomic against the cost of one nonzero of work -- and it arrived here as
-a literal 16, fitted on one host and never measured on another. The performance
-convention does not allow shipping that.
+clamped below by the generic chunk, above by a load-balance bound, and finally
+snapped back to generic unless it asks for at least SCORCH_SPMM_CHUNK_MINRATIO
+times that width. K is the machine term -- one contended atomic over one nonzero
+of work -- and it arrived as a literal 16 fitted on one host.
 
-This maps the response surface directly instead of sweeping K, because chunk* only
-moves as sqrt(K): a 4x error in K is a 2x error in chunk, so a sweep of K would
-compress exactly the axis being calibrated. Sweeping the chunk override over a wide
-ladder gives the per-cell optimum, and any K can then be evaluated against it
-without re-running anything.
+WHAT THE FIRST VERSION OF THIS HARNESS GOT WRONG, because the correction is the
+whole reason this file looks the way it does:
 
-What it reports per cell:
+  1. It ordered arms by ROTATION, j = (i + r) % n. A rotation moves each arm's
+     absolute position but never its predecessor -- the cyclic order is fixed --
+     so it cancels the cold-start effect and leaves neighbour effects fully
+     intact. With a power-of-two chunk ladder in the arm list, the arms are not
+     equal-cost: chunk=1 makes every row a contended atomic. The generic-width
+     arm always ran directly after chunk=32, and the two control arms sat at
+     indices 0 and n-1, always after the cheapest arm on the ladder. That is a
+     bias, not variance, and it survived every round. It reported cells where the
+     rule provably changes nothing (rule and override both resolve to 64) as
+     2.26x and 3.90x wins, largest exactly where per-call contention dominates
+     the runtime and absent on the big memory-bound matrices.
+  2. It mutated os.environ INSIDE the timed region, so one arm paid a putenv and
+     the other an unsetenv.
+  3. It compared min-over-two-arms for the rule against min-over-one for the
+     generic width. Min of more samples is smaller; the estimators must match.
+
+So: arms are randomly permuted every round, the override is set before the clock
+starts, and every quantity that gets compared is entered twice.
+
+The control that decides whether any of this is measurable at all is `mech`: the
+rule's OWN chosen width, requested through the override. Identical width, identical
+kernel, so it must read 1.000. Whatever it does read is this instrument's noise
+floor, and no vs_gen may be believed inside it.
+
+Columns:
   generic   the width the rule replaces -- the status quo
   formula   the width the shipped rule picks (read from the kernel, not restated)
-  best      the best width ON THE LADDER, which is powers of two only
-  vs_gen    time at the generic width over time at the rule's width, > 1 = the
-            rule is faster than what it replaces. This is the decision.
-  vs_best   time at the rule's width over time at the best ladder rung. NOT a
-            per-cell oracle: the rule picks widths like 104 and 698, which are not
-            on a power-of-two ladder, so this can come out below 1 and does.
-  K_implied what K the winning ladder rung would have required
-
-The decision this feeds: if the loss at K=16 is small on both hosts, and the
-implied-K distributions overlap, one constant is justified by measurement. If they
-do not overlap, K has to be derived on the host rather than written down.
+  vs_gen    time at generic / time at the rule's width. > 1 = the rule is faster.
+            THE DECISION.
+  mech      time at the rule's width / same width via the override. Must be 1.000.
+  A/A       widest same-width pair, i.e. this cell's floor.
+  best      best width on the power-of-two ladder (--ladder only)
+  K_impl    what K the winning rung implies (--ladder only)
 
 Needs an instrumented build (SCORCH_TUNE_HOOKS) for the chunk override.
 
 Usage:
-  python bench/bench_spmm_chunk_sensitivity.py --mtxdir DIR --matrices a,b --Ks 8,16,32
+  python bench/bench_spmm_chunk_sensitivity.py --mtxdir DIR --matrices a,b \
+      [--ladder] [--order shuffle|rotate] [--rounds N]
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 
@@ -76,16 +92,33 @@ def chunk_ladder(rows: int) -> list:
     return out
 
 
-def interleaved(arms, rounds):
-    n = len(arms)
+def timed_min(specs, rounds, order, seed=0):
+    """Time each arm `rounds` times and keep its own minimum.
+
+    specs is a list of (setup, run) pairs: setup happens OUTSIDE the clock, so the
+    cost of installing an override is never charged to the arm that needs one.
+
+    order='shuffle' draws a fresh permutation every round, which is what makes a
+    neighbour effect show up as variance -- visible in the A/A control -- instead
+    of as a fixed per-arm offset. order='rotate' reproduces the original defect and
+    exists only so the difference can be shown rather than asserted.
+    """
+    n = len(specs)
     best = [float("inf")] * n
-    for fn in arms:
-        fn()
+    rng = random.Random(seed)
+    for setup, run in specs:
+        setup()
+        run()
     for r in range(rounds):
-        for i in range(n):
-            j = (i + r) % n
+        if order == "shuffle":
+            visit = rng.sample(range(n), n)
+        else:
+            visit = [(i + r) % n for i in range(n)]
+        for j in visit:
+            setup, run = specs[j]
+            setup()
             t0 = time.perf_counter()
-            arms[j]()
+            run()
             dt = time.perf_counter() - t0
             if dt < best[j]:
                 best[j] = dt
@@ -99,13 +132,24 @@ def implied_k(chunk: int, rows: int, nnz: int, k: int) -> float:
     return (chunk / rows) ** 2 * nnz * k / KREF
 
 
+def spread(a: float, b: float) -> float:
+    return max(a, b) / min(a, b)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mtxdir", required=True)
     ap.add_argument("--matrices", required=True)
     ap.add_argument("--Ks", default="8,16,32,64")
-    ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--rounds", type=int, default=9)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--order", choices=("shuffle", "rotate"), default="shuffle")
+    ap.add_argument(
+        "--ladder",
+        action="store_true",
+        help="also sweep the power-of-two chunk ladder. Adds arms whose cost spans "
+        "10x, which is what made neighbour bias large enough to see.",
+    )
     args = ap.parse_args()
 
     if args.threads:
@@ -118,11 +162,17 @@ def main():
             "SCORCH_BUILD_TUNE_HOOKS=1."
         )
         sys.exit(2)
-    print(f"threads={nthreads}  rounds={args.rounds}  KREF={KREF}")
     print(
-        f"\n{'matrix':<18}{'k':>5}{'rows':>9}{'generic':>8}{'formula':>9}"
-        f"{'best':>8}{'vs_gen':>8}{'vs_best':>8}{'A/A':>7}{'K_impl':>9}"
+        f"threads={nthreads}  rounds={args.rounds}  KREF={KREF}  "
+        f"order={args.order}  ladder={args.ladder}"
     )
+    head = (
+        f"\n{'matrix':<18}{'k':>5}{'rows':>9}{'generic':>8}{'formula':>9}"
+        f"{'vs_gen':>8}{'mech':>7}{'A/A':>7}"
+    )
+    if args.ladder:
+        head += f"{'best':>8}{'K_impl':>9}"
+    print(head)
 
     rows_out = []
     for name in args.matrices.split(","):
@@ -138,89 +188,135 @@ def main():
             B = torch.randn(J, k, dtype=torch.float32)
             shapes = ([M, k], [M, J], Aidx, tv, [J, k], [[], []], B.reshape(-1))
 
-            def call(chunk):
-                if chunk is None:
-                    os.environ.pop("SCORCH_SPMM_CHUNK", None)
-                else:
-                    os.environ["SCORCH_SPMM_CHUNK"] = str(chunk)
+            def setup(chunk):
+                def go():
+                    if chunk is None:
+                        os.environ.pop("SCORCH_SPMM_CHUNK", None)
+                    else:
+                        os.environ["SCORCH_SPMM_CHUNK"] = str(chunk)
+
+                return go
+
+            def run():
                 return SO.spmm_csr_float_v2(
                     *shapes, nthreads_override=nthreads, atparallel=False
                 )
 
-            # Clear the override BEFORE asking the rule what it would pick. The
-            # override short-circuits the rule, and the arms below set it, so a
-            # leftover from the previous cell is read back as "the rule chose this".
-            # With a rotating start the leftover is deterministic, which makes the
-            # wrong number look stable across every row of the table.
+            # Clear the override BEFORE asking the rule what it would pick: the
+            # override short-circuits the rule, so a leftover from the previous
+            # cell reads back as "the rule chose this".
             os.environ.pop("SCORCH_SPMM_CHUNK", None)
-            formula = SO.scorch_spmm_chunk(M, nnz, k, nthreads)
+            # The thread count the KERNEL resolves, not the one this process asked
+            # for. They differ -- omp_get_num_procs() reports 32 on a 24-physical-
+            # core part -- and using torch's number attributed the kernel's chunk to
+            # a thread count it never used.
+            kernel_nt = SO.scorch_spmm_nthreads(nnz * k, M, nthreads)
+            formula = SO.scorch_spmm_chunk(M, nnz, k, kernel_nt)
             generic = SO.scorch_chunk_generic(M, nnz * k, GRAIN_SPMM)
-            ladder = chunk_ladder(M)
-            # The formula's own setting appears twice, at both ends: the A/A control.
-            arms = [lambda: call(None)]
-            arms += [(lambda c=c: call(c)) for c in ladder]
-            arms.append(lambda: call(None))
-            times = interleaved(arms, args.rounds)
-            t_f1, t_f2 = times[0], times[-1]
-            aa = max(t_f1, t_f2) / min(t_f1, t_f2)
-            t_formula = min(t_f1, t_f2)
-            best_i = min(range(1, len(arms) - 1), key=lambda i: times[i])
-            best_chunk = ladder[best_i - 1]
-            t_best = times[best_i]
-            loss = t_formula / t_best
-            # The status quo: the generic width, timed on the same ladder. This is
-            # the comparison that decides whether the rule should ship at all.
-            t_generic = (
-                times[1 + ladder.index(generic)] if generic in ladder else float("nan")
+
+            # Every compared quantity is entered twice, and `mech` re-requests the
+            # rule's own width through the override: same width, same kernel, so it
+            # is a null by construction and reads this cell's noise floor.
+            tags = ["rule", "rule", "mech", "mech", "gen", "gen"]
+            chunks = [None, None, formula, formula, generic, generic]
+            ladder = chunk_ladder(M) if args.ladder else []
+            for c in ladder:
+                tags.append("lad")
+                chunks.append(c)
+            specs = [(setup(c), run) for c in chunks]
+            times = timed_min(specs, args.rounds, args.order)
+
+            t_rule = min(times[0], times[1])
+            t_mech = min(times[2], times[3])
+            t_gen = min(times[4], times[5])
+            vs_gen = t_gen / t_rule
+            mech = t_rule / t_mech
+            aa = max(
+                spread(times[0], times[1]),
+                spread(times[2], times[3]),
+                spread(times[4], times[5]),
             )
-            vs_gen = t_generic / t_formula  # > 1 means the rule beat the status quo
-            ki = implied_k(best_chunk, M, nnz, k)
+            line = (
+                f"{name:<18}{k:>5}{M:>9}{generic:>8}{formula:>9}"
+                f"{vs_gen:>8.3f}{mech:>7.3f}{aa:>7.3f}"
+            )
+            best_chunk, ki = 0, float("nan")
+            if ladder:
+                lo = 6
+                best_i = min(range(lo, len(times)), key=lambda i: times[i])
+                best_chunk = ladder[best_i - lo]
+                ki = implied_k(best_chunk, M, nnz, k)
+                line += f"{best_chunk:>8}{ki:>9.1f}"
+            print(line, flush=True)
             rows_out.append(
-                (name, k, M, formula, best_chunk, loss, aa, ki, generic, vs_gen)
-            )
-            print(
-                f"{name:<18}{k:>5}{M:>9}{generic:>8}{formula:>9}{best_chunk:>8}"
-                f"{vs_gen:>8.3f}{loss:>8.3f}{aa:>7.3f}{ki:>9.1f}"
+                dict(
+                    name=name,
+                    k=k,
+                    rows=M,
+                    generic=generic,
+                    formula=formula,
+                    vs_gen=vs_gen,
+                    mech=mech,
+                    aa=aa,
+                    best=best_chunk,
+                    ki=ki,
+                    noop=(formula == generic),
+                )
             )
     os.environ.pop("SCORCH_SPMM_CHUNK", None)
 
-    print("\n" + "=" * 76)
-    gains = sorted(r[9] for r in rows_out if r[9] == r[9])
-    if gains:
-        ggeo = float(np.exp(np.mean(np.log(gains))))
+    def geo(xs):
+        return float(np.exp(np.mean(np.log(xs)))) if xs else float("nan")
+
+    print("\n" + "=" * 78)
+    mechs = sorted(r["mech"] for r in rows_out)
+    aas = sorted(r["aa"] for r in rows_out)
+    print(
+        f"MECHANISM NULL, same width through the override: n={len(mechs)} "
+        f"geomean {geo(mechs):.3f}  range {mechs[0]:.3f}-{mechs[-1]:.3f}"
+    )
+    print(
+        f"same-width A/A pairs:                            "
+        f"range {aas[0]:.3f}-{aas[-1]:.3f}"
+    )
+    print("  Nothing below is believable inside these two bands.\n")
+
+    # Cells where the rule returns the generic width run identical code, so their
+    # vs_gen is a second, independent null -- and it is the one that caught the
+    # rotation bias.
+    noop = sorted(r["vs_gen"] for r in rows_out if r["noop"])
+    fires = sorted(r["vs_gen"] for r in rows_out if not r["noop"])
+    if noop:
         print(
-            f"the rule against the GENERIC width it replaces: n={len(gains)} "
-            f"geomean {ggeo:.3f}  min {gains[0]:.3f}  max {gains[-1]:.3f}"
+            f"NO-OP cells (rule returns generic, identical code): n={len(noop)} "
+            f"geomean {geo(noop):.3f}  range {noop[0]:.3f}-{noop[-1]:.3f}"
         )
-        print("  (> 1 means the rule is faster than the status quo)")
-    losses = sorted(r[5] for r in rows_out)
-    aas = sorted(r[6] for r in rows_out)
-    geo = float(np.exp(np.mean(np.log(losses))))
-    print(
-        f"the rule vs the best POWER-OF-TWO width (not an oracle): n={len(losses)} "
-        f"geomean {geo:.3f}  median {losses[len(losses) // 2]:.3f}  max {losses[-1]:.3f}"
-    )
-    print(f"A/A control on the formula's own width:        {aas[0]:.3f}-{aas[-1]:.3f}")
-    # Only cells where the rule departs from the generic clamp say anything about K;
-    # where it returns the generic width, K never entered the answer.
-    # SCORCH_CHUNK_MAX is 64, so the generic chunk can never exceed it: a pick wider
-    # than 64 rows can only have come from the rule's own analytic term, and a pick
-    # of exactly 64 or below means the generic clamp decided and K never entered.
-    binding = [r for r in rows_out if r[3] > 64]
-    print(
-        f"\ncells where the rule's own term binds (formula > 64 rows): "
-        f"{len(binding)}/{len(rows_out)}"
-    )
-    if binding:
-        ks = sorted(r[7] for r in binding)
+    if fires:
         print(
-            f"  K implied by the winning width: min {ks[0]:.1f} "
+            f"cells where the rule FIRES: n={len(fires)} geomean {geo(fires):.3f}  "
+            f"range {fires[0]:.3f}-{fires[-1]:.3f}"
+        )
+        if noop:
+            below = [x for x in fires if x < noop[0]]
+            print(
+                f"  firing cells below the no-op null's floor ({noop[0]:.3f}): "
+                f"{len(below)}"
+            )
+    allg = sorted(r["vs_gen"] for r in rows_out)
+    print(
+        f"whole grid: n={len(allg)} geomean {geo(allg):.3f}  "
+        f"min {allg[0]:.3f}  max {allg[-1]:.3f}"
+    )
+
+    binding = [r for r in rows_out if r["formula"] > 64 and r["best"]]
+    if binding:
+        ks = sorted(r["ki"] for r in binding)
+        print(
+            f"\nK implied by the winning rung, over the {len(binding)} cells where "
+            f"the rule's own term binds: min {ks[0]:.1f} "
             f"median {ks[len(ks) // 2]:.1f} max {ks[-1]:.1f}"
         )
         print("  (the shipped constant is 16; compare across hosts before trusting it)")
-    else:
-        print("  the generic clamp bound every cell -- K is inert on this grid")
-    print("\nA cell only counts if its loss is outside its own A/A control.")
 
 
 if __name__ == "__main__":
