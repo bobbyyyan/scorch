@@ -1308,16 +1308,79 @@ def _learned_decide(a, b, M, J, N, nnz, C, model):
     return ("v2", None)
 
 
+def _interleaved_times(fns, rounds: int = 2) -> list:
+    """Time each candidate `rounds` times with the candidates INTERLEAVED, and
+    return the best (minimum) seconds for each, in input order.
+
+    Timing one candidate to completion before starting the next -- which is what
+    this replaces -- hands whatever runs later a machine the earlier candidates
+    warmed: on a turbo or hybrid part the clock is still ramping and the OpenMP
+    team has not settled. It mattered here in a specific way: the caller's
+    baseline is always the first candidate, so the safe fallback was the one arm
+    that never ran on a warm machine, in the routine whose whole purpose is to
+    guarantee we never lose to it.
+
+    Every candidate is warmed before any is timed, then each round runs them all,
+    rotating the start so no candidate keeps the first slot. The call budget is
+    unchanged: one warmup plus `rounds` timings per candidate, exactly what
+    timing them one at a time spent.
+
+    Results are deliberately not returned. Retaining one output per candidate
+    would multiply peak memory by the candidate count, and at a wide free
+    dimension a single output is hundreds of megabytes -- reddit at N=1024 is
+    950 MB. The caller re-runs the winner for its output instead, which costs one
+    call against a budget of three per candidate.
+    """
+    n = len(fns)
+    best = [float("inf")] * n
+    for fn in fns:
+        fn()
+    for r in range(rounds):
+        for i in range(n):
+            j = (i + r) % n
+            t0 = time.perf_counter()
+            fns[j]()
+            dt = time.perf_counter() - t0
+            if dt < best[j]:
+                best[j] = dt
+    return best
+
+
+def _clears_noise(t_tiled: float, t_first: float, t_last: float) -> bool:
+    """Does a tiled candidate beat the baseline by more than the measurement can
+    explain?
+
+    `t_first` and `t_last` are two timings of the SAME baseline function with the
+    same arguments, entered at opposite ends of the candidate list -- an A/A
+    control, measured on this machine, for this shape, in this probe. Their ratio
+    is what this cell's noise floor actually is; the house rule is that nothing
+    inside the noise floor counts, and this is where a selector can apply it
+    without a tuned constant, because it measures the floor rather than assuming
+    one.
+
+    The comparison is deliberately doubly conservative: the baseline is the
+    *faster* of the two identical arms, and the tiled candidate must beat it by
+    more than the *spread* between them. So a cell whose true margin is inside
+    the floor fails closed to the baseline. That trades an unmeasurable win --
+    which we could not have claimed anyway -- against an unbounded regression:
+    the probe memoizes its verdict permanently, so a coin flip decided by noise
+    is not a one-call mistake, it is every subsequent call on that shape.
+    """
+    base = t_first if t_first < t_last else t_last
+    spread = (t_last / t_first) if t_last > t_first else (t_first / t_last)
+    return t_tiled * spread < base
+
+
 def _confirm_vs_baseline(
     a, b, result_shape, kind, param, nt, baseline_fn, nthreads, epilogue=None
 ):
     """One-shot confirm: time {predicted winner, the caller's baseline} once each and
     keep the faster.
 
-    Guarantees no-regression against *that caller's own baseline* for a level that
-    does not run the full ladder probe, at 6 kernel invocations (2 candidates x 1
-    warmup + 2 timed) against the probe's 18. Memoized by the caller, so a shape
-    pays this once.
+    Keeps a level that does not run the full ladder probe no-slower than *that
+    caller's own baseline*, at 9 kernel invocations (3 entries x 1 warmup + 2
+    timed; the baseline is entered twice as its own control) against the probe's
+    22. Memoized by the caller, so a shape pays this once.
 
     ``epilogue`` is timed as part of the tiled candidate. A caller whose baseline
     folds an elementwise tail into the SpMM -- ``scorch.compile``'s fused
@@ -1335,21 +1398,24 @@ def _confirm_vs_baseline(
         )
     win = run if epilogue is None else (lambda: epilogue(run()))
 
-    def _t(fn):
-        fn()
-        best = float("inf")
-        for _ in range(2):
-            t0 = time.perf_counter()
-            fn()
-            best = min(best, time.perf_counter() - t0)
-        return best
+    def base():
+        return baseline_fn(nthreads)
+
+    # The baseline is entered TWICE, at both ends, and the three are interleaved.
+    # Two reasons. Order: timing the tiled candidate first and the baseline second
+    # -- which is what this used to do -- gave the baseline the warmer machine, so
+    # this level was biased the opposite way from the ladder probe below, and
+    # neither bias was measured. Floor: two timings of the same baseline are an A/A
+    # control, and without one there is no way to tell a real 3% win from noise
+    # before memoizing the verdict for good. See _interleaved_times, _clears_noise.
+    t_first, t_win, t_last = _interleaved_times([base, win, base])
 
     # The "v2" sentinel keeps its historical name at every level of this module and
     # in the on-disk cache; it means "run the caller's own baseline path", which is
     # the drop-in SpMM for `matmul` and the fused kernel for `scorch.compile`.
-    return (
-        (kind, param) if _t(win) < _t(lambda: baseline_fn(nthreads)) else ("v2", None)
-    )
+    if _clears_noise(t_win, t_first, t_last):
+        return (kind, param)
+    return ("v2", None)
 
 
 def maybe_dispatch(
@@ -1366,8 +1432,17 @@ def maybe_dispatch(
     """Return (result, used_tiled: bool) or None to signal "use the caller's own
     baseline path". Only ever returns a tiled kernel (tile-j / tile-ijk) when it
     has been MEASURED (balanced/max probe, or the one-shot confirm) to beat
-    `baseline_fn` on this shape: the baseline is always a candidate, so the
-    memoized route is never slower than it -> no regression by construction.
+    `baseline_fn` on this shape by more than that measurement's own noise floor.
+
+    The baseline is entered as a candidate twice, at both ends of the list, and
+    every candidate is timed interleaved. So the baseline is never the only arm
+    timed on a cold machine, and the two identical baseline arms give the probe an
+    A/A control for this exact cell -- which is what "beat it" is measured
+    against. A tiled candidate whose win is inside that floor fails closed to the
+    baseline. Being a candidate is not on its own enough to make the guarantee
+    true: the verdict is memoized for the process, and at "max" persisted for the
+    machine, so a margin decided by noise is not one bad call but every later call
+    on that shape.
 
     `baseline_fn(nthreads)` is the caller's own alternative, and `baseline_tag`
     names it. Two callers dispatch this kernel family and they are asking different
@@ -1542,24 +1617,16 @@ def maybe_dispatch(
     # coarse Jc ladder {base,/2,/4,/8} grabs the uniform-random (appu-like) tail
     # where base overshoots. Because the relayout runs INSIDE spmm_csr_float_tileijk,
     # timing that call accounts for the relayout honestly against tile-j and v2.
-    def _time(fn, out_holder):
-        fn()  # warmup (also fills caches / builds any relaid buffer once)
-        best = float("inf")
-        r = None
-        for _ in range(2):
-            t0 = time.perf_counter()
-            r = fn()
-            best = min(best, time.perf_counter() - t0)
-        out_holder[0] = r
-        return best
-
     def _tailed(fn):
         """Charge the caller's elementwise tail to a tiled candidate's clock."""
         return fn if epilogue is None else (lambda: epilogue(fn()))
 
+    def _baseline():
+        return baseline_fn(nthreads)
+
     # Heterogeneous param slot (None | Jc int | (Nc,Jc) tuple) -> annotate `list`.
     # The baseline needs no `_tailed`: a fused baseline already folds its own tail.
-    cands: list = [("v2", None, lambda: baseline_fn(nthreads))]
+    cands: list = [("v2", None, _baseline)]
     for jc in _jc_ladder(Jc):
         cands.append(
             (
@@ -1585,13 +1652,31 @@ def maybe_dispatch(
             )
         )
 
-    best_t = float("inf")
-    best_kind, best_param, best_out = "v2", None, None
-    for kind, param, fn in cands:
-        holder = [None]
-        t = _time(fn, holder)
-        if t < best_t:
-            best_t, best_kind, best_param, best_out = t, kind, param, holder[0]
+    # The baseline again, at the far end of the list: the same function with the
+    # same arguments as cands[0]. Two identical arms at opposite ends are this
+    # cell's A/A control, so the probe measures its own noise floor instead of
+    # assuming one, and they bracket the tiled candidates so no candidate is
+    # compared against a baseline timed only on a cold machine.
+    cands.append(("v2", None, _baseline))
+
+    # Interleaved, not one candidate at a time -- see _interleaved_times.
+    times = _interleaved_times([fn for _, _, fn in cands])
+    t_first, t_last = times[0], times[-1]
+
+    # The winner is chosen among the tiled candidates only; both baseline entries
+    # are controls, and either one winning means the same thing (route to v2).
+    best_i, best_t = -1, float("inf")
+    for i in range(1, len(cands) - 1):
+        if times[i] < best_t:
+            best_i, best_t = i, times[i]
+
+    if best_i < 0 or not _clears_noise(best_t, t_first, t_last):
+        # Inside the floor, or no tiled candidate at all: fail closed to the
+        # baseline. A verdict here is memoized for the process (and for the
+        # machine, at "max"), so guessing from noise is not a one-call error.
+        best_kind, best_param = "v2", None
+    else:
+        best_kind, best_param = cands[best_i][0], cands[best_i][1]
 
     _decision[memo_key] = (best_kind, best_param)
     if level == "max":
@@ -1601,4 +1686,8 @@ def maybe_dispatch(
         return None  # caller runs its own baseline + populates time_dict itself
     if time_dict is not None:
         time_dict["eval_time"] = best_t  # the winning kernel's measured time
-    return best_out, True
+    # Re-run the winner for its output rather than retaining every candidate's:
+    # one dense output per candidate is hundreds of megabytes at a wide free
+    # dimension. One call on a budget of three per candidate, and only on the
+    # tiled branch -- when the baseline wins, the caller runs it anyway.
+    return cands[best_i][2](), True
