@@ -574,6 +574,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
           "Number of live entries across both ABI validation memos");
 
+    // The cache size the KERNEL gates on, so a test can check it against the one
+    // tiling.query_llc gates on. Two gates that disagree about the machine would
+    // route a product to a tiled kernel the kernel then declines to stream for, and
+    // nothing in either layer would report the disagreement.
+    m.def("scorch_llc_bytes", &scorch_llc_bytes,
+          "Effective last-level cache in bytes, as the kernels compute it");
+
     // The same fused structural pass, offered to Scorch's own Python-side validator.
     //
     // `_validate_index_storage` in storage.py runs on every STensor built over a

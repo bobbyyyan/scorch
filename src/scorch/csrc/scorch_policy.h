@@ -56,8 +56,10 @@
 // back-to-back threads x chunk sweep can force any cell in-process via env, with
 // NO rebuild per cell. The shipped library defines nothing -> these evaporate and
 // the helpers are pure computation (zero getenv overhead).
-#ifdef SCORCH_TUNE_HOOKS
+#include <cstdio>     // scorch_llc_bytes reads sysfs on Linux
 #include <cstdlib>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 // --- Per-host autotune overrides (optional, generated, gitignored) -----------
@@ -136,6 +138,58 @@ inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRA
     if (e && *e) { long f = std::atol(e); if (f > 0) n = (f > hw) ? hw : f; } }
 #endif
   return (int)n;
+}
+
+// Effective last-level cache in bytes, queried from the OS -- no hardcoded
+// constant. Same sources and the same SCORCH_LLC_BYTES override as
+// tiling.query_llc on the Python side, so a kernel gate and a selector gate never
+// disagree about the machine. Linux: the largest cache level in sysfs (L3 where
+// there is one). macOS: the P-cluster L2, which is the binding cache for SpMM on
+// Apple silicon (the SLC is not exposed). Cached on first call.
+inline long scorch_llc_bytes() {
+  static const long cached = [] {
+    if (const char* e = std::getenv("SCORCH_LLC_BYTES")) {
+      if (*e) { long v = std::atol(e); if (v > 0) return v; }
+    }
+    long best = 0;
+#if defined(__APPLE__)
+    for (const char* key : {"hw.perflevel0.l2cachesize", "hw.l2cachesize"}) {
+      int64_t v = 0; size_t len = sizeof(v);
+      if (sysctlbyname(key, &v, &len, nullptr, 0) == 0 && v > 0) {
+        best = (long)v; break;
+      }
+    }
+#elif defined(__linux__)
+    for (int idx = 0; idx < 10; idx++) {
+      char path[128];
+      std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
+      FILE* f = std::fopen(path, "r");
+      if (!f) continue;
+      char buf[32] = {0};
+      if (std::fgets(buf, sizeof(buf), f)) {
+        long mult = 1;
+        for (char* q = buf; *q; ++q) {
+          if (*q == 'K') { mult = 1024; *q = 0; break; }
+          if (*q == 'M') { mult = 1024 * 1024; *q = 0; break; }
+          if (*q == '\n') { *q = 0; break; }
+        }
+        const long n = std::atol(buf) * mult;
+        if (n > best) best = n;
+      }
+      std::fclose(f);
+    }
+#endif
+    // Same fallback as tiling.query_llc, per platform. A different one here would
+    // make the claim above false in exactly the case it matters -- the query
+    // failing is when the two gates have nothing but the fallback to agree on.
+#if defined(__APPLE__)
+    return best > 0 ? best : (long)(16 << 20);
+#else
+    return best > 0 ? best : (long)(36 << 20);
+#endif
+  }();
+  return cached;
 }
 
 // Adaptive schedule chunk: ~SCORCH_CHUNKS_PER_THREAD dynamic chunks per worker.

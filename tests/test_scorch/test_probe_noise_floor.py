@@ -335,3 +335,44 @@ def test_the_confirm_accepts_a_win_that_clears_its_floor():
 def test_the_confirm_declines_a_candidate_slower_than_the_baseline():
     verdict, _fns = _confirm([1.00, 1.50, 1.00])
     assert verdict == ("v2", None)
+
+
+# ---------------------------------------------------------------------------
+# the kernel gate and the selector gate must agree about the machine
+# ---------------------------------------------------------------------------
+def test_the_kernel_and_the_selector_read_the_same_cache_size():
+    """Both layers gate on the last-level cache; a disagreement is invisible.
+
+    `tiling.query_llc` decides whether a product is eligible for a tiled kernel at
+    all, and the kernels' own `scorch_llc_bytes` decides whether the wide path may
+    stream its stores. They query the same sysctl keys on macOS and the same sysfs
+    entries on Linux, and honour the same SCORCH_LLC_BYTES override, so they should
+    return one number -- but nothing enforced it, and neither layer would report a
+    disagreement. It would show up only as a product routed to a tiled kernel that
+    then declines to stream, or the reverse.
+    """
+    scorch_ops = pytest.importorskip("scorch_ops")
+    if not hasattr(scorch_ops, "scorch_llc_bytes"):
+        pytest.skip("extension predates the scorch_llc_bytes binding")
+    assert scorch_ops.scorch_llc_bytes() == tiling.query_llc()
+
+
+def test_both_cache_queries_honour_the_same_override():
+    import os
+    import subprocess
+    import sys
+
+    scorch_ops = pytest.importorskip("scorch_ops")
+    if not hasattr(scorch_ops, "scorch_llc_bytes"):
+        pytest.skip("extension predates the scorch_llc_bytes binding")
+    # The C++ side caches on first call and the Python side caches in a module
+    # global, so the override has to be set before either runs -- hence a
+    # subprocess rather than monkeypatching the environment in place.
+    env = dict(os.environ, SCORCH_LLC_BYTES="1048576")
+    out = subprocess.check_output(
+        [sys.executable, "-c",
+         "import scorch_ops, scorch.tiling as t;"
+         "print(scorch_ops.scorch_llc_bytes(), t.query_llc())"],
+        env=env, text=True,
+    ).split()
+    assert out == ["1048576", "1048576"]
