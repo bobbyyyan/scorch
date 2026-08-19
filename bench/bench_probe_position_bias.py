@@ -43,9 +43,12 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import scorch  # noqa: E402
 from scorch.stensor import STensor  # noqa: E402
-from scorch import tiling  # noqa: E402
+from scorch import ops, tiling  # noqa: E402
+from scorch.prebuilt_kernels import (  # noqa: E402
+    execute_prebuilt_binary_kernel,
+    resolve_prebuilt_matmul,
+)
 
 _ops = tiling._ops
 
@@ -76,8 +79,10 @@ def synthetic_scatter(rows: int, degree: int, cols: int, seed: int) -> "torch.Te
     indices = indices.reshape(-1)
     values = g.standard_normal(rows * degree).astype(np.float32)
     return torch.sparse_csr_tensor(
-        torch.from_numpy(indptr), torch.from_numpy(indices),
-        torch.from_numpy(values), size=(rows, cols),
+        torch.from_numpy(indptr),
+        torch.from_numpy(indices),
+        torch.from_numpy(values),
+        size=(rows, cols),
     )
 
 
@@ -92,12 +97,14 @@ def load_bin(path: str):
     return torch.sparse_csr_tensor(
         torch.from_numpy(pos.astype(np.int64)),
         torch.from_numpy(crd.astype(np.int64)),
-        torch.from_numpy(val), size=(int(M), int(J)),
+        torch.from_numpy(val),
+        size=(int(M), int(J)),
     )
 
 
 def load_mtx(name: str):
     from scipy.io import mmread
+
     for d in SS_DIRS:
         p = os.path.join(d, name, f"{name}.mtx")
         if not os.path.exists(p):
@@ -107,7 +114,8 @@ def load_mtx(name: str):
             return torch.sparse_csr_tensor(
                 torch.from_numpy(m.indptr.astype(np.int64)),
                 torch.from_numpy(m.indices.astype(np.int64)),
-                torch.from_numpy(m.data), size=m.shape,
+                torch.from_numpy(m.data),
+                size=m.shape,
             )
     raise FileNotFoundError(name)
 
@@ -121,33 +129,62 @@ def build_candidates(a, b, nthreads) -> Tuple[List[Tuple[str, object, Callable]]
     nnz = int(idx[1][1].numel())
     C = tiling.query_llc()
     result_shape = [M, N]
-    nt = nthreads if nthreads is not None else -1
     Jc = tiling._panel_width(N, C)
 
     info = {
-        "M": M, "J": J, "N": N, "nnz": nnz, "C": C, "Jc": Jc,
+        "M": M,
+        "J": J,
+        "N": N,
+        "nnz": nnz,
+        "C": C,
+        "Jc": Jc,
         "eligible": tiling._eligible(J, nnz, N, C),
         "scattered": tiling._scattered(a, J),
     }
 
+    # The baseline must be the call PRODUCTION makes, derived from production
+    # rather than re-implemented here. Spelling out the kernel arguments got the
+    # positional `tile_size` parameter wrong -- it took the thread count -- and left
+    # nthreads_override at 0, which selects a different threading policy from the
+    # one `matmul` uses. A harness that mis-times the baseline overstates every
+    # tiled margin it reports, which is the one number this file exists to produce.
+    resolved = resolve_prebuilt_matmul(a, b, output_format="dd")
+    hint_threads, atparallel = ops._composition_hints(resolved)
+
     def baseline():
-        return _ops.spmm_csr_float_v2(
-            result_shape, a.shape, a._native_mode_indices(), a.values,
-            b.shape, b._native_mode_indices(), b.values, nthreads, False,
+        result, _shape = execute_prebuilt_binary_kernel(
+            resolved.fn, a, b, nthreads=hint_threads, atparallel=atparallel
         )
+        return result
+
+    # maybe_dispatch passes `nthreads if nthreads is not None else -1` to the tiled
+    # kernels; mirror that so the tiled arms are configured as production would.
+    nt = hint_threads if hint_threads is not None else -1
 
     cands: list = [("base@first", None, baseline)]
     for jc in tiling._jc_ladder(Jc):
-        cands.append(("tilej", jc, lambda jc=jc: _ops.spmm_csr_float_tilej(
-            *tiling._tilej_args(a, b, result_shape, jc, nt))))
+        cands.append(
+            (
+                "tilej",
+                jc,
+                lambda jc=jc: _ops.spmm_csr_float_tilej(
+                    *tiling._tilej_args(a, b, result_shape, jc, nt)
+                ),
+            )
+        )
     if tiling._HAS_TILEIJK and N >= tiling._NIJK_MIN:
         Nc, Jc_ijk = tiling._ijk_params(N, M, J, C)
         if Nc < N:
             info["ijk"] = (Nc, Jc_ijk)
-            cands.append(("tileijk", (Nc, Jc_ijk),
-                          lambda: _ops.spmm_csr_float_tileijk(
-                              *tiling._tileijk_args(
-                                  a, b, result_shape, Nc, Jc_ijk, nt))))
+            cands.append(
+                (
+                    "tileijk",
+                    (Nc, Jc_ijk),
+                    lambda: _ops.spmm_csr_float_tileijk(
+                        *tiling._tileijk_args(a, b, result_shape, Nc, Jc_ijk, nt)
+                    ),
+                )
+            )
     # The A/A twin: identical function, identical arguments, last position.
     cands.append(("base@last", None, baseline))
     return cands, info
@@ -194,16 +231,19 @@ def run_cell(label, a_t, N, nthreads, rounds, reps):
     bst = STensor.from_torch(b)
     cands, info = build_candidates(a, bst, nthreads)
     if not info["eligible"] or not info["scattered"]:
-        print(f"{label:<22}{N:>6}   gate closed "
-              f"(eligible={info['eligible']} scattered={info['scattered']})")
+        print(
+            f"{label:<22}{N:>6}   gate closed "
+            f"(eligible={info['eligible']} scattered={info['scattered']})"
+        )
         return None
     fns = [fn for _, _, fn in cands]
     names = [f"{k}{'' if p is None else '@' + str(p)}" for k, p, _ in cands]
 
     schemes = {
         "seq": lambda: time_sequential(fns, reps),
-        "seq_rev": lambda: [t for t in reversed(time_sequential(
-            list(reversed(fns)), reps))],
+        "seq_rev": lambda: [
+            t for t in reversed(time_sequential(list(reversed(fns)), reps))
+        ],
         "inter": lambda: time_interleaved(fns, rounds),
     }
     rows = {}
@@ -211,14 +251,18 @@ def run_cell(label, a_t, N, nthreads, rounds, reps):
         rows[sname] = run()
 
     first_i, last_i = 0, len(cands) - 1
-    print(f"\n### {label}  M={info['M']} J={info['J']} nnz={info['nnz']} "
-          f"N={N} Jc={info['Jc']} C={info['C'] >> 20}MiB")
+    print(
+        f"\n### {label}  M={info['M']} J={info['J']} nnz={info['nnz']} "
+        f"N={N} Jc={info['Jc']} C={info['C'] >> 20}MiB"
+    )
     hdr = f"{'candidate':<20}" + "".join(f"{s:>12}" for s in schemes)
     print(hdr)
     for i, nm in enumerate(names):
         print(f"{nm:<20}" + "".join(f"{rows[s][i] * 1e6:12.1f}" for s in schemes))
-    print(f"{'A/A last/first':<20}"
-          + "".join(f"{rows[s][last_i] / rows[s][first_i]:12.3f}" for s in schemes))
+    print(
+        f"{'A/A last/first':<20}"
+        + "".join(f"{rows[s][last_i] / rows[s][first_i]:12.3f}" for s in schemes)
+    )
 
     out = {"label": label, "N": N, "info": info}
     for s in schemes:
@@ -231,7 +275,8 @@ def run_cell(label, a_t, N, nthreads, rounds, reps):
         # the honest comparison: does that pick also beat the OTHER baseline copy?
         survives = bt < t[last_i]
         out[s] = {
-            "aa": aa, "pick": bn if picks_tiled else "base",
+            "aa": aa,
+            "pick": bn if picks_tiled else "base",
             "position_induced": bool(picks_tiled and not survives),
             "ratio_vs_first": t[first_i] / bt,
             "ratio_vs_last": t[last_i] / bt,
@@ -248,22 +293,27 @@ def run_cell(label, a_t, N, nthreads, rounds, reps):
     new_rule = tiling._clears_noise(best_tiled_t, t_first_i, t_last_i)
     floor = max(t_first_i, t_last_i) / min(t_first_i, t_last_i)
     margin = min(t_first_i, t_last_i) / best_tiled_t
-    out["rules"] = {"old": old_rule, "new": new_rule,
-                    "floor": floor, "margin": margin}
-    print(f"  floor {floor:.3f}  margin {margin:.3f}  "
-          f"old rule={'tiled' if old_rule else 'base'}  "
-          f"new rule={'tiled' if new_rule else 'base'}"
-          + ("   <-- RULES DISAGREE" if old_rule != new_rule else ""))
+    out["rules"] = {"old": old_rule, "new": new_rule, "floor": floor, "margin": margin}
+    print(
+        f"  floor {floor:.3f}  margin {margin:.3f}  "
+        f"old rule={'tiled' if old_rule else 'base'}  "
+        f"new rule={'tiled' if new_rule else 'base'}"
+        + ("   <-- RULES DISAGREE" if old_rule != new_rule else "")
+    )
 
     flag = ""
     if out["seq"]["position_induced"]:
         flag = "  <-- POSITION-INDUCED PICK under the shipped scheme"
-    print(f"  seq pick={out['seq']['pick']:<14} "
-          f"vs first {out['seq']['ratio_vs_first']:.3f}x  "
-          f"vs last {out['seq']['ratio_vs_last']:.3f}x{flag}")
-    print(f"  inter pick={out['inter']['pick']:<12} "
-          f"vs first {out['inter']['ratio_vs_first']:.3f}x  "
-          f"vs last {out['inter']['ratio_vs_last']:.3f}x")
+    print(
+        f"  seq pick={out['seq']['pick']:<14} "
+        f"vs first {out['seq']['ratio_vs_first']:.3f}x  "
+        f"vs last {out['seq']['ratio_vs_last']:.3f}x{flag}"
+    )
+    print(
+        f"  inter pick={out['inter']['pick']:<12} "
+        f"vs first {out['inter']['ratio_vs_first']:.3f}x  "
+        f"vs last {out['inter']['ratio_vs_last']:.3f}x"
+    )
     return out
 
 
@@ -274,15 +324,20 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--matrices", default="")
     ap.add_argument("--threads", type=int, default=0)
-    ap.add_argument("--mtxdir", default="",
-                    help="directory of flat .bin CSR dumps; --matrices names them")
+    ap.add_argument(
+        "--mtxdir",
+        default="",
+        help="directory of flat .bin CSR dumps; --matrices names them",
+    )
     args = ap.parse_args()
 
     if args.threads:
         torch.set_num_threads(args.threads)
     nthreads = torch.get_num_threads()
-    print(f"host threads={nthreads}  LLC={tiling.query_llc() >> 20}MiB  "
-          f"rounds={args.rounds} reps={args.reps}")
+    print(
+        f"host threads={nthreads}  LLC={tiling.query_llc() >> 20}MiB  "
+        f"rounds={args.rounds} reps={args.reps}"
+    )
 
     work = []
     if args.matrices and args.mtxdir:
@@ -302,8 +357,12 @@ def main():
         # Synthetic scatter across a range of CALL DURATIONS, because a fixed
         # turbo/thread-settling cost is a larger share of a short call.
         for rows, deg in ((20_000, 200), (60_000, 200), (200_000, 100)):
-            work.append((f"scatter{deg}-{rows // 1000}k",
-                         synthetic_scatter(rows, deg, rows, seed=7)))
+            work.append(
+                (
+                    f"scatter{deg}-{rows // 1000}k",
+                    synthetic_scatter(rows, deg, rows, seed=7),
+                )
+            )
 
     results = []
     for label, a_t in work:
@@ -316,34 +375,45 @@ def main():
         print("\nno cells ran")
         return
     print("\n" + "=" * 78)
-    print(f"{'cell':<28}{'aa_seq':>9}{'aa_rev':>9}{'aa_int':>9}"
-          f"{'seq pick':>16}{'inter pick':>16}")
+    print(
+        f"{'cell':<28}{'aa_seq':>9}{'aa_rev':>9}{'aa_int':>9}"
+        f"{'seq pick':>16}{'inter pick':>16}"
+    )
     for r in results:
-        print(f"{r['label'] + '/' + str(r['N']):<28}"
-              f"{r['seq']['aa']:9.3f}{r['seq_rev']['aa']:9.3f}"
-              f"{r['inter']['aa']:9.3f}{r['seq']['pick']:>16}"
-              f"{r['inter']['pick']:>16}")
+        print(
+            f"{r['label'] + '/' + str(r['N']):<28}"
+            f"{r['seq']['aa']:9.3f}{r['seq_rev']['aa']:9.3f}"
+            f"{r['inter']['aa']:9.3f}{r['seq']['pick']:>16}"
+            f"{r['inter']['pick']:>16}"
+        )
     print(f"\n{'cell':<28}{'floor':>8}{'margin':>8}{'old':>7}{'new':>7}")
     for r in results:
         ru = r["rules"]
-        print(f"{r['label'] + '/' + str(r['N']):<28}{ru['floor']:8.3f}"
-              f"{ru['margin']:8.3f}{'tiled' if ru['old'] else 'base':>7}"
-              f"{'tiled' if ru['new'] else 'base':>7}"
-              + ("   DISAGREE" if ru['old'] != ru['new'] else ""))
+        print(
+            f"{r['label'] + '/' + str(r['N']):<28}{ru['floor']:8.3f}"
+            f"{ru['margin']:8.3f}{'tiled' if ru['old'] else 'base':>7}"
+            f"{'tiled' if ru['new'] else 'base':>7}"
+            + ("   DISAGREE" if ru["old"] != ru["new"] else "")
+        )
     n_dis = sum(1 for r in results if r["rules"]["old"] != r["rules"]["new"])
     marg = sorted(r["rules"]["margin"] for r in results)
-    print(f"\nrules disagree: {n_dis}/{len(results)}   "
-          f"margin min {marg[0]:.3f} median {marg[len(marg) // 2]:.3f} "
-          f"max {marg[-1]:.3f}")
+    print(
+        f"\nrules disagree: {n_dis}/{len(results)}   "
+        f"margin min {marg[0]:.3f} median {marg[len(marg) // 2]:.3f} "
+        f"max {marg[-1]:.3f}"
+    )
     n_ind = sum(1 for r in results if r["seq"]["position_induced"])
     n_flip = sum(1 for r in results if r["seq"]["pick"] != r["inter"]["pick"])
-    print(f"\nposition-induced picks under the shipped scheme: "
-          f"{n_ind}/{len(results)}")
+    print(
+        f"\nposition-induced picks under the shipped scheme: " f"{n_ind}/{len(results)}"
+    )
     print(f"winner differs seq vs interleaved:                {n_flip}/{len(results)}")
     aa_seq = [r["seq"]["aa"] for r in results]
     aa_int = [r["inter"]["aa"] for r in results]
-    print(f"A/A spread  seq   {min(aa_seq):.3f}-{max(aa_seq):.3f}   "
-          f"inter {min(aa_int):.3f}-{max(aa_int):.3f}")
+    print(
+        f"A/A spread  seq   {min(aa_seq):.3f}-{max(aa_seq):.3f}   "
+        f"inter {min(aa_int):.3f}-{max(aa_int):.3f}"
+    )
 
 
 if __name__ == "__main__":

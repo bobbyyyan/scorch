@@ -370,9 +370,13 @@ def test_both_cache_queries_honour_the_same_override():
     # subprocess rather than monkeypatching the environment in place.
     env = dict(os.environ, SCORCH_LLC_BYTES="1048576")
     out = subprocess.check_output(
-        [sys.executable, "-c",
-         "import scorch_ops, scorch.tiling as t;"
-         "print(scorch_ops.scorch_llc_bytes(), t.query_llc())"],
-        env=env, text=True,
+        [
+            sys.executable,
+            "-c",
+            "import scorch_ops, scorch.tiling as t;"
+            "print(scorch_ops.scorch_llc_bytes(), t.query_llc())",
+        ],
+        env=env,
+        text=True,
     ).split()
     assert out == ["1048576", "1048576"]

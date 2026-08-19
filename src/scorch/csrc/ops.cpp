@@ -581,6 +581,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("scorch_llc_bytes", &scorch_llc_bytes,
           "Effective last-level cache in bytes, as the kernels compute it");
 
+    // Whether this build carries the A/B tuning hooks. Without them the SCORCH_*
+    // environment switches are inert, so a harness that flips one and compares two
+    // arms is timing the same code twice and will report a difference of zero as
+    // "the change did nothing" -- a vacuous measurement that looks like a result.
+    m.def("scorch_tune_hooks", []() {
+#ifdef SCORCH_TUNE_HOOKS
+      return true;
+#else
+      return false;
+#endif
+    }, "True if this build honours the SCORCH_* kernel A/B hooks");
+
     // The same fused structural pass, offered to Scorch's own Python-side validator.
     //
     // `_validate_index_storage` in storage.py runs on every STensor built over a
