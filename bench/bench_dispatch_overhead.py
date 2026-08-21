@@ -23,6 +23,10 @@ Method
   ``matmul`` arm and not to ``matmul - kernel``. Unchanged by anything in this tree, so
   it doubles as the cross-process control when comparing two trees.
 * Every cell is checked against a float64 reference.
+* ``--dtype float64`` runs the same grid at double. Both dtypes resolve a drop-in
+  kernel and both install a call plan, so the overhead columns mean the same thing --
+  which is the point: float64 once resolved a symbol the plan table did not know and
+  silently got no plan at all, and this is where that would show.
 
 Usage
 -----
@@ -69,13 +73,13 @@ BIG_CELLS = [
 ]
 
 
-def build(rows, deg, seed=0):
+def build(rows, deg, seed=0, np_dtype=np.float32):
     rng = np.random.default_rng(seed)
     cols = np.concatenate(
         [np.sort(rng.choice(rows, size=deg, replace=False)) for _ in range(rows)]
     ).astype(np.int64)
     indptr = np.arange(rows + 1, dtype=np.int64) * deg
-    data = rng.standard_normal(rows * deg).astype(np.float32)
+    data = rng.standard_normal(rows * deg).astype(np_dtype)
     return indptr, cols, data
 
 
@@ -97,6 +101,9 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--tag", default="cand")
+    ap.add_argument("--dtype", default="float32",
+                    choices=("float32", "float64"),
+                    help="value dtype; both resolve a drop-in kernel and a plan")
     ap.add_argument("--arms", default="all",
                     help="comma-separated subset of matmul,aa,kernel,torch,decline,"
                          "mixed,plan. "
@@ -109,6 +116,8 @@ def main():
     ap.add_argument("--profile", action="store_true",
                     help="cProfile the smallest cell instead of timing the grid")
     args = ap.parse_args()
+    np_dtype = {"float32": np.float32, "float64": np.float64}[args.dtype]
+    torch_dtype = {"float32": torch.float32, "float64": torch.float64}[args.dtype]
 
     import scorch
     import scorch_ops
@@ -128,11 +137,11 @@ def main():
         import pstats
 
         rows, deg, N = CELLS[0]
-        indptr, cols, data = build(rows, deg)
+        indptr, cols, data = build(rows, deg, np_dtype=np_dtype)
         t = torch.sparse_csr_tensor(torch.from_numpy(indptr), torch.from_numpy(cols),
                                     torch.from_numpy(data), size=(rows, rows))
         A = STensor.from_torch(t)
-        B = torch.ones(rows, N)
+        B = torch.ones(rows, N, dtype=torch_dtype)
         for _ in range(50):
             scorch.matmul(A, B)
         pr = cProfile.Profile()
@@ -146,8 +155,8 @@ def main():
         print("\n".join(s.getvalue().splitlines()[4:28]))
         return 0
 
-    print(f"# tag={args.tag} threads={args.threads} reps={args.reps} "
-          f"inner={args.inner}")
+    print(f"# tag={args.tag} dtype={args.dtype} threads={args.threads} "
+          f"reps={args.reps} inner={args.inner}")
     print(f"{'cell':>18s} {'kernel_us':>10s} {'plan_us':>8s} {'matmul_us':>10s} "
           f"{'over_us':>8s} {'share':>6s} {'floor':>6s} {'declin_us':>9s} "
           f"{'mixed_us':>8s} {'torch_us':>9s} {'relerr':>9s}")
@@ -155,16 +164,19 @@ def main():
     cells = CELLS + (BIG_CELLS if args.big else [])
     out = []
     for rows, deg, N in cells:
-        indptr, cols, data = build(rows, deg)
+        indptr, cols, data = build(rows, deg, np_dtype=np_dtype)
         t = torch.sparse_csr_tensor(torch.from_numpy(indptr), torch.from_numpy(cols),
                                     torch.from_numpy(data), size=(rows, rows))
         A = STensor.from_torch(t)
-        B = torch.ones(rows, N)
+        B = torch.ones(rows, N, dtype=torch_dtype)
 
         # The argument list the dispatch would have built, hoisted out of the timing.
+        # The kernel arm must be the symbol dispatch actually resolves for this dtype,
+        # not a fixed one -- otherwise `over_us` compares two different kernels.
         kargs = [(rows, N), tuple(A.shape), A._native_mode_indices(), A.values,
                  (rows, N), [[], []], B.reshape(-1)]
-        kfn = scorch_ops.spmm_csr_float_v2
+        kfn = (scorch_ops.spmm_csr_float_v2 if args.dtype == "float32"
+               else scorch_ops.spmm_csr_double_v2)
 
         def call_matmul():
             return scorch.matmul(A, B)
@@ -222,7 +234,7 @@ def main():
                                     torch.from_numpy(data.astype(np.float64)),
                                     size=(rows, rows)),
             B.to(torch.float64),
-        ).numpy()
+        ).numpy()  # at --dtype float64 this is the same dtype, so relerr is exactness
         got = call_matmul()
         g = got.numpy() if hasattr(got, "numpy") else got.to_torch().numpy()
         relerr = float(np.abs(g.reshape(ref.shape) - ref).max()
@@ -257,7 +269,7 @@ def main():
               f"{us['matmul']:10.1f} {over:8.1f} "
               f"{over / us['matmul'] * 100:5.1f}% {floor:5.2f}% {us['decline']:9.1f} "
               f"{us['mixed']:8.1f} {us['torch']:9.1f} {relerr:9.2e}")
-        out.append(dict(tag=args.tag, rows=rows, deg=deg, N=N,
+        out.append(dict(tag=args.tag, dtype=args.dtype, rows=rows, deg=deg, N=N,
                         kernel_us=us["kernel"], matmul_us=us["matmul"],
                         overhead_us=over, floor_pct=floor, torch_us=us["torch"],
                         plan_us=us["plan"], decline_us=us["decline"],
