@@ -6,9 +6,12 @@ codegen path, and `ba59040` cut the Python dispatch cost the grid was still payi
 all three land after the grid was taken. Hosts: **redwood** (Intel i9-14900K, 8 P + 16
 E cores, 36 MB L3, PyTorch 2.5.1 + MKL 2022.1) and **M5** (Apple, 6 P + 12 E cores,
 PyTorch 2.13.0).
-**Every headline number is float32 through the prebuilt route**; float64 and the JIT
-codegen path have their own sections and their own, weaker, conclusions. Read
-`SPMM_BEAT_MKL_PHASE0.md` first for the attribution that led here.*
+**Every headline number is float32 through the prebuilt route.** float64 now has its
+own section and its own, equally strong, x86 conclusion — a register-resident kernel
+above MKL on every cell — but it is a separate measurement on a separate kernel
+instantiation, and on ARM it is deliberately unchanged. The JIT codegen path has its own
+section and its own, weaker, conclusions. Read `SPMM_BEAT_MKL_PHASE0.md` first for the
+attribution that led here.*
 
 ## What changed
 
@@ -178,42 +181,239 @@ the Linux suite; the number to check is zero tiled-route regressions at `analyti
 
 ## float64
 
-float64 CSR × dense resolves a different prebuilt symbol (`prebuilt_spmm_csr_f64`) and
-**gets no tiling at all**, but goes through the same
-`bind_binary_kernel_with_tile` → `validate_binary_inputs` → `checked_csr_view` path, so
-it pays the same tax and gets the same fix. Measured on the M5, 3 rounds:
+float64 CSR × dense used to resolve `prebuilt_spmm_csr_f64` → `spmm_csr_double` →
+`spmm_csr_typed_core<double>`: the plain reference kernel, with no register-blocked row
+kernel and no tiling route. Removing the validation tax sped it up, but only exposed
+what the tax had been hiding — a kernel-quality gap. float32 beat MKL on the same cells
+because float32 resolved a different, much better kernel.
 
-| cell | reference ms | base ms | cand ms | **gain** | floor |
-|---|---|---|---|---|---|
-| pubmed@32 | 2.171 | 0.850 | 0.548 | **1.55x** | 0.4% |
-| bcsstk17@32 | 4.144 | 1.185 | 0.625 | **1.90x** | 1.5% |
-| bcsstk17@128 | 8.466 | 1.993 | 1.430 | **1.39x** | 1.7% |
-| band16@128 | 16.43 | 5.464 | 3.779 | **1.45x** | 0.5% |
-| scatter200@32 | 101.8 | 19.04 | 12.56 | **1.52x** | 1.5% |
+The fix is the obvious one done properly: **make the good kernel generic over the scalar
+type** rather than write a second one. `spmm_csr_float_v2_core` became
+`spmm_csr_v2_core<scalar_t>`, and the three AVX2 row kernels
+(`scorch_spmm_row_regblock`, `scorch_spmm_row_regtile_partial`,
+`scorch_spmm_row_regtile`) became templates over a `scorch_simd<T>` traits struct
+supplying `zero / splat / load / maskload / store / maskstore / fma / add / lane_mask`
+and a `lanes` count — 8 for `__m256`, 4 for `__m256d`. Every lane count in those kernels
+had been the literal `8`; each became `V::lanes`, so the register-blocking threshold and
+the wide tile now scale with the type instead of being pinned to float. Narrow-k
+register blocking is k ≤ 32 for float and k ≤ 16 for double, and the wide tile is 64
+float or 32 double elements — in both cases the same register budget, which is the point
+of expressing it in lanes. float32 reaches the template through a non-template
+forwarder, so `spmm_csr_float_v2` and every caller of it are textually untouched.
 
-redwood, 3 rounds, against the faster MKL arm — and this is the part worth reading:
+x86, **129 cells** — the whole pinned corpus, 26 matrices (GCN, SuiteSparse and
+synthetic) × N = 8…128, minus the cells a 3 GB working-set cap skips — 9 rounds, three
+arms plus an A/A control drawn in a fresh random permutation every round, one draw per
+arm, all in one process against one binary. The new kernel is called with the thread
+count and launch mode dispatch actually passes: the harness asks
+`ops._composition_hints` (`nthreads_override=24, atparallel=True`) rather than naming a
+value, and refuses to run if production resolves a symbol other than the one it times.
 
-| cell | MKL ms | base ms | cand ms | **gain** | cand vs MKL | was | floor |
-|---|---|---|---|---|---|---|---|
-| bcsstk17@32 | 0.131 | 0.697 | 0.220 | **3.17x** | 0.596x | 0.188x | 6.6% |
-| band16@128 | 7.840 | 13.07 | 10.59 | **1.23x** | 0.741x | 0.602x | 3.2% |
-| bcsstk17@128 | 1.160 | 1.822 | 1.328 | **1.40x** | 0.873x | 0.637x | 13.9% |
-| inline_1@32 | 42.93 | 104.9 | 45.13 | **2.33x** | 0.951x | 0.435x | 1.5% |
-| pubmed@32 | 0.211 | 0.539 | 0.217 | **2.48x** | 0.972x | 0.394x | 33.7% |
-| scatter200@32 | 4.524 | 12.35 | 4.169 | **2.96x** | 1.085x | 0.379x | 23.6% |
+| | geomean vs MKL | min | max | cells below MKL parity |
+|---|---|---|---|---|
+| old kernel (`spmm_csr_double`) | 1.296 | 0.549 | 3.099 | **45 of 129** |
+| new kernel (`spmm_csr_double_v2`) | **2.273** | **1.086** | 7.647 | **0 of 129** |
 
-Pooled vs MKL: **0.409x → 0.853x**. The gain is real and large (1.23–3.17x, and the two
-tightest floors — inline_1 at 1.5% and bcsstk17@32 at 6.6% — carry the biggest gains),
-but **float64 is still below MKL parity on 5 of 6 cells**. That is not the validation
-tax; it is that float64 resolves `prebuilt_spmm_csr_f64`, which has no register-blocked
-row kernel and no tiling route at all, so removing the tax exposes a plain kernel-quality
-gap that was previously hidden underneath it. float32 beats MKL on the same cells.
+The old kernel was up to **1.8x slower than MKL** (`syn__aeshape@16`, 0.549) and lost on
+a third of the corpus. The new one is above MKL on every cell measured.
 
-Stated plainly: float32 CSR × dense is done, float64 is not. Two of these cells
-(pubmed@32 at a 33.7% floor, scatter200@32 at 23.6%) are too small to measure at 3
-rounds and their ratios should not be quoted without a longer run. The M5 table above
-is a comparison against torch's own float64 path, not MKL — ARM has no MKL — so it says
-nothing about parity.
+New against the kernel it replaces: geomean **1.754x**, min 0.998, max 3.848. Two of the
+129 cells read a hair *below* 1.000 — `ss__mouse_gene@8` at 0.998 against its own A/A of
+1.022, and `gcn__reddit@8` at 0.999 against 1.008 — so the honest claim is not "faster
+everywhere" but **"faster everywhere outside the noise floor, and tied on two cells"**.
+Both are inside their own controls by a wide margin, and both are in the same regime as
+the other tight cells.
+
+The A/A control ran 1.000–1.317, with three cells above 1.10. Screening the grid by each
+cell's own control barely moves the result, which is why it is computed: 2.273 over all
+129 cells, 2.265 over the 126 with A/A ≤ 1.10, 2.248 over the 120 with A/A ≤ 1.05 — and
+zero cells below MKL parity in every subset. The noisy cells (`gcn__pubmed@64` at 1.317,
+`ss__consph@32` at 1.124, `gcn__citeseer@32` at 1.108) should not have their individual
+ratios quoted, but they are not what the headline rests on.
+
+The weakest cell is worth naming because it is the one to push on: `gcn__reddit@128` at
+**1.086x** of MKL on a control of 1.004 — a real 1.086, not a floor artefact. It sits
+with the other tight cells (`gcn__reddit@8/@16/@64`, `ss__mouse_gene@8`,
+`ss__nd24k@8`, `syn__scatter16@8`) in a coherent regime: 114.8M and 29.0M nonzeros at
+narrow k, where the reference kernel is already bandwidth-bound on the sparse operand
+and there is almost no output traffic for a register-resident row to save. New/ref on
+those cells is 0.998–1.018 — the register kernel neither helps nor hurts when the thing
+it removes is not the bottleneck. Everywhere the output round-trip *does* dominate, it is
+worth 1.4–3.8x.
+
+### What the first version of this table got wrong
+
+Recorded because the error was invisible and the number it produced looked fine. The
+first grid reported geomean 2.573 over 60 cells. It passed `atparallel=False` to the new
+kernel while dispatch ships `atparallel=True` — two different launch paths, `at::parallel_for`
+on torch's intra-op pool versus a private OpenMP team, with different core counts on a
+hybrid P+E part. So it measured a configuration nobody runs, and being a *harness*
+constant rather than a production one, nothing could disagree with it. The fix is that
+the harness no longer states the policy: it calls the same `_composition_hints` dispatch
+calls, and it hard-fails if resolution names a symbol it is not timing. The corrected
+number is lower — 2.273 against 2.573 — over more than twice the cells, and the count of
+cells the *old* kernel lost on went from 19 of 60 to 45 of 129.
+
+### float32 is untouched, and that is proved statically
+
+The templating rewrites the source of the kernel that carries every float32 headline in
+this document, so the first thing to establish is that float32's machine code did not
+move. Both `.so` files were disassembled and compared symbol by symbol, with addresses,
+immediates and branch/call targets normalized — a renamed callee is not a code change —
+and with the set of callee *names* reported separately on each side, so a genuine
+retarget could not hide behind that normalization. Baseline is the last build before this work
+(`7f88c18`; the commit after it, `8a8e6af`, is docs-only, so the C++ is the same).
+Rather than infer that, every file under `src/scorch/csrc/` was compared between the two
+trees: exactly three differ — `spmm.h`, `plan.h`, `ops.cpp` — and they are the three this
+work touches.
+
+**13 of 14 symbol pairs are instruction-identical**, including the one that matters
+most: the per-row work, which the compiler inlines into the chunk lambda, is identical
+at **996 instructions**. The register row kernels were templated and their float32 code
+did not move a single instruction. Also identical: `spmm_csr_linear_fused_float` (539),
+`spmm_csr_float_tilej_core` (434 body, 422 in its OpenMP region), and
+`spmm_csr_float_tileijk_core` (325 body, and 262/153/423/262 across its four regions).
+The callee-name differences are precisely the template renames —
+`scorch_spmm_row_regblock<4, true>` becoming `<float, 4, true>` — matching one to one.
+
+The one pair that differs is the once-per-call **setup body**, 581 instructions against
+594. It diverges at instruction 264, where the register allocator picks `%edx` instead
+of `%r8d`, and the substitution then cascades: 99 lines read differently for 13 more
+instructions in total. This is the block that validates arguments, allocates the output
+tensor and computes the thread count and chunk width, so thirteen instructions there are
+not a cost anything can measure — but it is the only thing that changed, so it is the
+only thing that needs measuring, and the small-cell dispatch grid is where it would show
+first.
+
+Measured, on the grid where per-call Python is a large share of the call:
+`bench_dispatch_overhead.py --dtype float32`, one identical harness copied into both
+trees so the harness itself is not a variable, the same arm set on both sides, and
+**base, cand, cand, base** passes — position-balanced, because cross-run drift on this
+host is far larger than the effect being bounded. Median dispatch overhead
+(`matmul − kernel`) came out **−0.4 and −0.5 µs on base against −0.5 and −0.5 µs on
+cand**: indistinguishable at the resolution of the measurement.
+
+Do not read the per-cell numbers in that run. `20000x24@128` moved from 365.8 to 583.1 µs
+*within the same tree* across passes — a 1.6x swing on identical code — which is the
+redwood cross-run drift this document measures elsewhere (p95 1.398, max 4.13x). The
+per-cell A/A floors in that run span 0.22–11.85% and bracket every tree-to-tree
+difference in the table. The median over cells is the only statistic that survives, and
+it is flat.
+
+### An estimator that gave one arm two draws
+
+Third finding in this section, and the one most likely to recur, so it is written down
+rather than just fixed. The harness times `[mkl, ref, new, new]` — `new` twice, because
+the second entry is the A/A control — and it reported `new` as `min` of the two. That
+gives `new` twice as many draws as `mkl` and `ref`, and a minimum over more draws is
+biased low. The bias flatters exactly the arm the document is arguing for.
+
+It was caught by the ARM run, which is a control in a stronger sense than intended: off
+AVX2 the `new` and `ref` arms are the *same machine code*, so the true ratio there is
+exactly 1.000 and any departure is the harness. What the M5 showed, over 69 cells:
+
+| estimator | geomean new/ref | median | cells >5% fast | cells >5% slow |
+|---|---|---|---|---|
+| `min` of two draws | 1.0068 | 1.0000 | **10** | 2 |
+| one draw per arm | 0.9917 | 0.9970 | 5 | 8 |
+
+The 10-against-2 lopsidedness is the tell: identical code cannot produce it, and a
+doubled draw count can. With one draw per arm it becomes 5 against 8, which is a
+coin-flip.
+
+The bias was also bounded independently of that host, since each cell's A/A pair *is*
+the two draws: a min-of-two beats a single draw by at most `A/A − 1`, on average about
+half of it, which on redwood is an expected **1.18%** against an upper bound of
+**2.35%**. Deflating every redwood cell by a flat 3% — more than the bound — left
+geomean 2.218, minimum 1.054 and **zero cells below MKL parity**, so no verdict ever
+depended on it. Both grids above were nonetheless re-taken with the corrected estimator.
+
+The same ARM run then gives something worth keeping: the **harness's own accuracy**, on
+cells where the answer is known to be exactly 1.000. At 9 rounds the deviation is
+**±1.4% at the median, ±7.4% at p90 and ±25.9% at worst**. So a single M5 cell's ratio
+means nothing finer than about ±7%, while the geomean over 69 cells is good to roughly
+±1%. That is the right prior to read every per-cell number in this section with.
+
+### ARM keeps the reference kernel, on purpose
+
+NEON has no masked load or store, so the traits layer does not specialize to it and
+there is no `scorch_simd<T>` for ARM. `spmm_csr_double_v2` is guarded on
+`__AVX2__ && __FMA__` and falls back to `spmm_csr_typed<double>` — the same reference
+kernel float64 already resolved — everywhere else.
+
+That forgoes a measured win, so here is the measurement. Routing float64 through the
+generic non-AVX2 path on the M5 gave geomean **1.642x** over the reference across the M5
+grid, with one regression: `gcn__pubmed@k=8` at **0.689**, i.e. 1.45x *slower*. Two
+attempts to remove it both failed:
+
+- single-tile direct accumulation with an assigning first nonzero — 0.681, no change;
+- bulk zeroing on the non-AVX2 path plus pure in-place accumulation — **worse overall**,
+  geomean 1.642 → 1.267.
+
+Both were reverted. Shipping a 1.45x regression on a real GCN shape to collect a 1.64x
+geomean is exactly the trade this project's performance convention exists to refuse, and
+the regression is still unexplained, so ARM float64 keeps the kernel it had.
+
+Those two ARM figures carry the same caveat as the x86 table above: they were taken
+with `atparallel=False`, and on the M5 that is the launch mode that gets all 18 cores
+rather than the six P-cores `at::parallel_for` hands out. They are not re-derived,
+because they describe a path this tree does not ship — the decision they informed was
+"do not ship it", and the direction of the `atparallel` difference on this host can only
+have made the generic path look *better* than production would. What is confirmed at
+production hints is the thing that matters: ARM float64 runs the same kernel it ran
+before. The M5
+confirm after that decision reads new/ref **0.992** over 69 cells (A/A control
+1.000–1.200) — ARM is unchanged, as intended, and the 0.8% shortfall from 1.000 is the
+harness's accuracy rather than a difference in the code, which off AVX2 is the same code
+by construction. A NEON register kernel for float64 is real remaining
+work, and it needs a different strategy for the ragged tail than the AVX2 mask, which
+is what made the float32 kernel portable to double in the first place.
+
+### The call plan the new symbol nearly lost
+
+Worth recording because it failed silently and in the direction this whole branch is
+about. Dispatch installs a native call plan (`plan.py` → `csrc/plan.h`) so a repeated
+product skips resolution, validation and argument marshalling; which plan to build is
+looked up by **symbol name** in `plan._SYMBOL_KINDS`. float64 was in that table twice,
+as `prebuilt_spmm_csr_f64` and `spmm_csr_double`, both mapping to the `reference` kind.
+Putting `spmm_csr_double_v2` in front of them in the prebuilt registry moved resolution
+to a symbol the table did not know, `.get` returned `None`, and **float64 stopped
+getting a plan at all** — paying back, on every call, exactly the per-call dispatch cost
+this branch exists to remove, while the kernel measurements above stayed true. An absent
+entry looks identical to "this kernel deliberately has no plan", which is why nothing
+raised.
+
+The fix is a fifth plan kind, `v2_double`, and one guard test —
+`test_every_resolvable_csr_dense_symbol_has_a_plan_kind` — which resolves the CSR ×
+dense symbol for each float dtype the way dispatch does and fails if the result is not
+plannable. That is the general statement the table itself cannot make.
+
+Two details the plan kind had to get right. It calls `spmm_csr_double_v2_core`, not
+`spmm_csr_v2_core<double>`: the AVX2-or-reference choice described above is a policy, and
+reaching past the one function that makes it would have had the plan take the generic
+path on ARM — the single thing the ARM decision was made to avoid. And a tiled verdict
+is still refused for a float64 plan, which is belt-and-braces given `tiling_gate` never
+offers float64 to the selector. `test_plan_matches_the_f64_drop_in_symbol_bitwise` pins
+the plan to the pybind entry with `atol=rtol=0`, so a plan that reached past the policy
+fails on ARM rather than shipping.
+
+### What float64 still does not get
+
+A tiling route. `spmm_csr_float_tilej` and `spmm_csr_float_tileijk` have no float64
+instantiation, so `tiling_gate` in `ops.py` is deliberately float32-only, with a comment
+recording why. float64 therefore never reaches the selector at all. That is a gap
+against a hypothetical tiled float64 on the wide-N, high-degree shapes where tile-j and
+tile-ijk pay — reddit at N ≥ 512 — and not a gap against MKL, which the drop-in beats on
+every cell measured.
+
+### Correctness
+
+`tests/test_scorch/test_spmm_float64.py`, 60 tests, plus four in
+`test_dispatch_plans.py` for the plan kind: that float64 resolves the new symbol; agreement with a dense reference at rel 1e-12 for every N in 1…40 plus
+47, 48, 63, 64, 65, 96, 127, 128 — which covers every register-block width, every mask
+remainder, and the first widths past the wide tile; exact agreement with the reference
+kernel it replaces; an all-empty matrix; more output rows than sparse rows; and a row
+wider than one tile. A 450-cell shape × density sweep through `matmul` is clean.
 
 ## The kernel hypotheses, all measured
 
@@ -2318,13 +2518,18 @@ sharing no other change is the evidence that the arithmetic did not move.
 
 ## Scope and gaps, stated plainly
 
-- **dtype.** Everything above is float32 except the float64 section below. float64 CSR
-  × dense resolves a different prebuilt symbol (`prebuilt_spmm_csr_f64`) and **gets no
-  tiling at all**, but it goes through the same `bind_binary_kernel_with_tile` →
-  `validate_binary_inputs` → `checked_csr_view` path, so it pays the same tax and
-  receives the same fix. Measured, not asserted — and the answer is that the fix helps
-  float64 by 1.23–3.17x but leaves it **below MKL on 5 of 6 redwood cells** (0.853x
-  pooled). The headline claim in this document is float32 only.
+- **dtype.** Everything above is float32. float64 CSR × dense has its own section and
+  its own kernel: the register-blocked drop-in was made generic over the scalar type, so
+  on x86 float64 now resolves `spmm_csr_double_v2` and is **above MKL on 129 of 129
+  grid cells (geomean 2.273x)**, where the reference kernel it replaced lost on 45. It is
+  still true that float64 **gets no tiling at all** — the tiled kernels have no float64
+  instantiation and `tiling_gate` is float32-only on purpose.
+- **float64 on ARM is deliberately unchanged.** NEON has no masked load/store, so the
+  SIMD traits layer has no ARM specialization and `spmm_csr_double_v2` falls back to the
+  reference kernel off AVX2. Routing ARM through the generic path measured 1.642x
+  geomean on the M5 but regressed `gcn__pubmed@k=8` to 0.689; two fixes failed and the
+  cause is unexplained, so it was not shipped. A NEON float64 register kernel is open
+  work, and its ragged tail needs a mechanism the AVX2 mask supplied for free.
 - **Index memory.** The narrowing memo holds an int32 copy alongside the caller's
   int64 arrays, i.e. +50% on index memory. It replaces a same-size allocation that was
   happening every call, so peak does not grow, but steady state does. An entry is
@@ -2361,13 +2566,14 @@ sharing no other change is the evidence that the arithmetic did not move.
   fills it and then stops caching, falling back to the ordinary construction rather than
   degrading. What it holds is a layout, a metadata record and an empty index tuple per
   key, no values, so the ceiling is kilobytes.
-- **The grid, the selector re-measurement and the float64 table all predate the
-  dispatch levers.** They were measured at `14e3ea6`/`6eec90f`; nothing in them is
-  invalidated, but every small-cell ratio in them now understates scorch by ~33 µs of
-  per-call Python.
+- **The grid and the selector re-measurement predate the dispatch levers.** They were
+  measured at `14e3ea6`/`6eec90f`; nothing in them is invalidated, but every small-cell
+  ratio in them now understates scorch by ~33 µs of per-call Python. The float64 grid is
+  the exception: it was re-taken on the current tree, in one process, and so carries no
+  such correction.
 - **Call plans cover one operation.** `SpmmCsrPlan` serves CSR × dense with a dense
-  output — the drop-in float32 SpMM and the float64 reference kernel, plus the two tiled
-  kernels the selector can choose. SpMV, SpGEMM, COO operands, sparse outputs, the fused
+  output — the drop-in SpMM at float32 and float64 and the float64 reference kernel,
+  plus the two tiled kernels the selector can choose. SpMV, SpGEMM, COO operands, sparse outputs, the fused
   bias/act and Linear kernels and everything on the generated-kernel route get no plan and
   are byte-unchanged. The plan machinery costs them a dict probe on a `__dict__` that has
   no plans in it.
