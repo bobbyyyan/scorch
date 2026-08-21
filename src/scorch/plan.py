@@ -83,8 +83,16 @@ MAX_FRUITLESS_DECLINES = 8
 # Prebuilt symbols a plan can serve, mapped to the kernel kind plan.h knows.
 # Anything absent here -- SpGEMM, SpMV, COO, the int32/int64 reference SpMMs --
 # simply never gets a plan.
+#
+# Every CSR x dense symbol the prebuilt registry can resolve must appear here, and
+# `test_every_resolvable_csr_dense_symbol_has_a_plan_kind` fails if one does not.
+# That test exists because adding `spmm_csr_double_v2` ahead of the two float64
+# entries below silently took float64 off the plan path entirely: resolution moved to
+# a symbol this table did not know, `.get` returned None, and float64 went back to
+# paying the per-call dispatch cost the plan exists to remove. Nothing failed.
 _SYMBOL_KINDS: Dict[str, str] = {
     "spmm_csr_float_v2": "v2",
+    "spmm_csr_double_v2": "v2_double",
     "prebuilt_spmm_csr_f64": "reference",
     "spmm_csr_double": "reference",
 }
@@ -240,8 +248,9 @@ def install(
     if plan_kind is None:
         return None
     if kind in ("tilej", "tileijk"):
-        # A tiled kernel is only ever chosen in place of v2, never of the f64
-        # reference kernel; guard anyway rather than trust the caller.
+        # A tiled kernel is only ever chosen in place of v2 at float32 -- the tiled
+        # kernels have no float64 instantiation and `tiling_gate` will not offer a
+        # float64 product to the selector. Guard anyway rather than trust the caller.
         if plan_kind != "v2":
             return None
         plan_kind = kind

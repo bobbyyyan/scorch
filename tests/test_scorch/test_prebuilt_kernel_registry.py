@@ -5,6 +5,13 @@ from scorch.prebuilt_kernels import resolve_prebuilt_matmul
 
 
 def test_resolve_prebuilt_spmm_float64_symbol():
+    """float64 CSR x dense resolves the drop-in kernel, not the reference one.
+
+    It used to name ``prebuilt_spmm_csr_f64`` -- ``spmm_csr_typed<double>``, the
+    reference kernel. ``spmm_csr_double_v2`` is the float32 drop-in instantiated at
+    double, and it is now first in the registry's float64 candidate list; the two
+    older symbols remain behind it as the fallback if the extension predates it.
+    """
     torch.manual_seed(0)
     n = 16
     a_torch = (torch.rand(n, n, dtype=torch.float64) * (torch.rand(n, n) < 0.2)).contiguous()
@@ -15,7 +22,7 @@ def test_resolve_prebuilt_spmm_float64_symbol():
 
     resolved = resolve_prebuilt_matmul(a, b)
     assert resolved is not None
-    assert resolved.symbol_name == "prebuilt_spmm_csr_f64"
+    assert resolved.symbol_name == "spmm_csr_double_v2"
 
 
 def test_resolve_prebuilt_spmv_int64_symbol():

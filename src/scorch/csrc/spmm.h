@@ -1998,6 +1998,59 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
 
 // ---------------------------------------------------------------------------
 #if defined(__AVX2__) && defined(__FMA__)
+
+// One SIMD vocabulary for both value types, so every register kernel below is
+// written once and instantiated twice. The ONLY thing the kernels see differ is
+// the lane count -- 8 floats or 4 doubles per YMM register -- and every shape
+// constant is expressed in terms of it, so the register budget is identical for
+// both types (4 accumulators for the narrow-k kernel, 8 for the wide-k tile) and
+// so is the instruction mix. float64 therefore gets the same avoidance of the
+// per-nonzero output round-trip that took float32 past MKL, rather than a second
+// hand-written kernel that would drift from this one.
+//
+// The float32 instantiation must compile to what the hand-written float32 kernel
+// compiled to: every member here is a one-line `inline` wrapper over the same
+// intrinsic, chosen at compile time, so there is nothing left to fold away.
+template <typename T> struct scorch_simd;
+
+template <> struct scorch_simd<float> {
+  using vec = __m256;
+  using mask = __m256i;
+  static constexpr int lanes = 8;
+  static inline vec zero() { return _mm256_setzero_ps(); }
+  static inline vec splat(float x) { return _mm256_set1_ps(x); }
+  static inline vec load(const float* p) { return _mm256_loadu_ps(p); }
+  static inline vec maskload(const float* p, mask m) { return _mm256_maskload_ps(p, m); }
+  static inline void store(float* p, vec v) { _mm256_storeu_ps(p, v); }
+  static inline void maskstore(float* p, mask m, vec v) { _mm256_maskstore_ps(p, m, v); }
+  static inline vec fma(vec a, vec b, vec c) { return _mm256_fmadd_ps(a, b, c); }
+  static inline vec add(vec a, vec b) { return _mm256_add_ps(a, b); }
+  // Lanes [0, valid) enabled. Same expression the hand-written kernel inlined.
+  static inline mask lane_mask(int valid) {
+    return _mm256_setr_epi32(
+        valid > 0 ? -1 : 0, valid > 1 ? -1 : 0, valid > 2 ? -1 : 0, valid > 3 ? -1 : 0,
+        valid > 4 ? -1 : 0, valid > 5 ? -1 : 0, valid > 6 ? -1 : 0, valid > 7 ? -1 : 0);
+  }
+};
+
+template <> struct scorch_simd<double> {
+  using vec = __m256d;
+  using mask = __m256i;                  // 64-bit lanes for the _pd mask forms
+  static constexpr int lanes = 4;
+  static inline vec zero() { return _mm256_setzero_pd(); }
+  static inline vec splat(double x) { return _mm256_set1_pd(x); }
+  static inline vec load(const double* p) { return _mm256_loadu_pd(p); }
+  static inline vec maskload(const double* p, mask m) { return _mm256_maskload_pd(p, m); }
+  static inline void store(double* p, vec v) { _mm256_storeu_pd(p, v); }
+  static inline void maskstore(double* p, mask m, vec v) { _mm256_maskstore_pd(p, m, v); }
+  static inline vec fma(vec a, vec b, vec c) { return _mm256_fmadd_pd(a, b, c); }
+  static inline vec add(vec a, vec b) { return _mm256_add_pd(a, b); }
+  static inline mask lane_mask(int valid) {
+    return _mm256_setr_epi64x(
+        valid > 0 ? -1 : 0, valid > 1 ? -1 : 0, valid > 2 ? -1 : 0, valid > 3 ? -1 : 0);
+  }
+};
+
 // Register-blocked narrow-k SpMM row kernel: accumulate the whole output row in
 // NVEC YMM registers across the row's nonzeros (2-nnz ILP for two independent
 // FMA chains), with a masked load/store on the final partial vector. Avoids the
@@ -2013,52 +2066,55 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
 // row's B loads masked for no reason, plus one masked store per row, and on a
 // short row the store is amortized over only a handful of FMAs. Both collapse to
 // plain vmovups when FULL_LAST holds. Ragged k keeps the mask, unchanged.
-template <int NVEC, bool FULL_LAST>
+template <typename T, int NVEC, bool FULL_LAST>
 static inline void scorch_spmm_row_regblock(
-    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
-    const float* SCORCH_RESTRICT B_val, int B1_size,
-    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end, __m256i mask_last) {
-  __m256 acc0[NVEC], acc1[NVEC];
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    typename scorch_simd<T>::mask mask_last) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  typename V::vec acc0[NVEC], acc1[NVEC];
   #pragma unroll
   for (int v = 0; v < NVEC; v++) {
-    acc0[v] = _mm256_setzero_ps();
-    acc1[v] = _mm256_setzero_ps();
+    acc0[v] = V::zero();
+    acc1[v] = V::zero();
   }
   int pA = pA_begin;
   for (; pA + 1 < pA_end; pA += 2) {
-    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
-    const float* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
     if (pA + 2 < pA_end)
       __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size, 0, 1);
-    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
-    const __m256 a1 = _mm256_set1_ps(A_val[pA + 1]);
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    const typename V::vec a1 = V::splat(A_val[pA + 1]);
     #pragma unroll
     for (int v = 0; v < NVEC; v++) {
       const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
-      const __m256 b0 = masked ? _mm256_maskload_ps(B0 + 8 * v, mask_last)
-                               : _mm256_loadu_ps(B0 + 8 * v);
-      const __m256 b1 = masked ? _mm256_maskload_ps(B1 + 8 * v, mask_last)
-                               : _mm256_loadu_ps(B1 + 8 * v);
-      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
-      acc1[v] = _mm256_fmadd_ps(a1, b1, acc1[v]);
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      const typename V::vec b1 = masked ? V::maskload(B1 + L * v, mask_last)
+                                        : V::load(B1 + L * v);
+      acc0[v] = V::fma(a0, b0, acc0[v]);
+      acc1[v] = V::fma(a1, b1, acc1[v]);
     }
   }
   if (pA < pA_end) {
-    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
-    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const typename V::vec a0 = V::splat(A_val[pA]);
     #pragma unroll
     for (int v = 0; v < NVEC; v++) {
       const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
-      const __m256 b0 = masked ? _mm256_maskload_ps(B0 + 8 * v, mask_last)
-                               : _mm256_loadu_ps(B0 + 8 * v);
-      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      acc0[v] = V::fma(a0, b0, acc0[v]);
     }
   }
   #pragma unroll
   for (int v = 0; v < NVEC; v++) {
-    const __m256 r = _mm256_add_ps(acc0[v], acc1[v]);
-    if ((v == NVEC - 1) && !FULL_LAST) _mm256_maskstore_ps(C_row + 8 * v, mask_last, r);
-    else _mm256_storeu_ps(C_row + 8 * v, r);
+    const typename V::vec r = V::add(acc0[v], acc1[v]);
+    if ((v == NVEC - 1) && !FULL_LAST) V::maskstore(C_row + L * v, mask_last, r);
+    else V::store(C_row + L * v, r);
   }
 }
 
@@ -2083,47 +2139,49 @@ static int g_scorch_regtile_base = 0;
 // Result: 9-29% fewer cycles on partial-tile K (K%64 != 0), full-64-multiple K
 // untouched (kw==0 -> this path never runs). Correctness bit-identical to the
 // runtime-nv form (verified K=33/63/65/100/120/127 checksum-parity + the suite).
-template <int NV>
+template <typename T, int NV>
 static inline void scorch_spmm_row_regtile_partial(
-    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
-    const float* SCORCH_RESTRICT B_val, int B1_size,
-    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
-    int k0, __m256i mask, bool full) {
-  __m256 acc0[NV], acc1[NV];
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    int k0, typename scorch_simd<T>::mask mask, bool full) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  typename V::vec acc0[NV], acc1[NV];
   #pragma unroll
-  for (int v = 0; v < NV; v++) { acc0[v] = _mm256_setzero_ps(); acc1[v] = _mm256_setzero_ps(); }
+  for (int v = 0; v < NV; v++) { acc0[v] = V::zero(); acc1[v] = V::zero(); }
   int pA = pA_begin;
   for (; pA + 1 < pA_end; pA += 2) {                        // 2-nnz ILP: 2*NV chains
-    const float* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA]     * (size_t)B1_size + k0;
-    const float* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0;
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA]     * (size_t)B1_size + k0;
+    const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0;
     if (pA + 2 < pA_end)
       __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size + k0, 0, 1);
-    const __m256 a0 = _mm256_set1_ps(A_val[pA]);
-    const __m256 a1 = _mm256_set1_ps(A_val[pA + 1]);
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    const typename V::vec a1 = V::splat(A_val[pA + 1]);
     #pragma unroll
     for (int v = 0; v < NV; v++) {
       const bool m = (v == NV - 1 && !full);
-      const __m256 b0 = m ? _mm256_maskload_ps(B0 + 8 * v, mask) : _mm256_loadu_ps(B0 + 8 * v);
-      const __m256 b1 = m ? _mm256_maskload_ps(B1 + 8 * v, mask) : _mm256_loadu_ps(B1 + 8 * v);
-      acc0[v] = _mm256_fmadd_ps(a0, b0, acc0[v]);
-      acc1[v] = _mm256_fmadd_ps(a1, b1, acc1[v]);
+      const typename V::vec b0 = m ? V::maskload(B0 + L * v, mask) : V::load(B0 + L * v);
+      const typename V::vec b1 = m ? V::maskload(B1 + L * v, mask) : V::load(B1 + L * v);
+      acc0[v] = V::fma(a0, b0, acc0[v]);
+      acc1[v] = V::fma(a1, b1, acc1[v]);
     }
   }
   for (; pA < pA_end; pA++) {                                // odd tail nnz
-    const float* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
-    const __m256 a = _mm256_set1_ps(A_val[pA]);
+    const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+    const typename V::vec a = V::splat(A_val[pA]);
     #pragma unroll
     for (int v = 0; v < NV; v++) {
       const bool m = (v == NV - 1 && !full);
-      const __m256 b = m ? _mm256_maskload_ps(Bp + 8 * v, mask) : _mm256_loadu_ps(Bp + 8 * v);
-      acc0[v] = _mm256_fmadd_ps(a, b, acc0[v]);
+      const typename V::vec b = m ? V::maskload(Bp + L * v, mask) : V::load(Bp + L * v);
+      acc0[v] = V::fma(a, b, acc0[v]);
     }
   }
   #pragma unroll
   for (int v = 0; v < NV; v++) {
-    const __m256 r = _mm256_add_ps(acc0[v], acc1[v]);
-    if (v == NV - 1 && !full) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, r);
-    else _mm256_storeu_ps(C_row + k0 + 8 * v, r);
+    const typename V::vec r = V::add(acc0[v], acc1[v]);
+    if (v == NV - 1 && !full) V::maskstore(C_row + k0 + L * v, mask, r);
+    else V::store(C_row + k0 + L * v, r);
   }
 }
 
@@ -2147,76 +2205,78 @@ static inline void scorch_spmm_row_regtile_partial(
 // does for a full-line write already costs what the read-for-ownership would have,
 // so there was nothing to skip. Not worth an alignment gate, a store fence and a
 // fault mode (vmovntps faults on a misaligned address and has no unaligned form).
+template <typename T>
 static inline void scorch_spmm_row_regtile(
-    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
-    const float* SCORCH_RESTRICT B_val, int B1_size,
-    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  constexpr int TILE = 8 * L;      // 64 floats or 32 doubles: 8 YMM accumulators
   int k0 = 0;
-  for (; k0 + 64 <= B1_size; k0 += 64) {
-    __m256 acc[8];
+  for (; k0 + TILE <= B1_size; k0 += TILE) {
+    typename V::vec acc[8];
     #pragma unroll
-    for (int v = 0; v < 8; v++) acc[v] = _mm256_setzero_ps();
+    for (int v = 0; v < 8; v++) acc[v] = V::zero();
     for (int pA = pA_begin; pA < pA_end; pA++) {
-      const float* SCORCH_RESTRICT Bp =
+      const T* SCORCH_RESTRICT Bp =
           B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
       if (pA + 1 < pA_end)
         __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
-      const __m256 a = _mm256_set1_ps(A_val[pA]);
+      const typename V::vec a = V::splat(A_val[pA]);
       #pragma unroll
       for (int v = 0; v < 8; v++)
-        acc[v] = _mm256_fmadd_ps(a, _mm256_loadu_ps(Bp + 8 * v), acc[v]);
+        acc[v] = V::fma(a, V::load(Bp + L * v), acc[v]);
     }
     #pragma unroll
-    for (int v = 0; v < 8; v++) _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+    for (int v = 0; v < 8; v++) V::store(C_row + k0 + L * v, acc[v]);
   }
-  // Final partial tile (kw in 1..63): the templated compile-time-nv path (2-nnz
+  // Final partial tile (kw in 1..TILE-1): the templated compile-time-nv path (2-nnz
   // ILP). A scalar tail here reintroduced the per-nnz round-trip (-0.5-0.9x at
   // k=48/96); the earlier runtime-nv YMM loop was correct but front-end-bound.
   const int kw = B1_size - k0;
   if (kw > 0) {
-    const int nv = (kw + 7) / 8;              // 1..8 vectors
-    const int ml = kw - 8 * (nv - 1);         // 1..8 valid lanes in last vector
-    const bool full = (ml == 8);              // complete last vector -> no mask
-    const __m256i mask = _mm256_setr_epi32(
-        ml > 0 ? -1 : 0, ml > 1 ? -1 : 0, ml > 2 ? -1 : 0, ml > 3 ? -1 : 0,
-        ml > 4 ? -1 : 0, ml > 5 ? -1 : 0, ml > 6 ? -1 : 0, ml > 7 ? -1 : 0);
+    const int nv = (kw + L - 1) / L;          // 1..8 vectors
+    const int ml = kw - L * (nv - 1);         // 1..L valid lanes in last vector
+    const bool full = (ml == L);              // complete last vector -> no mask
+    const typename V::mask mask = V::lane_mask(ml);
 #ifdef SCORCH_TUNE_HOOKS
     // A/B hook: SCORCH_REGTILE_BASE=1 forces the legacy runtime-nv partial path
     // (single-nnz, no compile-time unroll) for an in-process old-vs-new delta.
-    // Read once per SpMM op into g_scorch_regtile_base (below) — a per-row getenv
-    // would swamp the hot loop; a cached function-local static would latch the
-    // FIRST op's value and ignore later toggles. Compiled out of the shipped .so.
+    // Read once per SpMM op into g_scorch_regtile_base -- a per-row getenv would
+    // swamp the hot loop; a cached function-local static would latch the FIRST
+    // op's value and ignore later toggles. Compiled out of the shipped .so.
     if (g_scorch_regtile_base) {
-      __m256 acc[8];
-      for (int v = 0; v < nv; v++) acc[v] = _mm256_setzero_ps();
+      typename V::vec acc[8];
+      for (int v = 0; v < nv; v++) acc[v] = V::zero();
       for (int pA = pA_begin; pA < pA_end; pA++) {
-        const float* SCORCH_RESTRICT Bp =
+        const T* SCORCH_RESTRICT Bp =
             B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
         if (pA + 1 < pA_end)
           __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
-        const __m256 a = _mm256_set1_ps(A_val[pA]);
+        const typename V::vec a = V::splat(A_val[pA]);
         for (int v = 0; v < nv; v++) {
-          const __m256 b = (v == nv - 1) ? _mm256_maskload_ps(Bp + 8 * v, mask)
-                                         : _mm256_loadu_ps(Bp + 8 * v);
-          acc[v] = _mm256_fmadd_ps(a, b, acc[v]);
+          const typename V::vec b = (v == nv - 1) ? V::maskload(Bp + L * v, mask)
+                                                  : V::load(Bp + L * v);
+          acc[v] = V::fma(a, b, acc[v]);
         }
       }
       for (int v = 0; v < nv; v++) {
-        if (v == nv - 1) _mm256_maskstore_ps(C_row + k0 + 8 * v, mask, acc[v]);
-        else _mm256_storeu_ps(C_row + k0 + 8 * v, acc[v]);
+        if (v == nv - 1) V::maskstore(C_row + k0 + L * v, mask, acc[v]);
+        else V::store(C_row + k0 + L * v, acc[v]);
       }
       return;
     }
 #endif
     switch (nv) {
-      case 1: scorch_spmm_row_regtile_partial<1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 2: scorch_spmm_row_regtile_partial<2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 3: scorch_spmm_row_regtile_partial<3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 4: scorch_spmm_row_regtile_partial<4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 5: scorch_spmm_row_regtile_partial<5>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 6: scorch_spmm_row_regtile_partial<6>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 7: scorch_spmm_row_regtile_partial<7>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
-      case 8: scorch_spmm_row_regtile_partial<8>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 1: scorch_spmm_row_regtile_partial<T, 1>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 2: scorch_spmm_row_regtile_partial<T, 2>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 3: scorch_spmm_row_regtile_partial<T, 3>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 4: scorch_spmm_row_regtile_partial<T, 4>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 5: scorch_spmm_row_regtile_partial<T, 5>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 6: scorch_spmm_row_regtile_partial<T, 6>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 7: scorch_spmm_row_regtile_partial<T, 7>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
+      case 8: scorch_spmm_row_regtile_partial<T, 8>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, mask, full); break;
     }
   }
 }
@@ -2324,12 +2384,13 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
 // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
 // validated structure and so pays none of that per call. Splitting them is what
 // lets a warm dispatch be a single Python->C++ hop; the body is unchanged.
-torch::Tensor spmm_csr_float_v2_core(
+template <typename scalar_t>
+torch::Tensor spmm_csr_v2_core(
                 int C0_size, int C1_size, int A0_size,
                 const int* SCORCH_RESTRICT A1_pos,
                 const int* SCORCH_RESTRICT A1_crd,
-                const float* SCORCH_RESTRICT A_val,
-                int B1_size, const float* SCORCH_RESTRICT B_val,
+                const scalar_t* SCORCH_RESTRICT A_val,
+                int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel) {
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
@@ -2347,8 +2408,8 @@ torch::Tensor spmm_csr_float_v2_core(
   // non-empty row is fully overwritten by the kernel; an empty row is zeroed
   // here.
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
-  float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
+      torch::empty({(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
+  scalar_t* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<scalar_t>();
   bool zero_empty_only = true;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook retained for the zeroing policy. Output storage is always owned by
@@ -2359,12 +2420,12 @@ torch::Tensor spmm_csr_float_v2_core(
   if (zero_empty_only) {
     for (int i = 0; i < A0_size; i++)
       if (A1_pos[i] == A1_pos[i + 1])
-        memset(C_values + (size_t)i * (size_t)C1_size, 0, sizeof(float) * (size_t)C1_size);
+        memset(C_values + (size_t)i * (size_t)C1_size, 0, sizeof(scalar_t) * (size_t)C1_size);
     if (C0_size > A0_size)
       memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
-             sizeof(float) * (size_t)(C0_size - A0_size) * (size_t)C1_size);
+             sizeof(scalar_t) * (size_t)(C0_size - A0_size) * (size_t)C1_size);
   } else {
-    memset(C_values, 0, sizeof(float) * C_capacity);
+    memset(C_values, 0, sizeof(scalar_t) * C_capacity);
   }
 
   // Round tile to multiple of 16 for SIMD alignment
@@ -2412,14 +2473,16 @@ torch::Tensor spmm_csr_float_v2_core(
   // one SIMD lane — that was the 0.5-0.8x-of-MKL narrow-k gap (GCN k=3/16). For
   // K>16 the workspace path already matches/beats MKL, so it is unchanged.
 #if defined(__AVX2__) && defined(__FMA__)
-  // Register-block when the whole output row fits in <=4 YMM accumulators (k<=32).
-  const bool narrow_k = (B1_size >= 1 && B1_size <= 32);
-  const int nvec = (B1_size + 7) / 8;              // 1..4 when narrow_k
-  const int mlast = B1_size - 8 * (nvec - 1);      // valid lanes in last vec, 1..8
-  bool full_last = (mlast == 8);                   // k % 8 == 0 -> no mask needed
-  const __m256i mask_last = _mm256_setr_epi32(
-      mlast>0?-1:0, mlast>1?-1:0, mlast>2?-1:0, mlast>3?-1:0,
-      mlast>4?-1:0, mlast>5?-1:0, mlast>6?-1:0, mlast>7?-1:0);
+  // Register-block when the whole output row fits in <=4 YMM accumulators. That
+  // is k<=32 for float32 and k<=16 for float64: the same REGISTER budget, which is
+  // what the bound is really about, rather than the same k.
+  using SV = scorch_simd<scalar_t>;
+  constexpr int SL = SV::lanes;
+  const bool narrow_k = (B1_size >= 1 && B1_size <= 4 * SL);
+  const int nvec = (B1_size + SL - 1) / SL;        // 1..4 when narrow_k
+  const int mlast = B1_size - SL * (nvec - 1);     // valid lanes in last vec, 1..SL
+  bool full_last = (mlast == SL);                  // k % SL == 0 -> no mask needed
+  const typename SV::mask mask_last = SV::lane_mask(mlast);
 #else
   const bool narrow_k = false;
 #endif
@@ -2441,9 +2504,9 @@ torch::Tensor spmm_csr_float_v2_core(
     if (e && *e && std::atol(e) != 0) full_last = false; }
 #endif
 
-  scorch_unique_buffer<float> worker_workspaces;
+  scorch_unique_buffer<scalar_t> worker_workspaces;
 #if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
-  worker_workspaces = scorch_make_aligned_buffer_pool<float>(
+  worker_workspaces = scorch_make_aligned_buffer_pool<scalar_t>(
       static_cast<size_t>(nthreads), static_cast<size_t>(kTile));
 #endif
 
@@ -2459,7 +2522,7 @@ torch::Tensor spmm_csr_float_v2_core(
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
     // row, so the shipped build never touches it. Allocated only for the non-AVX2
     // fallback or the force_workspace hook.
-    float* SCORCH_RESTRICT ws = nullptr;
+    scalar_t* SCORCH_RESTRICT ws = nullptr;
 #if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
     ws = worker_workspaces.get() +
         static_cast<size_t>(worker_id) * static_cast<size_t>(kTile);
@@ -2478,7 +2541,7 @@ torch::Tensor spmm_csr_float_v2_core(
         const int pA_end   = A1_pos[i + 1];
         if (pA_begin == pA_end) continue;
 
-        float* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
+        scalar_t* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
 
 #if defined(__AVX2__) && defined(__FMA__)
         // AVX2 register-resident kernels own every row: narrow k (<=32) holds the
@@ -2496,8 +2559,8 @@ torch::Tensor spmm_csr_float_v2_core(
             // hoists and each row runs one straight-line instantiation.
             #define SCORCH_RB(NV) \
               (full_last \
-                 ? scorch_spmm_row_regblock<NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
-                 : scorch_spmm_row_regblock<NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+                 ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
+                 : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
             switch (nvec) {
               case 1: SCORCH_RB(1); break;
               case 2: SCORCH_RB(2); break;
@@ -2506,7 +2569,7 @@ torch::Tensor spmm_csr_float_v2_core(
             }
             #undef SCORCH_RB
           } else {
-            scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
+            scorch_spmm_row_regtile<scalar_t>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
           }
           continue;
         }
@@ -2515,12 +2578,12 @@ torch::Tensor spmm_csr_float_v2_core(
         for (int k_out = 0; k_out < B1_size; k_out += kTile) {
           const int kw = std::min(kTile, B1_size - k_out);
 
-          memset(ws, 0, kw * sizeof(float));
+          memset(ws, 0, kw * sizeof(scalar_t));
 
           for (int pA = pA_begin; pA < pA_end; pA++) {
             const int j = A1_crd[pA];
-            const float a = A_val[pA];
-            const float* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
+            const scalar_t a = A_val[pA];
+            const scalar_t* SCORCH_RESTRICT B_row = B_val + (size_t)j * (size_t)B1_size + k_out;
 
             if (pA + 1 < pA_end) {
               __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k_out, 0, 1);
@@ -2531,7 +2594,7 @@ torch::Tensor spmm_csr_float_v2_core(
             }
           }
 
-          memcpy(C_row + k_out, ws, kw * sizeof(float));
+          memcpy(C_row + k_out, ws, kw * sizeof(scalar_t));
         }
       }
     }
@@ -2592,6 +2655,21 @@ torch::Tensor spmm_csr_float_v2_core(
   return C_values_torch;
 }
 
+// The float32 entry every existing caller uses. A one-line forwarder, so plan.h and
+// spmm_csr_float_v2 are unchanged and the float32 instantiation is the same code the
+// hand-written kernel was.
+torch::Tensor spmm_csr_float_v2_core(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const float* SCORCH_RESTRICT A_val,
+                int B1_size, const float* SCORCH_RESTRICT B_val,
+                int tile_size, int nthreads_override, bool atparallel) {
+  return spmm_csr_v2_core<float>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                 B1_size, B_val, tile_size, nthreads_override,
+                                 atparallel);
+}
+
 Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape,
                 std::vector<std::vector<torch::Tensor>> A_mode_indices,
                 torch::Tensor A_values, std::vector<int> B_shape,
@@ -2606,6 +2684,95 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
       A_mode_indices[1][1].data_ptr<int>(),
       A_values.data_ptr<float>(),
       B_shape[1], B_values.data_ptr<float>(),
+      tile_size, nthreads_override, atparallel);
+  return C;
+}
+
+// float64 CSR x dense, on the SAME kernel as float32.
+//
+// The float64 route used to resolve spmm_csr_double, which is spmm_csr_typed_core --
+// the original reference kernel. That kernel accumulates straight into C with a
+// read-modify-write per nonzero, memsets the whole output serially before the
+// parallel region, and hands rows out with a fixed `schedule(dynamic, 16)` and no
+// thread policy. Every one of those is a thing the float32 path was measured fixing.
+// Removing the per-call index-validation tax (see the top of this file) took float64
+// from 0.409x to 0.853x of MKL and left it below parity on 5 of 6 redwood cells,
+// which was the tax having hidden a plain kernel-quality gap: float32 beat MKL on
+// the same cells with the same taxes removed.
+//
+// So this is not a new float64 kernel. It is the float32 one, instantiated at double,
+// which is why the register kernels above are templated rather than copied. float64
+// gets register-resident accumulation, the atomic row work-stealing with the analytic
+// chunk width, the work-aware thread count, and the empty-row-only output zeroing,
+// and it will get whatever the float32 path gets next.
+//
+// Kept alongside spmm_csr_double rather than replacing it, mirroring
+// spmm_csr_float / spmm_csr_float_v2: the reference kernel stays as the thing the
+// tests compare against.
+//
+// AVX2 ONLY, and the #else is not laziness -- it is the measurement. What makes this
+// kernel win is the register-resident row: on AVX2 the regblock/regtile kernels own
+// every row and nothing round-trips through memory. Without them the row falls to the
+// workspace loop, and that loop is not better than the reference kernel at low degree
+// and narrow k. Measured on the M5 over 50 float64 cells: geometric mean 1.64x the
+// reference, but pubmed at k=8 (degree 5.5) reads 0.69x and citeseer at k=8 0.91x.
+// Two attempts to close that failed -- accumulating in place with an assigning first
+// nonzero (0.69x, no change) and zeroing C in bulk instead of per empty row (0.80x at
+// that cell, and it cost the mid cells more than it gained, dropping the whole grid to
+// 1.27x). Both are reverted; the workspace loop above is byte-unchanged from what
+// shipped.
+//
+// So float64 takes the reference kernel where there is no register kernel to take
+// instead. That forgoes a real 1.64x on Apple silicon rather than ship an unexplained
+// 1.45x regression on a GCN shape, and Apple silicon has no MKL to be losing to in the
+// first place -- the parity claim this fixes is an x86 claim. The fix that would earn
+// the ARM win is a NEON register kernel, which is not a specialization of the traits
+// above: NEON has no masked load or store, so the ragged tail needs a different
+// strategy than the AVX2 kernels use.
+//
+// Split in two like the float32 entry, and for one reason beyond that: the
+// AVX2-or-reference choice below is a POLICY, and pybind is not the only caller that
+// needs it -- plan.h dispatches this same product without going through the entry
+// above. Both call this function, so the policy is written once. A plan that decided
+// it again would be free to get it wrong in the one direction that matters, using the
+// generic path on ARM, which is precisely what the paragraph above decided against.
+torch::Tensor spmm_csr_double_v2_core(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const double* SCORCH_RESTRICT A_val,
+                int B1_size, const double* SCORCH_RESTRICT B_val,
+                int tile_size, int nthreads_override, bool atparallel) {
+#if defined(__AVX2__) && defined(__FMA__)
+  return spmm_csr_v2_core<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                  B1_size, B_val, tile_size, nthreads_override,
+                                  atparallel);
+#else
+  // The composition hints are accepted and ignored here, so neither the Python side
+  // nor plan.h needs a per-platform branch: the reference kernel takes its thread
+  // count from the ambient OpenMP team, which is what it did when float64 resolved to
+  // it directly.
+  (void)nthreads_override;
+  (void)atparallel;
+  return spmm_csr_typed_core<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                     B1_size, B_val, tile_size);
+#endif
+}
+
+Tensor spmm_csr_double_v2(std::vector<int> result_shape, std::vector<int> A_shape,
+                std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                torch::Tensor A_values, std::vector<int> B_shape,
+                std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                torch::Tensor B_values, int tile_size = 256,
+                int nthreads_override = -1, bool atparallel = false) {
+  Tensor C;
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = spmm_csr_double_v2_core(
+      result_shape[0], result_shape[1], A_shape[0],
+      A_mode_indices[1][0].data_ptr<int>(),
+      A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<double>(),
+      B_shape[1], B_values.data_ptr<double>(),
       tile_size, nthreads_override, atparallel);
   return C;
 }
@@ -3119,8 +3286,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
           // unmasked full-vector dispatch; see the drop-in SpMM above.
           #define SCORCH_RB(NV) \
             (full_last \
-               ? scorch_spmm_row_regblock<NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
-               : scorch_spmm_row_regblock<NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+               ? scorch_spmm_row_regblock<float, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
+               : scorch_spmm_row_regblock<float, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
           switch (nvec) {
             case 1: SCORCH_RB(1); break;
             case 2: SCORCH_RB(2); break;
@@ -3133,7 +3300,7 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
           // row epilogue, so it re-reads the row it just wrote and a non-temporal
           // store would force that read back from memory. Whether a fused variant
           // wants streaming is a separate question with a separate grid.
-          scorch_spmm_row_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
+          scorch_spmm_row_regtile<float>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
         }
 #elif defined(__ARM_NEON)
         if (use_neon_regtile) {

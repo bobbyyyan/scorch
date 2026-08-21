@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union, List
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+    List,
+)
 
 import torch
 import scorch_ops as native_ops
@@ -51,8 +61,16 @@ _MATMUL_PREBUILT_SPECS: List[PrebuiltMatmulSpec] = [
         rhs_format="d,d",
         output_format="dd",
         symbol_by_dtype={
-            torch.float32: ("spmm_csr_float_v2", "prebuilt_spmm_csr_f32", "spmm_csr_float"),
-            torch.float64: ("prebuilt_spmm_csr_f64", "spmm_csr_double"),
+            torch.float32: (
+                "spmm_csr_float_v2",
+                "prebuilt_spmm_csr_f32",
+                "spmm_csr_float",
+            ),
+            torch.float64: (
+                "spmm_csr_double_v2",
+                "prebuilt_spmm_csr_f64",
+                "spmm_csr_double",
+            ),
             torch.int32: ("prebuilt_spmm_csr_i32",),
             torch.int64: ("prebuilt_spmm_csr_i64",),
         },
@@ -102,7 +120,9 @@ _MATMUL_PREBUILT_SPECS: List[PrebuiltMatmulSpec] = [
 ]
 
 
-def _resolve_symbol(candidates: Sequence[str]) -> Tuple[Optional[KernelFn], Optional[str]]:
+def _resolve_symbol(
+    candidates: Sequence[str],
+) -> Tuple[Optional[KernelFn], Optional[str]]:
     for symbol_name in candidates:
         fn = getattr(native_ops, symbol_name, None)
         if fn is not None:
@@ -133,8 +153,13 @@ def resolve_prebuilt_matmul(
     # hash -- whereas hashing the format itself recurses through its tuple of
     # LevelFormat on every lookup, which measured no better than rebuilding the string.
     cache_key = (
-        a.dim(), b.dim(), str(a.format), str(b.format),
-        of_key, a._raw_values.dtype, b._raw_values.dtype,
+        a.dim(),
+        b.dim(),
+        str(a.format),
+        str(b.format),
+        of_key,
+        a._raw_values.dtype,
+        b._raw_values.dtype,
     )
     cached = _resolve_matmul_cache.get(cache_key, _RESOLVE_MISS)
     if cached is not _RESOLVE_MISS:
@@ -152,7 +177,9 @@ def _resolve_prebuilt_matmul_uncached(
     if a.values.dtype != b.values.dtype:
         return None
 
-    requested_format = str(parse_format(output_format)) if output_format is not None else None
+    requested_format = (
+        str(parse_format(output_format)) if output_format is not None else None
+    )
     a_format = str(a.format)
     b_format = str(b.format)
     a_rank = a.dim()
@@ -163,7 +190,9 @@ def _resolve_prebuilt_matmul_uncached(
             continue
         if a_format != spec.lhs_format or b_format != spec.rhs_format:
             continue
-        if requested_format is not None and requested_format != str(parse_format(spec.output_format)):
+        if requested_format is not None and requested_format != str(
+            parse_format(spec.output_format)
+        ):
             continue
         symbols = spec.symbol_by_dtype.get(a.values.dtype)
         if symbols is None:
@@ -183,6 +212,7 @@ def _resolve_prebuilt_matmul_uncached(
 # ---------------------------------------------------------------------------
 # Fused prebuilt kernel specs (SpMM + postops)
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class PrebuiltFusedSpec:
@@ -259,9 +289,9 @@ def execute_prebuilt_binary_kernel(
         args.append(tensor._native_mode_indices())  # type: ignore[arg-type]
         args.append(tensor._raw_values)  # type: ignore[arg-type]
 
-    # nthreads/atparallel are only supplied for the drop-in SpMM (spmm_csr_float_v2,
-    # the only kernel accepting nthreads_override/atparallel); the caller gates on
-    # symbol_name. atparallel launches the SpMM on torch's intra-op pool so it
+    # nthreads/atparallel are only supplied for the drop-in SpMM -- spmm_csr_float_v2
+    # and spmm_csr_double_v2, the two instantiations of the one kernel that accepts
+    # nthreads_override/atparallel; the caller gates on symbol_name. atparallel launches the SpMM on torch's intra-op pool so it
     # shares one warm team with the pipeline's torch epilogue.
     #
     # The clock is read only when someone asked for the timing. Two time.time() calls

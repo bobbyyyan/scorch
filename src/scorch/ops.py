@@ -250,7 +250,11 @@ def _with_compiler_mode_order(
     return result
 
 
-# Composition thread-count matching for the drop-in CSR-SpMM (spmm_csr_float_v2).
+# The drop-in CSR@dense SpMM symbols: one kernel (spmm_csr_v2_core) instantiated at
+# float32 and float64. Both take the composition hints below.
+_DROP_IN_SPMM_SYMBOLS = frozenset({"spmm_csr_float_v2", "spmm_csr_double_v2"})
+
+# Composition thread-count matching for the drop-in CSR-SpMM.
 # When a scorch SpMM is used as a torch op inside a host pipeline (e.g. a GCN
 # layer: F.linear -> scorch.matmul -> ...), the SpMM's throttled policy thread
 # count differs from the host's (torch) thread count, forcing a libgomp team
@@ -597,8 +601,10 @@ def matmul_wksp(
 def _composition_hints(resolved):
     """Thread-count and pipelining hints for the drop-in CSR@dense SpMM.
 
-    Returns ``(nthreads, atparallel)``, both inert unless the resolved kernel is
-    ``spmm_csr_float_v2``.
+    Returns ``(nthreads, atparallel)``, both inert unless the resolved kernel is one
+    of the two drop-in SpMMs, ``spmm_csr_float_v2`` or ``spmm_csr_double_v2``. Those
+    are one kernel instantiated at two value types, so they take the same hints and
+    the thread-count match is worth the same thing to both.
 
     Derived here and nowhere else because two callers dispatch this kernel family --
     ``matmul`` and ``scorch.compile``'s fused SpMM+bias+act path -- and the tiling
@@ -607,7 +613,7 @@ def _composition_hints(resolved):
     deriving them differently would write verdicts the first cannot reproduce, and
     would forfeit the host-thread match (pubmed 0.78 -> 1.15x, commit e795127).
     """
-    if _MATCH_HOST_THREADS and resolved.symbol_name == "spmm_csr_float_v2":
+    if _MATCH_HOST_THREADS and resolved.symbol_name in _DROP_IN_SPMM_SYMBOLS:
         return torch.get_num_threads(), _ATPARALLEL_PIPELINE
     return None, False
 
@@ -628,6 +634,10 @@ def tiling_gate(a, b, resolved):
     dispatch that follows it cannot be asked at two different levels — a
     ``set_autotune`` context manager could otherwise exit between the two reads.
     """
+    # float32 only, deliberately: the tiled kernels the selector can pick
+    # (spmm_csr_float_tilej / _tileijk) have no float64 instantiation, so a float64
+    # product must not enter the selector at all. Widening this without widening
+    # those would hand the probe a candidate list with nothing in it.
     if resolved.symbol_name != "spmm_csr_float_v2":
         return None, False
     level = _tiling_current_level()

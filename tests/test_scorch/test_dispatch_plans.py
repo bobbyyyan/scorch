@@ -264,13 +264,56 @@ def test_planned_output_is_bit_identical(rows, cols, density, n, dtype):
     )
 
 
-def test_float64_uses_the_reference_kernel():
-    a, _ = random_csr(64, 64, 0.05, dtype=torch.float64)
+def test_float64_uses_the_drop_in_kernel():
+    """float64 plans the drop-in kernel, not the reference one it used to.
+
+    The "reference" kind still exists and is still tested below -- it is what ARM
+    runs, and what ``spmm_csr_double`` is still reachable as -- but it is no longer
+    what dispatch resolves.
+    """
+    a, dense = random_csr(64, 64, 0.05, dtype=torch.float64)
     b = dense_rhs(64, 8, dtype=torch.float64)
-    for _ in range(3):
-        scorch.matmul(a, b)
+    outs = [scorch.matmul(a, b) for _ in range(4)]
     (plan,) = plans_of(a).values()
-    assert plan.kind == "reference"
+    assert plan.kind == "v2_double"
+    # A plan that is installed but declines every call is the same defect wearing a
+    # different hat, so check it actually ran -- and that what it returned is right.
+    assert plan.served >= 1, "the float64 plan was installed but never served a call"
+    torch.testing.assert_close(
+        outs[-1], torch.matmul(dense, b), atol=1e-12, rtol=1e-12
+    )
+
+
+def test_every_resolvable_csr_dense_symbol_has_a_plan_kind():
+    """A new drop-in symbol must not silently take a dtype off the plan path.
+
+    ``plan._SYMBOL_KINDS`` and ``prebuilt_kernels``' symbol table are two lists of
+    the same kernels kept in two files. Adding ``spmm_csr_double_v2`` to the second
+    and not the first stopped float64 getting a plan at all: resolution moved to a
+    symbol the first table did not know, ``.get`` returned ``None``, and float64 went
+    back to paying the per-call dispatch cost a plan exists to remove. Nothing
+    failed, because an absent entry is indistinguishable from "this kernel
+    deliberately has no plan".
+
+    This states the distinction the table cannot. Only the float dtypes are required
+    to be plannable; int32/int64 resolve reference SpMMs that have no plan by design.
+    """
+    from scorch import prebuilt_kernels as pk
+
+    (spec,) = [
+        candidate
+        for candidate in pk._MATMUL_PREBUILT_SPECS
+        if candidate.lhs_format == "d,s"
+        and candidate.rhs_format == "d,d"
+        and candidate.output_format == "dd"
+    ]
+    for dtype in (torch.float32, torch.float64):
+        _, symbol = pk._resolve_symbol(spec.symbol_by_dtype[dtype])
+        assert symbol is not None, f"{dtype} resolves no CSR x dense symbol at all"
+        assert symbol in plan_mod._SYMBOL_KINDS, (
+            f"{dtype} resolves {symbol!r}, which plan._SYMBOL_KINDS does not know, "
+            f"so every {dtype} CSR x dense call silently runs without a plan"
+        )
 
 
 def test_each_result_is_a_fresh_buffer():
@@ -693,12 +736,16 @@ def test_plan_matches_the_tileijk_symbol_bitwise(panels):
     assert plan.kind == "tileijk"
 
 
-def test_plan_matches_the_f64_symbol_bitwise():
+def f64_case(free_dim=16):
     generator = torch.Generator().manual_seed(6)
     dense = (torch.rand((80, 80), generator=generator) < 0.1).double()
     dense *= torch.rand((80, 80), generator=generator).double()
-    b = dense_rhs(80, 16, dtype=torch.float64)
-    args = legacy_args(dense, b)
+    b = dense_rhs(80, free_dim, dtype=torch.float64)
+    return dense, b, legacy_args(dense, b)
+
+
+def test_plan_matches_the_f64_symbol_bitwise():
+    _, b, args = f64_case()
     legacy = scorch_ops.prebuilt_spmm_csr_f64(*args).storage.value.reshape(80, 16)
     plan = scorch_ops.make_spmm_csr_plan("reference", args[1], args[2], args[3], 16)
     torch.testing.assert_close(
@@ -709,15 +756,48 @@ def test_plan_matches_the_f64_symbol_bitwise():
     )
 
 
+def test_plan_matches_the_f64_drop_in_symbol_bitwise():
+    """The v2_double plan must be the pybind entry, bit for bit.
+
+    Both go through ``spmm_csr_double_v2_core``, which is the only place the
+    AVX2-or-reference choice is made -- so this also catches a plan that reached past
+    it to ``spmm_csr_v2_core<double>`` directly, which on ARM would take the generic
+    path the pybind entry deliberately does not.
+    """
+    _, b, args = f64_case()
+    symbol = scorch_ops.spmm_csr_double_v2(*args).storage.value.reshape(80, 16)
+    plan = scorch_ops.make_spmm_csr_plan("v2_double", args[1], args[2], args[3], 16)
+    torch.testing.assert_close(
+        plan.run(args[3], b, -1, False),
+        symbol,
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_the_two_f64_plan_kinds_agree_numerically():
+    """Different kernels, so not bitwise -- but the same product."""
+    _, b, args = f64_case()
+    ref = scorch_ops.make_spmm_csr_plan("reference", args[1], args[2], args[3], 16)
+    new = scorch_ops.make_spmm_csr_plan("v2_double", args[1], args[2], args[3], 16)
+    torch.testing.assert_close(
+        new.run(args[3], b, -1, False),
+        ref.run(args[3], b, -1, False),
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
 def test_factory_refuses_what_it_cannot_serve():
     generator = torch.Generator().manual_seed(7)
     dense = (torch.rand((32, 32), generator=generator) < 0.2).float()
     args = legacy_args(dense, dense_rhs(32, 4))
     make = scorch_ops.make_spmm_csr_plan
     assert make("nonsense", args[1], args[2], args[3], 4) is None
-    # float32 values cannot be served by the float64 reference kernel, and the
-    # tiled kernels reject a zero extent rather than guess.
+    # float32 values cannot be served by either float64 kernel, and the tiled
+    # kernels reject a zero extent rather than guess.
     assert make("reference", args[1], args[2], args[3], 4) is None
+    assert make("v2_double", args[1], args[2], args[3], 4) is None
     assert make("tileijk", args[1], args[2], args[3], 0) is None
     assert make("v2", [32], args[2], args[3], 4) is None
 

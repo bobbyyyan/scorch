@@ -300,6 +300,41 @@ void bind_experimental_spmm_variants(py::module_& m) {
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
         py::arg("B_values"), py::arg("tile_size") = 256,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
+  // float64 CSR x dense through spmm_csr_double_v2_core, which is the float32 v2
+  // kernel at double where AVX2 makes that worth doing and the reference kernel
+  // where it does not -- see the long note at that function. Bound explicitly for
+  // the same reason v2 is: it takes the composition hints. The float64 route
+  // resolves this instead of spmm_csr_double, which stays as the reference kernel
+  // the tests compare against.
+  m.def("spmm_csr_double_v2",
+        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+           torch::Tensor A_values, std::vector<int64_t> B_shape,
+           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+           torch::Tensor B_values, int tile_size, int nthreads_override,
+           bool atparallel) {
+          constexpr const char* op = "spmm_csr_double_v2";
+          scorch_native::validate_binary_inputs(
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              torch::kFloat64, result_shape, A_shape, A_mode_indices, A_values,
+              B_shape, B_mode_indices, B_values);
+          tile_size = scorch_native::validate_tile_size(
+              tile_size, op, "tile_size", B_shape[1]);
+          scorch_native::validate_thread_override(nthreads_override, op);
+          return spmm_csr_double_v2(
+              scorch_native::narrow_legacy_shape(result_shape, op,
+                                                  "result_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
+              A_mode_indices, A_values,
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
+              B_mode_indices, B_values, tile_size, nthreads_override, atparallel);
+        },
+        "float64 CSR x dense: the float32 v2 kernel at double on AVX2, the "
+        "reference kernel elsewhere",
+        py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
+        py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
+        py::arg("B_values"), py::arg("tile_size") = 256,
+        py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
   // Column-panel ("tile-j") SpMM for the high-degree operand-over-LLC thrash
   // regime (reddit/products-class). Reached only when the adaptive tiling selector
   // (scorch.tiling / ops.matmul) fires; v2 serves every other shape. Jc = panel

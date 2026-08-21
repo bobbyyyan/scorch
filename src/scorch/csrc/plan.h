@@ -49,15 +49,17 @@
 
 namespace scorch_native {
 
-// The kernels the adaptive tiling selector can choose between, plus the typed
-// reference kernel that serves float64. Mirrors tiling.py's decision vocabulary
-// ("v2" / "tilej" / "tileijk") so the plan is built straight from the memoized
-// decision without a translation table.
+// The kernels the adaptive tiling selector can choose between, plus the two float64
+// routes. The first three mirror tiling.py's decision vocabulary ("v2" / "tilej" /
+// "tileijk") so a plan is built straight from the memoized decision without a
+// translation table; the float64 names have no selector to mirror, because float64
+// never enters the selector (the tiled kernels have no float64 instantiation).
 enum class SpmmPlanKind : int {
-  V2 = 0,        // spmm_csr_float_v2, the drop-in float32 kernel
-  TileJ = 1,     // spmm_csr_float_tilej, column panels
-  TileIJK = 2,   // spmm_csr_float_tileijk, free-dim strips + B relayout
-  Reference = 3  // spmm_csr_typed<double>, the float64 route
+  V2 = 0,         // spmm_csr_float_v2, the drop-in kernel at float32
+  TileJ = 1,      // spmm_csr_float_tilej, column panels
+  TileIJK = 2,    // spmm_csr_float_tileijk, free-dim strips + B relayout
+  Reference = 3,  // spmm_csr_typed<double>, the kernel float64 used to resolve
+  V2Double = 4    // spmm_csr_double_v2, the drop-in kernel at float64
 };
 
 inline bool spmm_plan_kind_from_name(const std::string& name,
@@ -66,6 +68,7 @@ inline bool spmm_plan_kind_from_name(const std::string& name,
   if (name == "tilej") { out = SpmmPlanKind::TileJ; return true; }
   if (name == "tileijk") { out = SpmmPlanKind::TileIJK; return true; }
   if (name == "reference") { out = SpmmPlanKind::Reference; return true; }
+  if (name == "v2_double") { out = SpmmPlanKind::V2Double; return true; }
   return false;
 }
 
@@ -120,6 +123,7 @@ class SpmmCsrPlan {
       case SpmmPlanKind::TileJ: return "tilej";
       case SpmmPlanKind::TileIJK: return "tileijk";
       case SpmmPlanKind::Reference: return "reference";
+      case SpmmPlanKind::V2Double: return "v2_double";
     }
     return "unknown";
   }
@@ -190,6 +194,14 @@ class SpmmCsrPlan {
             rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
             free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_));
         break;
+      case SpmmPlanKind::V2Double:
+        // Not spmm_csr_v2_core<double> directly: that would bypass the
+        // AVX2-or-reference choice spmm.h makes, and take the generic path on ARM.
+        values = spmm_csr_double_v2_core(
+            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
+            free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_), nt,
+            atparallel);
+        break;
       default:
         return c10::nullopt;
     }
@@ -248,7 +260,7 @@ inline c10::optional<SpmmCsrPlan> make_spmm_csr_plan(
   if (!a_values.defined()) return c10::nullopt;
 
   const torch::ScalarType dtype = a_values.scalar_type();
-  if (kind == SpmmPlanKind::Reference) {
+  if (kind == SpmmPlanKind::Reference || kind == SpmmPlanKind::V2Double) {
     if (dtype != torch::kFloat64) return c10::nullopt;
   } else if (dtype != torch::kFloat32) {
     return c10::nullopt;
