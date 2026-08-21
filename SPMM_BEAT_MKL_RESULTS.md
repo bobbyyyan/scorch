@@ -2235,6 +2235,87 @@ for the suite and then sleeps five minutes. The general lesson is cheaper than t
 diagnosis, though: the A/A control had already reported the run unusable, and no
 amount of care about arm order substitutes for reading it.
 
+## The published 236-cell grid, candidate against the branch point
+
+The levers above were each measured on their own grid. That does not answer the
+question the performance convention actually asks, which is whether the shipped tree
+regressed anything on the corpus this document's headline numbers come from. So:
+`600cba2`, the `perf/spmm-beat-mkl` tip and the branch point, against the candidate
+tip, over all 236 cells at all five autotune levels — 1180 points.
+
+Two trees built from one bundle, differing in exactly four runtime files. Passes run
+**base, cand, cand, base** per group so both trees have the same mean position and a
+monotonic drift over the run cancels in the contrast rather than favouring whichever
+ran later. The two same-tree passes are the floor, and they need to be: the cross-run
+spread between `base_r1` and `base_r2` — same binary, two processes — has a median of
+1.035, a p95 of 1.398 and a **maximum of 4.13x**. A single base-run against a single
+cand-run on this corpus can invent almost any regression it likes.
+
+The split that makes the table readable is mechanism, not size. A cell is **live** only
+if a shipped change can execute in it:
+
+* the chunk rule fires only where `scorch_spmm_chunk` differs from the generic width —
+  **37 of 236 cells**, all through `spmm_csr_float_v2`, since the tiled kernels take no
+  chunk at all;
+* the mask lever runs only where the register-block path owns the row (N ≤ 32) or the
+  register-tile path has a ragged last tile (N % 64 ≠ 0). At N = 64, 128, 512, 1024 and
+  2048 the width is a whole number of 64-wide tiles and the masked instantiation never
+  executes.
+
+Everything else is running identical machine code in both trees.
+
+| group | n | geomean (base/cand) | 95% CI | worst point |
+|---|---|---|---|---|
+| **null** — no change can execute | 680 | 0.9947 | [0.989, 1.001] | **2.214x slower** |
+| **live** — a change can execute | 500 | **1.0470** | [1.038, 1.056] | 1.124x slower |
+
+**live − null: +5.25%, z = 9.55. Zero live points fall below the null's floor.** The
+worst live point — `syn:band16` at N=32, 1.124x slower across four levels — sits at the
+**4.9th percentile of the null distribution**: 33 of 680 points running unchanged code
+are at least that slow. It is not separable from noise, and four levels agreeing is not
+four observations, because all four route to `v2` and re-time the same kernel.
+
+Per group, and the wide-B tail is the cleanest case of all — at N = 1024 and 2048 the
+mask is inert and the chunk rule fires on none of those four matrices, so *every* wide
+cell is a null cell, and it reads 0.9995:
+
+| group | live n | live geomean | null n | null geomean |
+|---|---|---|---|---|
+| main | 255 | 1.0543 | 285 | 0.9984 |
+| ss-tiling | 130 | 1.0427 | 155 | 1.0020 |
+| ss-quick | 115 | 1.0357 | 200 | 0.9830 |
+| wide | 0 | — | 40 | 0.9995 |
+
+Decomposed by which lever can run, the two separate cleanly:
+
+| mechanism | n | geomean | range |
+|---|---|---|---|
+| mask only | 315 | 1.0133 | 0.890–1.469 |
+| chunk only | 75 | 1.0303 | 0.894–1.191 |
+| both | 110 | **1.1622** | 0.976–1.805 |
+
+`both` is superadditive against the other two because it is exactly the N = 16 and 32
+cells on the many-row matrices — `webbase-1M`, `thermal2`, `scircuit`, `ogbn-arxiv` —
+which is where the chunk rule's largest wins live. The mask-only figure, 1.0133 over
+315 points, is also the third independent estimate of that lever, against +2.3% from
+its own grid.
+
+**Route changed on 0 of 1180 points.** The probe's A/A control and fail-closed margin
+did not move a single dispatch decision on this corpus, which is what "behaviour-neutral
+on today's frontier" should mean when checked against a real grid rather than a
+frontier sample.
+
+Two things this grid says that the per-lever grids could not. The per-cell significance
+test flagged **93 regressions, 69 of them in the null group** — including the entire top
+of the list, `bcsstk17@512` at 2.21x and `cop20k_A@N=128` at 1.24x on all five levels,
+both of them cells where no shipped line can execute. That is the same false-positive
+mode measured at 46% earlier, reproduced on an unrelated corpus, and it is the reason
+this section reports groups rather than cells. And the null group is the only check made
+anywhere on the `scorch_spmm_nthreads` extraction, which touches the thread count of
+*every* call: it was factored out of two kernels that each computed it inline, one of
+them carrying a comment that merely claimed to match the other. 0.9947 over 680 points
+sharing no other change is the evidence that the arithmetic did not move.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32 except the float64 section below. float64 CSR
