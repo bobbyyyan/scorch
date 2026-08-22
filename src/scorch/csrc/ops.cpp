@@ -592,6 +592,18 @@ void bind_sddmm_variants(py::module_& m) {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Whether the SpMM A/B tune hooks (SCORCH_SPMM_WORKSPACE and friends) are
+    // compiled in. A harness that selects between two kernel paths by environment
+    // variable has no way to tell a build without them from a build where the change
+    // it is measuring does nothing: both arms take the same path and every ratio
+    // reads 1.000 with tight controls. Publishing the flag lets such a harness fail
+    // closed instead of reporting the null it manufactured.
+#ifdef SCORCH_TUNE_HOOKS
+    m.attr("spmm_tune_hooks") = true;
+#else
+    m.attr("spmm_tune_hooks") = false;
+#endif
+
     bind_prebuilt_kernel_family(m);
     bind_experimental_spmm_variants(m);
     bind_fused_spmm_variants(m);

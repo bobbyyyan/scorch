@@ -56,3 +56,24 @@ def test_resolve_prebuilt_skips_output_format_mismatch():
 
     resolved = resolve_prebuilt_matmul(a, b, output_format="dd")
     assert resolved is None
+
+
+def test_the_extension_says_whether_its_tune_hooks_are_compiled_in():
+    """`scorch_ops.spmm_tune_hooks` must exist, and must be a bool.
+
+    The SpMM A/B harnesses select between two kernel paths with an environment
+    variable that `spmm_csr_v2_core` reads per call. Run against a build without
+    `-DSCORCH_TUNE_HOOKS` those getenvs are not in the binary, both arms take the same
+    path, and the harness reports a tight ~1.000 that is indistinguishable from "the
+    change under test does nothing" -- which is exactly what happened once, for about
+    400 cells. This attribute is how a harness tells the two apart, so it is worth a
+    test of its own: deleting it would not break any kernel, it would quietly restore
+    the ability to publish that null.
+    """
+    import scorch_ops
+
+    flag = getattr(scorch_ops, "spmm_tune_hooks", None)
+    assert isinstance(flag, bool), (
+        "scorch_ops must publish spmm_tune_hooks as a bool; got "
+        f"{flag!r} of type {type(flag).__name__}"
+    )
