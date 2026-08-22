@@ -1,22 +1,31 @@
-"""The drop-in CSR SpMM across every narrow free-dimension width, ragged and not.
+"""The drop-in CSR SpMM across every free-dimension width, ragged and not.
 
-The narrow-k register kernel holds a whole output row in ceil(k/8) YMM registers,
-so k splits its behaviour three ways: whether the final vector is entirely valid
-(k % 8 == 0, no mask needed), whether it is ragged (a genuine partial vector, mask
-required), and whether k is narrow enough to take that path at all. The kernel is
-specialized on ceil(k/8) for 1..4, so k = 8, 16, 24, 32 are also the boundaries
-between instantiations.
+k is the axis that selects which template instantiation of the register row kernel
+runs, and the two SIMD arms cut it at different places, so a width that is a boundary
+on one host is interior on the other. Every width below is therefore checked against a
+dense reference on whatever host runs the suite.
 
-Dropping the mask where k is a multiple of 8 is semantics-preserving by
-construction -- with all eight lanes enabled, a masked load is a load and a masked
-store is a store -- but "provably equivalent" is an argument about the code, and
-the widths where the argument is made are exactly the widths nothing was checking.
-So every width from 1 to 40 is compared against a dense reference here, which
-covers both sides of all four instantiation boundaries and the crossing into the
-wide (register-tiled) path above 32.
+On AVX2 the narrow-k kernel holds a whole output row in ceil(k/8) YMM registers, so k
+splits three ways: a final vector that is entirely valid (k % 8 == 0, no mask), a ragged
+one (mask required), and k too wide for that path at all. It is specialized on ceil(k/8)
+for 1..4, making k = 8, 16, 24, 32 instantiation boundaries. Dropping the mask where k
+is a multiple of 8 is semantics-preserving by construction -- with all eight lanes
+enabled a masked load is a load -- but that is an argument about the code, and the
+widths where the argument is made were the widths nothing checked.
+
+On NEON there is no mask. The strip kernel carries the ragged remainder in TAIL scalar
+accumulators updated in the same pass over the row, and is specialized on (NV, TAIL) for
+lanes of 4 (float32) or 2 (float64). So the boundaries move: every multiple of 4 is an
+instantiation edge for float32, every multiple of 2 for float64, and a strip is 32
+elements, which puts a second boundary at k = 32 where a row stops being a single
+dispatch and starts being several. Widths past 40 matter here in a way they do not on
+AVX2, because that is where multi-strip rows live -- and the float64 arm reaches NV = 16
+at k = 32, a value a first version of the hoisted switch could not express: it wrote
+NV-1 vectors and left the last lanes of every row unwritten, silently.
 
 These run on any build; the masked-versus-unmasked timing comparison needs the
-instrumented build and lives in bench/bench_spmm_narrowk_mask.py.
+instrumented build and lives in bench/bench_spmm_narrowk_mask.py, and the
+NEON-versus-workspace comparison in bench/bench_spmm_neon_regkernel.py.
 """
 
 import pytest
@@ -64,7 +73,12 @@ def v2(a_st, b_dense, k):
     return out.storage.value.view(ROWS, k)
 
 
-@pytest.mark.parametrize("k", list(range(1, 41)))
+# 1..40 covers both sides of every AVX2 instantiation boundary and every NEON one up
+# to the first strip edge; the widths past it are where a NEON row becomes multi-strip,
+# including the ones whose remainder is a partial strip (33, 47, 65, 97, 127).
+@pytest.mark.parametrize(
+    "k", list(range(1, 41)) + [47, 48, 63, 64, 65, 96, 97, 127, 128]
+)
 def test_every_narrow_width_matches_a_dense_reference(k):
     dense = csr_operand()
     a_st = STensor.from_torch(dense.to_sparse_csr())

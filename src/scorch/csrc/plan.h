@@ -195,8 +195,10 @@ class SpmmCsrPlan {
             free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_));
         break;
       case SpmmPlanKind::V2Double:
-        // Not spmm_csr_v2_core<double> directly: that would bypass the
-        // AVX2-or-reference choice spmm.h makes, and take the generic path on ARM.
+        // Not spmm_csr_v2_core<double> directly: the forwarder owns the choice of
+        // which row kernel a host gets -- AVX2's regblock/regtile, NEON's strip
+        // kernel, or the reference loop where there is no SIMD arm at all -- and
+        // calling past it would hard-code one of the three here.
         values = spmm_csr_double_v2_core(
             rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
             free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_), nt,

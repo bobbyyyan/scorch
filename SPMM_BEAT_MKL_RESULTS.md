@@ -334,40 +334,52 @@ cells where the answer is known to be exactly 1.000. At 9 rounds the deviation i
 means nothing finer than about ±7%, while the geomean over 69 cells is good to roughly
 ±1%. That is the right prior to read every per-cell number in this section with.
 
-### ARM keeps the reference kernel, on purpose
+### ARM float64 keeps the reference kernel here, and one sentence in this section was wrong
 
-NEON has no masked load or store, so the traits layer does not specialize to it and
-there is no `scorch_simd<T>` for ARM. `spmm_csr_double_v2` is guarded on
-`__AVX2__ && __FMA__` and falls back to `spmm_csr_typed<double>` — the same reference
-kernel float64 already resolved — everywhere else.
+`spmm_csr_double_v2` is guarded on `__AVX2__ && __FMA__` and falls back to
+`spmm_csr_typed<double>` — the same reference kernel float64 already resolved —
+everywhere else, so this change leaves ARM's float64 exactly as it was. The M5 confirm
+reads new/ref **0.992** over 69 cells (A/A control 1.000–1.200): unchanged, as intended,
+and the 0.8% shortfall from 1.000 is the harness's accuracy rather than a difference in
+the code, which off AVX2 is the same code by construction.
 
-That forgoes a measured win, so here is the measurement. Routing float64 through the
-generic non-AVX2 path on the M5 gave geomean **1.642x** over the reference across the M5
-grid, with one regression: `gcn__pubmed@k=8` at **0.689**, i.e. 1.45x *slower*. Two
-attempts to remove it both failed:
+An earlier version of this section gave the wrong reason for that fallback. It said NEON
+has no masked load or store, so a register-resident row kernel would need a different
+strategy for the ragged tail before double could be ported to it. The premise is true and
+the conclusion does not follow. This file already contained a NEON register kernel —
+`scorch_spmm_row_neon_regtile`, written for the fused Linear kernel — and it handles the
+ragged tail with scalar accumulators updated in the same pass over the row: no masks, no
+overread, nothing to invent. The real reason every ARM row went through the workspace loop
+is duller. `spmm_csr_v2_core`'s register path was written under `#if defined(__AVX2__)`
+and nobody had put a NEON arm next to it. That is a wiring gap, not a portability barrier,
+and it is being fixed separately from this change.
+
+Two figures from an earlier attempt at ARM float64 are worth keeping, because they say
+what not to do. Routing float64 through the generic non-AVX2 path on the M5 gave geomean
+**1.642x** over the reference across the M5 grid, with one regression: `gcn__pubmed@k=8`
+at **0.689**, i.e. 1.45x *slower*. Two attempts to remove it both failed:
 
 - single-tile direct accumulation with an assigning first nonzero — 0.681, no change;
 - bulk zeroing on the non-AVX2 path plus pure in-place accumulation — **worse overall**,
   geomean 1.642 → 1.267.
 
 Both were reverted. Shipping a 1.45x regression on a real GCN shape to collect a 1.64x
-geomean is exactly the trade this project's performance convention exists to refuse, and
-the regression is still unexplained, so ARM float64 keeps the kernel it had.
+geomean is the trade this project's performance convention exists to refuse. Those two
+figures also carry the same caveat as the x86 table above: they were taken with
+`atparallel=False`, and on the M5 that is the launch mode that gets all 18 cores rather
+than the six P-cores `at::parallel_for` hands out. They are not re-derived, because they
+describe a path this tree does not ship.
 
-Those two ARM figures carry the same caveat as the x86 table above: they were taken
-with `atparallel=False`, and on the M5 that is the launch mode that gets all 18 cores
-rather than the six P-cores `at::parallel_for` hands out. They are not re-derived,
-because they describe a path this tree does not ship — the decision they informed was
-"do not ship it", and the direction of the `atparallel` difference on this host can only
-have made the generic path look *better* than production would. What is confirmed at
-production hints is the thing that matters: ARM float64 runs the same kernel it ran
-before. The M5
-confirm after that decision reads new/ref **0.992** over 69 cells (A/A control
-1.000–1.200) — ARM is unchanged, as intended, and the 0.8% shortfall from 1.000 is the
-harness's accuracy rather than a difference in the code, which off AVX2 is the same code
-by construction. A NEON register kernel for float64 is real remaining
-work, and it needs a different strategy for the ragged tail than the AVX2 mask, which
-is what made the float32 kernel portable to double in the first place.
+One fact about the hosts, because it bounds how much confirmation any ARM claim in this
+document can get: **MKT is x86_64, not ARM.** Slurm's `sinfo` reports `Arch=x86_64` for
+the allocation, so of the machines this project measures on, exactly one — the M5 — can
+execute a NEON instruction. Two-host confirmation is available for every x86 claim here
+and for no ARM one. An ARM number has to get its discipline from repetition and per-cell
+controls on a single host instead, and that host is a laptop that sleeps: one run in this
+session spent three hours cycling between Clamshell Sleep, a Thermal Emergency Sleep, and
+DarkWake, produced a full set of plausible ratios, and said nothing about it. Any ARM pass
+reported below therefore carries its own sleep check, taken from the gap between
+`time.time()` and `time.monotonic()` across the pass.
 
 ### The call plan the new symbol nearly lost
 
@@ -414,6 +426,152 @@ every cell measured.
 remainder, and the first widths past the wide tile; exact agreement with the reference
 kernel it replaces; an all-empty matrix; more output rows than sparse rows; and a row
 wider than one tile. A 450-cell shape × density sweep through `matmul` is clean.
+
+## A register kernel for ARM, and a three-hour measurement of nothing
+
+Every row of the drop-in SpMM on Apple silicon went through the workspace loop: memset
+a tile, load-modify-store into it once per nonzero, memcpy it out. The register-resident
+path in `spmm_csr_v2_core` was written under `#if defined(__AVX2__)` and no NEON arm had
+ever been put next to it. An earlier section of this file said NEON couldn't have one
+because it has no masked load or store; that was wrong, and it is corrected there. The
+file already contained `scorch_spmm_row_neon_regtile` for the fused Linear kernel, whose
+ragged tail is scalar accumulators updated in the same pass over the row. No masks
+needed.
+
+What now exists is one strip kernel, `scorch_spmm_row_neon_strip<T, NV, TAIL, ALLOW_DUAL>`,
+templated on element type, on the number of vector accumulators, on how many scalar
+accumulators carry the ragged tail, and on whether two nonzeros are in flight at once.
+`scorch_neon<T>` supplies the lanes (4 float / 2 double) and the strip width. A row
+narrower than one strip is a single dispatch — one pass over the nonzeros — and a wider
+row is cut into strips. `neon_single`, `neon_nv` and `neon_tail` are hoisted above the
+row loop because they are functions of k alone, so each row runs one straight-line
+instantiation, the same way the AVX2 arm switches on a loop-invariant `nvec`.
+
+Two things about that were wrong on the first attempt and are worth stating, because
+both were mechanism errors rather than tuning:
+
+- **The strip was sized in registers, not elements.** Eight vectors is 32 floats but
+  only 16 doubles, and every extra strip re-walks the row's nonzeros — a degree-3
+  float64 row did 24 index walks where it needed 3. `syn__aeshape@128` read 0.969.
+  Sizing the strip by element count (`strip_vecs` 8 for float, 16 for double, 32
+  elements either way) fixed it.
+- **The hoisted switch topped out below the reachable value.** `nv` reaches 16 for
+  float64 at k=32, and a `case 15:` ceiling with a literal default wrote NV-1 vectors
+  and left the last lanes of the row unwritten — a silent wrong answer, not a slow one.
+  Caught by the dense-k sweep in `tests/test_scorch/test_spmm_float64.py`, which walks
+  every k from 1 to 40; that test exists because of exactly this class of bug.
+
+### What it is worth
+
+Both arms are the same binary, built with `-DSCORCH_TUNE_HOOKS`, selected per call by
+`SCORCH_SPMM_WORKSPACE`, which `spmm_csr_v2_core` reads on every call. Interleaved in
+one process, because cross-run drift on this laptop is larger than the effect. The hook
+build carries per-row hook overhead on **both** arms, so these are lower bounds on the
+shipped kernel. 12 passes, 173 distinct cells, 447 cell-readings, 14 matrices plus three
+synthetic degree sweeps, k from 4 to 128, both dtypes:
+
+| | readings | geomean | min | max | below 1.0 |
+|---|---|---|---|---|---|
+| float32 | 259 | **1.393** | 1.014 | 2.208 | 0 |
+| float64 | 188 | **1.339** | 1.007 | 2.046 | 0 |
+| all | 447 | **1.370** | 1.007 | 2.208 | **0** |
+
+The same-code control over those readings: median 1.011, p90 1.035, worst 1.114. The
+smallest single reading, 1.007, is inside that control; nothing else is close to it.
+
+By k, and by row length, which is where the shape of the win lives:
+
+| | k=4 | k=8 | k=12 | k=16 | k=32 | k=64 | k=128 |
+|---|---|---|---|---|---|---|---|
+| float32 | 1.345 | 1.451 | 1.428 | 1.502 | 1.310 | 1.352 | 1.300 |
+| float64 | 1.319 | 1.461 | 1.292 | 1.342 | 1.326 | 1.293 | 1.253 |
+
+| mean row length | <4 | 4–8 | 8–25 | ≥25 |
+|---|---|---|---|---|
+| float32 | 1.248 | 1.397 | 1.505 | 1.659 |
+| float64 | 1.217 | 1.322 | 1.403 | 1.562 |
+
+The win grows with row length, which is the mechanism: the workspace loop pays a
+load-modify-store per nonzero and the register kernel pays nothing per nonzero beyond
+the FMA, so the longer the row the more there is to save. It does not vanish at wide k,
+because a strip is 32 elements and a wide row is simply more strips. Largest single
+cells are `ss__ct20stif@16` (degree 52) at 2.168 and `gcn__ogbn-arxiv@32` at 2.109;
+smallest are the near-empty `ss__webbase-1M` (degree 3.1) at 1.007–1.063 and
+`syn__aeshape@128` (degree 3.0) at 1.060.
+
+### The 2-nonzero unroll, priced on its own
+
+`ALLOW_DUAL` gives the kernel-before-the-unroll its own arm in the same binary, so the
+unroll is priced against its own predecessor rather than across two builds. Geomean
+1.031 on float32 and 1.014 on float64; 13% of float32 readings and 29% of float64 ones
+below 1.0, worst 0.928; the four cells that lose in a majority of their passes lose
+1.1–2.2%, inside the p90 of the control. It stays.
+
+That comparison carries a second control worth more than the first. The threshold
+`2*NV <= 16` turns the unroll off for float64 at k ≥ 32, where a strip is 16 vectors and
+a doubled set would want the whole register file. Those 85 readings are therefore
+identical machine code on both arms, and they measure **1.0066 / 1.0002 / 1.0052** at
+k = 32 / 64 / 128. That is the floor the float32 numbers above sit on. (Note the arithmetic
+that is easy to get wrong: a wide row is cut into strips of `strip_vecs`, so NV per strip
+is 8 for float32 at every k, not k/lanes. The unroll is never off for float32.)
+
+### Three ways this measurement lied before it worked
+
+None of the numbers above come from the first three attempts, and each failure was
+silent in a different way.
+
+**The machine was asleep.** A run started at 17:41 and finished at 20:48 with a full set
+of ratios — geomean 1.44 to 1.48, tight-looking controls, five sections. Four minutes in,
+the lid closed: Clamshell Sleep at 17:46:13, a Thermal Emergency Sleep at 17:46:59, then
+DarkWake→Sleep every fifteen minutes until 20:41. The same work now takes **five
+minutes**, so that run was about 99% sleep and throttle. Its only visible symptom was
+that two sections logged a starting load average of 12.52 and 33.51, which is
+indistinguishable from a busy desktop. Every pass now measures its own sleep directly:
+on Darwin `time.monotonic()` does not advance across a sleep and `time.time()` does, so
+their difference across the pass **is** the sleep duration. Every pass above reports
+0.0s.
+
+**The hook was not in the binary.** The next attempt pointed `PYTHONPATH` at a tree built
+without `-DSCORCH_TUNE_HOOKS`. Both arms took the same path. It produced 400-odd cells at
+geomean 0.98–1.03 with controls of 1.005–1.045 — a clean, tight, entirely fictional null,
+shaped exactly like "this change does nothing." The harness carried a comment promising
+to refuse such a build and did not implement the check. It does now, two ways: the
+extension publishes `spmm_tune_hooks` under the same `#ifdef`, and failing that the
+harness looks for the string literal `SCORCH_SPMM_WORKSPACE` in the shared object, since
+a getenv that was compiled out cannot name it. The tell that was there all along:
+relative error between arms read exactly 0.00e+00, where the unrolled kernel sums in two
+chains and must differ in the last bits.
+
+**The cells that mattered most were too fast to measure.** `gcn__cora@8` is a
+20-microsecond call, and its time does not move with k at all — 0.0250 ms at k=4 and
+0.0253 ms at k=32 — so its runtime is per-call fixed cost, not this kernel. Timed one
+call at a time, a 20µs parallel region is shorter than the OpenMP thread-wake noise it
+sits in; min-over-21-rounds never finds a clean draw and the control blows out to
+1.4–1.7. That cell is the entire reason the 2-nonzero unroll was written: it read below
+1.0 in three runs of four. Eight readings of it scatter from 0.875 to 1.440 with no
+consistent sign. Nothing was ever established there. The fix is to time a batch of
+back-to-back calls and divide, sized per cell to clear 3 ms; the control tightened from
+1.001–1.463 to 1.005–1.045 on the same busy machine, and became insensitive to load —
+the twelve passes above ran at starting loads from 3.25 to 13.64 and their geomeans
+agree to within 1%. Batching does change what is measured, from a cold first touch to
+the steady state, and both arms get it equally.
+
+The unroll turned out to be worth keeping anyway. The reason first given for it was not
+a reason.
+
+### One host, and that is all there is
+
+**MKT is x86_64.** `sinfo` reports `Arch=x86_64` for the allocation, so of the machines
+this project measures on, exactly one — the M5 — can execute a NEON instruction. There is
+no two-host confirmation available for anything in this section and there will not be
+one. What stands in for it: 12 interleaved passes rather than one, a per-cell same-code
+control on every cell, a second control from 85 readings where the compared code is
+provably identical, per-pass sleep detection, and a per-cell majority test before any
+single cell is called a regression.
+
+x86 is unaffected, and that is structural rather than measured: every line added here is
+inside `#if defined(__ARM_NEON)`, the release build's shared object contains neither hook
+string, and the AVX2 row dispatch is byte-for-byte the committed one.
 
 ## The kernel hypotheses, all measured
 

@@ -2282,6 +2282,285 @@ static inline void scorch_spmm_row_regtile(
 }
 #endif
 
+#if defined(__ARM_NEON)
+// ---------------------------------------------------------------------------
+// NEON register-resident row kernels for the drop-in SpMM, the ARM counterpart
+// of the AVX2 regblock/regtile pair above.
+//
+// Why these exist: until now the `#if defined(__AVX2__)` block above was the ONLY
+// register-resident path in this kernel, so on ARM every row fell through to the
+// workspace loop -- memset a tile, accumulate into it with a load-modify-store per
+// nonzero, memcpy it out. The fused Linear kernel further down has had a NEON
+// register kernel since f130f54 and measured the workspace round-trip at 10-14% of
+// its forward, so the drop-in SpMM was paying a cost its own file already knew how
+// to avoid, on the one architecture that could not use the AVX2 fix.
+//
+// NEON has no masked load or store, which is what the AVX2 kernels use for a k that
+// is not a whole number of vectors. The strategy here instead: a row is (a) whole
+// vectors accumulated in registers, plus (b) a remainder of fewer than `lanes`
+// columns accumulated in SCALAR registers -- both updated in the SAME pass over the
+// row's nonzeros. No masks, no overread past the end of B, and one walk of A1_crd
+// and A_val per row rather than one per column.
+//
+// That last point is the trap the fused kernel's version still falls into: its tail
+// is a per-column scalar loop OUTSIDE the nonzero loop, so a row with k below its
+// 32-wide strip re-walks the row once per column -- 8 walks at k=8, which is exactly
+// the GCN shape. Migrating the fused kernel onto these is a separate change with its
+// own grid; it is not done here.
+template <typename T> struct scorch_neon;
+
+template <> struct scorch_neon<float> {
+  using vec = float32x4_t;
+  static constexpr int lanes = 4;
+  static constexpr int strip_vecs = 8;      // 32 floats, 8 of 32 NEON registers
+  static inline vec zero() { return vdupq_n_f32(0.f); }
+  static inline vec splat(float x) { return vdupq_n_f32(x); }
+  static inline vec load(const float* p) { return vld1q_f32(p); }
+  static inline void store(float* p, vec v) { vst1q_f32(p, v); }
+  static inline vec fma(vec acc, vec a, vec b) { return vfmaq_f32(acc, a, b); }
+  static inline vec add(vec a, vec b) { return vaddq_f32(a, b); }
+};
+
+template <> struct scorch_neon<double> {
+  using vec = float64x2_t;
+  static constexpr int lanes = 2;
+  // 16 vectors, not 8: a strip is sized by how many ELEMENTS of the output row it
+  // covers, not by how many registers it uses. At 8 vectors a double strip covered
+  // 16 columns against float's 32, so float64 needed twice the strips for the same
+  // k -- and every extra strip re-walks the row's nonzeros, which is pure loss on a
+  // low-degree row. Measured: the win degraded monotonically with strips per row
+  // (1.446 / 1.323 / 1.276 / 1.193 at 1 / 2 / 4 / 8 strips) and degree-3.0 aeshape
+  // at k=128, the only 8-strip low-degree cell, fell to 0.969-0.990. 16 of 32 NEON
+  // registers is still half the file.
+  static constexpr int strip_vecs = 16;     // 32 doubles
+  static inline vec zero() { return vdupq_n_f64(0.0); }
+  static inline vec splat(double x) { return vdupq_n_f64(x); }
+  static inline vec load(const double* p) { return vld1q_f64(p); }
+  static inline void store(double* p, vec v) { vst1q_f64(p, v); }
+  static inline vec fma(vec acc, vec a, vec b) { return vfmaq_f64(acc, a, b); }
+  static inline vec add(vec a, vec b) { return vaddq_f64(a, b); }
+};
+
+// One strip of the output row: NV vector accumulators plus TAIL scalar ones, all
+// live across a single pass over [pA_begin, pA_end). NV and TAIL are template
+// parameters so the loops fully unroll and the tail costs nothing when TAIL == 0.
+template <typename T, int NV, int TAIL, bool ALLOW_DUAL = true>
+static inline void scorch_spmm_row_neon_strip(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end, int k0) {
+  using V = scorch_neon<T>;
+  constexpr int L = V::lanes;
+  // Two accumulator sets when the register budget allows, so two nonzeros are in
+  // flight at once. With NV accumulators and one nonzero per iteration each
+  // accumulator is a serial FMA chain as long as the row: at NV=2 (float32, k=8) and
+  // degree 5 that is ~5 dependent FMAs with only two chains to interleave. The AVX2
+  // regblock has carried the same 2-nonzero unroll from the start for that reason;
+  // the wide-k regtile does not need it because 8 accumulators already hide the
+  // latency. Threshold on 2*NV rather than NV so the doubled set never exceeds half
+  // the 32-register file.
+  //
+  // ALLOW_DUAL exists so the two versions can be compared inside one binary, next to
+  // the workspace arm, rather than across two builds.
+  //
+  // What the unroll is worth, M5, 447 cell-readings over 12 interleaved passes:
+  // geomean 1.031 on float32 and 1.014 on float64, largest at narrow k (float32
+  // k=4 1.047, k=8 1.045, decaying to 1.015 at k=32) and at longer rows (degree
+  // >= 8: 1.044 float32). 13% of float32 readings and 29% of float64 ones land
+  // below 1.0, none worse than 0.93, and the four cells that lose in a majority of
+  // their passes lose 1.1-2.2% -- inside the p90 of the same-code control (1.035).
+  //
+  // The threshold makes this provably inert for float64 at k >= 32, where a strip is
+  // 16 vectors and a doubled set would want all 32 registers. Those 85 readings are
+  // therefore identical code on both arms, and they measure 1.0066 / 1.0002 / 1.0052
+  // at k = 32 / 64 / 128 -- the floor against which the float32 numbers above are
+  // real. Note that a wide row is cut into strips of strip_vecs, so NV per strip is 8
+  // for float32 at every k, not k/lanes; the unroll is never off for float32.
+  //
+  // Worth recording why this needed measuring twice: the unroll was first added
+  // because gcn__cora@8 read below 1.0 in three runs of four, and that reading does
+  // not survive a better instrument. That cell is a 20-microsecond call whose time
+  // does not move with k at all, so its runtime is per-call fixed cost and not this
+  // kernel. Timed one call at a time its A/A control ran to 1.4-1.7 and eight
+  // readings of it scattered from 0.875 to 1.440 with no consistent sign. The unroll
+  // is worth keeping; the reason first given for it was not a reason.
+  constexpr bool DUAL = ALLOW_DUAL && (2 * NV <= 16);
+  typename V::vec acc[NV > 0 ? NV : 1];
+  typename V::vec acc2[(DUAL && NV > 0) ? NV : 1];
+  #pragma unroll
+  for (int v = 0; v < NV; v++) acc[v] = V::zero();
+  if constexpr (DUAL) {
+    #pragma unroll
+    for (int v = 0; v < NV; v++) acc2[v] = V::zero();
+  }
+  T tail[TAIL > 0 ? TAIL : 1];
+  T tail2[TAIL > 0 ? TAIL : 1];
+  #pragma unroll
+  for (int t = 0; t < TAIL; t++) { tail[t] = T(0); tail2[t] = T(0); }
+
+  int pA = pA_begin;
+  if constexpr (DUAL) {
+    for (; pA + 1 < pA_end; pA += 2) {
+      const T* SCORCH_RESTRICT B0 =
+          B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+      const T* SCORCH_RESTRICT B1 =
+          B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0;
+      if (pA + 2 < pA_end)
+        __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size + k0, 0, 1);
+      const T a0 = A_val[pA], a1 = A_val[pA + 1];
+      const typename V::vec va0 = V::splat(a0), va1 = V::splat(a1);
+      #pragma unroll
+      for (int v = 0; v < NV; v++) {
+        acc[v] = V::fma(acc[v], va0, V::load(B0 + L * v));
+        acc2[v] = V::fma(acc2[v], va1, V::load(B1 + L * v));
+      }
+      #pragma unroll
+      for (int t = 0; t < TAIL; t++) {
+        tail[t] += a0 * B0[L * NV + t];
+        tail2[t] += a1 * B1[L * NV + t];
+      }
+    }
+  }
+  for (; pA < pA_end; pA++) {
+    const T* SCORCH_RESTRICT B =
+        B_val + (size_t)A1_crd[pA] * (size_t)B1_size + k0;
+    if (pA + 1 < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size + k0, 0, 1);
+    const T a = A_val[pA];
+    const typename V::vec va = V::splat(a);
+    #pragma unroll
+    for (int v = 0; v < NV; v++)
+      acc[v] = V::fma(acc[v], va, V::load(B + L * v));
+    #pragma unroll
+    for (int t = 0; t < TAIL; t++) tail[t] += a * B[L * NV + t];
+  }
+
+  #pragma unroll
+  for (int v = 0; v < NV; v++) {
+    typename V::vec r = acc[v];
+    if constexpr (DUAL) r = V::add(r, acc2[v]);
+    V::store(C_row + k0 + L * v, r);
+  }
+  #pragma unroll
+  for (int t = 0; t < TAIL; t++) C_row[k0 + L * NV + t] = tail[t] + tail2[t];
+}
+
+// Dispatch a strip of `width` columns (width <= 8 * lanes) to the instantiation
+// that covers it. Straight-line once selected; the switch is on a value that is
+// loop-invariant per call.
+template <typename T, bool ALLOW_DUAL = true>
+static inline void scorch_spmm_row_neon_dispatch(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end, int k0, int width) {
+  using V = scorch_neon<T>;
+  constexpr int L = V::lanes;
+  const int nv = width / L;
+  const int tail = width - nv * L;
+#define SCORCH_NEON_CASE(NVV)                                                     \
+  case NVV:                                                                       \
+    switch (tail) {                                                               \
+      case 0: scorch_spmm_row_neon_strip<T, NVV, 0, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      case 1: scorch_spmm_row_neon_strip<T, NVV, 1, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      case 2: scorch_spmm_row_neon_strip<T, NVV, 2, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      default: scorch_spmm_row_neon_strip<T, NVV, 3, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+    }
+  switch (nv) {
+    SCORCH_NEON_CASE(0)
+    SCORCH_NEON_CASE(1)
+    SCORCH_NEON_CASE(2)
+    SCORCH_NEON_CASE(3)
+    SCORCH_NEON_CASE(4)
+    SCORCH_NEON_CASE(5)
+    SCORCH_NEON_CASE(6)
+    SCORCH_NEON_CASE(7)
+    SCORCH_NEON_CASE(8)
+    SCORCH_NEON_CASE(9)
+    SCORCH_NEON_CASE(10)
+    SCORCH_NEON_CASE(11)
+    SCORCH_NEON_CASE(12)
+    SCORCH_NEON_CASE(13)
+    SCORCH_NEON_CASE(14)
+    SCORCH_NEON_CASE(15)
+    default: break;
+  }
+#undef SCORCH_NEON_CASE
+  scorch_spmm_row_neon_strip<T, scorch_neon<T>::strip_vecs, 0, ALLOW_DUAL>(
+      A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0);
+}
+
+// A whole output row. Wide k is cut into 8-vector strips (32 floats / 16 doubles)
+// so the accumulators stay in registers; the last, narrower strip carries whatever
+// is left, vectors and scalars together. A row narrower than one strip is a single
+// dispatch -- one pass over the nonzeros, which is the case the fused kernel's
+// per-column scalar tail gets wrong.
+template <typename T, bool ALLOW_DUAL = true>
+static inline void scorch_spmm_row_neon(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  constexpr int NV_FULL = scorch_neon<T>::strip_vecs;
+  constexpr int STRIP = NV_FULL * scorch_neon<T>::lanes;   // 32 elements, both types
+  int k0 = 0;
+  // A full strip is NV_FULL vectors and no remainder by construction, so it needs
+  // no dispatch -- one instantiation, straight through.
+  for (; k0 + STRIP <= B1_size; k0 += STRIP)
+    scorch_spmm_row_neon_strip<T, NV_FULL, 0, ALLOW_DUAL>(
+        A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0);
+  if (k0 < B1_size)
+    scorch_spmm_row_neon_dispatch<T, ALLOW_DUAL>(
+        A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, B1_size - k0);
+}
+
+// The entry spmm_csr_v2_core calls per row. neon_single / neon_nv / neon_tail are
+// hoisted above the row loop by the caller because they are functions of B1_size
+// alone, so each row runs one straight-line instantiation rather than re-deriving
+// the split -- the same reason the AVX2 arm switches on a loop-invariant nvec.
+// Templated on ALLOW_DUAL so a release build instantiates exactly one version.
+template <typename T, bool ALLOW_DUAL>
+static inline void scorch_spmm_row_neon_hoisted(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    bool neon_single, int neon_nv, int neon_tail) {
+  if (neon_single) {
+    #define SCORCH_NEON_TAIL(NV)                                          \
+      switch (neon_tail) {                                                \
+        case 0: scorch_spmm_row_neon_strip<T, NV, 0, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, 0); break; \
+        case 1: scorch_spmm_row_neon_strip<T, NV, 1, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, 0); break; \
+        case 2: scorch_spmm_row_neon_strip<T, NV, 2, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, 0); break; \
+        default: scorch_spmm_row_neon_strip<T, NV, 3, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, 0); break; \
+      }
+    switch (neon_nv) {
+      case 0: SCORCH_NEON_TAIL(0); break;
+      case 1: SCORCH_NEON_TAIL(1); break;
+      case 2: SCORCH_NEON_TAIL(2); break;
+      case 3: SCORCH_NEON_TAIL(3); break;
+      case 4: SCORCH_NEON_TAIL(4); break;
+      case 5: SCORCH_NEON_TAIL(5); break;
+      case 6: SCORCH_NEON_TAIL(6); break;
+      case 7: SCORCH_NEON_TAIL(7); break;
+      case 8: SCORCH_NEON_TAIL(8); break;
+      case 9: SCORCH_NEON_TAIL(9); break;
+      case 10: SCORCH_NEON_TAIL(10); break;
+      case 11: SCORCH_NEON_TAIL(11); break;
+      case 12: SCORCH_NEON_TAIL(12); break;
+      case 13: SCORCH_NEON_TAIL(13); break;
+      case 14: SCORCH_NEON_TAIL(14); break;
+      case 15: SCORCH_NEON_TAIL(15); break;
+      // strip_vecs, not a literal: nv reaches 16 for float64 at k=32 (16
+      // vectors of 2 lanes) and 8 for float32 at k=32. A literal here wrote
+      // NV-1 vectors and silently left the last lanes of the row unwritten.
+      default: SCORCH_NEON_TAIL(scorch_neon<T>::strip_vecs); break;
+    }
+    #undef SCORCH_NEON_TAIL
+  } else {
+    scorch_spmm_row_neon<T, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row,
+                                        pA_begin, pA_end);
+  }
+}
+#endif  // __ARM_NEON
+
 // Rows per work-stealing chunk for SpMM.
 //
 // The generic scorch_chunk aims for a fixed number of dynamic chunks per worker
@@ -2487,11 +2766,29 @@ torch::Tensor spmm_csr_v2_core(
   const bool narrow_k = false;
 #endif
 
-#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
-  // A/B hook: force the legacy workspace path instead of the AVX2 register
-  // kernels, for wide-k regression re-checks. Compiled out of the shipped .so.
+#if defined(__ARM_NEON) && !defined(__AVX2__)
+  // Loop-invariant shape of a single-strip row, hoisted for the same reason the
+  // AVX2 block above hoists nvec/full_last: it is a function of B1_size only.
+  constexpr int kNeonLanes = scorch_neon<scalar_t>::lanes;
+  const bool neon_single =
+      (B1_size <= scorch_neon<scalar_t>::strip_vecs * kNeonLanes);
+  const int neon_nv = B1_size / kNeonLanes;
+  const int neon_tail = B1_size - neon_nv * kNeonLanes;
+#endif
+
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: force the legacy workspace path instead of whichever register kernel
+  // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
+  // guarded on the ISA, because the workspace path is what BOTH register kernels
+  // replaced and it is the only way to price either of them in one process against
+  // one binary. Compiled out of the shipped .so.
   const char* _wsonly = std::getenv("SCORCH_SPMM_WORKSPACE");
   const bool force_workspace = _wsonly && *_wsonly && std::atol(_wsonly) != 0;
+  const char* _nodual = std::getenv("SCORCH_SPMM_NEON_NODUAL");
+  const bool neon_no_dual = _nodual && *_nodual && std::atol(_nodual) != 0;
+  (void)neon_no_dual;
+#endif
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
   // A/B hook: refresh the regtile partial-tile toggle once per op (read by
   // scorch_spmm_row_regtile). SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial.
   { const char* e = std::getenv("SCORCH_REGTILE_BASE");
@@ -2504,8 +2801,13 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e && std::atol(e) != 0) full_last = false; }
 #endif
 
+  // A register-resident row kernel writes the whole row, so the workspace only
+  // exists for architectures that have neither (and for the force_workspace hook).
+#define SCORCH_SPMM_NEEDS_WORKSPACE                                            \
+  (!(defined(__AVX2__) && defined(__FMA__)) && !defined(__ARM_NEON)) ||        \
+      defined(SCORCH_TUNE_HOOKS)
   scorch_unique_buffer<scalar_t> worker_workspaces;
-#if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
+#if SCORCH_SPMM_NEEDS_WORKSPACE
   worker_workspaces = scorch_make_aligned_buffer_pool<scalar_t>(
       static_cast<size_t>(nthreads), static_cast<size_t>(kTile));
 #endif
@@ -2520,10 +2822,11 @@ torch::Tensor spmm_csr_v2_core(
   auto scorch_spmm_worker = [&](int worker_id) {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
-    // row, so the shipped build never touches it. Allocated only for the non-AVX2
-    // fallback or the force_workspace hook.
+    // row, and on NEON scorch_spmm_row_neon does, so neither shipped build touches
+    // it. Allocated only where there is no register kernel at all, or for the
+    // force_workspace hook.
     scalar_t* SCORCH_RESTRICT ws = nullptr;
-#if !defined(__AVX2__) || !defined(__FMA__) || defined(SCORCH_TUNE_HOOKS)
+#if SCORCH_SPMM_NEEDS_WORKSPACE
     ws = worker_workspaces.get() +
         static_cast<size_t>(worker_id) * static_cast<size_t>(kTile);
 #else
@@ -2571,6 +2874,34 @@ torch::Tensor spmm_csr_v2_core(
           } else {
             scorch_spmm_row_regtile<scalar_t>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
           }
+          continue;
+        }
+#endif
+
+#if defined(__ARM_NEON) && !defined(__AVX2__)
+        // The NEON strip kernel owns every row here, exactly as the AVX2 block above
+        // does: accumulators stay in registers for the whole pass over the row, so
+        // the workspace round-trip per nonzero is gone. The loop below survives only
+        // as the no-SIMD fallback and as the force_workspace A/B hook.
+#ifdef SCORCH_TUNE_HOOKS
+        if (!force_workspace)
+#endif
+        {
+          // ALLOW_DUAL=false selects the kernel as it was before the 2-nonzero
+          // unroll, reachable only under the tune hooks, so the unroll can be priced
+          // in this binary against both the workspace arm and its own predecessor
+          // rather than across two builds.
+#ifdef SCORCH_TUNE_HOOKS
+          if (neon_no_dual) {
+            scorch_spmm_row_neon_hoisted<scalar_t, false>(
+                A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
+                neon_single, neon_nv, neon_tail);
+            continue;
+          }
+#endif
+          scorch_spmm_row_neon_hoisted<scalar_t, true>(
+              A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
+              neon_single, neon_nv, neon_tail);
           continue;
         }
 #endif
@@ -2710,32 +3041,37 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
 // spmm_csr_float / spmm_csr_float_v2: the reference kernel stays as the thing the
 // tests compare against.
 //
-// AVX2 ONLY, and the #else is not laziness -- it is the measurement. What makes this
-// kernel win is the register-resident row: on AVX2 the regblock/regtile kernels own
-// every row and nothing round-trips through memory. Without them the row falls to the
-// workspace loop, and that loop is not better than the reference kernel at low degree
-// and narrow k. Measured on the M5 over 50 float64 cells: geometric mean 1.64x the
-// reference, but pubmed at k=8 (degree 5.5) reads 0.69x and citeseer at k=8 0.91x.
-// Two attempts to close that failed -- accumulating in place with an assigning first
-// nonzero (0.69x, no change) and zeroing C in bulk instead of per empty row (0.80x at
-// that cell, and it cost the mid cells more than it gained, dropping the whole grid to
-// 1.27x). Both are reverted; the workspace loop above is byte-unchanged from what
-// shipped.
+// Guarded on having a register-resident row kernel, not on a particular ISA. What
+// makes this kernel win is that the whole output row lives in registers for one pass
+// over the nonzeros: AVX2's regblock/regtile, or NEON's strip kernel. Where neither
+// exists the row falls to the workspace loop, and that loop is NOT better than the
+// reference kernel at low degree and narrow k -- so the #else really is the
+// measurement, and it is worth keeping the numbers that established it.
 //
-// So float64 takes the reference kernel where there is no register kernel to take
-// instead. That forgoes a real 1.64x on Apple silicon rather than ship an unexplained
-// 1.45x regression on a GCN shape, and Apple silicon has no MKL to be losing to in the
-// first place -- the parity claim this fixes is an x86 claim. The fix that would earn
-// the ARM win is a NEON register kernel, which is not a specialization of the traits
-// above: NEON has no masked load or store, so the ragged tail needs a different
-// strategy than the AVX2 kernels use.
+// Routing float64 through the workspace loop on the M5, over 50 cells: geometric mean
+// 1.64x the reference, but pubmed at k=8 (degree 5.5) read 0.69x and citeseer at k=8
+// 0.91x. Two attempts to close that failed -- accumulating in place with an assigning
+// first nonzero (0.69x, no change) and zeroing C in bulk instead of per empty row
+// (0.80x at that cell, and it cost the mid cells more than it gained, dropping the
+// grid to 1.27x). Both reverted. Shipping an unexplained 1.45x regression on a real
+// GCN shape to collect a 1.64x mean is the trade the performance convention refuses.
 //
-// Split in two like the float32 entry, and for one reason beyond that: the
-// AVX2-or-reference choice below is a POLICY, and pybind is not the only caller that
-// needs it -- plan.h dispatches this same product without going through the entry
-// above. Both call this function, so the policy is written once. A plan that decided
-// it again would be free to get it wrong in the one direction that matters, using the
-// generic path on ARM, which is precisely what the paragraph above decided against.
+// The register kernel is what closed it, and ARM has one now. An earlier version of
+// this comment said a NEON kernel could not be a specialization of the traits above
+// because NEON has no masked load or store, so the ragged tail would need a different
+// strategy. The premise is true and the conclusion was wrong: the tail wants scalar
+// accumulators updated in the same pass over the row, which needs no mask and no
+// overread, and scorch_spmm_row_neon_regtile in this file had been doing exactly that
+// for the fused Linear kernel the whole time. See scorch_spmm_row_neon_strip above:
+// float64 on the M5 now reads geomean 1.339 against the workspace loop it replaced
+// over 188 readings, none below 1.0.
+//
+// Split in two like the float32 entry, and for one reason beyond that: the choice of
+// row kernel below is a POLICY, and pybind is not the only caller that needs it --
+// plan.h dispatches this same product without going through the entry above. Both call
+// this function, so the policy is written once. A plan that decided it again would be
+// free to get it wrong in the one direction that matters, dropping a host to the
+// workspace loop that has a register kernel available.
 torch::Tensor spmm_csr_double_v2_core(
                 int C0_size, int C1_size, int A0_size,
                 const int* SCORCH_RESTRICT A1_pos,
@@ -2743,7 +3079,7 @@ torch::Tensor spmm_csr_double_v2_core(
                 const double* SCORCH_RESTRICT A_val,
                 int B1_size, const double* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel) {
-#if defined(__AVX2__) && defined(__FMA__)
+#if (defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON)
   return spmm_csr_v2_core<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
                                   B1_size, B_val, tile_size, nthreads_override,
                                   atparallel);
