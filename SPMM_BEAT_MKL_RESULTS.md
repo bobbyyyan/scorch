@@ -515,6 +515,68 @@ k = 32 / 64 / 128. That is the floor the float32 numbers above sit on. (Note the
 that is easy to get wrong: a wide row is cut into strips of `strip_vecs`, so NV per strip
 is 8 for float32 at every k, not k/lanes. The unroll is never off for float32.)
 
+### The fused Linear path had its own copy of this kernel, and its tail was wrong
+
+`spmm_csr_linear_fused_float` carried `scorch_spmm_row_neon_regtile`, written beside its
+own row loop rather than shared with the drop-in SpMM. The 32-wide strip body was fine.
+The tail was not: it walked the row's nonzeros **once per remaining column**, outside the
+nonzero loop. A free dimension under 32 read the row that many times instead of once, and
+a ragged width paid an extra full walk per leftover column. Here the free dimension is the
+**batch** — the sparse operand is the weight — so the widths that hit it are small batches
+and every batch that is not a multiple of 32, which includes a dataset's last incomplete
+one.
+
+The fused path now calls `scorch_spmm_row_neon`. In-binary A/B against the kernel it
+replaced via `SCORCH_FUSED_LEGACY_TAIL`, 4 passes, 5 weight shapes (64×256 through
+4096×1024, densities 0.01–0.10) × 15 batch widths, both relu and identity epilogues,
+300 readings: geomean **1.164**, max **2.658**, A/A median 1.010 / p90 1.042.
+
+Two changes ride together and the batch width separates them cleanly, which is the whole
+reason to sweep widths that are and are not multiples of 32:
+
+| | n | geomean |
+|---|---|---|
+| batch % 32 == 0 — no remainder, so the 2-nonzero unroll alone | 30 | 1.021–1.029 |
+| batch % 32 != 0 — unroll plus the tail | 45 | 1.265–1.271 |
+| batch < 32 — the row was re-walked once per column | 30 | 1.362–1.368 |
+
+The peak is at batch 31, the widest single-pass width: 2.51x, 2.29x, 2.22x on three of
+the five shapes. At batch 32 it drops to 1.03 — same kernel, one fewer leftover column.
+
+Nine of 75 cells lose in a majority of their four passes, none by more than 5.1%, and
+their mechanisms are known: batch=1 (0.949, 0.955), where the whole width is a single
+scalar accumulator; batch=33 (0.967–0.980), one full strip plus a 1-wide remainder, so
+two passes over the row; and the smallest weight (64×256) at batch 96–128 (0.982–0.987),
+where the whole op is a few microseconds and mostly fixed cost. They are reported rather
+than tuned around, because both attempts to fix them made things worse.
+
+### Two fixes for those nine cells, both measured, both rejected
+
+Worth writing down because each was a plausible mechanism argument that lost to a
+measurement.
+
+**Don't run the unroll when there are no vector accumulators.** At a free dimension of 1
+there is one FMA per nonzero and the loop's own pointer arithmetic and prefetch obviously
+dominate, so a second scalar chain looked like pure overhead. Gating `DUAL` on `NV >= 1`
+made that case **worse**, 0.968 → 0.922. Two scalar chains still pay. The argument was
+clean and wrong.
+
+**Let a single dispatch take a ragged tail at full strip width.** A dispatch covers NV
+vectors *and* TAIL scalars, so it could serve 35 elements for float32, not 32 —
+`strip<float, 8, 1>` writes exactly the 33 columns that currently cost two passes. Widening
+`neon_single` to that bound did not help the widths it was for (33: 0.986 → 0.981) and it
+**cost their neighbours**: batch 24 went 1.688 → 1.623 and batch 31 went 1.997 → 1.942,
+neither of which the change touches. Adding `NV=strip_vecs`-with-a-tail instantiations to
+the hoisted switch changed register allocation for the cases around them. That is the
+lesson worth keeping: in a switch over template instantiations, a new arm is not free to
+the arms beside it, so "this cannot affect that shape" is a claim about source and not
+about code.
+
+Both reverted. The revert was re-measured and reproduces the prior build to within 1% at
+every batch width (0.981–1.015), which is also what licenses comparing across these
+builds at all: the legacy arm is present in both binaries as an anchor, and rebuilding the
+same source lands in the same place.
+
 ### Three ways this measurement lied before it worked
 
 None of the numbers above come from the first three attempts, and each failure was

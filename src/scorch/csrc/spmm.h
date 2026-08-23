@@ -2384,6 +2384,11 @@ static inline void scorch_spmm_row_neon_strip(
   // kernel. Timed one call at a time its A/A control ran to 1.4-1.7 and eight
   // readings of it scattered from 0.875 to 1.440 with no consistent sign. The unroll
   // is worth keeping; the reason first given for it was not a reason.
+  // Not gated on NV >= 1, though a scalar-only width looks like it should be: at a
+  // free dimension of 1 the whole row is one scalar accumulator, one FMA per nonzero,
+  // and the loop's own pointer arithmetic and prefetch plainly dominate. Requiring
+  // NV >= 1 there was measured and made that case WORSE, 0.968 -> 0.922 against the
+  // kernel this replaced. Two scalar chains still pay. Left alone.
   constexpr bool DUAL = ALLOW_DUAL && (2 * NV <= 16);
   typename V::vec acc[NV > 0 ? NV : 1];
   typename V::vec acc2[(DUAL && NV > 0) ? NV : 1];
@@ -2770,6 +2775,15 @@ torch::Tensor spmm_csr_v2_core(
   // Loop-invariant shape of a single-strip row, hoisted for the same reason the
   // AVX2 block above hoists nvec/full_last: it is a function of B1_size only.
   constexpr int kNeonLanes = scorch_neon<scalar_t>::lanes;
+  // strip_vecs*lanes, and NOT the wider bound a single dispatch could in principle
+  // serve. It could take strip_vecs vectors plus lanes-1 scalars -- 35 elements for
+  // float32 -- which would make widths 33..35 one pass instead of a strip plus a
+  // remainder, and those widths do lose slightly (0.986 at 33). That was tried. It did
+  // not help them (0.986 -> 0.981) and it cost their neighbours, because adding
+  // NV=strip_vecs-with-a-tail instantiations to the hoisted switch changed register
+  // allocation for the cases around them: 24 went 1.688 -> 1.623 and 31 went
+  // 1.997 -> 1.942, neither of which the change touches. Reverted; 33..35 losing about
+  // 1.5% is left as a measured fact rather than tuned around.
   const bool neon_single =
       (B1_size <= scorch_neon<scalar_t>::strip_vecs * kNeonLanes);
   const int neon_nv = B1_size / kNeonLanes;
@@ -3463,15 +3477,18 @@ static inline void scorch_apply_row_bias_act(float* SCORCH_RESTRICT C_row,
 }
 
 #if defined(__ARM_NEON)
-// NEON register-tiled SpMM output row (ARM analogue of the AVX2 scorch_spmm_row_
-// regtile; the default ARM inner kernel for the fused Linear path). Accumulates
-// C_row[0..B1_size) = sum_nnz a*B_row directly in NEON registers, tiling the free
-// dim into 32-wide strips held in 8 float32x4 accumulators — 8 independent FMA
-// chains hide the ~4-cycle FMA latency without a 2-nnz unroll. This avoids the
-// scalar workspace loop's per-nnz round-trip (memset + ws L1 load/store + memcpy),
-// which measured ~10-14% of the fused forward on M5 across the AE grid. Tail
-// free-dim (B1_size % 32) done scalar.
-static inline void scorch_spmm_row_neon_regtile(
+// The fused Linear path's original NEON row kernel, kept only so the kernel that
+// replaced it can be priced against it in one binary. Do not call it in a release
+// build; scorch_spmm_row_neon does the same job without the defect below.
+//
+// The 32-wide strip body is fine and is what scorch_spmm_row_neon_strip does with
+// eight accumulators. The tail is not: it walks the row's nonzeros ONCE PER REMAINING
+// COLUMN, outside the nonzero loop. So a free dimension under 32 re-walks the row
+// B1_size times instead of once -- at B1_size = 8 the row is read eight times, and a
+// ragged width like 100 pays four extra full walks for its last four columns. The
+// replacement carries the remainder in TAIL scalar accumulators updated in the same
+// pass over the row, so every width is one pass.
+static inline void scorch_spmm_row_neon_regtile_legacy(
     const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
     const float* SCORCH_RESTRICT B_val, int B1_size,
     float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
@@ -3578,6 +3595,14 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   bool use_neon_regtile = true;
   if (const char* _nr = std::getenv("SCORCH_NEON_REGTILE"))
     if (*_nr) use_neon_regtile = (std::atol(_nr) != 0);
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: the pre-replacement row kernel, whose tail re-walks the row once per
+  // remaining column. The only way to price the replacement without comparing two
+  // builds. Compiled out of the shipped .so.
+  bool fused_legacy_tail = false;
+  if (const char* _lt = std::getenv("SCORCH_FUSED_LEGACY_TAIL"))
+    if (*_lt) fused_legacy_tail = (std::atol(_lt) != 0);
+#endif
 #endif
 
   scorch_unique_buffer<float> worker_workspaces;
@@ -3640,7 +3665,17 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
         }
 #elif defined(__ARM_NEON)
         if (use_neon_regtile) {
-          scorch_spmm_row_neon_regtile(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end);
+          // The same kernel the drop-in SpMM runs, rather than a second one that
+          // happened to live next to this loop: one pass over the row at every width,
+          // and the 2-nonzero unroll comes with it.
+#ifdef SCORCH_TUNE_HOOKS
+          if (fused_legacy_tail) {
+            scorch_spmm_row_neon_regtile_legacy(A1_crd, A_val, B_val, B1_size, C_row,
+                                                pA_begin, pA_end);
+          } else
+#endif
+          scorch_spmm_row_neon<float>(A1_crd, A_val, B_val, B1_size, C_row,
+                                      pA_begin, pA_end);
         } else {
           for (int k_out = 0; k_out < B1_size; k_out += kTile) {
             const int kw = std::min(kTile, B1_size - k_out);
