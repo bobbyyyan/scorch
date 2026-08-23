@@ -577,6 +577,64 @@ every batch width (0.981–1.015), which is also what licenses comparing across 
 builds at all: the legacy arm is present in both binaries as an anchor, and rebuilding the
 same source lands in the same place.
 
+### tile-ijk kept the scalar inner loop too, and this one only pays on one host
+
+`spmm_csr_float_tileijk` relayouts a strip of B, then for each contraction panel and
+each row accumulates that panel's nonzeros into the row's `Nc`-wide slice of a
+cache-resident output panel `Cp`:
+
+    for (; pb < pe; ++pb) { a = A_val[pb]; ...; for (k = 0; k < w; ++k) C_row[k] += a * B_row[k]; }
+
+That is `w` L1 loads and `w` L1 stores **per nonzero** into a row that is already hot.
+`Nc` exists so that `Cp` fits the *cache* — and at the widths production's own cost model
+picks it also fits *registers*, so the row can be loaded once, accumulated over the
+panel's nonzeros, and stored once. The harness asks `tiling._ijk_params` and
+`tiling.query_llc()` for `Nc` and `Jc` rather than restating the formula, because a
+harness that restates a production policy drifts from it silently, which has already
+happened three times here.
+
+On the M5 this is worth a uniform 22%. Three passes, 5 matrices (uniform, power-law and
+banded, degrees 8–64) × N ∈ {512, 1024, 2048}, in-binary A/B via
+`SCORCH_TILEIJK_SCALAR`:
+
+| pass | geomean | min | max | below 1.0 | A/A median |
+|---|---|---|---|---|---|
+| 1 | 1.217 | 1.124 | 1.288 | 0/15 | 1.008 |
+| 2 | 1.220 | 1.117 | 1.288 | 0/15 | 1.006 |
+| 3 | 1.217 | 1.123 | 1.271 | 0/15 | 1.010 |
+
+`Nc <= 32`, where the slice is one register strip and the row is walked once, reads
+1.196–1.204. `Nc > 32`, where it is walked once per strip, reads 1.226–1.237 — *higher*,
+not lower, because a wider slice saves more stores per nonzero and the extra walk is a
+cache-hot index stream.
+
+**The same change on x86 was built, measured, and rejected.** Cutting the slice into
+64-lane tiles and running `scorch_spmm_row_regtile_partial` with an accumulating seed
+gives, on redwood over the identical grid and three passes: geomean 1.033, min 0.971, and
+**4 to 5 of 15 cells below 1.0 in every pass**. The losers are every `Nc=112` cell on the
+short-row matrices (degree 16 and 33), where 112 lanes is two register tiles and so two
+walks of the row per panel, and where a panel holds only 8–16 nonzeros to amortize them.
+
+The asymmetry is the hosts, not the code. What the change removes is **L1** traffic to the
+output row. redwood achieves ~56 GB/s and is DRAM-bound streaming the relaid B, so
+removing L1 operations buys almost nothing; the M5 achieves ~412 GB/s, is core-bound, and
+it buys 22%. A 3.3% mean does not pay for a 2.4% regression on real shapes, so the AVX2
+arm is not taken and the path is `#if defined(__ARM_NEON)`. The `ACCUM` template parameter
+stays on `scorch_spmm_row_regtile_partial`, and the measured option if the x86 3% is ever
+wanted is to gate on the slice fitting **one** tile — every `Nc` of 16 or 32 won
+(1.027–1.058) and every `Nc=112` lost.
+
+One thing the change buys beyond speed: tile-ijk and the drop-in SpMM now run literally
+the same row kernel on ARM, and the existing bit-exactness test between the tiled fused
+route and `scorch.matmul` still passes.
+
+**tile-j was examined and is not the same opportunity**, which is worth stating because
+the two look alike. tile-j panels the *contraction* index, so its panel loop sits outside
+the row loop and every nonzero updates the full N-wide output row — N is exactly what
+tile-j is for, so the row cannot live in registers across panels. It is a streaming axpy,
+and the comment on that loop already records that a manual 16-wide unroll there measured
+**2x slower on ARM**. Left alone.
+
 ### Three ways this measurement lied before it worked
 
 None of the numbers above come from the first three attempts, and each failure was
@@ -631,9 +689,18 @@ control on every cell, a second control from 85 readings where the compared code
 provably identical, per-pass sleep detection, and a per-cell majority test before any
 single cell is called a regression.
 
-x86 is unaffected, and that is structural rather than measured: every line added here is
-inside `#if defined(__ARM_NEON)`, the release build's shared object contains neither hook
-string, and the AVX2 row dispatch is byte-for-byte the committed one.
+x86 is unaffected, and that is now measured rather than argued. Building the commit
+before this work and the tip on redwood (x86_64, 32 cores, gcc/torch 2.5.1) produces two
+shared objects of **exactly the same size**, 939968 bytes, differing in **126 bytes of
+the whole file**. Normalizing addresses, the disassembly is identical. Keeping the
+immediates, 11 instructions differ, all of the form `mov $IMM,%edx`, and every one of the
+11 shifts by exactly **+371** — which is exactly how many lines `spmm.h` grew
+(3914 → 4285). Those immediates are `TORCH_CHECK`'s `__LINE__` argument, and the line
+numbers they carry land on `TORCH_CHECK` calls in the new file. The rest of the 126 bytes
+is the GNU build-id, which cannot match across two builds.
+
+So the x86 machine code is identical apart from eleven assertion line numbers. Every line
+added here is inside `#if defined(__ARM_NEON)`, and the compiler agrees.
 
 ## The kernel hypotheses, all measured
 

@@ -2139,7 +2139,7 @@ static int g_scorch_regtile_base = 0;
 // Result: 9-29% fewer cycles on partial-tile K (K%64 != 0), full-64-multiple K
 // untouched (kw==0 -> this path never runs). Correctness bit-identical to the
 // runtime-nv form (verified K=33/63/65/100/120/127 checksum-parity + the suite).
-template <typename T, int NV>
+template <typename T, int NV, bool ACCUM = false>
 static inline void scorch_spmm_row_regtile_partial(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2148,8 +2148,21 @@ static inline void scorch_spmm_row_regtile_partial(
   using V = scorch_simd<T>;
   constexpr int L = V::lanes;
   typename V::vec acc0[NV], acc1[NV];
+  // ACCUM seeds the first set from the row, so this kernel serves both the assigning
+  // case (the drop-in SpMM owns the whole row) and the accumulating one (the tiled
+  // kernels add each contraction panel's contribution to a row later panels also add
+  // to). Only acc0 is seeded; acc1 starts at zero and is folded in at the store, so
+  // the row is added in exactly once.
   #pragma unroll
-  for (int v = 0; v < NV; v++) { acc0[v] = V::zero(); acc1[v] = V::zero(); }
+  for (int v = 0; v < NV; v++) {
+    if constexpr (ACCUM) {
+      const bool m = (v == NV - 1 && !full);
+      acc0[v] = m ? V::maskload(C_row + k0 + L * v, mask) : V::load(C_row + k0 + L * v);
+    } else {
+      acc0[v] = V::zero();
+    }
+    acc1[v] = V::zero();
+  }
   int pA = pA_begin;
   for (; pA + 1 < pA_end; pA += 2) {                        // 2-nnz ILP: 2*NV chains
     const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA]     * (size_t)B1_size + k0;
@@ -2344,7 +2357,7 @@ template <> struct scorch_neon<double> {
 // One strip of the output row: NV vector accumulators plus TAIL scalar ones, all
 // live across a single pass over [pA_begin, pA_end). NV and TAIL are template
 // parameters so the loops fully unroll and the tail costs nothing when TAIL == 0.
-template <typename T, int NV, int TAIL, bool ALLOW_DUAL = true>
+template <typename T, int NV, int TAIL, bool ALLOW_DUAL = true, bool ACCUM = false>
 static inline void scorch_spmm_row_neon_strip(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2392,8 +2405,15 @@ static inline void scorch_spmm_row_neon_strip(
   constexpr bool DUAL = ALLOW_DUAL && (2 * NV <= 16);
   typename V::vec acc[NV > 0 ? NV : 1];
   typename V::vec acc2[(DUAL && NV > 0) ? NV : 1];
+  // ACCUM starts from what is already in the row, so this kernel serves both the
+  // assigning case (the drop-in SpMM, which owns the whole row) and the accumulating
+  // one (the tiled kernels, which add each contraction panel's contribution to a row
+  // that later panels will add to as well). Only the first accumulator set is seeded;
+  // the second starts at zero and is folded in at the store, so the row is added in
+  // exactly once either way.
   #pragma unroll
-  for (int v = 0; v < NV; v++) acc[v] = V::zero();
+  for (int v = 0; v < NV; v++)
+    acc[v] = ACCUM ? V::load(C_row + k0 + L * v) : V::zero();
   if constexpr (DUAL) {
     #pragma unroll
     for (int v = 0; v < NV; v++) acc2[v] = V::zero();
@@ -2401,7 +2421,10 @@ static inline void scorch_spmm_row_neon_strip(
   T tail[TAIL > 0 ? TAIL : 1];
   T tail2[TAIL > 0 ? TAIL : 1];
   #pragma unroll
-  for (int t = 0; t < TAIL; t++) { tail[t] = T(0); tail2[t] = T(0); }
+  for (int t = 0; t < TAIL; t++) {
+    tail[t] = ACCUM ? C_row[k0 + L * NV + t] : T(0);
+    tail2[t] = T(0);
+  }
 
   int pA = pA_begin;
   if constexpr (DUAL) {
@@ -2453,7 +2476,7 @@ static inline void scorch_spmm_row_neon_strip(
 // Dispatch a strip of `width` columns (width <= 8 * lanes) to the instantiation
 // that covers it. Straight-line once selected; the switch is on a value that is
 // loop-invariant per call.
-template <typename T, bool ALLOW_DUAL = true>
+template <typename T, bool ALLOW_DUAL = true, bool ACCUM = false>
 static inline void scorch_spmm_row_neon_dispatch(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2465,10 +2488,10 @@ static inline void scorch_spmm_row_neon_dispatch(
 #define SCORCH_NEON_CASE(NVV)                                                     \
   case NVV:                                                                       \
     switch (tail) {                                                               \
-      case 0: scorch_spmm_row_neon_strip<T, NVV, 0, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
-      case 1: scorch_spmm_row_neon_strip<T, NVV, 1, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
-      case 2: scorch_spmm_row_neon_strip<T, NVV, 2, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
-      default: scorch_spmm_row_neon_strip<T, NVV, 3, ALLOW_DUAL>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      case 0: scorch_spmm_row_neon_strip<T, NVV, 0, ALLOW_DUAL, ACCUM>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      case 1: scorch_spmm_row_neon_strip<T, NVV, 1, ALLOW_DUAL, ACCUM>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      case 2: scorch_spmm_row_neon_strip<T, NVV, 2, ALLOW_DUAL, ACCUM>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
+      default: scorch_spmm_row_neon_strip<T, NVV, 3, ALLOW_DUAL, ACCUM>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0); return; \
     }
   switch (nv) {
     SCORCH_NEON_CASE(0)
@@ -2490,7 +2513,7 @@ static inline void scorch_spmm_row_neon_dispatch(
     default: break;
   }
 #undef SCORCH_NEON_CASE
-  scorch_spmm_row_neon_strip<T, scorch_neon<T>::strip_vecs, 0, ALLOW_DUAL>(
+  scorch_spmm_row_neon_strip<T, scorch_neon<T>::strip_vecs, 0, ALLOW_DUAL, ACCUM>(
       A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0);
 }
 
@@ -2499,7 +2522,7 @@ static inline void scorch_spmm_row_neon_dispatch(
 // is left, vectors and scalars together. A row narrower than one strip is a single
 // dispatch -- one pass over the nonzeros, which is the case the fused kernel's
 // per-column scalar tail gets wrong.
-template <typename T, bool ALLOW_DUAL = true>
+template <typename T, bool ALLOW_DUAL = true, bool ACCUM = false>
 static inline void scorch_spmm_row_neon(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2510,10 +2533,10 @@ static inline void scorch_spmm_row_neon(
   // A full strip is NV_FULL vectors and no remainder by construction, so it needs
   // no dispatch -- one instantiation, straight through.
   for (; k0 + STRIP <= B1_size; k0 += STRIP)
-    scorch_spmm_row_neon_strip<T, NV_FULL, 0, ALLOW_DUAL>(
+    scorch_spmm_row_neon_strip<T, NV_FULL, 0, ALLOW_DUAL, ACCUM>(
         A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0);
   if (k0 < B1_size)
-    scorch_spmm_row_neon_dispatch<T, ALLOW_DUAL>(
+    scorch_spmm_row_neon_dispatch<T, ALLOW_DUAL, ACCUM>(
         A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, k0, B1_size - k0);
 }
 
@@ -3306,6 +3329,14 @@ torch::Tensor spmm_csr_float_tileijk_core(
 
   // Panel/strip widths. Guard degenerate inputs.
   if (Nc <= 0 || Nc > N) Nc = N;
+#if defined(SCORCH_TUNE_HOOKS) && defined(__ARM_NEON) && !defined(__AVX2__)
+  // A/B hook: the scalar per-nonzero accumulation this kernel used before the
+  // register-resident pass, so the two can be timed in one binary. ARM only, because
+  // that is the only host the register pass ships on. Compiled out of the shipped .so.
+  bool tileijk_scalar_inner = false;
+  if (const char* _si = std::getenv("SCORCH_TILEIJK_SCALAR"))
+    if (*_si) tileijk_scalar_inner = (std::atol(_si) != 0);
+#endif
   if (Jc <= 0 || Jc > J) Jc = J;
   const int nstrip = (N + Nc - 1) / Nc;
   const int npanel = (J + Jc - 1) / Jc;
@@ -3368,6 +3399,40 @@ torch::Tensor spmm_csr_float_tileijk_core(
         const int pe = (int)(hi - A1_crd);
         if (pb == pe) continue;
         float* SCORCH_RESTRICT C_row = Cp + (size_t)i * (size_t)Nc;
+        // Register-resident accumulation of the panel's contribution, ARM only, and
+        // the numbers are why it is ARM only. The scalar loop below issues w L1 loads
+        // and w L1 stores PER NONZERO into a row that is already cache-hot. Nc exists
+        // so the output panel fits the CACHE; at the widths the cost model picks it
+        // also fits REGISTERS, so the row can be loaded once, accumulated over the
+        // panel's nonzeros, and stored once -- the same change the drop-in SpMM got,
+        // applied to the loop the tiled path kept.
+        //
+        // The same change on AVX2 (cut the slice into 64-lane tiles, run
+        // scorch_spmm_row_regtile_partial with ACCUM) was built and measured on
+        // redwood over the same 15 cells, 3 passes: geomean 1.033, but 4-5 cells below
+        // 1.0 in every pass, worst 0.971, all of them at Nc=112 on the short-row
+        // matrices (degree 16 and 33) where 112 lanes is two register tiles and so two
+        // walks of the row per panel. The M5 reads 1.217 on that grid with nothing
+        // below 1.122.
+        //
+        // The asymmetry is the hosts, not the code. What this removes is L1 traffic to
+        // the output row; redwood (~56 GB/s achieved) is DRAM-bound streaming the
+        // relaid B, so shaving L1 operations buys little, while the M5 (~412 GB/s) is
+        // core-bound and it buys a lot. A 3.3% mean does not pay for a 2.4% regression
+        // on real shapes, so the AVX2 arm is not taken. If it is ever wanted, the
+        // measured option is to gate it on the slice fitting ONE tile (w <= 8*lanes, no
+        // re-walk): every Nc 16 and Nc 32 cell won, 1.027-1.058, and every Nc=112 cell
+        // lost. scorch_spmm_row_regtile_partial keeps its ACCUM parameter for that.
+#if defined(__ARM_NEON) && !defined(__AVX2__)
+#ifdef SCORCH_TUNE_HOOKS
+        if (!tileijk_scalar_inner)
+#endif
+        {
+          scorch_spmm_row_neon<float, true, /*ACCUM=*/true>(
+              A1_crd, A_val, Brelaid, w, C_row, pb, pe);
+          continue;
+        }
+#endif
         for (; pb < pe; ++pb) {
           const float a = A_val[pb];
           const float* SCORCH_RESTRICT B_row = Brelaid + (size_t)A1_crd[pb] * (size_t)w;
