@@ -2943,19 +2943,37 @@ the surviving deficit against mean row degree and k:
 | 64-256 | 22 | 18 | 6 | 1 | 2 | 2 |
 | 256+ | 9 | 14 | 8 | 1 | 5 | 2 |
 
-(cells below MKL, of 362 per k). It is one class: high degree at narrow k. And 30 of
+(cells below MKL, of 362 per k). It is one class: high degree at narrow k. And 32 of
 the 101 are held below the parallelism they could use by the policy rather than by
 the structure -- `rows / SCORCH_ROWS_PER_THREAD` gives **four** threads for
 `Meszaros/kl02`, which has 71 rows holding 212536 nonzeros, on a 1.7 MB A that is
 L3-resident. Per thread we are already faster than MKL there; MKL wins on thread
 count. "16 rows per worker" is a proxy for "enough work to amortise fork/join" and for
 a row of 3000 nonzeros one row is plenty, so the fix is to express that ceiling in
-work rather than in rows -- but only if the measurement says lifting it closes the
-gap, which is what the forced-thread-count sweep over those 52 matrices asks.
+work rather than in rows.
 
-The other 71 are not ceiling-limited. `lp_osa_14` has 2337 rows and already gets all
+**This is not a decomposition limit, which is what it first looked like.** Row-parallel
+work-splitting cannot exceed one worker per row, so a matrix with fewer rows than the
+host has threads needs a nonzero-axis (segmented or merge-based) decomposition
+instead. No cell in the residual is that matrix: the smallest row count among the 101
+float32 cells and the 84 float64 cells is **64**, against 32 logical processors, and
+all 32 of the ceiling-limited cells have at least 64 rows. Row-parallel can reach the
+full width on every one of them. The limit is the policy alone.
+
+The other 69 are not ceiling-limited. `lp_osa_14` has 2337 rows and already gets all
 32 logical processors for a 78 us kernel at k=2, and reads 0.665; that is a
 *too-many-threads* question, not too few, and the same sweep answers it.
+
+Two candidate expressions of the ceiling, both implemented behind hooks and neither
+routed, taking `kl02` at k=2 from four workers:
+
+| candidate | what it changes | kl02 |
+|---|---|---|
+| `SCORCH_SPMM_NNZ_PER_THREAD=256` | states the requirement in nonzeros per worker, `max()`ed with the row proxy so it can only widen, capped at one worker per row | 4 -> 22 |
+| `SCORCH_SPMM_RAISE_ON_FLOORED=1` | the existing raise's bound reads `nnz*max(k,16)` rather than `nnz*k`, on the grounds that how many workers a product can *feed* is a question about time | 4 -> 11 |
+
+The first is inert on the low-degree shapes by construction: a 100000-row matrix of
+degree 2 already resolves to the full width, and `max()` cannot lower anything.
 
 ### What the k=8 story turned out to be
 
