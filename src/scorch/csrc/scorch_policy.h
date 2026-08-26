@@ -418,7 +418,14 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // path -- adopt the host team so a pipeline does not reshape at every op
     // boundary -- and widening it too would raise the count on the very k=1 cells
     // the gate above just declined to raise, by a different route.
-    const long by_rows = rows_axis;
+    // Deliberately rows/SCORCH_ROWS_PER_THREAD and NOT the widened rows_axis. The
+    // base path above pairs its ceiling with a work term, so widening it there cannot
+    // over-thread a small product; this path has no work term at all, and sharing the
+    // widened ceiling here is what made the nonzero-expressed ceiling fail on ARM --
+    // 64-row pruned ResNet layers went from 4 workers to 6 on a 20-microsecond kernel
+    // and ran 1.5-2x slower, 6.4% of cells more than 10% slower against a 1.4% floor.
+    // The ceiling was not choosing 6 workers for those; this line was.
+    const long by_rows = rows / SCORCH_ROWS_PER_THREAD;
     long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
     // Graded adoption: cap the adopted count so each worker gets a grain of REAL
     // arithmetic, rather than switching wholesale between the host count and the
