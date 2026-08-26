@@ -3023,6 +3023,65 @@ the shipped loop's ~10.5) has never been run at k >= 2, because the hook was onl
 discussed at k=1 where the shipped path is the *gather* kernel and enabling it swaps
 kernel families. But it is no longer where the residual is.
 
+## The shipping decision, and the two arms it rejects
+
+The crossed grid on the host that has MKL, 2172 cells per dtype, kernel timer,
+interleaved arms, per-cell same-code control:
+
+| arm | f32 speedup | f32 >10% slower | f32 below MKL | f64 speedup | f64 >10% slower | f64 below MKL |
+|---|---|---|---|---|---|---|
+| ships today | 1.0000 | -- | 463 | 1.0000 | -- | 431 |
+| thread gate alone | 0.9955 | 9.6% | 446 | 0.9678 | 13.5% | 411 |
+| **back-stealing alone** | **1.2416** | **1.7%** | **99** | **1.2013** | **1.5%** | **78** |
+| gate + front-stealing | 1.1325 | 6.5% | 327 | 1.0717 | 12.0% | 292 |
+| gate + back-stealing | 1.1650 | 6.4% | 286 | 1.0869 | 11.4% | 276 |
+
+A/A floors 2.1% and 2.2%. **Back-stealing alone is the answer** and it is not close:
+894 of 4344 cells below MKL becomes 177, and its harmed tail is under the floor on
+both dtypes. On the narrow-k-weighted grid (k = 1, 2, 4, 8, 16, 32) it reads 1.3286x
+and 1.2867x with harmed tails of 0.7% and 0.8% against 0.8% and 1.3% floors, taking
+705 and 556 cells below MKL down to 137 and 102.
+
+### The thread-count gate is rejected, and it is arm-variance
+
+Pricing the composition adoption on real arithmetic instead of `nnz*max(k,16)` read
+**1.070x float32 and 1.065x float64 on ARM**, with harmed tails *below* the noise
+floor, which is what made it look shippable. On x86 the same change is **0.996 and
+0.968** with harmed tails of 9.6% and 13.5% against 2.1% floors, and crossed with the
+partition it costs six to nine percent and multiplies the harmed tail by four.
+
+The cause is visible in the resolved thread counts, not in the timings. The adoption
+is all-or-nothing: clear the grain and the whole host team is taken, miss it and the
+count falls back to the policy's, which under one grain is **one**. A Cora-shaped
+output layer -- 2708 rows, 13264 nonzeros, k=7, so 92848 multiply-adds -- goes from 24
+workers to 1. On the 24-thread host that cliff is 24x; on the 6-thread host it is 6x,
+and there it lands inside the E-core noise. Same change, opposite sign, because the
+cliff height is the host's thread count.
+
+So it does not ship, and the graded form -- cap the adopted count so each worker gets
+a grain of *real* arithmetic, never below one, so the pipeline still shares one team
+-- is what gets measured instead.
+
+### The deep-unroll register kernel is rejected at narrow k
+
+`regblock_deep` runs UNROLL independent nonzero streams instead of two and drops the
+prefetch. It had never been run at k >= 2, because the hook was only ever discussed at
+k=1 where the shipped path is the gather kernel. Run at k = 1..32 against
+back-stealing:
+
+| arm | f32 | f64 | f32 >10% slower | below MKL (f32) |
+|---|---|---|---|---|
+| back-stealing | 1.3286 | 1.2867 | 0.7% | 137 |
+| + unroll 4 | 1.2274 | 1.1893 | 14.5% | 310 |
+| + unroll 8 | 1.2131 | 1.1668 | 13.8% | 317 |
+
+A ten percent loss with a harmed tail eighteen times the floor. By k it is worst
+exactly where it was supposed to help -- k=2 reads 1.0757 against back-stealing's
+1.2839, k=4 1.0908 against 1.2967 -- and its only positive region is float32 k=16 and
+k=32 (1.3970 and 1.4116 against 1.3680 and 1.3760), where the mask is nearly full
+anyway. So stream depth is not what narrow k is short of, which leaves the mask and
+the address arithmetic, and those are what the exact-width kernel removes.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32. float64 CSR × dense has its own section and
