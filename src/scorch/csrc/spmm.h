@@ -2186,6 +2186,93 @@ static inline void scorch_spmm_row_gather_f32(
   }
 }
 #endif  // AVX2 && FMA
+#if defined(__AVX2__) && defined(__FMA__)
+// Multi-stream nonzero-axis gather: S independent gather+FMA chains instead of one.
+//
+// The single-stream kernel above wins at k=1, and the reason it still loses to MKL
+// there is written in its own comment -- the profile is memory LATENCY, not FMA
+// throughput, and MKL's SpMV-shaped loop keeps eight or more loads in flight. One
+// VGATHERDPS is one outstanding memory operation covering eight nonzeros; the
+// accumulator it feeds is the loop's only carried dependency, so consecutive
+// iterations can overlap in principle, but the measured cost per nonzero on the
+// L3-resident band is far above what either gather throughput or FMA latency
+// accounts for, which is what an uncovered load latency looks like.
+//
+// The existing SCORCH_NARROWK_UNROLL hook does NOT test this. It deepens the
+// REGBLOCK kernel, and at k=1 float32 the shipped path is the gather kernel, so
+// turning it on swaps the kernel family and the stream count in the same step --
+// and the regblock family is already 0.903 of the gather at k=1 on the losing band,
+// so that arm starts ten percent behind. This changes the stream count and nothing
+// else.
+//
+// S streams need K*S accumulators plus S index vectors and S value vectors live at
+// once, so K*S is held to about half the 16 architectural YMM registers.
+//
+// S == 1 is deliberately NOT routed here; the shipped k=1 path stays on the kernel
+// above, byte for byte, until this one is measured to beat it.
+template <int K, int S>
+static inline void scorch_spmm_row_gather_f32_ms(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  __m256 acc[K][S];
+  #pragma unroll
+  for (int j = 0; j < K; j++)
+    #pragma unroll
+    for (int t = 0; t < S; t++) acc[j][t] = _mm256_setzero_ps();
+
+  int pA = pA_begin;
+  // The S index loads and value loads are issued before any FMA consumes them, so
+  // the gathers they feed are all in flight together rather than one per iteration.
+  for (; pA + 8 * S <= pA_end; pA += 8 * S) {
+    __m256i off[S];
+    __m256 av[S];
+    #pragma unroll
+    for (int t = 0; t < S; t++) {
+      const __m256i idx = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(A1_crd + pA + 8 * t));
+      off[t] = (K == 1) ? idx
+                        : _mm256_mullo_epi32(idx, _mm256_set1_epi32(K));
+      av[t] = _mm256_loadu_ps(A_val + pA + 8 * t);
+    }
+    #pragma unroll
+    for (int j = 0; j < K; j++)
+      #pragma unroll
+      for (int t = 0; t < S; t++)
+        acc[j][t] = _mm256_fmadd_ps(av[t],
+                                    _mm256_i32gather_ps(B_val + j, off[t], 4),
+                                    acc[j][t]);
+  }
+  // Whatever is left of the row that still fills one vector, single-stream.
+  for (; pA + 8 <= pA_end; pA += 8) {
+    const __m256i idx = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(A1_crd + pA));
+    const __m256i off0 = (K == 1) ? idx
+                                  : _mm256_mullo_epi32(idx, _mm256_set1_epi32(K));
+    const __m256 a = _mm256_loadu_ps(A_val + pA);
+    #pragma unroll
+    for (int j = 0; j < K; j++)
+      acc[j][0] = _mm256_fmadd_ps(a, _mm256_i32gather_ps(B_val + j, off0, 4),
+                                  acc[j][0]);
+  }
+
+  #pragma unroll
+  for (int j = 0; j < K; j++) {
+    __m256 tot = acc[j][0];
+    #pragma unroll
+    for (int t = 1; t < S; t++) tot = _mm256_add_ps(tot, acc[j][t]);
+    __m128 lo = _mm256_castps256_ps128(tot);
+    __m128 hi = _mm256_extractf128_ps(tot, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float sum = _mm_cvtss_f32(lo);
+    for (int q = pA; q < pA_end; q++)
+      sum += A_val[q] * B_val[(size_t)A1_crd[q] * (size_t)K + j];
+    C_row[j] = sum;
+  }
+}
+#endif  // AVX2 && FMA
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
 // Narrow-k variant that runs UNROLL independent nonzero streams instead of 2.
 //
@@ -3239,6 +3326,15 @@ torch::Tensor spmm_csr_v2_core(
   // measured map across k: k=1 is where K gathers stay cheaper than eight masked
   // FMAs, and from k=2 up the gather gives back more than it gains.
   int narrowk_gather = (B1_size == 1) ? 1 : 0;
+  // Independent gather streams in the nonzero-axis kernel. 1 is the shipped path.
+  // Only combinations whose K*S accumulators fit in about half the 16 architectural
+  // YMM registers are instantiated; anything else falls back to one stream.
+  int narrowk_streams = 1;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_NARROWK_GATHER_STREAMS");
+    if (e && *e) { long v = std::atol(e);
+      if (v == 2 || v == 4 || v == 8) narrowk_streams = (int)v; } }
+#endif
 #ifdef SCORCH_TUNE_HOOKS
   // A/B override, authoritative so the whole k=1..8 map is reproducible from this
   // binary: 0 forces the shipped regblock kernel at every width, and a positive
@@ -3406,19 +3502,34 @@ torch::Tensor spmm_csr_v2_core(
                 scorch_spmm_row_gather_f32<KK>( \
                     A1_crd, (const float*)A_val, (const float*)B_val, \
                     (float*)C_row, pA_begin, pA_end)
+              #define SCORCH_RGS(KK, SS) \
+                scorch_spmm_row_gather_f32_ms<KK, SS>( \
+                    A1_crd, (const float*)A_val, (const float*)B_val, \
+                    (float*)C_row, pA_begin, pA_end)
               if constexpr (std::is_same<scalar_t, float>::value) {
-                switch (B1_size) {
-                  case 1: SCORCH_RG(1); break;
-                  case 2: SCORCH_RG(2); break;
-                  case 3: SCORCH_RG(3); break;
-                  case 4: SCORCH_RG(4); break;
-                  case 5: SCORCH_RG(5); break;
-                  case 6: SCORCH_RG(6); break;
-                  case 7: SCORCH_RG(7); break;
-                  case 8: SCORCH_RG(8); break;
-                  default: SCORCH_RB(1); break;
+                // K*8+S keys the pair; only the register-feasible pairs exist.
+                switch (narrowk_streams > 1 ? B1_size * 16 + narrowk_streams : 0) {
+                  case 1 * 16 + 2: SCORCH_RGS(1, 2); break;
+                  case 1 * 16 + 4: SCORCH_RGS(1, 4); break;
+                  case 1 * 16 + 8: SCORCH_RGS(1, 8); break;
+                  case 2 * 16 + 2: SCORCH_RGS(2, 2); break;
+                  case 2 * 16 + 4: SCORCH_RGS(2, 4); break;
+                  case 4 * 16 + 2: SCORCH_RGS(4, 2); break;
+                  default:
+                    switch (B1_size) {
+                      case 1: SCORCH_RG(1); break;
+                      case 2: SCORCH_RG(2); break;
+                      case 3: SCORCH_RG(3); break;
+                      case 4: SCORCH_RG(4); break;
+                      case 5: SCORCH_RG(5); break;
+                      case 6: SCORCH_RG(6); break;
+                      case 7: SCORCH_RG(7); break;
+                      case 8: SCORCH_RG(8); break;
+                      default: SCORCH_RB(1); break;
+                    }
                 }
               }
+              #undef SCORCH_RGS
               #undef SCORCH_RG
               continue;
             }
