@@ -103,6 +103,20 @@ class ScorchBuildExtension(BuildExtension):
             if os.environ.get("SCORCH_BUILD_TUNE_HOOKS"):
                 compile_args.append("-DSCORCH_TUNE_HOOKS")
 
+            # Extra -D flags for the build, so a configuration that is compile-time
+            # by design -- which row-handout the SpMM uses, which narrow-k kernel owns
+            # the masked widths -- can be flipped without editing a header. That is
+            # what makes a two-build comparison a flag flip on ONE source tree
+            # instead of two trees that have to be kept in step, and two trees
+            # drifting apart is how a comparison quietly becomes one build twice.
+            extra_defs = os.environ.get("SCORCH_BUILD_DEFINES", "").split()
+            for d in extra_defs:
+                if not d.startswith("-D"):
+                    raise ValueError(
+                        "SCORCH_BUILD_DEFINES takes -DNAME=VALUE tokens, got %r" % d
+                    )
+                compile_args.append(d)
+
             if platform.system() == "Darwin":
                 compile_args.extend(["-Xpreprocessor", "-fopenmp"])
                 torch_omp = os.path.join(torch_lib_path, "libomp.dylib")

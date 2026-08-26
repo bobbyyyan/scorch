@@ -171,6 +171,19 @@
 #ifndef SCORCH_SPMM_PARTITION_MAXOUT_LLC
 #  define SCORCH_SPMM_PARTITION_MAXOUT_LLC 4L
 #endif
+// Which row-handout the SpMM uses by default. 0 = one global atomic counter, which is
+// what ships today and what costs A its inter-call L2 residency; 3 = contiguous home
+// ranges with stealing from the back of a victim's range. Compile-time so that
+// "shipped" is a build flag: the two-build comparison is then a flag flip on one
+// source tree rather than two trees that have to be kept in step.
+#ifndef SCORCH_SPMM_PARTITION_DEFAULT
+#  define SCORCH_SPMM_PARTITION_DEFAULT 0
+#endif
+// Independent nonzero streams in the exact-width narrow-k kernel, or 0 to leave those
+// widths on the register-block kernel and its whole-row lane mask.
+#ifndef SCORCH_NARROWK_EXACT_UNROLL
+#  define SCORCH_NARROWK_EXACT_UNROLL 0
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it

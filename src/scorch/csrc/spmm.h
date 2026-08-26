@@ -3475,7 +3475,7 @@ torch::Tensor spmm_csr_v2_core(
   // hand one back): worker w owns splits w, w+team_size, w+2*team_size, ..., which
   // covers every split whatever the team size and reduces to exactly one range in
   // the normal case.
-  int partition_mode = 0;
+  int partition_mode = SCORCH_SPMM_PARTITION_DEFAULT;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_PARTITION");
     if (e && *e) { long v = std::atol(e);
@@ -3636,6 +3636,13 @@ torch::Tensor spmm_csr_v2_core(
   const int neon_tail = B1_size - neon_nv * kNeonLanes;
 #endif
 
+  // Independent nonzero streams in the exact-width narrow-k kernel; 0 leaves the
+  // masked-row widths on the register-block kernel. Loop-invariant either way, so the
+  // row loop's dispatch on it hoists.
+  int narrowk_exact = SCORCH_NARROWK_EXACT_UNROLL;
+  // Float k=1 is the one width where two kernel families compete: the nonzero-axis
+  // gather kernel owns it by default and measures better there.
+  bool narrowk_exact_k1 = false;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
@@ -3667,12 +3674,9 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
   // A/B hook: the exact-width narrow-k kernel's unroll depth. 0 (unset) keeps the
   // register-block kernel, which at these widths masks every load and the store.
-  int narrowk_exact = 0;
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT");
     if (e && *e) { long v = std::atol(e);
-      if (v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
-  // Route float k=1 to it as well, which by default stays with the gather kernel.
-  bool narrowk_exact_k1 = false;
+      if (v == 0 || v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_K1");
     if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
@@ -3902,7 +3906,6 @@ torch::Tensor spmm_csr_v2_core(
               (full_last \
                  ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
                  : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
-#ifdef SCORCH_TUNE_HOOKS
             // The widths where regblock's mask covers the whole row: float k=1..7 and
             // double k=1..3. Float k=1 is instantiated but only routed when asked for
             // separately, because the nonzero-axis gather kernel owns it -- otherwise
@@ -3942,7 +3945,6 @@ torch::Tensor spmm_csr_v2_core(
               #undef SCORCH_RNE
               if (took) continue;
             }
-#endif
             if (narrowk_gather && nvec == 1 &&
                 std::is_same<scalar_t, float>::value) {
               // nvec==1 means k <= 8 for float, so K is B1_size itself.
