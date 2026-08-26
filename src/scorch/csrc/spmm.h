@@ -3230,8 +3230,11 @@ torch::Tensor spmm_csr_v2_core(
       const long w_lo = nnz_all * keff;                            // no empty row
       const long w_hi = w_lo + (long)A0_size * (long)C1_size;      // every row empty
       const long w_true = nnz_all * (long)B1_size;
-      if (scorch_spmm_nthreads(w_lo, A0_size, nthreads_override, w_true) ==
-          scorch_spmm_nthreads(w_hi, A0_size, nthreads_override, w_true))
+      // nnz has to be passed here too: it can widen the row-axis ceiling, and a
+      // skip decision taken under a different ceiling than the real call's would
+      // skip a scan whose result the real call then needs.
+      if (scorch_spmm_nthreads(w_lo, A0_size, nthreads_override, w_true, nnz_all) ==
+          scorch_spmm_nthreads(w_hi, A0_size, nthreads_override, w_true, nnz_all))
         do_scan = false;
     }
 #ifdef SCORCH_TUNE_HOOKS
@@ -3342,7 +3345,8 @@ torch::Tensor spmm_csr_v2_core(
   // itself lives in scorch_policy.h so a harness can ask for the same number
   // instead of recomputing it; see scorch_spmm_nthreads.
   const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
-                                            (long)total_nnz * (long)B1_size);
+                                            (long)total_nnz * (long)B1_size,
+                                            (long)total_nnz);
   const long nnz_total = A0_size > 0 ? (long)A1_pos[A0_size] : 0;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
@@ -4600,7 +4604,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
   const long work = (long)total_nnz * k_eff;
   const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
-                                            (long)total_nnz * (long)B1_size);
+                                            (long)total_nnz * (long)B1_size,
+                                            (long)total_nnz);
   // Deliberately the GENERIC chunk, not the SpMM-specific rule the drop-in kernel
   // uses. The fused kernel's workload is the sparse autoencoder grid, and the chunk
   // rule has never been run against it -- so this is a gap to close with its own

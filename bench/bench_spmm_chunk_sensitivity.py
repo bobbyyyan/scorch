@@ -211,7 +211,12 @@ def main():
             # for. They differ -- omp_get_num_procs() reports 32 on a 24-physical-
             # core part -- and using torch's number attributed the kernel's chunk to
             # a thread count it never used.
-            kernel_nt = SO.scorch_spmm_nthreads(nnz * k, M, nthreads)
+            # All four arguments, because the rule uses all four and asking with
+            # fewer does not fail -- it silently answers a different question. work
+            # is nnz*max(k,16), not nnz*k: at k=1 the two differ sixteenfold and the
+            # short form reported a thread count the kernel never ran on.
+            kernel_nt = SO.scorch_spmm_nthreads(nnz * max(k, 16), M, nthreads,
+                                                nnz * k, nnz)
             formula = SO.scorch_spmm_chunk(M, nnz, k, kernel_nt)
             generic = SO.scorch_chunk_generic(M, nnz * k, GRAIN_SPMM)
 

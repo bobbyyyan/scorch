@@ -129,6 +129,25 @@
 #ifndef SCORCH_SPMM_ROWS_PER_THREAD
 #  define SCORCH_SPMM_ROWS_PER_THREAD 1L
 #endif
+// Minimum NONZEROS per worker, as an alternative statement of the same "enough work
+// to be worth waking a worker" requirement that SCORCH_ROWS_PER_THREAD states in
+// rows. 0 keeps the row proxy alone, which is what ships.
+//
+// The row proxy and the raise above between them still leave one class stranded, and
+// it is the class the SuiteSparse residual is now made of. Meszaros/kl02 is 71 rows
+// holding 212536 nonzeros: rows/16 gives FOUR workers, and the raise cannot lift it
+// because the raise is bounded by nnz*k, which at k=2 is 425072 units -- one grain
+// and a bit. So a 1.7 MB L3-resident product runs on four threads and reads 0.593 of
+// MKL, while per thread we are faster than MKL. Stating the requirement in nonzeros
+// instead of rows lifts the ceiling to min(nnz/N, rows), and the work term
+// (nnz*max(k,16) / grain) still does the bounding, so a tiny product cannot be
+// over-threaded by this.
+//
+// max() with the row proxy, never min(): this can only ever RAISE the ceiling, so
+// nothing that is fast today can be reclassified by it.
+#ifndef SCORCH_SPMM_NNZ_PER_THREAD
+#  define SCORCH_SPMM_NNZ_PER_THREAD 0L
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
@@ -290,7 +309,7 @@ inline long scorch_llc_bytes() {
 // because the extra team's ramp is a large fraction of a 30 us kernel. Callers that
 // pass only one number get the old behaviour.
 inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
-                                long work_true = -1) {
+                                long work_true = -1, long nnz = -1) {
   if (work_true < 0) work_true = work;
   long rpt = SCORCH_SPMM_ROWS_PER_THREAD;
 #ifdef SCORCH_TUNE_HOOKS
@@ -299,9 +318,24 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   { const char* e = std::getenv("SCORCH_SPMM_ROWS_PER_THREAD");
     if (e && *e) { long v = std::atol(e); if (v > 0) rpt = v; } }
 #endif
-  // The proxy count, exactly as before: >= SCORCH_ROWS_PER_THREAD rows per worker.
-  int nthreads = scorch_nthreads(work, rows, SCORCH_GRAIN_SPMM, 1,
-                                 SCORCH_ROWS_PER_THREAD);
+  // The row-axis capacity. rows/SCORCH_ROWS_PER_THREAD is what ships; where a
+  // minimum nonzero count per worker is configured, that requirement is stated in
+  // nonzeros instead and the larger of the two wins, so this can only widen.
+  long rows_axis = rows / SCORCH_ROWS_PER_THREAD;
+  long nnz_per_thread = SCORCH_SPMM_NNZ_PER_THREAD;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_NNZ_PER_THREAD");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) nnz_per_thread = v; } }
+#endif
+  if (nnz_per_thread > 0 && nnz > 0) {
+    long by_nnz = nnz / nnz_per_thread;
+    if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
+    if (by_nnz > rows_axis) rows_axis = by_nnz;
+  }
+  // The proxy count, exactly as before when nnz_per_thread is 0: rows_axis is then
+  // rows/SCORCH_ROWS_PER_THREAD and dividing it by 1 reproduces the old expression
+  // including its truncation.
+  int nthreads = scorch_nthreads(work, rows_axis, SCORCH_GRAIN_SPMM, 1, 1);
   // Then raise it where the ROW proxy, not the work, is what bound it -- a 64-row
   // pruned-ResNet layer at k=512 is 62 grains of arithmetic held to 4 workers -- but
   // only as far as the real arithmetic supports: one grain per worker. Both bounds
@@ -310,7 +344,17 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // rows to work on.
   if (rpt < SCORCH_ROWS_PER_THREAD) {
     long cand = rows / rpt;
-    const long by_true = work_true / (SCORCH_SPMM_RAISE_GRAINS * SCORCH_GRAIN_SPMM);
+    // The bound is REAL arithmetic on purpose (see the constant's comment). The
+    // hook prices the other reading: nnz*max(k,16) is a TIME proxy, and how many
+    // workers a product can feed is a question about time, not about multiply-adds.
+    // It is what strands the high-degree narrow-k class -- kl02 at k=2 has 425072
+    // multiply-adds, one grain, and 3400576 units of the floored measure, eleven.
+    long raise_work = work_true;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_RAISE_ON_FLOORED");
+      if (e && *e && std::atol(e) != 0) raise_work = work; }
+#endif
+    const long by_true = raise_work / (SCORCH_SPMM_RAISE_GRAINS * SCORCH_GRAIN_SPMM);
     if (cand > by_true) cand = by_true;
     const long hw = (long)omp_get_num_procs();
     if (cand > hw) cand = hw;
@@ -338,7 +382,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // path -- adopt the host team so a pipeline does not reshape at every op
     // boundary -- and widening it too would raise the count on the very k=1 cells
     // the gate above just declined to raise, by a different route.
-    const long by_rows = rows / SCORCH_ROWS_PER_THREAD;
+    const long by_rows = rows_axis;
     long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
     const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
     if (cand > hw) cand = hw;
