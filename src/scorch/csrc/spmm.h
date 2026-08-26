@@ -3025,6 +3025,17 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
 //   5. Simple inner loop — let -O3 -march=native -ffast-math auto-vectorize.
 // ---------------------------------------------------------------------------
 
+// One row cursor per worker, each on its own cache line so the owner's fetch_add
+// does not invalidate a neighbour's. Used by the home-range row partition in
+// spmm_csr_v2_core.
+struct alignas(64) scorch_spmm_cursor {
+  // Deliberately NOT brace-initialised: an array of these is declared on the
+  // stack for every call that uses the partition, and a default member
+  // initialiser would make merely declaring it write every line. The setup
+  // stores into exactly the entries it will use.
+  std::atomic<int> v;
+};
+
 // The kernel proper takes plain pointers and sizes. Two callers reach it: the
 // legacy entry below, which unpacks the nested tensor vectors the pybind ABI
 // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
@@ -3281,6 +3292,96 @@ torch::Tensor spmm_csr_v2_core(
   const long nnz_total = A0_size > 0 ? (long)A1_pos[A0_size] : 0;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
+
+  // ROW PARTITION. The loop below hands rows out from ONE global atomic, so which
+  // worker gets which rows is decided by whoever calls fetch_add first and comes
+  // out different on every call. Measured on redwood with perf counters, that
+  // costs inter-call L2 residency of A. At k=1 float32 this kernel takes 5.2x
+  // (nemeth09) to 15.3x (ts-palko) as many L2 misses per nonzero as MKL on the
+  // same product: on ts-palko 138404 per call, which at 64B a line is 8.86 MB --
+  // the whole 8.6 MB A array re-fetched from L3 on every call, against MKL's 579
+  // KB, i.e. MKL keeps 93% of A in the cores' L2 across calls and this kernel
+  // keeps none of it. It is not a DRAM effect: LLC misses are 404 against MKL's
+  // 507.
+  //
+  // Only the miss counts are quoted because only they are clean. Both runtimes
+  // spin-wait their idle workers, and a spin loop retires instructions and burns
+  // cycles while touching no memory, so the cycle and instruction deltas from a
+  // whole-process perf stat are not attributable to either kernel; the L2 and LLC
+  // miss deltas are.
+  //
+  // Modes 1 and 2 give each worker a HOME RANGE instead: contiguous rows, split so
+  // that the work per worker is balanced -- equal ROW counts would not be, since
+  // degree varies -- computed once by binary search over A1_pos. The same worker
+  // then touches the same rows of A on every call with the same matrix, which is
+  // how every real caller uses an SpMM (GCN layers, an iterative solver, a
+  // benchmark loop), so A stays in that core's L2.
+  //
+  // The balanced measure is A1_pos[i] + i, not A1_pos[i]: a row costs its nonzeros
+  // PLUS a fixed amount -- the row-pointer pair, the register accumulator's
+  // horizontal reduction, the output store -- and at k=1 that fixed part is worth
+  // a few nonzeros, so pure nnz mis-balances a ragged matrix. It also makes the
+  // prefix STRICTLY increasing, which is what keeps a power-law matrix from
+  // collapsing: with pure nnz, a row holding 90% of the nonzeros sends every later
+  // split to the same boundary and one worker inherits all the remaining rows.
+  // Nothing is tuned here -- one unit per row and one per nonzero.
+  //
+  //   0  one global counter, any worker takes any chunk
+  //   1  home ranges only, no stealing
+  //   2  home ranges, then steal from whoever is still working
+  //
+  // Mode 1 isolates the locality effect; mode 2 is the shippable form, because a
+  // home range is balanced in nonzeros and NOT in time -- redwood is 8 P-cores
+  // plus 16 E-cores, so equal nnz is unequal duration and someone has to absorb
+  // the difference. Both are correct for a team SMALLER than nthreads (OpenMP may
+  // hand one back): worker w owns splits w, w+team_size, w+2*team_size, ..., which
+  // covers every split whatever the team size and reduces to exactly one range in
+  // the normal case.
+  int partition_mode = 0;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_PARTITION");
+    if (e && *e) { long v = std::atol(e);
+      if (v >= 0 && v <= 2) partition_mode = (int)v; } }
+#endif
+  const int nsplit = nthreads > 0 ? nthreads : 1;
+  // On the stack up to a core count no host here has, because the smallest cells
+  // in the corpus are ten microseconds long and two heap allocations per call
+  // would be a percent of that. The heap fallback exists so the bound is a
+  // performance choice and not a correctness one.
+  constexpr int kSplitOnStack = 128;
+  int split_stack[kSplitOnStack + 1];
+  scorch_spmm_cursor cursor_stack[kSplitOnStack];
+  std::unique_ptr<int[]> split_heap;
+  std::unique_ptr<scorch_spmm_cursor[]> cursor_heap;
+  int* row_split = nullptr;
+  scorch_spmm_cursor* cursors = nullptr;
+  if (partition_mode != 0) {
+    if (nsplit <= kSplitOnStack) {
+      row_split = split_stack;
+      cursors = cursor_stack;
+    } else {
+      split_heap.reset(new int[nsplit + 1]);
+      cursor_heap.reset(new scorch_spmm_cursor[nsplit]);
+      row_split = split_heap.get();
+      cursors = cursor_heap.get();
+    }
+    row_split[0] = 0;
+    row_split[nsplit] = A0_size;
+    for (int w = 1; w < nsplit; ++w) {
+      // First row whose prefix reaches w/nsplit of the total. The prefix is
+      // strictly increasing, so this is exact and the boundaries are distinct
+      // whenever there are at least nsplit rows.
+      const long target = (nnz_total + (long)A0_size) * (long)w / (long)nsplit;
+      int lo = row_split[w - 1], hi = A0_size;
+      while (lo < hi) {
+        const int mid = lo + ((hi - lo) >> 1);
+        if ((long)A1_pos[mid] + (long)mid < target) lo = mid + 1; else hi = mid;
+      }
+      row_split[w] = lo;
+    }
+    for (int w = 0; w < nsplit; ++w)
+      cursors[w].v.store(row_split[w], std::memory_order_relaxed);
+  }
   // Width of a stolen ZERO slice, in rows. Several slices per worker so a slow
   // core cannot become the critical path, and never narrower than the arithmetic
   // chunk. SCORCH_SPMM_ZERO_SLICES sets the slices-per-worker target; 4 is where
@@ -3490,6 +3591,10 @@ torch::Tensor spmm_csr_v2_core(
       }
     }
 
+    // Home-range progress for partition modes 1 and 2 (see the setup above).
+    int own_w = worker_id;   // next own split to try
+    int steal_t = 1;         // next victim offset to try
+
     // Atomic work-stealing loop with adaptive chunk size
     while (true) {
       // One zero slice per arithmetic chunk (mode 6). Alternating the two keeps a
@@ -3497,9 +3602,36 @@ torch::Tensor spmm_csr_v2_core(
       // idles, which is what draining the zero first does.
       if (zero_slices_left && zero_alternate && !zero_one_slice())
         zero_slices_left = false;
-      const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
-      if (start >= A0_size) break;
-      const int end = std::min(start + chunk, A0_size);
+      int start = 0, end = 0;
+      if (partition_mode == 0) {
+        start = next_row.fetch_add(chunk, std::memory_order_relaxed);
+        if (start >= A0_size) break;
+        end = std::min(start + chunk, A0_size);
+      } else {
+        // Own splits first, then -- mode 2 only -- steal from the rest. A cursor
+        // only ever advances, so a fetch_add that comes back at or past its range
+        // limit means that range is finished for good and this worker never asks
+        // again; own_w and steal_t therefore only move forward and the wasted
+        // atomics over a whole call are bounded by nsplit. Every chunk is claimed
+        // by exactly one fetch_add, on the owner's cursor or a thief's, so no row
+        // is computed twice and none is skipped.
+        bool got = false;
+        const int stride = team_size > 0 ? team_size : 1;
+        while (!got && own_w < nsplit) {
+          const int lim = row_split[own_w + 1];
+          const int st = cursors[own_w].v.fetch_add(chunk, std::memory_order_relaxed);
+          if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+          else own_w += stride;
+        }
+        while (!got && partition_mode == 2 && steal_t < nsplit) {
+          const int w = (worker_id + steal_t) % nsplit;
+          const int lim = row_split[w + 1];
+          const int st = cursors[w].v.fetch_add(chunk, std::memory_order_relaxed);
+          if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+          else steal_t++;
+        }
+        if (!got) break;
+      }
 
       for (int i = start; i < end; i++) {
         const int pA_begin = A1_pos[i];
