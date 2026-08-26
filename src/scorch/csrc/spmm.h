@@ -3028,7 +3028,17 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
 // One row cursor per worker, each on its own cache line so the owner's fetch_add
 // does not invalidate a neighbour's. Used by the home-range row partition in
 // spmm_csr_v2_core.
-struct alignas(64) scorch_spmm_cursor {
+//
+// 128, not 64, because at 64 the sentence above is false on one of the two hosts:
+// Apple silicon's cache line is 128 bytes, so two neighbouring workers would share
+// a line and each fetch_add would invalidate the neighbour's. 128 is also the right
+// number on x86, where the L2 spatial prefetcher works on 128-byte sector pairs and
+// would pull the neighbour's line in regardless. This is not offered as the
+// explanation for anything measured -- the M5's narrow-k behaviour under this
+// partition is under investigation and the thread count there argues the other way
+// (narrow k resolves to FEWER workers, hence fewer shared lines, and narrow k is
+// where the harm is). It is here because the struct should mean what it says.
+struct alignas(128) scorch_spmm_cursor {
   // Deliberately NOT brace-initialised: an array of these is declared on the
   // stack for every call that uses the partition, and a default member
   // initialiser would make merely declaring it write every line. The setup
