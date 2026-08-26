@@ -2975,6 +2975,38 @@ routed, taking `kl02` at k=2 from four workers:
 The first is inert on the low-degree shapes by construction: a 100000-row matrix of
 degree 2 already resolves to the full width, and `max()` cannot lower anything.
 
+### The nonzero ceiling fails on its own, and why
+
+Measured on ARM over 1650 cells against back-stealing alone:
+
+| arm | kernel speedup over ship | >10% slower | A/A floor |
+|---|---|---|---|
+| back-stealing | 1.0590x | 1.7% | 1.4% |
+| + nonzero ceiling | **1.0319x** | **6.4%** | 1.4% |
+| + raise on the floored measure | 1.0505x | 2.1% | 1.4% |
+
+The ceiling change is a net loss and its harmed tail is four times the floor. The
+mechanism is in the resolved thread counts, not in the timings: the policy resolves a
+different count on only 108 of the 1650 cells, and 81 of the 107 harmed cells are in
+that 108. The harmed shapes are 64-row pruned ResNet-50 layers of degree 44 to 288,
+going from 4 workers to 6 and running 1.5 to 2x slower, and `kl02` itself at k=1,
+going from 4 to 18 and running at 0.511.
+
+The route is the **composition adoption**, which has no work bound at all. A 64-row
+layer with 18432 nonzeros at k=1 gets `by_work = 1` from the policy, so the policy
+alone would run it on one worker; the adoption then hands it `min(host, rows/16)` = 4
+today and `min(host, rows_axis)` = 6 with the wider ceiling. The ceiling is not
+choosing 6 workers for a 20-microsecond kernel -- the adoption is, and the ceiling
+only removed the accident that was holding it back.
+
+So the two changes are not independent and the ceiling cannot ship without the graded
+adoption. The grain that grades it is bracketed rather than guessed: `kl02` needs
+`work_true / G >= 22` to reach the width it wants and the 64-row layer needs
+`work_true / G <= 4` to keep the width it has, which is **G in [4608, 19321]**. G near
+5000 gives `kl02` its 24 and the ResNet layer 3 or 4, and 5000 nonzero-units is about
+two microseconds of single-thread work -- a defensible "worth waking a worker" bar,
+where `SCORCH_GRAIN_SPMM`'s 150000 is about sixty-five.
+
 ### What the k=8 story turned out to be
 
 Single-threaded counters (one thread, so cycles and instructions are attributable --
