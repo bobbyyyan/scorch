@@ -2287,107 +2287,77 @@ static inline void scorch_spmm_row_gather_f32_ms(
 }
 #endif  // AVX2 && FMA
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
-#if defined(__AVX2__) && defined(__FMA__)
-// EXACT-WIDTH narrow-k row kernel. Two costs the register-block kernel pays at very
-// small k, both of which disappear once k is a compile-time constant.
+// EXACT-WIDTH narrow-k row kernel, for the widths where the register-block kernel's
+// lane mask covers the WHOLE output row.
 //
-// The mask. regblock holds the output row in NVEC full YMM registers and masks the
-// final partial one. At k=2 float32 that is two useful lanes in eight, and the mask
-// is on the ONLY vector, so every load in the row and the store are masked -- and
-// vmaskmovps is two uops on the load side and cannot fold into the FMA as a memory
-// operand (the FULL_LAST specialisation above exists because of exactly that, but it
-// can only help when k is a multiple of the lane count). The narrow widths have an
-// EXACT load, so they need no mask at all:
+// regblock holds the row in NVEC full vector registers and masks the last partial
+// one. When NVEC is 1 and k is not the lane count, that mask is on the only vector,
+// so every load in the row and the store go through it -- at k=2 float32, two useful
+// lanes in eight, and vmaskmovps is two uops on the load side and cannot fold into
+// the FMA as a memory operand. (The FULL_LAST specialisation above removes the mask
+// only when k IS a multiple of the lane count.) Separately, B1_size is a runtime
+// value there, so every nonzero costs an imul to find its B row: three per two
+// nonzeros counting the prefetch.
 //
-//   float   K=2  movq   (8 B)     K=4  movups xmm (16 B)
-//   double  K=1  movsd  (8 B)     K=2  movupd xmm (16 B)
+// Both disappear once k is a template parameter. Rather than hand-write a load for
+// each width, the accumulators are a compile-time-sized scalar array and the compiler
+// picks the decomposition -- which it does better than by hand, because a leftover
+// element folds into a scalar FMA as a memory operand and costs no instruction at
+// all. Cross-compiled and disassembled for every instantiation: ZERO masked
+// operations and ZERO multiplies, and no width reads a byte past its own row. k=3
+// float32 comes out as
 //
-// Neither reads past the end of B: the last row starts at (cols-1)*K and the load
-// covers exactly K elements. K=3 is deliberately absent -- there is no exact 12-byte
-// load and a 16-byte one would overread on B's last row. Float K=1 is absent because
-// the nonzero-axis gather kernel already owns it and measures better there.
+//   movslq (%rdi,%rax,4), %r8            ; the column index
+//   leaq   (%r8,%r8,2), %r14             ; times three, no imul
+//   vbroadcastss (%rsi,%rax,4), %xmm2    ; the A value, load and splat in one
+//   vfmadd231ss 0x8(%rdx,%r14,4), %xmm2, %xmm9    ; element 2, folded
+//   vmovsd (%rdx,%r14,4), %xmm11         ; elements 0-1, exactly 8 bytes
+//   vfmadd231ps %xmm11, %xmm2, %xmm10
 //
-// The address arithmetic. B1_size is a runtime value in regblock, so every nonzero
-// costs an imul to find its B row -- three per two nonzeros counting the prefetch.
-// Here K is a template parameter and K*sizeof(T) is 8 or 16, so `B_val + idx*K` folds
-// into an addressing-mode scale and no multiply is emitted.
+// six instructions per nonzero for twelve bytes read exactly, against regblock's
+// ~10.5 for a masked thirty-two.
 //
-// UNROLL independent accumulator chains, all of which fit in XMM registers at these
-// widths, so the FMA latency is covered without the deep-unroll register pressure
-// that limits the YMM kernels.
-template <typename T, int K> struct scorch_narrow;
-
-template <> struct scorch_narrow<float, 2> {
-  using vec = __m128;
-  static inline vec zero() { return _mm_setzero_ps(); }
-  static inline vec splat(float x) { return _mm_set1_ps(x); }
-  static inline vec load(const float* p) {           // exactly 8 bytes, zero-extended
-    return _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)));
-  }
-  static inline void store(float* p, vec v) {         // exactly 8 bytes
-    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), _mm_castps_si128(v));
-  }
-  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_ps(a, b, c); }
-  static inline vec add(vec a, vec b) { return _mm_add_ps(a, b); }
-};
-
-template <> struct scorch_narrow<float, 4> {
-  using vec = __m128;
-  static inline vec zero() { return _mm_setzero_ps(); }
-  static inline vec splat(float x) { return _mm_set1_ps(x); }
-  static inline vec load(const float* p) { return _mm_loadu_ps(p); }
-  static inline void store(float* p, vec v) { _mm_storeu_ps(p, v); }
-  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_ps(a, b, c); }
-  static inline vec add(vec a, vec b) { return _mm_add_ps(a, b); }
-};
-
-template <> struct scorch_narrow<double, 1> {
-  using vec = __m128d;
-  static inline vec zero() { return _mm_setzero_pd(); }
-  static inline vec splat(double x) { return _mm_set1_pd(x); }
-  static inline vec load(const double* p) { return _mm_load_sd(p); }
-  static inline void store(double* p, vec v) { _mm_store_sd(p, v); }
-  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_pd(a, b, c); }
-  static inline vec add(vec a, vec b) { return _mm_add_pd(a, b); }
-};
-
-template <> struct scorch_narrow<double, 2> {
-  using vec = __m128d;
-  static inline vec zero() { return _mm_setzero_pd(); }
-  static inline vec splat(double x) { return _mm_set1_pd(x); }
-  static inline vec load(const double* p) { return _mm_loadu_pd(p); }
-  static inline void store(double* p, vec v) { _mm_storeu_pd(p, v); }
-  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_pd(a, b, c); }
-  static inline vec add(vec a, vec b) { return _mm_add_pd(a, b); }
-};
-
+// The range is exactly the widths where regblock masks the entire row: float k=1..7
+// and double k=1..3. At float k=8 and double k=4 the last vector is full and regblock
+// is already mask-free, and the grid confirms this kernel is neutral there. Float k=1
+// is instantiated but not routed by default -- the nonzero-axis gather kernel owns it
+// and measures better -- so the two stay separately attributable.
 template <typename T, int K, int UNROLL>
 static inline void scorch_spmm_row_narrow_exact(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, T* SCORCH_RESTRICT C_row,
     int pA_begin, int pA_end) {
-  using N = scorch_narrow<T, K>;
-  typename N::vec acc[UNROLL];
+  T acc[UNROLL][K];
   #pragma unroll
-  for (int u = 0; u < UNROLL; u++) acc[u] = N::zero();
+  for (int u = 0; u < UNROLL; u++) {
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[u][j] = T(0);
+  }
   int pA = pA_begin;
   for (; pA + UNROLL <= pA_end; pA += UNROLL) {
     #pragma unroll
     for (int u = 0; u < UNROLL; u++) {
+      // K is a compile-time constant, so this is a shift or an lea, never a multiply.
       const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA + u] * (size_t)K;
-      acc[u] = N::fma(N::splat(A_val[pA + u]), N::load(Bp), acc[u]);
+      const T a = A_val[pA + u];
+      #pragma unroll
+      for (int j = 0; j < K; j++) acc[u][j] += a * Bp[j];
     }
   }
-  typename N::vec r = acc[0];
   #pragma unroll
-  for (int u = 1; u < UNROLL; u++) r = N::add(r, acc[u]);
+  for (int u = 1; u < UNROLL; u++) {
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[0][j] += acc[u][j];
+  }
   for (; pA < pA_end; pA++) {
     const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)K;
-    r = N::fma(N::splat(A_val[pA]), N::load(Bp), r);
+    const T a = A_val[pA];
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[0][j] += a * Bp[j];
   }
-  N::store(C_row, r);
+  #pragma unroll
+  for (int j = 0; j < K; j++) C_row[j] = acc[0][j];
 }
-#endif  // AVX2 && FMA
 
 // Narrow-k variant that runs UNROLL independent nonzero streams instead of 2.
 //
@@ -3701,6 +3671,10 @@ torch::Tensor spmm_csr_v2_core(
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT");
     if (e && *e) { long v = std::atol(e);
       if (v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
+  // Route float k=1 to it as well, which by default stays with the gather kernel.
+  bool narrowk_exact_k1 = false;
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_K1");
+    if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -3929,33 +3903,44 @@ torch::Tensor spmm_csr_v2_core(
                  ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
                  : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
 #ifdef SCORCH_TUNE_HOOKS
-            // Exact-width widths only: float k=2,4 and double k=1,2. Placed ahead of
-            // the gather dispatch but excluding float k=1, so this arm never swaps
-            // the gather out and the two kernels stay separately attributable.
+            // The widths where regblock's mask covers the whole row: float k=1..7 and
+            // double k=1..3. Float k=1 is instantiated but only routed when asked for
+            // separately, because the nonzero-axis gather kernel owns it -- otherwise
+            // this arm would swap two kernels in one step and neither would be
+            // attributable. Placed ahead of the gather dispatch for that reason.
             if (narrowk_exact) {
               #define SCORCH_RNE(KK, UN) \
                 scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
                     A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
-              const int kk = std::is_same<scalar_t, float>::value
-                                 ? (B1_size == 2 || B1_size == 4 ? B1_size : 0)
-                                 : (B1_size == 1 || B1_size == 2 ? B1_size : 0);
-              if (kk) {
-                switch (kk * 16 + narrowk_exact) {
-                  case 1 * 16 + 2: if constexpr (std::is_same<scalar_t, double>::value) { SCORCH_RNE(1, 2); } break;
-                  case 1 * 16 + 4: if constexpr (std::is_same<scalar_t, double>::value) { SCORCH_RNE(1, 4); } break;
-                  case 1 * 16 + 8: if constexpr (std::is_same<scalar_t, double>::value) { SCORCH_RNE(1, 8); } break;
-                  case 2 * 16 + 2: SCORCH_RNE(2, 2); break;
-                  case 2 * 16 + 4: SCORCH_RNE(2, 4); break;
-                  case 2 * 16 + 8: SCORCH_RNE(2, 8); break;
-                  case 4 * 16 + 2: if constexpr (std::is_same<scalar_t, float>::value) { SCORCH_RNE(4, 2); } break;
-                  case 4 * 16 + 4: if constexpr (std::is_same<scalar_t, float>::value) { SCORCH_RNE(4, 4); } break;
-                  case 4 * 16 + 8: if constexpr (std::is_same<scalar_t, float>::value) { SCORCH_RNE(4, 8); } break;
+              #define SCORCH_RNE_U(KK) \
+                switch (narrowk_exact) { \
+                  case 2: SCORCH_RNE(KK, 2); break; \
+                  case 4: SCORCH_RNE(KK, 4); break; \
+                  default: SCORCH_RNE(KK, 8); break; \
+                }
+              bool took = false;
+              if constexpr (std::is_same<scalar_t, float>::value) {
+                switch (B1_size) {
+                  case 1: if (narrowk_exact_k1) { SCORCH_RNE_U(1); took = true; } break;
+                  case 2: SCORCH_RNE_U(2); took = true; break;
+                  case 3: SCORCH_RNE_U(3); took = true; break;
+                  case 4: SCORCH_RNE_U(4); took = true; break;
+                  case 5: SCORCH_RNE_U(5); took = true; break;
+                  case 6: SCORCH_RNE_U(6); took = true; break;
+                  case 7: SCORCH_RNE_U(7); took = true; break;
                   default: break;
                 }
-                #undef SCORCH_RNE
-                continue;
+              } else {
+                switch (B1_size) {
+                  case 1: SCORCH_RNE_U(1); took = true; break;
+                  case 2: SCORCH_RNE_U(2); took = true; break;
+                  case 3: SCORCH_RNE_U(3); took = true; break;
+                  default: break;
+                }
               }
+              #undef SCORCH_RNE_U
               #undef SCORCH_RNE
+              if (took) continue;
             }
 #endif
             if (narrowk_gather && nvec == 1 &&
