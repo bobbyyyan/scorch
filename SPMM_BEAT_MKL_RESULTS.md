@@ -3082,6 +3082,68 @@ k=32 (1.3970 and 1.4116 against 1.3680 and 1.3760), where the mask is nearly ful
 anyway. So stream depth is not what narrow k is short of, which leaves the mask and
 the address arithmetic, and those are what the exact-width kernel removes.
 
+## The exact-width kernel, and the two policy arms that survive
+
+### Exact widths are worth ten percent where the mask covered the whole row
+
+x86 float32, 1448 cells, k = 1, 2, 4, 8, against back-stealing, per-cell same-code
+control at 0.9987 with 0.7% harmed:
+
+| arm | speedup over ship | >10% slower | vs MKL | below MKL |
+|---|---|---|---|---|
+| ships today | 1.0000 | -- | 1.4173 | 599 |
+| back-stealing | 1.3064 | 0.4% | 1.8515 | 121 |
+| + exact width, unroll 2 | 1.3529 | 0.3% | 1.9174 | 92 |
+| **+ exact width, unroll 4** | **1.3620** | **0.2%** | **1.9304** | **74** |
+| + exact width, unroll 8 | 1.3614 | 0.3% | 1.9295 | 68 |
+
+By k, against back-stealing alone, with the per-k floor beside it:
+
+| k | floor | unroll 4 | unroll 8 |
+|---|---|---|---|
+| 1 | 0.9994 | 0.9925 | 0.9896 |
+| **2** | 0.9975 | **1.1042** | **1.1039** |
+| **4** | 0.9981 | **1.0885** | **1.0920** |
+| 8 | 0.9996 | 0.9906 | 0.9888 |
+
+Ten percent at k=2 and nine at k=4, and the two widths where the kernel cannot fire
+read the floor -- k=1 goes to the nonzero-axis gather, k=8 fills the vector so
+regblock is already mask-free. The residual below MKL nearly halves again, 121 to 74.
+
+The 0.7 to 1.0% those inert columns sit below 1.0 is the hook build's own cost: with
+the hook, `if (narrowk_exact)` is a runtime branch taken once per ROW, and a row of
+five nonzeros at k=8 is about fifty instructions. In a build without hooks the
+dispatch is unconditional and only the loop-invariant `switch (B1_size)` remains,
+which hoists like the `nvec` switch beside it -- but that is an argument, not a
+measurement, and it is what the two-build comparison is for.
+
+### The nonzero-expressed ceiling is rejected
+
+It failed alone on ARM (6.4% of cells more than 10% slower against a 2.6% floor), and
+the diagnosis was that the ungraded adoption was the route. Grading the adoption does
+not rescue it. ARM float32, each arm against back-stealing alone:
+
+| arm | vs back-stealing | >10% slower |
+|---|---|---|
+| same-code floor | 0.9949 | 2.6% |
+| binary gate | 1.0469 | 2.1% |
+| graded adoption, G=15000 | 1.0330 | 2.1% |
+| graded adoption, G=5000 | 1.0062 | 2.3% |
+| graded adoption, G=2500 | 0.9999 | 1.8% |
+| + nonzero ceiling, G=15000 | 1.0111 | **6.4%** |
+| + nonzero ceiling, G=5000 | 0.9832 | **6.7%** |
+
+Two grains, both with a harmed tail two and a half times the floor. So the ceiling
+does not ship, and `kl02`-class shapes -- 71 rows holding 212536 nonzeros, held to
+four workers by `rows/16` -- keep their four workers until something else reaches
+them. The forced-thread-count sweep over those 52 matrices says whether more workers
+is even the right answer there; the ceiling was only one way of getting there.
+
+Graded adoption itself survives on ARM at G=15000 (+3.3% over back-stealing, harmed
+tail at the floor), where the binary gate is +4.7%. The binary gate is already
+rejected on x86, so the question graded adoption exists to answer is whether it keeps
+any of that on the host where the cliff is 24 workers deep.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32. float64 CSR × dense has its own section and
