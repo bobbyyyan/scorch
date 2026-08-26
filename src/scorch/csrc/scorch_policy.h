@@ -148,6 +148,20 @@
 #ifndef SCORCH_SPMM_NNZ_PER_THREAD
 #  define SCORCH_SPMM_NNZ_PER_THREAD 0L
 #endif
+// Real arithmetic each worker must get before the COMPOSITION ADOPTION hands it one.
+// 0 keeps the adoption ungraded, which is what ships.
+//
+// The adoption is currently all-or-nothing: clear nnz*max(k,16) >= the grain and the
+// whole host team is taken, miss it and the count falls back to the policy's, which
+// for anything under one grain is ONE. That cliff is why pricing the gate on real
+// arithmetic instead is risky rather than obviously right: a Cora output layer is
+// 13264 nonzeros at k=7, which is 92848 multiply-adds, and it would go from 24
+// workers to 1 -- the same defect in the other direction as the 12625-unit product
+// that takes the whole team today. Grading the adopted count by real arithmetic gives
+// it 6 instead, and leaves anything above a handful of grains at the host count.
+#ifndef SCORCH_SPMM_ADOPT_GRAIN
+#  define SCORCH_SPMM_ADOPT_GRAIN 0L
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
@@ -384,6 +398,20 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // the gate above just declined to raise, by a different route.
     const long by_rows = rows_axis;
     long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
+    // Graded adoption: cap the adopted count so each worker gets a grain of REAL
+    // arithmetic, rather than switching wholesale between the host count and the
+    // policy's. Never below one, so this can only lower an adopted count and never
+    // decline the adoption -- the pipeline still gets one shared team.
+    long adopt_grain = SCORCH_SPMM_ADOPT_GRAIN;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_ADOPT_GRAIN");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) adopt_grain = v; } }
+#endif
+    if (adopt_grain > 0) {
+      long by_real = work_true / adopt_grain;
+      if (by_real < 1) by_real = 1;
+      if (cand > by_real) cand = by_real;
+    }
     const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
     if (cand > hw) cand = hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
