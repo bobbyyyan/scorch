@@ -2208,8 +2208,20 @@ static inline void scorch_spmm_row_gather_f32(
 // S streams need K*S accumulators plus S index vectors and S value vectors live at
 // once, so K*S is held to about half the 16 architectural YMM registers.
 //
-// S == 1 is deliberately NOT routed here; the shipped k=1 path stays on the kernel
-// above, byte for byte, until this one is measured to beat it.
+// MEASURED, AND IT IS A NULL. Over the 118 matrices below MKL parity at k<=2, on
+// redwood, kernel timer, A/A 1.5% of cells outside +-10%:
+//   S=2/4/8 against the shipped single stream
+//     k=1  0.968 / 0.972 / 0.968      k=2  0.994 / 0.995 / 0.997
+//     k=4  1.001 / 0.994 / 1.001      k=8  1.000 / 1.000 / 0.999
+// float64 is 0.994-1.014 throughout. So the deficit at k=1 is NOT an uncovered load
+// latency that more outstanding gathers can hide -- the out-of-order window was
+// already overlapping consecutive iterations, and the accumulator chain the extra
+// streams break was never the limit. The comment on the regblock_deep hook below
+// reasons from the same premise and should be read with this result next to it.
+//
+// Kept, not deleted: it is the only way to re-price stream depth from a shipped
+// binary, and the null is the useful part of it. S == 1 is what ships and routes to
+// the single-stream kernel above, byte for byte.
 template <int K, int S>
 static inline void scorch_spmm_row_gather_f32_ms(
     const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
