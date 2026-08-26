@@ -3511,6 +3511,44 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e);
       if (v >= 0 && v <= 3) partition_mode = (int)v; } }
 #endif
+  // OUTPUT-SIZE GATE. The partition buys A's inter-call L2 residency and pays for it
+  // in the output store stream: with one global counter the workers all drain from a
+  // moving frontier, so at any instant their writes are close together in physical
+  // address space; with home ranges they write to as many regions as there are
+  // workers, tens of megabytes apart, and the memory controller sees that many open
+  // DRAM rows instead of a near-sequential stream.
+  //
+  // Measured over 2376 cells of the main and large-A corpora, back-stealing against
+  // the shipped counter, by output bytes -- and the thread count is identical on
+  // every one of the harmed cells, so this is not the policy:
+  //
+  //   output       float32            float64
+  //   < 1 MB       1.239             1.220
+  //   1-4 MB       1.433             1.305
+  //   4-16 MB      1.258             1.217
+  //   16-64 MB     1.109             1.030
+  //   64-256 MB    1.029             1.022
+  //   >= 256 MB    0.988             0.944   (26.9% of float64 cells below 0.95)
+  //
+  // Monotone decay, negative at the top. The A-bytes-per-output-byte ratio shows no
+  // trend at all across the same cells (1.13 to 1.33 in every band), so the scale
+  // that matters is absolute output size, not the balance between the two streams.
+  //
+  // Expressed as a multiple of the last-level cache rather than as a byte count: the
+  // decay begins where the output stops being cache-resident, and a fixed byte
+  // threshold would mean something different on every machine. Four times the LLC is
+  // 144 MB on a 36 MB L3, which is where the measured sign change is.
+  if (partition_mode != 0) {          // nothing to gate when the partition is off
+    long partition_maxout = SCORCH_SPMM_PARTITION_MAXOUT_LLC * scorch_llc_bytes();
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MAXOUT_MB");
+      if (e && *e) { long v = std::atol(e);
+        partition_maxout = v > 0 ? v * 1024L * 1024L : 0L; } }   // 0 = no gate
+#endif
+    if (partition_maxout > 0 &&
+        (long)A0_size * (long)C1_size * (long)sizeof(scalar_t) >= partition_maxout)
+      partition_mode = 0;
+  }
   int nsplit = nthreads > 0 ? nthreads : 1;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the number of ranges. More ranges than workers is safe -- the

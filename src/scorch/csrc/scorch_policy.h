@@ -162,6 +162,15 @@
 #ifndef SCORCH_SPMM_ADOPT_GRAIN
 #  define SCORCH_SPMM_ADOPT_GRAIN 0L
 #endif
+// Output size, in multiples of the last-level cache, above which the SpMM's row
+// partition is turned off. See the measured table at the gate itself in spmm.h: the
+// partition's gain decays monotonically with output size and goes negative past a
+// few times the LLC, because home ranges scatter the output store stream across as
+// many DRAM regions as there are workers where the global counter keeps it
+// near-sequential. 0 disables the gate.
+#ifndef SCORCH_SPMM_PARTITION_MAXOUT_LLC
+#  define SCORCH_SPMM_PARTITION_MAXOUT_LLC 4L
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
