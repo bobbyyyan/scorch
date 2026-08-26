@@ -2803,6 +2803,176 @@ anywhere on the `scorch_spmm_nthreads` extraction, which touches the thread coun
 them carrying a comment that merely claimed to match the other. 0.9947 over 680 points
 sharing no other change is the evidence that the arithmetic did not move.
 
+## The shared row counter, and what it was costing
+
+The narrow-k deficit against MKL was not the kernel. It was that we threw away A's
+cache residency between calls.
+
+`spmm_csr_v2_core` handed rows out from a single `std::atomic<int> next_row`. Which
+worker got which rows was therefore decided by arrival order at that counter, and
+arrival order differs on every call, so a core that held rows 400-450 in its L2 last
+call gets rows 1200-1250 this call and re-fetches its whole slice from L3. MKL assigns
+statically and keeps its slice.
+
+Measured with `perf stat` on redwood, float32, k=1, over four L3-resident matrices:
+
+| matrix | our L2 misses/nnz | MKL's | ratio |
+|---|---|---|---|
+| ts-palko | 0.1238 | 0.0062 | 15.3x |
+| nemeth09 | 0.0693 | 0.0134 | 5.2x |
+
+`0.125` is exactly what four bytes of value plus four bytes of index per nonzero
+predicts. We were re-reading all of A, every call. On ts-palko that is 138404 misses
+per call, 8.86 MB at a 64-byte line, against MKL's 579 KB -- MKL kept 93% of A in the
+cores' L2 and we kept none of it.
+
+### Home ranges, and why they need stealing
+
+The fix is a contiguous home range per worker. The split is balanced on
+`A1_pos[i] + i`, not `A1_pos[i]`: a row costs its nonzeros *plus* a fixed amount --
+the row-pointer pair, the accumulator reduction, the output store -- and adding one
+unit per row both prices that and makes the prefix strictly increasing, which stops a
+power-law matrix collapsing every boundary onto the same row.
+
+Ranges alone are not shippable. Three variants, same binary, interleaved:
+
+| mode | L2 misses, ts-palko k=1 | x86 f32 cells >10% slower than base |
+|---|---|---|
+| 0 global counter (ships today) | 133363 | -- |
+| 1 home ranges, no stealing | **5324** (below MKL's own 6637) | 21.4% |
+| 2 home + front-stealing | 37039 | 1.1% |
+| 3 home + back-stealing | -- | 1.5% |
+
+Mode 1 has the fewest misses of anything measured, including MKL, and is rejected on
+both hosts and three separate corpora: 21.4% of x86 float32 cells and 26.7% of float64
+cells more than 10% slower, and on the large-A corpus it is worse than what ships
+today (85 cells below MKL against 45). A range balanced in *work* is not balanced in
+*time* on 8P+16E or 6P+12E, and nothing absorbs the straggler.
+
+Front-stealing gives most of the locality back because it takes exactly the rows the
+owner would have reached next, so that work migrates between cores from call to call.
+Back-stealing takes from the far end instead. It claims through a compare-exchange on
+a packed `(head, tail)` uint64 -- one word deliberately, because two separate counters
+let an owner and a thief each read a stale view and hand out the same rows; with one
+word head only rises and tail only falls, so there is no ABA either.
+
+### What back-stealing measures
+
+Kernel timer, interleaved random-order arms, per-cell same-code A/A control:
+
+| host | dtype | mode 2 | mode 3 | >10% slower | A/A floor | below MKL, base -> mode 3 |
+|---|---|---|---|---|---|---|
+| x86 | f32 | 1.207x | **1.267x** | 1.5% | 2.3% | 472 -> **101** of 2172 |
+| x86 | f64 | 1.172x | **1.213x** | 2.1% | 2.8% | 437 -> **84** of 2172 |
+| ARM | f32 | 1.016x | 1.039x | 3.8% | 1.8% | (M5 has no MKL) |
+| ARM | f64 | -- | 1.045x | 4.5% | 2.5% | -- |
+
+Across both x86 dtypes: 909 of 4344 cells below MKL becomes 185. The vs-MKL geomean
+goes 1.79 -> 2.26 (float32) and 1.91 -> 2.32 (float64). Positive in every k, A-size,
+degree and duration band on both hosts, and the harmed tail is at or below the
+same-code floor everywhere. `tsteal/steal` is 1.0495, faster on 1807 of 2172 cells.
+One mode wins on both architectures, so there is no arm-variance to declare.
+
+Part of the gain is not residency at all. On a corpus of 56 matrices with A between
+16.8 and 225.5 MB the partition is still worth 1.042x *above* the machine's aggregate
+32 MB of L2, where no assignment can keep A resident: contiguous ranges narrow the
+band of B columns a worker touches, and 24-32 threads stop serialising on one atomic
+line.
+
+### The chunk width is not implicated
+
+`scorch_spmm_chunk`'s ceiling `rows / (nthreads * chunks_min)` was calibrated against
+the mechanism back-stealing replaces, so it owed a crossed grid. Over 2172 x86 float32
+cells, with the partition on, against a 0.9988 A/A:
+
+| CHUNKS_MIN | 2 (shipped) | 2 forced | 8 | 16 |
+|---|---|---|---|---|
+| kernel speedup over base | **1.1964** | 1.1881 | 1.1920 | 1.1884 |
+
+Within 0.7% end to end, and the shipped width is the best of the four. No change.
+
+### Cold, as a guard rather than a target
+
+A real caller is in a reuse loop or is partially evicted by the rest of its pipeline,
+never cold in the synthetic sense, so cold is asked only as "was anything traded
+away". Flushing 256 MB between calls and taking the median of 21 single calls, ARM
+float32, 372 cells: back-stealing is 1.035x on the whole-call timer cold and 1.080x
+warm, and every cell is above the ATen reference in both regimes. It gains less cold
+than warm, which is what a residency mechanism should do, and it does not go negative.
+The first cold run carried no same-code arm, which made "slower on a third of the
+cells" uninterpretable -- a median over flushed single calls is a far noisier
+estimator than a min over a warm batch. The probe now carries one.
+
+### The thread-count gate, a separate defect found on the way
+
+`scorch_spmm_nthreads` gates its composition-adoption override on
+`work = nnz * max(k, 16)`. The cache-line floor on k is right for throttling a
+bandwidth-bound product and overstates a k=1 product sixteenfold, so a product with
+12625 nonzero-units of real arithmetic reads 202000 against a 150000 grain and takes
+the whole host team. This is the third site with that defect; the raise gate directly
+above it already reads the unfloored measure for exactly this reason.
+
+Crossed against the partition on ARM, 1650 cells per dtype:
+
+| arm | f32 kernel | f64 kernel | >10% slower (f32/f64) |
+|---|---|---|---|
+| gate alone | 1.070x | 1.065x | 1.8% / 1.6% |
+| partition alone | 1.045x | 1.053x | 3.2% / 3.3% |
+| both | **1.115x** | **1.111x** | 1.8% / 2.5% |
+
+against A/A floors of 3.5% and 2.7% -- both arms and the combination sit at or under
+the floor. They are additive and they own different regions: the gate is worth
+1.12-1.17x at k<=8 and A under 256 KB and is inert to within 0.3% elsewhere, the
+partition is worth 1.21-1.27x on A between 4 and 16 MB and at k>=64. Each keeps
+essentially all of its value on top of the other (gate on top of the partition 1.067,
+partition on top of the gate 1.043).
+
+The gate is the one change here with real downside risk, because the adoption it
+prices exists to stop a GCN forward reshaping its team at every op boundary -- worth
+pubmed 0.78 -> 1.15x when it landed. It does not ship on the ARM numbers alone.
+
+### What the residual is now
+
+101 of 2172 x86 float32 cells, and the shape of it has changed completely. Crossing
+the surviving deficit against mean row degree and k:
+
+| degree | k=1 | k=2 | k=8 | k=64 | k=256 | k=512 |
+|---|---|---|---|---|---|---|
+| 0-8 | 3 | 5 | 0 | 0 | 0 | 0 |
+| 8-64 | 0 | 2 | 0 | 0 | 0 | 1 |
+| 64-256 | 22 | 18 | 6 | 1 | 2 | 2 |
+| 256+ | 9 | 14 | 8 | 1 | 5 | 2 |
+
+(cells below MKL, of 362 per k). It is one class: high degree at narrow k. And 30 of
+the 101 are held below the parallelism they could use by the policy rather than by
+the structure -- `rows / SCORCH_ROWS_PER_THREAD` gives **four** threads for
+`Meszaros/kl02`, which has 71 rows holding 212536 nonzeros, on a 1.7 MB A that is
+L3-resident. Per thread we are already faster than MKL there; MKL wins on thread
+count. "16 rows per worker" is a proxy for "enough work to amortise fork/join" and for
+a row of 3000 nonzeros one row is plenty, so the fix is to express that ceiling in
+work rather than in rows -- but only if the measurement says lifting it closes the
+gap, which is what the forced-thread-count sweep over those 52 matrices asks.
+
+The other 71 are not ceiling-limited. `lp_osa_14` has 2337 rows and already gets all
+32 logical processors for a 78 us kernel at k=2, and reads 0.665; that is a
+*too-many-threads* question, not too few, and the same sweep answers it.
+
+### What the k=8 story turned out to be
+
+Single-threaded counters (one thread, so cycles and instructions are attributable --
+with a team both runtimes spin-wait idle workers and only cache-miss deltas can be
+read from a whole-process `perf stat`) said we lost 0.53-0.88x at k=8 with our
+instructions per nonzero *rising* to 13.5-18.1 while MKL's *fell* to 7.9-8.9, and
+that at k=1 we beat MKL 1.38-1.71x on 3.2-7.6 against its 13.7-14.8. The conclusion
+drawn from that -- that k=1 was a parallel-efficiency problem and k=8 was the inner
+loop -- was half right. With back-stealing, k=8 is below MKL on 14 of 362 float32
+cells and 6 of 362 float64 cells, all of them at degree >= 64. The inner loop is worth
+looking at, and the arm that does it (`regblock_deep`, which resolves a group of
+addresses at once and drops the prefetch, about 5.75 instructions per nonzero against
+the shipped loop's ~10.5) has never been run at k >= 2, because the hook was only ever
+discussed at k=1 where the shipped path is the *gather* kernel and enabling it swaps
+kernel families. But it is no longer where the residual is.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32. float64 CSR × dense has its own section and
