@@ -3409,12 +3409,26 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e);
       if (v >= 0 && v <= 3) partition_mode = (int)v; } }
 #endif
-  const int nsplit = nthreads > 0 ? nthreads : 1;
-  // On the stack up to a core count no host here has, because the smallest cells
-  // in the corpus are ten microseconds long and two heap allocations per call
-  // would be a percent of that. The heap fallback exists so the bound is a
-  // performance choice and not a correctness one.
-  constexpr int kSplitOnStack = 128;
+  int nsplit = nthreads > 0 ? nthreads : 1;
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: force the number of ranges. More ranges than workers is safe -- the
+  // stride loop hands a worker its own extras and the steal loop reaches every range
+  // regardless -- so this is the only way to run the heap allocation path, and the
+  // very fine and very coarse splits, on a host whose team never gets that wide.
+  { const char* e = std::getenv("SCORCH_SPMM_NSPLIT_FORCE");
+    if (e && *e) { long v = std::atol(e);
+      if (v > 0 && v <= 4096) nsplit = (int)v; } }
+#endif
+  // On the stack, because the smallest cells in the corpus are ten microseconds long
+  // and two heap allocations per call would be a percent of that.
+  // 64 cursors of 128 bytes is 8 KB. At 128 the frame was 17440 bytes; halving it
+  // costs nothing and keeps the untouched stack reservation off pages the caller
+  // might otherwise be using. (It does not remove the entry stack probe -- clang
+  // emits that above 4 KB, and 24 cursors is too few for a 32-worker host.) The
+  // heap fallback keeps the bound a performance choice and not a correctness one;
+  // SCORCH_SPMM_NSPLIT_FORCE is how it gets correctness coverage, since no host
+  // here resolves to enough workers to reach it.
+  constexpr int kSplitOnStack = 64;
   int split_stack[kSplitOnStack + 1];
   scorch_spmm_cursor cursor_stack[kSplitOnStack];
   std::unique_ptr<int[]> split_heap;
@@ -4632,8 +4646,24 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
     if (e && *e) { long v = std::atol(e);
       if (v >= 0 && v <= 3) partition_mode = (int)v; } }
 #endif
-  const int nsplit = nthreads > 0 ? nthreads : 1;
-  constexpr int kSplitOnStack = 128;
+  int nsplit = nthreads > 0 ? nthreads : 1;
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: force the number of ranges. More ranges than workers is safe -- the
+  // stride loop hands a worker its own extras and the steal loop reaches every range
+  // regardless -- so this is the only way to run the heap allocation path, and the
+  // very fine and very coarse splits, on a host whose team never gets that wide.
+  { const char* e = std::getenv("SCORCH_SPMM_NSPLIT_FORCE");
+    if (e && *e) { long v = std::atol(e);
+      if (v > 0 && v <= 4096) nsplit = (int)v; } }
+#endif
+  // 64 cursors of 128 bytes is 8 KB. At 128 the frame was 17440 bytes; halving it
+  // costs nothing and keeps the untouched stack reservation off pages the caller
+  // might otherwise be using. (It does not remove the entry stack probe -- clang
+  // emits that above 4 KB, and 24 cursors is too few for a 32-worker host.) The
+  // heap fallback keeps the bound a performance choice and not a correctness one;
+  // SCORCH_SPMM_NSPLIT_FORCE is how it gets correctness coverage, since no host
+  // here resolves to enough workers to reach it.
+  constexpr int kSplitOnStack = 64;
   int split_stack[kSplitOnStack + 1];
   scorch_spmm_cursor cursor_stack[kSplitOnStack];
   std::unique_ptr<int[]> split_heap;
