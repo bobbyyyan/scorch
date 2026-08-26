@@ -3134,8 +3134,52 @@ torch::Tensor spmm_csr_v2_core(
     // When it comes back zero there is nothing to zero at all -- the kernel writes
     // every non-empty row in full -- so the common case makes one pass over
     // A1_pos and no longer makes the branchy pass the old loop made.
-    for (int i = 0; i < A0_size; i++)
-      empty_rows += (A1_pos[i] == A1_pos[i + 1]) ? 1 : 0;
+    // ... but it is also SERIAL, and it sits ahead of the parallel region, so on a
+    // narrow-k product it is Amdahl's serial fraction rather than a rounding error:
+    // it costs O(rows) while the parallel work is O(nnz*k), so its share grows as k
+    // shrinks.
+    //
+    // In the shipped mode the count has exactly one consumer -- the zero_work term
+    // in the thread policy below -- so it is only worth paying for when it can
+    // change the thread count, and that is decidable in O(1) without counting
+    // anything. Ask the policy for the count at the two extremes: no empty row, and
+    // every row empty. The count is monotone non-decreasing in work, so if the
+    // extremes agree then every value between them agrees and the scan cannot affect
+    // any decision. (total_nnz and k_eff are declared further down, next to the
+    // policy call itself; recomputing them here is two loads.)
+    //
+    // Measured worth: 1.0 to 2.2% at k<=2, rising with rows-per-nonzero exactly as
+    // an O(rows) term against an O(nnz*k) loop should -- 1.0025, 1.0124, 1.0218
+    // across the bands under 0.05, 0.05 to 0.25, and over 0.25.
+    //
+    // Skipping the scan UNCONDITIONALLY is a different and much worse thing, because
+    // it also drops the zero_work credit: measured that way the wide-k cells fall to
+    // 0.934 / 0.842 / 0.849 of the scanning arm at k = 64 / 256 / 512 on float32 and
+    // 0.851 / 0.793 / 0.806 on float64, since an empty-row-heavy output is
+    // bandwidth-bound and wants the workers that term buys it. This skips the scan
+    // only where the credit provably changes nothing.
+    bool do_scan = true;
+    if (zero_mode == 2 || zero_mode == 3) {
+      const long nnz_all = A0_size > 0 ? (long)A1_pos[A0_size] : 0L;
+      const long keff = B1_size < 16 ? 16L : (long)B1_size;
+      const long w_lo = nnz_all * keff;                            // no empty row
+      const long w_hi = w_lo + (long)A0_size * (long)C1_size;      // every row empty
+      const long w_true = nnz_all * (long)B1_size;
+      if (scorch_spmm_nthreads(w_lo, A0_size, nthreads_override, w_true) ==
+          scorch_spmm_nthreads(w_hi, A0_size, nthreads_override, w_true))
+        do_scan = false;
+    }
+#ifdef SCORCH_TUNE_HOOKS
+    // A/B hook: 1 forces the scan off outright -- which also drops the credit, so it
+    // prices the whole term and not this rule -- and 2 forces it always on, which is
+    // the pre-rule behaviour. Compiled out of the shipped .so.
+    { const char* e = std::getenv("SCORCH_SPMM_SKIP_EMPTY_SCAN");
+      if (e && *e) { const long v = std::atol(e);
+        if (v == 1) do_scan = false; else if (v == 2) do_scan = true; } }
+#endif
+    if (do_scan)
+      for (int i = 0; i < A0_size; i++)
+        empty_rows += (A1_pos[i] == A1_pos[i + 1]) ? 1 : 0;
     if (empty_rows != 0 && zero_mode <= 1) {
       const int64_t empty_elems = empty_rows * (int64_t)C1_size;
       if (zero_mode == 1 && empty_elems >= SCORCH_SPMM_ZERO_SPAN_ELEMS &&
