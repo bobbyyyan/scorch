@@ -86,8 +86,73 @@
                                              // generic kernel -> smaller grain than prebuilt)
 #endif
 
+// Minimum number of structurally-empty output ELEMENTS before the drop-in SpMM
+// zeroes them with one pre-loop parallel span instead of a serial memset per row.
+//
+// This gates an A/B arm, not the shipped path. The drop-in SpMM zeroes an empty
+// output row in the row loop that was going to visit it anyway (spmm.h, zero_mode
+// 2), which needs no threshold at all: it spawns no second team and makes no second
+// pass, so there is nothing for a size gate to protect. The constant survives
+// because the pre-loop span is still one of the arms that path is priced against,
+// and that arm needs the gate it was measured with.
+//
+// The value: measured on redwood, the span arm beats the serial one by 2.099x
+// (float32) / 3.152x (float64) on the 205 panel cells it fires on, and LOSES on 19
+// of the float32 ones, by up to 1.9x. Those losses sit entirely below an 8 MB
+// output span and, within that band, on the cells with the most arithmetic after
+// the zero -- the cost of the first team is paid by whatever runs next. 512K
+// elements is where the gate was left; it is not the value that makes the span arm
+// safe, because no value does.
+#ifndef SCORCH_SPMM_ZERO_SPAN_ELEMS
+#  define SCORCH_SPMM_ZERO_SPAN_ELEMS 524288L
+#endif
+
 #ifndef SCORCH_ROWS_PER_THREAD
 #  define SCORCH_ROWS_PER_THREAD 16L      // >= this many rows per worker
+#endif
+// Rows per worker for the SpMM specifically. 16 is a proxy for "enough work to be
+// worth waking a worker", and it is a proxy the SpMM does not need: it knows the
+// work exactly (nnz*k) and scorch_nthreads already divides that by the grain. The
+// proxy is wrong in the one direction that matters, because a row is not a fixed
+// amount of work -- it is deg*k. A pruned ResNet-50 bottleneck layer is 64 rows of
+// degree 288, so at k=512 it carries 9.4 M multiply-adds, which is 62 grains of
+// work, and 16-rows-per-worker throttles it to 4 workers on a 24-core host. Those
+// cells run at 0.53-0.63x of MKL, which splits the free dimension instead. 1 says
+// the row axis can feed one worker per row and lets the work term do the bounding
+// it was already doing.
+//
+// This can only change a decision where rows/16 is itself below the core count --
+// under 384 rows on a 24-core host -- AND the per-row work clears the grain, which
+// is deg*k > 9375. Every matrix with more rows than that gets the identical thread
+// count, so the GCN and autoencoder shapes, and reddit, are untouched by
+// construction rather than by measurement.
+#ifndef SCORCH_SPMM_ROWS_PER_THREAD
+#  define SCORCH_SPMM_ROWS_PER_THREAD 1L
+#endif
+// Grains of REAL arithmetic each worker must get before the row-proxy thread count
+// is raised. One grain is not enough: the grain is calibrated for "is more than one
+// thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
+// has to clear a higher bar than going from 1 to 2.
+//
+// 2 is where the measurement puts it, over 582 raises on two hosts and both dtypes
+// (redwood i9-14900K, Apple M5), scored on whether any admitted cell came out more
+// than 10% slower than the un-raised arm on the kernel timer:
+//     gate                        redwood                 M5
+//     no gate            212 admitted, 30 harmed   370 admitted, 91 harmed
+//     1 grain / worker   162 admitted, 18 harmed   320 admitted, 76 harmed
+//     2 grains / worker   64 admitted,  0 harmed   156 admitted,  0 harmed
+//     4 grains / worker   48 admitted,  0 harmed   116 admitted,  0 harmed
+// 2 is the smallest value with no harm on either host, so it is the one that keeps
+// the most of the win: +24% (redwood) / +33% (M5) on the cells it admits. Zero
+// harmed out of 64 is not luck -- same-code noise alone puts 4-7% of cells below
+// 0.9 on this grid, so a merely neutral set of 64 would show three or four.
+//
+// It is deliberately conservative. It declines 80 redwood cells that were better
+// than 1.15x, because the alternative rules that keep those (bounding on the work
+// the raise moves off the critical path) each harmed one to three cells, and the
+// performance convention here does not trade a regression for an average.
+#ifndef SCORCH_SPMM_RAISE_GRAINS
+#  define SCORCH_SPMM_RAISE_GRAINS 2L
 #endif
 #ifndef SCORCH_CHUNKS_PER_THREAD
 #  define SCORCH_CHUNKS_PER_THREAD 7L     // dynamic-schedule chunks per worker
@@ -123,9 +188,11 @@
 // this only ever RAISES the count toward what the platform already offers, it
 // cannot reintroduce an all-cores E-core cliff beyond torch's own default.
 inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRAIN_DEFAULT,
-                           int nfloor = 1) {
+                           int nfloor = 1,
+                           long rows_per_thread = SCORCH_ROWS_PER_THREAD) {
   int hw = omp_get_num_procs();               // stable; torch mutates omp_get_max_threads
-  long n = rows / SCORCH_ROWS_PER_THREAD;     // >= ~16 rows per worker
+  if (rows_per_thread < 1) rows_per_thread = 1;
+  long n = rows / rows_per_thread;            // row-axis parallel capacity
   if (work >= 0) {
     long by_work = work / grain_default;      // >= grain_default work per worker
     if (by_work < n) n = by_work;
@@ -214,16 +281,64 @@ inline long scorch_llc_bytes() {
 // two ways so a small product cannot regress: never past the row-parallelism
 // ceiling (a 130-row product at wide k clears the work floor but cannot feed 16
 // workers), and never below the policy count, so big graphs keep a higher one.
-inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override) {
-  const int policy_nt = scorch_nthreads(work, rows, SCORCH_GRAIN_SPMM);
-  int nthreads = policy_nt;
+// work_true is nnz*k, the actual arithmetic. `work` is nnz*max(k,16): the floor is
+// there because a row of one column still costs a whole cache line, which is the
+// right measure for throttling threads on BANDWIDTH, and the wrong one for deciding
+// how many threads to WAKE -- at k=1 it overstates the arithmetic sixteenfold. That
+// mattered: raising the count off the row proxy on the strength of the floored
+// measure made the 20-50 us cells 0.920 (float32, 40% of them more than 10% slower),
+// because the extra team's ramp is a large fraction of a 30 us kernel. Callers that
+// pass only one number get the old behaviour.
+inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
+                                long work_true = -1) {
+  if (work_true < 0) work_true = work;
+  long rpt = SCORCH_SPMM_ROWS_PER_THREAD;
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: 16 reproduces the pre-change policy exactly (the raise below is then
+  // unreachable), which is what the control arm needs. Compiled out of the shipped .so.
+  { const char* e = std::getenv("SCORCH_SPMM_ROWS_PER_THREAD");
+    if (e && *e) { long v = std::atol(e); if (v > 0) rpt = v; } }
+#endif
+  // The proxy count, exactly as before: >= SCORCH_ROWS_PER_THREAD rows per worker.
+  int nthreads = scorch_nthreads(work, rows, SCORCH_GRAIN_SPMM, 1,
+                                 SCORCH_ROWS_PER_THREAD);
+  // Then raise it where the ROW proxy, not the work, is what bound it -- a 64-row
+  // pruned-ResNet layer at k=512 is 62 grains of arithmetic held to 4 workers -- but
+  // only as far as the real arithmetic supports: one grain per worker. Both bounds
+  // are needed. rows/rpt alone wakes 31 threads for a k=1 product whose whole
+  // kernel is 30 us; work_true/grain alone would ignore that a worker still needs
+  // rows to work on.
+  if (rpt < SCORCH_ROWS_PER_THREAD) {
+    long cand = rows / rpt;
+    const long by_true = work_true / (SCORCH_SPMM_RAISE_GRAINS * SCORCH_GRAIN_SPMM);
+    if (cand > by_true) cand = by_true;
+    const long hw = (long)omp_get_num_procs();
+    if (cand > hw) cand = hw;
+    if (cand > (long)nthreads) nthreads = (int)cand;
+  }
   if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
+    // Deliberately the 16-rows-per-worker ceiling, not rpt. This is the composition
+    // path -- adopt the host team so a pipeline does not reshape at every op
+    // boundary -- and widening it too would raise the count on the very k=1 cells
+    // the gate above just declined to raise, by a different route.
     const long by_rows = rows / SCORCH_ROWS_PER_THREAD;
     long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
     const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
     if (cand > hw) cand = hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hook: force the FINAL count, after both the policy and the composition
+  // adoption. SCORCH_TUNE_THREADS cannot do this -- it sets the policy count and
+  // the adoption path then raises it straight back -- and asking "is this shape
+  // better on fewer threads" needs the answer to survive to the launch. Scorch
+  // against itself, so it does not inherit the kernel-timer-vs-whole-call
+  // asymmetry that the MKL comparison has. Compiled out of the shipped .so.
+  { const char* e = std::getenv("SCORCH_SPMM_NT_FORCE");
+    if (e && *e) { long v = std::atol(e);
+      if (v > 0) { const long hw2 = (long)omp_get_num_procs();
+                   nthreads = (int)(v > hw2 ? hw2 : v); } } }
+#endif
   return nthreads;
 }
 

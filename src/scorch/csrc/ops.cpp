@@ -662,8 +662,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // torch.get_num_threads(): omp_get_num_procs() reports 32 on a 24-physical-core
     // part, so the two differ, and the difference silently reclassified cells.
     m.def("scorch_spmm_nthreads", &scorch_spmm_nthreads,
-          "Threads the drop-in SpMM resolves to, for (work, rows, nthreads_override)",
-          py::arg("work"), py::arg("rows"), py::arg("nthreads_override"));
+          "Threads the drop-in SpMM resolves to, for (work, rows, "
+          "nthreads_override, work_true). work is nnz*max(k,16); work_true is "
+          "nnz*k and defaults to work, which reproduces the caller that has only "
+          "the one number.",
+          py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
+          py::arg("work_true") = -1);
 
     // The same fused structural pass, offered to Scorch's own Python-side validator.
     //

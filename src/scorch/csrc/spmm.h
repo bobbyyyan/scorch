@@ -10,6 +10,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #ifdef __ARM_NEON
@@ -20,6 +21,7 @@
 #include <immintrin.h>
 #endif
 
+#include "header.h"        // scorch_zero_dense (parallel span zero-fill)
 #include "prebuilt_types.h"
 #include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.h)
 #include <ATen/Parallel.h>  // at::parallel_for (pipeline-pool composition A/B)
@@ -2118,6 +2120,208 @@ static inline void scorch_spmm_row_regblock(
   }
 }
 
+#if defined(__AVX2__) && defined(__FMA__)
+// Narrow-k row kernel that vectorises across NONZEROS instead of across the output
+// row: the eight lanes hold eight different nonzeros of the same row, reduced at
+// the end, so every lane carries useful work at any k.
+//
+// The shipped regblock kernel puts the output row in the lanes, which means at
+// k=1 seven of eight lanes are mask and each nonzero costs a full-width masked
+// load and FMA to produce one float. Measured over the corpus that is where the
+// kernel loses: at k<=8 with more than 64 nonzeros per row it runs 0.866 of MKL
+// (9604 cells, 84% below parity), and those rows average 195 nonzeros with a
+// length spread of 0.13, so a nonzero-axis loop always has a full vector to fill.
+//
+// The trade is instruction count against gather throughput: one VGATHERDPS is
+// ~4-5 cycles and replaces eight masked loads, but K of them are needed to cover K
+// output columns while the regblock kernel needs eight masked FMAs whatever K is.
+// Measured over 160 matrices spanning mean row 1 to >1000, interleaved arms, A/A
+// p95 0.085 at k=1:
+//
+//   k=1  1.067x  (wins in 8 of 8 degree bins, 118/160 cells)
+//   k=2  0.819-1.008
+//   k=4  0.686-0.940
+//   k=8  0.495-0.824
+//
+// So it ships for k=1 only -- not a round number picked for tidiness, but where K
+// gathers stop being cheaper than eight masked FMAs. At k=1 it moves the kernel
+// from 0.714 to 0.762 of MKL and regresses none of the 49 panel cells that were
+// already at or above parity. The K=1..8 instantiations stay so the losing half of
+// that map can be re-measured from a shipped binary via SCORCH_NARROWK_GATHER.
+//
+// float only. The double path would need _mm256_i32gather_pd at 4 lanes, which
+// halves the instruction saving; it stays on the regblock kernel.
+template <int K>
+static inline void scorch_spmm_row_gather_f32(
+    const int* SCORCH_RESTRICT A1_crd, const float* SCORCH_RESTRICT A_val,
+    const float* SCORCH_RESTRICT B_val,
+    float* SCORCH_RESTRICT C_row, int pA_begin, int pA_end) {
+  __m256 acc[K];
+  for (int j = 0; j < K; j++) acc[j] = _mm256_setzero_ps();
+
+  int pA = pA_begin;
+  for (; pA + 8 <= pA_end; pA += 8) {
+    const __m256i idx = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(A1_crd + pA));
+    // element offset of column c's row in B is c*K; the gather's scale covers
+    // the 4-byte element size, so the index has to carry the K stride.
+    const __m256i off = (K == 1) ? idx
+                                 : _mm256_mullo_epi32(idx, _mm256_set1_epi32(K));
+    const __m256 a = _mm256_loadu_ps(A_val + pA);
+    for (int j = 0; j < K; j++)
+      acc[j] = _mm256_fmadd_ps(a, _mm256_i32gather_ps(B_val + j, off, 4), acc[j]);
+  }
+
+  // Fold each lane set down to one scalar, then finish the row's tail.
+  for (int j = 0; j < K; j++) {
+    __m128 lo = _mm256_castps256_ps128(acc[j]);
+    __m128 hi = _mm256_extractf128_ps(acc[j], 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float sum = _mm_cvtss_f32(lo);
+    for (int q = pA; q < pA_end; q++)
+      sum += A_val[q] * B_val[(size_t)A1_crd[q] * (size_t)K + j];
+    C_row[j] = sum;
+  }
+}
+#endif  // AVX2 && FMA
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+// Narrow-k variant that runs UNROLL independent nonzero streams instead of 2.
+//
+// Why: at k <= lanes the row needs a single vector accumulator (NVEC == 1), so the
+// 2-nnz form above keeps only two B loads in flight. Those loads are the random
+// part of an SpMM -- one cache line per nonzero, indexed by the column -- and the
+// whole-collection sweep shows the deficit against MKL tracking how far B sits
+// from the core: with B under 32 KB (L1-resident) the kernel is 0.894 of MKL, but
+// 0.591 once B is L2-sized and 0.489 once it is L3-sized. That is a memory-latency
+// profile, not an FMA-throughput one, and two outstanding loads cannot cover an L2
+// hit. MKL's SpMV-shaped kernel keeps 8 or more in flight.
+//
+// NVEC * UNROLL accumulators have to stay in registers, so the caller picks UNROLL
+// to hold that product at about 8 of the 16 architectural YMM registers, leaving
+// room for the B values and the splats. Rows shorter than UNROLL fall entirely to
+// the scalar tail, which has LESS instruction-level parallelism than the 2-stream
+// form it replaces, so a deep unroll is expected to lose on short rows -- that is
+// what the A/B measures, and it is why this is a hook and not yet a policy.
+template <typename T, int NVEC, bool FULL_LAST, int UNROLL>
+static inline void scorch_spmm_row_regblock_deep(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    typename scorch_simd<T>::mask mask_last) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  typename V::vec acc[UNROLL][NVEC];
+  for (int u = 0; u < UNROLL; u++)
+    for (int v = 0; v < NVEC; v++) acc[u][v] = V::zero();
+
+  int pA = pA_begin;
+  for (; pA + UNROLL <= pA_end; pA += UNROLL) {
+    // Resolve every base pointer and scalar first, so the UNROLL load chains are
+    // visibly independent and the out-of-order engine can overlap their misses.
+    const T* SCORCH_RESTRICT Bp[UNROLL];
+    typename V::vec av[UNROLL];
+    for (int u = 0; u < UNROLL; u++) {
+      Bp[u] = B_val + (size_t)A1_crd[pA + u] * (size_t)B1_size;
+      av[u] = V::splat(A_val[pA + u]);
+    }
+    for (int u = 0; u < UNROLL; u++) {
+      for (int v = 0; v < NVEC; v++) {
+        const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
+        const typename V::vec b = masked ? V::maskload(Bp[u] + L * v, mask_last)
+                                         : V::load(Bp[u] + L * v);
+        acc[u][v] = V::fma(av[u], b, acc[u][v]);
+      }
+    }
+  }
+  for (; pA < pA_end; pA++) {
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    for (int v = 0; v < NVEC; v++) {
+      const bool masked = (v == NVEC - 1) && !FULL_LAST;
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      acc[0][v] = V::fma(a0, b0, acc[0][v]);
+    }
+  }
+  for (int v = 0; v < NVEC; v++) {
+    typename V::vec r = acc[0][v];
+    for (int u = 1; u < UNROLL; u++) r = V::add(r, acc[u][v]);
+    if ((v == NVEC - 1) && !FULL_LAST) V::maskstore(C_row + L * v, mask_last, r);
+    else V::store(C_row + L * v, r);
+  }
+}
+#endif  // AVX2 && FMA && SCORCH_TUNE_HOOKS
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+// Narrow-k variant whose only difference from the shipped kernel is how far ahead
+// it prefetches B.
+//
+// The shipped kernel prefetches the row's next-but-one nonzero -- one loop
+// iteration, about four cycles of work at two nonzeros an iteration. On the
+// kernel-only timer the narrow-k deficit against MKL is confined almost exactly to
+// the band where a B row is an L2 miss and an L3 hit: over redwood's whole
+// collection at k <= 8, with B under half a megabyte scorch reads 0.93-1.88 of MKL
+// (float64) and with B over 8 MB it reads 0.96-1.20, but in between, at 0.5-8 MB,
+// it reads 0.51-0.95. Four cycles of run-ahead cannot cover a ~40-cycle L3 hit,
+// and a deeper distance is the cheapest thing that could. PFD is in NONZEROS, so
+// the prefetch issued while working on pA lands PFD/2 iterations early; it is
+// clamped to the row, so a short row issues none.
+template <typename T, int NVEC, bool FULL_LAST, int PFD>
+static inline void scorch_spmm_row_regblock_pf(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    typename scorch_simd<T>::mask mask_last) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  typename V::vec acc0[NVEC], acc1[NVEC];
+  #pragma unroll
+  for (int v = 0; v < NVEC; v++) {
+    acc0[v] = V::zero();
+    acc1[v] = V::zero();
+  }
+  int pA = pA_begin;
+  for (; pA + 1 < pA_end; pA += 2) {
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+    if (pA + PFD < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + PFD] * (size_t)B1_size, 0, 1);
+    if (pA + PFD + 1 < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + PFD + 1] * (size_t)B1_size,
+                         0, 1);
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    const typename V::vec a1 = V::splat(A_val[pA + 1]);
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      const typename V::vec b1 = masked ? V::maskload(B1 + L * v, mask_last)
+                                        : V::load(B1 + L * v);
+      acc0[v] = V::fma(a0, b0, acc0[v]);
+      acc1[v] = V::fma(a1, b1, acc1[v]);
+    }
+  }
+  if (pA < pA_end) {
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      acc0[v] = V::fma(a0, b0, acc0[v]);
+    }
+  }
+  #pragma unroll
+  for (int v = 0; v < NVEC; v++) {
+    const typename V::vec r = V::add(acc0[v], acc1[v]);
+    if ((v == NVEC - 1) && !FULL_LAST) V::maskstore(C_row + L * v, mask_last, r);
+    else V::store(C_row + L * v, r);
+  }
+}
+#endif  // AVX2 && FMA && SCORCH_TUNE_HOOKS
 #ifdef SCORCH_TUNE_HOOKS
 // A/B toggle for the regtile partial-tile path; refreshed once per SpMM op by
 // spmm_csr_float_v2 (SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial). Only
@@ -2652,25 +2856,61 @@ static inline void scorch_spmm_row_neon_hoisted(
 #ifndef SCORCH_SPMM_CHUNK_MINRATIO
 #define SCORCH_SPMM_CHUNK_MINRATIO 2
 #endif
+// Where the MINRATIO guard reads its width. The guard asks a question about the
+// MODEL -- "is this recommendation far enough from generic to be outside the
+// model's own error bars?" -- so it has to read the width the model asked for,
+// before the two load-balance ceilings below trim it. Reading it afterwards
+// conflates two different things: a ceiling saying "you may not have that much"
+// gets scored as the model saying "I am not sure enough to ask", and the
+// recommendation is thrown away entirely rather than granted up to the ceiling.
+// That is not a rare corner. The ceiling binds on exactly the large matrices where
+// the model is most confident, because it falls as 1/nthreads: at 32 threads and
+// CHUNKS_MIN 16 a 50000-row matrix may have 97 rows a chunk, so a model asking 316
+// (a 4.9x departure, far outside its error bars) lands at 97, which is below
+// 2*generic, and reverts to 64. Measured over the corpus this fires on 96 of 320
+// narrow-k band cells, where forcing 64 is a no-op (0.96) and forcing 256 is 1.49x
+// -- the width was being discarded, not chosen.
+#ifndef SCORCH_SPMM_CHUNK_GUARD_PRECAP
+#define SCORCH_SPMM_CHUNK_GUARD_PRECAP 1
+#endif
 inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
   const long generic = (long)scorch_chunk(rows, nnz * k, SCORCH_GRAIN_SPMM);
   if (rows <= 0 || nnz <= 0 || k <= 0 || nthreads <= 0) return (int)generic;
+  long chunks_min = SCORCH_SPMM_CHUNKS_MIN;
+  long minratio = SCORCH_SPMM_CHUNK_MINRATIO;
+  int guard_precap = SCORCH_SPMM_CHUNK_GUARD_PRECAP;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_CHUNK");
     if (e && *e) { long f = std::atol(e); if (f > 0) return (int)f; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CHUNKS_MIN");
+    if (e && *e) { long v = std::atol(e); if (v > 0) chunks_min = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CHUNK_MINRATIO");
+    if (e && *e) { long v = std::atol(e); if (v > 0) minratio = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CHUNK_GUARD_PRECAP");
+    if (e && *e) guard_precap = (int)std::atol(e); }
 #endif
   const double ratio = (double)SCORCH_SPMM_CHUNK_K * (double)SCORCH_SPMM_CHUNK_KREF
                        / ((double)nnz * (double)k);
-  long c = (long)((double)rows * std::sqrt(ratio));
+  const long model = (long)((double)rows * std::sqrt(ratio));
+  // The confidence guard, on the model's own width. Below the threshold the model
+  // is not saying anything it can support, so the generic width stands.
+  if (guard_precap && model < minratio * generic) return (int)generic;
+  long c = model;
   if (c < generic) c = generic;
-  long cap = rows / ((long)nthreads * SCORCH_SPMM_CHUNKS_MIN);
+  long cap = rows / ((long)nthreads * chunks_min);
   if (cap < generic) cap = generic;
   if (c > cap) c = cap;
   const long per_worker = rows / (long)nthreads;      // every worker gets one
   if (per_worker >= 1 && c > per_worker) c = per_worker;
   if (c < 1) c = 1;
-  // Last: a recommendation too close to the generic width is not a recommendation.
-  if (c < (long)SCORCH_SPMM_CHUNK_MINRATIO * generic) c = generic;
+  if (guard_precap) {
+    // A ceiling trims the recommendation; it never pushes it below the width we
+    // would have used anyway.
+    if (c < generic) c = generic;
+  } else {
+    // The pre-fix order, kept as the control arm: the guard reads the trimmed width.
+    if (c < minratio * generic) c = generic;
+  }
   return (int)c;
 }
 
@@ -2703,17 +2943,17 @@ torch::Tensor spmm_csr_v2_core(
 
   // Output allocation + zeroing. Every code path below (regblock / regtile /
   // workspace memcpy) ASSIGNS all C1_size entries of each NON-empty output row,
-  // so only structurally-empty rows (and any tail rows C0_size>A0_size) need
-  // pre-zeroing. The legacy path malloc'd a raw buffer and memset the WHOLE
-  // thing single-threaded before the parallel region — a serial O(C0*C1)
-  // zero-fault per call (14MB for a 14K-row k=256 product) that MKL never pays
-  // (its dense output is written in full by the kernel, from a pooled buffer).
-  // We (a) allocate via torch::empty (the same CPU allocator MKL's output uses,
-  // so scorch and MKL are apples-to-apples on allocation) and (b) zero only the
-  // rows the kernel won't touch. FEM/graph adjacencies have no empty rows ->
-  // the zeroing is a single O(rows) index scan. Correctness is identical: a
-  // non-empty row is fully overwritten by the kernel; an empty row is zeroed
-  // here.
+  // so only structurally-empty rows -- and any tail rows C0_size>A0_size, which
+  // no worker owns -- have to be zeroed at all. The legacy path malloc'd a raw
+  // buffer and memset the WHOLE thing single-threaded before the parallel
+  // region: a serial O(C0*C1) zero-fault per call (14MB for a 14K-row k=256
+  // product) that MKL never pays, since its dense output is written in full by
+  // the kernel from a pooled buffer. We allocate via torch::empty (the same CPU
+  // allocator MKL's output uses, so scorch and MKL are apples-to-apples on
+  // allocation) and write nothing outside the empty rows. Where those rows are
+  // zeroed is a performance question, settled below; correctness does not depend
+  // on it, since a non-empty row is fully overwritten by the kernel and every
+  // empty row is zeroed exactly once.
   torch::Tensor C_values_torch =
       torch::empty({(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<scalar_t>();
@@ -2724,16 +2964,129 @@ torch::Tensor spmm_csr_v2_core(
   { const char* e = std::getenv("SCORCH_SPMM_ALLOC");
     if (e && *e) { long v = std::atol(e); zero_empty_only = v & 2; } }
 #endif
+  // Which mechanism zeroes the structurally-empty output rows.
+  //
+  //   2 (default) the worker that steals the row zeroes it, merging consecutive
+  //               empty rows within the stolen chunk into one memset;
+  //   3           the same as 2, one memset per empty row;
+  //   6           the workers steal WIDE slices of the row range and zero the runs
+  //               of empty rows in them, alternating one such slice with one chunk
+  //               of arithmetic;
+  //   5           the same, but every zero slice is drained before any worker
+  //               starts on arithmetic;
+  //   4           the same, but a static slice per worker instead of stealing;
+  //   1           one pre-loop parallel span over the whole output, gated on
+  //               SCORCH_SPMM_ZERO_SPAN_ELEMS and on three quarters of the rows
+  //               being empty;
+  //   0           the pre-2026-08 serial per-empty-row memset.
+  //
+  // 0..3 are kept so all five can be priced against each other in ONE binary;
+  // they are compiled out of the shipped .so, where zero_mode is a constant and
+  // every branch on it folds.
+  //
+  // Why the default zeroes a row where the arithmetic loop already visits it, and
+  // not in a pass of its own. Every up-front variant -- 4, 5 and 6 -- walks A1_pos
+  // a SECOND time looking for runs of empty rows, and the arithmetic loop was going
+  // to visit every row anyway. Over redwood's 362-matrix panel that second pass
+  // costs, and it costs exactly the way an O(rows) pass should: the loss grows with
+  // the row count and shrinks as the degree gives it more arithmetic to hide
+  // behind (float64, geomean against the default):
+  //
+  //             deg<=2   2-8   8-32   32-128   >128
+  //   <1K rows   1.025  1.009  1.010   0.996   1.015
+  //   1-10K      0.920  0.976  0.995   1.001   1.004
+  //   10-100K    0.867  0.951  0.977      --      --
+  //   0.1-1M     0.914     --     --      --      --
+  //
+  // The wide variants exist because on the M5 a 0.8 GB nearly-empty float64 output
+  // ran 2.3x faster with one contiguous run per worker than with the arithmetic
+  // chunk's 781-row width. That turned out not to be about the zero: on that host a
+  // FRESH torch allocation over ~200 MB zeroes at 30-50 GB/s where a reused buffer
+  // holds 235, so what the wide runs were driving better was the page-fault path of
+  // an allocator that is not reusing its blocks. Redwood, whose allocator does
+  // reuse, has no such gap on the same matrices -- higgs-twitter_reply at 892 MB
+  // and 1784 MB zeroes at 33 GB/s of its ~56 GB/s achievable, and both wide
+  // variants read 0.856 (assigned) and 0.986 (stolen) against the default there.
+  // So the mechanism is chosen on the corpus with a warm allocator, and the fault
+  // path is recorded rather than tuned against.
+#ifdef SCORCH_TUNE_HOOKS
+  int zero_mode = 2;
+  { const char* e = std::getenv("SCORCH_SPMM_ZERO_MODE");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 6) zero_mode = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_ZERO_LEGACY");   // the older name for 0
+    if (e && *e && std::atol(e) != 0) zero_mode = 0; }
+#else
+  constexpr int zero_mode = 2;
+#endif
+  const size_t out_row_bytes = sizeof(scalar_t) * (size_t)C1_size;
+  // Empty output rows, counted before anything is zeroed. Feeds the thread
+  // policy below, and mode 2's row loop.
+  int64_t empty_rows = 0;
   if (zero_empty_only) {
+    // The comment above assumes empty rows are rare. That holds for FEM and graph
+    // adjacencies, but 27.9% of the SuiteSparse+DLMC corpus has at least one, and
+    // where most rows are empty the serial loop degenerates into a strided zero of
+    // essentially the whole output, issued as `rows` separate small memsets.
+    // Measured on redwood, a 200000x256 output with 40 nonzeros wrote at 4.7-5.6
+    // GB/s where a span write on the same host runs at 14.4-20.3, and vs MKL those
+    // shapes read 0.81-0.92.
+    //
+    // The scan is branchless and reads A1_pos, which the row loop reads anyway.
+    // When it comes back zero there is nothing to zero at all -- the kernel writes
+    // every non-empty row in full -- so the common case makes one pass over
+    // A1_pos and no longer makes the branchy pass the old loop made.
     for (int i = 0; i < A0_size; i++)
-      if (A1_pos[i] == A1_pos[i + 1])
-        memset(C_values + (size_t)i * (size_t)C1_size, 0, sizeof(scalar_t) * (size_t)C1_size);
-    if (C0_size > A0_size)
-      memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
-             sizeof(scalar_t) * (size_t)(C0_size - A0_size) * (size_t)C1_size);
+      empty_rows += (A1_pos[i] == A1_pos[i + 1]) ? 1 : 0;
+    if (empty_rows != 0 && zero_mode <= 1) {
+      const int64_t empty_elems = empty_rows * (int64_t)C1_size;
+      if (zero_mode == 1 && empty_elems >= SCORCH_SPMM_ZERO_SPAN_ELEMS &&
+          empty_rows * 4 >= (int64_t)A0_size * 3) {
+        // Mode 1: one parallel span over the whole output. Measured 2.10x (f32) /
+        // 3.15x (f64) over mode 0 on the 205 cells it fires on, but it spawns a
+        // team of omp_get_num_procs() immediately before the kernel's own team of
+        // scorch_spmm_nthreads(), and 19 of those 205 float32 cells LOST by up to
+        // 1.9x -- the ones with real arithmetic after the zero, which is the
+        // signature of the second team running in the wake of the first. The
+        // default has no second team, which is why it is the default; it also
+        // matches this arm on the enormous nearly-empty outputs where the
+        // contiguous span is at its best (0.975 and 1.019 on two 0.8 GB float64
+        // cells, against 0.430 and 0.448 for mode 2).
+        scorch_zero_dense(C_values, (int64_t)A0_size * (int64_t)C1_size);
+      } else {
+        for (int i = 0; i < A0_size; i++)
+          if (A1_pos[i] == A1_pos[i + 1])
+            memset(C_values + (size_t)i * (size_t)C1_size, 0, out_row_bytes);
+      }
+    }
+    if (C0_size > A0_size) {
+      // Rows past A's last one: no worker owns them, so they are zeroed here
+      // whatever the mode. A contiguous tail, so this is a span write whatever
+      // its size, and scorch_zero_dense falls back to memset below the grain.
+      if (zero_mode == 0)
+        memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
+               out_row_bytes * (size_t)(C0_size - A0_size));
+      else
+        scorch_zero_dense(C_values + (size_t)A0_size * (size_t)C1_size,
+                          (int64_t)(C0_size - A0_size) * (int64_t)C1_size);
+    }
   } else {
     memset(C_values, 0, sizeof(scalar_t) * C_capacity);
   }
+  // Where the empty rows get zeroed, as booleans the worker reads. All of them
+  // fold to constants in the shipped build, where only zero_in_loop and
+  // zero_merge_runs are true and the slice paths compile away entirely.
+  //
+  // empty_rows appears in the slice conditions, not just inside their loops, so a
+  // shape with no empty row does not pay even the slice scan.
+  const bool zero_static_slice =
+      zero_empty_only && zero_mode == 4 && empty_rows != 0;
+  const bool zero_stolen_slice =
+      zero_empty_only && (zero_mode == 5 || zero_mode == 6) && empty_rows != 0;
+  // Mode 6 takes one zero slice per arithmetic chunk instead of draining them
+  // first. Same slices, same counter, same total work; only the order differs.
+  const bool zero_alternate = zero_mode == 6;
+  const bool zero_in_loop = zero_empty_only && (zero_mode == 2 || zero_mode == 3);
+  const bool zero_merge_runs = zero_mode == 2;
 
   // Round tile to multiple of 16 for SIMD alignment
   const int kTile = (tile_size + 15) & ~15;
@@ -2753,7 +3106,19 @@ torch::Tensor spmm_csr_v2_core(
   // threads despite abundant row-parallelism). Floor the k term at the line
   // width so row-parallelism isn't starved; k>=16 behavior is unchanged.
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
-  const long work = (long)total_nnz * k_eff;
+  // The empty rows are output-writing work the nnz*k term cannot see. A
+  // 200000-row k=256 output with 40 nonzeros credits 10240 units against a
+  // 150000 grain, so scorch_nthreads gave the whole call ONE thread -- and in
+  // mode 2 that one thread would also own 200000 row zeros. Credit the span the
+  // workers actually zero, at one unit per element. That over-credits a pure
+  // store stream against a gather-and-FMA on purpose: the zero is
+  // bandwidth-bound, so more workers help it. The term is exactly zero when no
+  // row is empty, which is 72% of the corpus, so no shape without an empty row
+  // moves its thread count.
+  const long work_nnz = (long)total_nnz * k_eff;
+  const long zero_work = (zero_in_loop || zero_static_slice || zero_stolen_slice)
+      ? (long)(empty_rows * (int64_t)C1_size) : 0L;
+  const long work = work_nnz + zero_work;
   // Composition override: when this drop-in SpMM runs inside a host (torch)
   // pipeline, the surrounding dense ops use the host thread count (e.g. 16); the
   // throttled policy count (e.g. 11 for a narrow-k GCN layer) then forces a
@@ -2768,10 +3133,29 @@ torch::Tensor spmm_csr_v2_core(
   // nthreads_override<=0 => pure policy (the standalone/panel default). The rule
   // itself lives in scorch_policy.h so a harness can ask for the same number
   // instead of recomputing it; see scorch_spmm_nthreads.
-  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override);
+  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
+                                            (long)total_nnz * (long)B1_size);
   const long nnz_total = A0_size > 0 ? (long)A1_pos[A0_size] : 0;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
+  // Width of a stolen ZERO slice, in rows. Several slices per worker so a slow
+  // core cannot become the critical path, and never narrower than the arithmetic
+  // chunk. SCORCH_SPMM_ZERO_SLICES sets the slices-per-worker target; 4 is where
+  // the grid put it.
+  int zchunk = chunk;
+  if (zero_stolen_slice) {
+    long per_worker = 4;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_ZERO_SLICES");
+      if (e && *e) { long v = std::atol(e); if (v > 0) per_worker = v; } }
+#endif
+    long want = (long)A0_size / (per_worker * (nthreads > 0 ? nthreads : 1));
+    if (want < (long)chunk) want = (long)chunk;
+    if (want > (long)A0_size) want = (long)A0_size;
+    if (want < 1) want = 1;
+    zchunk = (int)want;
+  }
+  std::atomic<int> next_zero_row{0};
 
   // Narrow-k register-blocked path (K<=16): hold the whole output row in YMM
   // accumulators across the row's nonzeros, masked AVX2 load/store, 2-nnz ILP.
@@ -2836,6 +3220,42 @@ torch::Tensor spmm_csr_v2_core(
   // where full_last is const and the branch on it folds away.
   { const char* e = std::getenv("SCORCH_SPMM_MASKED");
     if (e && *e && std::atol(e) != 0) full_last = false; }
+  // A/B hook: number of independent nonzero streams the narrow-k register kernel
+  // runs. 0 (unset) keeps the shipped 2-stream form. Loop-invariant, so the row
+  // loop's dispatch on it hoists.
+  int narrowk_unroll = 0;
+  { const char* e = std::getenv("SCORCH_NARROWK_UNROLL");
+    if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
+  // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
+  // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
+  int narrowk_pf = 0;
+  { const char* e = std::getenv("SCORCH_NARROWK_PF");
+    if (e && *e) { long v = std::atol(e);
+      if (v == 4 || v == 8 || v == 16 || v == 32) narrowk_pf = (int)v; } }
+#endif
+
+#if defined(__AVX2__) && defined(__FMA__)
+  // Route k=1 through the nonzero-axis gather kernel. See its definition for the
+  // measured map across k: k=1 is where K gathers stay cheaper than eight masked
+  // FMAs, and from k=2 up the gather gives back more than it gains.
+  int narrowk_gather = (B1_size == 1) ? 1 : 0;
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B override, authoritative so the whole k=1..8 map is reproducible from this
+  // binary: 0 forces the shipped regblock kernel at every width, and a positive
+  // value routes at every width whose row needs one vector, subject to that mean
+  // row length. A floor buys nothing in the end -- the cells it would exclude were
+  // positive too -- but it is how the map was drawn.
+  { const char* e = std::getenv("SCORCH_NARROWK_GATHER");
+    if (e && *e) {
+      const long v = std::atol(e);
+      if (v <= 0) {
+        narrowk_gather = 0;
+      } else {
+        const long mean_row = A0_size > 0 ? (long)(A1_pos[A0_size] / A0_size) : 0;
+        narrowk_gather = (mean_row >= v) ? 1 : 0;
+      }
+    } }
+#endif
 #endif
 
   // A register-resident row kernel writes the whole row, so the workspace only
@@ -2856,7 +3276,7 @@ torch::Tensor spmm_csr_v2_core(
   // cross-runtime thread-team reformation at each op boundary — the drop-in-
   // pipeline "same thread pool" composition. Work distribution is byte-identical
   // (same next_row atomic, same regblock/regtile kernels); only the launch differs.
-  auto scorch_spmm_worker = [&](int worker_id) {
+  auto scorch_spmm_worker = [&](int worker_id, int team_size) {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
     // row, and on NEON scorch_spmm_row_neon does, so neither shipped build touches
@@ -2870,8 +3290,61 @@ torch::Tensor spmm_csr_v2_core(
     (void)worker_id;
 #endif
 
+    // Empty output rows first, in wide slices, as long contiguous memsets. Needs
+    // no barrier against the arithmetic loop below, and none between the workers:
+    // this writes only rows the arithmetic skips, and the arithmetic writes only
+    // rows this skips, whatever order the two run in.
+    //
+    // The A/B arm that ASSIGNS a slice per worker partitions by the ACTUAL team
+    // size, not the requested one, because OpenMP may hand back a smaller team and
+    // a slice nobody owns would ship uninitialised memory. The stolen form has no
+    // such hazard: the counter covers every row whatever the team size.
+    // One stolen zero slice, or false when the counter is exhausted.
+    auto zero_one_slice = [&]() -> bool {
+      const int zs = next_zero_row.fetch_add(zchunk, std::memory_order_relaxed);
+      if (zs >= A0_size) return false;
+      const int ze = std::min(zs + zchunk, A0_size);
+      for (int i = zs; i < ze;) {
+        if (A1_pos[i] == A1_pos[i + 1]) {
+          int run = i + 1;
+          while (run < ze && A1_pos[run] == A1_pos[run + 1]) run++;
+          memset(C_values + (size_t)i * (size_t)C1_size, 0,
+                 out_row_bytes * (size_t)(run - i));
+          i = run;
+        } else {
+          i++;
+        }
+      }
+      return true;
+    };
+    bool zero_slices_left = zero_stolen_slice;
+    if (zero_stolen_slice && !zero_alternate) {   // empty_rows != 0 is folded in
+      while (zero_one_slice()) {
+      }
+      zero_slices_left = false;
+    } else if (zero_static_slice && team_size > 0) {   // A/B arm: assigned, not stolen
+      const int64_t lo = (int64_t)worker_id * (int64_t)A0_size / team_size;
+      const int64_t hi = (int64_t)(worker_id + 1) * (int64_t)A0_size / team_size;
+      for (int64_t i = lo; i < hi;) {
+        if (A1_pos[i] == A1_pos[i + 1]) {
+          int64_t run = i + 1;
+          while (run < hi && A1_pos[run] == A1_pos[run + 1]) run++;
+          memset(C_values + (size_t)i * (size_t)C1_size, 0,
+                 out_row_bytes * (size_t)(run - i));
+          i = run;
+        } else {
+          i++;
+        }
+      }
+    }
+
     // Atomic work-stealing loop with adaptive chunk size
     while (true) {
+      // One zero slice per arithmetic chunk (mode 6). Alternating the two keeps a
+      // pure store phase from monopolising the write path while the load path
+      // idles, which is what draining the zero first does.
+      if (zero_slices_left && zero_alternate && !zero_one_slice())
+        zero_slices_left = false;
       const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
       if (start >= A0_size) break;
       const int end = std::min(start + chunk, A0_size);
@@ -2879,7 +3352,32 @@ torch::Tensor spmm_csr_v2_core(
       for (int i = start; i < end; i++) {
         const int pA_begin = A1_pos[i];
         const int pA_end   = A1_pos[i + 1];
-        if (pA_begin == pA_end) continue;
+        if (pA_begin == pA_end) {
+          // Structurally empty, so there is nothing to compute -- and this worker
+          // has the row in hand, so it zeroes it here rather than in a pass of its
+          // own. One team for the whole call, the zero spread over the same rows as
+          // the arithmetic and interleaved with it, each row first-touched by the
+          // core that will hold it, nothing written outside the empty rows, and no
+          // second walk of A1_pos. The fused Linear kernel below already worked
+          // this way -- its worker writes act(bias) into a channel with no
+          // nonzeros -- so this makes the drop-in SpMM agree with it.
+          //
+          // Consecutive empty rows are one memset, not one each, bounded by the
+          // stolen chunk so no two workers ever write the same bytes. That width is
+          // chosen for arithmetic and is narrow for a store stream; widening it is
+          // mode 6 above, and the second A1_pos walk that costs more than the
+          // streaming gains (see the mode table). Mode 3 drops the merge, to price
+          // it: about 3% here.
+          if (zero_in_loop) {
+            int run = i + 1;
+            if (zero_merge_runs)
+              while (run < end && A1_pos[run] == A1_pos[run + 1]) run++;
+            memset(C_values + (size_t)i * (size_t)C1_size, 0,
+                   out_row_bytes * (size_t)(run - i));
+            i = run - 1;          // the loop's ++ steps past the run
+          }
+          continue;
+        }
 
         scalar_t* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)C1_size;
 
@@ -2901,6 +3399,85 @@ torch::Tensor spmm_csr_v2_core(
               (full_last \
                  ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
                  : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+            if (narrowk_gather && nvec == 1 &&
+                std::is_same<scalar_t, float>::value) {
+              // nvec==1 means k <= 8 for float, so K is B1_size itself.
+              #define SCORCH_RG(KK) \
+                scorch_spmm_row_gather_f32<KK>( \
+                    A1_crd, (const float*)A_val, (const float*)B_val, \
+                    (float*)C_row, pA_begin, pA_end)
+              if constexpr (std::is_same<scalar_t, float>::value) {
+                switch (B1_size) {
+                  case 1: SCORCH_RG(1); break;
+                  case 2: SCORCH_RG(2); break;
+                  case 3: SCORCH_RG(3); break;
+                  case 4: SCORCH_RG(4); break;
+                  case 5: SCORCH_RG(5); break;
+                  case 6: SCORCH_RG(6); break;
+                  case 7: SCORCH_RG(7); break;
+                  case 8: SCORCH_RG(8); break;
+                  default: SCORCH_RB(1); break;
+                }
+              }
+              #undef SCORCH_RG
+              continue;
+            }
+#ifdef SCORCH_TUNE_HOOKS
+            #define SCORCH_RBD(NV, UN) \
+              (full_last \
+                 ? scorch_spmm_row_regblock_deep<scalar_t, NV, true, UN>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
+                 : scorch_spmm_row_regblock_deep<scalar_t, NV, false, UN>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+            if (narrowk_unroll) {
+              // NVEC * UNROLL accumulators must stay resident, so the deeper
+              // streams are only instantiated where the vector count is small.
+              switch (nvec * 16 + narrowk_unroll) {
+                case 1 * 16 + 4: SCORCH_RBD(1, 4); break;
+                case 1 * 16 + 8: SCORCH_RBD(1, 8); break;
+                case 2 * 16 + 4: SCORCH_RBD(2, 4); break;
+                case 2 * 16 + 8: SCORCH_RBD(2, 8); break;
+                case 3 * 16 + 4: SCORCH_RBD(3, 4); break;
+                case 4 * 16 + 4: SCORCH_RBD(4, 4); break;
+                default:
+                  switch (nvec) {
+                    case 1: SCORCH_RB(1); break;
+                    case 2: SCORCH_RB(2); break;
+                    case 3: SCORCH_RB(3); break;
+                    case 4: SCORCH_RB(4); break;
+                  }
+              }
+              continue;
+            }
+            #undef SCORCH_RBD
+            #define SCORCH_RBP(NV, D) \
+              (full_last \
+                 ? scorch_spmm_row_regblock_pf<scalar_t, NV, true, D>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
+                 : scorch_spmm_row_regblock_pf<scalar_t, NV, false, D>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+            if (narrowk_pf) {
+              switch (nvec * 64 + narrowk_pf) {
+                case 1 * 64 + 4:  SCORCH_RBP(1, 4); break;
+                case 1 * 64 + 8:  SCORCH_RBP(1, 8); break;
+                case 1 * 64 + 16: SCORCH_RBP(1, 16); break;
+                case 1 * 64 + 32: SCORCH_RBP(1, 32); break;
+                case 2 * 64 + 4:  SCORCH_RBP(2, 4); break;
+                case 2 * 64 + 8:  SCORCH_RBP(2, 8); break;
+                case 2 * 64 + 16: SCORCH_RBP(2, 16); break;
+                case 2 * 64 + 32: SCORCH_RBP(2, 32); break;
+                case 3 * 64 + 8:  SCORCH_RBP(3, 8); break;
+                case 3 * 64 + 16: SCORCH_RBP(3, 16); break;
+                case 4 * 64 + 8:  SCORCH_RBP(4, 8); break;
+                case 4 * 64 + 16: SCORCH_RBP(4, 16); break;
+                default:
+                  switch (nvec) {
+                    case 1: SCORCH_RB(1); break;
+                    case 2: SCORCH_RB(2); break;
+                    case 3: SCORCH_RB(3); break;
+                    case 4: SCORCH_RB(4); break;
+                  }
+              }
+              continue;
+            }
+            #undef SCORCH_RBP
+#endif
             switch (nvec) {
               case 1: SCORCH_RB(1); break;
               case 2: SCORCH_RB(2); break;
@@ -2966,6 +3543,10 @@ torch::Tensor spmm_csr_v2_core(
         }
       }
     }
+    // Mode 6 only: the arithmetic ran out before the zero slices did, and
+    // whatever is left is still this worker's to finish.
+    while (zero_slices_left && zero_one_slice()) {
+    }
   };
 
   // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
@@ -2986,8 +3567,12 @@ torch::Tensor spmm_csr_v2_core(
   // each draining rows via the atomic, so a short/excess worker count stays
   // correct. Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0), bypassing
   // the gate.
+  // work_nnz, not work: the zeroing term above sizes the TEAM, and this gate is a
+  // different question -- whether the surrounding torch pipeline's warm pool should
+  // be shared with this op. Nothing measured says an output span full of empty rows
+  // changes that answer, so the launch path every existing shape takes is unchanged.
   bool use_atparallel = atparallel && nthreads_override > 0
-      && work >= SCORCH_GRAIN_SPMM
+      && work_nnz >= SCORCH_GRAIN_SPMM
       && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
   if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
     if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
@@ -3005,18 +3590,20 @@ torch::Tensor spmm_csr_v2_core(
     if (nthreads >= 2 * atpool) {
       #pragma omp parallel num_threads(nthreads)
       {
-        scorch_spmm_worker(omp_get_thread_num());
+        scorch_spmm_worker(omp_get_thread_num(), omp_get_num_threads());
       }
     } else {
+      // Every id in [0, nthreads) is executed here, so nthreads IS the partition
+      // the static zero above can rely on, whatever pool size torch runs it on.
       at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
         for (int64_t w = wbeg; w < wend; ++w)
-          scorch_spmm_worker(static_cast<int>(w));
+          scorch_spmm_worker(static_cast<int>(w), nthreads);
       });
     }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
-      scorch_spmm_worker(omp_get_thread_num());
+      scorch_spmm_worker(omp_get_thread_num(), omp_get_num_threads());
     }
   }
 
@@ -3632,7 +4219,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   const int total_nnz = A1_pos[A0_size];
   const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
   const long work = (long)total_nnz * k_eff;
-  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override);
+  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
+                                            (long)total_nnz * (long)B1_size);
   // Deliberately the GENERIC chunk, not the SpMM-specific rule the drop-in kernel
   // uses. The fused kernel's workload is the sparse autoencoder grid, and the chunk
   // rule has never been run against it -- so this is a gap to close with its own
