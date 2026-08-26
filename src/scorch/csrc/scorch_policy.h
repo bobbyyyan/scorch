@@ -316,7 +316,24 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (cand > hw) cand = hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
-  if (nthreads_override > 0 && work >= SCORCH_GRAIN_SPMM) {
+  // Which work measure gates the composition adoption. `work` is nnz*max(k,16) --
+  // the k term floored at a cache line, which is right for throttling a
+  // bandwidth-bound product and overstates a k=1 product SIXTEENFOLD. Gating the
+  // adoption on it means a product with 12625 nonzero-units of real arithmetic
+  // reads 202000 against a 150000 grain and gets the whole host team.
+  //
+  // Measured on the M5 over the 40 matrices where the home-range partition was worst,
+  // forcing ONE thread beat the adopted count on 31 of 40 cells at k=1, 28 of 40 at
+  // k=2 and 29 of 40 at k=8, geomean 1.197 / 1.156 / 1.142 in favour of one thread;
+  // at k=64, where the floor does not bite, the adopted count is right and wins
+  // 1.68x. This is the same defect that has already been fixed twice elsewhere --
+  // the raise gate above reads work_true for exactly this reason.
+  long gate_work = work;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_OVERRIDE_GATE_TRUE");
+    if (e && *e && std::atol(e) != 0) gate_work = work_true; }
+#endif
+  if (nthreads_override > 0 && gate_work >= SCORCH_GRAIN_SPMM) {
     // Deliberately the 16-rows-per-worker ceiling, not rpt. This is the composition
     // path -- adopt the host team so a pipeline does not reshape at every op
     // boundary -- and widening it too would raise the count on the very k=1 cells

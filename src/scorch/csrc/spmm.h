@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -3043,8 +3044,51 @@ struct alignas(128) scorch_spmm_cursor {
   // stack for every call that uses the partition, and a default member
   // initialiser would make merely declaring it write every line. The setup
   // stores into exactly the entries it will use.
+  //
+  // v is the owner's cursor for modes 1 and 2, where a thief also takes from the
+  // front and one fetch_add serves both ends. Mode 3 needs the two ends
+  // independent, so it uses ht instead: head in the low 32 bits, exclusive tail in
+  // the high 32, moved by compare-exchange. Packing them in one word is what makes
+  // a claim atomic -- with two separate counters an owner and a thief can each read
+  // a stale view of the other and claim the same rows.
   std::atomic<int> v;
+  std::atomic<uint64_t> ht;
 };
+
+static inline uint64_t scorch_ht_pack(int head, int tail) {
+  return (uint64_t)(uint32_t)head | ((uint64_t)(uint32_t)tail << 32);
+}
+static inline int scorch_ht_head(uint64_t x) {
+  return (int)(uint32_t)(x & 0xffffffffu);
+}
+static inline int scorch_ht_tail(uint64_t x) { return (int)(uint32_t)(x >> 32); }
+
+// Claim up to `chunk` rows from one range. FRONT is the owner's end, BACK is a
+// thief's. False means the range is empty, and empty for good: head only rises and
+// tail only falls, so no caller has to ask a second time.
+static inline bool scorch_ht_claim(std::atomic<uint64_t>& ht, int chunk, bool front,
+                                   int* out_begin, int* out_end) {
+  uint64_t cur = ht.load(std::memory_order_relaxed);
+  for (;;) {
+    const int h = scorch_ht_head(cur), t = scorch_ht_tail(cur);
+    if (h >= t) return false;
+    int b, e;
+    uint64_t nxt;
+    if (front) {
+      b = h; e = (h + chunk < t) ? h + chunk : t;
+      nxt = scorch_ht_pack(e, t);
+    } else {
+      e = t; b = (t - chunk > h) ? t - chunk : h;
+      nxt = scorch_ht_pack(h, b);
+    }
+    if (ht.compare_exchange_weak(cur, nxt, std::memory_order_relaxed,
+                                 std::memory_order_relaxed)) {
+      *out_begin = b; *out_end = e;
+      return true;
+    }
+    // A failed exchange refreshed cur; retry against the view it handed back.
+  }
+}
 
 // The kernel proper takes plain pointers and sizes. Two callers reach it: the
 // legacy entry below, which unpacks the nested tensor vectors the pybind ABI
@@ -3338,7 +3382,15 @@ torch::Tensor spmm_csr_v2_core(
   //
   //   0  one global counter, any worker takes any chunk
   //   1  home ranges only, no stealing
-  //   2  home ranges, then steal from whoever is still working
+  //   2  home ranges, then steal from the FRONT of whoever is still working
+  //   3  same, but steal from the BACK, so an owner keeps a stable prefix
+  //
+  // Mode 3 exists because the counters say 1 and 2 recover different amounts. On
+  // ts-palko at k=1, L2 misses per call run 133363 (mode 0) -> 5324 (mode 1, below
+  // MKL's own 6637) -> 37039 (mode 2): stealing from the front takes exactly the
+  // rows the owner would have reached next, so that work migrates between cores
+  // call to call and drags a seventh of the misses back. Taking from the back
+  // leaves the owner's prefix where it was.
   //
   // Mode 1 isolates the locality effect; mode 2 is the shippable form, because a
   // home range is balanced in nonzeros and NOT in time -- redwood is 8 P-cores
@@ -3351,7 +3403,7 @@ torch::Tensor spmm_csr_v2_core(
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_PARTITION");
     if (e && *e) { long v = std::atol(e);
-      if (v >= 0 && v <= 2) partition_mode = (int)v; } }
+      if (v >= 0 && v <= 3) partition_mode = (int)v; } }
 #endif
   const int nsplit = nthreads > 0 ? nthreads : 1;
   // On the stack up to a core count no host here has, because the smallest cells
@@ -3389,8 +3441,13 @@ torch::Tensor spmm_csr_v2_core(
       }
       row_split[w] = lo;
     }
-    for (int w = 0; w < nsplit; ++w)
-      cursors[w].v.store(row_split[w], std::memory_order_relaxed);
+    for (int w = 0; w < nsplit; ++w) {
+      if (partition_mode == 3)
+        cursors[w].ht.store(scorch_ht_pack(row_split[w], row_split[w + 1]),
+                            std::memory_order_relaxed);
+      else
+        cursors[w].v.store(row_split[w], std::memory_order_relaxed);
+    }
   }
   // Width of a stolen ZERO slice, in rows. Several slices per worker so a slow
   // core cannot become the critical path, and never narrower than the arithmetic
@@ -3627,18 +3684,32 @@ torch::Tensor spmm_csr_v2_core(
         // is computed twice and none is skipped.
         bool got = false;
         const int stride = team_size > 0 ? team_size : 1;
-        while (!got && own_w < nsplit) {
-          const int lim = row_split[own_w + 1];
-          const int st = cursors[own_w].v.fetch_add(chunk, std::memory_order_relaxed);
-          if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
-          else own_w += stride;
-        }
-        while (!got && partition_mode == 2 && steal_t < nsplit) {
-          const int w = (worker_id + steal_t) % nsplit;
-          const int lim = row_split[w + 1];
-          const int st = cursors[w].v.fetch_add(chunk, std::memory_order_relaxed);
-          if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
-          else steal_t++;
+        if (partition_mode == 3) {
+          while (!got && own_w < nsplit) {
+            if (scorch_ht_claim(cursors[own_w].ht, chunk, true, &start, &end))
+              got = true;
+            else own_w += stride;
+          }
+          while (!got && steal_t < nsplit) {
+            const int w = (worker_id + steal_t) % nsplit;
+            if (scorch_ht_claim(cursors[w].ht, chunk, false, &start, &end))
+              got = true;
+            else steal_t++;
+          }
+        } else {
+          while (!got && own_w < nsplit) {
+            const int lim = row_split[own_w + 1];
+            const int st = cursors[own_w].v.fetch_add(chunk, std::memory_order_relaxed);
+            if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+            else own_w += stride;
+          }
+          while (!got && partition_mode == 2 && steal_t < nsplit) {
+            const int w = (worker_id + steal_t) % nsplit;
+            const int lim = row_split[w + 1];
+            const int st = cursors[w].v.fetch_add(chunk, std::memory_order_relaxed);
+            if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+            else steal_t++;
+          }
         }
         if (!got) break;
       }
@@ -4538,6 +4609,60 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   const int chunk = scorch_chunk(A0_size, work, SCORCH_GRAIN_SPMM);
   std::atomic<int> next_row{0};
 
+  // ROW PARTITION, the same mechanism as spmm_csr_v2_core and for the same reason:
+  // one shared counter means the worker->row map is decided by arrival order and
+  // differs on every call, so each core re-fetches its slice of A from L3 instead of
+  // holding it in L2. A fused Linear layer is the clearest case there is for caring
+  // -- the sparse weight matrix is the SAME on every batch of every epoch.
+  //
+  // Deliberately NOT enabled by default here even if it ships in the drop-in kernel.
+  // This kernel's workload is the sparse autoencoder grid, which the partition has
+  // not been run against, and turning it on off the back of the SuiteSparse grid is
+  // exactly the extension past the evidence that the chunk-rule comment above
+  // declines to make. Modes are the same: 0 global counter, 1 home ranges, 2 steal
+  // from the front, 3 steal from the back.
+  int partition_mode = 0;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_FUSED_PARTITION");
+    if (e && *e) { long v = std::atol(e);
+      if (v >= 0 && v <= 3) partition_mode = (int)v; } }
+#endif
+  const int nsplit = nthreads > 0 ? nthreads : 1;
+  constexpr int kSplitOnStack = 128;
+  int split_stack[kSplitOnStack + 1];
+  scorch_spmm_cursor cursor_stack[kSplitOnStack];
+  std::unique_ptr<int[]> split_heap;
+  std::unique_ptr<scorch_spmm_cursor[]> cursor_heap;
+  int* row_split = nullptr;
+  scorch_spmm_cursor* cursors = nullptr;
+  if (partition_mode != 0) {
+    if (nsplit <= kSplitOnStack) { row_split = split_stack; cursors = cursor_stack; }
+    else {
+      split_heap.reset(new int[nsplit + 1]);
+      cursor_heap.reset(new scorch_spmm_cursor[nsplit]);
+      row_split = split_heap.get();
+      cursors = cursor_heap.get();
+    }
+    row_split[0] = 0;
+    row_split[nsplit] = A0_size;
+    for (int w = 1; w < nsplit; ++w) {
+      const long target = ((long)total_nnz + (long)A0_size) * (long)w / (long)nsplit;
+      int lo = row_split[w - 1], hi = A0_size;
+      while (lo < hi) {
+        const int mid = lo + ((hi - lo) >> 1);
+        if ((long)A1_pos[mid] + (long)mid < target) lo = mid + 1; else hi = mid;
+      }
+      row_split[w] = lo;
+    }
+    for (int w = 0; w < nsplit; ++w) {
+      if (partition_mode == 3)
+        cursors[w].ht.store(scorch_ht_pack(row_split[w], row_split[w + 1]),
+                            std::memory_order_relaxed);
+      else
+        cursors[w].v.store(row_split[w], std::memory_order_relaxed);
+    }
+  }
+
 #if defined(__AVX2__) && defined(__FMA__)
   const bool narrow_k = (B1_size >= 1 && B1_size <= 32);
   const int nvec = (B1_size + 7) / 8;
@@ -4576,18 +4701,52 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   // Per-worker body: atomic row work-stealing, byte-identical distribution to v2.
   // Computes each output row via the AVX2 regblock/regtile kernels (or the non-
   // AVX2 workspace fallback), then folds bias+act into the SAME parallel region.
-  auto worker = [&](int worker_id) {
+  auto worker = [&](int worker_id, int team_size) {
     float* SCORCH_RESTRICT ws = nullptr;
 #if !defined(__AVX2__) || !defined(__FMA__)
     ws = worker_workspaces.get() +
         static_cast<size_t>(worker_id) * static_cast<size_t>(kTile);
-#else
-    (void)worker_id;
 #endif
+    int own_w = worker_id;   // next own split to try  (partition modes 1-3)
+    int steal_t = 1;         // next victim offset to try
     while (true) {
-      const int start = next_row.fetch_add(chunk, std::memory_order_relaxed);
-      if (start >= A0_size) break;
-      const int end = std::min(start + chunk, A0_size);
+      int start = 0, end = 0;
+      if (partition_mode == 0) {
+        start = next_row.fetch_add(chunk, std::memory_order_relaxed);
+        if (start >= A0_size) break;
+        end = std::min(start + chunk, A0_size);
+      } else {
+        bool got = false;
+        const int stride = team_size > 0 ? team_size : 1;
+        if (partition_mode == 3) {
+          while (!got && own_w < nsplit) {
+            if (scorch_ht_claim(cursors[own_w].ht, chunk, true, &start, &end))
+              got = true;
+            else own_w += stride;
+          }
+          while (!got && steal_t < nsplit) {
+            const int w = (worker_id + steal_t) % nsplit;
+            if (scorch_ht_claim(cursors[w].ht, chunk, false, &start, &end))
+              got = true;
+            else steal_t++;
+          }
+        } else {
+          while (!got && own_w < nsplit) {
+            const int lim = row_split[own_w + 1];
+            const int st = cursors[own_w].v.fetch_add(chunk, std::memory_order_relaxed);
+            if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+            else own_w += stride;
+          }
+          while (!got && partition_mode == 2 && steal_t < nsplit) {
+            const int w = (worker_id + steal_t) % nsplit;
+            const int lim = row_split[w + 1];
+            const int st = cursors[w].v.fetch_add(chunk, std::memory_order_relaxed);
+            if (st < lim) { start = st; end = std::min(st + chunk, lim); got = true; }
+            else steal_t++;
+          }
+        }
+        if (!got) break;
+      }
 
       for (int i = start; i < end; i++) {
         const int pA_begin = A1_pos[i];
@@ -4710,18 +4869,18 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
     if (nthreads >= 2 * atpool) {
       #pragma omp parallel num_threads(nthreads)
       {
-        worker(omp_get_thread_num());
+        worker(omp_get_thread_num(), omp_get_num_threads());
       }
     } else {
       at::parallel_for(0, (int64_t)nthreads, 1, [&](int64_t wbeg, int64_t wend) {
         for (int64_t w = wbeg; w < wend; ++w)
-          worker(static_cast<int>(w));
+          worker(static_cast<int>(w), nthreads);
       });
     }
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
-      worker(omp_get_thread_num());
+      worker(omp_get_thread_num(), omp_get_num_threads());
     }
   }
 
