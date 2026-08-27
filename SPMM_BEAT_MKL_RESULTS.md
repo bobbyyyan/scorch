@@ -3696,3 +3696,46 @@ at torch's 24 therefore changes nothing. On the M5 `omp_get_num_procs()` = 18 bi
 and capping at torch's 6 takes kl02 from 18 workers to 6. So the arm is a no-op on the host
 where the ceiling helps and a real change on the host where it hurts, which is the
 prediction the grid now has to confirm.
+
+## Design for the one unaddressed mechanism: splitting a long row
+
+Recorded now because the analysis is done and the measurements that come first may change
+whether it is worth building.
+
+**The problem.** Ten cells are limited by a single row. lp_osa_14 holds 38336 of its 317097
+nonzeros in one row of 2337; lp_osa_30 holds 72555 of 604488 in one of 4350; nw14 holds
+90951 of 904910 in one of 73. With the width widened to 32 workers the balanced share is
+9909, 18890 and 28278 nonzeros, so those rows are 3.87x, 3.84x and 3.22x the share. **No
+assignment of whole rows to workers can beat that**, so every policy arm in this document
+was arguing about the wrong axis for these cells.
+
+**The shape of the fix.** Split only rows longer than a threshold, and only those:
+
+1. The normal row-parallel pass runs over all rows as today, except that a worker reaching
+   a row longer than the threshold writes its output zeros and skips its arithmetic.
+2. A second pass handles the long rows. For each, the workers divide its nonzero range,
+   each accumulating `k` partials into its own slot of a `P x k` scratch buffer, and the
+   slots are then summed into that output row.
+
+Boundary handling is the whole difficulty in the general merge-based formulation — a
+worker owning an arbitrary nonzero range has two partial rows and empty rows can make the
+row-from-nonzero mapping ambiguous. Restricting the split to rows chosen *by index* avoids
+all of it: ownership of every row stays exactly as it is today, so zeroing stays correct
+for empty rows, and the only shared state is one scratch buffer per long row.
+
+**The cost when it does not fire, which is the part that decides it.** Finding the long
+rows needs `max` over `A1_pos` differences, which is O(rows) per call. On Pd_b that is 8081
+subtractions against a 25 µs kernel — around a tenth of it, which is far too much to pay on
+every call for a mechanism that fires on three matrices. So the statistic cannot be
+computed in the kernel. It belongs with the tensor, computed once: the plan cache in
+`ops.matmul` already stores per-tensor state keyed by `(b.shape, b.dtype, generation)`, and
+the longest row is a property of A alone, so it can be computed on the first call and
+passed to the kernel as an argument thereafter. That also means the mechanism is reachable
+only on the path that has a plan, which is the caller's path and not the harness's — so the
+grid harness would need the same statistic threaded through, or the arm cannot be measured
+at all.
+
+That last point is the reason this is written down rather than started: it needs an ABI
+change to the native symbol, and the ABI is what the previous round of work spent its time
+removing per-call costs from. Ten cells of 2172 does not obviously justify that, and three
+measurements now in flight will move which cells are left.
