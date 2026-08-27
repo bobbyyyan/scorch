@@ -3643,6 +3643,14 @@ torch::Tensor spmm_csr_v2_core(
   // Float k=1 is the one width where two kernel families compete: the nonzero-axis
   // gather kernel owns it by default and measures better there.
   bool narrowk_exact_k1 = false;
+  // Whether the unroll depth is reduced on rows too short to fill it. The kernel's
+  // prologue is UNROLL*K zero stores and its epilogue is (UNROLL-1)*K adds, both paid
+  // per row whatever the row's length, so a row of one nonzero at K=4 and UNROLL=4 does
+  // about thirty-two operations to perform four useful multiply-adds. That is not
+  // hypothetical: on the M5, as-735 (7716 rows, mean degree 1) is the single largest
+  // group of cells the exact-width kernel makes slower, 35 of 64, all at float k=2 and
+  // k=4 where this kernel fires.
+  bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
@@ -3679,6 +3687,8 @@ torch::Tensor spmm_csr_v2_core(
       if (v == 0 || v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_K1");
     if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_SHORT");
+    if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -3915,12 +3925,24 @@ torch::Tensor spmm_csr_v2_core(
               #define SCORCH_RNE(KK, UN) \
                 scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
                     A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+              // The unroll is a compile-time template argument, so adapting it to the
+              // row costs one halving loop over at most three steps and picks an
+              // instantiation that already exists. Rows at or above the configured
+              // depth take exactly the same instantiation as before.
               #define SCORCH_RNE_U(KK) \
-                switch (narrowk_exact) { \
-                  case 2: SCORCH_RNE(KK, 2); break; \
-                  case 4: SCORCH_RNE(KK, 4); break; \
-                  default: SCORCH_RNE(KK, 8); break; \
-                }
+                do { \
+                  int un_ = narrowk_exact; \
+                  if (narrowk_exact_short) { \
+                    const int len_ = pA_end - pA_begin; \
+                    while (un_ > 1 && len_ < un_) un_ >>= 1; \
+                  } \
+                  switch (un_) { \
+                    case 1: SCORCH_RNE(KK, 1); break; \
+                    case 2: SCORCH_RNE(KK, 2); break; \
+                    case 4: SCORCH_RNE(KK, 4); break; \
+                    default: SCORCH_RNE(KK, 8); break; \
+                  } \
+                } while (0)
               bool took = false;
               if constexpr (std::is_same<scalar_t, float>::value) {
                 switch (B1_size) {

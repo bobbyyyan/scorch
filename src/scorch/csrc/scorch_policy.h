@@ -210,6 +210,11 @@
 #ifndef SCORCH_NARROWK_EXACT_UNROLL
 #  define SCORCH_NARROWK_EXACT_UNROLL 0
 #endif
+// Whether the exact-width kernel reduces its unroll on rows shorter than it. Off until
+// both hosts have measured it; the harm it addresses is ARM-side and measured.
+#ifndef SCORCH_NARROWK_EXACT_SHORT
+#  define SCORCH_NARROWK_EXACT_SHORT 0
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
