@@ -3739,3 +3739,54 @@ That last point is the reason this is written down rather than started: it needs
 change to the native symbol, and the ABI is what the previous round of work spent its time
 removing per-call costs from. Ten cells of 2172 does not obviously justify that, and three
 measurements now in flight will move which cells are left.
+
+## The shipped shape on ARM, and the regression the average hid
+
+Three hookless builds of one source tree, differing only in `-D` flags: `ship` (what ships
+today), `cand` (`PARTITION_DEFAULT=3`, `NARROWK_EXACT_UNROLL=4`), and `ctrl`, a second build
+of `ship` with identical flags. Three separate `.so` files cannot be interleaved inside one
+process, so each build ran twice — once in the order ship, ctrl, cand and once reversed —
+and the two passes are averaged per cell, which cancels a monotonic drift instead of
+letting it land on whichever build went last. `ship` and `ctrl` both came out at 987168
+bytes, `cand` at 987360.
+
+float32, 1650 cells, two passes averaged:
+
+| comparison | kernel | whole call | >10% slower |
+|---|---|---|---|
+| ctrl / ship — the cross-process floor | 1.0081 | 1.0072 | 0.7% |
+| **cand / ship — the change** | **1.0352** | **1.0328** | 3.9% |
+| cand / ctrl — the same from the other side | 1.0269 | 1.0254 | 6.1% |
+
+Positive at every width, and rising with it: 1.0248 at k=1, 1.0233 at k=2, 1.0216 at k=4,
+1.0299 at k=8, 1.0537 at k=64, 1.0588 at k=256, against a floor of 1.0035–1.0107. ATen's
+own agreement across the three processes has a geomean spread of 1.0260 and a worst case of
+1.577x, which is the honest scale of cross-process noise on this host.
+
+**The tail is where the result is.** 64 of 1650 cells are more than 10% slower under `cand`
+and only **one** of them is also slow in the same-code control, so 63 are attributable.
+They are not spread out:
+
+| group | cells | shape | k |
+|---|---|---|---|
+| ss:as-735 | 35 | 7716 rows, mean degree 1 | 2, 4 |
+| dlmc:rn50 | 15 | mostly 64 rows, degree 288 | 1, 4, 8, 64 |
+| dlmc:transformer | 9 | 512–2048 rows | 1, 4 |
+| others | 4 | — | — |
+
+By width the tail is {1: 13, 2: 14, 4: 21, 8: 9, 64: 5, 256: 2}. The exact-width kernel
+fires only at float k=2..7 and float k=1 is not routed to it by default, so **the 35
+as-735 cells and the k=2/k=4 tail are the kernel's, and the 29 cells at k=1, 8, 64 and 256
+cannot be — they belong to the partition and are a separate question** the exact-width grid
+has the arms to settle.
+
+The kernel's part has a mechanism, and it is in the code rather than in the schedule. The
+prologue is `UNROLL*K` zero stores and the epilogue `(UNROLL-1)*K` adds, both paid once per
+row whatever that row holds. At K=4 and UNROLL=4 a row of a single nonzero does sixteen
+zero stores, twelve reduction adds, four multiply-adds and four stores — about thirty-two
+operations of overhead for four of work. as-735 is 7716 rows of mean degree 1, so that
+overhead *is* the regression. Fixed by choosing the unroll from the row's own length: one
+halving loop of at most three steps, landing on an instantiation that already exists, and a
+row long enough to fill the configured depth compiles to exactly what it did before. Off by
+default, because both hosts had grids in flight measuring the unadapted kernel and an arm
+is worth more than a silent change.
