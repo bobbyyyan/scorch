@@ -4422,3 +4422,41 @@ percent a result, and a tight control is allowed to resolve a large effect. Re-s
 
 So on real GCN inference the candidate is a win on two of five graphs and indistinguishable
 on the other three, with nothing regressed.
+
+## The ARM shipping number, sliced: 1.079 and 1.059 against floors of 1.017 and 1.004
+
+Same comparison as the x86 one — three hookless builds of one tree differing only in -D
+flags, `cand` carrying back-stealing plus the exact-width kernel at unroll 4 — but run in
+25-matrix slices with the three builds rotated inside each slice, and with the two slices a
+machine stall damaged re-measured afterwards. 1925 cells per dtype.
+
+| | kernel | whole call | floor (ctrl/ship) | harmed | floor harmed | reference spread |
+|---|---|---|---|---|---|---|
+| float32 | **1.0791** | 1.0728 | 1.0171 | 5.0% | 1.9% | 1.0626 |
+| float64 | **1.0593** | 1.0457 | 1.0043 | 4.3% | 0.6% | 1.0215 |
+
+Read the other way — against `ctrl`, the second build of the baseline — 1.0609 and 1.0548.
+Net of the floor, **the candidate is 5.5–6% above what ships today on ARM**.
+
+By free dimension, float32 against a floor of ~1.018: k=1 1.0456, **k=2 1.1036, k=3
+1.1299**, k=4 1.0510, k=8 1.0609, k=64 1.0866, k=256 1.0785. The k=2 and k=3 peaks are the
+exact-width kernel, which serves exactly those two widths; the k≥64 gains are the
+partition. float64 has the same shape (k=2 1.0848, k=3 1.0880).
+
+**The tail is real and it is not the floor.** 90 of 1750 float32 cells and 83 of 1925
+float64 cells are more than 10% behind, against floors of 1.9% and 0.6%, and only 4 of
+each have the floor below 0.9 as well. Every one is in the 0–1 MB output band, and they
+concentrate at k=1–4 — 24 of the 90 at k=2 and 15 at k=3, which is where the exact-width
+kernel fires, so *which* part of the candidate owns the tail is now a question with a
+suspect. Three shape families:
+
+| family | example | cand/ship |
+|---|---|---|
+| very low degree | as-735, 7716 rows, degree 1.6, k=2 | 0.695–0.793 |
+| mid-row transformer layers | 512 rows, degree 172, k=3 | 0.702 |
+| few-row pruned ResNet | 64 rows, degree 288, k=4 | 0.702–0.767 |
+
+`m5_stage18.sh` splits the candidate on that corpus — the partition without the kernel, the
+kernel with its short-row unroll clamp, the kernel at unroll 1 — because a degree-1.6 graph
+is nothing but short rows and the shipped configuration does not clamp the unroll by row
+length.
