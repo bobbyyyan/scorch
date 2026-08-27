@@ -3947,3 +3947,24 @@ torch's 6 on the M5, so the same rule widens kl02 to 22 workers inside a 24-thre
 on one host and to 18 — three times the pool, pulling in twelve efficiency cores — on the
 other. **The pool cap is the version of this rule that could ship**, and it is x86-inert
 by construction (uncapped 22, capped 22, pool 24).
+
+## Two runners collided, and what was discarded
+
+A chain had been parked waiting for the gate grid to finish. Interrupting that grid — so
+that the hookless three-build number, which had never run, could go first — released the
+parked chain, and for about two minutes redwood was doing two things at once: the parked
+chain rebuilt `scorch_ops` at 20:25:47 while the environment-cost ladder began timing on
+that same `.so` at 20:25:49. Discarded: `envcost_float32.csv` and
+`short8_nk2_float32.csv`, both renamed `.aborted` rather than deleted.
+
+The second file would have been worthless anyway, and for a reason worth stating: it was
+the exact-width grid, and the binary it was running on predates
+`SCORCH_NARROWK_EXACT_ACCUM`, so **three of its seven arms were silent duplicates of
+`p3e4`** — a hook that does not exist in the binary reads as absent, and the arm then
+measures the arm above it. That is the same failure the ARM stage refused to commit
+earlier, caught by a `strings` check on the `.so`; the x86 stage had no such check because
+its rebuild normally precedes it in the same script.
+
+Redwood now runs from a single script that refuses to start if anything else is timing,
+rebuilds once from the synced headers so every hooked stage shares one source revision,
+and orders the stages by decision value rather than by when they were written.
