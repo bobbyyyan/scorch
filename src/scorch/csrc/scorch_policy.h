@@ -233,6 +233,12 @@
 #ifndef SCORCH_NARROWK_EXACT_ACCUM
 #  define SCORCH_NARROWK_EXACT_ACCUM 0
 #endif
+// Widest k the exact-width kernel serves. Measured per width: it wins 6-8% at k=2 and
+// k=3 on both dtypes and loses at k=1, 5, 6 and 7, so 3 is where the sign changes. Only
+// 1..7 (float) and 1..3 (double) are instantiated and the dispatch clamps to that.
+#ifndef SCORCH_NARROWK_EXACT_HI
+#  define SCORCH_NARROWK_EXACT_HI 3
+#endif
 // Grains of work (nnz*max(k,16) over SCORCH_GRAIN_SPMM) the row partition needs before
 // its bookkeeping is amortised. Its only measured regression is a short-kernel one: the
 // cells where it falls more than 10% behind the shared counter sit at 19-30 microseconds

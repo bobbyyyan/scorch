@@ -3704,6 +3704,9 @@ torch::Tensor spmm_csr_v2_core(
   // is 24 live scalars, and float32 k=6 is the worst cell in the widened grid at 0.9132
   // where k=2 (8 live) is 1.0666. 0 disables the bound.
   int narrowk_exact_accum = SCORCH_NARROWK_EXACT_ACCUM;
+  // Widest k the exact-width kernel is allowed to serve. 3 is where the measured sign
+  // change is; the hook is how the bound gets re-measured rather than trusted.
+  int narrowk_exact_hi = SCORCH_NARROWK_EXACT_HI;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
@@ -3744,6 +3747,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_HI");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 7) narrowk_exact_hi = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -3758,11 +3763,26 @@ torch::Tensor spmm_csr_v2_core(
   // width the kernel does NOT serve, which is what the grid's control columns measured
   // (0.983-0.987 at float32 k=8 and 16, 0.988-0.991 at float64 k>=4). Zero means the row
   // loop skips the whole width family after one well-predicted test.
+  // The widths the kernel serves, measured per width on 362 cells at each k and corrected
+  // for the environment cost the ladder priced. It is a 6-8% win at k=2 and k=3 on BOTH
+  // dtypes -- 1.0787 and 1.0625 on float32, 1.0785 and 1.0697 on float64 -- and a loss
+  // everywhere else it was instantiated: 0.983 at k=1, 0.980 at k=5, 0.924 at k=6, 0.972
+  // at k=7. Pooling those together is what made the kernel look dead at 0.9873.
+  //
+  // k=3 has no exact 12-byte load and wins as much as k=2, so the mechanism is not the
+  // aligned load: it is dropping the register-block kernel's lane masks (2 or 3 useful
+  // lanes of 8) and the imul per nonzero that a runtime B1_size stride costs. Above k=4
+  // the mask is half full or better and UNROLL*K accumulators start spilling, which is
+  // where the sign changes.
   int exact_width = 0;
   if (narrowk_exact) {
     const bool exact_f32_ = std::is_same<scalar_t, float>::value;
-    const int exact_hi_ = exact_f32_ ? 7 : 3;
-    const int exact_lo_ = (exact_f32_ && !narrowk_exact_k1) ? 2 : 1;
+    // Only widths 1..7 (float) and 1..3 (double) are instantiated, so a hook that widens
+    // the bound cannot ask for one that does not exist.
+    int exact_hi_ = narrowk_exact_hi;
+    const int exact_cap_ = exact_f32_ ? 7 : 3;
+    if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
+    const int exact_lo_ = narrowk_exact_k1 ? 1 : 2;
     if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
   }
   // Route k=1 through the nonzero-axis gather kernel. See its definition for the
