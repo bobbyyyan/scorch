@@ -194,6 +194,16 @@
 // where 8x reads 0.921/0.954 and ungated 0.915/0.950 while 1x and 2x hold 1.00.
 // 2x rather than 1x because 1x also switches the partition off through the 16-64 MB band
 // that still pays (1.0573 against 1.0730 on float32, 1.0252 against 1.0407 on float64).
+// Whether the row partition is switched off when the policy resolved a single worker.
+// With one worker there is no second core to keep A resident for and nothing to steal, so
+// the partition can only cost the per-row difference between walking a home range and
+// claiming from the counter. Provably inert at two workers or more, and off by default
+// anyway -- not because the argument is weak but because flipping it would change what the
+// `p3` arm means on the tiny cells partway through a study whose other arms are already
+// measured. Priced as its own arm first, then flipped.
+#ifndef SCORCH_SPMM_PARTITION_SOLO_OFF
+#  define SCORCH_SPMM_PARTITION_SOLO_OFF 0
+#endif
 #ifndef SCORCH_SPMM_PARTITION_MAXOUT_LLC
 #  define SCORCH_SPMM_PARTITION_MAXOUT_LLC 2L
 #endif

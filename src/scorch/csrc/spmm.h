@@ -3509,6 +3509,22 @@ torch::Tensor spmm_csr_v2_core(
   // threshold would mean something different on every machine. Four times the LLC is
   // 144 MB on a 36 MB L3, which is where the measured sign change is.
   if (partition_mode != 0) {          // nothing to gate when the partition is off
+    // A single worker cannot benefit from any of this: there is no second core to keep
+    // A resident for and nothing to steal from. What it can still pay is the difference
+    // between walking a home range and claiming chunks from the counter, once per row --
+    // which is why the matrices that show it are the ones with the most rows per nonzero.
+    // On the M5, twenty of the forty-four cells where back-stealing is more than 10%
+    // slower than the counter are as-735, 7716 rows of mean degree 1, whose work
+    // (7716 * 16 = 123456) is under SCORCH_GRAIN_SPMM and so resolves to exactly one
+    // worker. Provably inert for two workers or more.
+    bool partition_solo_off = SCORCH_SPMM_PARTITION_SOLO_OFF != 0;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_SOLO_OFF");
+      if (e && *e) partition_solo_off = std::atol(e) != 0; }
+#endif
+    if (partition_solo_off && nthreads <= 1) partition_mode = 0;
+  }
+  if (partition_mode != 0) {
     long partition_maxout = SCORCH_SPMM_PARTITION_MAXOUT_LLC * scorch_llc_bytes();
 #ifdef SCORCH_TUNE_HOOKS
     { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MAXOUT_MB");
