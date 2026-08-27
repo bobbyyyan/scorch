@@ -4315,3 +4315,28 @@ that. Both remaining questions of that kind — is the ceiling inert outside its
 exact-width kernel inert at widths it does not serve — are settled by compiled-in
 three-builds (`rw_stage16.sh` for the ceiling, the k-band table of `rw_stage6.sh` for the
 kernel), where no `getenv` runs at all.
+
+## Chunk-aligned partition boundaries: a null on four corpus/dtype combinations, and removed
+
+The partition splits the row range on nonzeros and `scorch_spmm_chunk` picks a chunk width
+for the output store, so a worker's range generally starts mid-chunk: every range ends in a
+partial chunk and there are `nsplit` of those where the shared counter has exactly one. On
+the shape where the partition is worst — a 64-row rn50 bottleneck at chunk 4 — six workers
+each end in a two- or three-row claim. Snapping each interior boundary to the nearest chunk
+multiple removes that by construction. It also moves nonzeros between workers, and the
+nonzero-balanced split is what put them there.
+
+Measured against the candidate, with the same-code A/A control alongside:
+
+| corpus | dtype | + alignment | A/A floor | >10% slower than today |
+|---|---|---|---|---|
+| general (1810 cells) | float32 | 0.9960 | 1.0002 | 19 vs 14 |
+| general (1810 cells) | float64 | 0.9925 | 0.9996 | 19 vs 11 |
+| large-A (255 cells) | float32 | 1.0004 | 0.9999 | 1 vs 2 |
+| large-A (164 cells) | float64 | 0.9973 | 0.9972 | 2 vs 2 |
+
+Null every time, and on the general corpus the harmed tail rises. Part of the ~0.4–0.7%
+deficit is the arm being charged for naming one more knob the code reads, so the honest
+reading is "nothing, with a slightly worse tail" rather than "a small loss". **Removed**
+— the code, the default, and the hook — with the measurement recorded at the site where
+the boundaries are built. The same disposition the non-temporal store lever got.
