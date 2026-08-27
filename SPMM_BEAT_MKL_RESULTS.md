@@ -4250,3 +4250,41 @@ of cells. It fires on the run that motivated it and passes the x86 run. The fix 
 measurement is locality rather than repetition: slice the corpus into 25-matrix pieces and
 rotate the three builds *within* each slice, so a cell's three readings are about four
 minutes apart, with both orders per slice so no build keeps the late position.
+
+## The GCN guardrail, finally with a control tight enough to read
+
+Three earlier attempts produced no verdict. The third measured nothing at all: it passed
+five dataset names comma-joined to `--dataset`, which takes one name or the literal
+`"all"`, so all six passes printed `Unknown dataset: cora,citeseer,...`. (`"all"` is not
+usable either — `load_dataset()` runs *before* the weights check, so a dataset with no
+weights still triggers a multi-gigabyte download.) One invocation per dataset, three
+rotations, per-dataset minimum across passes, equal environment-variable counts:
+
+| dataset | ships today | back-stealing | + ceiling | + gate | same-code control |
+|---|---|---|---|---|---|
+| cora | 0.279 | 0.264 | 0.248 | 0.266 | 1.053x |
+| citeseer | 0.542 | 0.523 | 0.532 | 0.546 | 1.004x |
+| pubmed | 0.727 | 0.594 | 0.596 | 0.593 | 1.022x |
+| ogbn-arxiv | 82.334 | 82.843 | 81.522 | 82.841 | 1.015x |
+| reddit | 425.895 | 427.923 | 425.333 | 428.460 | 1.008x |
+
+Milliseconds, non-fused Scorch, minimum over three passes. The control is the bench's own
+PyTorch column, which reads none of the scorch environment. It spread 1.004–1.053x here
+against the 3.6x that made attempt 2 unreadable.
+
+**No arm regresses on any of the five graphs.** pubmed goes 0.727 → 0.594 with the
+partition on, which agrees with the earlier finding that pubmed's problem was the thread
+reshape rather than the kernel; the analyzer declines to call it because its rule asks for
+1.5x the control spread, which is too crude a test when the control is this tight — a
+1.226x arm spread against a 1.022x control is not noise. The fused path is flat everywhere
+(spreads 1.003–1.074x), as expected: it has its own partition knob, defaulted off.
+
+## The autoencoder guardrail passes its control, and still cannot resolve three percent
+
+At three rotations the controls read 0.9348 and 0.9554 (PyTorch Dense), 0.9936 and 0.9452
+(PyTorch Sparse) — inside the 15% tolerance, so the comparison is admitted, but the effect
+being asked about is 3% (Scorch 0.9684 for back-stealing, 0.9948 for back-stealing plus the
+fused partition, worst cell 0.8625). **The effect is smaller than the control's own
+movement, so the honest statement is only that nothing regresses by more than about 14%.**
+Each AE arm is roughly four seconds of work, so the variance is between processes, not
+within them; the fix is more rotations, not more repeats, and it is re-queued at eight.

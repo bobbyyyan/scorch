@@ -459,6 +459,20 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // Both thresholds are read off one host and one corpus, so both are hooks and the
   // compiled-in defaults leave the rule OFF. Promote them only once the M5 and the
   // held-out large-A corpus agree.
+  //
+  // Re-measured with equal environment-variable counts across arms, which the first
+  // measurement did not have: over 2660 redwood cells the rule reads 1.1125 (float32,
+  // z=3.38) and 1.1926 (float64, z=5.31) inside this gate against floors of 1.0180 and
+  // 0.9956, and the cells below MKL there fall 53 -> 47 and 48 -> 40. The earlier null
+  // was the arm being charged for naming two extra knobs. Capping at the caller's pool
+  // costs x86 nothing (1.1059 / 1.1978), so if that is what ARM needs it is free here.
+  //
+  // What a HOOKED grid cannot decide is whether the rule is inert where it cannot fire.
+  // Outside the gate all four variants read 0.9863-0.9962 with z from -6 to -19, ordered
+  // by how many variables each arm sets that this function also looks up -- one extra
+  // successful getenv and one atol per call. Padding the environment equalises the
+  // number of NAMES, not the number of LOOKUPS, so the question needs a compiled-in
+  // three-build (rw_stage16.sh / an_ceil3.py) and not another arm.
   long ceil_maxrows = SCORCH_SPMM_CEIL_MAXROWS;
   long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
   bool ceil_cap_pool = SCORCH_SPMM_CEIL_CAP_POOL != 0;
