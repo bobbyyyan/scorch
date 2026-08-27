@@ -222,6 +222,16 @@
 #endif
 // Whether the exact-width kernel reduces its unroll on rows shorter than it. Off until
 // both hosts have measured it; the harm it addresses is ARM-side and measured.
+// Whether the exact-width kernel's unroll is chosen once per call from the mean row
+// length instead of once per ROW from that row's length. The per-row clamp
+// (SCORCH_NARROWK_EXACT_SHORT) costs 1.0% pooled on x86 float32 -- 1.0257 -> 1.0157 over
+// 2880 padded cells -- and the reason is not the compare: the switch the clamp feeds stops
+// being predictable once neighbouring rows take different unrolls. A per-call decision from
+// nnz/rows has no per-row branch at all and still gives a degree-1.6 graph an unroll of 1,
+// which is the shape the ARM tail is made of. 0 leaves the configured unroll alone.
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL 0
+#endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
 #endif

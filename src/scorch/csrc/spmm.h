@@ -3721,6 +3721,7 @@ torch::Tensor spmm_csr_v2_core(
   // group of cells the exact-width kernel makes slower, 35 of 64, all at float k=2 and
   // k=4 where this kernel fires.
   bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
+  bool narrowk_exact_degunroll = SCORCH_NARROWK_EXACT_DEGUNROLL != 0;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
   // is 24 live scalars, and float32 k=6 is the worst cell in the widened grid at 0.9132
@@ -3754,6 +3755,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_SHORT");
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL");
+    if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_HI");
@@ -3780,6 +3783,17 @@ torch::Tensor spmm_csr_v2_core(
     if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
     const int exact_lo_ = narrowk_exact_k1 ? 1 : 2;
     if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
+  }
+  // The unroll, decided once for the call. A row shorter than the unroll runs the whole
+  // remainder path and pays the accumulator array's setup and its final reduction for two
+  // or three nonzeros, which is what a degree-1.6 graph is entirely made of; but deciding
+  // it per row makes the dispatch switch unpredictable and costs more than it saves (see
+  // the constant's comment). nnz/rows is the mean row, so a matrix whose rows are mostly
+  // shorter than the unroll gets a shorter one and a matrix with a few short rows does not.
+  int exact_unroll = narrowk_exact;
+  if (exact_width && narrowk_exact_degunroll) {
+    const long mean_deg = A0_size > 0 ? nnz_total / (long)A0_size : 0;
+    while (exact_unroll > 1 && mean_deg < (long)exact_unroll) exact_unroll >>= 1;
   }
 #endif
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
@@ -4046,7 +4060,7 @@ torch::Tensor spmm_csr_v2_core(
               // depth take exactly the same instantiation as before.
               #define SCORCH_RNE_U(KK) \
                 do { \
-                  int un_ = narrowk_exact; \
+                  int un_ = exact_unroll; \
                   if (narrowk_exact_accum > 0) { \
                     while (un_ > 1 && un_ * (KK) > narrowk_exact_accum) un_ >>= 1; \
                   } \
@@ -4204,7 +4218,7 @@ torch::Tensor spmm_csr_v2_core(
                 A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
           #define SCORCH_RNE_U(KK) \
             do { \
-              int un_ = narrowk_exact; \
+              int un_ = exact_unroll; \
               if (narrowk_exact_accum > 0) { \
                 while (un_ > 1 && un_ * (KK) > narrowk_exact_accum) un_ >>= 1; \
               } \
