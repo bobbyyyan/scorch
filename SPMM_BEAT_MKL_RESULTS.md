@@ -4376,3 +4376,29 @@ show no such fall. That is a prediction, and `cold_threads.py` (arms
 `SCORCH_SPMM_NT_FORCE` = 1/4/8/16/24/policy, tail group and a control group from the middle
 of the same distribution) is queued to test it. Note what it cannot become: capping workers
 would trade warm time for cold time on the same shape, and warm is the claim.
+
+## Counted per matrix instead of per cell, the row-bind form is a null — and the correction matters
+
+The regions the ceiling's two row conditions differ in are small, and small regions are
+where treating cells as independent goes wrong: a corpus contributes each matrix at five
+widths, and the five readings of one matrix move together. Aggregating each matrix to one
+number first, then testing across matrices, float64:
+
+| region | cells | **matrices** | count form | + pool cap | row-bind form | + pool cap | floor |
+|---|---|---|---|---|---|---|---|
+| both forms fire (rows ≤ 128, deg ≥ 192) | 60 | **7** | 1.1549 (z=4.53) | 1.1483 (z=3.42) | 1.1622 (z=4.03) | 1.1412 (z=3.16) | 0.9991 |
+| only the row-bind form (129–383 rows) | 130 | **9** | 1.0027 (z=0.16) | 0.9853 (z=−1.72) | 1.0053 (z=0.15) | 1.0370 (z=1.27) | 1.0015 |
+
+The gated region survives the correction and gets *larger* (1.14–1.16 against the
+cell-level 1.19). **The row-bind extension does not survive it.** Its pool-capped variant
+read 1.0438 with z = 3.15 at cell level and reads 1.0370 with z = 1.27 across the nine
+matrices that produced those 130 cells — the significance was five widths of nine matrices
+counted as 130 independent observations.
+
+So the row condition stays a row count, `SCORCH_SPMM_CEIL_ROWBIND` is removed, and the
+measurement stays in the comment at the condition. The motivation for it was sound — 128
+rows is a constant where the mechanism is a comparison against the available width, and
+the 256-row pruned-ResNet layers that dominate the warm caller-path residual sit outside
+128 and inside 384 — but the widening does not pay on those cells, so the residual is not
+a thread-count problem. What is still open on the ceiling is only whether the *count* form
+is inert outside its gate, which needs the compiled-in three-build.
