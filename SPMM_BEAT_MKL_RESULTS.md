@@ -4103,3 +4103,57 @@ Three changes, in the layer each belongs to:
 
 The six quarantined files are kept as `.threeway_aa`. The shipping number is unmeasured
 again, and it is first in the queue.
+
+## The exact-width kernel replicates on ARM, at the same widths and nearly the same size
+
+The kernel had never run on ARM because it had never existed there. Its first ARM grid,
+padded, 1650 cells per dtype, against back-stealing:
+
+| k | 1 | **2** | **3** | 4 | 8 | 64 |
+|---|---|---|---|---|---|---|
+| ARM float32 | 0.9943 | **1.0623** | **1.0638** | 0.9962 | 0.9964 | 0.9961 |
+| ARM float64 | 0.9908 | **1.0443** | **1.0591** | 0.9952 | 0.9981 | 0.9992 |
+| x86 float32, corrected | 0.9833 | **1.0787** | **1.0625** | 1.0054 | 0.9944 | 0.9954 |
+| x86 float64, corrected | 0.9843 | **1.0785** | **1.0697** | 0.9960 | 0.9988 | 0.9981 |
+
+Same two widths, same sign at every other width, and 4.4–7.9% where it fires against floors
+of 0.9982–0.9984. **Two hosts, two dtypes.** The widths it does not serve read 0.991–1.005,
+so the family is inert off its own region on both architectures.
+
+## No steal mode recovers the partition's short-kernel regression, so there is nothing to fix in the steal path
+
+The code says the steal scan cannot be the cost: a failed claim returns after one relaxed
+load — it only compare-exchanges a range that has work — and the victim offset never
+rewinds, so the wasted atomics per worker per call are bounded by `nsplit`, about six loads.
+The grid agrees. On the cells where back-stealing falls more than 10% behind the shared
+counter (118 float32, 93 float64):
+
+| arm | f32 on those cells | still behind `p0` | f64 on those cells | still behind `p0` |
+|---|---|---|---|---|
+| home ranges, **no** stealing | 1.0543 | 0.9124 | 0.9766 | 0.8396 |
+| front-stealing | 0.9611 | 0.8317 | 0.9685 | 0.8327 |
+| minimum-work gate | 1.0927 | 0.9456 | 1.1009 | 0.9464 |
+
+Removing stealing entirely leaves 8.8% (float32) and 16% (float64) on the table, and
+front-stealing is *worse* than back-stealing. Only switching the partition off recovers
+those cells. So the cost is inherent to static home ranges on a 20–30 µs kernel — imbalance,
+or a range nobody reaches until the tail — and no change to how stealing works addresses it.
+
+## ARM, against what ships today
+
+1650 cells per dtype, kernel time, padded, `p0` = the shared counter that ships:
+
+| arm | f32 pooled | >10% slower | >10% faster | f64 pooled | >10% slower | >10% faster |
+|---|---|---|---|---|---|---|
+| back-stealing | 1.0137 | 118 | 203 | 1.0183 | 93 | 219 |
+| **+ exact-width kernel** | **1.0316** | 119 | **315** | **1.0326** | 91 | **309** |
+| + minimum-work gate | 1.0117 | **38** | 171 | 1.0159 | **36** | 190 |
+
+The `aa` duplicate of back-stealing reports 114 and 98 cells more than 10% slower than `p0`,
+against back-stealing's own 118 and 93 — so that set is reproducible rather than noise, and
+it is not something the partition does to *some* cells but a stable property of those cells.
+
+The exact-width kernel adds 1.8% and about 100 more decisively-faster cells on both dtypes
+**without adding a single slower one**. The gate cuts the more-than-10%-slower count by
+about two thirds for 0.2% pooled and roughly 30 fewer decisive wins. Nothing measured yet
+carries both, which is what the combination ladder is for.
