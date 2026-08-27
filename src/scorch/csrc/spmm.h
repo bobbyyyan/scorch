@@ -3648,21 +3648,22 @@ torch::Tensor spmm_csr_v2_core(
     // a hook with a default of off, and the two effects get measured against each other
     // rather than argued.
     // The condition is well-formedness, not tuning: snapping moves a boundary by up to
-    // half a chunk, so it only makes sense while every range is at least two chunks long.
-    // scorch_spmm_chunk already aims for several chunks per worker, so this holds wherever
-    // the partition is worth having, and where it does not hold there is nothing to snap.
+    // half a chunk, so it is only worth doing while the AVERAGE range is at least two
+    // chunks. Individual ranges on a skewed matrix can be shorter than that and can be
+    // snapped to nothing, which is legal -- an empty range's owner goes straight to
+    // stealing. What is not legal is an inverted range, and the two clamps below rule
+    // that out: each boundary is clamped against the boundary to its left, which has
+    // already been snapped, so the sequence stays non-decreasing by induction, and
+    // against A0_size, which is the last entry. No second pass is needed; an earlier
+    // version carried a backward fixup loop that those two clamps make unreachable.
     if (split_align && chunk > 1 && (long)chunk * nsplit * 2 <= (long)A0_size) {
       for (int w = 1; w < nsplit; ++w) {
         const int r = row_split[w] % chunk;
         int cand = (r * 2 >= chunk) ? row_split[w] + (chunk - r) : row_split[w] - r;
-        // Monotone and inside the matrix. An EMPTY range is legal -- its owner goes
-        // straight to stealing -- but an inverted one is not.
         if (cand < row_split[w - 1]) cand = row_split[w - 1];
         if (cand > A0_size) cand = A0_size;
         row_split[w] = cand;
       }
-      for (int w = nsplit - 1; w >= 1; --w)
-        if (row_split[w] > row_split[w + 1]) row_split[w] = row_split[w + 1];
     }
     for (int w = 0; w < nsplit; ++w) {
       if (partition_mode == 3)
