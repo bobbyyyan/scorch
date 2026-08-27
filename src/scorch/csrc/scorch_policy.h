@@ -233,12 +233,13 @@
 #ifndef SCORCH_NARROWK_EXACT_ACCUM
 #  define SCORCH_NARROWK_EXACT_ACCUM 0
 #endif
-// Divisor of the last-level cache below which the row partition is not worth its
-// bookkeeping: if A's bytes times this are still under the LLC, the whole of A fits in
-// a core's private cache and the shared counter's rotating assignment is resident too,
-// so there is nothing for home ranges to keep resident. 0 leaves the gate out.
-#ifndef SCORCH_SPMM_PARTITION_MINA_DIV
-#  define SCORCH_SPMM_PARTITION_MINA_DIV 0L
+// Grains of work (nnz*max(k,16) over SCORCH_GRAIN_SPMM) the row partition needs before
+// its bookkeeping is amortised. Its only measured regression is a short-kernel one: the
+// cells where it falls more than 10% behind the shared counter sit at 19-30 microseconds
+// where the cells it wins sit at 31-110, and nnz*max(k,16) separates the two better than
+// any other feature in the grid, at about two grains on both dtypes. 0 leaves it out.
+#ifndef SCORCH_SPMM_PARTITION_MINGRAINS
+#  define SCORCH_SPMM_PARTITION_MINGRAINS 0L
 #endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one

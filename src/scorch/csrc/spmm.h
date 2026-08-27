@@ -3530,31 +3530,30 @@ torch::Tensor spmm_csr_v2_core(
     if (partition_solo_off && nthreads <= 1) partition_mode = 0;
   }
   if (partition_mode != 0) {
-    // Below some size of A the partition cannot win anything, and this is an argument
-    // rather than a threshold. Its whole benefit is that a worker touches the SAME
-    // slice of A on every call, so that slice stays in the core's private cache; the
-    // shared counter hands out a DIFFERENT slice each call, which is why the counter
-    // re-fetched all of A every call on ts-palko. But when the whole of A already fits
-    // in one core's private cache, the counter's rotating assignment is resident too,
-    // and the only thing left to pay is claiming chunks and, at the end of the call,
-    // every exhausted worker scanning every cursor for something to steal. The M5
-    // shipped-shape comparison is where that bill showed up: 63 of the 64 cells the
-    // partition made more than 10% slower have an output under one megabyte, and the
-    // worst of them are rn50 bottlenecks, 64 rows of degree 288 whose entire A is
-    // 147 KB, and as-735, 7716 rows of degree 1 whose A is 117 KB.
+    // Below a couple of grains of work the partition's bookkeeping is not amortised, and
+    // this is where its only measured regression lives. The ARM ladder is what says so.
+    // Over 1650 cells the cells where the partition is more than 10% behind the shared
+    // counter have a kernel-time distribution of 19 / 27 / 28 / 30 microseconds at min /
+    // q1 / median / q3, against 16 / 31 / 62 / 110 for the cells where it wins -- the
+    // regression is a SHORT-KERNEL phenomenon, not a shape.
     //
-    // A divisor of the queried last-level cache, not a byte constant: a sixteenth of
-    // redwood's 37.7 MB is 2.4 MB, which is an i9-14900K P-core's L2, and the same
-    // divisor means the analogous thing on a machine with a different cache. Swept,
-    // not asserted -- 0 leaves the gate out entirely.
-    long mina_div = SCORCH_SPMM_PARTITION_MINA_DIV;
+    // A's size was the first candidate and the ladder refuted it: even at a divisor that
+    // only fires below about 260 KB of A, a gate on A's bytes gave back 5% of the wins,
+    // because home ranges help small matrices too (contiguous ranges narrow each worker's
+    // B column band, and workers stop contending on one counter line). Searching every
+    // feature the grid carries, in both directions, the cleanest single separator is
+    // nnz*max(k,16) -- the same work proxy the thread policy already uses -- at 3.15e5 on
+    // float32 and 3.43e5 on float64, which catches 74% and 77% of the regressed cells
+    // against 14.5% and 13.7% of the winning ones. Both thresholds are about two
+    // SCORCH_GRAIN_SPMM, so that is how this is spelled: in grains, not in a constant.
+    long mingrains = SCORCH_SPMM_PARTITION_MINGRAINS;
 #ifdef SCORCH_TUNE_HOOKS
-    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MINA_DIV");
-      if (e && *e) { long v = std::atol(e); if (v >= 0) mina_div = v; } }
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MINGRAINS");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) mingrains = v; } }
 #endif
-    if (mina_div > 0) {
-      const long a_bytes = nnz_total * (long)(sizeof(scalar_t) + sizeof(int));
-      if (a_bytes * mina_div < (long)scorch_llc_bytes()) partition_mode = 0;
+    if (mingrains > 0) {
+      const long work_proxy = nnz_total * (long)(B1_size > 16 ? B1_size : 16);
+      if (work_proxy < mingrains * SCORCH_GRAIN_SPMM) partition_mode = 0;
     }
   }
   if (partition_mode != 0) {
