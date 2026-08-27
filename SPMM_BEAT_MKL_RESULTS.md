@@ -3616,8 +3616,11 @@ measurement rather than an assertion. Three builds, float32, 495 cells of the tb
 | old1's own in-process same-code arm (for contrast) | 1.0022 | 2.6% |
 | new with the partition on / old1 | **1.2917** | 2.6% |
 
-z of "present but off" against the two-run floor is **0.85** — not separable. The code
-costs nothing when it is off, and the partition switched on is worth 1.2917x against the
+Float64 says the same on 333 cells: floor 1.0178 with 3.3% harmed, present-but-off
+1.0000 with 3.3% harmed, z = **-2.33**, partition on 1.2824.
+
+z of "present but off" against the two-run floor is **0.85** on float32 and **-2.33** on
+float64 — neither separable. The code costs nothing when it is off, and the partition switched on is worth 1.2917x against the
 tree that predates it, which is the honest end-to-end number rather than a mode-0-versus-
 mode-3 comparison inside one binary.
 
