@@ -233,6 +233,13 @@
 #ifndef SCORCH_NARROWK_EXACT_ACCUM
 #  define SCORCH_NARROWK_EXACT_ACCUM 0
 #endif
+// Divisor of the last-level cache below which the row partition is not worth its
+// bookkeeping: if A's bytes times this are still under the LLC, the whole of A fits in
+// a core's private cache and the shared counter's rotating assignment is resident too,
+// so there is nothing for home ranges to keep resident. 0 leaves the gate out.
+#ifndef SCORCH_SPMM_PARTITION_MINA_DIV
+#  define SCORCH_SPMM_PARTITION_MINA_DIV 0L
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it

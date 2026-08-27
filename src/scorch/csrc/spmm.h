@@ -3530,6 +3530,34 @@ torch::Tensor spmm_csr_v2_core(
     if (partition_solo_off && nthreads <= 1) partition_mode = 0;
   }
   if (partition_mode != 0) {
+    // Below some size of A the partition cannot win anything, and this is an argument
+    // rather than a threshold. Its whole benefit is that a worker touches the SAME
+    // slice of A on every call, so that slice stays in the core's private cache; the
+    // shared counter hands out a DIFFERENT slice each call, which is why the counter
+    // re-fetched all of A every call on ts-palko. But when the whole of A already fits
+    // in one core's private cache, the counter's rotating assignment is resident too,
+    // and the only thing left to pay is claiming chunks and, at the end of the call,
+    // every exhausted worker scanning every cursor for something to steal. The M5
+    // shipped-shape comparison is where that bill showed up: 63 of the 64 cells the
+    // partition made more than 10% slower have an output under one megabyte, and the
+    // worst of them are rn50 bottlenecks, 64 rows of degree 288 whose entire A is
+    // 147 KB, and as-735, 7716 rows of degree 1 whose A is 117 KB.
+    //
+    // A divisor of the queried last-level cache, not a byte constant: a sixteenth of
+    // redwood's 37.7 MB is 2.4 MB, which is an i9-14900K P-core's L2, and the same
+    // divisor means the analogous thing on a machine with a different cache. Swept,
+    // not asserted -- 0 leaves the gate out entirely.
+    long mina_div = SCORCH_SPMM_PARTITION_MINA_DIV;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MINA_DIV");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) mina_div = v; } }
+#endif
+    if (mina_div > 0) {
+      const long a_bytes = nnz_total * (long)(sizeof(scalar_t) + sizeof(int));
+      if (a_bytes * mina_div < (long)scorch_llc_bytes()) partition_mode = 0;
+    }
+  }
+  if (partition_mode != 0) {
     long partition_maxout = SCORCH_SPMM_PARTITION_MAXOUT_LLC * scorch_llc_bytes();
 #ifdef SCORCH_TUNE_HOOKS
     { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MAXOUT_MB");
