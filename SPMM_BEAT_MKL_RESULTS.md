@@ -3625,3 +3625,34 @@ Worth noting for later cross-process work: the same-code floor is 1.0022 with 2.
 *within* a process and 0.9950 with 7.7% harmed *across* two, so a cross-process comparison
 carries about three times the tail. That is the floor the three-build shipped-shape stage
 has to clear, and it is why that stage runs each build twice in opposite orders.
+
+## What is actually left, and what limits each part of it
+
+With back-stealing, 34 of 2172 float32 cells and 22 of 2172 float64 cells are more than
+10% behind MKL. Small enough now to name every one, and they sort into four mechanisms.
+`P` below is the workers the row axis can actually feed with the gate in place, and
+`bound` is `max_row / (nnz/P)` — how much worse than perfect balance the longest row makes
+the best possible row-parallel schedule.
+
+| what limits it | f32 | f64 | worst | the mechanism | status |
+|---|---|---|---|---|---|
+| narrow-k per-thread efficiency | 10 | 7 | 0.605 | masked loads and an imul per nonzero at k=1,2 | exact-width kernel, grid running |
+| longest row | 8 | 2 | 0.558 | `bound` 2.0–3.9: one row is a tenth of the matrix | **nothing built** |
+| ultra-sparse, grain-bound | 6 | 4 | 0.538 | mean degree < 1, held to one worker by the base grain | grain sweep queued |
+| few rows, very high degree | 6 | 9 | 0.609 | `rows/16` caps the width | the gate, validation queued |
+| other | 4 | 0 | 0.673 | 64-row layers at k=256 | — |
+
+Three of the four already have a measurement in flight. The fourth is new and it is the
+one place row-parallelism itself is the wrong shape: lp_osa_14 is 2337 rows and one row
+holding 38336 of its 317097 nonzeros, lp_osa_30 is 4350 rows with one holding 72555 of
+604488, and nw14 is 73 rows with one holding 90951 of 904910. Once the width is widened to
+32 workers those give bounds of 3.87, 3.84 and 3.22 — so **no scheduling of whole rows can
+get within a factor of three of balanced**, however many workers are available, and every
+policy arm measured in this document was arguing about the wrong axis for these cells. The
+mechanism that fits is splitting a long row's nonzero range across workers and reducing
+the partials, which is a kernel change rather than a policy one and is worth ten cells of
+2172, so it goes behind the three measurements already running rather than ahead of them.
+
+Note also what is *not* in the table: nothing is limited by decomposition width any more,
+which was the diagnosis three sections ago. The forced-width sweep closed that, and this
+is what the residual looks like once it is.
