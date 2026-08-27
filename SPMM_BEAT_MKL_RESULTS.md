@@ -3457,3 +3457,41 @@ because it also switches the partition off through the 16–64 MB band that stil
 Changed to 2x. The constant is only read inside `if (partition_mode != 0)`, and the
 partition still defaults off, so this is inert in the binary that ships today — argued,
 not yet measured, and the two-build check is owed.
+
+## No fixed thread width beats what the policy already resolves
+
+`SCORCH_SPMM_NT_FORCE` overrides the final count after both the policy and the
+composition adoption, so it answers directly whether the residual is short of workers.
+Run on the 52 matrices that were still below MKL, 208 cells per dtype, against
+back-stealing with the policy's own choice:
+
+| forced width | f32 | >10% slower | below MKL | f64 | >10% slower | below MKL |
+|---|---|---|---|---|---|---|
+| the policy's choice | 1.0000 | — | 78/208 | 1.0000 | — | 64/208 |
+| 4 | 0.6649 | 81.2% | 155 | 0.6451 | 84.6% | 161 |
+| 8 | 0.7927 | 81.2% | 141 | 0.8197 | 80.3% | 124 |
+| 16 | 0.9400 | 42.8% | 100 | 0.9495 | 42.8% | 95 |
+| 24 (the host's torch count) | 0.9822 | 20.2% | 78 | 1.0236 | 13.0% | 53 |
+| 32 (every logical processor) | 0.8515 | 37.5% | 127 | 0.8729 | 39.9% | 109 |
+| row ceiling | 1.0058 | 6.7% | 78 | 1.0170 | 3.8% | 65 |
+
+Floors 0.9988 / 1.0075. **Nothing beats the policy**, including forcing every logical
+processor, which costs 13–15%. Forcing the host's torch count is the only arm that comes
+close, and on float64 it does recover eleven cells below MKL — at a 13.0% harmed tail
+against a 3.8% floor, so it is not a shape that can ship.
+
+Per matrix the aggregate hides two populations pulling opposite ways, which is exactly
+why every fixed rule loses. Nineteen of the 52 have *some* fixed width beating the policy
+by more than 5%, and they split cleanly: the ultra-sparse many-row matrices want more
+workers than the base grain allows (Pd_b, 8081 rows holding 6323 nonzeros, reads 1.828 at
+16 workers; Pd_rhs 1.622; bips07_3078_iv 1.404), while the 64-row pruned ResNet layers
+want *fewer* and collapse if pushed (0.608 at 24, 0.352 at 32). One rule cannot serve
+both, and the policy already sits between them.
+
+So the thread-width line is closed. Three separate mechanisms — the binary gate, the
+nonzero ceiling ungated, and graded adoption — are all rejected, and a direct sweep now
+shows there was no fixed width to find. What remains of the residual is per-thread
+efficiency and, for the few-row high-degree cases, the decomposition itself: kl02 is 71
+rows and 212536 nonzeros, already faster than MKL per thread, and row-parallel gives it
+at most 71 units of work no matter how the policy is tuned. That is a kernel question,
+not a policy one.
