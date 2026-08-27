@@ -4288,3 +4288,30 @@ fused partition, worst cell 0.8625). **The effect is smaller than the control's 
 movement, so the honest statement is only that nothing regresses by more than about 14%.**
 Each AE arm is roughly four seconds of work, so the variance is between processes, not
 within them; the fix is more rotations, not more repeats, and it is re-queued at eight.
+
+## Which earlier numbers the second environment charge moves, and in which direction
+
+`--pad-env` equalises how many names each arm puts in the environment. It does not
+equalise how many of those names the code looks up: an arm that sets a variable
+`scorch_policy.h` reads pays a successful `getenv` plus an `atol` on every call, and an arm
+that leaves it unset pays a miss and no conversion. Over 2485 cells where the row ceiling
+provably cannot fire, the four ceiling arms read 0.9863–0.9962 ordered by exactly that
+count (one read-variable → 0.9962 / 0.9934, two → 0.9959 / 0.9871, three → 0.9950 /
+0.9863). So the charge is roughly 0.3–0.6% per variable an arm sets *and* the code reads,
+on top of the ~1.1% per variable it merely sets.
+
+Everything this moves, it moves in the same direction — **the arm with more knobs was
+undercharged for its effect, so every padded number here understates the candidate**:
+
+- the exact-width kernel's padded x86 grid (1.0257 / 1.0199, harmed 0.2% / 0.1%) sets one
+  read variable more than its reference, so the true effect is nearer 1.029 / 1.023;
+- the ARM replication (1.0157 / 1.0143) likewise, at the ARM rate;
+- the ceiling's in-gate readings (1.11 / 1.19) are understated by the same amount, which is
+  immaterial at that size.
+
+What it does **not** let us conclude is inertness. "Reads 0.996 where it cannot fire" is
+indistinguishable from "costs 0.4% because it names a knob", and no arm ordering fixes
+that. Both remaining questions of that kind — is the ceiling inert outside its gate, is the
+exact-width kernel inert at widths it does not serve — are settled by compiled-in
+three-builds (`rw_stage16.sh` for the ceiling, the k-band table of `rw_stage6.sh` for the
+kernel), where no `getenv` runs at all.
