@@ -3495,3 +3495,41 @@ efficiency and, for the few-row high-degree cases, the decomposition itself: kl0
 rows and 212536 nonzeros, already faster than MKL per thread, and row-parallel gives it
 at most 71 units of work no matter how the policy is tuned. That is a kernel question,
 not a policy one.
+
+## Cold: the kernel wins by 1.71x and the call loses by 0.87x
+
+The cold probe flushes 256 MB between calls and times exactly one, taking the median
+over 21 repetitions because the minimum over cold repetitions picks whichever flush
+evicted least. MKL is in the same interleave. 372 float32 cells:
+
+| regime | arm | vs MKL, kernel only | vs MKL, whole call | non-kernel | below MKL |
+|---|---|---|---|---|---|
+| cold | ships today | 1.611 | 0.837 | 88.3 µs (49.7%) | 284/372 |
+| cold | back-stealing | **1.714** | **0.866** | 88.2 µs (52.5%) | 249/372 |
+| warm | ships today | 0.986 | 0.806 | 7.6 µs (18.7%) | 247/372 |
+| warm | back-stealing | 1.429 | 1.096 | 7.5 µs (24.5%) | 177/372 |
+
+The same-code control reads 1.0129 cold and 1.0007 warm, so the cold estimator is about
+ten times noisier than the warm one, as expected, and the arm differences still clear it.
+
+**Cold, our kernel is 71% faster than MKL's entire call and we still lose the call by
+13%.** The reason is the fourth column: 88 µs of non-kernel cost cold against 7.5 µs
+warm, and it is *flat* — 87.2, 87.6, 95.1, 134.7 µs across kernel-duration bands from
+20 µs to over a millisecond. A fixed cost, not a proportional one, and it is not the
+partition: base and back-stealing carry the same 88 µs.
+
+Two things go into it and they need separating rather than lumping. Some is irreducible:
+a Python dispatch faulted in from a cold instruction cache will always cost more than one
+C++ dispatcher call, and `torch.sparse.mm` is the latter. But some is the harness. The
+plan cache in `ops.matmul` serves a repeat call directly, and it is gated on
+`not kwargs and type(b) is torch.Tensor` — so asking for `time_dict` to get a kernel
+timer, or passing an `STensor` for B, disables it. **Every grid in this branch does both.**
+Arm against arm that cancels exactly; against MKL's whole call it is a handicap a real
+caller does not carry.
+
+Measured directly on the M5 warm, the plan path saves 5–33 µs (typically 10–20) on the
+same shapes, so it is not the whole 88 µs — the cold figure really is mostly cold-cache
+cost on the dispatch path. The cold run is repeating with a `plan` arm that reaches
+back-stealing the way a caller reaches it, with a per-cell check that the two paths agree,
+so the user-facing cold number stops being measured through a handicap the user would not
+have.
