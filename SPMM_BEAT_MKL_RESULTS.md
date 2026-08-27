@@ -3790,3 +3790,78 @@ halving loop of at most three steps, landing on an instantiation that already ex
 row long enough to fill the configured depth compiles to exactly what it did before. Off by
 default, because both hosts had grids in flight measuring the unadapted kernel and an arm
 is worth more than a silent change.
+
+## The exact-width kernel does not ship as it stands, and the widened grid is why
+
+The earlier reading — 1.3064 to 1.3620 on float32, below MKL 121 to 74 — came from a grid
+at k = 1, 2, 4, 8. Widening it to every width where the kernel fires (float 1..7, double
+1..3) plus k = 8 and 16 as controls reverses the verdict. 3258 cells per dtype, same-code
+floor 0.9998 and 1.0001:
+
+| arm | f32 | >10% slower | below MKL | f64 | >10% slower | below MKL |
+|---|---|---|---|---|---|---|
+| back-stealing | 1.0000 | — | 191/3258 | 1.0000 | — | 132/3258 |
+| + exact, unroll 4 | **0.9873** | 10.9% | 296 | **1.0039** | 2.1% | **95** |
+| + exact, unroll 8 | 0.9965 | 9.8% | 283 | 0.9919 | 4.3% | 123 |
+| + exact at k=1 too | 0.9771 | 14.6% | 294 | 0.9942 | 2.0% | 98 |
+
+By width, float32 unroll 4: 0.9723 (k=1), **1.0666** (k=2), **1.0506** (k=3), 0.9942,
+0.9692, **0.9132** (k=6), 0.9611 (k=7), then 0.9832 and 0.9843 at k=8 and 16 where it
+cannot fire. Float64 unroll 4: 0.9764, **1.0699**, **1.0611**, then 0.9867–0.9908 for k>=4
+where it cannot fire.
+
+Two separate defects, both visible in those numbers.
+
+**The per-row dispatch is a tax on every width the kernel does not serve.** The control
+widths read 0.983–0.987 on float32 and 0.988–0.991 on float64 — a consistent 1.2–1.7%.
+`B1_size` is loop-invariant, so testing `narrowk_exact` and then switching on it once per
+row is work that belongs outside the row loop entirely. That tax is paid by the majority of
+widths in exchange for helping two.
+
+**The accumulator spills at the wider widths.** `T acc[UNROLL][K]` is UNROLL*K scalars
+live across the row. At K=2, UNROLL=4 that is 8 — fine. At K=6, UNROLL=4 it is 24, and
+float32 k=6 is the worst cell in the grid at 0.9132. The unroll has to be bounded by a
+register budget divided by K, not chosen independently of it.
+
+So the honest verdict is that the kernel's *idea* is right — it wins 6.1–7.0% at k=2 and
+3.4–6.1% at k=3 on both dtypes, and on float64 it recovers 37 of the 132 cells below MKL
+even carrying both defects — and its *implementation* is not shippable yet. Three fixes are
+identified and two are already written: bounding the unroll by the row's length (committed,
+off), bounding it by a register budget divided by K, and hoisting the width decision out of
+the row loop.
+
+## The base grain is rejected, globally and by degree band
+
+150000 nonzero-units is about sixty-five microseconds of single-thread work, which is a
+conservative bar for waking a second worker, and it is what holds the ultra-sparse matrices
+to one thread. Swept alone on 1810 cells per dtype against a 1.0% and 1.5% floor:
+
+| grain | f32 | >10% slower | below MKL | f64 | >10% slower | below MKL |
+|---|---|---|---|---|---|---|
+| 150000 (shipped) | 1.0000 | — | 102/1810 | 1.0000 | — | 74/1810 |
+| 75000 | 0.9661 | 11.6% | 110 | 0.9748 | 10.9% | 90 |
+| 50000 | 0.9414 | 19.6% | 116 | 0.9480 | 18.7% | 103 |
+| 30000 | 0.9174 | 26.2% | 137 | 0.9319 | 24.8% | 107 |
+
+Monotonic in the wrong direction on every measure. It is also rejected *within the band it
+was aimed at*: on the 495 cells of mean degree below 1, grain 50000 reads 0.9706 on float32
+and 0.9875 on float64 — still worse than the baseline.
+
+One thing it does do: in that band, below MKL goes 7 to 0 on float32 and 5 to 0 on float64.
+So a lower grain fixes precisely the handful of ultra-sparse cells that are behind MKL while
+costing the several hundred in the same band that were already ahead. Mean degree is
+therefore the wrong discriminator, and twelve cells do not justify hunting for the right one
+ahead of the other work. **A global grain change is settled: no.**
+
+## The gate is inert off its own region, measured on held-out data
+
+The gate's thresholds were read off `final_groups`, so `big_groups` — the large-A corpus,
+56 matrices — is the first honest test. All 255 float32 cells fall *outside* the gated
+region, which makes it a test of inertness rather than of gain, and it passes cleanly:
+0.9993 for the gate, 0.9999 ungated, 0.9995 with the pool cap, all within z of ±0.6 of a
+0.9987 floor, and **0.0% of cells harmed by any arm**. Below MKL is 20 for back-stealing and
+18–19 for every gated arm.
+
+The liveness check on the same rebuild also confirms the pool cap is x86-inert by
+construction rather than by hope: uncapped 22, capped 22, pool 24 — exactly what the
+standalone policy driver predicted before the run.
