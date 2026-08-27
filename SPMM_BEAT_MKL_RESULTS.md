@@ -3533,3 +3533,39 @@ cost on the dispatch path. The cold run is repeating with a `plan` arm that reac
 back-stealing the way a caller reaches it, with a per-cell check that the two paths agree,
 so the user-facing cold number stops being measured through a handicap the user would not
 have.
+
+## Which vs-MKL number is the honest one
+
+Every grid here reports `mkl_ms / ours_kms` — MKL's whole call over our kernel only. That
+looks like it flatters us, and the obvious correction is `mkl_ms / ours_ms`. On float32
+the two readings are far apart: back-stealing is 2.2927x with 104 of 2172 cells below MKL
+on the first and 1.5440x with **512** below MKL on the second. Worth knowing which is
+right before quoting either.
+
+It is the first, and the reason is the plan cache. `ops.matmul` serves a repeat call from
+a per-tensor plan, gated on `not kwargs and type(b) is torch.Tensor`; the harness passes
+`time_dict` to get a kernel timer *and* an `STensor` for B, so it disables the fast path
+twice over. Measured on the M5, median of 201 calls each:
+
+| shape, k | kernel | general path − kernel | plan path − kernel | plan saves |
+|---|---|---|---|---|
+| 2708 rows, 13264 nnz, k=8 | 35.1 µs | +11.9 | **−0.3** | 12.3 |
+| 2708 rows, 13264 nnz, k=1 | 28.1 µs | +5.3 | **−1.6** | 6.8 |
+| 8081 rows, 6323 nnz, k=1 | 22.2 µs | +7.8 | **+2.3** | 5.5 |
+| 9506 rows, 395506 nnz, k=8 | 101.1 µs | +14.8 | **+7.0** | 7.8 |
+
+**On the caller's path the whole call is the kernel**, to within the measurement, on every
+shape tried. So `mkl_ms / ours_kms` is not a flattering approximation of the user-facing
+number, it *is* the user-facing number, and the 512-cells-below-MKL reading is an artifact
+of a handicap the harness imposes on itself and a caller never sees.
+
+Two consequences. The first is that the whole-call column in every grid above should be
+read as "what a caller would get if they also asked for a kernel timer", not as the
+user-facing figure. The second is that this needs confirming on x86, where the dispatch
+constant is a different size — the cold rerun carries a `plan` arm reaching back-stealing
+the way a caller reaches it, with a per-cell agreement check, and it reports both regimes.
+
+It also reframes the cold result. Cold, non-kernel cost was 88 µs against 7.5 µs warm; if
+the plan path removes as much of the cold constant as it removes of the warm one, the cold
+whole-call number moves a long way from 0.866x. That is the measurement the rerun exists
+to make, and it is the last thing standing between the two halves of the target.
