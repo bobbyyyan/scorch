@@ -4402,3 +4402,23 @@ the 256-row pruned-ResNet layers that dominate the warm caller-path residual sit
 128 and inside 384 — but the widening does not pay on those cells, so the residual is not
 a thread-count problem. What is still open on the ceiling is only whether the *count* form
 is inert outside its gate, which needs the compiled-in three-build.
+
+### and with the separability test fixed, two of the five graphs are wins, not just non-regressions
+
+The GCN analyzer declared an arm separable only when its spread exceeded 1.5x the
+same-code control's spread. That is the wrong shape of test: it scales the *threshold* with
+the control instead of comparing *excesses*, so a 1.226x arm spread against a 1.004x
+control was labelled "inside the control". Replaced by "the effect must exceed three times
+the control's own excess over one, with a 2% floor" — so a quiet control cannot make half a
+percent a result, and a tight control is allowed to resolve a large effect. Re-scored:
+
+| dataset | arm spread | control | verdict |
+|---|---|---|---|
+| pubmed | 1.226x | 1.022x | **separable** — 0.727 → 0.594 ms with the partition |
+| citeseer | 1.044x | 1.004x | **separable** — 0.542 → 0.523 ms |
+| cora | 1.125x | 1.053x | inside the control |
+| ogbn-arxiv | 1.016x | 1.015x | inside the control |
+| reddit | 1.007x | 1.008x | inside the control |
+
+So on real GCN inference the candidate is a win on two of five graphs and indistinguishable
+on the other three, with nothing regressed.
