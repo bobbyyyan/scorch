@@ -3427,3 +3427,33 @@ does not exclude it — its own measured gain is what keeps it in.
 So the ceiling ships gated, not unconditionally, and the gate is measured on one host and
 one corpus so far. Next: confirm on the M5, then on the large-A corpus, which is held out
 from the grid the thresholds were read off.
+
+## The output-size gate was set two steps too loose
+
+The gate that switches the row partition off on large outputs shipped at four times the
+last-level cache, a value picked from the band table rather than swept. Swept now on the
+large-A corpus (56 matrices; 204 float32 and 183 float64 cells; same-code floor 0.9964 and
+0.9978), against what ships today:
+
+| threshold | f32 | >10% slower | f64 | >10% slower |
+|---|---|---|---|---|
+| 1x LLC (36 MB) | 1.0917 | 0.0% | 1.0604 | 0.5% |
+| **2x LLC (72 MB)** | **1.0944** | **0.0%** | **1.0649** | **0.5%** |
+| 4x LLC (144 MB, shipped) | 1.0918 | 1.5% | 1.0636 | 1.6% |
+| 8x LLC (288 MB) | 1.0916 | 2.5% | 1.0589 | 3.8% |
+| no gate | 1.0866 | 2.9% | 1.0544 | 4.9% |
+
+Below MKL falls 29 → 4 (float32) and 18 → 2 (float64) at every threshold, so the gate is
+not what wins the corpus — the partition is. What the threshold buys is the tail, and it
+buys it monotonically: 0.0% harmed at 2x against 2.9% ungated.
+
+By output size the mechanism is exactly the predicted one. The partition gains
+1.13–1.14x below 16 MB and 1.04–1.07x from 16 to 64 MB, then flattens, and every cell it
+harms sits in the 144–256 MB band, where 8x reads 0.9213 (f32) and 0.9536 (f64) and the
+ungated arm 0.9153 and 0.9498, while 1x and 2x hold 1.00. 1x is not better than 2x
+because it also switches the partition off through the 16–64 MB band that still pays
+(1.0573 against 1.0730 on float32).
+
+Changed to 2x. The constant is only read inside `if (partition_mode != 0)`, and the
+partition still defaults off, so this is inert in the binary that ships today — argued,
+not yet measured, and the two-build check is owed.

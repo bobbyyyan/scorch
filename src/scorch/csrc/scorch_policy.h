@@ -178,8 +178,18 @@
 // few times the LLC, because home ranges scatter the output store stream across as
 // many DRAM regions as there are workers where the global counter keeps it
 // near-sequential. 0 disables the gate.
+//
+// Swept on redwood's large-A corpus (56 matrices, 204 float32 / 183 float64 cells,
+// same-code floor 0.996/0.998). The geomean is flat across every threshold to within
+// 0.3%; what the threshold buys is the TAIL. Fraction of cells more than 10% slower than
+// what ships: 0.0%/0.5% at 1x LLC, 0.0%/0.5% at 2x, 1.5%/1.6% at 4x, 2.5%/3.8% at 8x,
+// 2.9%/4.9% ungated. Broken out by output megabytes the partition gains 1.13-1.14x below
+// 16 MB and 1.04-1.07x from 16-64 MB, then flattens; the harm is confined to 144-256 MB,
+// where 8x reads 0.921/0.954 and ungated 0.915/0.950 while 1x and 2x hold 1.00.
+// 2x rather than 1x because 1x also switches the partition off through the 16-64 MB band
+// that still pays (1.0573 against 1.0730 on float32, 1.0252 against 1.0407 on float64).
 #ifndef SCORCH_SPMM_PARTITION_MAXOUT_LLC
-#  define SCORCH_SPMM_PARTITION_MAXOUT_LLC 4L
+#  define SCORCH_SPMM_PARTITION_MAXOUT_LLC 2L
 #endif
 // Which row-handout the SpMM uses by default. 0 = one global atomic counter, which is
 // what ships today and what costs A its inter-call L2 residency; 3 = contiguous home
