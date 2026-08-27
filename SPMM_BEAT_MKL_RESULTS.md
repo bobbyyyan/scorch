@@ -3601,3 +3601,27 @@ reads 1.714x with 13 of 372 cells below MKL on float32 and 1.685x with 10 of 372
 float64, against warm's 1.429x/110 and 1.507x/72. That is the expected direction once
 stated plainly — MKL's advantage is keeping 93% of A in the cores' L2 between calls, and a
 flush takes that away from MKL too.
+
+## The partition code is free when it is off, measured against the tree without it
+
+Mode 0 is not byte-identical to the pre-partition source: acquiring the row range moved
+from a const initialiser to mutable locals behind a runtime branch. That owed a
+measurement rather than an assertion. Three builds, float32, 495 cells of the tb corpus:
+
+| comparison | ratio | >10% slower |
+|---|---|---|
+| old2 / old1 — two runs of the *same* pre-partition build (the floor) | 0.9950 | 7.7% |
+| **new with the partition off / old1 — the code present but inert** | **1.0058** | **5.7%** |
+| same, whole call | 1.0073 | 5.5% |
+| old1's own in-process same-code arm (for contrast) | 1.0022 | 2.6% |
+| new with the partition on / old1 | **1.2917** | 2.6% |
+
+z of "present but off" against the two-run floor is **0.85** — not separable. The code
+costs nothing when it is off, and the partition switched on is worth 1.2917x against the
+tree that predates it, which is the honest end-to-end number rather than a mode-0-versus-
+mode-3 comparison inside one binary.
+
+Worth noting for later cross-process work: the same-code floor is 1.0022 with 2.6% harmed
+*within* a process and 0.9950 with 7.7% harmed *across* two, so a cross-process comparison
+carries about three times the tail. That is the floor the three-build shipped-shape stage
+has to clear, and it is why that stage runs each build twice in opposite orders.
