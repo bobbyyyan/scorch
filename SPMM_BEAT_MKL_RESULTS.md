@@ -3865,3 +3865,85 @@ region, which makes it a test of inertness rather than of gain, and it passes cl
 The liveness check on the same rebuild also confirms the pool cap is x86-inert by
 construction rather than by hope: uncapped 22, capped 22, pool 24 — exactly what the
 standalone policy driver predicted before the run.
+
+## There is no ARM exact-width kernel, so the ARM grid for it could never have measured anything
+
+`scorch_spmm_row_narrow_exact`, its dispatch, and every one of its hooks sit inside
+`#if defined(__AVX2__) && defined(__FMA__)`. An ARM binary therefore has no exact-width
+kernel to switch on and does not even contain the string `SCORCH_NARROWK_EXACT_SHORT`,
+which is why the ARM stage refused to run: the check was right and the premise behind the
+stage was wrong. Its header had reasoned about what ARM's *shipped* narrow-k path is —
+`scorch_spmm_row_neon_regtile`, a 4×4 kernel over 128-bit vectors — and concluded ARM
+"should still gain" at float k=1..3, where a q-register load produces 4 of 16 useful
+bytes. That conclusion is about an implementation nobody wrote.
+
+Two consequences worth stating. The ARM shipped-shape candidate was built with
+`-DSCORCH_NARROWK_EXACT_UNROLL=4` and that flag was **inert**, so the ARM number below is
+a clean measurement of the partition alone and not a two-change candidate. And the ARM
+stage was replaced with the measurement the ARM data actually asks for, which is the next
+section.
+
+## The partition on ARM: 1.035 and 1.092 above the floor, with a tail the average hides
+
+Three hookless builds of one tree — `ship`, a second build of `ship` as the cross-process
+floor, and `cand` with `-DSCORCH_SPMM_PARTITION_DEFAULT=3` — each run twice in opposite
+orders and the two passes averaged per cell, 1650 cells per dtype:
+
+| comparison | float32 kernel | float64 kernel | float32 >10% slower | float64 >10% slower |
+|---|---|---|---|---|
+| ctrl / ship (the floor) | 1.0081 | 1.0191 | 0.7% | 1.2% |
+| **cand / ship (the change)** | **1.0352** | **1.0918** | 3.9% | 3.4% |
+| cand / ctrl (the other side) | 1.0269 | 1.0713 | 6.1% | 4.1% |
+
+MKL's own agreement across the three processes is 1.0260 (float32) and 1.0496 (float64),
+which is the independent floor no scorch flag can move. By k, the float32 gain rises with
+width (1.025 at k=1 to 1.059 at k=256) and float64 is flat at 1.09–1.12 until k=256 drops
+to 1.043.
+
+The tail is the finding. 64 of 1650 float32 cells and 56 of 1650 float64 cells are more
+than 10% slower, against floor tails of 0.7% and 1.2%, and only one float32 cell has the
+floor below 0.9 as well — so it is the change, not the process. **63 of the 64 have an
+output under one megabyte.** The worst are rn50 bottleneck layers (64 rows of degree 288,
+whose entire A is 147 KB) at 0.70–0.80, a 512-row transformer layer at 0.76, and as-735
+(7716 rows of degree 1, A = 117 KB) at 0.81.
+
+## A minimum-A gate, argued from the mechanism rather than fitted to the tail
+
+The partition's whole benefit is that a worker touches the *same* slice of A on every
+call, so the slice stays in that core's private cache; the shared counter hands out a
+different slice each call, which is why it re-fetched all 8.6 MB of ts-palko's A every
+call against MKL's 579 KB. **When the whole of A already fits in one core's private
+cache, there is nothing to keep resident** — the counter's rotating assignment is
+resident too — and all that is left to pay is claiming chunks and, at the end of the
+call, every exhausted worker scanning every cursor for something to steal. A 147 KB A is
+exactly that case, and so is a 117 KB one.
+
+`SCORCH_SPMM_PARTITION_MINA_DIV` switches the partition off when A's bytes times the
+divisor are still under the queried LLC. It is a divisor of a queried quantity and not a
+byte constant: a sixteenth of redwood's 37.7 MB is 2.4 MB, which is an i9-14900K P-core's
+L2, and the same divisor means the analogous thing on the M5's reported 16.8 MB. Default
+0, so nothing changes until the ladder has a plateau on both hosts. The ladder runs `p0`
+as an arm on purpose — a gate that switches the partition off has to land on `p0`'s
+number for the cells it fires on, and if it does not then it is not the fallback it
+claims to be.
+
+## On ARM the row ceiling is harmful inside its own gate, and the pool cap is why
+
+The ARM gate grid, 1375 cells per dtype, 35 of them inside the gated region:
+
+| arm | float32 in-gate | harmed | float64 in-gate | harmed |
+|---|---|---|---|---|
+| floor | 0.9959 | 2.9% | 0.9989 | 2.9% |
+| ungated rule | 0.9117 (z −3.2) | 28.6% | 0.9536 | 20.0% |
+| the gated rule | 0.9321 (z −2.5) | 25.7% | 0.9690 | 14.3% |
+| gate one step wider | 0.9215 | 25.7% | 0.9542 | 14.3% |
+| **gated + capped at the pool** | **0.9871** | **2.9%** | **0.9965** | 8.6% |
+
+So the rule that reads 1.11 and 1.15 inside the gate on redwood reads 0.93 and 0.97 on
+the M5, and capping the widened count at the pool the caller manages recovers almost all
+of it — 0.9871 and 0.9965, both inside the floor. That is the mechanism the design
+predicted: `omp_get_num_procs()` is 32 against torch's 24 on redwood but 18 against
+torch's 6 on the M5, so the same rule widens kl02 to 22 workers inside a 24-thread pool
+on one host and to 18 — three times the pool, pulling in twelve efficiency cores — on the
+other. **The pool cap is the version of this rule that could ship**, and it is x86-inert
+by construction (uncapped 22, capped 22, pool 24).
