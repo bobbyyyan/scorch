@@ -162,6 +162,16 @@
 #ifndef SCORCH_SPMM_ADOPT_GRAIN
 #  define SCORCH_SPMM_ADOPT_GRAIN 0L
 #endif
+// Conditions on the nonzero-expressed row ceiling above. 0 disables a condition, which
+// reproduces the ungated rule that measures null. The measured region is rows <= 128 and
+// mean degree >= 192 on redwood; a plateau, not an edge -- rows in {96,128,192} crossed
+// with degree in {192,256} all read 1.108-1.164 with z of 3.2-3.9.
+#ifndef SCORCH_SPMM_CEIL_MAXROWS
+#  define SCORCH_SPMM_CEIL_MAXROWS 128L
+#endif
+#ifndef SCORCH_SPMM_CEIL_MINDEG
+#  define SCORCH_SPMM_CEIL_MINDEG 192L
+#endif
 // Output size, in multiples of the last-level cache, above which the SpMM's row
 // partition is turned off. See the measured table at the gate itself in spmm.h: the
 // partition's gain decays monotonically with output size and goes negative past a
@@ -363,7 +373,31 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   { const char* e = std::getenv("SCORCH_SPMM_NNZ_PER_THREAD");
     if (e && *e) { long v = std::atol(e); if (v >= 0) nnz_per_thread = v; } }
 #endif
-  if (nnz_per_thread > 0 && nnz > 0) {
+  // Whether the nonzero statement is allowed to fire at all. Unconditionally it is a
+  // null: over 2172 redwood cells it reads 1.2579 against back-stealing's 1.2670 on
+  // float32 and 1.2362 against 1.2374 on float64. That null is a gain and a loss
+  // cancelling. Scored against the same-code floor inside each region, it is 1.1109
+  // (float32, z=3.38) and 1.1542 (float64, z=3.18) on the 42 cells with few rows and
+  // very high degree, and 0.9837 (float32, z=-2.63) on the 276 cells with few rows and
+  // ordinary degree. So both conditions are load-bearing: the row cap has to be leaving
+  // most of the machine idle AND each row has to still have thousands of nonzeros to
+  // chew. kl02 (71 rows, degree 2993) is the shape it is for; a 64-row pruned-ResNet
+  // layer at degree 288 with 18432 nonzeros in total is the shape it must not catch.
+  //
+  // Both thresholds are read off one host and one corpus, so both are hooks and the
+  // compiled-in defaults leave the rule OFF. Promote them only once the M5 and the
+  // held-out large-A corpus agree.
+  long ceil_maxrows = SCORCH_SPMM_CEIL_MAXROWS;
+  long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_MAXROWS");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_maxrows = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_mindeg = v; } }
+#endif
+  if (nnz_per_thread > 0 && nnz > 0 &&
+      (ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
+      (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows)) {
     long by_nnz = nnz / nnz_per_thread;
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
     if (by_nnz > rows_axis) rows_axis = by_nnz;
