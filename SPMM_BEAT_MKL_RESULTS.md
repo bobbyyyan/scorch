@@ -4063,3 +4063,43 @@ are about **two `SCORCH_GRAIN_SPMM`**, so the gate is spelled in grains:
 `SCORCH_SPMM_PARTITION_MINGRAINS`, default 0, ladder 1–4 running now on both hosts. The
 min-A hook is removed rather than kept behind a flag, because a rejected hook still costs a
 `getenv` per call in every instrumented build, and the section above is what that costs.
+
+## The x86 shipping number was a three-way A/A, and how it announced itself
+
+The first completed run of the hookless three-build comparison on x86 read **cand/ship
+1.0022 against a 1.0007 floor**, with 4.0% of cells more than 10% slower against a 4.2%
+floor tail, and by k it was 0.9955, 1.0054, 1.0015, 0.9936, 1.0088, 1.0086 — flat
+everywhere. The interleaved grid on the *same* corpus (`final_groups`, 362 matrices) and
+the same k values reads **1.31 uniformly**, k=1 through k=16, against a 1.000 floor. Both
+cannot be true, and the flatness is what gives it away: a real mechanism does not read
+1.000 ± 0.006 in every band.
+
+`kprobe.py` did `sys.path.insert(0, <its own directory>/src)`. On this host kprobe lives
+in the measured tree, so that path holds a built `scorch_ops`, and inserting it at position
+zero **overrode the `PYTHONPATH` each arm was given**. All three arms loaded the
+instrumented tune build with no variables set, i.e. `SCORCH_SPMM_PARTITION_DEFAULT=0` — one
+binary, three times. Confirmed directly rather than inferred:
+
+    scorch_ops -> /scratch/bobbyy/mklcheck/tune/src/scorch_ops...so
+
+with `PYTHONPATH` pointing at `cand`. Every arm's `-D` flag was present in its own build log
+and every build produced a distinct `.so` (1012288 bytes for ship and ctrl, 1016528 for
+cand), so nothing upstream of the run was wrong — the binaries were built correctly and
+then not used.
+
+The ARM three-build number is unaffected and was checked, not assumed: there kprobe lives
+in the scratchpad, `<scratchpad>/src` does not exist, so the insert was a miss and
+`PYTHONPATH` won. 1.0352 and 1.0918 stand.
+
+Three changes, in the layer each belongs to:
+
+- `kprobe` falls back to its own tree **only when the caller has not set `PYTHONPATH`**.
+- `kprobe` prints the resolved `scorch` and `scorch_ops` paths in every log, so which
+  binary ran is on the record whether or not anyone thought to check.
+- `rw_stage6` **refuses** any run whose printed `.so` is not under that arm's own tree.
+  This is the check that would have caught it, and it is the third time this session that
+  the thing which found a silent null was a guard on the *output* rather than on the last
+  line a script reached.
+
+The six quarantined files are kept as `.threeway_aa`. The shipping number is unmeasured
+again, and it is first in the queue.
