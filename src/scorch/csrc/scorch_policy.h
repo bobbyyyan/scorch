@@ -368,10 +368,23 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
     if (by_nnz > rows_axis) rows_axis = by_nnz;
   }
-  // The proxy count, exactly as before when nnz_per_thread is 0: rows_axis is then
-  // rows/SCORCH_ROWS_PER_THREAD and dividing it by 1 reproduces the old expression
-  // including its truncation.
-  int nthreads = scorch_nthreads(work, rows_axis, SCORCH_GRAIN_SPMM, 1, 1);
+  // A/B hook: the grain the BASE path divides the work by. 150000 nonzero-units is
+  // about sixty-five microseconds of single-thread work, which is a very conservative
+  // bar for "is a second worker worth waking" when fork/join is two to five. It is
+  // what holds the mostly-empty matrices to one thread: Pd_b is 8081 rows holding
+  // 6323 nonzeros, so at k=1 its floored work is 101168 against the grain and it runs
+  // single-threaded in 24 us where MKL takes 15.3. Lowering it is NOT obviously right
+  // -- raising thread counts off this same floored measure by a different route made
+  // the 20-50 us cells 0.920 -- so the point of the hook is to ask rather than assume.
+  long grain = SCORCH_GRAIN_SPMM;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_GRAIN");
+    if (e && *e) { long v = std::atol(e); if (v > 0) grain = v; } }
+#endif
+  // The proxy count, exactly as before when nnz_per_thread is 0 and the grain is the
+  // default: rows_axis is then rows/SCORCH_ROWS_PER_THREAD and dividing it by 1
+  // reproduces the old expression including its truncation.
+  int nthreads = scorch_nthreads(work, rows_axis, grain, 1, 1);
   // Then raise it where the ROW proxy, not the work, is what bound it -- a 64-row
   // pruned-ResNet layer at k=512 is 62 grains of arithmetic held to 4 workers -- but
   // only as far as the real arithmetic supports: one grain per worker. Both bounds
@@ -413,7 +426,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   { const char* e = std::getenv("SCORCH_SPMM_OVERRIDE_GATE_TRUE");
     if (e && *e && std::atol(e) != 0) gate_work = work_true; }
 #endif
-  if (nthreads_override > 0 && gate_work >= SCORCH_GRAIN_SPMM) {
+  if (nthreads_override > 0 && gate_work >= grain) {
     // Deliberately the 16-rows-per-worker ceiling, not rpt. This is the composition
     // path -- adopt the host team so a pipeline does not reshape at every op
     // boundary -- and widening it too would raise the count on the very k=1 cells
