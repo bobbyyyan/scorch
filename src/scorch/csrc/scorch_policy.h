@@ -225,6 +225,14 @@
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
 #endif
+// Live scalar accumulators the exact-width kernel is allowed to hold. It keeps
+// UNROLL*K of them, so at K=6 with UNROLL=4 that is 24, more than the 16 general
+// registers x86-64 has; float32 k=6 is the worst cell in the widened grid at 0.9132
+// while k=2, which holds 8, reads 1.0666. Nonzero here halves the unroll until
+// UNROLL*K fits. 0 leaves the unroll at whatever the width was asked for.
+#ifndef SCORCH_NARROWK_EXACT_ACCUM
+#  define SCORCH_NARROWK_EXACT_ACCUM 0
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it

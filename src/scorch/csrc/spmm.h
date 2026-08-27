@@ -3672,6 +3672,11 @@ torch::Tensor spmm_csr_v2_core(
   // group of cells the exact-width kernel makes slower, 35 of 64, all at float k=2 and
   // k=4 where this kernel fires.
   bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
+  // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
+  // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
+  // is 24 live scalars, and float32 k=6 is the worst cell in the widened grid at 0.9132
+  // where k=2 (8 live) is 1.0666. 0 disables the bound.
+  int narrowk_exact_accum = SCORCH_NARROWK_EXACT_ACCUM;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
@@ -3710,6 +3715,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_SHORT");
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -3719,6 +3726,18 @@ torch::Tensor spmm_csr_v2_core(
 #endif
 
 #if defined(__AVX2__) && defined(__FMA__)
+  // Hoisted out of the row loop. B1_size cannot change between rows, so which width the
+  // exact kernel serves is a per-CALL question; asking it per row cost 1.2-1.7% on every
+  // width the kernel does NOT serve, which is what the grid's control columns measured
+  // (0.983-0.987 at float32 k=8 and 16, 0.988-0.991 at float64 k>=4). Zero means the row
+  // loop skips the whole width family after one well-predicted test.
+  int exact_width = 0;
+  if (narrowk_exact) {
+    const bool exact_f32_ = std::is_same<scalar_t, float>::value;
+    const int exact_hi_ = exact_f32_ ? 7 : 3;
+    const int exact_lo_ = (exact_f32_ && !narrowk_exact_k1) ? 2 : 1;
+    if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
+  }
   // Route k=1 through the nonzero-axis gather kernel. See its definition for the
   // measured map across k: k=1 is where K gathers stay cheaper than eight masked
   // FMAs, and from k=2 up the gather gives back more than it gains.
@@ -3942,7 +3961,7 @@ torch::Tensor spmm_csr_v2_core(
             // separately, because the nonzero-axis gather kernel owns it -- otherwise
             // this arm would swap two kernels in one step and neither would be
             // attributable. Placed ahead of the gather dispatch for that reason.
-            if (narrowk_exact) {
+            if (exact_width) {
               #define SCORCH_RNE(KK, UN) \
                 scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
                     A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
@@ -3953,6 +3972,9 @@ torch::Tensor spmm_csr_v2_core(
               #define SCORCH_RNE_U(KK) \
                 do { \
                   int un_ = narrowk_exact; \
+                  if (narrowk_exact_accum > 0) { \
+                    while (un_ > 1 && un_ * (KK) > narrowk_exact_accum) un_ >>= 1; \
+                  } \
                   if (narrowk_exact_short) { \
                     const int len_ = pA_end - pA_begin; \
                     while (un_ > 1 && len_ < un_) un_ >>= 1; \
@@ -3964,29 +3986,26 @@ torch::Tensor spmm_csr_v2_core(
                     default: SCORCH_RNE(KK, 8); break; \
                   } \
                 } while (0)
-              bool took = false;
               if constexpr (std::is_same<scalar_t, float>::value) {
-                switch (B1_size) {
-                  case 1: if (narrowk_exact_k1) { SCORCH_RNE_U(1); took = true; } break;
-                  case 2: SCORCH_RNE_U(2); took = true; break;
-                  case 3: SCORCH_RNE_U(3); took = true; break;
-                  case 4: SCORCH_RNE_U(4); took = true; break;
-                  case 5: SCORCH_RNE_U(5); took = true; break;
-                  case 6: SCORCH_RNE_U(6); took = true; break;
-                  case 7: SCORCH_RNE_U(7); took = true; break;
-                  default: break;
+                switch (exact_width) {
+                  case 1: SCORCH_RNE_U(1); break;
+                  case 2: SCORCH_RNE_U(2); break;
+                  case 3: SCORCH_RNE_U(3); break;
+                  case 4: SCORCH_RNE_U(4); break;
+                  case 5: SCORCH_RNE_U(5); break;
+                  case 6: SCORCH_RNE_U(6); break;
+                  default: SCORCH_RNE_U(7); break;
                 }
               } else {
-                switch (B1_size) {
-                  case 1: SCORCH_RNE_U(1); took = true; break;
-                  case 2: SCORCH_RNE_U(2); took = true; break;
-                  case 3: SCORCH_RNE_U(3); took = true; break;
-                  default: break;
+                switch (exact_width) {
+                  case 1: SCORCH_RNE_U(1); break;
+                  case 2: SCORCH_RNE_U(2); break;
+                  default: SCORCH_RNE_U(3); break;
                 }
               }
               #undef SCORCH_RNE_U
               #undef SCORCH_RNE
-              if (took) continue;
+              continue;
             }
             if (narrowk_gather && nvec == 1 &&
                 std::is_same<scalar_t, float>::value) {
