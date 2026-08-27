@@ -4157,3 +4157,96 @@ The exact-width kernel adds 1.8% and about 100 more decisively-faster cells on b
 **without adding a single slower one**. The gate cuts the more-than-10%-slower count by
 about two thirds for 0.2% pooled and roughly 30 fewer decisive wins. Nothing measured yet
 carries both, which is what the combination ladder is for.
+
+## Cold and warm, on the path a caller actually takes: 1.20x and 1.65x above MKL
+
+The question was whether scorch beats MKL cold and warm. Everything before this measured
+the harness's path, not a caller's, and the two differ: asking the probe for a `time_dict`
+and handing it an `STensor` B both disable the per-tensor plan cache that
+`matmul(A, B)` gets for free. `cold_probe.py`'s `plan` arm calls it the way a caller does.
+It has no kernel timer by construction — the whole point is that nothing extra is asked
+of it. 372 cells, the general corpus, caches flushed with 256 MB between cold readings,
+back-stealing compiled in. Every number is MKL's time over ours.
+
+| | k=1 | k=8 | k=64 | all |
+|---|---|---|---|---|
+| **cold, caller path (float32)** | 1.0539 | 1.2058 | 1.3658 | **1.2018** |
+| cold, harness path | 0.7570 | 0.8817 | 1.0745 | 0.8951 |
+| **warm, caller path (float32)** | 1.1954 | 1.6100 | 2.3217 | **1.6471** |
+| warm, harness path | 0.8530 | 1.1789 | 1.8594 | 1.2320 |
+| **cold, caller path (float64)** | 1.0857 | 1.2464 | 1.4644 | **1.2560** |
+| **warm, caller path (float64)** | 1.1681 | 1.7799 | 2.2526 | **1.6731** |
+
+Cells below MKL, whole call: cold 81 of 372 (float32) and 53 (float64); warm 37 and 31.
+On the harness path those counts are 245 and 168.
+
+The non-kernel cost is where the two paths separate. Median over all cells, float32:
+88.0 µs cold and 7.1 µs warm on the harness path, **42.4 µs cold and −0.4 µs warm** on the
+caller's. A warm caller pays nothing measurable for dispatch — the whole call is the
+kernel — and the cold penalty halves.
+
+**Where the remaining losses are.** Warm, they are one shape family: 24 of the 37 sit at
+degree ≥ 64 with ≤ 1024 rows, and the worst are 256-row pruned-ResNet layers at degree
+691–1152 (0.638 and 0.647 at k=1), then `lp_osa_14`, `connectus`, `nw14`, `kl02`. By
+output width, k=64 loses 1 cell of 124 and k=1 loses 25. Cold, they are the short calls:
+the band where MKL itself takes under 10 µs reads 0.9885 with 63.8% of cells below parity,
+while the 100 µs band reads 1.2396 with 14.1% — cold, a fixed cost of tens of microseconds
+is the whole measurement on a 10 µs kernel.
+
+## The row ceiling was rejected by the environment cost, and on padded held-out data it is a win
+
+The nonzero-expressed row ceiling — where a product's width was limited by the row count,
+state the requirement in nonzeros instead — was recorded as a null: 1.2579 against
+back-stealing's 1.2670. That comparison charged the arm about a percent for naming two
+extra variables (`## Setting an environment variable costs about a percent`). Re-measured
+with `--pad-env`, so every arm sets the same number of names, on the three corpora the
+thresholds were *not* read off:
+
+| corpus | region | n | floor | the rule (`p3ng`) | harmed | below MKL |
+|---|---|---|---|---|---|---|
+| nk2 | in gate | 10 | 1.1129 | 1.2865 (f32) / 1.3973 (f64) | 0.0% / 0.0% | 8→4 / 7→2 |
+| fewrow | in gate | 15 | 0.9214 / 0.9629 | 1.1763 / 1.2071 | 6.7% / 6.7% | 6→3 / 8→4 |
+| final | in gate | 35 | 1.0269 / 1.0575 | 1.0900 / 1.2124 (z=3.12) | 5.7% / 0.0% | 14→10 / 15→4 |
+| all three | outside | 575+240+1770 | ~0.998 | 0.9966–1.0019 | ≤2.1% | unchanged |
+
+Inert outside its gate on 2585 cells, positive inside on all three corpora in both dtypes,
+and the cells below MKL inside the gate fall by more than half. The pool-capped variant
+(`p3ngc`) reads the same on x86 (1.2239 / 1.0781 / 1.2009 in-gate, inert outside), so if it
+is what ARM needs, taking it costs x86 nothing.
+
+The ungated form is a different matter and stays rejected: `p3nu` costs 0.7% on 1770
+outside-gate cells with z = −4.71 (f32) and −4.98 (f64). Both conditions are load-bearing.
+
+**What is still open is the row condition, and 128 rows is not it.** The rule exists
+because the row proxy, not the arithmetic, held the width down — and that is a comparison
+against the available width, `rows/16 < pool`: rows < 384 on redwood's 24-thread pool and
+rows < 96 on the M5's 6-thread pool, where the constant says 128 on both hosts. It matters
+here: the largest group of cells still below MKL on the caller path is 256-row
+pruned-ResNet layers at degree 691–1152, which a 128-row threshold excludes and the
+row-bind statement includes, while the 64-row layers the ARM run regressed on are inside
+either form, so this cannot make that tail worse. `SCORCH_SPMM_CEIL_ROWBIND` states it that
+way; default off, both forms queued against each other on both hosts.
+
+## The ARM three-build measured a laptop, not a change, and its own controls said so
+
+The sliced ARM three-build exists because the unsliced one is unreadable. It ran each
+build over the whole 275-matrix corpus before starting the next, so the three readings of a
+cell were minutes to hours apart, and the run spanned fifteen hours. Its controls:
+
+| | float32 | float64 |
+|---|---|---|
+| ctrl / ship (two identical builds) | 0.9469, 50.9% of cells >10% apart | 0.9580, 37.1% |
+| reference column across processes (identical code) | spread 1.3163, worst 2.502x | 1.5604, worst 2.635x |
+| cand / ship (what was being asked) | 1.0018 | 1.2453 |
+
+The float64 reading would be a large win and it cannot be claimed: two builds of the same
+source disagree by more than 10% on 37% of cells, and code no flag touches moved 1.56x.
+The x86 run of the same comparison passes the same test (floor 0.9800 / 1.0186 with 4.8% /
+4.1% harmed, reference spread 1.079), so this is the host, not the method.
+
+`an_ship3.py` now refuses instead of reporting when a control is looser than the effect —
+reference spread above 1.10, or two identical builds more than 10% apart on more than 15%
+of cells. It fires on the run that motivated it and passes the x86 run. The fix to the
+measurement is locality rather than repetition: slice the corpus into 25-matrix pieces and
+rotate the three builds *within* each slice, so a cell's three readings are about four
+minutes apart, with both orders per slice so no build keeps the late position.

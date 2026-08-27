@@ -178,6 +178,18 @@
 #ifndef SCORCH_SPMM_CEIL_CAP_POOL
 #  define SCORCH_SPMM_CEIL_CAP_POOL 0
 #endif
+// Whether the row condition is stated as the mechanism instead of as a row count. The
+// rule exists to widen products whose width was limited by the ROW proxy rather than by
+// the arithmetic, and that is a comparison against the available width, not against 128:
+// rows/SCORCH_ROWS_PER_THREAD < pool. On redwood's 24-thread pool that is rows < 384 and
+// on the M5's 6-thread pool rows < 96, where the constant says 128 on both. It matters:
+// the largest group of cells still below MKL on the caller path is 256-row pruned-ResNet
+// layers at degree 691-1152, which a 128-row threshold excludes and the row-bind
+// statement includes, while the 64-row layers the ARM run regressed on are inside either
+// form, so this cannot make that tail worse. Off until measured on both hosts.
+#ifndef SCORCH_SPMM_CEIL_ROWBIND
+#  define SCORCH_SPMM_CEIL_ROWBIND 0
+#endif
 // Output size, in multiples of the last-level cache, above which the SpMM's row
 // partition is turned off. See the measured table at the gate itself in spmm.h: the
 // partition's gain decays monotonically with output size and goes negative past a
@@ -450,6 +462,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   long ceil_maxrows = SCORCH_SPMM_CEIL_MAXROWS;
   long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
   bool ceil_cap_pool = SCORCH_SPMM_CEIL_CAP_POOL != 0;
+  bool ceil_rowbind = SCORCH_SPMM_CEIL_ROWBIND != 0;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MAXROWS");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_maxrows = v; } }
@@ -457,10 +470,23 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_mindeg = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_CAP_POOL");
     if (e && *e) ceil_cap_pool = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_ROWBIND");
+    if (e && *e) ceil_rowbind = std::atol(e) != 0; }
 #endif
-  if (nnz_per_thread > 0 && nnz > 0 &&
-      (ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
-      (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows)) {
+  // The row condition, in whichever of its two forms is selected: a row count, or the
+  // statement that count stands for -- the row proxy is below the width available, so
+  // the row axis and not the arithmetic is what is holding the count down.
+  bool ceil_rows_ok = false;
+  if (nnz_per_thread > 0 && nnz > 0) {
+    if (ceil_rowbind) {
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_num_procs();
+      ceil_rows_ok = (rows / SCORCH_ROWS_PER_THREAD) < pool;
+    } else {
+      ceil_rows_ok = (ceil_maxrows <= 0 || rows <= ceil_maxrows);
+    }
+  }
+  if (ceil_rows_ok && (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows)) {
     long by_nnz = nnz / nnz_per_thread;
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
     // ... and optionally at the pool the CALLER manages rather than at the machine.
