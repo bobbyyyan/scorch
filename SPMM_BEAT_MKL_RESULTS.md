@@ -3569,3 +3569,35 @@ It also reframes the cold result. Cold, non-kernel cost was 88 µs against 7.5 �
 the plan path removes as much of the cold constant as it removes of the warm one, the cold
 whole-call number moves a long way from 0.866x. That is the measurement the rerun exists
 to make, and it is the last thing standing between the two halves of the target.
+
+## Stating the target as a distribution instead of a count
+
+"How many cells are below MKL" turns out to be a bad summary, and the reason is worth
+recording. Two harnesses measured the *same* 372 cells and reported 52 and 110 cells below
+MKL. They agree: our kernel reads 7.8% slower in the cold probe than in the corpus grid,
+because the cold probe's warm batch follows a 256 MB flush and gets one warm-up call,
+where the corpus grid settles and then runs a full batch. MKL only slows 1.7% under the
+same treatment, which is itself the residency effect back-stealing exists to fix. An 8%
+shift moved 58 cells across the line, which means the line is where the mass is, and a
+count near it is mostly reporting its own sensitivity.
+
+The distribution says it properly. 2172 cells, caller-facing basis:
+
+| dtype | arm | p5 | p25 | median | p75 | p95 | below 1.0 | below 0.9 |
+|---|---|---|---|---|---|---|---|---|
+| f32 | ships today | 0.61 | 1.16 | 2.06 | 2.93 | 4.19 | 22.0% | 19.4% |
+| f32 | **back-stealing** | **1.00** | 1.42 | 2.62 | 3.52 | 4.76 | **4.8%** | **1.6%** |
+| f64 | ships today | 0.65 | 1.22 | 2.24 | 3.08 | 4.40 | 20.2% | 17.5% |
+| f64 | **back-stealing** | **1.05** | 1.46 | 2.68 | 3.61 | 4.81 | **3.6%** | **1.0%** |
+
+**The fifth percentile moves from 0.61 to 1.00 on float32 and from 0.65 to 1.05 on
+float64.** Cells more than 10% behind MKL go from 19.4% to 1.6% and from 17.5% to 1.0%.
+Most of what remains "below MKL" is within 10% of parity — 11.3% of float32 cells sit in
+that band — so it is a tie, not a loss, and it is the band an 8% measurement shift moves
+wholesale.
+
+Cold, on the same basis, is our *strongest* regime rather than our weakest: back-stealing
+reads 1.714x with 13 of 372 cells below MKL on float32 and 1.685x with 10 of 372 on
+float64, against warm's 1.429x/110 and 1.507x/72. That is the expected direction once
+stated plainly — MKL's advantage is keeping 93% of A in the cores' L2 between calls, and a
+flush takes that away from MKL too.
