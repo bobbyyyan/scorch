@@ -3381,3 +3381,49 @@ rule stays out of the default, and the open question narrows to a sharper one th
 thread sweep can answer: on the specific few-row matrices, does more width actually help,
 and is the region it helps separable by a runtime condition that provably cannot fire on
 the shapes the ARM run showed it harms.
+
+## Where the row ceiling actually pays, and the analysis error that nearly hid it
+
+Two corrections to the section above, one of method and one of substance.
+
+**The method error, because it is the interesting one.** Decomposing the ceiling's
+effect, I divided `p3_kms` by `aa_kms` and called the result a same-code noise floor. It
+read 0.887 inside the high-degree band and 0.681 over the widest row band, which looked
+like an alarming positional bias on a harness that randomises arm order every repetition
+and reports min-of-reps. It is not a bias. `aa` duplicates `ARMS[0]`, and for this grid
+`ARMS[0]` is **`p0`** — the baseline — so `p3/aa` is the partition's own speedup wearing
+the label of a floor. The shared analyzer had been hardened against exactly this after it
+reported a 1.4189 floor once; the ad-hoc script I wrote alongside it had not. The floor is
+`p0/aa`, and it is 0.985–1.014 inside every band examined below.
+
+**The substance.** Aggregated over 2172 cells the ceiling is a null, but that null is a
+sum of a real gain and a real loss which the aggregate hides. Scored against `p0/aa`
+inside each region, with a z on the difference of the two means:
+
+| region | n | p3n/p3 (f32) | z | p3n/p3 (f64) | z |
+|---|---|---|---|---|---|
+| rows ≤ 128 and mean degree ≥ 192 | 42 | **1.1109** | 3.38 | **1.1542** | 3.18 |
+| rows ≤ 128 and mean degree < 256 | 276 | 0.9837 | −2.63 | 1.0071 | 1.85 |
+| rows ≤ 128, any degree | 318 | 0.9996 | 0.09 | 1.0254 | 3.35 |
+
+The third row is the first two cancelling. Below MKL inside the gated region goes 24 → 14
+on float64 and is unchanged at 26 on float32, whose cells there are too far behind (kl02
+sits at 0.52) for 11% to close.
+
+Both conditions are necessary and neither is a tuned constant. The complement is
+*negative* on float32 with z = −2.63, so dropping the degree condition costs 1.6% on 276
+cells to buy 11% on 42. And the region is a plateau rather than an edge: rows ∈ {96, 128,
+192} crossed with degree ∈ {192, 256} all give 42–48 cells at 1.108–1.164 with z of
+3.2–3.9, while rows ≤ 256 admits the 256-row ResNet bottlenecks and the float32 harmed
+tail jumps from 4.8% to 12.2%.
+
+The mechanism is the one the rule was designed for, now localised: `rows / 16` caps the
+worker count, and it is the wrong cap exactly when it would leave most of the machine idle
+*and* each row still has thousands of nonzeros to chew. kl02 (71 rows, degree 2993) and
+nw14 (73 rows, degree 12396) are the shape; a 64-row ResNet layer at degree 288 with
+18432 nonzeros total is the shape that must not be caught, and the degree condition alone
+does not exclude it — its own measured gain is what keeps it in.
+
+So the ceiling ships gated, not unconditionally, and the gate is measured on one host and
+one corpus so far. Next: confirm on the M5, then on the large-A corpus, which is held out
+from the grid the thresholds were read off.
