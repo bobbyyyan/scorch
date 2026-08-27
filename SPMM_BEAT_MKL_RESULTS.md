@@ -3356,3 +3356,28 @@ worse still and quadruples the harmed tail.
 That closes the pair. The ceiling needed graded adoption to be safe, graded adoption
 costs more than the ceiling was ever going to return, and the ceiling returns nothing.
 Back-stealing alone remains the change.
+
+The float64 half of the same grid (2172 cells, A/A 0.9979 / 1.5% harmed):
+
+| arm | kernel speedup | >10% slower | vs MKL | below MKL |
+|---|---|---|---|---|
+| ships today (`p0`) | 1.0000 | — | 1.9127 | 439/2172 |
+| **back-stealing (`p3`)** | **1.2374** | **1.1%** | **2.3667** | **79/2172** |
+| + row ceiling | 1.2362 | 1.1% | 2.3645 | 67/2172 |
+| + graded adoption G=5000 | 1.1963 | 2.0% | 2.2881 | 188/2172 |
+| + graded adoption G=15000 | 1.1197 | 6.6% | 2.1416 | 292/2172 |
+
+Grading loses on both dtypes and for the same reason — 1.1635 at k=1 and 1.2530 at k=2
+against back-stealing's 1.3161 and 1.3077.
+
+The ceiling deserves a more careful word than "null". Its geomean is unchanged on both
+dtypes (0.1% and 0.7% down, against a 0.2% floor), but the count below MKL moves in
+*opposite directions*: 104 → 107 on float32 and 79 → **67** on float64. Twelve float64
+cells recovered for free is not nothing, and it says the mechanism does reach some of the
+few-row high-degree residual rather than missing it entirely. What it does not do is
+reach it *reliably enough to ship as an unconditional policy change*, and the arm that
+was supposed to make it safe costs an order of magnitude more than it returns. So the
+rule stays out of the default, and the open question narrows to a sharper one the forced
+thread sweep can answer: on the specific few-row matrices, does more width actually help,
+and is the region it helps separable by a runtime condition that provably cannot fire on
+the shapes the ARM run showed it harms.
