@@ -3320,3 +3320,39 @@ the forced-thread-count sweep over those 52 matrices asks and nothing else can.
   `addr2line` pinning a single core added a flat ~8.6 ms to every arm of every cell,
   because with 32 OpenMP threads on 32 CPUs one preempted worker stalls the whole join
   barrier for a scheduler timeslice. It looked exactly like a uniform regression.
+
+## The corrected row ceiling is a null, and grading the adoption is a loss
+
+The ceiling rule ("let nonzeros, not just rows, express how many workers a matrix can
+feed") was re-measured after the one-line fix that had leaked the widened row axis into
+the composition adoption. The earlier ARM rejection had therefore measured a different
+rule. This is the corrected one, on redwood, 2172 float32 cells (ks 1, 2, 8, 64, 256,
+512), interleaved arms, `p0` duplicated as the same-code control:
+
+| arm | kernel speedup | >10% slower | vs MKL | below MKL |
+|---|---|---|---|---|
+| ships today (`p0`) | 1.0000 | — | 1.8095 | 477/2172 |
+| **back-stealing (`p3`)** | **1.2670** | **1.2%** | **2.2927** | **104/2172** |
+| + row ceiling | 1.2579 | 1.2% | 2.2762 | 107/2172 |
+| + graded adoption G=5000 | 1.2424 | 1.8% | 2.2481 | 247/2172 |
+| + graded adoption G=15000 | 1.1817 | 4.9% | 2.1384 | 303/2172 |
+| + ceiling + G=5000 | 1.2344 | 1.7% | 2.2336 | 250/2172 |
+| + ceiling + G=15000 | 1.1752 | 5.3% | 2.1266 | 293/2172 |
+
+A/A control: 0.9979 geomean, 1.7% harmed.
+
+**The ceiling is a null.** 1.2579 against 1.2670 is 0.7% down on a floor of 0.9979, and
+it costs three cells (104 → 107) rather than recovering any. It does not reach the
+residual it was designed for and it does not harm anything either; there is nothing to
+ship.
+
+**Grading the adoption is a loss, and the loss is exactly where we need the wins.** By k,
+G=5000 reads 1.1706 at k=1 and 1.2268 at k=2 against back-stealing's 1.2848 and 1.2901,
+while k=8 and above are unchanged (1.3524 vs 1.3422). So the grain that was bracketed to
+rescue 64-row ResNet layers on ARM pays for them by throttling narrow-k SpMM on x86 —
+the regime the whole branch exists to win. G=15000, the other end of the bracket, is
+worse still and quadruples the harmed tail.
+
+That closes the pair. The ceiling needed graded adoption to be safe, graded adoption
+costs more than the ceiling was ever going to return, and the ceiling returns nothing.
+Back-stealing alone remains the change.
