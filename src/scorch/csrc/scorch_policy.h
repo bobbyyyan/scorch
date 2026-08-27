@@ -172,6 +172,12 @@
 #ifndef SCORCH_SPMM_CEIL_MINDEG
 #  define SCORCH_SPMM_CEIL_MINDEG 192L
 #endif
+// Whether the widened count is capped at the caller's thread pool instead of at
+// omp_get_num_procs(). Candidate fix for the measured x86/ARM disagreement; off until
+// both hosts have run it.
+#ifndef SCORCH_SPMM_CEIL_CAP_POOL
+#  define SCORCH_SPMM_CEIL_CAP_POOL 0
+#endif
 // Output size, in multiples of the last-level cache, above which the SpMM's row
 // partition is turned off. See the measured table at the gate itself in spmm.h: the
 // partition's gain decays monotonically with output size and goes negative past a
@@ -399,17 +405,30 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // held-out large-A corpus agree.
   long ceil_maxrows = SCORCH_SPMM_CEIL_MAXROWS;
   long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
+  bool ceil_cap_pool = SCORCH_SPMM_CEIL_CAP_POOL != 0;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MAXROWS");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_maxrows = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINDEG");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_mindeg = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_CAP_POOL");
+    if (e && *e) ceil_cap_pool = std::atol(e) != 0; }
 #endif
   if (nnz_per_thread > 0 && nnz > 0 &&
       (ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
       (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows)) {
     long by_nnz = nnz / nnz_per_thread;
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
+    // ... and optionally at the pool the CALLER manages rather than at the machine.
+    // Inside the gate above the rule reads 1.1109/1.1542 on redwood and 0.934/0.948 on
+    // the M5, and the candidate mechanism for that disagreement is here: the widened
+    // count is capped by omp_get_num_procs(), which is 32 against torch's 24 on redwood
+    // but 18 against torch's 6 on the M5. So the same rule widens kl02 from 4 workers to
+    // 22 inside a 24-thread pool on one host and to 18 -- three times the pool, pulling
+    // in twelve efficiency cores -- on the other. Capping at the override makes the ARM
+    // widening 4 -> 6 and leaves the x86 widening untouched, which is the claim to test.
+    if (ceil_cap_pool && nthreads_override > 0 && by_nnz > (long)nthreads_override)
+      by_nnz = (long)nthreads_override;
     if (by_nnz > rows_axis) rows_axis = by_nnz;
   }
   // A/B hook: the grain the BASE path divides the work by. 150000 nonzero-units is
