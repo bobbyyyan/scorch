@@ -2000,6 +2000,93 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
 
 
 // ---------------------------------------------------------------------------
+// NOT guarded on SCORCH_TUNE_HOOKS. The dispatch site for this kernel is unguarded so
+// that it can ship, and a definition visible only under the hooks left a hookless x86
+// build unable to compile at all -- which is what `pip install -e .` does. ARM stayed
+// green because __AVX2__ removes both sides together, so only an x86 hookless build
+// ever saw it. The two guards have to match whatever the arm decides.
+//
+// Available on NEON as well as AVX2, and in its own preprocessor region for that reason:
+// the body is ordinary C++ over a compile-time K with no intrinsics, so there was never an
+// x86 dependency here -- the guard had been copied from the block above, which is genuinely
+// AVX2-only because scorch_simd wraps __m256. What ARM gets is smaller but the same in
+// kind: scorch_spmm_row_neon_regtile works in 4-lane vectors, so at k=2 it masks 2 lanes
+// of 4 where the AVX2 register-block kernel masks 6 of 8, and both pay an imul per nonzero
+// for the runtime B1_size stride that a compile-time K turns into a shift.
+#if (defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON)
+// EXACT-WIDTH narrow-k row kernel, for the widths where the register-block kernel's
+// lane mask covers the WHOLE output row.
+//
+// regblock holds the row in NVEC full vector registers and masks the last partial
+// one. When NVEC is 1 and k is not the lane count, that mask is on the only vector,
+// so every load in the row and the store go through it -- at k=2 float32, two useful
+// lanes in eight, and vmaskmovps is two uops on the load side and cannot fold into
+// the FMA as a memory operand. (The FULL_LAST specialisation above removes the mask
+// only when k IS a multiple of the lane count.) Separately, B1_size is a runtime
+// value there, so every nonzero costs an imul to find its B row: three per two
+// nonzeros counting the prefetch.
+//
+// Both disappear once k is a template parameter. Rather than hand-write a load for
+// each width, the accumulators are a compile-time-sized scalar array and the compiler
+// picks the decomposition -- which it does better than by hand, because a leftover
+// element folds into a scalar FMA as a memory operand and costs no instruction at
+// all. Cross-compiled and disassembled for every instantiation: ZERO masked
+// operations and ZERO multiplies, and no width reads a byte past its own row. k=3
+// float32 comes out as
+//
+//   movslq (%rdi,%rax,4), %r8            ; the column index
+//   leaq   (%r8,%r8,2), %r14             ; times three, no imul
+//   vbroadcastss (%rsi,%rax,4), %xmm2    ; the A value, load and splat in one
+//   vfmadd231ss 0x8(%rdx,%r14,4), %xmm2, %xmm9    ; element 2, folded
+//   vmovsd (%rdx,%r14,4), %xmm11         ; elements 0-1, exactly 8 bytes
+//   vfmadd231ps %xmm11, %xmm2, %xmm10
+//
+// six instructions per nonzero for twelve bytes read exactly, against regblock's
+// ~10.5 for a masked thirty-two.
+//
+// The range is exactly the widths where regblock masks the entire row: float k=1..7
+// and double k=1..3. At float k=8 and double k=4 the last vector is full and regblock
+// is already mask-free, and the grid confirms this kernel is neutral there. Float k=1
+// is instantiated but not routed by default -- the nonzero-axis gather kernel owns it
+// and measures better -- so the two stay separately attributable.
+template <typename T, int K, int UNROLL>
+static inline void scorch_spmm_row_narrow_exact(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, T* SCORCH_RESTRICT C_row,
+    int pA_begin, int pA_end) {
+  T acc[UNROLL][K];
+  #pragma unroll
+  for (int u = 0; u < UNROLL; u++) {
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[u][j] = T(0);
+  }
+  int pA = pA_begin;
+  for (; pA + UNROLL <= pA_end; pA += UNROLL) {
+    #pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      // K is a compile-time constant, so this is a shift or an lea, never a multiply.
+      const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA + u] * (size_t)K;
+      const T a = A_val[pA + u];
+      #pragma unroll
+      for (int j = 0; j < K; j++) acc[u][j] += a * Bp[j];
+    }
+  }
+  #pragma unroll
+  for (int u = 1; u < UNROLL; u++) {
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[0][j] += acc[u][j];
+  }
+  for (; pA < pA_end; pA++) {
+    const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)K;
+    const T a = A_val[pA];
+    #pragma unroll
+    for (int j = 0; j < K; j++) acc[0][j] += a * Bp[j];
+  }
+  #pragma unroll
+  for (int j = 0; j < K; j++) C_row[j] = acc[0][j];
+}
+#endif  // (AVX2 && FMA) || ARM_NEON
+
 #if defined(__AVX2__) && defined(__FMA__)
 
 // One SIMD vocabulary for both value types, so every register kernel below is
@@ -2286,84 +2373,8 @@ static inline void scorch_spmm_row_gather_f32_ms(
   }
 }
 #endif  // AVX2 && FMA
-// NOT guarded on SCORCH_TUNE_HOOKS. The dispatch site for this kernel is unguarded so
-// that it can ship, and a definition visible only under the hooks left a hookless x86
-// build unable to compile at all -- which is what `pip install -e .` does. ARM stayed
-// green because __AVX2__ removes both sides together, so only an x86 hookless build
-// ever saw it. The two guards have to match whatever the arm decides.
-#if defined(__AVX2__) && defined(__FMA__)
-// EXACT-WIDTH narrow-k row kernel, for the widths where the register-block kernel's
-// lane mask covers the WHOLE output row.
-//
-// regblock holds the row in NVEC full vector registers and masks the last partial
-// one. When NVEC is 1 and k is not the lane count, that mask is on the only vector,
-// so every load in the row and the store go through it -- at k=2 float32, two useful
-// lanes in eight, and vmaskmovps is two uops on the load side and cannot fold into
-// the FMA as a memory operand. (The FULL_LAST specialisation above removes the mask
-// only when k IS a multiple of the lane count.) Separately, B1_size is a runtime
-// value there, so every nonzero costs an imul to find its B row: three per two
-// nonzeros counting the prefetch.
-//
-// Both disappear once k is a template parameter. Rather than hand-write a load for
-// each width, the accumulators are a compile-time-sized scalar array and the compiler
-// picks the decomposition -- which it does better than by hand, because a leftover
-// element folds into a scalar FMA as a memory operand and costs no instruction at
-// all. Cross-compiled and disassembled for every instantiation: ZERO masked
-// operations and ZERO multiplies, and no width reads a byte past its own row. k=3
-// float32 comes out as
-//
-//   movslq (%rdi,%rax,4), %r8            ; the column index
-//   leaq   (%r8,%r8,2), %r14             ; times three, no imul
-//   vbroadcastss (%rsi,%rax,4), %xmm2    ; the A value, load and splat in one
-//   vfmadd231ss 0x8(%rdx,%r14,4), %xmm2, %xmm9    ; element 2, folded
-//   vmovsd (%rdx,%r14,4), %xmm11         ; elements 0-1, exactly 8 bytes
-//   vfmadd231ps %xmm11, %xmm2, %xmm10
-//
-// six instructions per nonzero for twelve bytes read exactly, against regblock's
-// ~10.5 for a masked thirty-two.
-//
-// The range is exactly the widths where regblock masks the entire row: float k=1..7
-// and double k=1..3. At float k=8 and double k=4 the last vector is full and regblock
-// is already mask-free, and the grid confirms this kernel is neutral there. Float k=1
-// is instantiated but not routed by default -- the nonzero-axis gather kernel owns it
-// and measures better -- so the two stay separately attributable.
-template <typename T, int K, int UNROLL>
-static inline void scorch_spmm_row_narrow_exact(
-    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
-    const T* SCORCH_RESTRICT B_val, T* SCORCH_RESTRICT C_row,
-    int pA_begin, int pA_end) {
-  T acc[UNROLL][K];
-  #pragma unroll
-  for (int u = 0; u < UNROLL; u++) {
-    #pragma unroll
-    for (int j = 0; j < K; j++) acc[u][j] = T(0);
-  }
-  int pA = pA_begin;
-  for (; pA + UNROLL <= pA_end; pA += UNROLL) {
-    #pragma unroll
-    for (int u = 0; u < UNROLL; u++) {
-      // K is a compile-time constant, so this is a shift or an lea, never a multiply.
-      const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA + u] * (size_t)K;
-      const T a = A_val[pA + u];
-      #pragma unroll
-      for (int j = 0; j < K; j++) acc[u][j] += a * Bp[j];
-    }
-  }
-  #pragma unroll
-  for (int u = 1; u < UNROLL; u++) {
-    #pragma unroll
-    for (int j = 0; j < K; j++) acc[0][j] += acc[u][j];
-  }
-  for (; pA < pA_end; pA++) {
-    const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)K;
-    const T a = A_val[pA];
-    #pragma unroll
-    for (int j = 0; j < K; j++) acc[0][j] += a * Bp[j];
-  }
-  #pragma unroll
-  for (int j = 0; j < K; j++) C_row[j] = acc[0][j];
-}
 
+#if defined(__AVX2__) && defined(__FMA__)
 // Narrow-k variant that runs UNROLL independent nonzero streams instead of 2.
 //
 // Why: at k <= lanes the row needs a single vector accumulator (NVEC == 1), so the
@@ -3719,25 +3730,12 @@ torch::Tensor spmm_csr_v2_core(
   const bool neon_no_dual = _nodual && *_nodual && std::atol(_nodual) != 0;
   (void)neon_no_dual;
 #endif
-#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
-  // A/B hook: refresh the regtile partial-tile toggle once per op (read by
-  // scorch_spmm_row_regtile). SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial.
-  { const char* e = std::getenv("SCORCH_REGTILE_BASE");
-    g_scorch_regtile_base = (e && *e && std::atol(e) != 0) ? 1 : 0; }
-  // A/B hook: force the masked load/store path even where k is a multiple of 8,
-  // which is the only way to time the masked and unmasked instantiations against
-  // each other in ONE process against ONE binary. Compiled out of the shipped .so,
-  // where full_last is const and the branch on it folds away.
-  { const char* e = std::getenv("SCORCH_SPMM_MASKED");
-    if (e && *e && std::atol(e) != 0) full_last = false; }
-  // A/B hook: number of independent nonzero streams the narrow-k register kernel
-  // runs. 0 (unset) keeps the shipped 2-stream form. Loop-invariant, so the row
-  // loop's dispatch on it hoists.
-  int narrowk_unroll = 0;
-  { const char* e = std::getenv("SCORCH_NARROWK_UNROLL");
-    if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
-  // A/B hook: the exact-width narrow-k kernel's unroll depth. 0 (unset) keeps the
-  // register-block kernel, which at these widths masks every load and the store.
+#if (defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON)
+#ifdef SCORCH_TUNE_HOOKS
+  // A/B hooks for the exact-width narrow-k kernel. Guarded on the architectures that HAVE
+  // the kernel rather than on AVX2 alone: its body is ordinary C++ over a compile-time K,
+  // so NEON compiles it too, and on ARM it replaces a tile kernel that masks 2 of 4 lanes
+  // at k=2 where AVX2's masks 2 of 8.
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT");
     if (e && *e) { long v = std::atol(e);
       if (v == 0 || v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
@@ -3749,20 +3747,7 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_HI");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 7) narrowk_exact_hi = (int)v; } }
-  // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
-  // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
-  int narrowk_pf = 0;
-  { const char* e = std::getenv("SCORCH_NARROWK_PF");
-    if (e && *e) { long v = std::atol(e);
-      if (v == 4 || v == 8 || v == 16 || v == 32) narrowk_pf = (int)v; } }
 #endif
-
-#if defined(__AVX2__) && defined(__FMA__)
-  // Hoisted out of the row loop. B1_size cannot change between rows, so which width the
-  // exact kernel serves is a per-CALL question; asking it per row cost 1.2-1.7% on every
-  // width the kernel does NOT serve, which is what the grid's control columns measured
-  // (0.983-0.987 at float32 k=8 and 16, 0.988-0.991 at float64 k>=4). Zero means the row
-  // loop skips the whole width family after one well-predicted test.
   // The widths the kernel serves, measured per width on 362 cells at each k and corrected
   // for the environment cost the ladder priced. It is a 6-8% win at k=2 and k=3 on BOTH
   // dtypes -- 1.0787 and 1.0625 on float32, 1.0785 and 1.0697 on float64 -- and a loss
@@ -3785,6 +3770,38 @@ torch::Tensor spmm_csr_v2_core(
     const int exact_lo_ = narrowk_exact_k1 ? 1 : 2;
     if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
   }
+#endif
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+  // A/B hook: refresh the regtile partial-tile toggle once per op (read by
+  // scorch_spmm_row_regtile). SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial.
+  { const char* e = std::getenv("SCORCH_REGTILE_BASE");
+    g_scorch_regtile_base = (e && *e && std::atol(e) != 0) ? 1 : 0; }
+  // A/B hook: force the masked load/store path even where k is a multiple of 8,
+  // which is the only way to time the masked and unmasked instantiations against
+  // each other in ONE process against ONE binary. Compiled out of the shipped .so,
+  // where full_last is const and the branch on it folds away.
+  { const char* e = std::getenv("SCORCH_SPMM_MASKED");
+    if (e && *e && std::atol(e) != 0) full_last = false; }
+  // A/B hook: number of independent nonzero streams the narrow-k register kernel
+  // runs. 0 (unset) keeps the shipped 2-stream form. Loop-invariant, so the row
+  // loop's dispatch on it hoists.
+  int narrowk_unroll = 0;
+  { const char* e = std::getenv("SCORCH_NARROWK_UNROLL");
+    if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
+  // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
+  // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
+  int narrowk_pf = 0;
+  { const char* e = std::getenv("SCORCH_NARROWK_PF");
+    if (e && *e) { long v = std::atol(e);
+      if (v == 4 || v == 8 || v == 16 || v == 32) narrowk_pf = (int)v; } }
+#endif
+
+#if defined(__AVX2__) && defined(__FMA__)
+  // Hoisted out of the row loop. B1_size cannot change between rows, so which width the
+  // exact kernel serves is a per-CALL question; asking it per row cost 1.2-1.7% on every
+  // width the kernel does NOT serve, which is what the grid's control columns measured
+  // (0.983-0.987 at float32 k=8 and 16, 0.988-0.991 at float64 k>=4). Zero means the row
+  // loop skips the whole width family after one well-predicted test.
   // Route k=1 through the nonzero-axis gather kernel. See its definition for the
   // measured map across k: k=1 is where K gathers stay cheaper than eight masked
   // FMAs, and from k=2 up the gather gives back more than it gains.
@@ -4163,6 +4180,55 @@ torch::Tensor spmm_csr_v2_core(
 #endif
 
 #if defined(__ARM_NEON) && !defined(__AVX2__)
+        // The exact-width family, ahead of the strip kernel for the same reason it is
+        // ahead of the AVX2 one: at k=2 and k=3 a compile-time K removes the lane mask
+        // and turns the stride multiply into a shift. The width bound, the unroll, the
+        // register budget and the row-length adaptation are the same knobs as on x86, so
+        // an ARM reading of them is comparable to the x86 one rather than a separate
+        // story. Whether it pays here is a question for the ARM grid; the compiled-in
+        // default leaves the family off on both architectures.
+        if (exact_width) {
+          #define SCORCH_RNE(KK, UN) \
+            scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
+                A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+          #define SCORCH_RNE_U(KK) \
+            do { \
+              int un_ = narrowk_exact; \
+              if (narrowk_exact_accum > 0) { \
+                while (un_ > 1 && un_ * (KK) > narrowk_exact_accum) un_ >>= 1; \
+              } \
+              if (narrowk_exact_short) { \
+                const int len_ = pA_end - pA_begin; \
+                while (un_ > 1 && len_ < un_) un_ >>= 1; \
+              } \
+              switch (un_) { \
+                case 1: SCORCH_RNE(KK, 1); break; \
+                case 2: SCORCH_RNE(KK, 2); break; \
+                case 4: SCORCH_RNE(KK, 4); break; \
+                default: SCORCH_RNE(KK, 8); break; \
+              } \
+            } while (0)
+          if constexpr (std::is_same<scalar_t, float>::value) {
+            switch (exact_width) {
+              case 1: SCORCH_RNE_U(1); break;
+              case 2: SCORCH_RNE_U(2); break;
+              case 3: SCORCH_RNE_U(3); break;
+              case 4: SCORCH_RNE_U(4); break;
+              case 5: SCORCH_RNE_U(5); break;
+              case 6: SCORCH_RNE_U(6); break;
+              default: SCORCH_RNE_U(7); break;
+            }
+          } else {
+            switch (exact_width) {
+              case 1: SCORCH_RNE_U(1); break;
+              case 2: SCORCH_RNE_U(2); break;
+              default: SCORCH_RNE_U(3); break;
+            }
+          }
+          #undef SCORCH_RNE_U
+          #undef SCORCH_RNE
+          continue;
+        }
         // The NEON strip kernel owns every row here, exactly as the AVX2 block above
         // does: accumulators stay in registers for the whole pass over the row, so
         // the workspace round-trip per nonzero is gone. The loop below survives only
