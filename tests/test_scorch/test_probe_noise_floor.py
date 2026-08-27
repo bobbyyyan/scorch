@@ -25,6 +25,7 @@ and measuring would make them machine-dependent and flaky in exactly the regime
 they exist to pin down.
 """
 
+import os
 import pytest
 import torch
 
@@ -429,3 +430,71 @@ def test_both_cache_queries_honour_the_same_override():
         text=True,
     ).split()
     assert out == ["1048576", "1048576"]
+
+
+# ---------------------------------------------------------------------------
+# the SpMM thread policy's new argument, and what the shipped build must ignore
+# ---------------------------------------------------------------------------
+def test_passing_nnz_to_the_thread_policy_changes_nothing_by_default():
+    """The rule gained an `nnz` argument; at the shipped constants it must be inert.
+
+    `scorch_spmm_nthreads` takes the nonzero count so that the row-axis ceiling can be
+    expressed in nonzeros per worker instead of rows per worker -- a 71-row matrix
+    holding 212536 nonzeros gets four workers from `rows / 16` on a 24-core host, and
+    the raise that was meant to cover that is bounded by `nnz * k`, which at k=2 is one
+    grain. But the ceiling is off by default (`SCORCH_SPMM_NNZ_PER_THREAD` is 0), so
+    passing the count must not move a single answer.
+
+    Worth pinning rather than reading off: the four-argument form is what every
+    existing caller and harness uses, and a silent change there would reattribute every
+    thread count in the ledger to a rule that had not shipped.
+    """
+    scorch_ops = pytest.importorskip("scorch_ops")
+    shapes = [
+        (71, 212536), (73, 904910), (64, 18432), (256, 294912),
+        (2708, 13264), (19717, 108365), (8081, 6323), (232965, 11461589),
+        (1, 1), (0, 0),
+    ]
+    for rows, nnz in shapes:
+        for k in (1, 2, 3, 7, 8, 16, 64, 512):
+            work = nnz * max(k, 16)
+            work_true = nnz * k
+            for override in (-1, 0, 6, 24):
+                short = scorch_ops.scorch_spmm_nthreads(work, rows, override, work_true)
+                full = scorch_ops.scorch_spmm_nthreads(
+                    work, rows, override, work_true, nnz
+                )
+                assert short == full, (
+                    "rows=%d nnz=%d k=%d override=%d: %d without nnz, %d with it"
+                    % (rows, nnz, k, override, short, full)
+                )
+
+
+def test_the_thread_policy_never_exceeds_the_machine_or_the_rows():
+    """Two bounds the rule must hold whatever the arguments say.
+
+    A count above `omp_get_num_procs()` oversubscribes the box; a count above `rows`
+    asks for workers that row-parallel decomposition cannot feed, and the partition
+    would hand those ranges zero rows. Both are cheap to state and neither was pinned,
+    which matters now that three separate paths (the base proxy, the raise, and the
+    composition adoption) can each be the one that sets the answer.
+    """
+    scorch_ops = pytest.importorskip("scorch_ops")
+    # The hardware bound the rule uses is omp_get_num_procs(), which is not bound to
+    # Python. os.cpu_count() is the same number on both hosts here (it counts logical
+    # processors), and using it as an UPPER bound is safe either way: if the two ever
+    # disagreed, the rule's own cap is the smaller of them.
+    procs = os.cpu_count()
+    for rows, nnz in [(1, 4096), (2, 1 << 20), (5, 1 << 22), (71, 212536),
+                      (256, 294912), (100000, 1 << 24)]:
+        for k in (1, 8, 64, 512):
+            n = scorch_ops.scorch_spmm_nthreads(
+                nnz * max(k, 16), rows, 64, nnz * k, nnz
+            )
+            assert n >= 1
+            assert n <= max(rows, 1), (
+                "rows=%d nnz=%d k=%d resolved %d workers for %d rows"
+                % (rows, nnz, k, n, rows)
+            )
+            if procs is not None:
+                assert n <= procs
