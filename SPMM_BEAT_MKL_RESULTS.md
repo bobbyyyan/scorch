@@ -3163,6 +3163,37 @@ verdict on the fix. Both hosts owe it a fresh grid; the arm that had already sta
 on the older binary was killed a minute in rather than spend an hour confirming a
 superseded rule.
 
+## Every thread-count change on this branch is arm-variant
+
+Three separate ways of changing how many workers the SpMM resolves were built and
+measured on both hosts. All three flip sign between the two.
+
+| change | ARM | x86 |
+|---|---|---|
+| price the adoption gate on real arithmetic | **1.070x / 1.065x**, tails under the floor | **0.996 / 0.968**, tails 9.6% / 13.5% |
+| grade the adopted count by real arithmetic (G=15000) | **+3.3%** over back-stealing, tail at the floor | **0.9122**, tail 18.7% against a 1.4% floor |
+| grade at G=5000 | +0.6% | 0.9831, tail 10.0% |
+| state the row ceiling in nonzeros (corrected) | (owed) | 0.9889, tail 1.5% -- inside the floor |
+
+The mechanism is not mysterious and it is the same one each time. On the 24-thread
+host the fallback when adoption is declined or capped is the policy count, which under
+one grain is **one**, so every cap is a cliff twenty-four workers deep; on the
+six-thread host the same cliff is six deep and lands inside the E-core noise. The
+cliff height *is* the host's thread count. Anything that narrows when the host team is
+adopted therefore has to be worth more than a 24x drop on the cells it catches, and on
+x86 nothing measured here is.
+
+So **no thread-count change ships**. Back-stealing does not touch the policy at all --
+it changes which rows a worker gets, not how many workers there are -- which is why it
+is the one change that reads the same sign on both hosts.
+
+The corrected row ceiling is the one arm still open, and it is open for a narrow
+reason: it is inside the noise floor on the general corpus (0.9889 against 0.9960 with
+the same harmed tail), because it can only change an answer on 32 of 2172 cells. Its
+decision rests entirely on whether those 32 -- `kl02` and its class, held to four
+workers on a 1.7 MB L3-resident matrix -- are actually faster with more, which is what
+the forced-thread-count sweep over those 52 matrices asks and nothing else can.
+
 ## Scope and gaps, stated plainly
 
 - **dtype.** Everything above is float32. float64 CSR × dense has its own section and
