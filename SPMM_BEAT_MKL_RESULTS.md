@@ -3117,11 +3117,11 @@ dispatch is unconditional and only the loop-invariant `switch (B1_size)` remains
 which hoists like the `nvec` switch beside it -- but that is an argument, not a
 measurement, and it is what the two-build comparison is for.
 
-### The nonzero-expressed ceiling is rejected
+### The nonzero-expressed ceiling failed, and the failure was one line of mine
 
 It failed alone on ARM (6.4% of cells more than 10% slower against a 2.6% floor), and
-the diagnosis was that the ungraded adoption was the route. Grading the adoption does
-not rescue it. ARM float32, each arm against back-stealing alone:
+grading the adoption did not rescue it. ARM float32, each arm against back-stealing
+alone:
 
 | arm | vs back-stealing | >10% slower |
 |---|---|---|
@@ -3133,16 +3133,35 @@ not rescue it. ARM float32, each arm against back-stealing alone:
 | + nonzero ceiling, G=15000 | 1.0111 | **6.4%** |
 | + nonzero ceiling, G=5000 | 0.9832 | **6.7%** |
 
-Two grains, both with a harmed tail two and a half times the floor. So the ceiling
-does not ship, and `kl02`-class shapes -- 71 rows holding 212536 nonzeros, held to
-four workers by `rows/16` -- keep their four workers until something else reaches
-them. The forced-thread-count sweep over those 52 matrices says whether more workers
-is even the right answer there; the ceiling was only one way of getting there.
+The diagnosis was that the route was the composition adoption, which has no work
+bound. That diagnosis was right, and the code was wrong in one line: the widened
+ceiling was shared with the adoption as well as with the base path. The base path
+pairs its ceiling with `min(work / grain)`, so widening it there cannot over-thread a
+small product -- the 64-row layer's `by_work` is 1 either way. The adoption has no such
+term, and it was the adoption handing those layers six workers.
 
-Graded adoption itself survives on ARM at G=15000 (+3.3% over back-stealing, harmed
-tail at the floor), where the binary gate is +4.7%. The binary gate is already
-rejected on x86, so the question graded adoption exists to answer is whether it keeps
-any of that on the host where the cliff is 24 workers deep.
+With `rows / SCORCH_ROWS_PER_THREAD` restored in the adoption, the resolved counts for
+a 24-thread host are:
+
+| shape | ships | + ceiling | + graded G=5000 | both |
+|---|---|---|---|---|
+| kl02 k=2 (71 rows, 212536 nnz) | 4 | **22** | 4 | **22** |
+| nw14 k=4 (73 rows, 904910 nnz) | 12 | **32** | 12 | **32** |
+| bibd_17_8 k=8 (136 rows) | 18 | **32** | 18 | **32** |
+| rn50 256-row k=1 | 16 | **31** | 16 | **31** |
+| rn50 64-row k=1 (the harmed shape) | 4 | 4 | 3 | 3 |
+| rn50 64-row k=64 (harmed) | 4 | 4 | 4 | 4 |
+| cora output k=7 | 24 | 24 | 18 | 18 |
+| cora hidden k=16 | 24 | 24 | 24 | 24 |
+| pubmed k=16 | 24 | 24 | 24 | 24 |
+| reddit k=64 | 32 | 32 | 32 | 32 |
+
+Every shape the ARM run harmed is now untouched by the ceiling, and every shape the
+residual needs still widens. So **the table above measured a different rule from the
+one that now exists**, and it is recorded as the reason for the fix rather than as a
+verdict on the fix. Both hosts owe it a fresh grid; the arm that had already started
+on the older binary was killed a minute in rather than spend an hour confirming a
+superseded rule.
 
 ## Scope and gaps, stated plainly
 
