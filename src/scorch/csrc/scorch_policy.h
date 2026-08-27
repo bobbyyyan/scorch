@@ -247,6 +247,13 @@
 #ifndef SCORCH_SPMM_PARTITION_MINGRAINS
 #  define SCORCH_SPMM_PARTITION_MINGRAINS 0L
 #endif
+// Whether the row partition snaps its range boundaries to multiples of the arithmetic
+// chunk. Without it every range ends in a partial chunk and there are nsplit of those where
+// the shared counter has one; with it a boundary can move by up to half a chunk, which
+// shifts nonzeros between workers on a skewed matrix. 0 leaves it out.
+#ifndef SCORCH_SPMM_SPLIT_ALIGN
+#  define SCORCH_SPMM_SPLIT_ALIGN 0
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it

@@ -3578,6 +3578,12 @@ torch::Tensor spmm_csr_v2_core(
         (long)A0_size * (long)C1_size * (long)sizeof(scalar_t) >= partition_maxout)
       partition_mode = 0;
   }
+  // Whether the home-range boundaries are snapped to multiples of the arithmetic chunk.
+  bool split_align = SCORCH_SPMM_SPLIT_ALIGN != 0;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_ALIGN");
+    if (e && *e) split_align = std::atol(e) != 0; }
+#endif
   int nsplit = nthreads > 0 ? nthreads : 1;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the number of ranges. More ranges than workers is safe -- the
@@ -3627,6 +3633,36 @@ torch::Tensor spmm_csr_v2_core(
         if ((long)A1_pos[mid] + (long)mid < target) lo = mid + 1; else hi = mid;
       }
       row_split[w] = lo;
+    }
+    // Optionally snap the boundaries to multiples of the arithmetic chunk.
+    //
+    // A range that is not a whole number of chunks ends in a partial one, and there are
+    // nsplit of those where the shared counter has exactly one. On the shape where the
+    // partition's regression is worst -- an rn50 bottleneck, 64 rows of degree 288 -- six
+    // workers get ranges of 10 or 11 rows at chunk 4, so every range ends in a 2 or 3 row
+    // claim: six ragged tails against the counter's one. Snapping removes that by
+    // construction rather than by declining to partition.
+    //
+    // It is not free: a boundary can move by up to half a chunk, which on a skewed matrix
+    // moves nonzeros between workers, and the split above is what balances them. So this is
+    // a hook with a default of off, and the two effects get measured against each other
+    // rather than argued.
+    // The condition is well-formedness, not tuning: snapping moves a boundary by up to
+    // half a chunk, so it only makes sense while every range is at least two chunks long.
+    // scorch_spmm_chunk already aims for several chunks per worker, so this holds wherever
+    // the partition is worth having, and where it does not hold there is nothing to snap.
+    if (split_align && chunk > 1 && (long)chunk * nsplit * 2 <= (long)A0_size) {
+      for (int w = 1; w < nsplit; ++w) {
+        const int r = row_split[w] % chunk;
+        int cand = (r * 2 >= chunk) ? row_split[w] + (chunk - r) : row_split[w] - r;
+        // Monotone and inside the matrix. An EMPTY range is legal -- its owner goes
+        // straight to stealing -- but an inverted one is not.
+        if (cand < row_split[w - 1]) cand = row_split[w - 1];
+        if (cand > A0_size) cand = A0_size;
+        row_split[w] = cand;
+      }
+      for (int w = nsplit - 1; w >= 1; --w)
+        if (row_split[w] > row_split[w + 1]) row_split[w] = row_split[w + 1];
     }
     for (int w = 0; w < nsplit; ++w) {
       if (partition_mode == 3)
