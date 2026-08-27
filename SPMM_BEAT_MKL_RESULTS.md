@@ -3968,3 +3968,98 @@ its rebuild normally precedes it in the same script.
 Redwood now runs from a single script that refuses to start if anything else is timing,
 rebuilds once from the synced headers so every hooked stage shares one source revision,
 and orders the stages by decision value rather than by when they were written.
+
+## Setting an environment variable costs about a percent, and it has been distorting the arm comparisons
+
+The ARM gate grid had an anomaly that could not be a real effect. Four arms are *provably*
+inert outside the gated region — `SCORCH_SPMM_NNZ_PER_THREAD` has exactly one consumer and
+it sits inside the gate's condition — and yet on the 1335 cells outside it they read
+0.9913, 0.9770, 0.9753 and 0.9647 against a 0.9974 same-code floor, at z between −5 and
+−21. Ordered by how many variables each arm sets — one, two, two, three — the deficits are
+monotone in the count.
+
+So a ladder of six arms was run, all the **same configuration**, differing only in how many
+names nothing in the binary reads are also set. One of them, `p3b`, has an *identical*
+environment to the reference, which separates "how long the environment is" from "which
+slot in the sequence the arm occupies". Both hosts, both dtypes, no rebuild:
+
+| extra variables | x86 f32 | x86 f64 | ARM f32 | ARM f64 |
+|---|---|---|---|---|
+| 0, identical environment | 1.0003 | 1.0006 | 0.9997 | 0.9999 |
+| 1 | 0.9888 | 0.9920 | 0.9964 | 0.9953 |
+| 2 | 0.9805 | 0.9785 | 0.9899 | 0.9894 |
+| 4 | 0.9656 | 0.9633 | 0.9807 | 0.9805 |
+| 8 | 0.9348 | 0.9373 | 0.9618 | 0.9632 |
+
+Two arms with identical environments agree to within 0.06% on all four grids, so the arm's
+position is not the cause. **One extra variable costs 1.1% on x86 and 0.4–0.5% on ARM**,
+and by kernel duration the whole effect is in the short cells: on x86 float32 the
+eight-variable arm is 0.9294 below 30 µs, 0.9833 between 30 and 100 µs, and 0.9897 above
+100 µs. That is the signature of a fixed per-call cost, and the mechanism is not subtle: an
+instrumented build calls `getenv` about thirty times per SpMM, most of those are misses,
+and a miss scans the whole environment.
+
+It predicts the anomaly it was built to explain. Against the x86 slope the four gate arms
+should read 0.989, 0.980, 0.980 and 0.967; they read 0.9913, 0.9770, 0.9753 and 0.9647.
+**Every one within 0.3%.**
+
+Three earlier readings change, all in the same direction:
+
+- **The exact-width kernel's rejection was mostly the instrument.** Its control columns at
+  k=8 and 16, where the kernel cannot fire, read 0.983–0.987, and that is what the "per-row
+  dispatch tax" was inferred from. Priced for one extra variable they are 0.994–0.998. The
+  kernel itself goes 0.9873 → ≈0.9985 on float32 and 1.0039 → ≈1.0153 on float64. The
+  hoist is still right as code — a loop-invariant test does not belong in a row loop — but
+  the number attached to it in `ef7a770`'s message was misattributed.
+- **The gated row ceiling's x86 rejection flips sign.** "1.2579 against back-stealing's
+  1.2670" becomes ≈1.2721 against 1.2670.
+- **On ARM the pool-capped ceiling becomes positive inside its gate**, 0.9871 → ≈1.007 at
+  the ARM slope for its two extra variables.
+
+The fix is structural rather than a correction factor: `kprobe --pad-env` pads every arm up
+to the widest arm's variable count with names nothing reads, so the environments are the
+same length and `getenv` costs every arm the same. It is off by default so it cannot change
+the meaning of a grid that was already half-run, and it is now on for every stage whose
+arms differ in count — including the GCN guardrail, whose four arms set 1, 1, 2 and 2 and
+whose cora and citeseer layers are exactly the sub-30 µs cells this hits hardest. The cold
+probe needed no change: it sets one variable for every arm and only varies its value.
+
+A second consequence is worth stating even though nothing acts on it yet. That per-call
+`getenv` constant is present in **both** arms of every instrumented comparison, so it
+dilutes every ratio on a short kernel toward one. The hookless three-build comparison is
+the only measurement here that is free of it, and it is the one that found the ARM
+small-output tail at all.
+
+## The partition's min-A gate is refuted, and duration is what separates the two populations
+
+The min-A gate was argued from a mechanism: when the whole of A fits in one core's private
+cache there is nothing for home ranges to keep resident, so the partition can only cost.
+The ARM ladder says no. Over 1650 cells, against a 0.9953 floor, the divisor ladder reads
+0.968 (÷8) to 0.980 (÷64) pooled — and the reason is in the split. On the 537 cells where
+the partition **wins** more than 5%, the same arms read 0.909 to 0.948. Even at ÷64, which
+only fires below about 260 KB of A, the gate takes 5% off the wins. It is giving back
+exactly what the partition is for, so A's size does not separate the two populations —
+home ranges help small matrices too, because contiguous ranges narrow each worker's B
+column band and the workers stop contending on one counter line.
+
+The gate does work on the cells it was built for: on the 51 float32 cells where the
+partition is more than 10% behind the counter, ÷8 reads 1.1294 and lands within 2.6% of
+`p0` there. The problem is only that it fires far too widely.
+
+What separates the two populations is **duration**. min / q1 / median / q3 kernel time:
+
+| | min | q1 | median | q3 |
+|---|---|---|---|---|
+| partition ≥10% behind the counter | 19.2 µs | 27.3 | 28.5 | 29.5 |
+| partition ≥5% ahead | 15.6 µs | 30.9 | 62.1 | 110 |
+
+Searching every feature the grid carries, in both directions and in every two-feature
+conjunction, the cleanest single separator is **`nnz*max(k,16)`** — the work proxy the
+thread policy already uses — at 3.15e5 on float32 and 3.43e5 on float64, catching 74% and
+77% of the regressed cells against 14.5% and 13.7% of the winning ones. The two
+conjunctions that score higher both contain `rows <= 7716`, which is one matrix's row
+count, and are rejected as fitted to the corpus rather than to a mechanism. Both thresholds
+are about **two `SCORCH_GRAIN_SPMM`**, so the gate is spelled in grains:
+`SCORCH_SPMM_PARTITION_MINGRAINS`, default 0, ladder 1–4 running now on both hosts. The
+min-A hook is removed rather than kept behind a flag, because a rejected hook still costs a
+`getenv` per call in every instrumented build, and the section above is what that costs.
