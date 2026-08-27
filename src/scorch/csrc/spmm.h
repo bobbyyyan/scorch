@@ -2286,7 +2286,12 @@ static inline void scorch_spmm_row_gather_f32_ms(
   }
 }
 #endif  // AVX2 && FMA
-#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+// NOT guarded on SCORCH_TUNE_HOOKS. The dispatch site for this kernel is unguarded so
+// that it can ship, and a definition visible only under the hooks left a hookless x86
+// build unable to compile at all -- which is what `pip install -e .` does. ARM stayed
+// green because __AVX2__ removes both sides together, so only an x86 hookless build
+// ever saw it. The two guards have to match whatever the arm decides.
+#if defined(__AVX2__) && defined(__FMA__)
 // EXACT-WIDTH narrow-k row kernel, for the widths where the register-block kernel's
 // lane mask covers the WHOLE output row.
 //
@@ -2424,7 +2429,7 @@ static inline void scorch_spmm_row_regblock_deep(
     else V::store(C_row + L * v, r);
   }
 }
-#endif  // AVX2 && FMA && SCORCH_TUNE_HOOKS
+#endif  // AVX2 && FMA
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
 // Narrow-k variant whose only difference from the shipped kernel is how far ahead
 // it prefetches B.
