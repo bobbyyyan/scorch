@@ -4340,3 +4340,39 @@ deficit is the arm being charged for naming one more knob the code reads, so the
 reading is "nothing, with a slightly worse tail" rather than "a small loss". **Removed**
 — the code, the default, and the hook — with the measurement recorded at the site where
 the boundaries are built. The same disposition the non-temporal store lever got.
+
+## What the cold penalty is made of, and the one class where it is five times the fit
+
+The cold-minus-warm **kernel** penalty over the 372-cell cold grid, banded by the bytes
+the call must touch (A values and indices, B, C), float32:
+
+| A+B+C | n | penalty, median | per MB | warm kernel | MKL's own cold penalty (whole call) |
+|---|---|---|---|---|---|
+| 0.12–0.25 MB | 32 | 36.9 µs | 158.6 | 13.0 µs | 80.9 µs |
+| 0.5–1 MB | 77 | 43.3 | 58.3 | 16.4 | 95.1 |
+| 2–4 MB | 59 | 78.0 | 27.4 | 28.5 | 135.0 |
+| 8–16 MB | 26 | 170.7 | 17.4 | 74.0 | 230.6 |
+| 16–32 MB | 24 | 284.6 | 14.8 | 96.8 | 390.2 |
+
+The fit is **35 µs + 14 µs/MB**. 14 µs/MB is about 71 GB/s — compulsory DRAM traffic,
+which MKL pays too, and its own cold penalty is larger in every band (that column is a
+whole call against our kernel, so it is a scale check, not a comparison). This is why the
+cold *ratio* against MKL is 1.20x where warm is 1.65x rather than something being wrong
+with the cold path: both runtimes pay a fixed ~35–80 µs, and on a 13 µs kernel that term
+is the measurement.
+
+**The four worst cold cells do not fit.** rn50 `bottleneck_2` at k=64: 256 rows, 2304
+columns, 176947 nonzeros — 2 MB of operands, so the fit predicts a 63 µs penalty, and the
+measured kernel is 342–369 µs cold against 51 µs warm. The shared row counter is the same
+(315–387 µs), so it is not the partition. The candidate mechanism is **per-thread
+replication of B**: at k=64 with 2304 columns B is 590 KB, which fits in one core's 2 MB
+L2, so warm every worker holds its own resident copy and cold every worker must fetch one.
+24 copies of 590 KB is 14 MB, and at 56 GB/s that is 250 µs — the missing term. MKL, which
+wakes fewer workers for a 256-row product, fetches fewer copies.
+
+If that is right, cold kernel time on these cells falls roughly linearly with a forced
+thread count while warm time rises, and cells whose B is too large for any worker to hold
+show no such fall. That is a prediction, and `cold_threads.py` (arms
+`SCORCH_SPMM_NT_FORCE` = 1/4/8/16/24/policy, tail group and a control group from the middle
+of the same distribution) is queued to test it. Note what it cannot become: capping workers
+would trade warm time for cold time on the same shape, and warm is the claim.
