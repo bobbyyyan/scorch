@@ -3659,3 +3659,40 @@ the partials, which is a kernel change rather than a policy one and is worth ten
 Note also what is *not* in the table: nothing is limited by decomposition width any more,
 which was the diagnosis three sections ago. The forced-width sweep closed that, and this
 is what the residual looks like once it is.
+
+## Checking the gate resolves what it claims, without a machine
+
+A policy change is checkable without timing anything: compile the policy header into a
+standalone binary with the hooks in and ask it what it resolves. That needs no rebuild of
+the extension and cannot disturb a run in progress, which matters when both hosts are
+mid-grid. (One trap: torch's bundled `libomp.dylib` carries the install name
+`/opt/llvm-openmp/lib/libomp.dylib`, so a standalone link needs
+`-Wl,-headerpad_max_install_names` and then `install_name_tool -change`, the same rewrite
+`scorch_build.py` does for the extension.)
+
+Resolved worker counts, `omp_get_num_procs()` = 18:
+
+| shape | ceiling off | gated | ungated | capped at pool 6 |
+|---|---|---|---|---|
+| kl02, 71 rows, degree 2993 | 4 | **18** | 18 | **6** |
+| nw14, 73 rows, degree 12396 | 6 | **18** | 18 | **6** |
+| bibd_17_8, 136 rows, degree 5005 | 8 | 8 | 18 | 8 |
+| rn50 256 rows, degree 1152 | 16 | 16 | 18 | 16 |
+| rn50 64 rows, degree 288 | 4 | 4 | 4 | 4 |
+| cora hidden layer | 18 | 18 | 18 | 18 |
+| Pd_b, degree < 1 | 1 | 1 | 1 | 1 |
+
+Three things fall out. The gate excludes the 256-row ResNet bottlenecks that the ungated
+rule was harming, which is what it is for. It also excludes bibd_17_8 at 136 rows — and
+the residual measurement says the ungated rule was worth 1.142x there, so the `rows <= 128`
+edge is leaving a real gain on the table; that is exactly what the `rows <= 192` arm in the
+validation exists to price. And the 64-row layer at degree 288 is *inside* the gate yet its
+count does not move, because the work term binds before the row axis does — which is why
+it was never the shape the ceiling harmed.
+
+The pool cap is confirmed x86-inert by construction rather than by hope. On redwood the
+gated count is 22, not 32, because `work / grain` = 3400576 / 150000 binds first; capping
+at torch's 24 therefore changes nothing. On the M5 `omp_get_num_procs()` = 18 binds first,
+and capping at torch's 6 takes kl02 from 18 workers to 6. So the arm is a no-op on the host
+where the ceiling helps and a real change on the host where it hurts, which is the
+prediction the grid now has to confirm.
