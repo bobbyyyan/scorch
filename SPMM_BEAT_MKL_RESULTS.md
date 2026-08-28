@@ -6367,3 +6367,40 @@ B that no caller takes). With the corpus held fixed and the build factor known, 
 between them isolates the path factor, which until now has only been a prior measurement on a
 different corpus. That is the last piece needed to state one parity number for the whole space
 rather than one per harness.
+
+### Why the accumulator ladder and the latency reading are not in conflict, and what that predicts
+
+Two measurements looked inconsistent. The standalone accumulator ladder found ACC=4 worth
+2.31x at degree 2048 with B resident in L1, 1.01-1.10 at L2, and nothing beyond; the ARM
+call-path version agreed, 1.47x at degree 1152 with B under 64 KB and nothing at 256 KB. But
+the dtype-scaling table says our narrow-k float32 is latency-bound, and a latency bound is
+usually fixed by more loads in flight -- which should have helped most where B is *far*, not
+where it is near.
+
+They are both right, for different reasons, and the resolution sharpens the prediction:
+
+* **B in L1.** The loads are cheap, so the loop binds on the carried FMA dependency chain.
+  Extra accumulators break that chain, which is the 2.31x.
+* **B beyond L1.** The loop binds on B-access latency. A scalar loop already gets
+  memory-level parallelism for free -- the indices are independent, so the out-of-order
+  engine keeps many loads outstanding whatever the accumulator count -- which is why the
+  ladder measured nothing there. But one `VGATHERDPS` is microcoded and serialises its eight
+  accesses, so the *gather* kernel delivers less parallelism than eight scalar loads would.
+  That is a defect of the kernel currently serving float32 k=1, not of the loop shape.
+
+Both regimes are dtype-blind, and for the same underlying reason: FMA latency and load
+latency are identical for four bytes and eight. So the scaling table's 1.00-1.07 is what
+either bound looks like, and no third explanation is needed.
+
+**The sharper prediction for chain42, which the B-footprint banding is what tests.** `ex1`
+replaces the gather with four independent scalar chains and therefore addresses *both*
+regimes; `s2`/`s4`/`s8` keep the gather and add streams, which addresses the dependency chain
+but leaves the microcoded serialisation in place. So:
+
+* `ex1` should beat `s4`, not merely match it;
+* `ex1`'s win should appear in **both** B bands;
+* the `s*` arms' win should concentrate in the **small-B** band and fade as B grows.
+
+If instead `s*` wins uniformly and `ex1` does not, the gather is not serialising the way this
+argument assumes and the account above is wrong -- which is worth knowing, because the same
+argument is the reason to expect anything at all from replacing the gather.
