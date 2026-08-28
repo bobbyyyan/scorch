@@ -6883,3 +6883,33 @@ warm family again. The *excess* is at large output, where it reaches 2.0x but pa
 
 That ordering matters for what to do next: the ILP lever stays first, and the output-buffer
 work is a separate, lower-priority item that should not be justified by the 267 number.
+
+### The ILP hypothesis already has a natural experiment in the shipped dispatch
+
+No new run needed. The dispatch assigns different kernels to adjacent widths, and one of them
+already has the property the fix would add:
+
+| k | kernel serving it | independent chains | f32 warm losses | f64 warm losses |
+|---|---|---|---|---|
+| 1 | nonzero-axis gather, `narrowk_streams = 1` | **1** | 27 | 22 |
+| 2 | `scorch_spmm_row_narrow_exact<T,2,4>` | **4** | **6** | **0 of 124** |
+| 4 | register block, masked 256-bit | **1** vector | 31 | 23 |
+| 8 | register block | 1 vector | 9 | 3 |
+
+`exact_lo_` is 2 and `SCORCH_NARROWK_EXACT_HI` is 3, so the exact-width scalar kernel with
+`UNROLL=4` serves k=2 and k=3 and nothing else. It is the only narrow width that keeps four
+independent accumulator chains, and it is the only narrow width that does not lose -- six cells
+in float32 and **zero of 124** in float64, against 22 to 31 for both of its immediate
+neighbours. The neighbours are not similar to each other in any other way: one is a microcoded
+gather, the other a masked vector kernel. What they share is a single carried dependency.
+
+This is correlational and it is one width, so it is not proof. But it is the same prediction
+the dtype-scaling table makes, arrived at from a completely different direction and from data
+already on disk, and it is the reason to expect the queued levers to work rather than merely
+to hope so: `ex1` in chain42 extends exactly this kernel down to k=1, and chain43's `d4np` /
+`d4pf` / `d8pf` arms add the same independent-chain structure at k=4.
+
+It also predicts something falsifiable and specific: if the account is right, `ex1` should move
+k=1 toward k=2's loss count rather than merely improving it, and chain43's depth arms should do
+the same at k=4. If either lands halfway, the single-dependency story is incomplete for that
+width.
