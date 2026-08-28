@@ -739,8 +739,14 @@ inline int scorch_pcore_count() {
     // do, and the physical core count is the answer.
     best = (smt_cores > 0 && smt_cores < all_cores) ? smt_cores : all_cores;
 #endif
-    if (best > 0) return best;
+    // Bounded by what the process can actually run on. The OS topology above counts the
+    // machine's cores and knows nothing about a cgroup limit or an affinity mask, so inside a
+    // two-CPU container it would still answer 8. That is wrong in the safe direction for a cap --
+    // a ceiling above the resolved count never binds -- but it is wrong, and this is a host
+    // property other rules may come to read. On both project machines the bound is inactive:
+    // 8 against 32 procs on redwood, 6 against 18 on the M5.
     const int hw = omp_get_num_procs();
+    if (best > 0) return (hw > 0 && best > hw) ? hw : best;
     return hw > 0 ? hw : 1;
   }();
   return cached;
