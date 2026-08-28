@@ -175,6 +175,22 @@
 // Whether the widened count is capped at the caller's thread pool instead of at
 // omp_get_num_procs(). Candidate fix for the measured x86/ARM disagreement; off until
 // both hosts have run it.
+// Pool FLOOR on the row ceiling: the rule applies only where the caller's pool is at
+// least this wide. 0 disables the floor, which is today's behaviour.
+//
+// This is the mirror of SCORCH_SPMM_PARTITION_GATE_MAXTHREADS. Compiled in, the ceiling
+// reads 1.3066 (f32) / 1.4011 (f64) inside its gate on a 24-thread x86 host with the
+// harmed tail below the A/A floor, and on a 6-thread ARM host no gain in gate (0.9887 /
+// 0.9753) with about 2% off outside it on float64 (per-matrix z -2.15 over 260 matrices).
+// The rule takes a few-row product from 4 workers to 22 on the first host and from 4 to 6
+// on the second -- there are only six to have -- so the sign is set by how much machine
+// the shape was failing to use, not by the shape and not by the ISA. A floor states that
+// directly, and on a host below it the whole block is unreachable, so the ARM cost goes
+// away as dead code rather than as a tuned constant.
+#ifndef SCORCH_SPMM_CEIL_MINTHREADS
+#  define SCORCH_SPMM_CEIL_MINTHREADS 0L
+#endif
+
 #ifndef SCORCH_SPMM_CEIL_CAP_POOL
 #  define SCORCH_SPMM_CEIL_CAP_POOL 0
 #endif
@@ -498,7 +514,10 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   long ceil_maxrows = SCORCH_SPMM_CEIL_MAXROWS;
   long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
   bool ceil_cap_pool = SCORCH_SPMM_CEIL_CAP_POOL != 0;
+  long ceil_minthreads = SCORCH_SPMM_CEIL_MINTHREADS;
 #ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINTHREADS");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_minthreads = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MAXROWS");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_maxrows = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINDEG");
@@ -514,9 +533,21 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // its pool-capped variant 1.0370 against a 1.0015 floor, z of 0.15 and 1.27 aggregated
   // per matrix. At cell level the second of those reads z=3.15, which is what five widths
   // of the same nine matrices look like when they are counted as independent.
+  // The floor reads the caller's POOL, not the resolved count and not
+  // omp_get_num_procs(): the resolved count is what this rule is about to change, and
+  // num_procs is 18 on a 6-thread ARM host, which straddles any floor between the two
+  // machines. That distinction already cost one grid -- see the work gate's ceiling.
+  //
+  // It is evaluated LAST and only when a floor is set, so that with the ceiling off --
+  // which is the default -- this costs nothing and no omp call is made. A pool read
+  // hoisted above the cheap tests is how an earlier version of this rule charged every
+  // call for a branch that could not fire.
   if (nnz_per_thread > 0 && nnz > 0 &&
       (ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
-      (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows)) {
+      (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows) &&
+      (ceil_minthreads <= 0 ||
+       (nthreads_override > 0 ? (long)nthreads_override
+                              : (long)omp_get_max_threads()) >= ceil_minthreads)) {
     long by_nnz = nnz / nnz_per_thread;
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
     // ... and optionally at the pool the CALLER manages rather than at the machine.

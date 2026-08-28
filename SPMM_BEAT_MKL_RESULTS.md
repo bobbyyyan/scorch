@@ -4824,11 +4824,15 @@ families.**
    The evidence for the x86 side is 7 matrices (per-matrix z 1.61 on f32, 2.95 on f64), which
    is thin. This corpus supplies 11 (f32) / 13 (f64) more of the same family, so the widened
    in-gate corpus needed to settle it exists.
-2. **Degree 1 with many rows.** Pd_rhs and Pd_b (8081 rows, degree 1, k=1–2): 27 µs for 8081
-   nonzeros is 3.3 ns per nonzero, against MKL's 17 µs. Nothing about the arithmetic costs
-   that; it is fixed per-row cost — the prefetch guard, the mask setup, the exact-width
-   dispatch — charged once per nonzero because each row has one. A low-mean-degree path that
-   skips the register-block machinery is the candidate.
+2. **Degree 1 with many rows.** Pd_rhs and Pd_b (8081 rows, 6323 nonzeros, k = 1–2): 27 µs
+   against MKL's 17. I first wrote this up as fixed per-row cost, and `scorch_policy.h`'s own
+   comment on the grain says something more specific: at k = 1 this shape's floored work is
+   101168 against a grain of 150000, so **it runs single-threaded**. So the deficit is 8081
+   iterations of the row loop at about 3.3 ns each against MKL's 2.1, and it is either the
+   grain being too conservative here or the row loop being too fat — forcing the thread count
+   separates the two, and neither has been measured on this matrix. The grain is not free to
+   lower: the same comment records that raising thread counts off this measure by another
+   route took the 20–50 µs cells to 0.920.
 
 Neither is a tuning question and neither is addressed by the change in flight. They are the
 next campaign, and they are now specified: a corpus, a mechanism, and a number to beat.
