@@ -9035,3 +9035,52 @@ build, not reasoned about from the ladder.
 Caveat on the reference: this host has no MKL, so `mkl_ms` here is `torch.sparse.mm`.
 The 4.3-5.6x figures above are against torch, not against MKL, and only the 1.285 --
 a scorch-to-scorch ratio -- is a like-for-like number.
+
+## A cap at the P-core count is positive on both hosts, and the corpora already contain it
+
+The ladders force a count; what I want to ship is a cap. The two are different
+experiments and the difference is most of the effect, so I scored the cap directly: a cap
+at C leaves every cell whose resolved count is already <= C untouched (ratio 1.000 by
+construction) and moves the rest to C, which the ladder measured as its tC arm. The
+resolved count came from `scorch_spmm_nthreads` on each host, not from a restatement of
+the rule.
+
+Where the resolver actually ends up is the whole story. On redwood 48 of 231 cells
+resolve to exactly 32, which is `omp_get_num_procs()`, above the 24-thread pool torch
+advertises. On the M5 128 of 676 resolve above 6, as high as 18, against a pool of 6.
+Both hosts ceiling on the machine's processor count when the surrounding framework has
+told them a smaller number.
+
+      cap C     x86 f32 whole / firing   x86 f64 whole / firing   ARM f32 whole / firing   fires x86 / ARM
+        2         1.0086 / 1.0120          1.0050 / 1.0069          1.0525 / 1.1889         72.7% / 29.6%
+        4         1.0509 / 1.0779          1.0430 / 1.0656          1.0513 / 1.2733         66.2% / 20.7%
+        6              --                       --                  1.0486 / 1.2850            -- / 18.9%
+        8         1.0839 / 1.1649          1.0648 / 1.1263          1.0325 / 1.2046         52.8% / 17.2%
+       16         1.0477 / 1.2117          1.0373 / 1.1632               --                 24.2% /   --
+       24         1.0470 / 1.2474          1.0384 / 1.1990               --                 20.8% /   --
+
+      A/A floor   x86 f32 1.0021 / 0.9934    x86 f64 0.9957 / 1.0109    ARM f32 1.0003 / 1.0004
+
+Reading down the P-core row of each host -- 8 on redwood, 6 on the M5 -- gives 1.0839
+(f32) and 1.0648 (f64) on x86 and 1.0486 on ARM, with 1.1649 / 1.1263 / 1.2850 on the
+cells the cap actually moves. Matrices losing more than 5%: none on x86 f32, one on x86
+f64, two on ARM f32. Every one of those numbers is an order of magnitude outside the A/A
+floor.
+
+The P-core count is also the better of the two candidate rules. Capping at the pool is
+the more obvious statement of "do not launch more workers than the framework advertises",
+and on the M5 it is the same number, but on redwood the pool is 24 and capping there is
+worth only 1.0470 against the 1.0839 that capping at 8 gets. Capping at the P-core count
+ties on one host and wins clearly on the other, which is why `scorch_pcore_count()` is
+the parameter this rule wants.
+
+What this is not yet. The whole-corpus column is a geomean over a corpus chosen to
+contain losers on x86 and over the mgladder corpus on ARM, so it sizes the effect on
+those corpora and is not a library-wide claim; the honest pair is the firing-cell ratio
+next to the count of matrices that lose. Both corpora stop at k=8, so nothing here says
+what a cap does to a wide-k or large-output SpMM -- and on ARM the shipped E-core recruit
+deliberately launches twice the pool for exactly that bandwidth-bound case, so a cap
+plainly conflicts with it somewhere above k=8. chain63 carries six widths and is the
+measurement that settles it. And this estimate is synthesised from force arms; a cap
+compiled into the build has to reproduce it, because lowering the count can also flip the
+row-handout mode that `scorch_spmm_partition_mode` derives from it.
