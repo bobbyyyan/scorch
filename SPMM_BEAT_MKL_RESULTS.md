@@ -4872,3 +4872,23 @@ genuinely loses sit at 5% density or above. Splitting those 82 by shape:
   charged once per nonzero.
 
 So the goal reduces to three named mechanisms on 3.8% of cells, not to a broad deficit.
+
+### The kernel-losing count, tested against each cell's own pass spread
+
+The 82 / 77 figures above came from a best-of-two number per cell. Each build ran two passes,
+so every cell carries two of our readings and two of MKL's, and the deficit can be required
+to exceed the cell's own pass-to-pass spread:
+
+| | float32 | float64 |
+|---|---|---|
+| kernel slower than MKL on the best pass | 86 | 82 |
+| **and by more than that cell's pass spread** | **60** | **41** |
+| their median pass spread | 2.3% | 1.7% |
+| their median deficit | 13.7% | 7.8% |
+| corpus-wide median pass spread | 3.1% | 3.6% |
+
+So the real kernel deficit is **60 of 2172 cells (2.8%) on float32 and 41 (1.9%) on
+float64** — the survivors are not marginal, their deficits are 5–6× their own noise. Split:
+32 near-dense, 22 few-rows-high-degree, 6 degree-below-4 on float32; 24 / 15 / 2 on float64.
+The near-dense family is the largest and the least understood; the few-row family has a
+mechanism waiting for power; degree-below-4 is three matrices.
