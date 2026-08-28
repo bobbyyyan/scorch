@@ -9763,3 +9763,45 @@ exceeds the pool, and correctly leaves kl02 alone -- 71 rows resolves to 4, belo
 the cap is inert there. The remaining ARM question is whether base-work-true adds anything on
 top of it, which stage35 is measuring now; on the probe shapes the pair and the cap alone give
 the same count, so the expectation is that it does not.
+
+## Capping at the pool would permanently disable the M5's E-core recruit
+
+Found by reading the launch site, not by measuring, which is the only reason it was found
+before it shipped. `spmm_csr_v2_core` and `spmm_csr_linear_fused_float` both choose their
+launch this way:
+
+      const int atpool = at::get_num_threads();
+      if (nthreads >= 2 * atpool) {
+        #pragma omp parallel num_threads(nthreads)     // recruit the E-cores
+      } else {
+        at::parallel_for(...)                          // torch's own pool
+      }
+
+The recruit exists because `at::parallel_for` runs on torch's intra-op pool, which on Apple
+silicon is the 6 P-cores and excludes the 12 E-cores, and a bandwidth-bound SpMM wants them.
+It fires when the resolved count reaches twice the pool -- 12 on the M5 -- and its own comment
+records that it "can NEVER fire on an all-physical-cores pool (x86: pool=24, nproc=32 w/ SMT,
+nthreads<=32 < 48)".
+
+**A cap at the pool makes that gate `pool >= 2 * pool`, which is false for every pool.** So it
+does not merely lower a thread count: on the M5 it permanently routes both kernels back onto
+the 6-P-core pool and disables a shipped, measured win -- the fused Linear path is up to 18x
+on the sparse autoencoder at 0.99 sparsity, and the recruit is part of why. On x86 the recruit
+cannot fire at all, so nothing there is affected; the conflict is ARM-only.
+
+What the measurements already say, and what they do not. On the mgladder corpus, which runs
+through `spmm_csr_v2_core`, capping is +25% at k<=8, +17% at k=16 and neutral (1.0104) at
+k=64 -- so for *that* workload the recruit is worth nothing-to-negative and the cap is a clear
+gain even though it disables it. The autoencoder is a different code path (the fused Linear),
+a different free dimension (the batch size, 256 and up), and a dense B. Nothing measured today
+touches it, and the one number I have for it is an 18x win that the cap would partly undo.
+
+So the shipping form is not simply "cap the resolved count at the pool". Either the cap applies
+to `spmm_csr_v2_core` only, leaving the fused Linear's thread policy as measured -- which is
+honest, since the two were measured separately and the fused path's policy is a deliberate
+result rather than an accident -- or the cap is expressed so that it cannot change the recruit's
+gate. The first is a change to where the cap is applied, not to what it does, and the resolver
+does not currently know which kernel is asking.
+
+Either way this needs the autoencoder guardrail on the M5 before the cap's default moves,
+and that is now a requirement rather than a nicety. It is queued behind the additivity ladder.
