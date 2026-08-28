@@ -10355,3 +10355,58 @@ cell is the reading.
 So the honest form of the claim is: on the real autoencoder the rule is a large win on two of the
 three shapes it can act on, neutral on the third, and provably inert on the nine it cannot act
 on. Not "1.4x on the autoencoder".
+
+## The harness/caller divergence is real, but it is confounded with the corpus
+
+chain21 carries a whole-call column as well as a kernel one, and reading it removes one candidate
+explanation. Per-cell geomean of `refb` over the arm, 1812 cells:
+
+      arm       kernel (_kms)   whole call (_ms)   kernel share of the call
+      cap24            1.0610             1.0536                     71.5%
+      cap12            0.8824             0.8998
+      cap8             0.7770             0.8055
+      btrue            1.0287             1.0235
+      aa               1.0046             1.0028
+
+float64 is the same shape: cap24 1.0390 kernel, 1.0373 whole call, kernel 74.3% of the call.
+
+So the harness path's gain is **not** an artefact of reading a kernel timer: it is +5.4% on the
+harness path's own whole call, with a 1.0028 A/A control. And the caller path reads 0.9967. Two
+whole-call numbers, same host, same knob, opposite answers.
+
+**But there are two uncontrolled differences between those runs, not one.** chain21 uses its own
+302-matrix corpus at widths 1/2/4/8/16/64; chain24's board uses `final_groups`, 124 matrices
+filtered to nnz in [20000, 4e6], at widths 1/2/4/8/16/32. So "path" and "corpus" are confounded,
+and I was treating the path as established when it is one of two candidates.
+
+Also settled on the way: **both paths pass the same thread override.** The plan path uses
+`_PLAN_NTHREADS = torch.get_num_threads` and `_PLAN_ATPARALLEL`, and the general path derives
+`torch.get_num_threads()` in `_composition_hints`. Same value, same kernel, same resolved count.
+Whatever differs, it is not the thread policy the two paths configure.
+
+The experiment that separates them costs nothing extra: **stage36 already ran kprobe on the ARM
+mgladder corpus with arms `refb`/`cpool`/`t10`, and stage38 runs cprobe on that same corpus with
+the same arms, same host, same day.** Path is then the only difference. If ARM shows the same
+divergence -- kprobe reading +24% on the firing cells and cprobe reading null -- the path is the
+cause and it is confirmed on a second host. If ARM's two probes agree, the x86 divergence is the
+corpus and chain26b will say so directly, since it holds the corpus fixed.
+
+Until one of those lands, the correct statement is that the cap's caller-path value is measured
+on one corpus only, where it is null.
+
+## The ARM GCN guardrail passes: every comparison inside the same-code control
+
+stage37, four datasets, three rotated passes, arms `ship` and `cand` (cap at the pool declined at
+10M), scored against the bench's own PyTorch column as a same-code control:
+
+      dataset       Scorch: arm spread / control     Scorch (fused): arm spread / control
+      citeseer            1.001x / 1.001x                    1.011x / 1.001x
+      cora                1.014x / 1.036x                    1.087x / 1.036x
+      ogbn-arxiv          1.004x / 1.001x                    1.004x / 1.001x
+      pubmed              1.009x / 1.025x                    1.013x / 1.025x
+
+**Eight of eight inside the control.** citeseer's fused arm (1.011x against a 1.001x control) and
+ogbn-arxiv's pair (1.004x against 1.001x) are the two that clear their control at all, by less
+than a percent, in a workload whose cells live below 30 microseconds. Nothing here is a
+regression and nothing here is a gain: GCN is where the rule was most likely to do harm -- the
+output layer's k is the class count, 3 to 7 -- and it does not.
