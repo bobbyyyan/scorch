@@ -5519,6 +5519,13 @@ Splitting those in-gate cells by degree says exactly where the harm is:
 All of it is the float64 low-degree subset, and on the high-degree subset the rule *reduces* the
 harmed count on float32 while adding to the helped count on float64.
 
+**Two different knobs are both called a degree floor in this file, and one is rejected while
+the other ships.** `SCORCH_NARROWK_EXACT_MINDEG` gates the exact-width *kernel* and is rejected
+on both hosts (it costs 4.5–6.6%, see the section above). `SCORCH_SPMM_CEIL_MINDEG` gates the
+row-axis *thread count* and ships at 128. They share a word and nothing else: one decides which
+arithmetic kernel runs, the other decides how many workers get rows. A reader who conflates them
+will read this file as contradicting itself.
+
 This is not a threshold discovered by sweeping. `nnz >= 128 * rows` is the filter chain31's
 corpus already applied, because the mechanism needs enough work per row to be worth
 redistributing — a matrix with four nonzeros per row has nothing to give a twenty-fourth worker.
