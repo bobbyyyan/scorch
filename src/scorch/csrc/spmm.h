@@ -2435,7 +2435,7 @@ static inline void scorch_spmm_row_gather_f32_ms(
 // the scalar tail, which has LESS instruction-level parallelism than the 2-stream
 // form it replaces, so a deep unroll is expected to lose on short rows -- that is
 // what the A/B measures, and it is why this is a hook and not yet a policy.
-template <typename T, int NVEC, bool FULL_LAST, int UNROLL>
+template <typename T, int NVEC, bool FULL_LAST, int UNROLL, bool PF = false>
 static inline void scorch_spmm_row_regblock_deep(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2449,6 +2449,19 @@ static inline void scorch_spmm_row_regblock_deep(
 
   int pA = pA_begin;
   for (; pA + UNROLL <= pA_end; pA += UNROLL) {
+    // Prefetch the NEXT group's B rows. This axis exists because the measurement that
+    // rejected stream depth changed two things at once: it took the depth from 2 to UNROLL
+    // AND dropped the prefetch that the shipped 2-deep kernel carries
+    // (__builtin_prefetch on A1_crd[pA + 2]). A 14.5% harmed tail was attributed to the
+    // depth, but no arm ever ran deep WITH a prefetch, so the attribution was not earned.
+    // PF is a template parameter, so an arm without it emits exactly the loop that was
+    // measured before.
+    if (PF) {
+      #pragma unroll
+      for (int u = 0; u < UNROLL; u++)
+        if (pA + UNROLL + u < pA_end)
+          __builtin_prefetch(B_val + (size_t)A1_crd[pA + UNROLL + u] * (size_t)B1_size, 0, 1);
+    }
     // Resolve every base pointer and scalar first, so the UNROLL load chains are
     // visibly independent and the out-of-order engine can overlap their misses.
     const T* SCORCH_RESTRICT Bp[UNROLL];
@@ -3796,6 +3809,14 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_unroll = 0;
   { const char* e = std::getenv("SCORCH_NARROWK_UNROLL");
     if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
+  // A/B hook: whether the deep register kernel prefetches the next group of B rows.
+  // Defaults to 1, because the arm that has never been run is the one WITH a prefetch: the
+  // measurement that rejected stream depth ran the deep kernel with no prefetch at all,
+  // while the shipped 2-deep kernel carries one, so its 14.5% harmed tail could be either
+  // change. Set to 0 to reproduce that arm exactly.
+  int narrowk_unroll_pf = 1;
+  { const char* e = std::getenv("SCORCH_NARROWK_UNROLL_PF");
+    if (e && *e) narrowk_unroll_pf = std::atol(e) != 0 ? 1 : 0; }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4144,10 +4165,13 @@ torch::Tensor spmm_csr_v2_core(
               continue;
             }
 #ifdef SCORCH_TUNE_HOOKS
-            #define SCORCH_RBD(NV, UN) \
+            #define SCORCH_RBD1(NV, UN, PFV) \
               (full_last \
-                 ? scorch_spmm_row_regblock_deep<scalar_t, NV, true, UN>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
-                 : scorch_spmm_row_regblock_deep<scalar_t, NV, false, UN>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+                 ? scorch_spmm_row_regblock_deep<scalar_t, NV, true, UN, PFV>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
+                 : scorch_spmm_row_regblock_deep<scalar_t, NV, false, UN, PFV>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+            // Prefetch is its own axis, so depth and prefetch can be attributed separately.
+            #define SCORCH_RBD(NV, UN) \
+              (narrowk_unroll_pf ? SCORCH_RBD1(NV, UN, true) : SCORCH_RBD1(NV, UN, false))
             if (narrowk_unroll) {
               // NVEC * UNROLL accumulators must stay resident, so the deeper
               // streams are only instantiated where the vector count is small.
