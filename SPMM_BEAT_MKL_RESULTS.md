@@ -10776,3 +10776,29 @@ recoverable *relative to MKL* is exactly what chain23b was written to answer, by
 intercept for both libraries rather than for ours alone. The earlier "166 of 198" figure should
 be read as an upper bound on what a fixed-cost fix could do, achieved only if MKL's own fixed cost
 were zero, which it is not.
+
+### Two more readings off chain24, both small
+
+**base-work-true is null on the x86 caller path**, which is what stage35 predicted when it showed
+the knob is the cap in a different spelling. Two reps per arm, matched estimator:
+
+      timer            effect     z  |  base r1/r2     z  |  btrue r1/r2     z
+      warm_plan_ms     1.0034  +1.3  |     1.0021   +1.1  |      1.0075   +2.9
+      cold_plan_ms     0.9925  -2.9  |     0.9920   -2.4  |      1.0058   +2.0
+
+The effect is smaller than one of its own controls in both phases. Nothing to report beyond
+"null", and it is consistent: this board runs k=1 to 32, and the knob is inert at k >= 16 by
+construction.
+
+**float64's first rep of the cap reads differently from float32's**, and is held rather than
+reported. One rep each, no same-arm control yet:
+
+      warm_plan_ms 1.0073 (z +3.4)     cold_plan_ms 0.9981 (z -0.7)
+      warm_mkl_ms  1.0033 (z +0.6)     cold_mkl_ms  0.9963 (z -1.0)
+
+Dividing out the MKL column leaves about +0.4%, and the position confound runs *against* it here
+-- cpool r1 is measured after base r1, so a warming machine should make cpool look slower, and it
+reads faster. Both of those make the sign more credible and neither makes 0.4% a result: float32's
+same-arm control on this column was 1.0021. The second rep of each arm is what turns this into a
+reading, and it is about half an hour out. Recorded now so the number is not quietly dropped if
+r2 disagrees with it.
