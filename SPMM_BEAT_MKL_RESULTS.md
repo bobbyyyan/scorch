@@ -7247,3 +7247,50 @@ host was losing. chain42 is the run that says whether the same lever closes the 
 **the prediction registered here is that it should win at least as much there**, because the
 gather it replaces serialises its eight accesses in microcode while ARM's masked register kernel
 does not -- so x86 starts from a worse baseline at the same width.
+
+### The gate quantity, found by binning finer: degree 8
+
+The targeted corpus read `ex1` at 1.0576 (z+4.3) in its degree-under-64 band; the other corpus
+read 0.9924 (z-1.0) in what is nominally the same band. That is not noise at those z values, and
+the cause is that "degree under 64" describes two different populations: median degree **1.9** in
+one corpus, where 32 of 49 matrices sit at degree 0-8, against median **48.6** in the other.
+Binning finer, pooling both corpora:
+
+| degree | n | ex1 vs the shipped kernel |
+|---|---|---|
+| 0-8 | 32 | **0.9664** |
+| 8-16 | 6 | 1.0561 |
+| 16-32 | 10 | 1.0782 / 0.9938 |
+| 32-64 | 20 | 1.0485 / 1.0731 |
+| 64-256 | 29 | 1.0637 (z+5.1) |
+| >=256 | 17 | 1.1411 (z+3.7) |
+
+Against a k=2 structural-null floor of 0.9972 to 1.0045 on the targeted corpus -- +/-0.5%, much
+tighter than the other corpus's +/-1.5%.
+
+**`ex1` loses about 3.4% below degree 8 and wins 5 to 14% above it, rising with degree.** That is
+exactly what four independent accumulator chains should do: below roughly four to eight nonzeros
+a row they cannot be filled, and what is left is the unroll's remainder loop and its setup. My
+earlier reading of "neutral at low degree" was a geomean over a bimodal population that cancelled
+a real loss against a real win -- the same mistake as trusting a pooled parity number, one level
+down.
+
+**This satisfies the gated branch of the rule pre-registered before any of it was measured**: the
+gate is on the quantity that predicts the loss, and it is a quantity the code already has.
+`SCORCH_NARROWK_EXACT_MINDEG` is documented as "minimum mean degree for the exact-width narrow-k
+kernel; at 1 the kernel is refused on any matrix holding fewer nonzeros than rows". Setting it to
+8 refuses exactly the band that loses. So the shipping form is two constants -- the exact band
+lowered to 1, and the degree floor raised to 8 -- not a new runtime mechanism.
+
+**A prediction for chain42, so its low-degree column is not misread.** chain42's `ex1` arm sets
+`SCORCH_NARROWK_EXACT_K1=1` and does *not* set MINDEG, so on x86 it will also lose on low-degree
+matrices. That is expected and is not a refutation; the ungated arm is measuring the kernel, and
+the gate is what makes it shippable. What would refute the account is `ex1` failing to win in the
+degree bands above 8, or the loss below 8 being much larger on x86 than the 3.4% measured here.
+
+**And one consequence to weigh before shipping.** `narrowk_gather` is 1 only at k=1, and
+`exact_width` is tested before it in the row loop, so lowering the exact band to 1 makes
+`scorch_spmm_row_gather_f32` unreachable at the only width it serves -- the kernel becomes dead
+code on x86 unless the MINDEG gate hands the low-degree band back to it, which it would. So the
+gate is not only a performance guard, it is also what keeps the gather alive for the shapes it is
+still better at.
