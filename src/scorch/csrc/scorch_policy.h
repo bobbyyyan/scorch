@@ -244,12 +244,12 @@
 // "shipped" is a build flag: the two-build comparison is then a flag flip on one
 // source tree rather than two trees that have to be kept in step.
 #ifndef SCORCH_SPMM_PARTITION_DEFAULT
-#  define SCORCH_SPMM_PARTITION_DEFAULT 0
+#  define SCORCH_SPMM_PARTITION_DEFAULT 3
 #endif
 // Independent nonzero streams in the exact-width narrow-k kernel, or 0 to leave those
 // widths on the register-block kernel and its whole-row lane mask.
 #ifndef SCORCH_NARROWK_EXACT_UNROLL
-#  define SCORCH_NARROWK_EXACT_UNROLL 0
+#  define SCORCH_NARROWK_EXACT_UNROLL 4
 #endif
 // Whether the exact-width kernel reduces its unroll on rows shorter than it. Off until
 // both hosts have measured it; the harm it addresses is ARM-side and measured.
@@ -293,7 +293,7 @@
 // where the cells it wins sit at 31-110, and nnz*max(k,16) separates the two better than
 // any other feature in the grid, at about two grains on both dtypes. 0 leaves it out.
 #ifndef SCORCH_SPMM_PARTITION_MINGRAINS
-#  define SCORCH_SPMM_PARTITION_MINGRAINS 0L
+#  define SCORCH_SPMM_PARTITION_MINGRAINS 2L
 #endif
 // Size of the CALLER'S POOL at or below which that work gate is allowed to fire. It exists
 // because the gate's sign depends on the pool, and this makes the dependence explicit
@@ -324,7 +324,7 @@
 // at any pool (that is the configuration x86 measured at 4-9% cost, and it is not what
 // ships).
 #ifndef SCORCH_SPMM_PARTITION_GATE_MAXTHREADS
-#  define SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 0
+#  define SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 16
 #endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
