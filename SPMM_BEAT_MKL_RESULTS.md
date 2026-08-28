@@ -7624,3 +7624,73 @@ The ladder placing the threshold -- `K1_MINDEG` in {0,1,2,4,8,16} over the strat
 two interleave seeds, with k=2 and k=4 as the instrument check -- is queued behind the host going
 quiet. It is still ARM-only, and ARM has no MKL, so this is guardrail work: it cannot move the
 scoreboard, and the x86 half is chain42.
+
+## Correction: the cold degradation ratio was a restatement, and the mechanism I read off it was wrong
+
+Two sections above I reported that we degrade 6.077x going cold against MKL's 4.623x, called the
+1.315 ratio evidence of a cold-specific defect, and inferred a mechanism from its trend in k.
+The ratio is arithmetic, not evidence:
+
+    D_s / D_m = (cold_s/warm_s) / (cold_m/warm_m) = (warm_m/warm_s) / (cold_m/cold_s)
+
+which is exactly (our warm advantage) / (our cold advantage). At k=16 that is 1.922 / 1.237 =
+1.554 against the 1.553 I printed. So the whole table restates two columns of the scoreboard I
+already had, and "we degrade worse than MKL" is the same sentence as "we beat MKL by less when
+cold", which was never in doubt.
+
+**The mechanism claim goes with it.** I read MKL's D falling with k (5.56 -> 3.51) while ours
+stayed flat as MKL overlapping its loads better as B widens. But D falling is equally consistent
+with MKL's *warm* code scaling badly in k -- and that is what the scoreboard says it does: our
+warm advantage grows from 1.174 at k=1 to 1.942 at k=32. A ratio of ratios cannot separate those,
+so nothing here supports a loads-in-flight story. Withdrawn.
+
+What caught it was applying the same statistic to the row partition, where the answer is known.
+Back-stealing has D = 3.951 against `base`'s 2.563, which by the reasoning I had used would make
+the shipped partition a cold regression. It is not: it is **1.0935 faster than base cold**
+(z+16.3) and **1.6857 faster warm**. It wins in both states, and its D is higher only because
+its warm number improved more. A statistic that condemns a change measured to be better in both
+states is the wrong statistic.
+
+**What survives, stated as counts rather than as ratios of ratios:**
+
+* 162 float32 and 105 float64 cells are below MKL cold, against 75 and 51 warm.
+* Of the cold ones, **116 and 79 are above MKL warm** -- they lose only when cold. That is a
+  count, not an identity, and it is why cold is where the remaining work is.
+* Our advantage over MKL is smaller cold than warm at every width: 1.05-1.26 cold against
+  1.17-1.94 warm.
+
+### And a real finding the correction turned up: the cold penalty is mostly outside the kernel
+
+Comparing our own wall clock against our own kernel timer is not a restatement, because a fixed
+per-call cost added to both states pulls a ratio *toward* 1. Ours goes the other way:
+
+| pooled | wall D | kernel D | kernel cold | kernel warm | non-kernel cold | non-kernel warm |
+|---|---|---|---|---|---|---|
+| float32, 744 cells | 6.077 | 3.951 | 93.7 us | 23.7 us | **39.9 us** | 0.9 us |
+| float64, 744 cells | 6.086 | 4.220 | 113.8 us | 27.0 us | **38.9 us** | 0.8 us |
+
+There is a **fixed cold-only cost of about 39 microseconds outside the kernel**, and it is flat
+in everything: 39.3 to 41.0 us across all six widths on float32, 37.5 to 40.2 on float64, on
+matrices spanning two orders of magnitude in nonzeros. Warm, the same path costs 0.9 us. So it
+is 30% of a cold call, it is invisible warm, and no work on the inner loop reaches it.
+
+Flat in k and in dtype rules out the obvious candidates. It is not first-touch faults on the
+output, which would grow with rows*k -- at k=32 the output is megabytes and the cost does not
+move. It is not proportional to the matrix.
+
+Two hypotheses worth separating, and they differ in whether the number is even ours:
+
+1. **The dispatch path's own working set.** 39 us is about 120,000 cycles where the warm path
+   takes 2,700, a 44x degradation, consistent with every Python object, dict and code page the
+   call touches having been evicted by the 192 MB flush.
+2. **Thread-pool wake-up.** The flush is `FLUSH.sum().item()`, an ATen reduction, so it runs the
+   pool and then leaves it parked. Waking parked OpenMP threads costs tens of microseconds and
+   would be flat in k and dtype -- exactly the signature. Against this: the kernel timer starts
+   inside the C++ call and should therefore contain the parallel region's startup, which puts
+   wake-up inside the 93.7 us rather than outside it. Unless it happens in the pybind or ATen
+   layer first.
+
+If (2) dominates, part of the cold deficit is the harness and some of the 195 cells are an
+artifact of how coldness is manufactured. That has to be settled before any cold lever is
+credited, and it is settled by re-running the decomposition at one thread: a cost that survives
+`OMP_NUM_THREADS=1` is not thread wake-up. Queued ahead of crediting anything from chain51.
