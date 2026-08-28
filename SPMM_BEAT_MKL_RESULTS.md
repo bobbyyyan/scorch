@@ -7572,3 +7572,55 @@ saying there is nothing there.
 The retraction two sections up was right in its conclusion and wrong in one of its reasons: it
 leaned partly on run 2, which is now the discredited reading. What actually kills the floor is
 non-monotonicity, which all four runs agree on.
+
+### The width-1 extension gets its own admission threshold, and it is byte-neutral off
+
+The k=1 extension is the one part of this that measured a real win -- 1.0243, 1.0460 and 1.1174
+on ARM float32 at mean degree 8-64, 64-256 and >=256 -- and it had no shipping form at all:
+`narrowk_exact_k1` was `bool ... = false`, a hooks-only experiment with no policy constant.
+It also could not use `SCORCH_NARROWK_EXACT_MINDEG` as its gate, because that constant gates the
+whole exact band and widths 2 and 3 measure worse under every value of it, in every band, on
+four runs.
+
+So width 1 now has its own two constants in `scorch_policy.h`, both defaulting to today's
+behaviour:
+
+    SCORCH_NARROWK_EXACT_K1         0 disables width 1, which is what ships
+    SCORCH_NARROWK_EXACT_K1_MINDEG  minimum mean degree for width 1; 0 admits at any degree
+
+and `exact_lo_` is decided from them rather than from a bool. The band {2,3} replaces a
+register-block tile whose mask wastes 6 lanes of 8 under AVX2 and 2 of 4 under NEON; width 1
+replaces a loop carrying a single accumulator, which no mask width describes. Different trade,
+own admission.
+
+**Emission, off: byte-identical.** `hv_emit_check.py` disassembled the pre-change and post-change
+objects, split by symbol: **161,687 instructions across 1,015 shared symbols, 0 symbols differing
+in code and 0 differing even in immediate operands**, no symbol added or removed. The recompile
+is real -- `ops.o` is newer than the source -- and with `SCORCH_NARROWK_EXACT_K1` a compile-time
+0 the block is dead and `exact_lo_` folds to 2. The 131 bytes that do differ in the file are
+outside the text sections. That is the strongest form of the neutrality gate, not an argument
+that it should hold.
+
+(The tool prints `FAILED` at the end: its final assertion is specific to the half-vector flip
+and expects a float32 symbol to have moved. Here no movement is the result being claimed, so
+the assertion is inverted for this use and the instruction counts above are the measurement.)
+
+**Firing, on: width-specific, checked against the object.** The justification for a second
+constant is entirely that it does not touch the band, so that is checked by output diff rather
+than by reading the source. Over 68 matrices, against the shipped default:
+
+| band | arm | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|---|
+| deg<8 (n=30) | `e0` (no threshold) | 27/30 | 0/30 | 0/30 | 0/30 |
+| deg<8 | `e8` (threshold 8) | **0/30** | 0/30 | 0/30 | 0/30 |
+| deg>=8 (n=38) | `e0` | 38/38 | 0/38 | 0/38 | 0/38 |
+| deg>=8 | `e8` | 38/38 | 0/38 | 0/38 | 0/38 |
+
+The threshold fires at width 1 and at no other width, and the gate holds below degree 8. The
+three low-degree matrices `e0` does not change are the degree-1 ones, where no summation order
+can change a one-term row.
+
+The ladder placing the threshold -- `K1_MINDEG` in {0,1,2,4,8,16} over the stratified corpus, at
+two interleave seeds, with k=2 and k=4 as the instrument check -- is queued behind the host going
+quiet. It is still ARM-only, and ARM has no MKL, so this is guardrail work: it cannot move the
+scoreboard, and the x86 half is chain42.
