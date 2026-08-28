@@ -4767,3 +4767,50 @@ The two readings are not in conflict — they are different calls. **The ceiling
 mechanism:** raise the team on a plan-cache miss, where the tensor was just built and A is
 not resident, and leave every repeat call exactly as it is. Not implemented; the measurement
 is recorded so the option is costed. Warm is the claim, so this stays behind the settled work.
+
+## What is actually left below MKL, and why most of it is the measurement path
+
+Offline, from the shipping three-build's own cells (2172 per dtype, candidate build, best of
+two passes). Comparing our whole call against MKL's whole call:
+
+| | float32 | float64 |
+|---|---|---|
+| cells below MKL | 615 / 2172 | 423 / 2172 |
+| their median ratio to MKL | 0.795 | 0.829 |
+| **share of total corpus time at stake** | **2.8%** | **0.7%** |
+| below-MKL cells under 30 µs | 564 of 615 | 361 of 423 |
+| below-MKL cells above 100 µs | 4 | 11 |
+| below-MKL cells at 100k+ rows | 0 / 12 | 0 / 12 |
+
+**87% (f32) / 82% (f64) of them have a kernel that already beats MKL's whole call.** They
+lose on a per-call cost outside the kernel, and that cost is flat: q1 6.9, median 7.0, q3
+7.1 µs on f32 (6.4 / 6.5 / 6.7 on f64), against a median gap to MKL of 4.5 / 3.7 µs. It is
+1.6–1.8× the gap. It is also present, at the same size, on the 1557 cells we *win*
+(median 6.9 µs) — so it is not a property of the losing shapes, it is a constant.
+
+**And it is a constant this corpus pays for asking.** These cells are timed through
+`scorch.matmul(..., time_dict=td)`, and passing `time_dict` is a keyword, which disables the
+per-tensor plan cache in `ops.matmul`. The separately measured caller path — the one a user
+gets, no keywords — has a non-kernel cost of **−0.4 µs warm**, and on it 37 of 372 f32 cells
+and 31 f64 cells are below MKL, about 10%, against 28% here. So most of the 615 is the
+instrument, and the honest count of the remaining deficit is the caller-path one.
+
+**The residue that is genuinely the kernel is 82 cells (f32) / 77 (f64), and it is two
+families.**
+
+1. **Fewer rows than workers, enormous degree.** kl02 (71 rows, degree 2993, k=2): 32 µs
+   against MKL's 25. nw14 (73 rows, degree 12396, k=2): 100 against 62. bibd_17_8 (136 rows,
+   degree 5005, k=4): 63 against 41. rn50 magnitude-pruned (256 rows, degree 1152, k=1): 29
+   against 22. Row-parallel decomposition cannot reach these — 71 rows over 24 workers is
+   already fewer rows than workers, and `rows/SCORCH_ROWS_PER_THREAD` holds the team at four.
+   What is missing is parallelism *within* a row: split a long row's nonzero range across
+   workers and reduce, the CSR-Vector / segmented-reduction shape. We have no such mechanism.
+   This is the one real hole the grid points at.
+2. **Degree 1 with many rows.** Pd_rhs and Pd_b (8081 rows, degree 1, k=1–2): 27 µs for 8081
+   nonzeros is 3.3 ns per nonzero, against MKL's 17 µs. Nothing about the arithmetic costs
+   that; it is fixed per-row cost — the prefetch guard, the mask setup, the exact-width
+   dispatch — charged once per nonzero because each row has one. A low-mean-degree path that
+   skips the register-block machinery is the candidate.
+
+Neither is a tuning question and neither is addressed by the change in flight. They are the
+next campaign, and they are now specified: a corpus, a mechanism, and a number to beat.

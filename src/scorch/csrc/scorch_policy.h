@@ -636,6 +636,130 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   return nthreads;
 }
 
+// The row-handout mode the SpMM will actually run in, for one call's shape.
+//
+// This is the whole rule, in one place, because the alternative is a harness that
+// restates it: the offline threshold sweep for the work gate below scored a 3.7% gain
+// on the ARM tail corpus against the 1.35% the machine measured, and the gap was
+// entirely cells the solo gate had already put in mode 0 -- where every arm runs the
+// same code and the sweep was fitting the difference between two noise draws. A rule
+// that can only be read by running the kernel is a rule whose firing set gets guessed.
+//
+// Exported to Python from the instrumented build (see ops.cpp) so a harness asks for
+// the decision instead of reproducing it.
+//
+// nthreads is the resolved worker count (scorch_spmm_nthreads); nthreads_override is
+// what the caller passed, which is what the pool ceiling reads. elem_size is
+// sizeof(scalar_t).
+inline int scorch_spmm_partition_mode(long rows, long nnz, long k, long out_cols,
+                                     long elem_size, int nthreads,
+                                     int nthreads_override) {
+  int partition_mode = SCORCH_SPMM_PARTITION_DEFAULT;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_PARTITION");
+    if (e && *e) { long v = std::atol(e);
+      if (v >= 0 && v <= 3) partition_mode = (int)v; } }
+#endif
+  // OUTPUT-SIZE GATE. The partition buys A's inter-call L2 residency and pays for it
+  // in the output store stream: with one global counter the workers all drain from a
+  // moving frontier, so at any instant their writes are close together in physical
+  // address space; with home ranges they write to as many regions as there are
+  // workers, tens of megabytes apart, and the memory controller sees that many open
+  // DRAM rows instead of a near-sequential stream.
+  //
+  // Measured over 2376 cells of the main and large-A corpora, back-stealing against
+  // the shipped counter, by output bytes -- and the thread count is identical on
+  // every one of the harmed cells, so this is not the policy:
+  //
+  //   output       float32            float64
+  //   < 1 MB       1.239             1.220
+  //   1-4 MB       1.433             1.305
+  //   4-16 MB      1.258             1.217
+  //   16-64 MB     1.109             1.030
+  //   64-256 MB    1.029             1.022
+  //   >= 256 MB    0.988             0.944   (26.9% of float64 cells below 0.95)
+  //
+  // Monotone decay, negative at the top. The A-bytes-per-output-byte ratio shows no
+  // trend at all across the same cells (1.13 to 1.33 in every band), so the scale
+  // that matters is absolute output size, not the balance between the two streams.
+  //
+  // Expressed as a multiple of the last-level cache rather than as a byte count: the
+  // decay begins where the output stops being cache-resident, and a fixed byte
+  // threshold would mean something different on every machine. Four times the LLC is
+  // 144 MB on a 36 MB L3, which is where the measured sign change is.
+  if (partition_mode != 0) {          // nothing to gate when the partition is off
+    // A single worker cannot benefit from any of this: there is no second core to keep
+    // A resident for and nothing to steal from. What it can still pay is the difference
+    // between walking a home range and claiming chunks from the counter, once per row --
+    // which is why the matrices that show it are the ones with the most rows per nonzero.
+    // On the M5, twenty of the forty-four cells where back-stealing is more than 10%
+    // slower than the counter are as-735, 7716 rows of mean degree 1, whose work
+    // (7716 * 16 = 123456) is under SCORCH_GRAIN_SPMM and so resolves to exactly one
+    // worker. Provably inert for two workers or more.
+    bool partition_solo_off = SCORCH_SPMM_PARTITION_SOLO_OFF != 0;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_SOLO_OFF");
+      if (e && *e) partition_solo_off = std::atol(e) != 0; }
+#endif
+    if (partition_solo_off && nthreads <= 1) partition_mode = 0;
+  }
+  if (partition_mode != 0) {
+    // Below a couple of grains of work the partition's bookkeeping is not amortised, and
+    // this is where its only measured regression lives. The ARM ladder is what says so.
+    // Over 1650 cells the cells where the partition is more than 10% behind the shared
+    // counter have a kernel-time distribution of 19 / 27 / 28 / 30 microseconds at min /
+    // q1 / median / q3, against 16 / 31 / 62 / 110 for the cells where it wins -- the
+    // regression is a SHORT-KERNEL phenomenon, not a shape.
+    //
+    // A's size was the first candidate and the ladder refuted it: even at a divisor that
+    // only fires below about 260 KB of A, a gate on A's bytes gave back 5% of the wins,
+    // because home ranges help small matrices too (contiguous ranges narrow each worker's
+    // B column band, and workers stop contending on one counter line). Searching every
+    // feature the grid carries, in both directions, the cleanest single separator is
+    // nnz*max(k,16) -- the same work proxy the thread policy already uses -- at 3.15e5 on
+    // float32 and 3.43e5 on float64, which catches 74% and 77% of the regressed cells
+    // against 14.5% and 13.7% of the winning ones. Both thresholds are about two
+    // SCORCH_GRAIN_SPMM, so that is how this is spelled: in grains, not in a constant.
+    long mingrains = SCORCH_SPMM_PARTITION_MINGRAINS;
+    long gate_maxthreads = SCORCH_SPMM_PARTITION_GATE_MAXTHREADS;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MINGRAINS");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) mingrains = v; } }
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_GATE_MAXTHREADS");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) gate_maxthreads = v; } }
+#endif
+    // The gate only applies where the pool is small enough that the shared counter's
+    // contention is not what binds -- see the constant's comment. Above the ceiling this
+    // whole block is unreachable, which is how the x86 reading is preserved. Deliberately
+    // the caller's POOL and not the resolved worker count: the resolved count is raised per
+    // shape and capped by omp_get_num_procs(), so on an 18-processor host it straddles a
+    // ceiling of 16 and the gate then fires on some shapes and not others -- which is what
+    // the ARM grid caught.
+    if (gate_maxthreads > 0) {
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_max_threads();
+      if (pool > gate_maxthreads) mingrains = 0;
+    }
+    if (mingrains > 0) {
+      const long work_proxy = nnz * (long)(k > 16 ? k : 16);
+      if (work_proxy < mingrains * SCORCH_GRAIN_SPMM) partition_mode = 0;
+    }
+  }
+  if (partition_mode != 0) {
+    long partition_maxout = SCORCH_SPMM_PARTITION_MAXOUT_LLC * scorch_llc_bytes();
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MAXOUT_MB");
+      if (e && *e) { long v = std::atol(e);
+        partition_maxout = v > 0 ? v * 1024L * 1024L : 0L; } }   // 0 = no gate
+#endif
+    if (partition_maxout > 0 &&
+        (long)rows * (long)out_cols * elem_size >= partition_maxout)
+      partition_mode = 0;
+  }
+  return partition_mode;
+}
+
+
 // Adaptive schedule chunk: ~SCORCH_CHUNKS_PER_THREAD dynamic chunks per worker.
 inline int scorch_chunk(long rows, long work, long grain_default = SCORCH_GRAIN_DEFAULT) {
   int nt = scorch_nthreads(work, rows, grain_default);

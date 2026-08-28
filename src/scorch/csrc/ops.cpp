@@ -670,6 +670,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
           py::arg("work_true") = -1, py::arg("nnz") = -1);
 
+    // The row-handout mode the drop-in SpMM will actually run in. Exported for the same
+    // reason as the chunk width: an offline sweep that restated this rule scored the work
+    // gate at 3.7% on the ARM tail against the 1.35% the machine measured, because it
+    // credited cells the single-worker gate had already forced to mode 0. A harness that
+    // asks cannot make that mistake.
+    m.def("scorch_spmm_partition_mode", &scorch_spmm_partition_mode,
+          "Row-handout mode (0 shared counter, 1 home ranges, 2 front-stealing, "
+          "3 back-stealing) the drop-in SpMM resolves to, for (rows, nnz, k, out_cols, "
+          "elem_size, nthreads, nthreads_override). nthreads is the resolved worker "
+          "count from scorch_spmm_nthreads; nthreads_override is what the caller "
+          "passed, which is what the pool ceiling reads.",
+          py::arg("rows"), py::arg("nnz"), py::arg("k"), py::arg("out_cols"),
+          py::arg("elem_size"), py::arg("nthreads"), py::arg("nthreads_override"));
+
     // The same fused structural pass, offered to Scorch's own Python-side validator.
     //
     // `_validate_index_storage` in storage.py runs on every STensor built over a
