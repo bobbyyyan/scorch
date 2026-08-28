@@ -8240,3 +8240,42 @@ where a 393-cell deficit comes from. **What made cold look like the largest buck
 of losing cells (267), and that count is still there** -- but the mechanism is not a fixed
 overhead we can delete, so the cold losses have to be in the kernel's cold behaviour, which
 chain51 is the run that addresses.
+
+### The nvec prediction is confirmed: the two dtypes win at different widths and the same vector count
+
+Registered before chain43's float64 half was read: float64 has four lanes per vector rather than
+eight, so if the deep kernel's sign is set by `nvec` and not by `k`, float64 must win at **k=8**
+and lose at k=4, while float32 wins at k=16.
+
+| dtype | lanes | k=4 | k=8 | k=16 | k=64 |
+|---|---|---|---|---|---|
+| float32 | 8 | 0.8034 (nvec 1) | 0.8124 (nvec 1) | **1.0396 (nvec 2)** | 0.9922 (nvec 8, null) |
+| float64 | 4 | 0.8392 (nvec 1) | **1.0448 (nvec 2)** | 1.0154 (nvec 4) | 0.9945 (nvec 16, null) |
+
+Both dtypes lose 16-20% at nvec=1 and win at nvec=2, at widths a factor of two apart. The
+structural nulls land where the instantiation table says they must in both. So the gate quantity
+is the vector count, and a rule stated in `k` would have been right on one dtype and wrong on the
+other by exactly the lane ratio.
+
+float64 at k=16 is nvec=4 and reads 1.0154, so nvec=4 may pay a little as well -- which is the
+hole chain55 fills, sweeping each dtype over its own nvec 1..5 rather than over a shared width
+list.
+
+This is the first prediction in this work that was written down before the data and then held.
+Worth saying plainly, because most of today's first readings did not.
+
+### And the ladder at one thread: the excess is not thread-related
+
+| rung | 6 threads | 1 thread |
+|---|---|---|
+| noop | 0.42 | 0.17 |
+| lookup | 2.25 | 1.21 |
+| alloc | 6.75 | 3.25 |
+| full | 14.21 | 10.62 |
+| mkl | 9.96 | 5.96 |
+| **full - mkl** | **+4.25** | **+4.67** |
+
+Everything gets cheaper at one thread -- the allocation halves, which is ATen's own thread-aware
+allocation path rather than anything of ours -- but **our excess over torch is 4.25 and 4.67
+microseconds, unchanged**. So the reducible part of our fixed cold cost is a few microseconds of
+plan probe and dispatch, and it does not come from the thread pool at either setting.
