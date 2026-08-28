@@ -10511,3 +10511,51 @@ Order is now 24, 25b, 26b, 27b, 28b, 29b, 48 through 61, 63b, with each guard na
 predecessors so the dependency stays one-directional. The two promoted chains are the ones whose
 targets the board says are the two largest loser groups; everything measured about either of them
 so far describes the general dispatch path, and both now report on both.
+
+## The cold deficit is not a kernel problem, and a quarter of the per-call cost would clear it
+
+The board carries a kernel timer and a whole-call timer for the harness arms, and a whole-call
+timer for the caller path. Kernel share of the harness call, 744 cells, float32:
+
+      warm  81.7%   (p10 73.0%, p90 92.2%)
+      cold  50.8%   (p10 38.7%, p90 71.3%)
+
+**Half of a cold call is not the kernel.** Then, for the cells the caller path loses on, comparing
+the deficit against `plan_ms - base_kms` -- the caller-path call minus the kernel as timed on the
+harness path:
+
+      cold, 198 losers            median      p90
+        deficit vs MKL             4.9 us    20.6 us
+        non-kernel estimate       42.8 us    48.6 us
+        whole call               107.0 us
+
+      cells whose entire deficit is smaller than their non-kernel cost:  183 / 190
+        ... if that cost were cut by half:                               176 / 190
+        ... if it were cut by only a quarter:                            160 / 190
+
+So **cold is a per-call fixed-cost problem, not a kernel problem**, and the arithmetic is not
+close: the median cold loser is 4.9 microseconds behind MKL while carrying about 43 microseconds
+of cost outside its kernel. **A 25% reduction in per-call overhead would flip 160 of the 198 cold
+cells below MKL** -- more than any kernel lever in the queue has ever been credited with, and it
+needs no kernel work at all. That 43 us also matches the ~39 us fixed cold cost measured
+independently earlier, from a different direction.
+
+Two things about the estimator, because it is a subtraction across two paths and that has been
+too coarse here before.
+
+- For **cold** it is conservative in the useful direction. If the caller path's kernel is faster
+  than the harness path's -- which the warm column below says it is -- then the true non-kernel
+  cost is *larger* than 42.8 us, not smaller. So 42.8 is a lower bound and the conclusion
+  strengthens rather than weakens.
+- For **warm** the estimator breaks down, and how it breaks is itself a finding.
+  `plan_ms - base_kms` is positive on only **3 of 107** losers: on the other 104 the caller
+  path's entire call is faster than the harness path's *kernel alone*. That is not an overhead
+  measurement, and I am not reporting one for warm. What it does say plainly is that the two paths
+  do not run equally fast kernels, which is the same conclusion the thread-cap disagreement
+  reached from the other side. Warm's deficit has to be attacked in the kernel, which is what the
+  narrow-k / few-row / high-degree characterisation already said.
+
+This reorders the queue again. **chain52 -- "what is the fixed cold cost of a call, and is it
+thread wake-up?" -- is now the highest-value queued run for the cold half of the board**, and it
+was ninth. It gets promoted next to the two kernel chains, and unlike them it needs no caller-path
+retrofit: it was written against `cold_probe` and `cold_overhead`, which time whole calls.
