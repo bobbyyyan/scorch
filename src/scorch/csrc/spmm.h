@@ -2181,7 +2181,7 @@ template <> struct scorch_simd_half<double> {
   static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_pd(a, b, c); }
   static inline vec add(vec a, vec b) { return _mm_add_pd(a, b); }
   static inline mask lane_mask(int valid) {
-    return _mm_setr_epi64x(valid > 0 ? -1 : 0, valid > 1 ? -1 : 0);
+    return _mm_set_epi64x(valid > 1 ? -1 : 0, valid > 0 ? -1 : 0);
   }
 };
 
