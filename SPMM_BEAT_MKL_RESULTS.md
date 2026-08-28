@@ -10410,3 +10410,47 @@ ogbn-arxiv's pair (1.004x against 1.001x) are the two that clear their control a
 than a percent, in a workload whose cells live below 30 microseconds. Nothing here is a
 regression and nothing here is a gain: GCN is where the rule was most likely to do harm -- the
 output layer's k is the class count, 3 to 7 -- and it does not.
+
+## What the path finding changes about how the rest of the queue is measured
+
+Eight of the twelve queued x86 chains drive kprobe, so all of their numbers are about the general
+dispatch path. That is not uniformly a problem, and the distinction is worth writing down once:
+
+- **Develop with kprobe.** For a lever that changes the kernel's instruction stream -- a register
+  kernel, a vector width, an unroll -- kernel time on either path is the same kernel, and the
+  kernel timer is the *better* instrument, because it does not bury a 5% inner-loop change under
+  dispatch.
+- **Decide with cprobe.** Any claim of the form "this many cells are now above MKL", or any claim
+  about a *policy* -- a thread count, a chunk width, a partition mode, a ceiling -- has to be made
+  on the path a caller uses, because the harness path adds overhead to our side only and because
+  the two paths have now disagreed about a thread knob by 5.4 percentage points.
+
+Three queued chains were changed accordingly, all of them still sitting in their wait loops
+having done no work, so nothing was thrown away. Each original is preserved beside it rather
+than overwritten -- a habit acquired by losing two scripts to exactly that this session.
+
+**chain63 -> chain63b, two fixes.** It was a thread-force ladder driven by `SCORCH_TUNE_THREADS`,
+and that knob forces only the *base* count inside `scorch_nthreads`: the composition-adoption
+branch below it raises the count straight back to the caller's pool, so an arm named `t8` never
+ran on eight threads and every number derived from such a ladder mislabels its mechanism. It now
+uses `SCORCH_SPMM_NT_FORCE`, which is applied after the policy and the adoption, so the arm's
+value is the count that launches. And it now runs **both probes on the same corpus, same arms,
+same session**, which makes it a second path-isolation experiment for free.
+
+**chain62 -> chain28b, promoted and given a caller-path pass.** chain45 makes multi-row register
+blocking the strongest lever in the queue -- the cells behind MKL falling 96 to 59 at float32 k=4
+and 17 to 6 at k=8, the largest reduction any lever here has produced -- and it was fifteenth in
+line. Renumbering it into the twenties is what promotes it, because every later chain's wait
+pattern already covers `rw_chain2[0-9]`, so no other script had to be touched and no deadlock can
+be introduced by editing fourteen guards. Its own guard now names only the four chains ahead of
+it. The three builds are the expensive part and they are shared, so measuring the caller path as
+well costs one extra probe pass per build and answers the question chain45's below-MKL counts
+cannot: whether the reduction is one a caller sees.
+
+**chain59** keeps its place. Half of it is superseded -- `SCORCH_SPMM_BASE_WORK_TRUE`, which
+stage35 showed is the cap in a different spelling -- but the other half is not:
+`SCORCH_SPMM_RAISE_ON_FLOORED` is still the only candidate that reaches kl02 and nw14, the four
+warm float32 losers no thread cap can touch. The subsumed arm stays in as a control, since a run
+that reproduces stage35's finding on x86 is a run whose build and harness are working.
+
+The queue is now 24, 25b, 26b, 27b, 28b, then 48 through 61, then 63b.
