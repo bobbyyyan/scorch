@@ -213,6 +213,24 @@
 #ifndef SCORCH_SPMM_NT_CAP
 #  define SCORCH_SPMM_NT_CAP 0L
 #endif
+
+// Whether the final cap declines to undo what the nonzero-expressed row ceiling deliberately
+// asked for. 1 respects it, 0 lets the cap win.
+//
+// The two rules correct OPPOSITE errors on populations that do not overlap. The ceiling raises
+// the count where the row proxy understated it -- kl02, 71 rows of degree 2993, from 4 workers
+// to 22 -- and the cap lowers it where the floored work measure overstated it. On the x86 width
+// board they between them cover the whole loser set: 71 of 75 cells for the cap and the
+// remaining 4, which are kl02 at k=2,4,8 and nw14 at k=2, for the ceiling.
+//
+// The cap is applied last on purpose, so the composition adoption cannot raise the count back
+// after it, and that placement means it would otherwise pull the ceiling's 22 down to 8. There is
+// no measurement saying 8 is acceptable for kl02: the ceiling's 1.1109 (float32, z=3.38) and
+// 1.1542 (float64, z=3.18) were both taken at its widened count. Hence the floor, and hence the
+// knob -- the alternative composition has to be measurable, not assumed.
+#ifndef SCORCH_SPMM_NT_CAP_FLOOR_CEIL
+#  define SCORCH_SPMM_NT_CAP_FLOOR_CEIL 1
+#endif
 // Conditions on the nonzero-expressed row ceiling above. 0 disables a condition, which
 // reproduces the ungated rule that measures null. The measured region is rows <= 128 and
 // mean degree >= 192 on redwood; a plateau, not an edge -- rows in {96,128,192} crossed
@@ -868,6 +886,9 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // test is evaluated last and only when something needs it, so with both off -- the
   // default -- this reads exactly as it did before and makes no omp call.
   const bool ceil_needs_pool = ceil_rowbind || ceil_minthreads > 0;
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_NT_CAP != 0
+  long ceil_request = 0;   // see SCORCH_SPMM_NT_CAP_FLOOR_CEIL
+#endif
   if (nnz_per_thread > 0 && nnz > 0 &&
       (ceil_rowbind || ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
       (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows) &&
@@ -886,6 +907,11 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (ceil_cap_pool && nthreads_override > 0 && by_nnz > (long)nthreads_override)
       by_nnz = (long)nthreads_override;
     if (by_nnz > rows_axis) rows_axis = by_nnz;
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_NT_CAP != 0
+    // Remembered so the final cap can decline to undo it. Tracked only where a cap can be
+    // live, so a build with the cap off pays neither the store nor the stack slot.
+    ceil_request = by_nnz;
+#endif
   }
   // A/B hook: the grain the BASE path divides the work by. 150000 nonzero-units is
   // about sixty-five microseconds of single-thread work, which is a very conservative
@@ -1020,6 +1046,15 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
       if (e && *e) nt_cap = std::atol(e); }
 #endif
     if (nt_cap < 0) nt_cap = (long)scorch_pcore_count();
+    bool floor_ceil = SCORCH_SPMM_NT_CAP_FLOOR_CEIL != 0;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_NT_CAP_FLOOR_CEIL");
+      if (e && *e) floor_ceil = std::atol(e) != 0; }
+#endif
+    // Never below what the row ceiling asked for, when it asked for more. This can only ever
+    // RAISE the effective cap, and only on cells where the ceiling fired -- so with the ceiling
+    // off, which is the default, ceil_request is 0 and this is exactly the plain cap.
+    if (floor_ceil && ceil_request > nt_cap) nt_cap = ceil_request;
     if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
   }
 #endif
