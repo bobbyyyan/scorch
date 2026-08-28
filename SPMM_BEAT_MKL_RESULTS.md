@@ -6638,3 +6638,46 @@ The two widths that carry the warm deficit are k=4 (31 below, 25 of them by more
 k=1 (27 below, 10 by more than 5%) -- which are exactly the two defects already separated by
 degree, and exactly what the queued runs target: chain45 and chain48 for k=4, chain42 and
 chain47 for k=1. float64 is still running.
+
+### Correction: the low-degree defect was a property of one hand-picked corpus
+
+The previous section split the deficit into two defects and said degree separated them, with
+the larger half being low degree, large, many rows. That generalised from chain38's thirty
+losing cells, which were a hand-picked `bigk4` selection of 65 matrices. chain39's 124-matrix
+corpus says the opposite, and it is the broader measurement. Loss rates, float32 warm, 744
+cells, each axis binned over the same cells:
+
+| axis | bins and loss rate |
+|---|---|
+| degree | <16 **0.3%** (1/342) / 16-64 0.8% / 64-128 14% / **128-256 38%** (34/90) / 256-1024 27% / >1024 26% |
+| B footprint | **<32KB 23%** (55/241) / 32-250KB 3% / 250KB-1.25MB 4% / 1.25-4MB 7% / >4MB 6% |
+| rows | **<1000 18%** (45/246) / 1k-10k 11% / **10k-100k 0.5%** (1/222) / >100k 0% |
+| nnz | <100k 4% / 100-300k 18% / 300k-1M 20% / >1M 10% |
+
+So the losing family is **few rows, small B, degree 64-256** -- which is the few-rows-and-high-
+degree family the instrumented grids originally pointed at, before chain38's corpus talked me
+out of it. Matrices with ten thousand rows or more essentially never lose (1 of 222), and
+degree below 16 essentially never loses (1 of 342), which is the direct negation of what I
+wrote from chain38. Both measurements are real on their own corpora; chain38's group was
+selected for large low-degree matrices at k=4, so it could only ever report on those, and I
+should not have promoted a 30-cell hand-picked group to a statement about the space.
+
+**float64 is not "essentially done" either, and that claim also came from the harness path.**
+Same corpus, caller path, warm: 51 of 744 cells below MKL, concentrated identically -- 0 of
+342 below degree 16, 28 of 90 at degree 128-256, 22% of the cells with B under 32KB. The
+earlier "47 of 2534, two widths with none at all" was the instrumented harness grid, and the
+caller path disagrees.
+
+**Cold is the weaker side by count on both dtypes** -- 162 and 105 cells below, against 75 and
+51 warm -- and its losses spread to bins that warm does not lose in at all: 19 of 342 at degree
+under 16, and 112 of 241 cells with B under 32KB. That is the signature of a fixed per-call
+cost rather than a loop property, which is consistent with cold being where allocation and
+first-touch land, and it is a different problem from the warm one.
+
+**What this does to the plan.** The warm deficit sits exactly where small B meets high degree,
+and that is the regime the standalone accumulator ladder measured at 2.31x -- B resident in L1,
+so the loop binds on the carried FMA dependency chain rather than on memory. So the gate I
+derived earlier from the ladder alone, "B fits L1 and degree is high", is the gate the broad
+caller-path corpus independently points to, with the degree threshold nearer 64 than 128.
+chain42 and chain47 measure exactly that lever. The low-degree per-row-overhead story, and
+with it multi-row's priority, drops back to chain38's corpus until something broader shows it.
