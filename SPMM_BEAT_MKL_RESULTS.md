@@ -8279,3 +8279,67 @@ Everything gets cheaper at one thread -- the allocation halves, which is ATen's 
 allocation path rather than anything of ours -- but **our excess over torch is 4.25 and 4.67
 microseconds, unchanged**. So the reducible part of our fixed cold cost is a few microseconds of
 plan probe and dispatch, and it does not come from the thread pool at either setting.
+
+## The deep register kernel becomes a policy, and what "default off" had to prove
+
+The kernel was unreachable outside an instrumented build. `scorch_spmm_row_regblock_deep` is
+defined under AVX2 guards alone, but its dispatch sat inside `#ifdef SCORCH_TUNE_HOOKS`, so a
+release `.so` did not contain the mechanism at all — which is why every number in the section
+above comes from a hooked binary, and why none of them can be confirmed by the three-build
+protocol until this changes. Committed as 44220e5:
+
+- the dispatch moves out of the hooks guard and stays under `#if defined(__AVX2__) &&
+  defined(__FMA__)`, so ARM is untouched by construction rather than by measurement;
+- four constants in `scorch_policy.h` back it: `SCORCH_NARROWK_DEEP_UNROLL` (0 ships),
+  `_PF`, and an inclusive `_NVEC_LO`/`_NVEC_HI` range;
+- the prefetch-distance dispatch (`SCORCH_RBP`) stays hooks-only. It is a different experiment
+  and has no candidate policy.
+
+**The range is in vector counts, not in k, and that is the finding it encodes.** float32 wins at
+k=16 and float64 at k=8. Those are the same nvec=2 and a factor-of-two-different width, so a rule
+written in k would have been right on one dtype and wrong on the other by exactly the lane ratio.
+`_NVEC_HI 0` means no restriction, which is what setting only the depth used to mean, so an A/B
+arm written against the older hooked build — chain55, queued now — fires exactly where it did.
+
+**Two things the change had to prove, and one it turned up.**
+
+Non-const does not fold. With `int narrowk_unroll = 0` the x86_64 `-O3` object grew **42 KB**: the
+dispatch sits inside the parallel region's lambda and the compiler would not propagate the
+constant into it, so all six deep instantiations were emitted into a release binary that can never
+call them. Declaring the four variables `const` in a non-hooks build fixes it — the same treatment
+`full_last` already carries, and for the same reason.
+
+Emission is neutral. Compiling `ops.cpp` for `x86_64-apple-macos13` with `-O3 -mavx2 -mfma`
+before and after: same object size, byte-identical string sections, and **12 differing
+instructions out of 157,717**, every one of them a `__LINE__` constant shifted by exactly +31 —
+the net line count the patch adds to `spmm.h`. Cross-compiling to check x86 emission from the ARM
+laptop is worth noting as a technique: it needs no allocation on a shared host, and it takes
+seconds.
+
+Also fixed while there: the hooks block reset the depth and the prefetch to their old hard-coded
+defaults, which would have made a build compiled with `-DSCORCH_NARROWK_DEEP_UNROLL=4` silently
+ignore it; and `SCORCH_NARROWK_UNROLL=0` is now accepted so an arm can turn OFF a depth the policy
+turned on. Widths 1 and 2 stay rejected because no instantiation exists for them.
+
+**This ships nothing.** Depth 0 is the default and the measurement is one run per dtype, on one
+host, in a hooked build, with nvec 3/4/5 unmeasured and nothing measured cold.
+
+## chain56: the ceiling ladder at the two widths chain53 cannot speak to
+
+Reading chain53 before it runs turned up a hole in its own design. Its widths are k = 1, 2, 4, 8,
+and the row ceiling's thread bound is `nnz*max(k,16)/grain` — so all four clamp to the same 16 and
+**the rule makes an identical decision at every width in the ladder**. Four widths, one decision.
+The payoffs still differ, because a row costs more at k=8 than at k=1, so chain53 is not four
+copies of one reading; but no width in it can move the decision, and the warm losers the ladder
+exists to explain include k=64 cells.
+
+chain56 runs the same seven arms over the same stratified corpus at k = 16 and 64, and refuses if
+chain53's groups file is absent rather than picking a corpus of its own — a corpus difference here
+would put composition inside the width axis, which is the error that cost three claims this
+session. Registered prediction: k=16 reproduces chain53's k=8 verdict, since `max(16,16) =
+max(8,16)` and the gate cannot tell them apart, so a large k=16-vs-k=8 difference is not the gate
+but the kernel. k=64 is the only width where the bound itself changes, and also where the kernel
+leaves the narrow-k register block for the wide-k tiled path.
+
+Written as a new chain rather than an edit, because chain53 is already executing its wait loop and
+bash resumes a running script at a byte offset.
