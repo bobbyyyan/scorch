@@ -7831,3 +7831,57 @@ right in three of four measured configurations is exactly the kind that gets fli
 And it should be kept in proportion: **+1.9% pooled at x86 float64 k=1**, where 22 of 124 warm
 cells and 39 of 124 cold cells are below MKL, most of them by more than 5%. This is worth taking
 if it is free, and it is not the answer to the deficit at that width.
+
+## The degree-adaptive unroll rescues the band, and the mechanism is the prologue
+
+Both constants aimed at low degree ship at 0. The floor is the wrong one -- withdrawing the
+kernel loses in nearly every band, on four runs. The other one is right, and it explains the one
+band that has been anomalous throughout this work.
+
+At mean degree 1-2 a row holds about one nonzero and the exact-width kernel runs with UNROLL=4,
+so that row pays a four-accumulator prologue and a three-add epilogue to perform one multiply-add.
+`SCORCH_NARROWK_EXACT_DEGUNROLL` halves the unroll while mean degree is below it -- 4 to 1 below
+degree 2 -- and it is live only there, which makes every band above degree 4 a structural null.
+
+ARM float32, two clean replicates at different interleave seeds, k=1:
+
+| band | n | `e0` K1 only | `e0du` K1 + unroll | replicate 2, `e0du` |
+|---|---|---|---|---|
+| deg<1 | 28 | 1.0611 z+7.9 | **1.0710 z+8.0** | 1.0693 z+7.7 |
+| **deg 1-2** | 29 | **0.9754 z-0.9** | **1.0175 z+1.2** | 1.0037 z+0.4 |
+| deg 2-4 | 48 | 1.0613 z+9.2 | **1.0759 z+11.2** | 1.0637 z+11.3 |
+| deg 4-8 | 24 | 1.0929 z+5.6 | 1.0957 z+5.8 | 1.0936 z+5.5 |
+| deg 8-64 | 20 | 1.0499 z+4.8 | 1.0465 z+4.2 | 1.0488 z+4.6 |
+| deg>=64 | 20 | 1.0547 z+4.8 | 1.0586 z+5.2 | 1.0541 z+5.4 |
+
+**With the unroll adapted, the extension is at or above 1.0 in every band, in both runs.** The
+band that cost 2.5-3.2% ungated reads 1.0175 and 1.0037, and the two low bands next to it get
+*better* rather than merely unharmed -- 1.0611 to 1.0710 and 1.0613 to 1.0759.
+
+Both controls hold. `du` at k=1 -- the unroll with width 1 still unserved, so there is no
+exact-width unroll to adapt -- reads 0.9891 to 1.0035 in every band across both runs. Every arm
+at k=4 reads 0.9893 to 1.0019. Neither was assumed; both follow from the constants and both were
+printed.
+
+**And the unroll pays at k=2 on its own,** which is a separate change from the k=1 extension. It
+is live below degree 4 there and replicates:
+
+| band | n | run 1 | run 2 |
+|---|---|---|---|
+| deg<1 | 28 | 0.9873 z-2.9 | 0.9834 z-2.9 |
+| deg 1-2 | 29 | **1.0376 z+2.8** | **1.0187 z+2.5** |
+| deg 2-4 | 48 | 1.0095 z+2.5 | 1.0034 z+1.3 |
+| deg>=4 | 64 | null, 0.9932-1.0013 | null, 0.9998-1.0020 |
+
+Weighting the three live bands by their matrix counts gives about **+0.7% net at k=2**: a real but
+small gain, and it includes a replicated **1.5% loss below degree 1** that a ship has to accept
+rather than average away. Below degree 1 most rows are empty, so there is no unroll to amortise in
+either direction and the halving buys nothing while still costing the decision.
+
+**What this is and is not ready for.** The k=1 half is conditioned on the gather not serving the
+width, so it is ARM-and-float64 only and needs ARM float64 plus an x86 float64 replicate. The
+unroll half is **not** ISA- or dtype-conditional: it changes k=2 and k=3 on every platform, x86
+included, and the only x86 measurement of it is chain50, which is queued. Enabling it on the
+strength of an ARM grid would be exactly the mistake the half-vector flip and the row partition
+both punished -- a lever whose sign is set by which kernel it displaces, adopted from the host
+where that kernel is different.
