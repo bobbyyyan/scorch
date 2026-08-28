@@ -8722,3 +8722,35 @@ forecast in three unmeasured cells. If chain60 shows x86 float32 k=1 winning, th
 the mechanism needs re-deriving. If it shows x86 float32 losing while float64 wins, the shipping
 form is not `K1=1` but `K1=1` conditioned on the gather not serving the width — which is a
 one-line change to a condition that already exists, not a new mechanism.
+
+## The K1_MINDEG trade dissolves: the band it was meant to fix is a hooked-build artefact
+
+I flagged a decision for Bobby: on ARM float64 the k=1 extension leaves a replicated -4.4% band at
+degree 1-2, and `SCORCH_NARROWK_EXACT_K1_MINDEG=2` removes it at the cost of the deg<1 win. The
+compiled-in run makes that trade lopsided enough that it is not a decision any more.
+
+Same host, same 169-matrix corpus, same dtype, same k=1, same degree band, both levers live:
+
+| | floor | candidate | relative to floor |
+|---|---|---|---|
+| hooked (`e0du`, two replicates) | 0.9919 | 0.9555, z -1.7 | **-3.7%** |
+| compiled in (stage26) | 0.9914 | 0.9866 | **-0.48%** |
+
+The band shrinks by a factor of roughly eight when the `getenv` disappears. That is the bias this
+file has already recorded — an arm is charged about 0.45% on ARM for each extra variable it actually
+*looks up*, `--pad-env` equalises names and not lookups, and this band is the smallest kernel in the
+corpus (k=1 on matrices averaging 1.5 nonzeros a row), so a fixed per-call charge is a large
+fraction of it. The compiled-in number is the authoritative one.
+
+**So the answer is: leave `K1_MINDEG` at 0.** Setting it to 2 would forfeit the deg<1 band, which
+compiled in reads **1.0545** on float64 and 1.0441 on float32, in order to avoid a band that reads
+-0.48%. Giving up five and a half percent to avoid half a percent is not a trade, and I should not
+have presented it as one — the hooked measurement made it look like giving up 5.5% to avoid 4.4%,
+which is at least arguable.
+
+Worth stating generally, because it has now bitten in both directions in one day: **a hooked A/B
+overstates any effect on a small kernel, and the sign of the overstatement depends on which arm sets
+more variables.** It made this band look four times worse than it is, and earlier it made the row
+ceiling's out-of-gate arms look ordered by nothing but their variable counts. Every number in this
+file that comes from a hooked build and concerns a sub-30-microsecond kernel should be re-read with
+that in mind before it is used to decide anything.
