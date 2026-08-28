@@ -4892,3 +4892,22 @@ float64** — the survivors are not marginal, their deficits are 5–6× their o
 32 near-dense, 22 few-rows-high-degree, 6 degree-below-4 on float32; 24 / 15 / 2 on float64.
 The near-dense family is the largest and the least understood; the few-row family has a
 mechanism waiting for power; degree-below-4 is three matrices.
+
+### Did the change in flight cause the near-dense residual? No — it improves that family
+
+22 of the 32 solid near-dense deficits are at k = 4, which on float32 is an exact width the
+new narrow-k kernel claims, so the obvious worry is that the thing about to ship is what put
+them there. It is not. Over all 246 cells at ≥20% density, candidate against what ships
+today, kernel time:
+
+| | cand / ship | A/A floor | vs MKL: ship → cand |
+|---|---|---|---|
+| float32, all ≥20% density | **1.1081** | 0.9855 | 1.462 → 1.620 |
+| float32, k = 4 only | 1.0699 | 0.9683 | 1.340 → 1.434 |
+| float64, all ≥20% density | **1.1490** | 1.0027 | 1.407 → 1.617 |
+| float64, k = 4 only | 1.2187 | 1.0473 | 1.297 → 1.580 |
+
+The candidate is 7–22% faster on the near-dense family and takes it from 1.30–1.46× ahead of
+MKL to 1.43–1.62× ahead. Three of 41 k=4 cells are more than 5% harmed on float32, none on
+float64, against a 3.2% float32 floor at that width. So the near-dense residual is a
+pre-existing minority inside a family we win pooled, not something this change introduced.
