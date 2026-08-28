@@ -6528,3 +6528,52 @@ What does come out is a third, independent line of support for the mechanism. Th
 to element size**. A loop that is cache-resident and does not care whether it moves four bytes
 or eight is bound by latency and dependency inside the cache hierarchy, not by traffic. That
 agrees with the dtype-scaling reading and with the ARM confirmation, by a different route.
+
+### There are two defects, not one, and degree separates them
+
+Characterising chain38's 30 losing cells shows they are not the family the instrumented grids
+pointed at. That family was few rows and very high degree. These are the opposite:
+
+| | the 30 losing cells | the 35 winning cells |
+|---|---|---|
+| nnz median | 1,100,592 (317k - 3.87M) | 3,276 |
+| rows median | 100,000 (73 - 345,688) | -- |
+| mean degree | **11.0** | 25.6 |
+| B footprint | 1.60 MB (0.2 - 2.9) | ~0.001 MB |
+| the same cells cold | **1.0939, 1 of 30 below MKL** | -- |
+
+The degree range spans 3.9 to 12396, which looked bimodal, but it is not: twenty-eight of the
+thirty have degree 41 or below and fourteen of them are exactly 11. `nw14` at degree 12396 is
+a single outlier that is also the worst cell in the grid. By band:
+
+| degree | losing / total | losing parity | whole band |
+|---|---|---|---|
+| < 16 | **20 / 28** | 0.8955 | 1.2730 |
+| 16 - 128 | 8 / 32 | 0.8791 | 2.7910 |
+| 128 - 1024 | 1 / 4 | 0.8010 | 1.6235 |
+| >= 1024 | 1 / 1 | 0.7381 | 0.7381 |
+
+So the work splits cleanly in two, and they want different fixes:
+
+1. **Low degree, large, many rows, warm only.** With degree 11 and k=4 a row does about eleven
+   masked FMAs against a per-row setup of comparable size -- reading both `A1_pos` entries,
+   forming pointers, building the lane mask, writing the output row -- so per-row overhead is
+   roughly half the work and is not amortised. That it appears *only* warm is the evidence:
+   cold, the DRAM fetch dominates and hides it; warm, the fetch is gone and the overhead is
+   what is left. This is precisely what the multi-row kernel exists to amortise, and at k=4
+   float32 nothing blocks it -- nvec is 1, both (1,2) and (1,4) are instantiated, and
+   `narrowk_gather` is 0 above k=1. chain45 measures it. Better still, the multi-row kernel's
+   own caveat is that it needs comparable row lengths within a group, and these matrices --
+   a chimera graph, an FEM mesh, a random graph with uniform pin counts -- are the uniform-
+   degree case it works best on rather than the power-law case it degrades toward.
+2. **High degree.** Too little work in flight per row, which is the latency bound the
+   dtype-scaling table measured on both hosts. Few cells in this corpus but a high loss rate
+   where they appear: one of one at degree >= 1024, one of four at 128-1024. chain42 and
+   chain47 measure it.
+
+**This also weakens my registered prediction for the flip.** I predicted chain48 lands the
+k=4 cell between 0.97 and 1.07, from a pooled 1.1008 measured on a different corpus. The
+half-vector kernel reduces per-*nonzero* masking cost and leaves per-*row* setup alone, and
+these cells are dominated by per-row setup at degree 11. So the flip should help less here
+than that estimate, and multi-row should be the larger lever for this half of the problem. If
+chain48 comes in below 0.97 that is the reason, and it is not evidence against the flip.
