@@ -6112,3 +6112,74 @@ gather kernel claims (`narrowk_gather = (B1_size == 1)`) and which the exact-wid
 clamps itself out of, since it serves 2..3. chain42's `ex1` arm forces exactly that width
 onto the exact-width kernel, so it is aimed at this cell and not at a shape I picked after
 seeing it.
+
+### chain37: the instrument costs 1.10x, not 1.5x, and the proof is a paired null
+
+The session had two grids from the same tree on the same host disagreeing 1.545x about our
+own kernel while agreeing on MKL to 1%. chain37 settles it: one corpus, one harness process,
+alternating between the instrumented build and a hookless build with the candidate shipping
+configuration compiled in, three rotations with the order flipped in the middle one.
+
+**The charge is additive.** Regressing the hooked-minus-hookless delta on hookless kernel
+time gives a slope of **-0.022**, where 0 is purely additive and 1 purely proportional.
+Median delta 1.2 us, IQR 0.8-2.7, over kernels spanning 4.1 to 916 us. So it is a fixed
+per-call cost: 15-17% of an 8 us kernel, and inside the noise of a 100 us one.
+
+**The first gate I wrote for it was the wrong statistic, and the guard I thought I had
+was not there.** The analyzer prints MKL's spread as `max/min` over every reading for a
+cell, which with two builds times three rotations is a max-over-six range — a far wider
+statistic than the comparison the parity table actually makes, which is median(build A)
+against median(build B). It read 1.0712 median, above the 1.05 threshold I had recorded as
+enforced; grepping the file shows no such check was ever added, so the run analyzed itself
+anyway and nothing announced that.
+
+The right control is MKL's own **build-to-build median ratio**, computed with the identical
+estimator used on our kernel. MKL is timed through `torch.sparse.mm` and enters neither
+build, so that ratio is a pure null.
+
+| group | median hookless kernel | MKL null | our ratio | null-corrected charge |
+|---|---|---|---|---|
+| agree f32 / f64 | 8.4 / 8.3 us | 0.9959 / 0.9914 | 1.1326 / 1.1263 | **1.1372 / 1.1361** |
+| dis_big f32 / f64 | 23.9 / 23.0 us | 0.9984 / 1.0023 | 1.0963 / 1.1243 | **1.0982 / 1.1218** |
+| dis_mid f32 / f64 | 72.8 / 118.2 us | 1.0180 / 1.0092 | 1.0164 / 0.9753 | 0.9984 / 0.9664 |
+| pooled, 136 cells | | **0.9995** | 1.0979 | **1.0985** |
+
+The paired null is 0.9995 pooled and 1.7% median per cell — not the 7.1% the max/min
+statistic claimed — and it is 189x smaller than the effect. So: **the instrumented grids
+understate our parity by 1.10x on kernels below about 25 microseconds and by nothing above
+it.** The two-grid 1.545x disagreement is therefore not the build. The build is 1.10x of it.
+The rest is corpus composition, and this one grid makes that obvious on its own: parity
+ranges from 0.97 to 3.47 *across groups inside it*.
+
+### The scoreboard, corrected: float32 is the whole remaining problem
+
+Applying that measured 1.0985x to our time only, per cell, and only where the kernel is
+below the 25 us knee where chain37 measured it — then counting rather than averaging:
+
+| k | f32 raw / corrected parity | f32 cells <MKL raw / corr / <0.95 | f64 corrected parity | f64 <MKL corr / <0.95 |
+|---|---|---|---|---|
+| 1 | 0.9379 / **1.0210** | 189 / 175 / **164** | 1.4040 | 19 / 10 |
+| 2 | 1.0329 / 1.1261 | 172 / 150 / 139 | 1.6038 | 8 / 2 |
+| 3 | 1.0852 / 1.1801 | 165 / 150 / 136 | 1.6942 | 5 / **0** |
+| 4 | 1.0891 / 1.1831 | 165 / 145 / 100 | 1.7252 | 7 / **0** |
+| 8 | 1.3212 / 1.4360 | 105 / 92 / 81 | 1.9819 | 1 / 1 |
+| 64 | 1.8240 / 1.9605 | 36 / 24 / 12 | 2.3832 | 2 / 1 |
+| 256 | 2.1469 / 2.2182 | 21 / 13 / 9 | 2.4506 | 5 / 3 |
+| all | 1.2894 / 1.3900 | 853 / 749 / **641** | **1.8571** | **47 / 17** |
+
+**float64 is essentially done**: 47 of 2534 cells below MKL, 17 below 0.95, and two widths
+with none at all. The correction cleared 38 of its 57 raw losses, which is what a marginal
+deficit looks like.
+
+**float32 is not**: 749 below, 641 below 0.95, and at k=1 the correction cleared only 14 of
+189 — so those are not marginal cells being flattered by the instrument, they are losing by
+more than ten percent. This is the first statement of the target that survives knowing what
+the instrument costs, and it is narrower than any earlier one: not "few rows and high
+degree", but **float32, worst at k=1 and material through k=8**.
+
+That width in float32 is served by `scorch_spmm_row_gather_f32<1>` with `narrowk_streams = 1`
+— a single accumulator — and the kernel's own comment already records both that it sits at
+0.762 of MKL there and why: "the profile is memory LATENCY, not FMA throughput, and MKL's
+SpMV-shaped loop keeps eight or more loads in flight". chain42 is aimed exactly at that, with
+`--pad-env` and a duplicate-environment `refb` arm so the environment charge cannot be
+mistaken for the effect.
