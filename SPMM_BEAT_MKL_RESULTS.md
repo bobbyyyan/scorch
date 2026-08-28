@@ -6313,3 +6313,30 @@ prior measurement) and the corpus (65 selected matrices against 362, and parity 
 to 3.47 across groups within one grid). chain39, now running, removes both at once — hookless
 build, caller path, the full corpus, and all six widths including k=1 and k=4 — so it will
 say which number describes the space rather than a corner of it.
+
+### chain48, queued: the flip on the caller path, and the emission attribution it discharges
+
+chain39 is measuring the pre-flip caller-path baseline right now — hookless build, eight
+shipped defaults checked, `cold_probe` over 300+ matrices at k=1,2,4,8,16,32, cold and warm,
+both dtypes. chain48 repeats that identically with one macro different, so the difference
+between the two runs is the flip and nothing else.
+
+It patches `ship2`'s own source rather than copying the local tree, which carries many other
+changes since `tune` was staged; copying would attribute all of them to the flip. The patch
+is exact-match with a count assertion on each of the two hunks and a post-patch check that
+the per-dtype macros are present and the combined one is gone, so a half-applied patch fails
+loudly instead of building something in between.
+
+It also discharges the x86 per-dtype emission attribution that nothing else in the queue
+covers. float32's instantiation is supposed to move and float64's is not, and that is a claim
+about the object rather than the source — the source is a single ternary. `hv_emit_check.py`
+disassembles both objects, splits by symbol so the two instantiations are not flattened
+together, classifies each differing symbol by whether its demangled name mentions float or
+double, and separates symbols whose only differences are immediate operands, which is what
+`__LINE__` metadata in TORCH_CHECK messages looks like. It refuses rather than passing if it
+compared fewer than a thousand instructions — the failure that printed "IDENTICAL" over zero
+instructions twice earlier here — and fails if any float64-only symbol changed code or if no
+float32 symbol did, the latter because that would mean the timing run was two identical
+builds.
+
+Queue order is now 39 (running) → 40 → 41 → 42 → 43 → 44 → 45 → 46 → 47 → 48.
