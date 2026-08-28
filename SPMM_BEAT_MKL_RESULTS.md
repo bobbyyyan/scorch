@@ -4822,8 +4822,19 @@ families.**
    which fires only *below* a pool ceiling. Both fail closed to what ships today.
 
    The evidence for the x86 side is 7 matrices (per-matrix z 1.61 on f32, 2.95 on f64), which
-   is thin. This corpus supplies 11 (f32) / 13 (f64) more of the same family, so the widened
-   in-gate corpus needed to settle it exists.
+   is thin — and enumerating the corpus says it supplies **no more in-gate matrices at all**:
+   the gate is rows ≤ 128, and the same 7 are the only ones that qualify. The extra
+   family-(i) cells are 256-row DLMC blocks (degree 555–1152) and bibd_17_8 (136 rows), 8
+   matrices that sit *just outside* the gate — at 256 rows the cap gives 16 workers of 24,
+   under-threaded but less so.
+
+   Which means fixing this family needs the row limit stated as the mechanism rather than as
+   128: the row proxy is below the width available, `rows/SCORCH_ROWS_PER_THREAD < pool`,
+   i.e. rows < 384 on a 24-thread host. That form was built and measured and rejected as
+   paying nothing — but the rejection was 9 matrices, and its pool-capped variant read
+   **1.0370** there with a per-matrix z of 1.27. That is a positive point estimate at low
+   power, not a refutation, and the way to settle it is more matrices in the band. DLMC has
+   thousands of layers of exactly this shape; this corpus samples 8 of them.
 2. **Degree 1 with many rows.** Pd_rhs and Pd_b (8081 rows, 6323 nonzeros, k = 1–2): 27 µs
    against MKL's 17. I first wrote this up as fixed per-row cost, and `scorch_policy.h`'s own
    comment on the grain says something more specific: at k = 1 this shape's floored work is
