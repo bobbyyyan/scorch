@@ -10701,3 +10701,24 @@ about 40 us; if its probe is also a few microseconds, then the cost is somewhere
 the allocator, the thread team, or the harness's own coldness -- and each of those has a different
 fix. That is exactly the question chain23b and chain22b answer between them, and it is why the
 ARM half (stage40) runs the same instrument rather than a different one.
+
+### The compiled-in candidate behaves like the env-set one, checked rather than assumed
+
+Every arm in every grid above set the rule through the environment, and a knob that only works
+when set is not the thing that would ship. stage37 builds the candidate as constants
+(`-DSCORCH_SPMM_NT_CAP=-2 -DSCORCH_SPMM_RECRUIT_MIN_WORK=10000000L`) with hooks OFF, so the
+resolver contains no `getenv` at all. Queried on that build, with both variables deliberately set
+to 0 in the environment so that any effect would be visible as a mismatch:
+
+      shape                    work      resolved   expected
+      AE fashion L1 s=0.8    107.5M           18   recruit kept
+      AE stl10 L3 s=0.99     290.2M           18   recruit kept
+      AE mnist L2 s=0.99       1.3M            6   capped
+      mgladder-ish k=1         0.3M            6   capped
+      mgladder-ish k=64       19.2M           18   recruit kept
+      high-degree k=2          0.9M            6   capped
+
+Six of six as the constants dictate, the environment ignored on all six, and `strings` finds no
+hook names in the object -- so this is the shipped shape and not an instrumented one. The build
+is also not byte-identical to the default build, which is the other half of the check: the
+constants are live rather than compiled away.
