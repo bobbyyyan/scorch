@@ -5243,9 +5243,14 @@ looks up. Reading the real ceiling arms against *it* rather than against the ref
 | wide | 1.0011 / 0.9985 | 1.0015 / 1.0003 |
 
 Everything is inside ±0.7%, and the two dtypes disagree in sign in the one group built to
-isolate the effect. **The ceiling does not ship on ARM; `SCORCH_SPMM_CEIL_MINTHREADS` and
-`SCORCH_SPMM_CEIL_ROWBIND` stay at their off defaults.** With the x86 pool-gate verdict already
-recorded, that closes the ceiling on both hosts.
+isolate the effect. **The ceiling does not ship on ARM.**
+
+That is a statement about ARM only, and the sentence that stood here — that the x86 verdict
+"closes the ceiling on both hosts" — was wrong. The x86 arm of this same grid reopened it: in
+its float64 in-gate group the rule reads 1.0651 against a 0.9887 control, and 1.3351 at k = 64.
+See the two sections below. On ARM the mechanism cannot exist, because a 128-row matrix already
+asks for 8 workers of a 6-thread pool, so there is no headroom to redistribute; nil there is
+what the gate failing closed looks like, not evidence against the rule.
 
 The control arm is the more useful number here. `p3ec0` changes no behaviour and reads 0.9652
 in the low-degree group, 0.9782–0.9795 in-gate, 0.9887–0.9911 in the wide group — a clean
