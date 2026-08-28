@@ -6934,3 +6934,34 @@ contains 2 -- so reading chain42 for k=4 would read a null.
 k=2's cold losses (29 float32, 25 float64) are not an ILP gap. Its warm behaviour is already
 the best of the narrow widths, so those cells belong to the small-output cold regime, and
 they are the part of the cold deficit that the ILP work will not touch.
+
+### chain49, queued: the lever the natural experiment points at, which nothing else tests
+
+k=4 is the worst warm width on the caller path (31 float32 and 23 float64 cells of 124, plus
+34 and 24 cold) and it is the width the exact-width kernel's own per-width sweep skipped -- its
+policy comment enumerates wins at k=2 and k=3 and losses at k=1, 5, 6 and 7, with k=4 in
+neither list, and the half-vector comment says so outright.
+
+Three candidate kernels for that one width, in one grid, each arm setting exactly three
+variables the code reads so that neither environment charge can order them:
+
+| arm | HI | HALFVEC | ACCUM | what serves k=4 float32 |
+|---|---|---|---|---|
+| ref / refb | 3 | 0 | 0 | register block, masked 256-bit over 4 lanes of 8 |
+| hv | 3 | 1 | 0 | the committed half-vector flip, 128-bit, no mask |
+| ex4 | 4 | 0 | 0 | exact-width scalar, UNROLL=4 -> 16 accumulators |
+| ex4a | 4 | 0 | 1 | the same with the unroll halved -> 8, as k=2 holds |
+
+Halfvec is tested before exact_width in the row loop, so they compete for the width and no arm
+sets both. `ex4a` exists because of the register accounting the ACCUM comment records: UNROLL*K
+at k=4 is 16 accumulators, exactly the architectural register count, and the same comment
+blames 24 accumulators for float32 k=6 reading 0.9132 while k=2, holding 8, reads 1.0666.
+
+The grid is unusually rich in free controls, and they are labelled rather than averaged: on
+float32 both k=2 and k=8 are inert for every arm (exact already serves 2; HI=4 < 8 and hv needs
+exactly 4), and on float64 `ex4`/`ex4a` are inert at *every* width because `exact_cap_` is 3 --
+so the whole float64 grid is a same-code floor for those two arms. One float64 cell is not a
+null: at k=2 the half-vector for doubles is exactly two lanes, so `hv` fires there, which
+re-measures on a broad corpus the cell where the flip read 0.9646 and turned 0 of 302
+below-MKL cells into 21. That is the measurement the float64 half of the flip rests on, and it
+has only been made once.
