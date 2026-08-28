@@ -6268,3 +6268,48 @@ latency bound should produce, and it is measurable without any absolute parity n
 
 The synthetic file was deleted rather than left in the scratch directory, so it cannot later
 be mistaken for a measurement.
+
+### chain38: on the caller path we are 2.0-2.5x, with exactly one systematic defect
+
+`cold_probe.py` times `ops.matmul` with the plan cache live, which is the path a caller
+actually takes, rather than the harness path through `time_dict` and an STensor B that no
+caller uses. Over its 65-matrix corpus, both dtypes, cold and warm:
+
+| dtype | phase | pooled | cells below MKL |
+|---|---|---|---|
+| float32 | warm | 2.1585 | 35 / 260 |
+| float32 | cold | 2.0075 | 3 / 260 |
+| float64 | warm | 2.5061 | 4 / 260 |
+| float64 | cold | 2.0914 | 4 / 260 |
+
+Cold and warm both clear MKL by 2x or better, which is the shape the goal asks for. And 30
+of float32-warm's 35 losing cells are one cell:
+
+**float32, k=4, warm, the bigk4 group: 0.8821, with 30 of 30 cells below MKL.** Its
+neighbours are healthy — k=2 reads 1.1747 with 2/30, k=8 reads 1.0921 with 2/30, k=32 reads
+2.0050 with 1/30 — and the same cell *cold* reads 1.0869 with 1/30. A 30-of-30 spike at one
+width with clean neighbours is not noise.
+
+k=4 in float32 is the half-vector width: four floats, exactly one 128-bit register. On the
+staged pre-flip tree that width runs the register-block kernel with a masked 256-bit load per
+nonzero over four lanes of eight, which is the deficit the half-vector kernel was written for
+and which is already committed here as `SCORCH_SPMM_HALFVEC_F32 1`. So chain38 found the same
+gap from a different direction, on the caller path, without being pointed at it.
+
+**Registered prediction.** The flip measured 1.1008 pooled at k=4 float32 and 1.2143 on the
+L2-resident band. Applied to 0.8821 that predicts this cell lands between 0.97 and 1.07 —
+parity, possibly just above, and not obviously enough on its own. If it lands below 1.0 the
+honest conclusion is that the half-vector kernel is necessary but not sufficient for this
+cell, not that the flip failed.
+
+**Warm is the harder side here**, 0.8821 against 1.0869 cold, which means MKL loses more of
+its advantage when cold than we do. That matches what the goal already assumed in treating
+warm as the number that matters and cold as a guard.
+
+**On the tension with the instrumented grids.** Those read 749 of 2534 float32 cells below
+MKL; this reads 5 of 230 once k=4 is set aside. Two differences explain it and neither is
+noise: the path (caller with the plan cache, against a harness path that is 1.2-1.3x worse by
+prior measurement) and the corpus (65 selected matrices against 362, and parity ranges 0.97
+to 3.47 across groups within one grid). chain39, now running, removes both at once — hookless
+build, caller path, the full corpus, and all six widths including k=1 and k=4 — so it will
+say which number describes the space rather than a corner of it.
