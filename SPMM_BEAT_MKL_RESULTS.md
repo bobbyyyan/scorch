@@ -7294,3 +7294,41 @@ degree bands above 8, or the loss below 8 being much larger on x86 than the 3.4%
 code on x86 unless the MINDEG gate hands the low-degree band back to it, which it would. So the
 gate is not only a performance guard, it is also what keeps the gather alive for the shapes it is
 still better at.
+
+### The gated candidate, measured: the gate is inert where it should be, and it found a second win
+
+ARM float32. `ex1` lowers the exact band to 1 with no degree floor; `ex1g` is the shipping
+candidate, the same with `SCORCH_NARROWK_EXACT_MINDEG=8`.
+
+| band | refb | ex1 ungated | **ex1g gated** | aa |
+|---|---|---|---|---|
+| k=1, deg<8 (n=32) | 0.9947 | **0.9317 (z-3.1)** | **0.9978 (z+0.3)** | 0.9862 |
+| k=1, deg 8-64 (n=17) | 1.0084 | 1.0375 | **1.0407 (z+1.9)** | 0.9940 |
+| k=1, deg 64-256 (n=14) | 0.9917 | 1.0695 | **1.0712 (z+3.1)** | 0.9926 |
+| k=1, deg>=256 (n=7) | 0.9986 | 1.1061 | **1.1417 (z+1.6)** | 1.0037 |
+
+The floor across `refb` and `aa` spans 0.9862 to 1.0123, so +/-1.4%. Three things hold at once,
+which is what the pre-registered rule asked for:
+
+* the ungated kernel's loss below degree 8 is real and larger than the pooled estimate --
+  **6.8%** at z=-3.1 over 32 matrices, not the 3.4% that pooling two corpora suggested;
+* the gate returns that band to **0.9978 at z=+0.3**, indistinguishable from the floor, so it is
+  provably inert where it fires rather than merely small;
+* the win above the gate is undamaged: +4.1%, +7.1%, +14.2%, rising monotonically with degree.
+
+**The gate also found a win nobody was looking for.** At k=2 with degree under 8, `ex1g` reads
+**1.0913 at z=+3.7**. k=2 is a null for the `K1` flag -- the exact band already contains 2 -- but
+`MINDEG=8` refuses the exact-width kernel at *that* width too, handing those rows back to the
+register-block kernel. So the exact-width kernel, which ships **ungated** at k=2 today, is about
+9% slower than what it replaced on short rows, and has been since it shipped. The same argument
+predicts the same at k=3, which the exact band also holds and which this grid did not measure.
+
+So one constant buys two things: it is the gate that makes the k=1 extension shippable, and it is
+a standalone fix for a regression the exact-width kernel already carries at k=2. That is worth
+separating in the ledger because the second half needs no new kernel and no new width -- it is a
+default that is wrong today.
+
+Still ARM-only, and ARM has no MKL, so none of this closes a measured deficit yet. chain42 is the
+x86 half. The prediction stands as registered: `ex1` should win at least as much there, because the
+gather it displaces serialises eight accesses in microcode while ARM's masked register kernel does
+not, and its low-degree loss should be gated away by the same constant.
