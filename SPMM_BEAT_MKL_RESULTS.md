@@ -11087,3 +11087,43 @@ torch**, so nothing in this split is a deficit against the only sparse rival ARM
 budget: on ARM the two reachable fixed costs are the 8.2 microsecond allocation and the 5.1
 microsecond Python path, in that order, and together they are worth more than any narrow-k
 kernel change measured so far.
+
+## Two scoreboards, and which one counts: chain24's counts are the hooked build's
+
+The section above that set today's agenda quotes "107/744 warm and 198/744 cold below MKL" from
+chain24's base arm. The canonical scoreboard, earlier in this document, says 75/744 and 162/744
+for float32. Both are caller-path, both are the same 124-matrix corpus at the same six widths,
+and they are ~30 cells apart in each phase. The difference is the build.
+
+**chain24 runs on `captune`, a hooks build.** Every `getenv` in the thread-policy resolver and
+the kernel dispatch is compiled in and executed, and the charge is asymmetric: it lands on our
+column and not on MKL's. That was measured earlier this session at about 1.1% per environment
+variable an arm sets on x86, on sub-30-microsecond kernels, and separately as a whole-build charge
+that moved our kernel 1.545x while moving MKL 1%. So a below-MKL count taken in a hooks build is
+pessimistic by construction.
+
+**The hookless board is the one the goal is measured against**: float32 warm 1.5272 with 75/744
+below and cold 1.1617 with 162/744; float64 warm 1.6329 with 51/744 and cold 1.2049 with 105/744;
+**393 of 2976 cells below, 172 of them by more than five percent.** Nothing has shipped since it
+was taken, so it still stands.
+
+The two boards agree completely on shape, which is why the agenda does not change:
+
+      k    hookless f32 warm parity   below MKL   |   chain24 (hooked) below MKL
+      1                     1.1737          27   |                          40
+      2                     1.3450           6   |                          17
+      4                     1.3159          31   |                          36
+      8                     1.6364           9   |                          10
+      16                    1.9219           1   |                           1
+      32                    1.9417           1   |                           3
+
+k=1 and k=4 are the weak widths on both, k >= 16 is clean on both, and the hooked counts are
+uniformly larger. **What the hookless parity column adds is that k=4 is a dip and not just a
+count**: 1.3159 sits below both its neighbours, k=2 at 1.3450 and k=8 at 1.6364, so the margin
+falls by a third between k=4 and k=8. That is the pooled form of the per-matrix width curves
+above, and it is the reason those curves are worth trusting even though they came from the hooked
+build -- a hooks charge that is flat in k cannot manufacture a dip at one width.
+
+**How to apply, going forward:** quote counts from the hookless board and shapes from whichever
+run has them, and say which build every count came from in the same sentence. The two boards
+differing by 30 cells is not an error in either; treating them as interchangeable would be.
