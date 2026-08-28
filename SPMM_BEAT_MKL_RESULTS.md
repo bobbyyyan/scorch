@@ -8972,3 +8972,66 @@ wrong run. I noticed because the numbers were digit-for-digit stage26's. The dat
 re-analysing the right prefix took one command. The general form is the one already in this file:
 **a rename that covers the outputs but not the reader produces a verdict about a different run**, and
 the only thing that catches it is knowing what the other run said.
+
+## stage28: the ARM thread ladder says force-no, cap-yes, and the difference is 2.0x
+
+The M5 ladder forced `SCORCH_TUNE_THREADS` to 2/4/6/8/12/18 over 169 matrices at
+k=1/2/4/8, float32, 15 reps, interleaved, with `refb` and `aa` as A/A controls. Read
+straight, it looks like a flat refusal. Every rung is neutral-or-worse than the
+resolved default, monotonically, and the loss grows with the count:
+
+      band          n     t2      t4      t6      t8     t12     t18
+      128-600      30   1.000   0.928   0.847   0.760   0.528   0.365
+      600-2400     23   1.002   0.780   0.666   0.497   0.344   0.224
+      >=2400      113   1.002   1.006   0.991   0.894   0.581   0.418
+
+t6 is this host's own P-core count (`hw.perflevel0.physicalcpu` = 6) and it is a loss:
+parity against the reference falls 4.345 -> 3.446 at k=1 and cells behind it go 3 -> 24.
+So the hypothesis chain46 raised on x86 -- that the good count is the host's P-core
+count, because forcing 8 on redwood took f32 78/231 behind down to 15/231 -- does not
+survive a second host in that form.
+
+**But a cap and a force are not the same experiment, and the ladder above scores a
+force.** A cap only ever touches cells whose resolved count already exceeds it. I asked
+the production resolver (`scorch_spmm_nthreads`, exported so a harness need not restate
+it) what it returns for every cell on this host, and the corpus splits in two:
+
+      resolved count      cells    what a cap at 6 does
+      1                     216    nothing
+      2..6                  332    nothing
+      7..18                 128    lowers it
+
+19% of the corpus resolves above 6, as high as 18. Stratifying the same measurements on
+that split inverts the verdict:
+
+      set                                cells    t2      t4      t6      t8     t12     t18   refb     aa
+      resolved > 6  (a cap fires)          128   1.299   1.305   1.285   1.186   0.941   0.747  1.008  1.006
+      resolved <= 6 (a cap cannot fire)    548   0.889   0.838   0.726   0.732   0.478   0.325  0.999  0.999
+
+On the cells a cap would actually change, six threads is **1.285x faster** than what
+ships today -- 26 of 32 matrices better by more than 5%, 2 worse. The 0.726 that made
+the unstratified table look damning comes entirely from the 548 cells a cap never
+reaches, and most of it from the 216 where the policy resolves to a single thread and
+forcing six is simply oversubscription. Averaging the two populations together hid a
+win under a loss that a cap cannot incur.
+
+Two things this does not yet settle.
+
+The cap *value* is not established as the P-core count. On the firing set t2 (1.299) and
+t4 (1.305) are indistinguishable from t6 (1.285), and t8 is already down at 1.186. The
+shape is "the resolved count is far too high on this population and almost any smaller
+number recovers ~30%", not "six is special". Six is defensible as a portable choice
+because it is derivable on any host and lands near the optimum on both, which is what
+`scorch_pcore_count()` is for -- but a claim that the optimum *is* the P-core count needs
+the same stratification applied to chain63's x86 ladder, which is still queued.
+
+A cap is also not a pure thread change. `scorch_spmm_partition_mode` takes the resolved
+count as an argument, so lowering it can flip the row-handout mode underneath. That is
+the most likely explanation for the two matrices that lose: both sit just above the cap
+(resolved 7 and 8, so the cap moves them by one or two threads) yet lose 17%, which is
+far more than one thread of parallelism is worth. It has to be measured on the real
+build, not reasoned about from the ladder.
+
+Caveat on the reference: this host has no MKL, so `mkl_ms` here is `torch.sparse.mm`.
+The 4.3-5.6x figures above are against torch, not against MKL, and only the 1.285 --
+a scorch-to-scorch ratio -- is a like-for-like number.
