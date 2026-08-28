@@ -9921,3 +9921,73 @@ to 8, below the recruit's gate, and there the cap alone read 0.834 and 0.915 -- 
 `at::parallel_for` 8 workers over a 6-thread pool beat handing it 6, presumably because more
 workers means a finer row handout off the shared counter. That is a real reading against part 2
 and it is why part 2 gets its own arm rather than riding along with part 1.
+
+## The rule that follows, and why it costs x86 nothing
+
+The fix is one condition on the cap, not a change at either launch site: **cap the resolved
+count at the caller's pool, except where capping would disable a recruit worth having.** In
+`scorch_spmm_nthreads`:
+
+      if (recruit_min_work > 0 && work_true >= recruit_min_work) {
+        const long pool = nthreads_override > 0 ? nthreads_override : omp_get_max_threads();
+        if (nthreads >= 2 * pool) nt_cap = 0;      // decline
+      }
+
+`work_true` is nnz*k with the width unfloored, `pool` is what the launch site reads as
+`at::get_num_threads()` (the caller passes it as the override, and the recruit branch is
+reachable only when it did). The threshold is 0 by default, which is exactly the cap as
+measured, so nothing about the previous readings is invalidated.
+
+Putting it here rather than at the launch site was not a matter of taste. The first two attempts
+moved the decision into a shared helper called from both kernels, and neither was
+emission-neutral: passing the work and letting dead-code elimination remove it left all three
+touched functions with **the same instruction count and a permuted register assignment**, and
+macro-guarding the work out of the token stream instead **removed four instructions** from
+`spmm_csr_v2_core` and two from the fused kernel, which then shifted the object's layout and
+moved 896 symbols' immediates. Neither is a regression and neither is byte-identical. The
+resolver-side form is: the whole `.so` compares **byte-identical at default on ARM**, because
+the new condition sits inside the cap's existing `#if`, which is already compiled out when the
+cap is off. The build was confirmed deterministic first -- two builds of the unchanged tree are
+byte-identical -- so that is a measurement and not an assumption.
+
+Verified live on the M5 (pool 6, recruit gate at 12), threshold 15M:
+
+      shape                      work    base  cap  cap+T
+      AE fashion L1 s=0.8      107.5M      18    6     18   recruit kept
+      AE stl10 L3 s=0.99       290.2M      18    6     18   recruit kept
+      AE mnist L2 s=0.99         1.3M       8    6      6   capped
+      mgladder-ish k=1           0.3M      18    6      6   capped
+      mgladder-ish k=64         19.2M      18    6     18   recruit kept
+
+### It cannot fire on a pool that is the whole machine
+
+On redwood the pool is 24, every physical core, and the resolved count is bounded by
+`omp_get_num_procs()` = 32. The recruit's gate needs 48. So `nthreads >= 2 * pool` is false for
+every cell and the decline never happens: on that host the rule *is* the unconditional cap, and
+chain21/chain24's numbers carry over unaltered. This is a property of the pool, not of the
+instruction set -- a user who calls `torch.set_num_threads(8)` on the same box makes the gate
+16, the recruit reachable, and the threshold live, which is the right behaviour, because with a
+shrunken pool going wide genuinely does reach cores the pool excludes.
+
+The worry worth checking was the other direction: if the x86 cap's win lived *above* the
+threshold, the same rule would be declining to collect it for a reason that does not apply
+there. Bucketing chain21's 302 matrices by the same work axis (per-matrix geomean, cap24 over
+`refb`):
+
+      work        f32 cap      z     f64 cap      z    matrices
+      < 10M        1.0628  +11.8      1.0516   +9.6     302
+      10 - 20M     1.1956  +20.3      1.0695   +5.8      71
+      20 - 40M     1.1160   +5.7      1.0229   +1.4      44
+      40 - 80M     1.0124   +0.9      1.0367   +5.2      49
+      > 80M        1.0119   +0.9      1.0104   +1.0      18
+
+The x86 win is concentrated in the same place -- below 40M, and strongest at 10-20M -- and
+above 40M it is inside the A/A floor at z +0.9 in float32. So the two hosts agree that
+over-threading hurts small work; they disagree only about what to do when the work is large,
+because only one of them has cores outside the pool to go and get. The rule as written gives
+each host its own answer without a host test, which is why it is one condition rather than two
+policies.
+
+The 40-80M float64 bucket reads 1.0367 at z +5.2 and is a real x86 win above the threshold --
+unaffected here, since the decline cannot fire on that host, but it is the reading that would
+matter if anyone shrinks the x86 pool.
