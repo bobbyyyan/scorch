@@ -9117,3 +9117,27 @@ costs one and 24 costs none. A cap that is monotonic in its argument should not 
 so something other than parallelism is moving -- most likely the row-handout mode, which
 `scorch_spmm_partition_mode` derives from the resolved count. It is another reason the
 cap has to be measured compiled in rather than synthesised from force arms.
+
+### The tC arms are the base count, not the final one, so the cap estimate is a proxy
+
+`SCORCH_TUNE_THREADS` forces the return value of `scorch_nthreads`. That is the *base*
+count inside `scorch_spmm_nthreads`, and two things downstream can raise it again: the
+row-proxy raise, which is live in the shipped build because `SCORCH_SPMM_ROWS_PER_THREAD`
+is 1 and the branch tests `rpt < 16`, and the composition adoption. Both ceiling at
+`omp_get_num_procs()`, not at the forced value. So a `tC` arm means "start from C and let
+the raises have it back", not "run on C", and every number in the two sections above is
+built on that proxy.
+
+The bias has a direction. A cell's tC count is somewhere between C and what ref
+resolved to, so on the firing set -- where fewer threads is better -- a true cap at C
+should be at least as good as tC, and the estimate understates the win. That argument
+needs monotonicity in the count, though, and this data is not monotonic: cap 16 costs
+twelve x86 matrices more than 5% where 8 costs one and 24 costs none. So "conservative"
+is an argument, not a measurement.
+
+The instrument that does answer it is the cap itself. `SCORCH_SPMM_NT_CAP` is applied
+after both raise paths, immediately before the return, so it is the only knob here whose
+value is the count the kernel launches on. The synthesised estimate was worth doing --
+it is what identified the P-core count over the pool, and it sized the effect well enough
+to justify building the thing -- but it does not get to be the number of record. The
+measurement of record is a ladder over that hook, and until it exists the cap stays at 0.

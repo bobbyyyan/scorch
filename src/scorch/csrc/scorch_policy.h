@@ -174,6 +174,13 @@
 // the composition adoption. 0 is off; a positive value is that many workers; -1 means
 // scorch_pcore_count(), the host's performance-core count.
 //
+// Every number below is SYNTHESISED from SCORCH_TUNE_THREADS arms, which force the base
+// count that scorch_nthreads returns and not the final one -- the row-proxy raise and the
+// composition adoption can both put it back, ceilinged at omp_get_num_procs(). So they
+// size the effect and identify the value; they are not a measurement of this knob. This
+// knob, applied after both raises, is the first instrument here whose value is the count
+// the kernel actually launches on.
+//
 // This is a cap and not a force, and the distinction is most of the effect. Forcing a
 // count also RAISES it on the cells that resolved below the value, and on the M5 that is
 // ruinous -- over 676 cells, forcing six threads reads 0.726 against the resolved default
