@@ -6577,3 +6577,18 @@ half-vector kernel reduces per-*nonzero* masking cost and leaves per-*row* setup
 these cells are dominated by per-row setup at degree 11. So the flip should help less here
 than that estimate, and multi-row should be the larger lever for this half of the problem. If
 chain48 comes in below 0.97 that is the reason, and it is not evidence against the flip.
+
+### chain45 already covers the low-degree half, exactly
+
+Checked rather than assumed: all thirty of chain38's losing cells are present in chain45's
+302-matrix corpus, and its widths include k=4, so the multi-row lever will be measured on
+precisely the cells that lose. Its degree distribution over those cells is the full range
+4 to 12396, so the grid can separate the low-degree bulk from the `nw14` outlier by itself.
+
+Its arms are `ref:M=0; refb:M=0; mr2:M=2; mr4:M=4`, each setting exactly one variable, with a
+duplicate-environment `refb` as the floor. Equal variable counts mean the environment-length
+charge falls on all arms alike and `--pad-env` is not needed here, which is why its absence is
+correct rather than an oversight. One difference to keep in mind when reading it: chain45 times
+the harness path in an instrumented build, whereas the defect was found on the caller path in a
+hookless one. The per-row overhead should be visible in both, but the magnitudes will not be
+comparable across the two, only the arm-to-arm ratios within chain45.
