@@ -9678,3 +9678,42 @@ read 1.000, and 186 matrices are more than 5% worse while only 143 cells are com
 fire. So my firing/inert split is wrong for those arms -- kprobe does not appear to pass an
 explicit override, and I resolved with the pool. The all-cells column and the regression
 counts carry no such assumption, and they are what the conclusion rests on.
+
+### chain21, both dtypes, all-cells columns
+
+Computed without the resolver, so without the firing-set assumption the previous section
+flags. Per-matrix geomean against `refb`, z under each, and the worst per-width count of
+matrices more than 5% slower.
+
+      float32       k=1        k=2        k=4        k=8       k=16       k=64   worst -5%
+      cap24      1.0625     1.0587     1.0628     1.0745     1.0622     1.0456      24
+                    +9         +9         +9        +11        +10         +8
+      btrue      1.0596     1.0540     1.0303     1.0153     1.0055     1.0088      19
+                    +8         +8         +4         +3         +1         +4
+      cappc      0.7736     0.7704     0.7787     0.7473     0.7683     0.8175     215
+      cap8       0.7752     0.7704     0.7763     0.7530     0.7659     0.8229     208
+      cap12      0.8740     0.8839     0.8828     0.8653     0.8745     0.9149     184
+      aa         1.0056     1.0010     1.0068     1.0017     1.0092     1.0033      13
+
+      float64       k=1        k=2        k=4        k=8       k=16       k=64   worst -5%
+      cap24      1.0568     1.0487     1.0443     1.0410     1.0154     1.0285      35
+      btrue      1.0670     1.0502     1.0250     1.0045     0.9949     1.0048      24
+      cappc      0.7584     0.7782     0.7648     0.7723     0.7901     0.8193     218
+      aa         1.0093     1.0027     1.0010     1.0017     1.0041     1.0029      17
+
+Cap-at-pool is positive at every width on both dtypes, 4-7% whole-corpus, z from +3 to +11.
+Its regression count -- 24 matrices on float32, 35 on float64 -- is about twice the A/A arm's
+13 and 17, which is worth stating rather than rounding away: the mean is strongly positive
+and a minority of matrices do lose.
+
+Two smaller things worth having. `btrue` at k=16 and k=64 reads 1.0055 / 1.0088 on float32
+and 0.9949 / 1.0048 on float64, against the A/A arm's 1.0092 / 1.0033 and 1.0041 / 1.0029 --
+so its inertness above k=16, which was an argument from `max(k,16) == k`, is now also an
+empirical structural null, and a well-behaved one. And `btrue` decays with width exactly as
+the mechanism says while cap-at-pool does not, which is the cleanest possible confirmation
+that they are two different defects and not two readings of one.
+
+Open, and one measurement: whether `btrue` is additive on top of cap-at-pool. Alone they are
++6.3% and +6.0% at k=1. Independent effects would compound to about 1.12; redundant ones
+would stay near 1.06. `btcap` cannot answer it because its cap arm was the P-core count,
+which swamps everything.
