@@ -11197,3 +11197,30 @@ Before that goes in, two things are outstanding and one is new:
    into a number or into drift. This is queued as the thing to do next on redwood, and until it
    lands the honest statement is "one x86 workload reads about 6% against, on a floor too loose to
    settle it".
+
+## The held float64 reading will not get its control from chain24, and does not need to
+
+The cap's float64 caller-path reading was recorded as held: `warm_plan_ms` 1.0073 at z +3.4 from
+one rep, with the note that "the second rep of each arm is what turns this into a reading".
+There is no second rep. chain24 runs `for rep in 1 2` over float32 only and then a single
+float64 pass of each arm -- by design, visible in the script -- and it finished at 11:30 having
+done exactly that.
+
+So the reading stays held, and the right response is not to re-run chain24. **chain26b measures
+both dtypes on the caller path with arms interleaved inside every repetition and a
+duplicate-of-base A/A column**, which is a strictly better instrument for this question than two
+whole-run reps of a fixed sequence: chain24's own float32 analysis showed its design cannot
+resolve an effect smaller than one position's drift, about 0.9%, and the float64 effect in
+question is 0.7%. chain26b is running now.
+
+One thing chain24's float32 half did settle, and it is worth separating from the held number: on
+the caller path the cap is null in float32 (0.9967 at z -1.3 against controls of the same size),
+and its kernel timer is disqualified by a 2.7% same-arm drift at z -8.7. Neither of those is
+affected by the missing float64 rep.
+
+**Where the x86 cap now stands, three readings that do not agree and one instrument left:**
++6.3% on the harness path (chain21, whole-corpus, ten matrices worse), null on the caller-path
+board (chain24 float32), and about 6% *against* on ogbn-arxiv's GCN (chain25b, on a control that
+moved 9%). The first is the wrong path, the third is one workload on a loose floor, and chain26b
+is the one measurement designed for the question. Nothing about the x86 default should be decided
+before it lands.
