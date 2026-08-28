@@ -4598,3 +4598,34 @@ caller's pool, it means 4 → 6. There are only six to have. The gain is not a p
 shape, it is a property of how much machine the shape was failing to use, so a shared
 default cannot express it — and a 7-matrix, one-host, one-dtype effect is not enough to
 justify an ISA-conditional one.
+
+## A work gate recovers half the ARM tail, and its own consistency check caught the wrong condition
+
+The gate turns the partition off below N grains of `nnz·max(k,16)`. On the 70-matrix ARM
+tail corpus, against the candidate (A/A floor 1.0008 / 0.9987):
+
+| arm | float32 | float64 | >10% behind today, float32 | float64 |
+|---|---|---|---|---|
+| candidate | 1.0000 | 1.0000 | 81 | 55 |
+| **+ gate at 2 grains** | **1.0154** | **1.0089** | **45** | **22** |
+| + gate at 2, ceiling 16 | 1.0087 | 1.0031 | 46 | 31 |
+| + gate at 4, ceiling 16 | 1.0097 | 1.0048 | 48 | 23 |
+| no partition (ships today) | 1.0270 | 1.0150 | 0 | 0 |
+
+The gate recovers about 57% of the gap on float32 and 59% on float64, and roughly halves the
+cells behind today. It leaves k=64 alone, where the partition wins even here (0.9972 against
+the candidate, and no-partition reads 0.9734).
+
+**The consistency check failed, and that is what it was for.** The ceiling is meant to stop
+the gate firing on a large pool; on a six-thread host it cannot bind, so the gated and
+gated-with-ceiling arms had to read *identically*. They differ by 0.7% (1.0154 against
+1.0087) — because the first version of the condition compared the **resolved worker count**,
+which is raised per shape and capped by `omp_get_num_procs()` = 18 on this host, so it
+straddles a ceiling of 16 and the ceiling blocked the gate on exactly the shapes whose count
+had been raised. Written down as a prediction before the run, it took one table to see.
+
+The condition now reads the **caller's pool** — 6 here, 24 on redwood, shape-independent,
+and the quantity the contention argument is actually about. Both hosts re-run against it,
+and the same check applies again: on ARM the two arms must now agree, on x86 they must
+differ. If ARM still shows them apart, the pool is not reaching this call site and the
+condition has to come from `at::get_num_threads()` instead.
