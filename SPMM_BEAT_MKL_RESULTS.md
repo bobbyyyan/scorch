@@ -6183,3 +6183,62 @@ That width in float32 is served by `scorch_spmm_row_gather_f32<1>` with `narrowk
 SpMV-shaped loop keeps eight or more loads in flight". chain42 is aimed exactly at that, with
 `--pad-env` and a duplicate-environment `refb` arm so the environment charge cannot be
 mistaken for the effect.
+
+### The float32 deficit has one mechanism, and dtype scaling proves it without any parity number
+
+Corrected parity is 1.02-2.22 in float32 and 1.40-2.45 in float64, so the float64 kernel is
+about 1.4x further ahead of MKL at narrow k. Both dtypes run structurally the same kernel and
+float32 moves half the bytes, so that has exactly two explanations pointing opposite ways:
+MKL's float32 kernel exploits the halved footprint better than its float64 one, or ours
+exploits it worse than ours does. The discriminator is the absolute dtype speedup each
+implementation gets on the *same* cell, time(f64)/time(f32), where 2.0 is perfect scaling
+with the bytes and 1.0 is float32 buying nothing.
+
+This is a within-build, within-run, same-matrix comparison, so none of the session's
+disputed absolute parity numbers enter it and the instrument question is irrelevant to it.
+Our side uses kernel time, because the ~4.2 us per-call floor is dtype-independent and wall
+time would dilute the ratio toward 1.0 — the very direction of the answer. MKL has no
+kernel-time column and never will; it keeps wall time, and since its own floor is the larger
+one (~12.8 us) that dilution biases *against* the reading below rather than for it.
+
+| k | ours (kernel) | MKL (wall) | MKL, floor-subtracted | gap |
+|---|---|---|---|---|
+| 1 | **1.0669** | 1.4059 | 2.0498 (n=39) | 1.32 |
+| 2 | **1.0087** | 1.3988 | 1.7466 (n=63) | 1.39 |
+| 3 | **1.0256** | 1.4244 | 1.6682 (n=83) | 1.39 |
+| 4 | **0.9984** | 1.4239 | 1.6763 (n=89) | 1.43 |
+| 8 | **1.0647** | 1.4187 | 1.5853 (n=173) | 1.33 |
+| 64 | 1.4591 | 1.6846 | 1.9920 (n=275) | 1.15 |
+| 256 | **2.1326** | 2.2353 | 2.5398 (n=322) | 1.05 |
+
+**Our narrow-k float32 kernel takes the same time as our float64 one.** Halving the element
+size buys between 0.998x and 1.067x at every width through k=8. MKL gets 1.41x on wall time
+there and 1.59-2.05x once its floor is subtracted. At k=256 ours scales 2.13x, so the kernel
+*can* be throughput-bound — at narrow k it simply is not.
+
+A loop that gets nothing from halving its bytes is not bandwidth-bound; it is latency-bound,
+because a load costs the same cycles whether it moves four bytes or eight. So this
+independently confirms, and much more sharply, what the multi-stream kernel's own comment
+already asserted from a profile: "the profile is memory LATENCY, not FMA throughput, and
+MKL's SpMV-shaped loop keeps eight or more loads in flight."
+
+It also reframes the float64 result. We are not 1.86x ahead of MKL at float64 because our
+float64 kernel is good; we are dtype-blind, and MKL's float64 pays for its bytes while ours
+does not. The float64 lead is MKL's float64 disadvantage. Fixing the latency bound therefore
+widens both dtypes, and the honest statement of the remaining work is one mechanism, not two
+dtype problems.
+
+**The prediction, registered before chain42 reports.** The fix is memory-level parallelism —
+more independent loads in flight — not vectorization and not blocking. If our narrow-k
+float32 reaches MKL's degree of throughput-boundness it gets up to 1.4x faster, taking
+corrected float32 k=1 parity from 1.021 to about 1.43 and clearing most of the 164 cells
+below 0.95. chain42's `s2`/`s4`/`s8` arms are exactly that intervention.
+
+**And a discriminator for chain42's analysis, so the two candidate sub-mechanisms do not get
+conflated.** The multi-stream kernel's comment predicts its win is largest where B is *not*
+L1-resident, because what it covers is L3 latency. My standalone scalar accumulator ladder
+found its 2.31x where B *was* L1-resident, because what it covered was the FMA dependency
+chain. Those are different causes with different gates, so chain42 must be binned on B
+footprint rather than pooled: a win concentrated in the large-B cells is the latency story,
+a win concentrated in the small-B cells is the dependency-chain story, and a flat win across
+both means neither explanation is complete.
