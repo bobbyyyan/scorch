@@ -4629,3 +4629,30 @@ and the quantity the contention argument is actually about. Both hosts re-run ag
 and the same check applies again: on ARM the two arms must now agree, on x86 they must
 differ. If ARM still shows them apart, the pool is not reaching this call site and the
 condition has to come from `at::get_num_threads()` instead.
+
+## The transformer guardrail: neutral on the path that ships, and its one bad cell is noise
+
+Sparse-attention transformer inference, three configs × two sequence lengths, three
+rotations, per-cell minimum over passes. The bench's own Dense and Sparse PyTorch columns
+are the same code in every arm and moved 1.0034 / 0.9872 and 0.9833 / 0.9837 — so the arms
+are comparable to about 1.7%.
+
+| framework | + back-stealing | + back-stealing and the ceiling | worst cell |
+|---|---|---|---|
+| **Scorch (fused)** — the path that ships | **0.9924** | 0.9991 | 0.9617 |
+| Scorch (unfused) | 0.9701 | 0.9772 | 0.8454 |
+
+The fused path — the single fused sparse-attention kernel — is neutral. The unfused chain
+(per-head SDDMM → CSR softmax → SpMM) shows one cell at 0.8454: base-w128 at sequence 1024,
+164.8 → 194.9 ms.
+
+**That cell cannot be attributed, and the run says so itself.** The row ceiling requires
+rows ≤ 128 and every transformer config here has rows = sequence length ≥ 1024, so the
+ceiling *cannot fire* — which makes the third arm a second copy of the second one for this
+workload, an A/A pair by accident. On that cell they read 194.913 and 172.238: **13% apart on
+behaviourally identical code.** Pooled they agree to 0.7%, so the pooled numbers stand and
+the per-cell floor on the unfused path at this shape is 13%, not 1.7%. The Dense and Sparse
+PyTorch controls are tight only because their kernels are ten to forty times longer.
+
+So: no regression on the transformer at the pooled level, nothing separable per cell on the
+unfused path, and the fused path — which is what a user gets — is flat.
