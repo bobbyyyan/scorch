@@ -639,7 +639,21 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // The proxy count, exactly as before when nnz_per_thread is 0 and the grain is the
   // default: rows_axis is then rows/SCORCH_ROWS_PER_THREAD and dividing it by 1
   // reproduces the old expression including its truncation.
-  int nthreads = scorch_nthreads(work, rows_axis, grain, 1, 1);
+  // WHICH work measure bounds the base count. `work` is nnz*max(k,16): a time proxy that
+  // floors the k term at a cache line, which is right for throttling a bandwidth-bound product
+  // and overstates a k=1 product SIXTEENFOLD. At k=1 the proxy therefore never binds, and
+  // rows/SCORCH_ROWS_PER_THREAD alone sets the count -- a 256-row product with 294912 nonzeros
+  // gets 16 workers for roughly 4 us of arithmetic, and measures 30.0 us of kernel time against
+  // MKL's 22.6, which is 7.2 cycles a nonzero per thread against a bound under one. The raise
+  // gate below already reads work_true for exactly this reason; the same correction on the base
+  // bound has never been priced. Off by default, and `work` is what ships until a grid on both
+  // hosts says otherwise.
+  long base_work = work;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_BASE_WORK_TRUE");
+    if (e && *e && std::atol(e) != 0) base_work = work_true; }
+#endif
+  int nthreads = scorch_nthreads(base_work, rows_axis, grain, 1, 1);
   // Then raise it where the ROW proxy, not the work, is what bound it -- a 64-row
   // pruned-ResNet layer at k=512 is 62 grains of arithmetic held to 4 workers -- but
   // only as far as the real arithmetic supports: one grain per worker. Both bounds
