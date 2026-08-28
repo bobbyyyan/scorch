@@ -284,6 +284,16 @@
 // Widest k the exact-width kernel serves. Measured per width: it wins 6-8% at k=2 and
 // k=3 on both dtypes and loses at k=1, 5, 6 and 7, so 3 is where the sign changes. Only
 // 1..7 (float) and 1..3 (double) are instantiated and the dispatch clamps to that.
+// Serve a width that is exactly the half-vector -- four floats, two doubles -- with 128-bit
+// registers instead of a masked 256-bit register. At k=4 float32 the register-block kernel
+// runs a masked load per NONZERO over 4 lanes of 8; 128-bit needs no mask and wastes no FMA
+// width. This is the width the per-width sweep skipped and where the k=4 float32 fit shows a
+// per-nonzero deficit against MKL of 8-23% whichever shapes go into it.
+// 0 = off (masked 256-bit, as before). 1 = the exact half-vector width only. 2 = also the
+// widths below it that the exact-width scalar kernel does not already claim.
+#ifndef SCORCH_SPMM_HALFVEC
+#  define SCORCH_SPMM_HALFVEC 0
+#endif
 #ifndef SCORCH_NARROWK_EXACT_HI
 #  define SCORCH_NARROWK_EXACT_HI 3
 #endif

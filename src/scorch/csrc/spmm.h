@@ -2141,6 +2141,50 @@ template <> struct scorch_simd<double> {
   }
 };
 
+// Half-width forms of the same interface. They exist because a width that is exactly
+// four floats (or two doubles) has no mask in it, and the 256-bit kernel has no way to say
+// so: at k=4 it runs _mm256_maskload_ps for EVERY nonzero over 4 lanes of 8, paying a masked
+// load and throwing away half the FMA width. That is a per-nonzero cost, and the per-nonzero
+// term is the one the k=4 float32 fit shows us losing to MKL by 8-23% whichever shapes go
+// into it. lane_mask is still provided so the same kernel can serve k=3 (3 lanes of 4 rather
+// than 3 of 8), but the width it exists for needs no mask at all.
+template <typename T> struct scorch_simd_half;
+
+template <> struct scorch_simd_half<float> {
+  using vec = __m128;
+  using mask = __m128i;
+  static constexpr int lanes = 4;
+  static inline vec zero() { return _mm_setzero_ps(); }
+  static inline vec splat(float x) { return _mm_set1_ps(x); }
+  static inline vec load(const float* p) { return _mm_loadu_ps(p); }
+  static inline vec maskload(const float* p, mask m) { return _mm_maskload_ps(p, m); }
+  static inline void store(float* p, vec v) { _mm_storeu_ps(p, v); }
+  static inline void maskstore(float* p, mask m, vec v) { _mm_maskstore_ps(p, m, v); }
+  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_ps(a, b, c); }
+  static inline vec add(vec a, vec b) { return _mm_add_ps(a, b); }
+  static inline mask lane_mask(int valid) {
+    return _mm_setr_epi32(valid > 0 ? -1 : 0, valid > 1 ? -1 : 0,
+                          valid > 2 ? -1 : 0, valid > 3 ? -1 : 0);
+  }
+};
+
+template <> struct scorch_simd_half<double> {
+  using vec = __m128d;
+  using mask = __m128i;
+  static constexpr int lanes = 2;
+  static inline vec zero() { return _mm_setzero_pd(); }
+  static inline vec splat(double x) { return _mm_set1_pd(x); }
+  static inline vec load(const double* p) { return _mm_loadu_pd(p); }
+  static inline vec maskload(const double* p, mask m) { return _mm_maskload_pd(p, m); }
+  static inline void store(double* p, vec v) { _mm_storeu_pd(p, v); }
+  static inline void maskstore(double* p, mask m, vec v) { _mm_maskstore_pd(p, m, v); }
+  static inline vec fma(vec a, vec b, vec c) { return _mm_fmadd_pd(a, b, c); }
+  static inline vec add(vec a, vec b) { return _mm_add_pd(a, b); }
+  static inline mask lane_mask(int valid) {
+    return _mm_setr_epi64x(valid > 0 ? -1 : 0, valid > 1 ? -1 : 0);
+  }
+};
+
 // Register-blocked narrow-k SpMM row kernel: accumulate the whole output row in
 // NVEC YMM registers across the row's nonzeros (2-nnz ILP for two independent
 // FMA chains), with a masked load/store on the final partial vector. Avoids the
@@ -2156,13 +2200,12 @@ template <> struct scorch_simd<double> {
 // row's B loads masked for no reason, plus one masked store per row, and on a
 // short row the store is amortized over only a handful of FMAs. Both collapse to
 // plain vmovups when FULL_LAST holds. Ragged k keeps the mask, unchanged.
-template <typename T, int NVEC, bool FULL_LAST>
+template <typename T, int NVEC, bool FULL_LAST, typename V = scorch_simd<T>>
 static inline void scorch_spmm_row_regblock(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
     T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
-    typename scorch_simd<T>::mask mask_last) {
-  using V = scorch_simd<T>;
+    typename V::mask mask_last) {
   constexpr int L = V::lanes;
   typename V::vec acc0[NVEC], acc1[NVEC];
   #pragma unroll
@@ -3652,6 +3695,9 @@ torch::Tensor spmm_csr_v2_core(
   // Widest k the exact-width kernel is allowed to serve. 3 is where the measured sign
   // change is; the hook is how the bound gets re-measured rather than trusted.
   int narrowk_exact_hi = SCORCH_NARROWK_EXACT_HI;
+  // Widths served by 128-bit registers rather than by a masked 256-bit one (see the policy
+  // header). Read here so the dispatch below is a compile-time constant when the hook is off.
+  int spmm_halfvec = SCORCH_SPMM_HALFVEC;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
@@ -3685,6 +3731,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_HI");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 7) narrowk_exact_hi = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_HALFVEC");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 2) spmm_halfvec = (int)v; } }
 #endif
   // The widths the kernel serves, measured per width on 362 cells at each k and corrected
   // for the environment cost the ladder priced. It is a 6-8% win at k=2 and k=3 on BOTH
@@ -3985,6 +4033,32 @@ torch::Tensor spmm_csr_v2_core(
             // separately, because the nonzero-axis gather kernel owns it -- otherwise
             // this arm would swap two kernels in one step and neither would be
             // attributable. Placed ahead of the gather dispatch for that reason.
+            // 128-bit register block. Placed ahead of the exact-width scalar kernel but
+            // gated so it only takes widths that kernel does not already own, because an arm
+            // that swapped both at once would attribute neither. HALFVEC=1 is the exact
+            // half-vector width (float k=4, double k=2); HALFVEC=2 also takes the widths
+            // below it, where the mask is 3 lanes of 4 instead of 3 of 8.
+            if (spmm_halfvec > 0) {
+              using VH = scorch_simd_half<scalar_t>;
+              constexpr int LH = VH::lanes;
+              const bool halfvec_exact = (B1_size == LH);
+              // B1_size >= 2 keeps k=1 with the nonzero-axis gather kernel that owns it:
+              // taking it here would swap two kernels in one step and attribute neither.
+              const bool halfvec_under = (spmm_halfvec >= 2 && B1_size < LH &&
+                                          B1_size >= 2 && !exact_width);
+              if (halfvec_exact || halfvec_under) {
+                if (halfvec_exact) {
+                  scorch_spmm_row_regblock<scalar_t, 1, true, VH>(
+                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
+                      VH::lane_mask(LH));
+                } else {
+                  scorch_spmm_row_regblock<scalar_t, 1, false, VH>(
+                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
+                      VH::lane_mask(B1_size));
+                }
+                continue;
+              }
+            }
             if (exact_width) {
               #define SCORCH_RNE(KK, UN) \
                 scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
