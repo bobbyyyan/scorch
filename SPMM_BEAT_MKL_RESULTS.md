@@ -9141,3 +9141,14 @@ value is the count the kernel launches on. The synthesised estimate was worth do
 it is what identified the P-core count over the pool, and it sized the effect well enough
 to justify building the thing -- but it does not get to be the number of record. The
 measurement of record is a ladder over that hook, and until it exists the cap stays at 0.
+
+### The synthesised estimate, all four host-dtype combinations
+
+      host / dtype   cap   fires        whole-corpus   firing cells   mats -5%   mats +5%   A/A floor
+      x86 f32          8   191/231       1.0865         1.1055           1         42       1.0021 / 0.9934
+      x86 f64          8   191/231       1.0700         1.0852           2         43       0.9957 / 1.0109
+      ARM f32          6   128/676       1.0486         1.2850           2         26       1.0003 / 1.0004
+      ARM f64          6   128/676       1.0450         1.2616           2         26       1.0024 / 0.9998
+
+Positive in all four, same direction, effect an order of magnitude above each floor, and
+the two dtypes agree closely on each host. That is as far as the proxy can take it.
