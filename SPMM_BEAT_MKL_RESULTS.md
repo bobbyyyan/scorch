@@ -6592,3 +6592,49 @@ correct rather than an oversight. One difference to keep in mind when reading it
 the harness path in an instrumented build, whereas the defect was found on the caller path in a
 hookless one. The per-row overhead should be visible in both, but the magnitudes will not be
 comparable across the two, only the arm-to-arm ratios within chain45.
+
+### The 1.545x is fully accounted for, and the caller-path scoreboard is much better than the harness one
+
+`an_pathfactor.py` on the 496 cells chain39 and `combo_final` share (124 matrices, widths
+1,2,4,8 -- the intersection, taken explicitly this time):
+
+| k | caller parity | harness parity | ratio | path factor alone |
+|---|---|---|---|---|
+| 1 | 1.1737 | 0.8136 | 1.4426 | 1.3475 |
+| 2 | 1.3450 | 0.9306 | 1.4453 | 1.3439 |
+| 4 | 1.3159 | 0.8997 | 1.4625 | 1.3713 |
+| 8 | 1.6364 | 1.1086 | 1.4761 | 1.3830 |
+| all | **1.3578** | 0.9322 | 1.4565 | **1.3613** |
+
+The path factor is 1.36x and almost flat across widths, which is what a fixed per-call
+difference between two harnesses should look like. With chain37's build factor:
+1.0985 x 1.3613 = **1.4956**, against the 1.545x two-grid disagreement that this whole
+sub-investigation started from. The residue is 1.03x, and that is corpus. **The session's
+central open question is closed**: the two grids disagreed because one was instrumented and
+timed a path no caller takes, and both effects are now measured rather than argued.
+
+The consequence is that the earlier conclusion needs narrowing. "float32 narrow-k is the whole
+remaining problem" was substantially a harness-path artifact: on the caller path k=1 float32
+reads 1.1737, above parity, not 0.9379 below it. Counting cells on the caller path, hookless,
+124 matrices at 20k nonzeros or more:
+
+| k | warm parity | <MKL | <0.95 | cold parity | <MKL | <0.95 |
+|---|---|---|---|---|---|---|
+| 1 | 1.1737 | 27 | 10 | 1.0510 | 48 | 13 |
+| 2 | 1.3450 | 6 | 4 | 1.1104 | 29 | 7 |
+| 4 | 1.3159 | **31** | **25** | 1.1349 | 34 | 13 |
+| 8 | 1.6364 | 9 | 7 | 1.1934 | 27 | 11 |
+| 16 | 1.9219 | 1 | 0 | 1.2373 | 15 | 5 |
+| 32 | 1.9417 | 1 | 0 | 1.2568 | 9 | 6 |
+| all | **1.5272** | 75 / 744 | 46 | **1.1617** | 162 / 744 | 55 |
+
+Pooled, both sides clear MKL -- warm 1.53x, cold 1.16x -- which is the shape the goal asks
+for. Per cell it is not yet everywhere: 75 of 744 warm cells and 162 of 744 cold ones are
+below, 46 and 55 of them by more than 5%. Cold is the weaker side by count even though it
+pools above parity, which is the reverse of the warm-is-harder pattern chain38 showed on its
+own corpus, and worth watching rather than explaining yet.
+
+The two widths that carry the warm deficit are k=4 (31 below, 25 of them by more than 5%) and
+k=1 (27 below, 10 by more than 5%) -- which are exactly the two defects already separated by
+degree, and exactly what the queued runs target: chain45 and chain48 for k=4, chain42 and
+chain47 for k=1. float64 is still running.
