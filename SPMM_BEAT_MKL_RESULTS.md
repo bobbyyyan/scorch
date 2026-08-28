@@ -6681,3 +6681,69 @@ derived earlier from the ladder alone, "B fits L1 and degree is high", is the ga
 caller-path corpus independently points to, with the degree threshold nearer 64 than 128.
 chain42 and chain47 measure exactly that lever. The low-degree per-row-overhead story, and
 with it multi-row's priority, drops back to chain38's corpus until something broader shows it.
+
+### chain40 is void twice over, and the real comparison says additive kernels are not free
+
+chain40 printed:
+
+      spmm/scorch symbols identical: 0
+      differing:                    0
+      only in the new build:        0
+      only in the old build:        0
+      NEUTRAL: the half-vector kernel changes nothing that ships
+
+Four zeros and a pass. **It compared no symbols at all.** Its `norm()` runs
+`sed -e 's/<[^>]*>//g'` before awk extracts the symbol name, and that substitution -- intended
+to strip jump-target annotations like `<foo+0x10>` -- also strips the name out of objdump's
+header line, turning `0000... <_Z3foov>:` into `0000... :`. So awk's `name=$2` picks up `:`,
+the following `gsub` reduces it to the empty string, the `name != ""` guard blocks every
+write, the per-symbol directories stay empty, the `*spmm*.txt` globs match nothing, and the
+three-way `-eq 0` test passes vacuously. This is the third vacuous neutrality check in this
+work and the reason `hv_emit_check.py` refuses below a thousand compared instructions.
+
+**And it is void a second, independent way.** Its two builds come from `stage_prehv` and
+`stage_src`, which differ by 240 lines of `spmm.h` across twelve hunks and contain **four**
+separate levers, not one: `scorch_simd_half`, `scorch_spmm_multirow_regblock`,
+`scorch_spmm_row_regblock_deep`, and `SCORCH_NARROWK_UNROLL_PF`. So even a working check could
+not have attributed its result to the half-vector kernel. The verdict's sentence was
+unattributable by construction.
+
+Running the careful checker on the same two objects locally -- macOS objdump reads ELF
+x86-64, so this cost the busy host nothing -- gives the real numbers: **157,859 instructions
+across 656 shared symbols**, 620 symbols differing only in immediates (`__LINE__` metadata,
+correctly separated), and **20 symbols differing in code**, led by
+
+    [float32]  +320 instr  spmm_csr_v2_core<float>
+    [float64]   -94 instr  spmm_csr_v2_core<double>
+
+plus sixteen unrelated symbols (pybind glue, `.plt`, `SpmmCsrPlan::~SpmmCsrPlan`). So adding
+four kernels that are all **dead by default** still moves the shipped object, in both
+directions -- the float core grows and the double core shrinks, which is inlining and layout
+changing rather than dead code surviving. That is a concrete instance of something the house
+convention assumes away: "purely additive, off by default" does not imply byte-neutral in this
+file. Whether it costs runtime is a separate question this does not answer.
+
+The shipping-relevant question -- does the *flip* change emission, and does it change float32
+without touching float64 -- is chain48's, and chain48 asks it properly: an exact-match patch of
+only the default, applied to a copy of one tree, so the two objects differ by that and nothing
+else.
+
+### Retraction: the half-vector path is x86-only, so three ARM checks were vacuous with respect to it
+
+`scorch_simd_half` is specialised only for float and double over SSE intrinsics -- `_mm_setzero_ps`,
+`_mm_maskload_ps`, `_mm_fmadd_pd` and so on -- with no NEON specialisation, and its use site
+`if (spmm_halfvec > 0)` sits inside `#if defined(__AVX2__) && defined(__FMA__)`. The flip is
+therefore completely inert on ARM.
+
+That retracts a claim I made two sections ago. I wrote that the ARM dtype-scaling grid ran the
+half-vector kernel at k=4 because the local build carries the flip, and concluded from its
+1.0290 reading that "a throughput fix does not cure a latency bound". **The kernel never ran
+there.** The reading stands as a measurement of the ordinary register-block path; the inference
+drawn from it does not, and the claim that the flip and the narrow-k mechanism are separate
+levers on the same cell is unsupported by that evidence.
+
+Two other ARM checks are weaker than I recorded for the same reason: the ARM emission diff
+after the flip moved only `__LINE__` immediates, which is what an inert change looks like
+rather than a safe one; and the full ARM suite passing at the flipped default exercised no
+half-vector code. The suite pass is still a valid general regression check. Neither is evidence
+about the flip, and the flip's only real evidence remains x86.
