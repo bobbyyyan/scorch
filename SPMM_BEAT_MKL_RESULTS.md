@@ -6340,3 +6340,30 @@ float32 symbol did, the latter because that would mean the timing run was two id
 builds.
 
 Queue order is now 39 (running) → 40 → 41 → 42 → 43 → 44 → 45 → 46 → 47 → 48.
+
+### A driver that reported DONE having measured nothing, again -- and the guard that caught it
+
+The ARM confirmation of the dtype-scaling diagnostic needs no MKL, since it compares our own
+two dtypes on the same matrix, so the second host can supply it despite having no MKL. The
+first attempt produced two CSVs of exactly 70 rows each, every one `status=nocache`, and
+`kprobe` printed `KPROBE_DONE float32 0.0 min` and exited 0. The corpus is DLMC and I had
+pointed `--cache` at the SuiteSparse cache; the real local cache is elsewhere and holds 636
+matrices, all 70 of the corpus among them.
+
+This is the third distinct instance of the same failure in this work and the second by this
+exact cause -- the wrong corpus path -- and it is worth recording that what surfaced it was
+not the driver but the analyzer: `an_armdt.py` opens with a refusal when the two dtype grids
+share no cells, so it printed `REFUSING: no cells shared between the two dtype runs` instead
+of a table of NaNs. A harness that says DONE having measured nothing is only harmless if
+something downstream refuses to report on it.
+
+### chain39's corpus is 362 matrices, which makes the path factor measurable for free
+
+chain39 confirmed the eight shipped defaults, built hookless, and is timing 362 matrices --
+the same count as the instrumented `combo_final` grid. So the two differ in exactly two known
+ways: the build, now measured at 1.10x below the 25 us knee and nothing above it, and the path
+(`ops.matmul` with the plan cache, against a harness path through `time_dict` and an STensor
+B that no caller takes). With the corpus held fixed and the build factor known, the ratio
+between them isolates the path factor, which until now has only been a prior measurement on a
+different corpus. That is the last piece needed to state one parity number for the whole space
+rather than one per harness.
