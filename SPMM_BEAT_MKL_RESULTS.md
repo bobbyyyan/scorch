@@ -7885,3 +7885,40 @@ included, and the only x86 measurement of it is chain50, which is queued. Enabli
 strength of an ARM grid would be exactly the mistake the half-vector flip and the row partition
 both punished -- a lever whose sign is set by which kernel it displaces, adopted from the host
 where that kernel is different.
+
+### The fixed cold cost is not thread wake-up, and part of "cold" is how coldness is made
+
+ARM half of the decomposition, four configurations, fixed cost read as the intercept of cold time
+against nonzeros and cross-checked against the 8-nonzero point where there is no kernel to speak of:
+
+| threads | flush | intercept | cold @8nnz | warm @8nnz |
+|---|---|---|---|---|
+| 6 | aten | 23.8 us | 15.9 | 4.2 |
+| 6 | numpy | 15.8 us | 10.1 | 4.2 |
+| **1** | aten | **21.2 us** | 11.1 | 4.2 |
+| **1** | numpy | **17.8 us** | 12.3 | 4.3 |
+
+**Hypothesis 2 is falsified.** The cost survives at one thread, where there is no team to wake:
+17.8 and 21.2 microseconds of intercept, 11-12 at the 8-nonzero point. So it is the call path's
+own working set, not thread wake-up, and the target for reducing it is the number of objects and
+code pages a call touches -- not the parallel region.
+
+**But the flush type moves it, and that is a caveat on the scoreboard's number.** At six threads
+the parallel ATen reduction leaves the cold point at 15.9 microseconds against 10.1 for a
+single-threaded numpy stream over the same bytes -- a factor of 1.57. So some of what `cold_probe`
+calls cold is the flush's own pool-parking rather than the caller's cache state. MKL pays the same
+flush in the same interleave, so the *comparison* stays fair and the 195 cold-only losing cells
+are not invalidated; what is inflated is the absolute degradation, which is another reason the
+6.077 figure deserved the retraction it got.
+
+Two things this does not settle. The magnitude does not transfer: this host reads 8-16 microseconds
+of cold-only fixed cost where redwood reads about 39, so the x86 four-configuration run (chain52)
+is still the one that prices the deficit. And the reference column is uninformative here --
+`torch.sparse.mm` on ARM is 6912 microseconds at a million nonzeros against our 309, so its
+intercept estimates swing from -14.9 to +95.4 as fit noise on a slope 23 times ours. Only the
+scorch intercept and the thread test are readable on this host.
+
+One number worth keeping from the same table: at 8 nonzeros our **warm** call is 4.2 microseconds
+against the reference's 1.0. On the tiny end our dispatch is four times as expensive, which the
+scoreboard's 20k-nonzero floor dilutes to invisibility but which is the same call path the 39
+microseconds is measured on.
