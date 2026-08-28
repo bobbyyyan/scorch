@@ -5779,3 +5779,37 @@ everything that decides the measurement — per-arm batching, interleaved random
 automatic A/A duplicate, environment padding, min-of-reps — is untouched, so the two probes'
 numbers are comparable. Its refusal counts **ok rows, not lines**, because a CSV of 362 error
 rows would pass a line count.
+
+### A prediction, written before the verdicts
+
+Recorded ahead of `rw_chain42.sh` and `rw_chain46.sh` so it can fail, which is what made the
+environment-lookup hypothesis cheap to kill.
+
+Take the worst float32 k=1 cell: `bottleneck_2_block_group3_1_1`, 294912 nonzeros over 256 rows
+at degree 1152, ours 30.0 µs against MKL's 22.6. B at k=1 is about 4.6 KB, so it is L1-resident
+and no gather can be missing. The thread rule resolves this shape to **16 workers**:
+`rows / SCORCH_ROWS_PER_THREAD = 16`, the work term `nnz * max(k,16) / 150000 = 31` does not
+bind, and the raise needs `work_true / (2 * 150000) = 294912 / 300000 = 0` grains, so it never
+fires. The row loop at k=1 is one `VGATHERDPS` plus one FMA per eight nonzeros — under a cycle
+per nonzero out of L1, and 4 cycles per eight even if the single accumulator chain is fully
+exposed.
+
+30.0 µs over 16 workers is **7.2 cycles per nonzero per thread**, seven to fourteen times any of
+those bounds. `eval_time` brackets the whole native call, so it contains the OpenMP fork/join and
+the output allocation. Sixteen workers launched for roughly 4 µs of arithmetic is a fork/join
+cost, not a kernel cost, and MKL's 22.6 µs on the same shape is mostly fixed cost too.
+
+So the prediction is:
+
+- **`rw_chain42.sh` reads near its floor at k=1.** The streams ladder and the scalar-unroll arm
+  are both changing the row loop, and the row loop is not what these cells are made of. If the
+  ladder does move, the mechanism above is wrong and the gather is more exposed than the
+  arithmetic says.
+- **`rw_chain46.sh` finds a rung below the default that wins**, with the effect concentrated in
+  the `rows<600` bands, because that is where `rows/16` hands out workers a k=1 product cannot
+  feed.
+- A third lever follows if both hold and neither is enough: the per-call floor itself — the
+  allocation and the team launch — which no arm in either chain touches.
+
+This also means the two chains are not redundant with each other, and that the k=1 half of the
+below-MKL count may not be a kernel problem at all.
