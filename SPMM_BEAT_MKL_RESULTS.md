@@ -6474,3 +6474,29 @@ nvec=1 the multi-row kernel still does four rows of one masked lane in eight, so
 independent chains but keeps the lane waste, whereas `ex1` -- already queued in chain42 --
 buys the same four chains with no masking at all. So the queue does cover float32 k=1, by two
 routes, neither of them multi-row.
+
+### Correction: chain39's corpus is 124 matrices, not 362, and the path factor is not free after all
+
+chain39's log prints "corpus: 362 matrices" and its float32 leg wrote 744 rows -- every one
+`ok`, but only 124 distinct matrices. The other 238 emitted no row at all, not even a status.
+The cause is `cold_probe.py`'s `--min-nnz`, which defaults to 20000 and which chain39 does not
+override; chain38 passes `--min-nnz 0` explicitly and chain39 does not. The default is
+deliberate and the flag says why -- the cold arm needs enough work to mean anything -- so the
+124-matrix corpus is the right corpus for a cold measurement. What is wrong is only the
+reporting: the line count guard is `[ "$lines" -ge 500 ]`, which 744 passes and which would
+also have passed at 84 matrices, so a threefold corpus reduction cannot trip it. A guard that
+reads the output still has to compare it against what the corpus promised, not against a
+constant.
+
+**This retracts a claim I made two sections ago.** I wrote that chain39 and the instrumented
+`combo_final` grid share a 362-matrix corpus, so that the ratio between them isolates the path
+factor with the corpus held fixed. They do not: `combo_final` has no nonzero floor and chain39
+effectively has a 20k one. The path factor is still derivable, but only on the intersection of
+the two key sets, which has to be taken explicitly rather than assumed from two equal counts.
+Two grids reporting the same number of matrices is not the same as two grids measuring the same
+matrices -- and here the counts were not even equal, they only looked it because one number was
+the corpus file's length and the other was the corpus actually measured.
+
+**The flip comparison is unaffected**, and by luck rather than design: chain48 copies chain39's
+`cold_probe` invocation verbatim, so it inherits the same 20000 default and the same 124
+matrices. That pairing is corpus-matched, which is what the pre/post difference needs.
