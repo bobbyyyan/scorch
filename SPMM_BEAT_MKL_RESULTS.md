@@ -8877,3 +8877,55 @@ So the ordering of the queue's remaining value is now clear: chain48 and chain47
 float32 warm cells the ceiling cannot; chain62 (multi-row) addresses a different, disjoint band
 where it wins 9-14%; chain61 settles 10 cells; and chain59 prices the two thread bounds that could
 move the k=1 group by a route neither of the others takes.
+
+## chain46: the resolved thread count is the largest single error on the board
+
+Redwood, 77 matrices, widths 1/2/8, `SCORCH_TUNE_THREADS` forcing the count against `ref` (the
+count the rule resolves to). Values are ref/arm, so >1 means the forced count is faster.
+
+| | ref | t2 | t4 | **t8** | t16 | t24 |
+|---|---|---|---|---|---|---|
+| f32 k=1, rows>=2400 (n=16) | — | 1.2222 | 1.3976 | **1.4592 z+5.0** | 1.3347 | 1.1452 |
+| f32 k=1, 600-2400 (n=15) | — | 1.0396 | 1.0630 | **1.2111 z+6.7** | 1.2215 | 1.2245 |
+| f32 k=1, MKL parity | 1.052, **39/77 behind** | 1.069, 36 | 1.154, 21 | **1.243, 1/77** | 1.173, 13 | 1.122, 18 |
+| f64 k=1, MKL parity | 0.993, 35/77 | 1.043, 34 | 1.092, 18 | **1.185, 5/77** | 1.131, 17 | 1.072, 19 |
+| f64 k=8, MKL parity | 1.270, 10/77 | 1.213, 26 | 1.268, 19 | **1.358, 5/77** | 1.359, 4 | 1.273, 7 |
+
+Pooled over all three widths: float32 goes from 1.1082 with **78/231** cells behind MKL to 1.2507
+with **15/231**; float64 from 1.1514 with 52/231 to 1.2877 with 15/231. Nothing else measured in this
+file moves the board like that.
+
+**The optimum is flat and the rule is not.** Per-band medians of the best sampled count: rows<128 →
+4, 128-600 → 8, 600-2400 → 8, >=2400 → 8. The rule's medians over the same bands: 1, 9, 13, **32**.
+
+**A cap is not the fix, which I had assumed it was.** Since forcing raises cells whose resolved count
+is below the target — that is why t8 loses on the seven rows<128 matrices — I reasoned that a cap
+would keep t8's wins and drop its losses. Synthesised from chain46's own arms, taking t8 where the
+export says the rule resolves above 8 and ref where it does not, a cap at 8 reads **1.2040 with 23
+behind against forcing-8's 1.2507 with 15**. The rule is wrong in *both* directions: 191 of 231 cells
+are over-threaded and the other 40 are under-threaded, and a cap only fixes the first.
+
+**The mechanism this host suggests is its P-core count.** `lscpu`: i9-14900K, 32 logical CPUs, 24
+cores, 2 threads per core; CPU0 and CPU1 are siblings at 5700 MHz while CPU24 stands alone — so CPUs
+0-15 are 8 P-cores with hyperthreading and 16-31 are 16 E-cores. **8 is exactly the P-core count**,
+and the ladder's order is one-thread-per-P-core (8) beats HT siblings (16) beats adding E-cores (24)
+beats everything (32). That is a host property discoverable at runtime rather than a constant to
+hardcode — and it is a hypothesis, not a finding, until the other host agrees.
+
+Two runs queued. **chain63** repeats the ladder on the broad 302-matrix corpus at six widths,
+because chain46 used a quarter of the corpus and omitted k=4 — which is 29 of the 63 float32 warm
+losers the ceiling cannot reach, the largest single group on the board — and omitted k=16 and 64,
+where a narrow-k thread rule must be shown not to hurt. **m5_stage28** runs it on ARM, which
+separates the readings: 6 P-cores, 12 E-cores, 18 logical, pool 6. One-per-P-core predicts 6; a
+quarter of num_procs predicts about 4; and "E-cores help when bandwidth-bound" predicts 12 or 18 —
+which is not a straw man, because this host has already shown exactly that once, when the fused
+Linear kernel was starved at 6 and the fix was a 2x-the-pool launch.
+
+**A harness defect found on the way, and it had been hiding a control.** `an_tthreads.py` hardcodes
+`ARMS = ["ref","refb","t2","t4","t8","t16","t24"]`, so the ARM ladder's t6/t12/t18 would have been
+dropped silently — the same defect as the hardcoded reference in the ceiling analyzer.
+`an_tthreads2.py` reads the arms from the CSV, reproduces the original's numbers exactly on chain46's
+data, and additionally shows an **`aa` column that was in every one of those CSVs and has never been
+printed**: at k=1 it reads 1.031 against ref's 1.052, so that verdict's floor is about 2% and t8's
+1.243 is far outside it. Also worth noting: chain46 measured a float64 half (232 lines) that its own
+verdict never analysed, because the analyzer was handed one file.
