@@ -6814,3 +6814,20 @@ in the cold phase too.
 **k=1 and k=4 are the weak widths in every one of the four cases**, and nothing above k=8 has
 more than a handful of losses. float64 k=2 warm is perfect at 0 of 124 while float64 k=2 cold
 loses 25, which is the same cold/warm split again rather than a width anomaly.
+
+### A gap in the queue: nothing measures the winning lever in the cold phase
+
+chains 42 through 47 all time with `kprobe`, which is warm only. Cold holds 267 of the 393
+remaining below-MKL cells. And `cold_probe` cannot be pointed at a new lever from the outside:
+its arms are hardcoded as base/steal/tsteal plus the automatic duplicate, which is why
+chain38's invocation carries no `--arms` flag. So no queued run can say whether the lever that
+wins warm also wins cold.
+
+The fix is the shape chain48 already uses: once chain42 names the arm, patch that default into
+a hookless build and run `cold_probe` on chain39's corpus and widths, then difference against
+chain39 with MKL as the cross-run null. That gives cold and warm for the same lever on the
+caller path in the build that ships. It cannot be written yet because what to patch is exactly
+what chain42 decides -- writing it now would mean guessing the winner, and the whole point of
+the ladder is that the S=2/4/8 and `ex1` arms make different predictions.
+
+Recorded here so the queue is not mistaken for complete when chain48 finishes.
