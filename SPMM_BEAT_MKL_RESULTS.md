@@ -9152,3 +9152,34 @@ measurement of record is a ladder over that hook, and until it exists the cap st
 
 Positive in all four, same direction, effect an order of magnitude above each floor, and
 the two dtypes agree closely on each host. That is as far as the proxy can take it.
+
+## The cap can reach the losers, which is a separate claim from the cap being a speedup
+
+A cap only touches cells whose resolved count exceeds it, and the scoreboard's losing
+family -- few rows, high degree, narrow k -- is characterised by the row axis *not*
+supporting many workers, which is the condition under which the resolver returns a small
+count. So it was entirely possible for the cap to be a real speedup and still be unable to
+move a single loser. Asked against the 744-cell width scoreboard, with the resolved count
+taken from production at the caller's pool of 24:
+
+      f32 warm    75 below MKL     71 can be moved by a cap at 8,  4 cannot
+      f32 cold   162 below MKL    161 can be moved,                1 cannot
+      f64 warm    51 below MKL     47 can be moved,                4 cannot
+      f64 cold   105 below MKL    (same shape)
+
+Better than that, the losers are concentrated exactly where a cap bites hardest. Of the 75
+f32 warm losers, 43 resolve to 24 and 21 to 32 -- 64 of 75 running on three to four times
+the P-core count. The worst cell on the board, lp_osa_14 at k=4, is 2337 rows of degree
+135 running on 32 workers and losing to MKL by 2.2x. The f64 warm losers are the same
+family: 31 of 51 at 24 workers, 12 at 32, and every one of the six worst is a 2048-row
+transformer decoder layer of degree 153-300.
+
+The cost side is equally clear and is the reason this is not a free win. 665 of the 669
+f32 warm cells that currently *beat* MKL also resolve above 8, so the cap is a global
+change to almost every cell on the board, not a targeted repair of the losing family.
+There is no gate here that fires only on losers -- the resolved count does not
+discriminate, because winners and losers alike are being handed 24 workers. Whether this
+ships therefore rests entirely on the regression count over those 665, which is what the
+compiled-in ladders now running on both hosts measure. The synthesised estimate put it at
+one matrix worse than 5% on x86 f32 and two on ARM f32; if the real cap holds that, it
+ships, and if it costs the winners more than it recovers from the losers, it does not.
