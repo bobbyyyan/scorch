@@ -5901,3 +5901,79 @@ be flat, since two chains buy nothing here either.
 `inf` ratios.** Every rep wrote the same values to the same output array, so the compiler kept
 only the last one. The fix is a barrier per rep plus a refusal to print any cell whose fastest
 arm ran under 5 ms — a table of zeros reads like a result, and "measured nothing" has to say so.
+
+## The half-vector kernel: a float32 win at k=4, and a float64 loss at k=2
+
+`rw_chain36.sh`, 1510 cells per dtype over the 302-matrix corpus, arms `ref`/`refb` (both
+`HALFVEC=0, EXACT_HI=3`), `h1` (`HALFVEC=1`), `h2` (`HALFVEC=2`), `s0` (`HALFVEC=0, EXACT_HI=1`),
+`hv` (`HALFVEC=2, EXACT_HI=1`). The kernel's exact width is k=4 for float and k=2 for double, so
+each dtype has one firing width and four structural nulls.
+
+**float32, at k=4 where it fires** — `h1` **1.1008 (z +14.6)** against a `refb` floor of 0.9945,
+and `h2` adds nothing over `h1` (1.0997), so the simpler gate — take only the exact half-vector
+width, not the widths below it — is the whole effect. By group:
+
+| group | h1 | | group | h1 |
+|---|---|---|---|---|
+| nk_l2band (80) | **1.2143** (z +40.6) | | d_sp (40) | 1.0684 |
+| d_ss (4) | 1.1463 | | d_mid (39) | 1.0564 |
+| nk_shortrow (40) | 1.1305 | | d_nd (39) | 1.0446 |
+| nk_inert (30) | 1.0408 | | nk_winning (30) | 1.0113 |
+
+Against MKL at k=4 float32: kernel parity **1.2880 → 1.4179**, cells below MKL **125/302 → 70**;
+whole call 0.9202 → 0.9940, below 192 → 148. At the four widths where it cannot fire it reads
+0.9913–0.9955, which is the arm being charged for naming a variable, not a kernel effect.
+
+**float64, at k=2 where it fires** — `h1` **0.9646 (z −10.7)**. Every group is negative except
+nk_shortrow (1.0353); nk_l2band is 0.9528 and d_ss 0.8451. Against MKL it is worse than that
+sounds: `ref` at k=2 float64 has kernel parity 1.6631 with **0 of 302 cells below MKL**, and `h1`
+takes that to 1.6042 with **21 below**. It creates below-MKL cells where there were none.
+
+**So this ships for float32 only.** 128-bit registers are the right shape for a four-lane float
+row and the wrong shape for a two-lane double row, where the halved register width costs more
+than the halved mask waste saves. The gate has to be stated per dtype.
+
+**Two things the control arms gave away for free.** `s0` turns the exact-width kernel off
+(`EXACT_HI=1` empties the band): at k=4, 5 and 8 it reads 1.0000 / 0.9987 / 1.0003, which is a
+clean structural null confirming the arm machinery; at k=2 and 3, where the exact kernel does
+ship, it reads 0.9191 and 0.9084 on float32 and **0.8647** and 0.9606 on float64 — so the
+exact-width kernel already in the default is worth 8–9% at float32 k=2/3 and 13.5% at float64
+k=2. And `hv` (half-vector on, exact off) reads 1.0944 at k=4 float32 against `h1`'s 1.1008, so
+the half-vector win does not depend on the exact kernel being there.
+
+## The accumulator lever through the real call path, on the second host
+
+`arm_spmv_ladder.py` on the ARM host — `scorch.matmul(A, x)` → `ops.spmv` →
+`prebuilt_spmv_csr_*`, so threading, allocation and dispatch are all inside the measurement,
+unlike the standalone sweep. Synthetic shapes so B's footprint and the degree move independently,
+which a corpus cannot do. Best of ACC=4 and ACC=8, against a `refb` floor that runs ±2%:
+
+| B | deg 8 | 64 | 256 | 1152 |
+|---|---|---|---|---|
+| 9 KB f32 | 1.04 | 1.02 | 1.19 | **1.47** |
+| 32 KB f32 | 1.01 | 1.03 | 1.19 | **1.45** |
+| 256 KB f32 | 1.05 | 1.01 | 1.01 | 1.03 |
+| 4 MB f32 | 1.00 | 1.00 | 1.00 | 1.00 |
+| 18 KB f64 | 1.04 | 1.03 | 1.12 | **1.29** |
+| 64 KB f64 | 1.00 | 1.02 | 1.12 | **1.27** |
+| 512 KB f64 | 1.00 | 1.01 | 1.00 | 0.99 |
+| 8 MB f64 | 1.02 | 1.00 | 1.01 | 1.01 |
+
+Same gate as the standalone sweep, both dtypes, through the real call path: **small B and high
+degree, nothing otherwise**, and ACC=2 buys nothing anywhere (0.97–1.02). The magnitudes are
+lower than standalone (1.47 against 2.31) because the call now includes the parts ACC cannot
+touch, and the footprint threshold is looser (64 KB rather than 4.5 KB) because six workers each
+have their own L2.
+
+## chain37 was void on its first run, and its own cross-check is what said so
+
+The build-attribution chain carried MKL as a control on the grounds that it enters none of our
+code and must therefore read the same in both builds. It did not: **median spread 1.185, p90
+4.14, max 7.83** over 136 cells, with the within-build A/A at ±4–5% against the ~0.03% kprobe
+normally reaches. So the run could not attribute a 3.4x effect and nothing in its table meant
+anything — a 17-matrix corpus with a single arm makes `per_rep` tiny, so every cell got a tiny
+batch, and twelve short-lived processes never let the host settle.
+
+Re-running with `--reps 25 --target-ms 400 --batch-ms 20 --settle 4`, and the analyzer now prints
+a **VOID** banner and says nothing below it can be read whenever the median MKL spread exceeds
+1.05, rather than leaving that inference to whoever reads the table.
