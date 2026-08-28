@@ -4533,3 +4533,34 @@ a fixed per-call cost is the measurement.
 The per-call degree unroll is neutral here (0.9987, inside the 0.9964 floor) with a small
 real gain at the widths it serves (k=2 1.0100, per-matrix z = +2.6). It is not the fix for
 this tail, and it needs an x86 reading before it could ship.
+
+## No home-range scheme wins on those shapes: it is the decomposition, and the reason is worker count
+
+Same 70-matrix corpus, four arms, A/A floor 0.9951 (float32) and 1.0006 (float64). Ratios
+against the candidate, so above 1 means the arm beats what we propose to ship:
+
+| arm | float32 | float64 | k=1 | k=2 | k=4 | k=8 | k=64 |
+|---|---|---|---|---|---|---|---|
+| back-stealing (candidate) | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| home ranges, **no stealing** | 0.9826 | 0.9622 | 1.0138 | 1.0239 | 0.9782 | 0.9504 | 0.9542 |
+| front-stealing | 0.9682 | 0.9592 | 0.9560 | 0.9795 | 0.9604 | 0.9699 | 0.9823 |
+| **no partition** | **1.0303** | **1.0222** | 1.0581 | 1.0372 | 1.0719 | 1.0187 | 0.9678 |
+
+The probe hypothesis is dead: mode 1 does no cursor probing at all and it is *worse* than
+back-stealing, not better (0.9826 / 0.9622). Front-stealing is worse again. **Every
+home-range scheme loses on these shapes and the shared counter wins** — so the cost is the
+static decomposition, and there is nothing inside the partition's parameter space to tune.
+
+Which makes the mechanism legible, because on x86 the same comparison goes the other way by
+a mile (p0/p3 = 0.785 on the general corpus, 65% of cells more than 10% behind). The
+partition buys inter-call L2 residency for A and pays a fixed setup plus a claim per chunk;
+the shared counter buys perfect load balance and pays contention on one atomic line. **A is
+100 KB on as-735 — it was never leaving L2, so there is no residency to win** — and the
+counter's contention scales with the number of workers: 24–32 of them on redwood make it
+the binding cost, 12 on the M5 do not. Same code, opposite sign, and the quantity that
+flips it is the worker count, which is why this is arm-variance rather than a bug.
+
+That is also why a work gate is not simply "the ARM fix": on x86 a min-work gate costs 4–9%
+because the partition wins there even on tiny products. The condition has to be the
+mechanism — apply the gate only where the pool is small enough that the counter is not the
+bottleneck — so that it *provably cannot fire* on a 24-thread host.
