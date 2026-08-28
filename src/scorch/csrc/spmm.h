@@ -3558,10 +3558,17 @@ torch::Tensor spmm_csr_v2_core(
     // against 14.5% and 13.7% of the winning ones. Both thresholds are about two
     // SCORCH_GRAIN_SPMM, so that is how this is spelled: in grains, not in a constant.
     long mingrains = SCORCH_SPMM_PARTITION_MINGRAINS;
+    long gate_maxthreads = SCORCH_SPMM_PARTITION_GATE_MAXTHREADS;
 #ifdef SCORCH_TUNE_HOOKS
     { const char* e = std::getenv("SCORCH_SPMM_PARTITION_MINGRAINS");
       if (e && *e) { long v = std::atol(e); if (v >= 0) mingrains = v; } }
+    { const char* e = std::getenv("SCORCH_SPMM_PARTITION_GATE_MAXTHREADS");
+      if (e && *e) { long v = std::atol(e); if (v >= 0) gate_maxthreads = v; } }
 #endif
+    // The gate only applies where the pool is small enough that the shared counter's
+    // contention is not what binds -- see the constant's comment. At a pool above the
+    // ceiling this whole block is unreachable, which is how the x86 reading is preserved.
+    if (gate_maxthreads > 0 && (long)nthreads > gate_maxthreads) mingrains = 0;
     if (mingrains > 0) {
       const long work_proxy = nnz_total * (long)(B1_size > 16 ? B1_size : 16);
       if (work_proxy < mingrains * SCORCH_GRAIN_SPMM) partition_mode = 0;

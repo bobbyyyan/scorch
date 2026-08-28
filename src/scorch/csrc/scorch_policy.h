@@ -257,6 +257,28 @@
 #ifndef SCORCH_SPMM_PARTITION_MINGRAINS
 #  define SCORCH_SPMM_PARTITION_MINGRAINS 0L
 #endif
+// Worker count at or below which that work gate is allowed to fire. It exists because the
+// gate's sign depends on the pool, and this makes the dependence explicit instead of
+// leaving it to a host-specific default.
+//
+// The partition buys A's inter-call L2 residency and pays a setup plus a claim per chunk;
+// the shared counter buys perfect load balance and pays contention on one atomic line.
+// Contention scales with the number of workers, so which cost binds is a question about
+// the pool: on redwood's 24 the counter is the bottleneck and the partition wins even on
+// tiny products (no-partition / partition = 0.785 pooled, 65% of cells more than 10%
+// behind), while on the M5's 12 it is not, and on the 70 matrices where the partition
+// regresses there -- 100 KB of A that was never leaving L2, so no residency to win -- the
+// counter wins 1.0303 and every home-range variant loses (no stealing 0.9826,
+// front-stealing 0.9682).
+//
+// A ceiling below the larger host's launched count makes the gate PROVABLY INERT there: it
+// cannot fire at 24 workers, so the x86 measurement stands unchanged by construction
+// rather than by a second grid agreeing. 0 disables the ceiling, which lets the gate fire
+// at any width (that is the configuration x86 measured at 4-9% cost, and it is not what
+// ships).
+#ifndef SCORCH_SPMM_PARTITION_GATE_MAXTHREADS
+#  define SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 0
+#endif
 // Grains of REAL arithmetic each worker must get before the row-proxy thread count
 // is raised. One grain is not enough: the grain is calibrated for "is more than one
 // thread worth it at all", and going from 4 workers to 18 wakes more of them, so it
