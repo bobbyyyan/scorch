@@ -9272,3 +9272,37 @@ wrong statistic because the arms fire on different numbers of cells.
 
 The width decay is the open question this leaves: 1.25 at k=1 falling to 1.00 (float32) or
 0.93 (float64) at k=64. That shape has a candidate mechanism, and it is not the cap.
+
+## The cap and the row ceiling move the same number in opposite directions
+
+The four warm float32 losers no thread cap can reach are two matrices: kl02 at k=2, 4 and
+8, and nw14 at k=2. 71 rows of degree 2993 and 73 rows of degree 12396 -- few rows, very
+high degree, resolving to four to six workers because the row axis is all the resolver has
+to go on.
+
+That is exactly the population the nonzero-expressed row ceiling exists for. Its own
+comment names the matrix: "kl02 (71 rows, degree 2993) is the shape it is for". It states
+the worker requirement in nonzeros instead of rows and so raises the count where the row
+proxy has starved it, measured at 1.1109 (float32, z=3.38) and 1.1542 (float64, z=3.18)
+inside its gate.
+
+So the board needs both mechanisms and they are opposites. The ceiling **raises** the count
+for few rows at high degree; the cap **lowers** it everywhere the floored work measure has
+inflated it. Between them they cover the whole loser set -- 71 of 75 for the cap, the
+remaining 4 for the ceiling -- and neither covers the other's cells.
+
+The problem is that they compose badly as currently written. The ceiling widens kl02 from
+4 workers to 22 inside a 24-thread pool. The cap is applied last, deliberately, so that the
+composition adoption cannot raise the count back afterwards -- and that same placement
+means it would pull the ceiling's 22 back down to 8, discarding most of what the ceiling
+just bought. The ceiling's measured gain was taken with its pool cap on, i.e. at 22
+workers, so there is no reading that says 8 is fine for kl02.
+
+Both are off by default today, so nothing is broken right now. But if both ship, order
+matters, and the fix is not to reorder them: the cap is applied last for a reason. The
+right shape is for the cap to floor at whatever the ceiling deliberately asked for, since
+the two corrections are aimed at opposite errors -- the ceiling at a count the row proxy
+**understated**, the cap at a count the floored work measure **overstated** -- on gates
+that do not overlap. That is a small change to the cap's expression, and it needs the
+crossed grid (ceiling on/off x cap on/off) on the few-row high-degree corpus to confirm,
+not an argument.
