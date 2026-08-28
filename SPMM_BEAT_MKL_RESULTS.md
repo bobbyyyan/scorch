@@ -6965,3 +6965,31 @@ null: at k=2 the half-vector for doubles is exactly two lanes, so `hv` fires the
 re-measures on a broad corpus the cell where the flip read 0.9646 and turned 0 of 302
 below-MKL cells into 21. That is the measurement the float64 half of the flip rests on, and it
 has only been made once.
+
+### Pre-registered: how a winning ILP arm gets shipped, decided before the data
+
+Writing this before chain42/43/47/49 report, so the choice between a gate and an unconditional
+default is not made by looking at which one the numbers happen to favour.
+
+The temptation will be to gate. The accumulator ladder found its 2.31x only where B fits L1 and
+degree is high, and the corrected losing family is few rows with small B at degree 64-256, so a
+gate on those two quantities would look well-supported. But the natural experiment argues the
+other way: the exact-width kernel at k=2 and k=3 is **not gated** on anything -- it serves those
+widths unconditionally -- and it both wins 6-8% and produces the healthiest warm column in the
+scoreboard. If four independent chains are simply better at a narrow width, a gate adds a
+branch, a tuning constant, and a second thing that can be wrong, for nothing.
+
+So the rule is:
+
+* **Ships ungated** if the winning arm is neutral-or-better in *every* degree band the analyzer
+  prints, including the low-degree controls and the `win_ctrl` group, judged against the `refb`
+  same-code floor rather than against 1.0.
+* **Ships gated** only if it wins in the target bands and *loses* outside them, in which case
+  the gate must be on the quantity that predicts the loss and must be shown provably inert on
+  the bands it would hurt -- the standard the existing `nfloor` and chunk-width gates meet.
+* **Does not ship** if it wins only inside the noise the floor establishes, whatever the
+  geomean says.
+
+And the width structure is not the gate. Extending the exact band from 3 to 4 is a change to
+one constant that the dispatch already reads; it is not a new runtime condition, and it should
+not be described as one.
