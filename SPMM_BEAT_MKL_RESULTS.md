@@ -5490,3 +5490,55 @@ scoreboard used. Quoting a single "above 20k nonzeros we are 0.7x of MKL" would 
 corpus. `rw_chain39.sh` measures `final_groups.csv` — the scoreboard's own 362 matrices —
 whole call against whole call from a hookless build, across k = 2, 4, 8, 16, 32. That is the
 number to quote, and it is the one that does not yet exist.
+
+## The no-regression pass, and the degree floor it forced into the shipping configuration
+
+302 matrices, four widths, both dtypes, arms differing only in the value of one variable. Split
+on whether the gate can fire at all — `rows / SCORCH_ROWS_PER_THREAD < pool`, i.e. rows < 384
+on a 24-thread pool.
+
+**Outside the gate the rule is inert, measured rather than argued.** Over 224 matrices the arm
+reads 0.9957–1.0006 against a floor of 0.9985–1.0046, every |z| ≤ 2.0, and the harmed tail is
+0.9% against the floor's 0.6% on float32 and 0.3% against 0.0% on float64 — 3 and 8 cells of
+896. That is the `ceil_pool_ok` refusal doing what the source says it does.
+
+**Inside the gate, on a general corpus, the distribution widens both ways.** float64 goes from
+8.3% of cells more than 10% slower and 10.3% more than 10% faster, to 11.9% and 14.1%. The mean
+is still positive (1.0059–1.0134), so it is not a systematic loss — it is a thread-count change
+redistributing outcomes on kernels short enough that the same-code floor itself puts 8–11% of
+cells outside ±10%. But "the mean is fine and the tail got wider" is not the no-regression
+standard.
+
+Splitting those in-gate cells by degree says exactly where the harm is:
+
+| in-gate subset | float32, floor → rule | float64, floor → rule |
+|---|---|---|
+| degree ≥ 128 — 20 matrices | 0.9783 → **1.0053**, harmed 15 → 13 | 1.0254 → **1.0338**, helped 12 → 21 |
+| degree < 128 — 58 matrices | 1.0069 → 1.0111, neutral | 1.0039 → **0.9886**, harmed 18 → **27** |
+
+All of it is the float64 low-degree subset, and on the high-degree subset the rule *reduces* the
+harmed count on float32 while adding to the helped count on float64.
+
+This is not a threshold discovered by sweeping. `nnz >= 128 * rows` is the filter chain31's
+corpus already applied, because the mechanism needs enough work per row to be worth
+redistributing — a matrix with four nonzeros per row has nothing to give a twenty-fourth worker.
+`SCORCH_SPMM_CEIL_MINDEG` states that precondition and already exists. Setting it to 128 makes
+the shipped rule fire on the family it was measured on and provably not on the family that
+reads 0.9886.
+
+**So the shipping configuration is four values, not three**, and because it is a different
+configuration from the one measured above it gets its own confirm on both corpora
+(`rw_chain41.sh`) rather than being inferred from this table:
+
+```
+SCORCH_SPMM_NNZ_PER_THREAD = 256    // insensitive: 128..2048 agree within 1%, the pool cap binds
+SCORCH_SPMM_CEIL_CAP_POOL  = 1      // cap at the caller's pool, not at omp_get_num_procs()
+SCORCH_SPMM_CEIL_ROWBIND   = 1      // the row condition as the mechanism: rows/16 < pool
+SCORCH_SPMM_CEIL_MINDEG    = 128    // enough work per row to redistribute
+```
+
+Two guardrail families need no re-measurement, because the rule cannot reach them. There is one
+call site, `spmm_csr_v2_core`. Every GCN graph is outside the gate by row count — the smallest,
+cora at 2708 rows, asks for 169 workers against a pool of 24 — and the autoencoder's shipped
+path is `sparse_linear`, which routes to the fused `spmm_csr_linear_fused_float` and never calls
+the rule. Inertness by construction beats inertness by measurement.
