@@ -10915,7 +10915,7 @@ the sign -- x86's pool equals its core count, so `nthreads >= 2*pool` is false t
 is provably the identity -- but "expected" is not "measured", and the defaults stay at 0 until
 both land.
 
-## The warm deficit peaks at exactly one width, and that width's kernel has half the accumulator chains
+## The warm deficit peaks at exactly one width, and the obvious explanation for it is already refuted
 
 Three readings off chain24's caller-path board, float32, both reps of the base arm averaged.
 Nothing new was run for any of them.
