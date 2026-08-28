@@ -9850,3 +9850,74 @@ won by 25 percentage points.
 The inert columns are the per-arm floor: 0.999-1.007 at k <= 16 and **1.032 at k=64**, where B
 reaches 111 MB and the fresh-allocation fault path dominates the reading. Nothing at k=64 that
 is smaller than 3% is a result on this host.
+
+## The fused Linear grid: the recruit is not wrong, it fires on far too little work
+
+The cap at the caller's pool would have shipped a 2x regression on the sparse autoencoder,
+and the grid that says so also says what the real defect is.
+
+Instrument: the autoencoder bench's own shapes -- every layer of all seven model configs at
+the three sparsities it reports, batch 256, so 84 cells -- driven straight through
+`scorch.sparse_linear_fm`, which is the fused kernel the autoencoder actually calls. Weights
+are unstructured-random CSR at the target nnz with distinct sorted columns per row. Arms
+switch per call, because the cap is read by `getenv` inside the resolver, so `refb` (cap off),
+`cpool` (cap at the pool) and `aa` (a duplicate of `refb`) interleave in random order at rep
+granularity with an identical environment-variable count. 9 reps, minimum per arm.
+
+The correctness check is the one that fits the question: the cap changes only how many workers
+run, and every output element is a dot product over one row's nonzeros computed by a single
+worker, so no thread count can reorder a summation. The two arms must agree bit-exactly.
+**They do, on 84 of 84 cells, maximum difference exactly zero**, and against a dense reference
+on the 54 cells small enough to take one the relative error is at most 1.4e-6.
+
+The recruit fires today on 82 of the 84 cells and under the cap on none of them. Every cell
+resolves 18 and the cap takes it to 6. Ratio is cap over no-cap, so below 1.0 means the cap is
+slower:
+
+      work = nnz*batch   cells      cap      A/A     worst     best   cap wins
+      < 10M                 16   1.1920   0.9917    0.8335   1.4670    14/16
+      10 - 20M               4   0.9624   1.0360    0.8006   1.0656     2/4
+      20 - 40M              12   0.7698   1.0063    0.6734   0.8937     0/12
+      40 - 80M              12   0.6320   1.0143    0.5481   0.7272     0/12
+      > 80M                 40   0.4578   0.9990    0.3433   0.6416     0/40
+      ALL                   84   0.6419   1.0025    0.3433   1.4670    16/84
+
+The A/A control is 0.999-1.036 with p5/p95 of 0.951/1.076, so the first bucket's 1.19 and every
+bucket from 20M up are outside the floor, and the 10-20M bucket is inside it.
+
+**The value of recruiting the E-cores is monotone in the work, and it crosses 1.0 between 10M
+and 20M.** Above the line the recruit is worth 1.30x, 1.58x, 2.18x by bucket; below it, it
+costs 19%. Worst single cell for the cap is stl10's widest layer at 0.343 -- the cap would make
+it 2.9x slower.
+
+That line reconciles every ARM number in this investigation, which until now looked like two
+hosts' worth of contradiction inside one host:
+
+- The mgladder corpus lives **below** the line. At k <= 16 its work is a few million and the
+  cap won 19-37%. At k=64 the bigger matrices approach 10M and the cap's win shrank to 4.7%.
+  That is not a width effect, it is the same work axis seen through width.
+- The autoencoder lives **above** it. nnz is 320-420k at sparsity 0.8 and the batch is 256, so
+  the work is 82-107M and up, and the recruit is worth 2x.
+- At sparsity 0.99 the autoencoder crosses down into the corpus's regime -- work 1.3-8.4M for
+  the small models -- and the cap goes back to winning, 1.19 to 1.47 on those cells.
+
+So the defect is not "the resolved count exceeds the pool". It is that **crossing from the
+framework's pool to a private oversubscribed team has no work requirement of its own.** The
+`nthreads >= 2 * atpool` gate is a *count* test standing in for a *work* test, and the count
+saturates at the machine width long before the work justifies paying for 12 more threads.
+
+The fix that follows is two-part and neither part is a cap on the resolver:
+
+1. **The recruit needs a work threshold.** Only launch the private team when the work is large
+   enough to amortise it. Everything below stays on the warm pool.
+2. **The pool path should not be handed more work items than the pool has threads.** This is
+   what the x86 measurement was really about all along: there the recruit can never fire
+   (pool 24, gate at 48, count at most 32), so cap-at-pool and this rule are the same change,
+   and chain21/chain24's +6% at every width transfers unaltered.
+
+Those two are separable and must be measured separately, because on the cells where the count
+resolves to 18 and the cap takes it to 6, the cap does both at once. Two of the 84 cells resolve
+to 8, below the recruit's gate, and there the cap alone read 0.834 and 0.915 -- handing
+`at::parallel_for` 8 workers over a 6-thread pool beat handing it 6, presumably because more
+workers means a finer row handout off the shared counter. That is a real reading against part 2
+and it is why part 2 gets its own arm rather than riding along with part 1.
