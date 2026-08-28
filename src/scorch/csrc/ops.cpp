@@ -628,6 +628,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("scorch_llc_bytes", &scorch_llc_bytes,
           "Effective last-level cache in bytes, as the kernels compute it");
 
+    // The performance-core count, as the policy layer derives it. Exported for the same reason as
+    // the chunk width and the thread count: chain46 made the resolved thread count the largest
+    // single error on the scoreboard, its optimum on that host is exactly the P-core count, and any
+    // harness exploring a rule written in those terms has to be able to ask for the number rather
+    // than re-derive it from lscpu or sysctl and drift.
+    m.def("scorch_pcore_count", &scorch_pcore_count,
+          "Performance cores this host has, as the policy layer derives them: on Linux the "
+          "physical cores carrying SMT where only some do, otherwise all physical cores; on macOS "
+          "hw.perflevel0.physicalcpu. Cached, and overridable with SCORCH_PCORES.");
+
     // Whether this build carries the A/B tuning hooks. Without them the SCORCH_*
     // environment switches are inert, so a harness that flips one and compares two
     // arms is timing the same code twice and will report a difference of zero as

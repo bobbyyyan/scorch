@@ -169,6 +169,43 @@
 #ifndef SCORCH_SPMM_ADOPT_GRAIN
 #  define SCORCH_SPMM_ADOPT_GRAIN 0L
 #endif
+
+// A ceiling on the FINAL resolved worker count, applied after both the policy count and
+// the composition adoption. 0 is off; a positive value is that many workers; -1 means
+// scorch_pcore_count(), the host's performance-core count.
+//
+// This is a cap and not a force, and the distinction is most of the effect. Forcing a
+// count also RAISES it on the cells that resolved below the value, and on the M5 that is
+// ruinous -- over 676 cells, forcing six threads reads 0.726 against the resolved default
+// because 216 of those cells resolve to a single thread and six is pure oversubscription
+// there. A cap leaves every one of them untouched.
+//
+// Why the machine needs one at all: both hosts resolve above the pool the surrounding
+// framework advertises. On redwood 48 of 231 cells land on 32, which is
+// omp_get_num_procs(), inside a 24-thread torch pool; on the M5 128 of 676 land above 6,
+// as high as 18, inside a pool of 6. Scored as a cap -- unchanged where it cannot fire,
+// the ladder's tC arm where it can -- the P-core count reads, against A/A floors of
+// 1.0021/0.9934 (x86 f32), 0.9957/1.0109 (x86 f64) and 1.0003/1.0004 (ARM f32):
+//
+//     x86 f32, cap 8   191/231 cells fire   1.0865 corpus   1.1055 firing    1 matrix -5%
+//     x86 f64, cap 8   191/231 cells fire   1.0700 corpus   1.0852 firing    2 matrices -5%
+//     ARM f32, cap 6   128/676 cells fire   1.0486 corpus   1.2850 firing    2 matrices -5%
+//
+// The P-core count beats the more obvious "never exceed the caller's pool" form: on the
+// M5 they are the same number, but on redwood the pool is 24 and capping there is worth
+// 1.0470 against 1.0865.
+//
+// OFF by default and every number above is synthesised from force arms, which is not the
+// same experiment: lowering the count also changes what
+// scorch_spmm_partition_mode derives from it, and cap 16 costing twelve x86 matrices more
+// than 5% where 8 costs one and 24 costs none is a non-monotonicity that parallelism alone
+// does not explain. Both corpora also stop at k=8, and on ARM the shipped E-core recruit
+// deliberately launches twice the pool for wide, bandwidth-bound products. Promote this
+// only once a compiled-in three-build reproduces it and a width sweep says where it must
+// stop firing.
+#ifndef SCORCH_SPMM_NT_CAP
+#  define SCORCH_SPMM_NT_CAP 0L
+#endif
 // Conditions on the nonzero-expressed row ceiling above. 0 disables a condition, which
 // reproduces the ungated rule that measures null. The measured region is rows <= 128 and
 // mean degree >= 192 on redwood; a plateau, not an edge -- rows in {96,128,192} crossed
@@ -571,6 +608,85 @@ inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRA
 // at 0.9972 against a 1.0315 null and removed (see scorch_spmm_row_regtile). This
 // stays because the selector's number has to be inspectable from a harness without
 // the harness restating how it is derived.
+// The number of PERFORMANCE cores this host has, queried from the OS and cached on first call,
+// the same shape as scorch_llc_bytes below and for the same reason: a harness that wants to know
+// what the thread rule is working with has to be able to ask, rather than restate the derivation
+// and drift from it.
+//
+// Nothing reads this yet. It exists because chain46 made the resolved thread count the largest
+// single error on the scoreboard -- forcing eight threads took the cells behind MKL from 78/231 to
+// 15/231 on float32 and 52/231 to 15/231 on float64, with the optimum flat at a median of 8 in
+// every row band above 128 rows while the rule's median ran 9, 13, then 32 -- and eight is exactly
+// this host's P-core count. That is a hypothesis about the mechanism, not a decided rule; the ARM
+// host has previously wanted its E-cores RECRUITED for a bandwidth-bound kernel, so the two may
+// disagree. Either way the count has to be available and inspectable before a rule can be written
+// in terms of it.
+//
+// How it is derived, per platform:
+//   Linux -- count physical cores whose thread_siblings_list names more than one CPU. On Intel
+//     hybrid parts the P-cores carry SMT and the E-cores do not, so this separates them without
+//     reading model numbers or frequencies. On a uniform SMT part every core qualifies and the
+//     answer is the physical core count, which is the right answer there.
+//   macOS -- hw.perflevel0.physicalcpu, which names the performance cluster directly.
+// Both fall back to the physical core count, then to omp_get_num_procs(), so a host whose topology
+// cannot be read gets today's bound rather than a wrong smaller one.
+inline int scorch_pcore_count() {
+  static const int cached = [] {
+    if (const char* e = std::getenv("SCORCH_PCORES")) {
+      if (*e) { long v = std::atol(e); if (v > 0) return (int)v; }
+    }
+    int best = 0;
+#if defined(__APPLE__)
+    // A plain array, not a braced list: a range-for over {...} needs <initializer_list>, and this
+    // header deliberately includes almost nothing.
+    static const char* const keys[] = {"hw.perflevel0.physicalcpu", "hw.physicalcpu"};
+    for (const char* key : keys) {
+      int32_t v = 0; size_t len = sizeof(v);
+      if (sysctlbyname(key, &v, &len, nullptr, 0) == 0 && v > 0) { best = (int)v; break; }
+    }
+#elif defined(__linux__)
+    // One entry per physical core, keyed by the lowest CPU id in its sibling list, so a core is
+    // counted once however many siblings it has.
+    int smt_cores = 0, all_cores = 0;
+    for (int cpu = 0; cpu < 4096; cpu++) {
+      char path[160];
+      std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+      FILE* f = std::fopen(path, "r");
+      if (!f) { if (cpu > 0) break; else continue; }
+      char buf[256] = {0};
+      const bool got = std::fgets(buf, sizeof(buf), f) != nullptr;
+      std::fclose(f);
+      if (!got) continue;
+      // The list is this CPU's siblings; count the core only from its first sibling.
+      int first = -1, n = 0;
+      for (char* q = buf; *q;) {
+        while (*q == ',' || *q == ' ' || *q == '\n') q++;
+        if (!*q) break;
+        const int id = std::atoi(q);
+        // A range "a-b" counts b-a+1 siblings.
+        char* dash = q;
+        while (*dash && *dash != ',' && *dash != '\n' && *dash != '-') dash++;
+        if (*dash == '-') n += std::atoi(dash + 1) - id + 1;
+        else n += 1;
+        if (first < 0) first = id;
+        while (*q && *q != ',' && *q != '\n') q++;
+      }
+      if (first != cpu) continue;          // not this core's first sibling
+      all_cores++;
+      if (n > 1) smt_cores++;
+    }
+    // Hybrid: only some cores carry SMT, and those are the performance ones. Uniform: all or none
+    // do, and the physical core count is the answer.
+    best = (smt_cores > 0 && smt_cores < all_cores) ? smt_cores : all_cores;
+#endif
+    if (best > 0) return best;
+    const int hw = omp_get_num_procs();
+    return hw > 0 ? hw : 1;
+  }();
+  return cached;
+}
+
 inline long scorch_llc_bytes() {
   static const long cached = [] {
     if (const char* e = std::getenv("SCORCH_LLC_BYTES")) {
@@ -578,7 +694,11 @@ inline long scorch_llc_bytes() {
     }
     long best = 0;
 #if defined(__APPLE__)
-    for (const char* key : {"hw.perflevel0.l2cachesize", "hw.l2cachesize"}) {
+    // A plain array, not a braced list, for the reason given in scorch_pcore_count: a
+    // range-for over {...} needs <initializer_list>, which this header does not include
+    // and only ever got transitively from whatever torch header preceded it.
+    static const char* const keys[] = {"hw.perflevel0.l2cachesize", "hw.l2cachesize"};
+    for (const char* key : keys) {
       int64_t v = 0; size_t len = sizeof(v);
       if (sysctlbyname(key, &v, &len, nullptr, 0) == 0 && v > 0) {
         best = (long)v; break;
@@ -875,6 +995,26 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (e && *e) { long v = std::atol(e);
       if (v > 0) { const long hw2 = (long)omp_get_num_procs();
                    nthreads = (int)(v > hw2 ? hw2 : v); } } }
+#endif
+  // The final ceiling (see SCORCH_SPMM_NT_CAP). Deliberately last: the adoption branch
+  // above is what raises the count to the pool or past it, so a ceiling applied before it
+  // would be undone. Deliberately a cap: it can only lower the count, never raise one,
+  // which is what makes it inert on the cells where forcing the same value is ruinous.
+  //
+  // The whole block is compiled out when the constant is 0 and the hooks are off. That is
+  // not cosmetic -- leaving a dead branch and its locals in place once added ten x86
+  // instructions and reshuffled every stack slot in this function, and marking them
+  // constexpr did not help.
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_NT_CAP != 0
+  {
+    long nt_cap = SCORCH_SPMM_NT_CAP;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_NT_CAP");
+      if (e && *e) nt_cap = std::atol(e); }
+#endif
+    if (nt_cap < 0) nt_cap = (long)scorch_pcore_count();
+    if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
+  }
 #endif
   return nthreads;
 }
