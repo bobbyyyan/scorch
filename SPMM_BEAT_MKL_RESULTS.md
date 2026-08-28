@@ -4895,9 +4895,14 @@ mechanism waiting for power; degree-below-4 is three matrices.
 
 ### Did the change in flight cause the near-dense residual? No — it improves that family
 
-22 of the 32 solid near-dense deficits are at k = 4, which on float32 is an exact width the
-new narrow-k kernel claims, so the obvious worry is that the thing about to ship is what put
-them there. It is not. Over all 246 cells at ≥20% density, candidate against what ships
+22 of the 32 solid near-dense deficits are at k = 4, so the obvious worry is that the thing
+about to ship is what put them there. It is not.
+
+(I first wrote that k = 4 is an exact width the new narrow-k kernel claims. **It is not** —
+`SCORCH_NARROWK_EXACT_HI` is 3, so the exact-width kernel takes k ∈ {2, 3} on both dtypes and
+k = 4 runs the register-block kernel. The ARM degree-floor grid is the direct evidence: the
+floor gates only `exact_width`, and it moved k = 2 by 7.8% and k = 3 by 10.7% while leaving
+k = 4 at 0.9925.) Over all 246 cells at ≥20% density, candidate against what ships
 today, kernel time:
 
 | | cand / ship | A/A floor | vs MKL: ship → cand |
@@ -5033,7 +5038,7 @@ pays two more successful `getenv` lookups, a per-call charge concentrated below 
 those cells are 15–27 µs. Both confounds push the same way and neither is separable from this
 arm set, so a fourth arm — today's handout *with* the new kernel — is measuring now.
 
-## The exact-width kernel's degree floor: right on x86, wrong on ARM
+## The exact-width kernel's degree floor: rejected on both hosts
 
 The floor refuses the exact-width kernel on matrices holding fewer nonzeros than rows. ARM,
 44 matrices in three groups, per-matrix z (the corpus contributes each matrix at five widths):
@@ -5050,10 +5055,34 @@ the same kernel's own case for existing: turning it off at degree 2–8 costs 4.
 z −8.3.
 
 So the NEON exact-width kernel is cheaper per row than the NEON general path even on
-mostly-empty matrices, and the AVX2 one is not. That is measured arm-variance with no queried
-quantity behind it — not a pool size, not a cache size, just two different kernels. **The
-decision waits on the x86 arm of the same grid**, which is the like-for-like counterpart of
-this table; the offline x86 evidence conflated the floor with the row partition.
+mostly-empty matrices. The x86 arm of the same grid has now reported and says the same thing,
+which retracts the arm-variance reading above: 390 cells per dtype, 26 matrices per group.
+
+The arm to read against is not the reference but `p3ez`, which sets the floor to 0 — the value
+it already has — and so is behaviourally identical while paying for one more variable the code
+looks up. It reads **1.0094–1.0101 with per-matrix z near 8**, a systematic ~1% offset that has
+to come out before any floor arm is read. The widths where the floor cannot change behaviour
+(k ∈ {1, 4, 8}, outside the exact-width kernel's k ∈ {2, 3}) supply the null directly: 0.991 on
+float32, 0.999 on float64. Against that null, with the floor ON:
+
+| | k = 2 | k = 3 |
+|---|---|---|
+| float32 | 0.8% slower | **4.5% slower** |
+| float64 | **6.6% slower** | **5.0% slower** |
+
+Per cell the mechanism is visible and it sorts on *width*, not degree. On `Pd_b` (8081 rows,
+0.78 nonzeros per row) the exact-width kernel is worth 26.1 µs against 31.4 without it at
+k = 3 — 1.20x — and costs 3.8% at k = 2. Every one of the six low-degree matrices I pulled by
+hand favours keeping it at k = 3 (0.831, 0.831, 0.954, 0.958, 0.943, 0.932).
+
+**So the floor does not ship, on either host, and `SCORCH_NARROWK_EXACT_MINDEG` stays 0.** The
+offline x86 evidence that motivated it was wrong twice over: it conflated the floor with the
+row partition, and its counter arm had the exact-width kernel off *and* a different getenv
+count. What survives is a real but narrow x86 float32 residual — four tall auxiliary matrices
+(`Pd_b`, `Pd_rhs`, `bips07_3078_iv`, `sts4098_b`) lose 3.8–7.6% at k = 2 only, which is
+1.2–2.3 µs on ~30 µs calls that already beat MKL. A discriminator that caught those four
+without also refusing the k = 3 win would be a per-matrix tune, so it is reported here rather
+than built.
 
 ## The decision refactor is not byte-identical, and the per-symbol reading is why that is fine
 
@@ -5150,13 +5179,13 @@ Float64's joint fit is not trustworthy — dropping the 50000-row shape flips th
 per-row difference (1.373 vs 1.512 ns) — and it under-predicts the observed gap fivefold. Only
 the float32 coefficient is established.
 
-**The candidate mechanism is the exact-width kernel's per-row accumulator array**: at unroll 4
-it zeroes UNROLL×K accumulators before each row and reduces them after, which is six to ten
-instructions of setup and reduction per row whatever the row's length — the right magnitude,
-and consistent with the degree floor finding, where refusing that kernel on matrices holding
-fewer nonzeros than rows recovered 5–17% on x86. Initialising the accumulator from the first
-nonzero instead of zeroing, or accumulating straight into the output row, is the lever. Not
-yet measured; the discriminating experiment is the same fit with the kernel switched off.
+**The fit was at k = 4, so this is the register-block kernel's per-row cost, not the
+exact-width kernel's** — the exact-width kernel takes only k ∈ {2, 3}, and the degree-floor
+grid confirms it by moving k = 2 and k = 3 while leaving k = 4 at 0.9925. That kills the first
+mechanism I reached for (the exact-width kernel's per-row accumulator array) and redirects the
+search to whatever the register-block kernel does once per row regardless of row length. The
+queued fit at k ∈ {1, 4, 64} is the right grid for that after all, since k = 4 is a
+register-block width.
 
 ### Counting the per-row work in the source, which agrees with the measured coefficient
 
@@ -5191,3 +5220,33 @@ be collapsed. The three levers, in increasing order of how much they change:
 None of this is implemented. The discriminating measurement — the same three-term fit with the
 exact-width kernel switched off — is queued, and if the per-row coefficient falls to MKL's with
 the kernel off, this is confirmed as its cost rather than the row loop's in general.
+
+## The gated row ceiling on ARM: nil, and the control arm is the whole reading
+
+The row ceiling refuses the row partition above a row count, gated so it can only fire where a
+pool is large enough to matter. The ARM grid ran it at full power: 165 matrices split into four
+groups by whether the gate can fire (in-gate 42, band 41, low-degree 40, wide 42), five widths,
+both dtypes, 815 cells per dtype.
+
+`p3ec0` sets the ceiling to 0 — off, the value it already has — so it is behaviourally
+identical to the reference and measures nothing but the cost of naming a variable the code
+looks up. Reading the real ceiling arms against *it* rather than against the reference:
+
+| group | float32 p3ec / p3ecb | float64 p3ec / p3ecb |
+|---|---|---|
+| in-gate — where it fires | 0.9974 / 0.9979 | 1.0070 / 1.0070 |
+| band | 0.9958 / 0.9987 | 0.9997 / 0.9982 |
+| low degree | 0.9987 / 0.9964 | 0.9992 / 0.9978 |
+| wide | 1.0011 / 0.9985 | 1.0015 / 1.0003 |
+
+Everything is inside ±0.7%, and the two dtypes disagree in sign in the one group built to
+isolate the effect. **The ceiling does not ship on ARM; `SCORCH_SPMM_CEIL_MINTHREADS` and
+`SCORCH_SPMM_CEIL_ROWBIND` stay at their off defaults.** With the x86 pool-gate verdict already
+recorded, that closes the ceiling on both hosts.
+
+The control arm is the more useful number here. `p3ec0` changes no behaviour and reads 0.9652
+in the low-degree group, 0.9782–0.9795 in-gate, 0.9887–0.9911 in the wide group — a clean
+monotone ordering by how long the kernel runs, which is what a fixed per-call charge looks
+like. So the instrumented build's resolution floor is not one number: it is ~3.5% on the
+shortest kernels in this corpus and ~1% on the longest. Any effect smaller than that is not
+decidable in a hooked build, which is why three of this session's four knobs came back nil.
