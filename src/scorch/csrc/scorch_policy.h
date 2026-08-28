@@ -245,6 +245,13 @@
 // being predictable once neighbouring rows take different unrolls. A per-call decision from
 // nnz/rows has no per-row branch at all and still gives a degree-1.6 graph an unroll of 1,
 // which is the shape the ARM tail is made of. 0 leaves the configured unroll alone.
+// Minimum mean degree (nonzeros per row) for the exact-width narrow-k kernel. 0 disables
+// the floor. At 1 the kernel is refused on any matrix holding fewer nonzeros than rows,
+// where its per-row setup has nothing to amortise -- see the measurement in spmm.h.
+#ifndef SCORCH_NARROWK_EXACT_MINDEG
+#  define SCORCH_NARROWK_EXACT_MINDEG 0L
+#endif
+
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL 0
 #endif

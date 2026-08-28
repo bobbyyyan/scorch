@@ -3643,6 +3643,7 @@ torch::Tensor spmm_csr_v2_core(
   // k=4 where this kernel fires.
   bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
   bool narrowk_exact_degunroll = SCORCH_NARROWK_EXACT_DEGUNROLL != 0;
+  long narrowk_exact_mindeg = SCORCH_NARROWK_EXACT_MINDEG;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
   // is 24 live scalars, and float32 k=6 is the worst cell in the widened grid at 0.9132
@@ -3678,6 +3679,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL");
     if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_mindeg = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_accum = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_HI");
@@ -3704,6 +3707,17 @@ torch::Tensor spmm_csr_v2_core(
     if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
     const int exact_lo_ = narrowk_exact_k1 ? 1 : 2;
     if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
+    // ... but not on a matrix with fewer nonzeros than rows. The exact-width loop's per-row
+    // setup has nothing to amortise there: over the pinned corpus at mean degree below 1 the
+    // kernel returns 1.0709 (f32) / 1.0473 (f64) against the general path's 1.2457 / 1.2130
+    // on the same cells' neighbours, and 13 float32 cells of 286 are 5-17% SLOWER than what
+    // ships today against a 1.004 A/A floor -- Pd_b and Pd_rhs at k=2 (0.831, 0.834),
+    // bips07_3078_iv at k=2 and k=4 (0.891, 0.887), sts4098_b, as-735. Every one has fewer
+    // nonzeros than rows. Above degree 1 the kernel reads 1.37 (degree 1-2) and 1.86
+    // (degree 2-4), so a floor at one nonzero per row cannot fire on anything it would cost.
+    if (exact_width && narrowk_exact_mindeg > 0 &&
+        nnz_total < narrowk_exact_mindeg * (long)A0_size)
+      exact_width = 0;
   }
   // The unroll, decided once for the call. A row shorter than the unroll runs the whole
   // remainder path and pays the accumulator array's setup and its final reduction for two
