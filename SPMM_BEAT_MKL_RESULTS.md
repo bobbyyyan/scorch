@@ -5114,3 +5114,46 @@ shipped binary, not a near relative of it.
 `pre-commit.sh` fails on this repository at `main` too (262 flake8 findings, 186 mypy errors,
 14 files black would reformat, all from black-version drift and missing stubs in compiler
 files). This branch is cleaner on all three (241, 184, 3) and changes no Python at all.
+
+## What the residual actually is: a per-ROW cost, not a per-call one
+
+I expected the remaining below-MKL cells to be fixed per-call cost — 29 near-dense blocks with
+a 0.7 µs median gap on 19 µs calls whose arithmetic is about 2 µs has exactly that shape. So I
+measured it directly: sweep the nonzero count at a fixed shape, fit `time = a + b·nnz` for both
+libraries, compare intercepts. An empty matrix was deliberately not used as the baseline,
+since an empty CSR may take a different path in either library.
+
+**Our per-call cost is lower than MKL's on seven of eight shapes** — intercepts of 2.9–16.6 µs
+against 8.9–36.9 µs, and at 512×512 k=64 we are 17–20 µs cheaper. That kills the hypothesis.
+
+But the 50000-row shape read a 63.6 µs "intercept", which is the tell: a single-shape fit puts
+everything that scales with **rows** into the constant. Fitting `time = a + c·rows + b·nnz`
+jointly across five row counts at k = 4, 48 readings per library:
+
+| float32, k=4 | per call | **per row** | per nonzero |
+|---|---|---|---|
+| ours | 5.83 µs | **1.162 ns** | 0.173 ns |
+| MKL | 6.53 µs | **0.086 ns** | 0.163 ns |
+
+**Per call we are cheaper, per nonzero we are level, and per row we cost 13.5× what MKL
+costs.** About 1.08 ns of excess per row — four to five cycles.
+
+That single coefficient predicts the residual on cells it was not fitted to. Over the 32
+float32 cells still behind MKL on the production path, `1.076 ns × rows` gives a median 0.55 µs
+against an observed median gap of 0.72 µs. It also explains why the deficits cluster below
+30 µs, why the degree-below-4 matrices (8081 rows, 6323 nonzeros) lose, and why the near-dense
+DLMC blocks at 512–2048 rows lose by a microsecond or two. On the 335 cells we *win*, the same
+per-row excess is 7.9 µs against a 14.7 µs margin — we are paying it there too and winning
+anyway, so removing it widens those margins as well.
+
+Float64's joint fit is not trustworthy — dropping the 50000-row shape flips the sign of the
+per-row difference (1.373 vs 1.512 ns) — and it under-predicts the observed gap fivefold. Only
+the float32 coefficient is established.
+
+**The candidate mechanism is the exact-width kernel's per-row accumulator array**: at unroll 4
+it zeroes UNROLL×K accumulators before each row and reduces them after, which is six to ten
+instructions of setup and reduction per row whatever the row's length — the right magnitude,
+and consistent with the degree floor finding, where refusing that kernel on matrices holding
+fewer nonzeros than rows recovered 5–17% on x86. Initialising the accumulator from the first
+nonzero instead of zeroing, or accumulating straight into the output row, is the lever. Not
+yet measured; the discriminating experiment is the same fit with the kernel switched off.
