@@ -6404,3 +6404,42 @@ but leaves the microcoded serialisation in place. So:
 If instead `s*` wins uniformly and `ex1` does not, the gather is not serialising the way this
 argument assumes and the account above is wrong -- which is worth knowing, because the same
 argument is the reason to expect anything at all from replacing the gather.
+
+### Two-host confirmation, and it exonerates the gather
+
+Same diagnostic on the ARM host, 420 cells, 70 matrices, kernel time, with the automatic
+same-code duplicate printed as the floor:
+
+| k | ARM | x86 | ARM A/A floor |
+|---|---|---|---|
+| 1 | **0.9859** | 1.0669 | 1.0357 |
+| 2 | **1.0131** | 1.0087 | 1.0364 |
+| 4 | **1.0290** | 0.9984 | 1.0350 |
+| 8 | **1.0574** | 1.0647 | 1.0318 |
+| 64 | 1.3675 | 1.4591 | 1.0274 |
+| 256 | 1.5192 | 2.1326 | 1.0192 |
+
+The ARM floor is 1.9-4.7%, so at narrow k the honest statement is "indistinguishable from
+1.0", not "exactly 1.0" -- but k=64 and k=256 are far outside it, so the *contrast* is solid.
+
+**This kills the explanation I was about to build on.** The two hosts run completely different
+kernels at k=1: x86 routes to the nonzero-axis gather and ARM cannot, because no gather
+instruction exists there before SVE, so it runs the register-block kernel with one lane of
+four. Both are dtype-blind. So the microcoded `VGATHERDPS` serialisation is *not* the cause of
+the float32 narrow-k bound; it is at most one contributor on one host. The bound is a property
+of the narrow-k loop shape itself, and replacing the gather is therefore necessary-but-not-
+sufficient at best. The chain42 prediction that `ex1` should beat `s4` in *both* B bands stands
+as written, but the reasoning behind it is now weaker than the reasoning for the general claim,
+which is that every narrow-k kernel we have keeps too little work in flight per row.
+
+**An internal consistency check I did not design for.** At wide k, ARM scales 1.52 where x86
+scales 2.13. The host with roughly seven times the achieved bandwidth is the *less*
+byte-sensitive one, which is what a bandwidth-bound regime predicts; and both collapse to ~1.0
+at narrow k, which is what a latency-bound regime predicts. The two hosts disagreeing in the
+right direction at wide k and agreeing at narrow k is a stronger result than either host alone.
+
+**One more thing this settles cheaply.** The local build carries the half-vector flip, so ARM
+k=4 float32 ran the half-vector kernel here -- and still reads 1.0290, no dtype scaling. A
+throughput fix does not cure a latency bound, which is consistent with the flip measuring a
+modest 1.1008 at that width rather than the ~1.4x the latency gap is worth. The flip and the
+narrow-k mechanism are separate levers on the same cell, and neither substitutes for the other.
