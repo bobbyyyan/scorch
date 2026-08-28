@@ -11127,3 +11127,73 @@ build -- a hooks charge that is flat in k cannot manufacture a dip at one width.
 **How to apply, going forward:** quote counts from the hookless board and shapes from whichever
 run has them, and say which build every count came from in the same sentence. The two boards
 differing by 30 cells is not an error in either; treating them as interchangeable would be.
+
+## The x86 side of the thread candidate: the threshold is inert there, so the arm is the bare cap -- and it costs ogbn-arxiv
+
+chain25b, two things.
+
+**The threshold is provably inert on x86.** All four values -- 5M, 10M, 20M, 40M -- read INERT
+against the cap alone, both dtypes. The mechanism is in the rule itself: it declines to cap only
+when capping would disable the E-core recruit, i.e. when `nthreads >= 2 * pool`. On this host the
+pool is 24 and the ceilings resolve at most 32, so `32 >= 48` is false and the decline never
+fires. **On x86 the candidate is exactly the bare cap**, and every threshold measurement there is
+a measurement of nothing.
+
+That matters more than it sounds, because the bare cap is not inert on x86. The three ceilings
+read `omp_get_num_procs()` = 32 while the caller's pool is 24, so capping gives up eight logical
+threads.
+
+**And on the GCN guardrail it costs the largest graph.** Min across three passes, milliseconds,
+with PyTorch as the arm-blind control -- it reads none of our variables, so its spread across the
+three passes is the machine's drift during them:
+
+      dataset       framework          ship     cpool    cpoolT   spread   control
+      ogbn-arxiv    PyTorch         114.854   124.897   125.211   1.090x        --
+      ogbn-arxiv    Scorch           82.196    95.254    95.184   1.159x   1.090x
+      ogbn-arxiv    Scorch (fused)   60.296    66.266    67.235   1.115x   1.090x
+      reddit        Scorch          427.612   421.688   421.185   1.015x   1.013x
+      pubmed        Scorch            0.601     0.634     0.591   1.073x   1.033x
+      cora          Scorch (fused)    0.246     0.244     0.232   1.060x   1.015x
+
+Nine of ten comparisons land inside their same-code control. **ogbn-arxiv is the exception and it
+is the one that matters**: dividing out PyTorch's own 9.0% drift leaves the candidate about **6.2%
+slower on the plain path and 2.3% on the fused one** for that graph. cora's fused arm is also
+flagged separable, but in our favour -- 0.232 against 0.246, 5.7% faster.
+
+Reddit, the biggest graph by far, is flat at 1.015x against a 1.013x control. So this is not "big
+graphs lose"; it is ogbn-arxiv specifically, and its 169k rows at k=128 put it a long way from the
+few-row narrow-k cells everything else here is about.
+
+### What that does to the decision: the defaults have to split by architecture
+
+Everything now measured points two ways at once, and consistently:
+
+      host    general caller-path corpus   real workload            correctness
+      ARM     +3.3% f32, +1.9% f64         autoencoder +12.3%       1099 passed
+                                           GCN 8/8 inside control
+      x86     null (chain24 board)         GCN 9/10 inside control  pending
+                                           ogbn-arxiv ~6% against
+
+**The rule is a win on ARM and is not on x86**, and the reason is structural rather than a tuning
+accident: the cap's whole value is on a host where the caller's pool (6) is a third of the logical
+width (18) and where crossing that gap means recruiting E-cores, and its whole cost is on a host
+where the pool (24) is most of the logical width (32) and the eight threads it gives up are doing
+useful work.
+
+So the landing this argues for is a **per-architecture default** -- `SCORCH_SPMM_NT_CAP = -2` and
+`SCORCH_SPMM_RECRUIT_MIN_WORK = 10000000` under `__ARM_NEON`, both 0 elsewhere -- which is
+byte-neutral on x86 by construction and has precedent twice over in this file: the half-vector
+kernel ships per dtype because its sign changes with dtype, and the exact-width degree floor's own
+comment says outright that "a value chosen on one host must not be compiled in for both".
+
+Before that goes in, two things are outstanding and one is new:
+
+1. **chain26b**, the x86 caller-path reading with the interleaved instrument. Expected null, since
+   chain24's board already read 0.9967 at z -1.3, but the cap is not inert on x86 and a null is
+   worth measuring properly rather than assuming.
+2. **ogbn-arxiv needs a rerun.** Its control moved 9.0% between passes, which is a poor floor for a
+   6% effect, and it is the only reading anywhere against the candidate on x86. A dedicated run --
+   that graph, more passes, arms interleaved rather than run as whole passes -- is what turns 6.2%
+   into a number or into drift. This is queued as the thing to do next on redwood, and until it
+   lands the honest statement is "one x86 workload reads about 6% against, on a floor too loose to
+   settle it".
