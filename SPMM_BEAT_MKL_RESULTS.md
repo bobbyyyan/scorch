@@ -7977,3 +7977,48 @@ reduces algebraically to (warm advantage)/(cold advantage) and carries no indepe
 **Harness gaps closed:** the ARM host had no refuse-to-run guard, which let two copies of one
 grid overlap and disagree by 12% (`m5_quiet_run.sh` now). Analyzers refuse below 90% corpus
 coverage, and print a width or band skipped for thinness instead of omitting it.
+
+### Correction: the "36 losers no row bound can reach" are the same population, just under the floor
+
+Two sections up I split the warm losers at the ceiling's own degree floor of 192, found 36 of 75
+below it, and wrote that no row bound reaches them and this mechanism addresses at most half the
+warm deficit. That was the wrong split, and looking at the 36 cells instead of their median says
+why: **35 of them sit in the 32-192 band**, at a median degree of 128 and a median of 1024 rows,
+and **none** is below degree 8. They are not a different population -- they are the same few-row
+high-degree shape, excluded by where the floor happens to sit.
+
+The furthest behind, and they are not obscure shapes:
+
+| matrix | k | rows | nnz | mean degree | MKL/ours |
+|---|---|---|---|---|---|
+| `lp_osa_14` | 4 | 2337 | 317097 | 135.7 | **0.453** |
+| `body_encoder_layer_2_ffn_conv1` | 4 | 2048 | 390912 | 190.9 | 0.755 |
+| `lock_group_projection_block_group4` | 4 | 2048 | 314571 | 153.6 | 0.769 |
+| `lp_osa_30` | 8 | 4350 | 604488 | 139.0 | 0.781 |
+| `bottleneck_3_block_group3_1_1` | 4 | 1024 | 131072 | 128.0 | 0.839 |
+
+`lp_osa_14` at k=4 is a 2.2x deficit against MKL, and its degree of 135.7 misses the gate by 56.
+
+**So both constants are mispositioned, and pricing them jointly is better than pricing either:**
+
+| maxrows \ mindeg | >=192 | **>=128** | >=64 | >=32 |
+|---|---|---|---|---|
+| 128 (ships) | 8/4 | 8/4 | 8/4 | 8/4 |
+| 512 | 32/88 | 41/103 | 45/147 | 45/201 |
+| **2048** | 39/93 | **59/121** | 71/193 | 71/247 |
+| 4096 | 39/93 | 60/126 | 72/198 | 72/252 |
+
+Losers-in-gate / winners-in-gate, of 75 and 669. Read as losers per winner admitted, the shipped
+corner is 2.00 -- a tight gate covering almost nothing -- and among the widened corners
+**(2048, 128) is the best at 0.49**, better than the same row bound at the shipped degree floor
+(0.42), because the losers cluster exactly at degree 128. Dropping the floor to 64 buys 12 more
+losers and costs the ratio (0.37).
+
+So the honest revision: this mechanism can reach **59 of 75** float32 warm losers, not half. It
+also admits 121 cells that currently beat MKL, in a region where a 1.3x rule has never been
+measured -- which is the whole reason chain53 exists rather than a patch.
+
+chain53 was rebuilt before it ran: it now ladders both constants, on a corpus binned on rows *and*
+degree that spans down to degree 32, and its analyzer classifies each (rows, degree) bin by whether
+the gate fires over the whole bin, over none of it, or straddles a bound -- the straddling bins
+excluded, since an arm firing on part of a bin is not comparable to one firing on all of it.
