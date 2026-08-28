@@ -10722,3 +10722,22 @@ Six of six as the constants dictate, the environment ignored on all six, and `st
 hook names in the object -- so this is the shipped shape and not an instrumented one. The build
 is also not byte-identical to the default build, which is the other half of the check: the
 constants are live rather than compiled away.
+
+### float64 is the same class, and fewer of it
+
+Same board, same arm, float64:
+
+                     cells below MKL   by width (k=1/2/4/8/16/32)   degree   rows   margin   within 10%
+      f32 warm            107/744          40 17 36 10  1  3          191    512    1.081      71/107
+      f64 warm             64/744          26  2 27  6  1  2          210    512    1.090      38/64
+      f32 cold            198/744          51 45 41 30 19 12          102    512    1.046     161/198
+      f64 cold            132/744          41 31 31 16  6  7          115    512    1.050     105/132
+
+**The signature is identical in both dtypes** -- k=1 and k=4 hold 53 of float64's 64 warm cells
+just as they hold 76 of float32's 107, the losing cells have nine to ten times the corpus median
+degree on a sixth of its rows in both, and the margins match to within a percent. float64 simply
+has fewer of them, which is consistent with the float64 register kernel already shipped.
+
+So this is one class of shape, not two, and the levers aimed at it -- chain29b at k=1 and chain28b
+at k=4/8 -- serve both dtypes. Across both, the whole board is 171 warm cells and 330 cold out of
+1488, and the great majority of each is within ten percent of MKL.
