@@ -10500,3 +10500,14 @@ Matching that against the queue: **chain28b's multi-row register blocking target
 which is why chain28b now measures both paths). **chain60's k=1 exact-width kernel targets the
 largest single group**, the 40 losers at k=1. Those two between them address 76 of the 107 warm
 cells, which is why they are the two to run first.
+
+**chain60 -> chain29b, promoted for the same reason and given the same treatment.** The k=1
+exact-width kernel with the degree-adaptive unroll targets the 40 warm cells at k=1, which the
+caller-path board says is the largest single group on it -- larger than k=4's 36. It was
+thirteenth. Renumbered into the twenties so every later wait pattern already covers it, guard
+naming only the five chains ahead of it, and both probes run over its three shared builds.
+
+Order is now 24, 25b, 26b, 27b, 28b, 29b, 48 through 61, 63b, with each guard naming only its
+predecessors so the dependency stays one-directional. The two promoted chains are the ones whose
+targets the board says are the two largest loser groups; everything measured about either of them
+so far describes the general dispatch path, and both now report on both.
