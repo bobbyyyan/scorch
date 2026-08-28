@@ -7750,3 +7750,45 @@ A hooked grid can decide this. `scorch_policy.h`'s warning is that a hooked grid
 whether the rule is inert *outside* its gate, because each arm pays for the variables it sets;
 widening the bound is an in-gate question, and the arms differ precisely on the cells the wider
 bound admits.
+
+## The k=1 extension is ARM-only, and x86 says so with a number already in the source
+
+chain42's float32 timing landed. Binned on degree, because `streams_groups.csv` is the matrices
+below MKL parity at k<=2 and its composition is whatever that selection produced -- here
+**deg 2-4=1, deg 8-64=19, deg 64-256=29, deg>=256=17, and nothing below degree 8 at all**. So it
+cannot speak to the low-degree question, and pooling it would have hidden that rather than
+saying it.
+
+What it does settle is the sign, against the ARM ladder on the same bands:
+
+| band | x86, k=1 | ARM, k=1 |
+|---|---|---|
+| deg 8-64 | 0.9706 z-2.1 | **1.0410 z+5.7** |
+| deg 64-256 | 0.9933 z-0.4 | **1.0446 z+6.4** |
+| deg>=256 | **0.9033 z-2.0** | **1.0646 z+8.7** |
+| pooled | 0.9628 | +4.8% over a stratified corpus |
+
+Opposite signs in every band where both hosts have data. And the x86 number is not a surprise to
+the codebase: `spmm.h` already records, in the comment explaining why the stream-depth hook does
+not test the k=1 question, that *"at k=1 float32 the shipped path is the gather kernel... and the
+regblock family is already 0.903 of the gather at k=1 on the losing band"*. The measured 0.9033
+at degree >=256 is that number, arrived at independently.
+
+So the mechanism is clear and the two hosts do not actually disagree about anything physical.
+Lowering the exact band to width 1 replaces whatever ships at k=1, and that differs by ISA: on
+x86 it displaces `vgatherdps`, one outstanding memory operation covering eight nonzeros, and
+loses; on ARM there is no gather instruction, so it displaces a register-block tile using one
+lane of four, and wins. **The extension is ARM-only.** Both constants default to 0, so nothing
+is at risk today, and shipping it means an ISA-conditional default in the manner of
+`SCORCH_SPMM_HALFVEC_F32` / `_F64` -- not a tuned constant, a different kernel being displaced.
+
+Since ARM has no MKL, this cannot move the scoreboard. It is worth having for the same reason the
+NEON work was: the ARM host is the only one where the narrow-k path is not a gather, and a 4-11%
+win there is real even when it is not a comparison.
+
+**Stream depth is confirmed a null on x86, band by band** -- s2/s4/s8 read 0.9765 to 1.0280 with
+|z| at most 2.1 across every band at k=1, 2, 4 and 8. The source recorded that verdict pooled
+("MEASURED, AND IT IS A NULL"); this adds that no band was hiding inside the pooled number, which
+is the objection that has overturned three other verdicts in this ledger. The arms are not dead
+yet: they were measured warm both times, and chain51 times them cold, which is where extra loads
+in flight have something to overlap.
