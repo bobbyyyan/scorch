@@ -4911,3 +4911,37 @@ The candidate is 7–22% faster on the near-dense family and takes it from 1.30�
 MKL to 1.43–1.62× ahead. Three of 41 k=4 cells are more than 5% harmed on float32, none on
 float64, against a 3.2% float32 floor at that width. So the near-dense residual is a
 pre-existing minority inside a family we win pooled, not something this change introduced.
+
+## The work gate's pool ceiling, measured on x86: the ceiling is what makes it shippable
+
+redwood, pool 24, hooked with `--pad-env`. Two corpora: the 312-cell few-row corpus and the
+full 2172-cell general one. Reference is the candidate (back-stealing + exact width); `p0` is
+what ships today.
+
+| arm | general f32 | general f64 | few-row f32 | few-row f64 |
+|---|---|---|---|---|
+| candidate (reference) | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| + work gate, **no** ceiling | **0.9303** | **0.9153** | 0.9916 | 0.9915 |
+| + work gate, ceiling at 16 | 0.9991 | 0.9858 | 0.9955 | 1.0049 |
+| + gate at 4 grains, ceiling 16 | 0.9913 | 0.9972 | 0.9964 | 1.0043 |
+| A/A | 0.9998 | 0.9999 | 1.0024 | 1.0062 |
+| what ships today | 0.7551 | 0.7609 | 0.7940 | 0.8181 |
+
+**The ungated gate costs 7.0% (f32) and 8.5% (f64) on the general corpus** — uniform across
+every k, 0.90–0.94 at each — and it costs almost nothing on the few-row corpus, because what
+it turns off is the partition on the many small products the general corpus carries and the
+few-row one does not. That is the x86 cost the ceiling exists to remove, reproduced.
+
+**With the ceiling the gate is inert, to the resolution this grid actually has.** At pool 24
+against a ceiling of 16 the gate's whole block is unreachable, so the two capped arms are an
+A/A pair by construction — and they read 0.9991 / 0.9913 on f32 and 0.9858 / 0.9972 on f64,
+i.e. **they disagree with each other by 0.8–1.1%**. That is this grid's arm-to-arm floor, and
+both capped arms sit inside it. Anything finer than about 1% is not decidable here; the 7–8.5%
+of the ungated arm is nowhere near it.
+
+Also the headline for the change itself, on the same 2172 cells: **the candidate is 1.3242
+(f32) / 1.3142 (f64) faster than what ships today**, with 1161 / 1155 cells more than 10%
+faster and 7 / 6 more than 10% slower.
+
+**So the shipping configuration is decided:** back-stealing, the exact-width narrow-k kernel
+at unroll 4, the work gate at two grains, and the gate's pool ceiling at 16.
