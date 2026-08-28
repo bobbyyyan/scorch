@@ -8580,3 +8580,43 @@ the difference between losing 6.9-7.3% and losing nothing, replicated twice on b
 that emits nothing today, so it cannot be wrong about performance. The question the hooked ladder
 cannot answer is whether turning `NNZ_PER_THREAD` on at all costs ARM something, and the answer so
 far is "about 0.2% on float32, float64 pending".
+
+## The repaired float64 half, and what the presence cost actually is
+
+`m5_repair15.sh` re-measured only the two stall-damaged float64 slices against the same three `.so`
+files. The reference column now moves 1.0451 against the 1.10 limit, so the run reads:
+
+| region, ARM compiled-in, capped ceiling on | matrices | floor | cand/ship | cell z | **per-matrix z** | below MKL |
+|---|---|---|---|---|---|---|
+| f32, rule fires | 7 | 0.9971 | 0.9887 | -0.69 | -0.58 | 0 -> 0 |
+| f32, cannot fire, rows 129-383 | 8 | 0.9995 | 0.9816 | -3.61 | -2.28 | 0 -> 0 |
+| f32, cannot fire, everything else | 260 | 1.0001 | 0.9981 | -2.38 | **-1.70** | 30 -> 31 |
+| f64, rule fires | 7 | 0.9465 | 0.9753 | +1.31 | +0.49 | 0 -> 0 |
+| f64, cannot fire, rows 129-383 | 8 | 0.9799 | 0.9818 | +0.36 | +0.12 | 0 -> 0 |
+| f64, cannot fire, everything else | 260 | 0.9983 | 0.9794 | -5.21 | **-2.06** | 21 -> 22 |
+
+Two things to read carefully here, and the second one downgrades my own correction from an hour ago.
+
+**The cost is much larger on float64 than on float32** — 2.1% against 0.2%, over the same 260
+matrices in the same runs. For a condition that evaluates to false after a couple of compares, 2.1%
+is far too big to be the branch, so if it is real it is code layout or inlining around the enabled
+block, not the test itself.
+
+**But "cell z -5.21" is not the number to quote, and I quoted the float32 equivalent earlier
+without its companion.** The five widths of one matrix are not five independent observations, and
+this analyzer prints both: aggregated per matrix the same comparisons are z **-2.06** (float64) and
+z **-1.70** (float32). Per matrix, one is marginal and the other is not significant. The
+below-MKL counts agree with the smaller reading — 30->31 and 21->22, one cell each.
+
+So the honest state of the ARM half of the ceiling: enabling `NNZ_PER_THREAD` is **probably not
+free** on ARM float64, at around 2% in the region where the rule cannot fire, on marginal evidence
+(per-matrix z -2.06); it is not measurably anything on float32; and it shows no gain in its own
+firing region on either dtype, where there are only seven matrices and the float64 floor is 0.9465,
+so that region has no power to show one. None of this is affected by the pool cap, which is a
+separate axis and is settled: when the rule *does* fire, capped costs nothing and uncapped costs
+6.9-7.3%.
+
+The decision therefore rests entirely on the x86 gain that chain57/58 measure, weighed against a
+possible ~2% ARM float64 cost that is only marginally established. If chain57 shows the widened gate
+paying on x86 at the 1.1-1.3x the shipped gate already shows, that trade is clearly worth taking. If
+it shows a few percent, it is not.
