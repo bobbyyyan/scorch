@@ -10656,3 +10656,48 @@ build and the same cells. That is measured rather than inferred, it is consisten
 quote when explaining why a kprobe ratio against MKL is not a caller-path ratio against MKL. It
 also explains why the subtraction degenerates warm: at the same mode the harness path's *kernel
 term alone* is about the size of the caller path's *entire call*.
+
+## Splitting the cold cost by layer, and a first ARM reading
+
+chain23b establishes the *shape* of the fixed cold cost -- it reads the intercept from a fit of
+cold time against nonzeros rather than subtracting, fits MKL the same way so the comparison is
+like for like, and crosses thread count with flush method to separate team wake-up from cache
+eviction. What it does not do is say which *layer* the cost sits in, and that is what decides
+whether it is reachable.
+
+`cold_split` does that with three arms plus the reference, all timing the same kernel in one
+process:
+
+      full     scorch.matmul(A_st, B)                the caller path, plan cache live
+      planrun  plan.run(values, B, nthreads, at)     where ops.matmul's fast path ENDS, so calling
+                                                     it directly isolates the probe above it: two
+                                                     type checks, the kwargs test, the
+                                                     (shape, dtype, generation) key, two dict looks
+      native   scorch_ops.spmm_csr_float_v2(...)     args prebuilt outside the timer
+      torch    torch.sparse.mm(A32, B)               reference, dispatch in C++
+
+`native` is deliberately **not** treated as the floor, and the first reading is why: its pybind
+entry runs `validate_binary_inputs`, which walks the caller's index arrays on every call, and on
+the M5 that made it read *slower than the entire caller path* -- 52.2 us against 45.7 us at k=4.
+So that arm prices the per-call ABI validation rather than bounding the kernel.
+
+A two-matrix look on ARM, cold, medians in microseconds:
+
+      matrix              k    full   planrun   native    torch   probe   validation
+      EVA                 1    33.8      36.2     40.3     74.9    -2.4        +4.1
+      EVA                 4    39.5      32.5     38.7    160.0    +7.0        +6.2
+      EVA                32    68.0      60.8     64.4    258.5    +7.2        +3.6
+      Reuters911          1    44.6      38.1     36.4     93.5    +6.5        -1.7
+      Reuters911          4    54.4      49.8     47.2    186.0    +4.6        -2.6
+      Reuters911         32   104.3     105.2    116.7    308.7    -0.9       +11.5
+
+At five reps the individual figures are noisy -- two of the probe readings are negative, which is
+impossible and is the noise floor announcing itself -- but the scale is clear enough to matter:
+**the Python probe is a few microseconds, not forty.** On calls of 34-104 us that is 5-20%, and
+scorch is 2-3x faster than `torch.sparse.mm` cold on every one of these cells.
+
+Which means the two hosts' cold costs may not be the same thing at all. redwood's fixed cost is
+about 40 us; if its probe is also a few microseconds, then the cost is somewhere else entirely --
+the allocator, the thread team, or the harness's own coldness -- and each of those has a different
+fix. That is exactly the question chain23b and chain22b answer between them, and it is why the
+ARM half (stage40) runs the same instrument rather than a different one.
