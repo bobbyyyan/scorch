@@ -6500,3 +6500,31 @@ the corpus file's length and the other was the corpus actually measured.
 **The flip comparison is unaffected**, and by luck rather than design: chain48 copies chain39's
 `cold_probe` invocation verbatim, so it inherits the same 20000 default and the same 124
 matrices. That pairing is corpus-matched, which is what the pre/post difference needs.
+
+### An attempt at an absolute headroom number, which did not work, and the one thing it did show
+
+The dtype-scaling table says MKL gains 2.05x from halving its bytes at float32 k=1 once its
+per-call floor is subtracted, which is what a loop at its bandwidth limit looks like. If that
+were right, converting both sides to achieved bandwidth would turn a ratio with an unknown
+ceiling into a headroom figure. It does not survive contact.
+
+The first version was confounded and would have read well: banded on B footprint with no
+nonzero floor, it gave ours 9.9 GB/s and MKL 6.6 in the dominant band, both far below the ~56
+GB/s this host streams at, which looks exactly like "neither side is bandwidth-bound and there
+is 5x on the table". But the small-B band selects small-column matrices and `combo_final` has
+no nonzero floor, so that band fills with matrices whose time is the ~4.2 us per-call floor
+rather than the loop. A 3000-nonzero cell reports a few GB/s whatever the kernel does. That is
+the per-call floor wearing the costume of a bandwidth measurement.
+
+With a 100k nonzero floor, where the fixed cost is a few percent, it inverts: ours 88.1 GB/s
+against MKL's 72.9, and at a 500k floor 155.0 against 110.5. **Both are far above the DRAM
+ceiling**, so the traffic is being served from cache and 56 GB/s was the wrong reference for
+these cells. And the apparent lead over MKL is not real either -- it charges MKL its ~12.8 us
+call floor while charging us none, the mirror image of the bias that made the instrumented
+grids read against us. So no headroom number comes out of this, and none is claimed.
+
+What does come out is a third, independent line of support for the mechanism. These cells are
+**cache-resident** -- effective bandwidth well above DRAM -- and simultaneously **insensitive
+to element size**. A loop that is cache-resident and does not care whether it moves four bytes
+or eight is bound by latency and dependency inside the cache hierarchy, not by traffic. That
+agrees with the dtype-scaling reading and with the ARM confirmation, by a different route.
