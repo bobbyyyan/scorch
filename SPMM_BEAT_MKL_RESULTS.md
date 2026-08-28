@@ -4460,3 +4460,35 @@ suspect. Three shape families:
 kernel with its short-row unroll clamp, the kernel at unroll 1 — because a degree-1.6 graph
 is nothing but short rows and the shipped configuration does not clamp the unroll by row
 length.
+
+## The x86 shipping number for the full candidate: kernel 1.33 and 1.29, below-MKL 803 → 629 and 688 → 449
+
+The first three-build ran before the exact-width grid existed, so its chooser had no data
+and fell back to the partition alone. Re-run with the chooser reading the finished grid —
+it picked `p3e4`, unroll 4, at 1.0198 of its floor — the candidate is back-stealing plus
+the exact-width kernel at k ∈ {2,3}. 2172 cells per dtype, two passes per build in
+opposite orders.
+
+| | kernel | whole call | floor (ctrl/ship) | harmed | floor harmed | vs MKL, before → after | below MKL |
+|---|---|---|---|---|---|---|---|
+| float32 | **1.3305** | 1.2559 | 1.0128 | **2.5%** | 3.8% | 1.1223 → **1.4011** | **803 → 629** |
+| float64 | **1.2851** | 1.2347 | 0.9877 | **3.6%** | 4.4% | 1.2713 → **1.5545** | **688 → 449** |
+
+**The harmed tail is at or below the floor on both dtypes** — 2.5% against 3.8%, 3.6%
+against 4.4% — which is the strongest form the "no regressions" requirement takes: two
+builds of identical source disagree on more cells than the change does. Reference spread
+1.0755 and 1.0796, inside the limit.
+
+By free dimension, float32: k=1 1.3298, k=2 1.3842, k=4 1.3252, k=8 1.3810, k=64 1.3895,
+k=256 1.1850, against floors of 1.004–1.030. float64 the same shape (1.2953 / 1.3477 /
+1.3137 / 1.3648 / 1.2745 / 1.1294). Uniform, not a single-width effect, and k=256 is the
+only band under 1.2 — the width where the register-block kernel already streams well.
+
+Against the partition-only run the float32 candidate is a touch better (1.3305 vs 1.3250)
+and float64 a touch worse (1.2851 vs 1.3106), but the floor moved 3% between the two runs
+(0.9877 here against 1.0186 there), so the exact-width kernel's ~2% is inside the
+run-to-run movement of the baseline. Net of each run's own floor both say the same thing:
+**about 1.30x the kernel that ships today, on x86, in both dtypes**.
+
+One caution on the "vs MKL" column: it is the harness path, which carries the plan-cache
+handicap. The caller-path answer is the cold/warm grid — 1.20x cold, 1.65x warm.
