@@ -9213,3 +9213,62 @@ implausible 1.50 uniform gain, five warm float32 cells stay below MKL, and the w
 on the board -- lp_osa_14 at k=4, 2337 rows of degree 135 on 32 workers -- needs 2.21x by
 itself. Whatever fixes that is a different mechanism, and the four warm losers that
 resolve at or below 8 threads cannot be touched by any thread rule at all.
+
+## stage29: the cap measured with the cap, on ARM — and the estimator the data forced
+
+169 matrices, k in {1,4,8,16,64}, both dtypes, 12 reps, interleaved, arms on
+`SCORCH_SPMM_NT_CAP`. The reference is `refb`, which sets that knob to 0 -- semantically
+off, same environment shape as every cap arm. That matters more than expected: `ref`,
+which sets nothing at all, reads 1.008-1.018 against `refb`, so naming one variable is
+worth 1-2% on this host, not the 0.45% I had assumed. The instrument was checked before
+the ladder ran: the probe shape resolves to 18 uncapped, `cap=0` gives 18, `cap=-1` gives
+6, and 2/4/6/8 each bind exactly.
+
+**The estimator.** A cap leaves its inert cells running identical code, so the inert
+column must read 1.000. At k<=16 it does (1.002-1.006). At k=64 it reads 1.0424 for cappc
+and 1.0538 for cap4 while cap8 and cap12 read clean -- per-arm drift of 4-5% at the width
+where B reaches 111 MB and this host's fresh-allocation fault path dominates. So the
+number of record is firing/inert, which cancels anything that moved a whole arm, and the
+inert ratio is that arm's own resolution floor at that width. Reported below in
+parentheses.
+
+      float32     k=1             k=4             k=8             k=16            k=64
+      cappc   1.2478(1.002)   1.2766(1.004)   1.2459(1.005)   1.1608(1.005)   1.0041(1.042)
+      cap6    1.2539(0.996)   1.2729(1.001)   1.2476(1.001)   1.1686(1.004)   1.0104(1.038)
+      cap12   1.1952(0.995)   1.1657(1.005)   1.1462(0.999)   1.0912(0.999)   1.0271(1.004)
+      cap8    1.1382(0.999)   1.1512(0.999)   1.1126(0.995)   0.9932(0.997)   0.8631(1.000)
+      cap4    1.0914(1.001)   1.0808(1.031)   1.0066(1.088)   0.9687(1.079)   0.9105(1.054)
+      cap2    0.9216(0.998)   0.8779(1.040)   0.8261(1.094)   0.7819(1.073)   0.6788(1.027)
+      aa      1.0104(1.000)   1.0143(1.000)   1.0089(1.000)   1.0097(1.000)   1.0017(1.000)
+
+      float64     k=1             k=4             k=8             k=16            k=64
+      cappc   1.2541(1.000)   1.2408(1.006)   1.1800(0.997)   1.0684(0.996)   0.9253(1.048)
+      cap6    1.2672(0.995)   1.2315(1.007)   1.1899(0.999)   1.0626(1.002)   0.9292(1.041)
+      cap12   1.1953(0.992)   1.1552(1.006)   1.0918(1.000)   1.0343(0.997)   0.9862(0.998)
+      cap8    1.1639(0.998)   1.1276(1.006)   1.0043(0.996)   0.8591(0.996)   0.7711(0.984)
+
+Four things follow.
+
+**The real cap reproduces the proxy.** 1.2478 against the synthesised 1.2850 on float32
+and 1.2541 against 1.2616 on float64, at k=1. The proxy was slightly optimistic, as
+predicted, and the instrument agrees with it.
+
+**cappc equals cap6, which is what it should do**, since this host's P-core count is 6.
+The accessor is doing what it claims in a real build.
+
+**The cap is NOT monotonic in its value.** cap6 (1.2539) beats cap8 (1.1382), which is
+beaten again by cap12 (1.1952), at k=1 on float32, with tight floors on all three. A pure
+change in parallelism cannot do that. `scorch_spmm_partition_mode` takes the resolved
+count as an argument, so lowering the count also moves the row-handout mode, and the
+composition of the two is not ordered by the count. Every cap value therefore has to be
+measured; none can be interpolated. This is the same non-monotonicity the x86 proxy showed
+when cap 16 cost twelve matrices while 8 cost one and 24 cost none.
+
+**And it corrects a reading I took an hour ago.** On the uncorrected table cap4 looked
+better than cap6 on whole-corpus geomean at every width up to 16, which would have made
+the P-core count the wrong value. That was cap4's inert column carrying 3-9% of drift.
+Divided out, cap4 is worse than cap6 at every width. The whole-corpus geomean was the
+wrong statistic because the arms fire on different numbers of cells.
+
+The width decay is the open question this leaves: 1.25 at k=1 falling to 1.00 (float32) or
+0.93 (float64) at k=64. That shape has a candidate mechanism, and it is not the cap.
