@@ -10131,3 +10131,55 @@ that ships today, since a lower threshold declines the cap more often. If a late
 Nothing is enabled. `SCORCH_SPMM_RECRUIT_MIN_WORK` stays 0 and `SCORCH_SPMM_NT_CAP` stays 0 until
 the x86 firing count comes back, the GCN guardrail runs on both hosts, the ARM correctness suite
 passes with both compiled in, and the real autoencoder bench confirms the synthetic fused grid.
+
+## Why chain21 read +6.3% and chain24 read null: they are not the same code path
+
+Not drift, not the corpus, and not dilution. The two runs call `scorch.matmul` differently, and
+one of the two ways is the one a caller uses.
+
+`ops.matmul` serves a repeat product from a per-tensor plan cache, but the fast path is guarded:
+
+      if _PLAN_ENABLED[0] and not kwargs and type(a) is STensor and type(b) is _TENSOR:
+
+kprobe -- which produced chain21's +6.3%, and every kernel number in this investigation -- times
+
+      scorch.matmul(A_st, B_st, time_dict=td)
+
+which passes an STensor B **and** a time_dict. Both disqualify it: `kwargs` is non-empty and `b`
+is not a `torch.Tensor`. So every kprobe reading is of the general dispatch path. chain24's `plan`
+column is `scorch.matmul(A_st, B)` -- no kwargs, plain tensor -- and is the caller path.
+
+This was already on the record and I did not connect it: the two paths have measured 1.20 cold /
+1.65 warm against MKL on the caller path and 0.90 / 1.23 on the harness path, same cells. A knob
+scored on one is not scored on the other, and the thread cap is now the second lever to be read
+differently by them.
+
+Two candidate explanations are eliminated on the way:
+
+- **Not a small firing set.** Bounding it from a different host: a cell fires on redwood only if
+  its formula wants 25 or more workers, and such a cell shows up clamped at 18 on an
+  18-processor host, so {cells at the local ceiling} contains redwood's firing set. That bound is
+  **93.7% of the 744 board cells** (91.9% at k=1 rising to 99.2% at k=32). Loose, but it rules
+  out dilution-by-rarity, and chain21 independently found nearly every cell firing.
+- **Not the kernel share.** A 6% kernel gain diluted by Python dispatch would land near 1.03, not
+  1.00.
+
+### The instrument that was missing, and now exists
+
+`cprobe.py` is `kprobe.py` with exactly one thing changed -- the timed call is
+`scorch.matmul(A_st, B)` -- so the machinery is the same code: per-arm batch sizing from each
+arm's own probe time, a fresh random arm order every repetition, `--pad-env`, the
+duplicate-of-the-first-arm A/A column, both MKL columns. It has no kernel-time column by
+construction, since asking for `time_dict` is what disables the path it measures; the docstring
+it inherited claimed one, which is corrected.
+
+That gives the caller path an **interleaved** measurement, which neither existing run has:
+chain21 interleaves but on the harness path, chain24 is on the caller path but its arms are whole
+runs. Queued as chain26b on the board corpus, both dtypes, six widths, arms
+`refb / cpool / cpoolT`.
+
+Until it reports, the honest state is: **the thread cap's value on the caller path is unmeasured.**
+The +6.3% is a real number about the general dispatch path, and the caller-path column that
+exists says null with a tight control. If the interleaved caller-path run agrees with chain24,
+then the cap fixes a defect that callers cannot feel, and what ships is decided by the ARM
+numbers -- where the fused Linear grid *is* the caller path, via `scorch.sparse_linear_fm`.
