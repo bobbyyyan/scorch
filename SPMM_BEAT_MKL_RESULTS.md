@@ -8144,3 +8144,50 @@ That closes the correctness gate for the ARM candidate. It does not close the x8
 change different kernels there (the gather serves k=1 on x86 float32), and chain43 has separately
 passed 306 tests at `UNROLL=4 PF=0` and 306 at `PF=1`, which covers the deep-kernel arms but not
 these two.
+
+## chain43: the deep register kernel wins at nvec=2, and it is the prefetch that was hiding it
+
+Arms: `ref` (shipped), `d4np` (4 streams, prefetch off), `d4pf` (4 streams, prefetch on), `d8pf`
+(8 streams, prefetch on). float32, 302 matrices, kernel timer, degree-binned.
+
+| k | `d4np` | `d4pf` | `d8pf` | nvec |
+|---|---|---|---|---|
+| 4 | 0.8034 | 0.7526 | 0.7614 | 1 |
+| 8 | 0.8124 | 0.7559 | 0.7717 | 1 |
+| **16** | **1.0396** | 0.9633 | 0.8950 | **2** |
+| 64 | 0.9922 | 0.9955 | 0.9946 | 8 |
+
+At k=16 the best band is degree 8-64: **1.0614 with z+12.5 over 160 matrices**, and degree>=256
+reads 1.0208 z+3.2. Everything at k=4 and k=8 is a 20-25% loss.
+
+**The prefetch is what made this look like a null before.** `spmm.h` says the earlier rejection of
+stream depth "ran the deep kernel with no prefetch at all, while the shipped 2-deep kernel carries
+one, so its 14.5% harmed tail could be either change". Now they are separate axes, and at k=16:
+
+* `d4pf` against `ref` -- depth 2 to 4, prefetch on throughout -- reads **0.9633**, so depth alone
+  *loses* 3.7%;
+* `d4np` against `d4pf` -- prefetch off at the same depth -- is **1.0792**, so turning the deep
+  kernel's prefetch off is worth **+7.9%**, which more than pays for the depth.
+
+So the win is the prefetch's absence, and depth is the price of reaching a kernel that can express
+it. Note what is *not* available: `narrowk_unroll_pf` only reaches
+`scorch_spmm_row_regblock_deep`, entered only when `narrowk_unroll` is set, so prefetch-off at the
+shipped depth of 2 cannot be asked for through this hook. The shipped path at k=16 is a different
+kernel (`scorch_spmm_row_regblock<2>`), and whether *its* prefetch is the same mistake is
+unmeasured and needs a source change, not an arm.
+
+**k=64 is a structural null, not a neutral reading.** The deep kernel is instantiated only for
+nvec 1-4 (`switch (nvec*16 + narrowk_unroll)`), and k=64 on AVX2 float32 is nvec=8, so no arm can
+fire there. All three read 0.992-0.996 against a 0.995 floor, which is what that should look like
+and is a free control on the whole grid.
+
+**The gate is nvec, and the grid has a hole in exactly the wrong place.** nvec=1 loses, nvec=2
+wins, and the widths were 4, 8, 16, 64 -- so **nvec=3 and nvec=4 (k=17..32 on AVX2 float32) were
+never measured**, though `case 3*16+4` and `case 4*16+4` are both instantiated. k=32 is one of the
+scoreboard's six widths. That is the next run.
+
+**A prediction to register before chain43's float64 half lands.** float64 has four lanes per
+vector, so nvec = k/4 rather than k/8: if the effect is set by nvec, float64 should **win at k=8**
+(nvec=2) and **lose at k=4** (nvec=1), and k=16 (nvec=4) becomes the unmeasured middle rather than
+the winner. If instead float64 wins at k=16, the quantity is k and not nvec, and the mechanism
+story above is wrong.
