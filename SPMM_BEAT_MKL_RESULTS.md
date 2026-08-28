@@ -5344,3 +5344,65 @@ One caveat on the whole-call column that is not in the table: on this harness pa
 cells read 0.6848 with 248 of 302 behind MKL, because passing `time_dict` disables the
 per-tensor plan cache and adds about 7 µs to a kernel that is only a few microseconds long.
 That is the measurement path, not the caller path, and the kernel column is the signal.
+
+## Sizing the row axis off nonzeros, and a pool sweep that beats a second host
+
+The row axis is `rows / SCORCH_ROWS_PER_THREAD`, so a 128-row matrix asks for 8 workers of a
+24-thread pool however much work each row carries. `SCORCH_SPMM_NNZ_PER_THREAD` sizes it off
+nonzeros instead and raises the count to `nnz / v`, capped at the caller's pool. 103 matrices
+with more work per row than 128 nonzeros and fewer than `16 × pool` rows, in three groups by
+how starved they are, five widths, both dtypes, 515 cells per dtype per pool. Every arm sets
+the same five variables; only `v` differs.
+
+**It is real at k ≥ 32 on both dtypes, and the value of `v` does not matter.**
+
+| pool 24, best arm | k=8 | k=16 | k=32 | k=64 | k=128 |
+|---|---|---|---|---|---|
+| float32 | 1.0199 z+2.9 | — | 1.0557 z+3.3 | **1.0898 z+3.8** | 1.0300 z+2.8 |
+| float64 | 1.0228 z+3.7 | — | 1.0796 z+3.1 | **1.1273 z+6.5** | 1.0580 z+2.6 |
+
+All four values of `v` from 128 to 2048 — sixteen-fold apart — read within a percent of each
+other. That is not four thresholds agreeing; it is the **pool cap** doing the work, because for
+every matrix in this corpus `nnz/128` and `nnz/2048` both exceed the pool. So the rule is not
+"one worker per 256 nonzeros", it is "use the whole pool rather than `rows/16` of it", and there
+is no constant in it to tune. k=16 is a dead zone on both dtypes and both pools, unexplained.
+
+And it moves cells across MKL parity, which is the point: at float64 k=64 the group goes from
+0.9715 with 56 of 103 behind MKL to **1.0725 with 34 behind**.
+
+### The pool sweep is the mechanism test, and it is better evidence than a second host
+
+This rule cannot be confirmed on the M5, and not for want of trying: at a 6-thread pool a
+128-row matrix already asks for 8 workers, so the headroom the rule exploits does not exist and
+the ARM grid's nil is the gate failing closed. Halving redwood's pool to 12 is the test that a
+second host would only have imitated, because it changes the one quantity the mechanism names.
+
+Both predictions hold. The effect **shrinks with the headroom** — float64 k=64 goes 1.1273 at
+pool 24 to 1.0792 at pool 12, float32 k=32 goes 1.0557 to 1.0260 — and the group the gate must
+*exclude* at pool 12 goes flat while its neighbour does not:
+
+| pool 12, float64, arm n2048 | k=32 | k=64 |
+|---|---|---|
+| `starve12` — gate still fires | 1.077 z+3.0 | **1.156 z+5.4** |
+| `starve24` — `rows/16 ≥ 12`, gate refuses | 1.001 z−0.6 | 0.997 z−0.1 |
+
+`starve24` reads 0.995–1.005 with every |z| under 1.4 across all five widths and both dtypes at
+pool 12, having read 1.004–1.057 at pool 24. The gate self-limits on the quantity it is written
+in terms of, measured rather than argued.
+
+### Why this is shippable rather than tuned
+
+Two properties, both readable in `scorch_policy.h` rather than inferred from the grid:
+
+- The rule is **monotone**: `if (by_nnz > rows_axis) rows_axis = by_nnz;`. It can only raise the
+  worker count, never lower it, so it cannot take parallelism away from a shape it misjudges.
+- It is **provably inert above the gate**: with `CEIL_ROWBIND`, `ceil_pool_ok` returns false
+  once `rows / SCORCH_ROWS_PER_THREAD >= pool`, i.e. for every matrix with at least `16 × pool`
+  rows — 384 on redwood, 96 on the M5. Most of the collection is above that line.
+
+Nothing in the grid is significantly negative: the worst reading anywhere is `starve4` at
+float32 k=16, 0.970 with z −2.0, inside the ±3 floor the float64 null established. The
+remaining work before this ships is the no-regression pass on a general corpus, where the gate
+should read flat because it cannot fire, and confirmation on the caller path — both of the
+parity numbers above are from the harness path, which adds about 7 µs by disabling the plan
+cache and so understates a 30 µs call by a fifth.
