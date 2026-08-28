@@ -5670,3 +5670,59 @@ it the only way that can: the same corpus, the same harness process, alternating
 hooked build and the hookless build that has the candidate shipping configuration compiled in,
 three rotations with the order flipped in the middle one, and eight matrices where the two
 original grids agreed carried along as the control group.
+
+## What is actually below MKL on the better grid: few rows, very high degree, and half of it at k=1
+
+Banding that grid's parity by degree and reading the geomeans says every band from k=1 to k=64
+is at or above parity. That reading is wrong, and it is wrong the way pooled numbers usually
+are: the deg 8–16 band reads 1.377 to 2.438 while containing a cell at 0.815. Counting cells
+instead of averaging them:
+
+| | float32 | float64 |
+|---|---|---|
+| cells below MKL, nnz ≥ 20k | 64 of 620 | 53 of 620 |
+| below by more than that cell's own A/A spread | 55 | 50 |
+| by width | k=1: 33, k=2: 7, k=8: 18, k=64: 2, k=256: 4 | k=1: 34, k=2: 8, k=8: 7, k=64: 2, k=256: 2 |
+
+**The shape is few rows at very high degree, and k=1 is half the count.** The worst cells:
+
+| parity | k | rows | degree | ours | MKL |
+|---|---|---|---|---|---|
+| 0.482 (f32) | 8 | 71 | 2993 | 81.6 µs | 39.4 µs |
+| 0.621 (f64) | 8 | 71 | 2993 | 54.9 | 34.1 |
+| 0.675 (f64) | 1 | 73 | 12396 | 115.8 | 78.1 |
+| 0.755 (f32) | 1 | 256 | 1152 | 30.0 | 22.6 |
+| 0.801–0.831 (f64) | 1 | 2048 | 154–300 | 33.0–46.2 | 26.4–38.4 |
+
+The 37 few-row losers are mostly **DLMC transformer and pruned-ResNet layers** — 256 to 2048
+rows at degree 100 to 2300, `body_encoder_layer_*_self_attention`, `bottleneck_*_block_group*`,
+`body_decoder_layer_*_ffn_conv1`. This is a family real callers have, which the size band the
+previous sections chased is not.
+
+### The lever this points at was built, instantiated, and never measured
+
+k=1 is where the nonzero-axis gather kernel ships, and the comment on
+`scorch_spmm_row_gather_f32_ms` already states the mechanism: the profile there is memory
+latency, MKL's SpMV-shaped loop keeps eight or more loads in flight, and one `VGATHERDPS` is a
+single outstanding memory operation. That kernel runs S independent gather+FMA chains for
+exactly this reason. It is instantiated for (K,S) = (1,2) (1,4) (1,8) (2,2) (2,4) (4,2), gated
+behind `SCORCH_NARROWK_GATHER_STREAMS`, defaulted to 1, and there is no measurement of it
+anywhere in this file. The `SCORCH_NARROWK_UNROLL` result that concluded "stream depth is not
+what narrow k is short of" deepened the *regblock* kernel, which is not the kernel k=1 runs —
+the gather kernel's own comment says so.
+
+There is a second candidate for the same family. `scorch_spmm_row_narrow_exact<T, K, UNROLL>`
+keeps UNROLL independent **scalar** accumulator chains, and `SCORCH_NARROWK_EXACT_K1` lowers the
+exact band's floor to 1 so it claims the width (`exact_width` is tested before
+`narrowk_gather`). Its comment says the gather measures better at k=1, but that predates the
+unroll now compiled in, and on Intel eight scalar loads issue two a cycle while one gather is
+microcoded — the same loads-in-flight argument by a different route. It is also templated on the
+scalar type and its dispatch has a double branch, so unlike the streams kernel it is a candidate
+for the 34 float64 k=1 cells as well.
+
+`rw_chain42.sh` measures both as one six-arm ladder in which **every arm sets exactly one
+variable this code looks up** — equal name counts and equal lookup counts, which is what the
+second environment charge needs and `--pad-env` cannot give. k=2, 4 and 8 come along as free
+structural nulls, since `narrowk_gather` is 1 only at k=1 by default and the exact band already
+contains 2: three widths of pure null on the same matrices in the same run, which is a better
+resolution floor than an A/A arm alone. float64's streams arms are a fourth null.
