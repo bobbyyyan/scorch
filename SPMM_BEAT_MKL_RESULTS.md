@@ -5850,3 +5850,54 @@ useful work in four. That is a mechanical explanation for float64 k=1 being the 
 (34 cells, minimum 0.675), and it predicts the `ex1` arm — the scalar exact-width kernel, which
 *is* dtype-generic and instantiates `case 1` in both branches — should help float64 k=1 most of
 anything in either chain.
+
+## The accumulator lever, measured on the row kernel directly: it needs L1 and it needs degree
+
+Before spending a grid on it, the row kernel was swept standalone on the ARM host —
+single-threaded, the kernel text extracted verbatim from `kernels.h`, four B footprints × eight
+degrees × ACC ∈ {1,2,4,8} × both dtypes. Single-threaded on purpose: threading is a separate axis
+and would hide this one.
+
+Speedup of ACC over one chain (ARM, ns/nonzero at ACC=1 in the first column):
+
+| B footprint | deg 4 | 16 | 64 | 128 | 512 | 2048 | ns/nnz @1 (deg 2048) |
+|---|---|---|---|---|---|---|---|
+| **4.5 KB (L1)** f32 | 1.05 | 1.12 | 1.15 | **1.30** | **1.86** | **2.31** | 0.380 |
+| 256 KB (L2) f32 | 0.95 | 1.05 | 1.05 | 1.05 | 1.04 | 1.09 | 0.402 |
+| 4 MB (SLC) f32 | 0.97 | 1.01 | 0.97 | 1.01 | 1.02 | 1.00 | 0.552 |
+| 16 MB f32 | 0.94 | 1.08 | 1.06 | 1.04 | 1.04 | 1.04 | 0.662 |
+| **9 KB (L1)** f64 | 0.85 | 1.02 | 1.04 | **1.22** | **1.81** | **2.21** | 0.386 |
+| 256 KB (L2) f64 | 0.95 | 1.01 | 1.00 | 1.03 | 0.94 | 0.98 | 0.426 |
+
+(columns are the best of ACC=4 and ACC=8)
+
+Three things, and the dtypes agree on all of them:
+
+1. **The gain is confined to an L1-resident B.** At 256 KB it is already gone — 1.01 to 1.10,
+   inside the run-to-run spread — and past L2 there is nothing. So this is not a general SpMV
+   improvement; it is a fix for one regime.
+2. **It needs degree.** At degree ≤ 64 it is 1.02–1.15 even in L1, and at degree 4 with eight
+   chains it is a *regression* (0.85–1.05): the cross-chain sum and the remainder loop cost more
+   than the chains save on a four-element row.
+3. **ACC=2 buys nothing anywhere** (0.94–1.06). Four chains capture most of it and eight add a
+   little at the top. Whatever the dependency structure is, two chains do not break it.
+
+So the rule this implies is `B fits L1 AND degree ≥ 128`, which is exactly the
+"gate it behind a condition that provably cannot fire on the shapes it would hurt" shape — and
+the shapes it would hurt (degree ≤ 8) are excluded by the same condition.
+
+**It matches the losing family.** The worst k=1 cell is a DLMC layer with 256 rows, degree 1152,
+and a column count that puts B at about 4.6 KB — L1-resident, degree well over 128, so squarely
+in the gate, with 1.86x predicted. That would take its 30.0 µs to about 16 µs against MKL's 22.6,
+i.e. 0.755 → ~1.4.
+
+**A sharper prediction for `rw_chain42.sh`, which measures a different kernel by the same
+mechanism.** Those k=1 cells run the nonzero-axis *gather* kernel, not this scalar loop, and its
+single accumulator is the same defect. So the streams arms should move by roughly this much —
+1.3x to 1.9x — on the high-degree, few-column matrices, and by nothing on the rest. `s2` should
+be flat, since two chains buy nothing here either.
+
+**The first version of this sweep measured nothing and printed a full table of `0.000` ns with
+`inf` ratios.** Every rep wrote the same values to the same output array, so the compiler kept
+only the last one. The fix is a barrier per rep plus a refusal to print any cell whose fastest
+arm ran under 5 ms — a table of zeros reads like a result, and "measured nothing" has to say so.
