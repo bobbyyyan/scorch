@@ -10962,60 +10962,47 @@ count (32 to 40 cells depending on the rep) and the **shallowest by depth**: its
 1.105 and its median is 1.075. So of the two big loser groups, k=1's entire available win is
 about ten percent on its worst cell, and k=4's is up to 57%.
 
-### The mechanism, and the arm it implies needs no code
+### The mechanism I proposed, and the grid that already refuted it
 
 k=4 float32 is the half-vector width, and the half-vector kernel already ships for it
 (`SCORCH_SPMM_HALFVEC_F32=1`, measured 1.1008 at z +14.6, cells below MKL 125/302 down to 70).
 chain24's build carries it -- verified in that tree's `scorch_policy.h` and its `.so` -- so the
 spike above is what is LEFT after it.
 
-What is left is an accumulator count. The half-vector path is
+My first reading of what is left was an accumulator count. The half-vector path is
 `scorch_spmm_row_regblock<float,1,true,128-bit>`, which keeps **two** accumulator chains (even
-nonzeros in one, odd in the other). The widths on either side of it, k=2 and k=3, run
+nonzeros in one, odd in the other), while the widths on either side of it, k=2 and k=3, run
 `scorch_spmm_row_narrow_exact<float,K,UNROLL>` with UNROLL=4 -- **four** chains. An FMA has four
-cycles of latency and two can issue per cycle, so two chains cap a row at two cycles per nonzero
-and four chains cap it at one.
+cycles of latency and two issue per cycle, so two chains cap a row at two cycles per nonzero and
+four cap it at one. That predicts routing k=4 to the exact-width kernel, which needs no code: the
+instantiation exists, both dispatch switches have a `case 4`, and `SCORCH_NARROWK_EXACT_HI=4`
+with `SCORCH_SPMM_HALFVEC=0` is the whole arm.
 
-And k=4 is precisely the width the exact-width kernel's per-width sweep never covered. The
-constant's own comment says so: `SCORCH_NARROWK_EXACT_HI=3` came from a sweep that measured
-k=2, 3, 5, 6 and 7, and "this is the width the per-width sweep skipped". The instantiation for
-k=4 exists and both dispatch switches have a `case 4`. Nothing routes to it, because the
-half-vector arm was placed ahead of the exact-width arm and takes width 4 unconditionally.
+**It has been measured and it is null.** The `exact4` grid -- designed in the section above, run
+as chain30 on 2026-08-27, 302 matrices, 1510 cells per dtype, five arms each setting the same
+three variables, thirteen repetitions -- put the exact-width kernel at k=4 at **1.0044 (z +1.0)
+against its same-code floor of 1.0030 (z +1.2)**, versus the masked 256-bit register block. The
+halved-unroll variant read 1.0017 and HI=5 read 1.0031. Nothing, in any of the eight groups, on
+either the whole call or the kernel-only column (MKL/kernel 0.9321 for the reference and 0.9280
+for the arm; 200 and 202 cells below MKL).
 
-So the experiment is three environment settings over two hooks that are already compiled in,
-with no source change at all:
+So the accumulator hypothesis is wrong, and the reason is instructive. On the SAME corpus and the
+SAME instrument, mask-free 128-bit beats masked 256-bit by 10% at z +14.6, while mask-free scalar
+with four chains ties masked 256-bit at z +1.0. Both drop the mask; only one wins. **The k=4 win
+came from dropping the lane mask, not from adding accumulator chains** -- and whatever the
+exact-width kernel's scalar-array formulation costs at K=4, where `UNROLL*K` is sixteen
+accumulator floats against eight at k=2, it gives back exactly what the mask-free load saves.
 
-      base    HALFVEC=1 HI=3   the shipped build, stated explicitly so all arms set two variables
-      exact4  HALFVEC=0 HI=4   k=4 to narrow_exact<float,4,4> -- four accumulator chains
-      nohv    HALFVEC=0 HI=3   k=4 back to the masked 256-bit regblock, which prices the
-                               half-vector kernel itself on this corpus
+### What that leaves for k=4
 
-k=2 and k=8 go in the width list as **the candidate's own inert set**: at k=2 all three arms
-route to the exact-width kernel and at k=8 all three route to the mask-free regblock, so those
-widths must read 1.000 and what they do read is the floor for k=4.
+The spike is real, it is post-half-vector, and the one no-code lever aimed at it is spent. The
+remaining candidate is the one already sixth in the queue: **chain28b's multi-row register
+blocking**, which chain45 put at 96 below-MKL cells down to 59 at k=4 and 17 down to 6 at k=8 --
+on the harness path, which is why chain28b measures both paths. That is now the only live k=4
+lever, and the width curves above are the reason it should not be judged on k=8 alone.
 
-### Queued as chain30, with the routing proved from the output bytes
-
-Timing cannot tell you which kernel ran, and an arm whose hook is dead reads as a null result
-rather than as an error -- that is how an earlier exact-width grid ran with three of seven arms
-silently equal to each other. So chain30 proves the routing before it times anything, from the
-last bits of the result:
-
-* The three kernels sum a row in different orders. `narrow_exact` groups nonzeros by position
-  modulo UNROLL; both regblock variants split them even/odd. So `exact4` **must** differ from
-  base at k=4, and the chain refuses if it does not.
-* The 128-bit regblock holds in lane i exactly what the masked 256-bit one held in lane i, so
-  `nohv` is **predicted bit-identical** to base at k=4. That is a prediction, not a
-  precondition: it is tested and reported, and if it fails the half-vector kernel changes
-  numerics as well as speed, which would be worth knowing. If it holds, `nohv` is a pure
-  instruction-count A/B with identical arithmetic.
-* An absence of difference proves nothing by itself, so the hook's liveness is established
-  separately on a pair whose route change must be visible: float64 k=2, where the shipped
-  default is the exact-width kernel and `SCORCH_SPMM_HALFVEC=1` moves it to 128-bit registers.
-* The two inert widths are checked to be bit-identical across all three arms, or they cannot
-  serve as the floor.
-
-It reuses chain25b's hooked build, so there is nothing to compile. Numbered 30 so that
-chain48's and chain63's existing wait patterns (`rw_chain(2[0-9]|3[0-9]|4[0-7])`) already
-cover it, and its own guard waits on chains 22 through 29, so no running script needed editing
-and no two chains can time at once.
+One process note, because it cost an hour. I designed the arm, wrote the chain, and only then
+searched this ledger for the constant's name -- and found both the pre-registered design and the
+completed run. **The order has to be the other way round: grep the ledger for the constant before
+designing an arm around it.** Eleven thousand lines is exactly long enough for a spent lever to
+look new.
