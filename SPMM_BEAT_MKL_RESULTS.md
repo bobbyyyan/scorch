@@ -10223,3 +10223,62 @@ So the blast radius of the fix is the two kernels that take a caller override --
 `spmm_csr_v2_core` and `spmm_csr_linear_fused_float` -- which is where it is applied. The three
 above would need the same treatment only if a shape appeared that resolved wide on small work,
 and their gates are what prevent that. Worth re-checking if any of those gates is ever widened.
+
+## The real autoencoder confirms the synthetic grid, once the run carries its own inert control
+
+stage37 runs the actual `bench_sparse_autoencoder.py` -- trained weights, real data, four models
+at three sparsities, batch 256, three rotated passes per arm, minimum per key over passes, equal
+environment-variable counts. Arms are `ship` and `cand` (cap at the pool, declined at 10M).
+`Scorch (fused)` has to be asked for by name; it is excluded from `DEFAULT_FRAMEWORKS`, and it is
+the kernel the threshold exists to protect, so a guardrail that took the defaults would have
+missed the point entirely.
+
+Read whole-corpus, the run says `cand` is 4% **slower** on the fused path. That reading is an
+artefact, and the run contains the control that shows it.
+
+**The control is the candidate's own inert set.** At sparsity 0.8 and 0.9 every layer of every
+model clears ten million units of nnz*k -- the narrowest is mnist at 0.9, at 13.4M -- and so does
+every stl10 layer at 0.99, the smallest being 21M. On those nine keys the candidate *declines*
+the cap and runs the same code as ship. They must read 1.000. Ratios are cand over ship in time,
+so **below 1.0 is faster**:
+
+      framework            group                          n   cand/ship
+      Scorch (fused)       INERT -- identical code        9      1.0204
+      Scorch (fused)       can act (work < 10M)           3      0.8043
+      Scorch               INERT -- identical code        9      1.0313
+      Scorch               can act (work < 10M)           3      0.9138
+      PyTorch Dense        INERT                          9      1.0098
+      PyTorch Dense        can act                        3      1.0176
+      PyTorch Sparse       INERT                          9      1.0266
+      PyTorch Sparse       can act                        3      1.0396
+
+So this instrument's floor is 2-3% -- our own identical code reads 1.0204 and 1.0313 -- and the
+whole-corpus 1.04 was nine inert keys' worth of drift outvoting three real ones nine to three.
+
+On the cells the candidate can act on, the fused Linear is **0.8043, a 20% gain, five times the
+floor**, and the plain `scorch.matmul` path is 0.9138. Per cell:
+
+      model     sparsity   min layer work   Scorch   Scorch (fused)
+      fashion       0.99            4.0M    0.9251           0.6930
+      mnist         0.99            1.3M    0.8057           0.8128
+      svhn          0.99            5.2M    1.0237           0.9238
+
+fashion at 0.99 is 1.44x. Three keys is a small group and the numbers are not tight, but the
+group's separation from the floor is not in doubt, and the direction and rough size match the
+synthetic fused grid's `<10M` bucket (1.28) and its `t10` arm (1.2840) measured independently on
+uniform-random weights.
+
+Two notes on the instrument, both of which cost this run a wrong answer before the split:
+
+- `an_ae.py`'s control tolerance is **15%**, which cannot guard a 4% effect. The bench's PyTorch
+  columns moved 1.0-3.0% here and it reported them without comment. The tolerance is the wrong
+  mechanism anyway: the right control was the candidate's own inert set, which is our code on our
+  path differing from ship in nothing.
+- `an_ae.py` took the **last** CSV read per key while `rw_ae2.sh`'s header has always claimed the
+  minimum over passes. With three rotated passes each arm was being scored by whichever pass
+  `glob()` happened to yield last. Fixed to take the minimum, and it now prints how many files
+  each arm was built from, so an unequal pass count is visible rather than silently biasing the
+  arm with more passes.
+
+This is the guardrail the candidate needed most, and it passes: **the cells it acts on get
+faster, on the real workload, and the cells it does not act on are provably untouched.**
