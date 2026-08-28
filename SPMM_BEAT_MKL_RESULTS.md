@@ -4492,3 +4492,44 @@ run-to-run movement of the baseline. Net of each run's own floor both say the sa
 
 One caution on the "vs MKL" column: it is the harness path, which carries the plan-cache
 handicap. The caller-path answer is the cold/warm grid — 1.20x cold, 1.65x warm.
+
+## The ARM tail is the partition, it is not the thread count, and it stops at k=8
+
+A corpus of exactly the matrices the ARM three-build put more than 10% behind — 70 of them,
+grouped by what makes them odd: 32 very low degree (as-735, degree 1.6–1.9), 24 mid-row
+(512-row transformer layers at degree ~175), 14 few-row (64-row pruned ResNet at degree
+288). 420 cells per dtype, 8 arms, equal environment-variable counts, A/A floor 0.9964.
+Ratios are against the candidate, so above 1 means *the arm is faster than what we propose
+to ship*:
+
+| arm | float32 | float64 | lowdeg | midrow | fewrow |
+|---|---|---|---|---|---|
+| candidate (partition + kernel) | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| partition, no kernel | 0.9878 | 0.9900 | 0.9966 | 0.9854 | 0.9719 |
+| kernel at unroll 1 | 0.9855 | 0.9872 | 0.9925 | 0.9850 | 0.9705 |
+| + per-row short clamp | 0.9970 | 0.9928 | 0.9970 | 0.9975 | 0.9962 |
+| + per-call degree unroll | 0.9987 | 0.9989 | 1.0010 | 0.9953 | 0.9992 |
+| **no partition (ships today)** | **1.0294** | **1.0206** | **1.0557** | 1.0050 | 1.0125 |
+| forced 6 threads | 0.8265 | 0.8326 | 0.8868 | 0.9774 | **0.5279** |
+| forced 2 threads | 0.9264 | 0.8867 | 0.9761 | 0.8987 | 0.8661 |
+| A/A floor | 0.9964 | 0.9965 | 0.9942 | 0.9959 | 1.0023 |
+
+**It is the partition.** Removing the kernel makes these cells *worse* (0.9878); removing
+the partition makes them better (1.0294, per-matrix z of +5.7 at k=1, +6.7 at k=4, +4.6 at
+k=8 — and these are 70 distinct matrices, so cells and matrices are the same count at each
+width).
+
+**It is not the thread count.** The mechanism I expected was heterogeneity: this host
+launches twice its six-thread pool so the twelve efficiency cores join, and a home range
+handed to an E-core running at a third of a P-core's speed has nothing left to steal at
+chunk granularity. Forcing the count *down* is far worse, not better — 0.8265 at six
+threads and 0.5279 on the few-row group. These shapes want every worker they can get; the
+static decomposition is the problem, not the width.
+
+**It stops at k=8.** At k=64 the partition wins even on this corpus (0.9752, z = −2.7). So
+the regressed region is low degree *and* narrow, which is where the kernel is 15–30 µs and
+a fixed per-call cost is the measurement.
+
+The per-call degree unroll is neutral here (0.9987, inside the 0.9964 floor) with a small
+real gain at the widths it serves (k=2 1.0100, per-matrix z = +2.6). It is not the fix for
+this tail, and it needs an x86 reading before it could ship.
