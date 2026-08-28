@@ -5977,3 +5977,29 @@ batch, and twelve short-lived processes never let the host settle.
 Re-running with `--reps 25 --target-ms 400 --batch-ms 20 --settle 4`, and the analyzer now prints
 a **VOID** banner and says nothing below it can be read whenever the median MKL spread exceeds
 1.05, rather than leaving that inference to whoever reads the table.
+
+### The two threads are the same lever, and that sharpens the prediction
+
+`rw_chain42.sh`'s `ex1` arm routes k=1 to `scorch_spmm_row_narrow_exact<T, K=1, UNROLL>`. With
+`NARROWK_EXACT_UNROLL` at 4 and `DEGUNROLL`, `SHORT` and `ACCUM` all defaulting to 0 — so nothing
+clamps the unroll — that instantiation is **four independent scalar accumulator chains over a
+k=1 row**. Which is precisely the `ACC=4` configuration the SpMV sweep measured, on precisely the
+shape family the sweep says it pays on.
+
+So the SpMV work and the k=1 SpMM work are one mechanism reached by two paths, and the ARM
+numbers become a quantitative prediction for an x86 grid that has not run yet:
+
+- `ex1` wins at k=1 by roughly **1.2x to 1.5x** on the matrices with a small B and a high degree,
+  and by nothing on the rest. The corpus is banded by degree for exactly this reason.
+- It wins on **both dtypes**, because the exact-width kernel is templated on the scalar type and
+  instantiates `case 1` in both dispatch branches. This is the only arm in either chain that can
+  reach the 34 float64 k=1 cells, since `narrowk_gather` is gated on
+  `is_same<scalar_t, float>` and those cells currently run the register-block kernel at one
+  useful lane in four.
+- `s2` and the two-chain rungs stay flat, because two chains bought nothing anywhere in either
+  sweep (0.94–1.06 across 60 cells).
+
+If `ex1` moves and the streams arms do not, the mechanism is the accumulator chain and not the
+gather; if the streams arms move and `ex1` does not, it is the gather's outstanding-load count
+and the two are separable after all. Either way the answer is attributable, which is the point of
+giving them separate arms in one interleaved grid.
