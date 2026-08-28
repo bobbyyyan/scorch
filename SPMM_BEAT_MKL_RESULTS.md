@@ -4656,3 +4656,42 @@ PyTorch controls are tight only because their kernels are ten to forty times lon
 
 So: no regression on the transformer at the pooled level, nothing separable per cell on the
 unfused path, and the fused path — which is what a user gets — is flat.
+
+## The work gate on the ARM tail, with the ceiling now read from the caller's pool
+
+Re-run after moving the ceiling's condition from the *resolved* worker count to the caller's
+pool. The resolved count is raised per shape and capped by `omp_get_num_procs()` = 18 on the
+M5, so a ceiling of 16 straddled it and the gate fired on some shapes and not others; the
+pool is 6 there, so a ceiling of 16 provably cannot bind and the capped arm must read the
+same as the uncapped one. That pair is the run's own consistency check.
+
+Hooked, `--pad-env`, 6 k values, ARM. Two corpora: the tail (the 8 matrices where the
+partition loses) and the general 275-cell corpus where the gate must be inert.
+
+| arm | tail f32 | tail f64 | general f32 | general f64 |
+|---|---|---|---|---|
+| back-stealing + exact width (reference) | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| + work gate at 2 grains | **1.0135** | **1.0111** | 1.0005 | 1.0000 |
+| + work gate at 2 grains, ceiling 16 | 1.0098 | 1.0067 | 0.9956 | 0.9948 |
+| + work gate at 4 grains, ceiling 16 | 1.0128 | 1.0091 | 0.9936 | 0.9927 |
+| the shared counter | 1.0347 | 1.0236 | 0.9740 | 0.9743 |
+| A/A | 1.0010 | 0.9987 | 0.9988 | 0.9986 |
+
+Tail cells more than 10% behind the shared counter: **96 → 55** (f32) and **76 → 38** (f64).
+
+**The consistency check passes.** The capped arm reads 0.37–0.52% below the uncapped one in
+all four columns, and split by the reference's own duration on the 1650-cell corpus that
+deficit is 1.21% / 1.23% below 10 µs, 0.55% / 0.66% at 10–30 µs, 0.21% / 0.31% at 30–100 µs
+and 0.08% / −0.49% above 100 µs — monotone to zero with kernel length, z = 26.7 at the short
+end. A fixed per-call cost, which is what one more variable *the code looks up* buys
+(`--pad-env` equalises names, not lookups). A gate that bound would not order itself by
+duration. The earlier version's 0.7% did not have this shape.
+
+Four grains buys nothing on the tail (1.0128 against 1.0098 at the same variable count) and
+costs 0.2% more on the general corpus, so **two grains is the setting**.
+
+The gate recovers about a third of the ARM tail (the shared counter is 3.47% / 2.36% ahead
+there) and halves the count of cells behind it, while staying inside the A/A floor
+everywhere else. Whether it ships depends on x86 inertness, which is a separate measurement:
+redwood's pool is 24, above the ceiling, so the gate's whole block should be unreachable
+there.
