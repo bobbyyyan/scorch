@@ -7045,3 +7045,44 @@ instantiations and re-measuring is what addresses float64 k=4's 23 warm and 24 c
 cells. If `ex4` loses on float32, the double work is not worth doing and the k=4 problem belongs
 to the half-vector kernel, multi-row, or deep unroll instead -- all three of which are already
 queued against that width.
+
+### An arm that measured the opposite of its intent, caught by an output diff
+
+chain49's `ex4a` arm was meant to be "the exact-width kernel at k=4 with the unroll halved, so
+it holds 8 live accumulators instead of 16". I set `SCORCH_NARROWK_EXACT_ACCUM=1`, reading the
+policy comment's "Nonzero here halves the unroll until UNROLL*K fits" as a boolean. The code is
+
+    while (un_ > 1 && un_ * (KK) > narrowk_exact_accum) un_ >>= 1;
+
+so it is an accumulator **budget**. A budget of 1 collapses the unroll to 1 at every width the
+kernel serves -- removing exactly the independent chains the whole grid exists to test, and
+doing the opposite of the arm's name.
+
+**What caught it was not reasoning, it was an output diff.** kprobe validates nothing -- no
+allclose, no reference, no assert -- so a misdesigned arm is timed and reported like any other.
+Two checks on the idle ARM host fixed that. First, correctness against a dense reference: all
+four configurations landed at 1.075e-06 worst relative error, identically to four significant
+figures, which is what a correct kernel looks like *and* equally what an environment variable
+that never took effect looks like. That ambiguity is the same defect as a neutrality gate
+comparing zero symbols, so the second check diffed each configuration's output against the
+shipped one, per width, on 25 matrices:
+
+| arm | k=1 | k=2 | k=4 | k=8 |
+|---|---|---|---|---|
+| ex4 | 0/25 | 0/25 | **25/25** | 0/25 |
+| ex4a (ACCUM=1) | 0/25 | **25/25** | **25/25** | 0/25 |
+| ex1 | **25/25** | 0/25 | 0/25 | 0/25 |
+| hv | 0/25 | 0/25 | 0/25 | 0/25 |
+
+`ex4` and `ex1` fire exactly where predicted and nowhere else, which is what makes the
+correctness result meaningful rather than vacuous. `hv` differs **nowhere**, positively
+confirming from behaviour what the source said about the half-vector path being x86-only.
+And `ex4a` fired at k=2, where it was predicted inert -- cutting that width's unroll from 4 to
+1. k=2 is the one narrow width that currently does not lose, so the arm was degrading the
+healthiest column in the scoreboard and would have been read as evidence against extending the
+exact band.
+
+Fixed to `ACCUM=8`, which means what was intended: at k=4 the unroll halves to 2, and at k=2 it
+is left alone because 4*2 is not greater than 8. Re-verified by the same diff -- `ex4a` now
+fires only at k=4, 25/25, and is inert at 1, 2 and 8. chain49 was parked in its wait loop, so
+it was killed by PID and relaunched from the corrected file rather than edited in place.
