@@ -2496,6 +2496,92 @@ static inline void scorch_spmm_row_regblock_deep(
     else V::store(C_row + L * v, r);
   }
 }
+
+// Register block over ROWS consecutive output rows at once.
+//
+// Why across rows rather than deeper within one. The measured deficit above 20k nonzeros is
+// about 19 cycles per nonzero per thread (0.18 ns/nnz over 24 threads) against a floor of two
+// to four for one FMA whose operand is in L1. That is L3 latency over the two B loads the
+// per-row kernel keeps in flight, and MKL's ~11 cycles is what four or more would give. But
+// the family this happens on has SHORT rows -- at >1M nonzeros the median matrix carries about
+// twelve nonzeros a row -- so deepening within a row cannot supply them: an eight-deep group
+// leaves a four-nonzero serial remainder, and a four-deep group leaves the loop overhead on
+// three iterations. Independent loads therefore have to come from different rows, which is
+// what this does: ROWS accumulators, ROWS gather streams, one iteration issuing ROWS
+// independent B loads that share no dependency.
+//
+// Rows of unequal length are handled by running the common prefix -- min(len) iterations with
+// every stream live and no branch in the loop -- and then finishing each row's tail serially.
+// On a uniform-degree matrix (FEM, mesh, most of the losing family) the tails are nearly empty.
+// On a power-law matrix they are not, and the kernel degrades toward the per-row one; that is a
+// property to measure per family, not to hide.
+//
+// An empty row needs no special case: its stream contributes nothing and its accumulator stays
+// zero, so the store writes the zeros the output needs (the output is torch::empty, so empty
+// rows must be written).
+template <typename T, int NVEC, bool FULL_LAST, int ROWS>
+static inline void scorch_spmm_multirow_regblock(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_values, size_t C1_size, int i0,
+    typename scorch_simd<T>::mask mask_last) {
+  using V = scorch_simd<T>;
+  constexpr int L = V::lanes;
+  typename V::vec acc[ROWS][NVEC];
+  int p[ROWS], e[ROWS];
+  // Seeded from row 0 rather than from INT_MAX, so this needs no <climits>.
+  int minlen = A1_pos[i0 + 1] - A1_pos[i0];
+  #pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) acc[r][v] = V::zero();
+    p[r] = A1_pos[i0 + r];
+    e[r] = A1_pos[i0 + r + 1];
+    const int len = e[r] - p[r];
+    if (len < minlen) minlen = len;
+  }
+  // The common prefix: every stream live, no branch, ROWS independent loads per iteration.
+  for (int t = 0; t < minlen; t++) {
+    const T* SCORCH_RESTRICT Bp[ROWS];
+    typename V::vec av[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+      Bp[r] = B_val + (size_t)A1_crd[p[r] + t] * (size_t)B1_size;
+      av[r] = V::splat(A_val[p[r] + t]);
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+      #pragma unroll
+      for (int v = 0; v < NVEC; v++) {
+        const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
+        const typename V::vec b = masked ? V::maskload(Bp[r] + L * v, mask_last)
+                                         : V::load(Bp[r] + L * v);
+        acc[r][v] = V::fma(av[r], b, acc[r][v]);
+      }
+    }
+  }
+  // Tails, and the store. Kept in one pass per row so a row's accumulator is written once.
+  #pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    for (int q = p[r] + minlen; q < e[r]; q++) {
+      const T* SCORCH_RESTRICT Bq = B_val + (size_t)A1_crd[q] * (size_t)B1_size;
+      const typename V::vec a = V::splat(A_val[q]);
+      #pragma unroll
+      for (int v = 0; v < NVEC; v++) {
+        const bool masked = (v == NVEC - 1) && !FULL_LAST;
+        const typename V::vec b = masked ? V::maskload(Bq + L * v, mask_last)
+                                         : V::load(Bq + L * v);
+        acc[r][v] = V::fma(a, b, acc[r][v]);
+      }
+    }
+    T* SCORCH_RESTRICT C_row = C_values + (size_t)(i0 + r) * C1_size;
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      if ((v == NVEC - 1) && !FULL_LAST) V::maskstore(C_row + L * v, mask_last, acc[r][v]);
+      else V::store(C_row + L * v, acc[r][v]);
+    }
+  }
+}
 #endif  // AVX2 && FMA
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
 // Narrow-k variant whose only difference from the shipped kernel is how far ahead
@@ -3817,6 +3903,13 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_unroll_pf = 1;
   { const char* e = std::getenv("SCORCH_NARROWK_UNROLL_PF");
     if (e && *e) narrowk_unroll_pf = std::atol(e) != 0 ? 1 : 0; }
+  // A/B hook: how many consecutive output rows the register block takes at once. 0 or 1 keeps
+  // the per-row kernels. Exists because the deficit above 20k nonzeros is about 19 cycles a
+  // nonzero -- L3 latency over two loads in flight -- on a family whose rows carry about twelve
+  // nonzeros each, so the loads cannot come from within a row.
+  int multirow = 0;
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 4) multirow = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4000,6 +4093,41 @@ torch::Tensor spmm_csr_v2_core(
       }
 
       for (int i = start; i < end; i++) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+        // A/B hook: take ROWS consecutive rows at once, so the independent B loads come from
+        // different rows rather than from deeper inside one. Placed ahead of the empty-row
+        // branch because the multi-row kernel writes an empty row's zeros itself.
+        //
+        // Deliberately refuses whenever another kernel would have owned the row -- the
+        // exact-width scalar loop, the nonzero-axis gather, the forced workspace -- so an arm
+        // never swaps two kernels in one step and neither is attributable. It also refuses
+        // when fewer than ROWS rows are left in the stolen chunk, which is why it cannot run
+        // past `end` and cannot read A1_pos out of range.
+        if (multirow > 1 && narrow_k && !exact_width && !force_workspace &&
+            !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
+            i + multirow <= end) {
+          #define SCORCH_MR(NV, RR) \
+            (full_last \
+               ? scorch_spmm_multirow_regblock<scalar_t, NV, true, RR>( \
+                     A1_pos, A1_crd, A_val, B_val, B1_size, C_values, \
+                     (size_t)C1_size, i, mask_last) \
+               : scorch_spmm_multirow_regblock<scalar_t, NV, false, RR>( \
+                     A1_pos, A1_crd, A_val, B_val, B1_size, C_values, \
+                     (size_t)C1_size, i, mask_last))
+          bool took = true;
+          switch (nvec * 16 + multirow) {
+            case 1 * 16 + 2: SCORCH_MR(1, 2); break;
+            case 1 * 16 + 4: SCORCH_MR(1, 4); break;
+            case 2 * 16 + 2: SCORCH_MR(2, 2); break;
+            case 2 * 16 + 4: SCORCH_MR(2, 4); break;
+            case 3 * 16 + 2: SCORCH_MR(3, 2); break;
+            case 4 * 16 + 2: SCORCH_MR(4, 2); break;
+            default: took = false; break;   // not instantiated: fall through, never skip a row
+          }
+          #undef SCORCH_MR
+          if (took) { i += multirow - 1; continue; }   // the loop's ++ steps past the group
+        }
+#endif
         const int pA_begin = A1_pos[i];
         const int pA_end   = A1_pos[i + 1];
         if (pA_begin == pA_end) {
