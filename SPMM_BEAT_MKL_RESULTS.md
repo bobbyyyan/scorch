@@ -7178,3 +7178,30 @@ either side of the `ex4a` fix, and read 0.9806 / 1.0324 / 0.9604 then 0.9843 / 1
 -- agreement to about 0.4%, which is much tighter than the +/-2.6% spread *across bands* inside
 one run. So that spread is corpus composition, not run-to-run randomness, and comparing the
 same band across runs is a far more sensitive test than comparing bands within one.
+
+### Correctness coverage across the queue, and the one gap that mattered
+
+Every chain's `pytest` count, separating the wait-guard's own `[p]ython -m pytest` string from
+real runs: chain42 runs the full suite with eight streams forced plus a narrow-k subset with
+four; chain43, chain45 and chain46 each force their arm and run a suite; chain44 and chain49
+had only the guard string.
+
+**chain44's omission is fine and does not need fixing.** Its arms change chunk width and the
+work-stealing granularity -- which thread computes which rows -- and every output row of an
+SpMM is computed independently of every other. So the result is bitwise identical whatever the
+chunking, and a suite would be testing that arithmetic is deterministic rather than that the
+arm is correct. Same argument covers chain46's thread ladder, which runs a suite anyway.
+
+**chain49's omission mattered and is fixed.** `ex4` routes k=4 to
+`scorch_spmm_row_narrow_exact<float, 4, UNROLL>`, which is instantiated but which the shipped
+dispatch never reaches because the exact band stops at 3 -- so that configuration may never
+have executed anywhere in this repository. It was checked on ARM against a dense reference
+(worst relative error 1.075e-06 over 20 matrix-dtype pairs, with an output diff proving the arm
+fired rather than silently doing nothing), but **x86 takes a different dispatch site**, the one
+under the AVX2 guard, so that check does not carry.
+
+chain49 now runs the full suite under both `ex4` and `ex4a` and **refuses** on failure, rather
+than printing the result alongside as the other chains do. It also refuses if no pass count
+appears at all, which is the difference between "the suite passed" and "the suite did not run"
+-- the same distinction that made the neutrality gate and the correctness check vacuous earlier.
+It was parked, so it was killed by PID and relaunched from the edited file.
