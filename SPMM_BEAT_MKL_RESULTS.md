@@ -5006,3 +5006,51 @@ measurement is 0.731; a 16-of-24 team predicts about 0.67 and the measurement is
 many cells but because it fixes the worst ones, and the mechanism is already measured at
 1.3066 / 1.4011 inside its gate on this host. connectus (512 rows → the full pool) and the
 transformer block (2048 rows) are *not* explained by under-threading and stay open.
+
+## Asking the compiled rule where the work gate fires, instead of restating it
+
+`scorch_spmm_partition_mode` is now exported from the instrumented build, so the firing set
+can be read rather than modelled. Splitting the ARM grid by what the rule actually decides:
+
+| corpus | group | cells | shared counter | the gate | A/A | median µs |
+|---|---|---|---|---|---|---|
+| tail f32 | gate fires | 253 | 1.0615 | 1.0282 | 1.0023 | 27 |
+| tail f32 | gate inert | 167 | 0.9954 | 0.9918 | 0.9991 | 30 |
+| general f32 | gate fires | 798 | 1.0219 | 1.0052 | 0.9981 | 15 |
+| general f32 | gate inert | 851 | **0.9311** | 0.9961 | 0.9995 | 47 |
+
+**The rule is doing exactly what it is for.** On the 851 general-corpus cells where it does
+not fire the partition is 6.9% ahead of the counter and the gate leaves them alone; on the 798
+where it does fire the counter is ahead and the gate switches to it.
+
+**And my earlier explanation of why it captures only half was wrong.** I had guessed that the
+single-worker gate already forced many cells to mode 0, so an offline threshold sweep was
+fitting noise between two identical arms. The exported rule says that group is **0 to 3 cells**
+— the hypothesis is dead. What actually differs is that the counter arm sets
+`SCORCH_SPMM_PARTITION` alone, so **the exact-width narrow-k kernel is off in it**: it is
+today's code, not today's handout with the new kernel. On the firing cells the gate arm also
+pays two more successful `getenv` lookups, a per-call charge concentrated below 30 µs, and
+those cells are 15–27 µs. Both confounds push the same way and neither is separable from this
+arm set, so a fourth arm — today's handout *with* the new kernel — is measuring now.
+
+## The exact-width kernel's degree floor: right on x86, wrong on ARM
+
+The floor refuses the exact-width kernel on matrices holding fewer nonzeros than rows. ARM,
+44 matrices in three groups, per-matrix z (the corpus contributes each matrix at five widths):
+
+| group | floor off (discriminator) | floor at 1 | floor at 2 | kernel off entirely |
+|---|---|---|---|---|
+| degree < 1 — the floor fires | 0.9971 | **0.9601** (z −5.5) | 0.9602 | 0.9615 |
+| degree 1–2 | 0.9976 | 0.9989 | 0.9909 | 0.9961 |
+| degree 2–8 | 0.9957 | 0.9936 | 0.9897 | **0.9532** (z −8.3) |
+
+**On ARM the floor costs 4%** on exactly the shapes where on x86 it recovers 5–17% — by
+width, k=2 reads 0.9221 and k=3 reads 0.8933 with the floor on. And the bottom-right cell is
+the same kernel's own case for existing: turning it off at degree 2–8 costs 4.7%, per-matrix
+z −8.3.
+
+So the NEON exact-width kernel is cheaper per row than the NEON general path even on
+mostly-empty matrices, and the AVX2 one is not. That is measured arm-variance with no queried
+quantity behind it — not a pool size, not a cache size, just two different kernels. **The
+decision waits on the x86 arm of the same grid**, which is the like-for-like counterpart of
+this table; the offline x86 evidence conflated the floor with the row partition.
