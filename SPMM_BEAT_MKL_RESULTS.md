@@ -6747,3 +6747,27 @@ after the flip moved only `__LINE__` immediates, which is what an inert change l
 rather than a safe one; and the full ARM suite passing at the flipped default exercised no
 half-vector code. The suite pass is still a valid general regression check. Neither is evidence
 about the flip, and the flip's only real evidence remains x86.
+
+### chain42's corpus fits the corrected family, and how to read its parity column
+
+Checked against the corrected definition rather than assumed. chain42's 66 matrices split
+37 `lose_fewrow` / 7 `lose_other` / 22 `win_ctrl`, and cross-tabulated on the two axes that
+now define the family:
+
+| | rows < 1000 | rows >= 1000 |
+|---|---|---|
+| degree < 64 | 9 | 11 |
+| degree 64-256 | **16** | 13 |
+| degree >= 256 | **16** | 1 |
+
+So 32 of 66 are in the family the broad caller-path corpus points at, with 20 low-degree
+controls and a 22-matrix winners group to catch a regression on cells that already clear MKL.
+That is the right shape for the question.
+
+**One reading instruction, because chain42 times the harness path in an instrumented build.**
+Its arm-to-arm ratios are unaffected -- both arms sit in the same harness and the same binary,
+so the 1.36x path factor and the 1.10x build factor cancel. Its `MKL parity` column does not
+cancel: it will read roughly 1.5x pessimistic against the caller path a user actually takes.
+So the decision comes from the arm-to-arm columns and the `refb` floor, and the parity column
+is a lower bound on where those cells really sit -- not the number to quote. The same applies
+to chain43 through chain47, all of which use kprobe.
