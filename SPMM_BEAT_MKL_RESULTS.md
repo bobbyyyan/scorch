@@ -6003,3 +6003,28 @@ If `ex1` moves and the streams arms do not, the mechanism is the accumulator cha
 gather; if the streams arms move and `ex1` does not, it is the gather's outstanding-load count
 and the two are separable after all. Either way the answer is attributable, which is the point of
 giving them separate arms in one interleaved grid.
+
+### What the half-vector flip still owes, and why it is not staged yet
+
+The flip is committed but deliberately **not** staged to the measurement host. Three queued runs
+read the width it changes, and one of them would refuse:
+
+- **chain39** copies the instrumented tree and then *checks* that eight shipped defaults are what
+  it expects, `SCORCH_SPMM_HALFVEC 0` among them. The flip deletes that definition, so chain39
+  would refuse — the guard working exactly as intended. Its own comment says the run measures
+  "what ships today, which is the baseline the two candidates will be judged against", so it
+  should stay the pre-flip baseline and the post-flip caller-path number is a separate run.
+- **chain40** is the emission gate for the kernel's *addition* with the default off. Flipping the
+  default under it turns a "this is neutral" gate into a "this changes emission, as intended"
+  gate, which is a different question.
+- **chain42** reads k=4, so the flip would move its baseline mid-grid.
+
+Two things still owed after those clear:
+
+1. **x86 emission attribution per dtype.** ARM is settled — the object moves 10 instructions, all
+   `__LINE__` constants shifted by exactly the net lines added, nothing else. On x86 the float32
+   instantiation is *supposed* to change and the float64 one is not, and that needs a per-symbol
+   diff of the two instantiations rather than a whole-object one. It needs a compile window on a
+   host that is not timing.
+2. **The post-flip caller-path scoreboard**, on chain39's corpus, widths and probe, so the
+   difference is a difference and not two different measurements.
