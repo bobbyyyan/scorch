@@ -5406,3 +5406,60 @@ remaining work before this ships is the no-regression pass on a general corpus, 
 should read flat because it cannot fire, and confirmation on the caller path — both of the
 parity numbers above are from the harness path, which adds about 7 µs by disabling the plan
 cache and so understates a 30 µs call by a fifth.
+
+## The k=4 story was a pooling artifact: the variable is matrix SIZE, not width
+
+The table above reads float32 k=4 as the worst cell in the grid and k=8 as a win, and I built a
+128-bit kernel on that reading. Splitting the same 1510 cells by size instead of pooling them
+shows the width was carrying an artifact. Kernel time against MKL's call, cells behind MKL
+beside each:
+
+| float32, nnz | k=2 | k=3 | k=4 | k=5 | k=8 |
+|---|---|---|---|---|---|
+| < 20k | 1.789 6/108 | 1.797 7/108 | 1.723 7/108 | 1.798 7/108 | 1.802 10/108 |
+| 20k–200k | 0.698 98/101 | 0.731 100/101 | 0.728 100/101 | 0.834 91/101 | 0.823 98/101 |
+| 200k–1M | 0.657 55/56 | 0.668 56/56 | 0.599 56/56 | 0.748 50/56 | 0.683 54/56 |
+| > 1M | 0.692 37/37 | 0.704 37/37 | 0.594 37/37 | 0.801 35/37 | 0.743 36/37 |
+
+Every width behaves the same way. k=8's pooled 1.0390 was carried entirely by the 108 small
+matrices; at 200k–1M nonzeros k=8 reads 0.683 with 54 of 56 cells behind, no better than k=4's
+0.599. So "k=4 is the width where we lose" was the size distribution of the corpus showing
+through a width average.
+
+**And the per-library normalisation says the k=4 dip is MKL's curve, not ours.** Dividing each
+library by its own k=8 time on the same matrix:
+
+| float32, k=4 vs own k=8 | < 20k | 20k–200k | 200k–1M | > 1M |
+|---|---|---|---|---|
+| scorch(8)/scorch(4) | 1.054 | 0.977 | 1.068 | 1.053 |
+| mkl(8)/mkl(4) | 1.103 | 1.105 | 1.217 | 1.316 |
+
+Ours is flat: our k=4 costs the same fraction of our k=8 at every size. MKL's grows. So nothing
+in our kernel singles out k=4, and the earlier "float32 k=4 is 0.9321 where its unmasked
+float64 twin is 1.0629" comparison is not evidence about the mask — both numbers are pooled
+over a size distribution, and float64's corpus-weighted average simply sits on the other side
+of the crossover.
+
+### What the size split does establish, and the one thing it cannot
+
+Two readings survive, and they are not the same claim:
+
+- **Above ~20k nonzeros our kernel is 0.60–0.85 of MKL's call at every width from 2 to 8**, on
+  91–100% of cells. That is trustworthy: at 220 µs the ~7 µs harness cost is 3% and `_kms`
+  excludes it anyway. It is also not new — it is the narrow-k B-size band (L2-miss, L3-hit)
+  that the `scorch_spmm_chunk` guard already addresses part of, re-found from a different
+  direction, and the size dependence here is the same mechanism stated as a corpus split.
+- **Below ~20k nonzeros the 1.7–1.8x is partly an artifact of the columns**, because `e3_kms`
+  is our kernel and `mkl_ms` is MKL's whole call. On a 5 µs call MKL's dispatch is a large
+  fraction of what it is charged. The fixed-cost fits put our per-call cost at 8.54 µs against
+  MKL's 10.47, a 1.23x edge — not 1.8. So the small-matrix win is real in direction and
+  overstated in size by this measurement.
+
+Both halves want the same fix in the harness rather than in the analysis: compare whole call to
+whole call on the path a caller reaches. That is what `rw_chain39.sh` does, from a hookless
+build, at the widths the published scoreboard skipped.
+
+**The half-vector kernel is still worth measuring, but its motivation is now narrower.** The
+mask is still a real per-nonzero cost and 128-bit still removes it; what the size split
+withdraws is the claim that k=4 is anomalous and that 14% is the prize. It should be judged on
+what it does at k=4 within each size band, not on the pooled number.
