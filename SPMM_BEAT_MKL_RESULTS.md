@@ -8929,3 +8929,46 @@ data, and additionally shows an **`aa` column that was in every one of those CSV
 printed**: at k=1 it reads 1.031 against ref's 1.052, so that verdict's floor is about 2% and t8's
 1.243 is far outside it. Also worth noting: chain46 measured a float64 half (232 lines) that its own
 verdict never analysed, because the analyzer was handed one file.
+
+## stage27: there is no presence cost, so my correction was itself too pessimistic
+
+The candidate enabled the row ceiling and made its gate impossible — `rows <= 1 && nnz >= 1000000*rows`,
+false twice over for every matrix — so it carries the enabled code and provably never fires. 275
+matrices, ks 1/2/8/64, two pass orders, `ship vs ctrl` differing on **0** disassembly lines.
+
+| | pooled cand/ship | floor | k=1 | k=2 | k=8 | k=64 |
+|---|---|---|---|---|---|---|
+| float32 | 0.9979 | 0.9908 | 0.9986 (fl 0.9884) | 0.9920 (fl 0.9884) | 0.9982 (fl 0.9910) | 1.0028 (fl 0.9954) |
+| float64 | 0.9997 | 1.0015 | 0.9984 (fl 1.0006) | 0.9993 (fl 1.0009) | 1.0021 (fl 1.0020) | 0.9991 (fl 1.0023) |
+
+Cells below MKL: 26/25/26 on float32 and 18/19/19 on float64 for ship/ctrl/cand — unchanged.
+
+**The prediction registered before the run was that a layout cost would reproduce stage17's
+out-of-gate numbers, about 0.978 on float64 and 0.998 on float32. It does not.** cand sits at its own
+floor on both dtypes, and float64's floor here is tight (1.0015, 0.3% of cells more than 10% apart).
+So carrying the enabled ceiling costs nothing where it cannot fire.
+
+That reverses the correction I made earlier today. The sequence, stated plainly because it went both
+ways:
+
+1. My hooked ladder concluded the capped ceiling is neutral on ARM. That part stands, and the cap
+   finding with it — when the rule fires, uncapped loses 6.9-7.3% and capped loses nothing.
+2. I then corrected it, on stage17's compiled-in out-of-gate figures, to "there is probably a ~2%
+   float64 presence cost". Those figures were **0.9981 at per-matrix z -1.70 and 0.9794 at z -2.06**
+   — I flagged them as marginal at the time and should have weighted that more.
+3. stage27 tests exactly that question with a build constructed to isolate it, and finds nothing.
+
+Best available reading: **no presence cost.** stage17's out-of-gate deficit was marginal and is not
+reproduced by a cleaner test of the same thing. So the ceiling decision rests entirely on its reward
+against its risk — 10 loser cells reachable against 36 winners exposed — which is what chain61
+measures.
+
+**A harness bug of my own, caught only by recognising the numbers.** stage27 was generated from
+stage26 by `sed 's/c26_/c27_/g'`, which renamed every output file but not the analyzer's argument,
+which is the bare prefix `c26`. So stage27 measured 1100 cells into `c27_*` and then printed
+stage26's verdict — 845 cells at ks 1/2/3/4/64 on 169 matrices, when stage27 ran 1100 cells at ks
+1/2/8/64 on 275. Nothing warned; the output was a complete, correct, controls-passing table for the
+wrong run. I noticed because the numbers were digit-for-digit stage26's. The data was intact and
+re-analysing the right prefix took one command. The general form is the one already in this file:
+**a rename that covers the outputs but not the reader produces a verdict about a different run**, and
+the only thing that catches it is knowing what the other run said.
