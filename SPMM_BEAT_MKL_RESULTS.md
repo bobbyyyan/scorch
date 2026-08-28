@@ -8419,3 +8419,39 @@ whether `CEIL_CAP_POOL` accounts for the disagreement, and whether a pool floor 
 rule inert here. `g2048_128_fl12` sets `MINTHREADS=12` against a pool of 6, so it must read the
 A/A floor exactly; if it does not, the floor is not reading the pool I think it is and nothing else
 in that run can be trusted.
+
+## The rest of the queue audited, and chain59: the two thread bounds fail in opposite directions
+
+Auditing every other queued chain for the same defect — an arm set that cannot differ — came back
+clean. `SCORCH_SPMM_MULTIROW` (chain45, 51) is read directly at its dispatch, and chain45's widths
+are 4, 8, 16, 64, which correctly avoids the k<=3 region where `!exact_width` makes it a
+structural null. `SCORCH_NARROWK_EXACT_ACCUM` (chain49, 50, 54) ships at 0 and the arms move it.
+`SCORCH_SPMV_ACCUM` ships at 1 and is `constexpr` only in a non-hooks build. `SCORCH_SPMM_HALFVEC`
+ships at 1 for float32, so chain48's `=0` arm is a real flip — though `SCORCH_SPMM_HALFVEC_F64`
+ships at **0**, so on float64 that arm is a structural null and its float64 columns are a free
+control rather than a result. The earlier ARM and x86 ceiling grids (`ceil_arms_arm.tsv`,
+`rw_stage16.sh`) all set `NNZ_PER_THREAD=256` correctly; chain53 was the one that did not.
+
+Reading that function closely turned up something better than the ceiling, though. The worker count
+is bounded twice and the two bounds use **different work measures**:
+
+| bound | measure | fails how |
+|---|---|---|
+| base: `nthreads(work, rows_axis, grain)` | `work = nnz*max(k,16)` | at k=1 the proxy overstates 16x and never binds, so `rows/ROWS_PER_THREAD` alone sets the count — **over**-threading |
+| raise: `min(rows/rpt, work_true/(RAISE_GRAINS*GRAIN))` | `work_true = nnz*k` | real arithmetic holds a high-degree narrow-k product to one grain — **under**-threading |
+
+Both failure modes have a hook that corrects them, both ship off, and the scoreboard has a loser
+class at each end. `scorch_policy.h` names the cases: kl02 at k=2 is 425072 multiply-adds, one
+grain, and eleven grains of the floored measure, and the true-arithmetic raise bound is "what
+strands the high-degree narrow-k class" — which is the shape of the warm losers. At the other end a
+256-row product with 294912 nonzeros "gets 16 workers for roughly 4 us of arithmetic, and measures
+30.0 us of kernel time against MKL's 22.6". Of `SCORCH_SPMM_BASE_WORK_TRUE` the source says
+plainly that it "has never been priced".
+
+chain59 ladders both, plus a `both` arm — one correction applied at two bounds, and fixing one
+could move the error to the other rather than remove it — plus `g2048_128` so the ceiling is
+priced on the identical corpus and the three answers to the same under-threading can be compared
+without a second run. k = 1, 2, 8, 64; all six names in every arm.
+
+This is a better shape of fix than the ceiling if it works: it corrects a measure that is already
+wrong rather than adding a gate with two constants read off one host.
