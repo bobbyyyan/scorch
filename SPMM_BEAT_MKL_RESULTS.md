@@ -8620,3 +8620,50 @@ The decision therefore rests entirely on the x86 gain that chain57/58 measure, w
 possible ~2% ARM float64 cost that is only marginally established. If chain57 shows the widened gate
 paying on x86 at the 1.1-1.3x the shipped gate already shows, that trade is clearly worth taking. If
 it shows a few percent, it is not.
+
+## Two build assertions worth keeping, and the ARM runs they now guard
+
+`m5_stage26.sh` — the ARM half of chain60, the k=1 extension plus the degree-adaptive unroll
+compiled in over the same 169-matrix degree-stratified corpus the two hooked replicates used —
+added two checks on the objects before any timing. Both fired usefully on the first run:
+
+```
+disassembly: ship vs cand differs on 64780 lines, ship vs ctrl on 0
+```
+
+**ship vs ctrl = 0.** Two builds of identical source in different directories produce *identical*
+disassembly, so the `ctrl/ship` floor on this host measures pure process variance with no code
+difference at all. Every previous three-build assumed that; none of them checked it. It is a
+better-founded floor than "we believe the flags were the same".
+
+**ship vs cand = 64780** is the check that would have caught chain53's defect and the reason `tune`
+cannot host chain60: a define that compiles and does nothing produces a candidate identical to
+ship, and this refuses under 50 differing lines. The magnitude does not mean the change is huge —
+jump targets and offsets shift when code moves, so most of those lines are relocation, not new
+instructions — it means the defines took effect.
+
+## stage27: is the ceiling's ARM cost layout or behaviour?
+
+That 40% churn is also a hypothesis. stage17 says the ceiling costs ARM float64 about 2% *in the
+region where it cannot fire*, and a condition that is false after two compares cannot cost 2% — so
+either that deficit is code layout around the enabled block, or the region labelling is wrong and
+the rule was firing where I think it was not. Those have opposite consequences and stage17 cannot
+tell them apart.
+
+stage27 can. Its candidate enables the rule and then makes the gate **impossible**:
+
+```
+-DSCORCH_SPMM_NNZ_PER_THREAD=256 -DSCORCH_SPMM_CEIL_CAP_POOL=1
+-DSCORCH_SPMM_CEIL_MAXROWS=1     -DSCORCH_SPMM_CEIL_MINDEG=1000000
+```
+
+The gate is `rows <= 1 && nnz >= 1000000*rows` with the row-bind form off — false for every matrix
+in the corpus, and false twice over. So the candidate is behaviourally identical to ship by
+construction and differs only in carrying the enabled code. Registered before the data: if the
+deficit is layout, cand/ship reproduces stage17's out-of-gate numbers, about 0.978 on float64 and
+0.998 on float32, from a build that provably never fires; if it is behavioural, cand/ship reads
+1.000 and stage17's region labels need re-deriving before any of its numbers mean what they say.
+
+Same corpus and widths as stage17's main run so the numbers are directly comparable. The
+ship-vs-ctrl disassembly check matters more here than anywhere else, because the whole run is a
+claim about code layout.
