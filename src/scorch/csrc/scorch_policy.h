@@ -187,6 +187,21 @@
 // the shape was failing to use, not by the shape and not by the ISA. A floor states that
 // directly, and on a host below it the whole block is unreachable, so the ARM cost goes
 // away as dead code rather than as a tuned constant.
+// State the row condition as the MECHANISM instead of as a row count: the rule applies
+// where the row proxy is below the width available, rows/SCORCH_ROWS_PER_THREAD < pool,
+// which on a 24-thread host is rows < 384 against SCORCH_SPMM_CEIL_MAXROWS's 128.
+//
+// This form was built, measured and removed once as a null: over the 130 cells (NINE
+// matrices) where the two forms differ it read 1.0053, and its pool-capped variant 1.0370,
+// against a 1.0015 floor -- z of 0.15 and 1.27 aggregated per matrix. It is back because
+// the production-path scoreboard says the three worst ratios in the whole corpus are
+// exactly there: rn50's 256-row block at 0.638 gets 16 workers of 24, and kl02 and nw14 at
+// 71 and 73 rows get 4 of 24. A 9-matrix null at low power is not evidence against a
+// mechanism whose target has since been identified by a different measurement.
+#ifndef SCORCH_SPMM_CEIL_ROWBIND
+#  define SCORCH_SPMM_CEIL_ROWBIND 0
+#endif
+
 #ifndef SCORCH_SPMM_CEIL_MINTHREADS
 #  define SCORCH_SPMM_CEIL_MINTHREADS 0L
 #endif
@@ -448,6 +463,22 @@ inline long scorch_llc_bytes() {
   return cached;
 }
 
+// One pool read serving both of the row ceiling's pool-conditioned tests: the floor (the
+// rule only applies on a wide enough pool) and the row-bind form (the rule applies where
+// the row proxy is below the width available). Reading it once, and only when one of the
+// two is enabled, is deliberate -- a pool read hoisted above the cheap tests is how an
+// earlier version of this rule charged every call for a branch that could not fire.
+//
+// Deliberately the caller's POOL and not omp_get_num_procs(): num_procs is 18 on a
+// 6-thread ARM host, which straddles any floor set between this project's two machines.
+inline bool ceil_pool_ok(int nthreads_override, long minthreads, bool rowbind, long rows) {
+  const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                          : (long)omp_get_max_threads();
+  if (minthreads > 0 && pool < minthreads) return false;
+  if (rowbind && rows / SCORCH_ROWS_PER_THREAD >= pool) return false;
+  return true;
+}
+
 // The thread count the drop-in SpMM actually runs on, given the caller's override.
 //
 // Extracted so there is ONE implementation. The SpMM used to compute this inline
@@ -522,9 +553,12 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   long ceil_mindeg = SCORCH_SPMM_CEIL_MINDEG;
   bool ceil_cap_pool = SCORCH_SPMM_CEIL_CAP_POOL != 0;
   long ceil_minthreads = SCORCH_SPMM_CEIL_MINTHREADS;
+  bool ceil_rowbind = SCORCH_SPMM_CEIL_ROWBIND != 0;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINTHREADS");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_minthreads = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_CEIL_ROWBIND");
+    if (e && *e) ceil_rowbind = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MAXROWS");
     if (e && *e) { long v = std::atol(e); if (v >= 0) ceil_maxrows = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CEIL_MINDEG");
@@ -549,12 +583,15 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // which is the default -- this costs nothing and no omp call is made. A pool read
   // hoisted above the cheap tests is how an earlier version of this rule charged every
   // call for a branch that could not fire.
+  // The row-bind form replaces the row-count test rather than adding to it, and the pool
+  // test is evaluated last and only when something needs it, so with both off -- the
+  // default -- this reads exactly as it did before and makes no omp call.
+  const bool ceil_needs_pool = ceil_rowbind || ceil_minthreads > 0;
   if (nnz_per_thread > 0 && nnz > 0 &&
-      (ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
+      (ceil_rowbind || ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
       (ceil_mindeg <= 0 || nnz >= ceil_mindeg * rows) &&
-      (ceil_minthreads <= 0 ||
-       (nthreads_override > 0 ? (long)nthreads_override
-                              : (long)omp_get_max_threads()) >= ceil_minthreads)) {
+      (!ceil_needs_pool ||
+       ceil_pool_ok(nthreads_override, ceil_minthreads, ceil_rowbind, rows))) {
     long by_nnz = nnz / nnz_per_thread;
     if (by_nnz > rows) by_nnz = rows;      // one worker per row is the hard ceiling
     // ... and optionally at the pool the CALLER manages rather than at the machine.
