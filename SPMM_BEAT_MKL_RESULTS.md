@@ -6913,3 +6913,24 @@ It also predicts something falsifiable and specific: if the account is right, `e
 k=1 toward k=2's loss count rather than merely improving it, and chain43's depth arms should do
 the same at k=4. If either lands halfway, the single-dependency story is incomplete for that
 width.
+
+### Which queued run covers which weak width
+
+Checked against each chain's actual arms and widths, not its title, because several arms are
+structural nulls at widths the chain nonetheless measures:
+
+| width | warm losses f32/f64 | what tests an ILP lever there |
+|---|---|---|
+| k=1 | 27 / 22 | chain42 `s2/s4/s8` and `ex1` (its arms fire **only** at k=1), chain47 `a2/a4/a8` (k=1 only) |
+| k=2 | 6 / 0 | nothing -- and nothing is needed: it already has four chains |
+| k=4 | 31 / 23 | chain43 `d4np/d4pf/d8pf` (ks 4,8,16,64), chain45 multi-row (ks 4,8,16,64) |
+| k>=8 | 9 / 3 | chain43, chain44, chain45 |
+
+So both weak widths have an independent-chain lever queued, by different routes: streams and
+the exact-width kernel at k=1, deep unroll and multi-row at k=4. chain42 does **not** reach
+k=4 despite listing it, since `narrowk_gather` is 1 only at k=1 and the exact band already
+contains 2 -- so reading chain42 for k=4 would read a null.
+
+k=2's cold losses (29 float32, 25 float64) are not an ILP gap. Its warm behaviour is already
+the best of the narrow widths, so those cells belong to the small-output cold regime, and
+they are the part of the cold deficit that the ILP work will not touch.
