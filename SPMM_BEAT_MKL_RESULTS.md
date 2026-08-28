@@ -10324,3 +10324,34 @@ Provisionally, then: **the thread cap's x86 caller-path value is null**, and the
 it rests on ARM, where the real autoencoder reads 0.8043 on the cells the rule acts on against a
 2-3% floor. Held until chain26b, which measures the x86 caller path with an instrument that can
 see 1%.
+
+### The autoencoder's third pass, which is the number to use
+
+The section above was written on two of three passes. With all three in, both arms at twelve
+CSVs, the estimates move and one cell changes sign. These supersede it:
+
+      framework            group                          n   cand/ship
+      Scorch (fused)       INERT -- identical code        9      1.0147
+      Scorch (fused)       can act (work < 10M)           3      0.8357
+      Scorch               INERT -- identical code        9      1.0203
+      Scorch               can act (work < 10M)           3      0.8963
+      PyTorch Dense        INERT                          9      0.9974
+      PyTorch Dense        can act                        3      1.0141
+      PyTorch Sparse       INERT                          9      1.0262
+      PyTorch Sparse       can act                        3      1.0146
+
+      model     sparsity   min layer work   Scorch   Scorch (fused)   Dense   Sparse
+      fashion       0.99            4.0M    0.8223           0.7034  1.0355   1.0217
+      mnist         0.99            1.3M    0.8057           0.8128  1.0056   0.9962
+      svhn          0.99            5.2M    1.0869           1.0207  1.0016   1.0262
+
+The verdict holds and is a little smaller: **0.8357 on the fused path where the rule acts,
+against a 1.5-2.6% floor from our own identical code.** Two of the three cells are large wins --
+fashion at 1.42x, mnist at 1.23x -- and **svhn is neutral at 1.0207, inside its own controls'
+1.0016-1.0262.** On two passes svhn read 0.9238; the third moved it, which is what a three-cell
+group at this floor should be expected to do and is why the group geomean rather than any single
+cell is the reading.
+
+So the honest form of the claim is: on the real autoencoder the rule is a large win on two of the
+three shapes it can act on, neutral on the third, and provably inert on the nine it cannot act
+on. Not "1.4x on the autoencoder".
