@@ -10803,84 +10803,117 @@ same-arm control on this column was 1.0021. The second rep of each arm is what t
 reading, and it is about half an hour out. Recorded now so the number is not quietly dropped if
 r2 disagrees with it.
 
-## The ARM caller path says the thread cap is a 3-4% regression, and the work threshold does not save it
+## The ARM caller path: the thread cap is a 3.3% win, and the threshold is what makes it safe
 
-stage38, the ARM caller-path run this whole candidate was waiting on. 169 matrices, six widths,
-1014 cells, five arms plus the duplicate-of-base A/A column, arms rotating randomly inside every
+**Correction first.** The version of this section committed as 53ac72c had every ratio inverted
+and drew the opposite conclusion. `an_caller.py` prints `ref/arm`, a SPEEDUP -- above 1.000 means
+the arm is faster -- and I read its columns as arm/ref. Checked against the raw times, which is
+what should have happened before anything was written: over all 1014 cells,
+`time(cpool)/time(base)` is 0.9626 and `time(aa)/time(base)` is 1.0060, so the cap is faster and
+the A/A duplicate is the floor. Everything below is the corrected reading and supersedes that
+section entirely. There is no contradiction between the two grids; the paragraph claiming one was
+an artifact of the inverted sign.
+
+stage38, the ARM caller-path run this candidate was waiting on. 169 matrices, six widths, 1014
+cells, five arms plus the duplicate-of-base A/A column, arms rotating randomly inside every
 repetition, eleven repetitions, `--pad-env` so every arm sets the same number of variables.
-Numbers are arm / base, so above 1.000 is slower.
+Below, every number is **time(arm) / time(base)**, so BELOW 1.000 is faster.
 
-      arm       k=1     k=2     k=4     k=8    k=16    k=64     ALL      z     float32
-      cpool  1.0399  1.0549  1.0304  1.0428  1.0249  1.0407  1.0389   +4.4
-      cpoolT 1.0224  1.0418  1.0314  1.0392  1.0158  1.0564  1.0344   +3.8
-      part0  0.9950  1.0025  0.9907  0.9952  0.9816  0.9806  0.9909   -2.5
-      chunk0 0.9817  0.9908  0.9776  0.9898  0.9599  0.9974  0.9828   -3.5
-      aa     0.9970  0.9917  0.9892  1.0017  0.9874  0.9974  0.9941   -2.8
+      arm       float32   float64     what it does
+      cpool      0.9626    0.9737     cap the resolved count at the caller's pool
+      cpoolT     0.9667    0.9815     the candidate: that cap, declining at nnz*k >= 10M
+      part0      1.0092    1.0143     the shipped row partition, turned OFF
+      chunk0     1.0175    1.0182     the shipped chunk-width rule, turned OFF
+      aa         1.0060    1.0081     base, timed a second time -- the floor
 
-      arm       k=1     k=2     k=4     k=8    k=16    k=64     ALL      z     float64
-      cpool  1.0374  1.0603  1.0398  1.0213  1.0118  0.9927  1.0270   +3.9
-      cpoolT 1.0231  1.0433  1.0225  1.0087  1.0009  1.0151  1.0188   +2.5
-      part0  0.9866  1.0141  0.9991  0.9892  0.9917  0.9756  0.9927   -2.1
-      chunk0 0.9728  1.0107  0.9964  0.9677  0.9553  0.9909  0.9821   -3.7
-      aa     0.9823  1.0045  0.9959  0.9806  0.9909  0.9979  0.9920   -3.8
+**The candidate is a 3.3% (float32) and 1.9% (float64) win on the ARM caller path over the
+general corpus, against a floor of 0.6-0.8%.** It is a win at all six widths in both dtypes.
+`cpool` and `cpoolT` behave identically on the 997 cells where the cap acts and read 0.9585
+against 0.9670 there, so a second estimate of the floor is 0.9%; the effect is three to four
+times it.
 
-`cpool` is the naive fix -- cap the resolved thread count at the caller's pool. `cpoolT` is the
-candidate: the same cap, declining to act when nnz*k is at or above ten million so it cannot
-disable the E-core recruit. `aa` is base timed a second time and is the floor.
+Two levers that already ship come out confirmed on the way past: **turning the row partition off
+costs 0.9-1.4% and turning the chunk-width rule off costs 1.8%.** Both ship on. Both are outside
+the floor and consistent across dtypes, so the earlier flagged question of whether either was
+paying for itself on ARM is answered: they are.
 
-**Capping at the caller's pool costs 3.9% (float32) and 2.7% (float64) on the ARM caller path,
-at every width, against a floor of 0.6-0.8%.** The cost does not vary with k -- 1.02 to 1.06
-across six widths with no trend -- so it is not a per-row-width effect.
+### The threshold is not insurance, it is most of the value
 
-**The work threshold recovers about half a percentage point of that, not the whole thing:**
-1.0344 against cpool's 1.0389 on float32, 1.0188 against 1.0270 on float64. The reason is
-arithmetic: this corpus's cells are 20K to 4M nonzeros, so nnz*k clears ten million on almost
-none of them even at k=64, and the rule therefore declines to act almost nowhere. It is very
-nearly cpool on this corpus by construction.
+Splitting the corpus at the rule's own threshold, which is the only split that can show what the
+threshold does:
 
-### That is a contradiction between two grids, and it closes the candidate
+      band                              n    cpool   cpoolT      aa
+      work < 10M   (the cap acts)      997   0.9585   0.9670  1.0063   float32
+      work >= 10M  (the cap declines)   17   1.2366   0.9510  0.9881
+      work < 10M   (the cap acts)      997   0.9667   0.9810  1.0081   float64
+      work >= 10M  (the cap declines)   17   1.4917   1.0090  1.0071
 
-The threshold's value came from the fused autoencoder Linear grid, where the recruit's value is
-monotone in work: 0.458 above 80M and 1.192 below 10M, crossing 1.0 between 10M and 20M. Below
-ten million units of work, **disabling the recruit made the fused autoencoder 1.20x FASTER**
-(the real-autoencoder run reads 0.8357 on the three cells where the rule acts). Below ten
-million units of work on this corpus, **disabling the recruit makes the general SpMM 1.04x
-SLOWER.** Same host, same work band, opposite sign.
+**Capping unconditionally costs 24% on the seventeen large-work cells in float32 and 49% in
+float64.** The threshold turns both into null-or-better. That is the same mechanism the fused
+autoencoder grid found -- the cap disables the E-core recruit, and above roughly ten million
+units of work the recruit is worth far more than respecting the pool -- now measured on the
+general SuiteSparse/dlmc corpus rather than on one workload.
 
-So no threshold on nnz*k separates them, and the feature that does is not in the rule. It is not
-k (flat across six widths here). What differs is the kernel: the autoencoder cells run
-`spmm_csr_linear_fused_float` and these run `spmm_csr_v2_core`, and the two have separate
-recruit gates at separate sites. A single work threshold in the shared thread-policy resolver
-cannot express "recruit for one kernel and not the other".
+It also bounds the worst cell. Synthesizing the rule at every threshold from the two measured
+columns (declining to cap IS base, so the rule at tau is cpool below tau and base at or above it,
+cell by cell) -- **in-sample, and the tau it likes is chosen on this data**:
 
-**Verdict: neither constant ships.** `SCORCH_SPMM_NT_CAP` stays 0 and
-`SCORCH_SPMM_RECRUIT_MIN_WORK` stays 0, which is the shipped behaviour and what the whole
-measurement history was taken with. The three ceilings' use of `omp_get_num_procs()` instead of
-the caller's pool is **load-bearing, not a bug**: it is what lets the recruit reach the E-cores,
-and taking it away costs 3-4% on ARM's general SpMM corpus and up to 2.9x on the fused
-autoencoder's worst cell. The commit that added the threshold constant (e296cb2) stays, because
-it is byte-identical at its default and it is the mechanism any future rule would use, but its
-default stays off.
+      tau      f32 geomean   >10% slow   worst cell  |  f64 geomean   >10% slow   worst cell
+      1M            0.9810          68        1.311  |       0.9775          59        1.350
+      3M            0.9658          73        1.367  |       0.9661          65        1.350
+      5M            0.9617          75        1.367  |       0.9632          66        1.350
+      10M           0.9591          76        1.367  |       0.9672          82        1.503
+      40M           0.9611          84        1.643  |       0.9718          94        1.932
+      none          0.9626          87        2.093  |       0.9737          97        2.289
 
-What remains genuinely unexploited is the autoencoder's 1.20x. That is a real win available to
-some discriminator, and the honest statement is that we do not have one: nnz*k was tried and it
-does not separate the two families. Finding a feature that does is a new question, not a rule
-ready to ship.
+Three things fall out. **Ten million is at the float32 optimum**, and the curve is flat enough
+either side of it that no value within a factor of three is distinguishable. **Float64's optimum
+is at five million and is worth 0.4% over ten**, which is inside the floor, so there is no case
+for a per-dtype constant here -- unlike the half-vector kernel, where the per-dtype split was
+worth 3.5% and a sign change. **The threshold's clearest effect is on the tail**: the worst cell
+goes from 2.093 to 1.367 in float32 and 2.289 to 1.503 in float64.
 
-### Two more readings from the same run, on levers that already ship
+And the cells more than 10% slower than base are 76 and 82 for the rule against **86 and 88 for
+the A/A arm** -- the same-code control has more of them than the candidate does. So the per-cell
+spread on this corpus is noise, not a population of regressions, and the right reading of the
+tail is the worst-cell column and not a count.
 
-`part0` turns the row partition off and `chunk0` turns the chunk-width rule off. Both ship on.
+### Where the win lives
 
-**part0 is null**: 0.9909 and 0.9927 against an A/A floor of 0.9941 and 0.9920. The partition
-neither helps nor hurts the ARM caller path on this corpus.
+Bucketing by feature, with the A/A arm computed on the same cells so the floor moves with the
+bucket (time(arm)/time(base), so below 1.000 is the cap winning):
 
-**chunk0 reads about one percent BELOW the floor, in both dtypes**: 0.9828 against 0.9941
-(float32) and 0.9821 against 0.9920 (float64), and it is the widest gap at k=16 (0.9599 and
-0.9553). That is the direction that says the shipped chunk-width rule costs ARM a little on the
-general corpus. It is one percent past a floor that is itself 0.7% off 1.000, from one run, so
-it is a signal and not yet a finding -- but it is the reading that was flagged as the one to
-watch, and it landed below 1.00 in both dtypes, so it is now a question that needs its own run
-rather than a caveat.
+      bucket by cell length (base)     n     cpool       aa
+      5.7 - 25.9 us                  254    1.0207   1.0171
+      25.9 - 31.9 us                 253    1.0353   1.0370
+      31.9 - 49.7 us                 253    0.9817   0.9917
+      49.7 - 1673 us                 254    0.8818   0.9987
+
+      bucket by degree (nnz/rows)      n     cpool       aa
+      0.011 - 1.63                   252    0.9938   1.0048
+      1.63 - 2.93                    252    0.9987   1.0102
+      2.93 - 7.12                    252    0.9592   1.0113
+      7.12 - 2304                    258    0.9031   0.9978
+
+**The win is on the long cells and the high-degree ones, and it is nowhere a loss.** The two
+short-cell buckets look like small losses at 1.02 and 1.035 -- and the A/A arm reads 1.017 and
+1.037 on exactly those cells, so the floor there is as wide as the apparent effect and there is
+nothing to see. On the cells over fifty microseconds the cap is worth 12% against a floor of
+0.1%, and above degree 7 it is worth 10% against a floor of 0.2%.
+
+### So the candidate ships, subject to what is still outstanding
+
+Everything measured now points the same way: **+3.3%/+1.9% on ARM's general caller path,
++12.3%/+9.4% on the real autoencoder's nine can-act cells (stage39, fused and non-fused), GCN
+8/8 inside its same-code control, x86 null on chain24's caller-path board, x86 threshold provably
+inert (chain25b: all four thresholds INERT against the cap alone, both dtypes), and ARM
+correctness green with the candidate COMPILED IN rather than env-set (1099 passed, 48 skipped).**
+
+What is still outstanding before flipping the two defaults: chain26b's x86 caller-path reading
+with the interleaved instrument, and chain25b's x86 GCN guardrail. Neither is expected to move
+the sign -- x86's pool equals its core count, so `nthreads >= 2*pool` is false there and the rule
+is provably the identity -- but "expected" is not "measured", and the defaults stay at 0 until
+both land.
 
 ## The warm deficit peaks at exactly one width, and that width's kernel has half the accumulator chains
 
