@@ -8455,3 +8455,48 @@ without a second run. k = 1, 2, 8, 64; all six names in every arm.
 
 This is a better shape of fix than the ceiling if it works: it corrects a measure that is already
 wrong rather than adding a gate with two constants read off one host.
+
+## Seven queued chains pointed at a harness that does not exist
+
+`/scratch/bobbyy/kprobe.py` is not a file. chain53 named it, and chains 50, 54, 55, 57, 58, 59 and
+60 inherited the path by being written from each other. The real one is
+`/scratch/bobbyy/mklcheck/tune/kprobe.py`; chains 44, 46 and 49 use `$T/kprobe.py` and are fine.
+Each of the seven would have refused at its first run step — `rw_run` checks the output CSV, so
+this is a loud failure, not a silent null — but that is seven slots and most of a day of queue time
+spent printing a refusal.
+
+Fixed with one symlink rather than seven edits, which also avoids editing scripts that are
+currently executing their wait loops. The symlink is safe for a specific reason: `kprobe.py`
+inserts its own sibling `src` at `sys.path[0]` **only when PYTHONPATH is unset**, a guard that
+exists because inserting it unconditionally once "made the three-build shipped-shape comparison
+load the same instrumented binary for all three arms: ship, ctrl and cand were one build, cand/ship
+read 1.0022 against a 1.0007 floor, and the whole run was a three-way A/A reported as a result."
+All seven chains set PYTHONPATH, so the fallback never fires and the symlink's location cannot
+matter. A `src` symlink alongside it would have been worse than nothing — it would make a
+PYTHONPATH-less run quietly load `tune`'s build and look like it worked.
+
+Then audited every absolute path all fourteen queued chains reference, not just the harness. Nothing
+else is missing.
+
+## chain60: the k=1 family's three-build, and why it cannot run on `tune`
+
+The k=1 exact-width extension plus the degree-adaptive unroll is the most-measured candidate in the
+queue — two ARM replicates, all four dtype x ISA configurations, a full ARM suite pass — and every
+number came from a hooked binary. `scorch_policy.h` records that hooked arms order themselves by
+how many variables each sets that the code also looks up, one extra successful `getenv` and one
+`atol` per call, and `--pad-env` equalises names rather than lookups. No further arm can settle it.
+chain60 is the compiled-in three-build: `ship`, a second build `ctrl` as the floor, and `cand` with
+`-DSCORCH_NARROWK_EXACT_K1=1 -DSCORCH_NARROWK_EXACT_DEGUNROLL=1`, over chain50's degree-stratified
+corpus, both pass orders, scored by `an_ship3.py` with `an_ship3deg.py` adding the degree axis
+because the effect is banded and a pooled number cannot show a band.
+
+**It has to build the branch tip, not `tune`.** The staged `tune` tree predates this work and
+carries `SCORCH_NARROWK_EXACT_K1` only as a `getenv` hook with **no policy constant behind it**, so
+`-DSCORCH_NARROWK_EXACT_K1=1` would compile there and change nothing — the same defect as chain53's
+seven identical arms, wearing different clothes. The tip is staged separately as
+`mklcheck/tip` via `git archive`, leaving `tune` untouched for the fourteen chains that depend on it.
+
+The tip also carries `SCORCH_SPMM_HALFVEC_F32 1`, which is a *different* pending decision that
+chain48 is measuring on the caller path. All three builds pin `-DSCORCH_SPMM_HALFVEC_F32=0`, so it
+cancels exactly rather than riding inside the comparison. The two do not interact — halfvec acts at
+k=4 float32, the extension at k=1 — but "does not interact" is an argument and pinning is a fact.
