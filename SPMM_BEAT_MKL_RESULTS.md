@@ -9991,3 +9991,43 @@ policies.
 The 40-80M float64 bucket reads 1.0367 at z +5.2 and is a real x86 win above the threshold --
 unaffected here, since the decline cannot fire on that host, but it is the reading that would
 matter if anyone shrinks the x86 pool.
+
+## stage36, the fused half: the threshold sweep, and where it can and cannot be read
+
+Same 84-cell fused-Linear grid, now with the rule's threshold as the swept parameter. `refb` is
+what ships, `cpool` caps unconditionally, `t5`/`t10`/`t20`/`t40` cap but decline at or above
+5/10/20/40 million nnz*k, `aa` duplicates `refb`. Ratios are `refb` over the arm, so above 1.0
+is faster than today. "fires" counts cells where the arm's resolved count differs from `refb`'s,
+asked of production per arm.
+
+      arm   fires      ALL    <10M   10-20M   20-40M   40-80M    >80M    worst  <0.95
+      refb      0   1.0000  1.0000   1.0000   1.0000   1.0000  1.0000   1.0000      0
+      cpool    84   0.6351  1.2909   0.9725   0.7554   0.5948  0.4436   0.3109     67
+      t5        8   1.0252  1.1402   1.0267   0.9981   1.0071  0.9955   0.8597      6
+      t10      16   1.0496  1.2840   0.9918   1.0031   0.9965  1.0027   0.8214      6
+      t20      20   1.0456  1.2802   0.9578   1.0023   1.0084  0.9959   0.7653      7
+      t40      32   1.0038  1.2965   0.9297   0.7551   0.9992  0.9960   0.6299     16
+      aa        0   1.0040  1.0079   1.0511   1.0022   1.0069  0.9975   0.7818      7
+
+Every arm is bit-identical to `refb` on all 84 cells, so the whole table is scheduling.
+
+The unconditional cap is confirmed ruinous here: 0.6351 overall, 67 of 84 cells more than 5%
+slower, worst 0.3109. Every threshold arm fixes that. `t10` and `t20` are the best two and are
+indistinguishable from each other; `t5` gives back most of the small-work gain (1.1402 against
+1.28) because it stops capping at 5M, and `t40` gives back the 20-40M bucket (0.7551) because it
+keeps capping there.
+
+**Where this table cannot be read.** Two limits, both from the arm's own controls:
+
+- Per-cell readings are not usable. `aa` -- the same arm timed twice -- has a worst cell of
+  0.7818 on a cell where it resolves the same count and therefore runs identical code. So the
+  "worst" and "<0.95" columns describe the instrument, not the arms; `t5`'s worst cell (0.8597)
+  is one where `t5` does not even fire.
+- The 10-20M bucket holds four cells and its `aa` reading is 1.0511. So the ordering inside that
+  bucket -- which is exactly where `t5` beats `t10` -- is inside its own drift and is not a
+  result. What *is* outside the floor is the `<10M` bucket, where `aa` reads 1.0079 and the
+  spread between `t5` (1.1402) and the others (~1.28) is ten times that.
+
+So the fused grid supports "somewhere between 10M and 20M" and nothing finer. Choosing between
+those two needs the other corpus, where the cells cluster differently -- and that half is
+running.
