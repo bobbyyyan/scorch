@@ -8073,3 +8073,57 @@ corpus is meant to represent.
 degree 8, so **x86 float64's low-degree behaviour is unmeasured**. If it loses at degree 1-2 the
 way ARM float64 does, the floor is needed on both hosts; if not, it is ARM-specific. chain50 has
 the stratified x86 corpus but sweeps `MINDEG` and `DEGUNROLL`, not `K1`, so this needs its own run.
+
+### Laddering the call path, and a reframing the 39 microseconds may need
+
+39 microseconds is about 120,000 cycles where the warm path takes 2,700, and the fast path is a
+few type checks, a tuple key, two dict gets and a pybind call. Twenty cache misses do not cost
+that, so `cold_ladder.py` times the path one rung at a time -- flush, then exactly one call --
+on a matrix small enough that the arithmetic is nothing:
+
+    noop      an empty Python function
+    lookup    build the key, both dict gets
+    alloc     torch.empty(rows, k)
+    planrun   plan.run(values, B, nthreads, atparallel)
+    full      scorch.matmul(A_st, B)
+    mkl       torch.sparse.mm(A32, B)
+
+An ARM smoke run at 5 reps and a 64 MB flush -- too thin to quote as a result, recorded for the
+two structural things it shows:
+
+| rung | cold us | warm us |
+|---|---|---|
+| noop | 1.04 | 0.04 |
+| lookup | 3.29 | 0.15 |
+| **alloc** | **7.54** | **0.48** |
+| planrun | 15.08 | 4.00 |
+| full | 13.17 | 4.22 |
+| mkl | 14.46 | 0.97 |
+
+1. **The output allocation is about half of it.** `torch.empty` on a 32-byte buffer costs 6.5
+   microseconds cold against 0.44 warm, a factor of 15. On 32 bytes that cannot be first-touch
+   faulting -- it is ATen's dispatcher and TensorImpl construction with everything they touch
+   evicted. That is a specific, attributable target rather than "the working set".
+2. **`full` minus `mkl` is NEGATIVE here**, -1.29 microseconds. Our fixed cold cost is no worse
+   than torch's own, which is unsurprising once the allocation is the bulk of it: both paths
+   allocate through ATen.
+
+**If the second point holds on x86 the conclusion has to change again.** A fixed cost both
+implementations pay is a tax, not a gap, and most of the 39 microseconds would be unattributable
+to us. It would still be worth removing our share -- an additive constant paid by both penalises
+whichever side is faster, and on the pooled numbers taking 39 microseconds off both sides moves
+our cold advantage from about 1.16 to about 1.24 -- but "cold is where the remaining deficit is"
+would become "cold calls are dominated by a shared per-call cost, and our cold losses are in the
+kernel after all."
+
+That is a big enough swing that no cold lever should be credited until chain52 reports. It now
+runs the ladder at three sizes crossed with one and all threads, on top of the four-configuration
+intercept measurement. The size sweep is the check on the flatness claim: the rungs below
+`planrun` cannot depend on nonzeros, so if they move with it the probe is measuring something
+other than what it names.
+
+Two probe defects worth recording because both would have produced clean-looking output. The
+plan is installed on a **later** call, not the first, so one warm-up left the cache empty and the
+`lookup` and `planrun` rungs would have been timing `None` -- the refuse-guard caught it. And the
+ladder verifies that `plan.run` reproduces `scorch.matmul` numerically before timing anything,
+since a rung that computes something else is not on the path being decomposed.
