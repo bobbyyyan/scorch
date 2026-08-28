@@ -5463,3 +5463,30 @@ build, at the widths the published scoreboard skipped.
 mask is still a real per-nonzero cost and 128-bit still removes it; what the size split
 withdraws is the claim that k=4 is anomalous and that 14% is the prize. It should be judged on
 what it does at k=4 within each size band, not on the pooled number.
+
+### The size deficit is not a selection artifact, but it is family-dependent
+
+180 of the 302 matrices above come from `narrowk_groups.csv`, which was built around the
+narrow-k deficit, so "91–100% of cells behind" partly measures how the corpus was chosen. The
+other 122 were sampled by density from DLMC with no reference to MKL. Splitting on provenance,
+float32 kernel time against MKL's call:
+
+| float32, nnz | density-sampled, 122 matrices | narrowk groups, 180 matrices |
+|---|---|---|
+| < 20k | 1.71–1.79, 5–7 of 43 behind | 1.73–1.84, 0–3 of 65 behind |
+| 20k–200k | **0.733–0.862**, 59–68 of 68 | 0.631–0.817, 32–33 of 33 |
+| > 200k | **0.693–0.938**, 6–11 of 11 | 0.585–0.749, 79–82 of 82 |
+
+The unselected half shows the same phenomenon at nearly the same size, so the crossover is
+real. Selection makes it about 0.1 worse, which is what selection should do.
+
+**But a third corpus disagrees.** The 165-matrix ceiling grid, also unselected on parity and
+also mostly DLMC, reads 0.975–1.206 at 20k–200k and 0.805–1.257 at 200k–1M on float32, and wins
+at every size at k=64. Its matrices are rn50 blocks — dense-ish, high degree, few rows — where
+the density-sampled groups spread across sparsity levels and shapes.
+
+So the crossover is family-dependent, and none of these three corpora is the one the published
+scoreboard used. Quoting a single "above 20k nonzeros we are 0.7x of MKL" would be picking a
+corpus. `rw_chain39.sh` measures `final_groups.csv` — the scoreboard's own 362 matrices —
+whole call against whole call from a hookless build, across k = 2, 4, 8, 16, 32. That is the
+number to quote, and it is the one that does not yet exist.
