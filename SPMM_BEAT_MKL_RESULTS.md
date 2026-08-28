@@ -11006,3 +11006,45 @@ searched this ledger for the constant's name -- and found both the pre-registere
 completed run. **The order has to be the other way round: grep the ledger for the constant before
 designing an arm around it.** Eleven thousand lines is exactly long enough for a spent lever to
 look new.
+
+## The autoencoder group widened from three cells to nine, and the win got bigger
+
+stage39. Sparsities 0.95 and 0.98 were added either side of the threshold and the model set
+widened, so the candidate now has nine cells it can act on and six it provably cannot, three
+passes each arm, scored on the minimum over passes. `cand/ship` is a time ratio, so below 1.000
+is the candidate winning.
+
+      framework               group                        n   cand/ship   worst cell
+      Scorch (fused)          INERT -- identical code       6      1.0053       1.0171
+      Scorch (fused)          can act (work < 10M)          9      0.8768       1.1195
+      Scorch                  INERT -- identical code       6      0.9931       1.0445
+      Scorch                  can act (work < 10M)          9      0.9060       1.0608
+      PyTorch Dense           INERT                         6      0.9964       1.0085
+      PyTorch Dense           can act                       9      1.0063       1.0401
+      PyTorch Sparse          INERT                         6      0.9988       1.0109
+      PyTorch Sparse          can act                       9      1.0004       1.0422
+
+**12.3% on the fused path and 9.4% on the plain one, against a floor of 0.5-0.7% from our own
+identical code.** The floor is three times tighter than the earlier three-cell version's
+(1.0147/1.0203), which is what widening a group is for. The two PyTorch columns cannot see the
+candidate at all and read within 0.6% in both groups, which is a second, independent floor.
+
+Per cell, the win is broad and there is exactly one loser:
+
+      model      sparsity  minwork/1e6   Scorch   Scorch (fused)
+      fashion        0.98          8.2   0.9978           0.8977
+      fashion        0.99          4.0   0.8027           0.7934
+      kmnist         0.98          8.2   0.9047           0.9755
+      kmnist         0.99          4.0   0.8632           0.7383
+      mnist          0.95          6.7   0.9663           0.8660
+      mnist          0.98          2.6   0.7937           0.7387
+      mnist          0.99          1.3   0.8319           0.8589
+      mnist_big      0.99          8.2   0.9714           0.9705
+      svhn           0.99          5.2   1.0608           1.1195
+
+Eight of nine cells win on both paths, four of them by more than 20%, and **svhn at 0.99 is the
+one cell against, 6% on the plain path and 12% on the fused one.** It was the neutral cell in the
+three-cell version too (1.0207), so this is the same cell moving further the same way rather than
+a new result, and it is the cell to explain if the defaults are flipped. Its minimum layer work
+is 5.2M, in the middle of the acting band, so the threshold cannot exclude it without giving up
+mnist at 0.98 and fashion at 0.99 as well.
