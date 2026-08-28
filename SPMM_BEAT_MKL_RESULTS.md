@@ -8544,3 +8544,39 @@ has now run it, twice, on both dtypes: capped is neutral here. So if chain57/58 
 gate paying on x86, it can ship as `NNZ_PER_THREAD=256` + `CAP_POOL=1` + the wider gate, with no
 pool floor and no ISA special case — and the ARM half of the two-host requirement is already done
 rather than pending. The x86 half is the open question, and it is the one that decides it.
+
+## Correction: "the widened gate is neutral on ARM" is narrower than I wrote it
+
+The section above concluded that the ARM half of the ceiling's two-host requirement is done. It is
+not, and the reason is one `scorch_policy.h` already states: **"What a HOOKED grid cannot decide is
+whether the rule is inert where it cannot fire."** In a hooked build every arm contains the same
+code and only the environment differs, so a hooked ladder can compare *firing* against *not
+firing* but is blind to the cost of the rule's mere presence. Mine was a hooked ladder.
+
+The compiled-in run exists and I should have read it first: `m5_stage17.sh`, an ARM sliced
+three-build of the capped ceiling from 2026-08-27, 275 matrices, 1375 cells, two passes per build.
+
+| region (float32) | matrices | floor ctrl/ship | cand/ship | below MKL |
+|---|---|---|---|---|
+| the rule fires (rows<=128, deg>=192) | 7 | 0.9971 | 0.9887 z-0.69 | 0 -> 0 |
+| cannot fire, rows 129-383 | 8 | 0.9995 | 0.9816 **z-3.61** | 0 -> 0 |
+| cannot fire, everything else | 260 | 1.0001 | 0.9981 **z-2.38** | 30 -> 31 |
+
+So compiled in, on ARM float32: **no measurable gain where it fires** — 7 matrices is very low
+power — and a small but statistically significant loss of about 0.2% where it *cannot*, over 260
+matrices against a 1.0001 floor. That is the signature of presence rather than behaviour: an extra
+branch, or code layout. It moves the below-MKL count by one cell, so it is not large; but "neutral"
+is the wrong word for it and a hooked grid could never have told me.
+
+float64 is unreadable in that run: it refused because the reference column — identical code in all
+three processes — moved 1.1042 with a worst-case 2.531x. The log shows why, and it is not the code:
+float64 slices 5 and 6 ran 33 and 46 minutes against a 2.3-minute median. `m5_slice_gaps.py` flags
+exactly those two, and `m5_repair15.sh` is re-measuring only them now, against the same three `.so`
+files, which still exist from yesterday.
+
+**What my hooked ladder does still establish, and it is not small:** when the rule fires, the cap is
+the difference between losing 6.9-7.3% and losing nothing, replicated twice on both dtypes with z of
+-6.4 and -6.3. That is a new result and it is what justified defaulting `CEIL_CAP_POOL` on — a flip
+that emits nothing today, so it cannot be wrong about performance. The question the hooked ladder
+cannot answer is whether turning `NNZ_PER_THREAD` on at all costs ARM something, and the answer so
+far is "about 0.2% on float32, float64 pending".
