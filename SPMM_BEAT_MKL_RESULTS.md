@@ -9493,3 +9493,35 @@ the defect is host-specific. If prediction 2 is what happens -- btrue right at k
 aggressive at k=1 -- the honest response is a grain correction, not a k=1 special case,
 because "two workers is too few for 400000 nonzeros" is a statement about the threshold and
 the same statement the ARM k=12 result already made. It is not a licence to gate on k.
+
+## The row ceiling's ARM presence cost is not established by this project's own standard
+
+The four warm float32 losers no thread rule can reach -- kl02 at k=2/4/8 and nw14 at k=2 --
+are the row ceiling's target shape, and it is measured at 1.1109 (float32, z=3.38) and
+1.1542 (float64, z=3.18) inside its gate on x86. What keeps it off is an ARM *presence*
+cost: compiled in, on cells where the rule cannot fire, the ARM three-build read 0.9981 on
+float32 over 260 matrices and 0.9794 on float64, against floors of 1.0001 and 0.9983.
+
+Those are per-matrix z of **-1.70 and -2.06**. This project's own resolution standard,
+established from a structural null where five arms ran identical code and still read up to
+|z| = 3.1, is that readings below |z| = 3 are retired as unresolved. By that standard
+neither presence figure is established, and I have been treating both as facts.
+
+That does not make the cost zero -- both point the same way, on both dtypes, which is
+weak evidence for something rather than evidence for nothing. It makes it *unresolved*, and
+the difference matters because the ceiling is the only mechanism that reaches the last four
+losers, and the deficits there are small: 0.884, 0.910, 0.913 and 0.965 against MKL.
+
+So the question is worth one properly powered measurement rather than an argument. A
+compiled-in three-build, ceiling on against off, restricted to the region where the rule
+CANNOT fire -- rows > 128 or degree < 192 -- with enough matrices and replicates to resolve
+0.2% on float32 and 2% on float64. If the cost is real, the remedy to try is code layout
+rather than the gate: the ceiling's own comment records that merely declaring policy
+variables and leaving a dead branch once added ten x86 instructions and reshuffled every
+stack slot, and that `constexpr` did not help. If it is not real, the ceiling ships as
+`NNZ_PER_THREAD=256` with `CAP_POOL=1`, and the last four cells on the board have a
+mechanism aimed at them.
+
+Note what this does NOT license: reading the two negative figures as noise because it would
+be convenient. The prediction to register is that a powered run finds a small real cost on
+float64, since 2.1% is large for pure layout, and finds nothing on float32.
