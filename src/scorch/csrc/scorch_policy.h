@@ -307,6 +307,40 @@
 // on two independent runs. Hence a second constant rather than a reused one.
 //
 // 0 disables width 1 entirely, which is what ships.
+// Multi-row register blocking: how many consecutive output rows one kernel call takes, and the
+// nonzero count below which it declines.
+//
+// The kernel exists (spmm.h, AVX2+FMA) but its dispatch has only ever been inside
+// SCORCH_TUNE_HOOKS, so a release binary does not contain it. Measured on redwood, 302 matrices,
+// 1208 cells per dtype, kernel timer, against an A/A floor of 0.995-1.009:
+//
+//   ROWS=2         float32                    float64
+//   nnz 200k-1M    1.1043 (k=4) 1.1171 (k=8)  1.1365 (k=4) 1.0932 (k=8)
+//   nnz >1M        1.1332 (k=4) 1.1434 (k=8)  1.1232 (k=4) 1.0862 (k=8)
+//   degree 8-32    1.1253 (k=4) 1.1256 (k=8)  1.1243 (k=4) 1.0890 (k=8)
+//   degree <8      0.9882 (k=4, z-0.4)        0.9922 (k=4, z-0.5)
+//
+// Every negative band for ROWS=2 has |z| < 1, i.e. inside the same-code floor, so on this corpus
+// ROWS=2 is neutral-or-better everywhere and wins 9-14% where B rows get re-read: mid-to-large
+// nonzero counts at moderate degree, which is what amortising the B loads across two output rows
+// is for. The cells behind MKL fall 96 -> 59 at float32 k=4, 17 -> 6 at k=8, 38 -> 31 and 11 -> 6
+// on float64 -- the largest reduction any single lever has produced.
+//
+// ROWS=4 is NOT the same answer: it loses at k=4 (0.9730 float32, z-2.0) and only beats ROWS=2 at
+// float32 k=16 (1.1604 against 1.0983). So the row count is not "more is better" and 4 is not the
+// default even where it is instantiated.
+//
+// 0 disables the kernel, which is what ships until a compiled-in three-build on both hosts agrees
+// with the hooked grid above. MINNNZ 0 means no nonzero gate; it exists because the wins concentrate
+// above about 200k nonzeros, so if the three-build finds a small deficit on tiny matrices the fix
+// is a gate that already exists rather than a new mechanism.
+#ifndef SCORCH_SPMM_MULTIROW_ROWS
+#  define SCORCH_SPMM_MULTIROW_ROWS 0
+#endif
+#ifndef SCORCH_SPMM_MULTIROW_MINNNZ
+#  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
+#endif
+
 // The deep register-block kernel: the vector counts it serves, its depth, and its prefetch.
 //
 // It exists (spmm.h, guarded on AVX2+FMA) but has never been reachable outside a

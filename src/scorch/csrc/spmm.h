@@ -3905,6 +3905,29 @@ torch::Tensor spmm_csr_v2_core(
     while (exact_unroll > 1 && mean_deg < (long)exact_unroll) exact_unroll >>= 1;
   }
 #endif
+#if !defined(SCORCH_TUNE_HOOKS) && defined(__AVX2__) && defined(__FMA__) && \
+    SCORCH_SPMM_MULTIROW_ROWS > 1
+  // SCORCH_SPMM_WORKSPACE is a hook and does not exist in a release build, but the multi-row
+  // dispatch below now does, and it reads this. State the value it always has in a release build
+  // once, rather than fragmenting the dispatch's condition with a preprocessor branch. The other
+  // two readers of this flag are themselves hooks-guarded, so they are unaffected.
+  const bool force_workspace = false;
+#endif
+#if defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+  // Multi-row register blocking's policy (measurements in scorch_policy.h). Outside the hooks
+  // guard because the dispatch below is too: a release build has to contain the mechanism for a
+  // three-build to measure it. const in a release build for the reason the deep kernel's
+  // constants are -- left non-const the dead branch does not fold, because the dispatch sits
+  // inside the parallel region's lambda.
+#ifdef SCORCH_TUNE_HOOKS
+  int multirow = SCORCH_SPMM_MULTIROW_ROWS;
+  long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
+#else
+  constexpr int multirow = SCORCH_SPMM_MULTIROW_ROWS;
+  constexpr long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
+#endif
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
   // The deep register kernel's policy; the measurements are in scorch_policy.h. These live
   // outside the hooks guard because the dispatch below does too: a release build has to CONTAIN
@@ -3963,9 +3986,10 @@ torch::Tensor spmm_csr_v2_core(
   // the per-row kernels. Exists because the deficit above 20k nonzeros is about 19 cycles a
   // nonzero -- L3 latency over two loads in flight -- on a family whose rows carry about twelve
   // nonzeros each, so the loads cannot come from within a row.
-  int multirow = 0;
   { const char* e = std::getenv("SCORCH_SPMM_MULTIROW");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 4) multirow = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_MINNNZ");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) multirow_minnnz = v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4149,7 +4173,8 @@ torch::Tensor spmm_csr_v2_core(
       }
 
       for (int i = start; i < end; i++) {
-#if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
+#if defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
         // A/B hook: take ROWS consecutive rows at once, so the independent B loads come from
         // different rows rather than from deeper inside one. Placed ahead of the empty-row
         // branch because the multi-row kernel writes an empty row's zeros itself.
@@ -4159,7 +4184,9 @@ torch::Tensor spmm_csr_v2_core(
         // never swaps two kernels in one step and neither is attributable. It also refuses
         // when fewer than ROWS rows are left in the stolen chunk, which is why it cannot run
         // past `end` and cannot read A1_pos out of range.
-        if (multirow > 1 && narrow_k && !exact_width && !force_workspace &&
+        if (multirow > 1 &&
+            (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
+            narrow_k && !exact_width && !force_workspace &&
             !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
             i + multirow <= end) {
           #define SCORCH_MR(NV, RR) \
