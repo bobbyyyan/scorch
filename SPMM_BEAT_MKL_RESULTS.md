@@ -4564,3 +4564,37 @@ That is also why a work gate is not simply "the ARM fix": on x86 a min-work gate
 because the partition wins there even on tiny products. The condition has to be the
 mechanism — apply the gate only where the pool is small enough that the counter is not the
 bottleneck — so that it *provably cannot fire* on a 24-thread host.
+
+## The row ceiling, compiled in on both hosts: x86 wants it, ARM does not, so it stays off
+
+The hooked grid could not answer whether the rule is inert where it cannot fire, because an
+arm pays a `getenv` hit and an `atol` per call for every variable it sets that the code
+reads. Compiled in — `cand` = the candidate plus the rule, `ctrl` = a second build of the
+candidate — there is no `getenv` at all. Both hosts, both dtypes, per-cell and per-matrix
+(the gated region is 35 cells from **7** matrices, so the second number is the one to read):
+
+| host / dtype | region | n / matrices | cand / ship | z per cell | **z per matrix** | floor | harmed vs floor |
+|---|---|---|---|---|---|---|---|
+| x86 float32 | in gate | 35 / 7 | **1.3066** | 3.47 | 1.61 | 1.0533 | 11.4% vs 31.4% |
+| x86 float64 | in gate | 35 / 7 | **1.4011** | 3.58 | **2.95** | 1.0665 | 8.6% vs 22.9% |
+| x86 float32 | outside | 1730 / 346 | 1.0047 | 1.13 | 0.75 | 1.0016 | 2.9% vs 3.8% |
+| x86 float64 | outside | 1730 / 346 | 0.9777 | −1.08 | −0.64 | 0.9807 | 11.6% vs 6.5% |
+| **ARM float32** | in gate | 35 / 7 | **0.9887** | −0.69 | −0.58 | 0.9971 | 5.7% vs 0.0% |
+| **ARM float64** | in gate | 35 / 7 | **0.9753** | 1.31 | 0.49 | 0.9465 | 14.3% vs 14.3% |
+| ARM float32 | outside | 1300 / 260 | 0.9981 | −2.38 | −1.70 | 1.0001 | 0.5% vs 0.2% |
+| ARM float64 | outside | 1300 / 260 | 0.9793 | −5.43 | **−2.15** | 0.9990 | 4.7% vs 4.5% |
+
+Two things settled. **Outside its gate the rule is inert on x86** — 1.0047 against a 1.0016
+floor on float32, and 0.9777 against a 0.9807 floor on float64, i.e. 0.997 of the floor,
+neither significant. The hooked grid's 0.9863–0.9962 with z from −6 to −19 was the
+instrument, exactly as predicted. **And the rule does not carry to ARM**: no gain in its own
+gate (0.9887 and 0.9753) and a ~2% loss outside it on float64 that survives a compiled-in
+build (per-matrix z = −2.15 over 260 matrices).
+
+**So the ceiling stays off.** It is the third thread-count lever in this branch whose sign
+is set by the pool size, and all three point the same way: the rule widens a few-row
+product's worker count, and on x86 that means 4 → 22 workers while on ARM, capped at the
+caller's pool, it means 4 → 6. There are only six to have. The gain is not a property of the
+shape, it is a property of how much machine the shape was failing to use, so a shared
+default cannot express it — and a 7-matrix, one-host, one-dtype effect is not enough to
+justify an ISA-conditional one.
