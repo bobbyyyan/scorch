@@ -8191,3 +8191,52 @@ vector, so nvec = k/4 rather than k/8: if the effect is set by nvec, float64 sho
 (nvec=2) and **lose at k=4** (nvec=1), and k=16 (nvec=4) becomes the unmeasured middle rather than
 the winner. If instead float64 wins at k=16, the quantity is k and not nvec, and the mechanism
 story above is wrong.
+
+### The ladder, run properly: the allocation is 63% of our fixed cold cost, and we do carry an excess
+
+41 reps, 192 MB flush, three sizes. ARM.
+
+| rung | nnz=8 cold | nnz=8000 | nnz=800000 | warm @8 |
+|---|---|---|---|---|
+| noop | 0.42 | 0.42 | 0.54 | 0.04 |
+| lookup | 2.25 | 2.04 | 2.08 | 0.14 |
+| **alloc** | **6.75** | **6.83** | **30.75** | 0.46 |
+| planrun | 13.00 | 20.58 | 229.79 | 4.03 |
+| full | 14.21 | 22.67 | 233.88 | 4.25 |
+| mkl | 9.96 | 63.13 | 2381.04 | 0.99 |
+
+**The probe validates itself on the size axis.** `noop` and `lookup` cannot depend on nonzeros and
+do not (0.42-0.54 and 2.04-2.25 across five orders of magnitude). `alloc` is flat while the output
+is small (6.75, 6.83) and jumps to 30.75 at 800k nonzeros, where the output is 3.2 MB and
+first-touch faulting is real rather than assumed -- so the probe separates the fixed part of the
+allocation from the part that scales, which is what it was for.
+
+**Decomposition of our fixed cold cost at 8 nonzeros, where the arithmetic is nothing:**
+
+| component | us cold | share |
+|---|---|---|
+| a Python call at all | 0.42 | 3% |
+| the plan-cache probe | 1.83 | 13% |
+| **the output allocation** | **6.33** | **45%** |
+| pybind conversion and the rest of plan.run | ~4.4 | 31% |
+| the Python dispatch above plan.run | 1.21 | 9% |
+
+**And the correction the proper run forces.** The 5-rep smoke said `full - mkl` was **-1.29 us**,
+i.e. our fixed cold cost was no better or worse than torch's; at 41 reps it is **+4.25 us**. The
+smoke's sign was noise, which is why it was labelled too thin to quote -- but I did draw a
+conclusion from it in the section above ("if that holds on x86 the 39 microseconds is largely a
+shared tax"), and that conclusion is now unsupported on this host. We carry a real fixed cold
+excess of about 4 microseconds over `torch.sparse.mm` on ARM.
+
+Where the excess can come from is bounded by the same table: torch allocates too, so the 6.33 us
+allocation is shared, and our extra is roughly the plan-cache probe plus the dispatch above
+`plan.run` (1.83 + 1.21 = 3.04 us) plus whatever our pybind conversion costs over ATen's. That is
+the reducible part, and it is small in absolute terms -- 3 us against a 20-microsecond warm kernel
+is 15%, but against the 93.7 us cold kernel on x86 it is 3%.
+
+So the honest position on cold, pending chain52's x86 version: the fixed cost is real, mostly the
+output allocation, mostly shared with torch, and our *excess* is a few microseconds. It is not
+where a 393-cell deficit comes from. **What made cold look like the largest bucket was the count
+of losing cells (267), and that count is still there** -- but the mechanism is not a fixed
+overhead we can delete, so the cold losses have to be in the kernel's cold behaviour, which
+chain51 is the run that addresses.
