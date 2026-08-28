@@ -9460,3 +9460,36 @@ this touches. But the `analytic` rule and the `learned` cost model were fit agai
 measurements taken with the current thread policy, so their *predictions* go stale for
 k<16 even where their route choice does not change. Retraining is cheap; noticing is the
 part that gets skipped.
+
+## Registered before reading chain21: predictions and the rule for deciding
+
+chain21 is running now, on 302 x86 matrices at k=1,2,4,8,16,64, both dtypes, arms
+`ref / refb / cappc / cap8 / cap12 / cap24 / btrue / btcap` on `SCORCH_SPMM_NT_CAP` and
+`SCORCH_SPMM_BASE_WORK_TRUE`. Written down first so the reading is not fitted to the answer.
+
+**Structural checks that must pass, or the grid is discarded.**
+`cappc` and `cap8` resolve to the same count on this host, because its P-core count is 8, so
+they must measure the same within the floor. Every arm's inert set must read 1.000, since a
+cap leaves identical code there. `btrue`'s firing set must be empty at k=16 and k=64.
+
+**Predictions.**
+1. `btrue` gains at k<=8 on x86 as it did on ARM. Confidence: moderate. The defect is
+   arithmetic, not architectural -- nnz*max(k,16) overstates a narrow product on any host.
+2. `btrue` is *more aggressive* on x86 than the cap, and may overshoot at k=1. Where the cap
+   takes a 2048-row degree-200 layer from 32 workers to 8, btrue takes it to
+   nnz*1/150000 = 2. On a host with a seventh of the M5's achieved bandwidth, two workers may
+   not be enough, and this is the specific way the two hosts could disagree. Registered as
+   the most likely failure.
+3. For the worst cell on the board -- lp_osa_14, 2337 rows of degree 135 at k=4 -- btrue and
+   cap8 coincide: work_true/grain is 1261980/150000 = 8. So that cell cannot discriminate
+   between the two mechanisms, and if both fix it that is one fact and not two.
+4. `btcap` adds nothing over the better of the two, as on ARM.
+
+**The rule.** btrue ships only if, on both hosts and both dtypes: it gains on the cells it
+fires with per-matrix z beyond the floor; the count of matrices losing more than 5% is not
+above the A/A arm's; and the caller-path board (chain22) moves cells above MKL without
+pushing others below. If x86 contradicts prediction 1, nothing ships and the finding is that
+the defect is host-specific. If prediction 2 is what happens -- btrue right at k=4-8 and too
+aggressive at k=1 -- the honest response is a grain correction, not a k=1 special case,
+because "two workers is too few for 400000 nonzeros" is a statement about the threshold and
+the same statement the ARM k=12 result already made. It is not a licence to gate on k.
