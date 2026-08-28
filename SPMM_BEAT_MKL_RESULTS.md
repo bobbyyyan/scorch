@@ -6028,3 +6028,87 @@ Two things still owed after those clear:
    host that is not timing.
 2. **The post-flip caller-path scoreboard**, on chain39's corpus, widths and probe, so the
    difference is a difference and not two different measurements.
+
+### The row partition reverses sign between the two hosts, and it is not a width effect
+
+The ARM ladder was built to decide which part of the back-stealing partition costs the ARM
+tail: mode 1 is home ranges with no stealing and therefore no cursor probing at all, mode 2
+steals from the front, mode 3 is the candidate that steals from the back and whose workers
+probe every other cursor once their own range is done. Twelve workers probing twelve cursors
+on shared lines is of the order of a coherence miss each on a kernel fifteen to thirty
+microseconds long, which made the probe the obvious suspect. The grid pre-registered the
+fork: if mode 1 recovers the tail the probe is the cost and can be bounded, and if mode 1 is
+as bad then the static decomposition is, which tuning cannot fix.
+
+**Mode 1 did not recover the tail.** ARM, 420 cells per dtype, arm-to-arm speedups against
+the candidate, with the released atomic counter (`p0`) as the thing a release has to beat:
+
+| arm | what it is | f32 | f64 |
+|---|---|---|---|
+| p3e | back-stealing, the candidate | 1.0000 | 1.0000 |
+| p1e | home ranges, no stealing, no probing | 0.9826 | 0.9622 |
+| p2e | steals from the front | 0.9682 | 0.9592 |
+| **p0** | **released global atomic counter** | **1.0303** | **1.0222** |
+| aa | same code as p3e | 0.9951 | 1.0006 |
+
+Removing the probe makes it *worse*, not better. So the cost is the static decomposition, and
+by the rule set before the run it is not fixable by tuning the stealing policy. On ARM the
+released counter wins at every width measured from k=1 to k=8 — 1.0581, 1.0372, 1.0313,
+1.0719, 1.0187 in float32 — and the candidate only wins at k=64 (1.0330). 95 of 420 float32
+cells have the candidate more than 10% slower than what ships; the same-code arm reports 99,
+so that count is the code and not a slot.
+
+**The obvious inference from that is wrong.** A k≤8 reversal invites a width gate, so I
+resolved the already-collected x86 grid by width before writing any. There is no crossover
+on x86: the candidate is faster than the counter at *every* width, in both dtypes.
+
+| k | f32 candidate over counter | f64 | f32 same-code floor |
+|---|---|---|---|
+| 1 | 1.2666 | 1.2975 | 0.9998 |
+| 2 | 1.3868 | 1.3781 | (1.0882 — see below) |
+| 3 | 1.3501 | 1.3375 | (1.0617) |
+| 4 | 1.2807 | 1.3000 | 0.9977 |
+| 8 | 1.3243 | 1.3298 | 0.9999 |
+| 64 | 1.3122 | 1.2389 | 1.0005 |
+| 256 | 1.1833 | 1.1243 | 0.9982 |
+
+A width gate would therefore hand back a 1.27x x86 win at exactly k=1, the width that holds
+the most below-MKL cells. The reversal is host-specific, not width-specific, and the
+mechanism fits: the partition's whole value is keeping A resident across calls, which is
+worth 1.3x on a host achieving ~56 GB/s and negative on one achieving ~412 GB/s. A
+bandwidth-scarcity benefit has no single value across hosts, so the honest home for this
+decision is the host-calibrated selector, not a compile-time default — and until it has one,
+compiling `SCORCH_SPMM_PARTITION_DEFAULT 3` in for both hosts is a 2-3% ARM regression that
+should be reported rather than shipped quietly.
+
+**The aa column is two different things in the same table, which is what makes it useful.**
+It duplicates the first arm, `p3`, not `p3e`, and those differ by the exact-width narrow-k
+kernel. The dispatch serves widths 2 and 3 only, so at k=1, 4, 8, 64 and 256 the kernel
+cannot fire and the column is a genuine same-code floor: 0.9977 to 1.0005 across five
+widths, on the same matrices in the same run. At k=2 and k=3 it stops being a floor and
+becomes a measurement — 1.0882 and 1.0617 — which independently reproduces the 6-8% at k=2
+and k=3 that the policy header already records for that kernel. The partition effect is two
+orders of magnitude above that floor.
+
+### Which cells are actually below MKL: float32, narrow k
+
+Same grid, 362 cells per width, counting rather than averaging:
+
+| k | f32 cells below MKL | f32 pooled | f64 cells below | f64 pooled |
+|---|---|---|---|---|
+| 1 | **189 / 362** | **0.9379** | 57 | 1.2948 |
+| 2 | 172 | 1.0329 | 23 | 1.4737 |
+| 3 | 165 | 1.0852 | 16 | 1.5576 |
+| 4 | 165 | 1.0891 | 17 | 1.5877 |
+| 8 | 105 | 1.3212 | 8 | 1.8287 |
+| 64 | 36 | 1.8240 | 6 | 2.2726 |
+| 256 | 21 | 2.1469 | 7 | 2.4040 |
+
+float32 k=1 is the only width that pools below parity anywhere in the grid, and float64 never
+pools below 1.29. The absolute level here is a hooked build and therefore is exactly what
+chain37 is settling, but the *ordering* by width is a within-build comparison and survives
+whatever chain37 says. The target is float32 at k≤4, worst at k=1 — which is the width the
+gather kernel claims (`narrowk_gather = (B1_size == 1)`) and which the exact-width dispatch
+clamps itself out of, since it serves 2..3. chain42's `ex1` arm forces exactly that width
+onto the exact-width kernel, so it is aimed at this cell and not at a shape I picked after
+seeing it.
