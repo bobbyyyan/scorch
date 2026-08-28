@@ -5157,3 +5157,37 @@ and consistent with the degree floor finding, where refusing that kernel on matr
 fewer nonzeros than rows recovered 5–17% on x86. Initialising the accumulator from the first
 nonzero instead of zeroing, or accumulating straight into the output row, is the lever. Not
 yet measured; the discriminating experiment is the same fit with the kernel switched off.
+
+### Counting the per-row work in the source, which agrees with the measured coefficient
+
+`scorch_spmm_row_narrow_exact<T, K, UNROLL>` does this per row, whatever the row's length:
+
+```cpp
+T acc[UNROLL][K];
+for (u) for (j) acc[u][j] = T(0);          // UNROLL*K zeroing ops
+... unrolled main loop over nonzeros ...
+for (u = 1..UNROLL-1) for (j) acc[0][j] += acc[u][j];   // (UNROLL-1)*K adds
+... remainder loop ...
+for (j) C_row[j] = acc[0][j];              // K stores
+```
+
+At the shipped `UNROLL = 4` and `K = 4` that is **16 zeroing operations, 12 cross-accumulator
+adds and 4 stores — 32 operations per row that do not depend on the row at all.** At four
+operations per cycle on a 4 GHz part that is about 8 cycles, 2 ns; the measured excess over
+MKL is 1.08 ns. Same order, and the fit was over synthetic matrices while this count is from
+the source, so they are independent.
+
+The separate accumulator sets exist to break the FMA dependency chain, so they cannot simply
+be collapsed. The three levers, in increasing order of how much they change:
+
+1. **Initialise the accumulators from the first `UNROLL` nonzeros** instead of zeroing them.
+   Removes 16 of the 32 operations and costs nothing — the values are loaded anyway.
+2. **Size the accumulator set to the latency, not to the unroll.** Four independent chains
+   cover a 4-cycle FMA; at K = 4 on float32 that is 16 scalar accumulators for what fits in
+   two 256-bit registers, so the reduction is over half-empty vectors.
+3. **Two output rows per register** at K = 4 float32, where four floats occupy half a YMM.
+   Halves both the zeroing and the reduction per row of output.
+
+None of this is implemented. The discriminating measurement — the same three-term fit with the
+exact-width kernel switched off — is queued, and if the per-row coefficient falls to MKL's with
+the kernel off, this is confirmed as its cost rather than the row loop's in general.
