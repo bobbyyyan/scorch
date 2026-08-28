@@ -7147,3 +7147,34 @@ was built for, and it is inert to within slot noise where it cannot, with no wid
 anywhere. This is a different lever from the narrow-k ILP work and can ship independently of it.
 Absolute parity is not the claim here -- this is the harness path in an instrumented build --
 the claim is arm-to-arm, which is what was measured.
+
+### ARM on the k=4 question: neutral, and it cannot be more than a guardrail
+
+Run on the idle ARM host ahead of chain49, in a purpose-built hooked copy of the tree so the
+hookless build stayed intact. float32 at k=4, columns refb / hv / ex4 / ex4a:
+
+| band | refb | hv | ex4 | ex4a |
+|---|---|---|---|---|
+| deg<64 (n=49) | 0.9983 | 0.9987 | **0.9843** | 0.9819 |
+| deg 64-256 (n=14) | 0.9974 | 0.9921 | **1.0369** | 1.0118 |
+| deg>=256 (n=7) | 1.0169 | 0.9947 | **0.9631** | 0.8870 (z-3.2) |
+
+The floor here is not the `refb` column alone -- it is every provably-inert arm-times-width
+cell, which on this host is k=2 and k=8 for all arms plus `hv` at every width. Those span 0.975
+to 1.026 and reach z=-2.0. So the floor is **+/-2.6%**, every `ex4` reading sits inside it, and
+the honest conclusion is that **ex4 has no measurable effect on ARM**. `ex4a` at degree >=256
+reads 0.8870 at z=-3.2, outside the floor and in the direction the mechanism predicts -- two
+chains instead of four hurts most where rows are longest -- but n is 7 and that is one band.
+
+**ARM cannot decide this question and it was never going to.** `mkl_ms` on this host is
+`torch.sparse.mm`, which is PyTorch's own sparse fallback rather than MKL, and against it we
+read 4.4x to 4.6x with **0 of 70 cells behind at every width**. There is no k=4 deficit on ARM
+to fix. So this run does exactly one useful thing: it clears the ARM guardrail for the lever
+before x86 has spent time on it, and it establishes that the ARM grid cannot resolve anything
+below about 3%.
+
+One incidental calibration worth keeping. `ex4` was measured twice, in two independent runs
+either side of the `ex4a` fix, and read 0.9806 / 1.0324 / 0.9604 then 0.9843 / 1.0369 / 0.9631
+-- agreement to about 0.4%, which is much tighter than the +/-2.6% spread *across bands* inside
+one run. So that spread is corpus composition, not run-to-run randomness, and comparing the
+same band across runs is a far more sensitive test than comparing bands within one.
