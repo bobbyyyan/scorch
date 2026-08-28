@@ -4814,3 +4814,28 @@ families.**
 
 Neither is a tuning question and neither is addressed by the change in flight. They are the
 next campaign, and they are now specified: a corpus, a mechanism, and a number to beat.
+
+### The same corpus by density, which is the cleanest statement of where we stand
+
+Our kernel against MKL's whole call, geomean, float32, 2172 cells:
+
+| density of A | cells | MKL / ours | cells below 1.0 |
+|---|---|---|---|
+| < 0.1% | 1050 | **2.794** | 6 |
+| 0.1–1% | 330 | **2.126** | 5 |
+| 1–5% | 258 | **2.600** | 0 |
+| 5–20% | 210 | **1.679** | 15 |
+| ≥ 20% | 324 | **1.525** | 56 |
+
+We are 1.5–2.8× ahead of MKL in every density band, and 71 of the 82 cells where the kernel
+genuinely loses sit at 5% density or above. Splitting those 82 by shape:
+
+- **fewer rows than the team can use, high degree** — 28 cells, 11 matrices, all DLMC
+  ResNet-50 pruned blocks (64–256 rows, degree 288–2300). Needs within-row parallelism.
+- **near-dense blocks** — 47 cells, 37 of them at ≥20% density, mostly k = 4, kernel around
+  19 µs, median ratio 0.955 and worst 0.775. A few percent behind in the regime where MKL's
+  kernel starts to look like a blocked dense one. The smallest of the three gaps.
+- **degree below 4** — 7 cells, 3 matrices (Pd_b, Pd_rhs, bips07_3078_iv). Fixed per-row cost
+  charged once per nonzero.
+
+So the goal reduces to three named mechanisms on 3.8% of cells, not to a broad deficit.
