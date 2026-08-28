@@ -10741,3 +10741,38 @@ has fewer of them, which is consistent with the float64 register kernel already 
 So this is one class of shape, not two, and the levers aimed at it -- chain29b at k=1 and chain28b
 at k=4/8 -- serve both dtypes. Across both, the whole board is 171 warm cells and 330 cold out of
 1488, and the great majority of each is within ten percent of MKL.
+
+### The allocation arm, and a qualification the cold claim needs
+
+Adding a fifth arm -- `torch.empty(M*k)` on its own, no compute -- changes what the cold split
+says. ARM, cold, medians in microseconds:
+
+      matrix         k    full   planrun   native    torch   probe  validate   alloc
+      EVA            1    37.5      36.9     61.7     97.3    +0.6     +24.8    12.0
+      EVA           32    63.9      64.0     69.0    180.6    -0.1      +5.0    10.0
+      Reuters911     1    28.0      30.8     42.3    116.5    -2.8     +11.5     9.0
+      Reuters911    32   108.7      99.5    106.3    325.2    +9.2      +6.8    24.8
+
+Three layers, and they roughly account for a forty-microsecond fixed cost between them:
+
+- **Output allocation is 9-25 us**, cold, even for a 34 KB result. That is 25-30% of a k=1 call.
+  It is on the caller path -- every call allocates its result.
+- **The ABI validation is 5-25 us**, and it is *not* on the caller path: the plan path does not
+  go through the pybind entry that walks the index arrays, which is why `native` reads slower than
+  `full`. Callers do not pay it; a harness calling the kernel directly does.
+- **The Python probe is a few microseconds at most**, and at five reps it is inside its own noise.
+
+**And here is the qualification.** I wrote earlier that cutting per-call cost by a quarter would
+flip about 166 of the 198 cold cells. That arithmetic treats our ~45 us of non-kernel cost as if
+removing it were free money, and it is not, because **MKL pays its own fixed cost on a cold call
+too** -- it allocates the same output, and it dispatches, in C++ rather than Python but not for
+nothing. The deficit is against MKL, so what matters is not our fixed cost but the *difference*
+between the two, and none of the numbers above measures that difference.
+
+So the correct statement is narrower: **half of a cold call is not the kernel, and the largest
+single component of that half is output allocation** -- which is also the component MKL is most
+likely to share, since `torch.sparse.mm` allocates its result the same way. Whether any of it is
+recoverable *relative to MKL* is exactly what chain23b was written to answer, by fitting the
+intercept for both libraries rather than for ours alone. The earlier "166 of 198" figure should
+be read as an upper bound on what a fixed-cost fix could do, achieved only if MKL's own fixed cost
+were zero, which it is not.
