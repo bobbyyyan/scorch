@@ -8370,3 +8370,52 @@ stealing recovers a straggler's *remaining* work, but the chunk count is what ma
 small in the first place, and the two are not substitutes. k=64, where the tiled kernel owns the
 row, is the control: there the cm arms are flat (0.9904 to 1.0063) and only w256 still loses,
 which says the cm effect really is about how the row loop is partitioned and not about the width.
+
+## The row ceiling does not run in any shipped build, and a queued chain's seven arms were one arm
+
+Reading the ceiling's code before believing the ladder that was about to measure it:
+
+```cpp
+if (nnz_per_thread > 0 && nnz > 0 &&
+    (ceil_rowbind || ceil_maxrows <= 0 || rows <= ceil_maxrows) &&
+    (ceil_mindeg  <= 0 || nnz >= ceil_mindeg * rows) && ...)
+```
+
+`SCORCH_SPMM_NNZ_PER_THREAD` ships at **0**. The whole block is unreachable in a default build, and
+`SCORCH_SPMM_CEIL_MAXROWS` / `_MINDEG` condition a statement that never executes. chain53 laddered
+exactly those two names across seven arms and would have produced seven copies of the A/A floor
+over about forty minutes of both dtypes — and reported a clean null with a plausible-looking table.
+
+`rw_hooks_present` does not catch this. Its check is that every name an arm sets is a string in the
+binary, and all of these are: it is the *mechanism* that is disabled, not the hook. The guard that
+would have caught it is a different one — assert that at least one arm differs from the reference
+in something the code can act on — and there is no cheap general form of it. What there is, is the
+habit of reading the enclosing condition and not just the constant.
+
+This also corrects how the scoreboard's warm losers were described earlier in this file. Saying
+the ceiling's "two constants are mispositioned" presumed the rule was on. It is not. The correct
+statement is that the losers sit in a region the rule would have to be **turned on and widened** to
+reach, and both of those are unmeasured together.
+
+Replacements, queued: **chain57** (k = 1, 2, 4, 8) and **chain58** (k = 16, 64, on chain57's
+corpus). Nine arms; the reference is the ceiling off, because that is what ships; every arm sets
+all four names so each pays the same four successful `getenv`+`atol` calls, which `--pad-env`
+alone does not equalise — `scorch_policy.h` records an earlier ceiling grid whose out-of-gate arms
+came out "ordered by how many variables each arm sets that this function also looks up". 256 is the
+value every earlier ceiling grid used for `NNZ_PER_THREAD`, so the numbers stay comparable.
+`g2048_128_nocap` prices `CEIL_CAP_POOL` at the candidate corner rather than assuming it.
+
+The analyzer needed replacing too, and would have failed quietly: `an_ceil2dlad.py` hardcodes
+`REF = "ceil128_192"` and drops any arm its `ceil<r>_<d>` regex does not match, so under the new
+names it would have printed a table with no ladder in it. `an_ceil57.py` takes `off` as the
+reference and gives the pool-floor arms their own group, so a measured arm cannot vanish from the
+verdict by failing a name parse.
+
+**And the ARM half is running now rather than after.** The M5's cache has 36 matrices at rows<=128
+and degree>=192 and 97 across the stratification, so the same ladder runs locally in parallel:
+6 arms, two replicates, k = 1, 2, 8, 64. Its point is not whether the gate helps — `scorch_policy.h`
+already has the M5 reading 0.934/0.948 inside the shipped gate against redwood's 1.11/1.19 — but
+whether `CEIL_CAP_POOL` accounts for the disagreement, and whether a pool floor makes the whole
+rule inert here. `g2048_128_fl12` sets `MINTHREADS=12` against a pool of 6, so it must read the
+A/A floor exactly; if it does not, the floor is not reading the pool I think it is and nothing else
+in that run can be trusted.
