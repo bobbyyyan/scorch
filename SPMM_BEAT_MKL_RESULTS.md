@@ -7530,3 +7530,45 @@ widths where the gap is worst on float32, and k=32 is a free structural null on 
 Verdict rule, fixed before the run: this is the hooked build, so the MKL columns read about 1.5x
 pessimistic and the decision is arm-vs-arm cold against the `aa` floor. A lever that wins cold
 earns a hookless compiled-in confirm against MKL. It does not earn a ship.
+
+### Four runs of the ladder: the k=2 win is real, and the floor still does not ship
+
+Two clean replicates under a new refuse-to-run guard, at different interleave seeds, settle it.
+Run 2 is the one whose low-degree bands were timed while run 1 was still finishing.
+
+| band | run 1 | run 2 (contended) | run 3 clean | run 4 clean |
+|---|---|---|---|---|
+| k=2 deg<1 | 0.9191 | 0.9314 | 0.9145 | 0.9210 |
+| **k=2 deg 1-2** | 1.0671 | **0.9409** | **1.0535** | **1.0533** |
+| k=2 deg 2-4 | 0.9333 | 0.9306 | 0.9199 | 0.9246 |
+| k=2 deg 4-8 | 0.9056 | 0.9032 | 0.8960 | 0.8988 |
+| k=3 deg<1 | 0.9097 | 0.9147 | 0.9088 | 0.9105 |
+| k=3 deg 1-2 | 1.0052 | 0.9340 | 0.9940 | 0.9955 |
+| k=3 deg 2-4 | 0.8975 | 0.8986 | 0.8912 | 0.8934 |
+| k=3 deg 4-8 | 0.9178 | 0.9096 | 0.9124 | 0.9105 |
+
+The two clean runs agree to four decimal places in the disputed band -- 1.0535 and 1.0533 -- and
+run 2 is the only reading of the eight cells that flips a sign anywhere. So the effect is real:
+at k=2 on matrices of mean degree 1-2, withdrawing the exact-width kernel is worth **5.3%**, and
+the earlier 0.9409 was a contended measurement, not a refutation.
+
+**And the floor still does not ship, for a better reason than the one I retracted on.** The
+kernel wins in every other band -- 8% below degree 1, 7% at 2-4, 10% at 4-8, and about 9-10%
+at all three at k=3 -- so the one band that wants the kernel withdrawn is flanked on both sides
+by bands that want it kept. `MINDEG=2` is the only value that could capture it, and it withdraws
+at deg<1 as well; weighting the two bands by their matrix counts,
+
+    exp((28*ln 0.9210 + 29*ln 1.0533) / 57) = 0.986
+
+so it is a 1.4% net loss at k=2 before k=3 is considered, where deg<1 loses 9% and deg 1-2 is a
+null and the loss is unambiguous. A degree floor is a monotone predicate and this is not a
+monotone effect.
+
+Recording it as a real, unexploited 5.3% rather than filing it as noise. It would need a
+condition on width *and* a degree band, for one width and one band, worth 5.3% on 29 matrices,
+on the host that has no MKL. That is not worth a mechanism, and saying so is different from
+saying there is nothing there.
+
+The retraction two sections up was right in its conclusion and wrong in one of its reasons: it
+leaned partly on run 2, which is now the discredited reading. What actually kills the floor is
+non-monotonicity, which all four runs agree on.
