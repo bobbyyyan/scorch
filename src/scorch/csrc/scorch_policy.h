@@ -180,8 +180,8 @@
 #  define SCORCH_SPMM_CEIL_MINDEG 192L
 #endif
 // Whether the widened count is capped at the caller's thread pool instead of at
-// omp_get_num_procs(). Candidate fix for the measured x86/ARM disagreement; off until
-// both hosts have run it.
+// omp_get_num_procs(). This was the candidate fix for the measured x86/ARM disagreement, and it
+// is now the confirmed one -- see the measurement recorded just above the constant.
 // Pool FLOOR on the row ceiling: the rule applies only where the caller's pool is at
 // least this wide. 0 disables the floor, which is today's behaviour.
 //
@@ -213,8 +213,27 @@
 #  define SCORCH_SPMM_CEIL_MINTHREADS 0L
 #endif
 
+// MEASURED on both hosts, 2026-08-28, so this is no longer "off until both hosts have run it".
+// M5, 97 matrices stratified on rows x degree, kernel timer, two replicates per dtype, six arms
+// each naming the same five knobs: inside the shipped gate the UNCAPPED rule reads 0.9272 and
+// 0.9311 on float32 (z -6.4, -6.3) and 0.9822 / 0.9779 on float64, and the CAPPED rule reads
+// 1.0025 / 1.0041 and 1.0000 / 1.0001 on the same matrices in the same runs. The cap is therefore
+// the entire ARM cost of this rule, exactly by the mechanism this comment predicted: num_procs is
+// 18 against a pool of 6 here, so uncapped the rule recruits twelve efficiency cores, and capped
+// it widens four workers to six. On x86 the cap costs nothing (1.1059 / 1.1978 against
+// 1.1125 / 1.1926).
+//
+// Default flipped to 1 on that evidence. It changes no emitted code today: `ceil_cap_pool` is
+// read only inside `if (nnz_per_thread > 0 && ...)`, and SCORCH_SPMM_NNZ_PER_THREAD ships at 0,
+// so the whole block folds away in a release build -- verified by compiling an x86_64 -O3 object
+// before and after. What it changes is that a build which turns the ceiling on gets the form that
+// is neutral on ARM, rather than the form that costs it 7%.
+//
+// The pool FLOOR below is what this makes unnecessary: an arm setting MINTHREADS=12 against a
+// pool of 6 read the A/A floor as predicted, confirming the floor reads the caller's pool, but
+// with the capped rule already neutral there is nothing left for a floor to protect.
 #ifndef SCORCH_SPMM_CEIL_CAP_POOL
-#  define SCORCH_SPMM_CEIL_CAP_POOL 0
+#  define SCORCH_SPMM_CEIL_CAP_POOL 1
 #endif
 // Output size, in multiples of the last-level cache, above which the SpMM's row
 // partition is turned off. See the measured table at the gate itself in spmm.h: the
