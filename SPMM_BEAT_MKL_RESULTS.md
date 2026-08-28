@@ -7389,3 +7389,50 @@ was what the harness tracked, so "completed, exit 0" described a shell that had 
 immediately, and a later foreground timeout killed the python still in its process group. The
 three highest bands vanished, which reads exactly like a corpus that never had them. The
 analyzer now checks its own coverage against the corpus file and refuses under 90%.
+
+### The same grid, run twice, disagrees by 12% in the one band the verdict rested on
+
+The stratified ladder ran twice by accident and the two runs are a replication. Seven of eight
+bands agree closely; the eighth is the one every version of this claim has depended on.
+
+| band | run 1 | run 2 |
+|---|---|---|
+| k=2 deg<1 | 0.9191 | 0.9314 |
+| **k=2 deg 1-2** | **1.0671  z+4.0** | **0.9409  z-5.9** |
+| k=2 deg 2-4 | 0.9333 | 0.9306 |
+| k=2 deg 4-8 | 0.9056 | 0.9032 |
+| k=3 deg<1 | 0.9097 | 0.9147 |
+| k=3 deg 1-2 | 1.0052  z+0.4 | 0.9340  z-7.1 |
+| k=3 deg 2-4 | 0.8975 | 0.8986 |
+| k=3 deg 4-8 | 0.9178 | 0.9096 |
+
+Opposite signs at z=+4.0 and z=-5.9, on the same 29 matrices, same host, same corpus, same arms.
+Both runs' A/A floors are tight and both runs' replicate arms agree with each other to under 1%
+-- the ladder's internal checks all pass in both. So the per-cell A/A floor is measuring
+something real and narrower than the quantity that actually varies here, and a z built from it
+is not a licence to believe a 6% band.
+
+**Everything else replicates, and it all says the same thing:** withdrawing the exact-width
+kernel loses in every band, from 0.90 to 0.93, at both widths. The kernel is good at low degree
+on ARM. Withdrawing it is worth about -7% to -10%.
+
+Two corrections to the record, then:
+
+* The floor does not ship on ARM at any value. Not `MINDEG=8`, not `MINDEG=1`. The section
+  above that credited `MINDEG=8` with a k=2 win is withdrawn in full -- first because its band
+  was 22/30 degree 1-2 matrices, and now because that band does not replicate.
+* The gate for the k=1 extension cannot be `MINDEG`, because `MINDEG` gates the whole exact
+  band {2,3} and those widths want no floor. Gating width 1 needs an admission threshold
+  attached to the width, which is a small code change, not a constant.
+
+What caused the disagreement is not settled and may be ordinary run-to-run drift, but there is a
+specific candidate: the two runs overlapped for about two minutes, and the corpus is ordered by
+band, so run 2's first bands were measured while run 1 was still finishing. That is a testable
+prediction about which readings moved, and it is also a hole in the harness -- redwood has
+`rw_quiet` to refuse to time while something else is timing, and the ARM host had nothing. It
+does now (`m5_quiet_run.sh`), and two clean replicates at different interleave seeds are running
+under it.
+
+The wider lesson is the one worth keeping: **a within-run null does not bound between-run
+variance.** Every gate in this ledger that rests on a single run's z, in a band of 20-30
+matrices, is weaker than its z suggests. Bands that survive should be shown to survive twice.
