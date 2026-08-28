@@ -11224,3 +11224,65 @@ board (chain24 float32), and about 6% *against* on ogbn-arxiv's GCN (chain25b, o
 moved 9%). The first is the wrong path, the third is one workload on a loose floor, and chain26b
 is the one measurement designed for the question. Nothing about the x86 default should be decided
 before it lands.
+
+## chain26b: on the x86 caller path the cap is a win too, and float64 is not
+
+362 matrices, six widths, 2172 cells per dtype, arms interleaved in a fresh random order inside
+every one of eleven repetitions, `--pad-env`, plus the duplicate-of-base A/A column. This is the
+instrument chain24's board was held for, on three times its corpus. `an_caller.py` prints
+**ship/arm, a speedup: above 1.000 means the arm is faster.**
+
+      arm       k=1     k=2     k=4     k=8    k=16    k=32     ALL      z      float32
+      cpool  1.0138  1.0236  1.0183  1.0212  1.0196  1.0340  1.0217   +7.4
+      cpoolT 1.0049  1.0195  1.0194  1.0178  1.0181  1.0368  1.0194   +6.7
+      aa     1.0013  0.9984  1.0021  0.9975  1.0001  1.0032  1.0004   +0.5
+
+      arm       k=1     k=2     k=4     k=8    k=16    k=32     ALL      z      float64
+      cpool  1.0099  1.0093  1.0098  1.0095  1.0105  1.0281  1.0128   +4.4
+      cpoolT 0.9967  1.0040  1.0071  1.0036  1.0031  1.0248  1.0065   +2.1
+      aa     0.9935  0.9988  1.0036  0.9983  0.9997  1.0053  0.9999   -0.1
+
+**float32: the candidate is 1.94% faster at z +6.7.** float64: 0.65% at z +2.1, which does not
+clear this project's |z| >= 3 bar. And the floor is not the A/A column's 0.04%: `cpool` and
+`cpoolT` are **provably the same code on x86** -- chain25b showed the threshold cannot fire here --
+and they read 0.23% apart on float32 and 0.63% apart on float64. That pair is the honest floor
+because it is two arms rather than two timings of one arm. So float32 clears its floor threefold
+and **float64 sits on it**.
+
+This supersedes chain24's null on the same question. chain24 read 0.9967 at z -1.3 from whole-run
+arms on 124 matrices, and its own analysis showed that design cannot resolve an effect below one
+position's drift, about 0.9%. The effect is 1.9%, which is why an interleaved instrument sees it
+and a positional one does not.
+
+**Against MKL, which is what the goal is measured in:**
+
+      dtype     arm      geomean MKL margin   cells below MKL   matrices below
+      float32   refb                 2.0891        121 / 2172               49
+      float32   aa (= refb)          2.0900        127 / 2172               56
+      float32   cpoolT               2.1296        111 / 2172               51
+      float64   refb                 2.1539        116 / 2172               49
+      float64   aa (= refb)          2.1536        117 / 2172               49
+      float64   cpoolT               2.1680        105 / 2172               45
+
+**Ten fewer float32 cells below MKL and eleven fewer float64**, against a same-code spread of six
+cells (float32, refb against its own duplicate) and one cell (float64). That is the first thing on
+this branch to move the below-MKL count on the caller path in the build's own terms.
+
+### The gains are largest at the widest k, and that is the clue to ogbn-arxiv
+
+`cpoolT` at k=32 is 1.0368 (float32) and 1.0248 (float64) -- the biggest column in both dtypes,
+where the A/A floor is 1.0032 and 1.0053. Fewer threads help most where the cells are largest,
+which on this corpus means nnz*k of about two million at k=32.
+
+ogbn-arxiv's GCN hidden layer is 1.16M nonzeros at k=256: **nnz*k of 297 million, two orders of
+magnitude past anything on this corpus** -- and that is the one workload the cap makes slower.
+Re-reading chain25b with the right control makes it worse rather than better: its `cpool` and
+`cpoolT` arms are the same code on x86 and agreed to **0.07%** on ogbn-arxiv (95.254 against
+95.184 ms) while `ship` sat 15.8% away at 82.196. The 9.0% PyTorch spread I used as the floor is
+a different code path's noise; the same-binary control inside our own column is two orders tighter.
+
+So the honest reading of the two runs together is: **the cap helps up to a couple of million units
+of work and costs 15.8% at three hundred million**, and the rule as written cannot tell the
+difference on x86 because its decline condition is tied to the E-core recruit, which never fires
+on a pool that is every core. That is a defect in the rule, not in either measurement, and the
+next section is the fix.
