@@ -9805,3 +9805,48 @@ does not currently know which kernel is asking.
 
 Either way this needs the autoencoder guardrail on the M5 before the cap's default moves,
 and that is now a requirement rather than a nicety. It is queued behind the additivity ladder.
+
+## stage35: the two candidates are one mechanism, and the cap subsumes the work measure
+
+The open question was whether the floored work measure is additive on top of the cap. Alone
+each is worth about +6% at k=1 on x86 and +22-25% on the ARM cells they fire, so if they
+corrected independent errors the pair would compound to roughly 1.12 and 1.53. They do not.
+
+M5, mgladder corpus, 169 matrices x 6 widths, 12 reps, interleaved random order, `--pad-env`
+so every arm sets the same number of environment variables. Per-matrix geomean on the cells
+each arm's own resolver says it fires, asked of production per arm:
+
+      k     cap-at-pool   base-work-true   both      cap-at-P-cores
+      1        1.2524         1.2227       1.2415       1.2518
+      2        1.3635         1.3734       1.3556       1.3695
+      4        1.2620         1.3027       1.2688       1.2647
+      8        1.2385         1.2469       1.2369       1.2423
+      16       1.1934          inert       1.1963       1.1929
+      64       1.0474          inert       1.0459       1.0469
+
+Both-together lands on either one alone, everywhere, and is if anything a hair below the cap
+by itself. **The two knobs are two spellings of the same defect**: the resolved worker count is
+too high on narrow products, and it does not matter whether you reach that by measuring the
+work honestly instead of flooring the width at 16, or by refusing to exceed the pool at the end.
+
+That decides which one ships, because the two are not equally general:
+
+- The floored work measure is **inert at k >= 16 by construction** (`max(k,16) == k` there), and
+  chain21 confirms it decays on x86 with width -- 1.0596 / 1.0303 / 1.0055 / 1.0088 at
+  k = 1 / 4 / 16 / 64.
+- The cap is positive at **every** width on both hosts: 1.0625 / 1.0628 / 1.0622 / 1.0456 on
+  x86, and 1.2524 / 1.3635 / 1.2620 / 1.2385 / 1.1934 / 1.0474 on ARM.
+
+So the cap dominates the work measure on both hosts at every width, and the pair buys nothing
+over the cap. The work measure is **subsumed, not rejected** -- it stays at its inert default as
+the honest expression of the same fix, and the ledger keeps it because it is the one that names
+the root cause. What ships, if anything ships, is the cap.
+
+Also confirmed here: `cap = -1` (the P-core count) and `cap = -2` (the caller's pool) agree to
+within 0.4% at every width, which they must, because on the M5 both are 6. That is an identity
+control and it read as one. The x86 grid is where they differ (8 against 24), and there the pool
+won by 25 percentage points.
+
+The inert columns are the per-arm floor: 0.999-1.007 at k <= 16 and **1.032 at k=64**, where B
+reaches 111 MB and the fresh-allocation fault path dominates the reading. Nothing at k=64 that
+is smaller than 3% is a result on this host.
