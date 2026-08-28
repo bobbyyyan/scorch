@@ -10031,3 +10031,56 @@ keeps capping there.
 So the fused grid supports "somewhere between 10M and 20M" and nothing finer. Choosing between
 those two needs the other corpus, where the cells cluster differently -- and that half is
 running.
+
+## chain24's kernel timer is unusable, and the MKL anchor does not detect why
+
+chain24 scores the cap as whole RUNS rather than interleaved arms, so it ran `base` twice. That
+control is the first thing to read, and it disqualifies most of the run.
+
+Per-matrix geomean over 124 matrices, 744 cells, float32, ratio of the first named run over the
+second:
+
+      timer            same arm, two runs        base vs cap
+      warm_base_kms      0.9726   z -8.7        0.9763   z -8.0
+      warm_base_ms       0.9775   z -7.7        0.9816   z -6.0
+      warm_plan_ms       1.0021   z +1.1        0.9972   z -1.0
+      warm_mkl_ms        1.0003   z +0.0        0.9990   z -0.2
+      cold_base_kms      0.9816   z -7.4        0.9802   z -7.2
+      cold_plan_ms       0.9920   z -2.4        0.9860   z -3.6
+
+**The control is larger than the effect.** Two runs of the same arm differ by 2.7% on the kernel
+timer at z -8.7; the cap differs from base by 2.4% at z -8.0. Nothing about the cap can be read
+off that column, in either direction.
+
+The part worth keeping is *why the run's own guard missed it*. `an_capboard.py` refuses a
+comparison when the MKL column moves more than 3%, on the reasoning that no environment variable
+of ours can touch `torch.sparse.mm` -- so if MKL moved, the run moved. Here **MKL reads 1.0003
+while our kernel timer reads 0.9726 at z -8.7.** The anchor passed a comparison that was already
+broken. MKL is a different code path with its own threading and its own dispatch, so it is a
+detector for machine-level drift and not for drift in the path being measured. A same-arm
+duplicate *of the arm being measured* is the only control that covers this, and it is cheap --
+chain24 had one only because it happened to run two reps.
+
+What survives is the caller path, and it survives because its own control is tight: `plan_ms`
+reads 1.0021 at z +1.1 between two runs of the same arm, so a reading there is a reading. On that
+column the cap is **0.9972, z -1.0 -- null.** Not a win and not a loss, on 744 cells of the board
+corpus.
+
+That is not consistent with chain21, which measured the same cap on the kernel with interleaved
+arms and read +6.3% whole-corpus. Three candidate reasons, in the order they should be checked:
+
+1. **The cap may barely fire on this corpus.** The board filters to nnz in [20000, 4e6]; chain21's
+   302 matrices were selected differently. If few board cells resolve above 24, a corpus-wide
+   1.00 is what the cap firing correctly *looks* like, and the number to report is the ratio on
+   the cells it moves, not on all 744. The firing count is a question for production, and the
+   x86 chain that asks it is queued.
+2. **Dilution.** chain21 timed the kernel; `plan_ms` times the whole `scorch.matmul` call
+   including Python dispatch. A 6% kernel gain on a call that is part dispatch is less than 6%.
+   But the residue is tens of microseconds against kernels of the same order, so this should
+   shrink 1.063 to something like 1.03, not to 1.00.
+3. **Different builds.** Two grids on this host, same matrices, have already come out 1.545x
+   apart on our own kernel because the builds differed. chain24's board build and chain21's
+   probe build are not the same tree.
+
+Until the firing count comes back, the cap's x86 value on the caller path is **unresolved**, and
+the +6.3% should not be quoted as a caller-path number. It was never measured as one.
