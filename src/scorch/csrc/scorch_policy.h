@@ -280,6 +280,13 @@
 // no measurement saying 8 is acceptable for kl02: the ceiling's 1.1109 (float32, z=3.38) and
 // 1.1542 (float64, z=3.18) were both taken at its widened count. Hence the floor, and hence the
 // knob -- the alternative composition has to be measurable, not assumed.
+// The work (nnz*k, width NOT floored at 16) at or above which the thread cap declines to
+// act when acting would disable the E-core recruit. 0 -- the default -- means the cap never
+// declines, which is what every cap measurement so far was taken with. See the block that
+// reads it in scorch_spmm_nthreads for the grid that prices it.
+#ifndef SCORCH_SPMM_RECRUIT_MIN_WORK
+#define SCORCH_SPMM_RECRUIT_MIN_WORK 0L
+#endif
 #ifndef SCORCH_SPMM_NT_CAP_FLOOR_CEIL
 #  define SCORCH_SPMM_NT_CAP_FLOOR_CEIL 1
 #endif
@@ -1122,6 +1129,44 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // RAISE the effective cap, and only on cells where the ceiling fired -- so with the ceiling
     // off, which is the default, ceil_request is 0 and this is exactly the plain cap.
     if (floor_ceil && ceil_request > nt_cap) nt_cap = ceil_request;
+    // DECLINE the cap where it would disable a recruit worth having.
+    //
+    // Two SpMM kernels -- the drop-in spmm_csr_v2_core and the fused
+    // spmm_csr_linear_fused_float -- launch their own omp team instead of using
+    // at::parallel_for when the resolved count reaches twice the caller's pool, to reach
+    // cores the pool excludes (on Apple silicon torch's pool is the 6 P-cores and the 12
+    // E-cores sit idle). Capping the count at the pool makes `nthreads >= 2 * pool`
+    // unsatisfiable, so it does not merely lower a thread count: it routes those kernels
+    // back onto the pool permanently.
+    //
+    // That is worth having or not having depending on the WORK, which the count test cannot
+    // see. On the autoencoder grid (84 layers, 7 configs, 3 sparsities, batch 256) the ratio
+    // of pool-launch over team-launch by work is
+    //
+    //       nnz*k  <10M   10-20M   20-40M   40-80M   >80M
+    //       ratio  1.192   0.962    0.770    0.632   0.458
+    //
+    // -- the team is worth 2.18x on the largest bucket and costs 19% on the smallest, and the
+    // crossing is between ten and twenty million. So: cap freely when no recruit is at stake,
+    // and when one is, cap only below the threshold.
+    //
+    // On an all-physical-cores pool no recruit is EVER at stake (x86: pool 24, gate at 48,
+    // count at most 32), so this condition cannot fire there and the cap stays unconditional
+    // -- which is what the x86 grid measured, +6% at every width. The threshold is therefore
+    // a hybrid-pool rule that is structurally inert on a uniform one, not a second policy.
+    long recruit_min_work = SCORCH_SPMM_RECRUIT_MIN_WORK;
+#ifdef SCORCH_TUNE_HOOKS
+    { const char* e = std::getenv("SCORCH_SPMM_RECRUIT_MIN_WORK");
+      if (e && *e) recruit_min_work = std::atol(e); }
+#endif
+    if (recruit_min_work > 0 && work_true >= recruit_min_work) {
+      // The pool the launch site reads is at::get_num_threads(), which is what the caller
+      // passes as the override; and the recruit branch is reachable only when it did pass
+      // one (use_atparallel requires nthreads_override > 0).
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_max_threads();
+      if ((long)nthreads >= 2 * pool) nt_cap = 0;   // 0 means "no cap", below
+    }
     if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
   }
 #endif
