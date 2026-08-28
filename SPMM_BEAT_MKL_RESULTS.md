@@ -11487,3 +11487,88 @@ The group numbers above are the reportable form of the same data, and they say t
 what causes it.** Which puts the row ceiling's bound ladder -- chain53, which ladders the row bound
 over {128..2048} and was priced at 32 of 75 losers covered at 512 -- squarely on the largest
 identified group rather than on a guess.
+
+## stage41: compiled in and hookless, the candidate reads 6.1% on the ARM caller path -- float32 only
+
+Three hookless builds of the branch tip -- `ship`, `cand` with both constants compiled in, and
+`ctrl`, a second build of `ship` with identical flags -- rotating within each of seven 25-matrix
+slices, each slice run forwards and then backwards so position cancels, timed with cprobe on the
+caller path. 169 matrices, six widths, 1014 cells. Ratios are ship/arm, so above 1.000 means the
+arm is faster.
+
+The two build assertions passed first: `ctrl` and `ship` differ on **zero** instruction lines, so
+the build is reproducible, and `cand` differs on 67199 -- which is mostly branch-target
+relocation, since the object grew by 401 instruction lines (0.24%) and every branch after the
+insertion point re-encodes. The guard's threshold is satisfied trivially and its magnitude is not
+a measure of change size.
+
+      float32                      whole call   >10% slower
+      ctrl / ship  (the floor)         1.0023          1.0%
+      cand / ship  (the change)       1.0609          2.6%
+      cand / ctrl  (the other side)   1.0585          2.9%
+      reference agreement across the three processes: 1.0148, worst 1.179x
+
+      by k    1       2       4       8      16      64
+      cand  1.0529  1.0810  1.0613  1.0484  1.0402  1.0825
+      floor 0.9998  1.0068  0.9951  1.0047  1.0029  1.0045
+
+**Compiled in, the candidate is 6.1% faster on the ARM caller path, against a 0.23% floor, and
+positive at every one of six widths.** That is nearly double the 3.3% the environment arms read
+inside one hooked build. Both instruments agree on sign and both clear their floors; the hookless
+number is the one that describes what would ship, and I do not have an account of the gap that I
+would defend -- the padded env counts mean the getenv charge should be in both arms.
+
+**The win is concentrated.** Per slice of 25 matrices the effect runs 1.0093, 1.0219, 1.0259,
+1.0268, 1.0459, 1.1153, **1.2392**, with the floor between 0.9960 and 1.0087 in every one of them.
+So the pooled 6.1% is one or two slices carrying most of it, which is the same shape as the x86
+board's 33 large-work cells carrying 19%.
+
+### float64 is not readable from this run
+
+      float64                      whole call   >10% slower
+      ctrl / ship  (the floor)        0.9779         12.2%
+      cand / ship  (the change)       1.0146         15.9%
+      reference agreement across the three processes: 1.0473, worst 1.588x
+
+**The floor is 2.2% off 1.000 and the effect is 1.5%, so the effect is inside its own control.**
+Per slice the float64 floor runs 0.9791, 0.9837, 0.9881, 0.9958, 0.9681, 1.0262 and **0.8871**,
+and the effect runs from **0.8351** to **1.1946**. A comparison whose same-code control moves 11%
+in one slice and whose effect changes sign across slices is not a measurement of anything. The
+analyzer did not refuse because its limits are 15% of cells and a 1.10 reference spread, and this
+run sits just inside both -- which means those limits are too loose and should be tightened before
+they pass something worse.
+
+### On the disturbance I caused, which turned out not to be the cause
+
+I ran two throwaway analyses on this host at 12:20-12:21, while float64 slice 3 was timing -- about
+three seconds of single-core work during a slice that takes 45 seconds per build. That is the
+discipline this project puts in `rw_quiet` and I broke it. Checked rather than assumed:
+
+      float64 slice 3, the disturbed one:  floor 0.9791   effect 0.9725
+      pooled with slice 3 excluded:        floor 0.9777   effect 1.0221
+      pooled with it included:             floor 0.9779   effect 1.0146
+      the worst slice, which I did not touch (slice 6): floor 0.8871
+
+**The disturbance is not detectable and is not what makes float64 unreadable.** Slice 3's floor is
+the fourth-worst of seven, dropping it moves the pooled floor by 0.0002, and the worst slice by a
+wide margin is one that ran before I touched anything. The float64 problem is that its cells are
+about twice as long as float32's and this host drifts over a seventeen-minute run. That does not
+make running analyses during a timing run acceptable; it means this particular run survived it.
+
+### What is left before the defaults can be flipped
+
+      gate                                              state
+      ARM caller path, hookless, compiled in            float32 +6.1% (float64 not readable)
+      ARM real autoencoder                              +12.3% fused, +9.4% plain, 8 of 9 cells
+      ARM GCN guardrail                                 8 of 8 inside the same-code control
+      ARM correctness, compiled in                      1099 passed, 48 skipped
+      x86 caller path, hooked, env arms                 float32 +1.94% z +6.7, float64 on the floor
+      x86 large-work cells                              +18.7% f32, +15.1% f64
+      x86 below-MKL count                               121 -> 111 f32, 116 -> 105 f64
+      x86 GCN guardrail                                 9 of 10 inside control; ogbn-arxiv open
+      x86 caller path, hookless, compiled in            NOT MEASURED
+      x86 correctness, compiled in                      NOT MEASURED
+      ARM float64, readable                             NOT MEASURED
+
+The last three are the gates, and two of them are the x86 half of exactly this stage. Queued as
+chain32. ogbn-arxiv is chain31.
