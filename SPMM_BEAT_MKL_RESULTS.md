@@ -11338,3 +11338,54 @@ rule ships decoupled on both hosts and the per-architecture split floated earlie
 If it fixes ogbn-arxiv and loses the board gain, the honest outcome is that the cap is a
 small-work optimisation with a narrow band and probably not worth a policy. If it does neither,
 the cap does not ship.
+
+## Retracted before it ran: the cap's biggest win IS the large-work cells
+
+The section above proposed decoupling the cap's decline from the E-core recruit, on the mechanism
+that "the cap helps small work and costs very large work". chain26b's own data refutes it, and the
+check cost nothing -- both columns were already measured on the same cells.
+
+Splitting chain26b's 2172 cells at the rule's own threshold, with the A/A arm recomputed on each
+subset so the floor belongs to the subset (ship/arm, so above 1.000 means the arm is faster):
+
+      dtype     band          n      cpoolT    cpool      aa    median us
+      float32   below 10M   2139     1.0170   1.0192  1.0007         14.0
+      float32   10M - 30M     28     1.1887   1.1984  0.9831         82.0
+      float32   30M and up     5     1.1796   1.2061  0.9981        149.6
+      float64   below 10M   2139     1.0045   1.0106  0.9998         14.9
+      float64   10M - 30M     28     1.1559   1.1714  1.0016        137.9
+      float64   30M and up     5     1.1216   1.1337  1.0011        284.1
+
+**On the large-work cells the cap is 18.7% and 15.1% faster, not slower** -- against floors of
+1.5% and 0.2% on those same cells, in both dtypes, monotonically in the same direction at both
+work bands. The 1.94% pooled figure is a dilution: 33 cells of 2172 carry a 19% win and the other
+2139 carry 1.7%.
+
+So the mechanism was backwards. Capping at the caller's pool on this host drops 32 threads to 24,
+and the threads it drops are the ones that help least when the kernel is bandwidth-bound and
+largest -- which is exactly where the cap pays most. Synthesizing the decoupled arm from the two
+measured columns (cpoolT below the threshold, refb at or above it, in-sample) gives 1.0167 against
+cpoolT's 1.0194 pooled, so decoupling looks nearly free **only because it would give away 19% on
+1.5% of the cells**. That is the opposite of an improvement.
+
+`SCORCH_SPMM_CAP_DECLINE_NEEDS_RECRUIT` is reverted out of the tree. A knob whose motivating
+mechanism is refuted should not land, even default-off, and the pre-registered predictions in the
+section above are void -- the one that would have "confirmed" it (board corpus keeping most of the
+gain) was satisfied in synthesis, which is a good illustration of why a pooled number is a poor
+test of a rule about a tail.
+
+### Which leaves ogbn-arxiv needing a different explanation, and drift is now the leading one
+
+If the cap helps monotonically with work on 362 matrices, ogbn-arxiv's 15.8% at 297 million units
+of work is not "the cap costs at large work". The likelier reading is the one I talked myself out
+of: **drift**. The GCN harness takes the minimum across three passes per arm, and the bench's
+PyTorch column -- same code in every arm -- spread 9.0% across those passes on that dataset. If
+`ship`'s minimum happened to land in the fast pass and both other arms' minima in slow ones, the
+result is exactly what was observed, including the 0.07% agreement between `cpool` and `cpoolT`:
+two arms whose minima come from the same pass agree to the pass, not to the code.
+
+That is a testable statement, and it is what chain31 now is -- ten passes instead of three, and a
+`shipB` arm that is a second copy of `ship` with identical padding, so the floor comes from our own
+binary on the same dataset rather than from PyTorch's. The `cpoolW` arm is gone with the
+hypothesis. Nothing else about the candidate changes: on x86 the threshold cannot fire, so the
+shipped rule is the bare cap, and the bare cap is 1.92% pooled and 19.96% on the large cells.
