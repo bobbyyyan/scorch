@@ -7487,3 +7487,46 @@ prediction is that chain43 finds depth and prefetch neutral and rejects them, an
 arms measured cold are where the effect lives. That is exactly how the non-temporal store
 experiment went wrong in the other direction, and it is why "prefetch refuted" in the narrow-k
 chunk work does not settle this: that was a warm measurement too.
+
+### chain51: the two levers aimed at cold, measured cold for the first time
+
+Queued behind chain50. `cold_probe2.py` is a sibling of `cold_probe.py` -- not an edit of it,
+because queued chains depend on that file -- taking arbitrary arms in kprobe's syntax and
+putting every arm through the caller path, `scorch.matmul(A_st, B)` with no `time_dict`, so the
+plan cache serves repeats the way a caller reaches it and the MKL column is not carrying a
+handicap no caller pays. There is no kernel timer, by construction: asking for one is what
+disables the path being measured.
+
+Arms, on the scoreboard's own corpus and widths (`final_groups.csv`, k in 1..32, both dtypes):
+
+| arm | MULTIROW | NARROWK_UNROLL | UNROLL_PF |
+|---|---|---|---|
+| ship, shipb | 0 | 0 | 1 |
+| mr2, mr4 | 2, 4 | 0 | 1 |
+| s4, s8 | 0 | 4, 8 | 1 |
+| s4np | 0 | 4 | **0** |
+
+`s4np` exists because the source says depth and prefetch have never been separated: the run that
+rejected stream depth used the deep kernel with no prefetch at all, while the shipped 2-deep
+kernel carries one, so its harmed tail could have been either change.
+
+Two things the probe does that the finding above needs:
+
+* **Every arm must state every variable any arm sets, and it refuses otherwise.** Padding an
+  unset variable to "0" is a guess at a shipped default, and `SCORCH_NARROWK_UNROLL_PF` ships at
+  **1** -- padding would have silently turned prefetch off in every arm that never asked about
+  prefetch, which is the arm `s4np` is deliberately spending a slot to measure.
+* **It records the median warm time as well as the min.** The cold finding is a statement about
+  the cold/warm ratio, and cold is a median over flushed single calls while warm is a min over
+  batches. That asymmetry inflates the ratio for whichever side has noisier warm timings, so
+  1.315 could in principle be an estimator artifact rather than a property of the kernel. The
+  monotone trend in k argues against that -- the estimator does not change with k -- but arguing
+  is not measuring, and with both statistics recorded the analyzer prints the degradation both
+  ways and the question is closed rather than reasoned about.
+
+`narrow_k` is `B1_size <= 4*SL`, so 32 on AVX2 float32 and 16 on float64: the levers reach the
+widths where the gap is worst on float32, and k=32 is a free structural null on float64.
+
+Verdict rule, fixed before the run: this is the hooked build, so the MKL columns read about 1.5x
+pessimistic and the decision is arm-vs-arm cold against the `aa` floor. A lever that wins cold
+earns a hookless compiled-in confirm against MKL. It does not earn a ship.
