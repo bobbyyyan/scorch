@@ -274,6 +274,30 @@
 #  define SCORCH_NARROWK_EXACT_MINDEG 0L
 #endif
 
+// Width 1 in the exact-width narrow-k band, and the mean degree it is admitted at.
+//
+// The band {2,3} replaces a register-block tile kernel whose mask wastes 6 lanes of 8 under
+// AVX2 and 2 of 4 under NEON. Width 1 replaces something else -- a loop carrying a single
+// accumulator, which no mask width describes -- so it is a different trade and gets its own
+// admission rather than inheriting the band's floor. On ARM float32, lowering the band floor
+// to 1 is worth 1.0243, 1.0460 and 1.1174 at mean degree 8-64, 64-256 and >=256, and costs
+// 6.8% below degree 8 (z-3.1 over 32 matrices), so the win is conditional on degree.
+//
+// The conditioning cannot be expressed with SCORCH_NARROWK_EXACT_MINDEG, which gates the whole
+// band: widths 2 and 3 measure 0.90-0.93 under every floor value tried, in every degree band,
+// on two independent runs. Hence a second constant rather than a reused one.
+//
+// 0 disables width 1 entirely, which is what ships.
+#ifndef SCORCH_NARROWK_EXACT_K1
+#  define SCORCH_NARROWK_EXACT_K1 0
+#endif
+
+// Minimum mean degree (nonzeros per row) for width 1, when the above is enabled.
+// 0 admits it at any degree, which the ARM grid says is a loss below degree 8.
+#ifndef SCORCH_NARROWK_EXACT_K1_MINDEG
+#  define SCORCH_NARROWK_EXACT_K1_MINDEG 0L
+#endif
+
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL 0
 #endif

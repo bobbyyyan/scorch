@@ -3775,7 +3775,8 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_exact = SCORCH_NARROWK_EXACT_UNROLL;
   // Float k=1 is the one width where two kernel families compete: the nonzero-axis
   // gather kernel owns it by default and measures better there.
-  bool narrowk_exact_k1 = false;
+  bool narrowk_exact_k1 = SCORCH_NARROWK_EXACT_K1 != 0;
+  long narrowk_exact_k1_mindeg = SCORCH_NARROWK_EXACT_K1_MINDEG;
   // Whether the unroll depth is reduced on rows too short to fill it. The kernel's
   // prologue is UNROLL*K zero stores and its epilogue is (UNROLL-1)*K adds, both paid
   // per row whatever the row's length, so a row of one nonzero at K=4 and UNROLL=4 does
@@ -3822,6 +3823,8 @@ torch::Tensor spmm_csr_v2_core(
       if (v == 0 || v == 2 || v == 4 || v == 8) narrowk_exact = (int)v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_K1");
     if (e && *e) narrowk_exact_k1 = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_K1_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_k1_mindeg = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_SHORT");
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL");
@@ -3854,7 +3857,15 @@ torch::Tensor spmm_csr_v2_core(
     int exact_hi_ = narrowk_exact_hi;
     const int exact_cap_ = exact_f32_ ? 7 : 3;
     if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
-    const int exact_lo_ = narrowk_exact_k1 ? 1 : 2;
+    // Width 1 is admitted on its own mean degree, not on the band's floor. In a build
+    // without hooks and with the shipped SCORCH_NARROWK_EXACT_K1 of 0 the whole block is
+    // dead and exact_lo_ folds to 2, so emission is unchanged.
+    int exact_lo_ = 2;
+    if (narrowk_exact_k1) {
+      const long mean_deg_k1_ = A0_size > 0 ? nnz_total / (long)A0_size : 0;
+      if (narrowk_exact_k1_mindeg <= 0 || mean_deg_k1_ >= narrowk_exact_k1_mindeg)
+        exact_lo_ = 1;
+    }
     if (B1_size >= exact_lo_ && B1_size <= exact_hi_) exact_width = B1_size;
     // ... but not on a matrix with fewer nonzeros than rows. The exact-width loop's per-row
     // setup has nothing to amortise there: over the pinned corpus at mean degree below 1 the
@@ -3864,6 +3875,20 @@ torch::Tensor spmm_csr_v2_core(
     // bips07_3078_iv at k=2 and k=4 (0.891, 0.887), sts4098_b, as-735. Every one has fewer
     // nonzeros than rows. Above degree 1 the kernel reads 1.37 (degree 1-2) and 1.86
     // (degree 2-4), so a floor at one nonzero per row cannot fire on anything it would cost.
+    //
+    // That measurement is x86. On ARM the floor is wrong at every value. A ladder of
+    // MINDEG in {1,2,4,8} over a corpus stratified on degree -- 29/28/48/24 matrices at
+    // deg<1, 1-2, 2-4, 4-8 -- has withdrawing the kernel losing in every band at both
+    // widths it serves: 0.919 and 0.907 below degree 1, 0.933 and 0.898 at 2-4, 0.906 and
+    // 0.918 at 4-8, against a floor of 1.000 +/- 0.01. Only degree 1-2 read as a win, and it
+    // did not replicate -- two runs of the same grid on the same matrices gave 1.0671 (z+4.0)
+    // and 0.9409 (z-5.9), which is also the reason no z in this comment is quoted from one run.
+    //
+    // The plausible reason the hosts disagree is what the kernel displaces: the register-block
+    // tile it replaces wastes 6 lanes of 8 at k=2 under AVX2 and only 2 of 4 under NEON, so
+    // there is far less for the exact-width loop to win back on ARM and its per-row setup is
+    // not amortised. Either way the constant stays 0 and this is host-conditional, so a value
+    // chosen on one host must not be compiled in for both.
     if (exact_width && narrowk_exact_mindeg > 0 &&
         nnz_total < narrowk_exact_mindeg * (long)A0_size)
       exact_width = 0;

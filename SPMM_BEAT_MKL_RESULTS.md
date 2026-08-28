@@ -7436,3 +7436,54 @@ under it.
 The wider lesson is the one worth keeping: **a within-run null does not bound between-run
 variance.** Every gate in this ledger that rests on a single run's z, in a band of 20-30
 matrices, is weaker than its z suggests. Bands that survive should be shown to survive twice.
+
+## Cold is a separate defect, it is the largest one left, and it grows with the width of B
+
+No new measurement for this -- the definitive scoreboard already holds both states for both
+implementations on every cell, and cold degradation is a paired quantity nobody had formed:
+
+    D_s = cold_plan_ms / warm_plan_ms      what going cold costs US
+    D_m = cold_mkl_ms  / warm_mkl_ms       what it costs MKL
+
+|  | ours | MKL | ratio |
+|---|---|---|---|
+| float32, 744 cells | 6.077 | 4.623 | **1.315** |
+| float64, 744 cells | 6.086 | 4.491 | **1.355** |
+
+We lose about a third more than MKL does when the caches are cold. Since `cold_probe` streams a
+192 MB buffer and then times one call with the plan cache live, this is not dispatch, planning,
+or first-call setup -- it is memory behaviour in the kernel.
+
+The shape of it is the informative part. Ours is flat in k and MKL's falls:
+
+| k | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| our cold/warm, f32 | 6.21 | 6.29 | 5.95 | 6.29 | 6.36 | 5.42 |
+| MKL cold/warm, f32 | 5.56 | 5.19 | 5.13 | 4.59 | 4.10 | 3.51 |
+| ratio | 1.117 | 1.211 | 1.159 | 1.371 | 1.553 | 1.545 |
+
+At k=1 we degrade almost exactly like MKL. By k=16 we degrade half again as much. MKL's cold
+penalty **falls** as B widens, which is what a kernel with enough outstanding misses to overlap
+them looks like: the per-nonzero cost of pulling a row of B in is amortised over more useful
+arithmetic as k grows. Ours does not fall at all, so our cold time is growing in proportion to
+k -- we are paying the full latency of each row of B, at every width, without overlapping.
+
+**How much is at stake.** Of the 162 float32 cells below MKL cold, 116 are above MKL warm and
+lose only when cold; float64 is 79 of 105. So 195 of the 267 cold losing cells are attributable
+to this gap and nothing else. That is a larger bucket than the k=1 and k=4 warm deficits
+combined, and it had no lever aimed at it.
+
+One honest qualification about the counterfactual: "if our degradation matched MKL's per cell,
+46 of 162 would still lose" is an algebraic identity, not an independent estimate -- substituting
+MKL's ratio for ours reduces the comparison to the warm one, so the answer is the warm loser
+count by construction. It is the right statement of what closing the gap would buy, but it is not
+evidence that the gap can be closed.
+
+**What this predicts about the queue, and it is a correction to the plan.** chain43 is depth x
+prefetch. Unroll depth and software prefetch are precisely the mechanisms that raise the number
+of outstanding misses, so they are cold levers. chain43 measures with kprobe, which is warm --
+where extra memory-level parallelism has nothing to overlap because B is already resident. The
+prediction is that chain43 finds depth and prefetch neutral and rejects them, and that the same
+arms measured cold are where the effect lives. That is exactly how the non-temporal store
+experiment went wrong in the other direction, and it is why "prefetch refuted" in the narrow-k
+chunk work does not settle this: that was a warm measurement too.
