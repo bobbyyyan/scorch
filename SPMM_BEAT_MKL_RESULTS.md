@@ -7018,3 +7018,30 @@ which is a kernel change, and both of which sit outside where the losses are.
 
 Recorded as a negative result so this is not re-investigated: the cold output cost is real, it
 is not a missing memset optimisation, and it is not the reason any cell is below MKL.
+
+### What extending the exact band to k=4 would cost on each dtype
+
+Read from the dispatch rather than inferred from `exact_cap_`:
+
+    if constexpr (std::is_same<scalar_t, float>::value) {
+      switch (exact_width) { case 1..6; default: 7; }     // serves 1..7
+    } else {
+      switch (exact_width) { case 1, 2;  default: 3; }    // serves 1..3
+    }
+
+So **float32 k=4 is already instantiated** -- chain49 can test it with nothing but the
+`SCORCH_NARROWK_EXACT_HI` hook, which is why that grid is cheap. **float64 stops at 3**, and
+`exact_cap_ = exact_f32_ ? 7 : 3` matches the switch exactly, so raising HI alone cannot reach
+float64 k=4; the arm is correctly a null there rather than silently clamped to something else.
+
+Extending float64 would need `case 3:` written out, `case 4:` added, and the cap raised -- three
+lines, since `scorch_spmm_row_narrow_exact<double, K, UNROLL>` is already generic in the scalar
+type. The register accounting is the same borderline case as float32: UNROLL*K at k=4 is 16
+accumulators against 16 architectural registers, which is why chain49 carries `ex4a` with the
+unroll halved to 8.
+
+That sets up the follow-up cleanly: if `ex4` wins on float32, adding the two double
+instantiations and re-measuring is what addresses float64 k=4's 23 warm and 24 cold losing
+cells. If `ex4` loses on float32, the double work is not worth doing and the k=4 problem belongs
+to the half-vector kernel, multi-row, or deep unroll instead -- all three of which are already
+queued against that width.
