@@ -9354,3 +9354,31 @@ be pursued separately.
 
 This needs x86 confirmation before anything changes: chain23 is staged for it. Two hosts
 have disagreed about thread counts before, and this is a two-host claim or it is nothing.
+
+### The ceiling/cap conflict is x86-only, and the first check of that was wrong
+
+stage31 was queued to measure the composition on the M5 and refused at its own instrument
+check, which is what the check is for. It printed `kl02 at k=2: off 4, ceiling 6, cap 4,
+both 6` and failed the assertion that the cap bounds the combination -- correctly, because
+that assertion encoded a misunderstanding of mine, not a defect in the code.
+
+I then asked whether the conflict can occur on this host by resolving every cell with the
+ceiling enabled and counting how many land above the cap. 212 of 845 did, up to 18, and I
+briefly took that as "the conflict occurs here too". That query was wrong: it reads the
+*resolved count* with the ceiling enabled, which includes the row-proxy raise and the
+composition adoption, and neither of those is the ceiling's request. The composition floor
+only ever protects `by_nnz`.
+
+The right question is whether the floor changes anything, and the knob exists to ask it
+directly. Over the same 845 cells, comparing the count with `SCORCH_SPMM_NT_CAP_FLOOR_CEIL`
+at 1 and at 0, with the ceiling and the cap both on: **zero cells differ.**
+
+The reason is structural. `SCORCH_SPMM_CEIL_CAP_POOL` is 1, so the ceiling's request is
+capped at the caller's pool, which on this host is 6 -- the same number as the P-core count,
+so the cap can never cut it. On redwood the pool is 24 and the P-core count is 8, so the
+ceiling can ask for up to 24 and the cap would cut it to 8. The conflict is x86-only, and
+the crossed grid belongs there.
+
+It is also now a lower priority. If what ships is base-work-true rather than the cap, the
+conflict does not arise at all: base-work-true corrects the base bound and leaves the
+ceiling's raise to apply after it.
