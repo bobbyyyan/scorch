@@ -5054,3 +5054,40 @@ mostly-empty matrices, and the AVX2 one is not. That is measured arm-variance wi
 quantity behind it — not a pool size, not a cache size, just two different kernels. **The
 decision waits on the x86 arm of the same grid**, which is the like-for-like counterpart of
 this table; the offline x86 evidence conflated the floor with the row partition.
+
+## The decision refactor is not byte-identical, and the per-symbol reading is why that is fine
+
+Moving the row-handout rule into `scorch_spmm_partition_mode()` changed the emitted binary:
+70125 → 70193 instructions across every symbol whose name contains "spmm", 838 differing
+lines. A flattened diff cannot say whether that is the inner loop or the call setup, because
+a register renumbering in a prologue propagates through the whole function — here the
+differing window is 91% of the entry symbol even though the streams re-sync in opcode terms.
+
+Split by symbol, on both ISAs (x86 by cross-compiling the pinned pre- and post-refactor
+headers for `x86_64` with the shipping defines and disassembling the objects):
+
+| | ARM | x86 |
+|---|---|---|
+| spmm symbols | 220 → 221 | 78 → 78 |
+| **identical** | **218** | **76** |
+| differing | 2 | 2 |
+| new | 1 (`scorch_spmm_partition_mode`, 74 insn) | 0 |
+
+**The arithmetic loops are byte-identical.** On x86 the row lambda is 7325 instructions with
+966 fused-multiply/multiply ops (float) and 3653 with 550 (double); the NEON register-tile
+kernel is 1672 with 315; the fused Linear kernel is 1256. Every one of them is unchanged. On
+ARM the outlined loop bodies are 8680 and 12937 instructions with 1463 and 2266 float ops —
+unchanged, including all 1499 and 2166 memory operations.
+
+**The only changed symbol is the once-per-call entry function**, which carries two
+multiply/add instructions in total, i.e. no arithmetic. It got *shorter*: 944 → 936 (f32) and
+942 → 934 (f64) on x86 with memory-operand instructions 321 → 313 and 318 → 311, and 947 →
+943 and 944 → 940 on ARM with 283 → 280 memory ops. It trades a load, a store, two sign
+extensions and two branches for a compare and two conditional selects.
+
+The new ARM-only symbol is an out-of-line copy of the decision, which exists **because it is
+exported** — the x86 object, which does not export it, has no such symbol and no extra
+instructions, which confirms the attribution.
+
+So the waiver is not "trust me, it should inline": the loops are the same bytes, the setup is
+strictly smaller, and no memory operation was added anywhere. No runtime A/B is owed.
