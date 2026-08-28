@@ -11286,3 +11286,55 @@ of work and costs 15.8% at three hundred million**, and the rule as written cann
 difference on x86 because its decline condition is tied to the E-core recruit, which never fires
 on a pool that is every core. That is a defect in the rule, not in either measurement, and the
 next section is the fix.
+
+## The fix: decouple the decline from the recruit, and what it is predicted to read
+
+The rule as written is "cap the resolved count at the caller's pool, but decline to cap when
+capping would disable the E-core recruit and the work clears ten million". The decline condition
+is `nthreads >= 2 * pool`, which is the recruit's own gate. On a pool that is every core it is
+unsatisfiable, so on x86 the rule reduces to the bare cap at every size -- 1.94% faster up to
+about two million units of work on the board corpus, and 15.8% slower at 297 million on
+ogbn-arxiv's GCN hidden layer.
+
+**The coupling is the defect.** The cap should stand down when the threads above the pool are
+doing useful work. A recruit is one reason they might be; large work is the general reason, and
+the recruit was a special case of it that happened to be the case the M5 exhibits. Tying the
+condition to the recruit made the rule structurally silent on exactly the host where the pool is
+wide, which is the host where the cap can give away the most.
+
+The decoupled form is one constant, `SCORCH_SPMM_CAP_DECLINE_NEEDS_RECRUIT`, defaulting to 1 --
+the coupled behaviour every measurement so far was taken with -- and set to 0 to make the decline
+a statement about the work alone. Written that way rather than by editing the condition because
+both forms then live in one binary and can be interleaved as arms, and because at the shipped
+default (`SCORCH_SPMM_RECRUIT_MIN_WORK` still 0) the whole block folds away and emission cannot
+change.
+
+### Pre-registered, before chain31 runs
+
+Writing the predictions down first, because "the decoupling fixed ogbn-arxiv" is the kind of
+claim that is easy to find in a table after the fact.
+
+* **ogbn-arxiv, `cpoolW` against `ship`: predicted 1.00 within the floor.** The hidden layer's
+  work is 597 million, 60x the threshold, so the decline must fire and the arm must be the shipped
+  code. Anything above about 1.02 means the decline is not firing on the layer that matters, and
+  the instrument asserts are there to catch that before the timing runs.
+* **ogbn-arxiv, `cpoolT` against `ship`: predicted about 1.16**, reproducing chain25b on ten
+  passes instead of three, with `shipB` supplying a floor from our own binary rather than
+  PyTorch's. If it comes back inside the floor then chain25b's 15.8% was drift after all and the
+  whole decoupling is unmotivated -- that is the outcome that would retire this section.
+* **Board corpus, `cpoolW` against `refb`: predicted 1.01 to 1.02, i.e. keeping most of
+  `cpoolT`'s 1.0194.** Only 17 of 744 cells on the 124-matrix version clear ten million, so the
+  decline should change very few cells. **If `cpoolW` gives up more than half the gain, the
+  threshold is in the wrong place** and the right answer is a higher one rather than a decoupling:
+  the two hypotheses are distinguishable because they predict different amounts of the 1.94%
+  surviving.
+* **ARM: predicted no change at all.** On the M5 every cell whose work clears ten million also
+  resolves at or above twice its pool, so the two forms should be behaviourally identical there.
+  This is a prediction about the M5's ceilings, not a theorem, and stage42 will check it against
+  the same corpus stage38 used.
+
+Failure modes worth naming now: if `cpoolW` fixes ogbn-arxiv **and** keeps the board gain, the
+rule ships decoupled on both hosts and the per-architecture split floated earlier is unnecessary.
+If it fixes ogbn-arxiv and loses the board gain, the honest outcome is that the cap is a
+small-work optimisation with a narrow band and probably not worth a policy. If it does neither,
+the cap does not ship.
