@@ -5179,6 +5179,9 @@ Float64's joint fit is not trustworthy — dropping the 50000-row shape flips th
 per-row difference (1.373 vs 1.512 ns) — and it under-predicts the observed gap fivefold. Only
 the float32 coefficient is established.
 
+**Retracted: the per-row coefficient is not identifiable from this design.** See the
+section at the end of this file. The rest of this section is kept for the record.
+
 **The fit was at k = 4, so this is the register-block kernel's per-row cost, not the
 exact-width kernel's** — the exact-width kernel takes only k ∈ {2, 3}, and the degree-floor
 grid confirms it by moving k = 2 and k = 3 while leaving k = 4 at 0.9925. That kills the first
@@ -5250,3 +5253,43 @@ monotone ordering by how long the kernel runs, which is what a fixed per-call ch
 like. So the instrumented build's resolution floor is not one number: it is ~3.5% on the
 shortest kernels in this corpus and ~1% on the longest. Any effect smaller than that is not
 decidable in a hooked build, which is why three of this session's four knobs came back nil.
+
+
+## Retraction: the residual is per-NONZERO, not per-row
+
+The per-row reading above does not survive being asked twice. Refitting
+`time = fixed + per_row*rows + per_nnz*nnz` at k = 4 over the same 48 cells, the only thing
+that decides the sign of the per-row difference is whether the 50000-row shape is in the fit:
+
+| float32, k=4 | fixed (µs) | ns/row | ns/nnz | R² |
+|---|---|---|---|---|
+| all shapes — scorch | 6.19 | **−0.167** | 0.1750 | 0.996 |
+| all shapes — MKL | 6.63 | 0.215 | 0.1615 | 0.992 |
+| without the 50000-row shape — scorch | 8.54 | **+1.156** | 0.0605 | 0.637 |
+| without the 50000-row shape — MKL | 10.47 | 0.015 | 0.0490 | 0.498 |
+
+The per-row difference is −0.382 ns one way and +1.140 ns the other, and R² falls from 0.996
+to 0.637 when the leverage point comes out — so within the small shapes the linear model
+explains almost nothing and the big shape is supplying all of the apparent fit. Float64 does
+the same thing (−0.666 against +0.158). The earlier note had already recorded this for float64
+and treated float32's coefficient as established; it is not. The 1.162 ns figure was a choice
+of shapes, and its "out-of-sample" prediction of 0.55 µs against a 0.72 µs observed gap sits
+inside the model's own ±0.6 µs spread, so it was never a confirmation.
+
+**What is robust to the shape selection is the per-nonzero term.** On float32 we cost more per
+nonzero than MKL in both fits — 0.0605 against 0.0490 and 0.1750 against 0.1615, 8–23% — while
+our *fixed* cost is lower in both (8.54 against 10.47, 6.19 against 6.63). That agrees with the
+production scoreboard, where the non-kernel cost is −2.4 µs, i.e. already in our favour.
+
+And a per-nonzero deficit at k = 4 float32 has a mechanism in the source rather than in a
+regression. The width lands on `scorch_spmm_row_regblock<float, NVEC=1, FULL_LAST=false>`, whose
+inner loop issues `_mm256_maskload_ps` for **every nonzero**, using 4 lanes of 8. So each
+nonzero pays a masked 256-bit load instead of a plain one and throws away half the FMA width.
+`scorch_simd<T>` has no 128-bit form, so there is currently no way to express "four floats,
+full width, no mask" — which is exactly what k = 4 is.
+
+That also explains the per-width shape of the exact-width kernel's own result without appealing
+to the aligned load: it wins 6–8% at k = 2 and k = 3 because a scalar loop has no mask either,
+and it loses from k = 5 up because there the mask is over half full and `UNROLL*K` accumulators
+begin to spill. At k = 4 neither kernel is the right one — the scalar loop has no vector width
+left to exploit and the masked 256-bit loop wastes half of its own.
