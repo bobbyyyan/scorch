@@ -5549,3 +5549,51 @@ call site, `spmm_csr_v2_core`. Every GCN graph is outside the gate by row count 
 cora at 2708 rows, asks for 169 workers against a pool of 24 — and the autoencoder's shipped
 path is `sparse_linear`, which routes to the fused `spmm_csr_linear_fused_float` and never calls
 the rule. Inertness by construction beats inertness by measurement.
+
+## What the size deficit actually is: ~19 cycles a nonzero, which is L3 latency over two loads
+
+The crossover is not a cache-residency cliff and not a bandwidth wall. Computing the working
+set of every cell — `A = nnz*8 + rows*4`, `B = cols*k*4`, `C = rows*k*4` — **exactly one of 302
+cells exceeds redwood's 36 MB L3**, and the median at >1M nonzeros is 14.5 MB. So in these warm
+measurements both libraries run entirely out of cache, and nothing here is DRAM-bound.
+
+What the deficit is, is a per-nonzero throughput gap that is flat in size once fixed cost stops
+dominating. float32 k=4, median cell in each band:
+
+| band | median ours | median MKL | ours ns/nnz | MKL ns/nnz | ratio |
+|---|---|---|---|---|---|
+| < 20k | 7.8 µs | 13.7 µs | 1.49 | 2.61 | we win, on fixed cost |
+| 20k–200k | 22.1 µs | 16.3 µs | 0.25 | 0.19 | 1.32 |
+| 200k–1M | 125.0 µs | 73.3 µs | 0.22 | 0.127 | 1.73 |
+| > 1M | 220.5 µs | 129.7 µs | 0.18 | 0.108 | 1.67 |
+
+So the crossover at ~20k nonzeros is not a mechanism — it is just where a per-nonzero cost we
+lose overtakes a fixed cost we win. Our fixed cost is genuinely lower (7.8 µs against 13.7 at
+5242 nonzeros); our per-nonzero cost is genuinely worse, by about 1.7x, and it does not improve
+with size.
+
+**0.18 ns per nonzero over 24 threads is about 19 cycles per nonzero per thread.** For one
+sequential index load, one sequential value load, an integer multiply and one FMA, the floor is
+two to four cycles with the operand in L1. Nineteen is what you get when the *random* load —
+the gather into B — is not covered: L3 latency is around 40 cycles and the register-block kernel
+keeps exactly **two** B loads in flight. 40/2 = 20. MKL's 0.108 ns/nnz is about 11 cycles, which
+is what four or more in flight would give.
+
+That is a quantitative case for the thing the source comment on `regblock_deep` already argued
+and the thing its measurement was thought to have refuted. It did not refute it: that kernel
+carries no prefetch while the shipped 2-deep kernel does, so the arm that lost by 14.5% changed
+depth and prefetch together. `rw_chain42.sh` separates them.
+
+It is also a case for `rw_chain43.sh`, from the other side: a wider chunk keeps a worker on
+consecutive rows for longer, which is the only thing that makes B's lines worth keeping, and the
+chunk-width rule's own ceiling is what currently discards the width the locality model asks for.
+
+### What this rules out
+
+- **DRAM bandwidth.** One cell of 302 exceeds L3.
+- **A per-call cost.** The 20k–200k band's median call is 22.1 µs, well under the ~52 µs
+  native-side figure recorded earlier, so that overhead is not what this band is made of.
+- **A width effect.** The per-nonzero ratio is the same at k=2, 3, 4, 5 and 8.
+- **Lane masking as the main term.** A masked load costs the same per nonzero at every size,
+  and would not leave the ratio flat while the absolute per-nonzero cost stays at 19 cycles.
+  The half-vector kernel remains worth its measurement, but it cannot be worth 1.7x.
