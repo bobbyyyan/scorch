@@ -6771,3 +6771,46 @@ cancel: it will read roughly 1.5x pessimistic against the caller path a user act
 So the decision comes from the arm-to-arm columns and the `refb` floor, and the parity column
 is a lower bound on where those cells really sit -- not the number to quote. The same applies
 to chain43 through chain47, all of which use kprobe.
+
+### The scoreboard, both dtypes, caller path, hookless -- the number the goal is measured against
+
+124 matrices at 20k nonzeros or more, six widths, `ops.matmul` with the plan cache live, in a
+build with no hooks compiled in. This supersedes every parity figure earlier in this document,
+all of which were instrumented, harness-path, or both.
+
+| | warm parity | <MKL | <0.95 | cold parity | <MKL | <0.95 |
+|---|---|---|---|---|---|---|
+| float32 | **1.5272** | 75 / 744 | 46 | **1.1617** | 162 / 744 | 55 |
+| float64 | **1.6329** | 51 / 744 | 28 | **1.2049** | 105 / 744 | 43 |
+
+Per width:
+
+| k | f32 warm | f32 <MKL | f64 warm | f64 <MKL | f32 cold | f32 <MKL | f64 cold | f64 <MKL |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1.1737 | 27 | 1.1876 | 22 | 1.0510 | **48** | 1.0745 | **39** |
+| 2 | 1.3450 | 6 | 1.5380 | **0** | 1.1104 | 29 | 1.1279 | 25 |
+| 4 | 1.3159 | **31** | 1.4415 | **23** | 1.1349 | 34 | 1.1726 | 24 |
+| 8 | 1.6364 | 9 | 1.7905 | 3 | 1.1934 | 27 | 1.2493 | 3 |
+| 16 | 1.9219 | 1 | 1.8989 | 1 | 1.2373 | 15 | 1.2757 | 8 |
+| 32 | 1.9417 | 1 | 2.1176 | 2 | 1.2568 | 9 | 1.3506 | 6 |
+
+**Pooled, all four cases clear MKL** -- warm 1.53x and 1.63x, cold 1.16x and 1.20x -- which is
+the shape the goal asks for, on the path a caller actually takes, in the build that actually
+ships. **393 of 2976 cells are still below**, 172 of them by more than five percent, so
+"everywhere" is not met and this is the list to close.
+
+Two things the table says that were not obvious:
+
+**Cold carries two thirds of the remaining deficit** -- 267 cells against warm's 126 -- even
+though warm is the harder pooled comparison. So the guard is doing more work than the claim.
+That is not the per-call floor, where we are ahead of MKL 4.2 us to 12.8: cold flushes 256 MB,
+so both sides fetch everything from DRAM and the winner is whoever streams better. A
+latency-bound loop does not saturate DRAM, which is exactly what the dtype-scaling table
+measured us doing at narrow k -- so the cold deficit and the warm one are the same mechanism
+seen through different caches, and the queued ILP levers address both. That is worth stating
+because it means cold does not need a separate research direction, only the same fix measured
+in the cold phase too.
+
+**k=1 and k=4 are the weak widths in every one of the four cases**, and nothing above k=8 has
+more than a handful of losses. float64 k=2 warm is perfect at 0 of 124 while float64 k=2 cold
+loses 25, which is the same cold/warm split again rather than a width anomaly.
