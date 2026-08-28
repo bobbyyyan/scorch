@@ -12035,3 +12035,71 @@ landed the other way:
 
 So the cap is a win on both hosts and the per-architecture default is not the right landing. Both
 constants go on unconditionally.
+
+## How far from beating the reference everywhere: 2% of cells, and 70–83% of those are one family
+
+chain32b's candidate build is the configuration that now ships, so its cells are the current
+scoreboard. Counting a cell as behind only when it is behind in **both** passes — one pass is a
+draw, not a fact — over 362 matrices at six widths:
+
+| dtype | cells | ahead in both passes | behind in both | split |
+|---|---|---|---|---|
+| float32 | 2172 | 2100 (96.7%) | **44 (2.0%)** | 28 |
+| float64 | 2172 | 2103 (96.8%) | **36 (1.7%)** | 33 |
+
+The two populations are nothing like each other. The cells we win, we win by 2.6x (float32
+geomean ratio to the reference 0.3843) and 2.75x (float64, 0.363). The cells we lose, we lose by
+17.9% and 15.1%. And they are 27 and 23 matrices out of 362.
+
+Split by structure:
+
+| family | float32 | float64 | share of its own population that loses | geomean behind |
+|---|---|---|---|---|
+| **A** rows ≤ 512 and mean degree ≥ 128 | 31 cells, 18 matrices | 30 cells, 19 matrices | 15% of 204 cells (9.4% of the corpus) | 1.175 / 1.164 |
+| **B** mean degree < 1 (more rows than nonzeros) | 7 cells, 4 matrices | 4 cells, 2 matrices | **1%** of 588 cells (27.1%) | 1.253 / 1.128 |
+| everything else | 6 cells, 5 matrices | 2 cells, 2 matrices | — | 1.122 / 1.014 |
+
+**Family A is the deficit.** It is 70% of the behind cells on float32 and 83% on float64 while being
+9.4% of the corpus, and its width distribution is k=1 and k=4 almost exclusively (9 and 14 of 31 on
+float32; 12 and 11 of 30 on float64). The worst cells in the whole corpus are its extremes:
+
+| matrix | rows | mean degree | cells behind | ratio |
+|---|---|---|---|---|
+| Meszaros/kl02 | 71 | 2993 | 5 | **1.472** / 1.445 |
+| JGD_BIBD/bibd_17_8 | 136 | 5005 | 3 | 1.281 / 1.379 |
+| Meszaros/nw14 | 73 | 12396 | 3 | 1.218 / 1.320 |
+| rn50 bottleneck blocks | 256 | 1152 | 2 each | 1.10–1.15 |
+
+Those are the matrices `SCORCH_SPMM_NNZ_PER_THREAD`'s comment was written about — "Meszaros/kl02 is
+71 rows holding 212536 nonzeros: rows/16 gives FOUR workers … so a 1.7 MB L3-resident product runs
+on four threads and reads 0.593 of MKL, while per thread we are faster than MKL." Two queued chains
+measure exactly this (59 prices the two thread-count corrections against each other, 61 runs the
+ceiling on the cells the production scoreboard says it moves), and one more measures the k=1
+exact-width extension that owns the other half of family A's width distribution.
+
+**Family B is nearly finished.** Only 1% of its 588 cells lose, and the residual is two matrices:
+Pd_b / Pd_rhs (8081 rows, 6323 nonzeros, 46% empty, 20–25 microsecond kernels) and
+higgs-twitter_reply (456626 rows, 32523 nonzeros, 94% empty). The empty-row-zeroing work did its
+job on this family; what is left is a handful of microseconds on kernels small enough that the fixed
+cost outside the kernel is a comparable term.
+
+So the honest answer to "beat the reference everywhere" is: **everywhere is 98% of cells today, the
+missing 2% is one structural family, and the mechanism aimed at that family is already written and
+queued rather than hypothetical.**
+
+### Two corrections to the row ceiling's own record
+
+The section above titled "x86 wants it, ARM does not, so it stays off" is **stale**, and it should be
+read against the constant's comment rather than on its own. That section measured the *uncapped*
+rule. `SCORCH_SPMM_CEIL_CAP_POOL` was flipped to 1 on 2026-08-28 after both hosts ran it, and with
+the capped form the ARM cost is gone: inside the shipped gate the uncapped rule reads 0.9272 and
+0.9311 on ARM float32 (z −6.4, −6.3) while the capped rule reads 1.0025 and 1.0041 on the same
+matrices in the same runs, and on x86 the cap costs nothing (1.1059 / 1.1978 against 1.1125 /
+1.1926). **The ISA-conditional objection that kept the ceiling off no longer applies** — the capped
+form is neutral on ARM and a win on x86.
+
+And the other objection — "a 7-matrix, one-host, one-dtype effect" — is answered by the scoreboard
+above rather than by argument. Those seven matrices are the majority of the entire remaining deficit
+on both dtypes. A lever whose target is 9.4% of the corpus and 70–83% of the losses is not a
+curiosity; the reason it has not shipped is that its gate region holds too few matrices in the
+current corpus to measure, which is what chain50's degree-stratified corpus is being built for.
