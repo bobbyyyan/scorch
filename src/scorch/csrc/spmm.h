@@ -3905,6 +3905,27 @@ torch::Tensor spmm_csr_v2_core(
     while (exact_unroll > 1 && mean_deg < (long)exact_unroll) exact_unroll >>= 1;
   }
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+  // The deep register kernel's policy; the measurements are in scorch_policy.h. These live
+  // outside the hooks guard because the dispatch below does too: a release build has to CONTAIN
+  // the mechanism for a compiled-in A/B to measure it without paying the hooks tax. With the
+  // shipped depth of 0 the dispatch is dead code and the compiler drops it, which is what the
+  // per-symbol emission check verifies.
+#ifdef SCORCH_TUNE_HOOKS
+  int narrowk_unroll = SCORCH_NARROWK_DEEP_UNROLL;
+  int narrowk_unroll_pf = SCORCH_NARROWK_DEEP_PF;
+  long narrowk_deep_lo = SCORCH_NARROWK_DEEP_NVEC_LO;
+  long narrowk_deep_hi = SCORCH_NARROWK_DEEP_NVEC_HI;
+#else
+  // const in the shipped build, the same way full_last is, so `if (narrowk_unroll && ...)` folds
+  // away and none of the deep instantiations are emitted. Left non-const it does NOT fold: the
+  // dispatch sits inside the parallel region's lambda, and the object grew 42 KB.
+  const int narrowk_unroll = SCORCH_NARROWK_DEEP_UNROLL;
+  const int narrowk_unroll_pf = SCORCH_NARROWK_DEEP_PF;
+  const long narrowk_deep_lo = SCORCH_NARROWK_DEEP_NVEC_LO;
+  const long narrowk_deep_hi = SCORCH_NARROWK_DEEP_NVEC_HI;
+#endif
+#endif
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
   // A/B hook: refresh the regtile partial-tile toggle once per op (read by
   // scorch_spmm_row_regtile). SCORCH_REGTILE_BASE=1 -> legacy runtime-nv partial.
@@ -3919,15 +3940,23 @@ torch::Tensor spmm_csr_v2_core(
   // A/B hook: number of independent nonzero streams the narrow-k register kernel
   // runs. 0 (unset) keeps the shipped 2-stream form. Loop-invariant, so the row
   // loop's dispatch on it hoists.
-  int narrowk_unroll = 0;
   { const char* e = std::getenv("SCORCH_NARROWK_UNROLL");
-    if (e && *e) { long v = std::atol(e); if (v > 2 && v <= 8) narrowk_unroll = (int)v; } }
+    if (e && *e) { long v = std::atol(e);
+      // 0 is accepted so an A/B can turn OFF a depth the policy turned on; 1 and 2 are
+      // rejected because no instantiation exists for them.
+      if (v == 0 || (v > 2 && v <= 8)) narrowk_unroll = (int)v; } }
+  // A/B hook: the inclusive nvec range the deep kernel serves. HI 0 means "every vector count",
+  // which is what SCORCH_NARROWK_UNROLL alone meant before this range existed, so an arm written
+  // against the older build still fires exactly where it used to.
+  { const char* e = std::getenv("SCORCH_NARROWK_DEEP_NVEC_LO");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 8) narrowk_deep_lo = v; } }
+  { const char* e = std::getenv("SCORCH_NARROWK_DEEP_NVEC_HI");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 8) narrowk_deep_hi = v; } }
   // A/B hook: whether the deep register kernel prefetches the next group of B rows.
   // Defaults to 1, because the arm that has never been run is the one WITH a prefetch: the
   // measurement that rejected stream depth ran the deep kernel with no prefetch at all,
   // while the shipped 2-deep kernel carries one, so its 14.5% harmed tail could be either
   // change. Set to 0 to reproduce that arm exactly.
-  int narrowk_unroll_pf = 1;
   { const char* e = std::getenv("SCORCH_NARROWK_UNROLL_PF");
     if (e && *e) narrowk_unroll_pf = std::atol(e) != 0 ? 1 : 0; }
   // A/B hook: how many consecutive output rows the register block takes at once. 0 or 1 keeps
@@ -4319,7 +4348,6 @@ torch::Tensor spmm_csr_v2_core(
               #undef SCORCH_RG
               continue;
             }
-#ifdef SCORCH_TUNE_HOOKS
             #define SCORCH_RBD1(NV, UN, PFV) \
               (full_last \
                  ? scorch_spmm_row_regblock_deep<scalar_t, NV, true, UN, PFV>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
@@ -4327,7 +4355,9 @@ torch::Tensor spmm_csr_v2_core(
             // Prefetch is its own axis, so depth and prefetch can be attributed separately.
             #define SCORCH_RBD(NV, UN) \
               (narrowk_unroll_pf ? SCORCH_RBD1(NV, UN, true) : SCORCH_RBD1(NV, UN, false))
-            if (narrowk_unroll) {
+            if (narrowk_unroll &&
+                (narrowk_deep_hi <= 0 || ((long)nvec >= narrowk_deep_lo &&
+                                          (long)nvec <= narrowk_deep_hi))) {
               // NVEC * UNROLL accumulators must stay resident, so the deeper
               // streams are only instantiated where the vector count is small.
               switch (nvec * 16 + narrowk_unroll) {
@@ -4348,6 +4378,7 @@ torch::Tensor spmm_csr_v2_core(
               continue;
             }
             #undef SCORCH_RBD
+#ifdef SCORCH_TUNE_HOOKS
             #define SCORCH_RBP(NV, D) \
               (full_last \
                  ? scorch_spmm_row_regblock_pf<scalar_t, NV, true, D>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \

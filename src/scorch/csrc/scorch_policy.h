@@ -288,6 +288,42 @@
 // on two independent runs. Hence a second constant rather than a reused one.
 //
 // 0 disables width 1 entirely, which is what ships.
+// The deep register-block kernel: the vector counts it serves, its depth, and its prefetch.
+//
+// It exists (spmm.h, guarded on AVX2+FMA) but has never been reachable outside a
+// SCORCH_TUNE_HOOKS build, so a release binary does not contain the dispatch at all. Measured on
+// 302 matrices with the kernel timer, against the shipped register block:
+//
+//   nvec   float32 (8 lanes)      float64 (4 lanes)
+//   1      0.8034 (k=4), 0.8124 (k=8)   0.8392 (k=4)
+//   2      **1.0396 (k=16)**            **1.0448 (k=8)**
+//   4      unmeasured                   1.0154 (k=16)
+//
+// The two dtypes win at widths a factor of two apart and at the SAME vector count, which is why
+// the range below is stated in nvec and not in k -- a rule in k would have been right on one
+// dtype and wrong on the other by exactly the lane ratio. At nvec=1 the kernel displaces a
+// specialised narrow path (exact-width, or the half-vector block at k=4) and loses 16-20%; at
+// nvec=2 it displaces the generic register block and wins.
+//
+// Decomposed, the gain is the prefetch's ABSENCE: at k=16 float32, depth alone reads 0.9633 and
+// turning the deep kernel's prefetch off is worth 1.0792 on top of that.
+//
+// SCORCH_NARROWK_DEEP_UNROLL 0 disables the kernel, which is what ships. NVEC_HI 0 means "no
+// vector-count restriction", so a hooks arm that sets only the depth behaves exactly as it did
+// before this range existed.
+#ifndef SCORCH_NARROWK_DEEP_UNROLL
+#  define SCORCH_NARROWK_DEEP_UNROLL 0
+#endif
+#ifndef SCORCH_NARROWK_DEEP_PF
+#  define SCORCH_NARROWK_DEEP_PF 1
+#endif
+#ifndef SCORCH_NARROWK_DEEP_NVEC_LO
+#  define SCORCH_NARROWK_DEEP_NVEC_LO 0
+#endif
+#ifndef SCORCH_NARROWK_DEEP_NVEC_HI
+#  define SCORCH_NARROWK_DEEP_NVEC_HI 0
+#endif
+
 #ifndef SCORCH_NARROWK_EXACT_K1
 #  define SCORCH_NARROWK_EXACT_K1 0
 #endif
