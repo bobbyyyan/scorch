@@ -9183,3 +9183,33 @@ ships therefore rests entirely on the regression count over those 665, which is 
 compiled-in ladders now running on both hosts measure. The synthesised estimate put it at
 one matrix worse than 5% on x86 f32 and two on ARM f32; if the real cap holds that, it
 ships, and if it costs the winners more than it recovers from the losers, it does not.
+
+## What the cap would buy on the scoreboard, as a bound
+
+The cap ladders run on the exact4 corpus; the scoreboard is the widths corpus, so there is
+no per-cell cap effect for the scoreboard's cells. Applying a uniform factor to every cell
+the cap fires on and sweeping the factor gives a bound and a sensitivity check -- not a
+prediction. Winners move by the same factor, so the cost side is in the same table.
+
+      factor    f32 warm            f32 cold            f64 warm            f64 cold
+                below  fixed broke  below  fixed broke  below  fixed broke  below  fixed broke
+      today       75      -     -    162      -     -     51      -     -    105      -     -
+      0.95        94      0    19    253      0    91     72      0    21    216      0   111
+      1.05        47     28     0     60    102     0     29     22     0     47     58     0
+      1.10        33     42     0     33    139     0     16     35     0     26     79     0
+      1.25        12     63     0      9    153     0      4     47     0     10     95     0
+      1.50         5     70     0      6    156     0      4     47     0      3    102     0
+
+At 1.10, which is roughly what the proxy measured on the firing set for x86 f32 (1.1055),
+the warm float32 board goes 75 -> 33 and the cold board 162 -> 23. The asymmetry is
+favourable because the cells sitting just below parity are dense: a 5% uniform gain alone
+fixes 28 warm and 102 cold float32 cells. The same density is why the downside is steep --
+a 5% uniform *loss* would newly break 19 warm and 91 cold float32 cells, so the ladder's
+regression count is not a formality.
+
+Two things this makes clear. The cap is a global change, touching 736 of 744 cells, so it
+cannot be justified on the losing family alone. And it is not sufficient: even at an
+implausible 1.50 uniform gain, five warm float32 cells stay below MKL, and the worst cell
+on the board -- lp_osa_14 at k=4, 2337 rows of degree 135 on 32 workers -- needs 2.21x by
+itself. Whatever fixes that is a different mechanism, and the four warm losers that
+resolve at or below 8 threads cannot be touched by any thread rule at all.
