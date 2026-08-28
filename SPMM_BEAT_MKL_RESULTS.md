@@ -8667,3 +8667,58 @@ deficit is layout, cand/ship reproduces stage17's out-of-gate numbers, about 0.9
 Same corpus and widths as stage17's main run so the numbers are directly comparable. The
 ship-vs-ctrl disassembly check matters more here than anywhere else, because the whole run is a
 claim about code layout.
+
+## stage26: the k=1 family compiled in on ARM wins 5.4%, and the hooked runs understated it
+
+M5, three hookless builds of the branch tip, 169 matrices degree-stratified, 7 slices with the
+builds rotating inside each, two pass orders, kernel timer. Controls: `ctrl/ship` 1.0028 (f32) and
+1.0013 (f64) with **zero disassembly difference** between those two builds; the reference column
+moves 1.0116 / 1.0196 against a 1.10 limit; no slice flagged (median 1.9 min, limit 5.6). The
+analyzer printed "controls within limits; the comparison above stands."
+
+Per matrix, so five widths of one matrix are not counted as five observations:
+
+| k | float32 excess over floor | z | float64 excess | z |
+|---|---|---|---|---|
+| **1** | **+5.44%** | **+8.23** | **+5.27%** | **+7.44** |
+| 2 | +0.12% | +0.30 | +0.63% | +2.17 |
+| 3 | -0.00% | -0.00 | -0.40% | -1.33 |
+| 4 | -0.73% | -1.95 | -0.55% | -1.88 |
+| 64 | -0.27% | -0.95 | -0.20% | -0.74 |
+
+**The intended effect is decisive and larger than the hooked runs suggested.** By degree at k=1,
+float32: 1.0441 below degree 1, 1.0568 at 2-4, **1.1278 at 4-8**, 1.0696 at 8-64, 1.0736 above 64;
+float64 tracks it (1.0545 / 1.0437 / **1.1273** / 1.0788 / 1.0769). The hooked replicates had this
+family *losing* 5.7% at degree 1-2; compiled in with the degree-adaptive unroll on, that band reads
+0.9946 against a floor of 0.9907 on float32 — inside its own floor — and 0.9866 against 0.9914 on
+float64, about half a percent below. So the degree-adaptive unroll does rescue the band, and the
+compiled-in numbers are the ones that count.
+
+**There is no general presence cost, but there may be a neighbour cost.** k=64 is null on both
+dtypes (-0.27%, -0.20%, |z| < 1), which is the strong control: the change cannot act there and does
+not. But k=4 reads -0.73% and -0.55% with z -1.95 and -1.88 — marginal individually, same sign and
+similar size on both dtypes, and k=4 is the width *immediately above* the exact-width ceiling
+(HI=3), so it shares code with the switch that just grew while k=64 takes an entirely different
+kernel. That is the instantiation-neighbour pattern from the NEON work, and it is what stage27 is
+independently measuring for a different change. Not claimed; flagged.
+
+## A prediction for chain60, registered before it runs
+
+The x86 half should NOT reproduce the ARM result, and the reason is structural rather than
+statistical. At k=1 the gather kernel is enabled by construction — `narrowk_gather = (B1_size == 1)`
+— and its dispatch requires `std::is_same<scalar_t, float>` inside `#if defined(__AVX2__) &&
+defined(__FMA__)`. The exact-width block at `spmm.h:4267` runs **before** it. So enabling the
+extension at k=1 displaces the gather on x86 float32, and displaces nothing on x86 float64 or on
+either ARM dtype, where no gather exists.
+
+| | k=1 shipped path | extension displaces | prediction |
+|---|---|---|---|
+| x86 float32 | AVX2 gather | the gather | **neutral or negative** |
+| x86 float64 | generic register block | the generic block | positive |
+| ARM float32/64 | generic register block | the generic block | positive — **measured +5.44% / +5.27%** |
+
+This is the "take width 1 wherever the gather does not serve it" rule stated as a falsifiable
+forecast in three unmeasured cells. If chain60 shows x86 float32 k=1 winning, the rule is wrong and
+the mechanism needs re-deriving. If it shows x86 float32 losing while float64 wins, the shipping
+form is not `K1=1` but `K1=1` conditioned on the gather not serving the width — which is a
+one-line change to a condition that already exists, not a new mechanism.
