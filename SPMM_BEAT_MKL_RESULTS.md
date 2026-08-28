@@ -5597,3 +5597,67 @@ chunk-width rule's own ceiling is what currently discards the width the locality
 - **Lane masking as the main term.** A masked load costs the same per nonzero at every size,
   and would not leave the ratio flat while the absolute per-nonzero cost stays at 19 cycles.
   The half-vector kernel remains worth its measurement, but it cannot be worth 1.7x.
+
+## Two grids on this host disagree by 1.5x about our own kernel, and agree about MKL to 1%
+
+The section above diagnoses a size deficit from the `exact4` grid. Before building anything on
+it I checked the diagnosis against another grid, and the two do not agree.
+
+`exact4` and `split_final` share 17 matrices and two widths (k=2 and k=8). Both were produced by
+the same harness on this host. On MKL they agree: as-caida_G_055 at k=2 reads 0.0475 ms in one
+and 0.0479 in the other, and the median MKL spread over all shared cells is under 1%. On **our**
+kernel the same cell reads 0.0759 ms in the newer grid against 0.0223 in the older — 3.4x — and
+over all 34 shared pairs the older grid reads **1.545x (float32) / 1.516x (float64)** better
+parity. Both arms of the newer grid are equally slow (its automatic A/A duplicate reads 0.0752
+against 0.0759), so this is not an arm; rows, nnz, mean_row, max_row and Bmb all match to the
+digit, so it is not the matrix.
+
+### The one hypothesis with a number attached, predicted and then refuted
+
+A `SCORCH_TUNE_HOOKS` build makes 44 `std::getenv` calls on the per-call path — 24 in `spmm.h`,
+20 in `scorch_policy.h` — all inside the region `time_dict["eval_time"]` measures, and a miss
+scans the whole environment. MKL is timed through `torch.sparse.mm` and enters none of our code,
+so unlike the arm-to-arm charge already recorded here, this one would land on one side of the
+ratio only. It is the right shape: a fixed per-call cost is 3.4x of a 22 µs kernel and 1.3x of a
+200 µs one, which is why the deficit had no signature in width, degree, B footprint or nonzero
+count.
+
+Measured before reading any verdict, so the prediction could fail: 44 misses against this
+host's environment cost **0.34 µs per call**, 7.7 ns a lookup. The hypothesis is wrong by 160x
+and the hooked getenv path is not worth optimising.
+
+### What the difference actually looks like
+
+Taking the difference in microseconds rather than as a ratio separates an additive charge from a
+slower kernel, and it is neither — it is three different things:
+
+| family | rows | delta (µs) | reading |
+|---|---|---|---|
+| 6 DLMC pruned-ResNet layers | 64 | −0.6 to +0.7 | the two builds agree exactly |
+| 5 as-caida graphs | 31379 | +47 to +56, the same at k=2 and k=8 | a fixed charge that scales with nothing in k |
+| connectus, bibd_17_8, cari | 136–512 | +3 to +34 | small next to a 100–150 µs kernel |
+| nw14 at k=8 | 73 | 81 → 832 | **10x** |
+| lp_osa_14 at k=8 | 2337 | 38 → 623 | **16x** |
+
+Regressing the delta on nonzeros gives R² 0.11, on rows 0.00, and on the kernel's own time 0.07.
+No single mechanism fits, which is why no more of this is worth doing by inspection.
+
+The last two rows are the interesting ones, and they are the family the row-axis rule in
+`scorch_spmm_nthreads` names in its own comment: few rows, very high degree. nw14 is 73 rows of
+mean degree 12396; lp_osa_14 is 2337 rows; kl02 (71 rows, degree 2993) is the shape the
+nonzero-expressed ceiling exists for, and that ceiling is **off by default**.
+
+### What this does to the section above, and to the published number
+
+The ~19-cycles-a-nonzero figure, the "0.60–0.94 above 20k nonzeros" family, and the case it
+makes for the multi-row and depth-versus-prefetch kernels all come from the grid that reads
+1.5x worse. On the other grid, every degree band at every width from k=1 to k=64 is at or above
+parity (0.95 to 3.40), and the only cells below 1.0 are degree ≥ 64 at k=1: 0.954 float32 and
+0.960 float64.
+
+So the honest position is that this session does not yet know its own parity to better than
+1.5x, and no kernel should be shipped against a number in that range. `rw_chain37.sh` settles
+it the only way that can: the same corpus, the same harness process, alternating between the
+hooked build and the hookless build that has the candidate shipping configuration compiled in,
+three rotations with the order flipped in the middle one, and eight matrices where the two
+original grids agreed carried along as the control group.
