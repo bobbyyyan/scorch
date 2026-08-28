@@ -8343,3 +8343,30 @@ leaves the narrow-k register block for the wide-k tiled path.
 
 Written as a new chain rather than an edit, because chain53 is already executing its wait loop and
 bash resumes a running script at a byte offset.
+
+## chain44: back-stealing did not make the chunk-count minimum redundant
+
+`SCORCH_SPMM_CHUNKS_MIN 16` was chosen before back-stealing shipped, and stealing is a different
+answer to the same problem — a worker that runs dry takes work from one that has not — so the
+constant might have been paying for a tail that no longer exists. It is not. Redwood, kernel
+timer, 302 matrices, 1208 cells per dtype, 13 reps, every arm setting both variables so the getenv
+charge cancels:
+
+| band | cm8 (min 8) | cm4 | cm2 | w256 (width forced) |
+|---|---|---|---|---|
+| f32 k=8, 20k-200k | 1.0043 z+1.0 | 0.9774 z-6.0 | 0.9627 z-6.5 | 0.9422 z-7.5 |
+| f32 k=8, >200k | 0.9836 z-4.2 | 0.9758 z-5.6 | 0.9745 z-5.8 | 0.9596 z-5.4 |
+| f64 k=16, 20k-200k | 0.9850 z-3.9 | 0.9686 z-5.3 | 0.9622 z-6.3 | 0.8847 z-14.1 |
+| f64 k=4, >200k | 0.9795 z-4.4 | 0.9722 z-5.3 | 0.9649 z-7.3 | 0.9649 z-4.7 |
+
+The loss is monotone in the relaxation and it grows with the matrix: under 20k nonzeros every arm
+sits inside the A/A floor (`shipb` runs 0.9735 to 1.0029), between 20k and 200k the relaxed arms
+lose 2-5%, and above 200k even the mildest one loses 2% with z of -4 to -5 on both dtypes.
+Forcing the width outright is worst of all — 0.8847 at f64 k=16 — so the upper bound the source
+quotes is not reachable by relaxing the ceiling, and is not somewhere we want to be anyway.
+
+**No change. The constant stays at 16**, and the reason is now measured rather than inherited:
+stealing recovers a straggler's *remaining* work, but the chunk count is what makes the straggler
+small in the first place, and the two are not substitutes. k=64, where the tiled kernel owns the
+row, is the control: there the cm arms are flat (0.9904 to 1.0063) and only w256 still loses,
+which says the cm effect really is about how the row loop is partitioned and not about the width.
