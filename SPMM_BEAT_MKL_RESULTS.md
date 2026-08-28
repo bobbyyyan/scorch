@@ -8754,3 +8754,81 @@ more variables.** It made this band look four times worse than it is, and earlie
 ceiling's out-of-gate arms look ordered by nothing but their variable counts. Every number in this
 file that comes from a hooked build and concerns a sub-30-microsecond kernel should be re-read with
 that in mind before it is used to decide anything.
+
+## chain45: multi-row register blocking is the strongest lever measured, and it did not exist in a release build
+
+Redwood, kernel timer, 302 matrices, 1208 cells per dtype, arms `mr2`/`mr4` against `ref`/`refb`
+(A/A floor 0.995-1.009). `SCORCH_SPMM_MULTIROW=2` takes two consecutive output rows per kernel call
+so the B rows are loaded once for both.
+
+| band | f32 k=4 | f32 k=8 | f64 k=4 | f64 k=8 |
+|---|---|---|---|---|
+| nnz 200k-1M | 1.1043 z+6.9 | 1.1171 z+12.7 | 1.1365 z+7.7 | 1.0932 z+7.9 |
+| nnz >1M | 1.1332 z+7.1 | 1.1434 z+10.9 | 1.1232 z+9.5 | 1.0862 z+5.1 |
+| degree 8-32 | 1.1253 z+12.4 | 1.1256 z+15.7 | 1.1243 z+15.0 | 1.0890 z+9.6 |
+| degree <8 | 0.9882 z-0.4 | 1.0071 z-0.1 | 0.9922 z-0.5 | 1.0242 z+1.4 |
+
+**Every negative band for ROWS=2 has |z| < 1**, i.e. inside the same-code floor, so on this corpus
+ROWS=2 is neutral-or-better everywhere and wins 9-14% exactly where amortising the B loads should
+help: mid-to-large nonzero counts at moderate degree. And the cells behind MKL fall
+
+* float32: **96/194 -> 59/194** at k=4, **17 -> 6** at k=8;
+* float64: 38 -> 31 at k=4, 11 -> 6 at k=8, 2 -> 1 at k=16.
+
+That is the largest below-MKL reduction any single lever has produced in this file. Correctness went
+first: chain45 ran the full suite with multi-row forced live at ROWS=4 (1097 passed) and a narrow-k
+subset at ROWS=2 (306 passed).
+
+ROWS=4 is **not** the same answer — it loses at k=4 (0.9730, z-2.0 on float32) and only beats ROWS=2
+at float32 k=16 (1.1604 against 1.0983). So the row count is not more-is-better. k=64 is the
+designed structural null (the dispatch needs `narrow_k`) and every arm reads 0.986-1.006 there,
+which is the control that makes the rest legible.
+
+**It could not ship, or even be three-built.** The kernel's definition is under AVX2+FMA but its
+dispatch was inside `SCORCH_TUNE_HOOKS`, so a release binary did not contain the mechanism — the
+same situation as the deep register kernel. Committed as 7af5418: two policy constants, and the
+dispatch compiles in a release build whose policy turned it on.
+
+**The block is conditioned on the constant, not merely moved out of the hooks guard, and that
+distinction is measured.** Simply declaring the variables and leaving the dead branch in place added
+**ten instructions and reshuffled every stack slot in the function** on x86; `constexpr` did not
+help, because the perturbation is the declarations, not their constness. Conditioned on
+`SCORCH_SPMM_MULTIROW_ROWS > 1`, a default build differs in 12 of 157,718 x86 and 10 of 162,761
+arm64 instructions, all `__LINE__` immediates shifted by the 27 lines added. That frame reshuffle is
+worth recording for its own sake: it is the row ceiling's ARM presence cost, visible in the object
+rather than inferred from a timing. ARM needs no measurement here — the dispatch is inside
+`#if defined(__AVX2__) && defined(__FMA__)`.
+
+chain62 is queued: the compiled-in three-build of ROWS=2 against the branch tip, on chain45's own
+corpus so the two sets of numbers sit side by side, widths 4/8/16 with 64 as the free null.
+
+## The ceiling ladder collapses to two behaviours, so chain57/58 were killed
+
+Asking `scorch_ops.scorch_spmm_nthreads` — the export that exists so a harness does not restate this
+rule — how many of the 744 scoreboard cells each candidate gate actually *moves*:
+
+| gate | cells moved | losers | winners | matrices |
+|---|---|---|---|---|
+| off | 0 | 0 | 0 | — |
+| (128,192) ships | 9 | 6 | 3 | kl02, nw14 |
+| (256,192) | 46 | 10 | 36 | + bibd_17_8, bottleneck_2_block |
+| (384,192), (512,192), (2048,192), (384,64), (384,17), (2048,128) | 46 | 10 | 36 | identical |
+
+**Seven distinct constant pairs, one behaviour.** The worker count is
+`min(rows_axis, work/grain, omp_get_num_procs())` and the ceiling raises only `rows_axis`, so once
+`rows/ROWS_PER_THREAD` reaches the cap the statement is a no-op however wide the gate is. chain53's
+premise — that (2048,128) "reaches 59 of the 75 float32 warm losers" — conflated a gate that
+**admits** a cell with a gate that **changes** one. The real prize is 10 of 75 losers, from four
+matrices, against 36 winners newly exposed.
+
+chain61 replaces both killed chains and is much cheaper: six arms over a 50-matrix corpus chosen by
+asking the export which matrices it moves, grouped by that partition rather than by row and degree
+bins, with `g512_192` carried as a **structural duplicate** of `g384_192` — the export certifies they
+resolve to the same count on every matrix, so their ratio is a second noise floor that no
+environment padding could fake.
+
+This also redirects the warm-loser effort. **65 of the 75 float32 warm losers cannot be moved by the
+ceiling at any gate** — they sit at rows 384-2048 where the thread count is already at the cap. They
+are not an under-threading problem, and the ceiling was never going to be their answer. chain59 (the
+two thread bounds) and chain62 (multi-row) are; chain59's corpus was repointed to the broad
+302-matrix one, since chain57 is no longer there to build the one it named.
