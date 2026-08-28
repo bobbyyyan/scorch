@@ -11389,3 +11389,48 @@ That is a testable statement, and it is what chain31 now is -- ten passes instea
 binary on the same dataset rather than from PyTorch's. The `cpoolW` arm is gone with the
 hypothesis. Nothing else about the candidate changes: on x86 the threshold cannot fire, so the
 shipped rule is the bare cap, and the bare cap is 1.92% pooled and 19.96% on the large cells.
+
+## chain27b: both shipped thread/partition levers pay for themselves on the x86 caller path, and one of them carries the MKL margin
+
+362 matrices, 2172 cells per dtype, interleaved arms, eleven repetitions, `--pad-env`. `part0`
+turns the row partition off and `chunk0` turns the chunk-width rule off; both ship ON, so these
+arms remove a shipped lever. Numbers are ship/arm, so **below 1.000 means the arm is slower**.
+
+      arm       k=1     k=2     k=4     k=8    k=16    k=32     ALL       z     float32
+      part0  0.7401  0.7525  0.7408  0.7115  0.6994  0.6986  0.7235   -19.4
+      chunk0 0.9479  0.9516  0.9605  0.9643  0.9695  0.9895  0.9638   -22.2
+      aa     0.9976  1.0001  1.0008  0.9975  0.9941  1.0096  1.0000    -0.0
+
+      arm       k=1     k=2     k=4     k=8    k=16    k=32     ALL       z     float64
+      part0  0.7330  0.7434  0.7336  0.7138  0.7245  0.7373  0.7309   -18.4
+      chunk0 0.9550  0.9588  0.9659  0.9693  0.9777  0.9915  0.9696   -18.9
+      aa     0.9983  0.9991  1.0018  1.0010  0.9995  0.9972  0.9995    -0.6
+
+The A/A floor is as good as this instrument gets -- **1.0000 at z -0.0** on float32 and 0.9995 on
+float64 -- so both effects are read against essentially nothing.
+
+**The row partition is worth 1.38x (float32) and 1.37x (float64)**, at every width, and
+**the chunk-width rule is worth 3.75% and 3.13%**, also at every width, largest at narrow k where
+the cells are shortest. Neither is close to its floor. The ARM half of the same question read
+1.009 and 1.018 -- the same signs, an order of magnitude smaller, which is what a 6-thread pool
+against a 24-thread one should do to a partition lever.
+
+**And the partition is carrying most of the MKL margin:**
+
+      dtype     arm                  geomean MKL margin   cells below MKL   matrices below
+      float32   aa (= ship)                      2.1917        111 / 2172               46
+      float32   chunk0                           2.1124        116 / 2172               49
+      float32   part0                            1.5858        721 / 2172              179
+      float64   aa (= ship)                      2.2635         91 / 2172               43
+      float64   chunk0                           2.1959        109 / 2172               52
+      float64   part0                            1.6552        625 / 2172              176
+
+Without the row partition the below-MKL count goes from 111 to **721** on float32 and from 91 to
+**625** on float64, and the pooled margin falls from 2.19x to 1.59x. **Six hundred of the cells we
+currently win, we win because of back-stealing.** That is worth stating plainly because the
+remaining deficit -- 393 cells of 2976 on the hookless board -- is routinely described as "what is
+left"; this says what is already held, and by what.
+
+It also answers the question that was flagged as the one to watch, in the direction that closes it:
+neither `part0` nor `chunk0` reads at or above 1.000 on either host or either dtype, so neither
+shipped lever is a regression anywhere measured. The caveat is retired.
