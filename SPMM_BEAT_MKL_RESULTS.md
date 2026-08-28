@@ -8022,3 +8022,54 @@ chain53 was rebuilt before it ran: it now ladders both constants, on a corpus bi
 degree that spans down to degree 32, and its analyzer classifies each (rows, degree) bin by whether
 the gate fires over the whole bin, over none of it, or straddles a bound -- the straddling bins
 excluded, since an arm firing on part of a bin is not comparable to one firing on all of it.
+
+## All four configurations of the k=1 extension, and the one trade it leaves
+
+| configuration | gather serves k=1? | verdict | replicates |
+|---|---|---|---|
+| x86 float32 | **yes** (AVX2 + `is_same<float>`) | **loses**: 0.9628 pooled, 0.9033 at degree>=256 | 1 |
+| x86 float64 | no | **wins**: 1.0188 pooled | 1 |
+| ARM float32 | no | **wins**: at or above 1.0 in every degree band with the adaptive unroll | 2 |
+| ARM float64 | no | **wins**: +3.8% net, but degree 1-2 loses | 2 |
+
+The rule holds in all four: **take width 1 wherever the gather kernel does not already serve it.**
+It is not an ISA rule and not a dtype rule -- it is a statement about what is displaced, and the
+gather's guard (`#if defined(__AVX2__) && defined(__FMA__)` plus `is_same<scalar_t, float>`)
+happens to select exactly one of the four.
+
+ARM float64, both replicates, k=1:
+
+| band | n | r1 `e0du` | r2 `e0du` |
+|---|---|---|---|
+| deg<1 | 28 | 1.0661 z+7.5 | 1.0665 z+8.2 |
+| **deg 1-2** | 29 | **0.9555 z-1.7** | **0.9575 z-1.9** |
+| deg 2-4 | 48 | 1.0409 z+4.7 | 1.0320 z+4.0 |
+| deg 4-8 | 24 | 1.0801 z+5.7 | 1.0861 z+6.9 |
+| deg 8-64 | 20 | 1.0492 z+4.2 | 1.0525 z+4.1 |
+| deg>=64 | 20 | 1.0601 z+7.3 | 1.0614 z+3.8 |
+
+**On float64 the adaptive unroll does not rescue degree 1-2, and it is not because the unroll
+failed to shrink.** It halves while mean degree is below it, so at mean degree 1 it already
+reaches 1 -- 4 to 2 to 1 -- and the band still reads 0.9555 and 0.9575. On float32 the same arm
+recovered the band to 1.0175 and 1.0037. So for float64 at one nonzero per row the exact-width
+kernel is simply worse than the register-block tile it replaces, for a reason the prologue does
+not explain, and the two dtypes need different treatment at that width.
+
+**The trade, priced.** `SCORCH_NARROWK_EXACT_K1_MINDEG=2` on float64 would withdraw width 1 below
+degree 2, which removes the losing band and also forfeits the deg<1 win. Over those two bands
+together, weighted by matrix count, ungated reads 1.0096 and gated reads 1.000 -- so **the gate
+costs about 0.3% of the total win over the whole corpus and removes a replicated 4.4% regression
+band on 29 matrices.** A degree floor cannot do better than that here, because the bad band is in
+the middle: deg<1 wins, deg 1-2 loses, deg 2-4 and up win.
+
+Under this project's convention -- neutral-or-better everywhere, no regressions, gate a sub-regime
+win behind a condition that provably cannot fire where it would hurt -- the gate is the right
+call and 0.3% is a cheap price. **Recording it as a decision for Bobby rather than taking it**,
+because the alternative reading is defensible: 4.4% on 29 low-degree float64 matrices, against
+0.3% of a 3.8% win, is close enough that which one counts as the regression depends on what the
+corpus is meant to represent.
+
+**Still open, and it matters for the same constant:** chain42's corpus contains nothing below
+degree 8, so **x86 float64's low-degree behaviour is unmeasured**. If it loses at degree 1-2 the
+way ARM float64 does, the floor is needed on both hosts; if not, it is ARM-specific. chain50 has
+the stratified x86 corpus but sweeps `MINDEG` and `DEGUNROLL`, not `K1`, so this needs its own run.
