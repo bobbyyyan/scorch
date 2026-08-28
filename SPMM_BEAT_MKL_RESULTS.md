@@ -7205,3 +7205,45 @@ than printing the result alongside as the other chains do. It also refuses if no
 appears at all, which is the difference between "the suite passed" and "the suite did not run"
 -- the same distinction that made the neutrality gate and the correctness check vacuous earlier.
 It was parked, so it was killed by PID and relaunched from the edited file.
+
+### The first positive result for the ILP lever: ex1 on ARM, +6% and +14% by degree
+
+ARM, float32, k=1, `ex1` (the exact band lowered to 1, giving the width four independent scalar
+chains instead of one carried dependency), against the same-code `refb` floor:
+
+| band | refb | ex1 | aa |
+|---|---|---|---|
+| deg<64 (n=49) | 1.0048 | 0.9924 (z-1.0) | 1.0147 |
+| deg 64-256 (n=14) | 1.0028 | **1.0608 (z+3.2)** | 1.0056 |
+| deg>=256 (n=7) | 0.9976 | **1.1372 (z+1.6)** | 0.9969 |
+
+The floor is not the `refb` column alone but every provably-inert cell in the run: k=2, where
+the exact band already holds 2, and k=4, which is above HI=3. Those span 0.9875 to 1.0147 --
++/-1.5%. `ex1` clears it by 6.1% at degree 64-256 and 13.7% at degree >=256, and the effect
+**rises monotonically with degree**, which is what more independent chains should do: they only
+pay when a row is long enough to keep them all fed. At degree below 64 it reads 0.9924, inside
+the floor, so it is neutral rather than harmful there. float64 agrees where it has data --
+1.0150, 1.0400 (z+2.5), 0.9626 across the three bands -- though its grid kept only 23 of 70
+matrices, so it is the weaker half.
+
+Three things make this worth more than its size suggests.
+
+It is at **the width and the degree band where x86 actually loses**. The caller-path scoreboard's
+k=1 deficit is 27 float32 and 22 float64 warm cells, and the losing family is few rows at
+degree 64-256 and above. This lever wins 6-14% in exactly that band.
+
+It is **mechanism confirmation on a host with a different kernel**. ARM has no gather
+instruction, so k=1 there runs the register-block kernel with one lane of four, not the
+microcoded gather x86 uses. Both are single-carried-dependency loops, and adding chains helps
+both. That is the same conclusion the dtype-scaling table reached from the opposite direction.
+
+And it **satisfies the shipping rule that was pre-registered before any of this was measured**:
+neutral-or-better in every degree band against the floor, including the low-degree band, which
+is the condition for shipping ungated rather than behind a gate.
+
+What it is not: a closed deficit. ARM has no MKL -- `mkl_ms` there is `torch.sparse.mm` -- and
+we read 4.1x to 4.5x against it with **0 of 70 cells behind at every width**. Nothing on this
+host was losing. chain42 is the run that says whether the same lever closes the x86 cells, and
+**the prediction registered here is that it should win at least as much there**, because the
+gather it replaces serialises its eight accesses in microcode while ARM's masked register kernel
+does not -- so x86 starts from a worse baseline at the same width.
