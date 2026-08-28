@@ -4945,3 +4945,38 @@ faster and 7 / 6 more than 10% slower.
 
 **So the shipping configuration is decided:** back-stealing, the exact-width narrow-k kernel
 at unroll 4, the work gate at two grains, and the gate's pool ceiling at 16.
+
+## The scoreboard on the path a user actually gets
+
+Everything above times the kernel, or times a call that passed `time_dict` and so bypassed
+the per-tensor plan cache. The production path is `ops.matmul(A, B)` with no keywords, served
+from the plan cache on every repeat call. Scored against MKL's whole call, 372 cells:
+
+| | float32 | float64 |
+|---|---|---|
+| **warm, whole call vs MKL** | **1.6471** | **1.6731** |
+| cells below MKL | **37 / 372** | **31 / 372** |
+| worst cell | 0.638 | 0.723 |
+| cold, whole call vs MKL | 1.2018 | 1.2560 |
+| cells below MKL, cold | 81 / 372 | 53 / 372 |
+| non-kernel cost, production path | **−2.4 µs** | **−2.0 µs** |
+| non-kernel cost, `time_dict` path | +7.3 µs | +7.0 µs |
+
+The kernel-only column reads 1.4978 / 1.5459 with 117 / 73 cells below MKL — *worse* than the
+whole-call column, because comparing our kernel against MKL's whole call charges MKL nothing
+for its own per-call cost. Whole call against whole call is both the fairer comparison and
+the one a user experiences.
+
+**And the remaining deficit is small in absolute terms.** Of the 37 below-MKL cells on float32,
+32 are the kernel's own (5 are overhead-only), and their gap is a **median 0.7 µs on an 18.6 µs
+call — 3.9%**. For the 22 of them under 20 µs the gap is 0.6 µs. Float64 is the same at 1.1 µs
+on 19.9 µs, except for 7 cells above 40 µs where the gap is real: **12.3 µs, 11.1%**.
+
+By family, the below-MKL kernel-fault cells are **29 near-dense and 3 few-row on float32, 25
+and 6 on float64**. So on the production path the near-dense family is essentially the whole
+remaining gap, the few-row family is three cells, and degree-below-4 does not appear at all.
+
+That reorders the next campaign. It is not a missing kernel: it is a **sub-microsecond fixed
+cost on ~19 µs calls** whose arithmetic is about 2 µs — output zero-fill, team fork and join,
+policy resolution — plus a separate group of seven large float64 cells that is worth its own
+look.
