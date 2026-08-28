@@ -9717,3 +9717,49 @@ Open, and one measurement: whether `btrue` is additive on top of cap-at-pool. Al
 +6.3% and +6.0% at k=1. Independent effects would compound to about 1.12; redundant ones
 would stay near 1.06. `btcap` cannot answer it because its cap arm was the P-core count,
 which swamps everything.
+
+## The defect, finally stated in one sentence: three ceilings read the wrong number
+
+Two refusals on the M5 closed this, and both were instrument checks declining to run rather
+than grids producing numbers.
+
+stage33 asked whether the *base grain* is the defect. Its check printed
+
+      at k=12, 1.2M nonzeros: default 18, grain x4 18, grain x8 18, btrue 18, cap-at-pool 6
+
+and refused, because the grain does not lower the count at all there. Neither does
+base-work-true. The eighteen is `omp_get_num_procs()`, reached through the **row-proxy
+raise**, whose own ceiling is num_procs and not the pool -- so no correction to the base
+bound's measure or threshold can touch it, and only a ceiling can.
+
+stage34 asked whether the *adoption* is the defect on ARM. It printed
+
+      pool=6: default 18, adopt-grain 18, base-work-true 7, both 7
+
+and the adoption grain moves nothing, because the adoption only ever RAISES and the base and
+raise paths have already produced 18. Even base-work-true leaves 7, which is still above the
+pool of 6.
+
+So the defect is one thing, in three places. `scorch_nthreads` caps the base count at
+`omp_get_num_procs()`; the row-proxy raise caps at `omp_get_num_procs()`; the adoption caps at
+`omp_get_num_procs()`. That is 32 against torch's pool of 24 on redwood and 18 against 6 on
+the M5. **The SpMM resolves more workers than the framework it lives in advertises, by three
+different routes, and capping the final count at the pool corrects all three at once.**
+
+Everything else measured today is a partial view of that one fact:
+
+      base-work-true    corrects one route's measure     ARM +23-34% at k<8, x86 +6% at k=1,
+                                                         inert at k>=16 by construction
+      adopt-grain       corrects a route that only       null on both hosts: it cannot lower
+                        raises                           what the other routes already set
+      base grain        corrects a threshold on the      null at k=12: wrong route
+                        base route
+      cap at P-cores    a ceiling at the wrong number    x86 -32%
+      cap at the pool   the ceiling at the right number  positive at every width, both hosts,
+                                                         both dtypes
+
+The `-2` sentinel is verified on ARM: over four probe shapes it equals an explicit 6, never
+exceeds the pool, and correctly leaves kl02 alone -- 71 rows resolves to 4, below the pool, so
+the cap is inert there. The remaining ARM question is whether base-work-true adds anything on
+top of it, which stage35 is measuring now; on the probe shapes the pair and the cap alone give
+the same count, so the expectation is that it does not.
