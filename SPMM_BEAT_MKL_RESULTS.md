@@ -4798,14 +4798,32 @@ instrument, and the honest count of the remaining deficit is the caller-path one
 **The residue that is genuinely the kernel is 82 cells (f32) / 77 (f64), and it is two
 families.**
 
-1. **Fewer rows than workers, enormous degree.** kl02 (71 rows, degree 2993, k=2): 32 µs
-   against MKL's 25. nw14 (73 rows, degree 12396, k=2): 100 against 62. bibd_17_8 (136 rows,
-   degree 5005, k=4): 63 against 41. rn50 magnitude-pruned (256 rows, degree 1152, k=1): 29
-   against 22. Row-parallel decomposition cannot reach these — 71 rows over 24 workers is
-   already fewer rows than workers, and `rows/SCORCH_ROWS_PER_THREAD` holds the team at four.
-   What is missing is parallelism *within* a row: split a long row's nonzero range across
-   workers and reduce, the CSR-Vector / segmented-reduction shape. We have no such mechanism.
-   This is the one real hole the grid points at.
+1. **Few rows, enormous degree — and the mechanism for it is already built.** kl02 (71 rows,
+   degree 2993, k=2): 32 µs against MKL's 25. nw14 (73 rows, degree 12396, k=2): 100 against
+   62. bibd_17_8 (136 rows, degree 5005, k=4): 63 against 41. rn50 magnitude-pruned (256 rows,
+   degree 1152, k=1): 29 against 22.
+
+   My first reading of this was that row-parallel decomposition cannot reach these and that
+   within-row parallelism — the CSR-Vector / segmented-reduction shape — was the missing
+   mechanism. **That is wrong, and the row counts say so directly:** the smallest is 64
+   against a 24-thread pool, so every one of these has more rows than workers and a row split
+   reaches full width on all of them. What holds the team narrow is not the decomposition, it
+   is `rows/SCORCH_ROWS_PER_THREAD`, which gives a 71-row product four workers.
+
+   That is the nonzero-expressed row ceiling, and compiled in it reads **1.3066 (f32) /
+   1.4011 (f64)** inside its own gate on x86 with the harmed tail *below* the A/A floor. It
+   is off today because it does not carry to ARM — no gain in gate (0.9887 / 0.9753) and
+   about 2% off outside it on float64, per-matrix z = −2.15. But the doc's own account of why
+   is that the sign is set by **how much machine the shape was failing to use**: on x86 the
+   rule takes a few-row product from 4 workers to 22, on ARM from 4 to 6, and there are only
+   six to have. A rule conditioned on the caller's pool expresses exactly that, is not
+   ISA-conditional, and on a 6-thread host becomes unreachable code — which removes the ARM
+   cost by construction rather than by tuning. It is the mirror image of the work gate above,
+   which fires only *below* a pool ceiling. Both fail closed to what ships today.
+
+   The evidence for the x86 side is 7 matrices (per-matrix z 1.61 on f32, 2.95 on f64), which
+   is thin. This corpus supplies 11 (f32) / 13 (f64) more of the same family, so the widened
+   in-gate corpus needed to settle it exists.
 2. **Degree 1 with many rows.** Pd_rhs and Pd_b (8081 rows, degree 1, k=1–2): 27 µs for 8081
    nonzeros is 3.3 ns per nonzero, against MKL's 17 µs. Nothing about the arithmetic costs
    that; it is fixed per-row cost — the prefetch guard, the mask setup, the exact-width
