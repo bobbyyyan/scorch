@@ -10,6 +10,51 @@
 #include "prebuilt_types.h"
 #include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.h)
 
+// A row's dot product with the dense vector, held in ACC independent accumulator chains.
+//
+// The shipped loop is ONE chain, and the compiler does not fix that. Built with
+// -O3 -march=native -ffast-math -funroll-loops, GCC unrolls it eight to sixteen deep but does
+// not reassociate: on this host every FMA in the disassembled float and double bodies targets
+// the same register (%xmm0), so a row costs one FMA LATENCY -- four cycles -- per nonzero
+// regardless of what the memory system is doing. It also never vectorises, because the B load
+// is indirect and GCC declines to form a gather inside a reduction. ACC chains issue the same
+// instructions and divide that latency by ACC, until the loads bind instead.
+//
+// ACC == 1 reproduces the shipped loop: nb == n, so the remainder loop cannot execute and the
+// cross-chain sum is a single copy. That is what keeps the default attributable.
+template <typename scalar_t, int ACC>
+static inline scalar_t scorch_spmv_row(
+    const int* SCORCH_RESTRICT A1_crd, const scalar_t* SCORCH_RESTRICT A_val,
+    const scalar_t* SCORCH_RESTRICT B_val, int pA_begin, int pA_end) {
+  // ACC == 1 is the shipped loop reproduced character for character, and it is a separate
+  // branch rather than a special case of the general one on purpose: written as
+  // `nb = n - n % ACC` with a remainder loop, ACC == 1 makes both provably dead and the
+  // compiler STILL emitted them -- a full normalised disassembly of the object moved by 3040
+  // lines, including a vector zero and a block-count guard this function never had. So the
+  // default path is spelled out instead, and the object is byte-identical to before the change.
+  if constexpr (ACC == 1) {
+    scalar_t accum = static_cast<scalar_t>(0);
+    for (int pA1 = pA_begin; pA1 < pA_end; pA1++) {
+      int j = A1_crd[pA1];
+      accum += A_val[pA1] * B_val[j];
+    }
+    return accum;
+  } else {
+    scalar_t acc[ACC];
+    for (int s = 0; s < ACC; s++) acc[s] = static_cast<scalar_t>(0);
+    const int n = pA_end - pA_begin;
+    const int nb = n - n % ACC;
+    for (int t = 0; t < nb; t += ACC) {
+      for (int s = 0; s < ACC; s++)
+        acc[s] += A_val[pA_begin + t + s] * B_val[A1_crd[pA_begin + t + s]];
+    }
+    scalar_t r = acc[0];
+    for (int s = 1; s < ACC; s++) r += acc[s];
+    for (int q = pA_begin + nb; q < pA_end; q++) r += A_val[q] * B_val[A1_crd[q]];
+    return r;
+  }
+}
+
 template <typename scalar_t>
 Tensor spmv_csr(
   std::vector<int> result_shape,
@@ -32,15 +77,54 @@ Tensor spmv_csr(
       torch::empty({C0_size}, scorch_torch_dtype<scalar_t>());
   scalar_t* C_values = C_values_torch.data_ptr<scalar_t>();
 
-  #pragma omp parallel for schedule(static)
-  for (int i = 0; i < C0_size; i++) {
-    scalar_t accum = static_cast<scalar_t>(0);
-    for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
-      int j = A1_crd[pA1];
-      accum += A_val[pA1] * B_val[j];
+  // How many independent accumulator chains a row runs. 1 is the shipped path and stays the
+  // default until a grid says otherwise; the hook is how the ladder gets measured. Only powers
+  // of two up to 8 are instantiated, and anything else falls back to 1 rather than silently
+  // picking a neighbour.
+#ifdef SCORCH_TUNE_HOOKS
+  int spmv_accum = SCORCH_SPMV_ACCUM;
+  { const char* e = std::getenv("SCORCH_SPMV_ACCUM");
+    if (e && *e) { long v = std::atol(e);
+      if (v == 1 || v == 2 || v == 4 || v == 8) spmv_accum = (int)v; } }
+#else
+  // constexpr, not const: it is what lets the switch below fold away entirely in the shipped
+  // build, so the other three instantiations are never emitted.
+  constexpr int spmv_accum = SCORCH_SPMV_ACCUM;
+#endif
+  // The schedule is deliberately left as it ships. Row length varies by orders of magnitude on
+  // a power-law matrix and a static split is the wrong decomposition for that, but changing it
+  // in the same step as the accumulator count would make neither attributable.
+  #define SCORCH_SPMV_LOOP(AC) \
+    _Pragma("omp parallel for schedule(static)") \
+    for (int i = 0; i < C0_size; i++) \
+      C_values[i] = scorch_spmv_row<scalar_t, AC>( \
+          A1_crd, A_val, B_val, A1_pos[i], A1_pos[i + 1]);
+  // The one-chain case is written out here rather than routed through the helper, and this
+  // duplication is exactly what byte-identity costs. Reaching the same loop through a call
+  // changes WHEN A1_pos[i + 1] is loaded -- the bound becomes an argument evaluated before the
+  // call instead of a condition inside it -- and the object moved by 55 lines of addressing and
+  // scheduling at an identical instruction count. Written at its original call site the object
+  // is unchanged, which is what lets this land without a waiver. In the shipped build
+  // spmv_accum is constexpr 1, so everything below folds away and the other three
+  // instantiations are never emitted.
+  if (spmv_accum == 1) {
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < C0_size; i++) {
+      scalar_t accum = static_cast<scalar_t>(0);
+      for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+        int j = A1_crd[pA1];
+        accum += A_val[pA1] * B_val[j];
+      }
+      C_values[i] = accum;
     }
-    C_values[i] = accum;
+  } else {
+    switch (spmv_accum) {
+      case 2: SCORCH_SPMV_LOOP(2); break;
+      case 4: SCORCH_SPMV_LOOP(4); break;
+      default: SCORCH_SPMV_LOOP(8); break;
+    }
   }
+  #undef SCORCH_SPMV_LOOP
 
   Tensor C;
   C.storage.index.mode_indices = {{}};

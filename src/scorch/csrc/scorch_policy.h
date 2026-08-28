@@ -126,6 +126,13 @@
 // is deg*k > 9375. Every matrix with more rows than that gets the identical thread
 // count, so the GCN and autoencoder shapes, and reddit, are untouched by
 // construction rather than by measurement.
+// Independent accumulator chains in the prebuilt SpMV row loop (kernels.h). 1 is what ships
+// and what the disassembly shows the compiler produces on its own; see scorch_spmv_row for why
+// the compiler will not widen it. Raise only once a grid on both hosts says so.
+#ifndef SCORCH_SPMV_ACCUM
+#  define SCORCH_SPMV_ACCUM 1
+#endif
+
 #ifndef SCORCH_SPMM_ROWS_PER_THREAD
 #  define SCORCH_SPMM_ROWS_PER_THREAD 1L
 #endif
