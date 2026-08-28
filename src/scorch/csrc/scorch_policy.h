@@ -172,7 +172,25 @@
 
 // A ceiling on the FINAL resolved worker count, applied after both the policy count and
 // the composition adoption. 0 is off; a positive value is that many workers; -1 means
-// scorch_pcore_count(), the host's performance-core count.
+// scorch_pcore_count(), the host's performance-core count; **-2 means the pool the caller
+// advertises**, which is the value the measurements chose.
+//
+// -2 is the rule worth shipping and the other two are not. The SpMM currently ceilings at
+// omp_get_num_procs() in three places -- the base bound inside scorch_nthreads, the row-proxy
+// raise, and the adoption -- and that is 32 against torch's pool of 24 on redwood and 18
+// against 6 on the M5. Capping at the pool instead reads, on the cells it moves:
+//
+//     x86 f32   1.2033 / 1.2395 / 1.2249 / 1.2349 / 1.2053 / 1.0787   at k = 1/2/4/8/16/64
+//     ARM f32   1.2539 / 1.2729 / 1.2476 / 1.1686 / 1.0104            at k = 1/2/4/8/16
+//
+// positive at every width on both hosts, 6.3% whole-corpus on x86 float32 with TEN of 302
+// matrices worse than 5% against the A/A arm's thirteen. No width gate and no chosen constant.
+//
+// The P-core count (-1) is a 32% LOSS on x86 -- 0.6841 at k=1 with z of -41.7, 186 of 302
+// matrices worse than 5% -- and it only looked right on ARM because there the P-core count IS
+// the pool. An earlier estimate synthesised from SCORCH_TUNE_THREADS arms said -1 was worth
+// 1.1055 here; those arms force the BASE count, which the adoption then raises back to the
+// pool, so the estimate was a reading of THIS rule mislabelled as that one.
 //
 // Every number below is SYNTHESISED from SCORCH_TUNE_THREADS arms, which force the base
 // count that scorch_nthreads returns and not the final one -- the row-proxy raise and the
@@ -1087,7 +1105,14 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     { const char* e = std::getenv("SCORCH_SPMM_NT_CAP");
       if (e && *e) nt_cap = std::atol(e); }
 #endif
-    if (nt_cap < 0) nt_cap = (long)scorch_pcore_count();
+    if (nt_cap == -2) {
+      // The pool the caller manages, exactly as ceil_pool_ok reads it: the override when the
+      // caller passed one, otherwise what the framework has configured. Deliberately not
+      // omp_get_num_procs(), which is the whole defect being corrected.
+      nt_cap = nthreads_override > 0 ? (long)nthreads_override : (long)omp_get_max_threads();
+    } else if (nt_cap < 0) {
+      nt_cap = (long)scorch_pcore_count();
+    }
     bool floor_ceil = SCORCH_SPMM_NT_CAP_FLOOR_CEIL != 0;
 #ifdef SCORCH_TUNE_HOOKS
     { const char* e = std::getenv("SCORCH_SPMM_NT_CAP_FLOOR_CEIL");
