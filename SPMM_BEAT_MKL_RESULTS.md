@@ -5091,3 +5091,26 @@ instructions, which confirms the attribution.
 
 So the waiver is not "trust me, it should inline": the loops are the same bytes, the setup is
 strictly smaller, and no memory operation was added anywhere. No runtime A/B is owed.
+
+## The change is in: both hosts correct, the flip proven to be the measured binary
+
+| | ARM (M5) | x86 (redwood) |
+|---|---|---|
+| correctness, shipping configuration compiled in | **1099 passed, 48 skipped** | **1097 passed, 48 skipped** |
+| wall clock | 33 min | 48 min |
+| exit | 0 | 0 |
+
+(The two-test difference is collection, not failure: 1150 against 1148 items, the ARM host
+carrying two NEON-specific tests.)
+
+Flipped: `SCORCH_SPMM_PARTITION_DEFAULT` 0 → 3, `SCORCH_NARROWK_EXACT_UNROLL` 0 → 4,
+`SCORCH_SPMM_PARTITION_MINGRAINS` 0 → 2, `SCORCH_SPMM_PARTITION_GATE_MAXTHREADS` 0 → 16.
+
+The flip was verified rather than assumed: built once with the old defaults plus those four
+`-D` flags — the shape every grid measured — then again with the new defaults and no flags, and
+**all 221 spmm symbols disassemble identically**. The `-D` grid results therefore describe the
+shipped binary, not a near relative of it.
+
+`pre-commit.sh` fails on this repository at `main` too (262 flake8 findings, 186 mypy errors,
+14 files black would reformat, all from black-version drift and missing stubs in compiler
+files). This branch is cleaner on all three (241, 184, 3) and changes no Python at all.
