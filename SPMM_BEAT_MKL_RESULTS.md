@@ -10881,3 +10881,108 @@ general corpus. It is one percent past a floor that is itself 0.7% off 1.000, fr
 it is a signal and not yet a finding -- but it is the reading that was flagged as the one to
 watch, and it landed below 1.00 in both dtypes, so it is now a question that needs its own run
 rather than a caveat.
+
+## The warm deficit peaks at exactly one width, and that width's kernel has half the accumulator chains
+
+Three readings off chain24's caller-path board, float32, both reps of the base arm averaged.
+Nothing new was run for any of them.
+
+### It is not a fixed per-call cost
+
+Fitting the below-MKL cells of each width two ways -- `ours = mkl + d` and `ours = mkl*(1+e)` --
+and reporting the median residual of each relative to MKL's time, plus the correlation between
+the gap and log nnz:
+
+      k    n | fixed cost: d      resid   r(log nnz) | proportional: e   resid   r(log nnz)
+      1   32 |       1.26 us     0.0197        +0.52 |          0.0748  0.0180        +0.38
+      2   16 |       0.96 us     0.0222        +0.71 |          0.0530  0.0195        +0.43
+      4   40 |       2.18 us     0.0978        +0.65 |          0.1157  0.0848        +0.63
+      8   10 |       1.34 us     0.0217        +0.46 |          0.0545  0.0302        +0.21
+
+The proportional model has the smaller residual at k=1, 2 and 4 and the weaker correlation with
+the work at k=1, 2 and 8. Neither model is clean, but the deficit is better described as a
+fraction of the work than as a constant, so **the fixed-cost lever is a cold lever and not a
+warm one** -- which is also how Bobby framed the two phases.
+
+### It peaks at k=4, sharply, for nearly every deep loser
+
+Ratio against MKL across all six widths, for the ten matrices that lose deepest at k=4:
+
+      rows      deg     k=1     k=2     k=4     k=8    k=16    k=32
+        73  12396.0   0.697   1.062   1.573   1.114   0.841   1.116   nw14
+      4350    139.0   0.839   0.800   1.458   0.726   0.989   0.712   lp_osa_30
+      2048    300.5   0.998   1.003   1.342   1.042   0.799   0.611   transformer l0_reg 0.5
+      2048    190.9   1.055   1.168   1.314   1.067   0.804   0.616   transformer l0_reg 0.6
+      2048    215.3   1.025   1.170   1.308   1.042   0.824   0.624   transformer var_drop 0.7
+      2048    153.6   1.030   1.165   1.285   1.013   0.752   0.578   rn50 mag_prune 0.7
+       512    255.7   1.093   1.060   1.234   0.884   0.769   0.941   transformer var_drop 0.6
+       512    277.6   1.088   1.061   1.224   0.916   0.788   0.861   transformer l0_reg 0.5
+       512    256.0   1.088   1.064   1.214   0.881   0.793   0.953   transformer rand_prune 0.5
+      1024    128.0   1.094   1.046   1.198   0.856   0.718   0.698   rn50 rand_prune 0.5
+
+Every row has the same shape: near parity at k=1 and k=2, a peak at k=4, and comfortably ahead
+of MKL from k=8 on. **A fixed per-call cost falls monotonically as k grows. A gather or
+bandwidth deficit rises with k. A spike at one width is neither -- it is that width's kernel.**
+
+The ten deepest at k=1 are the same matrices and the same curve; the k=1 group is the largest by
+count (32 to 40 cells depending on the rep) and the **shallowest by depth**: its worst cell is
+1.105 and its median is 1.075. So of the two big loser groups, k=1's entire available win is
+about ten percent on its worst cell, and k=4's is up to 57%.
+
+### The mechanism, and the arm it implies needs no code
+
+k=4 float32 is the half-vector width, and the half-vector kernel already ships for it
+(`SCORCH_SPMM_HALFVEC_F32=1`, measured 1.1008 at z +14.6, cells below MKL 125/302 down to 70).
+chain24's build carries it -- verified in that tree's `scorch_policy.h` and its `.so` -- so the
+spike above is what is LEFT after it.
+
+What is left is an accumulator count. The half-vector path is
+`scorch_spmm_row_regblock<float,1,true,128-bit>`, which keeps **two** accumulator chains (even
+nonzeros in one, odd in the other). The widths on either side of it, k=2 and k=3, run
+`scorch_spmm_row_narrow_exact<float,K,UNROLL>` with UNROLL=4 -- **four** chains. An FMA has four
+cycles of latency and two can issue per cycle, so two chains cap a row at two cycles per nonzero
+and four chains cap it at one.
+
+And k=4 is precisely the width the exact-width kernel's per-width sweep never covered. The
+constant's own comment says so: `SCORCH_NARROWK_EXACT_HI=3` came from a sweep that measured
+k=2, 3, 5, 6 and 7, and "this is the width the per-width sweep skipped". The instantiation for
+k=4 exists and both dispatch switches have a `case 4`. Nothing routes to it, because the
+half-vector arm was placed ahead of the exact-width arm and takes width 4 unconditionally.
+
+So the experiment is three environment settings over two hooks that are already compiled in,
+with no source change at all:
+
+      base    HALFVEC=1 HI=3   the shipped build, stated explicitly so all arms set two variables
+      exact4  HALFVEC=0 HI=4   k=4 to narrow_exact<float,4,4> -- four accumulator chains
+      nohv    HALFVEC=0 HI=3   k=4 back to the masked 256-bit regblock, which prices the
+                               half-vector kernel itself on this corpus
+
+k=2 and k=8 go in the width list as **the candidate's own inert set**: at k=2 all three arms
+route to the exact-width kernel and at k=8 all three route to the mask-free regblock, so those
+widths must read 1.000 and what they do read is the floor for k=4.
+
+### Queued as chain30, with the routing proved from the output bytes
+
+Timing cannot tell you which kernel ran, and an arm whose hook is dead reads as a null result
+rather than as an error -- that is how an earlier exact-width grid ran with three of seven arms
+silently equal to each other. So chain30 proves the routing before it times anything, from the
+last bits of the result:
+
+* The three kernels sum a row in different orders. `narrow_exact` groups nonzeros by position
+  modulo UNROLL; both regblock variants split them even/odd. So `exact4` **must** differ from
+  base at k=4, and the chain refuses if it does not.
+* The 128-bit regblock holds in lane i exactly what the masked 256-bit one held in lane i, so
+  `nohv` is **predicted bit-identical** to base at k=4. That is a prediction, not a
+  precondition: it is tested and reported, and if it fails the half-vector kernel changes
+  numerics as well as speed, which would be worth knowing. If it holds, `nohv` is a pure
+  instruction-count A/B with identical arithmetic.
+* An absence of difference proves nothing by itself, so the hook's liveness is established
+  separately on a pair whose route change must be visible: float64 k=2, where the shipped
+  default is the exact-width kernel and `SCORCH_SPMM_HALFVEC=1` moves it to 128-bit registers.
+* The two inert widths are checked to be bit-identical across all three arms, or they cannot
+  serve as the floor.
+
+It reuses chain25b's hooked build, so there is nothing to compile. Numbered 30 so that
+chain48's and chain63's existing wait patterns (`rw_chain(2[0-9]|3[0-9]|4[0-7])`) already
+cover it, and its own guard waits on chains 22 through 29, so no running script needed editing
+and no two chains can time at once.
