@@ -9525,3 +9525,52 @@ mechanism aimed at them.
 Note what this does NOT license: reading the two negative figures as noise because it would
 be convenient. The prediction to register is that a powered run finds a small real cost on
 float64, since 2.1% is large for pure layout, and finds nothing on float32.
+
+## Amendment to the registered predictions: base-work-true cannot work on x86, and why
+
+Written after reading chain21's *instrument* line and before any of its timing. The line is
+
+      pool=24: default 32, cap-pcores 8, cap8 8, base-work-true 24, both 8
+
+and it falsifies my registered prediction 2 in the opposite direction from the one I
+guessed. I predicted base-work-true would be *more aggressive* on x86 -- 32 workers down to
+two -- and might overshoot. It is far *less* aggressive: 32 down to 24.
+
+The base count does drop to 7. 1179648 nonzeros at k=1 is seven grains of real arithmetic,
+exactly as intended. Then the composition adoption raises it back to
+`min(override 24, rows/16 = 32)` = 24. That branch has no work term at all; the source says
+so in as many words, and notes that sharing the widened row ceiling with it is what once
+broke ARM. On the M5 the pool is 6, so there was nothing to raise back to and the reduction
+survived -- which is the whole reason ARM measured base-work-true at 1.23-1.34, and why that
+number was never going to transfer here.
+
+The cap survives because it is applied after the adoption. That is not an argument for the
+cap; it is a diagnosis of *where the x86 over-threading comes from*. It comes from the
+adoption path, not the base bound.
+
+And the designed remedy exists, and is off. `SCORCH_SPMM_ADOPT_GRAIN` grades the adopted
+count so each worker gets a grain of real arithmetic:
+`min(override, rows/16, work_true/adopt_grain)`, which for that same shape is
+`min(24, 32, 7)` = 7 -- the number base-work-true wanted and could not keep.
+
+So the three corrections are one family, and which of them binds is a property of the host's
+pool rather than of the code:
+
+      base-work-true    the base bound's MEASURE     binds where the pool is small     ARM
+      adopt-grain       the adoption's AMOUNT        binds where the pool is large     x86
+      the cap           a ceiling over both          blunt, host-parameterised, last
+
+This also explains, in retrospect, the one number in the ARM data that the base-bound story
+did not fit: at k=12 the cap was worth 1.2188 where base-work-true had faded to 1.0619. I
+read that as evidence about the grain threshold. It is at least as well explained by the
+adoption, which is indifferent to k and so does not fade with it.
+
+chain21 was already running with no adoption arm, so chain22 was killed while parked and
+rewritten as the adoption-grain ladder: `ag75 / ag150 / ag300`, plus `agbt` (both principled
+corrections together, the candidate to ship if it matches the cap), plus `cappc` and `agcap`
+so the comparison is on the same cells. The board run moves to chain23, and will use whatever
+wins rather than a mechanism I now expect to be nearly inert here.
+
+Prediction, registered: `ag150` recovers most of what `cappc` recovers on x86 at k<=8, and
+unlike the cap it also acts at k=16 and k=64, because the adoption never fades with width.
+That last part is the risk, not the benefit -- at k=64 the adopted count may be right.
