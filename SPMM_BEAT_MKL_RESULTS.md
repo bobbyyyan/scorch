@@ -10282,3 +10282,45 @@ Two notes on the instrument, both of which cost this run a wrong answer before t
 
 This is the guardrail the candidate needed most, and it passes: **the cells it acts on get
 faster, on the real workload, and the cells it does not act on are provably untouched.**
+
+## chain24 with two reps per arm: the cap is null on the caller path, and the design cannot do better
+
+Averaging each arm over its two reps and applying the same estimator to the effect and to both
+same-arm controls, 124 matrices, float32:
+
+      timer            effect     z  |  base r1/r2     z  |  cpool r1/r2     z
+      warm_plan_ms     0.9967  -1.3  |     1.0021   +1.1  |      1.0011   +0.4
+      warm_base_kms    0.9905  -5.3  |     0.9726   -8.7  |      1.0012   +0.6
+      warm_base_ms     0.9938  -2.8  |     0.9775   -7.7  |      1.0020   +1.0
+      warm_mkl_ms      0.9989  -0.3  |     1.0003   +0.0  |      1.0001   +0.0
+      cold_plan_ms     0.9962  -1.3  |     0.9920   -2.4  |      1.0125   +4.1
+      cold_base_kms    0.9916  -4.6  |     0.9816   -7.4  |      1.0045   +1.6
+
+**On the caller path the cap is null**: 0.9967 at z -1.3 warm, 0.9962 at z -1.3 cold, against a
+project bar of |z| >= 3 and controls of the same magnitude as the effect. Cold is worse than
+null-looking -- its two controls straddle it at 0.9920 and 1.0125.
+
+The kernel timer's disqualification now has a mechanism. Its two controls are **0.9726 (z -8.7)
+and 1.0012 (z +0.6)**: the drift is not general, it is specific to `base` r1, which is the first
+run the chain performed. r1 was the *fastest*, and every later run is slower, which is a monotone
+drift across the sequence -- a cold machine warming up under a two-hour chain.
+
+That is a **position-in-sequence confound, and averaging reps does not remove it.** chain24 runs
+base, cpool, btrue, base, cpool, btrue. Every arm's two positions are a constant offset apart, so
+a monotone drift shifts every arm by the same amount *relative to its predecessor* and cpool
+still sits one position behind base at both reps. One position is worth roughly 0.9% here
+(2.7% over three positions); the effect being measured is 0.33%. **The design cannot resolve an
+effect smaller than one position's drift**, and no number of reps fixes it, because reps are what
+create the positions.
+
+What chain24 IS fit for is the scoreboard: the below-MKL counts compare our column to MKL's
+*within the same run*, at the same position, so the drift enters both sides. Those numbers stand
+(107/744 warm and 198/744 cold below MKL on this build's base arm). What it is not fit for is
+scoring a sub-1% knob, and that is what chain26b's interleaved caller-path run exists to do --
+arms rotating randomly within every repetition of every cell, so position is randomised rather
+than fixed.
+
+Provisionally, then: **the thread cap's x86 caller-path value is null**, and the case for shipping
+it rests on ARM, where the real autoencoder reads 0.8043 on the cells the rule acts on against a
+2-3% floor. Held until chain26b, which measures the x86 caller path with an instrument that can
+see 1%.
