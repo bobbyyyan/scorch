@@ -5642,10 +5642,19 @@ slower kernel, and it is neither — it is three different things:
 Regressing the delta on nonzeros gives R² 0.11, on rows 0.00, and on the kernel's own time 0.07.
 No single mechanism fits, which is why no more of this is worth doing by inspection.
 
-The last two rows are the interesting ones, and they are the family the row-axis rule in
+The last two rows are the interesting ones, and they are the shape the row-axis rule in
 `scorch_spmm_nthreads` names in its own comment: few rows, very high degree. nw14 is 73 rows of
-mean degree 12396; lp_osa_14 is 2337 rows; kl02 (71 rows, degree 2993) is the shape the
-nonzero-expressed ceiling exists for, and that ceiling is **off by default**.
+mean degree 12396, lp_osa_14 is 2337 rows, and kl02 (71 rows, degree 2993) is the cell that
+comment is written about.
+
+But the nonzero-expressed ceiling does not explain the 10x, and the arithmetic says so without
+a measurement. With `RAISE_GRAINS` at 2, nw14 at k=8 has `work_true/300000 = 24`, so it already
+resolves to 24 workers today; turning the ceiling on moves it to 32, which is a widening and not
+a 10x. Where the ceiling is the fix is the same family at NARROW k, because that is where the
+raise's real-arithmetic bound is what binds: nw14 at k=2 goes from 6 workers to 32, and kl02 at
+k=2 from 4 to 22. Both are inside the gate (73 and 71 rows against `CEIL_MAXROWS` 128; degree
+12396 and 2993 against `CEIL_MINDEG` 128). So nw14's k=8 reading has a different cause, and
+locating it is a question about which build, not about the thread rule.
 
 ### What this does to the section above, and to the published number
 
