@@ -8127,3 +8127,20 @@ plan is installed on a **later** call, not the first, so one warm-up left the ca
 `lookup` and `planrun` rungs would have been timing `None` -- the refuse-guard caught it. And the
 ladder verifies that `plan.run` reproduces `scorch.matmul` numerically before timing anything,
 since a rung that computes something else is not on the path being decomposed.
+
+### Correctness with both levers live: passes
+
+`kprobe` has no numeric validation in it -- no `allclose` anywhere -- so every timing grid in this
+work compared speeds without comparing results, and `k1_fires.py` deliberately checks that the
+output *changes*, which is the opposite question. The suites that do check numerics had all run
+with both levers at their shipped 0.
+
+Full suite on the hooked ARM build with `SCORCH_NARROWK_EXACT_K1=1` and
+`SCORCH_NARROWK_EXACT_DEGUNROLL=1` exported: **1099 passed, 48 skipped, 3 deselected, exit 0**
+(30:13). Same counts as the default-configuration run earlier in the session, so nothing became
+skipped or deselected in the process.
+
+That closes the correctness gate for the ARM candidate. It does not close the x86 one: the levers
+change different kernels there (the gather serves k=1 on x86 float32), and chain43 has separately
+passed 306 tests at `UNROLL=4 PF=0` and 306 at `PF=1`, which covers the deep-kernel arms but not
+these two.
