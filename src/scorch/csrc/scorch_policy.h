@@ -298,9 +298,12 @@
 // per-nonzero deficit against MKL of 8-23% whichever shapes go into it.
 // 0 = off (masked 256-bit, as before). 1 = the exact half-vector width only. 2 = also the
 // widths below it that the exact-width scalar kernel does not already claim.
-#ifndef SCORCH_SPMM_HALFVEC
-#  define SCORCH_SPMM_HALFVEC 0
-#endif
+// Deliberately NOT given a combined default. A single SCORCH_SPMM_HALFVEC whose zero value fell
+// through to the per-dtype defaults below would be a knob that cannot express "off", so the two
+// per-dtype macros are the only compile-time control; -DSCORCH_SPMM_HALFVEC_F32=0 turns it off.
+// The environment hook of the same name still overrides both at runtime, and it CAN say 0
+// because that path tests whether the variable is set rather than whether it is nonzero.
+//
 // Per-dtype defaults, because the measurement splits by dtype and one number cannot carry both.
 // 128-bit registers are the right shape for a four-lane float row and the wrong shape for a
 // two-lane double row, where the halved register width costs more than the halved mask waste
