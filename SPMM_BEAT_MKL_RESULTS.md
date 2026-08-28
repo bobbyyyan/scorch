@@ -11812,3 +11812,67 @@ same-code control at 9) and the arm-vs-arm effects at k=8 and k=16, 7.5% and 6.0
 does not touch.
 
 Queued as chain28c: the guard in, the baseline shipping, three hookless builds, both dtypes.
+
+## The GCN guardrail for the thread cap, with a floor of its own (chain31b, x86)
+
+The earlier GCN check for the thread-cap candidate used PyTorch as the floor, which is
+not a floor for a comparison between two of our own builds. chain31b re-ran it with
+`shipB` — the shipping code a second time, under a different tag — as the floor, ten
+interleaved passes in rotating order, and both arms carrying two environment variables
+so neither pays for the other's `getenv` count. `cpoolT` is the pair I intend to flip:
+`SCORCH_SPMM_NT_CAP=-2` with `SCORCH_SPMM_RECRUIT_MIN_WORK=10000000`. The instrument
+confirmed it does what it says on ogbn-arxiv's two shapes: the pool is 24, the shipping
+code launches 32 threads, the candidate launches 24.
+
+Min across ten passes, milliseconds. `cpoolT/ship` is a **time** ratio, so above 1.000
+is slower.
+
+| dataset | framework | ship | shipB | cpoolT | floor | cpoolT/ship |
+|---|---|---|---|---|---|---|
+| ogbn-arxiv | PyTorch | 122.582 | 122.466 | 122.327 | 0.09% | 0.9979 |
+| ogbn-arxiv | Scorch | 95.208 | 94.991 | 93.030 | 0.23% | **0.9771** |
+| ogbn-arxiv | Scorch (fused) | 65.498 | 66.000 | 65.934 | 0.77% | 1.0067 |
+| pubmed | PyTorch | 0.903 | 0.901 | 0.926 | 0.22% | 1.0255 |
+| pubmed | Scorch | 0.574 | 0.580 | 0.592 | 1.05% | **1.0314** |
+| pubmed | Scorch (fused) | 0.569 | 0.572 | 0.564 | 0.53% | 0.9912 |
+
+Read straight off, that is a 2.3% win on ogbn-arxiv and a **3.1% loss on pubmed**, both
+outside their floors — a regression, and pubmed is the graph the shipped thread-reshape
+fix was written for, so the loss was plausible on its face.
+
+It is not the cap. PyTorch's own time moved 2.55% in the same slot, and no environment
+variable of ours reaches PyTorch's sparse kernel. Whatever cost the cpoolT passes
+carried on pubmed, the passenger carried it too. Dividing it out:
+
+| dataset | framework | raw cpoolT/ship | after removing the passenger's move | floor |
+|---|---|---|---|---|
+| ogbn-arxiv | Scorch | 0.9771 | 0.9792 | 0.23% |
+| ogbn-arxiv | Scorch (fused) | 1.0067 | 1.0088 | 0.77% |
+| pubmed | Scorch | 1.0314 | **1.0057** | 1.05% |
+| pubmed | Scorch (fused) | 0.9912 | 0.9666 | 0.53% |
+
+pubmed's 3.14% becomes 0.57%, inside its own 1.05% floor. ogbn-arxiv's win survives
+untouched, because there the passenger did not move (0.9979 against a 0.09% spread).
+
+Two mechanisms would produce the passenger's move and this run cannot separate them: the
+host was slower in the slots the cpoolT passes happened to land in, or the candidate's
+smaller thread team changes the spin state that PyTorch's next call inherits, which is
+the OpenMP team effect already recorded here. Under either, the quantity the goal is
+stated in — our time against the reference's — is what should be read, and it is:
+
+| dataset | framework | Scorch/PyTorch, ship | Scorch/PyTorch, cpoolT | change |
+|---|---|---|---|---|
+| ogbn-arxiv | Scorch | 0.7767 | 0.7605 | **−2.08%** |
+| ogbn-arxiv | Scorch (fused) | 0.5343 | 0.5390 | +0.88% |
+| pubmed | Scorch | 0.6357 | 0.6393 | +0.57% |
+| pubmed | Scorch (fused) | 0.6301 | 0.6091 | **−3.34%** |
+
+No separable regression on either graph, a 2.1% gain on the big one, and every cell still
+far below the reference. The GCN guardrail passes.
+
+The method point is that a verdict rule which compares an arm only against a same-code
+floor will call a shared slot cost a regression. The floor bounds our own build-to-build
+noise; it does not bound the host's drift between one arm's passes and another's. The
+reference column measures exactly that drift, for free, on every row — and it is the only
+column in the table that cannot respond to the thing being tested. The chain printed the
+passenger's spread beside each verdict but did not use it; it should.
