@@ -6242,3 +6242,29 @@ chain. Those are different causes with different gates, so chain42 must be binne
 footprint rather than pooled: a win concentrated in the large-B cells is the latency story,
 a win concentrated in the small-B cells is the dependency-chain story, and a flat win across
 both means neither explanation is complete.
+
+### The analyzer for the key run would have crashed on its primary case
+
+Before chain42 could depend on it, I ran `an_streams.py` on a synthetic file with the right
+columns and arm names — a smoke test for crashes, not for numbers. It raised on line 75:
+
+    if a != "ex1" and (dt == "float64" or (ki in INST and int(a[1:]) not in INST[ki])):
+
+`ARMS[1:]` includes `refb`, the floor arm, which is not a (K,S) pair, so `int(a[1:])`
+evaluates `int("efb")`. On float64 the `dt == "float64"` disjunct short-circuits before
+reaching it, which is why nothing had caught it; on float32 it raises at every k in `INST`,
+which is every width where the arms are live. chain42's float32 verdict — the run that tests
+the fix for the one identified mechanism — would have been a traceback.
+
+Two things were added to the same file while it was open, both required by the finding above:
+a banding of k=1 on **B footprint** rather than degree, because the losing family is
+few-rows-and-high-degree and therefore has high degree and a small B simultaneously, so a
+degree banding alone cannot separate the L3-latency story from the dependency-chain story;
+and a **dtype-scaling** pass across the two dtype files, printing whether each arm moves
+f64/f32 off 1.0 toward MKL's 1.41. Since the multi-stream dispatch sits inside an
+`if constexpr (is_same<scalar_t, float>)`, float64 is a null for `s2`/`s4`/`s8` and any
+movement in that ratio comes from the float32 side alone — which is exactly what a fix for a
+latency bound should produce, and it is measurable without any absolute parity number.
+
+The synthetic file was deleted rather than left in the scratch directory, so it cannot later
+be mistaken for a measurement.
