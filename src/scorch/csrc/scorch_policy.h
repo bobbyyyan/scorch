@@ -214,6 +214,40 @@
 #  define SCORCH_SPMM_NT_CAP 0L
 #endif
 
+// Which work measure bounds the BASE thread count. 0 is nnz*max(k,16), which is what ships; 1 is
+// nnz*k, the real arithmetic.
+//
+// The floored measure is a time proxy: flooring the k term at a cache line is right for throttling
+// a bandwidth-bound product and overstates a k=1 product SIXTEENFOLD. The raise gate and the
+// adoption gate were both corrected to read the real arithmetic for exactly this reason; the base
+// bound was not, and its comment has recorded "the same correction on the base bound has never
+// been priced" since.
+//
+// Priced now, on 169 ARM matrices, float32, as firing-cell ratio against an
+// environment-shape-matched control, with each arm's own inert-set floor in parentheses:
+//
+//     k=1  1.2377(0.998)   k=4  1.3105(1.003)   k=8  1.2546(1.008)   k>=16  inert
+//
+// against a cap at the P-core count reading 1.2570 / 1.2779 / 1.2498 / 1.1695 over the same
+// cells. It recovers the cap's whole gain where the cap works, and both knobs together add
+// nothing over either alone. float64 agrees: 1.2217 / 1.2682 / 1.1981.
+//
+// The reason to prefer this to a cap is that at k >= 16 max(k,16) IS k, so the two measures are
+// the same number and this knob cannot change anything -- inert at wide k by construction rather
+// than by measurement, which leaves every wide workload untouched. It also cannot conflict with
+// the nonzero-expressed row ceiling, since it corrects the base bound and leaves the ceiling's
+// raise to apply afterwards.
+//
+// It is also self-limiting on big work: at k=1 a matrix needs SCORCH_GRAIN_SPMM nonzeros per
+// worker, so reddit-scale products still resolve to the whole machine and only small and medium
+// ones lose workers.
+//
+// Still 0. This is one host. Two hosts have disagreed about thread counts before and the x86
+// grid is queued; nothing here changes until it agrees.
+#ifndef SCORCH_SPMM_BASE_WORK_TRUE
+#  define SCORCH_SPMM_BASE_WORK_TRUE 0
+#endif
+
 // Whether the final cap declines to undo what the nonzero-expressed row ceiling deliberately
 // asked for. 1 respects it, 0 lets the cap win.
 //
@@ -938,10 +972,12 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // gate below already reads work_true for exactly this reason; the same correction on the base
   // bound has never been priced. Off by default, and `work` is what ships until a grid on both
   // hosts says otherwise.
-  long base_work = work;
+  long base_work = SCORCH_SPMM_BASE_WORK_TRUE != 0 ? work_true : work;
 #ifdef SCORCH_TUNE_HOOKS
+  // Reads both ways, so an arm can force the floored measure back on in a build whose constant
+  // has been promoted. Setting it to 0 is what it always was: the floored measure.
   { const char* e = std::getenv("SCORCH_SPMM_BASE_WORK_TRUE");
-    if (e && *e && std::atol(e) != 0) base_work = work_true; }
+    if (e && *e) base_work = std::atol(e) != 0 ? work_true : work; }
 #endif
   int nthreads = scorch_nthreads(base_work, rows_axis, grain, 1, 1);
   // Then raise it where the ROW proxy, not the work, is what bound it -- a 64-row
