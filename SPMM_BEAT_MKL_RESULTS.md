@@ -10611,3 +10611,48 @@ autoencoder's can-act group widened from 3 cells to 9).
 
 **Nothing is enabled.** Both constants are 0. The candidate ships when the x86 caller path says
 it is not a regression, both hosts' guardrails pass, and correctness passes with it compiled in.
+
+### Correction: `base` is not the arm to subtract, and the clean path number
+
+The section above used `base_kms` as the kernel term. `base` is `cold_probe`'s
+`SCORCH_SPMM_PARTITION=0` arm -- the global atomic counter -- while the `plan` arm runs with
+`PLAN_ENV="3"`, the shipped mode. So that subtraction differenced two **partition modes** as well
+as two paths. The arm that shares `plan`'s mode is `tsteal`. Redone against it:
+
+      phase   arm      kernel share of its own call
+      warm    base                81.7%
+      warm    tsteal              74.7%
+      cold    base                50.8%
+      cold    tsteal              48.9%
+
+      cold, 198 losers            median      p90
+        deficit vs MKL             4.9 us    20.6 us
+        non-kernel estimate       45.6 us    50.5 us
+      deficit < non-kernel cost                183 / 193
+        ... overhead cut by half                181 / 193
+        ... overhead cut by a quarter           166 / 193
+
+**The cold conclusion is unchanged and slightly stronger.** Cutting per-call cost by a quarter
+still flips about 166 of the 198, against 160 on the wrong arm. An order of magnitude between
+45.6 us of overhead and a 4.9 us deficit does not care which partition mode the kernel term came
+from.
+
+**The warm conclusion has to be withdrawn as stated.** The estimate is positive on only 12 of 107
+losers even at the matched mode, and of those 12 only 2 have a deficit smaller than their
+overhead. Both quantities are a couple of microseconds on a 19 microsecond call, and a subtraction
+across two paths cannot separate two-microsecond terms. What I wrote earlier -- that the warm
+deficit is "entirely kernel" because the caller call beats the harness kernel -- is not supported
+by this estimator. The shape characterisation stands on its own (k=1 and k=4, degree 191, 512
+rows), and it is what warm should be attacked on; this arithmetic adds nothing to it.
+
+**What the matched-mode comparison does give, cleanly, is the size of the path difference itself.**
+Whole call against whole call, same partition mode, all 744 cells:
+
+      harness path / caller path      warm 1.389      cold 1.380
+
+**The caller path is about 1.38x faster than the harness path**, in both phases, on the same
+build and the same cells. That is measured rather than inferred, it is consistent with the
+1.20/1.65 against 0.90/1.23 pair recorded earlier from a different run, and it is the number to
+quote when explaining why a kprobe ratio against MKL is not a caller-path ratio against MKL. It
+also explains why the subtraction degenerates warm: at the same mode the harness path's *kernel
+term alone* is about the size of the caller path's *entire call*.
