@@ -10084,3 +10084,50 @@ arms and read +6.3% whole-corpus. Three candidate reasons, in the order they sho
 
 Until the firing count comes back, the cap's x86 value on the caller path is **unresolved**, and
 the +6.3% should not be quoted as a caller-path number. It was never measured as one.
+
+## stage36's corpus half, both dtypes, and the threshold that gets chosen
+
+On the mgladder corpus the threshold does more than avoid the autoencoder regression: at k=64,
+where the bigger matrices clear ten million units of work, **it beats the plain cap.** Firing
+columns, per-matrix geomean, 169 matrices, 12 reps, interleaved, `--pad-env`:
+
+      float32       cpool      t5     t10     t20     t40      A/A
+      k=1          1.2510  1.2411  1.2425  1.2335  1.2400   1.0101
+      k=64         1.0686  1.1086  1.1174  1.1049  1.0918   1.0191
+
+      float64       cpool      t5     t10     t20     t40      A/A
+      k=1          1.2426  1.2243  1.2399  1.2299  1.2316   1.0050
+      k=16         1.0749  1.1103  1.1129  1.0756  1.0737   1.0171
+      k=64         0.9767  1.0755  1.0376  1.0191  0.9973   1.0169
+                  (z -0.8)(z +5.8)(z +2.1)(z +1.0)(z -0.1)
+
+float64 at k=64 is the clearest single statement in the whole sweep: the unconditional cap reads
+0.9767 at z -0.8 -- a loss it cannot even resolve -- and `t5` reads 1.0755 at z +5.8. Same cells,
+same reps; the only difference is that one of them declines to cap the high-work cells.
+
+Correcting each arm by its own inert set, which cancels that arm's drift, at k=64 float64:
+`t5` 1.020, `t10` 0.991, `t20` 0.970, `t40` 0.949, `cpool` 0.920, and the A/A arm 1.006. The
+inert floor at k=64 float64 is 1.05-1.06 on its own, because B reaches 222 MB there and the
+fresh-allocation fault path dominates -- so nothing at that width smaller than about 6% is a
+reading, which is exactly why the correction is applied rather than the raw column quoted.
+
+### The threshold is 10 million, and two of the four candidates are excluded by measurement
+
+- **t5 is excluded.** On the fused grid's `<10M` bucket it reads 1.1402 against ~1.28 for every
+  other threshold, and that bucket's A/A is 1.0079, so the gap is ten times the floor. Declining
+  the cap at five million gives back small-work cells that want capping.
+- **t40 is excluded.** It reads 0.7551 on the fused grid's 20-40M bucket -- it is still capping
+  where the recruit is already worth 1.30x.
+- **t10 and t20 are not distinguishable.** Fused overall 1.0496 against 1.0456; fused `<10M`
+  1.2840 against 1.2802; corpus k=64 float32, drift-corrected, 1.0885 against 1.0776. Every one
+  of those gaps is inside the relevant A/A.
+
+So the data picks the pair, not the member. **10 million is chosen** on two grounds that are not
+measurements and are stated as such: it sits at the lower edge of the crossover the fused grid
+measured (between 10M and 20M), and of the two it changes fewer cells away from the behaviour
+that ships today, since a lower threshold declines the cap more often. If a later grid resolves
+10 against 20, it should be believed over this reasoning.
+
+Nothing is enabled. `SCORCH_SPMM_RECRUIT_MIN_WORK` stays 0 and `SCORCH_SPMM_NT_CAP` stays 0 until
+the x86 firing count comes back, the GCN guardrail runs on both hosts, the ARM correctness suite
+passes with both compiled in, and the real autoencoder bench confirms the synthetic fused grid.
