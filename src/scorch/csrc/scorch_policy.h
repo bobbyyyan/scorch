@@ -257,9 +257,18 @@
 #ifndef SCORCH_SPMM_PARTITION_MINGRAINS
 #  define SCORCH_SPMM_PARTITION_MINGRAINS 0L
 #endif
-// Worker count at or below which that work gate is allowed to fire. It exists because the
-// gate's sign depends on the pool, and this makes the dependence explicit instead of
-// leaving it to a host-specific default.
+// Size of the CALLER'S POOL at or below which that work gate is allowed to fire. It exists
+// because the gate's sign depends on the pool, and this makes the dependence explicit
+// instead of leaving it to a host-specific default.
+//
+// The pool, not the resolved worker count. The first version of this compared the resolved
+// count, and the ARM grid falsified it: the gated and gated-with-a-ceiling-of-16 arms must
+// read identically on a six-thread host, and they differed by 0.7% (1.0154 against 1.0087
+// on float32). The resolved count is raised per shape and is bounded by
+// omp_get_num_procs(), which is 18 there, so it straddles 16 and the ceiling blocked the
+// gate on exactly the shapes whose count had been raised. The pool the surrounding pipeline
+// runs is 6 there and 24 on redwood -- a factor of four apart, shape-independent, and it is
+// the quantity the contention argument is actually about.
 //
 // The partition buys A's inter-call L2 residency and pays a setup plus a claim per chunk;
 // the shared counter buys perfect load balance and pays contention on one atomic line.
@@ -271,10 +280,10 @@
 // counter wins 1.0303 and every home-range variant loses (no stealing 0.9826,
 // front-stealing 0.9682).
 //
-// A ceiling below the larger host's launched count makes the gate PROVABLY INERT there: it
-// cannot fire at 24 workers, so the x86 measurement stands unchanged by construction
+// A ceiling between the two pools makes the gate PROVABLY INERT on the larger host: it
+// cannot fire at a pool of 24, so the x86 measurement stands unchanged by construction
 // rather than by a second grid agreeing. 0 disables the ceiling, which lets the gate fire
-// at any width (that is the configuration x86 measured at 4-9% cost, and it is not what
+// at any pool (that is the configuration x86 measured at 4-9% cost, and it is not what
 // ships).
 #ifndef SCORCH_SPMM_PARTITION_GATE_MAXTHREADS
 #  define SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 0

@@ -3566,9 +3566,17 @@ torch::Tensor spmm_csr_v2_core(
       if (e && *e) { long v = std::atol(e); if (v >= 0) gate_maxthreads = v; } }
 #endif
     // The gate only applies where the pool is small enough that the shared counter's
-    // contention is not what binds -- see the constant's comment. At a pool above the
-    // ceiling this whole block is unreachable, which is how the x86 reading is preserved.
-    if (gate_maxthreads > 0 && (long)nthreads > gate_maxthreads) mingrains = 0;
+    // contention is not what binds -- see the constant's comment. Above the ceiling this
+    // whole block is unreachable, which is how the x86 reading is preserved. Deliberately
+    // the caller's POOL and not the resolved worker count: the resolved count is raised per
+    // shape and capped by omp_get_num_procs(), so on an 18-processor host it straddles a
+    // ceiling of 16 and the gate then fires on some shapes and not others -- which is what
+    // the ARM grid caught.
+    if (gate_maxthreads > 0) {
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_max_threads();
+      if (pool > gate_maxthreads) mingrains = 0;
+    }
     if (mingrains > 0) {
       const long work_proxy = nnz_total * (long)(B1_size > 16 ? B1_size : 16);
       if (work_proxy < mingrains * SCORCH_GRAIN_SPMM) partition_mode = 0;
