@@ -9618,3 +9618,63 @@ compiled-in constant for the base work measure; and the header made self-contain
 **The one-line summary.** The count is too high on narrow products, the reason differs by
 host, and every candidate fix is a correction to an existing bound rather than a new
 mechanism -- which is why none of them needs a new constant chosen by fitting.
+
+## chain21 reverses it: the parameter is the caller's POOL, not the P-core count
+
+302 x86 matrices, float32, k=1..64, arms on the real cap. All-cells column first, because it
+needs no assumption about firing sets (k=1, 302 matrices):
+
+      arm      fires   all      z      firing    mats -5%   mats +5%
+      ref        143   1.0074   +2.5   1.0021        7         11     <- the environment charge
+      cappc      143   0.7736  -18.3   0.6335      186         11
+      cap8       143   0.7752  -18.2   0.6376      188         17
+      cap12      103   0.8740  -15.3   0.8141      184         17
+      cap24       87   1.0625   +9.1   1.2121       10         85     <- the pool
+      btrue      195   1.0596   +8.4   1.0905       19         86
+      btcap      195   0.7678  -19.4   0.6682      191          9
+      aa         143   1.0056   +1.2   1.0093       13         12     <- the floor
+
+**Capping at the P-core count is a 32% loss on this host.** z of -41.7 on the cells it
+fires, 186 of 302 matrices worse than 5%. Capping at the caller's pool is a 6.3%
+whole-corpus gain with **ten** matrices worse -- fewer than the A/A arm's thirteen. `cap8`
+and `cappc` agree to within 0.2%, which is the identity control doing its job: on this host
+the P-core count IS 8, so those two arms must measure the same, and they do.
+
+By width, firing/inert with each arm's floor in parentheses:
+
+      arm        k=1             k=2             k=4             k=8            k=16            k=64
+      cap24  1.2033(1.007)   1.2395(0.995)   1.2249(1.002)   1.2349(1.011)   1.2053(1.005)   1.0787(1.005)
+      btrue  1.0845(1.005)   1.0825(1.003)   1.0521(1.001)   1.0230(1.005)      inert           inert
+      cappc  0.6841(0.926)   0.6625(0.936)   0.6734(0.942)   0.6683(0.907)   0.6997(0.913)   0.8561(0.900)
+      aa     1.0056(1.000)   1.0010(1.000)   1.0068(1.000)   1.0017(1.000)   1.0092(1.000)   1.0033(1.000)
+
+Cap-at-pool is positive at **every** width on x86, and on ARM the same rule -- cap 6, which
+is that host's pool -- read 1.2539 / 1.2729 / 1.2476 / 1.1686 / 1.0104. Two hosts, both
+dtypes, every width, no width gate needed.
+
+**So the rule is: the SpMM must never resolve more workers than the pool the surrounding
+framework advertises.** It currently ceilings at `omp_get_num_procs()` instead -- 32 against
+torch's 24 here, 18 against 6 on the M5. That is the whole defect, it is one line, and it
+needs no chosen constant. The P-core count only looked right on ARM because there it *is*
+the pool; `scorch_pcore_count()` is not the parameter this rule wants, and I spent a good
+while being confident that it was.
+
+**Why the synthesised estimate was not merely imprecise but measured a different knob.** It
+was built from chain46's `tC` arms, which force the base count. The composition adoption
+then raises the count straight back to the pool -- so `t8` was, in effect, *cap at 24*, and
+its 1.1055 was a reading of the rule that turns out to be right, attributed to the value
+that turns out to be catastrophic. The proxy's error was not noise in a magnitude; it was a
+label on the wrong mechanism, and nothing short of the real instrument could have shown it.
+
+Two consequences for the queue. `agbt` -- the two principled corrections together -- resolves
+to **7** workers on this host, inside the region where 8 loses 32%, so the adoption-grain
+correction is refuted here without needing its own run; chain22 was killed rather than spend
+an hour confirming it. And chain23's board was measuring `cappc`, now known to be a large
+loss, so it was killed two minutes in and replaced by chain24 with `base / cap-at-pool /
+base-work-true`.
+
+One caveat stated plainly: the inert columns for the cap arms read 0.90-0.94 where they must
+read 1.000, and 186 matrices are more than 5% worse while only 143 cells are computed to
+fire. So my firing/inert split is wrong for those arms -- kprobe does not appear to pass an
+explicit override, and I resolved with the pool. The all-cells column and the regression
+counts carry no such assumption, and they are what the conclusion rests on.
