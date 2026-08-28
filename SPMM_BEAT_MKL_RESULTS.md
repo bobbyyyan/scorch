@@ -10201,3 +10201,25 @@ a way a caller's single interleaved call does not.
 That is a hypothesis with an obvious test, and chain26b is most of it: if the caller path shows
 the cap's gain, there is nothing to audit; if it does not, the same question should be put to
 every policy lever that shipped on a kprobe number. Listing it here so it is not lost either way.
+
+### The other three SpMM kernels go wide too, and for once that is defensible
+
+`spmm_csr_bias_act`, `spmm_csr_float_tilej_core` and `spmm_csr_float_tileijk_core` all resolve
+with the plain `scorch_nthreads`, all launch a raw `omp parallel for num_threads(nthreads)`, and
+all can therefore run above the caller's pool -- the same shape as the defect. Checked one at a
+time, none of them is currently implicated, and the reason is the work axis:
+
+- **tile-j** is gated to fire only on cache-thrashing work in the first place; its own comment
+  says "tile-j fires only on big thrash work, so this returns every core". Its adoption branch
+  raises to `min(override, num_procs)` and never lowers, so the base count can reach `num_procs`
+  -- which is exactly what going wide on large work means. The new measurement is what that
+  comment was missing.
+- **tile-ijk** is gated at N >= 512, so its work is large by construction.
+- **bias_act** bounds by `omp_get_max_threads()` with no pool knowledge, but the GCN layers it
+  serves resolve low when they are small: cora at k=16 is about 208000 units against a 150000
+  grain, so one or two workers.
+
+So the blast radius of the fix is the two kernels that take a caller override --
+`spmm_csr_v2_core` and `spmm_csr_linear_fused_float` -- which is where it is applied. The three
+above would need the same treatment only if a shape appeared that resolved wide on small work,
+and their gates are what prevent that. Worth re-checking if any of those gates is ever widened.
