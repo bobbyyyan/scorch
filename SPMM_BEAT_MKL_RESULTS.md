@@ -4726,3 +4726,44 @@ kernel grids are the instruments.
 
 One thing the run does say: extending the partition to the fused Linear path is not positive
 (1.0140 against 1.0210, worst cell 0.9362), so that knob **stays off**, which is its default.
+
+## The cold penalty is not per-thread replication: cold wants MORE workers than warm
+
+The cold grid's tail cells sit 5× above the 35 µs + 14 µs/MB fit, and the mechanism written
+down before this ran was per-thread replication of B — at k = 64 over 2304 columns B is
+590 KB, one core's L2, so 24 copies is 14 MB, about 250 µs at redwood's 56 GB/s. The
+prediction was that **reducing** the forced thread count would cut cold time while raising
+warm time, and that the mid group (B too large for any worker to hold) would not show it.
+
+Forced thread ladder, 23 matrices × k ∈ {1, 8, 64}, 256 MB cache flush before each cold
+call, median of 21, MKL timed in the same interleaved slot. Kernel columns, against the
+policy count each shape resolves today:
+
+| | mid cold | mid warm | tail cold | tail warm |
+|---|---|---|---|---|
+| 1 thread | 0.5922 / 0.5161 | 0.5126 / 0.4076 | 0.5700 / 0.4321 | 0.3396 / 0.2428 |
+| 4 | 0.7915 / 0.7333 | 0.7877 / 0.7042 | 0.8400 / 0.7481 | 0.7680 / 0.6512 |
+| 8 | 0.9233 / 0.8922 | 0.9034 / 0.8721 | 1.0041 / 0.9300 | 0.9693 / 0.9314 |
+| 16 | 1.0157 / 0.9941 | 1.0029 / 0.9984 | 1.1588 / 1.0783 | 0.9710 / 0.9555 |
+| **24** | 1.0213 / 1.0207 | 1.0142 / 1.0212 | **1.1804 / 1.1979** | **0.8759 / 0.9163** |
+
+(f32 / f64. Above 1.0 is faster than the policy count.)
+
+**The prediction is refuted.** Fewer workers makes cold *worse*, monotonically, in both
+groups and both dtypes — 1 thread costs 1.7× (mid) to 2.3× (tail) cold. Cold time falls all
+the way to 24 workers. So the cold penalty is compulsory DRAM traffic, and more workers buy
+memory-level parallelism to cover it; that is consistent with the fit's 71 GB/s and with MKL
+paying it too. Replication would have shown the opposite sign.
+
+**What it does find is a lever, and it is one I had already rejected.** On the tail group —
+few rows, high degree, exactly where `rows/SCORCH_ROWS_PER_THREAD` holds the team narrow —
+24 workers is **1.18× (f32) / 1.20× (f64) faster cold** and **0.88× / 0.92× slower warm**.
+The mid group is flat both ways (1.02 either direction). So the policy count is right warm
+and 18–20% short cold, on one identifiable family of shapes.
+
+That is the nonzero-expressed row ceiling, which I rejected as a shared default because warm
+it cost 0.7% on x86 and 1–2% on ARM. Cold it is worth 18–20% on the family it was built for.
+The two readings are not in conflict — they are different calls. **The ceiling is a cold-only
+mechanism:** raise the team on a plan-cache miss, where the tensor was just built and A is
+not resident, and leave every repeat call exactly as it is. Not implemented; the measurement
+is recorded so the option is costed. Warm is the claim, so this stays behind the settled work.
