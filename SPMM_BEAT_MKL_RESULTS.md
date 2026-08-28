@@ -7792,3 +7792,42 @@ win there is real even when it is not a comparison.
 is the objection that has overturned three other verdicts in this ledger. The arms are not dead
 yet: they were measured warm both times, and chain51 times them cold, which is where extra loads
 in flight have something to overlap.
+
+### Correction to the section above: not ARM-only. "Wherever the gather does not serve k=1"
+
+chain42's float64 half inverts the float32 verdict on the same host, same corpus, same arms:
+
+| band | x86 f32 | x86 f64 | ARM f32 |
+|---|---|---|---|
+| deg 8-64 | 0.9706 z-2.1 | 1.0108 z+1.1 | 1.0410 z+5.7 |
+| deg 64-256 | 0.9933 z-0.4 | **1.0127 z+3.8** | 1.0446 z+6.4 |
+| deg>=256 | **0.9033 z-2.0** | **1.0413 z+2.1** | 1.0646 z+8.7 |
+| pooled | 0.9628 | **1.0188** | +4.8% |
+
+So it is not the ISA. The gather dispatch is at `spmm.h:4284`, inside
+`#if defined(__AVX2__) && defined(__FMA__)` and additionally requiring
+`std::is_same<scalar_t, float>::value`. It therefore serves k=1 in exactly one configuration --
+AVX2 float32 -- and that is exactly the one cell of the four where the extension loses. Three of
+four configurations have no gather at k=1 and the extension wins in all three.
+
+The rule is therefore not a per-host constant but a statement about what is being displaced:
+**take width 1 wherever the gather kernel does not already serve it.** Do not displace one
+outstanding memory operation covering eight nonzeros; do displace a register-block tile using one
+lane of four. That is expressible where the decision is made, since `narrowk_gather` and the
+dtype are both known there, and it mirrors `SCORCH_SPMM_HALFVEC_F32` / `_F64` in form.
+
+**Not shipped, and here is what is still missing** -- listing it because a mechanism that is
+right in three of four measured configurations is exactly the kind that gets flipped early:
+
+* ARM float64 is unmeasured. Three configurations measured, four exist.
+* Each side has one run. My own finding this session is that a within-run z does not bound
+  between-run variance; the ARM float32 replicate is running and x86 has no replicate.
+* On ARM float32 the extension still **loses 5.7% at degree 1-2** (z-3.2, n=29), and chain42's
+  corpus contains nothing below degree 8, so x86's low-degree behaviour is unknown. chain50 has
+  the stratified corpus for it.
+* Nothing has been measured cold, and the extension changes which kernel runs.
+* No correctness suite has run with it on.
+
+And it should be kept in proportion: **+1.9% pooled at x86 float64 k=1**, where 22 of 124 warm
+cells and 39 of 124 cold cells are below MKL, most of them by more than 5%. This is worth taking
+if it is free, and it is not the answer to the deficit at that width.
