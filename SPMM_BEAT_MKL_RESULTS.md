@@ -5813,3 +5813,40 @@ So the prediction is:
 
 This also means the two chains are not redundant with each other, and that the k=1 half of the
 below-MKL count may not be a kernel problem at all.
+
+### Correcting that prediction before it was tested: the floor is 4 µs, not 26
+
+The prediction above assumed the 30 µs was mostly fork/join and allocation. Measuring the floor
+instead of assuming it says otherwise, and the data was already on disk.
+
+The grid contains products with **one nonzero**, which is as close to pure per-call cost as a
+measurement gets. Ours, on 20k–23k rows:
+
+| k | nnz | rows | ours | MKL | parity |
+|---|---|---|---|---|---|
+| 1 | 1 | 23412 | 8.9 µs | 18.9 µs | 2.12 |
+| 2 | 1 | 23412 | 9.6 | 46.1 | 4.80 |
+| 8 | 1 | 23412 | 17.8 | 55.0 | 3.10 |
+
+and the **lowest kernel time anywhere in the grid is 4.21 µs (float32) / 4.11 µs (float64),
+against MKL's 12.84 / 12.69**. So our per-call floor is about a third of MKL's, and what floor
+there is scales with the OUTPUT (one nonzero over 23412 rows costs 8.9 µs at k=1 and 17.8 µs at
+k=8 — that is zeroing 749 KB, not launching a team).
+
+The worst k=1 cell has 256 rows, so its output is 1 KB and its floor is ~4.5 µs, not 26. Removing
+it leaves ~25.5 µs over 16 workers = **6.1 cycles a nonzero per thread**. A `VGATHERDPS` covers
+eight nonzeros at roughly 20–25 cycles of latency, so even fully exposed with one chain in flight
+that is ~2.8 cycles/nonzero. We are still about 2x above the latency-bound estimate and far above
+the throughput one.
+
+**So the k=1 deficit is kernel-side after all, and `rw_chain42.sh` is the right experiment.** The
+fork/join reading was wrong; the corrected prediction is that the streams ladder *does* move at
+k=1, and that `rw_chain46.sh`'s thread ladder finds much less than the earlier reasoning implied.
+
+One mechanism falls out of the same reading, and it is specific. `narrowk_gather` is gated on
+`std::is_same<scalar_t, float>`, so there is **no gather kernel at all for float64 k=1**: those
+cells run the register-block kernel with `nvec == 1` and a one-lane mask, doing one lane of
+useful work in four. That is a mechanical explanation for float64 k=1 being the worst band
+(34 cells, minimum 0.675), and it predicts the `ex1` arm — the scalar exact-width kernel, which
+*is* dtype-generic and instantiates `case 1` in both branches — should help float64 k=1 most of
+anything in either chain.
