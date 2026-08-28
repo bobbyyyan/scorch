@@ -6443,3 +6443,34 @@ k=4 float32 ran the half-vector kernel here -- and still reads 1.0290, no dtype 
 throughput fix does not cure a latency bound, which is consistent with the flip measuring a
 modest 1.1008 at that width rather than the ~1.4x the latency gap is worth. The flip and the
 narrow-k mechanism are separate levers on the same cell, and neither substitutes for the other.
+
+### The one ILP fix that is ISA-independent cannot reach the cell that needs it
+
+Since the gather is exonerated and the bound is the loop shape, the fix that ought to
+generalise across both instruction sets is processing several rows per group: ROWS
+independent accumulator chains regardless of dtype, width, or whether a gather instruction
+exists. That mechanism is already in the tree and chain45 measures it.
+
+It cannot reach float32 k=1. The branch guards on
+
+    multirow > 1 && narrow_k && !exact_width && !force_workspace &&
+    !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value)
+
+and `narrowk_gather` is 1 exactly at k=1, so the gather owns that width and the multi-row
+kernel never runs there. The refusal is deliberate and the comment says why -- it declines
+wherever another kernel would have owned the row, so that no arm swaps two kernels in one
+step and leaves neither attributable. Good hygiene, but the consequence is that chain45's
+float32 k=1 column is a structural null, and a null near 1.0 in that position reads exactly
+like "multi-row was tried on the worst width and did nothing".
+
+`an_multirow.py` labelled its k=64 null and its non-instantiated (nvec, ROWS) cells but not
+this one, so it now prints `[structural null: the nonzero-axis gather owns float32 k=1, so
+the multi-row branch refuses it -- NOT a measurement]`. That is the third distinct structural
+null in one grid, and each one is also a free control.
+
+Reaching the combination would need an arm that turns the gather off *and* sets multirow,
+which is a two-kernel swap this grid declines by design. It is not worth adding: at k=1 with
+nvec=1 the multi-row kernel still does four rows of one masked lane in eight, so it buys the
+independent chains but keeps the lane waste, whereas `ex1` -- already queued in chain42 --
+buys the same four chains with no masking at all. So the queue does cover float32 k=1, by two
+routes, neither of them multi-row.
