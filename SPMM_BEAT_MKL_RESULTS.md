@@ -10183,3 +10183,21 @@ The +6.3% is a real number about the general dispatch path, and the caller-path 
 exists says null with a tight control. If the interleaved caller-path run agrees with chain24,
 then the cap fixes a defect that callers cannot feel, and what ships is decided by the ARM
 numbers -- where the fused Linear grid *is* the caller path, via `scorch.sparse_linear_fm`.
+
+### An audit item this raises, stated as a question and not a claim
+
+Every kernel number on this branch came from kprobe, so every one of them is about the general
+dispatch path. For a lever that only changes the kernel's instruction stream -- the register
+kernel, the half-vector flip, NEON, the empty-row zeroing -- that is fine: it is the same kernel
+on both paths, and kernel time is kernel time.
+
+The levers to re-examine are the **policy** ones, where the decision depends on inputs the two
+paths might supply differently: the thread count, the chunk width, the partition mode, the row
+ceiling. `_composition_hints` derives the thread count identically for both paths as far as I can
+see, so the likely difference is not the policy input but the measurement -- kprobe scores scorch
+arms on summed `eval_time` over a batch of back-to-back calls, which keeps a thread team warm in
+a way a caller's single interleaved call does not.
+
+That is a hypothesis with an obvious test, and chain26b is most of it: if the caller path shows
+the cap's gain, there is nothing to audit; if it does not, the same question should be put to
+every policy lever that shipped on a kprobe number. Listing it here so it is not lost either way.
