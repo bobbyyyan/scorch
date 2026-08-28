@@ -7086,3 +7086,29 @@ Fixed to `ACCUM=8`, which means what was intended: at k=4 the unroll halves to 2
 is left alone because 4*2 is not greater than 8. Re-verified by the same diff -- `ex4a` now
 fires only at k=4, 25/25, and is inert at 1, 2 and 8. chain49 was parked in its wait loop, so
 it was killed by PID and relaunched from the corrected file rather than edited in place.
+
+### Does chain42 carry the same risk, and the proportionate answer
+
+The `ex4a` failure was not "the arm did nothing" -- that reads as the floor and would have been
+noticed -- it was "the arm fired somewhere it was not supposed to". Asking whether chain42's
+arms can do the same:
+
+* `ex1` sets `SCORCH_NARROWK_EXACT_K1=1`, which lowers the exact band floor to 1. Already
+  verified by output diff on the ARM host: fires at k=1, 25 of 25, and inert at 2, 4 and 8. The
+  mechanism is generic in the scalar type and has its own dispatch under the NEON guard, so that
+  verification carries.
+* `s2`/`s4`/`s8` set `SCORCH_NARROWK_GATHER_STREAMS`, which only reaches the nonzero-axis gather.
+  That kernel is x86-only, so ARM cannot verify it. But the wrong-place risk is structurally
+  low: `narrowk_gather` is 1 only at k=1, the (K,S) pairs (1,2), (1,4) and (1,8) are all
+  instantiated, chain42 already refuses if the hook string is absent from the binary, and its
+  analyzer flags any non-instantiated pair with a `*` rather than averaging it.
+
+So chain42 is not restructured. Killing and relaunching it to insert a check would open a window
+where it is not queued while chain41 is finishing, and chain43 would take its slot -- a real cost
+against a low risk.
+
+Instead both checks are staged on the measurement host and will be run **post hoc against every
+arm every chain used**, once the queue drains. That validates the arms without racing the queue,
+and it is the right place for it: an arm that fired in the wrong place invalidates its verdict
+whether the check runs before or after, and running it after costs nothing that running it
+before would have saved.
