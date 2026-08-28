@@ -9382,3 +9382,44 @@ the crossed grid belongs there.
 It is also now a lower priority. If what ships is base-work-true rather than the cap, the
 conflict does not arise at all: base-work-true corrects the base bound and leaves the
 ceiling's raise to apply after it.
+
+## stage32: the fine width sweep, and a third reading of "the count is too high"
+
+Eight widths, 169 ARM matrices, firing/inert with each arm's own floor in parentheses:
+
+      float32     k=1        k=2        k=3        k=4        k=6        k=8        k=12       k=16
+      btrue    1.2326     1.3420     1.3012     1.3002     1.1958     1.2519     1.0619      inert
+               (0.998)    (1.005)    (0.999)    (1.005)    (1.003)    (1.002)    (1.003)
+      cappc    1.2673     1.3648     1.2997     1.2801     1.2459     1.2408     1.2188     1.1688
+               (0.990)    (0.995)    (0.998)    (1.002)    (1.001)    (1.000)    (0.995)    (0.995)
+      aa       1.0091     1.0092     1.0080     1.0094     1.0105     1.0057     1.0097     1.0040
+
+      float64  btrue  1.2316  1.3221  1.2988  1.2730  1.1682  1.2105  1.0322  inert
+               cappc  1.2720  1.3329  1.2989  1.2360  1.2063  1.1896  1.1180  1.0570
+
+The mechanism's central prediction holds: base-work-true's gain decays through k=12 and is
+gone at k=16, which is where `max(k,16)` becomes `k`. Two things it did not predict.
+
+The peak is at k=2-4, not k=1. The overstatement is largest at k=1 -- sixteenfold against
+eightfold at k=2 -- so the naive expectation is a monotone decline from k=1, and instead
+k=1 reads 1.2326 against k=2's 1.3420. At k=1 the count is bound by the row axis rather
+than by work on many cells, so correcting the work measure moves fewer of them; and the
+k=1 kernel is short enough that the cost being removed is a smaller share of it. Both are
+consistent, neither is measured here.
+
+**And at k=12 the cap is worth 1.2188 where base-work-true has faded to 1.0619, with tight
+floors on both.** That is the interesting number, because at k=12 the measure is nearly
+right -- 1.2M nonzeros at k=12 is ninety-six grains of real arithmetic -- and the machine
+still prefers six workers. A statement about ninety-six grains being divided too finely is
+a statement about the *threshold*, not the measure.
+
+So there are three readings of "the resolved count is too high", not two, and they are
+distinguishable by where they act:
+
+      the MEASURE is wrong      nnz*max(k,16) overstates a narrow product   acts only at k<16
+      the THRESHOLD is wrong    150000 nonzero-units is too little work     acts at every width
+      neither                   and a cap on the count is all there is
+
+stage33 crosses SCORCH_SPMM_GRAIN at 1x/2x/4x/8x with base-work-true to separate them. If
+raising the grain recovers at k=12 and k=16 what the cap recovers, then the cap is a proxy
+twice over, and what ships is two threshold corrections and no new mechanism at all.
