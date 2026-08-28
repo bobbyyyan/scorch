@@ -9084,3 +9084,36 @@ plainly conflicts with it somewhere above k=8. chain63 carries six widths and is
 measurement that settles it. And this estimate is synthesised from force arms; a cap
 compiled into the build has to reproduce it, because lowering the count can also flip the
 row-handout mode that `scorch_spmm_partition_mode` derives from it.
+
+### Correction to the table above: the override I resolved with was not the one the kernel ran
+
+The cap table in the previous section asked the resolver with `nthreads_override = 0`,
+which the export documents as "pure policy". That is the wrong question for this estimate.
+The composition-adoption branch near the end of `scorch_spmm_nthreads` is entirely
+conditional on `override > 0`, so resolving with 0 skips a path the timed kernel took, and
+the resolved count is exactly what defines a cap's firing set. Re-resolved with the pool
+the caller path passes -- 24 on redwood, 6 on the M5:
+
+      x86, override 24    resolved counts: 1:27  4:9  5:1  6:1  8:2  16:21  18:1  24:121  32:48
+      (with override 0 it read              1:33 2:30 3:9 4:6 5:16 6:4 ... 16:21 ... 32:48)
+
+Almost everything is pulled up to the pool, so the firing sets change and so do the
+numbers. The P-core row, which is the one being proposed:
+
+      host / dtype     fires      whole-corpus    firing cells    mats -5%   mats +5%
+      x86 f32 cap 8    191/231  (82.7%)   1.0865        1.1055          1         42
+      x86 f64 cap 8    191/231  (82.7%)   1.0700        1.0852          2         43
+      ARM f32 cap 6    128/676  (18.9%)   1.0486        1.2850          2         26
+
+Against the earlier reading, x86's whole-corpus figure barely moves (1.0839 -> 1.0865)
+but its firing-cell figure falls a lot (1.1649 -> 1.1055) and it now costs one matrix
+rather than none, because the firing set grew from 122 cells to 191 and the added cells
+were resolving to 24 rather than 32. ARM's cap-6 row is unchanged, since the count of
+cells above 6 happens to be 128 either way. The conclusion is the same and the direction
+is the same on both hosts; the size of the per-cell effect on x86 was overstated.
+
+Cap 16 is worth noting as a warning: on x86 it costs 12 matrices more than 5% while 8
+costs one and 24 costs none. A cap that is monotonic in its argument should not do that,
+so something other than parallelism is moving -- most likely the row-handout mode, which
+`scorch_spmm_partition_mode` derives from the resolved count. It is another reason the
+cap has to be measured compiled in rather than synthesised from force arms.
