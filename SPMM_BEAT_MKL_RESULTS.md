@@ -11434,3 +11434,56 @@ left"; this says what is already held, and by what.
 It also answers the question that was flagged as the one to watch, in the direction that closes it:
 neither `part0` nor `chunk0` reads at or above 1.000 on either host or either dtype, so neither
 shipped lever is a regression anywhere measured. The caveat is retired.
+
+## Sixty percent of the below-MKL deficit is nine percent of the corpus, and two features name it
+
+From chain27b's cells, no new run. Define the family as **rows <= 512 and mean degree >= 128** --
+the two features the row ceiling already gates on. Numbers are ship/arm, so below 1.000 means the
+arm is slower than what ships.
+
+      dtype     group                          cells   part0   chunk0      aa
+      float32   the family                       204  0.8434   0.9759  0.9889
+      float32   family AND below MKL              62  0.7881   1.0010  1.0110
+      float32   everything else                 1968  0.7121   0.9625  1.0011
+      float64   the family                       204  0.8995   0.9962  0.9926
+      float64   family AND below MKL              57  0.8463   1.0009  1.0034
+      float64   everything else                 1968  0.7153   0.9669  1.0002
+
+**The family is 204 of 2172 cells -- 9.4% -- and holds 62 of the 106 float32 cells below MKL and 57
+of the 89 float64 ones. Fifty-eight and sixty-four percent of the deficit, in a tenth of the
+corpus, picked out by two integers.** That is the tightest characterisation of the target on this
+branch, and it agrees with what the row ceiling's own gate features already say and with the
+earlier finding that mean degree alone separates loser from winner at 0.88-0.91 at every width.
+
+Two things about the shipped levers inside it:
+
+**The row partition is not the problem there.** Turning it off still costs 21% (float32) and 18%
+(float64) on the family's below-MKL cells. It helps less than elsewhere -- 0.8434 against 0.7121 --
+which is what fewer rows should do to a work-stealing lever, but it is nowhere near neutral.
+
+**The chunk-width rule is exactly neutral there and worth 3.7% everywhere else.** 1.0010 and 1.0009
+on the family's below-MKL cells, against an A/A floor of 1.0110 and 1.0034 on those same cells, and
+0.9625 / 0.9669 outside. So it is not what puts those cells behind MKL -- but it also is not
+earning anything on them, which is worth knowing before anyone widens it.
+
+### The per-cell version, which is a candidate list and not a finding
+
+Asking per cell which below-MKL cells go faster with a lever switched off, at a 3% threshold:
+
+      dtype     arm       faster by >3% on a below-MKL cell    of which would then clear MKL
+      float32   part0                                     3                                1
+      float32   chunk0                                   10                                5
+      float64   part0                                     8                                5
+      float64   chunk0                                    9                                6
+
+Every one of them is in the family -- 64 to 512 rows at degree 128 to 3000 -- and the two arms'
+sets overlap heavily, so this is one phenomenon and not two. But the A/A duplicate itself moves
+more than 3% on **20 of the 106** float32 and **22 of the 89** float64 below-MKL cells, so a 3%
+per-cell threshold is at the noise level for a fifth of them and roughly half these cells are
+probably noise. Treated as a list of shapes worth a replicated arm, not as six cells recovered.
+
+The group numbers above are the reportable form of the same data, and they say the useful thing:
+**the deficit is concentrated, the concentration is nameable, and neither shipped policy lever is
+what causes it.** Which puts the row ceiling's bound ladder -- chain53, which ladders the row bound
+over {128..2048} and was priced at 32 of 75 losers covered at 512 -- squarely on the largest
+identified group rather than on a guess.
