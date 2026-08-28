@@ -11572,3 +11572,61 @@ make running analyses during a timing run acceptable; it means this particular r
 
 The last three are the gates, and two of them are the x86 half of exactly this stage. Queued as
 chain32. ogbn-arxiv is chain31.
+
+## stage42: the slice was the problem, not float64 -- +5.1% compiled in, against a 0.03% floor
+
+Same three objects as stage41, re-asserted before use (ship and ctrl still zero differing
+instruction lines, cand still differs). One change: **ten matrices per slice instead of
+twenty-five**, so a forwards-and-backwards rotation of three builds completes in about ninety
+seconds rather than five minutes.
+
+      float64                      whole call   >10% slower
+      ctrl / ship  (the floor)        1.0003          1.0%
+      cand / ship  (the change)       1.0511          2.4%
+      cand / ctrl  (the other side)   1.0508          3.0%
+      reference agreement across the three processes: 1.0191, worst 1.453x
+
+      by k    1       2       4       8      16      64
+      cand  1.0606  1.0700  1.0504  1.0423  1.0398  1.0438
+      floor 0.9973  0.9998  0.9977  0.9999  1.0062  1.0009
+
+**Compiled in and hookless, the candidate is 5.1% faster on the ARM caller path in float64, against
+a 0.03% floor, positive at every one of six widths.** stage41 read 1.0146 against a 0.9779 floor on
+the same corpus, the same widths and the same objects.
+
+      per-slice floor        stage41 (25 matrices)     stage42 (10 matrices)
+      worst                                0.8871                    0.9839
+      best                                 1.0262                    1.0157
+      pooled                               0.9779                    1.0003
+      per-slice effect, range      0.8351 to 1.1946          0.9974 to 1.1749
+      pooled effect                        1.0146                    1.0511
+
+**Nothing about the code changed. The slice length did.** Sixteen of seventeen slices now read
+positive and the seventeenth is 0.9974. The lesson is specific and reusable: on this host a
+cross-process comparison has to complete a full rotation inside the time the machine holds still,
+and for float64 -- whose cells are about twice as long as float32's -- twenty-five matrices is
+already too long. More passes would not have fixed it. Passes create positions, and a monotone
+drift biases each arm by one position however many you average; the only thing that helps is
+making the positions closer together.
+
+The effect is concentrated in the same way float32's is: slices 12 through 16 read 1.1439, 1.0714,
+1.0773, 1.1749 and 1.1614 while the first twelve sit between 0.9974 and 1.0424. That is a real
+feature of the candidate and not an artifact -- the corpus is ordered by group, so the last slices
+are a family, and it matches the x86 board's 33 large-work cells carrying 19%.
+
+And against the only sparse rival this host has: ship 6.44x torch.sparse.mm, cand 6.77x, **0 of
+1014 cells below it for any of the three builds.** ARM has no deficit to close; it has a 5-6% gain
+available.
+
+### ARM is now closed for this candidate
+
+      gate                                          float32              float64
+      caller path, hookless, compiled in            +6.1% (floor 0.23%)  +5.1% (floor 0.03%)
+      positive at every width                       6 of 6               6 of 6
+      real autoencoder, cells the rule acts on      +12.3% fused, +9.4% plain, 8 of 9 cells
+      GCN guardrail                                 8 of 8 inside the same-code control
+      correctness, compiled in                      1099 passed, 48 skipped
+      versus torch.sparse.mm                        0 of 1014 cells below, either dtype
+
+What remains is x86 and only x86: chain32b for the hookless compiled-in reading and correctness,
+chain31b for ogbn-arxiv.
