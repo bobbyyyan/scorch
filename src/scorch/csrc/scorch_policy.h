@@ -301,6 +301,27 @@
 #ifndef SCORCH_SPMM_HALFVEC
 #  define SCORCH_SPMM_HALFVEC 0
 #endif
+// Per-dtype defaults, because the measurement splits by dtype and one number cannot carry both.
+// 128-bit registers are the right shape for a four-lane float row and the wrong shape for a
+// two-lane double row, where the halved register width costs more than the halved mask waste
+// saves. Over 1510 cells per dtype on the 302-matrix corpus, at the width where the kernel
+// fires:
+//
+//   float32, k=4:  1.1008 (z +14.6) against a 0.9945 same-value control; by group, 1.2143 on
+//                  the L2-band family (z +40.6), 1.1463 on SuiteSparse, 1.1305 on short rows,
+//                  1.0113 at worst. MKL kernel parity 1.2880 -> 1.4179 and cells below MKL
+//                  125/302 -> 70. Taking the widths BELOW the exact one as well adds nothing
+//                  (1.0997), so 1 and not 2.
+//   float64, k=2:  0.9646 (z -10.7), negative in seven groups of eight, and it turns a column
+//                  with 0 of 302 cells below MKL into 21. Stays off.
+//
+// The kernel is inside the AVX2 block, so both values are inert on ARM by construction.
+#ifndef SCORCH_SPMM_HALFVEC_F32
+#  define SCORCH_SPMM_HALFVEC_F32 1
+#endif
+#ifndef SCORCH_SPMM_HALFVEC_F64
+#  define SCORCH_SPMM_HALFVEC_F64 0
+#endif
 #ifndef SCORCH_NARROWK_EXACT_HI
 #  define SCORCH_NARROWK_EXACT_HI 3
 #endif

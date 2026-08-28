@@ -3796,7 +3796,12 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_exact_hi = SCORCH_NARROWK_EXACT_HI;
   // Widths served by 128-bit registers rather than by a masked 256-bit one (see the policy
   // header). Read here so the dispatch below is a compile-time constant when the hook is off.
-  int spmm_halfvec = SCORCH_SPMM_HALFVEC;
+  // Split by dtype: see the constants' comment for the two measurements. SCORCH_SPMM_HALFVEC
+  // stays as the single-value override so a -D on the command line still forces both.
+  int spmm_halfvec = SCORCH_SPMM_HALFVEC != 0
+                         ? SCORCH_SPMM_HALFVEC
+                         : (std::is_same<scalar_t, float>::value ? SCORCH_SPMM_HALFVEC_F32
+                                                                 : SCORCH_SPMM_HALFVEC_F64);
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: force the legacy workspace path instead of whichever register kernel
   // this architecture has -- AVX2's regblock/regtile or NEON's strip kernel. Not
