@@ -11876,3 +11876,64 @@ noise; it does not bound the host's drift between one arm's passes and another's
 reference column measures exactly that drift, for free, on every row — and it is the only
 column in the table that cannot respond to the thing being tested. The chain printed the
 passenger's spread beside each verdict but did not use it; it should.
+
+## The multi-row kernel's empty-group guard: what is committed, and what emission it costs
+
+The guard itself — `A1_pos[i + multirow] > A1_pos[i]` in the multi-row dispatch — is in the
+tree as of `391a887`, whose subject says only `docs(spmm): recover chain28b's verdict`. It
+was swept in by a `git commit -am` alongside that section and is not mentioned in the
+message, so `git log` does not show that a kernel changed there. Recorded here instead of
+rewritten, because the two commits are cited elsewhere.
+
+**At the shipped default the guard is free by construction, not by the optimizer.** All
+three multi-row sites are inside
+
+```c
+#if defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+```
+
+and `SCORCH_SPMM_MULTIROW_ROWS` defaults to 0, so in a release build the block does not
+exist. No measurement is needed for that claim; the preprocessor makes it.
+
+It was checked anyway, and the check is worth keeping for its method. Five fresh trees, one
+build each, tree names all two characters long so the embedded-path differences are the same
+*length* in every comparison:
+
+| comparison | differing instruction lines |
+|---|---|
+| two builds of one source (the determinism control) | 0 |
+| the guard, at the shipped default | 10 |
+| `-DSCORCH_SPMM_MULTIROW_ROWS=2` against the default, same source | 0 |
+
+Every one of those 10 lines is a `mov w2, #imm` whose value rises by exactly 1 — the
+`__LINE__` constants `TORCH_CHECK` materializes, shifted by the one source line the guard
+adds. Zero real instructions differ.
+
+Three method findings came out of it, each of which had already produced a wrong reading:
+
+**A defines-only change does not trigger a rebuild.** The first attempt built two of its
+trees twice, once at the default and once with `-DSCORCH_SPMM_MULTIROW_ROWS=2`. setuptools
+compares source mtimes to object mtimes; `SCORCH_BUILD_DEFINES` is invisible to that
+comparison, so both second builds skipped compilation and relinked the first build's
+objects. The `.so` came out byte-identical (md5 `2c1bac71…` twice), the "with ROWS=2" arm was
+silently the default build, and a 31-minute correctness run tested the wrong object. **Never
+build one tree twice.** One tree, one configuration, one build.
+
+**Equal-length tree names took the noise floor from 2128 lines to 0.** The first attempt used
+`withguard` / `withoutguard` / `determinism`; every comparison read exactly 2128 differing
+lines, which is what tipped it off. Path length reaches the instruction stream. With
+two-character names the determinism control is exactly 0, which makes a 10-line difference
+readable instead of lost in noise.
+
+**md5 inequality does not prove a define reached the compiler.** The script asserted that a
+ROWS=2 build must differ from a default build, and it passed — on embedded path strings,
+which differ between any two trees. The disassembly says the truth: 0 differing instruction
+lines. The sound form of that assertion compares instruction lines against the determinism
+control, the same way the guard is tested.
+
+**The kernel cannot be tested on ARM at all.** `__AVX2__` and `__FMA__` gate all three sites,
+so on the M5 `ROWS=2` compiles to the same object as `ROWS=0` — which is what the third row
+of the table above is saying. Multi-row register blocking is an x86-only mechanism, its
+recovered win and its recovered loss are x86-only results, and the guard's *effect* is
+unmeasured until chain28c runs it on redwood against the shipping baseline.
