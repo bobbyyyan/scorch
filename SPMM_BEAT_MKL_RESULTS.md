@@ -5726,3 +5726,56 @@ second environment charge needs and `--pad-env` cannot give. k=2, 4 and 8 come a
 structural nulls, since `narrowk_gather` is 1 only at k=1 by default and the exact band already
 contains 2: three widths of pure null on the same matrices in the same run, which is a better
 resolution floor than an A/A arm alone. float64's streams arms are a fourth null.
+
+## A user-facing op with a provable ceiling that no grid in this session has measured: SpMV
+
+Every parity number in this file is SpMM. `scorch.matmul(A, x)` with a 1-D `x` is a different
+code path — matmul's 2-D × 1-D branch into `ops.spmv`, which resolves to
+`prebuilt_spmv_csr_*` (verified: `resolve_prebuilt_matmul` returns `prebuilt_spmv_csr_f32`).
+That kernel has never appeared in a grid, and reading its disassembly says why it should have.
+
+Its row loop is one accumulator. The compiler does not widen it. The extension is built with
+`-O3 -march=native -ffast-math -funroll-loops`, and in the float and double bodies of
+`spmv_csr` on this host GCC unrolls eight to sixteen deep and then targets the **same register**
+with every FMA:
+
+```
+vmovss     (%rsi,%rbp,4),%xmm0
+vfmadd132ss (%rdi,%rdx,4),%xmm1,%xmm0
+vmovss     (%rsi,%rdx,4),%xmm6
+vfmadd231ss (%rdi,%rbp,4),%xmm6,%xmm0      <- and every one after it, into xmm0
+```
+
+So a row costs one **FMA latency** — four cycles — per nonzero, whatever the memory system is
+doing, and there is no gather anywhere: the B load is indirect and GCC declines to vectorise a
+reduction over one. `-ffast-math` permits the reassociation that would fix this and the compiler
+did not take it. That is a hard ~4 cycles/nonzero/thread ceiling, roughly 4x off what the
+arithmetic allows, and it is what a caller doing `A @ x` gets today.
+
+`scorch_spmv_row<T, ACC>` (in `kernels.h`) runs ACC independent chains instead. Nothing routes
+to it: `SCORCH_SPMV_ACCUM` is 1, and in a build without hooks it is `constexpr`, so the switch
+folds and the other three instantiations are never emitted.
+
+**Getting the default to byte-identity took two attempts, and both failures are worth recording.**
+Written the obvious way — `nb = n - n % ACC` with a remainder loop — `ACC == 1` makes both
+provably dead and the compiler emitted them anyway: a full normalised disassembly of `ops.o`
+moved **3040 lines**, including a vector zero and a block-count guard the function never had.
+Given its own `if constexpr (ACC == 1)` branch containing the original loop, it still moved **55
+lines** at an identical instruction count, because reaching the same loop through a call changes
+when `A1_pos[i + 1]` is loaded — the bound becomes an argument evaluated before the call rather
+than a condition inside it. Only with the one-chain case written out **at its original call
+site** is the object unchanged across all 155951 instruction lines. The duplication is what
+byte-identity costs here, and it is cheaper than a waiver.
+
+Correctness: 4000 rows over eight (dtype, ACC) combinations against a double-precision scalar
+reference, lengths 0 to 40, so empty rows and lengths that are not multiples of ACC are covered.
+
+`rw_chain47.sh` measures it — the 362-matrix corpus, `ref`/`refb`/`a2`/`a4`/`a8`, both dtypes,
+against MKL's own sparse mat-vec (`torch.mv`), banded by degree because ACC chains cannot pay on
+a row shorter than ACC. The probe is `vprobe.py`, a marked copy of `kprobe.py` rather than a mode
+inside it: nine queued chains invoke kprobe and an edit there to add an axis it does not have
+would risk all of them for nothing. The five changes are all about the operand being a vector;
+everything that decides the measurement — per-arm batching, interleaved random arm order, the
+automatic A/A duplicate, environment padding, min-of-reps — is untouched, so the two probes'
+numbers are comparable. Its refusal counts **ok rows, not lines**, because a CSV of 362 error
+rows would pass a line count.
