@@ -7694,3 +7694,59 @@ If (2) dominates, part of the cold deficit is the harness and some of the 195 ce
 artifact of how coldness is manufactured. That has to be settled before any cold lever is
 credited, and it is settled by re-running the decomposition at one thread: a cost that survives
 `OMP_NUM_THREADS=1` is not thread wake-up. Queued ahead of crediting anything from chain51.
+
+## What the warm losers actually are: few rows, high degree -- the row ceiling's own two features
+
+"k=1 and k=4 are the weak widths" is a location, not a mechanism. Splitting the scoreboard's
+cells into those above and below MKL warm at the same width, and comparing feature medians, gives
+one:
+
+| k | losers / winners | losers' mean_row | winners' | losers' rows | winners' | best single split |
+|---|---|---|---|---|---|---|
+| 1 | 27 / 97 | 191 | 12.2 | 512 | 7716 | **0.88** on mean_row |
+| 2 | 6 / 118 | 236 | 17.8 | 1280 | 4338 | **0.91** |
+| 4 | 31 / 93 | 181 | 11.8 | 512 | 7716 | **0.90** |
+| 8 | 9 / 115 | 301 | 16.0 | 512 | 4935 | **0.91** |
+
+Mean degree alone separates loser from winner at 0.88-0.91 balanced accuracy at every width with
+enough losers, against base rates of 0.75-0.95. The losers are few-row and high-degree: 512 rows
+at ~200 nonzeros a row in a 512-column matrix is about 38% dense. That is a structural signature,
+not a corpus accident, and it is the same at both dtypes.
+
+**It is also, exactly, what the shipped row ceiling is gated on** -- `rows <= 128` and
+`mean degree >= 192` -- a rule that reads **1.3066 (f32) / 1.4011 (f64) inside its gate** on this
+24-thread host, with its harmed tail below the A/A floor. And `scorch_policy.h` says of the row
+bound: *"The measured region is rows <= 128 and mean degree >= 192 on redwood; a plateau, not an
+edge -- rows in {96,128,192} crossed with degree in {192,256} all read 1.108-1.164 with z of
+3.2-3.9."* The ceiling was still paying at 192 rows. 128 is where the measuring stopped.
+
+**Priced before running it, because the pricing is most of the answer:**
+
+| MAXROWS | float32 losers in gate | winners in gate | float64 losers | winners |
+|---|---|---|---|---|
+| 128 (ships) | 8/75 | 4/669 | 7/51 | 5/693 |
+| 256 | 12/75 | 48/669 | 10/51 | 50/693 |
+| **512** | **32/75** | **88/669** | **27/51** | **93/693** |
+| 2048 | 39/75 | 93/669 | 31/51 | 101/693 |
+
+Three things this says, and the second and third are why it is not a free win:
+
+* The jump is at 512, not at 256 or 384 -- many losers have exactly 512 rows, so an intermediate
+  bound buys almost nothing.
+* Raising the bound to 512 admits **88 float32 and 93 float64 cells that currently beat MKL**,
+  13% of the corpus. A 1.3x rule is then free to change them, and it has never been measured
+  above 128 rows. The winners are part of the verdict, not a footnote.
+* **36 of the 75 float32 losers have mean degree below 192**, so no row bound reaches them at
+  all. This mechanism can address at most about half the warm deficit, and saying "raise the
+  bound" as if it closed the warm gap would be wrong.
+
+chain53 is the ladder -- `MAXROWS` in {128, 256, 512, 1024, 2048} at `MINDEG` 192, on a corpus of
+degree>=192 matrices binned on rows with a rows>2048 group no bound admits, at four widths and
+both dtypes. Each row bin carries its own null and its own replicate: an arm whose bound is above
+the bin's upper edge applies the ceiling there and must agree with every other such arm, and one
+whose bound is below is the shipped rule under a different constant.
+
+A hooked grid can decide this. `scorch_policy.h`'s warning is that a hooked grid cannot decide
+whether the rule is inert *outside* its gate, because each arm pays for the variables it sets;
+widening the bound is an in-gate question, and the arms differ precisely on the cells the wider
+bound admits.
