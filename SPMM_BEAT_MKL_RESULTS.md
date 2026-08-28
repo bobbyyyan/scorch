@@ -8832,3 +8832,48 @@ ceiling at any gate** — they sit at rows 384-2048 where the thread count is al
 are not an under-threading problem, and the ceiling was never going to be their answer. chain59 (the
 two thread bounds) and chain62 (multi-row) are; chain59's corpus was repointed to the broad
 302-matrix one, since chain57 is no longer there to build the one it named.
+
+## The warm deficit is entirely kernel, and the family it lives in is named
+
+Decomposing the scoreboard's warm losers with the plan cache live. `plan` is the shipped caller
+path; `tsteal`'s kernel time is the closest available measurement of the same kernel:
+
+| | n | MKL/ours | kernel vs our whole call | MKL slower than our KERNEL alone |
+|---|---|---|---|---|
+| f32, ceiling cannot reach | 63 | 0.899 | 102.4% | **1 of 63** |
+| f32, ceiling can reach | 12 | 0.901 | 100.9% | 3 of 12 |
+| f64, ceiling cannot reach | 41 | 0.930 | 101.1% | 1 of 41 |
+
+**The kernel time and the whole warm call time are equal to within a couple of percent.** There is
+no call overhead left on the warm path — the plan cache already took it — so no amount of dispatch
+work can close a warm cell. And MKL is faster than our *kernel alone* in 62 of 63, so these are not
+cells we lose by a hair of overhead; we lose them in the arithmetic.
+
+The family is concentrated and recognisable. Of the 63 float32 cells the ceiling cannot reach:
+**29 are at k=4, 24 at k=1**, 6 at k=8, 4 at k=2; degree quartiles are 128 / 181 / 256; and the
+recurring shape is **rows = 2048 at degree 150-300** — pruned transformer and ResNet layers, one of
+the workload families the performance convention names. The worst cell on the whole board is
+`lp_osa_14`: 2337 rows, degree 136, k=4, ours 78.4 us against MKL's 35.5, a 2.2x deficit, all of it
+kernel. `connectus` (512 rows, degree 2202, k=4) is 0.716 and is the same story at ten times the
+degree.
+
+At rows 2048 and k=4 float32 the whole B matrix is 32 KB, so B is cache-resident and the kernel is
+gather-bound: about 200 scattered 16-byte reads per output row. That is a kernel shape, not a
+scheduling one, which is why neither lever measured today reaches it — the ceiling cannot move these
+cells at all, and chain45 puts multi-row's win at degree 8-32 while these sit at 130-300, where mr2
+reads 0.9926.
+
+**Two queued chains do target it, and they are better aimed than I realised:**
+
+* **chain47** measures `SCORCH_NARROWK_EXACT_ACCUM` at k=1 only — and k=1 is 24 of 63 float32 and
+  19 of 41 float64 unreachable cells. At k=1 this is SpMV, and the shipped x86-float32 path there is
+  the nonzero-axis gather. Note the gather's own degree floor was already measured and rejected —
+  "a floor buys nothing in the end, the cells it would exclude were positive too" — so choosing
+  differently among *existing* kernels is not the answer at k=1; a better one is.
+* **chain48** flips `SCORCH_SPMM_HALFVEC_F32` to 1, which is the k=4 float32 half-vector width — 29
+  of 63 float32 unreachable cells, the largest single group on the board.
+
+So the ordering of the queue's remaining value is now clear: chain48 and chain47 address 53 of the 63
+float32 warm cells the ceiling cannot; chain62 (multi-row) addresses a different, disjoint band
+where it wins 9-14%; chain61 settles 10 cells; and chain59 prices the two thread bounds that could
+move the k=1 group by a route neither of the others takes.
