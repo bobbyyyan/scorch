@@ -6993,3 +6993,28 @@ So the rule is:
 And the width structure is not the gate. Extending the exact band from 3 to 4 is a change to
 one constant that the dispatch already reads; it is not a new runtime condition, and it should
 not be described as one.
+
+### The obvious cause of the cold output-size cost is already fixed, and the next two are already rejected
+
+The cold excess scales with output size and reaches 2.0x on the largest float64 outputs, which
+points straight at a single-threaded full-width `memset` of C. `spmm.h` contains fifteen of
+those, one per older kernel, and `scorch_zero_dense` -- the parallel span zero-fill -- was only
+ever described as ported to the codegen path. So the hypothesis was that the shipped path still
+pays for a serial zero.
+
+It does not. `spmm_csr_v2_core` already calls `scorch_zero_dense` for contiguous spans, and in
+the shipped configuration -- where the comment notes "only `zero_in_loop` and `zero_merge_runs`
+are true and the slice paths compile away entirely" -- the empty rows are zeroed inside the
+arithmetic row loop and only the tail past A's last row is written as a span. The alternatives
+were measured against each other, including a second-team mode that lost by up to 1.9x on 19
+of 205 float32 cells and read 0.430/0.448 against the default's 0.975/1.019 on two 0.8 GB
+float64 cells. Nothing is left on the table there.
+
+The two next-obvious levers are also spent: non-temporal stores for the output were measured at
+0.9972 against a 1.0315 null and removed, and the parallel zero-fill is the thing that is
+already in. So the remaining candidates for the output-sized cold cost are page faults on a
+freshly mapped buffer after the 256 MB flush, and DRAM write bandwidth for C -- neither of
+which is a kernel change, and both of which sit outside where the losses are.
+
+Recorded as a negative result so this is not re-investigated: the cold output cost is real, it
+is not a missing memset optimisation, and it is not the reason any cell is below MKL.
