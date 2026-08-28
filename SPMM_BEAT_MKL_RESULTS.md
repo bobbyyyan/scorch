@@ -7922,3 +7922,58 @@ One number worth keeping from the same table: at 8 nonzeros our **warm** call is
 against the reference's 1.0. On the tiny end our dispatch is four times as expensive, which the
 scoreboard's 20k-nonzero floor dilutes to invisibility but which is the same call path the 39
 microseconds is measured on.
+
+## State of play, 2026-08-28
+
+This session appended a dozen sections and retracted two claims, so what follows is what a reader
+should carry forward. Where an entry contradicts an earlier section, this one is later.
+
+**The scoreboard, unchanged.** Caller path, hookless, 124 matrices at 20k+ nonzeros, six widths.
+float32 warm 1.5272 (75/744 below MKL), cold 1.1617 (162/744); float64 warm 1.6329 (51/744),
+cold 1.2049 (105/744). **393 of 2976 cells below, 172 of them by more than 5%.** Nothing shipped
+today, so these still stand.
+
+**Where the remaining deficit is, now that it has been characterised:**
+
+| bucket | size | what is known | what is queued |
+|---|---|---|---|
+| cold, non-kernel | ~39 us fixed per call on x86, 30% of a cold call | not thread wake-up (survives 1 thread on ARM); it is the call path's working set; ARM reads 8-16 us, so the magnitude does not transfer | chain52 for the x86 four-configuration version and the excess over MKL's own fixed cost |
+| warm, few-row high-degree | 39 of 75 f32 warm losers reachable | mean degree alone separates loser from winner at 0.88-0.91 at every width; these are the shipped row ceiling's own gate features, and its row bound of 128 was set where measuring stopped, not where paying stopped | chain53 ladders the bound over {128..2048}; priced at 32/75 losers covered and 88 winners admitted at 512 |
+| warm, low-degree | 36 of 75 f32 warm losers | degree below the ceiling's 192 floor, so no row bound reaches them; no mechanism identified | nothing |
+| k=1 warm | 27 f32, 22 f64 | the extension is a win where the gather does not serve k=1 and a 10% loss where it does | ARM float64 running; x86 replicate absent |
+
+**Established today, with replication:**
+
+* The exact-width kernel's degree floor (`SCORCH_NARROWK_EXACT_MINDEG`) does not ship at any
+  value. Withdrawing the kernel loses 7-10% in nearly every band on four runs. The floor is
+  documented in `spmm.h` and defined to 0 in `scorch_policy.h`, so the analysis behind it was
+  done and the constant left disabling it -- that gap is real regardless of the value.
+* The degree-adaptive unroll (`SCORCH_NARROWK_EXACT_DEGUNROLL`, also shipped at 0) is the right
+  lever for low degree. With it, the k=1 extension is at or above 1.0 in **every** degree band on
+  two ARM replicates, and it is worth about +0.7% at k=2 on its own. Mechanism: at mean degree 1
+  a row pays a four-accumulator prologue and three-add epilogue for one multiply-add.
+* The k=1 extension's sign is set by which kernel it displaces, not by the ISA. It has its own
+  two constants now, byte-identical when off (0 of 161,687 instructions differ) and verified
+  width-specific when on.
+* Back-stealing wins in **both** states -- 1.0935 cold, 1.6857 warm against one global counter.
+  Previously only the warm side was separated.
+* Stream depth is a null on x86 band by band, not merely pooled, at k=1, 2, 4 and 8.
+
+**Retracted today.** The `MINDEG=8` win (corpus composition, then non-monotonicity). The cold
+degradation ratio of 1.315 against MKL and the loads-in-flight mechanism read off it -- the ratio
+reduces algebraically to (warm advantage)/(cold advantage) and carries no independent information.
+
+**Two methodological rules this session earned:**
+
+1. **A within-run A/A floor does not bound between-run variance.** The same grid on the same
+   matrices, same host, gave 1.0671 (z+4.0) and 0.9409 (z-5.9) in the band a verdict rested on,
+   and strong bands moved 4% between clean replicates. Any gate resting on one run's z in a band
+   of 20-30 matrices is weaker than its z suggests. Two seeds, and prefer the paired comparison
+   (arm against arm on the same matrices) over either absolute value.
+2. **Print the corpus composition next to any pooled band.** Three claims this session were
+   composition, not physics: `MINDEG`'s 9%, the k=1 extension's "loses below degree 8", and
+   chain42's pooled k=1 -- whose corpus turned out to contain nothing below degree 8 at all.
+
+**Harness gaps closed:** the ARM host had no refuse-to-run guard, which let two copies of one
+grid overlap and disagree by 12% (`m5_quiet_run.sh` now). Analyzers refuse below 90% corpus
+coverage, and print a width or band skipped for thinness instead of omitting it.
