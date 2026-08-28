@@ -11048,3 +11048,42 @@ three-cell version too (1.0207), so this is the same cell moving further the sam
 a new result, and it is the cell to explain if the defaults are flipped. Its minimum layer work
 is 5.2M, in the middle of the acting band, so the threshold cannot exclude it without giving up
 mnist at 0.98 and fashion at 0.99 as well.
+
+## The ARM cold call, split by layer: a quarter of it is outside the kernel, and the Python part is genuinely fixed
+
+stage40, the ARM counterpart of the x86 cold layer split. 240 cells, every one with a plan
+installed, cold-flushed single calls, medians in microseconds.
+
+      layer                                  us    share of the call
+      caller path, the whole call          56.1              100%
+      plan.run directly                    51.1               91%
+      native entry (validates)             55.1               98%
+      torch.sparse.mm                     137.4              245%
+
+      Python dispatch above plan.run        5.1     9.1%   (p10 1.7, p90 8.5)
+      output allocation alone               8.2    17.4%
+      ABI validation, native minus plan     4.0     7.1%   (p10 1.2, p90 7.1)
+
+**About a quarter of a cold ARM call is not the kernel**: 5.1 microseconds of Python plus 8.2 of
+output allocation, 13.3 of 56.1. The validation's 4.0 microseconds is charged at the native entry
+and **not** on the plan path, which is the provenance split working as designed -- a caller's
+arrays get walked, a plan's do not.
+
+The Python part is fixed, and this is the test rather than the assumption. Split the cells in
+half two ways:
+
+      split                       cells   probe us   call us   probe share
+      k < 6                         120        5.6      39.4         14.2%
+      k >= 6                        120        4.8      60.1          7.9%
+      nnz < 6561                    120        5.1      36.2         14.2%
+      nnz >= 6561                   120        5.2      59.4          8.7%
+
+**The probe does not move with the work** -- 4.8 to 5.6 microseconds across a call that ranges
+from 39 to 60 -- so it is a constant, and its share is a function of how short the cell is, not
+of what the cell does. On the narrow half it is 14% of the call.
+
+Against the reference on this host, `torch/full` is 2.641 with **0 of 240 cells slower than
+torch**, so nothing in this split is a deficit against the only sparse rival ARM has. It is a
+budget: on ARM the two reachable fixed costs are the 8.2 microsecond allocation and the 5.1
+microsecond Python path, in that order, and together they are worth more than any narrow-k
+kernel change measured so far.
