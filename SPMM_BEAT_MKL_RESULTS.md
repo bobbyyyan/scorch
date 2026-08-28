@@ -11630,3 +11630,71 @@ available.
 
 What remains is x86 and only x86: chain32b for the hookless compiled-in reading and correctness,
 chain31b for ogbn-arxiv.
+
+## One rule, one mechanism, two architectures: the cap is worth 13-25% above 41 microseconds and neutral below 21
+
+Bucketing all four measurements at the same edges, so the hosts can be compared rather than
+described separately. ARM is the hookless three-build runs (stage41/42); x86 is chain26b's
+environment arms inside one hooked build. Those are the strongest instrument each host has for this
+candidate, but they are different instruments, so what should be compared is the **shape**, and only
+loosely the magnitude. Ship/arm, above 1.000 means the candidate is faster; the floor beside each
+number is that band's own same-code control.
+
+      cell time (ship)      ARM f32          ARM f64          x86 f32          x86 f64
+      under 21 us      0.9981 / 0.9964  1.0039 / 0.9972  1.0044 / 0.9993  0.9918 / 0.9991
+      21 - 24 us       0.9966 / 0.9953  0.9962 / 0.9972  1.0114 / 1.0066  1.0034 / 1.0048
+      24 - 41 us       1.0147 / 1.0120  1.0647 / 1.0069  1.0772 / 1.0014  1.0237 / 0.9936
+      over 41 us       1.2548 / 1.0056  1.1460 / 1.0000  1.1724 / 1.0118  1.1342 / 1.0120
+
+      work nnz*k            ARM f32          ARM f64          x86 f32          x86 f64
+      under 26k        1.0038 / 1.0006  1.0058 / 0.9966  1.0063 / 0.9989  0.9895 / 0.9978
+      26k - 100k       1.0076 / 0.9970  1.0083 / 0.9980  1.0025 / 0.9983  0.9959 / 1.0007
+      100k - 380k      1.0549 / 1.0061  1.0604 / 1.0040  1.0102 / 1.0026  1.0016 / 1.0024
+      over 380k        1.1872 / 1.0055  1.1348 / 1.0027  1.0687 / 1.0036  1.0557 / 1.0014
+
+**Four independent host-dtype combinations, one shape: neutral under about 21 microseconds, 13% to
+25% above 41.** The pooled figures -- ARM +6.1% and +5.1%, x86 +1.9% and +0.7% -- are dilutions of
+that single band, and they differ between hosts mostly because the two corpora contain different
+proportions of long cells (131 of 2172 x86 cells are over 41 microseconds against 254 of 1014 on
+ARM).
+
+Cell time discriminates better than work does, and on x86 much better: the over-41-microsecond
+bucket reads 1.1724 where the over-380k-work bucket reads 1.0687. That is worth noting because the
+resolver has the work and not the time, so the feature the effect actually follows is not the one
+the rule can gate on.
+
+This is the first account of this candidate that is one mechanism rather than two. The M5's pool is
+6 of 18 logical and redwood's is 24 of 32, the threads given up are E-cores in one case and
+hyperthread siblings in the other, and the sizes at which it starts to matter come out the same.
+Capping at the caller's pool helps once a cell is long enough that the threads above the pool are
+contending for bandwidth rather than adding throughput -- and it is measurably nothing below that.
+
+### The one band with a cost, and why it does not get a gate
+
+**x86 float64 under 100k units of work reads 0.9895 and 0.9959 against floors of 0.9978 and 1.0007
+-- a cost of about 0.5 to 0.8%.** It is the only band in sixteen that is below its own floor, and it
+is why x86 float64's pooled figure sits on the floor at +0.65% while its long cells read +5.6%.
+
+A minimum-work gate would remove it, and the direction is worth stating plainly because it is the
+opposite of the decline I retracted earlier today: **decline the cap BELOW a threshold, not above
+it.** Synthesized in-sample from the measured columns at three thresholds:
+
+      set            floor    ungated   t=26k    t=100k   t=380k
+      x86 float32   1.0004     1.0194  1.0165    1.0161   1.0144
+      x86 float64   0.9999     1.0065  1.0113    1.0120   1.0117
+      ARM float32   1.0023     1.0609  1.0599    1.0580   1.0439
+      ARM float64   1.0003     1.0511  1.0496    1.0475   1.0322
+
+      cells below MKL, x86    ship   A/A   ungated   t=26k   t=100k   t=380k
+      float32                  121   127       111     110      110      109
+      float64                  116   117       105     104      103      106
+
+**It does not get a gate.** At 26k it buys x86 float64 half a percentage point and costs the other
+three sets 0.1 to 0.3, and it moves the below-MKL count by one cell. That is a tuning constant, a
+branch, and a second thing that can be wrong, in exchange for less than the spread between the two
+instruments measuring it. The honest form is: the cap has one band where it costs slightly, that
+band is x86 float64 short cells, it is 0.5-0.8%, and it is left in.
+
+Checked by synthesis before any machine time, which is now twice today that a threshold hypothesis
+has been settled for free from columns already measured -- once rejected because the mechanism was
+backwards, once because the win was too small to pay for the constant.
