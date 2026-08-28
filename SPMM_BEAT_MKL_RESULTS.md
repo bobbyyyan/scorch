@@ -9574,3 +9574,47 @@ wins rather than a mechanism I now expect to be nearly inert here.
 Prediction, registered: `ag150` recovers most of what `cappc` recovers on x86 at k<=8, and
 unlike the cap it also acts at k=16 and k=64, because the adoption never fades with width.
 That last part is the risk, not the benefit -- at k=64 the adopted count may be right.
+
+## Where the thread investigation stands, in one place
+
+**The defect.** The SpMM resolves too many workers on narrow products. On redwood 48 of 231
+cells land on 32 -- `omp_get_num_procs()` -- inside a 24-thread pool, and 121 more on 24; on
+the M5 128 of 676 land above 6 inside a pool of 6. On the 744-cell width board, 64 of the 75
+warm float32 cells below MKL are running on 24 or 32 workers, and 71 of the 75 resolve above
+the P-core count.
+
+**Three bounds can be the one that is wrong, and which one binds depends on the host's pool.**
+
+      correction        what it fixes                         binds where            measured
+      base-work-true    the base bound uses nnz*max(k,16),    the pool is small      ARM: 1.23-1.34
+                        overstating a k=1 product 16x         (M5, pool 6)           at k<=8, inert k>=16
+      adopt-grain       the adoption raises to                the pool is large      x86: queued
+                        min(pool, rows/16) with no work term  (redwood, pool 24)     (chain22)
+      the cap           a ceiling applied after both          always                 ARM: 1.25 at k<=8,
+                                                                                     1.17 k=16, 1.00 k=64
+
+**What is established.** On ARM, both the cap and base-work-true recover about 25% on the
+cells they move at k<=8, they are indistinguishable there, and together they add nothing over
+either alone -- three readings of one defect. base-work-true is inert at k>=16 by
+construction, since `max(k,16)` is `k`. The cap is non-monotonic in its value (6 beats 8,
+and 12 beats 8 again), because `scorch_spmm_partition_mode` reads the resolved count, so no
+cap value can be interpolated. The estimator that survives this data is firing/inert, because
+a cap's inert cells run identical code and so measure that arm's own floor -- which is 1.002
+at k<=16 and 1.04 at k=64, where B reaches 111 MB and the M5's fault path dominates.
+
+**What is not.** Nothing on x86 yet: chain21 is running, and its instrument line already shows
+base-work-true reduced to trimming 32 to 24 there because the adoption undoes it. The
+caller-path board with any of these on. The GCN output layers, the one guarded workload the
+change can reach (k = 3, 6, 7 for pubmed, citeseer, cora; everything else is k>=16 or on a
+code path that calls the plain resolver). And whether the row ceiling -- the only mechanism
+that reaches the last four losers, kl02 and nw14 -- carries a real ARM presence cost, which
+its two readings put at per-matrix z of -1.70 and -2.06, below this project's own |z| = 3 bar.
+
+**Committed, all inert by default and byte-identical to the pre-change baseline on both ISAs:**
+`scorch_pcore_count()` bounded by the processors the process can use; the final thread cap;
+the cap's floor at the row ceiling's request, since the two correct opposite errors; a
+compiled-in constant for the base work measure; and the header made self-contained.
+
+**The one-line summary.** The count is too high on narrow products, the reason differs by
+host, and every candidate fix is a correction to an existing bound rather than a new
+mechanism -- which is why none of them needs a new constant chosen by fitting.
