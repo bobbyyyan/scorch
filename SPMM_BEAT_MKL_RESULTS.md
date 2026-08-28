@@ -7332,3 +7332,60 @@ Still ARM-only, and ARM has no MKL, so none of this closes a measured deficit ye
 x86 half. The prediction stands as registered: `ex1` should win at least as much there, because the
 gather it displaces serialises eight accesses in microcode while ARM's masked register kernel does
 not, and its low-degree loss should be gated away by the same constant.
+
+### The degree floor is already in the source, argued for, and shipped disabled
+
+Reading `spmm.h` around the gate rather than only the constant turned up that this floor is not
+a new idea. The comment at the gate says, of the exact-width kernel:
+
+> ... but not on a matrix with fewer nonzeros than rows. The exact-width loop's per-row setup
+> has nothing to amortise there: over the pinned corpus at mean degree below 1 the kernel
+> returns 1.0709 (f32) / 1.0473 (f64) against the general path's 1.2457 / 1.2130 on the same
+> cells' neighbours, and 13 float32 cells of 286 are 5-17% SLOWER than what ships today against
+> a 1.004 A/A floor -- Pd_b and Pd_rhs at k=2 (0.831, 0.834), bips07_3078_iv at k=2 and k=4
+> (0.891, 0.887), sts4098_b, as-735. Every one has fewer nonzeros than rows. Above degree 1 the
+> kernel reads 1.37 (degree 1-2) and 1.86 (degree 2-4), so a floor at one nonzero per row cannot
+> fire on anything it would cost.
+
+`scorch_policy.h:274` then defines `SCORCH_NARROWK_EXACT_MINDEG 0L`, and the gate is
+`mindeg > 0 && nnz_total < mindeg * A0_size`, so **no floor fires**. The analysis was done, the
+constant was added, the value was left at the one that disables it. The 13 cells the comment
+names at 0.831 to 0.891 are still losing today. Whatever the right value turns out to be, that
+gap between the comment and the constant is a defect on its own.
+
+### ...and my own 9% reading was a corpus artifact, not a k=2 regression
+
+The claim recorded one section earlier -- that `MINDEG=8` is worth about 9% at k=2 below degree
+8 -- does not survive looking at what "below degree 8" contained. On `armmode_groups.csv` the 30
+matrices under degree 8 are distributed:
+
+| band | deg<1 | deg 1-2 | deg 2-4 | deg 4-8 |
+|---|---|---|---|---|
+| n | 2 | 22 | 3 | 3 |
+
+So that band was a measurement of degree 1-2 and almost nothing else, and the two bands next to
+it had three matrices each -- below the n>=4 cut, so they were silently dropped from the table
+rather than shown as thin. It is the same error I retracted for chain38 two days ago: a pooled
+band whose composition, not whose physics, produced the number. The lesson keeps arriving in
+this form because a degree band sounds like a range and behaves like whatever the corpus put in
+it.
+
+Worse, the comment above predicts the pooled number cannot be right, because it puts the loss
+below degree 1 and a 1.37x **win** at degree 1-2 -- the opposite sign in the band that supplied
+22 of the 30 matrices. Two claims that disagree about the same band is the useful situation, so
+the corpus was rebuilt stratified from the full 426-matrix ARM cache: 29 / 28 / 48 / 24 matrices
+at deg<1, 1-2, 2-4, 4-8, plus 20 each at 8-64 and >=64 as controls, and a ladder of
+`MINDEG` in {1,2,4,8} instead of a single value.
+
+The ladder is self-checking, which is why it is worth the extra arms. `MINDEG=N` withdraws the
+kernel exactly where mean degree < N, so within one band the arms split by construction: at
+degree 2-4, `mg1` and `mg2` are ref with a different constant and must read the floor, while
+`mg4` and `mg8` make the same kernel choice as each other and must agree. Every band carries its
+own null control and a replicate of its own live measurement, on the same matrices in the same
+interleave.
+
+Result pending -- the first attempt covered 92 of 169 matrices and is set aside. Its launcher
+was what the harness tracked, so "completed, exit 0" described a shell that had returned
+immediately, and a later foreground timeout killed the python still in its process group. The
+three highest bands vanished, which reads exactly like a corpus that never had them. The
+analyzer now checks its own coverage against the corpus file and refuses under 90%.
