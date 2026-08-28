@@ -9423,3 +9423,40 @@ distinguishable by where they act:
 stage33 crosses SCORCH_SPMM_GRAIN at 1x/2x/4x/8x with base-work-true to separate them. If
 raising the grain recovers at k=12 and k=16 what the cap recovers, then the cap is a proxy
 twice over, and what ships is two threshold corrections and no new mechanism at all.
+
+## What base-work-true would actually touch, by code path
+
+Two of the five thread-resolution sites in spmm.h go through `scorch_spmm_nthreads`, which
+is where the base work measure is chosen, and three do not:
+
+      spmm_csr_v2_core                 scorch_spmm_nthreads    AFFECTED at k<16
+      spmm_csr_linear_fused_float      scorch_spmm_nthreads    AFFECTED at k<16
+      spmm_csr_bias_act                scorch_nthreads         unaffected
+      spmm_csr_float_tilej_core        scorch_nthreads         unaffected
+      spmm_csr_float_tileijk_core      scorch_nthreads         unaffected
+
+The three unaffected ones compute `work` themselves and call the plain resolver, so the
+base-work choice cannot reach them. That covers the fused GCN kernel and both tiled routes.
+
+Crossing that with the k<16 restriction gives the real blast radius on the workloads that
+have guardrails:
+
+      autoencoder     the fused Linear path, whose free dimension is the batch size (256 and
+                      up), so k>=16 and the knob is inert
+      GCN hidden      dims 16-256, so k>=16 and inert
+      GCN output      k is the class count: 3 for pubmed, 7 for cora, 6 for citeseer -- these
+                      ARE touched, on spmm_csr_v2_core
+      attention       wide, inert
+      tiled routes    unaffected by code path, and separately gated at N>=512
+
+So one thing needs a guardrail rather than an argument: the small-class GCN output layers.
+That is also the shape with the most thread-policy history on this project -- pubmed's
+deficit was diagnosed as a pool transition rather than a kernel, and the fix that shipped
+(e795127) was a thread reshape. A change to the narrow-k thread count lands exactly there.
+
+The selector needs a look too, though not for route choice. Its probing levels time the
+real candidates and adapt, and the tiled routes it can choose are gated above every width
+this touches. But the `analytic` rule and the `learned` cost model were fit against
+measurements taken with the current thread policy, so their *predictions* go stale for
+k<16 even where their route choice does not change. Retraining is cheap; noticing is the
+part that gets skipped.
