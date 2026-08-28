@@ -9306,3 +9306,51 @@ the two corrections are aimed at opposite errors -- the ceiling at a count the r
 that do not overlap. That is a small change to the cap's expression, and it needs the
 crossed grid (ceiling on/off x cap on/off) on the few-row high-degree corpus to confirm,
 not an argument.
+
+## stage30: the cap was a proxy for the floored work measure, and the root-cause fix is better
+
+The cap's benefit decayed with width -- 1.25 at k=1 to 1.00 at k=64 -- and that shape has a
+specific candidate cause that is not the cap. The base thread count is bounded by `work` =
+nnz*max(k,16), a time proxy whose k term is floored at a cache line. At k=1 it overstates
+the arithmetic sixteenfold and the count comes out far too high; at k>=16 the floor does
+not bite at all. Large at k=1, zero at k=64: the same shape.
+
+`SCORCH_SPMM_BASE_WORK_TRUE` bounds that base count by nnz*k, the real arithmetic. The
+header already records the identical correction made to the raise gate and to the adoption
+gate, and that "the same correction on the base bound has never been priced". Priced, on
+169 ARM matrices, float32, firing/inert with each arm's own floor in parentheses:
+
+      arm        k=1             k=4             k=8             k=16            k=64
+      btrue  1.2377(0.998)   1.3105(1.003)   1.2546(1.008)        --              --
+      cappc  1.2570(0.997)   1.2779(1.002)   1.2498(1.004)   1.1695(1.005)   1.0134(1.039)
+      btcap  1.2691(0.983)   1.2926(0.986)   1.2432(0.997)   1.1763(0.995)   1.0226(1.034)
+      cap12  1.1731(0.992)   1.1648(0.997)   1.1262(1.001)   1.1013(0.998)   1.0283(1.000)
+      aa     1.0084(1.000)   1.0088(1.000)   1.0118(1.000)   1.0085(1.000)   1.0027(1.000)
+
+The two dashes are not missing data. At k>=16, `max(k,16)` is k, so `work` and `work_true`
+are the same number and the knob cannot change anything. **base-work-true is inert at
+k>=16 by construction, not by measurement.**
+
+That settles the mechanism. btrue recovers the cap's entire gain where the cap works at
+all -- 1.2377/1.3105/1.2546 against 1.2570/1.2779/1.2498, indistinguishable, both an order
+of magnitude above their floors -- and `btcap`, which is both knobs at once, adds nothing
+on top (1.2691/1.2926/1.2432). Three readings of one defect.
+
+btrue is the better thing to ship, on every count that matters here. It fixes the cause
+the header has already identified twice rather than capping the symptom. It needs no
+P-core count, no chosen constant, and no arbitrary value -- the count comes out of the
+arithmetic. It cannot conflict with the row ceiling, because it corrects the base bound and
+leaves the ceiling's raise to apply afterwards, so the composition problem the previous
+section describes simply does not arise. And its blast radius is far smaller: structurally
+inert at k>=16 means every wide workload -- GCN hidden layers, the autoencoder, attention
+-- is untouched, where the cap fires at all widths and is only *empirically* neutral at
+k=64, against a 4% floor that cannot resolve it.
+
+The cap is not thereby dead. At k=16 it is worth 1.1695 with a 1.005 floor and z=+4.3,
+where btrue is inert by construction -- so at exactly the width where the floored measure
+stops biting, the count is still too high for some other reason, presumably the composition
+adoption or the num_procs ceiling. That is a separate defect at a single width, and it can
+be pursued separately.
+
+This needs x86 confirmation before anything changes: chain23 is staged for it. Two hosts
+have disagreed about thread counts before, and this is a two-host claim or it is nothing.
