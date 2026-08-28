@@ -11937,3 +11937,101 @@ so on the M5 `ROWS=2` compiles to the same object as `ROWS=0` — which is what 
 of the table above is saying. Multi-row register blocking is an x86-only mechanism, its
 recovered win and its recovered loss are x86-only results, and the guard's *effect* is
 unmeasured until chain28c runs it on redwood against the shipping baseline.
+
+## The x86 gate closes: the cap compiled in, and why the run's own verdict refused
+
+chain32b is the last gate — the thread cap **compiled in**, hookless, three builds, 362 matrices at
+six widths, both dtypes, on the caller path. It printed a refusal:
+
+> REFUSING to draw a conclusion -- the controls are looser than the effect:
+> float32: the same-code floor sits 0.68% from 1.000 and the effect 1.24%, so the effect is not 2x
+> its own floor and cannot be resolved by this run
+
+The refusal is correct about the statistic it was applied to and wrong as a verdict on the
+mechanism. Both halves are worth writing down.
+
+**First, the run is sound.** The two same-flag builds differ by **2 instruction lines** out of
+159643 — so the 0.68% is not build layout, it is run-to-run variance, and it can be beaten with an
+estimator that uses the 2172 cells instead of collapsing them. Position is already balanced: the
+rotation gives each build each slot once per three slices and 362/25 is exactly fifteen slices.
+`ship` against `cand` differs by 75857 lines, so the flip reached the object. Correctness with the
+candidate compiled in: **1099 passed, 48 skipped**, the same as ARM.
+
+**Second, the pooled number is diluted, not small.** The cap's mechanism is to stop launching 32
+threads on a 24-core pool, and it cannot do anything on a kernel too short for the extra eight
+threads to be contending. 53% of the float32 cells are under 20 microseconds. Banding on the
+**reference's** own time — which no build of ours can move, unlike banding on `ship`, which selects
+cells where ship was unlucky and biases every `/ship` column — and pairing each cell against itself
+so that selection cancels:
+
+float32, 4344 paired observations:
+
+| band | n | ctrl/ship | cand/ship | cand/ctrl | SE | t |
+|---|---|---|---|---|---|---|
+| < 20us | 2316 | 0.9976 | 1.0010 | **1.0034** | 0.084% | **+4.04** |
+| 20–50us | 1188 | 0.9885 | 0.9899 | 1.0015 | 0.636% | +0.23 |
+| 50–200us | 772 | 0.9779 | 0.9456 | **0.9670** | 0.919% | **−3.66** |
+| > 200us | 68 | 1.1084 | 0.9880 | 0.8913 | 5.941% | −1.94 |
+| all | 4344 | 0.9932 | 0.9877 | 0.9945 | 0.261% | −2.13 |
+
+float64, 4344 paired observations:
+
+| band | n | ctrl/ship | cand/ship | cand/ctrl | SE | t |
+|---|---|---|---|---|---|---|
+| < 20us | 1842 | 1.0021 | 1.0027 | 1.0006 | 0.104% | +0.61 |
+| 20–50us | 1290 | 0.9931 | 0.9738 | **0.9805** | 0.531% | **−3.70** |
+| 50–200us | 1096 | 0.9871 | 0.9570 | **0.9694** | 0.619% | **−5.01** |
+| > 200us | 116 | 0.9977 | 0.8720 | **0.8739** | 3.957% | **−3.41** |
+| all | 4344 | 0.9955 | 0.9787 | 0.9831 | 0.252% | −6.74 |
+
+Time ratios, so below 1.000 is the candidate faster. `cand/ctrl` is the quantity to read: both are
+divided by the same `ship` sample, so anything that sample carries cancels.
+
+**The cap acts above about 20 microseconds and is worth 2 to 13% there, on both dtypes, compiled in,
+with no hooks and no environment variables.** That is the same boundary the matched-bucket analysis
+found on ARM (neutral under 21µs, 13–25% above 41µs) and the same direction the hooked x86 arms
+found. Three instruments, two hosts, one mechanism.
+
+Cells slower than the reference, counted against a **common** reference reading so that the
+reference's 7.3% cross-process spread cannot move the three counts relative to each other:
+
+| dtype | ship | ctrl (same code) | cand |
+|---|---|---|---|
+| float32 | 134 | 136 | **127** |
+| float64 | 140 | 153 | **124** |
+
+### The band that costs, again, and again no gate
+
+**x86 float32 under 20 microseconds reads 1.0034 — 0.34% slower — at t = +4.04 over 2316
+observations.** It is small but it is not noise, and it is 53% of the float32 cells. float64's same
+band is 1.0006 at t = +0.61, so this is float32 only.
+
+This is the third time a threshold has been considered for this candidate and the third time it is
+refused, and the reasons do not repeat:
+
+- The **decline above** a work threshold was retracted because the mechanism was backwards — the cap
+  is *faster* at large work, not slower.
+- The **decline below** a work threshold was synthesized in-sample from the hooked columns and
+  rejected because at 26k it bought x86 float64 half a point and cost the other three sets 0.1 to
+  0.3, moving the below-MKL count by one cell.
+- Now, with the band identified on the compiled-in builds and on the right feature, the gate is
+  refused for a sharper reason: **the resolver has the work and the effect follows the time.** The
+  ledger already noted this — the over-41µs bucket reads 1.1724 where the over-380k-work bucket
+  reads 1.0687 — and the synthesis showed a work threshold makes x86 float32 *worse*, not better,
+  which is exactly what a gate cut on the wrong axis does. A 0.34% cost on the shortest float32
+  kernels is left in, declared, and named.
+
+### This overturns the per-architecture default
+
+An earlier section here argued for `SCORCH_SPMM_NT_CAP = -2` and
+`SCORCH_SPMM_RECRUIT_MIN_WORK = 10000000` **under `__ARM_NEON` only**, on the grounds that "the rule
+is a win on ARM and is not on x86", and listed two things outstanding. Both have landed, and both
+landed the other way:
+
+1. The x86 caller-path reading was expected null. chain26b read **+1.94% float32 at z +6.7**.
+2. ogbn-arxiv read about 6% against the candidate on a floor too loose to settle it. chain31b, with
+   ten interleaved passes and a same-code floor, read **0.9771 — 2.3% faster** — and −2.08% against
+   the reference once the PyTorch passenger's shared slot cost is removed.
+
+So the cap is a win on both hosts and the per-architecture default is not the right landing. Both
+constants go on unconditionally.
