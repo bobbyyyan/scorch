@@ -7112,3 +7112,38 @@ arm every chain used**, once the queue drains. That validates the arms without r
 and it is the right place for it: an arm that fired in the wrong place invalidates its verdict
 whether the check runs before or after, and running it after costs nothing that running it
 before would have saved.
+
+### chain41: the nnz-per-thread rule ships
+
+The analyzer now asks the binary which worker count each arm resolves to rather than restating
+the gate, and it printed `Worker-count probe using torch.get_num_threads() = 24` and
+`Gate split taken from the binary (scorch_spmm_nthreads), not restated here`. That split is
+also provably complete: `nnz_per_thread` feeds only the worker count, and `scorch_spmm_chunk`
+takes `nthreads` as an argument, so two arms resolving to the same worker count are identical
+all the way down. The "structural null" group is therefore a real null, which is what allows
+its reading to be interpreted as inertness rather than as a small effect.
+
+| corpus | in-gate cells | floor | ship | z | >10% slow, ship vs floor |
+|---|---|---|---|---|---|
+| general f32 | 100 / 1510 | 1.0026 | 1.0300 | +1.3 | 12 vs 13 |
+| general f64 | 100 / 1510 | 1.0229 | 1.0909 | +2.5 | 9 vs 16 |
+| fewrow f32 | 412 / 412 | 1.0171 | 1.0500 | +2.4 | 54 vs 51 |
+| fewrow f64 | 412 / 412 | 1.0294 | **1.0971** | **+6.1** | 36 vs 36 |
+
+The strongest cell is few-row float64, and it rises monotonically with width -- 1.0165, 1.0982,
+1.1386, 1.1398 at k=8, 32, 64 and 128 -- with the harmed tail *identical* to the same-code
+floor's, 36 cells of 412 each. On the general corpus only 100 of 1510 cells are even in the
+gate, 20 matrices of 302, which is the rule being narrow by design rather than the grid being
+weak.
+
+Out of the gate it reads 1.0037 and 1.0049 against a floor of 0.9979 and 0.9997 -- within 0.6%
+-- and its harmed tail is *narrower* than the floor's, 24 of 1410 against 44. The z values
+there are +2.1 and +2.2, which is a reminder rather than a finding: at 1410 cells a 0.5% slot
+difference clears z=2 easily, so the effect size and the tail counts are what matter and both
+say inert.
+
+So the rule meets the standard: it wins 3-10% where it can fire, strongest on the family it
+was built for, and it is inert to within slot noise where it cannot, with no wider harmed tail
+anywhere. This is a different lever from the narrow-k ILP work and can ship independently of it.
+Absolute parity is not the claim here -- this is the harness path in an instrumented build --
+the claim is arm-to-arm, which is what was measured.
