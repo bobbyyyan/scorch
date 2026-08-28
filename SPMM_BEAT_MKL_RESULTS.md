@@ -10559,3 +10559,55 @@ This reorders the queue again. **chain52 -- "what is the fixed cold cost of a ca
 thread wake-up?" -- is now the highest-value queued run for the cold half of the board**, and it
 was ninth. It gets promoted next to the two kernel chains, and unlike them it needs no caller-path
 retrofit: it was written against `cold_probe` and `cold_overhead`, which time whole calls.
+
+## Where this stands, in one place
+
+**The defect and the fix.** The SpMM resolved more workers than the framework advertises, by
+three routes that all ceiling at `omp_get_num_procs()`. Capping the final count at the caller's
+pool corrects all three -- but capping unconditionally makes the E-core recruit's gate
+(`nthreads >= 2 * pool`) unsatisfiable, which on the M5 would have shipped a 2.9x worst-cell
+regression on the fused autoencoder Linear. The recruit is not wrong; it fires on far too little
+work. So the fix is one condition on the cap: decline it when a recruit is at stake and the work
+clears a threshold. `SCORCH_SPMM_NT_CAP` and `SCORCH_SPMM_RECRUIT_MIN_WORK`, both 0 by default,
+whole `.so` byte-identical at default on ARM against a determinism-checked baseline.
+
+**The threshold is 10 million** units of nnz*k. t5 and t40 are excluded by measurement; t10 and
+t20 are not distinguishable, and 10M is chosen because it sits at the lower edge of the measured
+crossover and changes fewer cells away from shipped behaviour.
+
+**What the candidate is worth, by host and path.**
+
+      ARM, real autoencoder, cells the rule acts on      0.8357 (fused), 0.8963 (matmul)
+      ARM, same run, cells it cannot act on              1.0147 / 1.0203  -- the floor
+      ARM, GCN, four datasets, both kernels              8 of 8 inside the same-code control
+      ARM, mgladder corpus, general path, firing cells   1.24 - 1.37 at k <= 16
+      x86, board corpus, CALLER path                     0.9967 z -1.3 warm, 0.9962 z -1.3 cold
+      x86, board corpus, general path, whole call        1.0536
+      emission at default                                byte-identical
+      ARM correctness, candidate compiled in             running
+
+**The methodological finding that reframes the rest.** kprobe -- which produced every kernel
+number on this branch -- times `scorch.matmul(A_st, B_st, time_dict=td)`, and an STensor B and a
+time_dict each independently fail `ops.matmul`'s plan-cache guard. So all of those numbers
+describe the general dispatch path. The caller path is `scorch.matmul(A_st, B)`. The two disagree
+about the thread cap by 5.4 percentage points, and about the *kernel itself*: on 104 of 107 warm
+losers the caller path's whole call is faster than the harness path's kernel alone. Develop with
+kprobe; decide with cprobe.
+
+**What is actually left, on the caller path.** Warm: 107 of 744, concentrated at k=1 (40) and
+k=4 (36), median degree 191 against a corpus median of 22, median 512 rows against 3082, and
+shallow -- 71 of 107 within ten percent of MKL. Cold: 198 of 744, spread across every width,
+median only 4.6% behind, and **half of a cold call is not the kernel**: the median cold loser
+carries ~43 us outside its kernel against a 4.9 us deficit, so cutting per-call cost by a quarter
+would flip 160 of them.
+
+**The queue, reordered against that.** 24 (running), then 25b (x86 threshold inertness + GCN),
+26b (x86 caller-path cap), 27b (caller-path numbers for the two shipped policy levers), 28b
+(multi-row register blocking, k=4/8, promoted from 15th, both paths), 29b (k=1 exact-width kernel,
+promoted from 13th, both paths), 23b (the fixed cold cost, promoted from 9th), then 48-61, then
+63b (thread ladder, rewritten to use the knob that actually forces the launched count, both
+paths). On ARM: stage37 (correctness, running), stage38 (ARM caller path), stage39 (the
+autoencoder's can-act group widened from 3 cells to 9).
+
+**Nothing is enabled.** Both constants are 0. The candidate ships when the x86 caller path says
+it is not a regression, both hosts' guardrails pass, and correctness passes with it compiled in.
