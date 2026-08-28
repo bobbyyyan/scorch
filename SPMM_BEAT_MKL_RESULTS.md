@@ -4980,3 +4980,29 @@ That reorders the next campaign. It is not a missing kernel: it is a **sub-micro
 cost on ~19 µs calls** whose arithmetic is about 2 µs — output zero-fill, team fork and join,
 policy resolution — plus a separate group of seven large float64 cells that is worth its own
 look.
+
+### Count says near-dense; magnitude says few-row
+
+The two ways of ranking the production-path residual disagree, and the disagreement is the
+useful part. Every cell above 40 µs that is the kernel's own fault:
+
+| matrix | k | rows | degree | ours | MKL | ratio |
+|---|---|---|---|---|---|---|
+| kl02 | 8 | 71 | 2993 | 45.6 | 33.3 | **0.731** |
+| nw14 | 1 | 73 | 12396 | 119.7 | 88.5 | **0.740** |
+| rn50 bottleneck_2 (f32) | 1 | 256 | 1152 | 42.0 | 26.8 | **0.638** |
+| transformer body_decoder | 1 | 2048 | 300 | 45.6 | 37.6 | 0.823 |
+| kl02 | 64 | 71 | 2993 | 538.0 | 478.1 | 0.889 |
+| connectus | 8 | 512 | 2202 | 287.5 | 272.0 | 0.946 |
+| lp_osa_14 | 8 | 2337 | 136 | 86.5 | 85.8 | 0.992 |
+
+The near-dense family is 29 of the 32 kernel-fault cells but its median gap is 0.7 µs. The
+few-row family is 3 cells and it owns the three worst ratios in the whole corpus. Read the
+row counts against `rows/SCORCH_ROWS_PER_THREAD` on a 24-thread pool: kl02 and nw14 get **4
+workers of 24**, rn50's 256 rows get **16 of 24**. A 4-of-24 team predicts about 0.7 and the
+measurement is 0.731; a 16-of-24 team predicts about 0.67 and the measurement is 0.638.
+
+**So the pool-conditioned row ceiling is the highest-value next step**, not because it fixes
+many cells but because it fixes the worst ones, and the mechanism is already measured at
+1.3066 / 1.4011 inside its gate on this host. connectus (512 rows → the full pool) and the
+transformer block (2048 rows) are *not* explained by under-threading and stay open.
