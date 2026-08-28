@@ -6831,3 +6831,55 @@ what chain42 decides -- writing it now would mean guessing the winner, and the w
 the ladder is that the S=2/4/8 and `ex1` arms make different predictions.
 
 Recorded here so the queue is not mistaken for complete when chain48 finishes.
+
+### Cold, properly separated: where we LOSE and where we are INEFFICIENT are different regimes
+
+The previous section asserted that cold and warm are the same mechanism seen through different
+caches, and that cold therefore needs no separate direction. Testing it rather than asserting
+it splits the question in two, and the assertion is half right.
+
+First, cold does cost us more than it costs MKL, at every width, and the penalty grows with k.
+Taking each side's own cold/warm ratio and dividing -- so MKL's own cold penalty is the null:
+
+| k | f32 excess | f64 excess | f32 warm-losers / cold-losers / both |
+|---|---|---|---|
+| 1 | 1.117 | 1.105 | 27 / 48 / **19** |
+| 2 | 1.211 | 1.364 | 6 / 29 / 5 |
+| 4 | 1.159 | 1.229 | 31 / 34 / **19** |
+| 8 | 1.371 | 1.433 | 9 / 27 / **1** |
+| 16 | 1.553 | 1.488 | 1 / 15 / **1** |
+| 32 | 1.545 | 1.568 | 1 / 9 / **1** |
+| all | 1.315 | 1.355 | |
+
+At k=1 and k=4 the cold and warm losers substantially overlap -- 19 of 27 and 19 of 31 -- so
+there the two phases really are one mechanism. At k>=8 they are nearly disjoint, overlap of
+one, so something cold-specific is at work and it grows with width.
+
+Second, what it scales with is the **output buffer**, not A:
+
+| output MB | f32 excess | f32 cold parity | f64 excess | f64 cold parity |
+|---|---|---|---|---|
+| <0.03 | 1.089 | **1.02** (n=237) | 1.113 | **1.01** (n=169) |
+| <0.3 | 1.268 | 1.14 | 1.194 | 1.12 |
+| <1.5 | 1.739 | 1.39 | 1.654 | 1.44 |
+| <6 | 1.685 | 1.37 | 1.878 | 1.41 |
+| >=6 | -- | -- | **2.006** | 1.74 |
+
+Against A's size the same statistic *falls* -- 1.410, 1.312, 1.245, 1.085 -- so this is not
+about streaming A. An output-sized cold cost is allocation, first touch and zeroing of a fresh
+C, which is exactly what the per-call floor was already measured to scale with, and what the
+fresh-buffer page-fault behaviour on the other host is made of.
+
+**The two regimes do not coincide, and conflating them is what made the first reading wrong.**
+The *losses* are at small output, where cold parity is a marginal 1.02 over 237 cells and cells
+straddle 1.0 in both directions -- and small output means few rows and narrow k, which is the
+warm family again. The *excess* is at large output, where it reaches 2.0x but parity is still
+1.37 to 1.74, so we give away much of a large lead and win anyway. So:
+
+* closing the 267 cold losing cells is mostly the same narrow-k ILP work as warm, which is what
+  the first reading got right;
+* the output-buffer cold cost is a real second inefficiency worth its own fix, but it is not
+  where the losses are, and a fix there would widen margins rather than flip cells.
+
+That ordering matters for what to do next: the ILP lever stays first, and the output-buffer
+work is a separate, lower-priority item that should not be justified by the 267 number.
