@@ -5293,3 +5293,49 @@ to the aligned load: it wins 6–8% at k = 2 and k = 3 because a scalar loop has
 and it loses from k = 5 up because there the mask is over half full and `UNROLL*K` accumulators
 begin to spill. At k = 4 neither kernel is the right one — the scalar loop has no vector width
 left to exploit and the masked 256-bit loop wastes half of its own.
+
+## The exact-width bound does not want k=4, and float64 calibrates the whole design
+
+The per-width sweep that set `SCORCH_NARROWK_EXACT_HI` to 3 measured k = 1, 2, 3, 5, 6 and 7
+and asserted the boundary at 4 without a number for it — while 22 of the 32 near-dense cells
+behind MKL sit at k = 4. Widening the bound is a runtime hook, so the missing number was cheap
+to get: 302 matrices (the 180 the original sweep used, plus 122 grouped by density), five
+widths, both dtypes, arms differing only in the value of one variable so the getenv charge
+cancels exactly.
+
+**It is nil.** At k = 4 on float32 the widened arm reads 1.0044 against a 1.0030 slot floor,
+and nothing anywhere in the grid clears |z| = 2.5. The unroll-capping variant, which exists
+because `UNROLL*K` accumulators start spilling above k = 4, changes nothing either.
+
+The float64 half of this grid is worth more than its verdict, because on float64 the exact-width
+kernel caps at 3 and **all five arms are provably the same code path** — the whole 1510-cell
+grid is a null. It reads within ±0.6% with z running up to **±3.1**. So |z| ≤ 3 is the floor in
+this design, which retires every float32 reading in the table above, and is the number to hold
+other hooked grids to.
+
+### The width where we actually lose, and why float64 is the control for it
+
+Kernel time alone against MKL's call, on this corpus, for the arm that ships:
+
+| | k=2 | k=3 | k=4 | k=5 | k=8 |
+|---|---|---|---|---|---|
+| float32 | 0.9654 | 0.9871 | **0.9321** | 1.0706 | 1.0390 |
+| float64 | 1.0380 | 1.0776 | **1.0629** | 1.1208 | 1.2402 |
+
+float32 k = 4 is the worst cell in the grid — 200 of 302 matrices behind MKL — and float32 is
+behind float64 at every width. That is the shape the mask mechanism predicts, and k = 4 makes
+it a controlled comparison rather than an argument: **float32 has 8 lanes, so k = 4 is 4 of 8
+and every nonzero pays `_mm256_maskload_ps`; float64 has 4 lanes, so k = 4 is FULL_LAST and
+pays a plain load.** Same width, same kernel, same corpus, one masked and one not — 0.9321
+against 1.0629.
+
+Stated before the measurement: if the mask is the mechanism, giving float32 k = 4 a 128-bit
+register block (`SCORCH_SPMM_HALFVEC=1`, four floats, no mask, full FMA width) should move it
+from 0.9321 toward its unmasked twin's 1.0629, about 14%, and should do nothing at k = 2, 3 and
+8, where the hook cannot fire. If it moves the widths it cannot reach, the reading is the
+instrument.
+
+One caveat on the whole-call column that is not in the table: on this harness path the same
+cells read 0.6848 with 248 of 302 behind MKL, because passing `time_dict` disables the
+per-tensor plan cache and adds about 7 µs to a kernel that is only a few microseconds long.
+That is the measurement path, not the caller path, and the kernel column is the signal.
