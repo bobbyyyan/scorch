@@ -10454,3 +10454,49 @@ warm float32 losers no thread cap can touch. The subsumed arm stays in as a cont
 that reproduces stage35's finding on x86 is a run whose build and harness are working.
 
 The queue is now 24, 25b, 26b, 27b, 28b, then 48 through 61, then 63b.
+
+## What is actually still losing, on the caller path, characterised
+
+From chain24's base arm, 744 cells, float32, using the `plan` column -- so this is the path a
+caller uses, not the harness path.
+
+      warm: 107/744 below MKL              cold: 198/744 below MKL
+      by width  k=1  40/124                by width  k=1  51/124
+                k=2  17/124                          k=2  45/124
+                k=4  36/124                          k=4  41/124
+                k=8  10/124                          k=8  30/124
+                k=16  1/124                          k=16 19/124
+                k=32  3/124                          k=32 12/124
+      degree    median 191 (corpus 22)      degree    median 102
+      rows      median 512 (corpus 3082)    rows      median 512
+      margin    median 1.081, p90 1.219     margin    median 1.046, p90 1.128
+                worst 1.624                           worst 1.809
+      within 5% of MKL   35/107             within 5%   108/198
+      within 10%         71/107             within 10%  161/198
+      matrices           51 of 124          matrices    82 of 124
+
+Three things follow, and they set the agenda better than any single lever's number.
+
+**The warm deficit is narrow-k, few-row, high-degree.** k=1 and k=4 hold 76 of the 107, k >= 16
+is nearly clean at 4 of 248, and the losing cells have nine times the corpus median degree on a
+sixth of its rows. That is the same class the row ceiling was built for and the same class the
+four cap-unreachable losers belong to. It is one class, not a scatter.
+
+**The losses are shallow.** Warm median 1.081 and 71 of 107 within ten percent; cold median 1.046
+and 161 of 198 within ten percent. Nothing here needs a 2x kernel. **A lever worth 5-10% on
+narrow-k few-row high-degree cells clears most of the board**, and levers of that size are exactly
+what the queue is full of. The remaining tail is small: 36 warm cells more than 10% behind, worst
+1.624.
+
+**Cold is broader and shallower than warm.** It loses at every width including 32, its median
+margin is half of warm's, and it involves 82 of 124 matrices rather than 51. That is the
+signature of a fixed per-call cost rather than a kernel deficiency -- consistent with the ~39 us
+outside the kernel already measured -- and it is why cold and warm want different levers. Bobby's
+own framing has warm as the claim and cold as the guard, and the data agrees that they are
+separate problems.
+
+Matching that against the queue: **chain28b's multi-row register blocking targets k=4 and k=8**
+(chain45 put its below-MKL reduction at 96->59 at k=4 and 17->6 at k=8 -- on the harness path,
+which is why chain28b now measures both paths). **chain60's k=1 exact-width kernel targets the
+largest single group**, the 40 losers at k=1. Those two between them address 76 of the 107 warm
+cells, which is why they are the two to run first.
