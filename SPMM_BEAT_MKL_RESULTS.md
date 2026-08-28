@@ -11698,3 +11698,117 @@ band is x86 float64 short cells, it is 0.5-0.8%, and it is left in.
 Checked by synthesis before any machine time, which is now twice today that a threshold hypothesis
 has been settled for free from columns already measured -- once rejected because the mechanism was
 backwards, once because the win was too small to pay for the constant.
+
+## chain28b measured everything and reported nothing: two analyzer defects, and the result recovered
+
+chain28b ran for two hours, wrote all 24 CSVs (1209 lines each), and printed a verdict of nothing
+but `REFUSING -- only [] present` -- followed by **"Controls within limits; the comparison above
+stands"** and `CHAIN28B_DONE`. Three separate defects, all in the analysis and none in the
+measurement, so the data was intact and the verdict is recovered below.
+
+**Defect one: the analyzer assumed the build names.** `an_ship3.py` hardcodes `ship`, `ctrl`,
+`cand`; chain28b named its trees `mr_ship`, `mr_ctrl`, `mr_cand`. Every filename it tried was
+absent. Fixed by discovering the names from the files and re-keying them to their roles by suffix,
+so any tree-name prefix works.
+
+**Defect two: it printed success after refusing everything.** The per-dtype refusals `continue`d
+and the closing line was unconditional. Fixed with a counter of dtypes that actually produced a
+comparison, and a refusal when it is zero. This is the same failure family as the four drivers that
+printed DONE having measured nothing -- the fix is the same shape: check the output, not the last
+line reached.
+
+**Defect three: `an_ship3.py` cannot read a caller-path CSV at all.** It requires `only_kms`, and
+cprobe has no kernel column by construction -- asking for a `time_dict` is exactly what disables
+the plan-cache path it exists to measure. So every row of every cprobe CSV raised `KeyError` and
+was skipped, and chain28b's caller-path half -- the half its own header calls "what decides whether
+it ships" -- was the one that read as empty. Fixed to fall back to the whole call and say so, in
+both `an_ship3.py` and `an_ship3deg.py`.
+
+**A fourth thing, which is a scoping error rather than a bug.** The reference-spread limit was a
+blanket refusal. The reference column is MKL, no scorch change can move it, and its cross-process
+spread bounds what can be said about *versus MKL* -- not about a comparison between two of our own
+builds, which has its own control. chain28b hit exactly that: reference spread 1.1037, `ctrl/ship`
+floor **0.9983**, effect 1.0451. Refusing a 4.5% effect measured against a 0.17% floor because
+MKL's column was noisy discards the one claim the run was fit to make. It is now a caveat on the
+vs-reference block and leaves the arm-vs-arm verdict to the arm-vs-arm control.
+
+### And my own disturbance, on the second host today
+
+I rsynced a source tree to redwood at about 12:31, during chain28b's `mrkprobe float32 reverse`
+pass, plus a few small scp and ssh calls later. A few seconds of CPU on a two-hour run. Same
+discipline broken as on the M5 an hour earlier, on the other host. It is not visible -- the
+`ctrl/ship` floor for float32 is 0.9971 on the kprobe half and 0.9983 on the cprobe half, both
+tight -- but "not visible" is not "did not happen", and the two together are a pattern rather than
+a slip: I check whether a machine is busy before launching a *stage* and not before running a
+one-off command. The fix is to route one-off analysis through the scratchpad on the machine that is
+NOT running the thing I am analysing, which was available in both cases.
+
+### The recovered verdict: multi-row register blocking, ROWS=2, three hookless builds
+
+Caller path, 302 matrices, k = 4, 8, 16, 64, 1208 cells per dtype, `ship/arm` so above 1.000 means
+the candidate is faster.
+
+      float32                      whole call    float64
+      ctrl / ship  (the floor)         0.9983     1.0140
+      cand / ship  (the change)        1.0451     1.0127
+      by k    4       8      16      64
+      f32   1.0429  1.0751  1.0598  1.0038      (floor 1.0009 / 0.9955 / 0.9970 / 0.9997)
+      f64   1.0228  1.0312  0.9823  1.0151      (floor 1.0168 / 1.0168 / 1.0026 / 1.0199)
+
+**float32 is a 4.5% caller-path win against a 0.17% floor. float64 is inside its floor** (1.0127
+against 1.0140) and is refused. By degree band, float32 at k <= 16:
+
+      band        matrices   effect   floor    nnz range
+      deg<1              9   0.7197  1.0017   1 to 120215
+      deg1-2             2   0.9516  1.0136   806 to 36406
+      deg2-8            43   1.0623  1.0043   655 to 1334038
+      deg8-64          160   1.1224  1.0026   737 to 3866688
+      deg64+            88   0.9927  0.9853   9461 to 1127525
+
+**It wins 12.2% in the degree 8-64 band -- 160 of the 302 matrices -- and 6.2% at degree 2-8, and
+it loses 1.4x at degree below one.** Neutral at degree 64+ and at k=64.
+
+### The loss has a mechanism, and the gate that already existed is on the wrong quantity
+
+The worst cells name it: 334863 rows at 67462 nonzeros reads 0.4391 at k=4, **127224 rows at ONE
+nonzero** reads 0.4434, 292008 rows at one nonzero 0.5687, and 2048 rows at ~1000 nonzeros 0.4445 --
+every cell below its floor has fewer nonzeros than rows.
+
+The multi-row kernel is placed **ahead of the empty-row branch** and zeroes an empty row itself.
+That branch merges a *run* of consecutive empty rows into one memset; the multi-row kernel takes
+them two at a time and zeroes each pair separately. On a matrix that is mostly empty rows, that
+destroys the merge, and the merge is what the empty-row work shipped for.
+
+`SCORCH_SPMM_MULTIROW_MINNNZ` -- the gate the constant's own comment nominates for this case --
+**cannot express it.** It thresholds `nnz_total`, and the losing matrices run from 1 to 67462
+nonzeros while the winning bands start at 655 and 737. No threshold separates them.
+
+So the fix is the mechanism, not an aggregate: **take the group only if it contains a nonzero**,
+`A1_pos[i + multirow] > A1_pos[i]`. On a run of empty rows that is false and the row falls through
+to the branch that merges them; on a matrix with no empty rows it is always true. One compare on a
+value already loaded, inside a block that does not exist unless the kernel is enabled -- so it is
+predicted free at the shipped default, which is being checked against a determinism control rather
+than asserted.
+
+### One more caveat, and it is the largest: the k=4 column is against a baseline that does not ship
+
+All three of chain28b's builds pin `-DSCORCH_SPMM_HALFVEC_F32=0`, because when the chain was written
+the half-vector kernel was a separately-pending decision and pinning it off in every arm made it
+cancel. **It shipped at 02:18 today.** And the multi-row dispatch sits *ahead* of the half-vector
+branch, so the two compete for width 4 and multi-row wins the tie.
+
+That makes the k=4 numbers a comparison against the masked 256-bit register block, which is about
+10% slower than what now ships at that width -- and the below-MKL counts are where it bites:
+
+      float32, cells below MKL      k=4    k=8   k=16   k=64    all
+      ship                           85     10      2      1     98
+      ctrl (same code as ship)       80      9      2      4     95
+      cand                           46      5      2      1     54
+
+**Thirty-nine of the forty-four recovered cells are at k=4**, the one width whose baseline is wrong.
+So "98 to 54" is not a usable number, and the real open question is one nobody has measured:
+multi-row against the **half-vector** kernel at k=4. What survives is k=8 (10 to 5, with the
+same-code control at 9) and the arm-vs-arm effects at k=8 and k=16, 7.5% and 6.0%, which halfvec
+does not touch.
+
+Queued as chain28c: the guard in, the baseline shipping, three hookless builds, both dtypes.

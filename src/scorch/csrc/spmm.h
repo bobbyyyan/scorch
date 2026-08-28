@@ -4184,11 +4184,24 @@ torch::Tensor spmm_csr_v2_core(
         // never swaps two kernels in one step and neither is attributable. It also refuses
         // when fewer than ROWS rows are left in the stolen chunk, which is why it cannot run
         // past `end` and cannot read A1_pos out of range.
+        // ...and it must not take a group that is entirely empty rows. The empty-row branch
+        // below merges a RUN of consecutive empty rows into one memset; this kernel would take
+        // them two at a time and zero each group separately, which is the whole loss on matrices
+        // with far more rows than nonzeros. Measured on the three-build caller-path run: 334863
+        // rows at 67462 nonzeros reads 0.439 (2.3x SLOWER) at k=4, 127224 rows at ONE nonzero
+        // reads 0.443, and every cell below its own floor on that run has nnz < rows. The
+        // aggregate gate that already existed cannot express this -- SCORCH_SPMM_MULTIROW_MINNNZ
+        // is on nnz_total, and the losing matrices run from 1 to 67462 nonzeros while the winning
+        // bands start at 655, so no threshold separates them. This condition does, because it is
+        // the mechanism: a group with no nonzeros in it is exactly the group whose merge is being
+        // destroyed. It is one compare on a value already loaded, inside a block that does not
+        // exist unless the kernel is enabled.
         if (multirow > 1 &&
             (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
             narrow_k && !exact_width && !force_workspace &&
             !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
-            i + multirow <= end) {
+            i + multirow <= end &&
+            A1_pos[i + multirow] > A1_pos[i]) {
           #define SCORCH_MR(NV, RR) \
             (full_last \
                ? scorch_spmm_multirow_regblock<scalar_t, NV, true, RR>( \
