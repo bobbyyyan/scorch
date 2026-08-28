@@ -8500,3 +8500,47 @@ The tip also carries `SCORCH_SPMM_HALFVEC_F32 1`, which is a *different* pending
 chain48 is measuring on the caller path. All three builds pin `-DSCORCH_SPMM_HALFVEC_F32=0`, so it
 cancels exactly rather than riding inside the comparison. The two do not interact — halfvec acts at
 k=4 float32, the extension at k=1 — but "does not interact" is an argument and pinning is a fact.
+
+## ARM: the ceiling's whole ARM cost is the missing cap, and the widened gate is neutral
+
+M5, hooked build, 97 matrices stratified on rows x degree, kernel timer, two replicates per dtype,
+6 arms each naming the same five knobs so the successful-`getenv` counts are equal. Reference `off`
+is the ceiling actually turned off (`NNZ_PER_THREAD=0`), because that is what ships. Values are
+off/arm, so >1 means the arm beats shipping.
+
+| region | n | offb (floor) | g128_192 | g2048_128 | g2048_128 **nocap** | g2048_128_fl12 |
+|---|---|---|---|---|---|---|
+| f32 r1, shipped gate r<=128 d>=192 | 12 | 1.0043 | 1.0029 | 1.0025 | **0.9272 z-6.4** | 0.9983 |
+| f32 r2, same | 12 | 1.0063 | 1.0043 | 1.0041 | **0.9311 z-6.3** | 1.0011 |
+| f64 r1, same | 12 | 0.9975 | 0.9953 | 1.0000 | 0.9822 z-2.9 | 0.9973 |
+| f64 r2, same | 12 | 0.9978 | 1.0005 | 1.0001 | 0.9779 z-2.8 | 1.0014 |
+| f32 r1, newly admitted 128<r<=2048 d>=128 | 35 | 0.9992 | 1.0008 | 0.9998 | 0.9975 | 0.9982 |
+| f32 r2, same | 35 | 0.9998 | 0.9979 | 1.0012 | 0.9944 | 0.9977 |
+| f32 r1, outside every gate r>2048 d<64 | 12 | 1.0063 | 0.9939 | 0.9951 | 0.9926 | 0.9949 |
+
+Three things, all replicated:
+
+**`SCORCH_SPMM_CEIL_CAP_POOL` is the entire ARM disagreement.** Uncapped, the rule loses 6.9-7.3%
+on float32 inside the shipped gate with z of -6.4 and -6.3 — which is the 0.934/0.948 that
+`scorch_policy.h` records and that kept the whole rule off. Capped, the same gate on the same
+matrices in the same runs reads 1.0025 / 1.0041 / 1.0000 / 1.0001. The proposed mechanism is
+confirmed exactly: `omp_get_num_procs()` is 18 against a pool of 6 here, so uncapped the rule
+recruits twelve efficiency cores, and capped it widens 4 workers to 6.
+
+**The widened gate is neutral on ARM.** Over the 35 matrices (2048, 128) newly admits, the capped
+arm reads 0.9998 and 1.0012 on float32 and 0.9983 and 1.0028 on float64, every |z| <= 1.3 against
+floors of 0.9950-0.9998. Outside every candidate gate it is inside the floor too, so the rule is
+inert where it cannot fire.
+
+**The pool floor is unnecessary, and the prediction that says so held.** `g2048_128_fl12` sets
+`MINTHREADS=12` against a pool of 6, so the rule is structurally unreachable; it was registered
+before the run that this arm must read the A/A floor exactly, and it reads 0.9967-0.9980 pooled,
+inside it. That confirms the floor reads the caller's pool and not `num_procs` — the distinction the
+source says "already cost one grid". But with the capped form already neutral there is nothing for a
+floor to protect, so it stays at 0 and the rule stays one condition instead of two.
+
+**What this unblocks.** `scorch_policy.h` says of the cap "off until both hosts have run it". ARM
+has now run it, twice, on both dtypes: capped is neutral here. So if chain57/58 show the widened
+gate paying on x86, it can ship as `NNZ_PER_THREAD=256` + `CAP_POOL=1` + the wider gate, with no
+pool floor and no ISA special case — and the ARM half of the two-host requirement is already done
+rather than pending. The x86 half is the open question, and it is the one that decides it.
