@@ -4695,3 +4695,34 @@ there) and halves the count of cells behind it, while staying inside the A/A flo
 everywhere else. Whether it ships depends on x86 inertness, which is a separate measurement:
 redwood's pool is 24, above the ceiling, so the gate's whole block should be unreachable
 there.
+
+## The sparse-autoencoder guardrail at eight rotations, and the limit of what it can resolve
+
+Eight rotations of three arms over two datasets × three sparsities, per-key minimum. Arms:
+what ships today, back-stealing, and back-stealing extended to the fused Linear path (a
+separate knob, default off).
+
+| framework | back-stealing | + on the fused path | worst cell |
+|---|---|---|---|
+| **Scorch** | **1.0210** | 1.0140 | 0.9872 / 0.9362 |
+| PyG (not our code) | 1.1021 | 1.1288 | 0.9684 / 0.9498 |
+| PyTorch Dense (control) | 1.0005 | 0.9741 | — |
+| PyTorch Sparse (control) | 0.9488 | 0.9701 | — |
+
+**The per-cell numbers say this bench cannot resolve a 2% effect, and the aggregate hid it.**
+The control gate passed because it scores geomeans, but per cell the columns that *cannot be
+affected by the change* move like this: PyG mnist at 0.9 sparsity reads 1.5481 and 1.4036,
+PyG fashion at 0.8 reads 1.5065, PyTorch Sparse fashion at 0.9 reads 1.1685, PyTorch Sparse
+mnist at 0.8 reads 1.1187, PyTorch Dense mnist at 0.9 reads 0.9376. A 55% swing on a
+third-party framework is the bench's resolution at these sizes — every measured forward here
+is 0.5–4 ms.
+
+Scorch's own column stays in 0.9872–1.0779 (back-stealing) and 0.9362–1.0649 (fused path).
+So the honest statement is: **the autoencoder shows no regression, and this harness cannot
+support a claim finer than about 6% per cell.** Same conclusion as the transformer, where two
+behaviourally identical arms differed 13% on one cell. Whole-model benches on millisecond
+forwards are guardrails against breakage, not instruments for single-digit percentages — the
+kernel grids are the instruments.
+
+One thing the run does say: extending the partition to the fused Linear path is not positive
+(1.0140 against 1.0210, worst cell 0.9362), so that knob **stays off**, which is its default.
