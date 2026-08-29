@@ -12893,3 +12893,61 @@ disk — `k1_ship`, `k1_ctrl`, `k1_cand`, which persist after the run — agains
 k=1..4, which is one probe pass rather than three builds. That is not queued: it is worth doing only
 if chain65's answer in that band is a win, and queuing it now would be committing to measure something
 before knowing whether there is anything to measure.
+
+## chain65 float32: the k=1 extension is worth 19.5% in the band the residual lives in, and the degree-adaptive unroll is a clean win at k=2
+
+chain65's float32 halves are complete — three hookless builds, both probes, both orders, 1060 cells
+each, 212 matrices in six degree bands. The pooled number is 1.0173 on the caller path against a
+1.0014 floor: a 1.7% curiosity. **The pooled number is the wrong one to read**, which is why the
+degree axis was pre-registered above as the row to look at first.
+
+Caller path, whole call, `ship/cand` so above 1.0 means the candidate is faster, `floor` being
+`ship/ctrl` — two builds of identical code — in the same band and width:
+
+| band | n | k=1 | floor | k=2 | floor | k=4 | floor |
+|---|---|---|---|---|---|---|---|
+| deg<1 | 42 | 1.0266 | 1.0030 | **1.1275** | 0.9836 | 0.9932 | 1.0024 |
+| deg1-2 | 10 | 0.9742 | 0.9863 | **1.1342** | 0.9905 | 0.9901 | 0.9919 |
+| deg2-4 | 41 | 0.9858 | 1.0007 | **1.0422** | 0.9990 | 0.9989 | 0.9988 |
+| deg4-8 | 42 | **0.9651** | 1.0048 | 0.9995 | 0.9973 | 0.9981 | 1.0024 |
+| deg8-64 | 37 | **1.0420** | 1.0062 | 1.0216 | 1.0104 | 0.9955 | 1.0005 |
+| **deg64+** | 40 | **1.1947** | 1.0027 | 1.0263 | 1.0266 | 1.0188 | 1.0291 |
+
+The kernel-time pass agrees closely — k=1 at deg64+ reads 1.1876 against a 0.9978 floor there — so this
+is the kernel, not dispatch. Pooled by width, caller path: k=1 1.0355, k=2 1.0473, and k=4 1.0003,
+k=8 1.0012, k=64 1.0031 all inside their floors, which is the structural prediction confirmed: the
+exact-width kernel is bounded at 3, so neither flag can act at k≥4. Cells below MKL on this corpus go
+**23 → 13**, ship to cand, with the control at 22.
+
+Two separate decisions come out of this, and they are not the same shape.
+
+**`SCORCH_NARROWK_EXACT_DEGUNROLL=1` looks unconditional.** At k=2 — the width the exact kernel already
+serves in a shipping build, so the whole k=2 change is the unroll — it wins in four of six bands by
+2–13%, and its two non-wins (deg4-8 at 0.9995 against a 0.9973 floor, deg8-64 at 1.0216 against 1.0104)
+are a wash and a win. No band is negative beyond its floor, on either probe.
+
+**`SCORCH_NARROWK_EXACT_K1=1` is band-conditional and as tested it is not shippable.** +19.5% at deg64+
+and +4.2% at deg8-64, but **−3.5% at deg4-8 against a 1.0048 floor**, on 42 matrices, which is a
+populated band and not a noise story. It also reads −1.4% at deg2-4. Its own comment predicted a loss
+at k=1 (0.983 when instantiated); what is new is that the loss is confined to middling degree while
+high degree wins by a fifth — consistent with the mechanism, since the kernel's prologue is `UNROLL*K`
+zero stores and its epilogue `(UNROLL-1)*K` adds, both paid per row whatever the row's length, so the
+setup only amortises once rows are long.
+
+The gate for that already exists as `SCORCH_NARROWK_EXACT_K1_MINDEG`, currently 0 meaning no floor, and
+a value of about 8 would keep both winning bands and exclude both losing ones. **That value is not
+measured.** chain65 ran MINDEG=0, and picking 8 by reading the table I just printed is choosing a
+constant to fit the cells that produced it — the thing the performance convention forbids. It needs its
+own ladder, on a corpus stratified the same way, with the bands' boundaries not coinciding with the
+candidate values.
+
+And this is one dtype on one host. Outstanding before either flag can ship: chain65's float64 halves
+(running, started 23:19), the M5, and for K1 a MINDEG ladder. The ARM prior is specifically hostile —
+the policy comment records the exact-width kernel losing in every degree band on ARM at both widths it
+serves, 0.919 and 0.907 below degree 1 through 0.906 and 0.918 at 4–8 — so a compiled-in value chosen
+on x86 must not be compiled in for both hosts.
+
+Also worth noting against the earlier ARM ladder: its one apparent win was at degree 1–2 and it did not
+replicate, two runs of the same grid giving 1.0671 and 0.9409. Here deg1-2 has ten matrices, the fewest
+of any band, and it is the band whose k=1 reading (0.9742 against a 0.9863 floor) is inside its floor.
+Same band, same weakness, and no conclusion is drawn from it either time.
