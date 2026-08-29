@@ -14684,3 +14684,112 @@ The general form, which is worth more than the specific ordering: a per-width de
 which lever can possibly matter, and it costs nothing once the count is readable. Both of today's
 candidate levers were argued from mechanism — multi-row from the dependency chain, the flip from the
 setup-to-work ratio — and only one of them was ever pointed at the width where the deficit is.
+
+## chain76: the inlining explanation holds, and chain72's float64 refusal was the instrument
+
+The build-level structural null, pre-registered before it ran. `k2_null` carries the candidate's
+macros at `K1_MINDEG=1073741824` and `DEGUNROLL_MULT=0`, so `exact_lo_` can never reach 1 (no matrix
+has mean degree 2^30) and `mean_deg < exact_unroll * 0` is false for every non-negative degree — the
+same policy as `k2_ship` at every width and degree, built with the candidate's macros.
+
+**Gate A, the control chain72 never had.** Two digest passes of `k2_null`: 0 differing cells of 1192
+at every width, both dtypes. So x86 run-to-run nondeterminism is excluded as the third explanation.
+
+**Gate B, the positive control.** `k2_null` vs `k2_cand`: width 1 moves 245/248 (float32) and 248/248
+(float64) above degree 8, widths 2 and 3 move 40/42 below degree 4, width 4 inert. The 2^30 floor
+took, so gate C could not confirm the hypothesis by silently doing nothing.
+
+**Gate C, the question.** `k2_null` vs `k2_ship` — identical policy:
+
+| dtype | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|
+| float32 | 0/298 | 0/298 | **0/298** | 0/298 |
+| float64 | 0/298 | 0/298 | **40/42, 8/8, 248/248** | 0/298 |
+
+Two builds that compute the same thing by the same rule at every width disagree on **every one of 298
+matrices at float64 k=3**, and agree bit-for-bit everywhere else. The predictions held exactly as
+written: float64 k=3 moves in all three bands, k=4 holds, float32 holds throughout.
+
+The objects say why, and `k2_null` is the clincher. Out-of-line float instantiations of the
+exact-width kernel:
+
+```
+ship: (2,2) (2,4) (2,8) (3,4) (3,8) (4,4) (4,8) (5,2) (5,4) (5,8) (6,2) (6,4) (6,8) (7,4) (7,8)
+cand: (2,4) (2,8) (3,2) (3,4) (3,8) (4,4) (4,8) (5,4) (5,8) (6,2) (6,4) (6,8) (7,2) (7,4) (7,8)
+null: (2,4) (2,8) (3,2) (3,4) (3,8) (4,4) (4,8) (5,4) (5,8) (6,2) (6,4) (6,8) (7,2) (7,4) (7,8)
+```
+
+**`null`'s set is identical to `cand`'s and differs from `ship`'s** — while `null`'s *behaviour* is
+`ship`'s. The inliner's decisions track the **macros**, not what the macros do at runtime. And zero
+double instantiations are out of line in any of the three, so every double exact kernel is inlined
+into the caller, which is why float64 moves and float32 does not. Only k=3 moves among the double
+widths because `exact_hi_` is 3 for doubles, making it the widest and largest inlined body — and the
+`flip_fires.py` docstring had already guessed the mechanism for the degree axis: at K=3 the compiler
+vectorises the three-element accumulator array and `-ffast-math` lets it reassociate.
+
+So chain72's float64 k=3 refusal was correct behaviour by a gate asking a question its instrument
+cannot answer. **The flip is unimpeached**, and chain72's gate 3 needs its float64 k=3 prediction
+restated as a claim about the flags, checked where the code is out of line, with inlined widths
+declared unmeasurable by a digest.
+
+## chain75: the dispatch chain's questions are not hoisted, and it costs 6% where we are not losing
+
+Five arms in one hookless-plus-hooks binary, all setting the same five environment variables so the
+variable count cancels. `refb` is a same-code duplicate of `ref`. `dt8` adds eight loop-invariant
+tests per row; `dt8r` adds the same plus a row-dependent term last; `dt4` adds four. Reading
+`ref/arm`, so below 1.000 means the arm is slower. float32 kernel:
+
+| band | n | refb (floor) | dt4 | dt8 | dt8r |
+|---|---|---|---|---|---|
+| deg<2 | 22 | 1.0018 | 0.9866 | 0.9684 | 0.9615 |
+| deg2-4 | 70 | 0.9988 | 0.9676 | **0.9387** | **0.9161** |
+| deg4-8 | 16 | 0.9998 | 0.9783 | 0.9489 | 0.9382 |
+| deg8-64 | 320 | 0.9994 | 0.9790 | 0.9542 | 0.9415 |
+| deg64-256 | 132 | 1.0043 | 0.9977 | 0.9929 | 0.9938 |
+| deg≥256 | 44 | 1.0007 | 1.0057 | 0.9974 | 0.9999 |
+
+The floor is within 0.5% everywhere. **Both arms cost**, which is the outcome that says restructure:
+eight loop-invariant tests per row cost **6.1%** at degree 2–4 and fall to 0.3% above degree 256 —
+the per-row signature — and adding a row-dependent term makes it worse rather than being the whole
+mechanism. Four tests cost 3.2% against eight tests' 6.1%, so it is linear in the count at ~0.8% per
+test per row, which is the consistency check that says the instrument is measuring what it claims.
+float64 and the caller path agree throughout (0.9537 / 0.9407 at degree 2–4).
+
+`-O3` therefore does **not** hoist these out of the row loop, inside a lambda, inside a
+work-stealing loop. The shipping dispatch asks about eight comparable questions per row — `narrow_k`,
+two half-vector sub-tests, exact-width, three gather terms, the deep kernel — so it is paying
+something close to the `dt8` column. Since this is a hooks build, whose 32 per-call `getenv` scans
+inflate the denominator by ~1 µs, the release-build percentage is **larger**, not smaller.
+
+### Where the deficit actually is, and why that makes three levers in a row irrelevant to it
+
+With chain74's count readable, the below-MKL cells can be enumerated rather than described. On stable
+cells, both estimators (MKL's minimum across all three processes, and within-process MKL):
+
+| band | float32 n | below | float64 n | below |
+|---|---|---|---|---|
+| deg<64 | 624 | **0** | 541 | **0** |
+| deg64-256 | 156 | 8 | 175 | 5 |
+| deg≥256 | 64 | 13 | 65 | 8 |
+
+**Not one below-MKL cell exists below mean degree 64**, on 624 and 541 cells. And the survivors are
+two populations, listed in full:
+
+- **The dlmc transformer family** — 512 rows, 105–138k nonzeros, mean degree 205–269, all at k=4:
+  19 float32 cells at 1.001–1.117 of MKL (median 1.060) and 12 float64 cells at 1.001–1.058
+  (median 1.034).
+- **Two few-row extreme-degree matrices** — `nw14` (73 rows, 904,910 nonzeros, degree 12,396) at
+  1.528 and 1.072, and `kl02` (71 rows, 212,536 nonzeros, degree 2,993) at 1.483. These are the row
+  ceiling's targets and a separate problem.
+
+So chain75's restructuring is worth 4.5–6.1% at mean degree 2–64 — a band containing **zero**
+below-MKL cells — and 0.3–0.7% on the cells that are actually losing. That is the third lever today
+with the same shape: multi-row wins 8–15% at k=8/k=16 where nothing was losing, the flip's
+`DEGUNROLL` half acts below degree 4 where nothing is losing, and the dispatch chain costs 6% below
+degree 64 where nothing is losing. All three are real, measured, worth having, and none of them is
+aimed at the deficit.
+
+**The target is now a number.** The transformer cells need 3–12% (median 6% float32, 3.4% float64) on
+a 17.6 µs call whose fixed cost is roughly 13 µs — so cutting **~1.3 µs of per-call fixed cost clears
+the median on both dtypes**, and cutting 2 µs clears nearly all of them. That is what chain77
+measures, and it is why chain77 rather than any of today's three levers is the critical path.
