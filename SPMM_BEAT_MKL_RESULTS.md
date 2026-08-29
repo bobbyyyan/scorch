@@ -13022,3 +13022,53 @@ Still outstanding, unchanged by any of this: chain65's float64 halves, a MINDEG 
 boundaries do not coincide with its candidate values (8 is both a boundary and the obvious candidate,
 which is precisely why the ladder is needed rather than a reading of the table above), and an ARM
 re-confirmation that the unified rule holds where the ARM-only rule used to.
+
+## chain69: placing the k=1 admission threshold on x86, and why a hooked ladder is the right instrument this time
+
+Queued behind 65, 67 and 68. It sweeps `SCORCH_NARROWK_EXACT_K1_MINDEG` — which ships at 0, meaning
+no floor — over 302 matrices at k=1, 2 and 4, both dtypes, two seeds, seven arms.
+
+**Why hooked, when chain65 had to be compiled in.** chain65 compared K1 on against K1 off, so its arms
+differed in *how many* variables each set that the code also looks up, and `scorch_policy.h` records
+that this alone orders arms by about 1.1% on x86 for kernels under thirty microseconds. Every arm here
+sets the **same six** variables — `HI`, `ACCUM`, `MINDEG`, `DEGUNROLL`, `K1`, `K1_MINDEG` — and differs
+only in two values, so that cost sits identically in numerator and denominator. Placing a threshold is
+an in-gate question and the arms differ precisely on the cells the threshold admits.
+
+**Why these seven and no `e16`.** `an_k1ladder.py`'s bands are <1, 1-2, 2-4, 4-8, 8-64, 64-256, ≥256,
+and an arm with `K1_MINDEG=N` serves width 1 exactly where mean degree ≥ N. So in a band [lo,hi) an
+arm with N ≤ lo serves the whole band and one with N ≥ hi is the shipped kernel under a different
+constant — every band carries both, and **the arms that serve a band must agree with each other**,
+which is a null check the design gets for free. The candidates are therefore band *edges*: 0, 1, 2, 4,
+8. A candidate strictly inside a band — 16 is, inside 8-64 — serves some of that band's matrices and
+not others, so it agrees with neither side. The ARM ladder had an `e16`; on these bands it would be
+uninterpretable.
+
+Three things held still on purpose:
+
+- **`DEGUNROLL=1` in every arm, including `ref`.** chain65 says it is a clean win on its own at k=2
+  (four of six bands by 2–13%, no band negative beyond its floor), so it is the baseline this
+  threshold will be chosen on top of. Holding it at 0 would place the threshold in a configuration
+  that is not going to ship.
+- **`HALFVEC` set by nobody**, so each build keeps its compiled defaults, F32=1 and F64=0 — the
+  shipping pair. The ARM version of this ladder pinned `SCORCH_SPMM_HALFVEC=0`, harmless there because
+  the kernel is AVX2-gated and inert on ARM. On x86 it is not inert, and the pin would have put the
+  k=4 instrument rows on a baseline that does not ship. Dropping a variable from *every* arm keeps the
+  arms symmetric and improves the baseline — the rare case where removing a control is the fix.
+- **k=2 and k=4 are the instrument check.** `K1_MINDEG` attaches to width 1 only, so every arm must be
+  the reference there; a ladder that moves at k=2 is measuring something else.
+
+**Corpus:** chain63's own 302 matrices, so recovered-cell counts against MKL read directly, banded
+9 / 25 / 17 / 78 / 34 / 31 / 26 / 82 over [0,1) [1,3) [3,6) [6,12) [12,24) [24,48) [48,96) [96,∞).
+A power-of-two banding was tried first and rejected: it left **8** matrices between degree 4 and 8,
+which is the one band chain65 measured a loss in and therefore the one band this ladder cannot afford
+to be thin in.
+
+**Two seeds**, because a within-run A/A floor does not bound between-run variance, and this family's
+own history is a band that read 1.0671 and 0.9409 on two runs of the same grid on the same matrices.
+
+One defect caught before launch, worth naming because it is a shell trap rather than a statistical
+one: the build line read `env SCORCH_BUILD_TUNE_HOOKS=1 -u SCORCH_BUILD_DEFINES python …`. `env` stops
+parsing options at the first `NAME=VALUE`, so `-u` became the command and the build would have failed —
+loudly, as it happens, since the line carries `|| { echo BUILD FAILED; exit 1; }`, so this would have
+cost a refusal rather than a wrong number. Options before assignments.
