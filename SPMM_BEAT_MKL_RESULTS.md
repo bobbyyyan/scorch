@@ -14505,8 +14505,16 @@ Read against both:
 | 16 | 1.0836 | 0.9862 | 8.4% | **4.4× the worst null** |
 | 64 | 1.0048 | 0.9965 | **0.5%** | null (outside `narrow_k`) |
 
+The two movable widths in that table, k=8 and k=16, are widths where nothing was losing. That does
+not make the numbers wrong — it makes them irrelevant to the deficit, which is quantified further
+down.
+
 So multi-row at ROWS=2 is **11.9% faster at k=8 and 8.4% at k=16** on the kernel, resolvable against
-the worse of two structural nulls. The whole call agrees: `cand/ship` 1.0282 against a 0.9932 floor
+the worse of two structural nulls. **Both of those widths were already winning** — on this run's
+readable cells every arm is above MKL at every k=16 cell and all but one k=8 cell, and 95.2% of the
+remaining deficit is at k=4, which multi-row moves by one cell. See the deficit table below before
+quoting the 11.9% as progress toward beating MKL; it is a general-goodness win and not a lever on the
+goal. The whole call agrees: `cand/ship` 1.0282 against a 0.9932 floor
 pooled, and by width 1.0793 at k=8 (floor 0.9969) and 1.0439 at k=16 (floor 0.9830).
 
 ### By degree, compared band by band against the same band's null
