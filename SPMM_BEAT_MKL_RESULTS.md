@@ -13420,3 +13420,66 @@ The one remaining idea aimed at them needs new code and is worth stating precise
 halves are already measured wins that cannot currently compose: **a half-vector multirow kernel** — two
 rows of four float lanes in one mask-free 256-bit register. Dropping the lane mask is worth 10% at this
 width and pairing rows is worth 6.5% one width up; today the dispatch makes them mutually exclusive.
+
+## chain68 refused, as predicted, and the refusal closes the row ceiling
+
+The prediction recorded before it ran was that the widened row ceiling would come back at or below its
+floor because chain63 had shown the 128-600-row band is not thread-limited. It did better than that: it
+refused before spending any time, and the refusal is a stronger answer than a null would have been.
+
+```
+  matrices that lose at some width: 39 of 362
+  corpus: 50 matrices -> {'wide_lose': 8, 'ship_lose': 2, 'inert_win': 20, 'inert_lose': 20}
+  moved by the wide gate: 10 matrices; inert control: 40
+REFUSING: ship_lose has 2 matrices even from a corpus containing kl02, nw14 and
+bibd_17_8. The gate does not reach the deficit, which is the finding -- the ceiling's
+row bound and degree floor exclude the matrices the deficit is made of.
+```
+
+Of the **39 matrices that lose at some width**, the shipped gate (`MAXROWS=128`, `MINDEG=192`) changes
+the thread count for **2**, and the gate widened four-fold in rows and halved in degree
+(`MAXROWS=512`, `MINDEG=128`) reaches **10**. Twenty-nine of the thirty-nine are outside the ceiling's
+gate features altogether, whatever values those features take within the range the mechanism supports.
+
+So endgame item one is closed, from two directions that do not depend on each other:
+
+- **Reach.** The ceiling's gate cannot see three quarters of the losing matrices. This is a property of
+  which matrices the gate admits, measured by asking the production decision, and it does not involve
+  a timing at all.
+- **Effect.** Even where it can see them, chain63's ladder finds no forced thread count that helps the
+  128-600-row band — the best of five is t16 at 0.7679, all five worse than the rule by 23% or more at
+  z ≤ −11.
+
+`SCORCH_SPMM_NNZ_PER_THREAD` stays at 0, and the reason is now on record as a fact about the gate
+rather than a preference. This also retires the "its blocking objection is stale" note earlier in this
+file: the objection was indeed stale — it had measured the uncapped rule — and the ceiling is still not
+the lever, for a different and better-established reason.
+
+## A correctness check whose two arms were the same configuration
+
+chain71 was written to call `mr_correct.py` on the multirow candidate before reading its timing. Reading
+that script first: it drives `SCORCH_MULTIROW` through the environment and compares its `mr=0` and
+`mr=1` arms. chain71's candidate is a **hookless** build with `ROWS=2` compiled in, where that variable
+is not read at all — so both arms would have been the same compiled configuration and the check would
+have passed whatever the kernel computed.
+
+This is the "post-condition that cannot fail" defect in a new dress, and the dress is what makes it
+dangerous: a two-arm comparison *looks* like a differential test. It would have printed a pass, and the
+pass would have read as evidence that a kernel which has never shipped computes the right answer.
+
+Replaced with `mr2_correct.py`, which compares against a **dense torch reference** — valid whatever the
+build was compiled with — over shapes chosen for the multirow path's actual risk, which is its group
+arithmetic rather than its arithmetic:
+
+- odd and even row counts, so the last group is sometimes partial and `i + multirow <= end` decides;
+- rows with no nonzeros, which is what the `A1_pos[i+multirow] > A1_pos[i]` guard exists for;
+- row counts of 1, 2 and 3, at or below the group size;
+- widths spanning `nvec` 1 through 3 with every `mask_last` remainder — 1, 2, 3, 4, 5, 7, 8, 9, 15, 16,
+  17, 64;
+- one column, and twenty thousand columns against three hundred rows.
+
+864 comparisons per build, both dtypes, and chain71 runs it against the baseline as well so a failure is
+attributable to `ROWS=2` rather than to the harness or the tree. Smoke-tested on the M5 against the
+shipping install: **864 comparisons, 0 mismatches** — which is incidentally a free correctness result
+for the ARM shipping path over shapes the test suite does not contain, though it exercises no multirow
+there, the kernel being AVX2-gated.
