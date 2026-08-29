@@ -12819,3 +12819,57 @@ understates it.
 The three objects were copied off the machine and disassembled locally, so this cost the running probe
 nothing. Worth doing that way as a habit: an `objdump` on the host is a second of one core, and the
 thing it would perturb is a 21-rep timing of a kernel that runs in tens of microseconds.
+
+## Where the residual sits on the axes the two queued levers are banded on, before either reports
+
+Both queued mechanisms have prior evidence banded on mean degree, and the residual can be profiled on
+the same axis from chain63's caller-path data. Doing that before the runs report, because the answer
+is uncomfortable for both of them.
+
+The floored survivors, by degree band and nonzero count:
+
+| | float32 k=4 (76) | float32 k=1 (35) | float64 k=4 (23) | float64 k=1 (30) |
+|---|---|---|---|---|
+| degree 2–4 | 1 | — | — | — |
+| degree 8–32 | **42** | — | — | 1 |
+| degree 32–128 | — | 1 | — | — |
+| degree 128–512 | 28 | **31** | **23** | **23** |
+| degree ≥512 | 5 | 3 | — | 6 |
+| nnz 50–200k | 25 | 31 | 20 | 22 |
+| nnz 200k–1M | 24 | 4 | 3 | 7 |
+| nnz >1M | 27 | — | — | 1 |
+
+**multirow's own evidence covers a bit over half of one of the four groups.** chain45 put its win in
+the degree 8–32 band and at nnz 200k–1M and >1M: 1.1043/1.1332 at float32 k=4 for those two nonzero
+bands, 1.1243–1.1256 at degree 8–32. That band holds **42 of the 76 float32 k=4 cells** — a real
+majority of the group chain67 is aimed at — and **none of the 23 float64 ones**, which are all at
+degree 128–512 and nnz 50–200k, outside both of its nonzero bands as well.
+
+**The exact-width kernel's evidence covers essentially none of k=1.** Its measured degree behaviour is
+1.0709/1.0473 below degree 1, 1.37 at degree 1–2 and 1.86 at 2–4. The 65 k=1 cells sit at degree
+128–512 (54 of them) and ≥512 (9). Nothing about the kernel has been measured up there.
+
+So the residual is, on both dtypes and both widths, mostly **512-row matrices of degree 128–512 with
+50–200k nonzeros** — about 92k nonzeros in 512 rows of roughly 180 each — and neither lever has a
+number in that band.
+
+**That does not make chain67 misaimed, and here is why, stated as a prediction.** The mechanism
+multirow supplies is independent accumulators: a sparse `+=` through an indirect load keeps one
+accumulator register whatever `-ffast-math` is told, so a row is latency-bound at about four cycles
+per nonzero, and unrolling across rows is what breaks the dependency chain. That argument does not
+mention degree, and per-row-group setup amortises *better* over long rows, so if the mechanism is the
+dependency chain the win should be at least as large at degree 128–512 as at 8–32. If instead the
+win is confined to degree 8–32 and vanishes above it, the mechanism is not the accumulator chain and
+whatever chain45 measured needs renaming. `an_ship3deg.py` prints the degree axis, and **that is the
+row of its output to read first** — not the pooled number.
+
+One lever checked and ruled out while looking: `SCORCH_NARROWK_EXACT_ACCUM` is not a second
+accumulator mechanism. It is a register-pressure limiter that *halves* the unroll until `UNROLL*K`
+fits in the sixteen general registers, it exists because float32 k=6 holds 24 of them and reads
+0.9132, and it is read only inside the exact-width kernel — so like `DEGUNROLL` it cannot act at k=4.
+
+Also worth recording from the `HALFVEC_F32` comment, since it dates the residual: k=4 float32 was
+already known to carry "a per-nonzero deficit against MKL of 8–23% whichever shapes go into it", and
+the half-vector kernel was the answer to it, worth 1.1008 (z +14.6) and taking cells below MKL from
+125/302 to 70. The 76 cells here are what is left **after** that. A second lever at the same width is
+therefore not a repeat; it is the next one.
