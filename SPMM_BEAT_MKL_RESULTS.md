@@ -13248,3 +13248,39 @@ Nothing changes for chain69, which holds `DEGUNROLL=1` in every arm including `r
 the threshold is placed on the baseline that will ship on **this host and dtype pair**, and x86 float32
 is where DEGUNROLL is a win. For x86 float64 the same ladder measures the threshold with DEGUNROLL on
 and inert, which is the same as measuring it with DEGUNROLL off — so one ladder still answers both.
+
+### chain70: this family has been timed five times and never checked once
+
+Queued last. Every chain in the k=1 family — chain42, the ARM ladder, the ARM DEGUNROLL runs, chain65,
+and chain69 — measures time. `kprobe` and `cprobe` have no reference, no `allclose` and no assert. So
+the win tables above say nothing about whether the kernel computes the right answer, and
+`scorch_spmm_row_narrow_exact<float, 1, UN>` is a template the shipped dispatch never routes to:
+`SCORCH_NARROWK_EXACT_K1` is 0 and `exact_lo_` folds to 2, so **width 1 may never have executed in any
+test in this repository.** A ship decision on the timing alone would be taking a 19.5% win on trust.
+
+Four checks, cheapest first, and the cheap ones are what make the expensive one mean anything:
+
+1. **The two compiled-in objects must differ.** If `cmp` says `k1_ship` and `k1_cand` are the same file,
+   chain65 relinked instead of compiling and every number from it is void. Already verified once by
+   disassembly — ctrl vs ship 0 differing instruction lines, cand vs ship 61807 — but a check that has
+   to be remembered is a check that will not be run.
+2. **`k1_fires.py`: does the constant fire, and only at width 1?** Two kernels with different summation
+   orders cannot agree bitwise, so an output diff decides it. `e0` must differ at k=1 in every degree
+   band and nowhere else; `e8` must differ at k=1 only where mean degree is at least 8. **A nonzero
+   count at k=2, 3 or 4 means the constant is not width-specific**, which was the entire reason for
+   having it separate from `SCORCH_NARROWK_EXACT_MINDEG`.
+3. **`ex4_correct.py`: numerical agreement** with a dense torch reference at the project's
+   `atol=rtol=1e-3`, 60 matrices across the degree range, for the exact-width configurations including
+   K1.
+4. **The full suite against `k1_cand`**, the hookless object that would ship. The control run against
+   `k1_ship` fires **only if the candidate fails**, because its purpose is to attribute a failure to the
+   flags rather than to the tree or the environment, and half an hour of it is waste when the common
+   case is a pass.
+
+Checks 2 and 3 drive configurations through the environment and so need chain69's hooked tree; check 4
+needs chain65's hookless one. It therefore waits for both and rebuilds nothing — a rebuild in either
+tree would replace the object the check is about.
+
+Queue, in run order: **chain65** (k=1 timing, finishing) → **chain67** (k=4 multirow) → **chain68** (row
+ceiling, predicted null) → **chain69** (the k=1 threshold) → **chain70** (does k=1 compute the right
+answer).
