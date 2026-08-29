@@ -14166,3 +14166,85 @@ predicts a real effect at the peak of each tooth; the point is only that the cor
 matrices at those peaks. It also explains why the shipped MULT=1 was safe to commit inert: on this
 corpus 248 of 298 matrices take `exact_unroll = 4` at any MULT in {1, 2}, so no value of the knob
 could have destabilised the numbers the flip was measured on.
+
+## The environment scan: 32 getenv calls per SpMM in a hooks build, one in a release build
+
+While chain74 was timing, a read of the release path turned up something that is not a kernel
+question at all. `std::getenv` is a linear scan of `environ` comparing names, so its cost belongs to
+the **caller's shell**, not to this library. Measured on the M5, 2M reps, padding the environment the
+way a module/conda/slurm login does:
+
+| environment size | absent name | present name |
+|---|---|---|
+| 77 vars | 50.0 ns | 57.2 ns |
+| 117 vars | 137.8 ns | 143.4 ns |
+| 177 vars | 258.3 ns | 264.4 ns |
+| 277 vars | 479.4 ns | 485.6 ns |
+
+About 1.75 ns per variable, and an absent name costs the full scan — which is what every user who
+sets nothing pays.
+
+**The release build** read one such variable on every call: `SCORCH_SPMM_ATPARALLEL` on the x86 v2
+path and on the fused-linear path, plus `SCORCH_NEON_REGTILE` on ARM. `strings` on the shipped
+object confirms which names survive: those two do; `SCORCH_TILEIJK_SCALAR`, `SCORCH_TUNE_CHUNK` and
+every `SCORCH_NARROWK_*` name do not, so their reads are already compiled out. `7694c04` caches the
+two survivors once per process and adds `scorch_set_spmm_atparallel` / `scorch_set_neon_regtile`
+with matching getters, because two release-build harnesses — `fixed_decomp.py` and the tracked
+`bench/bench_tileijk_register_inner.py` — flip these between interleaved arms and an environment
+write that is no longer read is silent. A setter that is missing is an `AttributeError`; that is the
+better failure.
+
+**Do not read this as a win.** Under `rw_env` a chain's python sees **33** environment variables, so
+one scan there is roughly 25–50 ns, which on a 15 µs call is 0.2–0.4% — below anything our
+instruments resolve per cell. The claim this change is entitled to is that a per-call environment
+scan in a library's hot path is wrong and is now gone, plus the measured mechanism cost above. No
+kernel-runtime claim is made and none has been measured.
+
+**The hooks build is the interesting number.** The v2 SpMM core contains **32** `getenv` sites, all
+read per call, all inside the hooks guard: `SCORCH_SPMM_ALLOC`, `_ZERO_MODE`, `_ZERO_LEGACY`,
+`_SKIP_EMPTY_SCAN`, `_NSPLIT_FORCE`, `_ZERO_SLICES`, `_WORKSPACE`, `_NEON_NODUAL`, the seven
+`NARROWK_EXACT_*`, the three `DUMMY_*`, `_HALFVEC`, `REGTILE_BASE`, `_MASKED`, the four
+`NARROWK_DEEP/UNROLL`, `_MULTIROW`, `_MULTIROW_MINNNZ`, `NARROWK_PF`, and the two
+`NARROWK_GATHER*`. At redwood's 33 variables that is **0.8–1.6 µs of environment scanning on every
+call**, which is 5–11% of a 15 µs cell.
+
+Two consequences, and the second is the one that changes practice.
+
+First, it identifies the mechanism behind an effect already in this ledger: each extra variable an
+arm SETS lengthens all 32 scans, so it costs about 32 × 1.75 ≈ 56 ns per call — 0.4% of a 15 µs
+cell, against the ~1.1% per variable measured on x86 sub-30 µs kernels. Same order, and it explains
+why the fix had to be `kprobe --pad-env` (equalise the scan length) rather than anything about the
+kernel.
+
+Second, **a small-call claim must come from a release build, not a hooks build.** A hooks build adds
+about a microsecond of fixed cost per call, which inflates the denominator of every percentage
+measured in it. For a kernel-time ratio that mostly cancels; for the k≤4 residual — which *is* a
+per-call fixed-cost question at 15–18 µs — a hooks build is measuring partly itself. chain73 is a
+release build with no arms for exactly this reason, and that choice is now quantified rather than
+stylistic.
+
+The hooks build is deliberately **not** changed. Caching its reads would need harnesses to announce
+each arm switch, and a harness that forgot would get two identical arms — the failure mode that has
+already overturned verdicts three times here. Paying a microsecond to keep arm switching impossible
+to get silently wrong is the right trade; the fix is to prefer release builds where the
+microsecond matters, which is now written down.
+
+### And a bug the same read turned up
+
+`bench/test_abi_guards.py` was failing 1 of 73 before any of this: **`scorch.matmul` raised inside
+`torch.inference_mode()`** — `RuntimeError: Inference tensors do not track version counter.` The
+native validator already handles it (`abi_version_of` in `csrc/native_abi.h` asks
+`version_counter().enabled()` first, and its comment says exactly what happens otherwise), and the
+three native cases in that section passed while the Python one failed. `storage.py`'s
+`_validation_stamp` and `stensor.py`'s operand-copy cache both read `._version` directly.
+
+`71d15ab` mirrors the native rule instead of inventing a second one: `tensor_version()` returns 0
+for a tensor that tracks no version. The stamp then cannot see an in-place write to an inference
+tensor that preserves both `data_ptr` and `numel`, documented at the helper beside the blind spots
+it already had — a write through a raw pointer or a numpy view bumps no counter either. Refusing to
+memoize inside `inference_mode` would have been the other option and is worse: it puts the O(nnz)
+revalidation back on the hot path precisely where an inference workload spends all of its time.
+73 passed, 0 failed, `scorch.matmul` under `inference_mode` at relerr 0.
+
+This bug is in the main tree too, and reaching it requires only `with torch.inference_mode():` — the
+standard inference idiom — around any scorch matmul.
