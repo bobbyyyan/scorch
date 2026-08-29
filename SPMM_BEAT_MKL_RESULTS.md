@@ -13347,3 +13347,76 @@ single-shot wait I armed grepped for `CHAIN65_DONE`, while the script's own `rw_
 30-minute deadline and reported "still running or died" twenty-three minutes after the verdict had
 printed. The deadline is what made this cost nothing; an unbounded wait would still be sitting there.
 Read the marker out of the script rather than inferring it from the chain number.
+
+## chain67: multirow loses 5.7% at k=4 — because it displaces the half-vector kernel, which nothing told it not to
+
+The k=4 lever came back negative, and the reason is a missing gate in the dispatch rather than a
+property of the kernel.
+
+float32, both probes, `ship`/`cand` with each width's own same-code floor:
+
+| width | kernel cand | floor | caller cand | floor |
+|---|---|---|---|---|
+| **k=4** | **0.9425** | 1.0026 | **0.9466** | 1.0178 |
+| k=8 | **1.0652** | 0.9989 | **1.0825** | 1.0078 |
+| k=16 | **1.0498** | 0.9986 | **1.0581** | 1.0181 |
+| k=64 | 0.9999 | 1.0145 | 1.0110 | 1.0112 |
+
+k=64 is inert on both probes, which is the structural null passing — the dispatch requires `narrow_k`.
+The k=4 loss is uniform across every degree band: 0.9404, 0.9151, 0.9364, 0.9477, 0.9452 from deg<1 to
+deg64+, every floor within 1%. float64 is unresolvable at every level in this run — both pooled
+comparisons refused, per-width effects at most 1.5× their floors — and the vs-reference counts are
+unusable on both dtypes because the reference column itself moved 1.106 to 1.121 against a 1.10 limit.
+So the readable result is the float32 arm-vs-arm table above.
+
+**The mechanism is in the dispatch, and `spmm.h` states the rule it is breaking three lines away from
+where it breaks it.** The multirow block is entered at `spmm.h:4199` and `continue`s when it takes a
+row group. Its condition already excludes two kernels by name:
+
+```
+narrow_k && !exact_width && !force_workspace &&
+!(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
+```
+
+There is no such exclusion for the half-vector kernel, which is dispatched **later**, at
+`spmm.h:4286`. So at k=4 float32 the candidate runs multirow *instead of* the half-vector path. And the
+half-vector site's own comment says exactly why that is wrong:
+
+> gated so it only takes widths that kernel does not already own, because an arm that swapped both at
+> once would attribute neither
+
+chain67's k=4 arm is that arm. It swapped two kernels at once, and the number it produced —
+`multirow / halfvec` — is the ratio of two wins, not the value of one. `HALFVEC_F32=1` is worth 1.1008
+at z +14.6 over the masked 256-bit register block, so a multirow worth about 1.037 over the same
+baseline divides out to 0.942, which is the 0.9425 measured. The kernel is not bad at k=4; it is being
+asked to replace something better.
+
+**Two things follow, one immediate and one not.**
+
+*Immediate, no new code:* the multirow dispatch needs the same exclusion for the half-vector kernel
+that it already has for the gather and the exact-width kernel. That makes multirow inert at float32 k=4
+and float64 k=2 — the exact half-vector widths — and leaves the k=8 and k=16 wins standing. The change
+is provably inert on the shipping build, because the whole block lives inside
+`#if … SCORCH_SPMM_MULTIROW_ROWS > 1` and the constant ships at 0.
+
+*Not immediate:* the k=8 and k=16 wins are real (+6.5% and +5.0% on the kernel, +7.4% and +3.9% on the
+caller, against floors within 2%), and they are **confined to middling degree** — at k=8 by band:
+1.0361, —, 1.0326, 1.0646, **1.1142**, 0.9979, so deg8-64 gives 11.4% and deg64+ gives nothing. By the
+criterion pre-registered above — *"if the mechanism is the dependency chain the win should be at least
+as large at degree 128-512 as at 8-32; if it is confined to degree 8-32, the mechanism is not the
+accumulator chain"* — **the mechanism is not the accumulator chain.** It is per-row setup amortising
+over a paired group, which stops mattering once rows are long enough to amortise it alone. My
+prediction was wrong in the direction the test was designed to catch, which is the point of writing it
+down first.
+
+**And for the goal, the honest position: the k=4 residual now has no live lever.** The ledger already
+recorded that routing k=4 to the exact-width kernel was measured and null (chain30: 1.0044 against a
+1.0030 floor) and named multirow "the only live k=4 lever". That lever is now measured against the
+shipping baseline and it is negative for the reason above — so both no-code levers at that width are
+spent. The 99 floored k=4 cells are not a missing-kernel problem: the width is already served by the
+kernel that wins there, and the two alternatives each give back what they save.
+
+The one remaining idea aimed at them needs new code and is worth stating precisely because both of its
+halves are already measured wins that cannot currently compose: **a half-vector multirow kernel** — two
+rows of four float lanes in one mask-free 256-bit register. Dropping the lane mask is worth 10% at this
+width and pairing rows is worth 6.5% one width up; today the dispatch makes them mutually exclusive.
