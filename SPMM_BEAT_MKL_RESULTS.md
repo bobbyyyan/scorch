@@ -12403,3 +12403,53 @@ Nothing in that list is a shape to tune. Items 1 and 2 are mechanisms with names
 enough that it should be re-counted after 1 and 2 land rather than attacked now — several of its
 cells are within a couple of percent of parity and may not survive a build that changes the thread
 count underneath them.
+
+## The work measure is blind to the row count — confirmed — and giving those shapes more threads does not help
+
+Endgame item 2 is Pd_b / Pd_rhs: 8081 rows, 6323 nonzeros, 46% of rows empty, 20–25 microsecond
+kernels, 1.21–1.50 behind MKL at k=1 and k=2. Asking the production policy what it resolves for that
+shape at a 24-thread pool answers the first question immediately: **one worker**, at every width up
+to 16. Not over-threaded — single-threaded.
+
+The reason is in the work measure. It is built from two terms,
+
+    work = total_nnz * max(k, 16)  +  empty_rows * C1_size
+
+and both are about nonzeros or about output stores. **Neither is about visiting a row.** For Pd_b
+that is 6323·16 + 3717·1 ≈ 105000 against a 150000 grain, so the call gets one thread — while the
+kernel must still walk 8081 rows whatever their contents.
+
+Holding nonzeros **fixed at 6323** and changing only the row count, on the M5:
+
+| rows | degree | k | policy workers | our time | forced 6 threads | gain | vs torch | ns per row |
+|---|---|---|---|---|---|---|---|---|
+| 512 | 12.35 | 1 | 1 | 4.4µs | 4.3µs | 1.009 | 0.142 | 8.6 |
+| 2048 | 3.09 | 1 | 1 | 7.0µs | 7.1µs | 0.988 | 0.184 | 3.4 |
+| 8081 | 0.78 | 1 | 1 | 17.6µs | 18.2µs | 0.968 | 0.342 | 2.2 |
+| 32768 | 0.19 | 1 | 1 | 35.5µs | 38.3µs | 0.927 | 0.391 | 1.1 |
+| 32768 | 0.19 | 2 | 1 | 35.2µs | 33.8µs | 1.042 | 0.239 | 1.1 |
+
+**The diagnosis is confirmed.** The same 6323 nonzeros cost 4.4µs over 512 rows and 35.5µs over
+32768 — eight times the time for identical arithmetic. The cost is the row walk, and the work
+measure cannot see it.
+
+**And the obvious fix is refuted.** `nthreads_override` on `spmm_csr_float_v2` forces the count
+directly, so "credit rows in the work measure so these shapes get more threads" can be tested without
+building it: force 6 and see. The gains are 0.927 to 1.093 — noise, and more often *slower*. At
+17.6µs over 8081 rows a six-way split leaves about 3µs of row-walking per worker, which is the same
+order as the wake-up, so there is nothing to win. A term crediting rows would have allocated threads
+that do not pay for themselves, and it would have fired on every shape with a mean degree below its
+constant — which is 27% of the corpus.
+
+So the constant does not get written. What the measurement does say is that the remedy for the
+degree-under-one family is a **cheaper row loop**, not more workers: at 1.1 nanoseconds per row we are
+spending four or five cycles to load two row pointers, compare them, and store a zero, and 46% of
+those rows are empty. Whether that is improvable is a different question from the one this settles,
+and it is a kernel question rather than a policy one.
+
+**Two limits on this result, stated because they matter.** It is one host, and it is the host where
+this family is not a problem — on ARM we are 2.6x to 7x *faster* than the reference on every row in
+that table, because `torch.sparse.mm` pays the same row walk and more. Pd_b's deficit is against
+**MKL on x86**, where the pool is 24 rather than 6 and the per-thread cost is different, so the
+thread remedy is refuted on ARM and merely untested on x86. And the shapes are synthetic — 46% empty
+rows and uniformly-spread nonzeros, matched to Pd_b's summary statistics rather than to its structure.
