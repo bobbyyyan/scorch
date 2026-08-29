@@ -14478,3 +14478,108 @@ hundred lines up. That is now two failures in one paragraph traceable to derivin
 which suggests the two guards from today compose into one habit rather than two: **before writing a
 number, search the file for the quantity and for other citations of the claim; only derive what the
 search does not return.**
+
+## chain74: multi-row is a resolvable float32 win at k=8 and k=16, and float64 has no usable null in this grid
+
+Three hookless builds from tip4 differing only in `SCORCH_SPMM_MULTIROW_ROWS` — `ph_ship` at 1,
+`ph_ctrl` at 1 (the same-code floor), `ph_cand` at 2 — over 302 matrices at k ∈ {4, 8, 16, 64}, two
+passes each, interleaved. The run refused on its float64 kernel comparison and stands on the rest.
+
+### It has two structural null widths on float32, and I declared one
+
+`narrow_k` is `B1_size <= 4*lanes` = 32 for floats, so k=64 is outside it and multi-row cannot act.
+That is the null I wrote into `phkprobe.nullwidths`. **It is not the only one, and the source says
+so** — the comment above `multirow_ok` states in words: *"With the half-vector exclusion in place
+multi-row DECLINES float32 k=4 — so ship and candidate run the identical kernel at that width."*
+`scorch_simd_half<float>::lanes` is 4, and `SCORCH_SPMM_HALFVEC_F32=1` was pinned in this run's BASE
+defines, so k=4 float32 is a second null — doubly so, since the gather exclusion (`nvec == 1`) also
+fires there. Declaring only k=64 handed the run its **loosest** available floor, because k=64 turned
+out to have the smallest deviation of the two. Fixed in the file, with the reason, for the next run.
+
+Read against both:
+
+| k | ship/cand | same-code floor | deviation from 1.000 | status |
+|---|---|---|---|---|
+| 4 | 1.0191 | 0.9853 | **1.9%** | null (half-vector + gather exclusions) |
+| 8 | 1.1190 | 0.9924 | 11.9% | **6.3× the worst null** |
+| 16 | 1.0836 | 0.9862 | 8.4% | **4.4× the worst null** |
+| 64 | 1.0048 | 0.9965 | **0.5%** | null (outside `narrow_k`) |
+
+So multi-row at ROWS=2 is **11.9% faster at k=8 and 8.4% at k=16** on the kernel, resolvable against
+the worse of two structural nulls. The whole call agrees: `cand/ship` 1.0282 against a 0.9932 floor
+pooled, and by width 1.0793 at k=8 (floor 0.9969) and 1.0439 at k=16 (floor 0.9830).
+
+### By degree, compared band by band against the same band's null
+
+Deviations from 1.000, with the k=4 null's deviation in the same band as the floor to beat:
+
+| band | n | k=8 | k=16 | k=4 (null) | k=8 ratio | k=16 ratio |
+|---|---|---|---|---|---|---|
+| deg<1 | 9 | 1.6% | 1.1% | 3.6% | **inside the null** | **inside the null** |
+| deg2-4 | 35 | 10.2% | 4.0% | 1.1% | 9.3× | 3.6× |
+| deg4-8 | 8 | 12.4% | 12.1% | 2.1% | 5.9× | 5.8× |
+| deg8-64 | 160 | 15.1% | 11.1% | 2.0% | 7.6× | 5.6× |
+| deg64+ | 88 | 8.2% | 6.0% | 3.6% | 2.3× | 1.7× |
+
+The win is 8–15% above mean degree 2, **not resolvable below degree 1**, and thinnest at deg64+ where
+k=16 falls to 1.7× its band's null. That the win *grows* with degree up to deg8-64 is the shape the
+dependency-chain mechanism predicts and the shape this file predicted for it — per-row-group setup
+amortises better over long rows, so if the mechanism is the accumulator chain the win should hold at
+high degree, and it does.
+
+### Against the four pre-registered predictions
+
+1. **k=4 inside its floor — HELD**, and it is the confirmation the hoist needed. chain71 measured this
+   same structural-null width at 0.9702 against a 1.0097 floor, monotone in degree
+   (0.9298 / 0.9594 / 0.9670 / 0.9933) in exactly the shape a per-row cost predicts. After `b51f857`
+   lifted `multirow_ok` out of the row loop it reads 1.0191 against 0.9853 — a 1.9% deviation against
+   a 1.5% floor, ratio 1.3, which is no effect. **The cost of asking is gone.**
+2. **The degree gradient flattens — held in the sense that matters, not literally.** The per-row-cost
+   signature is gone: k=4 is no longer below 1.0 above degree 4, and the monotone approach-to-1.0-
+   from-below is absent. But it is not flat either — 0.9641 / 0.9886 / 1.0205 / 1.0202 / 1.0360 still
+   spans 7% at a width where *nothing can act*. It cannot be a per-row test cost: `ph_ship` at ROWS=1
+   compiles the multi-row block out entirely and evaluates **no** test, while the candidate evaluates
+   one per row, so a test cost would make the candidate slower, and it is faster. This is the chain72
+   finding showing up in timing rather than in bits — two objects, identical policy at this width,
+   and a systematic several-percent difference. It bounds the run, which is why it belongs in the
+   nullwidths file.
+3. **k=8/k=16 grow most at low degree — REFUTED**, and the refutation supports the mechanism rather
+   than undermining it. They grow *least* at low degree (1.6% and 1.1% at deg<1) and most at
+   deg8-64. A prediction I wrote that contradicted this file's own reasoning about why multi-row
+   should work; the data sided with the file.
+4. **k=64 stays null — HELD on float32** at 0.5%, **FAILED on float64** at 5.1%.
+
+### float64 is not unresolvable because of the change; the grid has no usable null
+
+| k | ship/cand | same-code floor |
+|---|---|---|
+| 4 | 1.0210 | 0.9931 |
+| 8 | 1.0140 | 0.9992 |
+| 16 | 0.9727 | 0.9949 |
+| 64 | **1.0510** | **1.0531** |
+
+`narrow_k` is **16** for doubles, so every width above 16 is a null and the only one probed is 64 —
+which is also the **largest-footprint cell in the grid**. It deviated 5.1%, and its own same-code
+control deviated 5.3%, so the width is noisy rather than the change being large. The biggest movable
+effect is 2.7% at k=16, half the null's deviation. The run's own refusal — "the same-code floor sits
+0.98% from 1.000 and the effect 1.43%" — is the pooled version of the same thing.
+
+This is the second time float64 has come out unresolvable this way; chain71's float64 half failed on
+the same width for the same reason. **The fix is the grid, not the code:** a float64 multi-row run
+needs k=24 or k=32 probed, so the null's footprint is comparable to the widths under test instead of
+four times larger. Recorded in the nullwidths file.
+
+### What this does and does not license
+
+Multi-row ROWS=2 is a real float32 kernel win of 8–15% at k=8 and k=16 above mean degree 2, provably
+inert at k=4 and at k≥32, and null below degree 1. That supports a **dtype-conditional default —
+ROWS=2 on float32 only** — on the kernel axis.
+
+**It does not license shipping yet, for a reason in this run's own output.** The below-MKL counts
+went the wrong way: float32 `cand` 62/1208 against `ship` 53/1208, and float64 `cand` 43/1208 against
+`ship` 48/1208. Those counts are **not resolvable** — MKL's own column, identical code in all three
+processes, moved 1.1073 (float32) and 1.1066 (float64) against a 1.10 limit, and the harness said so
+without being asked. So the counts cannot be read either as a regression or as an improvement, and a
+change whose whole purpose is to reduce below-MKL cells cannot ship on a run that could not count
+them. What is needed is a rerun with a stable reference column — fewer arms per process, or the
+reference timed in its own process — plus k=24 for the float64 half.
