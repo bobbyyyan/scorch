@@ -680,6 +680,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
           py::arg("work_true") = -1, py::arg("nnz") = -1);
 
+    // The two escape-hatch flags that survive into a release object, as explicit process-level
+    // policy rather than as an environment read on every call. See the comment above
+    // scorch_flags in scorch_policy.h for why the read was moved: std::getenv is a linear scan
+    // of environ, so it cost 50-480 nanoseconds per call depending on how many variables the
+    // caller's shell happened to export, and an A/B arm that set more variables slowed every
+    // arm in the process.
+    //
+    // A release-build harness that needs to flip one of these between interleaved arms must call
+    // the setter; writing to os.environ after the first call no longer has any effect. That is
+    // deliberate and it is the safer failure: a missing setter is an AttributeError, while an
+    // environment write that is no longer read is silent, and a silently-ignored A/B flag turns
+    // two arms into the same configuration -- a comparison that cannot fail. A HOOKS build still
+    // reads per call, so hooks harnesses are unaffected.
+    //
+    // -1 restores "take it from the environment", which is what an unset flag means.
+    m.def("scorch_set_spmm_atparallel",
+          [](int v) { scorch_flags::atparallel_slot() = (v < 0 ? -1 : (v != 0 ? 1 : 0)); },
+          "Force the drop-in SpMM's at::parallel_for launch on (1) or off (0) for this process; "
+          "-1 returns to SCORCH_SPMM_ATPARALLEL. Release-build A/B only -- a hooks build reads "
+          "the environment per call and ignores this.",
+          py::arg("v"));
+    m.def("scorch_set_neon_regtile",
+          [](int v) { scorch_flags::neon_regtile_slot() = (v < 0 ? -1 : (v != 0 ? 1 : 0)); },
+          "Force the NEON register-tiled row kernel on (1) or off (0) for this process; -1 "
+          "returns to SCORCH_NEON_REGTILE. ARM only; inert on x86.",
+          py::arg("v"));
+    m.def("scorch_get_spmm_atparallel", []() { return scorch_flags::atparallel(); },
+          "The resolved at::parallel_for flag: 1, 0, or -1 for 'not asked'. A harness that sets "
+          "the policy should read it back rather than assume the set took.");
+    m.def("scorch_get_neon_regtile", []() { return scorch_flags::neon_regtile(); },
+          "The resolved NEON register-tile flag: 1, 0, or -1 for 'not asked'.");
+
     // The row-handout mode the drop-in SpMM will actually run in. Exported for the same
     // reason as the chunk width: an offline sweep that restated this rule scored the work
     // gate at 3.7% on the ARM tail against the 1.35% the machine measured, because it

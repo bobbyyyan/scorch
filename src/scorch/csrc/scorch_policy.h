@@ -1407,3 +1407,64 @@ inline int scorch_chunk(long rows, long work, long grain_default = SCORCH_GRAIN_
   if (c > SCORCH_CHUNK_MAX) c = SCORCH_CHUNK_MAX;
   return (int)c;
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Escape-hatch flags: read ONCE PER PROCESS in a release build, per call in a hooks build.
+//
+// std::getenv is a linear scan of `environ` comparing names, so its cost is a property of the
+// CALLER's environment rather than of this library. Measured on the M5 (2026-08-29, 2M reps):
+// 50 ns at 77 variables, 138 ns at 117, 258 ns at 177, 480 ns at 277 -- about 1.75 ns per
+// variable, and the same whether the variable is present or absent, since an absent name costs
+// the full scan and that is what every real user pays. The shipped SpMM read one such variable
+// on EVERY call, which is 0.3-3% of a 15 microsecond call depending on whose shell launched it.
+//
+// The second reason is worse than the first. An A/B arm that SETS more environment variables
+// lengthens the scan for every arm in the process, which is why an extra variable measured ~1.1%
+// on x86 on sub-30-microsecond kernels -- an effect large enough to have overturned three
+// verdicts, currently worked around by padding every arm's environment to the same length. That
+// padding treats the symptom; caching the read removes the cause.
+//
+// A HOOKS build keeps reading per call, deliberately. Hooks harnesses interleave arms inside one
+// process and flip these variables between them, and a cached read would quietly make two arms
+// the same configuration -- a comparison that cannot fail, which is the single most expensive
+// mistake available here. Release-build harnesses that need the same thing must say so out loud
+// through the setters below, which is an improvement on writing to the environment and hoping:
+// a setter that is missing from the .so is an AttributeError, while an environment write that is
+// no longer read is silent.
+//
+// Only the two flags that survive into a release object are here. `strings` on the shipped .so
+// finds SCORCH_SPMM_ATPARALLEL and SCORCH_NEON_REGTILE and does NOT find SCORCH_TILEIJK_SCALAR,
+// SCORCH_TUNE_CHUNK or any SCORCH_NARROWK_* name: those are inside the hooks guard, their reads
+// are already compiled out of what ships, and caching them would be dead code that also broke
+// the hooks harnesses that flip them between interleaved arms.
+namespace scorch_flags {
+
+// -1 = nothing has asked for an override.
+inline int& atparallel_slot()     { static int v = -1; return v; }
+inline int& neon_regtile_slot()   { static int v = -1; return v; }
+
+// -1 when the variable is unset or empty, so a caller can tell "not asked" from "asked for 0".
+inline int env_tristate(const char* name) {
+  const char* e = std::getenv(name);
+  if (!e || !*e) return -1;
+  return std::atol(e) != 0 ? 1 : 0;
+}
+
+#ifdef SCORCH_TUNE_HOOKS
+#  define SCORCH_FLAG_BODY(NAME, SLOT)                     \
+     (void)SLOT();                                         \
+     return env_tristate(NAME);
+#else
+#  define SCORCH_FLAG_BODY(NAME, SLOT)                     \
+     { const int ovr = SLOT(); if (ovr >= 0) return ovr; }  \
+     static const int cached = env_tristate(NAME);          \
+     return cached;
+#endif
+
+inline int atparallel()     { SCORCH_FLAG_BODY("SCORCH_SPMM_ATPARALLEL",  atparallel_slot) }
+inline int neon_regtile()   { SCORCH_FLAG_BODY("SCORCH_NEON_REGTILE",     neon_regtile_slot) }
+
+#undef SCORCH_FLAG_BODY
+
+}  // namespace scorch_flags

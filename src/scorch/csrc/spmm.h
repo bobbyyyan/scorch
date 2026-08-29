@@ -4689,8 +4689,8 @@ torch::Tensor spmm_csr_v2_core(
   bool use_atparallel = atparallel && nthreads_override > 0
       && work_nnz >= SCORCH_GRAIN_SPMM
       && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
-  if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
-    if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
+  { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
+    if (_atpf >= 0) use_atparallel = (_atpf != 0); }
   if (use_atparallel) {
     // E-CORE RECRUIT (M5/hybrid-P+E). at::parallel_for runs on torch's intra-op
     // pool, which on Apple M-series is the 6 P-cores and excludes the 12 E-cores.
@@ -5432,8 +5432,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   // forces the scalar workspace loop (A/B escape hatch, mirrors
   // SCORCH_SPMM_ATPARALLEL). Read once per op.
   bool use_neon_regtile = true;
-  if (const char* _nr = std::getenv("SCORCH_NEON_REGTILE"))
-    if (*_nr) use_neon_regtile = (std::atol(_nr) != 0);
+  { const int _nr = scorch_flags::neon_regtile();     // cached per process; see scorch_policy.h
+    if (_nr >= 0) use_neon_regtile = (_nr != 0); }
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook: the pre-replacement row kernel, whose tail re-walks the row once per
   // remaining column. The only way to price the replacement without comparing two
@@ -5597,8 +5597,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   // unconditionally; that measured faster on svhn @0.99 than v2's gate. Env
   // SCORCH_SPMM_ATPARALLEL still forces the choice for A/B (1/0).
   bool use_atparallel = atparallel && nthreads_override > 0;
-  if (const char* _atpf = std::getenv("SCORCH_SPMM_ATPARALLEL"))
-    if (*_atpf) use_atparallel = (std::atol(_atpf) != 0);
+  { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
+    if (_atpf >= 0) use_atparallel = (_atpf != 0); }
   if (use_atparallel) {
     // E-CORE RECRUIT (M5/hybrid-P+E fix). at::parallel_for runs on torch's intra-op
     // pool, whose size is torch's per-platform default thread count. On Apple M-series
