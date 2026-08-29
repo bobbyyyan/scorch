@@ -13946,3 +13946,60 @@ so its signature is a ratio rising monotonically toward 1.0 as degree grows, and
 sits at high degree will pool it away. Every arm sets the same five variables so the per-variable
 lookup charge cancels, `--pad-env` equalises the rest, and this run needs no correctness check because
 the arms are a pure A/A in results by construction — they differ only in what the loop evaluates.
+
+## The ARM half of the shipped flip, compiled in: 8% at width 1 and a clean null everywhere else
+
+Every ARM number behind 799205e came from the hooked `k1lad` ladder, and the convention is two hosts
+for a shipped default, measured in the configuration that ships. This is that run: three hookless
+builds from the branch tip — old defaults forced with `-D`, a same-code control, and the new defaults
+— 275 matrices, k=1..4, both dtypes, forward and reverse, on the M5.
+
+Gates first. The fires-check's **A/A null held** — two digest passes of the same build agreed on
+every cell, so its difference counts are not noise — and then both dtypes satisfied every prediction:
+
+| | deg<4 | deg4-8 | deg≥8 |
+|---|---|---|---|
+| k=1 (must move in every band; `K1_MINDEG=0` here) | 84/103 | 22/22 | 122/122 |
+| k=2 (must move below degree 4 only) | 80/103 | 0/22 | 0/122 |
+| k=3 (same) | 80/103 | 0/22 | 0/122 |
+| k=4 (must move nowhere; the exact band stops at 3) | 0/103 | 0/22 | 0/122 |
+
+float64 reads 84 / 79 / 80 / 0 the same way, so the two dtypes agree to one cell. The 19 non-moving
+cells at width 1 in the first band are matrices whose rows are almost all a single nonzero, where
+every kernel gives the same bits because there is nothing to reassociate. 864 dense-reference
+comparisons passed on both builds.
+
+Then the timing, `ship/cand` so above 1.000 is the candidate faster:
+
+| dtype | pooled kernel | floor | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|---|---|
+| float32 | 1.0179 | 0.9978 | **1.0799** | 1.0004 | 0.9973 | 0.9964 |
+| float64 | 1.0183 | 0.9987 | **1.0832** | 0.9984 | 0.9963 | 0.9980 |
+
+**8.0% and 8.3% at width 1, and a null at every other width against floors of 0.4% or less.** k=4 is
+the structural null — the exact band stops at 3, so no arm can act there — and it reads 0.9964 against
+a 0.9989 floor, which puts this run's unexplained drift at about four parts in a thousand. That is
+the tightest control any run in this ledger has had.
+
+By degree at width 1, with every floor between 0.994 and 1.007:
+
+| dtype | deg<1 | deg1-2 | deg2-4 | deg4-8 | deg8-64 | deg64+ |
+|---|---|---|---|---|---|---|
+| float32 | 1.0207 | **0.9862** | 1.0321 | 1.1292 | 1.1131 | **1.1723** |
+| float64 | 1.0305 | 1.0018 | 1.0441 | 1.1419 | 1.1115 | **1.1563** |
+
+Rising with degree, 12–17% in the three top bands, exactly as the mechanism says: the exact-width
+kernel's per-row setup amortises over the row. The single negative band is float32 degree 1-2 at
+0.9862 against a 1.0014 floor — 1.4% on 28 matrices — which is the band the ARM ladder called
+unresolvable, and it is the honest cost of `K1_MINDEG=0` on this ISA.
+
+**And one predicted cost does not reproduce.** 799205e's header states that `DEGUNROLL` costs about
+1.8% on ARM at k=2 below degree 1, from the hooked ladder. Compiled in, that cell reads 0.9943 against
+a 0.9965 floor — inside it. The hooked estimate overstated a cost that a shipping build does not pay,
+which is the same asymmetry that motivated running this at all.
+
+The reference here is `torch.sparse.mm`, PyTorch's own sparse fallback rather than MKL, and its column
+moved only 1.0140 across the three processes — so unlike chain71 its numbers are readable: 5.36x
+(float32) and 5.48x (float64), with 28 and 22 cells of 1100 below it, **identical in all three builds**,
+so the flip neither creates nor closes any of them. There is no MKL deficit on this host to fix and
+this run does not claim one; it is the guardrail, and the guardrail is clean.
