@@ -14049,3 +14049,77 @@ One more caveat that applies to both halves and to nothing else in the run: the 
 code in all three processes, moved 1.1115 and 1.1251 (limit 1.10), so the vs-MKL ratios and the
 below-MKL counts from chain71 are not resolvable. The arm-vs-arm verdicts are unaffected — they never
 read that column — but `386/378/365 below MKL` should not be quoted from this run.
+
+## chain72: the x86 floor fires at exactly degree 8, and float64 k=3 exposes a limit of the instrument
+
+chain72 is the x86 half of the compiled-in fires-check the ARM stage ran: three hookless trees from
+one source (tip4), differing only in three `-D` values, compared by a bitwise digest of the SpMM
+output per (matrix, width) over 298 matrices. Gates 1 and 2 passed — `fe2a57a` is release-neutral at
+the old defaults (every immediate shifted by exactly the spmm.h line-count delta and nothing else),
+and `k2_ship` and `k2_cand` are not the same object, so the defines took.
+
+Gate 3, float32, held every prediction:
+
+```
+  k             deg<4        deg4-8        deg>=8
+  k=1         0/42          0/8         245/248
+  k=2        40/42          0/8           0/248
+  k=3        40/42          0/8           0/248
+  k=4         0/42          0/8           0/248
+```
+
+Read row by row. Width 1 moves in 245 of 248 cells above mean degree 8 and in **zero** cells below
+it — that is `SCORCH_NARROWK_EXACT_K1_MINDEG=8`, the ISA-conditional floor, doing precisely what the
+policy header claims, measured on the host the constant was chosen for. Widths 2 and 3 move in 40 of
+42 cells below degree 4 and nowhere above — that is `DEGUNROLL`, acting on the mean degree while the
+bits depend on each row's length, exactly as the corrected prediction says. Width 4 is inert
+everywhere, as a width above the exact band's ceiling must be.
+
+This is also the cross-host confirmation of the *corrected* prediction rather than of the retracted
+one. The earlier claim — that unroll depth is bitwise invisible at k≤2 — was refuted on ARM at 80 of
+103 cells and replaced; x86 now agrees with the replacement at 40 of 42 and 40 of 42.
+
+Gate 3, float64, held k=1, k=2 and k=4 and then moved k=3 in **every** band: 40/42, 8/8, 248/248.
+The run refused, which is correct — but the refusal is not about the flip.
+
+No flag in the source can do that, and the reason is worth stating exactly, because "my model of the
+flags is incomplete" was the first hypothesis and it is wrong:
+
+- `SCORCH_NARROWK_EXACT_K1` and `_K1_MINDEG` only set `exact_lo_`, and only ever to 1. They change
+  which kernel serves width 1 and touch nothing else.
+- `SCORCH_NARROWK_EXACT_DEGUNROLL` only enters
+  `while (exact_unroll > 1 && mean_deg < exact_unroll * mult) exact_unroll >>= 1;`
+  with `UNROLL=4` and `mult=1`, so it cannot act at mean degree ≥ 4, never mind ≥ 8.
+
+The objects say what actually changed. `nm -C` on chain72's own builds finds **fifteen** float
+instantiations of `scorch_spmm_row_narrow_exact` emitted out of line and **zero** double ones — every
+double instantiation is inlined into the caller — and the two builds do not agree on which float ones
+are out of line: `k2_ship` emits `(2,2)` and `(5,2)`, `k2_cand` emits `(3,2)` and `(7,2)`. Changing
+these macros moves the inliner. An inlined accumulator array under `-ffast-math` can then be
+reassociated differently, which changes the bits **at every degree** rather than in a band, and only
+at widths whose kernel is inlined. That is the observed shape, including why float32 — whose k=2 and
+k=3 bodies are out of line, and so do not change when a sibling case becomes reachable — was inert.
+
+So the general lesson, which applies to every fires-check in this ledger: **a two-build output digest
+cannot prove policy inertness at a width whose kernel is inlined.** It can prove a flag *fired*
+(a difference where the policy predicts one), but a difference where the policy predicts none is
+ambiguous between "the flag acted" and "the compiler reassociated". Byte-identical emission gates do
+not have this problem, because they compare code rather than results; a digest gate does, and chain72
+is the first place it bit.
+
+chain76 tests the explanation with a **build-level structural null** — the same idea as a structural
+null width, one level up. `k2_null` carries the candidate's macros in a configuration that provably
+cannot act: `K1_MINDEG=1073741824`, so `exact_lo_` never reaches 1 because no matrix has a mean
+degree of 2^30, and `DEGUNROLL_MULT=0`, so `mean_deg < exact_unroll * 0` is false for every
+non-negative mean degree and the unroll is never halved. `k2_null` is therefore the same policy as
+`k2_ship` at every width and every degree, built with the candidate's macros, and any digest
+difference between them is the compiler's. Pre-registered: float64 k=3 must move in all three bands
+(the hypothesis, asserted so that confirming it costs something), k=4 must hold (its family is not
+the inlined one), float32 k=1/2/3 must all hold, width 1 must move against `k2_cand` (the positive
+control that the 2^30 floor took), and two passes of `k2_null` must agree cell for cell — the A/A
+null chain72 did not have, since it was added to the ARM stage after chain72 was already queued, so
+x86 run-to-run nondeterminism at float64 k=3 was never excluded and is a live third explanation.
+
+Consequences already visible: chain73 refused immediately on its `CHAIN72_DONE` guard and is
+unqueued pending a chain72 re-run. chain74 and chain75 are unaffected — chain74 builds `ph_base` from
+tip4 itself precisely so its neutrality gate does not depend on chain72.
