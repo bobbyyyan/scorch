@@ -14438,3 +14438,37 @@ source already recorded — showed that no constant available without measuremen
 rule that would have short-circuited all three: when a derived quantity needs a hardware constant,
 either cite one this repository has measured, or state that the quantity is unavailable. Estimating it
 produces a number that reads exactly like the other two.
+
+### The bandwidth range in my own budget box broke the rule I had just written, and the analysis already existed
+
+Applying the rule to the box that motivated it: the budget's "200 / 300 / 400 GB/s" were three
+invented constants. This file already contains a **measured** bandwidth from the same host in the same
+run — `heart1` moving 11.1 MB in 48 µs, **231 GB/s** — and it came from a *larger* operand, so it is a
+conservative floor for a 1.07 MB one.
+
+Recomputed on that, with A's stream stated the way the earlier section states it (`nnz*8 + rows*4`,
+1,070,504 bytes):
+
+| bandwidth | source | µs for A's stream |
+|---|---|---|
+| 231 GB/s | `heart1`, measured, L3-resident, same run | **4.63** |
+| 59 GB/s | what this cell actually achieves at 18 µs | 18.14 |
+| 53 GB/s | `af_shell2`, this host's DRAM ceiling | 20.20 |
+
+So the floor is **4–5 µs on a measured number**, not 3–5 µs on three invented ones, and the residual
+is ~13 µs of fixed cost. The conclusion does not move.
+
+But the sharper problem is that **this analysis already existed in this file and I duplicated it with
+worse inputs.** The earlier section derives exactly the same thing — same 1.07 MB, same `nnz*8 +
+rows*4`, same subtraction at heart1's measured rate — and states the answer in bold: roughly 13 µs of
+per-call fixed cost at 512 rows, with MKL paying about 12 µs of it. It also already contains the
+observation my box presented as new, that the small matrix achieves a quarter of the bandwidth an
+L3-resident matrix does in the same process. My box added nothing except a worse constant and a fourth
+opportunity to be wrong.
+
+The same enumerate-first move that found the third citation of the ceiling would have prevented this
+one: before deriving a quantity, grep for it. "Bandwidth on this host" had a measured answer four
+hundred lines up. That is now two failures in one paragraph traceable to deriving instead of looking —
+which suggests the two guards from today compose into one habit rather than two: **before writing a
+number, search the file for the quantity and for other citations of the claim; only derive what the
+search does not return.**
