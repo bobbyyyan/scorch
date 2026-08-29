@@ -4200,6 +4200,22 @@ torch::Tensor spmm_csr_v2_core(
             (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
             narrow_k && !exact_width && !force_workspace &&
             !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
+            // ...and not a width the half-vector kernel owns. That kernel is dispatched LATER in
+            // this same loop, and its own comment states the rule: "gated so it only takes widths
+            // that kernel does not already own, because an arm that swapped both at once would
+            // attribute neither." Without this line multirow replaces the half-vector path rather
+            // than the masked register block it is meant to replace, and the resulting number is
+            // the ratio of two wins instead of the value of one. Measured: at float32 k=4, where
+            // SCORCH_SPMM_HALFVEC_F32=1 is worth 1.1008 (z +14.6) over the masked 256-bit path,
+            // ROWS=2 read 0.9425 on the kernel and 0.9466 on the caller against the shipping
+            // build, uniformly across every degree band (0.9404 to 0.9477) with every same-code
+            // floor inside 1%. One width up, where the half-vector kernel does not serve, the same
+            // build reads 1.0652 and 1.0825. The exact-width kernel is excluded on the line above,
+            // so the halfvec_under branch's own !exact_width term needs no repeating here.
+            !(spmm_halfvec > 0 &&
+              (B1_size == scorch_simd_half<scalar_t>::lanes ||
+               (spmm_halfvec >= 2 && B1_size >= 2 &&
+                B1_size < scorch_simd_half<scalar_t>::lanes))) &&
             i + multirow <= end &&
             A1_pos[i + multirow] > A1_pos[i]) {
           #define SCORCH_MR(NV, RR) \
