@@ -14445,6 +14445,16 @@ rule that would have short-circuited all three: when a derived quantity needs a 
 either cite one this repository has measured, or state that the quantity is unavailable. Estimating it
 produces a number that reads exactly like the other two.
 
+**Correction to this box, after chain77 measured the quantity.** It closed by observing that the
+~13 µs never moved across any of the corrections, and concluded the analysis "was right the first
+time". That conclusion was wrong, and its wrongness is the more useful finding. The answer had been
+wrong from the *first* pass — our per-call fixed cost is 4.1 µs, not 13 — and not one of the five
+corrections touched it, because every one of them argued about the **term being subtracted** while the
+error was in what the **residue was called**. A stable answer across five careful revisions was
+evidence only that all five were asking the same wrong question. Five corrections to an inference
+cannot substitute for measuring the quantity, and the invariance of a residue under corrections to its
+subtrahend is not confirmation of the residue.
+
 ### The bandwidth range in my own budget box broke the rule I had just written, and the analysis already existed
 
 Applying the rule to the box that motivated it: the budget's "200 / 300 / 400 GB/s" were three
