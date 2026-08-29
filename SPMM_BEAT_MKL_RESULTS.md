@@ -12789,3 +12789,33 @@ chain68 (the row ceiling, predicted null).** chain68 is chain64 renumbered twice
 unchanged; both times it was killed in its wait loop having done no work, so the reorder cost nothing.
 Each guard was hand-run with `pgrep -af` after being written and matched exactly its intended
 dependencies — the check that a numbered queue needs and that cost thirteen hours when it was skipped.
+
+## chain65's three builds, verified at the instruction level from off the machine
+
+chain65 checks that each build is hookless and that the loaded `.so` is the one under its own tree.
+It does not check that the candidate's defines reached the compiler, which is the failure that
+invalidated an earlier multirow arm — setuptools compares source mtimes to object mtimes and
+`SCORCH_BUILD_DEFINES` is invisible to that comparison, so a build can relink an earlier build's
+objects and silently keep the earlier build's defines.
+
+Disassembled with `llvm-objdump -d --no-show-raw-insn --no-addresses`, instruction lines only, the
+three trees having deliberately equal-length names so no path-length difference reaches the
+instruction stream:
+
+| comparison | differing instruction lines |
+|---|---|
+| `k1_ctrl` vs `k1_ship` — same flags, the determinism control | **0** |
+| `k1_cand` vs `k1_ship` — the change | **61807** (and 35 fewer instructions in total) |
+
+So the defines reached the compiler and the compile is deterministic. The 61807 is not a magnitude —
+an address-free diff realigns badly around an inserted block — it is only the contrast against a
+control that is exactly zero.
+
+One correction to the script's own output. It prints "ship and ctrl differ as objects (expected:
+embedded paths); floor includes that", because `cmp` on the two files fails. At the instruction level
+they are identical, so the floor is pure process variance after all and the weaker of its two branches
+understates it.
+
+The three objects were copied off the machine and disassembled locally, so this cost the running probe
+nothing. Worth doing that way as a habit: an `objdump` on the host is a second of one core, and the
+thing it would perturb is a 21-rep timing of a kernel that runs in tens of microseconds.
