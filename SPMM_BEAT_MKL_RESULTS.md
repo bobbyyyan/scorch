@@ -13660,13 +13660,22 @@ deficit was recomputed from chain65's shipping build, on the caller path (`cprob
 
 | width | float32 behind MKL | median ours/MKL | float64 behind | median |
 |---|---|---|---|---|
-| k=1 | 7 / 212 | 0.779 | 5 / 212 | 0.725 |
+| k=1 | 10 / 212 | 0.779 | 8 / 212 | 0.725 |
 | k=2 | 2 / 212 | 0.740 | 0 / 212 | 0.582 |
-| k=4 | **12 / 212** | 0.626 | **8 / 212** | 0.506 |
+| k=4 | **14 / 212** | 0.626 | **9 / 212** | 0.506 |
 | k=8 | 1 / 212 | 0.403 | 0 / 212 | 0.327 |
 | k=64 | 0 / 212 | 0.287 | 0 / 212 | 0.292 |
 
-22 float32 and 13 float64 cells of 1060, and the deepest is 1.119. **This is not the same board as
+27 float32 and 17 float64 cells of 1060, and the deepest is 1.119.
+
+**Corrected from 22 and 13, and the difference is a convention that matters.** The first version of
+this table took the minimum over passes of the *pair* — the pass where our own time was lowest, and
+that same pass's MKL reading. `an_mklcount.py`, and every other analyzer here, takes the minimum
+over passes for each side independently. Pairing lets our best pass be scored against an MKL pass
+that was not MKL's best, which flatters us by 3 cells on float32 and 4 on float64 — about 15% of the
+count. Independent minima are the right convention for the same reason best-of-N is: each side gets
+its own best, and the comparison is between two floors rather than between one floor and one
+sample. The medians are unaffected at the precision shown. **This is not the same board as
 chain63's 128/59** — chain65's corpus is the degree-stratified `mg50_groups`, of which only 9
 matrices appear in chain63's corpus at all, and chain63's count is over six widths of 302 matrices.
 chain72 is the run that puts the shipping build on chain63's corpus, which is the comparable
