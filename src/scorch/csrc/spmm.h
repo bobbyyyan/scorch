@@ -4055,6 +4055,40 @@ torch::Tensor spmm_csr_v2_core(
 #endif
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+  // Whether the multi-row kernel may serve this CALL. Every term here is loop-invariant, and the
+  // row loop's test is the two that are not.
+  //
+  // This was the whole condition, inside the row loop, and chain71 priced leaving it there. With
+  // the half-vector exclusion in place multi-row DECLINES float32 k=4 -- so ship and candidate run
+  // the identical kernel at that width and the ratio should have been a structural null. It read
+  // 0.9702 against a same-code floor of 1.0097, and the degree axis was monotone in exactly the
+  // shape a per-row cost predicts: 0.9298 at degree 2-4, 0.9594 at 4-8, 0.9670 at 8-64, 0.9933 at
+  // 64+. A test whose cost is fixed per row is a larger share of a short row. The compiler is
+  // entitled to hoist these itself, and at -O3 inside a lambda in a work-stealing loop it did not.
+  //
+  // The half-vector term is the one that has to be here rather than assumed: that kernel is
+  // dispatched LATER in the same loop, and its own comment states the rule -- it only takes widths
+  // another kernel does not already own, because an arm that swapped two kernels at once would
+  // attribute neither. Without it multi-row replaces the half-vector path rather than the masked
+  // register block it is meant to replace. Measured at float32 k=4, where SCORCH_SPMM_HALFVEC_F32=1
+  // is worth 1.1008 (z +14.6) over the masked 256-bit path: ROWS=2 read 0.9425 on the kernel and
+  // 0.9466 on the caller, uniformly across every degree band, with every same-code floor inside 1%.
+  // One width up, where the half-vector kernel does not serve, the same build read 1.0652 and
+  // 1.0825. The exact-width kernel is excluded by its own term, so the half-vector branch's
+  // !exact_width needs no repeating.
+  const bool multirow_ok =
+      multirow > 1 &&
+      (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
+      narrow_k && !exact_width && !force_workspace &&
+      !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
+      !(spmm_halfvec > 0 &&
+        (B1_size == scorch_simd_half<scalar_t>::lanes ||
+         (spmm_halfvec >= 2 && B1_size >= 2 &&
+          B1_size < scorch_simd_half<scalar_t>::lanes)));
+#endif
+
   // A register-resident row kernel writes the whole row, so the workspace only
   // exists for architectures that have neither (and for the force_workspace hook).
 #define SCORCH_SPMM_NEEDS_WORKSPACE                                            \
@@ -4215,26 +4249,11 @@ torch::Tensor spmm_csr_v2_core(
         // the mechanism: a group with no nonzeros in it is exactly the group whose merge is being
         // destroyed. It is one compare on a value already loaded, inside a block that does not
         // exist unless the kernel is enabled.
-        if (multirow > 1 &&
-            (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
-            narrow_k && !exact_width && !force_workspace &&
-            !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
-            // ...and not a width the half-vector kernel owns. That kernel is dispatched LATER in
-            // this same loop, and its own comment states the rule: "gated so it only takes widths
-            // that kernel does not already own, because an arm that swapped both at once would
-            // attribute neither." Without this line multirow replaces the half-vector path rather
-            // than the masked register block it is meant to replace, and the resulting number is
-            // the ratio of two wins instead of the value of one. Measured: at float32 k=4, where
-            // SCORCH_SPMM_HALFVEC_F32=1 is worth 1.1008 (z +14.6) over the masked 256-bit path,
-            // ROWS=2 read 0.9425 on the kernel and 0.9466 on the caller against the shipping
-            // build, uniformly across every degree band (0.9404 to 0.9477) with every same-code
-            // floor inside 1%. One width up, where the half-vector kernel does not serve, the same
-            // build reads 1.0652 and 1.0825. The exact-width kernel is excluded on the line above,
-            // so the halfvec_under branch's own !exact_width term needs no repeating here.
-            !(spmm_halfvec > 0 &&
-              (B1_size == scorch_simd_half<scalar_t>::lanes ||
-               (spmm_halfvec >= 2 && B1_size >= 2 &&
-                B1_size < scorch_simd_half<scalar_t>::lanes))) &&
+        // Everything that does not depend on the row is in multirow_ok, decided once per call
+        // before the parallel region. Only the two row-dependent terms are left here. See the
+        // hoist site for why: eight loop-invariant tests per row cost 0.7-7% at widths this
+        // kernel DECLINES, in inverse proportion to row length.
+        if (multirow_ok &&
             i + multirow <= end &&
             A1_pos[i + multirow] > A1_pos[i]) {
           #define SCORCH_MR(NV, RR) \
