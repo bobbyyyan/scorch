@@ -13483,3 +13483,81 @@ attributable to `ROWS=2` rather than to the harness or the tree. Smoke-tested on
 shipping install: **864 comparisons, 0 mismatches** — which is incidentally a free correctness result
 for the ARM shipping path over shapes the test suite does not contain, though it exercises no multirow
 there, the kernel being AVX2-gated.
+
+## chain69 places the k=1 threshold, and float64 says one bound is not enough
+
+Eight readings — two probes × two seeds × two dtypes, 302 matrices, seven arms each setting the same
+six variables so the getenv cost cancels. `on/off` is served-over-withheld within a band, so above 1.0
+means admitting width 1 to the exact-width kernel is faster there.
+
+**float32**
+
+| band | n | cprobe s17 | cprobe s23 | kprobe s17 | kprobe s23 |
+|---|---|---|---|---|---|
+| deg<1 | 8 | 0.9827 z−1.6 | 0.9729 z−2.7 | 0.9828 z−1.8 | 0.9784 z−2.1 |
+| deg2-4 | 35 | 0.9901 z−5.7 | 0.9874 z−7.0 | 0.9915 z−7.0 | 0.9907 z−5.9 |
+| deg4-8 | 8 | 0.9922 z−2.9 | 0.9839 z−6.6 | 0.9936 z−3.2 | 0.9844 z−6.8 |
+| deg8-64 | 160 | 1.0018 z+0.8 | 1.0029 z+1.3 | 1.0104 z+5.0 | 1.0019 z+1.0 |
+| deg64-256 | 66 | **1.1124 z+18.8** | **1.1167 z+20.2** | **1.1149 z+21.0** | **1.0995 z+14.8** |
+| deg≥256 | 22 | **1.1297 z+5.3** | **1.0972 z+4.1** | **1.1046 z+5.0** | **1.1464 z+7.4** |
+
+**float64**
+
+| band | n | cprobe s17 | cprobe s23 | kprobe s17 | kprobe s23 |
+|---|---|---|---|---|---|
+| deg<1 | 8 | 1.0086 z+0.8 | 1.0099 z+0.8 | 1.0076 z+0.8 | 1.0117 z+1.3 |
+| deg2-4 | 35 | **1.1341 z+23.4** | **1.1238 z+21.3** | **1.1237 z+20.7** | **1.1268 z+22.9** |
+| deg4-8 | 8 | **0.8436 z−10.1** | **0.8412 z−10.3** | **0.8562 z−10.3** | **0.8606 z−8.8** |
+| deg8-64 | 160 | **1.0486 z+10.3** | **1.0464 z+9.8** | **1.0490 z+11.0** | **1.0482 z+10.7** |
+| deg64-256 | 66 | **1.1333 z+41.9** | **1.1294 z+37.2** | **1.1124 z+34.2** | **1.1227 z+36.7** |
+| deg≥256 | 22 | **1.2423 z+23.0** | **1.2388 z+25.6** | **1.2475 z+22.4** | **1.2401 z+22.2** |
+
+The float64 half is the most reproducible result in this file: four independent readings agree to
+within one percent in every band, including a 15.7% loss at degree 4–8 and a 24% win above 256. The
+instrument check passes in all eight — across k=2 and k=4 every arm is the reference — so the constant
+really is attached to width 1 and nothing else, which was the whole reason it exists separately from
+`SCORCH_NARROWK_EXACT_MINDEG`.
+
+**The answers differ by dtype, and only one of them fits a one-sided bound.**
+
+*float32: `K1_MINDEG = 8`.* Below degree 8 serving costs 0.6% to 2.7% in every band and every one of
+the four readings; deg8-64 is a wash in three of four; above 64 it pays 10% to 15% in all four. A floor
+at 8 keeps every win and drops every loss.
+
+*float64: no single floor works.* Serving **pays 12.4% at degree 2–4** on 35 matrices, **costs 15.7% at
+4–8** on 8, and pays 4.8%, 12.9% and 24% in the three bands above. `MINDEG=8` gives up the 2–4 win to
+avoid the 4–8 loss; `MINDEG=4` takes the loss to keep the win. The winning region is
+*short rows or long rows*, which is what the shape predicted before this ran, and expressing it needs a
+second bound — a new constant, and now with a price on it: **+12.4% on 11.6% of the corpus**, which is
+what a one-sided gate leaves behind.
+
+**What this buys against the goal.** The residual's k=1 cells — 35 float32 and 30 float64 — sit at mean
+degree 128 to 512, which is `deg64-256` and `deg≥256`. Both bands pay in all eight readings, by 10–15%
+on float32 and 11–24% on float64. So every one of those 65 cells is inside the region a floor at 8
+admits.
+
+Correctness is settled separately: chain70 reported **ALL CHECKS PASSED** — the two compiled objects
+differ, `k1_fires.py` confirms the kernel fires at k=1 in every degree band and at no other width,
+60 matrices agree with a dense reference at the project tolerance, and the full 1099-test suite passes
+against the hookless candidate. That was the gap worth closing before believing any of the above: this
+family had been timed five times and never once checked.
+
+### The analyzer read eight files of good data as a null in every band
+
+chain69's caller-path halves came out of the run reading `no arm serves k=1 here` in every band, with
+`ladder ` and an empty arm list, and `arms nan (n=0)` for the instrument check. Nothing was wrong with
+the data. `an_k1ladder.py` derived its arm list from column names ending `_kms`, and `cprobe` writes
+only `_ms` — so it found zero arms and printed a complete, well-formatted table of nothing.
+
+That is the same failure as a driver reporting DONE having measured nothing, one level up: the
+*analyzer* rather than the harness, and its output is more convincing because the table has the right
+shape and the right band names and the right matrix counts. Fixed two ways: the suffix is now discovered
+from the columns, and **an empty ladder refuses** rather than printing:
+
+```
+REFUSING <file>: no ladder arm found in its columns (looked for *_kms). An empty
+  ladder prints as 'no arm serves' in every band, which reads like a null and is not one.
+```
+
+The four caller-path readings above are that data, read. They agree with the kernel path in every band
+of both dtypes, which is also the check that the fix did not invent anything.
