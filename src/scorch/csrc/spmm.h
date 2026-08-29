@@ -3773,8 +3773,11 @@ torch::Tensor spmm_csr_v2_core(
   // masked-row widths on the register-block kernel. Loop-invariant either way, so the
   // row loop's dispatch on it hoists.
   int narrowk_exact = SCORCH_NARROWK_EXACT_UNROLL;
-  // Float k=1 is the one width where two kernel families compete: the nonzero-axis
-  // gather kernel owns it by default and measures better there.
+  // Float k=1 is the one width where two kernel families compete. The exact-width kernel
+  // owns it as of the ISA-conditional floor in the policy header; below that floor the
+  // nonzero-axis gather (x86 float32) or a one-lane register-block tile (everywhere else)
+  // keeps it. The floor differs by ISA because what is displaced differs -- see the grids
+  // above SCORCH_NARROWK_EXACT_K1.
   bool narrowk_exact_k1 = SCORCH_NARROWK_EXACT_K1 != 0;
   long narrowk_exact_k1_mindeg = SCORCH_NARROWK_EXACT_K1_MINDEG;
   // Whether the unroll depth is reduced on rows too short to fill it. The kernel's
@@ -3786,6 +3789,7 @@ torch::Tensor spmm_csr_v2_core(
   // k=4 where this kernel fires.
   bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
   bool narrowk_exact_degunroll = SCORCH_NARROWK_EXACT_DEGUNROLL != 0;
+  long narrowk_exact_degunroll_mult = SCORCH_NARROWK_EXACT_DEGUNROLL_MULT;
   long narrowk_exact_mindeg = SCORCH_NARROWK_EXACT_MINDEG;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
@@ -3829,6 +3833,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_short = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL");
     if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL_MULT");
+    if (e && *e) { long v = std::atol(e); if (v >= 1) narrowk_exact_degunroll_mult = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_MINDEG");
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_mindeg = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
@@ -3857,9 +3863,11 @@ torch::Tensor spmm_csr_v2_core(
     int exact_hi_ = narrowk_exact_hi;
     const int exact_cap_ = exact_f32_ ? 7 : 3;
     if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
-    // Width 1 is admitted on its own mean degree, not on the band's floor. In a build
-    // without hooks and with the shipped SCORCH_NARROWK_EXACT_K1 of 0 the whole block is
-    // dead and exact_lo_ folds to 2, so emission is unchanged.
+    // Width 1 is admitted on its own mean degree, not on the band's floor -- the two
+    // are different questions, since the exact kernel's per-row setup amortises over the
+    // row and not over the width. SCORCH_NARROWK_EXACT_K1 now ships at 1, so this block is
+    // live in a release build; it was dead until the ladder placed the floor, and anything
+    // in this file that still reasons from "K1 is off" is stale.
     int exact_lo_ = 2;
     if (narrowk_exact_k1) {
       const long mean_deg_k1_ = A0_size > 0 ? nnz_total / (long)A0_size : 0;
@@ -3902,7 +3910,18 @@ torch::Tensor spmm_csr_v2_core(
   int exact_unroll = narrowk_exact;
   if (exact_width && narrowk_exact_degunroll) {
     const long mean_deg = A0_size > 0 ? nnz_total / (long)A0_size : 0;
-    while (exact_unroll > 1 && mean_deg < (long)exact_unroll) exact_unroll >>= 1;
+    // The comparison is against MULT unrolls' worth of work, not one. At MULT=1 the unroll is
+    // the largest power of two no greater than the mean row, which puts the worst
+    // setup-to-work ratio exactly AT each threshold: the kernel's setup is 2*UNROLL-1 scalar
+    // operations per row (UNROLL zero stores, UNROLL-1 adds), so a mean row of 4 at UNROLL=4
+    // does seven setup operations for four useful multiply-adds while a mean row of 7 does
+    // seven for seven. The ratio is therefore sawtoothed in degree, peaking where the unroll
+    // has just doubled, which is the shape the x86 float64 width-1 ladder measured: +12.4% at
+    // degree 2-4, -15.7% at 4-8, +4.8% and above from 8 up. MULT=2 requires a row to hold two
+    // unrolls before taking one, which caps the ratio at 7/8 instead of 7/4 and moves only two
+    // bands (degree 2-4 from unroll 2 to 1, and 4-8 from 4 to 2).
+    while (exact_unroll > 1 &&
+           mean_deg < (long)exact_unroll * narrowk_exact_degunroll_mult) exact_unroll >>= 1;
   }
 #endif
 #if !defined(SCORCH_TUNE_HOOKS) && defined(__AVX2__) && defined(__FMA__) && \

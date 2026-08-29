@@ -587,6 +587,28 @@
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL 1
 #endif
+// How many unrolls' worth of work a mean row must hold before the kernel takes an unroll that
+// deep. The rule above halves while `mean_deg < UNROLL * MULT`, so MULT=1 -- today's shipped
+// behaviour, and byte-neutral by construction -- sets UNROLL to the largest power of two no
+// greater than the mean row.
+//
+// MULT=1 puts the kernel's worst setup-to-work ratio exactly AT each threshold. Setup is
+// 2*UNROLL-1 scalar operations per row (UNROLL zero stores, UNROLL-1 adds), so a mean row of 4
+// at UNROLL=4 pays seven to do four useful multiply-adds, while a mean row of 7 pays seven to do
+// seven. The ratio is sawtoothed in degree and peaks where the unroll has just doubled. That is
+// the shape the x86 float64 width-1 ladder measured and that the ISA-conditional floor above
+// currently steps around rather than fixes: +12.4% at degree 2-4, -15.7% at 4-8, then +4.8%,
+// +12.9% and +24.0% in the three bands from 8 up. A non-monotone admission curve with a floor
+// placed above the dip gives up the band below it -- 35 of 302 matrices on that corpus.
+//
+// MULT=2 caps the ratio at 7/8 instead of 7/4 and moves exactly two bands (degree 2-4 from
+// unroll 2 to 1, and 4-8 from 4 to 2), leaving degree >= 8 and degree < 2 alone. Whether that
+// is the right number, and whether it holds at k=2 and k=3 where this rule also acts and where
+// DEGUNROLL is separately worth +4.5% on x86 float32, is a ladder and not an argument. Default
+// 1 until that ladder runs.
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT 1L
+#endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
 #endif
