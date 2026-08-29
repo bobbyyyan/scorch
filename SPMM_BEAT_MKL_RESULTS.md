@@ -14322,3 +14322,35 @@ That is a correctness statement and nothing more. No runtime claim attaches to a
 the environment-scan change is worth 25–50 ns per call at redwood's 33 variables, which is below what
 these instruments resolve, and it has not been timed on a kernel. x86 confirmation is still owed for
 the caching, and is queued behind chain74/75/76/73 rather than being run alongside them.
+
+### What the residual cell's 15–18 µs can be spent on, and which ceiling actually binds
+
+An order-of-magnitude budget, not a measurement, for the deepest residual cell: 512 rows, 133,557
+nonzeros, mean degree 260.9, k=1, on 24 workers at ~5 GHz. A's indices plus values are 133,557 × 8 =
+**1.07 MB**, which is L3-resident on that host.
+
+Two independent routes to the arithmetic-plus-streaming floor:
+
+| route | µs |
+|---|---|
+| dependency chain, one accumulator at 4 cyc/nnz | 4.45 |
+| dependency chain, four accumulators at ~1 cyc/nnz | 1.11 |
+| stream 1.07 MB of A from L3 at 200 / 300 / 400 GB/s | 5.34 / 3.56 / 2.67 |
+
+**The first row does not apply here, and saying so is the point.** The 4-cycles-per-nonzero ceiling
+in this ledger is about a sparse `+=` with an indirect load staying in *one* accumulator register.
+At mean degree 261 the `DEGUNROLL` rule does not halve anything (261 ≥ 4), so width 1 runs
+`scorch_spmm_row_narrow_exact<T,1,4>` with `acc[4][1]` — **four** independent accumulators, which is
+exactly what the unroll is for. The dependency ceiling is therefore ~1.1 µs and is not what binds.
+What binds is streaming A out of L3, at 2.7–5.3 µs.
+
+The conclusion is unchanged — a floor of roughly 3–5 µs against a measured 15–18 µs leaves something
+like 11–14 µs of fixed cost per call, consistent with the ~13 µs the earlier subtraction estimated
+and with MKL paying about 12 of it. But it is unchanged *for a different reason than the one I first
+gave*, and a budget that cites a mechanism the kernel defeats is worse than no budget: it would have
+sent the next person to look for accumulator pressure at a width that already has four chains.
+
+What this budget is for: it says the fixed cost is large enough to be worth a decomposition, and
+chain73 is that decomposition — it sweeps thread count at exactly 512 rows beside its per-row-count
+intercepts, so it can separate launch-and-barrier from setup. A budget suggests where to look; it
+does not settle anything, and none of these numbers should be quoted as a result.
