@@ -356,6 +356,34 @@ def test_planned_call_inside_inference_mode():
     )
 
 
+def test_stensor_built_inside_inference_mode():
+    """Building the operand inside the block, not merely calling inside it.
+
+    The two tests around this one construct their STensor outside ``inference_mode``
+    and only multiply inside, which never reaches the memo that broke: the index
+    validation stamp is taken when the storage is assembled, so it is only asked for
+    a version counter if ``from_torch`` itself runs in there. An inference tensor's
+    counter is disabled and ``._version`` raises on it, so before the guard in
+    ``storage.tensor_version`` this raised ``RuntimeError: Inference tensors do not
+    track version counter.`` -- for every scorch matmul in the standard inference
+    idiom. int64 indices on purpose: that is what makes the narrowing path, and hence
+    the stamp, do work.
+    """
+    rows, cols, n, deg = 128, 128, 8, 4
+    with torch.inference_mode():
+        indptr = torch.arange(rows + 1, dtype=torch.int64) * deg
+        indices = torch.arange(deg, dtype=torch.int64).repeat(rows)
+        values = torch.ones(rows * deg, dtype=torch.float32)
+        a = STensor.from_torch(
+            torch.sparse_csr_tensor(indptr, indices, values, size=(rows, cols))
+        )
+        b = torch.ones((cols, n), dtype=torch.float32)
+        for _ in range(3):      # three calls, so the memo is consulted and not just filled
+            out = scorch.matmul(a, b)
+    expected = torch.full((rows, n), float(deg), dtype=torch.float32)
+    torch.testing.assert_close(as_tensor(out).clone(), expected, atol=1e-3, rtol=1e-3)
+
+
 def test_plan_built_inside_inference_mode_serves_outside():
     a, dense = random_csr(64, 64, 0.05)
     b = dense_rhs(64, 8)
