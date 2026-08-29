@@ -12151,3 +12151,49 @@ reordering just produces a refusal, or worse, a result against a corpus that is 
 any promotion, check the guard against the *dependencies*, not against the numbers. Re-deployed as
 chain65 at the end of the queue, with its `HALFVEC` pin moved from 0 to 1 — the value that actually
 ships now that chain48 has established the flip was already in.
+
+## The shipping configuration, as of `1262c1d` — generated from the header, not written
+
+Three runs were designed in one day against a stale belief about what ships. chain28b pinned
+`SCORCH_SPMM_HALFVEC_F32=0` in all three of its builds, and that value had been superseded hours
+earlier. chain48 patched in a per-dtype macro split that had already landed, so its before and
+after were the same source. chain65 was written while its own pin was still pending and had to be
+moved before it ran. Every section of this file states the world as of the section that wrote it,
+which is right for a log and useless as a reference — so here is the configuration itself, read out
+of `scorch_policy.h`. The reasoning for each value lives in that header's comment above the
+constant; this table is only the answer to "what is on".
+
+Regenerate rather than edit it:
+
+    python3 -c "import re; h=open('src/scorch/csrc/scorch_policy.h').read(); \
+      [print(m.group(1),'=',m.group(2).strip()) for m in \
+       re.finditer(r'#ifndef (SCORCH_\w+)\s*\n#\s*define \1 ([^\n/]+)', h)]"
+
+**Enabled — 27 of 45:**
+
+| `SCORCH_CHUNKS_PER_THREAD` = `7L` | `SCORCH_CHUNK_MAX` = `64L` | `SCORCH_CHUNK_MIN` = `4L` |
+|---|---|---|
+| `SCORCH_GRAIN_CODEGEN_SPGEMM` = `1500L` | `SCORCH_GRAIN_DEFAULT` = `500L` | `SCORCH_GRAIN_SPMM` = `150000L` |
+| `SCORCH_GRAIN_SPMSPM` = `3000L` | `SCORCH_MEMSET_GRAIN_BYTES` = `262144L` | `SCORCH_NARROWK_DEEP_PF` = `1` |
+| `SCORCH_NARROWK_EXACT_HI` = `3` | `SCORCH_NARROWK_EXACT_UNROLL` = `4` | `SCORCH_ROWS_PER_THREAD` = `16L` |
+| `SCORCH_SPMM_CEIL_CAP_POOL` = `1` | `SCORCH_SPMM_CEIL_MAXROWS` = `128L` | `SCORCH_SPMM_CEIL_MINDEG` = `192L` |
+| `SCORCH_SPMM_HALFVEC_F32` = `1` | `SCORCH_SPMM_NT_CAP` = `(-2L)` | `SCORCH_SPMM_NT_CAP_FLOOR_CEIL` = `1` |
+| `SCORCH_SPMM_PARTITION_DEFAULT` = `3` | `SCORCH_SPMM_PARTITION_GATE_MAXTHREADS` = `16` | `SCORCH_SPMM_PARTITION_MAXOUT_LLC` = `2L` |
+| `SCORCH_SPMM_PARTITION_MINGRAINS` = `2L` | `SCORCH_SPMM_RAISE_GRAINS` = `2L` | `SCORCH_SPMM_RECRUIT_MIN_WORK` = `10000000L` |
+| `SCORCH_SPMM_ROWS_PER_THREAD` = `1L` | `SCORCH_SPMM_ZERO_SPAN_ELEMS` = `524288L` | `SCORCH_SPMV_ACCUM` = `1` |
+
+**Zero — 18 of 45. A zero here means the mechanism is not merely disabled at
+runtime: most of these gate a `#if`, so the code does not exist in a release build.**
+
+| `SCORCH_NARROWK_DEEP_NVEC_HI` | `SCORCH_NARROWK_DEEP_NVEC_LO` | `SCORCH_NARROWK_DEEP_UNROLL` |
+|---|---|---|
+| `SCORCH_NARROWK_EXACT_ACCUM` | `SCORCH_NARROWK_EXACT_DEGUNROLL` | `SCORCH_NARROWK_EXACT_K1` |
+| `SCORCH_NARROWK_EXACT_K1_MINDEG` | `SCORCH_NARROWK_EXACT_MINDEG` | `SCORCH_NARROWK_EXACT_SHORT` |
+| `SCORCH_SPMM_ADOPT_GRAIN` | `SCORCH_SPMM_BASE_WORK_TRUE` | `SCORCH_SPMM_CEIL_MINTHREADS` |
+| `SCORCH_SPMM_CEIL_ROWBIND` | `SCORCH_SPMM_HALFVEC_F64` | `SCORCH_SPMM_MULTIROW_MINNNZ` |
+| `SCORCH_SPMM_MULTIROW_ROWS` | `SCORCH_SPMM_NNZ_PER_THREAD` | `SCORCH_SPMM_PARTITION_SOLO_OFF` |
+
+Two of the zeros are the next levers rather than dead ends: `SCORCH_SPMM_NNZ_PER_THREAD` is the row
+ceiling's master switch and is aimed at the family that is 70–83% of the remaining deficit, and
+`SCORCH_SPMM_MULTIROW_ROWS` is multi-row register blocking, which is +12% at degree 8–64 on x86 and
+whose empty-group guard is now in the tree. Neither is a shape to tune; both have a queued run.
