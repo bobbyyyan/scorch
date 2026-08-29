@@ -220,16 +220,36 @@
 // M5 they are the same number, but on redwood the pool is 24 and capping there is worth
 // 1.0470 against 1.0865.
 //
-// OFF by default and every number above is synthesised from force arms, which is not the
-// same experiment: lowering the count also changes what
-// scorch_spmm_partition_mode derives from it, and cap 16 costing twelve x86 matrices more
-// than 5% where 8 costs one and 24 costs none is a non-monotonicity that parallelism alone
-// does not explain. Both corpora also stop at k=8, and on ARM the shipped E-core recruit
-// deliberately launches twice the pool for wide, bandwidth-bound products. Promote this
-// only once a compiled-in three-build reproduces it and a width sweep says where it must
-// stop firing.
+// ON as of the compiled-in three-builds on both hosts. Everything above was synthesised from
+// force arms, which is not the same experiment -- lowering the count also changes what
+// scorch_spmm_partition_mode derives from it, and cap 16 costing twelve x86 matrices more than
+// 5% where 8 costs one and 24 costs none is a non-monotonicity parallelism alone does not
+// explain. The promotion conditions were a compiled-in three-build reproducing it and a width
+// sweep saying where it must stop firing. Both landed:
+//
+//   ARM, hookless, compiled in    +6.1% float32, +5.1% float64, positive at all six widths
+//   x86, hookless, compiled in    float64 1.7% faster pooled (t -6.74); float32 0.55% (t -2.13)
+//   the width sweep              all six widths positive on both dtypes on both hosts
+//   correctness, compiled in      1099 passed on each host
+//
+// And where it stops firing is a TIME boundary, not a width: paired per cell against a same-code
+// build, banded on the reference's own time, the cap is worth 2 to 13% above 20 microseconds and
+// measurably nothing below it -- x86 float64 0.9805 / 0.9694 / 0.8739 across the 20-50us,
+// 50-200us and >200us bands (t -3.70 / -5.01 / -3.41), x86 float32 0.9670 at 50-200us (t -3.66).
+// ARM's matched buckets put the same boundary at 21 microseconds. Cells slower than the reference
+// fall 134 -> 127 (float32) and 140 -> 124 (float64) against a common reference reading.
+//
+// One declared cost, left in deliberately: x86 float32 under 20 microseconds is 0.34% slower at
+// t +4.04 over 2316 observations. A threshold has been considered three times and refused three
+// times for three different reasons; the current one is that the resolver has the work and the
+// effect follows the time, so a work threshold cuts on the wrong axis and made float32 worse when
+// synthesised. See SPMM_BEAT_MKL_RESULTS.md.
+//
+// -2 is the caller's pool -- the override when the caller passed one, otherwise what the
+// framework configured. Deliberately not omp_get_num_procs(), which is the defect being
+// corrected: on redwood 48 of 231 cells resolved to 32 inside a 24-thread torch pool.
 #ifndef SCORCH_SPMM_NT_CAP
-#  define SCORCH_SPMM_NT_CAP 0L
+#  define SCORCH_SPMM_NT_CAP (-2L)
 #endif
 
 // Which work measure bounds the BASE thread count. 0 is nnz*max(k,16), which is what ships; 1 is
@@ -280,12 +300,20 @@
 // no measurement saying 8 is acceptable for kl02: the ceiling's 1.1109 (float32, z=3.38) and
 // 1.1542 (float64, z=3.18) were both taken at its widened count. Hence the floor, and hence the
 // knob -- the alternative composition has to be measurable, not assumed.
-// The work (nnz*k, width NOT floored at 16) at or above which the thread cap declines to
-// act when acting would disable the E-core recruit. 0 -- the default -- means the cap never
-// declines, which is what every cap measurement so far was taken with. See the block that
-// reads it in scorch_spmm_nthreads for the grid that prices it.
+// The work (nnz*k, width NOT floored at 16) at or above which the thread cap declines to act
+// when acting would disable the E-core recruit. 0 means the cap never declines.
+//
+// Ten million, as of the same promotion as SCORCH_SPMM_NT_CAP, and it is a hybrid-pool rule that
+// is STRUCTURALLY INERT on a uniform one rather than a second policy. The recruit is only at
+// stake when the resolved count reaches twice the caller's pool; on x86 the pool is 24, the gate
+// is at 48 and the count is at most 32, so this condition provably cannot fire there and the cap
+// stays unconditional -- which is the configuration every x86 number above was measured in. On
+// the M5 the pool is 6, the gate is 12 and the count reaches 18, so it does fire, and the
+// threshold is where the autoencoder grid crosses over: the team is worth 2.18x above eighty
+// million units of work and costs 19% below ten million. See the block that reads it in
+// scorch_spmm_nthreads for that grid.
 #ifndef SCORCH_SPMM_RECRUIT_MIN_WORK
-#define SCORCH_SPMM_RECRUIT_MIN_WORK 0L
+#define SCORCH_SPMM_RECRUIT_MIN_WORK 10000000L
 #endif
 #ifndef SCORCH_SPMM_NT_CAP_FLOOR_CEIL
 #  define SCORCH_SPMM_NT_CAP_FLOOR_CEIL 1
