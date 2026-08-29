@@ -13862,3 +13862,35 @@ in all three bands on ARM (84/103, 22/22, 122/122), which is what `K1_MINDEG=0` 
 non-moving cells in the first band are matrices whose rows are almost all a single nonzero, where every
 kernel produces the same bits because there is nothing to reassociate. Width 4 moved nowhere
 (0/103, 0/22, 0/122) — the exact band stops at 3, and that is the structural null holding.
+
+### The leading suspect for the fixed cost, and the reason it can be A/B'd without a rebuild
+
+The SpMM launches its workers on a **private libgomp team** by default and uses torch's own intra-op
+pool only when the caller sets `atparallel` — which the plain `matmul` path does not. This ledger
+already records what a private team costs the code next to it: torch's own matmul runs 1.12–1.33x
+slower beside one. On a 24-core host with torch's pool also holding 24 spinning threads, launching a
+second team of 18–24 means preempting spinners that belong to **the pool MKL runs on**. That is a
+fixed per-call cost we pay and MKL does not, of exactly the order the decomposition is hunting.
+
+It needs no new build. `SCORCH_SPMM_ATPARALLEL` is read outside the hooks guard, so it is live in a
+release `.so`, and it bypasses the eligibility gate entirely. The branch it selects uses the
+**resolved** worker count and executes every id in `[0, nthreads)`, so forcing it is correct whatever
+the caller passed — the `nthreads_override > 0` term in the gate is about *policy*, not correctness.
+`fixed_decomp.py` now carries it as a third arm, and every scorch arm sets that one variable (`"0"`
+for the two baselines, `"1"` for the candidate) because in a build that looks up environment
+variables each extra variable an arm *sets* is worth about 1.1% on x86 on a sub-30µs kernel.
+
+A smoke test on the M5 showed the kernel column moving by 10–14µs of 35 and the whole-call column not
+moving at all. **That is not offered as a result and should not be quoted as one.** It ran nice-19
+alongside the ARM three-build's own timing, its kernel figure was one sample where its whole-call
+figure was a minimum over nine batches, and the two disagreeing by that much is itself a sign the
+measurement was not clean. It is recorded only as the reason the arm is worth a proper run.
+
+**And the contamination is worth recording as a process failure, because it cost the ARM run.** I
+launched that probe on the same laptop while ship/pass1 and ctrl/pass1 were being timed. `nice -19`
+does not stop two processes contending for six P-cores, and a minimum over batches does not rescue a
+run whose disturbance outlasts a batch. The affected passes were discarded and the stage restarted
+from the top with a **refuse-to-run guard** ahead of its timing section, matching on the interpreter
+invocation rather than a bare word so a monitor's own command line cannot satisfy it. The remote
+harness has had `rw_quiet` for exactly this since chain20-something; the local one had nothing, which
+is the same defect in a place I had not thought of as a measurement host.
