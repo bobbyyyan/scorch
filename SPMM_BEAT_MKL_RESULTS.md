@@ -12634,3 +12634,73 @@ the run reports, so the reading is not fitted to the result.
 
 float64 is still in the probe as of this writing; the float32 halves are complete and are what is
 above.
+
+## The endgame list was named without a per-cell floor, and two of its three top items do not survive one
+
+chain63's caller path carries three arms that are the identical configuration — `ref`, `refb` and
+`aa`, all `NT_FORCE=0` — so every one of its 1812 cells has three replicates of the shipping code
+inside one probe session. That is a per-cell floor, which the endgame table in this file did not
+have. Applying it changes which matrices the residual is made of.
+
+Call a cell *behind MKL* only if MKL beats the **best** of the three replicates by more than the
+three differ among themselves. The range of three, rather than a standard error, is a deliberately
+conservative floor: it is easy for a cell to clear and hard to argue with.
+
+| how the residual is counted | cells behind, of 1812 |
+|---|---|
+| by `ref` alone, which is how the scoreboard counted | 158 |
+| by the median of three replicates | 158 |
+| by the best of three | 144 |
+| by the best of three **and** beyond that cell's own spread | **128** |
+
+The same-code spread is 1.020 at the median, 1.323 at p90, 2.066 at p99 and 2.970 at worst. So
+four-fifths of the residual is real and one-fifth is a cell's own variance reported as a deficit —
+but the noise is not distributed where you would guess. **The ten noisiest matrices, spreads 1.33 to
+1.76, have three cells behind MKL between them, and seven have none.** The 128 survivors sit on quiet
+matrices whose median spread is 1.004 to 1.027. Noise did not manufacture the residual.
+
+It did manufacture the *names*. Cell by cell, `par` being MKL over the best of the three replicates:
+
+| matrix | rows | degree | cells behind MKL | of those, surviving the cell's own spread |
+|---|---|---|---|---|
+| kl02 | 71 | 2993 | 4 of 6 | **1** (k=64, 0.908 against a spread of 1.091) |
+| nw14 | 73 | 12396 | 3 of 6 | **0** |
+| bibd_17_8 | 136 | 5005 | 2 of 6 | **1** (k=4, 0.905 against a spread of 1.051) |
+
+kl02 at k=1 reads 1.643 against a same-code spread of **2.441**; at k=4, 0.898 against 1.330. nw14 at
+k=4 reads 0.832 against 1.203, at k=16 0.974 against 1.392. These are 71- and 73-row matrices with
+mean degrees of 2993 and 12396 — a few dozen enormous rows spread over 24 threads, which is the
+worst case for run-to-run variance on this host, and it shows up in the same-code arms directly.
+
+This is a correction to a claim earlier in this file. The endgame table named kl02, nw14, bibd_17_8
+and four rn50 blocks as 21 of the 31 float32 cells more than 5% behind, and I wrote that "every
+endgame item has a queued run and a pre-existing mechanism". The three SuiteSparse matrices
+contribute **two** surviving cells here, not fifteen. Their margins were never shown against their
+own floors, and when they are, most of them are not there. Before any of them is optimised, it needs
+a run that establishes its floor — more replicates, or pinning, or both.
+
+**What the residual actually is.** The 128 survivors:
+
+- by width: k=1 → 35, k=2 → 15, **k=4 → 76**, k=8 → 0, k=16 → 1, k=64 → 1. **126 of 128 are at k ≤ 4.**
+- by row band: rows<128 → 1, **128-600 → 75**, 600-2400 → 9, >=2400 → 43.
+- median 512 rows, median degree 182.
+- margin over MKL: median 1.084, p90 1.175, max 1.654. Only ten cells are more than 20% behind.
+
+The 43 at 2400 rows and up are the band the shipped pool cap takes to zero, so the post-ship residual
+on this corpus is about **85 cells, 75 of them 128 to 600 rows, essentially all at k ≤ 4, median 8%
+behind, on quiet matrices**. Not a few pathological SuiteSparse matrices — a broad band of
+512-row, degree-180 layers at narrow width.
+
+**Which says what to build next, and it is not a thread rule.** chain63's ladder finds no forced count
+that helps the 128-600 band: the best of five is t16 at 0.7679, all five worse than the rule by 23% or
+more at z ≤ −11. A thread mechanism cannot reach a deficit that is not about threads. What is left is
+kernel throughput at k ≤ 4 on medium-degree rows, which is `SCORCH_NARROWK_EXACT_DEGUNROLL` and the
+exact-width kernel — chain65, already queued — and it is consistent with the measured ceiling that a
+sparse `+=` through an indirect load keeps one accumulator register at about four cycles per nonzero
+whatever `-ffast-math` is told.
+
+So the queue's value order is now the reverse of its run order: chain65 is the run that can move the
+residual, and chain64 is predicted null twice over — its mechanism is a thread count, and the band it
+aims at is not thread-limited. It stays queued, because a predicted null that reports the null is
+worth more than a prediction, and because its `g512_192_nocap` arm prices the pool cap on a third
+corpus. But nothing should be designed on the assumption it will find something.
