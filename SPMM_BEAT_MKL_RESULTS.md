@@ -13175,3 +13175,76 @@ band is unresolvable is not a contradiction, and no decision rests on it.
 `e16` is present here and, as the note in chain69's design says, uninterpretable: 16 lies inside the
 8-64 band, so at deg8-64 it reads 1.0496 — serving the part of the band above 16 and withholding the
 part below — agreeing with neither column. chain69 drops it for that reason.
+
+## chain65 x86 float64: the fourth configuration, a correct-but-uninformative refusal, and a correction about DEGUNROLL
+
+The float64 kernel halves are complete (both passes, both orders) and `an_ship3.py` **refuses the
+pooled comparison**, correctly:
+
+```
+      ctrl / ship  (the floor)   1.0136   1.0145
+     cand / ship  (the change)   1.0284   1.0280
+REFUSING -- the same-code floor sits 1.45% from 1.000 and the effect 2.84%,
+so the effect is not 2x its own floor and cannot be resolved by this run
+```
+
+That guard exists because a run whose float64 half was unreadable once passed two other limits. Here
+it fires for a different reason, and the per-width table says which: the floor is **6.5% at k=64**
+(`cand` 1.0675 against a `floor` of 1.0651) while it is **0.19% at k=1** (`cand` 1.0630 against
+0.9981). k=64 is a band where neither flag can act — `EXACT_HI` is 3 — so the pooled floor is
+dominated by same-code drift in cells the change cannot touch. Banded by degree the k=64 floors reach
+**1.3015** at deg<1 and 1.1168 at deg1-2.
+
+This is the dilution failure this file has recorded before: a pooled floor rule refuses a real effect
+when an inert band carries the variance. The refusal is right about the pooled number and says nothing
+about k=1, whose own floor is a fifth of a percent against a 6.3% effect. Stratify and read the row
+the mechanism acts on.
+
+x86 float64, kernel, by degree at k=1, with each band's own same-code floor beside it:
+
+| band | n | k=1 cand | floor |
+|---|---|---|---|
+| deg<1 | 42 | 1.0706 | 0.9976 |
+| deg1-2 | 10 | 1.0983 | 1.0001 |
+| deg2-4 | 41 | 1.0619 | 0.9987 |
+| deg4-8 | 42 | **0.9595** | 0.9983 |
+| deg8-64 | 37 | 1.0672 | 0.9999 |
+| deg64+ | 40 | **1.1621** | 0.9955 |
+
+Every k=1 floor is inside half a percent of 1.000. So the fourth configuration is measured, and **all
+four now show the same structure — exactly one contiguous losing band, in the middle, with wins on
+both sides of it:**
+
+| | deg<1 | deg1-2 | deg2-4 | deg4-8 | deg8-64 | deg≥64 |
+|---|---|---|---|---|---|---|
+| ARM f32 | +6.9% | +0.4% | +6.4% | +9.4% | +4.9% | +5.4% |
+| ARM f64 | +6.7% | **−4.3%** | +3.2% | +8.6% | +5.3% | +6.1% |
+| x86 f32 | +2.7% | −1.7% (in floor) | **−1.5%** | **−3.5%** | +3.6% | +19.5% |
+| x86 f64 | +7.1% | +9.8% | +6.2% | **−4.1%** | +6.7% | +16.2% |
+
+Four for four with the cost model, and the losing band's *position* moves with how expensive the
+kernel's per-row setup is against what it displaces — deg1-2 on ARM float64, deg4-8 on x86 float64,
+deg2-4 through 4-8 on x86 float32, nowhere on ARM float32. The setup is `UNROLL*K` accumulators, which
+is eight doubles where it is eight floats, so the dtype moving the band is expected; the incumbent is a
+`vgatherdps` on x86 float32 and a quarter-full register tile elsewhere, so the ISA moving it is too.
+
+**Correction: `DEGUNROLL` is not the unconditional win claimed above.** I wrote that it "looks
+unconditional" from x86 float32, where at k=2 it is worth +4.5% pooled and up to +13.6% at deg<1. The
+other three configurations say otherwise:
+
+- **x86 float64 at k=2: inert.** Every band inside its floor — 1.0197/1.0085, 1.0420/1.0530,
+  0.9948/0.9978, 0.9915/1.0074, 1.0023/0.9999, 0.9885/0.9905.
+- **ARM at k=2: a small, clear cost at the bottom.** float32 deg<1 reads 0.9834 at z −2.9 against a
+  0.9972 floor; float64 deg<1 reads 0.9815 at z −4.6 against 0.9969. It gains 1–2% at deg1-2 and
+  deg2-4 on both dtypes.
+
+So DEGUNROLL is a float32-on-x86 win at k=2, inert on x86 float64, and mixed at the ±2% level on ARM
+with a repeatable 1.8% cost below degree 1. That is the same shape as `SCORCH_SPMM_HALFVEC_F32` versus
+`_F64` — a per-configuration default, not a single flag — and the honest statement is that it needs one
+per ISA and dtype, not that it ships everywhere. Its k=1 contribution is separate and still holds:
+on ARM float32 it is what turns K1's one losing band from 0.9682 to 1.0037.
+
+Nothing changes for chain69, which holds `DEGUNROLL=1` in every arm including `ref`. That was chosen so
+the threshold is placed on the baseline that will ship on **this host and dtype pair**, and x86 float32
+is where DEGUNROLL is a win. For x86 float64 the same ladder measures the threshold with DEGUNROLL on
+and inert, which is the same as measuring it with DEGUNROLL off — so one ladder still answers both.
