@@ -14246,8 +14246,22 @@ memoize inside `inference_mode` would have been the other option and is worse: i
 revalidation back on the hot path precisely where an inference workload spends all of its time.
 73 passed, 0 failed, `scorch.matmul` under `inference_mode` at relerr 0.
 
-This bug is in the main tree too, and reaching it requires only `with torch.inference_mode():` — the
-standard inference idiom — around any scorch matmul.
+**Correction, same day.** I first wrote that this bug is in the main tree. It is not, and the check
+is worth recording because the wrong version would have told Bobby that a matmul inside
+`torch.inference_mode()` breaks in code he has shipped. `_validation_stamp` does not exist on `main`
+at all; no python file under `src/scorch/` on `main` or on the phase-3 branch checked out in
+`/Users/bobby/scorch` reads `._version`; and `7c067bc`, which introduced the stamp, is an ancestor of
+only `perf/spmm-beat-mkl` and `perf/spmm-probe-and-kernel` — both of which are pushed to origin, so
+the regression is on a pushed branch but not on `main`. "Failing 1 of 73 before any of today's work"
+is still right: it predates today without predating the branch.
+
+What replaces it is a better finding anyway, and the dates make it sharp. `6a65525` fixed the
+**native** half of exactly this defect on 2026-08-16, with a comment stating the consequence of not
+guarding. `7c067bc` added the Python half on 2026-08-17 — *the next day* — with the same
+version-counter pattern and no guard. The rule was in the codebase, one day old, and the new layer
+did not mirror it. The failure pattern said so too: three native cases passing in the same section
+while the Python one failed is the signature of a rule implemented in one layer and not the other,
+and it is worth reading that shape as a class of defect rather than as one bug.
 
 ### Correction to the section above: the corpus already exists
 
