@@ -12277,3 +12277,66 @@ floors said 0.4–0.7% while the inert group's cell-to-cell spread is 2.98%. A f
 cell's two readings measures that cell's repeatability, not the spread of the population it sits in,
 and comparing an effect to the first while claiming the second is how a 2% artifact becomes a
 finding. The null group's spread is the honest denominator.
+
+## The straddling hypothesis is refuted, and the section above it is wrong
+
+stage44 held each model fixed and moved sparsity across that model's own threshold crossing, so the
+only thing changing is how many of its four weight matrices the cap acts on. Three models, three
+regimes each, three passes, reusing stage43's exact binaries. The prediction was that "some" — a
+model whose layers straddle `nnz*batch = 10,000,000` — would be **slower** than "none".
+
+**It is not.** Time ratios, below 1.000 is the flip faster:
+
+| the cap acts on | n | geomean | spread | vs the floor | z |
+|---|---|---|---|---|---|
+| no layer (the floor) | 6 | 0.9880 | 1.93% | — | — |
+| **half the layers** | 8 | **0.9670** | 3.99% | 0.9788 | **−1.33** |
+| every layer | 8 | **0.8661** | 11.11% | 0.8766 | **−3.29** |
+
+"Some" is *faster* than the floor, not slower, and inside the noise. Within each model, holding the
+model fixed:
+
+| model | none | some | all |
+|---|---|---|---|
+| fashion | 0.9812 | 0.9596 | **0.7483** |
+| mnist | 1.0034 | 0.9226 | **0.8923** |
+| svhn | 0.9795 | 0.9871 / 1.0006 | 0.9872 |
+
+fashion and mnist improve **monotonically** with the number of layers the cap reaches. There is no
+straddling penalty to find. The real pattern is the boring one: the cap's benefit scales with how
+much of the model it applies to.
+
+**And svhn at 0.99 did not replicate.** stage43 read 1.0192 plain and 1.0317 fused there; stage44,
+same binaries, same model, same sparsity, three passes instead of two, reads **1.0044 and 0.9967**.
+svhn is simply a weak responder at every sparsity — 0.98 to 1.00 across all four points, including
+the one where the cap acts on all four layers.
+
+### What went wrong, and it is the mistake I had just finished writing up
+
+stage43's svhn 0.99 cell had a same-code floor of **0.02%** — `n1` and `n2` agreed to three decimal
+places — and against a 0.02% floor a 1.9% reading is separable by any rule. In the same section I
+wrote that a per-cell floor from two builds measures that cell's repeatability and not the spread of
+the population it sits in, and that comparing an effect to the first while claiming the second is how
+an artifact becomes a finding. I then did exactly that: the two cells I *dismissed* as noise had
+floors of 0.42% and 0.73%, and the cell I *promoted* to a finding had a floor of 0.02%, which is a
+tighter coincidence of two readings, not better evidence. The inert group's 2.98% spread was the
+honest denominator for all three, and by it none of them were separable.
+
+The z of +3.59 inherited the same defect: it was computed against the inert group's spread, which is
+correct, but from a two-cell group whose two cells are the same configuration measured twice — so it
+had one degree of freedom pretending to be two.
+
+**The corrected ARM real-workload result, which is a better one:** on the autoencoder the flip is
+**13.4% faster where the cap acts on the whole model** (z −3.29 against a production-derived null
+group), neutral-to-slightly-faster where it acts on part of it, and provably nothing where it cannot
+act. On GCN it is neutral, eight of eight cells inside their floors. **No separable regression
+anywhere on either workload.** The "3.4% against on the configuration that straddles" in the
+preceding section should be read as withdrawn, and the mechanism it proposed — paying an OpenMP team
+transition at every layer boundary — is unsupported: the models that straddle are the ones that
+improve monotonically.
+
+The falsification test cost one twenty-minute run on already-built binaries and overturned a
+published number. It is worth noting why it was cheap: the hypothesis made a sharp prediction about
+a population that could be *constructed* — sparsities chosen so a model's layers land on a chosen
+side of a known constant — rather than one that had to be found. A mechanism that only predicts the
+cases you already measured cannot be tested this way, which is a reason to prefer the ones that do.
