@@ -13824,3 +13824,41 @@ displacing the half-vector kernel, and the exclusion was the fix. Both were true
 recovered only 0.9425 → 0.9702 of it; the rest was never the kernel swap at all, it was the cost of
 asking. **A gate that declines a width still charges for the question**, and on short rows that
 charge is measurable.
+
+### Correction: the unroll depth IS observable at k=2, and a uniform-degree synthetic hid it
+
+The section above claimed that the exact-width kernel's unroll depth cannot reach the output at k=1
+or k=2, and drew two conclusions from it: that `DEGUNROLL` had shipped unconfirmed against an object,
+and that k=3 was the only width where it could ever be confirmed. **The first claim is wrong in the
+band that matters and both conclusions with it.** The ARM three-build's fires-check refuted it on the
+first pass — at mean degree below 4, k=2 differed on **80 of 103 matrices**, and k=3 on the same 80.
+
+The argument was right about rows and wrong about matrices. For a row shorter than the deeper unroll
+the two depths are bitwise identical: the full loop runs zero times, the epilogue adds exact zeros,
+and the remainder loop sums in order, which is what a unroll of 1 produces. But `DEGUNROLL` chooses
+the unroll from the **mean** degree while the bits depend on **each row's** length, and a matrix of
+mean degree 2 with a skewed degree distribution has plenty of rows longer than 4. Those rows see a
+different summation order.
+
+**What hid it was the shape of the probe.** I verified the claim on synthetic matrices with every row
+exactly `deg` nonzeros long — the one degree distribution in which "shorter than the unroll" is a
+property of the matrix rather than of individual rows, and therefore the only one where the
+invisibility holds. A real corpus refuted it immediately. The ledger already carries this lesson
+attached to a different result ("the shapes are synthetic — 46% empty rows and uniformly-spread
+nonzeros, matched to Pd_b's summary statistics rather than to its structure"); it applies to any claim
+about a rule that reads a mean and acts per row, because a synthetic matrix built from a mean has no
+variance for the rule to be wrong about.
+
+What survives, and it is the useful half: the invisibility is real per row, so a rule that halves the
+unroll only on matrices whose rows are *all* short is genuinely unobservable in the output, and any
+fires-check for such a rule needs a skewed corpus or it will report a false null. And the correct
+prediction, now encoded in `flip_fires.py` and gating both hosts' runs, is that widths 2 and 3 move
+below mean degree 4 and are inert from 4 up, which is `DEGUNROLL`'s band — and the ARM data satisfies
+it exactly (0 of 22 at degree 4-8, 0 of 122 at degree ≥8).
+
+So `DEGUNROLL` is confirmable against an object after all, at every width the exact kernel serves, and
+this run is the confirmation. Two further readings from the same table, both consistent: width 1 moved
+in all three bands on ARM (84/103, 22/22, 122/122), which is what `K1_MINDEG=0` requires; and the 19
+non-moving cells in the first band are matrices whose rows are almost all a single nonzero, where every
+kernel produces the same bits because there is nothing to reassociate. Width 4 moved nowhere
+(0/103, 0/22, 0/122) — the exact band stops at 3, and that is the structural null holding.
