@@ -12197,3 +12197,83 @@ Two of the zeros are the next levers rather than dead ends: `SCORCH_SPMM_NNZ_PER
 ceiling's master switch and is aimed at the family that is 70–83% of the remaining deficit, and
 `SCORCH_SPMM_MULTIROW_ROWS` is multi-row register blocking, which is +12% at degree 8–64 on x86 and
 whose empty-group guard is now in the tree. Neither is a shape to tune; both have a queued run.
+
+## The ARM real workloads at the compiled-in default, and what the threshold costs when it splits a model
+
+stage43 is the last ARM guardrail: the autoencoder and GCN benches with the flip **compiled in**
+rather than set in the environment. Three trees, each built exactly once, names two characters long
+so the embedded-path difference is the same length in every comparison — `n1` and `n2` are the tip's
+new defaults, `o1` pins `-DSCORCH_SPMM_NT_CAP=0 -DSCORCH_SPMM_RECRUIT_MIN_WORK=0`, which folds the
+whole cap block away and reproduces the pre-flip release build. Same-code control: **2 differing
+instruction lines**. The flip: **67159**.
+
+**GCN is neutral, all eight cells inside their floors.** Pooled over the four datasets, Scorch
+0.9989 (t −0.11) and fused 1.0068 (t +1.92), as time ratios.
+
+The autoencoder needed the population split, and the split is not by sparsity — it is by **how many
+of each model's four weight matrices the cap can act on at all**, which is a question for the
+production policy function rather than for a rule of thumb. `SCORCH_SPMM_RECRUIT_MIN_WORK` declines
+the cap when `nnz*batch >= 10,000,000`, so at batch 256:
+
+| model | layers (nnz·batch, millions) at s=0.99 | acts on |
+|---|---|---|
+| mnist | 2.1, 1.3, 1.3, 2.1 | **4 of 4** |
+| fashion | 4.1, 5.4, 5.4, 4.1 | **4 of 4** |
+| svhn | 16.1, 5.4, 5.4, 16.1 | **2 of 4** |
+| stl10 | 289.9, 21.5, 21.5, 289.9 | 0 of 4 |
+
+and at s=0.8 and s=0.9 every layer of every model is above the threshold. So of the twelve
+model × sparsity groups, nine are **provably inert** — both builds resolve to the same thread count,
+so those cells cannot move by mechanism and their spread is the apparatus's own floor, measured
+rather than assumed:
+
+| group | n | geomean | spread | vs the inert group | z |
+|---|---|---|---|---|---|
+| the cap acts on **no** layer | 18 | **0.9917** | 2.98% | — (this *is* the floor) | — |
+| the cap acts on **every** layer | 4 | **0.8068** | 8.89% | 0.8135 | **−4.59** |
+| the cap acts on **half** the layers | 2 | **1.0254** | 0.86% | 1.0340 | **+3.59** |
+
+**Where the cap acts on the whole model it is 19.3% faster on all four cells** (fashion fused
+0.7096, mnist fused 0.8152, mnist 0.8470, fashion 0.8645). **Where it acts on half the model it is
+3.4% slower**, and both cells agree (svhn 0.99: 1.0192 plain, 1.0317 fused).
+
+That is a mechanism this project has already named twice — a private OpenMP team slows the code next
+to it, and pubmed's cost was a pool transition rather than a kernel. A model whose layers straddle
+the threshold alternates, within one forward pass, between a six-thread capped team and an
+eighteen-thread recruited one, and pays for the transition at every layer boundary. The cost is in
+neither regime; it is in changing between them.
+
+**It is one group, and it should be read as one group.** svhn at 0.99 is the only model × sparsity
+in this grid that straddles, so "mixed" is two cells from one configuration, and z = +3.59 is
+against a floor built from other configurations. What raises it above a curiosity is that an earlier
+run reached it independently: stage37, environment arms on a hooks build, also found svhn the single
+loser, at 1.1195. Two instruments, same model, same direction.
+
+**The falsifiable prediction, which is what makes this worth acting on rather than noting:** any
+autoencoder configuration whose four layers straddle `nnz*batch = 10,000,000` should be slower, and
+any configuration entirely on one side of it should not. That is a grid that can be built on purpose
+rather than found by accident — hidden sizes chosen so the outer layers sit just above the threshold
+and the inner ones just below. If it holds, the threshold's shape is wrong in a way a different
+*value* cannot fix, and the honest fix is hysteresis or a per-model decision rather than a per-call
+one. Until that grid runs, the flip ships as measured: 19.3% where it fully applies, 3.4% against on
+the one configuration that straddles, and provably nothing on the other nine.
+
+### Two corrections to how this was first scored
+
+**The passenger correction needs a passenger worth correcting with.** The first scoring of this run
+reported cora at 1.0688 — a separable 6.9% regression — because it divided out PyTorch's 4.89%
+move. But PyTorch's own same-code floor on cora is **6.71%**, larger than its move, so that move was
+not evidence of anything and dividing by it amplified noise into a finding. Raw, cora is 1.0165
+against a 1.63% floor: nothing. The correction is right when the passenger's move is large compared
+to the passenger's own noise — on chain31b pubmed it was 2.55% against a 0.22% spread, eleven times
+its noise — and wrong otherwise. `an_flip43b.py` now applies it only when the move exceeds twice the
+passenger's floor, and prints which happened. Across this run the gate opens exactly once, on pubmed,
+where it moves 0.9668 to 0.9716.
+
+**A per-cell same-code floor from two builds understates the noise.** Two cells looked separably
+slower on the first pass — mnist s0.9 fused at 1.0256 against a 0.42% floor, stl10 s0.9 at 1.0222
+against 0.73%. Both are in the provably-inert group, so both are noise by construction. Their own
+floors said 0.4–0.7% while the inert group's cell-to-cell spread is 2.98%. A floor computed from one
+cell's two readings measures that cell's repeatability, not the spread of the population it sits in,
+and comparing an effect to the first while claiming the second is how a 2% artifact becomes a
+finding. The null group's spread is the honest denominator.
