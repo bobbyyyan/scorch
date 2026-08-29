@@ -13758,3 +13758,66 @@ on x86 is 8, so this is the flip's effect without its floor; the losing k=1 cell
 128–512, above the floor, so the shipped configuration should recover the same cells, and chain72 is
 where that stops being an argument. And this is chain65's degree-stratified corpus, not chain63's —
 9 matrices overlap — so it is not a 128 → N claim about the canonical residual board.
+
+## chain71 float32: the exclusion works, and the dispatch's own test costs up to 7%
+
+chain71's gates passed cleanly and are worth recording as much as its numbers. Release neutrality of
+10cf611 came back with **159,998 instructions on both sides, 10 differing pairs, every one a
+`mov $imm,%edx`, every delta exactly 16, zero real code** — against a patch that inserted exactly 16
+source lines into `spmm.h`. The classifier that distinguishes a `__LINE__` immediate from a changed
+constant is what made that a pass rather than the refusal a flat count produced. `mr2_correct` read
+864 comparisons and 0 mismatches on both the candidate and the baseline.
+
+Then the measurement, float32, 1208 cells, two passes averaged per build:
+
+| | kernel | whole | | |
+|---|---|---|---|---|
+| ctrl / ship (the floor) | 1.0038 | 1.0053 | | |
+| cand / ship (the change) | 1.0153 | 1.0113 | | |
+
+| k | cand/ship | floor | n |
+|---|---|---|---|
+| 4 | **0.9702** | 1.0097 | 302 |
+| 8 | 1.0601 | 1.0046 | 302 |
+| 16 | 1.0325 | 0.9937 | 302 |
+| 64 | 1.0006 | 1.0073 | 302 |
+
+k=8 and k=16 hold their wins, k=64 is the structural null it has to be — and **k=4 is still slower,
+0.9702 against a floor of 1.0097.** That is the part that should have been impossible. With the
+half-vector exclusion in place multi-row *declines* float32 k=4, so candidate and baseline run the
+identical kernel at that width and the ratio is a structural null by construction.
+
+The degree axis says what is going on:
+
+| band | n | k=4 | k=8 | k=16 | k=64 |
+|---|---|---|---|---|---|
+| deg2-4 | 35 | **0.9298** | 1.0382 | 1.0044 | 1.0449 |
+| deg4-8 | 8 | **0.9594** | 1.0540 | 1.0547 | 0.9944 |
+| deg8-64 | 160 | **0.9670** | 1.1083 | 1.0741 | 1.0004 |
+| deg64+ | 88 | **0.9933** | 0.9921 | 0.9572 | 0.9791 |
+
+(`ship/cand` here, so above 1 is the candidate winning — the opposite orientation from the table
+above it, which is `an_ship3.py`'s.) The k=4 column is monotone in degree and converges on 1.0 as
+rows lengthen. **That is the signature of a cost paid per row rather than per nonzero**: fixed work
+per row is a larger share of a short row.
+
+And the dispatch is where it comes from. The condition tested **eight loop-invariant terms inside
+the row loop** — the policy depth, the nonzero floor, `narrow_k`, `exact_width`, `force_workspace`,
+the nonzero-axis gather, and the two-part half-vector exclusion — when only `i + multirow <= end` and
+`A1_pos[i + multirow] > A1_pos[i]` depend on the row. The compiler is entitled to hoist the rest and
+at `-O3`, inside a lambda inside a work-stealing loop, it did not. Committed as **b51f857**: a single
+`const bool multirow_ok` computed before the parallel region, with the bounds test still ahead of the
+`A1_pos` load so the guard order is unchanged. Pure short-circuit reordering, and `#if`-excluded
+entirely in a release build at `MULTIROW_ROWS=0`.
+
+**Pre-registered for chain74, before the data.** (1) float32 k=4 comes inside its same-code floor.
+(2) That degree gradient flattens — if k=4 still runs 0.93 → 0.99 monotonically, the per-row test was
+not the mechanism and something else costs per row. (3) k=8 and k=16 grow, and grow *most* in the low
+degree bands, because the cost being removed is the same one suppressing them there. (4) k=64 stays a
+structural null. **Satisfying (1) but not (2) is the interesting failure** and will be reported as one.
+
+Note what this implies about chain67's number. Its 0.9425 at float32 k=4 was read as multi-row
+displacing the half-vector kernel, and the exclusion was the fix. Both were true, but the exclusion
+recovered only 0.9425 → 0.9702 of it; the rest was never the kernel swap at all, it was the cost of
+asking. **A gate that declines a width still charges for the question**, and on short rows that
+charge is measurable.
