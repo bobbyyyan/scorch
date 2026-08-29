@@ -13894,3 +13894,40 @@ from the top with a **refuse-to-run guard** ahead of its timing section, matchin
 invocation rather than a bare word so a monitor's own command line cannot satisfy it. The remote
 harness has had `rw_quiet` for exactly this since chain20-something; the local one had nothing, which
 is the same defect in a place I had not thought of as a measurement host.
+
+### chain75, pre-registered: does the SHIPPING dispatch chain pay for its questions too?
+
+b51f857 fixed the multi-row condition. The shipping row loop asks a comparable number of
+loop-invariant questions on every row — `narrow_k`, then half-vector (two sub-tests), then
+`exact_width`, then the nonzero-axis gather (three terms), then the deep kernel — and whether *those*
+are hoisted decides whether the chain is worth restructuring into one per-call decision. That would
+be a broad win on short rows, which is where the real GCN graphs live (cora ~4, citeseer ~3, pubmed
+~4.5, arxiv ~14 nonzeros a row), so it is worth knowing rather than guessing.
+
+Guessing is tempting and would be wrong in a specific way. The multi-row condition ends in
+`A1_pos[i + multirow] > A1_pos[i]` — a term that changes every iteration — and a conjunction whose
+last operand is row-dependent cannot be lifted as a whole; the compiler would have to unswitch the
+loop, duplicating a large body. The shipping chain has no such trailing term, so it *may* already be
+hoisted, in which case restructuring it buys nothing and risks a regression.
+
+So the two mechanisms get separated instead of pooled. A hooks-only block at the top of the row loop
+evaluates N loop-invariant tests whose values come from the environment (so they cannot be folded)
+and whose final operand is always zero (so the branch is never taken and behaviour cannot change):
+
+| arm | what it evaluates per row |
+|---|---|
+| `ref`, `refb` | nothing — identical, and they bound the floor |
+| `dt4`, `dt8` | four and eight invariant tests, all hoistable in principle |
+| `dt8r` | the same eight, then a row-dependent term **last** |
+
+* **`dt8` null and `dt8r` costs** → the trailing row-dependent term is the mechanism. The shipping
+  chain has none, is already hoisted, and should be left alone.
+* **Both cost** → invariant tests in this loop are simply not hoisted. The shipping chain pays for
+  every question on every row and restructuring it is worth doing.
+* **`dt8` costs and `dt8r` null** → incoherent; report as an instrument failure, not a result.
+
+Read the **degree axis**, not the pooled number: a cost paid per row is a larger share of a short row,
+so its signature is a ratio rising monotonically toward 1.0 as degree grows, and a corpus whose mass
+sits at high degree will pool it away. Every arm sets the same five variables so the per-variable
+lookup charge cancels, `--pad-env` equalises the rest, and this run needs no correctness check because
+the arms are a pure A/A in results by construction — they differ only in what the loop evaluates.
