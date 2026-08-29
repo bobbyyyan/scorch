@@ -12453,3 +12453,51 @@ that table, because `torch.sparse.mm` pays the same row walk and more. Pd_b's de
 **MKL on x86**, where the pool is 24 rather than 6 and the per-thread cost is different, so the
 thread remedy is refuted on ARM and merely untested on x86. And the shapes are synthetic — 46% empty
 rows and uniformly-spread nonzeros, matched to Pd_b's summary statistics rather than to its structure.
+
+### The cheaper row loop already has a name, a mechanism, and a queued run
+
+The section above ended by saying the remedy for the degree-under-one family is a cheaper row loop
+rather than more workers, and left open whether that is improvable. It is, and `spmm.h` already says
+how — the mechanism was written down when the exact-width narrow-k kernel was built:
+
+> The kernel's prologue is `UNROLL*K` zero stores and its epilogue is `(UNROLL-1)*K` adds, both paid
+> per row whatever the row's length, so a row of one nonzero at K=4 and UNROLL=4 does about
+> thirty-two operations to perform four useful multiply-adds. That is not hypothetical: on the M5,
+> as-735 (7716 rows, mean degree 1) is the single largest group of cells the exact-width kernel makes
+> slower, 35 of 64, all at float k=2 and k=4 where this kernel fires.
+
+That is the same cost my row sweep measured from the outside — about four nanoseconds per non-empty
+row of one or two nonzeros — reached from the code instead of from the clock. `SCORCH_NARROWK_EXACT_UNROLL`
+ships at 4, so every short row pays a prologue and epilogue sized for four independent nonzero
+streams it does not have.
+
+Three constants address it and all three are zero. Their status is not symmetric and the difference
+matters:
+
+- **`SCORCH_NARROWK_EXACT_SHORT`** — clamp the unroll per row, from that row's length. **Measured and
+  rejected**: it costs 1.0% pooled on x86 float32, 1.0257 to 1.0157 over 2880 padded cells, and the
+  comment identifies why — not the compare, but that the switch it feeds stops being predictable once
+  neighbouring rows take different unrolls.
+- **`SCORCH_NARROWK_EXACT_DEGUNROLL`** — choose the unroll **once per call** from the mean row length
+  instead of once per row. No per-row branch at all, and it still gives a degree-1.6 graph an unroll
+  of 1. This is the designed successor to the rejected form and it is what the queue should settle.
+- **`SCORCH_NARROWK_EXACT_MINDEG`** — refuse the exact-width kernel entirely below a degree floor.
+  Off "until both hosts have measured it".
+
+So endgame item 2 does not need a new mechanism either. **chain65 is exactly this run** — it builds
+`-DSCORCH_NARROWK_EXACT_K1=1 -DSCORCH_NARROWK_EXACT_DEGUNROLL=1` compiled in, three builds, over
+chain50's degree-stratified corpus, which is a corpus built to hold enough low-degree matrices to
+resolve it. It was re-deployed today after a promotion had put it ahead of the chain that builds that
+corpus.
+
+Which means the whole endgame is queued rather than open:
+
+| what is behind | cells (f32 / f64) | mechanism | queued as |
+|---|---|---|---|
+| kl02, nw14, bibd_17_8, rn50 256-row blocks | 21 / 15 | `SCORCH_SPMM_NNZ_PER_THREAD`, the row ceiling | chains 59, 61 |
+| Pd_b, Pd_rhs, bips07 — degree under one | 6 / 2 | `SCORCH_NARROWK_EXACT_DEGUNROLL` | chain65 |
+| connectus, higgs-twitter, lp_osa, transformer k=4 | ~8 / ~1 | re-count after the two above | — |
+
+Nothing on that list is a new idea. All of it is a constant that is already written, already
+documented with the measurement that motivated it, and already off pending a run — which is what
+this branch has been building toward rather than a coincidence.
