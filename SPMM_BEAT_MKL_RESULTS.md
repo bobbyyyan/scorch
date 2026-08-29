@@ -14248,3 +14248,24 @@ revalidation back on the hot path precisely where an inference workload spends a
 
 This bug is in the main tree too, and reaching it requires only `with torch.inference_mode():` — the
 standard inference idiom — around any scorch matmul.
+
+### Correction to the section above: the corpus already exists
+
+The reach arithmetic stands and the conclusion about `exact4_merged.csv` stands, but "the ladder
+needs a degree-stratified corpus before it needs machine time" was wrong in a way worth fixing
+rather than leaving: such a corpus is already on disk. `/scratch/bobbyy/k1deg_groups.csv`, built for
+the width-1 degree ladder, is 302 matrices stratified on mean degree — 9 at 0–1, 25 at 1–3, 17 at
+3–6, 78 at 6–12, 34 at 12–24, 31 at 24–48, 26 at 48–96, 82 above 96.
+
+Against the unroll table, MULT=1 → 2 changes the unroll wherever mean degree is in [2, 8): the [2,3)
+part of the 25 in `d1_3`, **all 17** of `d3_6` (both the [3,4) matrices, which go from unroll 2 to 1,
+and the [4,6) ones, which go from 4 to 2), and the [6,8) part of the 78 in `d6_12`. That is
+comfortably more than the **8** matrices `exact4_merged` has in its whole 4–8 band, and it is
+stratified rather than incidental, so a per-band effect is resolvable there.
+
+So the open item is not "build a corpus" but "run the ladder on `k1deg_groups.csv`, restricted to
+the bands where the knob can act, and report the bands rather than a pooled geomean" — the pooled
+number over 302 matrices would still be dominated by the 173 above degree 12 where MULT cannot
+reach, which is the trap the section above describes. The reason the mistake is worth recording: I
+concluded "no instrument exists" from one corpus being unfit, without checking the corpora already
+on the host. Reach arithmetic tells you a corpus is unfit; it does not tell you no corpus is fit.
