@@ -14123,3 +14123,46 @@ x86 run-to-run nondeterminism at float64 k=3 was never excluded and is a live th
 Consequences already visible: chain73 refused immediately on its `CHAIN72_DONE` guard and is
 unqueued pending a chain72 re-run. chain74 and chain75 are unaffected — chain74 builds `ph_base` from
 tip4 itself precisely so its neutrality gate does not depend on chain72.
+
+## The MULT ladder cannot be placed on this corpus, and chain72's banding is the proof
+
+`SCORCH_NARROWK_EXACT_DEGUNROLL_MULT` ships inert at 1 and was left for a ladder to place. Before
+spending machine time on that ladder, ask what it could possibly move. The rule is
+
+```
+while (exact_unroll > 1 && mean_deg < (long)exact_unroll * mult) exact_unroll >>= 1;
+```
+
+with `UNROLL=4`, so the unroll as a function of mean degree is
+
+| mean degree | MULT=1 | MULT=2 | MULT=4 |
+|---|---|---|---|
+| < 2 | 1 | 1 | 1 |
+| 2 – 4 | 2 | 1 | 1 |
+| 4 – 8 | 4 | 2 | 1 |
+| 8 – 16 | 4 | 4 | 2 |
+| ≥ 16 | 4 | 4 | 4 |
+
+chain72's gate 3 banded the pinned corpus while answering a different question: **42** matrices below
+mean degree 4, **8** at 4–8, **248** at 8 and above. So going from MULT=1 to MULT=2 changes the unroll
+on the 8 matrices at 4–8, on whichever of the 42 sit at 2–4, and on **none of the 248**. The reach is
+at least 8 and at most 50 of 298 matrices — 2.7% to 17% — and the 83% of the corpus that dominates
+every pooled number is structurally untouchable.
+
+That makes the ladder unplaceable here, and not because of noise. A run would spend two hosts' worth
+of machine time to move a handful of cells, and its pooled geomean would be dominated by matrices
+where the knob provably does nothing — which is the shape of a result that reads as "MULT is neutral"
+when what it means is "MULT was not asked". Same failure as measuring a kernel swap on a corpus
+selected for already losing, in the other direction.
+
+So the ladder needs a **degree-stratified** corpus before it needs machine time: enough matrices in
+2–4 and 4–8 to resolve a per-band effect, which is exactly the stratification the ARM MINDEG ladder
+used (29/28/48/24 matrices at deg<1, 1–2, 2–4, 4–8). Until that corpus exists the honest status of
+MULT is "compiled in, inert at 1, unmeasured, and the pinned corpus cannot measure it" rather than
+"pending a ladder".
+
+Worth noting what this does *not* say. The sawtooth argument for MULT is unchanged and still
+predicts a real effect at the peak of each tooth; the point is only that the corpus has almost no
+matrices at those peaks. It also explains why the shipped MULT=1 was safe to commit inert: on this
+corpus 248 of 298 matrices take `exact_unroll = 4` at any MULT in {1, 2}, so no value of the knob
+could have destabilised the numbers the flip was measured on.
