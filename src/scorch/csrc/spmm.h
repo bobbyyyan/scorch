@@ -3835,6 +3835,37 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL_MULT");
     if (e && *e) { long v = std::atol(e); if (v >= 1) narrowk_exact_degunroll_mult = v; } }
+  // A/B hook with no candidate policy: price the cost of ASKING, in a loop where the compiler was
+  // caught not hoisting a question it could have. chain71 found the multi-row dispatch's eight
+  // loop-invariant terms costing 0.7-7% per row -- most on the shortest rows -- at a width the
+  // kernel DECLINES. The shipping dispatch chain (narrow_k, then half-vector, then exact-width,
+  // then the gather, then the deep kernel) is a comparable number of loop-invariant tests in the
+  // same loop, and whether IT is hoisted decides whether that chain is worth restructuring too.
+  //
+  // Two arms, because they separate the two candidate mechanisms rather than pooling them:
+  //   SCORCH_DUMMY_TESTS=N   N invariant tests per row, nothing else. All hoistable in principle.
+  //   SCORCH_DUMMY_ROWDEP=1  the same tests followed by a row-dependent term, which is the shape
+  //                          the multi-row condition had -- a conjunction the compiler cannot lift
+  //                          as a whole because its last operand changes every iteration.
+  // If arm 1 is null and arm 2 costs, the trailing row-dependent term is the mechanism and the
+  // shipping chain (which has none) is already being hoisted. If both cost, invariant tests in this
+  // loop are simply not hoisted, and the shipping chain is paying for its questions on every row.
+  //
+  // Behaviour cannot change: every dummy is read from the environment, so the compiler cannot fold
+  // the conjunction, and the final operand is a value that is always zero, so the branch is never
+  // taken. Compiled out of a release build with the rest of the hooks.
+  int dummy_tests = 0;
+  int dummy_rowdep = 0;
+  int dummy_true[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  { const char* e = std::getenv("SCORCH_DUMMY_TESTS");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 8) dummy_tests = (int)v; } }
+  { const char* e = std::getenv("SCORCH_DUMMY_ROWDEP");
+    if (e && *e) dummy_rowdep = std::atol(e) != 0; }
+  for (int _d = 0; _d < dummy_tests; ++_d) dummy_true[_d] = 1;
+  // Always zero. Read from the environment so the compiler must keep the whole conjunction.
+  int dummy_never = 0;
+  { const char* e = std::getenv("SCORCH_DUMMY_NEVER");
+    if (e && *e) dummy_never = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_MINDEG");
     if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_mindeg = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_ACCUM");
@@ -4226,6 +4257,16 @@ torch::Tensor spmm_csr_v2_core(
       }
 
       for (int i = start; i < end; i++) {
+#ifdef SCORCH_TUNE_HOOKS
+        // See the hook's comment above. dummy_never is always 0, so this never fires; the point is
+        // what evaluating the conjunction costs. The row-dependent arm puts a term that changes
+        // every iteration LAST, which is what stopped the multi-row condition from being lifted.
+        if (dummy_true[0] && dummy_true[1] && dummy_true[2] && dummy_true[3] &&
+            dummy_true[4] && dummy_true[5] && dummy_true[6] && dummy_true[7] &&
+            (!dummy_rowdep || A1_pos[i] >= 0) && dummy_never) {
+          continue;   // unreachable
+        }
+#endif
 #if defined(__AVX2__) && defined(__FMA__) && \
     (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
         // A/B hook: take ROWS consecutive rows at once, so the independent B loads come from
