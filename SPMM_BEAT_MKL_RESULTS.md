@@ -13561,3 +13561,158 @@ REFUSING <file>: no ladder arm found in its columns (looked for *_kms). An empty
 
 The four caller-path readings above are that data, read. They agree with the kernel path in every band
 of both dtypes, which is also the check that the fix did not invent anything.
+
+## The narrow-k flip is committed, and the k=4 residual turns out not to be a kernel problem
+
+Two commits and four analyses, none of which needed machine time; the machine was busy with
+chain71 throughout.
+
+### Committed
+
+* **799205e** — `SCORCH_NARROWK_EXACT_K1` and `SCORCH_NARROWK_EXACT_DEGUNROLL` default to 1, and
+  `SCORCH_NARROWK_EXACT_K1_MINDEG` becomes the first ISA-conditional value in
+  `scorch_policy.h`: 8 on AVX2+FMA, 0 elsewhere. The ARM suite passed under it — 1099 passed, 48
+  skipped — which was the last gate.
+* **fe2a57a** — the unroll rule takes a multiplier, `SCORCH_NARROWK_EXACT_DEGUNROLL_MULT`,
+  defaulting to 1 so it is today's behaviour. Reasoning below. Also two comments in `spmm.h` that
+  still said width 1 was not routed by default; both were true until 799205e.
+
+### The unroll depth is invisible in the output at k=1 and k=2, and that is not a bug
+
+Written down because it invalidates an instrument, not because it changes a kernel. I wrote a
+fires-check for the multiplier that compared outputs with `MULT=1` against `MULT=2` and predicted
+differences in the two degree bands the multiplier moves. It reported k=3 differing and **k=1 and
+k=2 identical** — in the band where the mechanism acts most.
+
+That is correct behaviour and the kernel body says why. `scorch_spmm_row_narrow_exact` zeroes
+`acc[UNROLL][K]`, runs `floor(L/UNROLL)` full iterations, reduces `acc[1..]` into `acc[0]`, then
+sums the remainder into `acc[0]`. For a row of 2 at UNROLL=2 the result is `(a0b0)+(a1b1)`; at
+UNROLL=4 it is `((0+a0b0)+a1b1)`, and adding zero is exact. For a row of 3 at UNROLL=2 it is
+`((a0b0+a1b1)+a2b2)`, which is exactly the order UNROLL=1 produces. So **whenever the shallower
+unroll runs at most one full iteration, the two depths are bitwise identical** — and DEGUNROLL only
+acts below mean degree 4, where that is always the case at K≤2. At K=3 the compiler vectorises the
+three-element accumulator array and `-ffast-math` reassociates, so the depth reaches the bits.
+
+Verified directly on ARM with the unroll forced rather than inferred, `SCORCH_NARROWK_EXACT` in
+{2,4,8} and DEGUNROLL off:
+
+| mean degree | k=1 | k=2 | k=3 |
+|---|---|---|---|
+| 1 | same | same | same |
+| 2, 3 | same | same | **differs** |
+| 4 and up | **differs** | **differs** | **differs** |
+
+Consequences worth keeping. **DEGUNROLL, which shipped this morning, has never been confirmed
+against an object, and could not have been by the check that confirmed K1** — that check reads k=1
+and reports a difference, which is K1's doing. k=3 is the only width where DEGUNROLL is observable,
+and `flip_fires.py` (staged for chain72) predicts exactly that: k=1 differs at degree ≥ 8 and
+nowhere below, k=2 identical everywhere, k=3 differs below degree 4, k=4 identical. A k=2
+difference would mean the analysis above is wrong.
+
+### Why the multiplier, and why default 1
+
+The rule halves while `mean_deg < UNROLL`, which sets the unroll to the largest power of two no
+greater than the mean row. Setup is `2*UNROLL-1` scalar operations per row — UNROLL zero stores and
+UNROLL-1 adds — and is paid whatever the row holds, so setup per useful multiply-add is
+`(2*UNROLL-1)/L`. That is **sawtoothed in degree and peaks exactly at each threshold**: a mean row
+of 4 at UNROLL=4 pays seven operations to do four, a mean row of 7 pays seven to do seven. It is
+the shape chain69 measured on x86 float64 at width 1 — +12.4% at degree 2-4, **−15.7% at 4-8**,
+then +4.8%, +12.9%, +24.0% — and the floor at 8 shipped in 799205e steps around the dip rather
+than fixing it, giving up the band below on 35 of 302 matrices.
+
+`MULT=2` requires two unrolls' worth of work before taking an unroll that deep. It caps the ratio
+at 7/8 instead of 7/4 and moves exactly two bands: degree 2-4 from unroll 2 to 1, and 4-8 from 4
+to 2. Degree ≥ 8 and degree < 2 are untouched. Whether 2 is right, and whether it holds at k=2 and
+k=3 where this rule also acts and where DEGUNROLL is separately worth +4.5% on x86 float32, is a
+ladder. Default 1 until it runs — and the alternative it displaces, a second `UNDERDEG` bound on
+the K1 gate, is the narrow fix for one width where this is the general one for three.
+
+### chain30's k=4 null is a real null, re-cut by family rather than trusted
+
+This ledger's own rule is that a pooled floor refuses a real effect diluted by an inert band, so
+chain30's 302 rows were re-cut by matrix provenance — dlmc transformer, dlmc rn50, suitesparse —
+which is fixed before any timing and cannot condition on the outcome the way selecting losers does.
+Kernel-only, arm over `e3`, float32:
+
+| k | family | e3b (floor) | e4 (HI=4) | e4a (+ACCUM=8) | e5 (HI=5) |
+|---|---|---|---|---|---|
+| 4 | dlmc rn50 | 1.0117 | 1.0118 | 1.0088 | 1.0032 |
+| 4 | dlmc transformer | 0.9998 | 1.0005 | 0.9977 | 1.0019 |
+| 4 | suitesparse | 0.9996 | 1.0021 | 0.9998 | 1.0038 |
+
+Every arm is inside its own same-code floor in every family, and float64 — where `e4`/`e4a` are
+structurally inert because the double instantiation caps at 3 — reads the same way. **The null is
+not dilution.** Together with the deep register kernel's 0.8034 at float32 nvec=1 (which is k=4)
+and multi-row now declining the width by construction, that is three refutations of "more
+accumulator chains at k=4" from three different kernels.
+
+It also retires the idea I had named as the one remaining k=4 candidate — a half-vector multi-row
+kernel packing two rows of four float lanes into one mask-free 256-bit register. That adds chains
+across rows at nvec=1, which is the axis the deep kernel already lost 20% on, and it does not
+reduce the per-nonzero index and value loads, which is where the cost is. Not queued.
+
+### What the k=4 cells actually are, on the caller path and on the shipping build
+
+Every k=4 number above is kernel-only, and the whole-call column in chain30's grid predates both
+the O(nnz)-per-call ABI revalidation fix and the Python dispatch fix — it reads us 1.09 to 1.63x
+**behind** MKL, which is the confounded number this ledger has already retracted once. So the
+deficit was recomputed from chain65's shipping build, on the caller path (`cprobe`), 212 matrices:
+
+| width | float32 behind MKL | median ours/MKL | float64 behind | median |
+|---|---|---|---|---|
+| k=1 | 7 / 212 | 0.779 | 5 / 212 | 0.725 |
+| k=2 | 2 / 212 | 0.740 | 0 / 212 | 0.582 |
+| k=4 | **12 / 212** | 0.626 | **8 / 212** | 0.506 |
+| k=8 | 1 / 212 | 0.403 | 0 / 212 | 0.327 |
+| k=64 | 0 / 212 | 0.287 | 0 / 212 | 0.292 |
+
+22 float32 and 13 float64 cells of 1060, and the deepest is 1.119. **This is not the same board as
+chain63's 128/59** — chain65's corpus is the degree-stratified `mg50_groups`, of which only 9
+matrices appear in chain63's corpus at all, and chain63's count is over six widths of 302 matrices.
+chain72 is the run that puts the shipping build on chain63's corpus, which is the comparable
+number. Until it reports, neither count supersedes the other and they should not be added.
+
+What is striking is the *identity* of the cells. Almost all of them are one family: `dlmc
+transformer` `body_decoder`/`body_encoder` layers, **512 rows, degree 200-260**, at k=1 and k=4,
+on both dtypes.
+
+### And on those cells the kernel is flat in k, which means no kernel at one width can fix them
+
+Kernel-only microseconds for the deepest cell, 512 rows and 133,557 nonzeros:
+
+| | k=1 | k=2 | k=4 | k=8 | k=64 |
+|---|---|---|---|---|---|
+| ours (kernel) | 18.39 | 17.56 | 18.14 | **15.10** | 34.19 |
+| MKL (whole call) | 18.04 | 18.16 | 16.60 | 17.99 | 52.40 |
+
+**Both implementations are flat at 17-18µs from k=1 to k=8.** Eight columns of B cost no more than
+one. A least-squares fit of `F + a·k` over the widths measured puts the width-independent part at
+18.4µs on the cells behind MKL at k=4 — 102% of the k=4 kernel time, i.e. the fit cannot see a
+k-dependent term at all — with a median worst-cell fit error of 7.6%.
+
+This is also what produced the one number that looked like a kernel finding earlier in the day: on
+those cells our cost **per nonzero** is 0.853 at k=8 against k=4, so twice the useful work costs 15%
+less. That is not a better kernel at k=8; it is a fixed cost divided by a larger total.
+
+Nor is the 18µs data movement. A's stream is `nnz*8 + rows*4` bytes, so 1.07MB here, and 18µs of it
+is 59 GB/s — while `heart1` in the same run moves 11.1MB in 48µs, 231 GB/s, and `af_shell2` moves
+142MB in 2680µs, 53 GB/s, which is this host's DRAM ceiling. So the small matrix achieves a quarter
+of the bandwidth an L3-resident matrix does in the same process. Subtracting the movement at
+heart1's rate leaves **roughly 13µs of per-call fixed cost inside the kernel timer at 512 rows, and
+MKL pays about 12µs of it.**
+
+The load-imbalance explanation was checked and refuted rather than assumed. Asking the binary —
+`scorch_spmm_chunk` and `scorch_spmm_nthreads` are exported precisely so a harness need not restate
+them — gives 18 workers and chunk widths of 64, 64, 24, 10 rows at k=1, 2, 4, 8, so at k=1 there are
+only 8 chunks for 18 workers. That would starve ten of them under a shared counter, but the
+resolved partition mode is 3: home ranges balanced in `nnz + rows`, each about 28 rows, claimed in
+`chunk`-sized bites *within the range*. A chunk wider than the home range means one bite, not an
+idle worker. So the chunk rule is nearly inert at this size and is not the lever.
+
+**What this changes.** The largest remaining slice is not a narrow-k kernel problem and no
+per-width kernel can address it, because the cost it would reduce is not being paid. The target is
+a per-call fixed cost of order 13µs at 512 rows on a 24-thread pool, of which MKL pays about 12 —
+so the honest prior is that most of it is not ours to remove, and the measurement that matters is
+the decomposition rather than another arm. That is what the next chain should be: fit
+`F + b·rows + c·nnz` for us and for MKL over a synthetic grid at fixed k on x86, and either name a
+term we pay and MKL does not, or record that these cells are floor-bound and stop working on them.
