@@ -12501,3 +12501,54 @@ Which means the whole endgame is queued rather than open:
 Nothing on that list is a new idea. All of it is a constant that is already written, already
 documented with the measurement that motivated it, and already off pending a run — which is what
 this branch has been building toward rather than a coincidence.
+
+## chain61: a well-designed run that answered nothing, because its corpus lacked the phenomenon
+
+The row ceiling was measured on redwood with six interleaved arms and padded environments — `off`,
+`offb` as a same-code floor, the shipped gate `(256,128,192)`, the wider `(384,192)` and `(512,192)`,
+and a no-cap arm — over 50 matrices at six widths, both dtypes. The corpus was chosen the right way:
+by asking `scorch_spmm_nthreads` which matrices each gate changes the worker count for, with an
+equal-sized control group the decision provably does not touch.
+
+One thing it establishes cleanly. **The enabled code is free where it cannot act:** the two inert
+groups, 20 matrices each, read 0.9957 to 1.0039 across every arm with |z| ≤ 1.4 on both dtypes. The
+single exception is the no-cap arm's float32 `inert_lose` at 1.0039, z +3.2 — four tenths of a
+percent, and in a group that by construction cannot be moved by the gate, so it is the cost of
+carrying the code rather than of using it.
+
+Everything else is a null with no power behind it:
+
+| group | n | shipped gate | (384,192) | (512,192) |
+|---|---|---|---|---|
+| float32 `wide_lose` | 5 | 0.9774 z−1.0 | 1.0365 z+1.1 | 1.0441 z+1.0 |
+| float32 `wide_win` | 3 | 1.0118 z+0.0 | 1.0321 z+0.0 | 0.9924 z+0.0 |
+| float64 `wide_lose` | 5 | 1.0005 z−0.0 | 1.0795 z+1.4 | 1.0759 z+1.3 |
+| **`ship_lose`** | **2** | **SKIPPED, under 3 matrices** | | |
+
+`ship_lose` is the group the shipped gate moves *and* that currently loses — the only group that can
+say whether the ceiling closes any part of the deficit. It has two matrices. The analyzer skipped it,
+correctly. And the run's own floor note reads "worst cell 1.696x. That is this run's real floor;
+anything inside it is nothing", which is true and disposes of the `wide_*` rows as well.
+
+**The defect is upstream of everything the run does well.** `ceil_corpus.py` classifies whatever
+cells it is handed, and it was handed a corpus that does not contain kl02, nw14 or bibd_17_8 — the
+three matrices the shipping scoreboard identifies as 13 of the 31 float32 cells and 12 of the 17
+float64 cells still behind MKL by more than 5%. A classification cannot recover a phenomenon that is
+not in the population. Every methodological choice here was sound — production-derived groups, an
+inert control, a same-code floor, an honest statement of the worst cell — and the run still could not
+answer its question, because none of those choices is about coverage.
+
+Worth stating as a general point, because this is the second time today a run's *inputs* rather than
+its method were the problem, after chain48 patched a change that had already landed: **check that the
+population contains the effect before running the grid.** For a gate, that is one query — ask the
+production decision how many matrices land in the group under test, and refuse if it is under a
+handful. chain64 does exactly that, and refuses rather than reporting if `ship_lose` is still under
+three matrices even from a corpus that does contain those three.
+
+chain64 changes one thing and nothing else: it feeds `ceil_corpus.py` chain32b's own scoreboard — 362
+matrices, 8688 cells, caller path, at the configuration that now ships — instead of the older corpus,
+adapted only in column names. Same classifier, same probe, same analyzer, same six-arm structure,
+plus two arms the family's own shape demands: `(512,192)` because family A's row counts run from 64
+to 512 while the shipped bound is 128, and `(512,128)` because family A's degrees start at 128 while
+the shipped floor is 192. On the numbers above, a gate that cannot reach rows past 128 cannot reach
+most of the matrices the deficit is made of, which may be the whole reason `ship_lose` is empty.
