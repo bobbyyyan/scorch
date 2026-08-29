@@ -526,18 +526,66 @@
 #  define SCORCH_NARROWK_DEEP_NVEC_HI 0
 #endif
 
+// Serve width 1 from the exact-width kernel instead of whatever owns it by default. On x86 float32
+// that displaces the nonzero-axis gather (one vgatherdps covering eight nonzeros); everywhere else it
+// displaces a register-block tile using one lane of four or eight.
+//
+// It pays above a degree threshold and costs below it, and the threshold differs by what is being
+// displaced. The exact-width kernel's prologue is UNROLL*K zero stores and its epilogue
+// (UNROLL-1)*K adds, both paid per row whatever the row holds, so its cost per nonzero FALLS as rows
+// lengthen, while the gather's is roughly flat. Two curves like that cross once.
+//
+// Measured on both hosts, served-over-withheld within each degree band, ladder arms chosen to be band
+// edges so no arm is ever partial inside a band (chain69 on x86, two probes x two seeds x two dtypes,
+// 302 matrices; the k1lad ladder on ARM, two seeds):
+//
+//   x86 float32:  deg<1 0.978-0.983 | 2-4 0.987-0.992 | 4-8 0.984-0.994 | 8-64 1.002-1.010
+//                 | 64-256 1.100-1.117 | >=256 1.097-1.146
+//   x86 float64:  deg<1 1.008-1.012 | 2-4 1.124-1.134 | 4-8 0.841-0.861 | 8-64 1.046-1.049
+//                 | 64-256 1.112-1.133 | >=256 1.239-1.248
+//   ARM float32:  pays in six of seven bands, deg<1 1.064 | 2-4 1.104 | 4-8 1.109 | 8-64 1.034
+//                 | 64-256 1.046 | >=256 1.080; deg1-2 is unresolvable (1.021 z+1.5 in one run,
+//                 0.968 z-1.4 in another, and 1.067/0.941 in two earlier runs of the same grid)
+//
+// Hence the values below. Eight on x86 keeps every win and drops every loss on float32, and on
+// float64 keeps +4.8%, +12.9% and +24.0% in the three bands above it while dropping the 15.7% loss at
+// degree 4-8. Zero on ARM, where serving pays in every band that resolves.
+//
+// Two costs stated rather than hidden. On x86 float64 a floor at eight also gives up a 12.4% win at
+// degree 2-4 on 35 of 302 matrices: that band is a win, the band above it is a loss, and the band
+// above that is a win, so the shape wants TWO bounds and one bound cannot express it. And on ARM,
+// SCORCH_NARROWK_EXACT_DEGUNROLL -- which ships with this and is what turns ARM float32's weakest
+// band from 0.968 to 1.004 -- costs about 1.8% at k=2 below degree 1 (z -2.9 on float32, z -4.6 on
+// float64) while gaining 1-2% at degrees 1-4.
+//
+// Correctness: chain70 -- the two compiled objects differ, the kernel fires at k=1 in every degree
+// band and at no other width (verified by output diff, since two summation orders cannot agree
+// bitwise), 60 matrices agree with a dense reference at atol=rtol=1e-3, and the full suite passes
+// against the hookless candidate.
 #ifndef SCORCH_NARROWK_EXACT_K1
-#  define SCORCH_NARROWK_EXACT_K1 0
+#  define SCORCH_NARROWK_EXACT_K1 1
 #endif
 
-// Minimum mean degree (nonzeros per row) for width 1, when the above is enabled.
-// 0 admits it at any degree, which the ARM grid says is a loss below degree 8.
+// Minimum mean degree (nonzeros per row) for width 1, when the above is enabled. 0 admits it at any
+// degree. The value is ISA-conditional because what the kernel displaces is: see the grids above.
 #ifndef SCORCH_NARROWK_EXACT_K1_MINDEG
-#  define SCORCH_NARROWK_EXACT_K1_MINDEG 0L
+#  if defined(__AVX2__) && defined(__FMA__)
+#    define SCORCH_NARROWK_EXACT_K1_MINDEG 8L
+#  else
+#    define SCORCH_NARROWK_EXACT_K1_MINDEG 0L
+#  endif
 #endif
 
+// Halve the exact-width kernel's unroll while the mean row is shorter than it, so a degree-1 matrix
+// does not pay a four-accumulator prologue and a three-add epilogue to perform one multiply-add.
+// Ships with SCORCH_NARROWK_EXACT_K1 because it is what makes width 1 viable in the low bands on ARM
+// (float32 deg1-2 goes 0.9682 -> 1.0037 with it), and because on x86 float32 it is separately worth
+// +4.5% at k=2 -- the width the exact kernel already serves -- winning in four of six degree bands by
+// 2-13% with no band negative beyond its floor. It is inert at k=2 on x86 float64 (every band inside
+// its floor) and costs about 1.8% on ARM at k=2 below degree 1. It cannot act at k>=4: it is read
+// inside `if (exact_width && ...)` and SCORCH_NARROWK_EXACT_HI is 3.
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL
-#  define SCORCH_NARROWK_EXACT_DEGUNROLL 0
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL 1
 #endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
