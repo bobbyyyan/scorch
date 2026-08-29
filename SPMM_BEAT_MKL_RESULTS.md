@@ -14354,3 +14354,53 @@ What this budget is for: it says the fixed cost is large enough to be worth a de
 chain73 is that decomposition — it sweeps thread count at exactly 512 rows beside its per-row-count
 intercepts, so it can separate launch-and-barrier from setup. A budget suggests where to look; it
 does not settle anything, and none of these numbers should be quoted as a result.
+
+### Where the four-cycles-per-nonzero ceiling applies, and where this file has cited it anyway
+
+The correction above prompted grepping every citation of that ceiling in this file rather than the
+one I had been asked about. There are three that matter, and the ceiling is a property of **one
+kernel**, not of sparse SpMM. Per kernel, from the source:
+
+| kernel | accumulators | nonzeros per FMA | latency floor |
+|---|---|---|---|
+| general v2 row loop | one scalar | 1 | **4 cyc/nnz** — the ceiling as derived |
+| nonzero-axis gather (`scorch_spmm_row_gather_f32`) | `__m256 acc[K]`, one chain per column | **8** | 0.5 cyc/nnz |
+| exact-width (`scorch_spmm_row_narrow_exact`) | `acc[UNROLL][K]`, UNROLL chains | 1 | ~1 cyc/nnz at UNROLL=4 |
+| multi-row | independent per row group | 1 | ~1/ROWS cyc/nnz |
+
+So the derivation at the top of this file is correct where it was made — the general row loop is one
+scalar accumulator and the compiler will not widen it — and it does not transfer to any kernel that
+carries more than one chain, or that retires eight nonzeros per FMA.
+
+Three citations, and what each is now worth:
+
+1. **The residual-cell budget above.** Corrected in place: the exact kernel has four chains at this
+   degree, so the ceiling does not bind and L3 streaming does. Conclusion unchanged.
+2. **The "what to build next" paragraph** that concluded the live lever was kernel throughput at
+   k ≤ 4 on medium-degree rows, "consistent with the measured ceiling". That inference has since been
+   superseded twice over — the ceiling does not bind at those cells, and the deficit turned out not
+   to be in the kernel at all (three independent refutations, then the fixed-cost decomposition). It
+   stands as the honest record of what chain63's ladder licensed at the time; it should not be read
+   forward.
+3. **The effective-cores table** for kl02 and nw14, which converts our measured MAC/ns into "about 5
+   of 24" and "about 20 of 24" using ~1 MAC per nanosecond per core, sourced to this ceiling. Those
+   cells were served by the **gather** kernel at the time (pre-flip x86 float32 k=1), whose latency
+   floor is 0.5 cyc/nnz — so the stated source is wrong by 8x. The baseline nevertheless lands in
+   roughly the right neighbourhood, because what actually limits that kernel is `vgatherdps`
+   *throughput* (order 12–20 cycles per 8-element gather, so 1.5–2.5 cyc/nnz) rather than the FMA
+   chain. Right number, wrong mechanism, a second time.
+
+   The consequence is bounded but real: at 1.5–2.5 cyc/nnz a core sustains roughly 2–3 MAC/ns, not 1,
+   so the implied effective-core figures are optimistic by about 2x — kl02 reads nearer 2 of 24 than
+   5, and nw14 nearer 8 than 20. The **direction** survives, which is what the section used it for
+   (kl02 starved, nw14 not), and the row ceiling that section motivated was separately measured
+   rather than argued from this. But the specific counts should be read as order-of-magnitude, and
+   pinning them properly needs a measured gather throughput on that host, which is machine work and
+   is not queued.
+
+The portable part: a latency ceiling is a property of a *loop*, and this codebase has four SpMM inner
+loops with four different chain counts. Citing "the ceiling recorded earlier in this file" is only
+valid after naming which kernel serves the cell — which depends on dtype, width, degree and, since
+`799205e`, on the ISA-conditional floor. Two of the three citations above got that wrong in the same
+direction, and both times the arithmetic still validated, which is exactly why neither was caught by
+checking the numbers.
