@@ -12704,3 +12704,88 @@ residual, and chain64 is predicted null twice over — its mechanism is a thread
 aims at is not thread-limited. It stays queued, because a predicted null that reports the null is
 worth more than a prediction, and because its `g512_192_nocap` arm prices the pool cap on a third
 corpus. But nothing should be designed on the assumption it will find something.
+
+## chain63 float64, and the k=4 gap: the queued kernel lever is structurally inert where most of the residual is
+
+chain63's float64 halves finished and agree with float32 in every particular. Caller path, whole
+call against MKL's whole call, 1812 cells:
+
+| arm | geomean MKL/arm | cells behind | matrices behind |
+|---|---|---|---|
+| **ref** | **1.7819** | **77 / 1812** | **46 / 302** |
+| aa (A/A) | 1.7835 | 78 | 46 |
+| t24 | 1.4932 | 279 | 123 |
+| t16 | 1.4895 | 231 | 107 |
+| t8 | 1.2914 | 617 | 204 |
+| t4 | 1.0584 | 928 | 208 |
+| t2 | 0.7631 | 1141 | 238 |
+
+No fixed count beats the rule on float64 either, by the same margins. The two paths agree on the
+floor to within a percent — `aa` 1.0034 general / 1.0019 caller, `ref` 1.0075 / 1.0010 — and
+disagree only in how much they penalise a bad thread count, the general path flattering every forced
+arm by 6–11%.
+
+Applying the same three-replicate floor: 77 → 73 by the median, → 67 by the best, → **59** beyond the
+cell's own spread. Unlike float32, **kl02 and nw14 do keep two cells each here**, and their same-code
+spreads are 1.204 and 1.102 rather than 2.441 and 1.829. So the retraction above is dtype-specific:
+those matrices are genuinely behind on float64 at narrow width, and were not shown to be on float32.
+
+The float64 survivors, and the two dtypes side by side:
+
+| | float32 | float64 |
+|---|---|---|
+| cells behind by `ref` | 158 | 77 |
+| surviving the cell's own spread | 128 | 59 |
+| at k=1 | 35 | 30 |
+| at k=2 | 15 | 0 |
+| **at k=4** | **76** | **23** |
+| at k≥8 | 2 | 6 |
+| at 128–600 rows | 75 | 45 |
+| at ≥2400 rows | 43 | 1 |
+| median rows / degree | 512 / 182 | 512 / 249 |
+| median margin | 1.084 | 1.066 |
+
+The ≥2400 band is 43 cells on float32 and one on float64 — which is the pool cap's own band, and
+float64 having nothing there is consistent with its register kernel already reading 2.273× against
+MKL. Subtracting it, the post-cap residual is about **85 float32 and 58 float64 cells**, and across
+both dtypes it is **99 cells at k=4 and 65 at k=1**, on 512-row matrices of degree 180–250.
+
+**Now the gap.** `SCORCH_NARROWK_EXACT_HI` is **3**, and `exact_lo_` folds to 2 in a shipping build,
+so the exact-width narrow-k kernel serves widths 2 and 3 only — widths 1 through 7 are instantiated
+for float and 1 through 3 for double, but the shipped bound admits two of them. Its own comment
+records why: 1.0787 and 1.0625 at k=2 and k=3 on float32, and a loss at every other width it was
+instantiated at, including 0.983 at k=1. `SCORCH_NARROWK_EXACT_DEGUNROLL` is read *inside*
+`if (exact_width && ...)`, so it can only act on widths the kernel already serves.
+
+**So chain65 — `SCORCH_NARROWK_EXACT_K1=1` plus `DEGUNROLL=1` — is structurally inert at k=4.** It
+addresses the 65 cells at k=1 and can reach k=2 and k=3 through the unroll, and it cannot touch the
+99 at k=4, which is the largest single group of the residual in either dtype. I had written that
+chain65 "is the run that can move the residual"; that is right for k=1 and wrong for k=4, and k=4 is
+the bigger half.
+
+**What acts at k=4 is multi-row register blocking**, `SCORCH_SPMM_MULTIROW_ROWS`, still 0. There was a
+three-build script for it on the machine and it was wrong in three ways, all the same kind — a
+baseline that is not what ships:
+
+1. It pinned `-DSCORCH_SPMM_HALFVEC_F32=0` in all three builds. That cancels, and it was correct when
+   written while the halfvec flip was pending, but 1 ships now and halfvec acts at **float32 k=4** —
+   the exact width the multirow claim lives at, where the constant's own comment records 1.1008
+   (z +14.6) and cells below MKL 125/302 → 70. Measuring a k=4 change on top of a k=4 baseline that
+   does not ship is what cost chain28b its headline, where 39 of the 44 cells it recovered were at the
+   width the pin affects.
+2. Its staged tree was from 08:02 and did not contain the multirow empty-group guard — the
+   `A1_pos[i + multirow] > A1_pos[i]` term added in 391a887, which sits in the multirow dispatch
+   condition itself. It would have measured a dispatch that is not the one in the tree.
+3. That tree also predated b5b2404, so it had no `NT_CAP` and its baseline was the pre-cap policy.
+
+All three are fixed and it is deployed as **chain67**: `-DSCORCH_SPMM_HALFVEC_F32=1` in ship, ctrl and
+cand; both staged trees re-cut from the branch tip and verified content-identical by md5 over every
+regular file; widths 4, 8, 16 where the kernel acts and 64 as the structural null, since the dispatch
+requires `narrow_k`. `/scratch/bobbyy/mklcheck/tip` was 10.5 hours stale in the same two ways and was
+re-staged before chain65 read it; the old trees are kept as `tip.stale0635` and `tip2.stale0802`.
+
+**The queue is now in value order rather than arrival order: chain65 (k=1, running) → chain67 (k=4) →
+chain68 (the row ceiling, predicted null).** chain68 is chain64 renumbered twice and otherwise
+unchanged; both times it was killed in its wait loop having done no work, so the reorder cost nothing.
+Each guard was hand-run with `pgrep -af` after being written and matched exactly its intended
+dependencies — the check that a numbered queue needs and that cost thirteen hours when it was skipped.
