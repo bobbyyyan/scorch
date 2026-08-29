@@ -13072,3 +13072,74 @@ one: the build line read `env SCORCH_BUILD_TUNE_HOOKS=1 -u SCORCH_BUILD_DEFINES 
 parsing options at the first `NAME=VALUE`, so `-u` became the command and the build would have failed —
 loudly, as it happens, since the line carries `|| { echo BUILD FAILED; exit 1; }`, so this would have
 cost a refusal rather than a wrong number. Options before assignments.
+
+## The ARM half was already measured, and it says the gate has to be two-sided
+
+The ARM runs of exactly these two flags completed this morning and their verdicts were on disk
+unread. Hooked, two seeds, 169 matrices in six degree bands, three live arms — `du` (DEGUNROLL only),
+`e0` (K1 only), `e0du` (both) — against `ref`/`refb`. Every arm sets the **same seven** variables and
+differs only in values, so the getenv tax cancels rather than biasing the candidate.
+
+k=1, `ref/arm` so above 1.0 means faster than what ships, replicate 2:
+
+| band | n | floor | `du` | `e0` | `e0du` |
+|---|---|---|---|---|---|
+| **float32** | | | | | |
+| deg<1 | 28 | 0.9996 | 0.9988 null | 1.0426 z+6.4 | **1.0693 z+7.7** |
+| deg1-2 | 29 | 0.9959 | 0.9935 null | **0.9682 z−1.4** | **1.0037 z+0.4** |
+| deg2-4 | 48 | 0.9998 | 0.9990 null | 1.0467 z+8.4 | **1.0637 z+11.3** |
+| deg4-8 | 24 | 1.0038 | 1.0035 null | 1.0952 z+5.8 | 1.0936 z+5.5 |
+| deg8-64 | 20 | 0.9988 | 0.9953 null | 1.0491 z+4.5 | 1.0488 z+4.6 |
+| deg≥64 | 20 | 0.9985 | 0.9943 null | 1.0551 z+5.4 | 1.0541 z+5.4 |
+| **float64** | | | | | |
+| deg<1 | 28 | 1.0012 | 0.9979 null | 1.0749 z+9.3 | 1.0665 z+8.2 |
+| deg1-2 | 29 | 0.9972 | 0.9979 null | **0.9504 z−2.0** | **0.9575 z−1.9** |
+| deg2-4 | 48 | 0.9902 | 0.9958 null | 1.0115 z+2.2 | 1.0320 z+4.0 |
+| deg4-8 | 24 | 0.9993 | 1.0010 null | 1.0818 z+5.8 | 1.0861 z+6.9 |
+| deg8-64 | 20 | 0.9984 | 1.0065 null | 1.0566 z+4.7 | 1.0525 z+4.1 |
+| deg≥64 | 20 | 1.0089 | 1.0121 null | 1.0708 z+3.9 | 1.0614 z+3.8 |
+
+Four things come out of it.
+
+**On ARM float32 the pair wins in every band**, 1.0037 to 1.0936, and **DEGUNROLL is what rescues the
+one band K1 loses in**: deg1-2 goes 0.9682 → 1.0037, and the unroll also adds to the win at deg<1
+(1.0426 → 1.0693) and deg2-4 (1.0467 → 1.0637). That was the hypothesis the ARM run was built to test
+and it holds.
+
+**On ARM float64 it does not rescue it.** deg1-2 reads 0.9504 with K1 alone and 0.9575 with the unroll
+adapted — a 4.3% loss either way, z −1.9, on 29 matrices. So DEGUNROLL is not a general fix for the
+losing band; it fixed one dtype's.
+
+**Two instrument checks pass, and they are worth as much as the result.** `du` alone is a *proven null*
+at k=1 in every band on both dtypes, which is exactly right: without K1 there is no `exact_width` at
+width 1, so there is no unroll for it to adapt. And every arm is null in every band at **k=4** on both
+dtypes — the k≥4 inertness that the code says must hold (`EXACT_HI` is 3) now measured on ARM rather
+than only inferred.
+
+**And the shape is the finding.** Put the four configurations side by side at k=1 with both flags on:
+
+| | deg<1 | deg1-2 | deg2-4 | deg4-8 | deg8-64 | deg≥64 |
+|---|---|---|---|---|---|---|
+| ARM f32 | +6.9% | +0.4% | +6.4% | +9.4% | +4.9% | +5.4% |
+| ARM f64 | +6.7% | **−4.3%** | +3.2% | +8.6% | +5.3% | +6.1% |
+| x86 f32 (chain65) | +2.7% | −1.7% (in floor) | **−1.5%** | **−3.5%** | +3.6% | +19.5% |
+
+Two of the three measured configurations **win at the bottom, lose in a middle band, and win at the
+top**. That is not noise; it is what the cost model predicts. The exact-width kernel costs about
+`C_setup + deg·c_e` per row and what it displaces costs about `deg·c_i` with a smaller setup, so at
+degree near zero the comparison is between two fixed costs and the exact kernel's is smaller (no
+gather machinery, no lane mask); in the middle `C_setup` dominates while there are too few nonzeros to
+pay it back; and above that `c_e < c_i` carries it. Win, lose, win.
+
+**Consequently `SCORCH_NARROWK_EXACT_K1_MINDEG`, a one-sided `deg >= N` floor, cannot express the right
+gate on x86 float32 or ARM float64.** The winning region is "very short rows **or** long rows" and the
+losing region is a band in between. A floor at 8 on x86 float32 would take the +19.5% and the +3.6%,
+correctly drop the −1.5% and −3.5%, and needlessly give up the +2.7% below degree 1. That is a
+defensible trade and it is not the optimum, and the difference should be stated rather than absorbed.
+
+chain69 already answers the two-sided question without modification, which is worth noting since it is
+queued and must not be edited while it waits: its `e0` arm serves every band including deg<1 while `e1`
+and `e2` withhold only the lowest ones, so `e0` against `e1` in the deg<1 band prices exactly the
+two-sided part, and `an_k1ladder.py` prints serve-versus-withhold band by band rather than a single
+threshold. What it cannot do is measure a constant that does not exist yet. If the two-sided gate is
+worth the second bound, that is a new constant and a new run.
