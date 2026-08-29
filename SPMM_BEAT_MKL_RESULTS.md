@@ -12340,3 +12340,66 @@ published number. It is worth noting why it was cheap: the hypothesis made a sha
 a population that could be *constructed* — sparsities chosen so a model's layers land on a chosen
 side of a known constant — rather than one that had to be found. A mechanism that only predicts the
 cases you already measured cannot be tested this way, which is a reason to prefer the ones that do.
+
+## The endgame, by name: 31 float32 cells and 17 float64 cells, across about twenty matrices
+
+"Behind in both passes" counts a cell that is 1% behind twice, which for a 1% margin is a coin that
+landed the same way twice — probability a quarter by chance. Requiring a **margin** as well shortens
+the list a lot, and the shortened list is nameable:
+
+| dtype | >1.00 | >1.02 | >1.05 | >1.10 | >1.20 | of 2172 |
+|---|---|---|---|---|---|---|
+| float32 | 44 | 37 | **31** | 20 | 13 | 2172 |
+| float64 | 36 | 27 | **17** | 12 | 11 | 2172 |
+
+**31 float32 cells (1.4%) and 17 float64 cells (0.8%) are behind by more than 5%**, across 18 and 8
+matrices. Every one of them, with the widths at which it loses:
+
+| matrix | rows / degree | float32 | float64 | mechanism |
+|---|---|---|---|---|
+| **kl02** | 71 / 2993 | k1 1.80, k2 1.32, k4 1.59, k8 1.55, k16 1.11 | k1 1.40, k2 1.23, k4 1.72, k8 1.58, k16 1.15 | thread-starved |
+| **nw14** | 73 / 12396 | k2 1.16, k4 1.26, k8 1.17 | k1 1.62, k2 1.23, k4 1.27, k8 1.06 | thread-starved |
+| **bibd_17_8** | 136 / 5005 | k2 1.13, k4 1.11 | k1 1.30, k2 1.09, k4 1.39 | thread-starved |
+| **Pd_b / Pd_rhs** | 8081 / 0.78 | k1 1.21–1.32, k2 1.47–1.50 | k1 1.23–1.24 | 46% empty rows, 20µs kernels |
+| **rn50 bottleneck 256-row blocks** (4 variants) | 256 / 1152 | k1 1.09–1.24, k4 1.06 | k1 1.08 | thread-starved |
+| transformer attention layers (4) | 512 / 278 | k4 1.06–1.09 | — | intermediate width |
+| connectus | — | k32 1.13 | — | wide-k |
+| higgs-twitter_reply | 456626 / 0.07 | k8 1.09, k16 1.09 | — | 94% empty rows |
+| lp_osa_30, lp_osa_14, bips07_3078_iv | — | k1 1.06–1.09, k4 1.06 | — | mixed |
+
+**kl02, nw14 and bibd_17_8 alone are 13 of the 31 float32 cells and 12 of the 17 float64 cells**, and
+all three are few-row, high-degree — the row ceiling's exact targets. Add the four rn50 256-row
+blocks and it is 21 of 31 and 15 of 17.
+
+That the mechanism is thread starvation and not the kernel is checkable from the times rather than
+assumed. At k=1 each nonzero needs one gather, so a core sustains roughly one multiply-accumulate per
+nanosecond — the four-cycles-per-nonzero ceiling recorded earlier in this file — and 24 cores could
+give about 24:
+
+| matrix | k=1 our time | MKL | our MAC/ns | implied effective cores |
+|---|---|---|---|---|
+| kl02 | 40.2µs | 22.3µs | **5.29** | about 5 of 24 |
+| nw14 | 45.4µs | 72.3µs | 19.94 | about 20 |
+| bibd_17_8 | 26.7µs | 38.8µs | 25.49 | about 24 |
+
+kl02 is getting a fifth of the machine, which is what `rows/16 = 4 workers` predicts, and it is the
+one matrix that loses at every width up to 16 while winning at 32 — the signature of too little
+parallelism at low arithmetic intensity rather than a slow kernel. nw14 and bibd_17_8 are not starved
+at k=1 (they win there) and lose in the middle widths instead, so they need the ceiling *and* the
+narrow-k ladder.
+
+**So the remaining work is finite and already aimed at:**
+
+1. `SCORCH_SPMM_NNZ_PER_THREAD` — the row ceiling. Targets 21 of 31 float32 and 15 of 17 float64
+   cells. Queued as chains 59 and 61. Its blocking objection was stale and is corrected above.
+2. Pd_b / Pd_rhs — 8081 rows, 6323 nonzeros, 46% empty, 20–25 microsecond kernels. Six cells. The
+   empty-row-zeroing work took this family from a systematic loss to 1% of its 588 cells; these two
+   are what is left of it.
+3. A tail of about eight cells: connectus at k=32, higgs-twitter_reply at k=8 and 16, four
+   transformer attention layers at k=4 reading 1.06–1.09, and three linear-programming matrices at
+   k=1 and k=4 reading 1.06–1.09.
+
+Nothing in that list is a shape to tune. Items 1 and 2 are mechanisms with names, and item 3 is small
+enough that it should be re-counted after 1 and 2 land rather than attacked now — several of its
+cells are within a couple of percent of parity and may not survive a build that changes the thread
+count underneath them.
