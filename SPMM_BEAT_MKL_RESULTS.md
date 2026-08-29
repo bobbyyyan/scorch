@@ -14003,3 +14003,49 @@ moved only 1.0140 across the three processes — so unlike chain71 its numbers a
 (float32) and 5.48x (float64), with 28 and 22 cells of 1100 below it, **identical in all three builds**,
 so the flip neither creates nor closes any of them. There is no MKL deficit on this host to fix and
 this run does not claim one; it is the guardrail, and the guardrail is clean.
+
+## chain71 complete, and its float64 half fails a control the floor rule passes
+
+The float32 half is in the section above. The float64 half is the more instructive one, because the
+automated floor rule declared it resolvable and it is not.
+
+| dtype, kernel probe | k=4 | k=8 | k=16 | k=64 |
+|---|---|---|---|---|
+| float32 `ship/cand` | 0.9702 | **1.0601** | **1.0325** | 1.0006 |
+| float32 floor | 1.0097 | 1.0046 | 0.9937 | 1.0073 |
+| float64 `ship/cand` | 1.0113 | 0.9929 | **0.9467** | **0.9632** |
+| float64 floor | 1.0038 | 1.0057 | 0.9987 | 1.0142 |
+
+**k=64 cannot move.** The multi-row dispatch requires `narrow_k`, which is `B1_size <= 4 * lanes` —
+32 for float32, **16 for float64** — so at k=64 both builds run identical code at both dtypes. float32
+reads 1.0006 against a 1.0073 floor, correctly null. float64 reads **0.9632 against a 1.0142 floor**:
+a 3.7% move at a width where there is nothing to move, against a floor that itself sits 1.4% off
+1.000.
+
+So the float64 half carries unexplained variance larger than its stated floor, and its k=16 reading
+of 0.9467 — which is inside `narrow_k` for doubles and therefore a width the arm can act on — cannot
+be separated from that variance. The caller-path probe says the same thing more mildly: k=64 reads
+0.9862 against a 0.9959 floor, about 1% of drift, with k=16 at 0.9670.
+
+**The lesson is about which control to trust.** `an_ship3.py` requires an effect to be at least twice
+its same-code floor, and float64 k=16 passes that test: 5.3% against 1.4% is 3.8x. It passes and it
+is still not readable, because the same-code control measures cross-process and build-position
+variance and nothing else, while a **structural null** — a width where the candidate's code is
+provably identical to the baseline's, for a reason in the source rather than in the run — measures
+that variance *plus* whatever else the corpus, the width, and the machine contributed. Where a
+structural null exists it is strictly the better floor, and it should be read first. Here it converts
+a 5.3% "loss" into an unresolved reading, which is the correct conclusion.
+
+Two consequences. **Multi-row cannot ship on float64 on this evidence** — not because it loses, but
+because this run cannot say. And chain74 re-measures everything with the per-row cost of the dispatch
+removed, so these numbers will move anyway; the float64 question should be asked again there, with
+k=64 read first.
+
+For the record, the float32 half's own controls were clean at every width including its structural
+null, and its verdict stands: k=8 +6.0%, k=16 +3.3%, k=64 null, k=4 −3.0% — that last being the
+per-row cost of asking, which is what b51f857 removes.
+
+One more caveat that applies to both halves and to nothing else in the run: the MKL column, identical
+code in all three processes, moved 1.1115 and 1.1251 (limit 1.10), so the vs-MKL ratios and the
+below-MKL counts from chain71 are not resolvable. The arm-vs-arm verdicts are unaffected — they never
+read that column — but `386/378/365 below MKL` should not be quoted from this run.
