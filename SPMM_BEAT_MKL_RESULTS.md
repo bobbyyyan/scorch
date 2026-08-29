@@ -14310,3 +14310,15 @@ strings <so> | grep -E '^SCORCH_[A-Z_0-9]+$' | sort -u
 Worth keeping as a check when adding an escape hatch: if a new name appears in that list, it is on a
 release path and has to be cached or moved behind the hooks guard. Everything under
 `SCORCH_TUNE_HOOKS` is absent from the list by construction, which is why the list is short.
+
+### Today's commits, verified locally
+
+`pytest tests/ -q -m "not perf"` on the M5 against the tree carrying all of `7694c04` (cached
+release flags), `71d15ab` (the inference-mode guard) and `b9ed6d0` (the regression test and the
+`testpaths` fix): **1099 passed, 48 skipped, 3 deselected, 0 failed**, 1864.9 s. `bench/test_abi_guards.py`
+separately reads **73 passed, 0 failed**, where before `71d15ab` it read 72 passed, 1 failed.
+
+That is a correctness statement and nothing more. No runtime claim attaches to any of these commits:
+the environment-scan change is worth 25–50 ns per call at redwood's 33 variables, which is below what
+these instruments resolve, and it has not been timed on a kernel. x86 confirmation is still owed for
+the caching, and is queued behind chain74/75/76/73 rather than being run alongside them.
