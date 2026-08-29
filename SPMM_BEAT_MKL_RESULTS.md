@@ -13143,3 +13143,35 @@ and `e2` withhold only the lowest ones, so `e0` against `e1` in the deg<1 band p
 two-sided part, and `an_k1ladder.py` prints serve-versus-withhold band by band rather than a single
 threshold. What it cannot do is measure a constant that does not exist yet. If the two-sided gate is
 worth the second bound, that is a new constant and a new run.
+
+### The ARM version of chain69 also already ran, and its answer is "no floor"
+
+`k1lad_r2.csv`, same analyzer chain69 will use, K1 alone with DEGUNROLL at its compiled 0, six
+candidate thresholds. It is worth reproducing because the serve/withhold structure comes out textbook
+and that is the shape to expect from chain69:
+
+| band | n | floor | e0 | e1 | e2 | e4 | e8 | e16 | withheld | served | z |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| deg<1 | 28 | 0.9961 | 1.0604 | 0.9944 | 0.9965 | 0.9968 | 0.9973 | 0.9962 | 0.9962 | 1.0604 | +7.2 |
+| deg1-2 | 29 | 0.9975 | 1.0069 | 1.0139 | 0.9962 | 0.9856 | 0.9887 | 0.9743 | 0.9899 | 1.0104 | +1.5 |
+| deg2-4 | 48 | 0.9882 | 1.0921 | 1.0903 | 1.0876 | 0.9884 | 0.9860 | 0.9844 | 0.9871 | 1.0900 | +20.6 |
+| deg4-8 | 24 | 0.9955 | 1.1067 | 1.0959 | 1.0999 | 1.1013 | 0.9930 | 0.9884 | 0.9931 | 1.1009 | +10.1 |
+| deg8-64 | 20 | 0.9958 | 1.0536 | 1.0461 | 1.0509 | 1.0480 | 1.0424 | 1.0496 | 1.0134 | 1.0482 | +3.9 |
+| deg64-256 | 8 | 1.0001 | 1.0442 | 1.0366 | 1.0468 | 1.0550 | 1.0463 | 1.0471 | 1.0001 | 1.0460 | +6.6 |
+| deg≥256 | 12 | 1.0013 | 1.0835 | 1.0825 | 1.0837 | 1.0809 | 1.0766 | 1.0794 | 1.0013 | 1.0811 | +12.4 |
+
+In every band the arms that serve agree with each other and the arms that withhold agree with each
+other *and sit on the floor* — read deg2-4 across: e0/e1/e2 at 1.0921/1.0903/1.0876 and e4/e8/e16 at
+0.9884/0.9860/0.9844 against a 0.9882 floor. That is the null check the edge-aligned candidate design
+buys, and it passing is what makes the served column believable. The instrument check passes too:
+across k=2 and k=4 every arm is the reference, 0.9967 over 1014 cells against a 0.9975 floor over 338.
+
+**On ARM the threshold is 0 — serving pays in six of seven bands and the seventh is indistinguishable.**
+Note that seventh: deg1-2 reads 1.0207 at z+1.5 here for K1 alone, while the DEGUNROLL run above read
+0.9682 at z−1.4 for the same arm. Opposite signs, both marginal, in the one band this family's history
+already records as reading 1.0671 and 0.9409 on two runs of the same grid. Two runs agreeing that a
+band is unresolvable is not a contradiction, and no decision rests on it.
+
+`e16` is present here and, as the note in chain69's design says, uninterpretable: 16 lies inside the
+8-64 band, so at deg8-64 it reads 1.0496 — serving the part of the band above 16 and withholding the
+part below — agreeing with neither column. chain69 drops it for that reason.
