@@ -13284,3 +13284,66 @@ tree would replace the object the check is about.
 Queue, in run order: **chain65** (k=1 timing, finishing) → **chain67** (k=4 multirow) → **chain68** (row
 ceiling, predicted null) → **chain69** (the k=1 threshold) → **chain70** (does k=1 compute the right
 answer).
+
+## chain65 complete: the caller path agrees with the kernel on k=1, and two honest caveats
+
+The caller-path halves finished. x86 float64, whole call, `ship`/`cand` with each band's own same-code
+floor:
+
+| band | n | k=1 caller | floor | k=1 kernel (for comparison) |
+|---|---|---|---|---|
+| deg<1 | 42 | 1.0745 | 1.0021 | 1.0706 |
+| deg1-2 | 10 | 1.1296 | 1.0316 | 1.0983 |
+| deg2-4 | 41 | 1.0616 | 1.0021 | 1.0619 |
+| deg4-8 | 42 | **0.9547** | 0.9979 | 0.9595 |
+| deg8-64 | 37 | 1.0654 | 1.0012 | 1.0672 |
+| deg64+ | 40 | **1.1748** | 0.9909 | 1.1621 |
+
+The two probes agree to about a percent in every band including the losing one, which is what a
+kernel-level change should look like when the kernel is most of the warm call. Pooled at k=1 the
+caller path reads 1.0659 against a 1.0003 floor, and this time `an_ship3c.py` passes its own limits
+("controls within limits"), the float64 caller floor being 1.0018 against a 1.0100 effect.
+
+**Caveat one: float64's recovered-cell count is not readable.** Cells below the reference go ship 20,
+`ctrl` **10**, cand 7. The control is the same code as ship and it halves the count on its own, so
+cand's 7 against ctrl's 10 is three cells and means nothing. Contrast float32, where the same three
+numbers are 23, 22 and 13 — there the control barely moves and the nine-cell reduction is real. A
+below-reference count is only as good as its control's stability, and that has to be checked per dtype
+rather than assumed from the arm that happens to be quiet.
+
+**Caveat two: the compiled-in candidate may cost a fraction of a percent at widths it cannot serve.**
+On the float64 caller path, k=4 reads 0.9914 against a 1.0002 floor and k=8 0.9917 against 1.0059 —
+k=4 being 43× its floor. `EXACT_HI` is 3, so nothing in the candidate can act at k=4, and the kernel
+path reads the opposite sign there (1.0040 against 0.9985). Two readings that disagree in sign across
+probes are not a result, and a floor as tight as 1.0002 over 212 cells is luck rather than evidence —
+but the mechanism for a real sub-percent cost exists and this file has recorded it before: the
+candidate object differs from the baseline by 61807 instruction lines and 35 fewer instructions, and
+merely leaving a dead branch in place has previously reshuffled every stack slot in the enclosing
+function. If K1 ships, its cost at k=4 and k=8 needs a measurement of its own rather than an
+assumption of inertness from the source.
+
+## chain67's builds verified the same way, and they also prove the two staged trees are one source
+
+chain67 is past its builds and into its probes. Disassembled off the machine, instruction lines only,
+tree names again equal-length:
+
+| comparison | differing instruction lines |
+|---|---|
+| `mr_ctrl` vs `mr_ship` — same flags, the control | **0** |
+| `mr_cand` vs `mr_ship` — `MULTIROW_ROWS=2` | **114996** |
+
+`mr_cand` carries **7054 more instructions** and is 35848 bytes larger, which is what instantiating a
+whole multi-row register-block kernel family should look like — a much bigger footprint than chain65's
+candidate, whose 61807 differing lines came with 35 *fewer* instructions.
+
+And a check that came free: `mr_ship` has **exactly 160772 instruction lines, the same as `k1_ship`**.
+Those two objects were built in different chains from different staged trees — `tip2` and `tip` — with
+the same flags. Identical instruction counts is independent confirmation that the two re-staged trees
+really are one source, which until now rested on an md5 over their regular files.
+
+One small harness defect, recorded because it is the "marker that never appears" trap in miniature: a
+single-shot wait I armed grepped for `CHAIN65_DONE`, while the script's own `rw_done` writes
+**`CHAIN65B_DONE`** — the run kept the B suffix from being promoted out of slot 29b. The wait hit its
+30-minute deadline and reported "still running or died" twenty-three minutes after the verdict had
+printed. The deadline is what made this cost nothing; an unbounded wait would still be sitting there.
+Read the marker out of the script rather than inferring it from the chain number.
