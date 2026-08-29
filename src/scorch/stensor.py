@@ -36,7 +36,7 @@ from .plan import (
     SEEN_ATTR as _PLAN_SEEN_ATTR,
     DECLINES_ATTR as _PLAN_DECLINES_ATTR,
 )
-from .storage import SparseStorage, TensorIndex
+from .storage import SparseStorage, TensorIndex, tensor_version
 from .utils import (
     parse_format,
     get_extra_cflags,
@@ -463,7 +463,7 @@ def _remember_operand_copy(key, base: torch.Tensor, copy: torch.Tensor) -> None:
         held = weakref.ref(base)
     except TypeError:  # not weak-referenceable, so there is nothing to hold on to
         return
-    _OPERAND_COPY_CACHE[key] = (held, base._version, copy, copy._version)
+    _OPERAND_COPY_CACHE[key] = (held, tensor_version(base), copy, tensor_version(copy))
 
 
 def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
@@ -489,8 +489,8 @@ def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
         held, base_version, remembered, copy_version = entry
         if (
             held() is base
-            and base._version == base_version
-            and remembered._version == copy_version
+            and tensor_version(base) == base_version
+            and tensor_version(remembered) == copy_version
         ):
             _OPERAND_COPY_STATE[0] = 0
             return remembered

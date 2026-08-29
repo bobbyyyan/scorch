@@ -653,6 +653,27 @@ def _validate_index_storage(
         )
 
 
+def tensor_version(array: torch.Tensor) -> int:
+    """``array._version``, or 0 for a tensor that does not track one.
+
+    Inference-mode tensors have their version counter disabled and ``_version`` *raises* on
+    them, so this has to be asked rather than assumed. The native validator already does
+    exactly this -- ``abi_version_of`` in ``csrc/native_abi.h`` -- and its comment states the
+    consequence of not doing it: a ``with torch.inference_mode():`` block turns every matmul
+    into an exception. This is the Python half of the same guard, added after the ABI guard
+    suite caught the Python half missing while the native half passed.
+
+    Collapsing the version to 0 leaves the stamp unable to see an in-place write to an
+    inference tensor that preserves both ``data_ptr`` and ``numel``. That is one more blind
+    spot beside the ones the stamp already has -- a write through a raw pointer or a numpy
+    view bumps no counter either -- and it buys keeping the O(nnz) validation skipped inside
+    ``inference_mode``, which is where an inference workload spends all of its time. Failing
+    closed to always-revalidate there would put the cost back on the hot path it was removed
+    from, for a mutation pattern nothing else in Scorch catches either.
+    """
+    return 0 if array.is_inference() else array._version
+
+
 def _validation_stamp(
     mode_indices: IndexModes, value: torch.Tensor
 ) -> Tuple[Tuple[Tuple[int, int, int], ...], Tuple[int, int, int]]:
@@ -675,11 +696,11 @@ def _validation_stamp(
     """
     return (
         tuple(
-            (array.data_ptr(), array._version, array.numel())
+            (array.data_ptr(), tensor_version(array), array.numel())
             for arrays in mode_indices
             for array in arrays
         ),
-        (value.data_ptr(), value._version, value.numel()),
+        (value.data_ptr(), tensor_version(value), value.numel()),
     )
 
 
