@@ -13863,14 +13863,30 @@ non-moving cells in the first band are matrices whose rows are almost all a sing
 kernel produces the same bits because there is nothing to reassociate. Width 4 moved nowhere
 (0/103, 0/22, 0/122) — the exact band stops at 3, and that is the structural null holding.
 
-### The leading suspect for the fixed cost, and the reason it can be A/B'd without a rebuild
+### The leading suspect for the fixed cost, eliminated from the source before it cost a run
 
-The SpMM launches its workers on a **private libgomp team** by default and uses torch's own intra-op
-pool only when the caller sets `atparallel` — which the plain `matmul` path does not. This ledger
-already records what a private team costs the code next to it: torch's own matmul runs 1.12–1.33x
-slower beside one. On a 24-core host with torch's pool also holding 24 spinning threads, launching a
-second team of 18–24 means preempting spinners that belong to **the pool MKL runs on**. That is a
-fixed per-call cost we pay and MKL does not, of exactly the order the decomposition is hunting.
+**The obvious suspect was the launch, and it is wrong — eliminated by reading, before any machine
+time went into it.** The reasoning was: the SpMM launches its workers on a private libgomp team by
+default and uses torch's intra-op pool only when the caller sets `atparallel`, the plain `matmul`
+path does not set it, and this ledger records that a private team costs the code next to it (torch's
+own matmul 1.12–1.33x slower beside one) — so launching a second team of 18–24 on a host whose pool
+already holds 24 spinners would be a fixed cost we pay and MKL does not, of exactly the order being
+hunted.
+
+Every step of that is false for these cells. `ops.py` sets `_ATPARALLEL_PIPELINE` from
+`SCORCH_ATPARALLEL_PIPELINE` with a default of **"1"**, so the plain path *does* set it. And the C++
+gate passes at every width measured: `nthreads_override` is `torch.get_num_threads()`, the work term
+is `total_nnz * k_eff` with **`k_eff = max(k, 16)`** — so at k=1 it is 133557×16 = 2.1M against a
+150000 grain, not 133557 against it — and `A0_size >= nthreads_override * ROWS_PER_THREAD` is
+512 ≥ 24×16 = 384. **So the residual cells already run on torch's warm pool, and the private team is
+not the fixed cost.**
+
+Worth keeping for the shape of it: that row gate binds at 384 rows on this host and the residual sits
+at 512, one factor of two from falling off it. Not the explanation, but a threshold the residual is
+close to, which anyone widening `ROWS_PER_THREAD` should know.
+
+The arm stays in `fixed_decomp.py` as a **control** rather than a candidate. It now prices what the
+rejected launch would cost, which is how much the existing gate is worth — a number nobody has.
 
 It needs no new build. `SCORCH_SPMM_ATPARALLEL` is read outside the hooks guard, so it is live in a
 release `.so`, and it bypasses the eligibility gate entirely. The branch it selects uses the
@@ -13880,8 +13896,7 @@ the caller passed — the `nthreads_override > 0` term in the gate is about *pol
 for the two baselines, `"1"` for the candidate) because in a build that looks up environment
 variables each extra variable an arm *sets* is worth about 1.1% on x86 on a sub-30µs kernel.
 
-A smoke test on the M5 showed the kernel column moving by 10–14µs of 35 and the whole-call column not
-moving at all. **That is not offered as a result and should not be quoted as one.** It ran nice-19
+A smoke test on the M5 forced the private team and moved the kernel column by 10–14µs of 35 — in the direction that says the default is the better one — while the whole-call column did not move at all. **That is not offered as a result and should not be quoted as one.** It ran nice-19
 alongside the ARM three-build's own timing, its kernel figure was one sample where its whole-call
 figure was a minimum over nine batches, and the two disagreeing by that much is itself a sign the
 measurement was not clean. It is recorded only as the reason the arm is worth a proper run.
