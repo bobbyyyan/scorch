@@ -13796,9 +13796,12 @@ The degree axis says what is going on:
 | deg8-64 | 160 | **0.9670** | 1.1083 | 1.0741 | 1.0004 |
 | deg64+ | 88 | **0.9933** | 0.9921 | 0.9572 | 0.9791 |
 
-(`ship/cand` here, so above 1 is the candidate winning — the opposite orientation from the table
-above it, which is `an_ship3.py`'s.) The k=4 column is monotone in degree and converges on 1.0 as
-rows lengthen. **That is the signature of a cost paid per row rather than per nonzero**: fixed work
+(`ship/cand`, so above 1 is the candidate winning — the **same** orientation as the two tables
+above it. An earlier version of this paragraph called them opposite, on the strength of
+`an_ship3.py` printing a column headed `cand/ship`; its arithmetic is `per[den]/per[num]`, which for
+the pair `("cand","ship")` is ship over cand. One orientation throughout, and the label has been
+fixed at the source rather than explained here.) The k=4 column is monotone in degree and converges
+on 1.0 as rows lengthen. **That is the signature of a cost paid per row rather than per nonzero**: fixed work
 per row is a larger share of a short row.
 
 And the dispatch is where it comes from. The condition tested **eight loop-invariant terms inside
