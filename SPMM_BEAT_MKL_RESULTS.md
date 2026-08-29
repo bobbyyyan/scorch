@@ -12951,3 +12951,74 @@ Also worth noting against the earlier ARM ladder: its one apparent win was at de
 replicate, two runs of the same grid giving 1.0671 and 0.9409. Here deg1-2 has ten matrices, the fewest
 of any band, and it is the band whose k=1 reading (0.9742 against a 0.9863 floor) is inside its floor.
 Same band, same weakness, and no conclusion is drawn from it either time.
+
+## The k=1 extension is not ARM-only. It is degree-conditional, and x86 float32 wins 40 matrices out of 40 above degree 64
+
+The section above titled "The k=1 extension is ARM-only, and x86 says so with a number already in
+the source" is **wrong on its central claim**, and chain65 overturns it on the same host at the same
+widths in the same bands.
+
+That section rested on chain42: x86 float32 at k=1 reading 0.9706 at degree 8–64, 0.9933 at 64–256
+and 0.9033 at ≥256, against ARM's 1.0410 / 1.0446 / 1.0646. From that it built a rule — *"take width
+1 wherever the gather kernel does not already serve it"* — which fit three of four configurations and
+attributed the fourth to `vgatherdps`, one outstanding memory operation covering eight nonzeros,
+being displaced by something worse.
+
+The displacement is real and the dispatch order confirms it: `if (exact_width) { … continue; }` sits
+immediately *before* `if (narrowk_gather && nvec == 1 && is_same<scalar_t,float>)`, so admitting width
+1 to the exact-width kernel does preempt the gather. What is wrong is the sign.
+
+chain65's k=1 cells, per matrix, `ship`/`cand` so above 1.0 means the exact-width kernel is faster,
+with the floor being `ship`/`ctrl` — two builds of identical code:
+
+| band | n | cand geomean | min | median | max | floor | >2% faster | >2% slower |
+|---|---|---|---|---|---|---|---|---|
+| deg<1 | 40 | 1.0265 | 0.965 | 1.032 | 1.102 | 1.0026 | 25 | 4 |
+| deg1-2 | 12 | 0.9833 | 0.905 | 0.973 | 1.086 | 0.9896 | 3 | 8 |
+| deg2-4 | 40 | 0.9848 | 0.709 | 0.995 | 1.070 | 1.0007 | 5 | 11 |
+| deg4-8 | 40 | **0.9663** | 0.618 | 0.988 | 1.058 | 1.0055 | 5 | **15** |
+| deg8-64 | 40 | 1.0356 | 0.866 | 1.020 | 1.351 | 1.0057 | 20 | 8 |
+| **deg64+** | 40 | **1.1947** | **1.025** | 1.189 | 1.419 | 1.0030 | **40** | **0** |
+
+**Forty of forty matrices above degree 64 are faster, none slower, the slowest of them by 2.5% and
+the fastest by 42%.** That is not a pooled number carried by a few cells, and chain42's own bands
+disagree with it at every point of overlap — including 64–256, where chain65's lowest-degree entries
+(79 to 104) read 1.028 to 1.101 against chain42's 0.9933.
+
+chain65 is the better measurement on four independent counts, and the reasons are worth naming
+because they are the standing traps in this file:
+
+1. **Its corpus is not selected on the outcome.** chain42 binned `streams_groups.csv`, which *is* the
+   set of matrices below MKL parity at k≤2. Measuring a kernel swap on a population chosen for
+   already losing selects partly on noise and partly on the incumbent being bad there.
+2. **It is compiled in.** chain65 exists because everything previously measured about this family came
+   from a hooked binary, where arms order themselves by how many variables each sets that the code
+   also looks up. chain42 was one of those.
+3. **It has more matrices in band** — 40 at deg64+ against 17 at deg≥256 — and a same-code floor per
+   band and per width.
+4. **chain42's own statistics were marginal**: z −2.0 in the one band and −0.4 in the next.
+
+**The rule survives, restated, and it is a better rule.** The gather's cost per nonzero is roughly
+flat; the exact-width kernel's prologue is `UNROLL*K` zero stores and its epilogue `(UNROLL-1)*K`
+adds, both paid per row whatever the row holds, so its cost per nonzero *falls* as rows lengthen.
+Two curves like that cross once. So the question is not whether a gather exists but **at what degree
+the crossover sits**, and it differs by what is being displaced: about 8 on x86 float32, where the
+incumbent is a gather covering eight nonzeros per instruction, and below 1 on ARM, where the
+incumbent is a register-block tile using one lane of four. ARM's own numbers rise with degree in
+exactly the same way — 1.0410, 1.0446, 1.0646 at deg 8–64, 64–256, ≥256 — which the ARM-only reading
+had no use for and this one predicts.
+
+That also explains the shape of the x86 loss without a second mechanism: −3.5% at degree 4–8, −1.5%
+at 2–4, and back to +2.7% below degree 1, where rows are so short that neither kernel amortises
+anything and the comparison is between two different fixed costs.
+
+**Consequence.** `SCORCH_NARROWK_EXACT_K1_MINDEG` is the right mechanism and its value is where the
+crossover is, not where a table looks best. The residual's k=1 cells — 35 float32 and 30 float64, at
+mean degree 128–512 — sit squarely inside the band where 40 of 40 matrices got faster. If that
+holds, K1 gated on degree is not an ARM curiosity worth 4% on a host with no MKL to beat; it is the
+lever for all 65 of them on x86.
+
+Still outstanding, unchanged by any of this: chain65's float64 halves, a MINDEG ladder whose band
+boundaries do not coincide with its candidate values (8 is both a boundary and the obvious candidate,
+which is precisely why the ladder is needed rather than a reading of the table above), and an ARM
+re-confirmation that the unified rule holds where the ARM-only rule used to.
