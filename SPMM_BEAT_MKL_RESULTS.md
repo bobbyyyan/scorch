@@ -14639,3 +14639,40 @@ float32, and multi-row ROWS=2 on float32 now has a kernel win of 8–15% above d
 non-worse below-MKL count at every width. What is still owed before shipping is float64 — which needs
 k=24 or k=32 in the grid to have a comparable-footprint null — and a confirmation on a second host,
 since every number in this section is redwood.
+
+### The recovered count settles priority: multi-row wins cells we already win
+
+The partition adds back exactly, which is what distinguishes it from a second look at a different
+subset: ship 24+29 = 53, ctrl 25+39 = 64, cand 21+41 = 62 — the three totals first reported — and
+205+242+214+183 = 844 with 1208−844 = 364.
+
+With the count readable, ask where the deficit actually is. On the best arm, float32, stable cells:
+
+| k | below MKL | % of that width | % of the remaining deficit |
+|---|---|---|---|
+| 4 | 20/205 | 9.8% | **95.2%** |
+| 8 | 1/242 | 0.4% | 4.8% |
+| 16 | 0/214 | 0% | 0% |
+| 64 | 0/183 | 0% | 0% |
+
+**Ninety-five percent of what is left is k=4, and multi-row moves k=4 by one cell** (21 → 20). Its
+8–15% kernel win is at k=8 and k=16 — widths where all three arms are already above MKL at every
+stable cell measured. So ROWS=2 on float32 is a general-goodness improvement worth having on its own
+terms, and it is **not** a lever on "beat MKL everywhere". Stating that plainly because the 11.9% is
+the most quotable number of the day and it is the least relevant one to the goal.
+
+That makes the ordering explicit rather than implicit:
+
+- **chain73 is the critical path.** The remaining deficit is k=4, k=4 is where the per-call fixed cost
+  lives (the 512-row transformer family at degree 200–260, flat from k=1 to k=8), and chain73 measures
+  `F_ours − F_mkl` directly instead of by subtraction.
+- **The float64 multi-row rerun — k=24 or k=32 for a comparable-footprint null — completes a side
+  result and should be queued behind, not ahead of, whatever chain73 points to.** It was on my list
+  as the next chain; it is not.
+- A second host for the float32 multi-row win is still owed before it ships, but shipping it does not
+  advance the goal, so it is not urgent either.
+
+The general form, which is worth more than the specific ordering: a per-width deficit table tells you
+which lever can possibly matter, and it costs nothing once the count is readable. Both of today's
+candidate levers were argued from mechanism — multi-row from the dependency chain, the flip from the
+setup-to-work ratio — and only one of them was ever pointed at the width where the deficit is.
