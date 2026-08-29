@@ -13716,3 +13716,36 @@ so the honest prior is that most of it is not ours to remove, and the measuremen
 the decomposition rather than another arm. That is what the next chain should be: fit
 `F + b·rows + c·nnz` for us and for MKL over a synthetic grid at fixed k on x86, and either name a
 term we pay and MKL does not, or record that these cells are floor-bound and stop working on them.
+
+### The count the goal is stated in, from chain65's data, with a same-code floor on the count itself
+
+Every analyzer in this ledger scores candidate-over-ship as a time ratio. `an_mklcount.py` asks the
+other question — on how many cells is each build's time longer than MKL's — and chain65's three
+builds were still on disk, so this needed no machine time. Minimum over passes for both us and MKL,
+212 matrices, five widths, and the control build is the same code as `ship`, so the ship-versus-ctrl
+gap is the floor on a *count*.
+
+Whole call (`cprobe`, the caller path):
+
+| dtype | build | k=1 | k=2 | k=4 | k=8 | k=64 | total |
+|---|---|---|---|---|---|---|---|
+| float32 | ship | 10 | 2 | 14 | 1 | 0 | 27 / 1060 |
+| float32 | ctrl (same code) | 10 | 2 | 13 | 1 | 0 | 26 / 1060 |
+| float32 | **cand** | **1** | 1 | 13 | 0 | 0 | **15 / 1060** |
+| float64 | ship | 8 | 0 | 9 | 0 | 0 | 17 / 1060 |
+| float64 | ctrl (same code) | 9 | 0 | 9 | 0 | 0 | 18 / 1060 |
+| float64 | **cand** | **0** | 1 | 10 | 1 | 0 | **12 / 1060** |
+
+Kernel only is larger in the same direction: float32 k=1 goes 17 → 1 against a control of 16, and
+float64 11 → 0 against 10.
+
+**The floor on this count is one cell.** Two builds of identical code differ by 1 at k=1 on float32
+and by 1 on float64, so 10 → 1 and 8 → 0 are not floor effects. And k≥4 is a free structural null
+here — both flags are inert above width 3 by construction — which is exactly what it reads: 14/13/13
+and 9/9/10, moving by at most one cell in either direction.
+
+Two things this does not say. chain65's candidate was built with `K1_MINDEG=0` and the shipped value
+on x86 is 8, so this is the flip's effect without its floor; the losing k=1 cells sit at degree
+128–512, above the floor, so the shipped configuration should recover the same cells, and chain72 is
+where that stops being an argument. And this is chain65's degree-stratified corpus, not chain63's —
+9 matrices overlap — so it is not a 128 → N claim about the canonical residual board.
