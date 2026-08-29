@@ -14269,3 +14269,30 @@ number over 302 matrices would still be dominated by the 173 above degree 12 whe
 reach, which is the trap the section above describes. The reason the mistake is worth recording: I
 concluded "no instrument exists" from one corpus being unfit, without checking the corpora already
 on the host. Reach arithmetic tells you a corpus is unfit; it does not tell you no corpus is fit.
+
+### The audit, so the claim is about the object and not about two sites
+
+Fixing two call sites is not the same as the object having no per-call environment reads left, so ask
+the object. Every `SCORCH_*` name that survives into the shipped `.so` is a read that happens at
+runtime; there are five:
+
+| name | read in | cached? |
+|---|---|---|
+| `SCORCH_SPMM_ATPARALLEL` | `scorch_policy.h` (`scorch_flags`) | yes, as of `7694c04` |
+| `SCORCH_NEON_REGTILE` | `scorch_policy.h` (`scorch_flags`) | yes, as of `7694c04` |
+| `SCORCH_ABI_VALIDATE_MEMO` | `native_abi.h:387` | yes, already |
+| `SCORCH_LLC_BYTES` | `scorch_policy.h:878` | yes, already |
+| `SCORCH_PCORES` | `scorch_policy.h:815` | yes, already |
+
+The last three were already `static const` with a lambda initialiser — the same idiom `scorch_flags`
+now uses — so the house pattern was right and the SpMM's two escape hatches were the outliers rather
+than the rule. **The release object now has no uncached per-call environment read**, which is a claim
+about the whole object and is checkable in one command:
+
+```
+strings <so> | grep -E '^SCORCH_[A-Z_0-9]+$' | sort -u
+```
+
+Worth keeping as a check when adding an escape hatch: if a new name appears in that list, it is on a
+release path and has to be cached or moved behind the hooks guard. Everything under
+`SCORCH_TUNE_HOOKS` is absent from the list by construction, which is why the list is short.
