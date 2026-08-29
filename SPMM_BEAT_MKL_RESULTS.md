@@ -14877,3 +14877,83 @@ fixed-cost story it survived contact with a direct measurement. The next run is 
 ladder at k∈{1,2,4,8} × degree∈{64,128,250,500} × rows∈{256,512,1024} with interleaved arms and a
 same-code control — on the real dlmc matrices, not the synthetic ladder, since the synthetic cell's
 locality is not the transformer family's.
+
+## chain78: the thread candidate dies, and the shipped policy is the best fixed count there is
+
+The ladder on the real corpus — 1192 cells, k ∈ {1,2,4,8}, worker count forced as the
+`nthreads_override` **argument** so the arms share one build, one process and set no environment
+variable. The floor (`policy` vs `policyb`, identical code and identical argument) held at
+0.9818–1.0288 in every band on both dtypes, so the instrument is fit and everything below is readable.
+
+**Prediction 2 failed, and with it the candidate.** chain77 found eight workers beating the policy by
+17% at 512 rows, mean degree 250, k=4. On the real matrices, `policy/nt8` at k=4 is **0.9530**
+(float32) and **0.9681** (float64) in the deg64-256 band — nt8 is 3–5% *slower* — and at deg≥256 it is
+2.3% faster on float32 and unresolvable on float64. chain77's 17% was a **synthetic-locality
+artefact**: its ladder builds rows of uniformly random columns over 1024 columns, and the transformer
+family it was standing in for does not have that structure. I promoted that reading to "the live
+candidate" one message ago on the strength of one reading per cell from one run. It does not survive
+contact with the corpus.
+
+**Prediction 3 also failed, in the interesting direction.** At deg≥256 it is **k=1** that prefers
+eight workers — 1.0528 (float32, floor 0.9818) and 1.0736 (float64, floor 1.0288), both above 2× their
+band's floor — while k=4 there is 1.0231 and unresolvable. chain77 had this exactly backwards. So a
+width-dependent optimum does exist at fixed rows and degree; it is simply not the one that was
+predicted, which is the outcome that makes a pre-registration worth writing.
+
+**The positive result, and it is the shipped policy's.** Below-MKL cells by arm, of 1192:
+
+| arm | float32 | float64 |
+|---|---|---|
+| **policy** | **20** | **18** |
+| policyb (floor) | 20 | 15 |
+| nt12 | 51 | 21 |
+| nt24 | 70 | 58 |
+| nt8 | 161 | 97 |
+| nt4 | 406 | 380 |
+| nt2 | 619 | 619 |
+
+**The current thread rule beats every fixed count tested, on both dtypes, by margins of 2.5× to 30×**,
+against a floor of 0 cells (float32) and 3 cells (float64). That closes the thread count as a
+*constant*: there is no number to change. It is also the first time in this ledger that the shipped
+policy has been scored against the whole ladder on the real corpus rather than defended a shape at a
+time.
+
+**And the constraint that kills every fixed count as a rule**, asked in both directions:
+
+| arm | float32: clears / 20 losing | breaks / 1172 winning | float64: clears / 18 | breaks / 1174 |
+|---|---|---|---|---|
+| nt8 | 6 | 147 | 9 | 88 |
+| nt12 | 11 | 42 | 9 | 12 |
+| nt24 | 8 | 58 | 5 | 45 |
+
+Nothing here is a rule. The best case, `nt12` on float64, clears 9 and breaks 12 — net negative — and
+on float32 it clears 11 and breaks 42.
+
+### What remains, stated without a lever attached
+
+There *is* real per-cell headroom, and it is on the losing cells specifically:
+
+| matrix | k | deg | rows | policy | best | MKL | best arm |
+|---|---|---|---|---|---|---|---|
+| `..._attention_multihead_attention_k` | 1 | 269 | 512 | 20.37 | **12.67** | 18.93 | nt8 |
+| `..._1_ffn_conv1_fully_connected` | 1 | 10 | 2048 | 16.29 | **10.27** | 14.48 | nt8 |
+| `body_encoder_layer_0_ffn_conv1` | 4 | 204 | 2048 | 35.80 | **26.02** | 28.06 | nt24 |
+| `ss:lp_osa_14` | 4 | 136 | 2337 | 59.52 | **42.57** | 46.83 | nt12 |
+| `body_encoder_layer_0_ffn_conv2` | 2 | 295 | 512 | 21.30 | **18.90** | 20.46 | nt8 |
+
+Five cells where a forced count beats both the policy and MKL, by 12–37%. An oracle over the ladder
+clears 9 of 18 (float64) and 11 of 20 (float32). But **an oracle is not a policy**, and picking the
+per-cell winner out of the same readings that score it is in-sample — the mistake this ledger already
+records against a learned cost model whose stamped held-out geomean turned out to be in-sample. A
+rule would have to be gated on observable features (rows, nnz, degree, k) that separate those cells
+from the 1172 the same count breaks, and the ladder's own numbers say the separating surface is not
+any of the four axes alone: 2048 rows at degree 204 wants *more* threads while 512 rows at degree 269
+wants *fewer*.
+
+So: **four levers examined today, and none of them moves the deficit.** Multi-row wins 8–15% at
+k=8/k=16 where nothing was losing. `DEGUNROLL` acts below degree 4 where nothing is losing. The
+dispatch chain costs 6% below degree 64 where nothing is losing. The thread count has no constant
+better than the one that ships. What is left of the deficit is 20 float32 and 18 float64 cells of
+1192 — `nw14`, `kl02`, `connectus`, `bibd_17_8` at few rows and extreme degree needing 30–45%, and a
+handful of dlmc layers needing 2–10% — and the honest position is that the next step is a
+feature-gated per-cell thread selector validated held-out, not another constant.
