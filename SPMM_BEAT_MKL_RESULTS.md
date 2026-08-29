@@ -14793,3 +14793,77 @@ aimed at the deficit.
 a 17.6 µs call whose fixed cost is roughly 13 µs — so cutting **~1.3 µs of per-call fixed cost clears
 the median on both dtypes**, and cutting 2 µs clears nearly all of them. That is what chain77
 measures, and it is why chain77 rather than any of today's three levers is the critical path.
+
+## chain77: our per-call fixed cost is ten microseconds SMALLER than the reference's — the residual is not overhead
+
+One hookless tree (`k2_cand`, gated: `mr2_correct` 864 comparisons 0 mismatches, and the full suite
+1099 passed / 48 skipped / 3 deselected in 47:58), one process per dtype, no arms that differ in
+behaviour, and a same-code duplicate of our own call as the floor. `F` is the intercept in nonzeros of
+a low-degree ladder at each row count: the cost of a call on that many rows with no arithmetic in it.
+
+float32, k=1 and k=4, and float64 alongside:
+
+| rows | F_ours (f32) | F_ref (f32) | **F_ours − F_ref** | same-code floor | F_atpar − F_ours |
+|---|---|---|---|---|---|
+| 128 | 3.53 / 3.58 | 13.43 / 13.93 | **−9.90 / −10.14** | −0.02 / −0.10 | −0.26 / −0.15 |
+| 256 | 3.70 / 3.49 | 13.62 / 13.76 | **−9.92 / −10.77** | +0.04 / +0.10 | −0.04 / −0.17 |
+| 512 | 4.07 / 4.13 | 13.32 / 13.98 | **−9.25 / −10.27** | +0.17 / +0.15 | +0.02 / −0.05 |
+| 1024 | 4.84 / 4.51 | 18.13 / 14.16 | **−13.30 / −9.08** | +0.33 / −0.39 | +0.16 / −0.15 |
+| 2048 | 7.92 / 7.69 | 13.79 / — | **−5.87 / −14.13** | +0.37 / −0.13 | +0.06 / −0.39 |
+
+**Our per-call fixed cost is 3.5–8.0 µs and the reference's is 13.3–22.9 µs. We pay roughly ten
+microseconds LESS, at every row count, both dtypes, both widths, against a same-code floor of
+0.02–1.05 µs** — so the difference is 25× to 600× its own control. This is the tightest control in
+the ledger and it says the opposite of what the section above it says.
+
+### Which retracts the ~13 µs, and the target I derived from it
+
+This file has said, since the bandwidth section, that subtracting A's movement at `heart1`'s measured
+231 GB/s "leaves roughly 13 µs of per-call fixed cost inside the kernel timer at 512 rows, and MKL
+pays about 12 µs of it". Both halves are wrong. Directly measured, our fixed cost at 512 rows is
+**4.1 µs**, not 13, and the reference's is **14.0 µs**, not 12 — so the difference is −10 µs, not
++1 µs. The sign is reversed.
+
+The subtraction was not merely imprecise, it was **mislabelled**: it attributed to "fixed cost"
+everything that was not A-streaming at L3 rate. The direct intercept shows only about 4 µs of that is
+per-call cost. The other ~9 µs is the thing this file had already observed two boxes earlier and not
+connected — the small matrix achieves **59 GB/s where an L3-resident matrix in the same process
+achieves 231**. That is a bandwidth shortfall on the cell, not an overhead on the call.
+
+So one message ago I wrote that "cutting ~1.3 µs of per-call fixed cost clears the median on both
+dtypes". **There is no 1.3 µs of excess fixed cost to cut.** We are already 10 µs better than the
+reference on that axis, and a lever aimed there would be aimed at our strongest component. Withdrawn.
+
+Two subsidiary results, both clean:
+
+- **The launch mechanism is null.** `F_atpar − F_ours` is −0.62 to +0.16 µs across ten row-count ×
+  dtype × width combinations, entirely inside the same-code floor. Forcing `at::parallel_for` on
+  changes the per-call cost by nothing measurable, which closes the private-team / launch-path
+  question on the fixed-cost axis rather than by the source reading that eliminated it earlier.
+- **The reference is 67–101% fixed cost at these shapes** (`F/T` at degree 250) against our 19–33%.
+  Whatever advantage MKL has on the real dlmc cells, it is not a cheaper call.
+
+### The one new lever, and it is a thread count
+
+The sweep at 512 rows, where the residual family sits, forcing the worker count instead of taking the
+policy's:
+
+| cell | policy | nt1 | nt2 | nt4 | nt8 | nt24 |
+|---|---|---|---|---|---|---|
+| k=4, deg=250 | 20.50 (resolves 24) | 48.64 | 28.85 | 18.84 | **16.93** | 20.50 |
+| k=1, deg=250 | 14.78 (resolves 24) | 38.62 | 23.37 | 16.21 | 17.88 | **13.83** |
+| k=4, deg=16 | 8.11 (resolves 1) | 7.39 | 7.39 | 7.39 | 7.39 | 7.39 |
+| k=1, deg=16 | 9.54 (resolves 1) | 9.54 | 9.30 | 9.54 | 9.54 | 9.30 |
+
+At k=4, degree 250, 512 rows — the residual's exact shape — **eight workers beat the policy's
+twenty-four by 17%** (16.93 vs 20.50 µs). At k=1 the same shape prefers 24 and eight is 21% worse.
+So the optimum is width-dependent at fixed rows and degree, which no current rule captures: the
+thread policy sees work and rows, not k.
+
+This is one reading per cell from one run, and a thread gate has been rejected here before as
+arm-variance, so it is a **candidate and not a result**. But it is the first lever all day pointed at
+the cells that are actually losing rather than at cells that are already winning, and unlike the
+fixed-cost story it survived contact with a direct measurement. The next run is a proper thread
+ladder at k∈{1,2,4,8} × degree∈{64,128,250,500} × rows∈{256,512,1024} with interleaved arms and a
+same-code control — on the real dlmc matrices, not the synthetic ladder, since the synthetic cell's
+locality is not the transformer family's.
