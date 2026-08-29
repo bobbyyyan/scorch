@@ -14404,3 +14404,37 @@ valid after naming which kernel serves the cell — which depends on dtype, widt
 `799205e`, on the ISA-conditional floor. Two of the three citations above got that wrong in the same
 direction, and both times the arithmetic still validated, which is exactly why neither was caught by
 checking the numbers.
+
+### And the repair to the effective-cores table was itself an estimate; withdraw it
+
+Above I replaced the wrong mechanism with `vgatherdps` throughput "of order 12–20 cycles per
+8-element gather, so 1.5–2.5 cyc/nnz", and concluded the implied core counts were optimistic by about
+2x. That figure was mine and was not sourced. The comment above the gather kernel in `spmm.h` records
+a measured one: **"one VGATHERDPS is ~4-5 cycles and replaces eight masked loads."**
+
+At 4–5 cycles per 8 nonzeros the chain floor is ~0.55 cyc/nnz, which would put a core near 9 MAC/ns
+and make kl02's measured 5.29 MAC/ns *less than one core's worth* — collapsing the effective-core
+reading entirely rather than halving it. But that cannot be right either, and the reason is the point:
+4–5 cycles is the instruction's cost with its eight elements **in L1**. These gathers index B at
+random, so what the loop actually pays is B's cache behaviour, which depends on B's size relative to
+L1 and L2 and is not a constant at all.
+
+So there are now three candidate baselines — 1 MAC/ns from the wrong ceiling, 2–3 from my unsourced
+gather estimate, 9 from the source's L1-resident figure — spanning 9x, and the honest conclusion is
+that **the conversion from MAC/ns to effective cores cannot be repaired by argument.** It needs a
+measured per-core gather rate at the B sizes those matrices actually present. Withdraw the "optimistic
+by about 2x"; it was one guess replacing another, and quoting it would have propagated a number with a
+plausible-sounding provenance and no measurement behind it.
+
+What survives is what was measured: kl02 at 0.593 of MKL on 71 rows and 212,536 nonzeros, nw14 above
+parity, and the row ceiling that section motivated, which was measured rather than argued. The
+*direction* — kl02 starved, nw14 not — rests on those ratios and not on any per-core baseline. The
+effective-core column should be read as an illustration that was never load-bearing, and if anyone
+wants it to mean something, the measurement is unqueued.
+
+Three corrections deep on one paragraph is itself the finding: the first was a wrong mechanism, the
+second was a right mechanism with an invented constant, and only the third — reading the constant the
+source already recorded — showed that no constant available without measurement can settle it. The
+rule that would have short-circuited all three: when a derived quantity needs a hardware constant,
+either cite one this repository has measured, or state that the quantity is unavailable. Estimating it
+produces a number that reads exactly like the other two.
