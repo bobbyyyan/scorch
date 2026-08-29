@@ -12552,3 +12552,85 @@ plus two arms the family's own shape demands: `(512,192)` because family A's row
 to 512 while the shipped bound is 128, and `(512,128)` because family A's degrees start at 128 while
 the shipped floor is 192. On the numbers above, a gate that cannot reach rows past 128 cannot reach
 most of the matrices the deficit is made of, which may be the whole reason `ship_lose` is empty.
+
+## chain63's thread ladder: the shipped rule beats every fixed count, and the pool cap reproduces itself
+
+chain63 forces the launch count to 2, 4, 8, 16 and 24 with `SCORCH_SPMM_NT_FORCE` — applied after
+the policy *and* after the composition-adoption branch, so an arm named t8 really launches eight
+threads — over 302 matrices at k = 1, 2, 4, 8, 16, 64, on both the general dispatch path and the
+caller path, interleaved with padded environments and 13 reps. 1812 cells per path. Two same-code
+controls: a duplicate `refb` arm and an `aa` arm, reading 0.9962 and 1.0058 on the caller path at
+z −1.3 and +1.8, so the floor is about half a percent.
+
+Read the build first, because it is the whole interpretation. The tree is
+`/scratch/bobbyy/mklcheck/tune`, built 08:12, and `strings` finds `SCORCH_SPMM_NT_FORCE` and
+`SCORCH_SPMM_NNZ_PER_THREAD` in it but **not** `SCORCH_SPMM_NT_CAP` or
+`SCORCH_SPMM_RECRUIT_MIN_WORK`. So its `ref` is the policy as it stood *before* b5b2404 — the
+uncapped E-core recruit, which on this host can launch 32 logical CPUs against a pool of 24.
+
+**No fixed thread count beats the rule, anywhere.** Caller path, whole call against MKL's whole call:
+
+| arm | geomean MKL/arm | cells behind MKL | matrices behind |
+|---|---|---|---|
+| **ref** | **1.6639** | **158 / 1812** | **99 / 302** |
+| aa (A/A) | 1.6672 | 158 / 1812 | 99 |
+| t24 | 1.3602 | 360 | 148 |
+| t16 | 1.3768 | 303 | 156 |
+| t8 | 1.1816 | 759 | 204 |
+| t4 | 0.9864 | 968 | 201 |
+| t2 | 0.7233 | 1156 | 223 |
+
+**This refutes chain46.** chain46 reported that forcing eight threads took the cells behind MKL from
+78/231 to 15/231 on float32 and called the resolved count "the largest single error on the board".
+On four times the corpus and twice the widths, forcing eight threads takes 158 cells behind to 759
+and the geomean from 1.66 to 1.18. There is no band and no width where t8 beats ref; its best
+reading anywhere is 0.9364, at rows<128 and k=64. chain46 had 77 matrices, three widths, and one
+probe. That claim is withdrawn, and the "8 is exactly this host's P-core count" mechanism it
+proposed — plausible, and stated as a hypothesis — has nothing left to explain.
+
+**The pool cap reproduces itself, from the other direction.** Banding by rows on the caller path,
+ratios are ref/arm so above 1.0 means the arm is faster:
+
+| band | cells | t8 | t16 | t24 | aa | MKL: ref → t24 | behind: ref → t24 |
+|---|---|---|---|---|---|---|---|
+| rows<128 | 168 | 0.7091 z−6 | 0.5855 z−9 | 0.4319 z−12 | 1.0223 | 2.212 → 0.956 | 10 → 84 |
+| 128-600 | 804 | 0.7630 z−18 | 0.7679 z−13 | 0.6857 z−11 | 0.9971 | 1.567 → 1.075 | 89 → 255 |
+| 600-2400 | 132 | 0.7576 z−8 | 0.8449 z−3 | 0.8660 z−2 | 1.0000 | 1.487 → 1.288 | 12 → 21 |
+| **>=2400** | **708** | 0.6469 z−22 | 0.9739 z−2 | **1.1488 z+16** | 1.0032 z+1 | **1.699 → 1.952** | **47 → 0** |
+
+On matrices of 2400 rows and up, launching exactly the caller's pool is 14.9% faster than the
+pre-ship policy and closes that band's deficit completely — and all 47 of those cells are at k=4,
+every other width already being clear. It holds at every width: 1.1637, 1.1768, 1.1804, 1.1758,
+1.1510 and 1.0509 for k = 1…64, z +10 to +14, against an A/A of 1.0032.
+
+That is the cap that shipped in b5b2404. `NT_CAP=-2` resolves to the caller's pool and declines the
+2× recruit; `tune` has no such define, so its `ref` takes the recruit to 32 and t24 is the capped
+behaviour. The ship decision was made on the board corpus, on a paired analysis banded by kernel
+time, reading 0.9805 / 0.9694 / 0.8739. chain63 finds the same mechanism on a different corpus with a
+different probe, banded by the variable that actually gates the recruit — matrix size — and reads
+1.149 with 47 cells recovered. Independent, larger, and cleaner, because the band is the mechanism's
+own condition rather than a proxy for it.
+
+**And it confirms the cap has to stay conditional.** Forcing the pool unconditionally is 2.3× slower
+under 128 rows (0.4319, ten cells behind MKL becoming eighty-four) and 1.5× slower from 128 to 600
+(0.6857, eighty-nine becoming two hundred fifty-five). `NT_CAP=-2` never forces a count; it only
+declines a doubling that the small bands never request. The ladder prices what the unconditional
+version of the same idea would have cost, which is a number the ship decision did not have.
+
+**Where this leaves the residual, and a prediction for chain64.** 158 cells over 99 matrices are
+behind MKL on this pre-ship build, 86 of the 158 at k=4, split 10 / 89 / 12 / 47 across the four row
+bands. The cap that already ships takes the 47 to zero, so the post-ship residual on this corpus is
+about 111 cells, and 89 of them are matrices of 128 to 600 rows — family A, and the same place the
+shipping scoreboard puts it.
+
+In that band **no rung of the ladder helps**: the best of five forced counts is t16 at 0.7679, and
+every one of the five is worse than the rule by 23% or more, at z ≤ −11. So family A's deficit is
+not a thread-count deficit. That is a prediction about chain64, which is queued behind this run and
+tests a thread-count mechanism — the row ceiling with its row bound widened from 128 to 512 and its
+degree floor lowered from 192 to 128 — on precisely those matrices. If the ladder is right, chain64's
+wide arms come back at or below their floor, and the answer for endgame item 1 is that the ceiling
+cannot reach family A because the count is not what family A is short of. Recording that now, before
+the run reports, so the reading is not fitted to the result.
+
+float64 is still in the probe as of this writing; the float32 halves are complete and are what is
+above.
