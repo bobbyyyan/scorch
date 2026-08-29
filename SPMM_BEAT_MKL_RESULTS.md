@@ -14325,6 +14325,12 @@ the caching, and is queued behind chain74/75/76/73 rather than being run alongsi
 
 ### What the residual cell's 15–18 µs can be spent on, and which ceiling actually binds
 
+> **Read the three corrections that follow this box before using anything in it.** Its bandwidth
+> range is three invented constants, this file already has a measured 231 GB/s for the same host, and
+> the whole derivation duplicates the bandwidth section roughly four hundred lines above — which did
+> it correctly the first time and states the same answer in bold. The box is left standing as the
+> record of a mistake made five times in one paragraph; the conclusion never moved.
+
 An order-of-magnitude budget, not a measurement, for the deepest residual cell: 512 rows, 133,557
 nonzeros, mean degree 260.9, k=1, on 24 workers at ~5 GHz. A's indices plus values are 133,557 × 8 =
 **1.07 MB**, which is L3-resident on that host.
