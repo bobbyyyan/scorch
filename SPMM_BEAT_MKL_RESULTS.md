@@ -12103,3 +12103,51 @@ above rather than by argument. Those seven matrices are the majority of the enti
 on both dtypes. A lever whose target is 9.4% of the corpus and 70–83% of the losses is not a
 curiosity; the reason it has not shipped is that its gate region holds too few matrices in the
 current corpus to measure, which is what chain50's degree-stratified corpus is being built for.
+
+### What instrument the 98% is measured on, and what the flip was measured against
+
+Worth stating precisely, because both numbers above are load-bearing and this project has twice
+found a result that belonged to an instrument rather than to the code.
+
+**The scoreboard is a whole-call number.** chain32b timed `cprobe.py`, which calls
+`scorch.matmul(A_st, B)` with the plan cache live — not a kernel-only timer, and not the
+general-dispatch path that an `STensor` B or a `time_dict` argument forces. So "98% of cells beat
+the reference" is 98% of *calls a caller makes*, dispatch and all, against MKL's own call. That is
+the harder version of the claim and the one the goal is stated in.
+
+**The flip was measured against the shipping code, with nothing pinned.** chain32b's `ship` and
+`ctrl` were built with an empty `SCORCH_BUILD_DEFINES` — the tree's own defaults — and `cand` added
+exactly `-DSCORCH_SPMM_NT_CAP=-2 -DSCORCH_SPMM_RECRUIT_MIN_WORK=10000000L`, which are the two
+values now committed as those defaults. No third constant was pinned in any of the three builds, so
+the difference between arms is the flip and nothing else. This is the check chain28b failed — it
+pinned `SCORCH_SPMM_HALFVEC_F32=0` in all three builds, which cancels but makes the baseline a
+build that does not ship, and 39 of the 44 cells it recovered were at the one width that pin
+affects.
+
+## Two queue defects that cost a run each, and what the guards should have been
+
+**chain48 measured a change that had already shipped.** It patched a combined
+`SCORCH_SPMM_HALFVEC` macro into the per-dtype `_F32` / `_F64` pair, then verified the post-patch
+state: "per-dtype macros in, combined macro gone". That was already true of the staged tree, because
+the split had landed since the chain was written. The `replace` matched nothing, the check passed,
+and the log printed `patched the policy default in scorch_policy.h`. Its per-symbol emission
+attribution then caught it — `0 symbols differ in code, 4 differ only in immediates (__LINE__
+metadata)` — and it refused rather than reporting a null.
+
+The lesson is about the check, not the chain: **a post-condition check cannot detect a no-op patch.**
+It passes hardest exactly when there was nothing to do. Assert the OLD state is present before
+patching, or assert the diff is non-empty. And note which check saved it: the emission attribution,
+which is a statement about the object rather than about the source.
+
+**chain60 ran ahead of the chain that builds its corpus.** It was promoted into slot 29b by copying,
+and the copy took slot 29's wait pattern — `[r]w_chain2[45678]\.sh` — which does not include
+chain50, whose degree-stratified corpus the run needs. So it started at 14:14 while chain50 was
+still queued and refused: `mg50_groups.csv is missing`. The refusal was correct and cost nothing but
+the slot.
+
+**A renumber rewrites a chain's wait pattern, and a pattern that no longer covers a chain the run
+depends on is not a deadlock — it is a silent reordering.** A deadlock announces itself; a
+reordering just produces a refusal, or worse, a result against a corpus that is not there yet. After
+any promotion, check the guard against the *dependencies*, not against the numbers. Re-deployed as
+chain65 at the end of the queue, with its `HALFVEC` pin moved from 0 to 1 — the value that actually
+ships now that chain48 has established the flip was already in.
