@@ -14583,3 +14583,59 @@ without being asked. So the counts cannot be read either as a regression or as a
 change whose whole purpose is to reduce below-MKL cells cannot ship on a run that could not count
 them. What is needed is a rerun with a stable reference column — fewer arms per process, or the
 reference timed in its own process — plus k=24 for the float64 half.
+
+### The below-MKL count was recoverable from chain74's own data, and it does not go the wrong way
+
+The no-ship notice above rested on counts the run could not read. Before spending a rerun on it, ask
+whether the data already answers it — the caller-path CSVs carry per-cell `mkl_ms` from all three
+build processes, so MKL's disagreement with itself is measurable **per cell**, not just pooled.
+
+`an_mklstable.py` classifies each cell by MKL's own cross-process spread (the max/min of its three
+build-means, each the minimum over two passes) and counts below-MKL separately on the cells where
+that spread is within a pre-registered 1.05 — half the 1.10 limit the harness applies to the pooled
+figure. **The subset is chosen using only the reference's own readings.** MKL's cross-process spread
+cannot depend on which `SCORCH_SPMM_MULTIROW_ROWS` a process was built with — same code, interleaved
+arms — so the selection is orthogonal to which arm wins. It does select for quiet cells, so both
+populations are reported.
+
+float32, 844 of 1208 cells stable (69.9%; median spread 1.0179, p95 1.0441):
+
+| arm | k=4 | k=8 | k=16 | k=64 | total |
+|---|---|---|---|---|---|
+| ship | 21/205 | 3/242 | 0/214 | 0/183 | 24/844 |
+| ctrl | 23/205 | 2/242 | 0/214 | 0/183 | 25/844 |
+| **cand** | **20/205** | **1/242** | 0/214 | 0/183 | **21/844** |
+
+And the 364 dropped cells (median spread 1.1003, worst **4.95x**), which is where the apparent
+regression lived:
+
+| arm | k=4 | k=8 | k=16 | k=64 | total |
+|---|---|---|---|---|---|
+| ship | 8/97 | 4/60 | 7/88 | 10/119 | 29/364 |
+| ctrl | 8/97 | 8/60 | 12/88 | 11/119 | 39/364 |
+| cand | 9/97 | 8/60 | 10/88 | 14/119 | 41/364 |
+
+**On readable cells the candidate is not worse at any width, and better at two.** 21/844 against
+ship's 24 and ctrl's 25, with the same-code pair differing by one cell — so a 3–4 cell improvement
+against a 1-cell discrepancy. On the dropped cells the same-code pair differs by **ten** cells
+(29 vs 39), which is larger than the ship-to-cand difference of twelve, so nothing is readable there
+in either direction. The apparent regression was the reference column's noise, precisely as the
+harness's own caveat said, and it is now shown rather than asserted.
+
+Two things worth noting about the restriction. It does **not** drop the cells that matter: k=4 keeps
+205 of 302 and k=64 is dropped hardest (183 of 302), so the small-matrix residual family is the
+best-represented width, not the worst. And on stable cells we are **above MKL at every k=16 and k=64
+cell measured, for all three arms** — the entire remaining below-MKL population is k=4 with a trace
+at k=8, which is the same conclusion the caller-path work reached by a different route.
+
+float64, 781 of 1208 stable: cand 13/781 against ship 17 and ctrl 22. The candidate is nominally best,
+but the **same-code pair differs by five cells** — more than the ship-to-cand difference of four — so
+float64 is not resolvable here either. Consistent with the kernel half refusing, and for a related
+reason: the widths where float64's variance concentrates are the same ones its only structural null
+sits at.
+
+So the no-ship blocker is narrowed rather than removed. The count no longer looks like a regression on
+float32, and multi-row ROWS=2 on float32 now has a kernel win of 8–15% above degree 2 *and* a
+non-worse below-MKL count at every width. What is still owed before shipping is float64 — which needs
+k=24 or k=32 in the grid to have a comparable-footprint null — and a confirmation on a second host,
+since every number in this section is redwood.
