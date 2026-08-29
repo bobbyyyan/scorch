@@ -12873,3 +12873,23 @@ already known to carry "a per-nonzero deficit against MKL of 8–23% whichever s
 the half-vector kernel was the answer to it, worth 1.1008 (z +14.6) and taking cells below MKL from
 125/302 to 70. The 76 cells here are what is left **after** that. A second lever at the same width is
 therefore not a repeat; it is the next one.
+
+### A note on reading chain65 and chain67 against the residual
+
+chain67 probes `exact4_merged.csv`, which is chain63's own 302-matrix corpus, so its cells map
+one-to-one onto the residual and "recovered N of the 76 float32 k=4 cells" will be readable directly
+from its caller-path pass.
+
+chain65 does not. Its corpus is chain50's degree-stratified `mg50_groups.csv`, 212 matrices in six
+bands — 40 each at `deg<1`, `deg2-4`, `deg4-8`, `deg8-64` and `deg64+`, and 12 at `deg1-2` — and only
+**9 of the 212 appear in chain63's corpus at all**. That is the right corpus for a degree-banded
+question, and `deg64+` is the band the k=1 residual lives in (the single overlapping matrix there has
+degree 210 in 512 rows, exactly the residual's profile). But its output will be a ratio per degree
+band, not a count of recovered cells, and its pooled number will be dragged down by `deg<1`, where the
+kernel's own comment records 13 float32 cells 5–17% slower than what ships. **Read the `deg64+` row.**
+
+If `deg64+` comes back positive, the cheap follow-up is to re-probe the three builds chain65 leaves on
+disk — `k1_ship`, `k1_ctrl`, `k1_cand`, which persist after the run — against `exact4_merged.csv` at
+k=1..4, which is one probe pass rather than three builds. That is not queued: it is worth doing only
+if chain65's answer in that band is a win, and queuing it now would be committing to measure something
+before knowing whether there is anything to measure.
