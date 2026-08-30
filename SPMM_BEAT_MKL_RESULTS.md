@@ -15616,3 +15616,50 @@ cap turned on, which is suggestive and is not evidence; nothing here changes the
 because a rule that is 1.30x on one host and 0.78x on another cannot ship in either direction. It
 does mean the earlier entry's "regression on two hosts, therefore closed" was one host short of the
 whole picture, and the reason to keep it closed is now arm-variance rather than uniform harm.
+
+## chain81: "one worker per physical core" is refuted as the mechanism
+
+redwood's 24 physical cores are 8 P-cores carrying SMT plus 16 E-cores that do not, so at a pool of
+32 -- reached by exporting `OMP_NUM_THREADS=32`, which is what any launcher sizing a pool from
+logical CPUs does -- the two competing hypotheses name **different numbers**: physical cores is 24,
+half the pool is 16. On MKT both are 16 and no allocation can separate them, because 2-way SMT makes
+the physical count exactly half the logical count for every `--cpus-per-task`. Forced final counts,
+scoring only cells where the count really became n:
+
+```
+pool 32, float32      n    floor      nt8     nt16     nt24     nt32
+  nnz<1e5            66   0.9942   1.0147   1.0026   0.9461   0.8599
+  1e5-4e5            90   0.9995   1.0093   1.0213   1.0160   0.9530
+  4e5-2e6            84   0.9940   0.7620   0.9037   0.9736   1.0003
+  2e6-1e7            60   0.9915   0.7075   0.8926   0.9785   1.0107
+  nnz>1e7            60   0.9990   0.9917   0.9940   0.9864   1.0034
+
+pool 32, float64      n    floor      nt8     nt16     nt24     nt32
+  nnz<1e5            66   1.0025   1.0273   1.0223   0.9645   0.8955
+  1e5-4e5            90   0.9967   0.9438   1.0132   1.0111   0.9764
+  4e5-2e6            84   0.9916   0.7498   0.9133   1.0210   1.0179
+  2e6-1e7            60   1.0009   0.8014   0.9367   0.9673   1.0001
+  nnz>1e7            60   1.0013   1.0004   0.9955   0.9959   1.0012
+```
+
+Three readings, in order of how much they matter.
+
+**The cap's own number loses here.** Capping at physical cores means forcing 24, and that reads
+0.9461 and 0.9645 on the smallest band -- a 3.5-5.4% loss, where the mechanism predicts a gain. The
+quantity is wrong.
+
+**The best count is not 24 and not 16 either.** It is 8 on the smallest band and about 16-24 on the
+next, and the whole gain is at most **2%** (1.0213). MKT's is 24-35%. Whatever MKT has, redwood does
+not have a small version of it.
+
+**Oversubscribing redwood's pool is itself the cost.** Forcing 32 -- more workers than the host has
+physical cores -- reads 0.8599 and 0.8955 on the smallest band against floors within 0.6% of 1.000,
+and the policy already declines to do that, which is why `pol` beats it. So the policy is right and
+there is nothing here for a rule to pick up; this agrees with the offline oracle above, where every
+work-based rule was a regression and a perfect per-cell oracle was worth 2.7%.
+
+So the MKT effect is real, arm-vs-arm inside one binary, and **not** SMT contention: it is specific
+to that host's shape -- two sockets, and a 32-CPU allocation spread over four core complexes with 32
+MB of L3 each, against redwood's 32 logical CPUs on one die behind one 36 MB L3. A barrier across 32
+threads costs very differently in those two places. That is a topology cost, not a sibling cost, and
+naming it correctly is why the cap is rejected rather than gated.
