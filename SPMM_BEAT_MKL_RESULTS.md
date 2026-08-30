@@ -15721,3 +15721,44 @@ the x86 grids have to inform, not this one: on redwood at 24 workers and MKT at 
 balance-bound (C(24) = 8.27) and is one of the cells this exists for. Deliberately not choosing the
 constants until chain84 and job 17143258 report -- picking them from the ARM run alone is how a
 threshold gets fitted to the one host that cannot see the mechanism.
+
+## Measured: the hooks build costs 17-26 microseconds per SpMM call on MKT
+
+The prediction above was that 54 getenv lookups a call could account for the whole 0.64 short-kernel
+reading on that host. Measured directly, same node, same corpus, two release/hooks objects built from
+one archive:
+
+```
+environment: 71 variables, 1959 bytes        allocation: 0-15,64-79 (16 cores, both siblings)
+
+scorch_spmm_nthreads, one call        ship 1.522 us      tune 3.977 us      (+2.455)
+
+products with essentially no arithmetic, our kernel:
+                            ship (release)              tune (hooks)                    MKL
+  1x1                       7.05 us                     24.24 us at nt1              11.4 us
+  2048 rows x 1 nnz        16.31 us                     34.26 us at nt1              14.9 us
+  2048 rows x 8 nnz        24.48 us                     50.26 us at nt1              19.1 us
+```
+
+**The hooks object is 17-26 microseconds per call slower than the release object on identical work.**
+That is the range the deficit needed (18.9 us), and it lands on us and not on MKL, which is called
+through torch in both processes. Every short-kernel MKL comparison in this file that came from a
+hooks build is therefore biased against us by roughly that much, and the 0.6371/0.7277 reading is
+not a property of the code. The policy function alone accounts for 2.455 us of it across its
+seventeen lookups -- about 145 ns each, at the top of the 50-480 ns range `scorch_flags`' comment
+records, which is what a 71-variable Slurm environment buys.
+
+Two further things fall out of the same table, both about this host rather than about the build.
+
+**A 32-thread launch costs about 17 microseconds here.** On the 1x1 product the hooks object reads
+24.24 us forced to one worker and 41.04 us forced to 32; on 2048x8 it is 50.26 and 46.05. Redwood's
+launch is a few microseconds. Two sockets and an allocation spread over four core complexes is what
+that buys, and it is the same axis the MKT thread-count effect turned on -- a barrier, not a sibling.
+Production never pays it on a product that small, because the grain rule declines to widen; these are
+forced counts.
+
+**There is still a real short-kernel deficit here, and it is smaller than reported.** On the RELEASE
+object, 2048 rows x 8 nonzeros reads 24.48 us against MKL's 19.12 -- 1.28x behind, not the 1.57x the
+hooks grid implied. And our bare 1x1 call is 7.05 us against MKL's 11.39, so we are 4.3 us *better*
+on pure per-call overhead; the deficit appears once there are rows to walk. Part 1 of the same job
+quantifies it over the full corpus on both objects, which is the number to use.
