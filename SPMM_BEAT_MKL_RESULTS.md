@@ -15434,3 +15434,48 @@ failed, which is harmless, and
 changes nothing -- **passed, for exactly the wrong reason**. The guard is now
 `scorch_ops.scorch_tune_hooks()`. Release build: 2 pass, 11 skip with a stated reason. Hooks
 build: 13 pass.
+
+## MKT looks 0.64 of MKL on 30-100 microsecond kernels, and the hooks build can account for all of it
+
+Banding the harm grid by our own kernel time rather than by nonzeros, and splitting the corpus by
+how each matrix got in -- `gbkeys` was selected for already losing, the rest is a size-stratified
+random draw, and pooling the two is the mistake that reversed a verdict earlier in this file:
+
+```
+random, size-stratified (50 matrices)      float32              float64
+  30-100us      n=139/128     0.6371 [1.0002]      0.7277 [1.0011]
+  100-500us     n= 74/ 73     1.1124 [0.9986]      1.2658 [0.9978]
+  0.5-5ms       n= 62/ 58     1.2960 [0.9966]      1.4589 [0.9760]
+  >5ms          n= 25/ 41     1.7428 [0.9992]      1.8677 [0.9963]
+```
+
+116 of 139 and 91 of 128 cells below MKL in the short band, from an unselected corpus. On redwood
+the same banding reads 1.8545 and 2.0207 in that band with 7 of 318 and 9 of 302 below MKL, and
+redwood additionally has 821 cells *under* 30 microseconds where this corpus has none at all --
+on matrices reaching down to twenty thousand nonzeros. A fixed per-call cost, not a slower loop.
+
+**And the build can account for the whole thing.** Counting `std::getenv` calls on the SpMM path
+of a hooks build:
+
+```
+scorch_spmm_nthreads          17
+scorch_spmm_partition_mode     5
+spmm_csr_v2_core              32
+                              54 lookups per call
+```
+
+`scorch_flags`' own comment records that a lookup costs 50-480 ns depending on how many variables
+the caller exported, and a Slurm job environment is at the large end of that range. So the tax is
+2.7 us at the low end and **25.9 us at the high end** -- against the 18.9 us of excess needed to
+take a 52-microsecond median from parity to 0.6371. The deficit is therefore *quantitatively
+consistent with being entirely an artifact of the instrument*, and nothing here should be believed
+until job 17141647 re-measures it on a release object with the same corpus, the same widths and
+MKL timed inside both processes. That job also times the lookups directly and prints the
+environment size.
+
+Two consequences worth stating even before it runs. The **MKL comparison is biased against us** by
+this tax, on every short-kernel number in this file that came from a hooks build. But the
+**thread-count comparisons are not**: `pol` and `nt16` both pay the same additive term, so a
+common cost biases their ratio *toward* 1.000 and the SMT win is understated, not manufactured.
+And the harm result above sits above ten million nonzeros where kernels run in milliseconds, so a
+25-microsecond tax cannot move it.
