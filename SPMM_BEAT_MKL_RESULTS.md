@@ -15762,3 +15762,56 @@ object, 2048 rows x 8 nonzeros reads 24.48 us against MKL's 19.12 -- 1.28x behin
 hooks grid implied. And our bare 1x1 call is 7.05 us against MKL's 11.39, so we are 4.3 us *better*
 on pure per-call overhead; the deficit appears once there are rows to walk. Part 1 of the same job
 quantifies it over the full corpus on both objects, which is the number to use.
+
+## MKT on a RELEASE object: 1.20x / 1.44x of MKL, and the deficit is narrow-k only
+
+Same 80-matrix size-stratified corpus, same six widths, MKL timed inside each process, two passes,
+release object against hooks object:
+
+```
+float32       n |  ship/MKL   floor  median us |  tune/MKL   floor
+  <30us     111 |    0.8249  1.0017        25.0 |       --      --
+  30-100us  132 |    1.2888  0.9987        43.7 |    0.6626  1.0005
+  100-500us 115 |    1.3101  1.0054       180.4 |    1.1561  1.0034
+  0.5-5ms    91 |    1.3439  0.9984       813.5 |    1.2771  0.9996
+  >5ms       31 |    1.8328  1.0004     16751.6 |    1.8733  1.0009
+  POOLED        |    1.2034  (188/480 below MKL) |    0.9329  (288/480)
+
+float64       n |  ship/MKL   floor  median us |  tune/MKL   floor
+  <30us      93 |    1.0009  1.0004        25.9 |    0.4554  1.0349
+  30-100us  144 |    1.4203  1.0004        48.0 |    0.7748  0.9994
+  100-500us 101 |    1.5723  1.0017       195.5 |    1.3088  1.0022
+  0.5-5ms    92 |    1.6211  1.0039      1153.6 |    1.5314  1.0006
+  >5ms       50 |    1.9319  1.0044     20273.0 |    1.8990  1.0004
+  POOLED        |    1.4360  (112/480 below MKL) |    1.1078  (193/480)
+```
+
+The 30-100 microsecond band that read **0.6626** on the hooks object reads **1.2888** on the release
+object. The hooks build understated us by 29% and 30% pooled. As matched pairs -- the same cell under
+both objects, which is the right estimator, because banding computed per object lets cells migrate
+between bands and a difference of medians is then partly a difference of membership -- the tax is
+**18.9 us median (float32, quartiles 17.9/23.3) and 20.7 us (float64, 18.8/32.3)**, ratio 1.293 and
+1.291. Independent of Part 0's 17-26 us and agreeing with it.
+
+**The one real deficit, and it is narrow-k.** On the release object, the only band behind MKL is
+float32 under 30 microseconds, 0.8249 against a floor of 1.0017. Split by width, with the same cells'
+float64 numbers for contrast:
+
+```
+             k=1     k=2     k=4     k=8    k=16    k=64
+  float32  0.670   0.639   0.779   0.972   1.089   1.705
+  float64  0.671   0.749   1.010   1.198   1.599   2.187
+       n      25      22      22      20      16       6
+```
+
+Every one of the worst cells is a dlmc transformer or pruned-ResNet layer, 512-2048 rows and
+20k-105k nonzeros, ours 23-26 us against MKL's 13-15 us -- a **fixed excess of about ten
+microseconds** that shrinks to nothing by k=8 and inverts by k=16. That is the k<=4 residual this
+file already closed as a kernel question three separate ways; it is larger here than on redwood
+because this host's per-call and barrier costs are larger (Part 0: a forced 32-thread launch is ~17
+us here against a few us there), and it is where the remaining MKT work is.
+
+**Part 2 of that job measured nothing and said DONE.** The four caller-path runs failed instantly on
+`cprobe.py: error: the following arguments are required: --arms` and the script printed its
+completion marker anyway -- the exact defect this file records four previous instances of, this time
+in a driver I wrote today. Requeued with a check on the OUTPUT rather than on the last line reached.
