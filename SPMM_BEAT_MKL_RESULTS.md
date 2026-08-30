@@ -15363,3 +15363,74 @@ thread rule helps; MKT's pool of 32 sits on 16 physical cores, and there forcing
 only on the host that does it. That is now the leading reading of the MKT result rather than the
 confound I recorded above -- and job 17141177, which puts the same pool of 32 on 16 cores and
 then on 32 cores, is what decides it rather than this argument.
+
+## The physical-core cap FAILS its harm gate, and two defects in my own work on it
+
+### Gate one: the harm check, with the count actually forced
+
+The size grid above could not speak for the largest band, because an `nt16` override sets its own
+recruit-decline threshold to 32 and so stopped binding there. Re-run with `SCORCH_SPMM_NT_FORCE`
+on a hooks build, 59 matrices, six widths, two passes, scoring only cells whose resolved count
+changed:
+
+```
+band          n    float32 [floor]     float64 [floor]
+nnz<1e5      66    1.2442 [0.9994]     1.2295 [0.9989]
+1e5-4e5     102    1.2041 [1.0009]     1.1799 [0.9988]
+4e5-2e6      66    1.0725 [1.0009]     1.0710 [0.9971]
+2e6-1e7      60    0.9948 [0.9982]     0.9882 [1.0048]
+nnz>1e7      60    0.9549 [0.9998]     0.9708 [1.0039]
+```
+
+Above ten million nonzeros the cap costs **4.5% on float32 and 2.9% on float64**, both outside
+their floors, which is what the `nt24` arm had already implied for that band. So an unconditional
+cap does not ship. It stays committed and off. Whether a size-gated form is worth testing depends
+on job 17141177, which decides whether the effect is SMT contention at all; if it is not, the
+physical core count is the wrong quantity and gating it would be fitting a threshold to a
+mechanism that is not there.
+
+Also in that table, `nt32` forced where the policy chose less reads 0.7737 and 0.8034 in the
+1e5-4e5 band -- the policy is right not to always take the whole pool, and a fixed count in
+either direction is worse than what ships.
+
+### Gate three: emission neutrality on ARM, per symbol
+
+`46a67e6^` against the tip, both built in place from `git archive` exports, cap constant 0 and
+hooks off in both:
+
+```
+shared symbols                        1027
+kernel-family shared symbols           266   of which changed: 0
+all shared symbols changed               1   pybind11_init_scorch_ops
+symbols added                            5   scorch_phys_cores_avail, its cache, 3 pybind trampolines
+total instructions             163226 -> 163500   (+274)
+```
+
+Every SpMM, policy, chunk, partition, transpose and NEON symbol is instruction-for-instruction
+identical, including `spmm_csr_v2_core<float>` and `<double>`, which inline the policy function.
+The one shared symbol that moved is the module registration function, which runs once at import.
+
+Three attempts at this comparison reported "not neutral" on 129 symbols that all had identical
+instruction counts, and that was the comparison rather than the code: objdump annotates a
+page-relative `adrp` with whichever symbol precedes the target page, so growing a data section
+renames the annotation on instructions that did not change, and `GCC_except_table` and
+`.omp_outlined.` carry compiler-assigned sequence numbers that renumber. A flattened object diff
+would have reported the byte delta and said nothing about which symbols it landed in.
+
+### Two defects of mine that the gate caught
+
+**A duplicate pybind registration.** The cap commit re-exported `scorch_pcore_count` next to the
+new `scorch_phys_cores_avail`, to make the contrast between the two counts explicit. But
+`scorch_pcore_count` was already exported two hundred lines earlier, and two `m.def` calls with
+the same name and signature register a second overload that the first always shadows -- dead
+registration code nothing could reach. Removed; the contrast belongs in the comment, which is
+where it now is. The emission delta fell from +459 instructions to +274.
+
+**A test that could not fail.** The cap's tests guarded on the *presence* of
+`scorch_phys_cores_avail`, which a release object also exports. On a release build the
+environment knobs are compiled out, so the knob-driven tests ran against inert switches: two
+failed, which is harmless, and
+`test_with_the_cap_off_the_core_count_knob_is_inert` -- which asserts that setting the knob
+changes nothing -- **passed, for exactly the wrong reason**. The guard is now
+`scorch_ops.scorch_tune_hooks()`. Release build: 2 pass, 11 skip with a stated reason. Hooks
+build: 13 pass.
