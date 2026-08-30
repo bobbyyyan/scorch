@@ -30,6 +30,20 @@ pytestmark = pytest.mark.skipif(
     reason="scorch_ops predates the physical-core cap",
 )
 
+# Every test below that drives SCORCH_PHYS_CORES or SCORCH_SPMM_NT_CAP_PHYS needs a build that
+# honours the hooks, and it needs a SKIP rather than a failure or -- worse -- a pass.
+#
+# Guarding on the presence of scorch_phys_cores_avail is not enough and was the first version of
+# this guard: that symbol is exported from a RELEASE object too, so on a release build the knobs
+# below are inert and the assertions ran anyway. Two of them then failed, which is the harmless
+# direction. But test_with_the_cap_off_the_core_count_knob_is_inert asserts that setting the knob
+# changes nothing, and on a release build it PASSES -- for exactly the wrong reason, because
+# nothing can change anything. A test that cannot fail is the defect this file exists to avoid.
+_needs_hooks = pytest.mark.skipif(
+    not scorch_ops.scorch_tune_hooks(),
+    reason="release build: the SCORCH_* knobs are compiled out, so these arms are the same code",
+)
+
 # Two products, because the cap DECLINES itself in one regime and that is deliberate.
 #
 # The cap feeds SCORCH_SPMM_NT_CAP, which refuses to apply where it would drop the resolved
@@ -78,7 +92,7 @@ def test_physical_cores_and_pcore_count_are_separate_questions():
     assert scorch_ops.scorch_phys_cores_avail() >= 1
     assert scorch_ops.scorch_pcore_count() >= 1
 
-
+@_needs_hooks
 def test_the_forced_core_count_is_what_the_binary_reports():
     """The positive control's precondition: if this fails, every case below is vacuous."""
     for phys in (2, 5, 9):
@@ -86,6 +100,7 @@ def test_the_forced_core_count_is_what_the_binary_reports():
         assert reported == phys
 
 
+@_needs_hooks
 @pytest.mark.parametrize("phys", [1, 2, 3, 5, 8, 1024])
 def test_the_cap_never_raises_a_worker_count(phys):
     """The whole safety argument: two min()s cannot reclassify anything that is fast today."""
@@ -93,7 +108,7 @@ def test_the_cap_never_raises_a_worker_count(phys):
     _, capped = _resolve(phys=phys, cap=1)
     assert capped <= uncapped
 
-
+@_needs_hooks
 def test_a_small_forced_core_count_actually_binds():
     """A positive control, so the cap cannot pass these tests by being dead code."""
     _, uncapped = _resolve(phys=1, cap=0)
@@ -102,14 +117,14 @@ def test_a_small_forced_core_count_actually_binds():
         assert capped < uncapped, "the cap did not bind; it may be compiled out"
     assert capped >= 1, "the cap must never ask for fewer than one worker"
 
-
+@_needs_hooks
 def test_with_the_cap_off_the_core_count_knob_is_inert():
     """A negative control: the input the cap reads must not act when the cap is off."""
     _, wide = _resolve(phys=None, cap=0)
     _, narrow = _resolve(phys=1, cap=0)
     assert wide == narrow
 
-
+@_needs_hooks
 def test_the_cap_is_bounded_by_the_forced_core_count():
     """Where it binds it binds AT the core count, not at some other number."""
     for phys in (2, 3, 5):
@@ -118,7 +133,7 @@ def test_the_cap_is_bounded_by_the_forced_core_count():
         if uncapped > phys:
             assert capped <= phys
 
-
+@_needs_hooks
 def test_the_cap_declines_where_it_would_disable_the_out_of_pool_recruit():
     """The safety property that made folding it into SCORCH_SPMM_NT_CAP the right layer.
 
