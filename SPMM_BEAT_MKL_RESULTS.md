@@ -15479,3 +15479,76 @@ this tax, on every short-kernel number in this file that came from a hooks build
 common cost biases their ratio *toward* 1.000 and the SMT win is understated, not manufactured.
 And the harm result above sits above ten million nonzeros where kernels run in milliseconds, so a
 25-microsecond tax cannot move it.
+
+## A row-split partition, built and off by default (70cc600)
+
+The mechanism the residual asks for, implemented so the measurement can be of the real thing rather
+than of a simulation of it.
+
+**What it does.** `spmm_csr_v2_rowsplit` splits every row wider than one segment into separate rows
+of a CSR matrix that shares `A1_crd` and `A_val` **untouched** -- same column indices, same values,
+same order, only a different `indptr` -- runs the unmodified `spmm_csr_v2_core` on it, and sums each
+original row's pieces.
+
+**Why a wrapper rather than a change to the claim loop.** The claim loop is the hottest code in
+`spmm.h` and carries a dozen loop-invariant specialisations and A/B hooks; threading a segment space
+through it would put a branch inside it and reshuffle the register allocation of every kernel it
+dispatches to. Out here, the non-split path is the same object code it was -- and it is, checked per
+symbol: with the constant at its default 0 the gate folds away and **0 of 266 kernel-family symbols
+change**, `spmm_csr_v2_core<float>` and `<double>` included. The core already takes `A1_pos` and
+`A0_size` as parameters and allocates its own output, so no plumbing was needed.
+
+**The gate is derived, not fitted.** `scorch_spmm_row_imbalance` answers "does one row exceed its
+fair share, and by how much" in **O(refn log rows) with no pass over the degrees**, using an
+identity: cut the nonzeros into `refn` equal pieces and find the row containing each cut; a row of
+degree at least `nnz/refn` spans a whole piece so two consecutive cuts land in it, and conversely
+two cuts can only share a row that wide. The longest run of cuts sharing a row is therefore the
+factor by which the widest row exceeds its share. Asked of the binary over the corpus:
+
+```
+matrix        rows       nnz    maxdeg   widest row's share   imbalance(refn=64)
+connectus      512   1127525    120065        10.65%                  7
+lp_osa_14     2337    317097     38336        12.09%                  8
+nw14            73    904910     90951        10.05%                  6
+kl02            71    212536      7638         3.59%                  2
+bibd_17_8      136    680680      5005         0.74%                  1
+heart1        3557   1385317      1120         0.08%                  1
+dlmc (4 of)    512+   52428+       128+        0.06-0.24%             1
+```
+
+It reads 1 on every balanced matrix and 6-8 on exactly the three the ceiling binds on. It is
+deliberately **not** max-degree over mean: a matrix of 100000 degree-1 rows plus one row of 2000 has
+a max/mean of 1000 and an imbalance of 1, because no row is near a fair share of the whole matrix
+and a whole-row partition handles it fine. There is a test for that decoy.
+
+**Results do not depend on the pool.** Splitting a row changes the order its nonzeros are summed, so
+both the decision (a fixed reference width, not the host's thread count) and the segment width (a
+function of nnz, k and the element size, chosen to hold the partial buffer under 8 MB) ignore the
+worker count. Measured: 168 comparisons across pools 1, 2, 3, 4, 8, 12, 18 on the four matrices that
+fire, both dtypes, three widths -- **bit-identical every time**. And a matrix whose widest row is
+under one segment produces exactly its own rows, so it is bit-identical to today rather than merely
+close.
+
+**Correctness.** Against the unsplit kernel over ten matrices, six widths, both dtypes: 24 cells
+change bits, which is the point, and the worst relative error is 6.7e-6 (float32) and 2.4e-14
+(float64) -- rounding level, against a convention of 1e-3. Two stress settings (split everything,
+segments of one nonzero) hold at the same level.
+
+**A test of mine that could not fail, again.** The first float64 check generated B with
+`torch.rand` and widened it to double. `torch.rand` returns float32, so every product was exactly
+representable in float64 -- 24 significant bits plus log2(120065) is 41, under the 53 available --
+the sums were **exact**, and no reordering could change them. Three of the four matrices duly
+reported bit-identical results and I nearly recorded that as a property of the code. B is now
+generated at the target dtype, and the float64 arm then shows the reordering it is there to bound.
+
+**The screening cost, measured rather than assumed.** With the mechanism off -- the shipped default
+-- the screen is two integer compares and the probe never runs. With it on, the probe costs
+0.42-1.53 us against the kernels the nonzero floor lets through, which are 33 us and up: 0.2% to
+1.9%. The 1.9% is a real cost on a balanced matrix that clears the floor and is the thing chain84's
+control group exists to measure.
+
+Off by default (`SCORCH_SPMM_SPLIT_MIN_IMBALANCE` 0) until the grid speaks. chain84 builds two
+release trees -- the mechanism is a compiled constant and a defines-only rebuild relinks the old
+objects, so one tree cannot hold both arms -- over three groups: the four matrices that fire,
+balanced controls where the probe runs and must find nothing, and a size-stratified random draw so a
+regression anywhere is visible rather than inferred.
