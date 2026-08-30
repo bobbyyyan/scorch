@@ -15157,3 +15157,114 @@ every number above times the native symbol and this file already records one ver
 from a path no caller uses; per-symbol emission neutrality of `spmm_csr_float_v2` with the cap
 off; and a second host, which redwood can only supply by oversubscribing its pool to 32,
 because at its default pool of 24 -- exactly its physical core count -- the cap is inert.
+
+## The thread-count finding is CONFOUNDED, and one thing I wrote above about the instrument is wrong
+
+Two corrections and one gate result, in the order they matter.
+
+### The float64 loss on large matrices is real and reproducible
+
+Pooling both passes of the size grid, `policy / nt16`, scoring only cells whose resolved count
+actually changed, floors from the same-code duplicate arm in brackets:
+
+```
+band          n    float32            float64
+nnz<1e5      48    1.3520 [1.0007]    1.3370 [1.0007]
+1e5-4e5      48    1.2774 [1.0013]    1.2408 [1.0008]
+4e5-2e6      48    1.0714 [0.9968]    1.0663 [1.0011]
+2e6-1e7      48    0.9910 [0.9878]    0.9401 [0.9965]
+nnz>1e7      48    --                 --
+```
+
+float32 at two-to-ten million is inside its own floor and is a null. float64 there is 0.9401
+against 0.9965 -- a six percent **loss**, reproduced across both passes. So lowering the count
+is not safe everywhere, which was already the reason not to ship it.
+
+### `nthreads_override` does not only raise a count, and the arm goes blind in exactly one band
+
+The section above says "nthreads_override only ever RAISES the count". That is wrong, and it is
+wrong because I read one of its three uses. The argument also becomes the **final cap**: the
+shipped `SCORCH_SPMM_NT_CAP` is `-2`, which resolves to "the pool the caller manages", which is
+the override. So passing 16 to a 32-thread pool really does resolve to 16, and the ladder was
+measuring what it claimed to.
+
+The real defect is the third use. That final cap **declines** when `nthreads >= 2 * pool`, so as
+not to disable the out-of-pool recruit -- and `pool` there is *the override the arm passed*. An
+`nt16` arm therefore sets its own recruit threshold to 32, which the largest matrices reach, and
+the cap silently stops applying:
+
+```
+resolved count under nt16, float32 pass 1, by band
+  nnz<1e5    {16: 48}
+  1e5-4e5    {16: 44, 32: 4}
+  4e5-2e6    {16: 35, 32: 13}
+  2e6-1e7    {16: 13, 32: 35}
+  nnz>1e7    {32: 48}      <- the cap never applied; the band is the two dashes above
+```
+
+Production's cap keeps `pool` at the real override of 32, so its own gate sits at 64 and it
+*does* bind above ten million nonzeros. The arm is a faithful proxy everywhere except the one
+band where the effect was most likely to reverse sign, and the nearby evidence says it does:
+`nt24`, which binds there, reads 0.9694 (float32) and 0.9832 (float64). Only the run that
+forces the final count with `SCORCH_SPMM_NT_FORCE` can speak for that band, which is what the
+harm job does.
+
+The band did not become a wrong number -- it became a dash -- purely because the harness records
+the resolved count per cell per arm and the scorer separates cells whose decision changed. That
+is the second time that habit has caught something this session.
+
+### The mechanism I named is not identified: physical cores and half the pool are the same number
+
+`nt8 / nt16 / nt24` on the small bands read 1.216 / 1.352 / 1.041 (float32, `nnz<1e5`) and
+0.985 / 1.277 / 1.018 (`1e5-4e5`). The optimum is 16 and it is 16 in every band below two
+million nonzeros; above that it is 32. That is consistent with "one worker per physical core",
+which is what I claimed. It is equally consistent with "the policy over-threads a small product
+and 16 wins because it is fewer, not because it is one per core" -- and the two cannot be
+separated on this host at any allocation size, because 2-way SMT makes the physical core count
+exactly half the logical count for every `--cpus-per-task` value.
+
+It matters which is true. One is a claim about the machine that generalises to any host whose
+pool is sized from logical CPUs, and the physical core count is the right thing to cap at. The
+other is a claim about the work, it would apply on redwood and the M5 as well, and capping at
+physical cores would be the wrong mechanism for it -- right answer on this host by coincidence.
+
+Two runs separate them, and both are queued rather than argued:
+
+* **redwood at pool 32.** Its 24 physical cores are 8 P-cores with SMT plus 16 E-cores without,
+  so physical cores (24) and half the pool (16) are *different numbers* there. Whichever the
+  optimum lands on names the mechanism (chain81, both parts, release build for the head-to-head
+  and hooks for the forced counts).
+* **MKT with the same pool over twice the cores.** Take 64 logical CPUs and build two 32-CPU
+  sets from the topology: one covering 16 physical cores with both siblings, one covering 32
+  physical cores with one sibling each. Same pool, same ladder, same corpus. If `nt16`'s win
+  survives on 32 physical cores it is not SMT contention at all (job 17141177).
+
+### Emission neutrality of the committed cap, on ARM: zero kernel symbols changed
+
+Gate three, run per symbol rather than as a flattened object diff, comparing `46a67e6^` against
+the tip. Both objects built in place from `git archive` exports so neither touches a working
+tree, `SCORCH_SPMM_NT_CAP_PHYS` 0 and hooks off in both, `SCORCH_SPMM_NT_FORCE` absent from both
+objects.
+
+```
+shared symbols                       1027
+kernel-family shared symbols          266   of which changed: 0
+all shared symbols changed              1   pybind11_init_scorch_ops, +22 insns
+symbols added                           8   scorch_phys_cores_avail + its cache + 6 pybind trampolines
+total instructions            163226 -> 163685   (+459)
+```
+
+Every SpMM, policy, chunk, partition, transpose and NEON symbol is instruction-for-instruction
+identical, including `spmm_csr_v2_core<float>` and `<double>` which inline the policy function.
+The one shared symbol that moved is the module registration function, which runs once at import
+and picked up the two `m.def` calls; the eight added symbols are the exported helper and its
+pybind wrappers. So the cap costs the kernels nothing while off, and the deliberate cost of
+exporting the count so harnesses can ask for it is 459 instructions of import-time code.
+
+The first three attempts at this comparison all reported "not neutral" on 129 symbols with
+identical instruction counts, which was the comparison and not the code: objdump annotates a
+page-relative `adrp` with whichever symbol precedes the target page, so growing a data section
+renames the annotation on instructions that did not change, and `GCC_except_table` and
+`.omp_outlined.` carry compiler-assigned sequence numbers that renumber. Each normalization was
+added only after reading the lines it hides. A flattened diff would have reported the +459 and
+said nothing about which symbols it landed in.
