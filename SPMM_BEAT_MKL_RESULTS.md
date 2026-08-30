@@ -15552,3 +15552,67 @@ release trees -- the mechanism is a compiled constant and a defines-only rebuild
 objects, so one tree cannot hold both arms -- over three groups: the four matrices that fire,
 balanced controls where the probe runs and must find nothing, and a size-stratified random draw so a
 regression anywhere is visible rather than inferred.
+
+## The caller path kills the physical-core cap, and Group A behaves differently on this host
+
+### Gate two: the caller path
+
+`ops.matmul` with the plan cache live, 129 matrices stratified by size, six widths, two passes,
+`aa` being a duplicate of the `off` arm and therefore the floor:
+
+```
+float32              k=1     k=2     k=4     k=8    k=16    k=64     ALL       z
+  pass 1  on      0.9486  0.8992  0.9181  0.9036  0.9111  0.8908  0.9117    -9.3
+          aa      0.9999  1.0002  0.9992  0.9988  1.0008  0.9920  0.9985    -2.2
+  pass 2  on      0.9333  0.8802  0.9069  0.8961  0.9042  0.8770  0.8994   -10.3
+          aa      0.9984  0.9990  0.9989  0.9999  1.0016  0.9904  0.9980    -3.0
+
+float64  pass 1  on      0.9327  0.8997  0.9223  0.9223  0.9167  0.8844  0.9129   -9.7
+                 aa      0.9995  0.9985  0.9986  1.0005  0.9990  0.9974  0.9989   -1.6
+         pass 2  on      0.9044  0.8757  0.9055  0.9046  0.8999  0.8647  0.8923  -11.7
+                 aa      0.9989  0.9995  1.0015  1.0016  0.9996  0.9968  0.9997   -0.8
+
+cells below MKL:  float32  off 482/774 -> on 535/774      float64  off 332/774 -> on 390/774
+```
+
+**The cap costs 9-11% on the path a caller takes, at every width, on both dtypes, in both passes,
+against a floor within 0.2% of 1.000.** It also moves 53 and 58 more cells below MKL. Together with
+the harm result above -- 4.5% and 2.9% lost over ten million nonzeros -- that is two independent
+gates failed, and the 1.24-1.35x it showed on the native symbol does not reach a caller.
+
+The mechanism for the gap between the two paths is in the policy: the resolved count is not only a
+worker count. `scorch_spmm_chunk` and `scorch_spmm_partition_mode` both consume it, so lowering it
+moves two other decisions with it, and on the caller path that is a net loss. This is the third time
+in this file that a kernel-level reading has failed to survive the caller path.
+
+**Rejected, kept behind its hook**, with the numbers written into `scorch_policy.h` next to the code
+so the next reader does not have to find this file. `scorch_phys_cores_avail()` stays exported: it is
+the only way to tell a cgroup's physical cores from `scorch_pcore_count()`'s machine-wide answer, and
+conflating those two is what made the cap look inert on the host where it binds.
+
+### Group A on the third host: the row ceiling HELPS here
+
+The same ladder that made the row ceiling a regression on redwood and the M5, run on MKT, scoring
+only cells whose count the gate changed:
+
+```
+group      k     n   off/gate       z     floor       (>1 means the RULE is faster)
+rn50       1     4     1.0586    5.27    1.0002
+rn50       2     4     1.0720    5.92    0.9975
+rn50       4     4     1.0330    4.11    1.0006
+rn50       8     4     1.0479    5.60    1.0005
+rn50      64    64     1.0749    4.88    1.0011
+target     1     7     1.2967    3.89    0.9997
+target     2     7     1.3297    4.74    0.9996
+target     4     7     1.1307    3.93    1.0000
+target     8     7     1.1297    4.18    1.0236
+```
+
+Every cell favours the rule, by 3-33%, with z from 3.9 to 5.9 -- on a host where redwood read 0.7548
+and 0.8278 and the M5 read 0.7771 and 0.7813. So the rule is not simply wrong: it is **arm-variant
+across hosts**, and the two hosts it harms are the two whose pool equals or undershoots their
+physical core count while the one it helps oversubscribes its cores 2:1. That is the same axis the
+cap turned on, which is suggestive and is not evidence; nothing here changes the rule's status,
+because a rule that is 1.30x on one host and 0.78x on another cannot ship in either direction. It
+does mean the earlier entry's "regression on two hosts, therefore closed" was one host short of the
+whole picture, and the reason to keep it closed is now arm-variance rather than uniform harm.
