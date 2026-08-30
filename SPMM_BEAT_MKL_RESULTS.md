@@ -15268,3 +15268,98 @@ renames the annotation on instructions that did not change, and `GCC_except_tabl
 `.omp_outlined.` carry compiler-assigned sequence numbers that renumber. Each normalization was
 added only after reading the lines it hides. A flattened diff would have reported the +459 and
 said nothing about which symbols it landed in.
+
+## chain80 + an offline reading of chain78: the residual is THREE MATRICES, and two of them are load-balance bound
+
+### What chain80 refuted
+
+**B's footprint is not the mechanism, on this host either.** The ablation rewrites only A's column
+indices, holding rows, `indptr`, every row's degree, nnz and A's values byte-identical, so A's
+stream is the same size and only B's footprint moves. Our own sensitivity to *shrinking* B is a
+null -- 0.9897 / 0.9984 / 0.9729 by B-size band against same-code floors of 0.9802 / 1.0015 /
+0.9875 -- so we are already at the plateau. Growing B costs us (0.83 at 4x in the L2 band, 0.53
+above 2 MB) and costs MKL the same (0.88 / 0.39), so neither implementation has an advantage
+there. The same refutation now holds on both x86 hosts.
+
+**Nor is it a cost per call, per row, or per nonzero.** The three-parameter fit
+`t = a + b*rows + c*nnz`, run per family and width and refused where the design matrix cannot
+support the separation, has us *better than MKL on every admissible term*: per-call from -0.75 to
+-21.7 us, per-row -0.04 to -0.85 ns, per-nnz -0.007 to -0.028 ns. A linear model in rows and nnz
+therefore predicts we win everywhere, and we do not -- so what is left is per-matrix structure,
+which is where chain80's second half pointed.
+
+### The whole-row balance ceiling
+
+Every partition mode in the SpMM hands out **whole rows**. So no schedule can finish before the
+largest single row is done, and `C(N) = nnz / LPT(N)` -- the longest-processing-time-first
+makespan over the real degree sequence -- is an upper bound on the speedup the kernel can reach
+at N workers, whatever the code does. Computed from `indptr` alone over the ladder's 298
+matrices:
+
+```
+matrix        rows       nnz    maxdeg   share of nnz in one row   C(24)
+nw14            73    904910     90951            10.1%            9.95
+connectus      512   1127525    120065            10.6%            9.39
+lp_osa_14     2337    317097     38336            12.1%            8.27
+heart1        3557   1385317      1120             0.08%          17.98
+```
+
+Three matrices hold a tenth of themselves in a single row, and redwood's pool is 24. So at most
+39-41% of the machine is reachable on them by any whole-row schedule.
+
+**The prediction and the test.** For those three, `maxdeg` already exceeds `nnz/12`, so
+`C(12) = C(24)` exactly: the ceiling permits *nothing* from doubling the workers. Everything else
+has a ceiling still rising. Measured over both passes:
+
+```
+ceiling behaviour 12 -> 24        n    measured 12->24   permitted
+C(24) = C(12)  (row-bound)       12         0.9065        1.0000
+C rises 1.02-1.5x                 4         1.0115        1.4462
+C rises > 1.5x                 1176         1.0298        1.9709
+```
+
+The twelve row-bound cells are exactly the four widths of those three matrices, and doubling
+their workers makes them **9% slower** -- no parallelism left to buy, only fork/join and store
+contention to pay. The prediction came from `indptr` before any timing was read.
+
+### The residual, stated exactly
+
+Scoring the whole ladder -- 1192 cells, same-code floor 1.0011 -- we are **1.9707x MKL pooled on
+float32 and 2.0116x on float64**, with 24 and 23 cells below MKL. Taking the best thread count
+available per cell as an oracle, that becomes 2.0240x / 2.1028x and **7 and 6 cells**:
+
+```
+float32                    k    rows       nnz   C(24)   policy    best     mkl   floor
+nw14                       4      73    904910    9.95    78.81   73.78   55.81   0.909
+connectus                  8     512   1127525    9.39   148.80  143.89  116.41   1.130
+kl02                       4      71    212536   22.67    31.24   31.08   28.15   0.980
+up_projection_block_group4 4    2048    578646   23.90    33.59   31.86   28.97   0.888
+nw14                       8      73    904910    9.95    89.97   89.97   84.26   0.998
+attention_multihead_att_k  4     512    137762   23.45    22.69   17.71   16.80   0.881
+kl02                       2      71    212536   22.67    26.23   26.23   25.60   1.014
+```
+
+float64 is the same shape: nw14 twice, connectus twice, kl02 twice. Two of the float32 rows carry
+floors of 0.888 and 0.881 -- the same-code duplicate differs from itself by 11-12% there -- so
+their 2.9 us deficits are not resolvable and they are not targets.
+
+**So the residual is three matrices.** `nw14` and `connectus` are load-balance bound, provably,
+and need a partition that can split a row. `kl02` is 71 rows of mean degree 2993 with a balanced
+degree sequence, deficit 0.9-5.2 us on a 26-44 us kernel, and is a separate question.
+
+### And the thread count is NOT the remaining lever, on this host
+
+A rule `N = clamp(work_true / G, 1, 24)` -- stating the count in real arithmetic instead of the
+`nnz * max(k,16)` proxy that overstates a k=1 product sixteenfold, which is the correction the
+policy's own comment says has never been priced -- was swept over G from 2000 to 300000. **Every
+value is a regression against the shipped policy**: 0.9219, 0.9406, 0.9573, 0.9512, 0.9074,
+0.8277, 0.7362, 0.6384. So is every fixed count (best: nt24 at 0.9191). And the perfect per-cell
+oracle is worth only 2.7% on float32 and 4.5% on float64.
+
+That is worth stating against the MKT finding above, because the two hosts disagree and the
+disagreement is informative: redwood's pool of 24 **is** its physical core count, and there no
+thread rule helps; MKT's pool of 32 sits on 16 physical cores, and there forcing 16 is worth
+1.24-1.35x. Over-threading a short kernel would show on both. Running two threads per core shows
+only on the host that does it. That is now the leading reading of the MKT result rather than the
+confound I recorded above -- and job 17141177, which puts the same pool of 32 on 16 cores and
+then on 32 cores, is what decides it rather than this argument.
