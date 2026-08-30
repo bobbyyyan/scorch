@@ -1340,6 +1340,34 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     }
     // ALSO cap at the physical cores this process can run on, when asked to.
     //
+    // MEASURED AND REJECTED. Kept behind the hook because re-pricing it later is then cheap, and
+    // because the numbers below are worth having; do not turn it on without re-reading them.
+    //
+    // The case for it looked strong. On a 32-logical-CPU allocation over 16 physical cores, forcing
+    // one worker per core is 1.24-1.35x on the native symbol at every width below two million
+    // nonzeros, on both dtypes, and it flips cells from losing to beating MKL. Neither of the
+    // project's other hosts is affected: redwood's pool of 24 IS its 24 physical cores and the M5's
+    // is 6 against 18, so min() leaves both untouched by construction.
+    //
+    // Two gates then failed, independently.
+    //
+    //   * HARM, with the count forced to the final value (an override cannot do it -- it sets the
+    //     recruit-decline threshold to twice itself and stops binding on the largest matrices):
+    //     above ten million nonzeros the cap costs 4.5% on float32 and 2.9% on float64, against
+    //     floors of 0.9998 and 1.0039. Large products are DRAM-bound and the second sibling helps
+    //     there by keeping more requests outstanding.
+    //
+    //   * THE CALLER PATH, through ops.matmul with the plan cache live, 129 matrices x 6 widths x 2
+    //     passes: 0.8994 and 0.8994/0.8923 against A/A floors of 0.9980-0.9997, z from -9.3 to
+    //     -11.7, and the cells below MKL rising 482 -> 535 (float32) and 332 -> 390 (float64). The
+    //     kernel-level win does not survive on the path a caller takes. The resolved count is not
+    //     only a worker count: scorch_spmm_chunk and scorch_spmm_partition_mode both consume it, so
+    //     lowering it moves two other decisions, and on the caller path that is a net loss.
+    //
+    // scorch_phys_cores_avail() itself stays exported and is not dead: it is the only way to tell a
+    // cgroup's physical cores from scorch_pcore_count()'s machine-wide answer, and conflating those
+    // two is what made this look inert on the host where it binds.
+    //
     // Placed here, inside the existing final cap, and NOT as a separate earlier cap. A
     // separate one was written first and was wrong: lowering the count before the block
     // below drops it under the `2 * pool` recruit gate, which does not merely lower a
