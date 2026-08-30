@@ -15663,3 +15663,61 @@ to that host's shape -- two sockets, and a 32-CPU allocation spread over four co
 MB of L3 each, against redwood's 32 logical CPUs on one die behind one 36 MB L3. A barrier across 32
 threads costs very differently in those two places. That is a topology cost, not a sibling cost, and
 naming it correctly is why the cap is rejected rather than gated.
+
+## The row split on ARM: inert where it declines, and TWO mechanisms where it fires
+
+M5, arm against arm inside one hooks object -- the right instrument here, because both arms pay the
+same 54 getenv lookups per call and they cancel in the ratio, and there is no MKL on this host for a
+hooks build to bias. `offb` is `off` again and is the floor. Pass 1:
+
+```
+float32                 k    imb    off us     on us    on/off     floor
+connectus               1      7      90.8      93.6    0.9710    0.9998
+connectus               4      7     147.9     149.3    0.9907    1.0096
+connectus              64      7    1667.5    1170.3    1.4249    0.9958
+kl02                    1      2      34.6      40.2    0.8612    1.0840
+kl02                    4      2      51.1      47.1    1.0842    1.0060
+kl02                   64      2     180.1     163.7    1.0996    0.9704
+nw14                    1      6      76.2      69.8    1.0920    0.9957
+nw14                    4      6     121.5     109.8    1.1065    0.9944
+nw14                   64      6    1245.3     885.0    1.4072    0.9964
+lp_osa_14               1      8      45.4      64.9    0.6990    0.9999
+lp_osa_14               4      8      61.6      80.8    0.7623    1.0061
+lp_osa_14              64      8     324.7     279.2    1.1631    1.0001
+
+                        n    off/on     floor    cells below 0.98
+  FIRES                24    0.9668    0.9992         12
+  inert                36    1.0008    1.0010          7
+float64 FIRES          24    0.9806    1.0051         10
+float64 inert          36    0.9950    0.9980          7
+```
+
+**The guardrail passes.** On the 36 cells where the probe declines, `off/on` is 1.0008 and 0.9950
+against floors of 1.0010 and 0.9980 -- so the screening probe, which does run on those (they clear
+the nonzero floor), does not show. That was the property most likely to block this and it holds.
+
+**Where it fires, ARM disagrees with itself, and the reason is that the split does two different
+things.** nw14 wins at every width (1.09 / 1.11 / 1.41 float32, up to 1.43 float64) and lp_osa_14
+loses 30% at k=1 and 24% at k=4 while winning 1.16-1.25 at k=64. That is not noise: the floors on
+those cells are within 0.6% of 1.000.
+
+The M5's pool is 6, and at 6 workers **neither** matrix is load-balance bound: nnz/6 is 150818 for
+nw14 against a widest row of 90951, and 52849 for lp_osa_14 against 38336. So none of the ARM
+movement is the balance mechanism. What is left is ROW GRANULARITY: nw14 is 73 rows, and splitting it
+into 3572 gives the work-stealing loop something to hand out, while lp_osa_14 already has 2337 rows,
+gains no granularity, and pays the reduction pass -- which at k=1 is 3308 row-visits of almost no
+arithmetic each.
+
+So the mechanism separates cleanly by what the matrix lacks:
+
+  * **balance** matters when the widest row exceeds nnz/N, and only a host with enough workers can
+    show it -- which is why the M5, saturating at 4.8x speedup against ceilings of 8.3-9.9, cannot;
+  * **granularity** matters when the row count is small relative to workers times chunk, and it is
+    what moves on ARM.
+
+The gate as written (a fixed reference width, for pool-independent results) fires on both cases and
+therefore takes the lp_osa_14 loss on a small pool. Whether that is the right trade is a decision
+the x86 grids have to inform, not this one: on redwood at 24 workers and MKT at 32, lp_osa_14 IS
+balance-bound (C(24) = 8.27) and is one of the cells this exists for. Deliberately not choosing the
+constants until chain84 and job 17143258 report -- picking them from the ARM run alone is how a
+threshold gets fitted to the one host that cannot see the mechanism.
