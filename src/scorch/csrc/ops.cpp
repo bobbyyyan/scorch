@@ -680,6 +680,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
           py::arg("work_true") = -1, py::arg("nnz") = -1);
 
+    // Exported so a harness asks for these counts instead of recomputing them. A harness that
+    // restates a production policy is wrong silently and flatteringly, and the two numbers
+    // below are easy to conflate: scorch_pcore_count() counts the MACHINE's performance cores
+    // and then clamps to omp_get_num_procs(), while scorch_phys_cores_avail() counts distinct
+    // physical cores inside the process's affinity mask. Inside a 32-CPU cgroup over 16 cores
+    // the first answers 32 and the second 16.
+    m.def("scorch_phys_cores_avail", &scorch_phys_cores_avail,
+          "Distinct physical cores in this process's CPU affinity mask. Falls back to "
+          "omp_get_num_procs() where the topology cannot be read.");
+    m.def("scorch_pcore_count", &scorch_pcore_count,
+          "The host's performance-core count, clamped to omp_get_num_procs(). Machine-wide: "
+          "it does not see a cgroup or an affinity mask.");
+
     // The two escape-hatch flags that survive into a release object, as explicit process-level
     // policy rather than as an environment read on every call. See the comment above
     // scorch_flags in scorch_policy.h for why the read was moved: std::getenv is a linear scan

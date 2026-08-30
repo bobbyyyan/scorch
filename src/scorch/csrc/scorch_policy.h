@@ -61,6 +61,9 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__)
+#include <sched.h>    // scorch_phys_cores_avail reads the process's affinity mask
+#endif
 
 // --- Per-host autotune overrides (optional, generated, gitignored) -----------
 #if defined(__has_include)
@@ -381,6 +384,30 @@
 // The pool FLOOR below is what this makes unnecessary: an arm setting MINTHREADS=12 against a
 // pool of 6 read the A/A floor as predicted, confirming the floor reads the caller's pool, but
 // with the capped rule already neutral there is nothing left for a floor to protect.
+// Also cap the SpMM worker count at the PHYSICAL CORES the process can run on.
+//
+// A sparse row loop is bound by memory, not by issue width, so a second thread on the same
+// physical core adds contention and fork/join cost without adding bandwidth. Where the
+// caller's pool is sized from LOGICAL CPUs -- which is what torch does by default; on an
+// AMD EPYC allocation of 32 CPUs over 16 cores torch.get_num_threads() reports 32 with
+// nothing set -- the policy runs both SMT siblings of every core.
+//
+// This feeds SCORCH_SPMM_NT_CAP rather than acting on its own, so it composes with that
+// block's measured recruit decline instead of pre-empting it. The effective cap becomes the
+// smaller of the caller's pool and the physical core count, which is inert on both existing
+// hosts by construction: redwood min(24, 24), the M5 min(6, 18).
+//
+// NOT the P-core cap chain21 rejected: capping redwood at its EIGHT P-cores discarded
+// sixteen real E-cores and cost 32%. Physical cores there are 24, so redwood's pool is
+// untouched. The two counts are exported separately -- scorch_phys_cores_avail() and
+// scorch_pcore_count() -- because they are easy to conflate and differ by exactly the
+// factor that matters inside a cgroup.
+//
+// Off by default until measured on two hosts, per the convention for a new policy.
+#ifndef SCORCH_SPMM_NT_CAP_PHYS
+#  define SCORCH_SPMM_NT_CAP_PHYS 0
+#endif
+
 #ifndef SCORCH_SPMM_CEIL_CAP_POOL
 #  define SCORCH_SPMM_CEIL_CAP_POOL 1
 #endif
@@ -875,6 +902,78 @@ inline int scorch_pcore_count() {
   return cached;
 }
 
+// The number of DISTINCT PHYSICAL CORES this process can actually run on.
+//
+// This is NOT scorch_pcore_count(). That one counts the MACHINE's cores and then clamps to
+// omp_get_num_procs(), and its own comment records the gap: "knows nothing about a cgroup
+// limit or an affinity mask, so inside a two-CPU container it would still answer 8". For a
+// ceiling that gap is safe -- a bound above the resolved count never binds -- but the two
+// numbers differ by exactly the factor that matters here. On a 32-CPU Slurm allocation that
+// is 16 physical cores x 2 SMT siblings, scorch_pcore_count() answers 32 (the logical count,
+// after clamping) while the process has 16 real cores.
+//
+// Why the distinction earns its keep: a sparse SpMM row loop is bound by memory, not by
+// issue width, so a second thread on the same physical core adds contention and fork/join
+// cost without adding bandwidth. Measured on MKT (AMD EPYC 9334, one socket, pool 32 over 16
+// physical cores) one worker per physical core is 17-45% faster than one per logical CPU at
+// every width from 1 to 64 wherever the count can be lowered at all.
+//
+// Derivation: intersect the affinity mask with the sysfs topology and count distinct
+// (package, core) pairs. Falls back to omp_get_num_procs() when the topology cannot be read,
+// so a host we cannot inspect keeps today's bound rather than a wrong smaller one -- the same
+// fail-safe direction scorch_pcore_count uses.
+//
+// macOS has no per-process affinity API and no SMT on Apple silicon, so hw.physicalcpu is
+// both the right answer and, on the project's ARM host, an inactive one: 18 physical against
+// a pool of 6.
+inline int scorch_phys_cores_avail() {
+  static const int cached = [] {
+    if (const char* e = std::getenv("SCORCH_PHYS_CORES")) {
+      if (*e) { long v = std::atol(e); if (v > 0) return (int)v; }
+    }
+    int best = 0;
+#if defined(__APPLE__)
+    int32_t v = 0; size_t len = sizeof(v);
+    if (sysctlbyname("hw.physicalcpu", &v, &len, nullptr, 0) == 0 && v > 0) best = (int)v;
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      // Distinct (package, core) pairs among the CPUs we may run on. Bounded lists rather
+      // than a container: this header includes almost nothing on purpose.
+      int pkgs[CPU_SETSIZE], cores[CPU_SETSIZE], n = 0;
+      for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &set)) continue;
+        char path[160];
+        int core_id = -1, pkg_id = -1;
+        std::snprintf(path, sizeof(path),
+                      "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        if (FILE* f = std::fopen(path, "r")) {
+          if (std::fscanf(f, "%d", &core_id) != 1) core_id = -1;
+          std::fclose(f);
+        }
+        std::snprintf(path, sizeof(path),
+                      "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        if (FILE* f = std::fopen(path, "r")) {
+          if (std::fscanf(f, "%d", &pkg_id) != 1) pkg_id = -1;
+          std::fclose(f);
+        }
+        if (core_id < 0 || pkg_id < 0) { best = 0; n = 0; break; }  // unreadable -> fall back
+        bool seen = false;
+        for (int i = 0; i < n; i++)
+          if (cores[i] == core_id && pkgs[i] == pkg_id) { seen = true; break; }
+        if (!seen && n < CPU_SETSIZE) { cores[n] = core_id; pkgs[n] = pkg_id; n++; }
+      }
+      best = n;
+    }
+#endif
+    const int hw = omp_get_num_procs();
+    if (best > 0) return (hw > 0 && best > hw) ? hw : best;
+    return hw > 0 ? hw : 1;
+  }();
+  return cached;
+}
+
 inline long scorch_llc_bytes() {
   static const long cached = [] {
     if (const char* e = std::getenv("SCORCH_LLC_BYTES")) {
@@ -1218,6 +1317,39 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     } else if (nt_cap < 0) {
       nt_cap = (long)scorch_pcore_count();
     }
+    // ALSO cap at the physical cores this process can run on, when asked to.
+    //
+    // Placed here, inside the existing final cap, and NOT as a separate earlier cap. A
+    // separate one was written first and was wrong: lowering the count before the block
+    // below drops it under the `2 * pool` recruit gate, which does not merely lower a
+    // thread count -- it routes the drop-in and fused SpMM kernels back onto the pool
+    // permanently and gives up a measured 2.18x on the largest autoencoder bucket. Folding
+    // the physical-core count into nt_cap instead means it inherits every safeguard that
+    // block already carries, including the decline.
+    //
+    // A second min(), so the effective cap is the SMALLER of the caller's pool and the
+    // core count. That is what makes it inert on both of the project's existing hosts by
+    // construction rather than by measurement: redwood caps at min(24, 24) and the M5 at
+    // min(6, 18), both unchanged, while an allocation of 32 logical CPUs over 16 physical
+    // cores caps at 16 instead of 32.
+    // Compiled out entirely when the constant is 0 and the hooks are off, rather than left
+    // as a dead branch with a live local. That is the pattern the surrounding block already
+    // uses and its comment says why: a dead branch and its locals here once added ten x86
+    // instructions and reshuffled every stack slot in this function, and constexpr did not
+    // help.
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_NT_CAP_PHYS != 0
+    {
+      bool cap_phys = SCORCH_SPMM_NT_CAP_PHYS != 0;
+#ifdef SCORCH_TUNE_HOOKS
+      { const char* e = std::getenv("SCORCH_SPMM_NT_CAP_PHYS");
+        if (e && *e) cap_phys = std::atol(e) != 0; }
+#endif
+      if (cap_phys) {
+        const long phys = (long)scorch_phys_cores_avail();
+        if (phys > 0 && phys < nt_cap) nt_cap = phys;
+      }
+    }
+#endif
     bool floor_ceil = SCORCH_SPMM_NT_CAP_FLOOR_CEIL != 0;
 #ifdef SCORCH_TUNE_HOOKS
     { const char* e = std::getenv("SCORCH_SPMM_NT_CAP_FLOOR_CEIL");
