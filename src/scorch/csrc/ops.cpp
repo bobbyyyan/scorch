@@ -689,6 +689,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Re-exporting pcore_count here as a "matching pair" was written first and was wrong: two
     // m.def calls with the same name and signature register a second overload the first always
     // shadows, so it was dead registration code that nothing could ever reach.
+    // The row-split partition's two decisions, exported for the same reason as the chunk width and
+    // the thread count: a harness that restates a production policy is wrong silently and
+    // flatteringly. The imbalance probe in particular is easy to get almost right -- it is the
+    // longest run of equal-nonzero cuts landing in ONE row, not the max degree over the mean, and
+    // the two differ on exactly the matrices this mechanism is for.
+    m.def("scorch_spmm_row_imbalance",
+          [](torch::Tensor A1_pos, long rows, long refn) {
+            TORCH_CHECK(A1_pos.dtype() == torch::kInt32, "A1_pos must be int32");
+            TORCH_CHECK(A1_pos.is_contiguous(), "A1_pos must be contiguous");
+            TORCH_CHECK(rows >= 0 && rows < A1_pos.numel(),
+                        "rows must be less than indptr's length");
+            return scorch_spmm_row_imbalance(A1_pos.data_ptr<int>(), rows, refn);
+          },
+          "How far past its fair share of the nonzeros the widest row is, measured against a "
+          "reference width: the longest run of equal-nonzero cuts that land in one row.",
+          py::arg("A1_pos"), py::arg("rows"), py::arg("refn"));
+    m.def("scorch_spmm_seg_width", &scorch_spmm_seg_width,
+          "Nonzero width of one row-split segment for (nnz, k, elem_size). A function of the call "
+          "only, never of the worker count, so a split result does not depend on OMP_NUM_THREADS.",
+          py::arg("nnz"), py::arg("k"), py::arg("elem_size"));
+
     m.def("scorch_phys_cores_avail", &scorch_phys_cores_avail,
           "Distinct physical cores in this process's CPU affinity mask. Falls back to "
           "omp_get_num_procs() where the topology cannot be read.");

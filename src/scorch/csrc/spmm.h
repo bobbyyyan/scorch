@@ -4725,6 +4725,128 @@ torch::Tensor spmm_csr_v2_core(
   return C_values_torch;
 }
 
+// ---------------------------------------------------------------------------------------------
+// ROW-SPLIT PARTITION.
+//
+// spmm_csr_v2_core above hands out whole rows in every partition mode, so a matrix holding a tenth
+// of its nonzeros in ONE row cannot use more than about 40% of a 24-worker machine no matter how
+// good the inner loop is. That is the measured cause of three of the seven cells still below MKL
+// after a perfect per-cell thread oracle: nw14, connectus and lp_osa_14, whose twelve cells read
+// 0.9065 from doubling workers 12 -> 24 where their ceiling permits exactly 1.0000. The full
+// argument and the numbers are in scorch_spmm_row_imbalance's comment and in
+// SPMM_BEAT_MKL_RESULTS.md.
+//
+// This splits every row wider than one segment into separate rows of a CSR matrix that shares
+// A1_crd and A_val untouched -- same column indices, same values, same order, only a different
+// indptr -- runs the UNMODIFIED core on it, and sums each original row's pieces.
+//
+// Why a wrapper and not a change to the core's claim loop. The claim loop is the hottest code in
+// the file and carries a dozen loop-invariant specialisations and A/B hooks; threading a segment
+// space through it would put a branch inside it and reshuffle the register allocation of every
+// kernel it dispatches to. Doing it out here means the non-split path is the same object code it
+// was -- checkable per symbol, and checked -- and the split path costs exactly one extra pass over
+// the partials. The core already takes A1_pos and A0_size as parameters and allocates its own
+// output, so no plumbing is needed.
+//
+// Determinism. Splitting a row changes the order its nonzeros are summed, so the result is NOT
+// bit-identical to the unsplit kernel on a matrix this fires on. It is identical for every thread
+// count and on every host, because both the decision (a fixed reference width) and the segment
+// width (a function of nnz, k and the element size) ignore the pool. A matrix whose widest row is
+// under one segment produces exactly its own rows and is bit-identical to today.
+//
+// Off by default: SCORCH_SPMM_SPLIT_MIN_IMBALANCE is 0 until the grid says what it should be.
+template <typename scalar_t>
+torch::Tensor spmm_csr_v2_rowsplit(
+                int C0_size, int C1_size, int A0_size,
+                const int* SCORCH_RESTRICT A1_pos,
+                const int* SCORCH_RESTRICT A1_crd,
+                const scalar_t* SCORCH_RESTRICT A_val,
+                int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
+                int tile_size, int nthreads_override, bool atparallel) {
+  long min_imb = SCORCH_SPMM_SPLIT_MIN_IMBALANCE;
+  long min_nnz = SCORCH_SPMM_SPLIT_MIN_NNZ;
+  long refn    = SCORCH_SPMM_SPLIT_REFN;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_MIN_IMBALANCE");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) min_imb = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_MIN_NNZ");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) min_nnz = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_REFN");
+    if (e && *e) { long v = std::atol(e); if (v > 1) refn = v; } }
+#endif
+  const long nnz_total = (A0_size > 0 && A1_pos) ? (long)A1_pos[A0_size] : 0;
+  // The screening test is two integer compares, so a build with the mechanism off and a caller
+  // below the size floor pay only those. The O(refn log rows) probe is behind them.
+  const bool maybe = min_imb > 0 && A0_size > 1 && nnz_total >= min_nnz;
+  long seg = 0;
+  if (maybe && (long)scorch_spmm_row_imbalance(A1_pos, A0_size, refn) >= min_imb)
+    seg = scorch_spmm_seg_width(nnz_total, (long)C1_size, (long)sizeof(scalar_t));
+  if (seg <= 0) {
+    return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                      B1_size, B_val, tile_size, nthreads_override, atparallel);
+  }
+
+  // Segment boundaries. row_seg[r] is the first segment of row r, so row r owns
+  // [row_seg[r], row_seg[r+1]) and an EMPTY row owns none -- which is what lets the reduction
+  // below zero it without a second walk of A1_pos.
+  std::vector<int> row_seg((size_t)A0_size + 1);
+  long nseg = 0;
+  for (int r = 0; r < A0_size; ++r) {
+    row_seg[(size_t)r] = (int)nseg;
+    const long deg = (long)A1_pos[r + 1] - (long)A1_pos[r];
+    if (deg > 0) nseg += (deg + seg - 1) / seg;
+  }
+  row_seg[(size_t)A0_size] = (int)nseg;
+  if (nseg <= A0_size) {
+    // No row exceeded one segment after all -- the imbalance probe answers a question about the
+    // widest row relative to the whole matrix, and the segment width answers a different one about
+    // absolute size, so they can disagree. Nothing to split, and nothing has been allocated that
+    // the core would have to know about.
+    return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                      B1_size, B_val, tile_size, nthreads_override, atparallel);
+  }
+  std::vector<int> seg_pos((size_t)nseg + 1);
+  {
+    long s = 0;
+    for (int r = 0; r < A0_size; ++r) {
+      const long b = (long)A1_pos[r], e = (long)A1_pos[r + 1];
+      for (long p = b; p < e; p += seg) seg_pos[(size_t)s++] = (int)p;
+    }
+    seg_pos[(size_t)nseg] = (int)nnz_total;
+  }
+
+  // The unmodified core, on a matrix that is legal CSR and simply has more rows.
+  torch::Tensor partials = spmm_csr_v2_core<scalar_t>(
+      (int)nseg, C1_size, (int)nseg, seg_pos.data(), A1_crd, A_val,
+      B1_size, B_val, tile_size, nthreads_override, atparallel);
+  const scalar_t* SCORCH_RESTRICT part = partials.template data_ptr<scalar_t>();
+
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)((size_t)C0_size * (size_t)C1_size)},
+                   scorch_torch_dtype<scalar_t>());
+  scalar_t* SCORCH_RESTRICT C_values = C_values_torch.template data_ptr<scalar_t>();
+  const size_t row_bytes = (size_t)C1_size * sizeof(scalar_t);
+
+  // Sum each row's segments, in segment order, so the answer does not depend on how the work was
+  // scheduled. Parallel over ROWS through torch's pool: this runs after the core's team has been
+  // torn down, and a private team here would be a second fork/join on the critical path.
+  at::parallel_for(0, (int64_t)C0_size, /*grain=*/1024, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      scalar_t* SCORCH_RESTRICT dst = C_values + (size_t)r * (size_t)C1_size;
+      if (r >= (int64_t)A0_size) { std::memset(dst, 0, row_bytes); continue; }
+      const int s0 = row_seg[(size_t)r], s1 = row_seg[(size_t)r + 1];
+      if (s0 == s1) { std::memset(dst, 0, row_bytes); continue; }   // structurally empty
+      const scalar_t* SCORCH_RESTRICT src = part + (size_t)s0 * (size_t)C1_size;
+      std::memcpy(dst, src, row_bytes);
+      for (int s = s0 + 1; s < s1; ++s) {
+        const scalar_t* SCORCH_RESTRICT add = part + (size_t)s * (size_t)C1_size;
+        for (int j = 0; j < C1_size; ++j) dst[j] += add[j];
+      }
+    }
+  });
+  return C_values_torch;
+}
+
 // The float32 entry every existing caller uses. A one-line forwarder, so plan.h and
 // spmm_csr_float_v2 are unchanged and the float32 instantiation is the same code the
 // hand-written kernel was.
@@ -4735,9 +4857,9 @@ torch::Tensor spmm_csr_float_v2_core(
                 const float* SCORCH_RESTRICT A_val,
                 int B1_size, const float* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel) {
-  return spmm_csr_v2_core<float>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                 B1_size, B_val, tile_size, nthreads_override,
-                                 atparallel);
+  return spmm_csr_v2_rowsplit<float>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                     B1_size, B_val, tile_size, nthreads_override,
+                                     atparallel);
 }
 
 Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape,
@@ -4819,9 +4941,9 @@ torch::Tensor spmm_csr_double_v2_core(
                 int B1_size, const double* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel) {
 #if (defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON)
-  return spmm_csr_v2_core<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                  B1_size, B_val, tile_size, nthreads_override,
-                                  atparallel);
+  return spmm_csr_v2_rowsplit<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                      B1_size, B_val, tile_size, nthreads_override,
+                                      atparallel);
 #else
   // The composition hints are accepted and ignored here, so neither the Python side
   // nor plan.h needs a per-platform branch: the reference kernel takes its thread

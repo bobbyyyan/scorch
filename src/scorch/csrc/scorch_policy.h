@@ -404,6 +404,27 @@
 // factor that matters inside a cgroup.
 //
 // Off by default until measured on two hosts, per the convention for a new policy.
+// Row-split partition (see scorch_spmm_row_imbalance). SPLIT_REFN is the fixed reference width the
+// imbalance is stated against -- NOT the host's thread count, so the same matrix splits the same way
+// everywhere and a result never depends on OMP_NUM_THREADS. SPLIT_MIN_IMBALANCE is how far past its
+// fair share the widest row has to be: 2 against a reference of 64 means one row holding more than
+// 3.1% of the nonzeros. SPLIT_MIN_NNZ keeps the O(refn log rows) probe off products too small for
+// the split to matter. 0 in SPLIT_MIN_IMBALANCE disables the whole mechanism.
+#ifndef SCORCH_SPMM_SPLIT_REFN
+#  define SCORCH_SPMM_SPLIT_REFN 64L
+#endif
+#ifndef SCORCH_SPMM_SPLIT_MIN_IMBALANCE
+#  define SCORCH_SPMM_SPLIT_MIN_IMBALANCE 0L
+#endif
+#ifndef SCORCH_SPMM_SPLIT_MIN_NNZ
+#  define SCORCH_SPMM_SPLIT_MIN_NNZ 150000L
+#endif
+#ifndef SCORCH_SPMM_SEG_MIN
+#  define SCORCH_SPMM_SEG_MIN 256L
+#endif
+#ifndef SCORCH_SPMM_SEG_SCRATCH_KB
+#  define SCORCH_SPMM_SEG_SCRATCH_KB 8192L
+#endif
 #ifndef SCORCH_SPMM_NT_CAP_PHYS
 #  define SCORCH_SPMM_NT_CAP_PHYS 0
 #endif
@@ -1401,6 +1422,86 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   }
 #endif
   return nthreads;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// ROW-SPLIT PARTITION: the load-balance ceiling, and how to tell when it binds.
+//
+// Every partition mode below hands out WHOLE ROWS. So no schedule can finish before the largest
+// single row is done, and nnz / LPT(N) -- the longest-processing-time-first makespan over the real
+// degree sequence -- is an upper bound on the speedup the kernel can reach at N workers, whatever
+// the inner loop does. Three matrices in the corpus hold a tenth of themselves in ONE row (nw14
+// 90951 of 904910, connectus 120065 of 1127525, lp_osa_14 38336 of 317097), which caps them at
+// 8.3-10.0 of 24 workers. The prediction that follows from that -- for those three, maxdeg already
+// exceeds nnz/12, so C(12) = C(24) and doubling the workers must buy exactly nothing -- was made
+// from indptr before any timing was read and then measured: those twelve cells read 0.9065 from 12
+// -> 24 workers where the 1176 cells with a rising ceiling read 1.0298. They are three of the seven
+// cells still below MKL after a perfect per-cell thread oracle. See SPMM_BEAT_MKL_RESULTS.md.
+//
+// scorch_spmm_row_imbalance answers "does one row exceed its fair share, and by how much" in
+// O(N log rows) and WITHOUT a pass over the degrees. The identity it uses: cut the nonzeros into N
+// equal pieces and find the row containing each cut. A row of degree >= nnz/N spans at least one
+// whole piece, so two consecutive cuts land in it; and conversely two cuts can only land in the
+// same row if that row is at least a piece wide. So the longest run of cuts sharing a row is the
+// factor by which the widest row exceeds nnz/N -- which is exactly the ratio the ceiling is about,
+// measured on the partition that will actually run rather than on a summary statistic. An O(rows)
+// max-degree scan was the first version and is not needed: on a matrix with as many rows as
+// nonzeros it costs a second walk of indptr on every call, for an answer these 400-odd operations
+// already give.
+//
+// N here is a FIXED reference width, not the host's thread count, and that is deliberate. Splitting
+// a row changes the order its nonzeros are summed, so a decision that read the pool would make the
+// result depend on OMP_NUM_THREADS. Today's kernel gives the same answer for any thread count and
+// that is worth keeping, so the decision is stated against a constant and the same matrix splits
+// the same way on every host. The cost is that a host with fewer workers than the reference may
+// build a split it cannot use; the cost of that is the scratch traffic, which is bounded below.
+inline int scorch_spmm_row_imbalance(const int* A1_pos, long rows, long refn) {
+  if (!A1_pos || rows <= 0 || refn <= 1) return 1;
+  const long nnz = (long)A1_pos[rows];
+  if (nnz <= 0) return 1;
+  int worst = 1, run = 1;
+  long prev = -1;
+  for (long w = 1; w < refn; ++w) {
+    const long target = nnz * w / refn;      // the nonzero index this cut falls on
+    // Largest r with A1_pos[r] <= target: the row that owns that nonzero.
+    long lo = 0, hi = rows - 1;
+    while (lo < hi) {
+      const long mid = lo + ((hi - lo + 1) >> 1);
+      if ((long)A1_pos[mid] <= target) lo = mid; else hi = mid - 1;
+    }
+    if (lo == prev) { if (++run > worst) worst = run; } else run = 1;
+    prev = lo;
+  }
+  return worst;
+}
+
+// The nonzero width of one segment. A function of the CALL only -- never of the worker count, for
+// the reason above. Two bounds meet here:
+//
+//   * from below, a segment has to be worth claiming: SCORCH_SPMM_SEG_MIN nonzeros, which at k=4 is
+//     a few hundred nanoseconds of arithmetic, and which also means a matrix whose widest row is
+//     under one segment splits into exactly its own rows and runs bit-identically to today;
+//   * from above, the partial-output buffer costs (nnz/seg) * k * sizeof(scalar_t) bytes beyond the
+//     output itself, so the width rises with k and with the element size to hold that under
+//     SCORCH_SPMM_SEG_SCRATCH_KB. At k=256 float64 and a hundred million nonzeros that is a 32768
+//     segment and about six megabytes of partials; at k=4 it is the floor and 56 kilobytes.
+inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
+  long budget = (long)SCORCH_SPMM_SEG_SCRATCH_KB * 1024L;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SEG_SCRATCH_KB");
+    if (e && *e) { long v = std::atol(e); if (v > 0) budget = v * 1024L; } }
+#endif
+  long seg = SCORCH_SPMM_SEG_MIN;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SEG_MIN");
+    if (e && *e) { long v = std::atol(e); if (v > 0) seg = v; } }
+#endif
+  if (k > 0 && elem_size > 0 && budget > 0) {
+    const long need = (nnz * k * elem_size + budget - 1) / budget;   // ceil
+    while (seg < need) seg <<= 1;                                   // stays a power of two
+  }
+  return seg;
 }
 
 // The row-handout mode the SpMM will actually run in, for one call's shape.
