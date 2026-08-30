@@ -14957,3 +14957,100 @@ better than the one that ships. What is left of the deficit is 20 float32 and 18
 1192 — `nw14`, `kl02`, `connectus`, `bibd_17_8` at few rows and extreme degree needing 30–45%, and a
 handful of dlmc layers needing 2–10% — and the honest position is that the next step is a
 feature-gated per-cell thread selector validated held-out, not another constant.
+
+## chain79: the row ceiling is a REGRESSION on its own targets, on two hosts, and the reason is that these matrices are over-threaded
+
+The nnz-per-thread row ceiling has been the standing candidate for the few-row extreme-degree
+family — `nw14`, `kl02`, `bibd_*`, `connectus` — since chain41. chain68 closed it on *reach*: the
+gate cannot see three quarters of the losing matrices. What no run had ever established is
+whether it helps the cells it *can* see. chain61 refused (`ship_lose` had two matrices), chain68
+refused for the same reason, chain63's ladder covered rows 128–600 while these matrices are
+50–128, and **chain78's ladder was blind to them by construction** — it forced the count through
+the `nthreads_override` argument, which `scorch_spmm_nthreads` caps at
+`rows/SCORCH_ROWS_PER_THREAD`, the very bound the ceiling exists to lift. Asked directly, the
+binary confirms it: on kl02 (71 rows) `override=24` resolves to **4**, identical to the policy.
+So five prior runs left the load-bearing question untouched.
+
+### The blast radius, exhaustively, before any timing
+
+Asking `scorch_ops.scorch_spmm_nthreads` for every matrix in the cache at six widths — 8404
+matrices, 50424 cells, the export existing precisely so a harness need not restate the rule:
+
+| gate | cells moved | matrices moved |
+|---|---|---|
+| shipped (`MAXROWS=128`, `MINDEG=192`, `CAP_POOL=1`) | 121 | 72 |
+| uncapped | 123 | 72 |
+| widened (512, 128) | 365 | 178 |
+
+**84 of the shipped gate's 121 cells are the dlmc rn50 pruned-ResNet family**, rows 64–128,
+degree 203–878. `scorch_policy.h` states in as many words that "a 64-row pruned-ResNet layer at
+degree 288 with 18432 nonzeros in total is the shape it must not catch". The degree floor of 192
+was chosen to exclude them and does not: that family's degrees start at 203. Its two intended
+targets, kl02 and nw14, are 2 of the 72 matrices. And **68 of the 121 cells are at k=64**, a
+width where the scoreboard has us behind MKL on 0 of 212 matrices on both dtypes — over half the
+blast radius is exposure with no available upside.
+
+chain68's count differed (9 cells, 2 matrices) because it classified the 362-matrix scoreboard;
+the full cache contains the whole rn50 family. Both numbers are right about their own corpus, and
+the larger one is the one that matters for a harm claim.
+
+### Timing, scored only on the cells whose resolved count actually changed
+
+The groups come from that enumeration, not from the outcome: `target` = the gate moves it and it
+is a suitesparse extreme-degree matrix; `rn50` = the gate moves it and it is a pruned-ResNet
+layer, so a number below 1.000 there is a harm; `inert` = the gate provably does not move it.
+Ratios are shipping/gate, so **below 1.000 means the rule is slower**. Arms all set the same five
+environment variables and differ only in their values, so no arm is charged for a longer scan.
+
+redwood, float32, hooks build, interleaved, pass 1:
+
+| group | k | n | shipping/rule | z | floor |
+|---|---|---|---|---|---|
+| target | 1 | 7 | **0.7674** | −2.92 | 1.0176 |
+| target | 2 | 7 | 1.0424 | 0.47 | 1.0075 |
+| target | 4 | 7 | 1.0715 | 2.09 | 0.9973 |
+| target | 8 | 6 | 1.0781 | 1.60 | 0.9746 |
+| rn50 | 1 | 4 | **0.7011** | −4.44 | 0.9421 |
+| rn50 | 2 | 4 | **0.8226** | −16.89 | 0.9438 |
+| rn50 | 4 | 4 | **0.9006** | −3.77 | 0.9653 |
+| rn50 | 64 | 64 | **0.9317** | −4.43 | 1.0086 |
+
+M5, float32, same instrument, pool 6 so the pool cap makes the widening 4 → 6 rather than 4 → 24:
+
+| group | k | n | shipping/rule | z | floor |
+|---|---|---|---|---|---|
+| target | 1 | 4 | 0.9112 | −0.98 | 0.9961 |
+| target | 2 | 3 | **0.7818** | −4.89 | 1.0198 |
+| target | 4 | 3 | **0.8846** | −2.03 | 1.0213 |
+| target | 8 | 3 | 0.9582 | −1.23 | 1.0170 |
+| rn50 | 64 | 13 | **0.9458** | −2.06 | 1.0075 |
+
+Worst individual cells, both hosts: `bibd_15_7` k=1 0.553 (6 → 14 workers, 11.65 → 21.07 µs),
+`bibd_16_8` k=1 0.579, **nw14 k=1 0.750 (4 → 24, 44.80 → 59.70 µs)**, **kl02 k=1 0.757 (4 → 22,
+18.77 → 24.79 µs)**, `air02` k=2 0.709 on ARM (3 → 6, 21.17 → 29.86 µs).
+
+**The unmoved cells are a second, independent floor, and they hold.** Where ship and off resolve
+to the same count the ratio reads 0.9769–1.0167 on redwood and 0.9875–1.0138 on the M5, every
+|z| ≤ 1.7. So the enabled code is inert where it cannot act — the claim a hooked grid famously
+cannot make — and it is inert here because *the decision is identical*, which is a stronger
+statement than a null ratio: it is the same code taking the same branch.
+
+### Why it fails, which is the part worth keeping
+
+The force ladder in the same runs says these matrices are **over**-threaded, not under-threaded,
+so a rule whose whole mechanism is to raise the count is pointed the wrong way:
+
+* M5, rn50: forcing **2** workers against the policy's 4 reads 1.1769 / 1.1846 / **1.2031** /
+  1.0620 at k=1/2/4/8, while every count at or above 6 reads 0.68–0.75.
+* redwood, inert group at k=1: forcing 8 against the policy's 24 reads **1.2373**.
+* redwood, target group: every forced count from 8 to 32 is at or below shipping at k=1
+  (0.9152, 0.6360, 0.6194, 0.6059, 0.6491).
+
+That is the same conclusion chain63 and chain78 reached from the other direction — no forced
+count beats the rule — restated as a mechanism: the error on this family has the opposite sign
+from the one the ceiling corrects. `SCORCH_SPMM_NNZ_PER_THREAD` stays **0**, and now for a
+measured reason on the cells it moves rather than only a reach argument about the cells it
+does not.
+
+Also settled in passing: `SCORCH_SPMM_CEIL_CAP_POOL` was never the question. Capped, the rule
+still loses on both hosts.
