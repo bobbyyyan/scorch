@@ -419,6 +419,27 @@
 #ifndef SCORCH_SPMM_SPLIT_MIN_NNZ
 #  define SCORCH_SPMM_SPLIT_MIN_NNZ 150000L
 #endif
+// SPLIT_MIN_DEGREE is a MEAN-DEGREE floor, and it is derived from what the wrapper costs rather
+// than fitted to a corpus. The wrapper reduces by walking every output row once -- one memcpy for
+// a row that was not split, a memcpy plus adds for one that was -- so it adds about rows*k*elem
+// bytes of write traffic and as much read traffic, against nnz*k nonzeros of arithmetic. That
+// ratio is rows/nnz, the reciprocal of the mean degree, and it is paid whether or not the split
+// helps: on a matrix with three million rows and nine nonzeros each, one monster row buys a little
+// balance and the extra pass costs a full extra output. So the floor's natural scale is the segment
+// width itself -- at mean degree equal to one segment the split at most doubles the row count.
+//
+// Measured on redwood, ours/MKL before against after (MKL timed inside each process, so this is
+// immune to drift between the two builds):
+//
+//   mean degree >= 1000   nw14 12396, kl02 2993, connectus 2202     1.1843 (f32)  1.3259 (f64)
+//   mean degree <  1000   lp_osa_14 136, case39 26, FullChip 9      0.4474        0.6057
+//
+// It is also checked BEFORE the imbalance probe, because it is two integer operations and the probe
+// is sixty-four binary searches: on a corpus where the probe ran on everything above the nonzero
+// floor, cells the gate declined still read 0.9730 against a 1.0021 floor on float32.
+#ifndef SCORCH_SPMM_SPLIT_MIN_DEGREE
+#  define SCORCH_SPMM_SPLIT_MIN_DEGREE 256L
+#endif
 #ifndef SCORCH_SPMM_SEG_MIN
 #  define SCORCH_SPMM_SEG_MIN 256L
 #endif
@@ -1530,6 +1551,36 @@ inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
     while (seg < need) seg <<= 1;                                   // stays a power of two
   }
   return seg;
+}
+
+// The whole gate in one function, so the kernel and any harness ask the same code rather than two
+// copies of the same rule that can drift apart. Returns the segment width the row-split partition
+// would use, or 0 for "leave the rows whole". A harness that restated these four screens instead of
+// calling this reported a firing set that put two firing matrices in its inert group and reversed
+// the sign of its own conclusion.
+inline long scorch_spmm_split_seg(const int* A1_pos, long rows, long k, long elem_size) {
+  long min_imb = SCORCH_SPMM_SPLIT_MIN_IMBALANCE;
+  long min_nnz = SCORCH_SPMM_SPLIT_MIN_NNZ;
+  long refn    = SCORCH_SPMM_SPLIT_REFN;
+  long min_deg = SCORCH_SPMM_SPLIT_MIN_DEGREE;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_MIN_IMBALANCE");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) min_imb = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_MIN_NNZ");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) min_nnz = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_REFN");
+    if (e && *e) { long v = std::atol(e); if (v > 1) refn = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_MIN_DEGREE");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) min_deg = v; } }
+#endif
+  if (min_imb <= 0 || rows <= 1 || !A1_pos) return 0;
+  const long nnz = (long)A1_pos[rows];
+  // Integer screens first, cheapest first: the mean-degree floor is a multiply and a compare, the
+  // imbalance probe is refn binary searches.
+  if (nnz < min_nnz) return 0;
+  if (nnz < min_deg * rows) return 0;
+  if ((long)scorch_spmm_row_imbalance(A1_pos, rows, refn) < min_imb) return 0;
+  return scorch_spmm_seg_width(nnz, k, elem_size);
 }
 
 // The row-handout mode the SpMM will actually run in, for one call's shape.

@@ -709,6 +709,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Nonzero width of one row-split segment for (nnz, k, elem_size). A function of the call "
           "only, never of the worker count, so a split result does not depend on OMP_NUM_THREADS.",
           py::arg("nnz"), py::arg("k"), py::arg("elem_size"));
+    m.def("scorch_spmm_split_seg",
+          [](torch::Tensor A1_pos, long rows, long k, long elem_size) {
+            TORCH_CHECK(A1_pos.dtype() == torch::kInt32, "A1_pos must be int32");
+            TORCH_CHECK(A1_pos.is_contiguous(), "A1_pos must be contiguous");
+            TORCH_CHECK(rows >= 0 && rows < A1_pos.numel(),
+                        "rows must be less than indptr's length");
+            return scorch_spmm_split_seg(A1_pos.data_ptr<int>(), rows, k, elem_size);
+          },
+          "The row-split gate itself: the segment width the SpMM would use for this call, or 0 for "
+          "leave the rows whole. Exported so a harness or a test asks the shipped rule instead of "
+          "keeping a second copy of it that can drift.",
+          py::arg("A1_pos"), py::arg("rows"), py::arg("k"), py::arg("elem_size"));
 
     m.def("scorch_phys_cores_avail", &scorch_phys_cores_avail,
           "Distinct physical cores in this process's CPU affinity mask. Falls back to "

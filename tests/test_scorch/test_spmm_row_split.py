@@ -201,3 +201,70 @@ def test_the_size_floor_keeps_the_probe_off_small_products():
     _, off = _run(small, imbalance=0)
     _, on = _run(small, imbalance=2, min_nnz=150000)
     assert on == off
+
+
+def test_the_gate_is_exported_so_a_harness_asks_it_instead_of_copying_it():
+    """scorch_spmm_split_seg answers the whole question -- width, or zero for leave rows whole.
+
+    This exists because the alternative was measured and it failed: a harness that restated the
+    four screens put two firing matrices into its inert group and reversed the sign of its own
+    conclusion. The export makes the harness and the kernel the same code.
+    """
+    assert hasattr(scorch_ops, "scorch_spmm_split_seg")
+    indptr, _, _, _ = _csr([4] * 200)
+    ip = torch.from_numpy(indptr)
+    # Under the nonzero floor, so it declines regardless of build, and the answer is exactly 0
+    # rather than a truthy width.
+    assert scorch_ops.scorch_spmm_split_seg(ip, 200, 4, 4) == 0
+
+
+@_needs_hooks
+def test_the_mean_degree_floor_declines_a_lopsided_matrix_of_short_rows():
+    """The floor is about what the wrapper COSTS, not about how lopsided the matrix is.
+
+    The reduction walks every output row once, so it adds work proportional to rows*k against
+    arithmetic proportional to nnz*k -- a ratio of one over the mean degree, paid whether the split
+    helps or not. This matrix is as lopsided as the ones the split is for (one row holds a large
+    share of the nonzeros) but averages far under one segment per row, and on redwood matrices in
+    that regime measured 0.4474 of MKL with the floor removed against 1.1843 for the high-degree
+    ones. So the imbalance probe must say yes and the gate must still say no.
+    """
+    deg = np.full(60000, 4, dtype=np.int64)
+    deg[0] = 300000                       # 540k nonzeros total, mean degree 9
+    indptr, _, _, _ = _csr(deg, cols=300000)
+    ip = torch.from_numpy(indptr)
+    rows = len(deg)
+    assert _imbalance(indptr) >= 2, "the matrix is not lopsided, so the test proves nothing"
+    assert int(indptr[-1]) >= 150000, "under the nonzero floor, so the test proves nothing"
+    env_on = dict(SCORCH_SPMM_SPLIT_MIN_IMBALANCE="2", SCORCH_SPMM_SPLIT_MIN_DEGREE="256")
+    env_no = dict(SCORCH_SPMM_SPLIT_MIN_IMBALANCE="2", SCORCH_SPMM_SPLIT_MIN_DEGREE="0")
+    old = {k: os.environ.get(k) for k in env_on}
+    try:
+        os.environ.update(env_on)
+        assert scorch_ops.scorch_spmm_split_seg(ip, rows, 8, 4) == 0
+        os.environ.update(env_no)
+        assert scorch_ops.scorch_spmm_split_seg(ip, rows, 8, 4) > 0, (
+            "the floor is not what declined it -- something else did, so this measures nothing")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@_needs_hooks
+def test_the_floor_still_admits_the_matrices_the_split_is_for():
+    """The mirror image: few rows, very high degree, one row over its share. nw14 in the corpus is
+    73 rows and 904910 nonzeros, mean degree 12396, and gained 1.1843 of MKL from the split."""
+    deg = np.full(73, 8000, dtype=np.int64)
+    deg[0] = 300000
+    indptr, _, _, _ = _csr(deg, cols=300000)
+    ip = torch.from_numpy(indptr)
+    os.environ["SCORCH_SPMM_SPLIT_MIN_IMBALANCE"] = "2"
+    os.environ["SCORCH_SPMM_SPLIT_MIN_DEGREE"] = "256"
+    try:
+        assert scorch_ops.scorch_spmm_split_seg(ip, len(deg), 8, 4) > 0
+    finally:
+        os.environ.pop("SCORCH_SPMM_SPLIT_MIN_IMBALANCE", None)
+        os.environ.pop("SCORCH_SPMM_SPLIT_MIN_DEGREE", None)
