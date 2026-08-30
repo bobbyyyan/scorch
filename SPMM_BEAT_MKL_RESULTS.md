@@ -15054,3 +15054,106 @@ does not.
 
 Also settled in passing: `SCORCH_SPMM_CEIL_CAP_POOL` was never the question. Capped, the rule
 still loses on both hosts.
+
+### chain79 completed: all four passes, both dtypes, both hosts
+
+The float64 halves agree with float32 and on ARM they are worse. Scored on the cells whose
+resolved count changed, shipping/rule, so below 1.000 is a regression:
+
+| host | dtype | group | k | n | shipping/rule | z | floor |
+|---|---|---|---|---|---|---|---|
+| redwood | f32 | target | 1 | 7 | **0.7548** | −3.25 | 1.0011 |
+| redwood | f32 | rn50 | 1 | 4 | **0.7573** | −4.63 | 1.0076 |
+| redwood | f32 | rn50 | 2 | 4 | **0.8278** | −22.82 | 1.0011 |
+| redwood | f32 | rn50 | 64 | 64 | **0.9230** | −4.66 | 1.0001 |
+| M5 | f32 | target | 2 | 3 | **0.7771** | −4.51 | 1.0234 |
+| M5 | f64 | rn50 | 64 | 13 | **0.7813** | −4.76 | 1.0107 |
+| M5 | f64 | target | 1 | 4 | 0.8606 | −1.36 | 0.9613 |
+| M5 | f64 | target | 2 | 3 | 0.8225 | −1.81 | 1.0139 |
+
+The only region that gains is redwood float32 target at k=2/4/8: 1.0717, 1.0850, 1.0974 with
+z of 0.87, 2.41, 2.07. **A width gate does not rescue the rule**, because the rn50 harm sits
+at those same widths (0.8278 at k=2, 0.9042 at k=4). Separating the two families would need a
+degree floor placed in the gap between kl02 at 2993 and the rn50 family's ceiling of 878 --
+two matrices in the numerator and a cutoff fitted to the corpus, which is the shape of
+overfitting this file exists to refuse. So the rule is not salvageable by gating, and
+`SCORCH_SPMM_NNZ_PER_THREAD` stays 0.
+
+## The residual is partly a THREAD COUNT after all -- but the pool is oversubscribed, not the rule wrong
+
+MKT (`mkt1`, AMD EPYC 9334, Zen 4, two sockets, 64 physical cores, 256 MB L3) is a third host
+and a different microarchitecture from redwood's Intel AVX2 hybrid and the M5's ARM. Its
+scorch tree was eleven days stale; rebuilt from the branch tip, both configurations, and
+gated on a dense-reference correctness run before any timing (400 comparisons per build, 0
+mismatches, worst relative error 1.75e-06).
+
+**On that host we lost 30 of 36 cells on the dlmc transformer family** -- far worse than
+redwood's residual -- and the absolute times said why before any arm did: 52k nonzeros cost
+22.5 µs and 314k cost 28.8 µs, so six times the work for 28% more time. A fixed term of about
+20 µs dominated. The 1x1 marshalling control read only 7.1 µs against MKL's 11.7, so it was
+not the call: a 1x1 matrix resolves to ONE worker and never pays a fork/join at all.
+
+**The pool is 32 logical CPUs over 16 physical cores.** `Cpus_allowed_list` is 32-47,96-111 --
+sixteen cores, both SMT siblings of each, one socket. So the policy runs two threads per
+physical core on a kernel that is bound by memory rather than issue width. Forcing one worker
+per core:
+
+| dtype | k=1 | k=2 | k=4 | k=8 | k=16 | k=64 |
+|---|---|---|---|---|---|---|
+| float32, policy/nt16 | **1.3841** | 1.2845 | 1.3233 | 1.2686 | 1.2772 | 1.2262 |
+| float64, policy/nt16 | **1.2837** | 1.2375 | 1.2987 | 1.3032 | 1.2865 | 1.1654 |
+
+Floors 0.995–1.016; nt16 is the best arm at every width on both dtypes, and 16 is exactly the
+physical core count. Two things this is NOT: `atpar` reads 0.982–0.996, so the launch
+*mechanism* is a small negative and not the lever, which reproduces chain77's null on a NUMA
+host; and `nt8` collapses to 0.54–0.64 on the larger bands, so this is "one per physical core"
+and not "fewer threads".
+
+**The win decays with size, which bounds the claim.** float32, banded by nonzero count on a
+size-stratified corpus with bands fixed before timing:
+
+| nnz | < 1e5 | 1e5–4e5 | 4e5–2e6 | 2e6–1e7 | > 1e7 |
+|---|---|---|---|---|---|
+| policy/nt16 | 1.3501 | 1.2765 | 1.0722 | 0.9873 ~ | (see below) |
+| floor | 1.0005 | 1.0015 | 0.9984 | 1.0282 | 1.0129 |
+
+Null above two million nonzeros -- inside the floor, not negative. That is the shape the
+mechanism predicts: small products are latency- and overhead-bound where SMT contention
+costs, large ones are bandwidth-bound where the extra threads are all waiting on memory
+anyway.
+
+**An instrument limitation found on the way, and it lands exactly on the harm check.**
+`nthreads_override` can only ever RAISE the resolved count -- the adoption path is
+`if (cand > nthreads)` -- so on any matrix whose base policy already resolves to the full
+pool, every ntN arm is a structural null. `heart1` at k=16 reads `resolved=32` for nt1 through
+nt32. That is precisely the population a harm check needs, so the >1e7 band above has no nt16
+reading at all and the harm check has to drive `SCORCH_SPMM_NT_FORCE` from a hooks build.
+Queued as such rather than inferred.
+
+### What shipped, and what has not
+
+Committed **46a67e6**: `scorch_phys_cores_avail()` plus `SCORCH_SPMM_NT_CAP_PHYS`, defaulting
+to **0**. Deliberately NOT `scorch_pcore_count()`, whose own comment records the gap -- it
+counts the machine's cores then clamps to `omp_get_num_procs()`, so inside this cgroup it
+answers 32 where the process has 16. Both are exported so a harness asks instead of
+recomputing.
+
+**The placement is the part worth recording, because the first one was wrong.** A standalone
+cap in front of the existing final cap defeated a mechanism it could not see: dropping the
+count below twice the caller's pool makes `nthreads >= 2 * pool` unsatisfiable, which routes
+the drop-in and fused kernels back onto the pool permanently and gives up 2.18x on the largest
+autoencoder bucket. The symptom was a test failing at `assert 18 <= 2` on ARM. Folded into
+`SCORCH_SPMM_NT_CAP` instead, it inherits that block's decline, and a test now pins it:
+forcing one core on a product that resolves past twice the pool must leave the count alone.
+
+Verified so far: 13 tests including a positive control (forced counts of 1,2,3,5,8 bind
+exactly), a negative control (with the cap off the core-count knob is inert), and the decline;
+and exhaustive inertness on the M5 by asking the binary for every decision over 135 matrices
+at six widths -- 1620 decisions, 0 changed.
+
+**Four gates are open and it does not ship until they report:** the harm check above two
+million nonzeros with `NT_FORCE`; the caller path through `ops.matmul`'s plan cache, since
+every number above times the native symbol and this file already records one verdict that came
+from a path no caller uses; per-symbol emission neutrality of `spmm_csr_float_v2` with the cap
+off; and a second host, which redwood can only supply by oversubscribing its pool to 32,
+because at its default pool of 24 -- exactly its physical core count -- the cap is inert.
