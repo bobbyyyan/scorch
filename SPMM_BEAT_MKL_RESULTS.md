@@ -15815,3 +15815,93 @@ us here against a few us there), and it is where the remaining MKT work is.
 `cprobe.py: error: the following arguments are required: --arms` and the script printed its
 completion marker anyway -- the exact defect this file records four previous instances of, this time
 in a driver I wrote today. Requeued with a check on the OUTPUT rather than on the last line reached.
+
+## The row split was measured wrong, and fixing the measurement found a defect in the split
+
+Two separate things went wrong here and they compounded. Both are worth recording because the
+second one only became visible after the first was fixed.
+
+**The measurement.** chain84 built the two arms as two release objects and ran a whole corpus pass
+per object, then grouped matrices by a hardcoded list of four names. Neither is defensible. The
+build-per-corpus layout puts thirteen minutes of drift entirely on one arm, so only `ours/MKL` --
+MKL being timed inside each process -- was safe to read. And the hardcoded firing set was simply
+wrong: asking the binary which matrices the gate fires on gives **six**, not four. `ss/FullChip`
+(2987012 rows, 26621983 nonzeros, imbalance 5) and `ss/case39/case39_A_08` (40216 rows, 1042170
+nonzeros, imbalance 2) were both in the "inert" group, where their 0.23-0.48 readings were being
+reported as the cost of a screening probe that takes about a microsecond.
+
+Regrouped by the gate's own answer, the conclusion **reverses**. The cells the split fires on go
+from 1.0857/1.2546 to **0.7569 (float32) / 0.8926 (float64)** against same-code floors of
+1.0173/1.0068, and `ours/MKL` on those cells falls 1.2581 -> 0.9157 and 1.2280 -> 1.1005.
+
+The fix is a function, not a discipline. `scorch_spmm_split_seg(A1_pos, rows, k, elem_size)` is the
+whole gate -- segment width, or zero for leave the rows whole -- exported through pybind, and the
+kernel calls the same function. A harness cannot hold a stale copy of a rule it does not have.
+
+**The defect.** Mean degree separates the winners from the losers perfectly, and it is not a
+coincidence:
+
+```
+  float32, ours/MKL before -> after      float64
+  mean degree >= 1000   n=18   1.1843    1.3259     nw14 12396, kl02 2993, connectus 2202
+  mean degree <  1000   n=18   0.4474    0.6057     lp_osa_14 136, case39 26, FullChip 9
+```
+
+The split was built as a wrapper around the unmodified kernel: hand it a matrix of segments, then
+sum segments back into rows. That reduction **walks every output row**, so it charges `rows*k` of
+traffic against `nnz*k` of arithmetic -- a ratio of one over the mean degree -- and it charges it
+whether or not the split helped anything. FullChip has three million rows of nine nonzeros and one
+row of 2.3 million: the split buys real balance there and the extra pass costs a whole extra output.
+
+A mean-degree floor fixes the symptom and was measured doing exactly that. Four arms in one hooks
+object, 46 matrices, interleaved in a per-cell random order, `offb` a duplicate of `off` as the
+noise floor, and `nofloor` the same arm with the floor removed (float32, speedup against `off`):
+
+```
+                                          floor   effect   no floor
+  cells the gate fires on          n=12   0.9838   1.3242   1.3112
+  cells only the floorless gate
+    fires on -- what it excludes   n=12   0.9978   1.0007   0.5176
+  everything else, gate declines   n=160  0.9992   1.0016   0.9952
+```
+
+So the floor works: 1.0007 where it declines, against 0.5176 without it. But a floor that gives up
+FullChip is treating the wrapper's cost as a law of nature, and it is not one.
+
+**The actual fix is in the kernel.** `spmm_csr_v2_core` now takes a `REDIRECT` template parameter.
+With it, `A0_size` and `A1_pos` describe UNITS -- a whole row, or one segment of a row wide enough
+to split -- and a `unit_row` array says which output row each unit writes. A row that was not split
+is written once, in place, by the worker that claimed it, exactly as before; only a split row's
+later segments go to scratch slots past the output, and only those get folded back. The cost is
+proportional to the segments of the rows actually split, so a matrix with three million short rows
+and one monster row pays for the monster row and nothing else.
+
+Getting that to be free on the shipped path took two more fixes, both silent per-call costs that a
+whole-object byte count would have hidden:
+
+  * as a runtime null-pointer test the compiler put the select **inside the row loop** rather than
+    hoisting it. The float64 claim loop went 12937 -> 12944 instructions, the addition being
+    `mov, cbz, ldr, ldr, ldr` in place of an `sxtw` at 2% into the function. One perfectly-predicted
+    branch per row is small, but per-row overhead is what decides the matrices with more rows than
+    nonzeros, and paying it in every SpMM in the library to serve a path that is off is the wrong
+    trade. It is a template parameter now, and the whole split path is behind
+    `SCORCH_SPMM_SPLIT_ENABLED` -- true only in a hooks build or once the default gate is nonzero;
+  * a **defaulted twelfth parameter is not free**. It goes on the stack in this ABI, so every call
+    site stored a zero there and the two forwarders lost their tail call: `spmm_csr_float_v2_core`
+    went from 3 instructions to 12, and `spmm_csr_float_v2` and `SpmmCsrPlan::run` each picked up a
+    `str xzr`. The parameter is absent unless the mechanism is compiled in.
+
+With both, the release object emits **0 of 256 kernel-family symbols changed** against the
+pre-split commit. The only shared symbol that differs is `pybind11_init_scorch_ops`, +302
+instructions of module registration for the three new exports, which runs once at import.
+
+Correctness of the in-place version, with the split forced on for every matrix and width rather
+than as the gate would have it: **1320 comparisons against a sparse float64 reference, worst
+relative error 8.65e-07, and bit-identical at pools 1, 2, 3, 5, 8 and 16 in every one.** The
+reference is scipy sparse and not a dense `A`, because the first version of that driver capped on
+nonzeros -- and a dense reference's size is `rows*cols`, which has nothing to do with nnz. It ran
+for two minutes on redwood's corpus asking for an eight-terabyte array before I killed it.
+
+Still off by default. The gate constants are not chosen yet: chain86 (the same four arms on the
+in-place design), the M5 grid, and MKT are what decide whether the mean-degree floor is still
+needed at all, and the prediction under test is that `nofloor` stops being catastrophic.
