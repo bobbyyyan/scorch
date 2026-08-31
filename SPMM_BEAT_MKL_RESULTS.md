@@ -16045,7 +16045,7 @@ With the setup free, the width derived, the multirow kernel restored and the fir
 ```
   cells the gate fires on (3 matrices x 4 widths)     float32   float64   same-code floor
     redwood, pool 24                                  0.9430    0.9104   0.9888 / 0.9956
-    MKT,     pool 32                                  0.9303       --    0.9928
+    MKT,     pool 32                                  0.9303    1.0879   0.9928 / 1.0004
     M5,      pool 6                                   1.0139    1.0316   0.9994 / 1.0027
 
   cells the gate declines
@@ -16053,9 +16053,12 @@ With the setup free, the width derived, the multirow kernel restored and the fir
     M5       648 cells                                0.9992       --    1.0007
 ```
 
-Neutrality where the gate declines is solid on every host. But a mechanism that costs 6-9% on two
-x86 hosts and gains 1-3% on one ARM host, on the very cells it was built for, fails the standard: it
-is arm-variance across hosts, which is the same ground the physical-core cap was rejected on.
+Neutrality where the gate declines is solid on every host. But look at the float64 column: the two
+x86 hosts have OPPOSITE SIGNS on the same cells with the same code -- MKT gains 8.8% against a 1.0004
+floor where redwood loses 9.0% against a 0.9956 one. A mechanism whose effect does not even agree in
+sign across two hosts of the same architecture cannot be gated on anything the compiler knows, and it
+fails the standard on the plainest reading: arm-variance across hosts, which is the same ground the
+physical-core cap was rejected on.
 
 **Per matrix, the two x86 hosts agree, and the pattern has a mechanism.** Speedup against `off`:
 
