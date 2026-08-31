@@ -440,6 +440,19 @@
 #ifndef SCORCH_SPMM_SPLIT_MIN_DEGREE
 #  define SCORCH_SPMM_SPLIT_MIN_DEGREE 256L
 #endif
+
+// Is the row-split machinery compiled at all? A release object with the mechanism off should not
+// merely skip it at run time -- it should not contain it, because the redirection the split needs
+// costs one instruction per ROW inside the claim loop when it is a runtime check rather than a
+// template parameter, and per-row overhead is exactly what matters on the matrices with more rows
+// than nonzeros. Measured on the M5 before this guard existed: the float64 claim loop grew by seven
+// instructions, one of them a cbz on the redirection pointer at 2% into the function, which is
+// inside the row loop and not hoisted out of it.
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_SPLIT_MIN_IMBALANCE > 0
+#  define SCORCH_SPMM_SPLIT_ENABLED 1
+#else
+#  define SCORCH_SPMM_SPLIT_ENABLED 0
+#endif
 #ifndef SCORCH_SPMM_SEG_MIN
 #  define SCORCH_SPMM_SEG_MIN 256L
 #endif

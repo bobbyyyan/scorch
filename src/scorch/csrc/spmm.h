@@ -3325,7 +3325,7 @@ static inline bool scorch_ht_claim(std::atomic<uint64_t>& ht, int chunk, bool fr
 // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
 // validated structure and so pays none of that per call. Splitting them is what
 // lets a warm dispatch be a single Python->C++ hop; the body is unchanged.
-template <typename scalar_t>
+template <typename scalar_t, bool REDIRECT = false>
 torch::Tensor spmm_csr_v2_core(
                 int C0_size, int C1_size, int A0_size,
                 const int* SCORCH_RESTRICT A1_pos,
@@ -3334,10 +3334,17 @@ torch::Tensor spmm_csr_v2_core(
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel,
                 const int* SCORCH_RESTRICT unit_row = nullptr) {
-  // unit_row breaks the assumption that the i-th claimed thing is the i-th output row. With it,
+  // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it,
   // A0_size and A1_pos describe UNITS -- a whole row, or one segment of a row wide enough to be
-  // split across workers -- and unit_row[i] says which output row unit i writes. Passing nullptr
-  // is the identity and is what every existing caller does, so their generated code is unchanged.
+  // split across workers -- and unit_row[i] says which output row unit i writes.
+  //
+  // It is a TEMPLATE parameter and not a null pointer test for a measured reason. As a runtime
+  // check the compiler put the select inside the row loop rather than hoisting it: the float64
+  // claim loop grew from 12937 to 12944 instructions, the addition being `mov, cbz, ldr, ldr, ldr`
+  // replacing a `sxtw` at 2% into the function. One perfectly-predicted branch per row is small,
+  // but per-ROW overhead is what decides the matrices with more rows than nonzeros, and paying it
+  // in every SpMM in the library to serve a path that is off would be the wrong trade. As a
+  // template parameter the shipped instantiation is the code it was before.
   //
   // This is the layer the row split belongs in. The alternative, and the version measured first,
   // was a wrapper that fed the unmodified kernel a matrix of segments and then summed segments back
@@ -3346,6 +3353,7 @@ torch::Tensor spmm_csr_v2_core(
   // many short rows went to 0.4474 of MKL while the ones the split is for went to 1.1843. Here an
   // unsplit row is written once, in place, by the worker that claimed it, exactly as before, and
   // only the segments of a split row need a second pass.
+  if (!REDIRECT) (void)unit_row;
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
   // Output allocation + zeroing. Every code path below (regblock / regtile /
@@ -3427,7 +3435,7 @@ torch::Tensor spmm_csr_v2_core(
   // contains -- goes through the same redirection as the arithmetic, so it is the mode that stays
   // correct. Clamping here rather than forbidding the combination keeps a hooks build usable: an A/B
   // arm that sets ZERO_MODE and happens to hit a split call gets the default instead of wrong bytes.
-  if (unit_row && zero_mode != 3) zero_mode = 2;
+  if (REDIRECT && zero_mode != 3) zero_mode = 2;
 #else
   constexpr int zero_mode = 2;
 #endif
@@ -3518,7 +3526,7 @@ torch::Tensor spmm_csr_v2_core(
             memset(C_values + (size_t)i * (size_t)C1_size, 0, out_row_bytes);
       }
     }
-    if (C0_size > A0_size && !unit_row) {
+    if (C0_size > A0_size && !REDIRECT) {
       // Rows past A's last one: no worker owns them, so they are zeroed here
       // whatever the mode. A contiguous tail, so this is a span write whatever
       // its size, and scorch_zero_dense falls back to memset below the grain.
@@ -4133,7 +4141,7 @@ torch::Tensor spmm_csr_v2_core(
       // It writes rows i..i+multirow-1 of C from A1_pos[i..i+multirow], so it is the one kernel
       // that reads the claim index as an output row directly. Under a redirection it would have to
       // check that the group's units are consecutive rows, which for a split row they are not.
-      !unit_row &&
+      !REDIRECT &&
       (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
       narrow_k && !exact_width && !force_workspace &&
       !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
@@ -4344,9 +4352,9 @@ torch::Tensor spmm_csr_v2_core(
 #endif
         const int pA_begin = A1_pos[i];
         const int pA_end   = A1_pos[i + 1];
-        // The one place a claimed unit becomes an output row. unit_row is loop-invariant and null
-        // in every existing caller, so this is a hoisted select on the shipped path.
-        const int out_row = unit_row ? unit_row[i] : i;
+        // The one place a claimed unit becomes an output row. REDIRECT is false in every existing
+        // caller, so on the shipped path this IS `i` and no instruction is emitted for it.
+        const int out_row = REDIRECT ? unit_row[i] : i;
         if (pA_begin == pA_end) {
           // Structurally empty, so there is nothing to compute -- and this worker
           // has the row in hand, so it zeroes it here rather than in a pass of its
@@ -4793,6 +4801,15 @@ torch::Tensor spmm_csr_v2_rowsplit(
                 const scalar_t* SCORCH_RESTRICT A_val,
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel) {
+#if !SCORCH_SPMM_SPLIT_ENABLED
+  // The mechanism is off at compile time, so it is not here: no gate call, no unit arrays, and no
+  // REDIRECT=true instantiation of the core to be dead-stripped later. The forwarder below stays the
+  // tail call it has always been, which is why the shipped SpMM emits the same code it did before
+  // the split existed. Flipping SCORCH_SPMM_SPLIT_MIN_IMBALANCE off zero -- which is the ship
+  // decision, taken on measured kernel runtime -- compiles the rest of this function in.
+  return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                    B1_size, B_val, tile_size, nthreads_override, atparallel);
+#else
   // One call, because the gate lives in one place: scorch_spmm_split_seg answers "how wide a segment,
   // or leave the rows whole" and is the same function a harness or a test asks. Splitting this rule
   // into a copy here and a copy in the harness is how a firing set ended up with two firing matrices
@@ -4865,7 +4882,7 @@ torch::Tensor spmm_csr_v2_rowsplit(
 
   // One team, one pass, and the output rows that were not split are written in place by the worker
   // that claimed them -- no copy, no second visit.
-  torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t>(
+  torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
       (int)buf_rows, C1_size, (int)nunits, u_pos.data(), A1_crd, A_val,
       B1_size, B_val, tile_size, nthreads_override, atparallel, u_row.data());
   scalar_t* SCORCH_RESTRICT C_values = C_values_torch.template data_ptr<scalar_t>();
@@ -4896,6 +4913,7 @@ torch::Tensor spmm_csr_v2_rowsplit(
   // The scratch slots sit past the output, so the result is the leading rows. A view, not a copy:
   // the core allocated it contiguous and every caller either uses it flat or calls view().
   return C_values_torch.narrow(0, 0, (long long)((size_t)C0_size * (size_t)C1_size));
+#endif
 }
 
 // The float32 entry every existing caller uses. A one-line forwarder, so plan.h and
