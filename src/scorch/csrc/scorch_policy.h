@@ -1647,14 +1647,21 @@ inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
 // segment is truncated to its first segment -- which needs no lookup, because a row is split
 // exactly when its degree exceeds `seg`, so its first unit is [A1_pos[i], A1_pos[i] + seg). Only
 // the LATER segments need describing, and there are nnz/seg of them at most, never rows of them.
+// There is no nnz_total field, and there was one. A caller that filled six of the seven fields left
+// it holding whatever was on the stack, and nnz_total picks the worker count, the chunk width and
+// the multirow threshold -- so the kernel did the RIGHT ARITHMETIC at a nonsense worker count. Every
+// correctness check passed, including bit-identity against the unsplit kernel, and only the clock
+// complained: the ablation arm built that way read 0.28 of the kernel it was the baseline for, and
+// on one shape 0.157. Initializing the field would have made the bug deterministic rather than
+// absent, so the field is gone instead. n_row_units IS the row count -- that is what it means -- so
+// the kernel reads A1_pos[n_row_units] and there is nothing left to forget to pass.
 struct ScorchSplitPlan {
-  long n_row_units;   // units below this index are rows; at or above, entries of the arrays below
-  long seg;           // segment width in nonzeros: how much of a wide row one unit covers
-  long wide_deg;      // a row is split exactly when its degree EXCEEDS this; see scorch_spmm_wide_rows
-  long nnz_total;     // A1_pos[rows]; passed because A1_pos is indexed by ROW, not by unit
-  long slot_base;     // extra unit x writes output row slot_base + x, a scratch row past the output
-  const int* x_pos;   // later segments: first nonzero
-  const int* x_end;   //                 one past the last nonzero
+  long n_row_units = 0;       // units below this index are rows; at or above, entries of the arrays below
+  long seg = 0;               // segment width in nonzeros: how much of a wide row one unit covers
+  long wide_deg = 0;          // a row is split exactly when its degree EXCEEDS this; see scorch_spmm_wide_rows
+  long slot_base = 0;         // extra unit x writes output row slot_base + x, a scratch row past the output
+  const int* x_pos = nullptr; // later segments: first nonzero
+  const int* x_end = nullptr; //                 one past the last nonzero
 };
 
 // The whole gate in one function, so the kernel and any harness ask the same code rather than two

@@ -3348,7 +3348,7 @@ torch::Tensor spmm_csr_v2_core(
   // be the entire cost of the mechanism on matrices with many short rows.
   //
   // Under REDIRECT, A1_pos is still indexed by ROW and so cannot be indexed by A0_size; every such
-  // use below takes split->nnz_total or split->n_row_units instead.
+  // use below takes split->n_row_units instead, and derives the nonzero count from it.
   //
   // It is a TEMPLATE parameter and not a null pointer test for a measured reason. As a runtime
   // check the compiler put the select inside the row loop rather than hoisting it: the float64
@@ -3365,16 +3365,18 @@ torch::Tensor spmm_csr_v2_core(
   // many short rows went to 0.4474 of MKL while the ones the split is for went to 1.1843. Here an
   // unsplit row is written once, in place, by the worker that claimed it, exactly as before, and
   // only the segments of a split row need a second pass.
-  // Two shorthands, so the row-indexed reads below say which quantity they mean. Both fold to the
-  // ordinary expression when REDIRECT is false, which is every existing caller.
+  // Two shorthands, so the row-indexed reads below say which quantity they mean. Under a redirection
+  // A0_size counts UNITS, which is more than the rows, so A1_pos[A0_size] would read past the end --
+  // hence the first of these. Both fold to the ordinary expression when REDIRECT is false, which is
+  // every existing caller. The nonzero count is DERIVED from the row count rather than carried in
+  // the plan: a plan that has to hand it over is a plan a caller can fill in wrong, and one did.
 #if SCORCH_SPMM_SPLIT_ENABLED
-#  define SCORCH_SPMM_NNZ_TOTAL \
-     (REDIRECT ? split->nnz_total : (A0_size > 0 ? (long)A1_pos[A0_size] : 0L))
 #  define SCORCH_SPMM_ROW_UNITS (REDIRECT ? (int)split->n_row_units : A0_size)
 #else
-#  define SCORCH_SPMM_NNZ_TOTAL (A0_size > 0 ? (long)A1_pos[A0_size] : 0L)
 #  define SCORCH_SPMM_ROW_UNITS A0_size
 #endif
+#define SCORCH_SPMM_NNZ_TOTAL \
+    (SCORCH_SPMM_ROW_UNITS > 0 ? (long)A1_pos[SCORCH_SPMM_ROW_UNITS] : 0L)
 
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
@@ -4967,7 +4969,6 @@ torch::Tensor spmm_csr_v2_rowsplit(
   plan.n_row_units = (long)A0_size;
   plan.seg = seg;
   plan.wide_deg = wide_deg;
-  plan.nnz_total = nnz_total;
   plan.slot_base = (long)C0_size;
   plan.x_pos = x_pos.data();
   plan.x_end = x_end.data();
@@ -4993,10 +4994,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
       ScorchSplitPlan idle;
       idle.n_row_units = (long)A0_size;
       idle.seg = seg;
-      idle.wide_deg = std::numeric_limits<long>::max();
+      idle.wide_deg = std::numeric_limits<long>::max();   // so no row is truncated
       idle.slot_base = (long)C0_size;
-      idle.x_pos = nullptr;
-      idle.x_end = nullptr;
       return spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
           C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
           B1_size, B_val, tile_size, nthreads_override, atparallel, &idle);
