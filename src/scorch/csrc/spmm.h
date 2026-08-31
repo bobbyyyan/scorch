@@ -4978,9 +4978,29 @@ torch::Tensor spmm_csr_v2_rowsplit(
   // larger output buffer -- which is the only way to tell a slow setup from a split that does not
   // pay. It is how the per-row version above was convicted. Compiled out of a release object.
   { const char* e = std::getenv("SCORCH_SPMM_SPLIT_ABLATE");
-    if (e && std::atol(e) == 1)
+    const long ab = (e && *e) ? std::atol(e) : 0;
+    if (ab == 1)
       return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                        B1_size, B_val, tile_size, nthreads_override, atparallel); }
+                                        B1_size, B_val, tile_size, nthreads_override, atparallel);
+    if (ab == 2) {
+      // Mode 2 runs the REDIRECT=true instantiation with NOTHING split: every row is a unit, no row
+      // is truncated (wide_deg above any degree), no extra units, no fold, and the output is the
+      // ordinary size. The answer is therefore identical to the unsplit kernel, and the time is the
+      // cost of the redirected loop body alone -- the extra compares, the lost induction variable on
+      // the output pointer, and whatever the different instantiation costs. Without this arm, "the
+      // split does not pay on this matrix" and "the redirected body is slower on this matrix" are the
+      // same number, which is how the multirow refusal stayed hidden for two rounds.
+      ScorchSplitPlan idle;
+      idle.n_row_units = (long)A0_size;
+      idle.seg = seg;
+      idle.wide_deg = std::numeric_limits<long>::max();
+      idle.slot_base = (long)C0_size;
+      idle.x_pos = nullptr;
+      idle.x_end = nullptr;
+      return spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
+          C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+          B1_size, B_val, tile_size, nthreads_override, atparallel, &idle);
+    } }
 #endif
 
   // One team, one pass, and the output rows that were not split are written in place by the worker
@@ -5005,9 +5025,15 @@ torch::Tensor spmm_csr_v2_rowsplit(
   // Slot order is row order, and within a row it is segment order, so one pass in slot order sums
   // each row's segments in the order their nonzeros appear -- which is what makes the result
   // independent of the schedule and of the worker count.
-  at::parallel_for(0, (int64_t)C1_size,
-                   /*grain=*/std::max<int64_t>(1, 32768 / std::max<int64_t>(1, extra)),
-                   [&](int64_t j0, int64_t j1) {
+  // The grain has to let the pool participate when there is work, and cost no launch when there is
+  // not. The first version divided a constant by `extra`, which gets it exactly backwards: at 355
+  // extra segments the grain came out 92 against a range of 64, so the whole fold ran on one thread
+  // precisely when there was most of it to do.
+  const int64_t fold_work = (int64_t)extra * (int64_t)C1_size;
+  const int64_t fold_grain = fold_work < 8192
+      ? (int64_t)C1_size + 1                        // one task: not worth a launch
+      : std::max<int64_t>(1, (int64_t)C1_size / std::max(1, at::get_num_threads()));
+  at::parallel_for(0, (int64_t)C1_size, fold_grain, [&](int64_t j0, int64_t j1) {
     for (long x = 0; x < extra; ++x) {
       scalar_t* SCORCH_RESTRICT dst = C_values + (size_t)x_owner[(size_t)x] * (size_t)C1_size;
       const scalar_t* SCORCH_RESTRICT add =
