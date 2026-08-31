@@ -16129,3 +16129,36 @@ Also fixed while looking at the fold: its parallel grain divided a constant by t
 more segments gave a coarser grain, and at 355 segments the grain came out 92 against a range of 64 --
 one task. It serialized precisely when there was most work. It is now the free dimension over the pool
 size with a total-work floor.
+
+## The footprint constant swept on all three hosts: no value is neutral-or-better everywhere
+
+The segment width's one free constant is the B footprint a unit should keep resident. Four settings,
+the cells the gate fires on, speedup against `off`, with the same-code floor beside it:
+
+```
+  host      dtype    n    floor    64KB    16KB   256KB  1024KB
+  redwood   float32  12  1.0048  0.9430  0.8965  0.9872  0.9406
+  redwood   float64  12  0.9890  0.9105  0.8301  0.9310  0.9873
+  MKT       float32  12  0.9928  0.9303  0.8602  0.9994  1.0153
+  MKT       float64  12  1.0004  1.0879  1.0125  1.1645  1.1560
+  M5        float32  12  0.9994  1.0139  0.9847  1.0409  1.0452
+  M5        float64  12  1.0039  1.0258  0.9955  1.0582  1.0799
+```
+
+Three things this settles.
+
+**The shipped 64 KB was the worst defensible choice.** It came from a single measured point -- a
+600000-row matrix of mean degree 9 at k=64, where 64 KB of B resident beat 2.9 MB streamed by 1.6x --
+and one point is one point. 256 KB and 1024 KB are better than it on all six host-and-dtype
+combinations, by up to 8 percentage points. Had this shipped on that one point it would have shipped
+the wrong constant, which is what a sweep is for.
+
+**And no value clears the bar.** At 256 KB the worst cell is redwood float64 at 0.9310; at 1024 KB it
+is redwood float32 at 0.9406. Both are 6-7% regressions well outside their floors, and they are on
+DIFFERENT dtypes, so redwood wants 256 for one and 1024 for the other. Selecting per dtype would be
+two constants fitted to one host.
+
+**MKT float64 is a genuine 1.16x and it is not available.** The same setting that delivers it costs
+redwood float32 6%. That asymmetry -- same code, same cells, opposite signs on two x86 hosts -- is the
+whole finding, and it is why the mechanism cannot be gated on anything the compiler or the caller
+knows.
