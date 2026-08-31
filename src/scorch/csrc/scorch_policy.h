@@ -462,8 +462,19 @@
 #ifndef SCORCH_SPMM_SEG_MIN
 #  define SCORCH_SPMM_SEG_MIN 256L
 #endif
-#ifndef SCORCH_SPMM_SEG_SCRATCH_KB
-#  define SCORCH_SPMM_SEG_SCRATCH_KB 8192L
+// How much of B one unit should be able to keep resident. An L1-scale figure: the measured point is
+// a 600000-row matrix of mean degree 9 at k=64, where a 256-nonzero unit -- 64 KB of B -- read 1.690
+// of the unsplit kernel and an 11445-nonzero unit -- 2.9 MB -- read 1.057. Swept, not assumed; the
+// sweep is in the ledger.
+#ifndef SCORCH_SPMM_SEG_BFOOT_KB
+#  define SCORCH_SPMM_SEG_BFOOT_KB 64L
+#endif
+// How far under a fair share at the reference width the makespan excess is asked to be. The bound is
+// nnz/N + seg, so seg = nnz/(refn*OVER) puts the excess at 1/(refn*OVER) of the matrix: at 64 and 8
+// that is nnz/512, six percent over ideal on 32 workers. Raising it buys balance and costs per-unit
+// overhead; the numbers that set it are in the comment on scorch_spmm_seg_width.
+#ifndef SCORCH_SPMM_SEG_OVER
+#  define SCORCH_SPMM_SEG_OVER 8L
 #endif
 #ifndef SCORCH_SPMM_NT_CAP_PHYS
 #  define SCORCH_SPMM_NT_CAP_PHYS 0
@@ -1545,15 +1556,28 @@ inline int scorch_spmm_row_imbalance(const int* A1_pos, long rows, long refn) {
 }
 
 // The nonzero width of one segment. A function of the CALL only -- never of the worker count, for
-// the reason above. Two bounds meet here:
+// the reason above.
 //
-//   * from below, a segment has to be worth claiming: SCORCH_SPMM_SEG_MIN nonzeros, which at k=4 is
-//     a few hundred nanoseconds of arithmetic, and which also means a matrix whose widest row is
-//     under one segment splits into exactly its own rows and runs bit-identically to today;
-//   * from above, the partial-output buffer costs (nnz/seg) * k * sizeof(scalar_t) bytes beyond the
-//     output itself, so the width rises with k and with the element size to hold that under
-//     SCORCH_SPMM_SEG_SCRATCH_KB. At k=256 float64 and a hundred million nonzeros that is a 32768
-//     segment and about six megabytes of partials; at k=4 it is the floor and 56 kilobytes.
+// THREE bounds meet here, each with a mechanism, and the middle one was found the hard way.
+//
+//   * from ABOVE, the makespan. Longest-processing-time-first over units of at most `seg` nonzeros
+//     finishes no later than nnz/N + seg, so `seg` IS the excess over the ideal nnz/N; asking for
+//     that excess to be 1/OVER of a fair share at the reference width gives seg = nnz/(refn*OVER).
+//     At refn 64 and OVER 8 that is nnz/512, six percent over ideal on 32 workers.
+//   * from ABOVE also, the B footprint. A unit reads one row of B per nonzero it holds, so it
+//     touches up to seg * k * elem bytes of B, and a unit that does not keep that resident streams B
+//     from memory instead of from cache. This is a real effect and it is why a fixed 256-nonzero
+//     width beat the makespan-derived one on the wide-k cells: on a 600000-row matrix of mean degree
+//     9 at k=64, seg 256 (64 KB of B) read 1.690 of the unsplit kernel and seg 11445 (2.9 MB) read
+//     1.057. Same matrix, same balance, 1.6x apart on where B lives.
+//   * from BELOW, a unit has to be worth claiming at all: SCORCH_SPMM_SEG_MIN nonzeros, which at
+//     k=64 is sixteen thousand fused multiply-adds. The floor also means a matrix whose widest row
+//     is under one segment splits into exactly its own rows and runs bit-identically to today.
+//
+// Two ways of getting this wrong were measured. A fixed 256 chopped a wide row of a 26.6-million-
+// nonzero matrix into 9033 units, and the per-unit overhead was the whole residual cost on low-degree
+// matrices at narrow k, where B is small and its footprint bound is slack. Ignoring the footprint
+// bound cost 1.6x at k=64. Neither bound dominates; both apply.
 // The rows the split cares about, found WITHOUT a pass over the degrees.
 //
 // A row whose nonzero interval is longer than the spacing between equal-nonzero cuts must contain at
@@ -1590,21 +1614,26 @@ inline long scorch_spmm_wide_rows(const int* A1_pos, long rows, long refn, long 
 }
 
 inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
-  long budget = (long)SCORCH_SPMM_SEG_SCRATCH_KB * 1024L;
-#ifdef SCORCH_TUNE_HOOKS
-  { const char* e = std::getenv("SCORCH_SPMM_SEG_SCRATCH_KB");
-    if (e && *e) { long v = std::atol(e); if (v > 0) budget = v * 1024L; } }
-#endif
-  long seg = SCORCH_SPMM_SEG_MIN;
+  long floor_seg = SCORCH_SPMM_SEG_MIN;
+  long refn = SCORCH_SPMM_SPLIT_REFN;
+  long over = SCORCH_SPMM_SEG_OVER;
+  long bfoot = (long)SCORCH_SPMM_SEG_BFOOT_KB * 1024L;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_SEG_MIN");
-    if (e && *e) { long v = std::atol(e); if (v > 0) seg = v; } }
+    if (e && *e) { long v = std::atol(e); if (v > 0) floor_seg = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_REFN");
+    if (e && *e) { long v = std::atol(e); if (v > 1) refn = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SEG_OVER");
+    if (e && *e) { long v = std::atol(e); if (v > 0) over = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_SEG_BFOOT_KB");
+    if (e && *e) { long v = std::atol(e); if (v > 0) bfoot = v * 1024L; } }
 #endif
-  if (k > 0 && elem_size > 0 && budget > 0) {
-    const long need = (nnz * k * elem_size + budget - 1) / budget;   // ceil
-    while (seg < need) seg <<= 1;                                   // stays a power of two
+  long seg = (refn > 0 && over > 0) ? nnz / (refn * over) : floor_seg;      // makespan
+  if (k > 0 && elem_size > 0 && bfoot > 0) {
+    const long by_b = bfoot / (k * elem_size);                             // B footprint
+    if (by_b < seg) seg = by_b;
   }
-  return seg;
+  return seg > floor_seg ? seg : floor_seg;                                // worth claiming
 }
 
 // What the row-split partition hands the kernel. Deliberately NOT an array over rows.

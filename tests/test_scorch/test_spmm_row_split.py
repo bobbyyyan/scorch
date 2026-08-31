@@ -93,21 +93,45 @@ def test_the_probe_is_not_max_degree_over_mean():
     assert _imbalance(indptr) == 1, "no row is close to a fair share, so nothing should fire"
 
 
-def test_the_segment_width_ignores_the_worker_count_and_rises_with_k():
+_REFN, _OVER, _BFOOT = 64, 8, 64 * 1024      # the shipped constants, restated for the bounds below
+
+
+def test_the_segment_width_obeys_all_three_of_its_bounds():
+    """seg is the minimum of two upper bounds, held up by a floor. Each bound has a mechanism.
+
+    Makespan: LPT over units of at most seg nonzeros finishes by nnz/N + seg, so seg IS the excess.
+    B footprint: a unit reads one row of B per nonzero, so it touches seg*k*elem bytes of B, and a
+    unit that cannot keep that resident streams B from memory -- worth 1.6x at k=64 on a low-degree
+    matrix. Floor: a unit has to be worth claiming.
+    """
     w = scorch_ops.scorch_spmm_seg_width
-    assert w(1_000_000, 4, 4) == w(1_000_000, 4, 4)
-    narrow = w(100_000_000, 4, 4)
-    wide = w(100_000_000, 256, 8)
-    assert wide > narrow, "the partial buffer scales with k and the element size"
-    assert narrow & (narrow - 1) == 0 and wide & (wide - 1) == 0, "widths stay powers of two"
+    for nnz in (10**5, 10**6, 10**7, 10**8):
+        for k, elem in ((1, 4), (4, 4), (16, 4), (64, 4), (256, 8), (1024, 8)):
+            seg = w(nnz, k, elem)
+            assert seg >= _REFN and seg > 0, (nnz, k, elem, seg)
+            if seg > 256:                    # above the floor, both upper bounds must hold
+                assert seg <= nnz // (_REFN * _OVER), ("makespan", nnz, k, elem, seg)
+                assert seg * k * elem <= _BFOOT, ("footprint", nnz, k, elem, seg)
 
 
-def test_the_segment_width_bounds_the_partial_buffer():
-    """The extra memory is (nnz / seg) * k * elem, and that is what the width is chosen to hold."""
-    for nnz, k, elem in [(10**8, 256, 8), (10**8, 4, 4), (10**6, 64, 8)]:
-        seg = scorch_ops.scorch_spmm_seg_width(nnz, k, elem)
-        extra_mb = (nnz / seg) * k * elem / 2**20
-        assert extra_mb <= 16.0, (nnz, k, elem, seg, extra_mb)
+def test_which_bound_binds_moves_with_k_and_not_with_the_worker_count():
+    """At narrow k B is small and the makespan bound decides; at wide k the footprint does."""
+    w = scorch_ops.scorch_spmm_seg_width
+    nnz = 10**6
+    narrow, wide = w(nnz, 1, 4), w(nnz, 256, 4)
+    assert narrow == nnz // (_REFN * _OVER), ("makespan should bind at k=1", narrow)
+    assert wide == 256, ("the floor should bind at k=256, since 64KB/1KB is 64", wide)
+    assert wide < narrow
+    # And nothing here reads a thread count: same answer whatever torch's pool is.
+    old = torch.get_num_threads()
+    try:
+        seen = set()
+        for pool in (1, 4, 16):
+            torch.set_num_threads(pool)
+            seen.add(w(nnz, 16, 4))
+        assert len(seen) == 1, seen
+    finally:
+        torch.set_num_threads(old)
 
 
 _PROBE = r"""
