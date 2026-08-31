@@ -16651,3 +16651,41 @@ So `raise` is arm-variant, which is the ground the row split and the physical-co
 rejected on, and it cannot ship on this evidence. What is different is the shape of the problem: the
 x86 gain is large, clean and exactly on target, and the ARM loss is two cells of one matrix. MKT is
 running and will say whether the x86 half replicates.
+
+### The ARM regression is reproducible, and the ARM optimum is width-dependent
+
+Three rounds of a forced-count ladder on the M5, 41 repetitions at a 60 ms batch, arm order reshuffled
+per round, the count forced after the policy and the adoption so nothing but the count differs, and
+the partition mode confirmed to be back-stealing at every rung. `policyb` is `policy` again and is the
+floor. Microseconds, float32:
+
+| cell | policy | forced 3 | forced 4 | forced 5 | forced 6 | floor |
+|---|---|---|---|---|---|---|
+| kl02 k=1 | 37.5 / 38.5 / 37.8 | 38.2 / 38.3 / 39.2 | 36.2 / 37.2 / 37.9 | **35.4 / 35.2 / 34.7** | 40.4 / 40.6 / 40.3 | 0.992 / 1.037 / 1.008 |
+| kl02 k=2 | **32.7 / 32.1 / 32.7** | 42.8 / 42.9 / 42.6 | 31.6 / 32.1 / 32.6 | 39.0 / 36.3 / 38.8 | 40.4 / 40.2 / 40.6 | 1.006 / 0.993 / 0.998 |
+| kl02 k=4 | 50.4 / 50.0 / 50.3 | 59.2 / 58.9 / 57.9 | 49.7 / 49.2 / 50.7 | **47.3 / 47.1 / 47.5** | 49.3 / 48.9 / 49.9 | 1.005 / 0.998 / 1.003 |
+| kl02 k=8 | 53.2 / 53.3 / 53.5 | 67.4 / 67.6 / 66.8 | 57.0 / 56.2 / 56.4 | 53.5 / 52.6 / 53.5 | **51.9 / 52.0 / 52.9** | 0.994 / 1.004 / 0.999 |
+| nw14 k=1 | 75.0 / 75.1 / 75.3 | 92.6 / 91.9 / 92.9 | 75.2 / 75.2 / 75.3 | 71.8 / 71.8 / 71.9 | **64.3 / 63.6 / 64.4** | 0.997 / 1.001 / 1.000 |
+
+**The regression is real.** kl02 at k=2 takes 32 µs on four workers and 40 on six, in all three rounds,
+against a floor within 0.7% of 1.000. `raise` takes that cell to six. So the M5 numbers in chain93 —
+0.9263 at k=1 and 0.8092 at k=2 — reproduce, and the earlier caveat that a sharp non-monotonic optimum
+might be noise is answered: it is not.
+
+**Two explanations tried and both refuted.** Saturating the six performance cores and starving the OS:
+no, because five is as bad as six at k=2 (39.0 / 36.3 / 38.8 µs against four's 31.6 / 32.1 / 32.6).
+The E-core recruit: no, it is gated on the resolved count reaching twice the caller's pool, which is
+12 here, and these cells run at four and six.
+
+**What the ladder does show is that kl02's best count moves with the width** — five at k=1, four at
+k=2, five at k=4, six at k=8 — with the matrix, the host, the partition mode and everything else held
+fixed. That is chain78's conclusion arriving from a third direction: the optimum is width-dependent,
+and neither of the two work measures the resolver has can express it, because `nnz*max(k,16)` is
+constant in k below 16 and `nnz*k` is linear in it while the optimum is neither.
+
+So no formulation of the raise bound fixes the ARM cells. The choice is not between two spellings of
+one rule; it is that a single scalar work measure cannot name this optimum at all.
+
+It is also dtype-specific, which no mechanism on offer explains: kl02 at k=2 on **float64** *gains*
+from six workers (1.034 / 1.030 / 1.045) where float32 loses 20%. Recorded as measured and unexplained
+rather than fitted to a story.
