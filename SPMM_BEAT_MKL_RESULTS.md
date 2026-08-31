@@ -16743,3 +16743,51 @@ the build order rotated inside each slice and MKL timed in the same process as o
 chain93 cannot answer it — a hooks object pays 54 getenv lookups a call and MKL pays none, which on a
 25 µs kernel is most of the gap being argued about. Until that lands, the +19% to +33% is a gain
 against **our own** previous count and not a claim about crossing a competitor.
+
+## The ARM regression in release builds: worse than the hooks grid said, and on both dtypes
+
+Two release builds on the M5 from one archive, differing only in
+`-DSCORCH_SPMM_RAISE_ON_FLOORED=1`, corpus cut into slices with the build order rotated between
+passes. There is no MKL on this host — `torch.sparse.mm` runs 1000-4300 µs against our 27-65, a
+different regime entirely — so this is a cross-build comparison of our own kernel, which the slicing
+and rotation manage rather than eliminate. `ron/roff`, so below 1.000 is a regression:
+
+| cell | workers | float32 | float64 | float32 µs |
+|---|---|---|---|---|
+| kl02 k=1 | 4→6 | **0.8395** | **0.8781** | 25.9 → 30.8 |
+| kl02 k=2 | 4→6 | **0.8666** | **0.9663** | 27.1 → 31.3 |
+| kl02 k=8 | 5→6 | **0.9405** | 1.1070 | 44.0 → 46.8 |
+| kl02 k=4 | 4→6 | 0.9729 | 1.0776 | 40.2 → 41.3 |
+| nw14 k=1 | 4→6 | 1.1774 | 1.1426 | 65.3 → 55.4 |
+| **net on moved cells** | | **0.9525** (floor 0.9930) | 1.0295 (floor 0.9988) | |
+| **cells it cannot touch** | | 1.0001 (floor 0.9994), n=127 | 0.9938 (floor 1.0008), n=127 | |
+
+**kl02 regresses at k=1 and k=2 on both dtypes**, in the configuration that would actually ship. The
+guardrail holds: 127 cells the raise cannot reach read 1.0001 and 0.9938 against floors of 0.9994 and
+1.0008, which also fixes the precision of this instrument — a cross-build comparison here carries
+about 0.6% of systematic, so nothing under ~1% is readable. The regressions are 3-16%.
+
+### And the hooks grid understated it, which is worth recording as a property of the instrument
+
+The same five cells, measured as arms inside one hooks object (chain93) and as two release builds:
+
+| cell | hooks | release |
+|---|---|---|
+| kl02 k=1 | 0.9263 | **0.8395** |
+| kl02 k=2 | 0.8092 | 0.8666 |
+| kl02 k=4 | 1.0364 | 0.9729 |
+| kl02 k=8 | 1.0244 | **0.9405** |
+| nw14 k=1 | 1.1819 | 1.1774 |
+
+The hooks object showed **two** regressions of five and release shows **three**. This is the expected
+direction and this file has stated the principle before — both arms pay the same additive 54-getenv
+term, so it pulls their ratio toward 1.000 and can only understate an effect — but the size is worth
+having measured: the same kl02 kernel is 25.9 µs in release and 37.5 µs under hooks, so on a sub-50 µs
+kernel the compression is large enough to change **which cells count as regressions**. Arm-vs-arm in a
+hooks build remains safe for the sign of an aggregate. It is not safe for a per-cell regression list,
+and a ship decision is exactly a per-cell regression list.
+
+So `RAISE_ON_FLOORED` does not ship as it stands, and that conclusion no longer depends on the hooks
+grid. What the two x86 runs still decide is whether its gain crosses MKL, because that is what makes
+the remaining question a real trade rather than a curiosity: gains on x86 cells that lose to a
+competitor, against three ARM cells on the one host that has no sparse competitor at all.
