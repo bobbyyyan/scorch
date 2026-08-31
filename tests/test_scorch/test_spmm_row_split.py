@@ -292,3 +292,58 @@ def test_the_floor_still_admits_the_matrices_the_split_is_for():
     finally:
         os.environ.pop("SCORCH_SPMM_SPLIT_MIN_IMBALANCE", None)
         os.environ.pop("SCORCH_SPMM_SPLIT_MIN_DEGREE", None)
+
+
+@_needs_hooks
+@pytest.mark.parametrize("wide_at", [0, 1, 5, 6, 99])
+def test_the_multirow_kernel_stays_correct_next_to_a_split_row(wide_at):
+    """The register-block kernel that takes 2-4 rows at a time must refuse a group containing a
+    wide row, and must never index A1_pos by a claim index past the last row.
+
+    It used to be refused outright under a redirection, and that was expensive -- it is the kernel
+    that carries matrices with many short rows, which are exactly the ones a split has least to
+    offer. On redwood, firing the split with no degree floor read 0.475 on a 40216-row matrix of mean
+    degree 26 at k=1 where the setup-only arm read 0.948, and the split was adding nine units. So it
+    is allowed now, under two conditions, and the wide row is placed at several offsets here because
+    which groups straddle it depends on the alignment.
+    """
+    deg = np.full(200, 4, dtype=np.int64)
+    deg[wide_at] = 200000                      # 200796 nonzeros, one row far over its share
+    indptr, idx, _, cols = _csr(deg, cols=200000)
+    ip = torch.from_numpy(indptr)
+    ix = torch.from_numpy(idx)
+    assert int(indptr[-1]) >= 150000, "under the nonzero floor, so this proves nothing"
+    for dt, npd, sym in ((torch.float32, np.float32, scorch_ops.spmm_csr_float_v2),
+                         (torch.float64, np.float64, scorch_ops.spmm_csr_double_v2)):
+        vals = torch.from_numpy(np.ones(int(indptr[-1]), dtype=npd))
+        for k in (1, 2, 4, 8):
+            g = torch.Generator().manual_seed(11 + k)
+            B = torch.rand((cols, k), generator=g, dtype=torch.float64).to(dt)
+            native = dict(result_shape=[len(deg), k], A_shape=[len(deg), cols],
+                          A_mode_indices=[[], [ip, ix]], A_values=vals,
+                          B_shape=[cols, k], B_mode_indices=[[], []],
+                          B_values=B.reshape(-1).contiguous())
+            ref = np.zeros((len(deg), k), dtype=np.float64)
+            Bd = B.to(torch.float64).numpy()
+            for r in range(len(deg)):
+                ref[r] = Bd[idx[indptr[r]:indptr[r + 1]]].sum(axis=0)
+            old = {kk: os.environ.get(kk) for kk in
+                   ("SCORCH_SPMM_SPLIT_MIN_IMBALANCE", "SCORCH_SPMM_SPLIT_MIN_NNZ",
+                    "SCORCH_SPMM_SPLIT_MIN_DEGREE")}
+            try:
+                os.environ.update(SCORCH_SPMM_SPLIT_MIN_IMBALANCE="1",
+                                  SCORCH_SPMM_SPLIT_MIN_NNZ="0",
+                                  SCORCH_SPMM_SPLIT_MIN_DEGREE="0")
+                assert scorch_ops.scorch_spmm_split_seg(ip, len(deg), k,
+                                                        4 if dt is torch.float32 else 8) > 0, (
+                    "the split did not fire, so this test proves nothing")
+                got = sym(nthreads_override=4, atparallel=False,
+                          **native).storage.value.reshape(len(deg), k).to(torch.float64).numpy()
+            finally:
+                for kk, v in old.items():
+                    if v is None:
+                        os.environ.pop(kk, None)
+                    else:
+                        os.environ[kk] = v
+            rel = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
+            assert rel < (3e-5 if dt is torch.float32 else 3e-13), (wide_at, dt, k, rel)

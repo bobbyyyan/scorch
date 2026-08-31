@@ -4160,10 +4160,6 @@ torch::Tensor spmm_csr_v2_core(
   // !exact_width needs no repeating.
   const bool multirow_ok =
       multirow > 1 &&
-      // It writes rows i..i+multirow-1 of C from A1_pos[i..i+multirow], so it is the one kernel
-      // that reads the claim index as an output row directly. Under a redirection it would have to
-      // check that the group's units are consecutive rows, which for a split row they are not.
-      !REDIRECT &&
       (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
       narrow_k && !exact_width && !force_workspace &&
       !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
@@ -4229,8 +4225,12 @@ torch::Tensor spmm_csr_v2_core(
     // One stolen zero slice, or false when the counter is exhausted.
     auto zero_one_slice = [&]() -> bool {
       const int zs = next_zero_row.fetch_add(zchunk, std::memory_order_relaxed);
-      if (zs >= A0_size) return false;
-      const int ze = std::min(zs + zchunk, A0_size);
+      if (zs >= (int)SCORCH_SPMM_ROW_UNITS) return false;
+      // Bounded by the ROW count, not the claim count: under a redirection the claim range runs past
+      // the last row and A1_pos is indexed by row. This loop cannot run under a redirection anyway,
+      // since it belongs to a zeroing mode the clamp above excludes -- the bound states the
+      // invariant rather than relying on that.
+      const int ze = std::min(zs + zchunk, (int)SCORCH_SPMM_ROW_UNITS);
       for (int i = zs; i < ze;) {
         if (A1_pos[i] == A1_pos[i + 1]) {
           int run = i + 1;
@@ -4250,8 +4250,9 @@ torch::Tensor spmm_csr_v2_core(
       }
       zero_slices_left = false;
     } else if (zero_static_slice && team_size > 0) {   // A/B arm: assigned, not stolen
-      const int64_t lo = (int64_t)worker_id * (int64_t)A0_size / team_size;
-      const int64_t hi = (int64_t)(worker_id + 1) * (int64_t)A0_size / team_size;
+      const int64_t rows_only = (int64_t)SCORCH_SPMM_ROW_UNITS;   // see the note on `ze` above
+      const int64_t lo = (int64_t)worker_id * rows_only / team_size;
+      const int64_t hi = (int64_t)(worker_id + 1) * rows_only / team_size;
       for (int64_t i = lo; i < hi;) {
         if (A1_pos[i] == A1_pos[i + 1]) {
           int64_t run = i + 1;
@@ -4328,7 +4329,7 @@ torch::Tensor spmm_csr_v2_core(
         // every iteration LAST, which is what stopped the multi-row condition from being lifted.
         if (dummy_true[0] && dummy_true[1] && dummy_true[2] && dummy_true[3] &&
             dummy_true[4] && dummy_true[5] && dummy_true[6] && dummy_true[7] &&
-            (!dummy_rowdep || A1_pos[i] >= 0) && dummy_never) {
+            (!dummy_rowdep || A1_pos[i < SCORCH_SPMM_ROW_UNITS ? i : 0] >= 0) && dummy_never) {
           continue;   // unreachable
         }
 #endif
@@ -4359,9 +4360,29 @@ torch::Tensor spmm_csr_v2_core(
         // before the parallel region. Only the two row-dependent terms are left here. See the
         // hoist site for why: eight loop-invariant tests per row cost 0.7-7% at widths this
         // kernel DECLINES, in inverse proportion to row length.
+        // Under a redirection this kernel needs two more things, and BOTH are one compare on a
+        // value the gate already loaded. It writes rows i..i+multirow-1 of C straight from
+        // A1_pos[i..i+multirow], so the group must lie entirely in the row region -- past it a unit
+        // is a segment and its destination is a scratch slot -- and no row in the group may be a
+        // wide one, whose unit covers only its first segment. The group's own nonzero count settles
+        // the second: if the whole group holds no more than wide_deg nonzeros then no single row in
+        // it does either.
+        //
+        // Simply refusing under a redirection was measured and it is expensive, because this is the
+        // kernel that carries matrices with many short rows -- exactly the ones a split has the
+        // least to offer. On redwood, firing the split with no degree floor read 0.475 on a
+        // 40216-row matrix of mean degree 26 at k=1 while the setup-only arm read 0.948, and the
+        // split was adding NINE units: the whole gap was this kernel going dark.
+        // ORDER MATTERS in this condition. A1_pos is indexed by ROW, and under a redirection the
+        // claim index runs past the last row into the extra units, so the region test has to come
+        // BEFORE the A1_pos read or the read is out of bounds. && evaluates left to right; the first
+        // version of this had the region test last.
         if (multirow_ok &&
             i + multirow <= end &&
-            A1_pos[i + multirow] > A1_pos[i]) {
+            (!REDIRECT || (long)(i + multirow) <= sp_row_units) &&
+            A1_pos[i + multirow] > A1_pos[i] &&
+            (!REDIRECT ||
+             (long)A1_pos[i + multirow] - (long)A1_pos[i] <= sp_wide_deg)) {
           #define SCORCH_MR(NV, RR) \
             (full_last \
                ? scorch_spmm_multirow_regblock<scalar_t, NV, true, RR>( \
