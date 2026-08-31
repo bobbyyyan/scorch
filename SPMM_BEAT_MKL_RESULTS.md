@@ -16404,3 +16404,71 @@ can say what the corpus wants.
 So chain93 is expected to be the record that retires chain59 rather than a lever. It is worth the host
 time for that: chain59 has been re-queued four times precisely because no one produced its data, and
 "we inferred it would lose" is what got it re-queued the fourth time.
+
+## chain92: the body attribution, and a noise floor measured on the wrong arm
+
+With a working `body` arm, redwood's twelve firing cells, min over three passes, speedup against `off`:
+
+```
+  float32   floor 1.0069   body 0.9701   nofloor 0.7683   on 0.8222
+            the split itself once the body is paid (nofloor/body): 0.7920
+  float64   floor 1.0070   body 0.9899   nofloor 0.9556   on 0.9810
+            nofloor/body: 0.9654
+```
+
+**The redirected loop body is not the cost.** It runs 3% slower than the unsplit loop on float32 and
+1% on float64 — 2 to 10% per cell, and 4 of 24 cells inside their own floor. The extra compares per
+row, the lost induction variable on the output pointer and the different instantiation together cost
+a few percent, and that is all they cost. The loss is the **split**: once the body's cost is paid,
+splitting costs a further 21% on float32 and 3.5% on float64. So the mechanism question "is the
+redirection expensive, or is splitting rows a bad trade here" has one answer, and it is the second.
+
+That closes the last open question on the row split. The NO-GO is unchanged and now has its cost
+attributed rather than merely measured.
+
+### But the same run says the floor has been measured on the wrong arm
+
+Within one run, across its three passes, per cell, max/min — how reproducible each arm is:
+
+| arm | what it runs | float32 median / p90 / worst | float64 median / p90 / worst |
+|---|---|---|---|
+| `off` | unsplit | 1.041 / 1.211 / 1.531 | 1.032 / 1.141 / 1.216 |
+| `offb` | unsplit, the floor | 1.036 / 1.174 / 1.524 | 1.042 / 1.125 / 1.193 |
+| `setup` | plan built, unsplit kernel | 1.027 / 1.162 / 1.412 | 1.018 / 1.102 / 1.177 |
+| `body` | redirected loop, **no fold** | 1.050 / 1.181 / 1.489 | 1.040 / 1.130 / 1.202 |
+| `on` | the split | 1.044 / **1.473** / **2.237** | 1.057 / 1.329 / **4.368** |
+| `nofloor` | the split | 1.068 / **2.141** / **4.400** | 1.118 / **2.768** / 3.198 |
+| `b16` | the split | 1.242 / **3.414** / 3.941 | 1.314 / 2.725 / 3.431 |
+| `b256` | the split | 1.056 / 1.476 / 2.705 | 1.171 / 2.539 / 3.779 |
+| `b1024` | the split | 1.047 / 1.577 / 3.248 | 1.147 / 2.253 / **5.129** |
+
+Every unsplit arm sits at a p90 of 1.10-1.21. Every split arm is 1.3 to 3.4 at p90 and up to 5.1 at
+worst. A pass's value is already the minimum over 61 timed batches, so a 4.4x gap between passes is
+not one stall — it is sustained state that differs between passes.
+
+**The same-code floor cannot see this**, because `off` against `offb` compares two *unsplit* arms. It
+reads 1.007 and says the instrument is fit, and it is fit — for the arm it measures. It says nothing
+about the reproducibility of the arm being argued about. Bounding that needs two identical *split*
+arms, which no run here has had.
+
+**The variance has a mechanism, and the arms locate it.** `body` runs the REDIRECT instantiation with
+its extra per-row compares and is as stable as `off` (p90 1.181 against 1.211). `setup` builds the
+whole plan and is the most stable arm in the table. What `on` and `nofloor` add over both is the extra
+units and **the fold — a second `at::parallel_for` after the core's private team is torn down**. Two
+parallel regions a call, alternating with a private team, is the shape this project has already
+measured poisoning neighbouring code by 1.12-1.33x. The variance appears exactly where the second
+region does, and not in either arm that lacks it.
+
+**Which corrects the precision of numbers reported earlier in this file.** The footprint sweep's
+per-value readings — redwood float32 0.9430 / 0.8965 / 0.9872 / 0.9406 at 64 / 16 / 256 / 1024 KB —
+are differences of 5-10% between arms whose own p90 pass-to-pass spread is 1.48 to 3.41. **The ordering
+of those four values is not resolvable** and should not be read as one. What survives is the claim the
+section actually rested on, which does not depend on the ordering: no setting is neutral-or-better on
+every host and dtype, and the per-matrix pattern (connectus gains, nw14 loses, kl02 has nothing to
+recover on redwood) reproduces across hosts and across chains 86, 88, 90 and 92.
+
+And it is a third, independent reason the split does not ship, which no amount of retuning addresses:
+**a kernel whose time varies two- to fourfold pass-to-pass on the same cell in the same process is not
+shippable at any mean.** That is also why chain90's and chain92's per-matrix numbers disagree on
+exactly the split arms — nw14 k=16 `nofloor` reads 193 µs in one and 534 in the other — while `off`
+agrees to a few percent in 46 of 48 cells across the two objects.
