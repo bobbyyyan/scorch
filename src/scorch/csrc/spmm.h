@@ -27,6 +27,55 @@
 #include "scorch_policy.h"  // shared scorch_nthreads / scorch_chunk (see header.h)
 #include <ATen/Parallel.h>  // at::parallel_for (pipeline-pool composition A/B)
 #include <cstdlib>          // std::getenv / std::atol (runtime A/B flag)
+#ifdef SCORCH_TUNE_HOOKS
+#include <chrono>           // the per-worker accounting below, hooks builds only
+#endif
+
+#ifdef SCORCH_TUNE_HOOKS
+// Per-worker accounting for the SpMM's parallel region. Hooks builds only, and inert unless
+// SCORCH_SPMM_WSTAT is set.
+//
+// Running six workers instead of four on the M5 costs a FIXED 10-19 microseconds that does not shrink
+// as the kernel gets longer -- measured over a 14x span of work, with the team reshape and the load
+// balance both ruled out. Three mechanisms produce a fixed cost, and a wall-clock number cannot tell
+// them apart: it says the team was slow without saying which worker was slow, or whether one of them
+// was working at all.
+//
+//   one worker at several times the others' nanoseconds per nonzero  placement or preemption
+//   every worker uniformly slower per nonzero                        contention for a shared resource
+//   per-worker times flat while the region's wall time grows         fork/join, or the exit barrier
+//
+// So each worker records the nonzeros it actually processed and the time it spent inside the claim
+// loop, and the region records its own wall time. Accumulated over calls and read from Python, the
+// three separate on the numbers. Two clock reads per worker per call and three adds per claim.
+struct ScorchSpmmWStat {
+  double ns_busy;
+  double ns_entry;    // nanoseconds between the region opening and this worker reaching the loop
+  long nnz;
+  long rows;
+  long claims;
+  long calls;
+};
+inline ScorchSpmmWStat* scorch_spmm_wstat() {
+  static ScorchSpmmWStat s[256] = {};
+  return s;
+}
+// [0] summed wall nanoseconds of the parallel region, [1] regions counted, [2] last team size.
+inline double* scorch_spmm_wstat_wall() {
+  static double w[3] = {0.0, 0.0, 0.0};
+  return w;
+}
+inline void scorch_spmm_wstat_reset() {
+  ScorchSpmmWStat* s = scorch_spmm_wstat();
+  for (int i = 0; i < 256; ++i) s[i] = ScorchSpmmWStat{0.0, 0.0, 0, 0, 0, 0};
+  double* w = scorch_spmm_wstat_wall();
+  w[0] = w[1] = w[2] = 0.0;
+}
+inline double scorch_spmm_now_ns() {
+  return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
 
 #define SCORCH_PRAGMA_UNROLL _Pragma("unroll")
 #define SCORCH_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -4201,12 +4250,25 @@ torch::Tensor spmm_csr_v2_core(
   const int* SCORCH_RESTRICT sp_x_pos = REDIRECT ? split->x_pos : nullptr;
   const int* SCORCH_RESTRICT sp_x_end = REDIRECT ? split->x_end : nullptr;
 #endif
+#ifdef SCORCH_TUNE_HOOKS
+  bool wstat_on = false;
+  { const char* e = std::getenv("SCORCH_SPMM_WSTAT");
+    if (e && *e) wstat_on = std::atol(e) != 0; }
+  // Stamped just before the launch and read by every worker, so a worker can record how long after
+  // the region opened it got to run. On a short kernel that offset is the whole story: a worker that
+  // enters after the last chunk is claimed contributes nothing and the exit barrier still waits for it.
+  double wstat_region_t0 = 0.0;
+#endif
   auto scorch_spmm_worker = [&](int worker_id, int team_size) {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
     // row, and on NEON scorch_spmm_row_neon does, so neither shipped build touches
     // it. Allocated only where there is no register kernel at all, or for the
     // force_workspace hook.
+#ifdef SCORCH_TUNE_HOOKS
+    const double wstat_t0 = wstat_on ? scorch_spmm_now_ns() : 0.0;
+    long wstat_nnz = 0, wstat_rows = 0, wstat_claims = 0;
+#endif
     scalar_t* SCORCH_RESTRICT ws = nullptr;
 #if SCORCH_SPMM_NEEDS_WORKSPACE
     ws = worker_workspaces.get() +
@@ -4323,6 +4385,16 @@ torch::Tensor spmm_csr_v2_core(
         }
         if (!got) break;
       }
+#ifdef SCORCH_TUNE_HOOKS
+      if (wstat_on) {
+        wstat_claims++;
+        wstat_rows += (long)(end - start);
+        // A1_pos is indexed by ROW, and under a redirection a claim runs past the last row into the
+        // extra units, so the nonzero term is only taken where that index means what it says.
+        // REDIRECT is false on every shipped path and in every arm that reads this.
+        if (!REDIRECT) wstat_nnz += (long)A1_pos[end] - (long)A1_pos[start];
+      }
+#endif
 
       for (int i = start; i < end; i++) {
 #ifdef SCORCH_TUNE_HOOKS
@@ -4781,6 +4853,17 @@ torch::Tensor spmm_csr_v2_core(
     // whatever is left is still this worker's to finish.
     while (zero_slices_left && zero_one_slice()) {
     }
+#ifdef SCORCH_TUNE_HOOKS
+    if (wstat_on && worker_id >= 0 && worker_id < 256) {
+      ScorchSpmmWStat& st = scorch_spmm_wstat()[worker_id];
+      st.ns_busy += scorch_spmm_now_ns() - wstat_t0;
+      st.ns_entry += wstat_t0 - wstat_region_t0;
+      st.nnz += wstat_nnz;
+      st.rows += wstat_rows;
+      st.claims += wstat_claims;
+      st.calls += 1;
+    }
+#endif
   };
 
   // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
@@ -4810,6 +4893,10 @@ torch::Tensor spmm_csr_v2_core(
       && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
   { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
     if (_atpf >= 0) use_atparallel = (_atpf != 0); }
+#ifdef SCORCH_TUNE_HOOKS
+  const double wstat_wall_t0 = wstat_on ? scorch_spmm_now_ns() : 0.0;
+  wstat_region_t0 = wstat_wall_t0;
+#endif
   if (use_atparallel) {
     // E-CORE RECRUIT (M5/hybrid-P+E). at::parallel_for runs on torch's intra-op
     // pool, which on Apple M-series is the 6 P-cores and excludes the 12 E-cores.
@@ -4840,6 +4927,14 @@ torch::Tensor spmm_csr_v2_core(
       scorch_spmm_worker(omp_get_thread_num(), omp_get_num_threads());
     }
   }
+#ifdef SCORCH_TUNE_HOOKS
+  if (wstat_on) {
+    double* w = scorch_spmm_wstat_wall();
+    w[0] += scorch_spmm_now_ns() - wstat_wall_t0;
+    w[1] += 1.0;
+    w[2] = (double)nthreads;
+  }
+#endif
 
   return C_values_torch;
 #undef SCORCH_SPMM_NNZ_TOTAL

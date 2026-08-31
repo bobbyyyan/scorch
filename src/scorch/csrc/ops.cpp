@@ -655,6 +655,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // restatement of it -- a second implementation of a rule is a second thing that
     // can be wrong, and it would be wrong silently, in the direction that flatters
     // whichever one the harness used.
+#ifdef SCORCH_TUNE_HOOKS
+    // Per-worker accounting for the SpMM's parallel region, hooks builds only, and only for calls
+    // made while SCORCH_SPMM_WSTAT is set. Returns one row per worker id that ran --
+    // (calls, nonzeros, rows, claims, busy nanoseconds) -- plus a final row holding the region's own
+    // summed wall nanoseconds, the number of regions, and the last team size. A wall-clock time
+    // measured from Python says the team was slow; this says which worker was slow, and whether the
+    // per-worker times even add up to the wall. See the struct's comment in spmm.h.
+    m.def("scorch_spmm_wstat", []() {
+      std::vector<std::vector<double>> out;
+      const ScorchSpmmWStat* st = scorch_spmm_wstat();
+      for (int i = 0; i < 256; ++i) {
+        if (st[i].calls == 0) continue;
+        out.push_back({(double)i, (double)st[i].calls, (double)st[i].nnz, (double)st[i].rows,
+                       (double)st[i].claims, st[i].ns_busy, st[i].ns_entry});
+      }
+      const double* w = scorch_spmm_wstat_wall();
+      out.push_back({-1.0, w[1], 0.0, 0.0, 0.0, w[0], 0.0});
+      out.push_back({-2.0, w[2], 0.0, 0.0, 0.0, 0.0, 0.0});
+      return out;
+    }, "Per-worker (id, calls, nnz, rows, claims, busy_ns, entry_ns) for the SpMM parallel "
+       "region; entry_ns is how long after the region opened the worker started; row "
+       "id=-1 carries (regions, ..., wall_ns) and id=-2 carries the last team size. Empty "
+       "without SCORCH_TUNE_HOOKS.");
+
+    m.def("scorch_spmm_wstat_reset", []() {
+      scorch_spmm_wstat_reset();
+    }, "Zero the per-worker accounting above.");
+
+#endif  // SCORCH_TUNE_HOOKS
+
     m.def("scorch_spmm_chunk", &scorch_spmm_chunk,
           "Rows per work-stealing chunk the SpMM would use for (rows, nnz, k, nthreads)",
           py::arg("rows"), py::arg("nnz"), py::arg("k"), py::arg("nthreads"));

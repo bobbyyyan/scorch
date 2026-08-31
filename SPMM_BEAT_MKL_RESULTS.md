@@ -16956,3 +16956,175 @@ The convention also says arm-variance may ship when it is measured and declared,
 on both dtypes in release builds on all three hosts. Which way that resolves is Bobby's call and not
 this file's; the constant exists, defaults to off, and is byte-identical at 0, so it is a one-line
 decision either way.
+
+## chain95: why the raise helps at eleven workers and hurts at six — the team's own cost, measured per worker
+
+The verdict above left the ARM regression stated but not explained: three cells of kl02 lose 12-16% on
+the M5 while the same change clears seven below-MKL cells on each x86 host. "It helps at 24 and hurts at
+6" is a restatement, not a mechanism. This is the mechanism, measured.
+
+### The instrument
+
+`spmm.h` now records, per worker per call and only in a hooks build with `SCORCH_SPMM_WSTAT` set, the
+nonzeros that worker processed, the nanoseconds it spent inside the claim loop, and how long after the
+parallel region opened it reached that loop; the region records its own wall time. Two clock reads per
+worker and three adds per claim. Read from Python through `scorch_spmm_wstat`.
+
+A wall-clock time measured from outside says the team was slow. It cannot say which worker was slow, or
+whether one of them did any work at all, and those are different mechanisms with different fixes.
+
+**Release emission is unaffected, proved per symbol.** Everything added is inside
+`#ifdef SCORCH_TUNE_HOOKS`, the two `m.def` registrations included, so a release build gains no code and
+cannot answer with an empty table that a harness would read as "no workers ran". Comparing a release
+object built from this tree against the chain94 release object: **0 of 1038 shared symbols differ in
+mnemonic sequence**, module init included — no instruction added, removed or substituted anywhere. The
+929 differing operands are all the low half of an `adrp`/`add` pair addressing the string table, shifted
+2 to 6 bytes because c10's assertion macros stringify `__LINE__` into the message and the inserted lines
+moved those digits. `wstat_neutral.py`, which refuses if it parses fewer than 10000 instructions — its
+first version used a regex for space-separated byte pairs, which macOS objdump does not emit, so it
+parsed nothing and reported neutral on an empty comparison.
+
+### The load balance is not the answer, and it acquits the split
+
+Reimplementing the split the kernel builds (`spmm.h`, prefix `A1_pos[i] + i`, target
+`(nnz + rows) * w / nsplit`) and taking `1 / max-range-share` as the speedup a perfectly scheduled call
+could reach:
+
+```
+  kl02 (71 rows, 212536 nnz, degree CV 0.57)      T=4  3.635   T=5  4.648   T=6  5.676   T=11  9.467   T=24 14.781
+  nw14 (73 rows, 904910 nnz, degree CV 1.21)      T=4  3.497   T=5  4.094   T=6  5.232               T=24  9.950
+```
+
+On the M5 the balance gets BETTER with more workers — kl02's worst range falls from 27.5% of the work at
+four to 17.6% at six — so balance predicts six workers should be 1.56x faster and it is 1.09x slower.
+Whatever the cost is, it is not the partition. nw14's ceiling stops climbing past twelve because one row
+holds 10.1% of its nonzeros and whole rows cannot be split; at T=24 three of its 24 ranges come out
+empty. That is the ceiling already recorded for nw14/connectus/lp_osa_14, arriving here as a number.
+
+### The cost is fixed in microseconds, and three confounds were ruled out before believing it
+
+Synthetic matrices at a constant B footprint, so the ceiling is 1.50 in every cell and only duration
+varies. Deriving the penalty as `delta + T4/3`, which is what a 1.50 ceiling implies with no penalty:
+
+```
+  rows x deg      nnz      T4 us    6/4 p50   penalty implied
+  71 x 512       36352      21.8     0.590      18.7 us
+  71 x 2048     145408      44.6     1.036       9.7
+  71 x 8192     581632      63.5     1.024      16.0
+  71 x 32768   2326528     149.5     1.235      17.7
+  1136 x 2048  2326528     304.0     1.387      12.8
+```
+
+Flat at 10-19 microseconds across a 14x span of work, so it is a fixed cost and not a fraction. Two
+cells share a nonzero count with a cell of the other family, which is what separates "the kernel got
+longer" from "the rows or the degree changed".
+
+- **The hooks tax is not it.** All 33 `getenv` sites in this kernel are before the `#pragma omp
+  parallel`; none is inside the worker. The tax is serial and per call, so it inflates both arms
+  equally and cannot scale with team width.
+- **My own interleaving is not it.** Timing arms call by call makes libomp change `num_threads` every
+  call, which production never does. Re-running with each arm as a block of 1500 calls reproduces the
+  same numbers (6/4 p50 0.590 / 1.036 / 1.024 / 1.235 / 1.387 against 0.647 / 0.956 / 1.025 / 1.224 /
+  1.369), and the block-open excess is a one-off +2 to +12 us rather than a per-call cost.
+- **Ambient load on the laptop is not it.** Six competitors burning 598% CPU leave the sixth worker's
+  entry offset at 13.7 us against 14.2 with none. Entry offset is measured inside the region against the
+  region's own start, so unlike a wall-clock comparison it does not care that ambient load makes every
+  arm slower — which is what made the earlier cross-level timing unreadable, `nt4` alone swinging
+  42.8 / 38.5 / 34.7 us between levels.
+
+### What the fixed cost is: the team, not the work
+
+kl02, float32, k=1, per worker as `entry us -> busy us`:
+
+```
+  4 workers:  1.7->19.3   7.7->12.4   7.1->12.4   6.1->12.8
+  6 workers:  2.7->14.5  10.3-> 7.9   9.1-> 8.7   7.9-> 9.9   8.5->9.3   15.4->6.5
+```
+
+The arithmetic parallelises: the critical worker's busy time falls 19.3 -> 14.5, saving 4.8 us. The
+master enters at about 2 us and helpers one through four at 6-10, but the sixth worker enters at 15.4,
+which costs 7.7 us on the new critical path, and the region's teardown grows 5.6 -> 9.1. Net +4.4 us on
+a 30 us kernel, which is the 12-16% regression, accounted for term by term. On a 4544-nonzero matrix the
+sixth worker enters 14.8 us into a 21 us kernel, does **literally zero** nonzeros, and the exit barrier
+waits for it anyway. Across every cell `wall - max(busy)` is about 8 us at four workers and about 15 at
+six, and the per-worker `ns/nnz` spread is 1.006-1.13, so no core is running slow: the team is late.
+
+### The cliff is at six because six is the fast-core count, not the pool size
+
+Region wall on a 4544-nonzero matrix, where the arithmetic is 2.7 us and the rest is overhead:
+
+```
+  torch pool   T=1   T=2   T=3   T=4   T=5   T=6    T=7   T=8
+      4        1.8   6.8  11.6  12.8  13.6  21.7   23.8  26.5
+      6        1.7   6.6  11.0  12.2  13.7  21.4   24.0  26.4
+     12        1.7   6.6  11.1  12.3  13.9  21.0   23.6  26.5
+     18        1.7   6.6  11.1  12.3  13.5  20.9   23.9  26.6
+```
+
+About 1.3 us per worker up to five, then a step of 8 us at the sixth, and **the step stays at six in a
+pool of eighteen**. So it is not a pool boundary; it tracks the six perflevel0 ("Super") cores this part
+has. Past six the entry offsets keep climbing as threads spill onto perflevel1 — at T=8 workers four
+through seven enter at 11.6 to 17.3 us — while the teardown stays at about 9.5.
+
+The M5 is the only host in this project where the resolved worker count can reach the fast-core count,
+because its pool IS the fast-core count: `torch.get_num_threads()` is 6 on an 18-core part.
+
+### The two hosts, in one comparison
+
+Bounding the arithmetic saving by perfect scaling, which no partition can beat, so the implied cost of
+the added workers is an upper bound:
+
+```
+  redwood  kl02 k=1 float64   4 -> 11 workers   23.0 -> 20.3 us  (+2.7)   added workers cost <= 1.71 us each
+  M5       kl02 k=1 float64   4 ->  6 workers   29.1 -> 33.1 us  (-4.0)   added workers cost <= 6.85 us each
+```
+
+and the M5's cost is not a bound but a measurement: 12.2 us of region at four workers against 21.4 at
+six is **4.75 us per added worker**, which already exceeds redwood's upper bound of 1.71. The two hosts
+differ by at least 2.8x on the per-worker cost of a team, established without needing redwood.
+
+So the raise is a purchase, and both terms go the wrong way on the M5:
+
+- **What it can buy.** The raise bound computes eleven workers on both hosts. redwood runs eleven, worth
+  3.635 -> 9.467 of ceiling. The M5's final cap (`SCORCH_SPMM_NT_CAP = -2`, the caller's pool) clips it
+  to six, worth 3.635 -> 5.676. redwood buys 2.60x of parallelism, the M5 1.56x.
+- **What it pays.** 1.71 us or less per worker on redwood, 4.75 measured on the M5.
+
+redwood spends at most 12 us to buy up to 14.6 and nets +2.7. The M5 spends about 9.5 to buy at most 9.7
+and nets -4.0. Same mechanism, opposite sign, and nothing about the ISA is in the explanation: it is the
+pool size relative to the machine and the cost of widening a team on it.
+
+It also explains the shape of the ARM result without a further assumption. The cost is fixed, so it
+matters in proportion to how short the kernel is: kl02 at k=1 and k=2 runs 26-42 us and the 9.5 us step
+is a quarter to a third of it, while nw14 at 65-120 us absorbs the same step and gains. The duration
+sweep is the same statement: the 6/4 ratio climbs monotonically toward the 1.50 ceiling as the kernel
+lengthens, 0.590 at 22 us to 1.387 at 300.
+
+### What this says about the policy
+
+The thread rule never charges for team width. The base bound compares work against a grain, the raise
+bound compares a different work measure against two grains, and the adoption takes the caller's pool —
+none of them knows that the Nth worker arrives late and that the region costs more to close. A worker
+is worth adding only when the arithmetic it removes from the critical path exceeds its own arrival delay
+plus its share of the teardown, which is a per-host constant this instrument now measures. That is a
+general term, not a threshold fitted to kl02, and on redwood at 1.71 us or less per worker it would
+still add all seven. Whether to build it is Bobby's call; it is the first candidate in this project that
+would fix the ARM cells without touching the x86 gains.
+
+### Two corrections to what this file said earlier
+
+- "Forcing five is as bad as six" was a k=2 result generalised too far. kl02's optimum moves with the
+  width: at k=1 the ladder reads 38.2 / 37.2 / **35.2** / 40.4 us for T=3/4/5/6, so five is the best
+  count and six is a cliff; at k=2 it reads 42.8 / **32.1** / 38.8 / 40.4 and four is best.
+- A summary earlier in this session said the raise takes kl02 from four to twenty-four workers on
+  redwood. It takes it from four to **eleven**; four to twenty-four is nw14, and the 78.8 -> 43.4 us
+  quoted with it is nw14 k=1, not kl02.
+
+### What is not measured
+
+The per-worker region cost on redwood and MKT directly. The instrument is portable — plain `std::chrono`
+and no ISA-specific code — and the x86 number here is an upper bound derived from chain94's timings, not
+a reading. Both hosts need a fresh login, and the Duo passcode batch sent at 12:33 on 2026-08-31 did not
+reach this Mac's Messages database, so the login stopped rather than retrying. Running `m5_wstat.py` and
+`m5_teamcost.py` against a hooks build on each host is what closes it, and it would also say whether the
+cliff-at-the-fast-core-count shape has an x86 analogue on redwood's 8 P + 16 E part.
