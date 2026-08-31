@@ -16103,3 +16103,26 @@ real, it is what caps nw14 / connectus / kl02, and connectus shows the ceiling c
 on two of the three, because the mechanisms that make the row loop fast -- whole-row register blocking
 and tiling, the multirow kernel, an induction variable on the output pointer, one claim per row -- are
 worth more than the balance a split buys back.
+
+## A third silent-duplicate arm, and a guard that could not have caught it
+
+`SCORCH_SPMM_SPLIT_ABLATE` is read in the wrapper, not in the exported gate, so the knob-liveness
+check added earlier -- which compares the gate's answer under two settings of each variable -- could
+not see it. And an unimplemented ablation mode does not error: it falls through to the ordinary split
+path. So when a staged tarball lagged the staged harness, the `body` arm silently became a duplicate
+of `nofloor` in two files of one run (`c90cold_float64_p1/p2`; `grep -c 'ab == 2'` on that tree's
+source returns 0). Those two files are declining cells, where nothing fires and every arm agrees, so
+no conclusion rested on them -- but the number was quoted once and it was mislabeled.
+
+The guard now covers it behaviourally, which is the only way: mode 2 must be BIT-IDENTICAL to the
+split being off, because it runs the redirected loop with nothing split, and mode 0 must differ from
+it, because otherwise the split did not fire on the check matrix and the run is measuring nothing.
+Both halves matter. And the guard was itself checked against an unimplemented mode -- asking for mode
+9, which falls through exactly as a stale binary would -- because a guard that cannot fail is not a
+guard. Its predecessor had that exact flaw: the first version of the gate-knob check used an
+8000-nonzero probe matrix, where the segment floor binds and every setting agrees.
+
+Also fixed while looking at the fold: its parallel grain divided a constant by the segment count, so
+more segments gave a coarser grain, and at 355 segments the grain came out 92 against a range of 64 --
+one task. It serialized precisely when there was most work. It is now the free dimension over the pool
+size with a total-work floor.
