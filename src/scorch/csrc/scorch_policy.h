@@ -289,6 +289,27 @@
 #  define SCORCH_SPMM_BASE_WORK_TRUE 0
 #endif
 
+// Which work measure bounds the RAISE below (the base bound's counterpart; see the block that reads
+// this in scorch_spmm_nthreads). 0 keeps real arithmetic, `nnz*k`, which is what ships. 1 reads the
+// time proxy `nnz*max(k,16)`, which raises the count on the few-row very-high-degree class the raise
+// currently strands -- kl02 4 to 11 workers, nw14 4 to 24, bibd_17_8 8 to 18 on a pool of 24.
+//
+// A compiled-in constant and not only a hook, because the question it answers is a comparison against
+// MKL and a hooks object cannot ask that one: 54 getenv lookups a call is 18.9 us on MKT, which
+// manufactures a deficit on a 25 us kernel. Arm against arm inside one hooks object is safe and is
+// how the numbers below were taken; against MKL it takes two release objects.
+//
+// STILL 0, and the reason is a measured regression rather than a missing measurement. On redwood it is
+// +25.9% (float32, z=3.86) and +32.8% (float64, z=3.36) per matrix on exactly the three matrices that
+// are the deficit, across eleven cells with not one regression among them, inert on the other 265 and
+// on every guarded workload. On the M5 it costs kl02 6% at k=1 and 20% at k=2 on float32, reproducibly
+// over three rounds against a floor within 0.7% of 1.000. The M5 has no MKL, so that is a trade of
+// absolute ARM performance on two cells against x86 cells that are losing to a competitor -- which is
+// a decision to be taken deliberately and not by a default.
+#ifndef SCORCH_SPMM_RAISE_ON_FLOORED
+#  define SCORCH_SPMM_RAISE_ON_FLOORED 0
+#endif
+
 // Whether the final cap declines to undo what the nonzero-expressed row ceiling deliberately
 // asked for. 1 respects it, 0 lets the cap win.
 //
@@ -1293,10 +1314,12 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // workers a product can feed is a question about time, not about multiply-adds.
     // It is what strands the high-degree narrow-k class -- kl02 at k=2 has 425072
     // multiply-adds, one grain, and 3400576 units of the floored measure, eleven.
-    long raise_work = work_true;
+    long raise_work = SCORCH_SPMM_RAISE_ON_FLOORED != 0 ? work : work_true;
 #ifdef SCORCH_TUNE_HOOKS
+    // Reads both ways, so an arm can force real arithmetic back on in a build whose constant has
+    // been promoted -- the same shape as the base bound's hook, and for the same reason.
     { const char* e = std::getenv("SCORCH_SPMM_RAISE_ON_FLOORED");
-      if (e && *e && std::atol(e) != 0) raise_work = work; }
+      if (e && *e) raise_work = std::atol(e) != 0 ? work : work_true; }
 #endif
     const long by_true = raise_work / (SCORCH_SPMM_RAISE_GRAINS * SCORCH_GRAIN_SPMM);
     if (cand > by_true) cand = by_true;
