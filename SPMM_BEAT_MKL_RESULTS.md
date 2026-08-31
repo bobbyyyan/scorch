@@ -15905,3 +15905,72 @@ for two minutes on redwood's corpus asking for an eight-terabyte array before I 
 Still off by default. The gate constants are not chosen yet: chain86 (the same four arms on the
 in-place design), the M5 grid, and MKT are what decide whether the mean-degree floor is still
 needed at all, and the prediction under test is that `nofloor` stops being catastrophic.
+
+## The row split, redesigned three times: what each version's cost actually was
+
+chain86 measured the first in-place version on redwood -- five arms in one hooks object, 46 matrices,
+per-cell random order, both passes, both dtypes. Speedup against `off`:
+
+```
+                                          floor    on      nofloor
+  cells the gate fires on          f32   0.9738  1.1760   1.1760     n=12
+                                   f64   1.0066  1.2993   1.2958
+  cells only the floorless gate
+    fires on -- what it excludes   f32   1.0132  0.9832   0.7390     n=12
+                                   f64   1.0059  1.0006   0.8857
+  everything else, gate declines   f32   0.9997  0.9990   0.9906     n=160
+                                   f64   1.0018  1.0000   0.9955
+```
+
+Better than the wrapper (0.5176 -> 0.7390 on the floor-excluded cells) but still bad there, and the
+question was whether that was the split or the machinery around it. A hooks arm settles it: `setup`
+builds the plan and then runs the UNSPLIT kernel, so `setup` against `off` is the construction alone
+and `nofloor` against `setup` is what the split itself buys. Without that arm they are one number.
+
+**Three constructions, and the first two lost to their own setup.** M5, pool 6:
+
+```
+                                        setup/off   on/setup      shape
+  one plan entry per row                  0.451      1.021     600k rows, deg 9, k=1
+  parallel two-pass scan of degrees        0.585      0.990     40216 rows, deg 26, k=1
+  no scan at all                       0.968-1.029      --      all twelve cells
+```
+
+The second is the interesting failure: a correct parallel blocked scan, and it cost MORE on the
+smaller matrix, because five blocks of trivial work still pay two thread-pool launches. The third
+scans nothing. A row longer than the spacing between equal-nonzero cuts must contain a cut, so the
+refn-1 binary searches the imbalance probe already runs yield a set containing every row above its
+fair share; and since a row is split exactly when its degree exceeds nnz/refn, its first unit needs
+no lookup either. The plan's arrays are sized by the split segments, at most nnz/seg of them.
+
+**Then the segment width, which has three bounds and not one.** M5, pool 6, against the unsplit
+kernel:
+
+```
+                                     nw14-like k=1   fullchip-like k=64
+  fixed 256 nonzeros                     1.124             1.690
+  makespan bound alone, nnz/512          1.286             1.057
+  both bounds and the floor              1.242             1.724
+```
+
+From above, the makespan: LPT over units of at most `seg` nonzeros finishes by nnz/N + seg, so `seg`
+IS the excess over ideal. From above also, the B footprint: a unit reads one row of B per nonzero, so
+it touches seg*k*elem bytes of B, and 64 KB of that resident against 2.9 MB streamed is worth 1.6x at
+k=64 on the same matrix with the same balance. From below, a unit has to be worth claiming. Neither
+upper bound dominates -- at narrow k B is small and the makespan decides, at wide k the footprint
+does -- and a fixed width gets one regime right and the other wrong.
+
+What remains on the M5 after all three fixes, on a 600000-row matrix of mean degree 9 where one row
+holds 7.8% of the nonzeros and a sixth of the machine is 16.7%, so there is no ceiling to relieve:
+0.862 / 0.760 / 0.859 / 1.724 at k = 1 / 4 / 16 / 64. That is not a code question any more. It is the
+gate: at pool 6 this matrix has nothing to gain from balance, and the k=64 win is the OTHER mechanism
+-- B-locality blocking -- which is pool-independent. The gate constants are being chosen from
+chain88 (redwood, the final build, seven arms including a sweep of the footprint constant), the same
+grid on the M5, and MKT job 17144967, and not before.
+
+**Two harness defects fixed along the way, both of the kind that reports a number rather than an
+error.** A staged tarball can lag a staged harness, in which case an arm sets an environment variable
+the binary never reads and two arms meant to differ report a difference of zero as a measurement --
+so the probe now checks that every knob its arms name actually changes the exported gate's answer,
+and refuses otherwise. That check's own first version used an 8000-nonzero probe matrix, where the
+segment floor binds and every setting agrees: a guard that reports a live knob as dead.
