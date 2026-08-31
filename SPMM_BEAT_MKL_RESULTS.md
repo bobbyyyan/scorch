@@ -16162,3 +16162,73 @@ two constants fitted to one host.
 redwood float32 6%. That asymmetry -- same code, same cells, opposite signs on two x86 hosts -- is the
 whole finding, and it is why the mechanism cannot be gated on anything the compiler or the caller
 knows.
+
+## A fourth broken instrument: the ablation arm that ran the right arithmetic on a nonsense schedule
+
+The `body` arm exists to split the row split's cost in two. It runs the redirected loop with nothing
+split -- every row a unit, no row truncated, no extra units, no fold, ordinary output size -- so its
+answer is bit-identical to the unsplit kernel and its time is the redirected loop body alone. `body`
+against `off` is what that body costs; `nofloor` against `body` is what the split itself buys.
+
+On redwood's twelve firing cells it read **0.2788** of `off`, against `nofloor`'s 0.9180. Per cell it
+ran 0.101 to 0.758: nw14 at k=16 0.101, connectus at k=4 0.145, connectus at k=16 0.160.
+
+That is not a number the code can produce. `body` does strictly less work than `nofloor` -- it is
+`nofloor` minus the split -- so it cannot be 3.3x slower than it. A result that contradicts the shape
+of the code is a broken instrument, and it was not reported as a finding.
+
+**The cause.** `ScorchSplitPlan` had seven fields and the mode-2 ablation filled six. The one it left
+was `nnz_total`, holding whatever was on the stack. `nnz_total` picks the worker count, the chunk
+width and the multirow threshold, so the arm ran the correct arithmetic on a nonsense schedule.
+
+Every check passed. Bit-identity against the unsplit kernel passed -- and that is precisely what an
+arm computing the right answer on the wrong number of workers would pass, because the redirected loop
+sums each row in one place regardless of who runs it. The chain asserted bit-identity before spending
+two hours, got `True`, and measured a fiction. Only the clock complained, and the clock has no way to
+say *why*.
+
+**Reproduced deliberately**, because a cause you have not made happen twice is a guess. With
+`idle.nnz_total = 0` -- defined rather than genuinely uninitialized, so it is repeatable -- against
+the same object with the field supplied, on two synthetic shapes at three widths, M5 pool 6:
+
+| shape | k | floor (same code) | body/off, field = 0 | body/off, field supplied |
+|---|---|---|---|---|
+| nw14-like, 73 rows | 4 | 0.9627 | 0.2656 | 0.9527 |
+| nw14-like | 16 | 0.9842 | 0.3011 | 0.9703 |
+| nw14-like | 64 | 1.0156 | 0.2780 | 0.9671 |
+| connectus-like, 512 rows | 4 | 0.9809 | 0.2791 | 1.0247 |
+| connectus-like | 16 | 1.0015 | 0.2114 | 1.0316 |
+| connectus-like | 64 | 1.0212 | 0.1573 | 1.0216 |
+
+0.157-0.301 with the field missing, 0.953-1.032 with it supplied, against a same-code floor of
+0.963-1.021. The bit-identity assertion passed in **both** builds. So the number was the missing
+field and nothing else, and with the field supplied `body` sits inside the noise floor -- which is
+what an arm doing the same arithmetic in the same order on the same schedule has to read.
+
+**The fix is not to initialize the field.** Initializing it makes the bug deterministic rather than
+absent: a future caller can still forget, and would then get a defined-but-wrong schedule instead of
+an undefined one. The field is gone. `n_row_units` **is** the row count -- that is its definition --
+so the kernel derives the nonzero count as `A1_pos[n_row_units]` and there is nothing a caller can
+fail to pass. Release emission is unaffected, because with the split compiled out the macro expands
+to the same `A1_pos[A0_size]` it always did: 0 of 256 kernel-family symbols changed against the
+pre-split commit, the only difference being `pybind11_init_scorch_ops` growing for the three exports.
+
+**None of the row-split verdict's numbers move.** The real plan always set the field, so `on`,
+`nofloor`, `setup` and the whole footprint sweep were measuring what they claimed. On the same shape
+`nofloor/off` reads 2.1193 before the fix and 2.1232 after. The NO-GO stands on exactly the evidence
+it stood on.
+
+**What guards it now.** The specific defect is unrepresentable, so a test for it would be a test for
+a bug that cannot occur. What is still representable is the arm being misconfigured in some new way,
+and the general property is cheap to state: the redirected body does the same arithmetic in the same
+order on the same schedule, so `body/off` near 1 is structural, not empirical. `bodycause.py
+--refuse-below 0.80` asserts it on two synthetic shapes and both chains run it as a pre-flight before
+they spend hours on a body column. The broken object read 0.157-0.301, so the guard is one that
+demonstrably fires rather than one assumed to.
+
+This is the fourth instrument in this project to report a plausible number instead of an error: a
+firing set hardcoded from four matrix names when the binary said six (which reversed a sign), a
+harness restating the production gate, an arm that was a silent duplicate of another because the
+object did not implement its mode, and now an arm that measured a different configuration rather
+than a slower one. The pattern in all four is the same -- the check that would have caught it was
+the one nobody wrote, because the wrong answer looked like an answer.
