@@ -16791,3 +16791,39 @@ So `RAISE_ON_FLOORED` does not ship as it stands, and that conclusion no longer 
 grid. What the two x86 runs still decide is whether its gain crosses MKL, because that is what makes
 the remaining question a real trade rather than a curiosity: gains on x86 cells that lose to a
 competitor, against three ARM cells on the one host that has no sparse competitor at all.
+
+### Correction: a resolver queried on the wrong machine answers 18 where the host answers 24
+
+The chain94 analysis recomputed which cells the raise moves by asking the exported resolver — the right
+principle, applied on the wrong machine. It ran against the **M5's** hooks object, and the resolver
+caps its answer at `omp_get_num_procs()`, which is 18 there and 32 on redwood. So it answered 18 where
+redwood's own binary recorded 24, on ten of eighteen cells checked:
+
+```
+  bibd_17_8 k=1   binary: ships  8 raise 24     offline on the M5: ships  8 raise 18
+  nw14      k=1   binary: ships  4 raise 24     offline on the M5: ships  4 raise 18
+  nw14      k=8   binary: ships 24 raise 24     offline on the M5: ships 18 raise 18
+  kl02      k=1   binary: ships  4 raise 11     offline on the M5: ships  4 raise 11   (agrees)
+```
+
+The shapes matched in every case, so this was not a data mismatch; it was the machine. This file
+already records the same distinction costing a grid — `omp_get_num_procs()` is 18 on a 6-thread ARM
+host and straddles any floor stated between the two machines — and the export exists precisely so a
+harness asks the binary instead of restating the rule. Asking *a* binary is not asking *the* binary.
+
+Two consequences, both stated before the corrected numbers exist rather than after:
+
+1. **The chain94 moved-set of 10 cells is wrong**; chain93's probe, which recorded the count from the
+   host's own binary per cell, says 11 on redwood — bibd_17_8 at k=8 is missing from the offline
+   classification. The per-cell vs-MKL readings themselves are unaffected, since they come from the
+   CSVs; it is the grouping into moved and inert that is wrong, and one cell moves group.
+2. **The "zero guarded-workload cells moved" claim was checked with hw=18** and has to be re-checked on
+   each host's object. Reading the code, it is very likely to survive: the final cap
+   (`SCORCH_SPMM_NT_CAP = -2`) is applied after the raise and caps at the caller's pool, so a shape
+   that already resolves to its applicable ceiling cannot be lifted, and every GCN and AE shape does.
+   But "very likely from reading the code" is not the standard this file holds, so it is re-measured
+   on redwood and MKT rather than argued.
+
+The fix for the analysis is to stop recomputing at all: `threadprobe.py` records the resolved count per
+cell from the binary that ran it, and `shipprobe.py` does not. It should, and the join should be on
+that column rather than on an offline query that cannot know which machine produced the row.
