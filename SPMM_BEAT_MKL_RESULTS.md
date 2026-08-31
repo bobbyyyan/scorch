@@ -16351,3 +16351,56 @@ construction. There is no mechanism behind such a condition — the adoption is 
 composition, and row count and degree do not say whether a call is inside a pipeline — so it would be
 a threshold fitted to the workloads it needs to survive. If the workload runs say the pair costs GCN
 more than it wins on the transformer family, the answer is that it does not ship.
+
+### Correcting the paragraph above: chain78 already priced this direction, and it is worse than I wrote
+
+Two sections back I called the pair "the direction with measurements behind it", citing chain79's
+force ladders. That is true but selective, and the fuller picture is worse for the candidate.
+Recording it before the grids land, so the prediction is on the record rather than fitted afterwards.
+
+**chain78 closed the thread count as a constant** on 1192 real cells, worker count forced as the
+`nthreads_override` argument so the arms shared one build and one process and set no environment
+variable. Cells below MKL, of 1192:
+
+| arm | float32 | float64 |
+|---|---|---|
+| **policy** | **20** | **18** |
+| policyb (floor) | 20 | 15 |
+| nt12 | 51 | 21 |
+| nt24 | 70 | 58 |
+| nt8 | 161 | 97 |
+| nt4 | 406 | 380 |
+| nt2 | 619 | 619 |
+
+Every fixed count is 2.5x to 30x worse than the rule, and asked in both directions nt8 clears 6 of the
+20 losing cells while breaking 147 of the 1172 winning ones. chain77's "eight workers beat the policy
+by 17% at 512 rows, degree 250, k=4" — which is the residual family's exact shape — was separately
+shown to be a **synthetic-locality artefact**: its ladder used uniformly random columns over 1024,
+and on the real dlmc matrices `policy/nt8` at k=4 reads 0.9530 and 0.9681, i.e. nt8 is 3-5% *slower*.
+
+So the two readings are not in conflict but they cut different ways. Lowering the count helps specific
+subgroups — the M5's rn50 layers by 1.18-1.20x at k≤4, redwood's k=1 inert group by 1.24x — and any
+fixed low count applied corpus-wide is a rout.
+
+**What is still open, and why chain93 is worth running anyway.** chain78 tested fixed counts. The pair
+is not a fixed count: it lowers the count only where real arithmetic is thin, and leaves the rest
+alone. Whether a *selective* rule lands on the helped subgroups without breaking the rest is a
+question chain78 did not ask.
+
+**The prediction, written before the data.** I expect the pair to lose, and specifically at k=1. Its
+grading divides `work_true = nnz*k`, which at k=1 is just the nonzero count, so a 138000-nonzero
+transformer layer gets **one** worker where chain77's direct sweep measured the optimum at 24 (nt1 is
+38.62 µs against the policy's 14.78, a 2.6x regression). The whole 75000/150000/300000 ladder gives
+one worker there, so the ladder does not span the interesting region — the grain that would give 24 on
+that cell is nearer 5000. And the reason the base bound floors k at 16 in the first place is that a
+narrow product is bandwidth-bound on A, whose size does not depend on k, so real arithmetic is the
+wrong measure exactly where the pair is most aggressive.
+
+Nor does the other available measure rescue it: `work = nnz*max(k,16)` is k-independent for k ≤ 16, so
+grading by it returns the same count at k=1 and k=4 and cannot express a width-dependent optimum at
+all. That is chain78's conclusion restated in terms of the two measures actually available — neither
+can say what the corpus wants.
+
+So chain93 is expected to be the record that retires chain59 rather than a lever. It is worth the host
+time for that: chain59 has been re-queued four times precisely because no one produced its data, and
+"we inferred it would lose" is what got it re-queued the fourth time.
