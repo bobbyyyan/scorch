@@ -16546,3 +16546,108 @@ else in the corpus triggers the same transition. n = 1 matrix, so there is no z 
 second family to check it against. It is a lead for the x86 hosts, not a result.
 
 `basework` moved 0 cells, confirming the offline prediction, and its column reads the floor.
+
+## MKT confirms the body attribution, on both dtypes
+
+The second x86 host, same twelve firing cells, min over three passes:
+
+```
+  float32   floor 1.0042   body 0.9704   nofloor 0.9507   nofloor/body 0.9797
+  float64   floor 1.0009   body 0.9924   nofloor 1.0567   nofloor/body 1.0647
+```
+
+Against redwood's `body` of 0.9701 and 0.9899. **The redirected loop body costs 3% on float32 and
+about 1% on float64, on two hosts, to within a few tenths of a percent.** That is a two-host
+confirmation of the one number the ablation existed to produce, and it means the row split's cost is
+the split on both hosts — on MKT float64, where the split *gains*, it gains 6.5% once the body is
+paid, which is the same decomposition with the sign flipped.
+
+## chain93 on redwood: the candidate is dead, and the arm I predicted would lose is the one that won
+
+46 matrices — the loser class, eight rn50 few-row layers, and 32 unselected SuiteSparse matrices
+across four nonzero bands — six widths, three passes each dtype, eight arms in one hooks object, pool
+24. Speedup against `ships`.
+
+```
+  float32   arm         cells moved                        cells inert
+            basework      0  (predicted null, confirmed)     276  1.0068 (floor 1.0009)
+            adopt        99  0.8966 (floor 0.9998)           177  1.0004 (floor 1.0014)
+            raise        11  1.2458 (floor 1.0018)           265  0.9989 (floor 1.0008)
+            bw_ad       135  0.6210 (floor 0.9999)           141  1.0026 (floor 1.0018)
+            bw_ad_lo    112  0.7194 (floor 0.9995)           164  1.0005 (floor 1.0018)
+            bw_ad_hi    135  0.6194 (floor 0.9999)           141  1.0031 (floor 1.0018)
+```
+
+**The candidate is not merely a regression, it is a rout.** `bw_ad` reads 0.6210 against a 0.9999
+floor. Per family, z aggregated across matrices: unselected 0.5821 (z **−10.22**), loser class 0.5612
+(z −8.89), few-row layers 0.7833 (z −5.07), ceiling matrices 0.8373 (z −4.03). 106 of the 135 moved
+cells fall below their own floor; the worst are usroads-48 k=1 at 0.1411 (24 → 2 workers), case9_A_07
+k=2 at 0.2269 (24 → 1), ex3sta1 k=1 at 0.2848 (24 → 1). The grain ladder is 0.7194 / 0.6210 / 0.6194,
+so no value rescues it. **chain59's pair is finished on two hosts**, which is what four re-queues did
+not produce.
+
+`adopt` alone is also dead here — 0.8966 on 99 cells. On the M5 it read 1.1931 on 5 cells of one
+matrix. So that lead was host-specific, as flagged when it was recorded, and it is now closed.
+
+### `raise` gains 26% and 33% on exactly the three matrices that are the deficit
+
+I predicted this arm would lose, on the strength of chain78 and chain79. It is worth stating plainly
+that the prediction was wrong. Every cell it moves, and it moves eleven of 276:
+
+| matrix | k | workers | float32 | float64 | float32 µs |
+|---|---|---|---|---|---|
+| bibd_17_8 | 1 / 2 / 4 / 8 | 8→24, 8→24, 9→24, 18→24 | 1.0902 / 1.2601 / 1.1802 / 1.0911 | 1.1619 / 1.0632 / 1.1392 / 1.2279 | 34.6→31.7 … 51.3→47.0 |
+| kl02 | 1 / 2 / 4 / 8 | 4→11, 4→11, 4→11, 5→11 | 1.0794 / 1.2711 / 1.3278 / 1.2406 | 1.1367 / 1.3301 / 1.4620 / 1.4160 | 25.5→23.6 … 31.3→25.2 |
+| nw14 | 1 / 2 / 4 | 4→24, 6→24, 12→24 | 1.8005 / 1.4784 / 1.0537 | 1.6687 / 1.6741 / 1.2990 | 76.5→42.5 … 66.1→62.8 |
+
+Per matrix: bibd_17_8 1.1533, kl02 1.2261, nw14 1.4103 on float32, geomean **1.2587, z +3.86**; and
+1.1465 / 1.3301 / 1.5367 on float64, geomean **1.3282, z +3.36**. **Not one of the eleven cells is a
+regression.** Inert on the other 265 at 0.9989 and 0.9986 against floors of 1.0008 and 0.9992.
+
+Four properties that make this different in kind from every other thread-count arm here:
+
+- **It moves nothing on the guarded workloads.** Zero cells, across three pool sizes, eleven GCN and
+  autoencoder and dlmc shapes, twelve widths. And by mechanism rather than by a condition: the raise
+  clause only ever *raises* a count the row proxy held down, and the GCN and AE shapes already resolve
+  high through the base bound and the adoption, so there is nothing for it to lift.
+- **It is not a constant.** It is a one-bit choice between two work measures that both already exist.
+  There is no grain to ladder and nothing to fit.
+- **It does not change the partition mode.** Asked of the binary at both counts on all three hosts,
+  every cell is back-stealing before and after — so this is a worker-count change and not two changes
+  at once, which the non-monotonic thread ladders in this file made a real worry.
+- **The three matrices it moves are the deficit**: kl02, nw14 and bibd_17_8 are 13 of the 31 float32
+  and 12 of the 17 float64 cells behind MKL.
+
+**It also contradicts chain79 on one cell and the contradiction is unresolved.** chain79 recorded nw14
+k=1 going 4 → 24 workers as 44.80 → 59.70 µs, a ratio of 0.750. chain93 records the same matrix, the
+same width, the same host and the same 4 → 24 transition as 76.5 → 42.5 µs, a ratio of 1.8005 — and
+even the 4-worker baseline differs, 44.80 against 76.5. Something between the two runs changed both
+the baseline and the sign. Back-stealing shipped in that interval and changes how work is handed out,
+which would plausibly do exactly this, but that is a hypothesis and not a measurement. chain93 is on
+today's binary with a same-code floor and 265 inert cells as a control; chain79's number should not be
+quoted for today's code until the difference is explained.
+
+### But it regresses on ARM, so it does not ship
+
+The M5, pool 6, where the raise lands on 6 workers rather than 11 or 24 because
+`SCORCH_SPMM_NT_CAP = -2` caps at the caller's pool:
+
+| matrix | k | workers | float32 | float64 | floor (f32) |
+|---|---|---|---|---|---|
+| kl02 | 1 | 4→6 | **0.9263** | **0.9418** | 1.0374 |
+| kl02 | 2 | 4→6 | **0.8092** | 1.0754 | 1.0030 |
+| kl02 | 4 | 4→6 | 1.0364 | 1.0784 | 1.0066 |
+| kl02 | 8 | 5→6 | 1.0244 | 1.0823 | 1.0012 |
+| nw14 | 1 | 4→6 | 1.1819 | 1.1692 | 1.0195 |
+
+kl02 at k=2 loses 19% on float32, well outside its 1.0030 floor, and k=1 loses on both dtypes. A
+forced-count ladder on that host — the count forced after the policy and the adoption, so nothing but
+the count differs, and the partition mode confirmed constant at every rung — says kl02 at k=2 genuinely
+prefers **exactly** 4: forcing 3 reads 0.7353, 4 reads 1.0048, 5 reads 0.8022, 6 reads 0.8432. So the
+ARM loss is a real property of that host and not an artefact, and the first guess — that 6 workers
+saturates the M5's six performance cores and starves the OS — is **refuted**, because 5 is as bad as 6.
+
+So `raise` is arm-variant, which is the ground the row split and the physical-core cap were both
+rejected on, and it cannot ship on this evidence. What is different is the shape of the problem: the
+x86 gain is large, clean and exactly on target, and the ARM loss is two cells of one matrix. MKT is
+running and will say whether the x86 half replicates.
