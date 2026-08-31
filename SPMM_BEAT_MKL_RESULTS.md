@@ -17128,3 +17128,69 @@ a reading. Both hosts need a fresh login, and the Duo passcode batch sent at 12:
 reach this Mac's Messages database, so the login stopped rather than retrying. Running `m5_wstat.py` and
 `m5_teamcost.py` against a hooks build on each host is what closes it, and it would also say whether the
 cliff-at-the-fast-core-count shape has an x86 analogue on redwood's 8 P + 16 E part.
+
+### chain95 on redwood: the team cost measured rather than bounded, and it is 10 to 18 times smaller
+
+The section above closed with the x86 per-worker cost as an upper bound (<= 1.71 us, derived from
+chain94's kl02 timings by assuming perfect scaling) because both hosts needed a login and the passcode
+did not arrive. It arrived on the second attempt — the reader was at fault, not the SMS, see the note
+at the end — so here is the reading. Same instrumented tree, same harness, and the two matrices copied
+over so both hosts measure byte-identical input; the synthetic cells are generated from a fixed seed
+and are identical by construction.
+
+Region wall on the 4544-nonzero cell, where the arithmetic is a couple of microseconds and the rest is
+overhead. `nthreads_override` is 32 in every arm so the final cap cannot clip the wide teams:
+
+```
+                 T=1  T=2  T=4  T=6  T=8  T=10 T=12 T=16 T=20 T=24 T=28 T=32
+  redwood pool 8  2.1  2.3  3.4  3.3  4.1  5.1  5.5  6.4  8.4  9.0  8.5 12.4
+  redwood pool 24 2.1  2.9  3.2  3.7  4.1  5.3  6.9  7.0  7.5  8.7 12.0 15.5
+  M5 (any pool)   1.7  6.6 12.2 21.4   --   --   --   --   --   --   --   --
+```
+
+**Per added worker, four to eleven: 0.26 us on redwood (pool 8) and 0.46 (pool 24), against 4.75
+measured on the M5.** A factor of ten to eighteen. Even widening redwood all the way from four to
+thirty-two costs 0.32 us a worker — twenty-eight extra workers for less than the M5 pays for two. The
+bound of 1.71 held and was conservative.
+
+**There is no cliff on redwood, and in particular none at eight.** That part is 8 P-cores plus 16
+E-cores and `scorch_pcore_count` reports 8, so the M5's shape would put a step there: T=7 / 8 / 9 read
+4.0 / 4.1 / 4.4 at pool 8 and 4.5 / 4.1 / 5.0 at pool 24. Smooth through the P-core count, through the
+pool, and past it.
+
+The per-worker entry offsets say why, on the actual regressing cell. kl02, float32, k=1, as
+`entry us -> busy us`:
+
+```
+  redwood  4 workers:  1.0->14.9  1.6->15.8  1.6->16.6  1.6->12.7                        region 20.1
+  redwood  6 workers:  1.3->11.3  1.8->11.0  1.9-> 9.6  1.9-> 9.8  2.0->10.5  2.0-> 9.8  region 15.0
+  M5       4 workers:  1.7->19.3  7.7->12.4  7.1->12.4  6.1->12.8                        region 26.6
+  M5       6 workers:  2.7->14.5 10.3-> 7.9  9.1-> 8.7  7.9-> 9.9  8.5-> 9.3 15.4-> 6.5  region 31.0
+```
+
+Every worker on redwood is running within 1.0 to 2.0 us at both counts, so the region falls 20.1 -> 15.0
+and the raise is nearly free to take. On the M5 the helpers arrive at 6-10 us and the sixth at 15.4, so
+the region grows 26.6 -> 31.0. `wall - max(busy)` is 3.5 and 3.7 us on redwood at four and six workers,
+flat, against 7.2 and 16.5 on the M5.
+
+Note also that the critical worker's busy time is 16.6 us on redwood and 19.3 on the M5, and the whole
+call is 27.1 against 38.6. **The two hosts run this kernel at comparable speed.** Kernel length is not
+the discriminator between them; the discriminator is entirely how much ceiling the pool allows the raise
+to buy, and what a worker costs to start.
+
+### Why the login failed the first time, since it looked exactly like a missing SMS
+
+`duo-sms-code` reported "no passcode from 386767 within 120s". The SMS had in fact arrived at 12:34:04,
+four seconds into the window, and its row was inserted in date order (ROWID 187240, below the 13:12
+message's 187244), so it existed in the database while the reader was polling. The reader could not see
+it: it opened `~/Library/Messages/chat.db` with `mode=ro`, and recent messages live in the `-wal`
+sidecar, which a read-only connection does not reliably read. The row became visible when the WAL was
+checkpointed at 13:56 — 82 minutes later, at which point the same reader returned the code immediately.
+
+Fixed by reading a CLONE of the database plus its `-wal` and `-shm`, re-cloned on every poll and opened
+read-write so SQLite replays the log; on APFS `cp -c` clones by reference so the 300 MB file is free to
+copy. The originals are only ever read. The reader also now refuses if it could not clone even once,
+because "nothing was searched" and "no passcode arrived" are different answers and it was reporting the
+second for the first. `myth-login`'s wait went from 120s to 240s as well, since the code is valid for
+five minutes and waiting longer costs nothing. Originals saved beside both scripts as
+`.bak-20260831`.
