@@ -16035,3 +16035,71 @@ preferred a 1024 KB bound (redwood 1.0929/1.0518, MKT 1.0388/1.1551, against 64 
 0.9516/1.0723) while the cells it excludes preferred 16 KB (0.7451 against 1024 KB's 0.6014). High
 degree and few rows want coarse segments, low degree and many rows want fine ones. A 256 KB arm is in
 the next round; the shipped 64 KB is not obviously the right point and will not stay there by default.
+
+## Verdict on the row split: NO-GO, and it is arm-variant across hosts
+
+With the setup free, the width derived, the multirow kernel restored and the firing set measured at
+61 repetitions over three passes -- which brought redwood's same-code floor on those cells from a
+0.837-1.136 band down to 0.973-1.036 -- the three hosts do not agree, and the two that matter say no.
+
+```
+  cells the gate fires on (3 matrices x 4 widths)     float32   float64   same-code floor
+    redwood, pool 24                                  0.9430    0.9104   0.9888 / 0.9956
+    MKT,     pool 32                                  0.9303       --    0.9928
+    M5,      pool 6                                   1.0139    1.0316   0.9994 / 1.0027
+
+  cells the gate declines
+    redwood  160 cells                                1.0002       --    1.0012
+    M5       648 cells                                0.9992       --    1.0007
+```
+
+Neutrality where the gate declines is solid on every host. But a mechanism that costs 6-9% on two
+x86 hosts and gains 1-3% on one ARM host, on the very cells it was built for, fails the standard: it
+is arm-variance across hosts, which is the same ground the physical-core cap was rejected on.
+
+**Per matrix, the two x86 hosts agree, and the pattern has a mechanism.** Speedup against `off`:
+
+```
+  matrix      imb  rows  ceiling  binds at        redwood k=1/4/16/64        MKT k=1/4/16/64
+  connectus     7   512     9.4   24 and 32   1.112 1.178 1.367 1.331   1.257 1.369 1.237 0.968
+  nw14          6    73     9.9   24 and 32   1.357 1.039 0.736 0.490   1.095 0.939 0.831 0.566
+  kl02          2    71    27.8   32 only     0.668 1.003 0.859 0.709   0.664 0.948 0.740 0.905
+```
+
+"Ceiling" is nnz divided by the longest single row: the most workers a whole-row partition can ever
+use. It explains two of the three. **kl02's ceiling is 27.8**, and redwood's thread policy resolves
+these cells to 18 workers, so on redwood kl02 is not ceiling-bound at all -- there is nothing for a
+split to recover and only cost to pay, which is what it reads. **connectus is bound at both counts
+and it wins on both hosts**, by 0.71 ms at k=64 on redwood (2.87 ms to 2.15, and 1.95 with a coarser
+footprint bound -- 1.47x) and by 1.36x at k=64 on MKT with the same setting.
+
+**nw14 is the failure, and it is a real one.** It is ceiling-bound at 9.9 of 18 workers, so the
+partition has about 1.8x of headroom by construction, and it loses 0.72 ms at k=64 on redwood
+(0.696 ms to 1.420) and 0.40 ms on MKT. The `setup` arm reads 0.668 ms against `off`'s 0.696, so the
+construction is free and the loss is inside the loop. No width tested recovers it: at k=64 on redwood
+the segment widths 256 / 1024 / 1767 nonzeros read 0.490 / 0.735 / 0.426, and the best cell anywhere
+in the sweep is 0.946. What distinguishes it from connectus is the length of the rows it is NOT
+splitting -- connectus averages 1971 nonzeros over its other 511 rows, nw14 averages 11305 over its
+other 72 -- so on nw14 the split replaces work the kernel does at its most efficient with units an
+order of magnitude shorter, and on connectus it does not.
+
+A gate that admitted connectus and excluded nw14 would be worth having, and I could not find one that
+was a mechanism rather than a fit to three matrices. Both are ceiling-bound, both hold about a tenth
+of their nonzeros in one row, and both have mean degree over 2000; what separates them is a fourth
+quantity -- the typical length of the unsplit rows against the segment width -- that is a plausible
+rule with three data points behind it and no independent confirmation. Writing that threshold now
+would be exactly the overfit the performance convention forbids.
+
+So the split stays in the tree and off: `SCORCH_SPMM_SPLIT_MIN_IMBALANCE` is 0, the whole mechanism is
+behind `SCORCH_SPMM_SPLIT_ENABLED` and absent from a release object, 19 tests cover it, and the
+release SpMM emits 0 of 256 kernel-family symbols differently from before it existed. The ablation
+hooks that priced it -- `setup` for the construction, `body` for the redirected loop, and the
+footprint sweep -- stay with it, because the next person to ask this question should not have to
+rebuild the instrument.
+
+**And the standing conclusion about the residual is unchanged, but sharper.** The whole-row ceiling is
+real, it is what caps nw14 / connectus / kl02, and connectus shows the ceiling can be relieved for a
+1.3-1.5x gain. What is now measured is that relieving it by splitting rows costs more than it recovers
+on two of the three, because the mechanisms that make the row loop fast -- whole-row register blocking
+and tiling, the multirow kernel, an induction variable on the output pointer, one claim per row -- are
+worth more than the balance a split buys back.
