@@ -3332,8 +3332,15 @@ torch::Tensor spmm_csr_v2_core(
                 const int* SCORCH_RESTRICT A1_crd,
                 const scalar_t* SCORCH_RESTRICT A_val,
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
-                int tile_size, int nthreads_override, bool atparallel,
-                const int* SCORCH_RESTRICT unit_row = nullptr) {
+                int tile_size, int nthreads_override, bool atparallel
+#if SCORCH_SPMM_SPLIT_ENABLED
+                // Not merely defaulted to nullptr: a twelfth parameter goes on the stack in this
+                // ABI, so a default argument made every call site store a zero there and cost the
+                // two forwarders their tail call (3 instructions became 12). Absent when the
+                // mechanism is compiled out, present when it is.
+                , const int* SCORCH_RESTRICT unit_row = nullptr
+#endif
+                ) {
   // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it,
   // A0_size and A1_pos describe UNITS -- a whole row, or one segment of a row wide enough to be
   // split across workers -- and unit_row[i] says which output row unit i writes.
@@ -3353,7 +3360,6 @@ torch::Tensor spmm_csr_v2_core(
   // many short rows went to 0.4474 of MKL while the ones the split is for went to 1.1843. Here an
   // unsplit row is written once, in place, by the worker that claimed it, exactly as before, and
   // only the segments of a split row need a second pass.
-  if (!REDIRECT) (void)unit_row;
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
   // Output allocation + zeroing. Every code path below (regblock / regtile /
@@ -4354,7 +4360,11 @@ torch::Tensor spmm_csr_v2_core(
         const int pA_end   = A1_pos[i + 1];
         // The one place a claimed unit becomes an output row. REDIRECT is false in every existing
         // caller, so on the shipped path this IS `i` and no instruction is emitted for it.
+#if SCORCH_SPMM_SPLIT_ENABLED
         const int out_row = REDIRECT ? unit_row[i] : i;
+#else
+        const int out_row = i;
+#endif
         if (pA_begin == pA_end) {
           // Structurally empty, so there is nothing to compute -- and this worker
           // has the row in hand, so it zeroes it here rather than in a pass of its
