@@ -16689,3 +16689,57 @@ one rule; it is that a single scalar work measure cannot name this optimum at al
 It is also dtype-specific, which no mechanism on offer explains: kl02 at k=2 on **float64** *gains*
 from six workers (1.034 / 1.030 / 1.045) where float32 loses 20%. Recorded as measured and unexplained
 rather than fitted to a story.
+
+## MKT closes chain93: the pair is dead on all three hosts, and the raise replicates on x86
+
+50 matrices — the loser class, twelve dlmc few-row layers, 32 unselected — six widths, three passes,
+eight arms, pool 32.
+
+```
+  float32   basework   0 cells (predicted null, confirmed)   raise     12  1.1912 (floor 0.9988)
+            adopt    127  1.0814 (floor 1.0009)              bw_ad    177  0.7428 (floor 1.0001)
+            bw_ad_lo 150  0.8744                             bw_ad_hi 177  0.7429
+  float64   adopt    127  1.0372 (floor 1.0006)              raise     12  1.3020 (floor 1.0012)
+            bw_ad    177  0.6799 (floor 1.0014)              bw_ad_hi 177  0.6805
+```
+
+**`bw_ad` is dead on the third host too**, and every family is negative: unselected 0.6923 (z −7.04),
+loser class 0.6236 (z −5.52), few-row layers 0.7944 (z −4.56), transformer family 0.8887 (z −4.42).
+Three hosts, two dtypes, three grains, no survivors. chain59 is finished.
+
+**`adopt` alone disagrees in sign across hosts** — 0.8966 on redwood, 1.0814 on MKT, and 1.1931 on the
+M5 where all five of its cells were one matrix. Three hosts, three answers. Dead.
+
+### `raise` replicates on the second x86 host, and brings one regression with it
+
+| host | float32 per matrix | z | float64 per matrix | z | cells moved | inert |
+|---|---|---|---|---|---|---|
+| redwood, pool 24 | **1.2587** | +3.86 | **1.3282** | +3.36 | 11 of 276 | 0.9989 (floor 1.0008) |
+| MKT, pool 32 | **1.1912** | +2.22 | **1.3020** | +2.89 | 12 of 300 | 0.9981 (floor 0.9991) |
+
+Per matrix on MKT: kl02 1.3880 / 1.5581, nw14 1.1415 / 1.2234, bibd_17_8 1.0667 / 1.1579. kl02 at k=2
+goes 68.5 → 46.4 µs on float32 and 105.7 → 60.5 on float64; nw14 at k=1 goes 118.0 → 86.1 and
+307.3 → 175.4.
+
+**But MKT has a regression the redwood grid did not: nw14 at k=8 on float64, 0.8212** — 24 → 32
+workers, 127.3 → 155.0 µs, against a 1.0081 floor. On float32 the same cell reads 0.9709 against a
+0.9827 floor, inside it.
+
+So across three hosts `raise` has **three** regressions, and they share a property: every one is a
+cell where the raise reaches **the caller's whole pool**. MKT's nw14 k=8 goes to 32, and this
+allocation is 32 logical CPUs over 16 physical cores, so 32 workers is SMT oversubscription — which
+this file has already measured as a cost in its own right (forcing 32 read 0.8599 and 0.8955 on the
+smallest band). The M5's kl02 cells go to 6, which is every performance core it has. redwood's pool of
+24 is *below* its 32 logical CPUs, so raising to 24 leaves headroom, and redwood has no regression at
+all — including nw14 k=1, which reaches 24 and gains 1.80x.
+
+That is a mechanism and not a fit, but the obvious move it suggests — cap the raise below the pool
+where the pool is the whole allotment — is the physical-core cap, which this file has already measured
+and **rejected**: 1.24-1.35x on the native symbol but −9 to −11% on the caller path. So the mechanism
+that explains the regressions does not come with a fix that is free.
+
+The deciding measurement is now running on both x86 hosts: two release builds against MKL, sliced with
+the build order rotated inside each slice and MKL timed in the same process as ours in every cell.
+chain93 cannot answer it — a hooks object pays 54 getenv lookups a call and MKL pays none, which on a
+25 µs kernel is most of the gap being argued about. Until that lands, the +19% to +33% is a gain
+against **our own** previous count and not a claim about crossing a competitor.
