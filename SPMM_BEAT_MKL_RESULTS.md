@@ -16232,3 +16232,83 @@ harness restating the production gate, an arm that was a silent duplicate of ano
 object did not implement its mode, and now an arm that measured a different configuration rather
 than a slower one. The pattern in all four is the same -- the check that would have caught it was
 the one nobody wrote, because the wrong answer looked like an answer.
+
+## chain59 has refused to run four times, and asking its question offline changed the question
+
+`SCORCH_SPMM_BASE_WORK_TRUE` and `SCORCH_SPMM_RAISE_ON_FLOORED` correct the two bounds on the worker
+count, which use different work measures and fail in opposite directions. Between them they are aimed
+at 21 of the 31 float32 and 15 of the 17 float64 cells still behind MKL. chain59 was queued to price
+them on 28 August and refused four times, correctly: the hooks object it pointed at predated
+`BASE_WORK_TRUE`, so its arms would have been silent duplicates. The guard did its job and the chain
+then sat.
+
+Both hooks are in the tree today, so before spending host time I asked the resolver directly — the
+count is exported, so a harness can ask what each arm resolves instead of timing first and
+interpreting after. That query changed the arm set, and it is worth writing down because two of
+chain59's three arms could not have said anything.
+
+**`BASE_WORK_TRUE` alone moves no count on the caller path.** Not on kl02, not on nw14, not on the
+rn50 blocks, and not on the 256-row / 294912-nonzero product its own source comment is written about.
+The reason is the third bound, which the chain's design did not account for: the composition adoption
+at the end of the resolver re-raises the count to `min(pool, rows/16)`, and its grading by real
+arithmetic ships off (`SCORCH_SPMM_ADOPT_GRAIN` is 0). Correcting the base bound and then having the
+adoption undo it is the whole of that arm.
+
+The mechanism was checked causally rather than read off the source, because a cause you have not made
+happen twice is a guess. Grading the adoption makes the arm live on 10 of 12 probe cells:
+
+| shape | k | ships | `BASE_WORK_TRUE`, adoption ungraded (as shipped) | `BASE_WORK_TRUE`, adoption graded |
+|---|---|---|---|---|
+| rn50 256-row block | 1 / 2 / 4 | 16 | 16 / 16 / 16 | **1 / 3 / 7** |
+| 64-row layer | 1 / 2 | 4 | 4 / 4 | **1 / 3** |
+| kl02, 71 rows | 1 / 2 | 4 | 4 / 4 | **1 / 2** |
+| 1024-row | 1 / 2 / 4 | 18 | 18 / 18 / 18 | **1 / 3 / 7** |
+
+**Grading the adoption alone moves almost nothing either**, and for the mirror-image reason: the
+adoption can only *raise* a count, so where the base bound has already returned the high number,
+lowering what the adoption would have raised to changes nothing. It is live on exactly one family —
+the 64-row pruned layers, 4 workers to 1 — because there the adoption is what raised the count.
+
+So the two corrections show only **together**, which is what chain59's own `both` arm was for; the
+design note even says "fixing one could move the error to the other rather than remove it". What it
+did not know is that one of its two single arms is a structural null and the other nearly so, so the
+pair is not a third data point, it is the only one.
+
+**Together they point the way the evidence already says is right.** On a pool of 32, the pair lowers
+the count on exactly the families chain79's force ladders found *over*-threaded:
+
+```
+  dlmc transformer, 512 rows   18 -> 1 / 1 / 3 / 7 / 14   at k=1/2/4/8/16
+  rn50 256-row block           16 -> 1 / 3 / 7 / 15       at k=1/2/4/8
+  rn50 64-row layer             4 -> 1                    (the adoption alone moves this one)
+  kl02, 71 rows                 4 -> 1 / 2                at k=1/2
+  1M-nonzero 4096-row           18 -> 6 / 13              at k=1/2   <-- the regression risk
+```
+
+The transformer family is 19 of the 31 float32 below-MKL cells and every one of them is at k=4, where
+the pair asks for 3 workers instead of 18. chain79 measured 1.1769-1.2031 from forcing 2 workers
+against the policy's 4 on the M5's rn50 layers, and 1.2373 from forcing 8 against 24 on redwood's
+inert group at k=1. So this is the direction with measurements behind it.
+
+**`RAISE_ON_FLOORED` points the other way** — kl02 4 to 11, nw14 4 to 18, bibd_17_8 8 to 18 — and
+chain79's ladders say every forced count from 8 to 32 is at or below shipping on those cells at k=1.
+Its arm is in the run anyway, because a direction refuted on another chain's corpus should be
+confronted with data in this one rather than inherited.
+
+**Two properties this does not have yet, and neither is a formality.** The counts are what the
+resolver answers; whether the *kernel* is faster at those counts is a measurement, and chains 93 (on
+redwood) and MKT 17146988 are it, over the loser class plus the families the change must not harm
+plus thirty unselected matrices — never a corpus chosen for already losing, which reversed the sign
+of a conclusion here once. And 150000 is the existing `SCORCH_GRAIN_SPMM` rather than a constant read
+off a host, but "not fitted" is a claim about provenance; the runs ladder 75000 and 300000 beside it
+so insensitivity is shown rather than asserted.
+
+`basework` alone stays in both runs as a **predicted null** and the probe refuses to start if it
+moves a count, since the prediction coming out backwards would mean the object or the harness is not
+what it is thought to be. Its column is a second noise floor.
+
+One more instance of the recurring defect, caught by its own guard: the liveness check refused the
+first arm set because `adopt` moved nothing on any of its probe shapes — and it was right about the
+shapes it had, which omitted the 64-row low-nonzero layer that is the only place that arm binds. A
+liveness guard whose probe shapes exclude the case a knob binds on reports a live knob as dead. That
+is the second time in this project the guard itself has been the thing that was wrong.
