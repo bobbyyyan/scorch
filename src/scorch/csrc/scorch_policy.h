@@ -437,6 +437,12 @@
 // It is also checked BEFORE the imbalance probe, because it is two integer operations and the probe
 // is sixty-four binary searches: on a corpus where the probe ran on everything above the nonzero
 // floor, cells the gate declined still read 0.9730 against a 1.0021 floor on float32.
+// The most wide rows the split will describe. One per equal-nonzero cut is the structural bound --
+// a wider row swallows a cut rather than adding one -- so the reference width caps it, and this is a
+// stack array rather than an allocation.
+#ifndef SCORCH_SPMM_SPLIT_REFN_MAX
+#  define SCORCH_SPMM_SPLIT_REFN_MAX 1024
+#endif
 #ifndef SCORCH_SPMM_SPLIT_MIN_DEGREE
 #  define SCORCH_SPMM_SPLIT_MIN_DEGREE 256L
 #endif
@@ -1548,6 +1554,41 @@ inline int scorch_spmm_row_imbalance(const int* A1_pos, long rows, long refn) {
 //     output itself, so the width rises with k and with the element size to hold that under
 //     SCORCH_SPMM_SEG_SCRATCH_KB. At k=256 float64 and a hundred million nonzeros that is a 32768
 //     segment and about six megabytes of partials; at k=4 it is the floor and 56 kilobytes.
+// The rows the split cares about, found WITHOUT a pass over the degrees.
+//
+// A row whose nonzero interval is longer than the spacing between equal-nonzero cuts must contain at
+// least one cut, because an interval longer than the spacing always contains a multiple of it. So
+// locating the refn-1 cuts -- the same binary searches scorch_spmm_row_imbalance already does --
+// yields a set that contains EVERY row of degree above nnz/refn. It may also contain narrower rows,
+// which is harmless: the caller and the kernel both apply the same degree test, so a narrow row in
+// the set contributes nothing.
+//
+// This exists because scanning every degree was measured to be the entire cost of the mechanism on
+// matrices with many short rows. Even a parallel two-pass scan cost 42% of a 111-microsecond kernel
+// on a 40216-row matrix, most of it two thread-pool launches for five blocks of trivial work.
+// Returns the number of rows written, ascending, or -1 if they do not fit in cap.
+inline long scorch_spmm_wide_rows(const int* A1_pos, long rows, long refn, long min_deg,
+                                 int* out, long cap) {
+  if (!A1_pos || rows <= 0 || refn <= 1 || !out || cap <= 0) return 0;
+  const long nnz = (long)A1_pos[rows];
+  if (nnz <= 0) return 0;
+  long n = 0, prev = -1;
+  for (long w = 1; w < refn; ++w) {
+    const long target = nnz * w / refn;
+    long lo = 0, hi = rows - 1;
+    while (lo < hi) {
+      const long mid = lo + ((hi - lo + 1) >> 1);
+      if ((long)A1_pos[mid] <= target) lo = mid; else hi = mid - 1;
+    }
+    if (lo == prev) continue;                 // the cuts are ascending, so equal means adjacent
+    prev = lo;
+    if ((long)A1_pos[lo + 1] - (long)A1_pos[lo] <= min_deg) continue;
+    if (n >= cap) return -1;
+    out[n++] = (int)lo;
+  }
+  return n;
+}
+
 inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
   long budget = (long)SCORCH_SPMM_SEG_SCRATCH_KB * 1024L;
 #ifdef SCORCH_TUNE_HOOKS
@@ -1565,6 +1606,27 @@ inline long scorch_spmm_seg_width(long nnz, long k, long elem_size) {
   }
   return seg;
 }
+
+// What the row-split partition hands the kernel. Deliberately NOT an array over rows.
+//
+// The first design built one entry per row, and that was measured to be the whole cost of the
+// mechanism on matrices with many short rows: a hooks arm that constructed the arrays and then ran
+// the UNSPLIT kernel read 0.451 of the unsplit kernel on a 600000-row matrix of mean degree 9 at
+// k=1, while the split itself read 1.021 of that arm. The construction was the loss, entirely.
+//
+// So there is no per-row array. Units [0, n_row_units) ARE the rows, and a row wider than one
+// segment is truncated to its first segment -- which needs no lookup, because a row is split
+// exactly when its degree exceeds `seg`, so its first unit is [A1_pos[i], A1_pos[i] + seg). Only
+// the LATER segments need describing, and there are nnz/seg of them at most, never rows of them.
+struct ScorchSplitPlan {
+  long n_row_units;   // units below this index are rows; at or above, entries of the arrays below
+  long seg;           // segment width in nonzeros: how much of a wide row one unit covers
+  long wide_deg;      // a row is split exactly when its degree EXCEEDS this; see scorch_spmm_wide_rows
+  long nnz_total;     // A1_pos[rows]; passed because A1_pos is indexed by ROW, not by unit
+  long slot_base;     // extra unit x writes output row slot_base + x, a scratch row past the output
+  const int* x_pos;   // later segments: first nonzero
+  const int* x_end;   //                 one past the last nonzero
+};
 
 // The whole gate in one function, so the kernel and any harness ask the same code rather than two
 // copies of the same rule that can drift apart. Returns the segment width the row-split partition

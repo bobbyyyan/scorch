@@ -3338,12 +3338,17 @@ torch::Tensor spmm_csr_v2_core(
                 // ABI, so a default argument made every call site store a zero there and cost the
                 // two forwarders their tail call (3 instructions became 12). Absent when the
                 // mechanism is compiled out, present when it is.
-                , const int* SCORCH_RESTRICT unit_row = nullptr
+                , const ScorchSplitPlan* split = nullptr
 #endif
                 ) {
-  // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it,
-  // A0_size and A1_pos describe UNITS -- a whole row, or one segment of a row wide enough to be
-  // split across workers -- and unit_row[i] says which output row unit i writes.
+  // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it
+  // A0_size counts UNITS: the first `split->n_row_units` of them are the rows, each truncated to
+  // its first segment if it is wider than one, and the rest are the later segments of those wide
+  // rows. See ScorchSplitPlan for why there is no array over rows -- building one was measured to
+  // be the entire cost of the mechanism on matrices with many short rows.
+  //
+  // Under REDIRECT, A1_pos is still indexed by ROW and so cannot be indexed by A0_size; every such
+  // use below takes split->nnz_total or split->n_row_units instead.
   //
   // It is a TEMPLATE parameter and not a null pointer test for a measured reason. As a runtime
   // check the compiler put the select inside the row loop rather than hoisting it: the float64
@@ -3360,6 +3365,17 @@ torch::Tensor spmm_csr_v2_core(
   // many short rows went to 0.4474 of MKL while the ones the split is for went to 1.1843. Here an
   // unsplit row is written once, in place, by the worker that claimed it, exactly as before, and
   // only the segments of a split row need a second pass.
+  // Two shorthands, so the row-indexed reads below say which quantity they mean. Both fold to the
+  // ordinary expression when REDIRECT is false, which is every existing caller.
+#if SCORCH_SPMM_SPLIT_ENABLED
+#  define SCORCH_SPMM_NNZ_TOTAL \
+     (REDIRECT ? split->nnz_total : (A0_size > 0 ? (long)A1_pos[A0_size] : 0L))
+#  define SCORCH_SPMM_ROW_UNITS (REDIRECT ? (int)split->n_row_units : A0_size)
+#else
+#  define SCORCH_SPMM_NNZ_TOTAL (A0_size > 0 ? (long)A1_pos[A0_size] : 0L)
+#  define SCORCH_SPMM_ROW_UNITS A0_size
+#endif
+
   const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
 
   // Output allocation + zeroing. Every code path below (regblock / regtile /
@@ -3488,7 +3504,7 @@ torch::Tensor spmm_csr_v2_core(
     // only where the credit provably changes nothing.
     bool do_scan = true;
     if (zero_mode == 2 || zero_mode == 3) {
-      const long nnz_all = A0_size > 0 ? (long)A1_pos[A0_size] : 0L;
+      const long nnz_all = SCORCH_SPMM_NNZ_TOTAL;
       const long keff = B1_size < 16 ? 16L : (long)B1_size;
       const long w_lo = nnz_all * keff;                            // no empty row
       const long w_hi = w_lo + (long)A0_size * (long)C1_size;      // every row empty
@@ -3509,7 +3525,7 @@ torch::Tensor spmm_csr_v2_core(
         if (v == 1) do_scan = false; else if (v == 2) do_scan = true; } }
 #endif
     if (do_scan)
-      for (int i = 0; i < A0_size; i++)
+      for (int i = 0; i < SCORCH_SPMM_ROW_UNITS; i++)
         empty_rows += (A1_pos[i] == A1_pos[i + 1]) ? 1 : 0;
     if (empty_rows != 0 && zero_mode <= 1) {
       const int64_t empty_elems = empty_rows * (int64_t)C1_size;
@@ -3527,7 +3543,7 @@ torch::Tensor spmm_csr_v2_core(
         // cells, against 0.430 and 0.448 for mode 2).
         scorch_zero_dense(C_values, (int64_t)A0_size * (int64_t)C1_size);
       } else {
-        for (int i = 0; i < A0_size; i++)
+        for (int i = 0; i < SCORCH_SPMM_ROW_UNITS; i++)
           if (A1_pos[i] == A1_pos[i + 1])
             memset(C_values + (size_t)i * (size_t)C1_size, 0, out_row_bytes);
       }
@@ -3572,7 +3588,7 @@ torch::Tensor spmm_csr_v2_core(
   // barriers than computing — so scorch_nthreads throttles it; the cap only binds
   // below ~GRAIN*num_procs, so large products keep every core. `chunk` is the
   // number of rows each worker steals per next_row.fetch_add below.
-  const int total_nnz = A1_pos[A0_size];
+  const int total_nnz = (int)SCORCH_SPMM_NNZ_TOTAL;
   // Thread-cap work measure: a B-row gather touches a full 64B cache line (16
   // f32) regardless of how narrow k is, so a tall-skinny product (many rows,
   // k<16) is memory-bound at ~one line per nnz. Crediting only nnz*k here
@@ -3610,7 +3626,7 @@ torch::Tensor spmm_csr_v2_core(
   const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
                                             (long)total_nnz * (long)B1_size,
                                             (long)total_nnz);
-  const long nnz_total = A0_size > 0 ? (long)A1_pos[A0_size] : 0;
+  const long nnz_total = SCORCH_SPMM_NNZ_TOTAL;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
 
@@ -4112,7 +4128,7 @@ torch::Tensor spmm_csr_v2_core(
       if (v <= 0) {
         narrowk_gather = 0;
       } else {
-        const long mean_row = A0_size > 0 ? (long)(A1_pos[A0_size] / A0_size) : 0;
+        const long mean_row = A0_size > 0 ? (long)(SCORCH_SPMM_NNZ_TOTAL / A0_size) : 0;
         narrowk_gather = (mean_row >= v) ? 1 : 0;
       }
     } }
@@ -4175,6 +4191,18 @@ torch::Tensor spmm_csr_v2_core(
   // cross-runtime thread-team reformation at each op boundary — the drop-in-
   // pipeline "same thread pool" composition. Work distribution is byte-identical
   // (same next_row atomic, same regblock/regtile kernels); only the launch differs.
+#if SCORCH_SPMM_SPLIT_ENABLED
+  // The plan's scalars, copied out of the struct BEFORE the loop. Read through the pointer they are
+  // two loads per row that the compiler cannot hoist, because a store to C_values may alias them --
+  // and per-row loads are what decide a matrix of mean degree 9. All three fold away when REDIRECT
+  // is false, which is every existing caller.
+  const long sp_row_units = REDIRECT ? split->n_row_units : 0;
+  const long sp_wide_deg  = REDIRECT ? split->wide_deg : 0;
+  const long sp_seg       = REDIRECT ? split->seg : 0;
+  const long sp_slot_base = REDIRECT ? split->slot_base : 0;
+  const int* SCORCH_RESTRICT sp_x_pos = REDIRECT ? split->x_pos : nullptr;
+  const int* SCORCH_RESTRICT sp_x_end = REDIRECT ? split->x_end : nullptr;
+#endif
   auto scorch_spmm_worker = [&](int worker_id, int team_size) {
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
@@ -4356,14 +4384,30 @@ torch::Tensor spmm_csr_v2_core(
           if (took) { i += multirow - 1; continue; }   // the loop's ++ steps past the group
         }
 #endif
+        // The one place a claimed unit becomes a nonzero range and an output row. REDIRECT is
+        // false in every existing caller, so on the shipped path this is A1_pos[i], A1_pos[i+1]
+        // and `i`, and no instruction is emitted for the rest.
+#if SCORCH_SPMM_SPLIT_ENABLED
+        int pA_begin, pA_end, out_row;
+        if (REDIRECT && (long)i >= sp_row_units) {
+          const long x = (long)i - sp_row_units;
+          pA_begin = sp_x_pos[x];
+          pA_end   = sp_x_end[x];
+          out_row  = (int)(sp_slot_base + x);
+        } else {
+          pA_begin = A1_pos[i];
+          pA_end   = A1_pos[i + 1];
+          // A row is split exactly when its degree exceeds its fair share, so its first unit needs
+          // no lookup: it is the first `seg` nonzeros. This is what lets the plan's arrays be sized
+          // by the split segments and lets the caller find the wide rows without scanning any.
+          if (REDIRECT && (long)(pA_end - pA_begin) > sp_wide_deg)
+            pA_end = pA_begin + (int)sp_seg;
+          out_row = i;
+        }
+#else
         const int pA_begin = A1_pos[i];
         const int pA_end   = A1_pos[i + 1];
-        // The one place a claimed unit becomes an output row. REDIRECT is false in every existing
-        // caller, so on the shipped path this IS `i` and no instruction is emitted for it.
-#if SCORCH_SPMM_SPLIT_ENABLED
-        const int out_row = REDIRECT ? unit_row[i] : i;
-#else
-        const int out_row = i;
+        const int out_row  = i;
 #endif
         if (pA_begin == pA_end) {
           // Structurally empty, so there is nothing to compute -- and this worker
@@ -4383,8 +4427,12 @@ torch::Tensor spmm_csr_v2_core(
           // it: about 3% here.
           if (zero_in_loop) {
             int run = i + 1;
-            if (zero_merge_runs)
-              while (run < end && A1_pos[run] == A1_pos[run + 1]) run++;
+            if (zero_merge_runs) {
+              // Bounded by the row region as well as by the stolen chunk: past it the units are
+              // segments of wide rows, which are never empty, and A1_pos is not indexed by unit.
+              const int run_cap = end < SCORCH_SPMM_ROW_UNITS ? end : SCORCH_SPMM_ROW_UNITS;
+              while (run < run_cap && A1_pos[run] == A1_pos[run + 1]) run++;
+            }
             // The run merge survives the redirection because an EMPTY unit is always a whole empty
             // row -- a segment is carved out of a non-empty range and so is never empty -- and the
             // split numbers units in row order with an unsplit row keeping its own index. So a run
@@ -4771,6 +4819,8 @@ torch::Tensor spmm_csr_v2_core(
   }
 
   return C_values_torch;
+#undef SCORCH_SPMM_NNZ_TOTAL
+#undef SCORCH_SPMM_ROW_UNITS
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4832,71 +4882,92 @@ torch::Tensor spmm_csr_v2_rowsplit(
                                       B1_size, B_val, tile_size, nthreads_override, atparallel);
   }
 
-  // How many EXTRA units the split needs. A row narrower than one segment stays one unit and writes
-  // its output row in place, exactly as it does today; only a row wider than a segment needs slots,
-  // and only ceil(deg/seg) - 1 of them, because its first segment writes the output row directly.
-  // That is the whole difference from the wrapper this replaces, and it is the difference between
-  // paying rows*k and paying (split segments)*k.
+  // Which rows are wide enough to matter, and how many extra units they need. Neither step touches
+  // every row: the wide rows come out of the same binary searches the imbalance probe runs, and the
+  // arrays are sized by the split segments -- at most nnz/seg of them.
+  //
+  // Two earlier versions of this construction were measured and rejected, and both failed the same
+  // way. One entry per row read 0.451 of the unsplit kernel on a 600000-row matrix of mean degree 9
+  // at k=1, with the split itself worth 1.021 of that arm -- construction was the whole loss. A
+  // parallel two-pass block scan over the degrees fixed that one and cost 0.585 on a 40216-row
+  // matrix instead, because five blocks of trivial work still pay two thread-pool launches. So this
+  // version scans nothing.
+  //
+  // A row is split exactly when its degree exceeds nnz/refn, its fair share at the reference width.
+  // Splitting a row that is merely longer than a segment but still under its share buys no balance
+  // and costs a slot, and the threshold is where the probe's own arithmetic already is.
+  long refn_used = SCORCH_SPMM_SPLIT_REFN;
+#ifdef SCORCH_TUNE_HOOKS
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_REFN");
+    if (e && *e) { long v = std::atol(e); if (v > 1) refn_used = v; } }
+#endif
+  const long wide_deg = nnz_total / refn_used;
+  int wide[SCORCH_SPMM_SPLIT_REFN_MAX];
+  const long nwide = scorch_spmm_wide_rows(A1_pos, (long)A0_size, refn_used, wide_deg,
+                                           wide, (long)SCORCH_SPMM_SPLIT_REFN_MAX);
   long extra = 0;
-  for (int r = 0; r < A0_size; ++r) {
-    const long deg = (long)A1_pos[r + 1] - (long)A1_pos[r];
-    if (deg > seg) extra += (deg + seg - 1) / seg - 1;
+  for (long i = 0; i < nwide; ++i) {
+    const long deg = (long)A1_pos[wide[i] + 1] - (long)A1_pos[wide[i]];
+    extra += (deg + seg - 1) / seg - 1;
   }
   const long nunits = (long)A0_size + extra;
   const long buf_rows = (long)C0_size + extra;
-  if (extra == 0 || nunits > (long)std::numeric_limits<int>::max() || buf_rows > (long)std::numeric_limits<int>::max() ||
+  if (nwide <= 0 || extra <= 0 || nunits > (long)std::numeric_limits<int>::max() ||
+      buf_rows > (long)std::numeric_limits<int>::max() ||
       buf_rows * (long)C1_size > (long)std::numeric_limits<int>::max()) {
-    // extra == 0: the imbalance probe answers a question about the widest row relative to the whole
-    // matrix and the segment width answers a different one about absolute size, so they can disagree
-    // and nothing is wide enough to split. The INT_MAX tests are the honest limit of an int32 CSR
-    // index space; falling back rather than truncating is the only correct answer, and nothing has
-    // been allocated yet that the core would have to know about.
+    // nwide <= 0 covers both "no row is over its share after all" and "they did not fit", since the
+    // imbalance probe answers a question about the widest row relative to the whole matrix and this
+    // asks a different one about absolute degree, so they can disagree. The int32 tests are the
+    // honest limit of a CSR index space this narrow; falling back rather than truncating is the only
+    // correct answer, and nothing has been allocated yet that the core would have to know about.
     return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
                                       B1_size, B_val, tile_size, nthreads_override, atparallel);
   }
 
-  // The unit list, in row order, with an unsplit row keeping its own index. Two invariants the core
-  // relies on: unit boundaries are non-decreasing (so unit u ends where unit u+1 begins), and an
-  // empty unit is always a whole empty row, never a segment. Both hold by construction here.
-  std::vector<int> u_pos((size_t)nunits + 1);
-  std::vector<int> u_row((size_t)nunits);
-  // Which output rows got split, and the slot range each one owns. Slots are handed out in row
-  // order and consecutively within a row, so a range is all this needs.
-  std::vector<int> sp_row;
-  std::vector<int> sp_slot0;
-  sp_row.reserve(16);
-  sp_slot0.reserve(17);
+  // x_owner is the row a slot belongs to, recorded here where the row index is in hand. Recovering
+  // it afterwards by walking A1_pos would be O(rows) and serial, which is the cost this whole
+  // construction exists to avoid; the first version of the fold did exactly that.
+  std::vector<int> x_pos((size_t)extra), x_end((size_t)extra), x_owner((size_t)extra);
   {
-    long u = 0, slot = (long)C0_size;
-    for (int r = 0; r < A0_size; ++r) {
-      const long b = (long)A1_pos[r], e = (long)A1_pos[r + 1];
-      if (e - b <= seg) {
-        u_pos[(size_t)u] = (int)b;
-        u_row[(size_t)u] = r;
-        ++u;
-        continue;
-      }
-      sp_row.push_back(r);
-      sp_slot0.push_back((int)slot);
-      bool first = true;
-      for (long q = b; q < e; q += seg) {
-        u_pos[(size_t)u] = (int)q;
-        u_row[(size_t)u] = first ? r : (int)slot++;
-        first = false;
-        ++u;
+    long x = 0;
+    for (long i = 0; i < nwide; ++i) {
+      const long r = wide[i];
+      const long beg = (long)A1_pos[r], fin = (long)A1_pos[r + 1];
+      for (long q = beg + seg; q < fin; q += seg) {
+        x_pos[(size_t)x] = (int)q;
+        x_end[(size_t)x] = (int)std::min(q + seg, fin);
+        x_owner[(size_t)x] = (int)r;
+        ++x;
       }
     }
-    u_pos[(size_t)nunits] = (int)nnz_total;
-    sp_slot0.push_back((int)slot);      // one past the last, so a range is slot0[i]..slot0[i+1]
   }
+
+  ScorchSplitPlan plan;
+  plan.n_row_units = (long)A0_size;
+  plan.seg = seg;
+  plan.wide_deg = wide_deg;
+  plan.nnz_total = nnz_total;
+  plan.slot_base = (long)C0_size;
+  plan.x_pos = x_pos.data();
+  plan.x_end = x_end.data();
+
+#ifdef SCORCH_TUNE_HOOKS
+  // Ablation: build the plan and then throw it away, running the UNSPLIT kernel. The difference
+  // between this and `off` is what the setup costs and nothing else -- no redirection, no fold, no
+  // larger output buffer -- which is the only way to tell a slow setup from a split that does not
+  // pay. It is how the per-row version above was convicted. Compiled out of a release object.
+  { const char* e = std::getenv("SCORCH_SPMM_SPLIT_ABLATE");
+    if (e && std::atol(e) == 1)
+      return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
+                                        B1_size, B_val, tile_size, nthreads_override, atparallel); }
+#endif
 
   // One team, one pass, and the output rows that were not split are written in place by the worker
   // that claimed them -- no copy, no second visit.
   torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
-      (int)buf_rows, C1_size, (int)nunits, u_pos.data(), A1_crd, A_val,
-      B1_size, B_val, tile_size, nthreads_override, atparallel, u_row.data());
+      (int)buf_rows, C1_size, (int)nunits, A1_pos, A1_crd, A_val,
+      B1_size, B_val, tile_size, nthreads_override, atparallel, &plan);
   scalar_t* SCORCH_RESTRICT C_values = C_values_torch.template data_ptr<scalar_t>();
-  const size_t row_bytes = (size_t)C1_size * sizeof(scalar_t);
 
   // Rows past A's last one. The core skips these under a redirection, because there A0_size counts
   // units and the tail it would compute is the scratch region.
@@ -4904,22 +4975,26 @@ torch::Tensor spmm_csr_v2_rowsplit(
     scorch_zero_dense(C_values + (size_t)A0_size * (size_t)C1_size,
                       (int64_t)(C0_size - A0_size) * (int64_t)C1_size);
 
-  // Fold each split row's later segments into its output row, in segment order, so the answer does
-  // not depend on how the work was scheduled or on how many workers ran it. Parallel over the FREE
-  // dimension and not over rows: there may be exactly one split row -- that is the case this exists
-  // for -- and two workers must never add into the same row. This runs after the core's team is torn
-  // down, so it goes through torch's pool rather than forking a private team on the critical path.
-  const int64_t nsplit = (int64_t)sp_row.size();
-  at::parallel_for(0, (int64_t)C1_size, /*grain=*/std::max<int64_t>(1, 32768 / std::max<int64_t>(1, extra)),
+  // Fold each later segment into its row, in segment order within a row, so the answer does not
+  // depend on how the work was scheduled or on how many workers ran it. Parallel over the FREE
+  // dimension and not over segments: there may be exactly one split row -- that is the case this
+  // exists for -- and two workers must never add into the same output row. This runs after the
+  // core's team is torn down, so it uses torch's pool rather than forking a private team.
+  //
+  // Slot order is row order, and within a row it is segment order, so one pass in slot order sums
+  // each row's segments in the order their nonzeros appear -- which is what makes the result
+  // independent of the schedule and of the worker count.
+  at::parallel_for(0, (int64_t)C1_size,
+                   /*grain=*/std::max<int64_t>(1, 32768 / std::max<int64_t>(1, extra)),
                    [&](int64_t j0, int64_t j1) {
-    for (int64_t i = 0; i < nsplit; ++i) {
-      scalar_t* SCORCH_RESTRICT dst = C_values + (size_t)sp_row[(size_t)i] * (size_t)C1_size;
-      for (int s = sp_slot0[(size_t)i]; s < sp_slot0[(size_t)i + 1]; ++s) {
-        const scalar_t* SCORCH_RESTRICT add = C_values + (size_t)s * (size_t)C1_size;
-        for (int64_t j = j0; j < j1; ++j) dst[j] += add[j];
-      }
+    for (long x = 0; x < extra; ++x) {
+      scalar_t* SCORCH_RESTRICT dst = C_values + (size_t)x_owner[(size_t)x] * (size_t)C1_size;
+      const scalar_t* SCORCH_RESTRICT add =
+          C_values + ((size_t)C0_size + (size_t)x) * (size_t)C1_size;
+      for (int64_t j = j0; j < j1; ++j) dst[j] += add[j];
     }
   });
+
   // The scratch slots sit past the output, so the result is the leading rows. A view, not a copy:
   // the core allocated it contiguous and every caller either uses it flat or calls view().
   return C_values_torch.narrow(0, 0, (long long)((size_t)C0_size * (size_t)C1_size));
