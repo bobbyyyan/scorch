@@ -16878,3 +16878,81 @@ are the three matrices behind MKL that no thread rule, no partition mode, no ker
 has been able to reach across chains 45, 59, 61, 63, 78, 79 and 84-93, and turning one bit in the
 raise bound's work measure takes eight below-MKL cells to one, and seven to zero, on a corpus of 46
 matrices whose other 265 cells do not move.
+
+## chain94 on MKT, and the verdict on the raise: no x86 regression anywhere, and the cost is ARM
+
+Same design, 50 matrices, pool 32.
+
+```
+                                       n     roff                       ron
+  float32  cells the raise MOVES      12     0.7077 (10 below MKL)      0.9597  (8 below MKL)   floor 1.0010
+           cells it cannot touch     288     1.2744 (115 below MKL)     1.2795 (113 below MKL)  floor 1.0000
+  float64  cells the raise MOVES      12     0.5414 (10 below MKL)      0.7944  (8 below MKL)   floor 1.0019
+           cells it cannot touch     288     1.4704  (68 below MKL)     1.4791  (69 below MKL)  floor 0.9999
+```
+
+**The relative gain is larger here than on redwood and the crossings are fewer**, because MKT starts
+further behind on these cells: the MKL ratio improves 36% on float32 and 47% on float64 — kl02 at k=2
+goes 49.0 → 28.1 µs, nw14 at k=1 on float64 goes 288.7 → 147.9 — but only two of ten cells cross. MKT's
+whole position against MKL is weaker (115 of 288 untouched cells below MKL against redwood's 11 of 265,
+pooled 1.27 and 1.47 against redwood's 1.68 and 1.77), which is this host's known narrow-k deficit and
+not something this change is aimed at.
+
+**The guardrail holds on 288 cells**: 1.2744 → 1.2795 with the below-MKL count going 115 → 113, and
+1.4704 → 1.4791 with 68 → 69. And the guarded workloads, re-taken on MKT's own binary: **zero cells
+move**, as on redwood.
+
+### The one MKT regression chain93 reported does not exist
+
+chain93 recorded nw14 at k=8 on float64 as 0.8212, and it was the only x86 regression in the whole
+grid. In release, every timing of that cell:
+
+```
+  roff  150.4 / 149.4 (dup) / 140.7 (dup) / 139.9        ron  132.6 (dup) / 131.9 / 131.4 / 130.4 (dup)
+```
+
+The raise makes it about 7% **faster**. chain93's number came from an arm with a 39% pass-to-pass
+spread — `ships` read 151.1, 176.9 and 127.3 µs across its three passes while `raise` read 166.1, 155.0
+and 178.8 — so taking each arm's minimum compared `ships`' lucky pass against `raise`'s unlucky one.
+
+**And the floor could not catch it, which is the lesson.** The floor was computed as
+`min(ships)/min(shipsb)` = 127.3/126.2 = **1.0087**, which looks tight — but both minima came from the
+same good pass, so a floor built from minima can read 1.00 while both arms individually swing 40%. The
+right floor has to see the per-pass spread, not only the minima. Scored that way the defect is
+contained: **8 of 300 cells** on MKT have an arm swinging more than 20% across passes, in both the
+hooks and the release runs. So chain93's aggregates and per-matrix z values stand; its per-cell
+regression list does not, for those eight cells, and the one x86 regression it reported was one of them.
+
+### Verdict
+
+`SCORCH_SPMM_RAISE_ON_FLOORED` is one bit choosing between two work measures that both already exist.
+Turning it on, measured in release builds on three hosts:
+
+| | redwood (pool 24) | MKT (pool 32) | M5 (pool 6) |
+|---|---|---|---|
+| below-MKL cells among those it moves, f32 | **8 → 1** | 10 → 8 | no MKL on this host |
+| below-MKL cells among those it moves, f64 | **7 → 0** | 10 → 8 | — |
+| MKL ratio on moved cells, f32 / f64 | 0.90→1.13 / 0.87→1.27 | 0.71→0.96 / 0.54→0.79 | — |
+| regressions among moved cells | **none** | **none** | 3 of 5 (f32), 2 of 5 (f64) |
+| cells it cannot touch | 265, neutral | 288, neutral | 127, neutral |
+| guarded GCN/AE/dlmc cells moved | **0** | **0** | 0 |
+
+**What is in its favour.** It reaches the three matrices — kl02, nw14, bibd_17_8 — that chains 45, 59,
+61, 63, 78, 79 and 84 through 93 could not move with any thread rule, any partition mode, any kernel
+change or a row split, and it clears seven of eight below-MKL cells on one x86 host and improves every
+moved cell's MKL ratio on both. It has no constant to fit. It does not change the partition mode. It is
+provably inert on 680 untouched cells across three hosts and on every guarded workload, and inert *by
+mechanism* — the final cap is applied after the raise and caps at the caller's pool, so a shape already
+at its ceiling cannot be lifted, and every GCN and autoencoder shape is.
+
+**What is against it.** On the M5, kl02 loses 16% at k=1 and 13% at k=2 on float32 and 12% at k=1 on
+float64, reproducibly, in release builds. Three cells of one matrix. That is a real regression and the
+performance convention in CLAUDE.md says a change ships only if it is neutral-or-better everywhere.
+
+**The trade, stated plainly, because it is not a measurement.** The M5 has no sparse competitor —
+`torch.sparse.mm` runs 1000-4300 µs there against our 27-65 — so the ARM cost is absolute performance
+on three cells with nothing to lose to, while the x86 gain is on cells that are losing to MKL today.
+The convention also says arm-variance may ship when it is measured and declared, and it is now measured
+on both dtypes in release builds on all three hosts. Which way that resolves is Bobby's call and not
+this file's; the constant exists, defaults to off, and is byte-identical at 0, so it is a one-line
+decision either way.
