@@ -15974,3 +15974,64 @@ the binary never reads and two arms meant to differ report a difference of zero 
 so the probe now checks that every knob its arms name actually changes the exported gate's answer,
 and refuses otherwise. That check's own first version used an 8000-nonzero probe matrix, where the
 segment floor binds and every setting agrees: a guard that reports a live knob as dead.
+
+## What the split actually cost: it turned the multirow kernel off
+
+chain88 (redwood) and MKT job 17144967 ran the same eight-arm grid on the final construction, and
+together they located the last cost -- and it was not any of the three things already fixed.
+
+Where the gate declines, both hosts are clean:
+
+```
+  160 cells, gate declines        floor    on
+    redwood  float32             0.9987  0.9983
+             float64             0.9987  1.0004
+    MKT      float32             1.0018  1.0001
+             float64             0.9976  0.9965
+```
+
+Where the degree floor excludes cells, the floor keeps them inert (`on` 0.987-1.012 on both hosts)
+and firing them costs a quarter:
+
+```
+  cells the floor excludes        on      nofloor   setup
+    redwood  float32            1.0121   0.6969   0.9952
+             float64            1.0044   0.8153   0.9980
+    MKT      float32            0.9964   0.7209   0.9777
+             float64            0.9867   0.7701   0.9719
+```
+
+`setup` is ~0.98-1.00, so it is not the construction. And per-unit overhead cannot explain it either:
+on `case39_A_08` -- 40216 rows, mean degree 26 -- the split adds **nine** units and `nofloor` reads
+0.475 at k=1 against a `setup` of 0.948. Nine units cannot cost a factor of two.
+
+**The cause is that `spmm_csr_v2_core` refused the multirow register-block kernel whenever a
+redirection was in play.** That kernel takes 2-4 rows at a time and it is what carries matrices with
+many short rows -- which are precisely the matrices a row split has least to offer, so the cost landed
+exactly where there was no gain to pay for it. The refusal was there for a real reason (the kernel
+writes rows i..i+multirow-1 of C straight from A1_pos[i..i+multirow], so it reads the claim index as
+an output row) but the right answer is two conditions, not a refusal, and each is one compare on a
+value the gate already loaded: the group must lie entirely in the row region, and the group's own
+nonzero count must not exceed a fair share -- if the whole group holds no more than wide_deg nonzeros
+then no single row in it does.
+
+Re-enabling it exposed two out-of-bounds reads that the refusal had been hiding. A1_pos is indexed by
+ROW while the claim index runs past the last row into the extra units, so the region test has to come
+BEFORE the A1_pos read; `&&` evaluates left to right and the first version had the region test last.
+And the zeroing modes that walk slices of the claim range, plus the hooks-only conjunction-cost probe,
+were bounded by the claim count rather than the row count.
+
+**Two measurement problems this round also surfaced.** chain88's firing group is three matrices of 71
+to 512 rows, twelve cells, and its same-code floor ran **0.837 to 1.136** -- a 30% band, on which the
+arms `on` and `nofloor` are literally the same code and read 0.828 and 1.116 on one cell. Nothing of
+any size can be resolved there, so chain88's headline 0.8858 on that group is not a result and neither
+was chain86's 1.1760. MKT's floor on the same group is 0.9995/1.0076, which is why its numbers are
+readable and redwood's are not. The next round gives the firing set 61 repetitions, a 60 ms batch
+target and three passes, and keeps the ordinary budget for the broad corpus where the floor is already
+0.999.
+
+The other is that the footprint constant is not settled: on BOTH x86 hosts the cells the gate fires on
+preferred a 1024 KB bound (redwood 1.0929/1.0518, MKT 1.0388/1.1551, against 64 KB's 0.8858/0.9516 and
+0.9516/1.0723) while the cells it excludes preferred 16 KB (0.7451 against 1024 KB's 0.6014). High
+degree and few rows want coarse segments, low degree and many rows want fine ones. A 256 KB arm is in
+the next round; the shipped 64 KB is not obviously the right point and will not stay there by default.
