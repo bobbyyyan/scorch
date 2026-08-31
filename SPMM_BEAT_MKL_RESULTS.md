@@ -16312,3 +16312,42 @@ first arm set because `adopt` moved nothing on any of its probe shapes — and i
 shapes it had, which omitted the 64-row low-nonzero layer that is the only place that arm binds. A
 liveness guard whose probe shapes exclude the case a knob binds on reports a live knob as dead. That
 is the second time in this project the guard itself has been the thing that was wrong.
+
+### The same query disqualifies the candidate from shipping on the SpMM grid alone
+
+Asking the resolver what the pair does to the **guarded workloads** — before the grids ran, which is
+the point of having the count exported — it moves 27 cells, and not harmlessly:
+
+```
+  pool 24   cora      k=3 / 6 / 7 / 16    ships 18 -> 1 / 1 / 1 / 1
+  pool 24   pubmed    k=3 / 6 / 7 / 16    ships 18 -> 1 / 3 / 4 / 9
+  pool 24   citeseer  k=64 / 128 / 256    ships 18 -> 3 / 7 / 15
+  pool 24   AE mnist  k=3 / 6 / 7         ships 18 -> 3 / 6 / 7
+  pool  6   the same shapes                ships  6 -> 1 / 1 / 1 / 1  (cora), 1 / 3 / 4 (pubmed)
+```
+
+k = 3, 6 and 7 are the GCN **output-layer** widths for pubmed, citeseer and cora — the one guarded
+region a thread-count change can reach. The large graphs are immune by arithmetic: arxiv from k=3,
+reddit and products and AE stl10 from k=1, so nothing at reddit scale moves.
+
+That exposure is disqualifying for a ship decision made on the SpMM grid alone, because commit
+e795127 shipped the *opposite* change on these very shapes: matching `torch.get_num_threads()` took
+pubmed from 0.78 to 1.15x and gained 5-6% on cora and citeseer. The adoption's own comment says why —
+"adopt the host team so a pipeline does not reshape at every op boundary" — so the count is high there
+for a composition reason, not an arithmetic one, and a private team has separately been measured to
+slow the code *next to* it, torch's own matmul by 1.12-1.33x. Grading the adoption trades arithmetic
+efficiency against pool-reshape cost, and a grid of standalone SpMM calls prices only one side of
+that trade. cora at k=3 is 31,668 multiply-adds; one worker may well be right for the kernel and
+wrong for the model.
+
+So the honest status: the pair is the only live arm chain59 has, it points the direction chain79's
+force ladders support, and **it cannot ship on chains 93 / 17146988 alone.** Those price the kernel.
+The ship gate additionally needs the GCN and autoencoder workload runs on both hosts, because 27
+cells of the guarded set move and four of them are the widths a GCN actually uses.
+
+Stated explicitly because the temptation here is obvious and is the thing this file exists to refuse:
+a condition that switched the grading off for "small graphs" would make the guarded workloads pass by
+construction. There is no mechanism behind such a condition — the adoption is about pipeline
+composition, and row count and degree do not say whether a call is inside a pipeline — so it would be
+a threshold fitted to the workloads it needs to survive. If the workload runs say the pair costs GCN
+more than it wins on the transformer family, the answer is that it does not ship.
