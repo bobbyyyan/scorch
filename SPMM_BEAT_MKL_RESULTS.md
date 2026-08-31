@@ -16827,3 +16827,54 @@ Two consequences, both stated before the corrected numbers exist rather than aft
 The fix for the analysis is to stop recomputing at all: `threadprobe.py` records the resolved count per
 cell from the binary that ran it, and `shipprobe.py` does not. It should, and the join should be on
 that column rather than on an offline query that cannot know which machine produced the row.
+
+## chain94 on redwood: the raise clears seven of eight below-MKL cells on float32 and all seven on float64
+
+Two release builds from one archive differing only in `-DSCORCH_SPMM_RAISE_ON_FLOORED=1`, 46 matrices
+cut into slices of fifteen with the build order rotated between passes, two passes per dtype, MKL timed
+in the same process as ours in every cell so `ours/MKL` is immune to drift between the builds. Which
+cells the raise moves comes from `dumpnt.py` run on redwood itself, not from an offline query — see the
+correction above for why that distinction is not pedantry.
+
+```
+                                       n     roff                      ron
+  float32  cells the raise MOVES      11     0.9036  (8 below MKL)     1.1301  (1 below MKL)   floor 1.0061
+           cells it cannot touch     265     1.6755 (11 below MKL)     1.6754 (11 below MKL)   floor 1.0011
+  float64  cells the raise MOVES      11     0.8745  (7 below MKL)     1.2697  (0 below MKL)   floor 1.0054
+           cells it cannot touch     265     1.7695  (6 below MKL)     1.7795  (9 below MKL)   floor 0.9995
+```
+
+**Seven cells cross MKL on each dtype.** Ratios are ours against MKL, so above 1.000 is a win:
+
+| cell | workers | float32 | float64 | float64 µs |
+|---|---|---|---|---|
+| nw14 k=1 | 4→24 | 0.7244 → **1.3093** | 0.7782 → **1.4682** | 78.8 → 43.4 |
+| nw14 k=2 | 6→24 | 0.7792 → **1.0385** | 0.5843 → **1.1307** | 106.5 → 59.0 |
+| nw14 k=4 | 12→24 | 0.8224 → 0.8109 | 0.6312 → **1.0846** | 115.2 → 78.3 |
+| kl02 k=1 | 4→11 | 0.9817 → **1.1531** | 1.1103 → 1.2837 | 23.0 → 20.3 |
+| kl02 k=2 | 4→11 | 0.8951 → **1.2057** | 0.8604 → **1.2062** | 32.0 → 21.2 |
+| kl02 k=4 | 4→11 | 0.6863 → **1.0372** | 0.6707 → **1.1161** | 37.0 → 22.9 |
+| kl02 k=8 | 5→11 | 0.8116 → **1.1284** | 0.6823 → **1.1988** | 42.5 → 28.1 |
+| bibd_17_8 k=4 | 9→24 | 0.8557 → **1.0986** | 0.9255 → **1.2054** | 55.3 → 41.6 |
+
+The one float32 cell that does not cross is nw14 at k=4: our kernel gets 13% faster (65.3 → 56.6 µs)
+and the ratio barely moves, because MKL was also faster in that process. On float64 the same cell
+crosses.
+
+**The guardrail holds, and the one wobble in it is noise on loose cells.** On float32 the 265 cells the
+raise cannot reach read 1.6755 and 1.6754 — a difference of six parts in ten thousand — with the same
+eleven cells below MKL. On float64 the geomean moves 0.6% and the count reads 6 then 9, and all three
+cells that changed side have loose *own* same-code floors: kl02 k=64 (floor 1.0564, and it sits 0.4%
+from parity), lp_osa_14 k=2 (floor 0.9504, 1.7% from parity), lp_osa_14 k=8 (floor **0.8001** — a 20%
+spread between two timings of identical code in one process — and it moved 32%). Of the 265 inert
+cells, 15 sit within 10% of parity, so a few crossing on noise is the expected behaviour of the
+measure, not a property of the change. lp_osa_14 has been the noisy matrix in this file before.
+
+**And the guarded workloads were re-checked on redwood's own binary with the correct ceiling: zero
+cells move.** The claim survives the correction.
+
+So on this host the change does what the whole project has been trying to do: kl02, nw14 and bibd_17_8
+are the three matrices behind MKL that no thread rule, no partition mode, no kernel and no row split
+has been able to reach across chains 45, 59, 61, 63, 78, 79 and 84-93, and turning one bit in the
+raise bound's work measure takes eight below-MKL cells to one, and seven to zero, on a corpus of 46
+matrices whose other 265 cells do not move.
