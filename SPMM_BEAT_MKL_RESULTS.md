@@ -16472,3 +16472,77 @@ And it is a third, independent reason the split does not ship, which no amount o
 shippable at any mean.** That is also why chain90's and chain92's per-matrix numbers disagree on
 exactly the split arms — nw14 k=16 `nofloor` reads 193 µs in one and 534 in the other — while `off`
 agrees to a few percent in 46 of 48 cells across the two objects.
+
+## chain93 on the M5: every thread-bound arm fails, and the pre-registered prediction was right
+
+22 matrices — the loser class, four dlmc transformer layers, and twelve unselected SuiteSparse
+matrices across two nonzero bands — six widths, three passes each dtype, eight arms in one hooks
+object with equal environment-variable counts. Pool 6. Speedup against `ships`, so below 1.000 is a
+regression.
+
+```
+  float32   arm         cells moved                       cells inert
+            basework      0   (predicted null, confirmed)   132  0.9985 (floor 0.9990)
+            adopt         5   1.1931 (floor 0.9941)         127  0.9992 (floor 0.9992)
+            raise         5   0.9878 (floor 1.0134)         127  0.9991 (floor 0.9985)
+            bw_ad        31   0.9298 (floor 0.9987)         101  0.9991 (floor 0.9991)
+            bw_ad_lo     18   1.1085 (floor 0.9992)         114  0.9985 (floor 0.9990)
+            bw_ad_hi     31   0.9403 (floor 0.9987)         101  0.9976 (floor 0.9991)
+  float64   bw_ad        31   0.9153 (floor 1.0020)         101  0.9989 (floor 1.0009)
+```
+
+**The prediction written before the run holds.** `bw_ad` is a regression, and the damage is at k=1 and
+k=2 where its grading divides `nnz*k` and hands a bandwidth-bound product one worker. 17 cells fall
+below their own floor on float32, worst first: TF16 k=1 0.4925 (6 → 1 workers), uni_chimera k=1 0.5382
+(6 → 3), a transformer layer k=1 0.6591 (6 → 1), kl02 k=1 0.6864 (4 → 1). On the unselected corpus it
+reads 0.7671 (float32) and 0.7814 (float64) with **z of −3.28 and −3.22** aggregated per matrix.
+
+**It does not even help the family it was aimed at.** The transformer family reads 1.0383 and 1.0157
+with z of +0.38 and +0.19 — inside noise.
+
+**It is properly inert where it does not fire**, which is the one thing that went right: 101 cells at
+0.9991 and 0.9989 against floors of 0.9991 and 1.0009.
+
+### The grain is a fit, and the ladder proves it on identical cells
+
+Scored on the same 18 cells — the ones the smallest grain moves, where all three grains act but
+resolve *different* worker counts:
+
+| arm | float32 | float64 |
+|---|---|---|
+| `shipsb` (floor) | 0.9992 | 1.0016 |
+| 75000 | **1.1085** | **1.1018** |
+| 150000 | 0.9545 | 0.9291 |
+| 300000 | 0.9603 | 0.9249 |
+
+On the 13 cells only the larger grains move: 0.8967 against a 0.9978 floor, and 0.8966 against 1.0026.
+
+So the sign of the effect is a function of the constant. That is the definition of a fitted parameter
+rather than a rule, and it is exactly what the ladder was put in the run to detect. 150000 was chosen
+because it is the existing `SCORCH_GRAIN_SPMM` and therefore not fitted — but "not fitted" was a claim
+about provenance, and the measurement says the provenance does not buy insensitivity.
+
+**And 75000 does not survive on its own terms either.** Per matrix, which is how this file scores
+things after counting six widths of nine matrices as independent once inflated a z from 1.27 to 3.15:
+8 matrices, geomean 1.0445 (float32) and 1.0397 (float64), **z +0.71 and +0.70** — not significant.
+**6 of its 18 cells are regressions** on both dtypes, worst 0.7655 and 0.8012 (TF16 k=1, 6 → 2
+workers), and its gains are concentrated in one matrix reading 1.77 / 1.73 / 1.44 / 1.14 at
+k=1/2/4/8. A change that is not significant, regresses a third of the cells it touches, and takes its
+wins from one matrix does not ship under this project's rules.
+
+### `raise` is null here, and `adopt` alone is one matrix
+
+`raise` moves 5 cells and reads 0.9878 against a 1.0134 floor on float32 and 1.0669 against 1.0034 on
+float64 — different signs on the two dtypes at n=5. Nothing to report either way, which is consistent
+with chain78 and chain79 and is the fourth independent look at that direction.
+
+`adopt` alone is the one arm with a clean-looking number — 1.1931 (float32) and 1.1777 (float64) on
+the cells it moves, inert on 127 others — and it should not be believed as it stands. **All five cells
+are one matrix**, a 512-row 52428-nonzero decoder attention layer at k=1..16, and the change is
+6 workers to 5. A 1.26x from surrendering one worker of six is not an arithmetic effect; the plausible
+mechanism is that leaving one of the M5's six performance cores free for the OS and the main thread is
+worth more than the sixth worker contributes, which is a host-specific effect on a host where nothing
+else in the corpus triggers the same transition. n = 1 matrix, so there is no z to quote and no
+second family to check it against. It is a lead for the x86 hosts, not a result.
+
+`basework` moved 0 cells, confirming the offline prediction, and its column reads the floor.
