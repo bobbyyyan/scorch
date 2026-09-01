@@ -17194,3 +17194,57 @@ because "nothing was searched" and "no passcode arrived" are different answers a
 second for the first. `myth-login`'s wait went from 120s to 240s as well, since the code is valid for
 five minutes and waiting longer costs nothing. Originals saved beside both scripts as
 `.bak-20260831`.
+
+### chain95 on MKT: the third host, and the cost of a worker is essentially zero there
+
+Same tree, same harness, same seeded synthetic cells and the same two matrices copied over. This host is
+a 32-core Zen4 part with no heterogeneous cores at all, which is the simplest configuration of the three
+and reads that way.
+
+Region wall on the 4544-nonzero cell, `nthreads_override` 64 so no arm is clipped:
+
+```
+                 T=1  T=2  T=4  T=6  T=8  T=12 T=16 T=24 T=32
+  MKT pool 8      3.3  4.3  3.3  3.3  3.4  3.8  4.2  5.8  8.6
+  MKT pool 32     3.4  4.6  3.3  3.3  3.3  3.8  4.1  6.4  8.8
+  redwood pool 8  2.1  2.3  3.4  3.3  4.1  5.5  6.4  9.0 12.4
+  M5 (any pool)   1.7  6.6 12.2 21.4   --   --   --   --   --
+```
+
+**Going from four workers to six costs nothing on MKT: 3.3 us to 3.3 us.** Four to twelve costs 0.5 us
+for eight added workers, or **0.06 us each**; four to thirty-two costs 0.19 us each. The teardown is flat
+at 0.8 to 1.6 us across the entire range, where the M5's grows 4.1 -> 10.4 between four workers and six.
+Identical at pools of 8 and 32, so as on redwood there is nothing pool-shaped here either.
+
+Per added worker in the four-to-twelve band, all three hosts, same instrument and same input:
+
+```
+  MKT      32 homogeneous cores, pool 32 = every core          0.06 us
+  redwood   8 P + 16 E cores,    pool 24 = every core          0.26 us
+  M5 Max    6 Super + 12 Perf,   pool  6 = the fast cluster     4.75 us
+```
+
+A factor of 18 against redwood and 79 against MKT. The ordering is not mysterious: the cost rises with
+core heterogeneity, and then rises sharply again on the one host whose pool is not every core but only
+the fast subset of them. Nothing here is about the instruction set.
+
+kl02 float32 k=1 on MKT, as `entry us -> busy us`, for comparison with the two hosts above:
+
+```
+  4 workers:  1.3->20.7  1.6->19.4  1.2->21.0  1.6->17.6                        region 22.9
+  6 workers:  1.5->13.5  1.7->13.3  1.4->13.2  1.7->13.5  1.4->12.9  1.7->13.2  region 16.1
+```
+
+Every worker running within 1.7 us at both counts, the arithmetic parallelising cleanly, and the region
+falling 22.9 -> 16.1 for a 1.42x gain on the cell that loses 12-16% on the M5. nw14 goes 88.1 -> 66.9 on
+the same transition.
+
+So the mechanism is confirmed on three hosts and the x86 side twice: the raise buys ceiling and pays team
+width, the payment is 0.06 to 0.26 us a worker on x86 and 4.75 on the M5, and the M5 is also the host
+whose pool cap lets it buy the least ceiling (1.56x against redwood's 2.60x). Same change, opposite sign,
+for two reasons that both point the same way on that one machine.
+
+One note on reading the MKT rows: the whole call is 27 to 44 us on a cell whose region is 3.3, because
+this host's hooks tax is 18.9 us (float32) and 20.7 (float64) a call. That tax is serial, identical in
+every arm, and outside the region, so it does not touch any number reported here -- but it is why the
+call column looks nothing like redwood's.
