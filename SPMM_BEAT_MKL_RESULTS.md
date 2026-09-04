@@ -17800,13 +17800,33 @@ ORACLE bound and not an achievable number -- realising it needs a PREDICTOR of t
 choice. Predicting a pool width is the same shape of problem. This is the largest remaining lever
 found so far and the next one to work.
 
-**And it predicts the BASE_WORK_TRUE gate will come back negative at narrow k.** `prod/ntTrue` is
-0.7583 and 0.8184 at float32 k=1 and k=2 (0.6941 / 0.7977 on float64), so passing `nnz*k` in the
-work slot is 22-44% SLOWER there, and only reaches parity at k>=8 (1.0054, 1.0044). `ntTrue/best` is
-1.60-1.67 at k=1 against production's 1.16-1.21, so it is three to four times further from the
-oracle than what ships. The constant's comment says the correction "has never been priced"; this
-prices it, and a compiled-in gate is running on both hosts to confirm it as a build rather than as
-an ABI argument.
+**It also predicted the BASE_WORK_TRUE gate would come back badly negative at narrow k, and the
+compiled-in gate refuted that within the hour.** `prod/ntTrue` in the sweep is 0.7583 and 0.8184 at
+float32 k=1 and k=2 (0.6941 / 0.7977 on float64), which reads as `nnz*k` in the work slot being
+22-44% slower there. The compiled-in build on MKT -- 3600 rows per build, three release objects,
+same corpus -- says it is a wash:
+
+```
+  median bwt/c0     k=1     k=2     k=4     k=8     k=16    k=64
+  float32          0.9967  1.0013  1.0031  1.0008  1.0028  0.9950   (floor 0.9974-1.0024)
+  float64          0.9917  0.9939  0.9941  0.9931  0.9991  0.9968   (floor 0.9935-1.0020)
+  crossings        float32 +3/-3 against a floor of +5/-4;  float64 +5/-2 against +6/-3
+```
+
+The sweep's `basetrue` arm was never BASE_WORK_TRUE. It passes the count that constant's rule would
+resolve to back in through `nthreads_override` -- and that argument is the caller's POOL, which the
+rule reads four more times, so handing a resolved count back through it does not reproduce the
+configuration that produced it. **This analysis file's own comment says exactly that**, two lines
+above the arm's definition, and I still read the derived arm as a prediction about the constant.
+The constant's comment says the correction "has never been priced"; it is now priced, by the build,
+and it is neutral. It stays at 0.
+
+The same caveat applies to the `nt` arms and therefore bounds what chain101's oracle is an oracle
+OVER: a declared pool value, which is a knob a caller really can turn, but one that moves the
+adoption, the ceiling, the recruit gate, the chunk model and the partition mode together. The 5-21%
+is real and cross-fitted; what it is not is a pure thread-count effect, and any attempt to realise
+it has to be measured as a build or through the dispatcher, not by handing numbers to that
+argument.
 
 ### Two defects in the analysis, found by the numbers disagreeing with each other
 
