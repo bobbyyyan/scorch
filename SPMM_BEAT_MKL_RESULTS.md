@@ -17757,3 +17757,64 @@ is consistent with it being a code-layout effect on a short kernel that the call
 dilutes.
 
 This was the gating measurement for the row count, and on this host it passes.
+
+## chain101: the declared pool is 5-21% off a per-cell oracle, cross-fitted, on both dtypes
+
+The thread-floor sweep on MKT finished: 50 matrices x 6 widths x 10 declared pool widths x 2 dtypes
+x 2 passes, 18000 readings, release object. What it varies is the pool the caller DECLARES, not the
+team: `nthreads_override` is read four times by the rule (the composition adoption, the `NT_CAP=-2`
+ceiling, the E-core recruit gate, and through the resolved count the chunk model and partition
+mode), so handing it a number is not "use this many workers". Production is the `pool` arm.
+
+Ratios are times, so above 1 means production is slower. `best` is the best declared width for that
+cell, chosen on one pass and scored on the OTHER -- the minimum of ten noisy readings is biased low,
+and the cross-fit is what makes this a headroom number rather than a selection artifact:
+
+```
+  float32                                   float64
+  k    prod/best  ntTrue/best  floor        prod/best  ntTrue/best  floor
+  1    1.2098     1.5955       0.9965       1.1588     1.6695       1.0026
+  2    1.1570     1.4138       1.0006       1.1403     1.4294       1.0630
+  4    1.1600     1.2181       1.0774       1.1612     1.2310       0.9955
+  8    1.1414     1.1352       1.0001       1.1523     1.1542       1.0021
+  16   1.1317     1.1267       0.9995       1.1259     1.1193       0.9982
+  64   1.0690     1.0750       1.0077       1.0531     1.0566       1.0057
+```
+
+The cross-fit barely moves it -- float32 k=1 goes 1.2167 biased to 1.2098 cross-fitted, six tenths of
+a percent -- so essentially none of this gap is the oracle flattering itself. Against A/A floors of
+0.996-1.008 (two cells at 1.06-1.08), **production's declared pool is 5-21% off the best one for the
+cell, on every width and both dtypes, and the gap is largest exactly where the below-MKL cells are.**
+
+By cell count over the same corpus, if that oracle could be realised:
+
+```
+  cells below MKL        production   BASE_WORK_TRUE   per-cell best
+  float32, all widths       120           123               67
+  float64, all widths        73            84               49
+```
+
+That is 53 float32 cells, against the 13 the multi-row row count clears on the caller path. It is an
+ORACLE bound and not an achievable number -- realising it needs a PREDICTOR of the best width from
+(rows, nonzeros, k, degree), which is the machinery the autotune selector already runs for tile
+choice. Predicting a pool width is the same shape of problem. This is the largest remaining lever
+found so far and the next one to work.
+
+**And it predicts the BASE_WORK_TRUE gate will come back negative at narrow k.** `prod/ntTrue` is
+0.7583 and 0.8184 at float32 k=1 and k=2 (0.6941 / 0.7977 on float64), so passing `nnz*k` in the
+work slot is 22-44% SLOWER there, and only reaches parity at k>=8 (1.0054, 1.0044). `ntTrue/best` is
+1.60-1.67 at k=1 against production's 1.16-1.21, so it is three to four times further from the
+oracle than what ships. The constant's comment says the correction "has never been priced"; this
+prices it, and a compiled-in gate is running on both hosts to confirm it as a build rather than as
+an ABI argument.
+
+### Two defects in the analysis, found by the numbers disagreeing with each other
+
+  * **A column headed `ntTrue/prod` was computed as `prod/ntTrue`.** Read as labelled it said
+    BASE_WORK_TRUE was 24-32% faster at narrow k; read as computed it says 22-44% slower. The
+    below-MKL counts in the same row are what caught it -- 31 cells for production against 32 for
+    BASE_WORK_TRUE cannot sit beside a 24% win.
+  * **The cross-fit chose its two passes globally rather than per dtype.** `files[0], files[1]` are
+    the two float32 files, so every float64 lookup went into a float32 file, missed, and dropped the
+    row: the float64 table printed empty under a header naming the float32 passes it had used. The
+    header is what gave it away, and only because it printed the file names rather than "p1/p2".
