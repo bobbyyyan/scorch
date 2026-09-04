@@ -17483,7 +17483,7 @@ gets worse. Counting crossings in both directions, with the same-code floor arm 
 
 ```
   float32          median @ k=8    cells cleared / broken, all widths    at k=8
-  c0b (floor)      1.0018          +1 / -4                               +0 / -1
+  c0b (floor)      0.9986          +1 / -4                               +0 / -1
   mr2  ROWS=2      1.1565          +9 / -2                               +7 / -0
   mr2x ROWS=2,     1.1477          +8 / -2                               +5 / -0
        band off
@@ -17522,3 +17522,106 @@ the same thing without paying for it: k=1 keeps the kernel it ships with, and on
 to multi-row. That is `mr2h`, queued on both hosts at widths 1/2/3/4/8 with plain ROWS=2 in the grid
 so any k=2 difference is attributable to the band and not to multi-row. If the `+9` survives and the
 `-7` does not appear, the width-2 result is real and separable.
+
+## chain99 -- redwood confirms the float32 row count, and the chunk starvation lever is a null
+
+Redwood's gate finished: 298 matrices x 6 widths x 2 dtypes x 3 arms, 10728 rows per build. With
+MKT's five-build grid that gives the two-host reading the constant's own comment asked for.
+
+### The float32 win is confirmed at the same two widths on both hosts
+
+Medians over cells, stall-damaged cells excluded, floor in the same direction as the candidate:
+
+```
+                    redwood                     MKT
+  k     mr2      floor      mr2      floor    frac of redwood cells where mr2 is faster
+  1    0.9872   0.9969    1.0038   0.9968     0.326
+  2    0.9931   0.9961    0.9963   0.9982     0.391
+  4    1.0000   0.9957    1.0024   1.0015     0.498
+  8    1.0728   0.9978    1.1565   0.9986     0.858
+  16   1.0649   0.9964    1.1059   1.0006     0.868
+  64   0.9982   0.9990    1.0095   0.9997     0.478
+```
+
+k=8 and k=16 are the win on both hosts, and on redwood 86% of cells move the same way -- a shift,
+not a few outliers. Cells below MKL go 49 -> 44 on redwood (float32, all widths) and, by the
+crossing count, +9/-2 on MKT against a floor of +1/-4. **SCORCH_SPMM_MULTIROW_ROWS_F32 = 2 is
+supported on both hosts by both statistics.**
+
+### And it costs about 1% at float32 k=1 on redwood, at a width where it cannot fire
+
+f32 k=1 reads 0.9872 against a 0.9969 floor, with only 32.6% of cells faster -- systematic. The
+mechanism provably declines that width: `narrowk_gather` owns float32 k=1 and the admission test
+excludes it. So this is the cost of the kernel EXISTING in the object -- code layout moving its
+neighbours -- which is the same effect the NEON work recorded when adding a kernel changed the
+codegen of the one instantiated next to it. It does not appear on MKT (1.0038 against 0.9968), so
+it is host-specific, and by cell count it is nearly free (k=1 below MKL 3 -> 4). It is a real
+time-regression at one width on one host and it goes in the ledger as one.
+
+### float64 is a genuine mixed bag, which is why the per-dtype split exists
+
+```
+  k     redwood mr2   floor     frac faster   cells below MKL
+  1      0.9898      0.9980       0.328        1 -> 7
+  2      1.0170      0.9985       0.704       10 -> 3
+  4      1.0191      0.9981       0.652       20 -> 18
+  8      1.0144      0.9984       0.626        6 -> 3
+  16     0.9801      0.9995       0.280        3 -> 4
+  64     0.9969      1.0024       0.460        4 -> 7
+```
+
+Wins at 2/4/8 of 1.4-1.9% and losses at 1 (1.0%) and 16 (2.0%), all sign-consistent, netting
+44 -> 42 cells. MKT read float64 null with a floor that moved six cells on its own. A mechanism
+that wins three widths and loses two is not one to enable by default, so
+`SCORCH_SPMM_MULTIROW_ROWS_F64` stays 0 -- measured null-to-mixed, not "off for now".
+
+### The chunk starvation lever: measured, and it is a null
+
+The starvation argument was that `scorch_spmm_chunk` derives its own worker count, so on a short
+matrix at narrow k it returns a width that leaves most of the team unable to claim -- estimated at
+24 of 32 idle. Measured on MKT with the team pinned to what production resolves to, over 500 cells:
+
+```
+  cells                      n     per_worker/dflt    floor
+  STARVED (claims < team)    44    1.0016 - 1.0064    0.9986 - 1.0008
+  FED (claims >= team)      456    0.9994 - 1.0014    0.9994 - 1.0002
+```
+
+Two things kill it. **The team is 16, not 32** -- uniformly, across all 4000 readings, from a
+136-row matrix to a 100000-row one, with `nproc` 32 and the torch pool 32. The 32-worker premise was
+never measured; it was computed with the M5's processor count standing in. At 16 workers only 44 of
+500 cells starve at all. **And where they do starve, narrowing the chunk is worth 0.2-0.6%** against
+a 0.1% floor -- above the floor, and nothing. `SCORCH_SPMM_CHUNK_GUARD_FEED` stays at 0.
+
+The fed half is the reassuring part: 456 cells at 0.9994-1.0014 against an identical floor, so the
+guard is inert where it must not fire. That was the half that would have blocked it.
+
+Worse for the earlier story: only **2 of 120** dlmc cells are starved at all, and both read null
+(0.999, 0.992). The 512-row attention family that is the shared residual on both hosts is NOT
+starved, so chunk starvation is not the explanation for it. That residual is open again.
+
+### Four harness and analysis defects found while doing this, all of which had produced numbers
+
+  * **The floor column was the reciprocal of the columns it calibrated.** `an_mrall.py` computed
+    `floor/base` and every candidate as `base/candidate`. At a floor within 0.4% of unity it
+    changes no verdict, but a floor is what every marginal call is measured against. Caught by
+    computing the same quantity independently and getting exactly the reciprocal.
+  * **A cell was dropped unless its base arm happened to be written last.** The chunk analysis
+    keyed its per-cell metadata off whichever row came last, and the arm order is shuffled per
+    cell, so it silently kept 118 of ~250 cells -- enough to look like a corpus. Fixed, and the
+    starved count went 12 -> 44.
+  * **The build-verification digest hashed an ELF wrapper, not code.** `mrbuild.sh` used
+    `objcopy --only-section=.text` with no `-O binary`, so the digest included headers and a symbol
+    table that are not a function of the code alone. Two jobs refused with "c0 and c0b have
+    different .text" on source that had built byte-identically an hour earlier under a different
+    directory name.
+  * **A guard that could only ever report failure.** `grep -E error | head -3` exits 0 whether or
+    not grep matched, so `&& echo FAILED` fired on all four configurations of the macro check,
+    including the ones that passed. A check that always fails is as useless as one that always
+    passes, and this one was reporting a real change broken.
+
+162 of redwood's 3576 cells are stall-damaged -- same-code floors from 0.291 to 2.362 -- and they
+are almost entirely dlmc: `bottleneck_*` and `body_*`, the 256- and 512-row resnet and transformer
+layers. The family that is the residual on both hosts is the family whose same-code noise floor is
+worst here. Any claim about it at these repetition counts is unreliable, which is worth knowing
+before the next attempt on it.
