@@ -17219,14 +17219,31 @@ Identical at pools of 8 and 32, so as on redwood there is nothing pool-shaped he
 Per added worker in the four-to-twelve band, all three hosts, same instrument and same input:
 
 ```
-  MKT      32 homogeneous cores, pool 32 = every core          0.06 us
-  redwood   8 P + 16 E cores,    pool 24 = every core          0.26 us
-  M5 Max    6 Super + 12 Perf,   pool  6 = the fast cluster     4.75 us
+  MKT      16 physical cores as 32 logical, pool 32 = 2x physical   0.06 us
+  redwood   8 P + 16 E cores,               pool 24 = every core    0.26 us
+  M5 Max    6 Super + 12 Perf,              pool  6 = fast cluster  4.75 us
 ```
 
-A factor of 18 against redwood and 79 against MKT. The ordering is not mysterious: the cost rises with
-core heterogeneity, and then rises sharply again on the one host whose pool is not every core but only
-the fast subset of them. Nothing here is about the instruction set.
+A factor of 18 against redwood and 79 against MKT.
+
+**Corrected 2026-09-04.** This table said "MKT 32 homogeneous cores, pool 32 = every core", which
+contradicts chain79's own finding above: `Cpus_allowed_list` is 32-47,96-111, two ranges of sixteen
+that are SMT siblings of each other, so the allocation is **16 physical cores presented as 32
+logical CPUs** and the pool is twice the physical core count. The 0.06 us measurement is unaffected
+-- it is a clock reading -- but the explanation built on it was half wrong, and the correction adds
+a mechanism rather than just a label.
+
+The ordering still runs with core heterogeneity: homogeneous cores are cheapest, then a pool
+spanning fast and slow cores, then a pool confined to the fast cluster so every added worker
+competes for it. But MKT's end of that scale has a second reason to be cheap that the original
+story missed: **half of its added workers are SMT siblings of cores already running.** Waking a
+sibling on a live core is not the same event as waking a core, so the four-to-twelve band on MKT is
+partly measuring sibling activation and not core activation. That makes MKT the wrong host to read
+a per-core activation cost from, and it is consistent with the flatness -- four to six costing
+literally nothing (3.3 us to 3.3 us) is what filling siblings looks like, not what waking cores
+looks like.
+
+Nothing here is about the instruction set.
 
 kl02 float32 k=1 on MKT, as `entry us -> busy us`, for comparison with the two hosts above:
 
@@ -17692,6 +17709,17 @@ Two of that experiment's findings do survive, because they do not depend on the 
 the fed cells read 0.9994-1.0014 against an identical floor, so the guard is inert where it must
 not fire; and the dlmc 512-row family was not starved *at a 16-worker team*, which says nothing
 about 32.
+
+**16 is also MKT's physical core count, and that coincidence has to be ruled out rather than
+noticed later.** The allocation is 16 physical cores as 32 logical CPUs (chain79's
+`Cpus_allowed_list` 32-47,96-111), so a flat resolved team of 16 looks exactly like a
+physical-core cap doing its job. It is not one, for three separate reasons: `SCORCH_SPMM_NT_CAP_PHYS`
+ships at 0, and while its block does compile into a hooks object the flag it reads is that same 0,
+so `cap_phys` is false there too; the release build returns 32 on 92% of the identical corpus; and
+a cap only binds where the uncapped answer exceeds it, so it could not hold a 256-row dlmc layer at
+k=1 -- two and a half grains of work -- up at 16. A leaked forcing variable explains all three
+observations and a cap explains none of them. The requeued run discriminates anyway, since it clears
+the variable and refuses on flatness.
 
 A guard now refuses the run if the resolved team is constant across the corpus. A work-based rule
 cannot be flat over 50 matrices and 5 widths, and flatness is what a leaked forcing variable looks
