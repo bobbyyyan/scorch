@@ -17361,3 +17361,95 @@ a worker is most expensive and it has no MKL, so this is evidence about our thre
 about the deficit. And MKT's 0.06 us a worker, measured across the 4-to-12 band, would predict only about
 2 us at 32 -- which does not explain a 25 us floor there. A per-cell team-width sweep against MKL on the
 MKT corpus is queued to settle both.
+
+## chain97 -- the multi-row gate on redwood, and where both hosts' residual actually is
+
+### The gate, compiled in, 175 matrices, six widths
+
+`SCORCH_SPMM_MULTIROW_ROWS=2` against the shipping build, with a second shipping tree as the floor.
+The two floor trees have identical `.text`, so the floor is the same code and not merely the same
+source. Grouped by whether the rule in spmm.h says the multi-row kernel serves the cell -- stated as
+a prediction and then checked, because the same-code floor on the short end of this corpus is about
++-5% and a single 15-microsecond cell cannot resolve a 5% effect:
+
+```
+  float32   serves  1.0515 +-0.43% (n=350)   floor on the same cells 1.0008 +-0.33%
+            quiet   1.0023 +-0.45% (n=600)   floor                   1.0000 +-0.45%
+```
+
+The prediction is what validates the predicate: if it were wrong both groups would read the same
+intermediate value. By width, float32 moves only where the rule says it can -- 1.0587 at k=8 and
+1.0444 at k=16, against 1.0016 / 1.0002 / 1.0038 / 1.0063 at k=1, 2, 4 and 64. Cells below MKL fall
+43 -> 34.
+
+Two corrections to the constant's own comment, which recorded 1.1043 (k=4) and 1.1171 (k=8) from a
+hooked grid.
+
+First, the size. Compiled in, the effect is about half that, and the difference is not mysterious:
+the hooked grid was taken before the half-vector exclusion existed, so its k=4 number is multi-row
+replacing the half-vector kernel rather than the masked register block. Post-exclusion, float32 k=4
+cannot move at all and reads 1.0038.
+
+Second, the shape. The comment records the win at "mid-to-large nonzero counts at moderate degree"
+and neutral below degree 8 (0.9882, z-0.4). The compiled-in run says the win is LARGEST below degree
+8 and smallest above 32:
+
+```
+  float32   deg <8    k=8 1.1032   k=16 1.1078   (n=10)
+            deg 8-32  k=8 1.0897   k=16 1.0828   (n=43)
+            deg >32   k=8 1.0368   k=16 1.0218   (n=97)
+```
+
+Float64 does not earn it. Where it serves it reads 1.0042 +-0.51% against a floor of 1.0027, and it
+has a regression band: `deg <8` at k=16 is 0.9476, distributed across ten matrices rather than one
+family, and cells below MKL go the wrong way at k=1 (3 -> 6) and k=16 (2 -> 4) while improving at
+k=2 (9 -> 3) and k=4 (18 -> 15), for a net 38 -> 31. So the indicated shape is a PER-DTYPE constant,
+float32 on and float64 off, which is what `SCORCH_SPMM_HALFVEC_F32` / `_F64` already does and whose
+comment states the reason: a single constant whose zero value fell on one dtype would hide the other.
+
+### What multi-row cannot reach, and what is left
+
+On MKT's release grid the float32 deficit is 123 cells of 300, and it sits at the widths where some
+other narrow-k kernel owns the row:
+
+```
+  k         1     2     4     8    16    64
+  below   31    43    28    18     3     0
+  multi-row can serve      0     0     0    18     3     0
+```
+
+So multi-row reaches 21 of 123 (17%) on that host -- the nonzero-axis gather owns float32 k=1, the
+exact-width band owns 2 and 3, and the half-vector kernel owns 4. On float64 it reaches 26 of 73.
+
+Decomposing the 102 cells at k<=4 by the TIME they lose rather than by count:
+
+```
+  large, not starved       n=36   median MKL/ours 0.823   excess 3059 us  87%
+  starved (chunk < team)   n=32   median MKL/ours 0.634   excess  238 us   7%
+  short, not starved       n=34   median MKL/ours 0.863   excess  205 us   6%
+```
+
+Read by time, the answer is the large matrices at k=2 -- af_2_k101 +503 us, msdoor +398, Hardesty1
++357, halfb +214 -- and the hooked sweep in the previous section already moves exactly those
+(af_2_k101 0.581 -> 0.776, msdoor 0.696 -> 0.858, troll 0.711 -> 0.874) by giving width 2 to
+multi-row instead of the exact-width kernel. Note that the same sweep says a STREAM count change to
+the kernel that already ships is comparable there -- `ex2` 1.046 and `ex8` 1.051 against `ex0_mr2`
+1.077 pooled, and af_2_k101 itself preferred `ex8` (0.791) to multi-row (0.776) -- so withdrawing a
+kernel is not the only option and is the riskier one.
+
+Read by CELL COUNT, which is what "beats MKL everywhere" asks, the three buckets are nearly equal and
+the starved bucket is the one with a fix in hand. And it is the same bucket on both hosts. After
+multi-row, 26 of redwood's 34 remaining float32 cells below MKL are at k=4, and every one of the 27
+float32 k=4 cells below MKL there is a 512-row transformer layer of mean degree 228 -- the same
+family as MKT's starved 32. Asked of the chunk rule with the worker count passed explicitly, that
+family is starved on both:
+
+```
+  512 rows, 104857 nnz   k=1  chunk 64 ->  8 claims   16 of 24 idle (redwood)   24 of 32 (MKT)
+                         k=4  chunk 36 -> 15 claims    9 of 24 idle             17 of 32
+  512 rows, 131072 nnz   k=4  chunk 24 -> 22 claims    2 of 24 idle             10 of 32
+```
+
+So `SCORCH_SPMM_CHUNK_GUARD_FEED` (committed, off) addresses the dominant residual by cell count on
+both hosts while being 7% of the excess by time. Both readings are worth stating because they lead
+to different work, and the goal as set is the cell-count one.
