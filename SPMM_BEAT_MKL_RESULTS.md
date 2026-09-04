@@ -17248,3 +17248,116 @@ One note on reading the MKT rows: the whole call is 27 to 44 us on a cell whose 
 this host's hooks tax is 18.9 us (float32) and 20.7 (float64) a call. That tax is serial, identical in
 every arm, and outside the region, so it does not touch any number reported here -- but it is why the
 call column looks nothing like redwood's.
+
+## chain96 -- the multi-row register block's gate could not be run, and the small-cell floor is our own thread policy
+
+Two independent findings. The first is a build defect that had been silently holding a lever shut; the
+second is a mechanism for the deficit that a kernel change cannot reach.
+
+### The gate was unrunnable, not merely unrun
+
+`scorch_policy.h` holds `SCORCH_SPMM_MULTIROW_ROWS` at 0 "until a compiled-in three-build on both hosts
+agrees with the hooked grid above", and records that grid: redwood, 302 matrices, 1208 cells a dtype,
+ROWS=2 worth 1.10-1.14, with the cells behind MKL falling 96 -> 59 at float32 k=4 and 17 -> 6 at k=8,
+"the largest reduction any single lever has produced".
+
+Building a release object with `-DSCORCH_SPMM_MULTIROW_ROWS=2` fails outright:
+
+```
+spmm.h:4456: error: 'sp_row_units' was not declared in this scope
+spmm.h:4459: error: 'sp_wide_deg'  was not declared in this scope
+```
+
+The multi-row admission test reads two of the row-split plan's scalars, and those are declared inside
+`#if SCORCH_SPMM_SPLIT_ENABLED`, which is 1 only under hooks or when `SCORCH_SPMM_SPLIT_MIN_IMBALANCE`
+is above zero -- and that ships at 0. So the dispatch has only ever compiled in a hooks build, every
+number in the constant's comment comes from one, and the build the comment asks for had never been
+possible to run. Fixed where it belongs: the two names get split-off definitions of 0, so the terms
+parse and fold away with the `!REDIRECT` that already guards them.
+
+The shipped object is unchanged, proven per symbol rather than by a file digest. Two trees built from
+identical source with identical flags produce different sha256 -- same size, different bytes, because
+the build path is embedded outside `.text` -- so a file-digest test passes no matter what. Comparing
+disassembly instead: the mnemonic sequence is identical over all 164601 instructions, and every one of
+the 10 differing operands is a `__LINE__` constant shifted by exactly +10, the number of lines the
+comment added.
+
+### What the hooked sweep on MKT says, once its own tax is taken off
+
+A nine-arm hooked sweep over the 13 matrices that lose worst on MKT, arms differing only in which
+narrow-k kernel is selected. The absolute ratios against MKL in that run are not usable and the reason
+is worth recording: joined against chain94's release numbers on the same cells, MKL agrees (median
+0.970) while our arm reads 1.354x slower, as a flat additive offset -- dlmc 23->48 us, crack_dual
+31->57, p2p 29->55, kl02 32->53. That is the getenv tax, and MKL does not pay it. Arm against arm is
+still readable, and is conservative, because an additive tax dilutes a multiplicative gain.
+
+Gain over the shipped arm with the tax removed additively, against an A/A floor of 0.996-1.001:
+
+```
+            k=1     k=2     k=4     k=8
+  float32  1.016   1.077   1.000   1.192
+  float64  1.073   1.171   1.062   1.045
+```
+
+Every entry is explained by which kernel owns the width, and the map is worth stating because it is why
+three of the twelve cells are structurally flat rather than measured null. `multirow_ok` requires
+`!exact_width` and that the half-vector kernel does not serve the width. So: float32 k=4 cannot move at
+all, because `SCORCH_SPMM_HALFVEC_F32=1` owns width 4 (half of eight lanes) and multi-row declines --
+which is correct, prior art measured multi-row at 0.9425 there. Widths 2 and 3 are owned by the
+exact-width band at both dtypes, so the gain only appears in the arms that withdraw it. float32 k=8 and
+float64 k=4 and k=8 have nothing in the way, and there the constant being 0 is the only reason the kernel
+is absent.
+
+New beyond the constant's comment, which only covers k=4 and k=8: at k=2 the exact-width kernel wins the
+dispatch and loses the clock. The intermediate arm decomposes it. float32: withdrawing the exact band
+costs 5.0%, then multi-row gains 13.4% on top, net 1.077. float64: withdrawing it *gains* 8.9% by
+itself, and multi-row adds 7.5%, net 1.171. At that width we ship the slower of two kernels we already
+have.
+
+It does nothing for the dlmc transformer family -- 0.997 to 1.058 for every arm at every width -- which
+is the next section.
+
+### The small-cell floor is the team width, and the policy that forces it
+
+On MKT's release grid our arm reads 22-27 us on the 512-row transformer matrices and on several
+4000-row graphs, and does not move from k=1 to k=16. large_A_07 is 25.6 us at k=1 and 25.7 at k=16:
+sixteen times the arithmetic, same clock. MKL's floor on the same cells is about 13 and does scale.
+A time that ignores the arithmetic is a fixed cost, and three candidates are ruled out: it is a release
+object so there is no getenv tax, the eight-argument pybind call costs 1.4 us against `torch.sparse.mm`'s
+0.9, and the O(nnz) ABI structural scan is memoized behind an O(1) key.
+
+It is the parallel region. Holding the matrix fixed and sweeping the forced team width on the M5:
+
+```
+  512 rows, 102/row, k=1    T1 11.27  T2 10.73  T3 14.20  T4 16.13  T5 18.04  T6 24.00
+  4249 rows, 4/row,  k=1    T1 10.55  T2 10.58  T3 12.75  T4 14.08  T5 15.86  T6 24.94
+  512 rows, 1/row,   k=1    T1  2.36  T2  2.36  T3  2.37  T4  2.33  T5  2.35  T6  2.30
+```
+
+`scorch_spmm_nthreads` -- asked of the build, not restated -- wants 1 worker on the first two. The third
+row is the control: with a hundredth of the nonzeros the same shapes cost 2.3 us at every width, so this
+is not a per-call constant, it is what opening a team of six costs when there is nothing for it to do.
+
+Production pays it. `_composition_hints` passes `torch.get_num_threads()` as `nthreads_override` for the
+drop-in SpMM -- the shipped host-thread match, e795127, which is what took pubmed from 0.78 to 1.15x --
+and the kernel's third bound adopts it, a bound that can only raise. Through the real entry point:
+
+```
+                          scorch.matmul   same kernel at the rule's own count
+  512 rows, 102/row, k=1     22.39 us              11.35 us
+  4249 rows, 4/row,  k=1     22.81 us              10.60 us
+```
+
+The rule is not the answer either, and this is why the fix is not a cap. At k=16, and on matrices ten
+times larger, the rule's own count is the one that loses: 9506 rows at k=16 reads 180.04 us at the rule
+against 108.66 at the pool, and 20141 rows reads 87.96 against 37.04. The policy overshoots on small and
+narrow work; the rule undershoots on large and wide. What is missing is a bound that prices the team --
+a worker is worth adding only when the arithmetic it takes off the critical path exceeds its arrival
+delay plus its share of teardown -- and the per-host constant for that is already measured in the
+section above: 0.06 us on MKT, 0.26 on redwood, 4.75 on the M5.
+
+Two limits on the paragraph above, stated rather than left for a reader to find. The M5 is the host where
+a worker is most expensive and it has no MKL, so this is evidence about our thread policy and not yet
+about the deficit. And MKT's 0.06 us a worker, measured across the 4-to-12 band, would predict only about
+2 us at 32 -- which does not explain a 25 us floor there. A per-cell team-width sweep against MKL on the
+MKT corpus is queued to settle both.

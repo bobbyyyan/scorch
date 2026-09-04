@@ -4249,6 +4249,16 @@ torch::Tensor spmm_csr_v2_core(
   const long sp_slot_base = REDIRECT ? split->slot_base : 0;
   const int* SCORCH_RESTRICT sp_x_pos = REDIRECT ? split->x_pos : nullptr;
   const int* SCORCH_RESTRICT sp_x_end = REDIRECT ? split->x_end : nullptr;
+#else
+  // With the split compiled out, REDIRECT is false in every instantiation and every term below that
+  // mentions these folds away at compile time -- but the terms still have to PARSE, and two of them
+  // are in the multi-row register block's admission test. Nothing declared these on the split-off
+  // path because until now nothing compiled that test into a release object: building with
+  // -DSCORCH_SPMM_MULTIROW_ROWS=2 failed outright on `sp_row_units was not declared`, which is why
+  // the constant's own comment could still ask for a compiled-in three-build that had never been
+  // possible to run. Constants, not the struct reads, so a split-off build emits nothing for them.
+  constexpr long sp_row_units = 0;
+  constexpr long sp_wide_deg  = 0;
 #endif
 #ifdef SCORCH_TUNE_HOOKS
   bool wstat_on = false;
