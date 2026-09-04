@@ -3251,6 +3251,32 @@ static inline void scorch_spmm_row_neon_hoisted(
 // -- the width was being discarded, not chosen.
 #ifndef SCORCH_SPMM_CHUNK_GUARD_PRECAP
 #define SCORCH_SPMM_CHUNK_GUARD_PRECAP 1
+
+// Whether the chunk width is allowed to fall below the GENERIC width in order to give every worker
+// in the team something to claim.
+//
+// scorch_chunk derives its OWN worker count from the work and cuts SCORCH_CHUNKS_PER_THREAD (7)
+// chunks for that many workers, clamped to SCORCH_CHUNK_MAX (64). When the team that actually runs
+// is wider than the count it derived, the claims run out before the workers do. A 512-row matrix
+// with 52428 nonzeros at k=1 is under one grain, so it derives ONE worker and returns
+// min(512/7, 64) = 64 -- eight claims for a team of 32, with 24 workers finding nothing. The width
+// is then independent of nthreads at every value from 1 to 32, which is how this was found.
+//
+// There are TWO paths to that, and they contradict each other:
+//
+//   * the confidence guard returns `generic` early, before the clamps below are reached; and
+//   * when the guard does not fire, `per_worker` trims the width to rows/nthreads and is then
+//     UNDONE two lines later by "a ceiling never pushes it below the width we would have used
+//     anyway" -- so the clamp written to give every worker a chunk cannot bind in precisely the
+//     case it was written for.
+//
+// This constant makes the floor `min(generic, rows/nthreads)` on both paths. It can only LOWER a
+// width, and only when the width exceeds a worker's share, so it cannot fire on a cell that already
+// has at least one chunk per worker: 0 of 34 GCN, autoencoder and attention cells change at teams
+// of 24 or 32. It ships off until measured on both hosts.
+#ifndef SCORCH_SPMM_CHUNK_GUARD_FEED
+#  define SCORCH_SPMM_CHUNK_GUARD_FEED 0
+#endif
 #endif
 inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
   const long generic = (long)scorch_chunk(rows, nnz * k, SCORCH_GRAIN_SPMM);
@@ -3258,6 +3284,7 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
   long chunks_min = SCORCH_SPMM_CHUNKS_MIN;
   long minratio = SCORCH_SPMM_CHUNK_MINRATIO;
   int guard_precap = SCORCH_SPMM_CHUNK_GUARD_PRECAP;
+  int guard_feed = SCORCH_SPMM_CHUNK_GUARD_FEED;
 #ifdef SCORCH_TUNE_HOOKS
   { const char* e = std::getenv("SCORCH_SPMM_CHUNK");
     if (e && *e) { long f = std::atol(e); if (f > 0) return (int)f; } }
@@ -3267,15 +3294,26 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
     if (e && *e) { long v = std::atol(e); if (v > 0) minratio = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_CHUNK_GUARD_PRECAP");
     if (e && *e) guard_precap = (int)std::atol(e); }
+  { const char* e = std::getenv("SCORCH_SPMM_CHUNK_GUARD_FEED");
+    if (e && *e) guard_feed = (int)std::atol(e); }
 #endif
   const double ratio = (double)SCORCH_SPMM_CHUNK_K * (double)SCORCH_SPMM_CHUNK_KREF
                        / ((double)nnz * (double)k);
   const long model = (long)((double)rows * std::sqrt(ratio));
+  // The width the generic answer is allowed to fall back to. Normally that is `generic` itself;
+  // with SCORCH_SPMM_CHUNK_GUARD_FEED it is capped at a worker's share, because a fallback wider
+  // than rows/nthreads hands part of the team nothing to claim. See the constant's comment.
+  long floor_w = generic;
+  if (guard_feed) {
+    const long share = rows / (long)nthreads;
+    if (share >= 1 && floor_w > share) floor_w = share;
+    if (floor_w < 1) floor_w = 1;
+  }
   // The confidence guard, on the model's own width. Below the threshold the model
   // is not saying anything it can support, so the generic width stands.
-  if (guard_precap && model < minratio * generic) return (int)generic;
+  if (guard_precap && model < minratio * generic) return (int)floor_w;
   long c = model;
-  if (c < generic) c = generic;
+  if (c < floor_w) c = floor_w;
   long cap = rows / ((long)nthreads * chunks_min);
   if (cap < generic) cap = generic;
   if (c > cap) c = cap;
@@ -3284,8 +3322,11 @@ inline int scorch_spmm_chunk(long rows, long nnz, long k, int nthreads) {
   if (c < 1) c = 1;
   if (guard_precap) {
     // A ceiling trims the recommendation; it never pushes it below the width we
-    // would have used anyway.
-    if (c < generic) c = generic;
+    // would have used anyway -- where "anyway" is floor_w, which equals `generic` unless
+    // SCORCH_SPMM_CHUNK_GUARD_FEED is on. With `generic` here, this line undid the per_worker
+    // clamp above whenever generic exceeded a worker's share, which is the only case that clamp
+    // was written for.
+    if (c < floor_w) c = floor_w;
   } else {
     // The pre-fix order, kept as the control arm: the guard reads the trimmed width.
     if (c < minratio * generic) c = generic;
