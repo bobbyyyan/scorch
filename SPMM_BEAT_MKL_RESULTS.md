@@ -17838,3 +17838,42 @@ argument.
     the two float32 files, so every float64 lookup went into a float32 file, missed, and dropped the
     row: the float64 table printed empty under a header naming the float32 passes it had used. The
     header is what gave it away, and only because it printed the file names rather than "p1/p2".
+
+## Two properties of this harness setup that are load-bearing and easy to break
+
+Neither is a defect. Both are places where the next sensible-looking change breaks something silently,
+so they are written down rather than left to be rediscovered.
+
+### An sbatch copies its scripts at RUN time, and that cuts both ways
+
+`mkt_*.sbatch` copies the harness it runs out of the staging directory when the job STARTS, not when
+it is submitted. Slurm snapshots the sbatch itself at submit, so the two behave differently: editing
+a queued job's sbatch does nothing, while editing the python it copies changes what that job will do.
+
+That saved a queued job today -- the `RAISE_ON_FLOORED` enumeration was already in the queue when it
+needed a change (report which matrices moved, not just how many), and restaging the script was
+enough. It is also the sharp edge of a trap already recorded here: editing a live bash script makes
+bash re-read it mid-loop, which silently changed what a running experiment was measuring and cost a
+whole data set its provenance. **Same property, opposite sign.** Anyone who makes the staging copy
+happen at submit instead -- which is the more obviously correct design -- breaks the restage without
+any sign that they have.
+
+### Zero means "a value" in one hook and "the absence of one" in another, in the same function
+
+Both of these are read by `scorch_spmm_nthreads`:
+
+  * `SCORCH_SPMM_NT_FORCE=0` means **do not force**. Zero is the absence of a setting, and an arm
+    labelled `policy` with that value is the real policy -- which is why it is the correct floor of
+    a forcing sweep, and why a lint looking for the ABI-argument defect flagged it wrongly.
+  * `SCORCH_SPMM_RAISE_ON_FLOORED=0` means **use `work_true`**. Zero is a value. Unset is what means
+    "the absence of one", and unset falls back to the compiled default -- which is 0 today, so the
+    two coincide, and would stop coinciding the moment the constant is promoted. An enumeration
+    written as "unset versus 1" would then be comparing 1 against 1 and reporting a clean null.
+  * `SCORCH_SPMM_NT_CAP=-2` is a third convention again: a sentinel meaning "take the caller's
+    override, or `omp_get_max_threads()`".
+
+Three conventions for the same idea in one function's inputs. Nothing is wrong with any of them
+individually; the hazard is that a harness author has to know which is which per variable, and the
+failure is silent in both directions. If a fourth appears, the convention belongs in the hooks
+section of `scorch_policy.h` as a stated rule, with an audit of every hook's sentinel behind it --
+that audit has not been done and is not implied by this note.
