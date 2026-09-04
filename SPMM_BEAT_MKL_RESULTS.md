@@ -17877,3 +17877,61 @@ individually; the hazard is that a harness author has to know which is which per
 failure is silent in both directions. If a fourth appears, the convention belongs in the hooks
 section of `scorch_policy.h` as a stated rule, with an audit of every hook's sentinel behind it --
 that audit has not been done and is not implied by this note.
+
+## chain102: chain101's oracle is mostly the physical-core cap, which is already rejected -- but not the same intervention
+
+chain101 reported production's declared pool as 5-21% off a per-cell oracle and I called it the
+largest remaining lever. Two follow-up analyses on the same data, both free, cut that claim down and
+then point somewhere narrower and genuinely unmeasured.
+
+### It is a worker-count lever, not a chunk lever
+
+The sweep records the resolved chunk and partition mode beside every reading, so which decision the
+oracle actually moves is answerable without new measurement. Of 1200 cells, the pool is already best
+on 124. On the 1076 where some other declared width wins:
+
+```
+  chunk same, partition same     804 cells   median gain 1.1813   p90 1.4284
+  chunk moves, partition same    272 cells   median gain 1.0784   p90 1.2824
+```
+
+Three quarters of the win lands on cells where nothing but the count changes, and those carry the
+LARGER gain. So this is not a chunk-width oracle wearing a thread-width costume.
+
+### And the better count is a constant, not a function -- it is the physical core count
+
+Restricting to the 928 cells where only the count is in play, the best declared width is 16 on 395
+of them and the MEDIAN best is 16 at every width and both dtypes (float32 k=1 is 12). A work-based
+closed form does not fit at all -- `T = clamp(nnz*k/G, 1, pool)` gives mean |log(pred/best)| of 1.19
+to 2.32 across four decades of G, which is what a constant looks like when you try to fit a slope
+to it.
+
+**16 is this allocation's physical core count** (32 logical over 16 physical, chain79). So the
+oracle is, to first order, "run one worker per physical core" -- and that is
+`SCORCH_SPMM_NT_CAP_PHYS`, which scorch_policy.h records as MEASURED AND REJECTED on two
+independent gates: above ten million nonzeros it costs 4.5% (float32) and 2.9% (float64), and on the
+caller path it reads 0.8994 with z from -9.3 to -11.7 and cells below MKL RISING 482 -> 535 and
+332 -> 390.
+
+**So no ML predictor is warranted and I am not building one.** The answer the oracle wants is a
+constant that has already been priced and declined.
+
+### The part that is still open, and it is a distinction the same trap hides
+
+The rejection and the oracle are not the same intervention, and the constant's own comment says so
+in passing: *"an override cannot do it -- it sets the recruit-decline threshold to twice itself and
+stops binding on the largest matrices"*. The cap forces the FINAL resolved count. The oracle's `nt`
+arms DECLARE a pool of T through `nthreads_override`, which the rule reads five times. Those are
+different configurations, and the recorded rejection measured the cap.
+
+What production does today is pass `torch.get_num_threads()` -- 32 here -- as that argument, from
+`_composition_hints`. What has never been measured is passing the **physical** core count there
+instead: not capping the resolved count, but telling the rule the pool is 16. The oracle says that
+configuration is worth a median 1.18 on two thirds of cells at the kernel; the caller path for it is
+unmeasured, because the caller-path number on file belongs to the cap.
+
+That is a one-line change at a single site and a caller-path A/B against a same-code floor, which is
+the harness that already exists. It is a much narrower claim than "the largest remaining lever" and
+it is the honest residue of chain101. The 4.5%-above-ten-million-nonzeros harm is a property of the
+worker count itself rather than of how it was set, so it should be expected to survive and to need
+the same nonzero gate; that is a reason to expect a gated win at best, not an unconditional one.
