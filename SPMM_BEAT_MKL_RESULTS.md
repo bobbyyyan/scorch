@@ -17453,3 +17453,72 @@ family is starved on both:
 So `SCORCH_SPMM_CHUNK_GUARD_FEED` (committed, off) addresses the dominant residual by cell count on
 both hosts while being 7% of the excess by time. Both readings are worth stating because they lead
 to different work, and the goal as set is the cell-count one.
+
+## chain98 -- MKT's five-build gate read by cell count: ROWS=2, not ROWS=4, and float64 stays off
+
+MKT's five-build gate finished: 3600 rows per build, 50 matrices, widths 1/2/4/8/16/64, two dtypes,
+two passes, release objects only. Three things came out of it, and the first is about the statistic.
+
+### Three cells with 20x stalls, and why the median is the primary statistic here
+
+The first read of the grid showed all three candidates losing 4-6% at float32 k=64 -- a width where
+multi-row provably cannot fire, since 64 > 4*SL = 32 and `narrow_k` bounds the mechanism at 32. That
+was stall damage, and the tell is decisive: `neos1`'s FLOOR arm read **20.861x** against the base.
+The floor is the same source in a different directory. No code change can do that.
+
+Excluding cells whose same-code floor lands outside [0.80, 1.25] removed exactly three
+(`float32 k=64 neos1` at 20.861, `float64 k=64 uni_chimera_i1_A_05` at 3.676, `float64 k=16 msdoor`
+at 0.646), and float32 k=64 went to 1.0097 / 1.0103 / 1.0078 against a 1.0004 floor -- neutral, as
+the mechanism requires. But that filter is not enough on its own: it only sees stalls that land on
+the floor arm. `kl02` at float32 k=64 read 0.031 in the mr2 arm with a perfectly sane floor of
+1.059, and one such cell moves a 49-cell geomean by 6%. The median over cells needs no judgement
+about which cells to drop, so that is what the tables below report.
+
+### Read by crossings of the MKL line, ROWS=4 is the worse arm despite the better median
+
+A geomean answers a different question from the one Bobby asked. "Faster than MKL everywhere" is a
+cell count, and a geomean rewards a candidate that makes already-winning cells win by more: lift one
+cell from 3.0x to 3.6x, push another from 1.02x to 0.98x, and the geomean improves while the goal
+gets worse. Counting crossings in both directions, with the same-code floor arm as the noise level:
+
+```
+  float32          median @ k=8    cells cleared / broken, all widths    at k=8
+  c0b (floor)      1.0018          +1 / -4                               +0 / -1
+  mr2  ROWS=2      1.1565          +9 / -2                               +7 / -0
+  mr2x ROWS=2,     1.1477          +8 / -2                               +5 / -0
+       band off
+  mr4  ROWS=4      1.2058          +9 / -4                               +4 / -0
+```
+
+ROWS=4 has the largest median at k=8 by four points and clears the fewest cells there. ROWS=2's
+`+7/-0` at k=8, against a floor that moved `+0/-1`, is the cleanest signal in the grid. Its k=1
+crossings (`+1/-0`) are floor-level and expected to be: `narrowk_gather` owns float32 k=1 and the
+admission test excludes it. **The float32 verdict is ROWS=2**, and it agrees with redwood's
+(43 below-MKL cells to 34).
+
+### float64 is null, and the width-2 arm's trade is negative
+
+```
+  float64          cells cleared / broken, all widths     at k=1        at k=2
+  c0b (floor)      +5 / -1                                +2 / -0       +1 / -1
+  mr2              +7 / -6                                +1 / -1       +1 / -3
+  mr2x             +13 / -15                               +1 / -7      +9 / -3
+  mr4              +7 / -5                                +4 / -1       +0 / -3
+```
+
+The float64 floor itself moves six cells, because float64 cells sit closer to the MKL line than
+float32 cells do. mr2 at `+7/-6` and mr4 at `+7/-5` are inside that. So float64 multi-row is null on
+MKT, and redwood called it a wash with a deg<8 k=16 regression -- **float64 stays at 0**, which is
+the same per-dtype split the half-vector constants already ship with.
+
+mr2x is the interesting one and it is a real trade, not noise: `+9` at k=2 and `-7` at k=1, both well
+clear of the floor. The mechanism is exact: mr2x sets `SCORCH_NARROWK_EXACT_UNROLL=0`, and
+`narrowk_exact` IS the unroll count, so `if (narrowk_exact)` at spmm.h:4031 is false and the
+exact-width path switches off at EVERY width -- including k=1, which is where that kernel earns its
+place. Net, mr2x is negative and cannot ship as it stands.
+
+But `exact_lo_` decides k=1 independently of the band's top. So `SCORCH_NARROWK_EXACT_HI=1` asks for
+the same thing without paying for it: k=1 keeps the kernel it ships with, and only widths 2 and 3 go
+to multi-row. That is `mr2h`, queued on both hosts at widths 1/2/3/4/8 with plain ROWS=2 in the grid
+so any k=2 difference is attributable to the band and not to multi-row. If the `+9` survives and the
+`-7` does not appear, the width-2 result is real and separable.
