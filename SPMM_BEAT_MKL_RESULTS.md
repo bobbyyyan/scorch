@@ -17660,3 +17660,45 @@ it calibrates, and it moved 0.3-0.4% against effects of 7-16%. That is what a fl
 is a live confound for any future two-build comparison whose labels differ in length and whose
 effect is small, and it is invisible: it produces a working binary, a plausible number, and no
 warning.
+
+## Correction to chain99: the chunk-starvation null was measured at a team production does not use
+
+The chunk section of chain99 is withdrawn. It reported that narrowing the chunk to a worker's share
+is worth 0.2-0.6% on the 44 of 500 cells that starve, and that "the team is 16, not 32 --
+uniformly". The second claim is a harness artifact and it invalidates the first.
+
+`chunkstarve_mkt.py` pins the team by setting `SCORCH_SPMM_NT_FORCE`, and in a hooks build --
+which that experiment requires, since `SCORCH_SPMM_CHUNK` is compiled out of a release object --
+`scorch_spmm_nthreads` READS that same variable. The harness asked the rule for each cell's team
+and then set the variable; so from the second cell onward the query returned the previous cell's
+answer, and `team` was sticky at whatever the first cell resolved to for the entire corpus. It
+recorded 16 on all 4000 readings.
+
+The release build says otherwise. Over 18000 readings of the same 50-matrix corpus, `nt_ship` --
+the rule's answer at a pool of 32, asked of a release object with nothing forced -- is:
+
+```
+  32   16500      16    720      8    120      4    240
+  24      60      18     60      5/6/9/11/12   60 each
+```
+
+So production resolves per cell and mostly runs 32 workers. The starvation experiment therefore
+pinned every cell to a 16-worker team AND cut its candidate chunk widths for 16 workers, which is
+not the policy it was measuring. A 32-worker team starves on strictly more cells than a 16-worker
+one, so the effect it was looking for was systematically understated. **The chunk lever is
+reopened, not closed**, and it is requeued with the variable cleared before the rule is asked.
+
+Two of that experiment's findings do survive, because they do not depend on the team being right:
+the fed cells read 0.9994-1.0014 against an identical floor, so the guard is inert where it must
+not fire; and the dlmc 512-row family was not starved *at a 16-worker team*, which says nothing
+about 32.
+
+A guard now refuses the run if the resolved team is constant across the corpus. A work-based rule
+cannot be flat over 50 matrices and 5 widths, and flatness is what a leaked forcing variable looks
+like -- it is otherwise indistinguishable from a working experiment.
+
+Separately, and not a defect but worth stating because it changes what that sweep measures:
+`threadfloor.py`'s forced-width arms pass `nthreads_override=T`, and that argument is **the
+caller's pool**, not "use T workers". Small T does cap the team, but large T only raises a cap the
+rule may not reach, so the sweep varies the pool a caller declares rather than forcing a team
+width. Its `nt`/`pool` arms at T = 32 are the same configuration.
