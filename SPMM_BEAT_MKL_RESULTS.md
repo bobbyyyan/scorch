@@ -17702,3 +17702,30 @@ Separately, and not a defect but worth stating because it changes what that swee
 caller's pool**, not "use T workers". Small T does cap the team, but large T only raises a cap the
 rule may not reach, so the sweep varies the pool a caller declares rather than forcing a team
 width. Its `nt`/`pool` arms at T = 32 are the same configuration.
+
+## chain100: the caller-path gate on MKT -- the win survives scorch.matmul undiminished
+
+The gate measured `spmm_csr_float_v2` directly. That decides whether a KERNEL is faster. What
+decides whether a USER is faster is `scorch.matmul`, which also pays format dispatch, the tiling
+selector's probe, the output allocation and the STensor wrapper -- fixed cost a per-call win has to
+clear. Same corpus, same discipline, three release builds, warm (the STensor built once per cell so
+the plan cache is live for every timed call):
+
+```
+  k     mr2      floor     cells below MKL       crossings (mr2)   crossings (floor)
+  1    1.0143   1.0028     29 -> 28              +2/-1             +0/-2
+  2    1.0003   1.0021     41 -> 42              +0/-1             +0/-1
+  4    1.0058   1.0026     25 -> 22              +3/-0             +0/-0
+  8    1.1512   0.9999     17 ->  7              +10/-0            +0/-1
+  16   1.1076   1.0024      1 ->  1              +0/-0             +0/-0
+  all                     113 -> 100             +15/-2            +0/-4
+```
+
+k=8 reads 1.1512 at the caller against 1.1565 at the native symbol, so essentially none of the win
+is lost on the way in, and by cell count the caller path is the STRONGER result: +10/-0 at k=8
+against a floor that moved +0/-1, and 13 cells cleared net. The float32 k=1 regression that redwood
+showed at the native symbol (0.9872) does not appear here -- the caller path reads 1.0143 -- which
+is consistent with it being a code-layout effect on a short kernel that the caller's fixed cost
+dilutes.
+
+This was the gating measurement for the row count, and on this host it passes.
