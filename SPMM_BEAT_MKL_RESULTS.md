@@ -17625,3 +17625,38 @@ are almost entirely dlmc: `bottleneck_*` and `body_*`, the 256- and 512-row resn
 layers. The family that is the residual on both hosts is the family whose same-code noise floor is
 worst here. Any claim about it at these repetition counts is unreliable, which is worth knowing
 before the next attempt on it.
+
+## The build directory's NAME changes .text without changing its size
+
+Three jobs refused with "c0 and c0b have different .text -- the A/A floor is not the same code",
+on identical source that had built byte-identically an hour earlier. The diagnosis took two wrong
+turns worth recording, because the wrong ones were both plausible.
+
+First guess: the digest hashed an ELF wrapper. `objcopy --only-section=.text` without `-O binary`
+emits an ELF that still carries headers and a symbol table, neither of which is a function of the
+code alone. That was a real defect and worth fixing, but it was not the cause -- with raw bytes the
+refusal stood, and the sizes it then printed settled it:
+
+```
+  c0  .text 1073666 bytes
+  c0b .text 1073666 bytes      identical size, different digest
+```
+
+Identical size rules out an extra instruction, a different inlining decision, and a padding shift.
+What changes bytes without changing size is an IMMEDIATE. The build path is embedded as a string --
+`assert`'s `__FILE__` among others -- so a directory named `c0b` puts one more byte in .rodata than
+`c0` does, every .rodata offset after that string shifts, and .text reaches .rodata through
+RIP-relative displacements whose 32-bit immediates all change. Same instructions, same lengths,
+same total size, different bytes. Whether the extra byte crosses an alignment boundary decides
+whether anything shifts at all, which is why one job passed this check and the next two failed it
+on the same script.
+
+Fixed by compiling every configuration at one fixed path (`$ROOT/wk`) and moving the tree to its
+label afterwards, so the embedded strings are identical and the comparison is exact.
+
+**This does not invalidate the gate results.** The floor arm is `c0b`, which has the same name
+length as `mr2`, `mr4` and `mr2h` -- so the floor carries the identical confound as the candidates
+it calibrates, and it moved 0.3-0.4% against effects of 7-16%. That is what a floor is for. But it
+is a live confound for any future two-build comparison whose labels differ in length and whose
+effect is small, and it is invisible: it produces a working binary, a plausible number, and no
+warning.
