@@ -603,9 +603,33 @@
 // with the hooked grid above. MINNNZ 0 means no nonzero gate; it exists because the wins concentrate
 // above about 200k nonzeros, so if the three-build finds a small deficit on tiny matrices the fix
 // is a gate that already exists rather than a new mechanism.
+//
+// The row count is per dtype, on the same grounds as SCORCH_SPMM_HALFVEC_F32/_F64 below: the
+// compiled-in gate on both hosts found the mechanism worth having on float32 and worth nothing on
+// float64. Read by cell count against MKL -- which is the goal as set, and not the same as a
+// geomean -- ROWS=2 on float32 cleared 7 cells at k=8 on MKT and broke none, against a same-code
+// floor that moved +0/-1, and took redwood's float32 deficit from 43 cells to 34. On float64 both
+// hosts read null: MKT's floor arm alone moved 6 cells (float64 cells sit closer to the MKL line),
+// ROWS=2 moved +7/-6 and ROWS=4 +7/-5, and redwood called it a wash with a regression at deg<8
+// k=16. So float64 is 0 and not "0 for now": the grid that would justify a non-zero value is the
+// one that measured it null.
+//
+// A single -DSCORCH_SPMM_MULTIROW_ROWS=N still sets both, so every harness written before the split
+// keeps meaning what it meant.
 #ifndef SCORCH_SPMM_MULTIROW_ROWS
 #  define SCORCH_SPMM_MULTIROW_ROWS 0
 #endif
+#ifndef SCORCH_SPMM_MULTIROW_ROWS_F32
+#  define SCORCH_SPMM_MULTIROW_ROWS_F32 SCORCH_SPMM_MULTIROW_ROWS
+#endif
+#ifndef SCORCH_SPMM_MULTIROW_ROWS_F64
+#  define SCORCH_SPMM_MULTIROW_ROWS_F64 SCORCH_SPMM_MULTIROW_ROWS
+#endif
+// Whether ANY instantiation wants the kernel, which is what decides whether the mechanism is
+// compiled at all. The per-dtype value then folds the branch away inside the instantiations that
+// do not want it, exactly as the half-vector flag does.
+#define SCORCH_SPMM_MULTIROW_ANY \
+  (SCORCH_SPMM_MULTIROW_ROWS_F32 > 1 || SCORCH_SPMM_MULTIROW_ROWS_F64 > 1)
 #ifndef SCORCH_SPMM_MULTIROW_MINNNZ
 #  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
 #endif

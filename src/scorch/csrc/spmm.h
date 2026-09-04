@@ -4097,7 +4097,7 @@ torch::Tensor spmm_csr_v2_core(
   }
 #endif
 #if !defined(SCORCH_TUNE_HOOKS) && defined(__AVX2__) && defined(__FMA__) && \
-    SCORCH_SPMM_MULTIROW_ROWS > 1
+    SCORCH_SPMM_MULTIROW_ANY
   // SCORCH_SPMM_WORKSPACE is a hook and does not exist in a release build, but the multi-row
   // dispatch below now does, and it reads this. State the value it always has in a release build
   // once, rather than fragmenting the dispatch's condition with a preprocessor branch. The other
@@ -4105,17 +4105,23 @@ torch::Tensor spmm_csr_v2_core(
   const bool force_workspace = false;
 #endif
 #if defined(__AVX2__) && defined(__FMA__) && \
-    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
   // Multi-row register blocking's policy (measurements in scorch_policy.h). Outside the hooks
   // guard because the dispatch below is too: a release build has to contain the mechanism for a
   // three-build to measure it. const in a release build for the reason the deep kernel's
   // constants are -- left non-const the dead branch does not fold, because the dispatch sits
   // inside the parallel region's lambda.
+  // std::is_same is a compile-time constant inside the instantiation, so the release form stays
+  // constexpr and a dtype whose row count is 0 folds multirow_ok -- and the whole dispatch that
+  // reads it -- to nothing. That is what keeps the float64 object byte-identical while float32
+  // gains the kernel.
 #ifdef SCORCH_TUNE_HOOKS
-  int multirow = SCORCH_SPMM_MULTIROW_ROWS;
+  int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
+                                                      : SCORCH_SPMM_MULTIROW_ROWS_F64;
   long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
 #else
-  constexpr int multirow = SCORCH_SPMM_MULTIROW_ROWS;
+  constexpr int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
+                                                                : SCORCH_SPMM_MULTIROW_ROWS_F64;
   constexpr long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
 #endif
 #endif
@@ -4228,7 +4234,7 @@ torch::Tensor spmm_csr_v2_core(
 #endif
 
 #if defined(__AVX2__) && defined(__FMA__) && \
-    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
   // Whether the multi-row kernel may serve this CALL. Every term here is loop-invariant, and the
   // row loop's test is the two that are not.
   //
@@ -4459,7 +4465,7 @@ torch::Tensor spmm_csr_v2_core(
         }
 #endif
 #if defined(__AVX2__) && defined(__FMA__) && \
-    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ROWS > 1)
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
         // A/B hook: take ROWS consecutive rows at once, so the independent B loads come from
         // different rows rather than from deeper inside one. Placed ahead of the empty-row
         // branch because the multi-row kernel writes an empty row's zeros itself.
