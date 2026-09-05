@@ -19155,3 +19155,89 @@ respond to a kernel change by 1.47 and by 1.11. This is the same defect as measu
 on a corpus selected for already losing, and as pricing a lever off a mean run length when 41% of
 the mass sits at length one: **the summary statistic was computed over the wrong set, and it was the
 set that made the arm look small.**
+
+## chain119: the floor is the declared pool, at least on one host -- and a pre-registration for the prefetch arm
+
+### The floor, decomposed locally
+
+chain117 left the per-call floor unexplained after eliminating three candidates: the ABI validation
+memoizes its O(rows) and O(nnz) scans on the index pair, the whole pybind-plus-eight-kwargs call
+floor is **1.62 us at one row** (1.22 positional, so the kwargs path costs 0.4), and the recorded
+team-width cost is too small to be 20 us. The fourth candidate is the one the harness passes in.
+
+`nthreads_override` is the caller's pool, and `mrgate.py` passes 32 on MKT and 24 on redwood, which
+is what `ops.matmul` also passes. Sweeping it on the M5, on a 512-row 26214-nonzero matrix at k=1:
+
+| declared pool | 1 | 2 | 4 | 8 | 16 | 32 | default (pool 6) |
+|---|---|---|---|---|---|---|---|
+| us, 512 rows / 26214 nnz | **6.81** | 8.00 | 15.15 | 26.90 | 50.37 | **57.88** | 8.08 |
+| us, 4249 rows / 19637 nnz | 10.91 | 10.69 | 12.87 | 30.67 | 52.36 | 59.51 | 10.74 |
+| us, 32768 rows / 262144 nnz | 108.01 | 62.15 | **38.57** | 47.13 | 69.67 | 74.87 | 38.18 |
+
+**Eight and a half times**, on work that one core finishes in seven microseconds. The third row is
+the control: on 262144 nonzeros the sweep has a real minimum at four, so this is not "threads are
+always bad", it is a team whose width is set by the caller's pool rather than by the work.
+
+And the per-row dispatch cost, from a sweep that holds nnz at 32768 and spreads it over more
+non-empty rows (R2 0.997-0.999):
+
+| declared pool | 1 | 2 | 4 | default |
+|---|---|---|---|---|
+| ns per row | 1.603 | 0.814 | 0.430 | 0.607 |
+| intercept us | 6.73 | 9.89 | 13.51 | 11.82 |
+
+So the per-row cost is real but small -- about 6.4 cycles single-threaded -- and it parallelises.
+The floor is in the intercept, and the intercept grows with the declared pool.
+
+**This does not yet explain MKT**, and the honest statement is that it cannot: the recorded
+per-worker team cost is 4.75 us on the M5, 0.26 on redwood and **0.06 on MKT**, so 32 workers there
+should be about 2 us against a 22 us floor. Either that figure describes widening a warm team rather
+than entering a region, or MKT's floor is something else. A 40-minute sweep is queued first on both
+hosts to say which, and it is queued first because of what it would mean.
+
+### What it would mean, which is why it goes before the kernel arms
+
+If the floor tracks the declared pool, then **every arm ever read on the floor-dominated part of
+this corpus was measuring a thread policy, not a kernel** -- which is the same defect chain118 found
+in the pooled geomeans, one layer down. It also stops being a harness question: `ops.matmul` passes
+`torch.get_num_threads()` the same way the harness does, so a user on a 64-core machine multiplying
+a small sparse matrix pays it. And the fix would be a work-based team cap rather than a kernel
+change, which is a different part of the code from everything else in this sequence.
+
+Three cautions, all from the record. Thread interventions here have been rejected four times
+(`chain59`, the adoption's 24-to-1 cliff, the physical-core cap, the auto-probe). The pool cap that
+did ship matches `torch.get_num_threads()` floored and capped by rows -- 512 rows over 32 threads is
+16 rows each, so the row cap does not bind on the shapes that lose. And the same intervention has
+reversed sign across hosts before: 1.53x faster on the M5 and 1.32x slower on MKT.
+
+### mrhv is correct on x86
+
+The full suite under the multi-row half-vector kernel: **1108 passed, 72 skipped**, 48 minutes, on
+top of the 81 shape/density/width numeric cases and the 33 constructed ragged cases. The kernel is
+new code on the hot path, so this is the gate it needed.
+
+### Pre-registration: what the prefetch arm should read
+
+Written before it runs, at the peer session's suggestion, because there is a real prior in each
+direction and that is exactly when a pre-registration earns its keep.
+
+*For removal helping:* the prefetch and its guard are 9 of 23 emitted instructions per two
+nonzeros, 11.50 instructions per nonzero become 7.00; two nonzeros of run-ahead is about four cycles
+against a ~40-cycle L3 hit, which the depth hook's own comment already doubted; and the multi-stream
+gather result is a null at every stream count (0.968-1.001), so these kernels are not starved for
+outstanding loads in a way more run-ahead fixes.
+
+*Against:* the deep-unroll history, where a +4% turned out to be the prefetch's absence rather than
+the depth -- but that was nvec=2 on a different kernel, so it is a prior and not a result here. And
+the gather pattern defeats the hardware prefetcher, so the software one is the only run-ahead there
+is; if it is covering anything at all, removing it will show.
+
+*The prediction.* Removal reads **between 1.00 and 1.08 on the live widths** (float32 k=4, 8, 16 and
+float64 k=4, 8, 16), largest at k=4 where the loop is shortest, and inside the same-code floor at
+k=1 and k=2, which the dispatch map says are structural nulls. Specifically: **not** the 1.39 the
+instruction count alone implies -- chain117 already showed a 2.3x instruction ratio cashing out as
+1.54x in time, because the A stream is a common per-nonzero cost neither arm avoids. If the arm
+reads inside the floor at every live width, these kernels are latency-bound at the widths that lose
+and the instruction budget is not the thing to spend effort on; if it reads above 1.08, the loop is
+issue-bound and the unmasked-load variant at widths 2-3 becomes worth building rather than merely
+worth costing.
