@@ -852,6 +852,37 @@
 #ifndef SCORCH_NARROWK_EXACT_HI
 #  define SCORCH_NARROWK_EXACT_HI 3
 #endif
+// Per dtype, on the same grounds as SCORCH_SPMM_HALFVEC_F32/_F64 and
+// SCORCH_SPMM_MULTIROW_ROWS_F32/_F64 above: the measurement splits by dtype and one number cannot
+// carry both. Both default to the combined value, so a build that names neither emits what it
+// emitted before, and every harness written against SCORCH_NARROWK_EXACT_HI keeps its meaning.
+//
+// The split is here because the pending measurement needs it. Re-reading the retired mr2h arm
+// (EXACT_HI=1 with multi-row) over only the matrices where the KERNEL is most of the call -- nnz
+// >= 1e6, a threshold taken from the floor measurement and not from this arm -- gives, as the
+// geomean of c0/arm over 18 matrices on MKT and 37 on redwood, with the same-code c0/c0b pair
+// beside it:
+//
+//              MKT k=2   MKT k=3   redwood k=2   redwood k=3   floors (MKT / redwood)
+//   float32     1.1588    1.4657        1.0157        1.1581    1.015-1.026 / 1.001-1.009
+//   float64     1.0850    1.2263        0.9566        1.0294    0.995-1.001 / 0.998-0.999
+//
+// improving 17/18 and 18/18 of MKT's and 28/37 and 36/37 of redwood's on float32; and on float64
+// 11/18 and 14/18 on MKT against 9/37 and 27/37 on redwood. So width 3 wants the vector kernel on
+// both hosts and both dtypes, and width 2 wants it on float32 on both hosts but NOT on float64 on
+// redwood, where it is a 4.3% regression that improves only 9 of 37 matrices. One combined number
+// has to give up one of those; 1 for float32 and 2 for float64 gives up neither.
+//
+// Not yet shipped as that pair: the numbers above are a re-analysis of an arm that ran for a
+// different purpose, and the arm that isolates EXACT_HI from multi-row is queued on both hosts with
+// the nnz split pre-registered. This is the mechanism, defaulted to the current behaviour, so that
+// the decision is a value and not a refactor.
+#ifndef SCORCH_NARROWK_EXACT_HI_F32
+#  define SCORCH_NARROWK_EXACT_HI_F32 SCORCH_NARROWK_EXACT_HI
+#endif
+#ifndef SCORCH_NARROWK_EXACT_HI_F64
+#  define SCORCH_NARROWK_EXACT_HI_F64 SCORCH_NARROWK_EXACT_HI
+#endif
 // Grains of work (nnz*max(k,16) over SCORCH_GRAIN_SPMM) the row partition needs before
 // its bookkeeping is amortised. Its only measured regression is a short-kernel one: the
 // cells where it falls more than 10% behind the shared counter sit at 19-30 microseconds

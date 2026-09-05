@@ -3952,7 +3952,11 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_exact_accum = SCORCH_NARROWK_EXACT_ACCUM;
   // Widest k the exact-width kernel is allowed to serve. 3 is where the measured sign
   // change is; the hook is how the bound gets re-measured rather than trusted.
-  int narrowk_exact_hi = SCORCH_NARROWK_EXACT_HI;
+  // Split by dtype for the reason the constants' comment gives: width 2 wants the vector kernel on
+  // float32 on both hosts and does not want it on float64 on redwood, and one number cannot say
+  // both. Both values default to the combined constant, so this is inert until one is set.
+  int narrowk_exact_hi = std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_HI_F32
+                                                             : SCORCH_NARROWK_EXACT_HI_F64;
   // Widths served by 128-bit registers rather than by a masked 256-bit one (see the policy
   // header). Read here so the dispatch below is a compile-time constant when the hook is off.
   // Split by dtype: see the constants' comment for the two measurements that split it.
