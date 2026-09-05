@@ -18523,3 +18523,64 @@ and 5x, and does not beat it at 8 and 9 where two rows already fill most of a li
 the policy is not a constant but `rows ~ 64 / row_bytes`, and the two widths still excluded --
 float32 k=1 and k=4 -- become the argument for letting multi-row into the gather and half-vector
 kernels rather than for choosing between single-row kernels there.
+
+## chain110: mr2h does not ship -- width 2 is host-variant, and the arm that should ship is EXACT_HI=2
+
+redwood's narrowed-band gate finished: five builds, 8940 rows each, the broad 298-matrix corpus,
+widths 1/2/3/4/8, both dtypes. It disagrees with MKT at exactly one width, and that is enough to
+change the recommendation.
+
+Median over cells, floor first:
+
+```
+  f32  k     1       2       3       4       8         f64  k     1       2       3       4       8
+  c0b        0.9961  0.9966  0.9985  1.0007  0.9989         c0b   1.0020  1.0012  1.0022  1.0011  1.0007
+  mr2        0.9913  0.9933  0.9911  1.0096  1.0860         mr2   0.9914  1.0194  0.9902  1.0373  1.0126
+  mr2h       0.9901  0.9852  1.0531  1.0028  1.0777         mr2h  0.9932  0.9660  1.0049  1.0380  1.0197
+  mrf64      0.9951  1.0030  1.0005  1.0023  0.9993         mrf64 0.9950  1.0250  0.9866  1.0345  1.0131
+```
+
+Cells below MKL at k=2: float32 **7 -> 27**, float64 **7 -> 16**. On the crossing statistic mr2h is
++0/-18 at float32 k=2 and +1/-13 at float64 k=2, and negative overall on this host (+14/-28 and
++8/-27).
+
+MKT read the same arm at k=2 as **1.0516** and **1.0348**, with cells 42->41 and 30->27, and the
+dense band put its float32 total at 230->183 over widths 1-9.
+
+**So freeing width 2 from the exact-width kernel is a win on MKT and a loss on redwood.** Same arm,
+same widths, opposite signs, and the disagreement is at one width only: k=3 is positive on both
+hosts (1.1841 on MKT, 1.0531 here). Under the no-regression rule this cannot ship as `EXACT_HI=1`.
+
+**The calibration that makes the k=2 number trustworthy is already in the table.** At k=4 the
+half-vector kernel owns the width, so mr2 and mr2h run *identical code* to c0 there -- and the
+below-MKL count still moves 30 -> 26 and 30 -> 25. That is this statistic's noise on this host at
+this corpus size: about five cells. A twenty-cell one-directional move at a single width is outside
+it by a factor of four.
+
+### The arm that should ship is EXACT_HI=2
+
+`exact_hi_` is the band's top and `exact_lo_` its floor. `EXACT_HI=1` empties the band above k=1,
+which frees widths 2 **and** 3; only width 3 is a two-host win. `EXACT_HI=2` keeps the exact kernel
+at width 2 and gives up width 3 alone, which is the change both hosts want and nothing else:
+
+* at k=3, multi-row takes the width -- +18 cells on MKT, +4 on redwood, positive median on both;
+* at k=2, the exact kernel keeps it, so redwood's -1.5%/-3.4% and MKT's +5%/+3.5% both become
+  structural nulls, and MKT gives up the one cell that width was worth to it;
+* at k>=5 nothing changes, so multi-row's 1.08-1.13x at 8 and 9 is untouched.
+
+Queued as `mr2i` on both hosts. This is the shipping candidate; `mr2h` is retired to the ledger.
+
+### And the discriminator answered the other question mr2 owed
+
+`mrf64` exists to separate two explanations of mr2's small deficit at the widths where multi-row
+declines: the code being present in the object at all (layout, instruction cache) versus the
+per-row `multirow_ok` test that -O3 did not unswitch out of the row loop. In `mrf64` the kernel and
+its dispatch are compiled in exactly as in mr2, but float32 gets `constexpr multirow == 0` so the
+branch folds away.
+
+float32 in `mrf64` reads **0.9951 / 1.0030 / 1.0005 / 1.0023 / 0.9993** against mr2's 0.9913 /
+0.9933 / 0.9911. So the cost is **the branch, not the code's presence**, and hand-unswitching the
+row loop should recover the 0.5-0.9% mr2 gives up at every width where it declines. That is the
+indicated code change: hoist the admission test out of the row loop and emit two loop bodies, which
+is what chain71's comment says the compiler declined to do inside a lambda in a work-stealing loop.
+Worth 0.5-0.9% at three of five widths on the arm that is otherwise 1.08-1.15x at k=8.
