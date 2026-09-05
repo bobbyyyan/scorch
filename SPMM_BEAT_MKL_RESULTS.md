@@ -19476,3 +19476,47 @@ Two smaller things in the same hour, both the same shape as the above:
   from matching *itself*, but the loop that built the pattern had the plain name in its own argv, so
   the pattern matched the ssh command text. Killing by pid has no such failure mode.
 - Two `zsh`/`tail` poller pairs from eight days ago were still resident and were killed.
+
+## chain123: the audit for sign-selected corpora, claim by claim with the corpus named
+
+Prompted by a fair question: an admission rule that selects on which side of MKL a cell lands makes
+the side reproducible and bounds nothing about the size, so a magnitude read off such a corpus is
+unsupported. That is what retracted chain120's two cells. The question is whether any *surviving*
+magnitude claim in this file rests on the same footing.
+
+**Scope, stated so the result is not read as more than it is.** This enumerates the magnitude claims
+reachable by searching for corpora defined in loss terms -- 228 mentions of below-MKL, the five
+places this file already names the hazard, and the sections whose headings promise a size. It is not
+a line-by-line re-read of nineteen thousand lines. A claim absent from the table below has not been
+cleared; it has not been examined.
+
+| claim | corpus it was computed over | verdict |
+|---|---|---|
+| chain118 f32 k=3 MKT, 1.4657 pooled / 1.4970 passing | pre-registered nnz >= 1e6 target group, 18 matrices, split fixed before any timing | clean |
+| chain118 f32 k=3 redwood, 1.1581 / 1.1714 | same split, 37 matrices | clean |
+| chain117, the per-call floor being flat in k | five named matrices, absolute microseconds, no admission rule | clean |
+| chain117, the per-nonzero deficit at f32 widths 2-3, R2 0.903 / 0.943 | **all** cells at each width (`an_fixed2.py`) | clean as re-fitted |
+| — its first version | below-MKL cells only (`an_fixed.py`), which biased every intercept up and read 70-98% fixed cost at almost every width | **withdrawn** |
+| the non-monotonicity, 1515.7 us at k=3 against 864.9 at k=4 | five named matrices, both widths, absolute times | clean |
+| chain65, the k=1 extension worth +19.5% | 212 matrices in six **degree** bands, 1060 cells, per-band A/A floor, and the two losing bands reported alongside | clean |
+| the regblock at 0.9033 "on the losing band" | degree >= 256 within a stratified corpus, every band tabulated on both hosts | clean; the phrase is loose, the measurement is not |
+| MKT reading 0.64 of MKL on 30-100 us kernels | **split by how each matrix got in**: `gbkeys` (selected for already losing) reported separately from a 50-matrix size-stratified random draw, and the load-bearing figures are the stratified ones | clean by disclosure |
+| the five cells of per-cell thread headroom, 12-37% | cells where a forced count beat both the policy and MKL -- sign-selected *and* in-sample | clean by disclosure; the text states it is not a policy, and gives clears-against-breaks in both directions |
+| chain120's `ffn_conv2` f64 k=2 and `bottleneck_3` f64 k=1 | cells admitted by the both-builds-agree rule, which selects on side and not size | **withdrawn** (chain121) |
+| chain120's residual census, 97 of 2980 and median 2.21 us | the unselected 298-matrix corpus | clean as a count; the file already notes that any *size* claim about the residual is a claim about a subset chosen by sign |
+| the 236-cell autotune board, 0.675x -> 1.878x | four pre-existing matrix sets (the ones the 195-cell tiling study used) plus N=16 and 64 | clean |
+| the shipping candidate | pre-registered split plus a three-graph GCN guardrail | pending, both hosts |
+
+Two withdrawals, both already on the books before this audit and neither newly discovered. Nothing
+else in the table needs re-measuring.
+
+The reason the rate is that low is visible in the file itself: it names this hazard in five separate
+places, twice as grounds for *declining* to run something -- a degree ladder whose pooled geomean
+would have been dominated by matrices where the knob provably cannot act, and a thread-count arm
+that was given thirty unselected matrices specifically so it would not inherit a corpus chosen for
+losing. The lesson was learned expensively once and has been applied since.
+
+What the audit does not settle, and is the honest residual: "clean by disclosure" is weaker than
+clean. Two entries above are sign-selected corpora whose text says so. That is the right treatment
+and it still means the numbers cannot be lifted out of their paragraphs. Anyone quoting the five
+headroom cells or the `gbkeys` band without the sentence next to them is quoting a selection effect.
