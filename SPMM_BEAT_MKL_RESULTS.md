@@ -18716,3 +18716,59 @@ in the same cell order, so they separate cleanly, and they turned out to be wort
 same-code samples of every cell, taken hours apart, which is where the floor column above comes
 from. An append-mode harness plus a killed run is a silent mixing of two machine states, and the
 only reason it was noticed is that the stage prints rows per build and one number was not 36.
+
+## chain113: the deficit is byte-shaped, but multi-row's gain is not -- the reuse story is withdrawn
+
+chain109 said two things. The first is measured: the below-MKL count is one curve for both dtypes
+against the B row's footprint in bytes, zero by 80. The second was a mechanism -- that multi-row
+fixes it by amortising the wasted cache line -- and that half is **wrong**.
+
+It can be scored on data already in hand. Multi-row's gain has to be read only where the baseline is
+the same kernel, so the comparable band is float32 widths 5 to 8: the exact band is below it, the
+half-vector width is inside it, and `nvec` is 1 for all four, so the only thing changing is the byte
+width.
+
+| B row bytes | waste factor 64/bytes | mr2h gain |
+|---|---|---|
+| 20 | 3.2x | 1.0918 |
+| 24 | 2.7x | 1.0823 |
+| 28 | 2.3x | 1.0765 |
+| 32 | 2.0x | 1.1243 |
+
+Correlation between the waste factor and the gain: **−0.447**. Wrong sign, and the gain is flat
+(7.7% to 12.4%) where a reuse story predicts it should fall by 40% across that range.
+
+**And re-reading the kernel, the reuse story was never mechanically available.** The multi-row loop
+loads `Bp[r] = B_val + A1_crd[p[r] + t] * B1_size` for each `r` -- **ROWS different B rows per
+iteration**, one from each output row's own nonzero stream. There is no line to share unless the
+grouped rows happen to name the same column, which is a property of the matrix and not of the width.
+What the kernel adds is memory-level parallelism: ROWS loads outstanding, ROWS independent FMA
+chains. That predicts a gain roughly flat in width, which is what the table shows.
+
+So the corrected pair of claims:
+
+* **The deficit's size is byte-shaped**, and both dtypes losing at the same *byte* width rather than
+  the same element count is real evidence that the cause has cache-line granularity. Unchanged.
+* **Multi-row's benefit is streams, not reuse**, and it is roughly width-independent at 8-12%.
+
+Corrected in the source comments at e25d393, because a wrong mechanism in a policy comment is what
+the next reader inherits. The commit that added the kernel (1c01014) carries the same wrong sentence
+in its message, where it stays as written with this section as its correction.
+
+### What it changes about what is queued
+
+* **mrhv's prediction is now simpler and stronger.** If the mechanism is streams rather than reuse,
+  multi-row at the half-vector width should be worth about the same 8-12% it is worth everywhere
+  else, rather than "most at the most wasteful width". A result near 1.09 supports streams; a result
+  near 1.20 would mean something else is happening at that width specifically.
+* **mr4h's prediction changes the same way** (it is running now). Under streams, ROWS=4 should help
+  roughly uniformly until the load queue or the register file runs out, not preferentially at the
+  narrow widths. The prediction registered with that job -- "mr4h beats mr2h at widths 2 and 3 where
+  the waste is 8x and 5x, and not at 8 and 9" -- was derived from the reuse story and is withdrawn
+  before its data is read. Under streams the expectation is flat-or-better everywhere until it runs
+  out of registers, and the k=2/k=3 asymmetry it predicted should be absent.
+* **What still wants explaining is the deficit, not the fix.** If the cause has cache-line
+  granularity and multi-row does not address it, then the thing that would address it is B-row
+  packing or blocking over the contraction index -- reordering so that the lines a row's gathers pull
+  are used more fully. That is the tile-j family, aimed the other way round from how it ships (it is
+  gated for wide B), and it is now the indicated direction rather than a deeper multi-row.
