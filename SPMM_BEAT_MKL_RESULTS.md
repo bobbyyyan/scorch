@@ -18584,3 +18584,72 @@ row loop should recover the 0.5-0.9% mr2 gives up at every width where it declin
 indicated code change: hoist the admission test out of the row loop and emit two loop bodies, which
 is what chain71's comment says the compiler declined to do inside a lambda in a work-stealing loop.
 Worth 0.5-0.9% at three of five widths on the arm that is otherwise 1.08-1.15x at k=8.
+
+## chain111: the emitted loop settles the k=4 kernel question before a machine runs, and indicates a different arm
+
+chain108 queued chain49's arms on redwood -- the exact-width scalar kernel against the shipped
+128-bit register block at float32 k=4. Before spending the slot, the same question was put to the
+compiler. The kernels are self-contained templates over raw pointers, so they can be lifted verbatim
+out of `spmm.h` and compiled for AVX2 at the extension's own flags (`-O3 -ffast-math
+-funroll-loops`), and the steady-state loop counted. Instructions per nonzero, with the loop's own
+nonzero count taken from its packed FMAs:
+
+| kernel at float32 k=4 | loop insns | packed FMA | nnz/iter | insns/nnz | spill-st |
+|---|---|---|---|---|---|
+| `multirow_regblock<1,true,2,half>` (new) | 11 | 2 | 2 | **5.5** | 0 |
+| `multirow_regblock<1,true,4,half>` (new) | 24 | 4 | 4 | 6.0 | 0 |
+| `multirow_regblock<1,false,2>` (masked 256) | 13 | 2 | 2 | 6.5 | 0 |
+| `row_regblock<1,true,half>` -- **the shipped path** | 23 | 2 | 2 | 11.5 | 0 |
+| `row_regblock<1,false,full>` (half-vector off) | 27 | 2 | 2 | 13.5 | 0 |
+| `narrow_exact<4,1>` (`ex4b`) | 117 | 8 | 8 | 14.6 | 0 |
+| `narrow_exact<4,4>` (`ex4`) | 547 | 20 | 20 | 27.4 | **25** |
+| `narrow_exact<4,2>` (`ex4a`) | 289 | 10 | 10 | 28.9 | 4 |
+
+**Every exact-width variant is heavier per nonzero than the kernel it would replace**, and two of
+them spill in the hot loop. A kernel with 27 instructions and 25 spill-stores per nonzero is not
+going to close a 12% deficit against a kernel with 11.5 and none.
+
+Two things this exercise corrected in itself, both worth keeping:
+
+* The first version passed `B1_size` as the literal 4, which let the compiler strength-reduce
+  `A1_crd[p] * B1_size` into a shift and **deleted the per-nonzero multiply that is the exact-width
+  kernel's entire reason for existing**. A literal there refutes the candidate for free. With the
+  width opaque, the shipped kernel carries 5 address instructions per 2 nonzeros and still wins.
+* `SCORCH_NARROWK_EXACT_ACCUM`'s comment says spilling starts *above* k=4. It starts **at** k=4:
+  25 spill-stores at UNROLL=4. The reason is that `-funroll-loops` multiplies the source unroll --
+  the UNROLL=4 loop body holds five source iterations, so 16 accumulators are the smaller half of
+  what is live. That is also why `ex4b` (`ACCUM=4`, which drives the unroll to 1 at k=4) is the only
+  one of the three worth a slot.
+
+### So the arm was changed, and the reason is a mechanism rather than a preference
+
+chain109 found the deficit to be a function of the B row's footprint in bytes, zero by 80 bytes,
+with multi-row worth 1.09-1.13x at every width where it is admitted. The emitted loops say the
+single-row kernel choice at width 4 is not where the remaining cost is. Both point at the same
+missing arm: **multi-row at the half-vector width**, which the code could not express, because
+`scorch_spmm_multirow_regblock` hardcoded `using V = scorch_simd<T>` where `scorch_spmm_row_regblock`
+has taken the SIMD type as a template parameter all along.
+
+Parameterising it is mechanical -- the body uses only `V`'s operations -- and it is committed at
+1a84ddd behind `SCORCH_SPMM_MULTIROW_HALFVEC`, which ships 0 so emission is unchanged. The arm that
+turns it on also lifts `multirow_ok`'s exclusion of that width, which was placed there so that no
+arm would swap two kernels at once; this one swaps them deliberately.
+
+One defect caught in review before it ran: the new branch first reused the dispatch switch's `took`
+flag. The general switch only ever *assigns* false, so a false carried out of the new branch would
+have left a row group computed by the multi-row kernel and then computed again by the single-row
+path -- the same values, twice the work, and silent. It has its own flag.
+
+redwood's slot now runs `c0 / c0b / mr2 / mrhv / ex4b` at widths 2, 4 and 8 with the paired
+instrument, and MKT's runs the same five at 2, 3, 4, 5, 8. The nulls are the controls: k=2 and k=3
+(the exact band owns them), k=5 and k=8 (no half-vector width, so `mrhv` is `mr2`), and every
+float64 column (`HALFVEC_F64` ships 0, so the exclusion `mrhv` lifts was never applied there and the
+new branch is unreachable).
+
+**Registered before either runs:** the exact-width arm loses at k=4 on x86, for the reason in the
+table above; `mrhv` is the arm with a chance, and if it wins it should win most where degree is high
+and B is small, because that is where a B-row fetch has the most reuse to give. Also gated before
+timing: the local host is ARM and cannot compile any of this -- the block is inside `#if __AVX2__` --
+so redwood is the first machine that can say whether the new dispatch is correct, and its stage runs
+a targeted numeric sweep over the shapes that reach the new branch and then the full suite, and
+refuses on either.
