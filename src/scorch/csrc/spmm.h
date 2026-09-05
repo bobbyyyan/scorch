@@ -2568,13 +2568,16 @@ static inline void scorch_spmm_row_regblock_deep(
 // An empty row needs no special case: its stream contributes nothing and its accumulator stays
 // zero, so the store writes the zeros the output needs (the output is torch::empty, so empty
 // rows must be written).
-template <typename T, int NVEC, bool FULL_LAST, int ROWS>
+// V is a parameter for the same reason it is one on scorch_spmm_row_regblock: at a width that is
+// exactly the half-vector -- four floats, two doubles -- 128-bit registers need no mask and waste no
+// FMA width, and that width is where the deficit against MKL is deepest. The body only uses V's
+// operations, so the substitution is mechanical; the default keeps every existing caller unchanged.
+template <typename T, int NVEC, bool FULL_LAST, int ROWS, typename V = scorch_simd<T>>
 static inline void scorch_spmm_multirow_regblock(
     const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
     const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
     T* SCORCH_RESTRICT C_values, size_t C1_size, int i0,
-    typename scorch_simd<T>::mask mask_last) {
-  using V = scorch_simd<T>;
+    typename V::mask mask_last) {
   constexpr int L = V::lanes;
   typename V::vec acc[ROWS][NVEC];
   int p[ROWS], e[ROWS];
@@ -4119,10 +4122,12 @@ torch::Tensor spmm_csr_v2_core(
   int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
                                                       : SCORCH_SPMM_MULTIROW_ROWS_F64;
   long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
+  int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
 #else
   constexpr int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
                                                                 : SCORCH_SPMM_MULTIROW_ROWS_F64;
   constexpr long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
+  constexpr int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
 #endif
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
@@ -4187,6 +4192,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 4) multirow = (int)v; } }
   { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_MINNNZ");
     if (e && *e) { long v = std::atol(e); if (v >= 0) multirow_minnnz = v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_HALFVEC");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 1) multirow_halfvec = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4261,7 +4268,7 @@ torch::Tensor spmm_csr_v2_core(
       (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
       narrow_k && !exact_width && !force_workspace &&
       !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
-      !(spmm_halfvec > 0 &&
+      !(spmm_halfvec > 0 && !multirow_halfvec &&
         (B1_size == scorch_simd_half<scalar_t>::lanes ||
          (spmm_halfvec >= 2 && B1_size >= 2 &&
           B1_size < scorch_simd_half<scalar_t>::lanes)));
@@ -4523,6 +4530,35 @@ torch::Tensor spmm_csr_v2_core(
                      A1_pos, A1_crd, A_val, B_val, B1_size, C_values, \
                      (size_t)C1_size, i, mask_last))
           bool took = true;
+          // The half-vector width, taken by multi-row rather than by the single-row 128-bit kernel.
+          // These are two different fixes for the same cost and until now the code could only apply
+          // one: the single-row kernel drops the mask (11.5 instructions per nonzero against the
+          // masked path's 13.5, measured on the emitted loop), while multi-row amortises the 64-byte
+          // line that a short B row wastes -- 4x waste at float32 k=4. The dense width sweep put the
+          // below-MKL count on one curve in BYTES for both dtypes, zero by 80 bytes, which says the
+          // waste is what is left to fix. `multirow_ok` excluded this width precisely so that no arm
+          // would swap two kernels at once; this branch is the arm that swaps them deliberately.
+          if (multirow_halfvec && B1_size == scorch_simd_half<scalar_t>::lanes) {
+            using VH = scorch_simd_half<scalar_t>;
+            // A flag of its own, NOT `took`. The general switch below only ever assigns false, so a
+            // false carried out of here would leave the group computed by the multi-row kernel and
+            // then computed AGAIN by the single-row path -- same values, twice the work, silently.
+            bool took_h = true;
+            switch (multirow) {
+              case 2:
+                scorch_spmm_multirow_regblock<scalar_t, 1, true, 2, VH>(
+                    A1_pos, A1_crd, A_val, B_val, B1_size, C_values, (size_t)C1_size, i,
+                    VH::lane_mask(B1_size));
+                break;
+              case 4:
+                scorch_spmm_multirow_regblock<scalar_t, 1, true, 4, VH>(
+                    A1_pos, A1_crd, A_val, B_val, B1_size, C_values, (size_t)C1_size, i,
+                    VH::lane_mask(B1_size));
+                break;
+              default: took_h = false; break;
+            }
+            if (took_h) { i += multirow - 1; continue; }
+          }
           switch (nvec * 16 + multirow) {
             case 1 * 16 + 2: SCORCH_MR(1, 2); break;
             case 1 * 16 + 4: SCORCH_MR(1, 4); break;
