@@ -18321,3 +18321,106 @@ get two-host confirmation -- though the team-cost explanation has three hosts be
 the confirmation that matters for a rule conditioned on team cost. And the declared pool feeds the
 E-core recruit gate, which is worth 1.5-2.9x on the M5's fused Linear path; anything that lowers the
 declared pool has to be shown not to switch that off.
+
+## chain108: three corrections from the source, and the shape of the k=4 gap
+
+Before the band grid reports, four questions about it were worth asking of `spmm.h` rather than of a
+machine. Three of the four answers correct something written earlier today, including two claims I
+sent to the documentation session, which is where they get retracted.
+
+### 1. `EXACT_HI=7` does NOT move float32 width 4
+
+chain106 said that under `EXACT_HI=7` width 4 runs the exact-width kernel instead of the half-vector
+one, and made a prediction that turned on it. The dispatch says otherwise:
+
+```c
+const bool halfvec_exact = (B1_size == LH);
+const bool halfvec_under = (spmm_halfvec >= 2 && B1_size < LH && B1_size >= 2 && !exact_width);
+if (halfvec_exact || halfvec_under) { ... }
+```
+
+The half-vector branch is dispatched **ahead** of the exact-width kernel, and only `halfvec_under`
+carries `!exact_width`. At the exact half-vector width the branch takes the row unconditionally. So
+with `SCORCH_SPMM_HALFVEC_F32` shipping at 1 -- checked, it is 1 -- float32 width 4 belongs to the
+half-vector kernel no matter what the exact band's top is, and `hi7` moves widths 5, 6 and 7 only.
+
+The overlap is unreachable with shipped constants (the band tops out at 3, the half-vector width is
+4, and float64's half-vector is off), which is why it has never mattered. It matters the moment
+someone raises `EXACT_HI`, and chain49's design table already knew it: "Halfvec is tested before
+exact_width in the row loop, so they compete for the width and no arm sets both." I asserted the
+opposite from memory with that sentence sitting in this document.
+
+The consequence is good for the arm and bad for the prediction: `hi7` is *cleaner* than described --
+three widths, no width-4 confound, and a float64 half that is null by construction -- and nothing
+currently queued tests the k=4 kernel at all.
+
+### 2. Widths 5, 6 and 7 have been timed for the exact kernel, and it loses there
+
+The scope section said the exact kernel is instantiated to 7 and excluded from 5-7 by a constant that
+nobody has priced. The constant's own comment prices it:
+
+> a loss everywhere else it was instantiated: 0.983 at k=1, 0.980 at k=5, 0.924 at k=6, 0.972 at
+> k=7 ... Above k=4 the mask is half full or better and UNROLL*K accumulators start spilling, which
+> is where the sign changes.
+
+362 cells at each width. So `EXACT_HI=3` is a measured boundary, not an unexamined default, and
+"widths 5-7 are k=3 again" is wrong: k=3's win came from *multi-row* taking a width the exact kernel
+was holding, not from the exact kernel taking a width it was denied.
+
+**But the scope gap at 5-7 survives in a form that matters more for the decision.** At widths 5, 6
+and 7 in the shipped build there is no exact width, no half-vector (that is width 4), and nvec is 1
+-- so `multirow_ok` is satisfied, and **ROWS=2 already acts at all three**. The candidate this
+document is recommending changes behaviour at three widths that no grid has ever measured. That is
+the band job's real job, and it is a shipping question rather than an exploratory one.
+
+### 3. chain49's x86 timing was never recorded, so the k=4 kernel question is open
+
+chain49 was designed for exactly the width redwood loses at, with the arms this needs: `ex4`
+(`HALFVEC_F32=0, EXACT_HI=4`, the exact-width scalar with UNROLL*K = 16 accumulators) and `ex4a`
+(the same with `EXACT_ACCUM=8`, which halves the unroll to 2 at k=4 and provably leaves k=2 alone).
+It was corrected twice, relaunched from the corrected file, and the only timing this ledger carries
+for it is **the ARM host**: `ex4` inside a +-2.6% floor at every band, `ex4a` positive only at
+degree >= 256. No x86 numbers were ever written down, and the queue moved to chain47/48.
+
+So the natural experiment that motivated it is still standing, on the host where k=4 is now the
+whole demonstrable deficit, and the losing family there is degree 137-2202 -- the band where ARM's
+`ex4a` was the arm that moved.
+
+### 4. The shape of the k=4 gap: throughput on redwood, fixed cost on MKT
+
+Regressing the absolute gap (our microseconds minus MKL's) on nnz, over the cells that lose:
+
+| host / harness | width | cells | fit | R^2 |
+|---|---|---|---|---|
+| redwood, paired round-robin, native | 4 | 31 | 0.07 us + **0.0219 us/1000nnz** | **0.889** |
+| MKT, caller gate | 4 | 25 | **8.58 us** + 0.0032 us/1000nnz | 0.634 |
+| MKT, caller gate | 2 | 41 | 5.41 us + 0.0209 us/1000nnz | 0.929 |
+| redwood, caller gate | 4 | 29 | 6.09 us + 0.0010 us/1000nnz | **0.001** |
+
+Redwood's kernel deficit at k=4 has **no intercept** -- 0.07 us against gaps of 0.2 to 28.7 us --
+and a slope that holds across a 54x nnz range, from a 20971-nonzero transformer layer to connectus
+at 1.1M. It is 11.7% of our own time at the median. That is a throughput deficit, and it is the same
+quantity the half-vector kernel's own comment names: "the k=4 float32 fit shows a per-nonzero
+deficit against MKL of 8-23% whichever shapes go into it". The half-vector kernel closed part of it
+(1.1008, and 125 of 302 cells below MKL at k=4 became 70); what chain108 adds is that the *residue*
+is still per-nonzero rather than fixed.
+
+MKT's k=4 gap has the opposite shape -- an 8.6 us intercept dominating below about 2.7M nnz -- which
+is the ~13 us per-call fixed cost this document attributed earlier, on that host. **My chain106
+prediction imported MKT's attribution to redwood.** Two hosts, one width, two different causes; the
+7.3x difference in achieved bandwidth between them is enough to put the crossover in a different
+place.
+
+The last row is a warning about the instrument rather than a finding. Redwood's caller gate fits
+noise at k=4 (R^2 0.001), and the raw rows say why: at connectus k=4 the same code reads 0.958 in one
+tree and 0.895 in the other, and at k=8 it reads 174.83 us, 219.42 us and 141.24 us across three
+builds two of which are identical. A 6 us "intercept" from that data means nothing. Only the paired
+round-robin instrument resolves these cells, which is now the third demonstration of that.
+
+### What this changes in the queue
+
+`ex4` / `ex4a` at k=4 on redwood, on the unselected 154-matrix residual corpus with the paired
+instrument, is now the best-motivated measurement available on either host: it targets the only
+resolved deficit on that host, at the width where the deficit lives, with arms that were designed
+for it and never run there. Queued behind the current chain. The band grid keeps its slot and its
+value, but for reason 2 rather than the one it was queued with.
