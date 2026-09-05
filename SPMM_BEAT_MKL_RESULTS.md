@@ -18082,3 +18082,59 @@ not whether a candidate helps but where we lose.
 Until that reports, the honest statement of this project's position is that scorch beats MKL on the
 widths it has measured, and that the widths it has measured were chosen by convention rather than by
 the code.
+
+## chain105: correctness passes on x86, and a per-dtype constant does NOT give per-dtype code
+
+Three release builds on redwood -- shipped, both dtypes at ROWS=2, and float32-only -- each run
+through the full suite:
+
+```
+  shipped (both dtypes 0)      1108 passed, 72 skipped   48:39
+  bare flag (both dtypes 2)    1108 passed, 72 skipped   49:06
+  float32 only                 1108 passed, 72 skipped   49:12
+```
+
+This is the correctness gate that counts. The M5's copy of it is nearly vacuous for this mechanism:
+every multi-row guard requires `__AVX2__ && __FMA__`, so on ARM the constant cannot change the
+object and its third arm correctly refused as a duplicate. x86 is where the kernel exists, and there
+the suite is clean at both candidate values.
+
+### The float64 half of the object is not neutral, and the per-dtype split does not make it so
+
+Comparing float32-only against shipped, symbol by symbol rather than as a flattened diff:
+
+```
+  float64 SpMM symbols:   24 matched --  5 identical, 17 CHANGED,  2 in only one object
+  float32 (the control):  130 matched -- 24 identical, 93 changed, 13 in only one object
+```
+
+The control moving is the point of a control. The float64 result is the finding: **turning float32
+multi-row on rewrites 17 of 24 float64 SpMM symbols.** One example is
+`scorch_spmm_row_regtile_partial<double, 8, false>` at 345 instructions before and 345 after, so
+this is not added code -- it is the same code compiled differently, with the enclosing function's
+inlining and register allocation shifted by the block that now exists beside it.
+
+The mechanism is that the guards are ISA-gated, not dtype-gated. `SCORCH_SPMM_MULTIROW_ANY` decides
+whether the dispatch is compiled at all, and it is true if EITHER dtype wants it; the per-dtype
+constant then folds the branch away inside the instantiation that declines, but folding a branch is
+not the same as never having compiled the block next to it.
+
+So the sentence in 0e59834's commit message -- "that is what keeps the float64 object
+byte-identical while float32 gains the kernel" -- is **wrong**, and this is where it gets corrected.
+The per-dtype constant does exactly what it was built to do at the level of DISPATCH: float64
+declines the kernel. It does not and cannot give byte-identical float64 CODE.
+
+Two consequences. Any float64 reading taken from a build that enables float32 multi-row carries a
+layout component, which is one more reason the float64 numbers in chain99 were hard to interpret.
+And for the configuration chain104 now indicates -- both dtypes at 2 with the band narrowed --
+the question is moot, because float64 is being changed deliberately. It matters for the ledger, not
+for the decision.
+
+### And the GCN guardrail refused on a bug in its own guard
+
+Its object-verification step imported `scorch_ops` without importing `torch` first, which fails on
+undefined symbols for a torch extension; with stderr discarded that was indistinguishable from an
+object whose `.text` could not be digested, so the guard refused a run that was fine. Fail-closed,
+so nothing was measured wrongly and nothing was measured at all. Fixed to import torch first and to
+keep stderr, and requeued. That is the third harness bug today whose only symptom was a correct
+refusal, which is the good failure mode and still costs a queue slot each time.
