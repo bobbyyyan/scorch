@@ -19926,3 +19926,58 @@ Rows 1, 2, 5 pass. Row 3 is unresolved rather than failed. **Row 4 now has a lic
 rather than a failure: the ARM regression is one constant, and gating it makes the ARM object
 byte-identical, which also satisfies row 10. Rows 7, 8, 9 pending -- and row 8 is now satisfiable,
 since every constant that would ship has been measured alone.
+
+## chain130: the gate is written, and both ISAs' objects are verified by digest
+
+Two constants ship, float32 only, x86 only, gated inside `#if defined(__AVX2__) && defined(__FMA__)`:
+
+```
+SCORCH_NARROWK_EXACT_HI_F32     3  ->  1
+SCORCH_SPMM_MULTIROW_ROWS_F32   0  ->  2
+```
+
+`SCORCH_SPMM_HALFVEC_F32` stays at 1. It was in the candidate and is not in the change.
+
+### The object checks, which are what make this safe rather than argued
+
+The measured arms were built by passing `-D` defines to a tree whose header defaults were unchanged;
+the flip changes the defaults instead. Those must reach the same code, and it is checked rather than
+inferred -- both builds at one fixed absolute path, since a directory one character longer shifts
+every embedded string and every RIP-relative displacement.
+
+**x86** (job 17283152, three builds, no timing in the job at all):
+
+| build | `.text` digest | bytes |
+|---|---|---|
+| the measured arm, pre-flip tree + defines | `b2ed1412c6e6e767` | 1096738 |
+| **the flipped tree, no defines** | **`b2ed1412c6e6e767`** | 1096738 |
+| the pre-flip tree, no defines | `f58dcf626cfa0c5f` | 1073666 |
+
+Identical to the measured arm, and different from what it replaces, so the defaults took effect.
+**Consequence worth stating: the 120-case correctness check that `bandmr` passed applies to the
+shipped object literally rather than by analogy, because it is the same object.**
+
+**ARM** (M5, built at the same path as the reference): `f1b096cb6ef90d6f` before the flip and
+`f1b096cb6ef90d6f` after. Byte-identical. ARM neutrality is a property of the preprocessor, not a
+claim about 60 matrices -- which also retires the gate's row 10, because the region above 1.5M
+nonzeros that this host's cache cannot reach is a region where nothing changed.
+
+The x86 object is 23072 bytes larger, which is the multi-row kernel being instantiated.
+
+### Gate status
+
+| # | requirement | status |
+|---|---|---|
+| 1 | x86 float32: no regression population beyond the control | PASS (-1 pp) |
+| 2 | x86 float32: the win present, clearing its floor severalfold | PASS (+19.2% / +20.6% / +33.9% at widths 2 / 3 / 8; 34 of 42 below-MKL cells at width 3 become 15) |
+| 3 | x86 float64: no regression population | **UNRESOLVED** -- the statistic that failed it swung 45 points between two runs of the same object and was withdrawn |
+| 4 | ARM float32: no regression | PASS by construction (byte-identical object) |
+| 5 | ARM float64: no regression | PASS by construction |
+| 6 | GCN guardrail neutral-or-better, both dtypes | PASS -- all 24 cells at or above 1.0, worst 1.0080, best 1.2139 (pubmed width 3, 42.7 -> 35.2 us), and strictly better than the three-constant arm on float64 |
+| 7 | second x86 host agrees in sign | **PENDING** -- redwood running the same nested arms |
+| 8 | every shipped constant measured alone | PASS -- `bandf32` isolates the band, `bandmr` minus `bandf32` isolates multi-row, and the constant that could not be isolated was dropped for it |
+| 9 | flipped defaults produce the measured object | PASS on both ISAs |
+| 10 | unmeasured regions named and provably inert there | PASS on ARM by digest; on x86 the corpus is the pre-registered split with both groups reported |
+
+Eight pass, one unresolved, one pending. **This commit is not to be pushed until row 7 lands.** The
+x86 evidence is currently one host, and the standing rule in this file is two.
