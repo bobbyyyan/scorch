@@ -19530,3 +19530,28 @@ What the audit does not settle, and is the honest residual: "clean by disclosure
 clean. Two entries above are sign-selected corpora whose text says so. That is the right treatment
 and it still means the numbers cannot be lifted out of their paragraphs. Anyone quoting the five
 headroom cells or the `gbkeys` band without the sentence next to them is quoting a selection effect.
+
+## chain124: the decision rule for the shipping candidate, registered before its data is read
+
+Three runs are in flight and none has been read: MKT (17 of 20 arms at the time of writing), the M5
+ARM regression check (8 of 12), and redwood (queued behind a repair). Writing the rule down now
+because a rule chosen after seeing the numbers is not a rule, and this file has an expensive
+precedent for post-hoc reading.
+
+The candidate is `EXACT_HI_F32=1` + `HALFVEC_F32=2` + `MULTIROW_ROWS_F32=2`, shipped as a set
+because the three interact (1.036 and 1.013 separately, 1.466 together at MKT float32 width 3).
+
+| what the three runs show | what ships |
+|---|---|
+| MKT wins at widths 2-3, redwood same sign, M5 neutral, GCN guardrail neutral | the flip, globally, per-dtype as measured |
+| MKT wins, redwood **smaller but same sign**, others neutral | the flip. Same sign with a host-dependent size is the expected case, not a failure: chain118 already measured 1.4657 on MKT against 1.1581 on redwood over the same split. Report both sizes, pool neither. |
+| any **regression on redwood** beyond its own floor | **no flip.** Report it as a finding. A host-conditional default is not on the table -- this library does not tune per host -- so the constants stay where they are and the mechanism stays behind them. |
+| a regression on the **M5** beyond its floor | an **ISA-conditional** default: x86 takes the values, ARM keeps the current ones. Precedent is in the tree already, where `HALFVEC` carries per-dtype defaults for the same reason, and in this file, where the ARM-only k=1 extension was scoped the same way. |
+| a regression on the **GCN guardrail** at width 3 | **not a reason to drop the arm, and not a reason to tune around it.** The win is measured on `nnz >= 1e6`; cora, citeseer and pubmed are 13K, 12K and 108K nonzeros, all three orders below it. So the remedy is a structural gate at the same threshold the split already uses, which is *provably* inert on every GCN and autoencoder shape rather than tuned to miss them. That is the house rule for a sub-regime win and it applies here without modification. |
+| the candidate's `.text` differs from a build of the flipped defaults | **no flip until that is explained.** The arm was built from `-D` defines and the flip changes header defaults; those must reach the same code. This is a check on the object, not an inference from the source -- the same discipline that caught the unread define this morning. |
+
+Two things this rule deliberately does not do. It does not let a large MKT number outvote a small
+redwood one, because the standing goal is a cell count on an unselected corpus and MKT's corpus is
+selected for already losing (chain123). And it does not treat the M5 as a confirmation: that host
+has two matrices above 1e6 nonzeros, so it can refute the candidate and cannot support it, and its
+result above ~1.5M nonzeros is absent rather than neutral.
