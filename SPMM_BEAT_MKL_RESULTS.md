@@ -17972,3 +17972,65 @@ changes the clock by less than the noise floor. Whatever puts that family below 
 worker participation. Two mechanisms are now excluded for it -- the chunk width here, and the
 multi-row register block, which declines k=4 on float32 by its own admission test -- so the next
 attempt on it should not be a parallelism or a blocking change.
+
+## chain104: the narrowed band is the result -- 33 float32 cells and 27 float64 cells on MKT
+
+The five-build gate on MKT finished (3000 rows per build, five release objects, widths 1/2/3/4/8,
+two dtypes, two passes). `mr2h` is `SCORCH_SPMM_MULTIROW_ROWS=2` plus `SCORCH_NARROWK_EXACT_HI=1`,
+which lowers the exact-width band's top so widths 2 and 3 go to the multi-row register block while
+k=1 keeps the kernel it ships with. It dominates plain ROWS=2 on both dtypes.
+
+```
+  float32   median vs c0                        crossings of the MKL line
+  k     c0b     mr2     mr2h    mrf64      c0b      mr2      mr2h      mrf64
+  1   0.9964  0.9986  1.0026  0.9963      +0/-1    +1/-1    +2/-0     +0/-1
+  2   0.9966  0.9939  1.0548  0.9951      +0/-0    +0/-0    +2/-0     +0/-0
+  3   0.9986  0.9951  1.1884  0.9958      +2/-2    +2/-1   +18/-0     +1/-1
+  4   1.0061  1.0006  1.0066  0.9994      +1/-1    +3/-3    +3/-2     +2/-2
+  8   0.9943  1.1532  1.1653  0.9999      +1/-0    +6/-0    +8/-0     +2/-0
+  all                                     +4/-4   +12/-5   +33/-2     +5/-4
+
+  float64
+  k     c0b     mr2     mr2h    mrf64      c0b      mr2      mr2h      mrf64
+  1   1.0013  1.0042  0.9989  1.0020      +1/-0    +1/-0    +2/-0     +3/-1
+  2   0.9985  0.9859  1.0519  0.9888      +0/-1    +2/-2    +9/-5     +2/-5
+  3   0.9968  0.9921  1.0611  0.9915      +1/-0    +0/-1   +13/-0     +2/-1
+  4   1.0003  1.0319  1.0233  1.0202      +0/-0    +3/-2    +3/-0     +5/-2
+  8   0.9945  1.0004  1.0002  1.0034      +0/-0    +0/-1    +0/-3     +0/-0
+  all                                     +2/-1    +6/-6   +27/-8    +12/-9
+```
+
+**k=3 is where the exact-width kernel was losing badly and nobody had looked.** 1.1884 on float32
+and 1.0611 on float64, clearing 18 and 13 cells with none broken, against floors that moved 2 and 1.
+That width was inside the exact band (`SCORCH_NARROWK_EXACT_HI` ships at 3) so the multi-row kernel
+was excluded from it by its own admission test, and the previous gates never tried a width the band
+owned. Cells below MKL over the five widths go 159 -> 128 on float32 and 103 -> 84 on float64.
+
+**This reverses the float64 verdict from chain99.** Plain ROWS=2 on float64 was +6/-6 against a
++2/-1 floor -- null, which is what chain99 recorded and why the per-dtype constant was written. With
+the band narrowed, float64 is +27/-8. So the mechanism was never the problem on float64; the
+exact-width band was standing in front of it. The indicated configuration is now ROWS=2 on BOTH
+dtypes plus EXACT_HI=1, and the per-dtype split may turn out to be unnecessary -- it stays in as
+mechanism because it costs nothing and the redwood gate has not reported yet.
+
+The one loss worth naming: float64 k=8 is 0/-3. It is 3 cells of 50 at a width where only 2 were
+below MKL to begin with, on a candidate that clears 27 elsewhere, and the k=8 median is 1.0002. It
+goes in the ledger and it is not a reason to hold the config.
+
+### The discriminator, now built correctly, says the float32 k=1 cost is not object layout
+
+`mrf64` is float64-only ROWS=2, so the multi-row kernel and its dispatch are compiled into the
+object while the float32 instantiation gets `constexpr multirow == 0` and folds its branch away. It
+is the control for whether redwood's ~1% float32 k=1 cost is the code being PRESENT or the per-row
+`if (multirow_ok && ...)` being LIVE.
+
+On MKT it reads float32 k=1 at 0.9963 against a floor of 0.9964 -- identical -- and +5/-4 against a
+floor of +4/-4 across all widths. So having the kernel in the object costs float32 nothing. MKT
+never showed the k=1 cost in the first place (mr2 reads 0.9986 there), so this does not yet close
+the question; it establishes the control. Redwood's copy of this gate is what decides it, and if the
+cost appears there with `mr2` but not with `mrf64`, it is the live branch and manual loop
+unswitching fixes it.
+
+`mrf64` also confirms independently that float64 can reach the kernel -- +12/-9 with k=4 at 1.0202
+-- which is the timing counterpart to `nm` finding 12 `multirow_regblock<double>` instantiations in
+the mr2 object.
