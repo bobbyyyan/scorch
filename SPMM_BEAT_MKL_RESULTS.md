@@ -18424,3 +18424,102 @@ instrument, is now the best-motivated measurement available on either host: it t
 resolved deficit on that host, at the width where the deficit lives, with arms that were designed
 for it and never run there. Queued behind the current chain. The band grid keeps its slot and its
 value, but for reason 2 rather than the one it was queued with.
+
+## chain109: the deficit is a B-row footprint in BYTES, and multi-row is the mechanism that fixes it
+
+Two MKT grids landed together: the dense width sweep (23 widths, shipping config against its own A/A
+floor, 13800 rows per build) and the band grid (widths 1-9, five builds, 5400 rows each). Read
+together they change what this document thinks the residual deficit *is*.
+
+### The width map, and there is no cliff at any dispatch boundary
+
+Cells below MKL, counted only where both same-code builds agree, out of 50 per width:
+
+```
+  f32  k=  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 20 24 32 33 48 64
+      below 30 43 42 30 26 25 16 15 12 13  8  9  5  5  1  3  4  0  0  0  0  0  0
+  f64  below 30 31 29 10 11  4  2  3  2  0  0  1  0  0  0  0  0  0  0  0  0  0  0
+```
+
+Nothing happens at 8/9, 16/17, 24/25 or 32/33 -- the `nvec` steps and `narrow_k`'s own edge are all
+smooth. The six-width grid this document has used was not hiding a boundary effect, and the honest
+form of the scope caveat is now: interpolation between the sampled widths was right on this corpus.
+
+### But the two dtypes' deficits are the same curve in bytes
+
+float32 loses out to k=17 and float64 only to k=9, which looks like a dtype difference until both
+are put on the axis that governs the memory system. Aligned on the B row's footprint in bytes:
+
+| B row bytes | f32 below/50 | f64 below/50 | f32 median mkl/ours | f64 median mkl/ours |
+|---|---|---|---|---|
+| 8 | 43 | 30 | 0.752 | 0.925 |
+| 16 | 30 | 31 | 0.963 | 0.894 |
+| 24 | 25 | 29 | 0.997 | 0.930 |
+| 32 | 15 | 10 | 1.083 | 1.147 |
+| 40 | 13 | 11 | 1.142 | 1.208 |
+| 48 | 9 | 4 | 1.147 | 1.235 |
+| 56 | 5 | 2 | 1.324 | 1.395 |
+| 64 | 3 | 3 | 1.510 | 1.593 |
+| 80 | 0 | 0 | 1.649 | 1.866 |
+
+The counts track each other at every shared byte width, parity is crossed at about half a cache
+line for both dtypes, and the deficit is **zero at 80 bytes** on both. A gathered load of one B row
+pulls a 64-byte line and uses `N * sizeof(T)` of it, so the waste factor is `64 / bytes`: 8x at 8
+bytes, 2x at 32, 1x at 64. The below-count follows that curve and the parity ratio is monotone in it.
+
+**So "narrow k" was never the right description of where we lose. The description is "B rows
+shorter than about half a cache line".** It explains why the two per-dtype policy constants sit at
+different element counts -- `EXACT_HI=3` and the half-vector width at 4 for float32, the same
+kernels at 3 and 2 for float64 -- they are two approximations of one byte threshold.
+
+### Which makes multi-row the mechanism, not a lever among levers
+
+The waste is unavoidable per gather. What removes it is reuse: fetch a B row once and use it for
+more than one output row. That is exactly what `SCORCH_SPMM_MULTIROW_ROWS` does, and the band grid
+says so at every width where the admission test lets it act. Median over cells, floor in the first
+column:
+
+```
+  f32  k     1       2       3       4       5       6       7       8       9
+  c0b        0.9935  0.9963  0.9986  0.9980  0.9928  0.9950  0.9946  0.9990  1.0007
+  mr2h       1.0055  1.0516  1.1841  1.0021  1.1079  1.1000  1.0929  1.1276  1.0180
+  hi7        0.9938  0.9965  0.9971  0.9946  0.7817  0.7379  0.7018  0.9959  1.0059
+  hi7mr      1.0071  1.0016  0.9998  1.0047  0.7769  0.7264  0.6916  1.1365  1.0312
+```
+
+`mr2h` wins at **every** width where multi-row is admitted -- 2, 3, 5, 6, 7, 8, 9 -- and is inside
+the floor at exactly the two widths where the admission test excludes it, k=1 (the gather kernel
+owns it) and k=4 (the half-vector kernel owns it). Below-MKL cells over widths 1-9 go **230 to 183
+on float32**, with the gains landing where the mechanism acts: k=3 40->22, k=5 26->16, k=6 23->15,
+k=7 14->10, k=8 16->11. float64 moves 28->15 at k=3 and 30->27 at k=2.
+
+### hi7 is rejected, decisively, and the shipped boundary is right
+
+At widths 5, 6 and 7 the exact-width kernel reads **0.7817, 0.7379, 0.7018** and takes cells below
+MKL from 26/23/14 to 40/40/39. The policy comment's 0.980/0.924/0.972 understated it on this corpus;
+`EXACT_HI=3` is not merely a measured boundary, it is a load-bearing one. chain108's retraction was
+right and this is the arm that confirms it. `hi7mr` tracks `hi7` at 5-7 (the exact band blocks
+multi-row) and tracks `mr2h` at 8-9 (the band caps at 7) -- which is the dispatch behaving as read.
+
+### And chain105's layout worry costs nothing measurable
+
+`hi7` changes float32 code only, so its float64 columns are a null by construction. They read 0.9970
+to 1.0086 against a same-code floor of 0.9939 to 1.0094 -- indistinguishable. So the 17-of-24
+float64 symbol rewrite that a float32-only constant causes is real in the object and **not
+measurable on the clock**. That question is answered and closed.
+
+### What the byte reading predicts next, written before it is queued
+
+If the deficit is `64 / bytes` of waste and multi-row is amortization, then the right depth is the
+one that fills a line: about `64 / (N * sizeof(T))` output rows, which is 8 rows at float32 k=2 and
+2 rows at k=8. The shipped mechanism offers 2 and 4, and **4 has never been measured below width 5**
+-- `mr4` was in the earlier gate, but with the exact band in place it could not act at 2 or 3, the
+half-vector kernel owns 4, so its only live widths were 5 and up. `ROWS=4` with the band narrowed is
+therefore an untested cell of the design, and it is the cell the byte reading points at.
+
+Queued next on MKT: `mr4h` (`ROWS=4 + EXACT_HI=1`) against `c0`, `c0b` and `mr2h` over widths 1-9,
+both dtypes. Prediction, on the record: `mr4h` beats `mr2h` at 2 and 3 where the waste factor is 8x
+and 5x, and does not beat it at 8 and 9 where two rows already fill most of a line. If that holds,
+the policy is not a constant but `rows ~ 64 / row_bytes`, and the two widths still excluded --
+float32 k=1 and k=4 -- become the argument for letting multi-row into the gather and half-vector
+kernels rather than for choosing between single-row kernels there.
