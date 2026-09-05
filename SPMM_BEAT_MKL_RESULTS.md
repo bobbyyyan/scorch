@@ -18138,3 +18138,112 @@ object whose `.text` could not be digested, so the guard refused a run that was 
 so nothing was measured wrongly and nothing was measured at all. Fixed to import torch first and to
 keep stderr, and requeued. That is the third harness bug today whose only symptom was a correct
 refusal, which is the good failure mode and still costs a queue slot each time.
+
+## chain106: redwood's entire demonstrable MKL deficit is one width and one family
+
+Three instruments reported on redwood while MKT was building. They agree, and what they agree on is
+narrower than anything this document has claimed so far.
+
+### The caller-path gate: the runtime win confirms on a second host
+
+`mc_*` over 12 slices, 1490 cells, float32, widths 1/2/4/8/16, builds c0 / c0b / mr2 (36 CSVs,
+13410 rows). Median over cells of candidate/base:
+
+| k | n | c0b (A/A floor) | mr2 |
+|---|---|---|---|
+| 1 | 288 | 1.0013 | 0.9915 |
+| 2 | 290 | 0.9982 | 0.9923 |
+| 4 | 288 | 1.0034 | 1.0055 |
+| 8 | 291 | 0.9992 | **1.0966** |
+| 16 | 291 | 0.9998 | **1.0822** |
+
+MKT's caller path read 1.1512 at k=8. So chain100 has its second host: multi-row's win survives
+`scorch.matmul` on both machines, at 1.10x and 1.15x, against floors inside 0.2%.
+
+### The crossing statistic has a noise floor, it is host-dependent, and on redwood it is 55 cells
+
+The cell counts told a different story. Redwood, same data, crossings of the MKL line:
+
+```
+  k    n     below@c0  c0b             mr2
+  1    298   8         +6/-5           +6/-3
+  2    298   11        +8/-9           +7/-5
+  4    298   29        +11/-7          +7/-7
+  8    298   8         +3/-5           +4/-1
+  16   298   1         +1/-0           +0/-1
+  all                  +29/-26         +24/-17
+```
+
+The floor arm crosses 55 cells. That is identical code measured twice, so 55 cells of 1490 change
+which side of the MKL line they sit on for no reason at all, and a candidate that moves 41 cannot be
+resolved against it. MKT's floor, on the same statistic, moved +0/-4.
+
+This is a property of the instrument, not of these two runs, and it is fixable with data the gate
+already pays for. `an_stable.py` counts a cell as below the line only when BOTH same-code builds
+read below it, above only when both read above, and undecided otherwise -- a flip must survive two
+independent measurements of the same code before it counts:
+
+```
+                        below   undecided   mr2
+  redwood caller path   28      55          +6/-9
+  MKT caller path       113     4           +15/-0
+  MKT mr2h gate f32     155     8           +30/-2   (mr2h; mr2 +9/-2)
+  MKT mr2h gate f64     101     3           +25/-7   (mr2h; mr2 +5/-5)
+```
+
+MKT's numbers survive the stricter test essentially unchanged -- chain100's +15/-2 becomes +15/-0,
+chain104's +33/-2 becomes +30/-2, its +27/-8 becomes +25/-7 -- because MKT leaves only 4 to 8 cells
+of several hundred undecided. Redwood leaves 55 undecided out of 1490 and its mr2 crossings collapse
+to nothing. **The cell counts in this document are MKT's; redwood contributes runtime medians, and
+the two hosts are not interchangeable for a count.**
+
+### Interleaving the arms per repetition tightens the floor 4x, measured
+
+The residual harness ran both schedules: each arm in its own block, and the arms round-robined
+within every repetition. On the same-code A/A paired ratio, over 462 cells:
+
+| schedule | median &#124;r-1&#124; | p90 &#124;r-1&#124; | max &#124;r-1&#124; |
+|---|---|---|---|
+| block | 0.0076 | 0.0737 | 0.6905 |
+| roundrobin | 0.0023 | 0.0182 | 0.1522 |
+
+A 4x tighter floor at p90 and 3x at the median. Interleaving has been house practice here on the
+argument that it cancels machine state; this is the first time it has been priced, and it earns its
+place. Everything below uses the round-robin schedule.
+
+### The deficit, resolved: 23 cells, all at k=4, 21 of them 512-row transformer layers
+
+`an_resid.py`'s test asked whether the deficit exceeded the p5-p95 reach of the A/A ratio, and that
+reach is one repetition against one repetition -- about +-12% here. It resolved 0 of 34 candidate
+cells, including cells sitting 20% below MKL, which is not a null result but an instrument that
+cannot see. The claim is about where a cell's median sits, and with 41 paired repetitions the median
+is known much better than a single repetition is, so `an_resid2.py` bootstraps the median (2000
+resamples, seeded, both arms resampled on the same repetition index so the pairing survives).
+
+Of 462 cells: 428 at or above MKL, 34 below by the median, **23 resolved below** and 11 unresolved.
+All 23 are at k=4. By family: 21 transformer attention/ffn layers at 512 rows, plus `connectus` and
+`nw14`. The worst are 0.775 (connectus), 0.796 and 0.825 (nw14); the rest run 0.86 to 0.98.
+
+The corpus carries widths 1, 2 and 4 only, so this says k=1 and k=2 resolve *nothing* below MKL
+while k=4 resolves 23. It agrees with the caller-path gate independently: of 28 reproducibly-below
+cells there, 18 are at k=4.
+
+So redwood's whole demonstrable deficit is **float32 k=4 on few-row, high-degree matrices** --
+the same family the whole-row balance ceiling named (nw14, connectus) plus the 512-row transformer
+layers, which have 512 rows for 24 workers and degree 137-323.
+
+### Which is exactly the width multi-row cannot serve
+
+`multirow_ok` excludes `B1_size == scorch_simd_half<scalar_t>::lanes`, and that is 4 for float32.
+The half-vector kernel owns width 4 and multi-row declines there by construction, deliberately, so
+that an arm never swaps two kernels at once. Redwood's deficit sits at the one width in the band
+where the mechanism this week has been about provably cannot act. mr2 and mr2h ship on MKT's counts
+and on both hosts' runtime; they will not move redwood's count, and now there is a reason rather
+than a shrug.
+
+The `hi7` arm queued as 17271161 is the first thing that can touch it: under `EXACT_HI=7` width 4
+goes to the exact-width kernel instead of the half-vector one. **Stating the prediction before the
+data lands: it probably will not help.** k=4 was closed as a kernel question three separate ways,
+and the residual there was attributed to a ~13us per-call fixed cost of which MKL pays ~12us -- and
+the exact kernel changes the arithmetic, not the fixed cost. If `hi7` does move these cells, that
+reopens a question this document closed, which is worth knowing either way.
