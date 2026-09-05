@@ -18247,3 +18247,66 @@ data lands: it probably will not help.** k=4 was closed as a kernel question thr
 and the residual there was attributed to a ~13us per-call fixed cost of which MKL pays ~12us -- and
 the exact kernel changes the arithmetic, not the fixed cost. If `hi7` does move these cells, that
 reopens a question this document closed, which is worth knowing either way.
+
+## chain107: the same thread intervention is 1.5x faster on the M5 and 1.4x slower on MKT
+
+The M5 float64 re-run finished (the pass quarantined for a closed lid), and its same-code floors
+come back at 0.995-1.004 against the 0.92-1.06 the damaged pass carried, so the quarantine did what
+it was for. Both dtypes now read the same thing, cross-fitted -- width chosen on one pass, scored on
+the other, so the oracle cannot flatter itself.
+
+Put the two hosts' cross-fitted tables side by side. Ratios are times, so >1 means slower.
+
+```
+              M5 float32              MKT float32
+  k    prod/best  ntTrue/best     prod/best  ntTrue/best     prod/ntTrue M5   prod/ntTrue MKT
+  1    1.7257     1.1203          1.2098     1.5955          1.5403           0.7583
+  2    1.7182     1.1236          1.1570     1.4138          1.5292           0.8184
+  4    1.3076     1.1205          1.1600     1.2181          1.1670           0.9523
+  8    1.2596     1.2150          1.1414     1.1352          1.0367           1.0054
+  16   1.1795     1.1791          1.1317     1.1267          1.0004           1.0044
+  64   1.0091     1.0099          1.0690     1.0750          0.9992           0.9944
+```
+
+float64 agrees on both hosts (M5 1.6755/1.1106/1.5086 at k=1; MKT 1.1588/1.6695/0.6941).
+
+**The sign flips.** The count `SCORCH_SPMM_BASE_WORK_TRUE`'s rule resolves to is within 11-12% of
+the best on the M5 and beats production by 1.53x at k=1; on MKT the same count is 1.60x *worse* than
+the best and loses to production by 24-31%. This is not a shape or a corpus difference -- it is the
+same 50-matrix corpus, the same widths, the same statistic.
+
+The per-worker cost of widening the team explains it without any fitting: 0.06 us on MKT, 0.26 on
+redwood, **4.75 on the M5**, measured earlier and recorded already. On a 4 us kernel the M5 pays
+more to recruit a worker than the worker can possibly return, so fewer workers wins; on MKT a worker
+is nearly free and more parallelism wins. The worst M5 cells make it concrete: production declares 4
+where 1 is best, and the kernel goes 4.1 us to 14.3 us -- three extra workers at 4.75 us each is
+14.25 us of predicted overhead against 10.2 us observed, the right order from a number measured for
+a different question.
+
+### The correction chain102 applied to MKT applies here too, and it is the whole table
+
+Every swept arm in this harness is `SYM(nthreads_override=T)`. That argument is **the caller's
+pool**, not "run with T workers" -- the same reading that has now been the source of five separate
+defects in this document. So `bestT` is the best *declared pool*, not the best team width, and this
+table cannot say the thread rule picks the wrong number of workers. It says: the pool the call site
+declares is wrong for narrow k on a host with an expensive team, and production declares
+`torch.get_num_threads()` in `_composition_hints` regardless of what a worker costs there.
+
+That is still a real finding, and it is the honest form of it. It also means the fix is not
+`BASE_WORK_TRUE`: that constant is a compile-time choice between two work estimates, and what the
+data actually asks for is a grain that knows the host's team cost. The grain constant in
+`scorch_policy.h` already encodes a per-worker cost implicitly, at one value for every machine we
+run on, and those machines differ by 79x on exactly that quantity.
+
+### Why this does not advance the goal, said plainly
+
+The M5 has no MKL. The rival column in every M5 table here is ATen's own sparse kernel and the
+harness refuses to name it `mkl` for that reason. So a 1.5x narrow-k win on the M5 improves the M5
+and moves no cell of the count Bobby asked about. It belongs in the ledger, not in the queue, and
+the queue stays pointed at MKT and redwood.
+
+Two further cautions if it is ever picked up. ARM has one host, so the mechanism as stated cannot
+get two-host confirmation -- though the team-cost explanation has three hosts behind it, which is
+the confirmation that matters for a rule conditioned on team cost. And the declared pool feeds the
+E-core recruit gate, which is worth 1.5-2.9x on the M5's fused Linear path; anything that lowers the
+declared pool has to be shown not to switch that off.
