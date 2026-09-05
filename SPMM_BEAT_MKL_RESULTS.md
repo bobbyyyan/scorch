@@ -18836,3 +18836,63 @@ named in `c94_dropped_rw.txt`. The dense width ladder queued for this host was p
 file and would have run 30 matrices while its log said 50 -- and its whole purpose is to be
 comparable to MKT's 50. It now refuses below 40 and prints what it dropped, and the comparison will
 restrict MKT's curve to the same 46.
+
+## chain115: the run-length distribution kills the wide-load lever for the family that carries the deficit
+
+chain114 priced the wide-load lever off the *mean* run length. The mean is the wrong summary, and
+replacing it with the distribution changes the verdict. Share of nonzeros sitting in a run of
+exactly length L, by family:
+
+| family | L=1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | >=32 |
+|---|---|---|---|---|---|---|---|---|---|
+| dlmc rn50 | **0.775** | 0.176 | 0.037 | 0.009 | 0.002 | 0.001 | 0.000 | 0.000 | 0.000 |
+| dlmc transformer | **0.411** | 0.266 | 0.146 | 0.077 | 0.043 | 0.024 | 0.013 | 0.008 | 0.000 |
+| suitesparse | 0.066 | 0.019 | 0.072 | 0.073 | 0.062 | 0.085 | 0.047 | 0.005 | 0.058 |
+
+**41% of the transformer family's nonzeros are isolated** -- no column-adjacent neighbour at all --
+and 77% of rn50's are. A mean run of 1.66 was hiding that: it is not "mostly pairs", it is "mostly
+singletons with a tail".
+
+Recomputing the yield from the distribution rather than the mean, for a pairwise wide load (runs of
+length L give `floor(L/2)` saved loads over L nonzeros):
+
+* dlmc transformer: **0.259** loads saved per nonzero, against 0.396 from the mean.
+* suitesparse: still large, because that family really is blocked.
+
+And there is an alignment term the mean-based estimate ignored. At float32 k=4 the B row for column
+`c` begins at byte `16c`, so a 32-byte load covering rows `c` and `c+1` starts at `16c` and straddles
+a 64-byte line only when `c ≡ 3 (mod 4)` -- **one pair in four**, which is milder than it first looks
+but still trades one line fill for another on a quarter of the wins. Measured share of nonzeros whose
+run starts on an even column: 0.503 transformer, 0.513 rn50, 0.461 suitesparse -- so half the runs
+begin at an odd column, and a quarter of those cross.
+
+Net for the transformer family: about 0.20-0.26 loads saved per nonzero out of 11.5 instructions,
+which is **1.7-2.3%** against deficits of 8-25%.
+
+**So the wide-load lever is not worth building for the family that carries the deficit.** It keeps
+its value on the SuiteSparse family -- 6-7% before alignment, 3-4% after -- which is the largest
+single estimate on the table and still smaller than the gap. This is the third time in this sequence
+that the right shape has turned out not to be the right size, and all three were settled without a
+machine: the reach enumeration for `RAISE_ON_FLOORED`, the emitted-loop count for chain49's arms, and
+now this.
+
+### The comparable subset, pre-registered before redwood's ladder lands
+
+redwood can address 46 of MKT's 50 matrices (chain114). Restricting MKT's published curve to those
+46 *before* the second host reports, so the comparison cannot be chosen after the fact:
+
+| k | bytes | f32 all 50 | f32 subset 46 | f64 all 50 | f64 subset 46 |
+|---|---|---|---|---|---|
+| 1 | 4 | 30 | 27 | 30 | 26 |
+| 2 | 8 | 43 | 39 | 31 | 29 |
+| 3 | 12 | 42 | 38 | 29 | 27 |
+| 4 | 16 | 30 | 27 | 10 | 10 |
+| 8 | 32 | 15 | 15 | 3 | 3 |
+| 16 | 64 | 3 | 3 | 0 | 0 |
+| 20 | 80 | 0 | 0 | 0 | 0 |
+
+The four dropped matrices contribute at most four cells, all at widths 1 to 4, and nothing above k=9.
+The curve's shape, its crossover and its zero at 80 bytes are identical. **Both curves stay in the
+record**: the 50-matrix one because it is what the reframing was derived from, and the 46-matrix one
+because it is what the two hosts will be compared on. Rewriting the first retroactively would make
+the derivation unreproducible.
