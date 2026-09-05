@@ -19309,18 +19309,17 @@ wiggles differ by a microsecond.
 
 The tail is three known things, not a fourth mechanism:
 
-| cell | nnz | rows | deg | ours | MKL | EXACT_HI=1 |
-|---|---|---|---|---|---|---|
-| ffn_conv2, f64 k=2 | 104857 | 512 | 205 | 73.3 | 31.8 | **0.623** |
-| connectus, f32 k=8 | 1127525 | 512 | 2202 | 168.0 | 126.8 | 1.132 |
-| nw14, f64 k=2 | 904910 | 73 | 12396 | 104.5 | 76.6 | 1.292 |
-| bottleneck_3, f64 k=1 | 94620 | 2048 | 46 | 37.2 | 17.2 | 3.689 |
+| cell | nnz | rows | deg | ours | MKL | EXACT_HI=1 | |
+|---|---|---|---|---|---|---|---|
+| ffn_conv2, f64 k=2 | 104857 | 512 | 205 | 73.3 | 31.8 | 0.623 | **RETRACTED, chain121: A/A spread 40.4 us** |
+| connectus, f32 k=8 | 1127525 | 512 | 2202 | 168.0 | 126.8 | 1.132 | **A/A spread 32.3 us** |
+| nw14, f64 k=2 | 904910 | 73 | 12396 | 104.5 | 76.6 | 1.292 | stands (A/A 1.9 us) |
+| bottleneck_3, f64 k=1 | 94620 | 2048 | 46 | 37.2 | 17.2 | 3.689 | **RETRACTED, chain121: A/A spread 14.3 us** |
 
 `nw14`, `connectus` and `lp_osa_14` are the whole-row balance ceiling's three matrices, already
-diagnosed and already exhausted on thread count and B footprint. The `ffn_conv2` cell is the largest
-single deficit in the corpus and the exact-band arm takes it to **0.623 of MKL** -- from losing 2.3x
-to winning 1.6x. And `bottleneck_3` at float64 k=1 is the worst ratio anywhere at 3.689, on 2048
-rows at degree 46, which is width-1 exact-kernel territory and has not been looked at.
+diagnosed and already exhausted on thread count and B footprint. **The two cells this section called
+apparent defects are retracted in chain121: neither can support a size claim, because on both of
+them the two same-code builds disagree by more than the deficit.**
 
 Only **4 of the 97** cells sit on matrices above 1e6 nonzeros, though they carry 18% of the total
 deficit. The exact-band arm flips **7 of 97**.
@@ -19345,3 +19344,42 @@ the cut: at redwood's recorded 0.26 us per worker, the optimum team for 400000 u
 6. **The floor arm's premise is strong on the M5, weak on redwood, and unmeasured on MKT** -- which
 is exactly what the sweep queued first on both hosts is for, and a reason to read its answer before
 releasing the arm rather than after.
+
+## chain121: half the residual cannot be sized, and the two apparent defects were both A/A spread
+
+chain120 read ratios off cells the crossing rule had admitted. The rule -- both same-code builds must
+agree a cell is below MKL -- protects which **side** of the line a cell is on. It says nothing about
+the **magnitude**, and I reported a cell at 3.689x whose two same-code builds differ from each other
+by 1.62x. A cell can support a size claim only when its A/A spread is small next to the deficit
+claimed, and applying that test:
+
+| cell | deficit | A/A spread | c0/MKL | c0b/MKL | verdict |
+|---|---|---|---|---|---|
+| ffn_conv2, f64 k=2 | 41.5 us | **40.4 us** | 2.307 | **1.035** | cannot be sized |
+| connectus, f32 k=8 | 41.3 us | 32.3 us | 1.326 | 1.071 | cannot be sized |
+| nw14, f64 k=2 | 28.0 us | 1.9 us | 1.365 | 1.341 | **stands** |
+| bottleneck_3, f64 k=1 | 20.0 us | 14.3 us | 2.165 | 1.334 | cannot be sized |
+| nw14, f64 k=4 | 20.4 us | 7.2 us | 1.231 | 1.312 | stands |
+| lp_osa_14, f32 k=8 | 19.1 us | 7.9 us | 1.582 | 1.340 | stands |
+
+**45 of the 97 cells have an A/A spread under half their deficit.** Their median deficit is 2.21 us
+and their median ratio 1.096 -- so chain120's characterisation of the population survives; what does
+not survive is its two named defects.
+
+And the survivors are one family. Every sizeable one is `nw14` (73 rows, degree 12396), `kl02` (71
+rows, 2993), `lp_osa_14` (2337 rows, 136) or `connectus` (512 rows, 2202) -- stable in both builds,
+1.09 to 1.58 in each. That is the whole-row balance ceiling, diagnosed already: these matrices hold
+about a tenth of themselves in a single row, so whole-row partitioning caps them near 40% of the
+machine, and thread count and B footprint were both exhausted on them.
+
+**So the honest statement of what is left on an unselected corpus is:** 45 sizeable below-MKL cells
+of 2980, median 2.2 us against MKL's 18.2, of which the sizeable ones are four matrices with a known
+structural cap and the rest are two comparable per-call floors whose wiggles cross. There is no
+defect to fix. The kernel wins measured in chain118 remain worth landing on their own terms -- they
+are 1.16-1.47x on matrices where the kernel dominates -- but they are speed, not cells.
+
+The general form, and the third time this project has hit it: **a statistic that qualifies a cell for
+one claim does not qualify it for another.** `an_stable.py` was written to make the crossing count
+reproducible and it does that correctly. Reading a ratio off the cells it admits is a different
+question, and it needs its own test -- which is now `an_resid_stable.py`, and which should have run
+before any cell was called a defect.
