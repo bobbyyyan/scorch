@@ -19505,10 +19505,20 @@ cleared; it has not been examined.
 | chain120's `ffn_conv2` f64 k=2 and `bottleneck_3` f64 k=1 | cells admitted by the both-builds-agree rule, which selects on side and not size | **withdrawn** (chain121) |
 | chain120's residual census, 97 of 2980 and median 2.21 us | the unselected 298-matrix corpus | clean as a count; the file already notes that any *size* claim about the residual is a claim about a subset chosen by sign |
 | the 236-cell autotune board, 0.675x -> 1.878x | four pre-existing matrix sets (the ones the 195-cell tiling study used) plus N=16 and 64 | clean |
+| MKT's 113-of-250 caller-path count, and every MKT count in this file | `c94_keys.txt` -- 50 matrices (38 SuiteSparse, 12 DLMC) **selected because those cells were already below MKL** | clean by disclosure, and the disclosure is the best in the file: it names the right use (of the cells we knew we lose, how many still do -- the correct denominator for measuring a fix) and the wrong one (a census) |
 | the shipping candidate | pre-registered split plus a three-graph GCN guardrail | pending, both hosts |
 
 Two withdrawals, both already on the books before this audit and neither newly discovered. Nothing
 else in the table needs re-measuring.
+
+**The `c94_keys.txt` row is the one to carry forward into how the shipping candidate is reported.**
+Every MKT count in this file runs on a corpus selected for already losing, and redwood's 298-matrix
+corpus is not, which is why the two hosts' cell counts are not comparable and why this file already
+says so. The consequence for the candidate is specific: on redwood's unselected corpus the
+kernel-dominated group is already at 0 or 1 of 37 below MKL per width, so chain118's 1.16-1.47x at
+widths 2 and 3 is a **runtime** win on cells we were already winning there, and its cell-count value
+was a property of MKT's selected corpus. Both are real; they are not the same claim, and the standing
+goal is a cell count. Say which one the candidate delivers on which host rather than pooling them.
 
 The reason the rate is that low is visible in the file itself: it names this hazard in five separate
 places, twice as grounds for *declining* to run something -- a degree ladder whose pooled geomean
