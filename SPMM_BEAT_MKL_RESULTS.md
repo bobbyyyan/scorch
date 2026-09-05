@@ -18191,6 +18191,17 @@ independent measurements of the same code before it counts:
   MKT mr2h gate f64     101     3           +25/-7   (mr2h; mr2 +5/-5)
 ```
 
+**Those four lines are not four measurements of the same thing, and the table above should not be
+read as "redwood loses 28 cells and MKT loses 113."** The two MKT rows run on `c94_keys.txt` -- 50
+matrices, 38 SuiteSparse and 12 DLMC, *selected* as the residual family because those cells were
+already below MKL. The redwood row runs on the broad 298-matrix caller corpus (127 SuiteSparse, 171
+DLMC), which was not selected for anything. So MKT's 113-of-250 is "of the cells we already knew we
+lose, how many still lose", which is the right denominator for measuring a fix and the wrong one for
+a census; redwood's 28-of-1490 is a census, and it says 1.9% of a broad corpus is reproducibly below
+MKL there. Comparing the *undecided* fractions across the two rows is fair, because that is a
+property of the host and the instrument rather than of the corpus. Comparing the below counts is
+not.
+
 MKT's numbers survive the stricter test essentially unchanged -- chain100's +15/-2 becomes +15/-0,
 chain104's +33/-2 becomes +30/-2, its +27/-8 becomes +25/-7 -- because MKT leaves only 4 to 8 cells
 of several hundred undecided. Redwood leaves 55 undecided out of 1490 and its mr2 crossings collapse
