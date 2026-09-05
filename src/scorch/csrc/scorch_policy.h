@@ -661,6 +661,23 @@
 #ifndef SCORCH_SPMM_MULTIROW_HALFVEC
 #  define SCORCH_SPMM_MULTIROW_HALFVEC 0
 #endif
+
+// The narrow-k register block's B-row prefetch. Ships at 1, which is what it has always done; the
+// constant exists because its COST was never measured and is larger than it looks.
+//
+// The run-ahead is one loop iteration -- two nonzeros, about four cycles -- and the prefetch-depth
+// hook's own comment argues that four cycles cannot cover the ~40-cycle L3 hit the narrow-k deficit
+// lives in. So the value was already doubted. The cost, on the emitted AVX2 loop at float32 k=4:
+// the prefetch and its bounds test are 9 of 23 instructions per two nonzeros, and removing them
+// takes 11.50 instructions per nonzero to 7.00. The guard is most of that -- a compare, a branch, a
+// second index load, a second multiply and a jump back, because the compiler emits it as a side
+// block rather than folding it into the body.
+//
+// Whether that converts into time is a separate question and depends on whether these kernels are
+// issue-bound or latency-bound at the widths that lose, which is exactly what the arm measures.
+#ifndef SCORCH_SPMM_ROW_PREFETCH
+#  define SCORCH_SPMM_ROW_PREFETCH 1
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_MINNNZ
 #  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
 #endif

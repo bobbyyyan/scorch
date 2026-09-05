@@ -2266,8 +2266,18 @@ static inline void scorch_spmm_row_regblock(
   for (; pA + 1 < pA_end; pA += 2) {
     const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
     const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+    // The run-ahead is one loop iteration -- two nonzeros, about four cycles -- and this file
+    // already argues that four cycles cannot cover the ~40-cycle L3 hit the narrow-k deficit lives
+    // in. What was never priced is the cost of the attempt, and at these widths the kernel is
+    // instruction-dense enough for it to matter: on the emitted AVX2 loop at float32 k=4 the
+    // prefetch and its bounds test are 9 of 23 instructions per two nonzeros, so 11.50
+    // instructions per nonzero become 7.00 without them. The guard is what makes it expensive --
+    // it costs a compare, a branch, a second index load, a second multiply and a jump back,
+    // because the compiler lays it out as a side block.
+#if SCORCH_SPMM_ROW_PREFETCH
     if (pA + 2 < pA_end)
       __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size, 0, 1);
+#endif
     const typename V::vec a0 = V::splat(A_val[pA]);
     const typename V::vec a1 = V::splat(A_val[pA + 1]);
     #pragma unroll
