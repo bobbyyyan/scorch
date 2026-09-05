@@ -19761,3 +19761,68 @@ from `bandmr` on ARM, then that comment is false and there is a second defect to
 Rows 3 and 6 are about float64 on x86, where the source path does not change but the object does.
 If more passes do not dissolve the +13 pp, the honest options are to declare the cost and let Bobby
 weigh it against a 22% width-3 win, or to abandon the flip. Not to describe it as inert.
+
+## chain128: the gate is designed and held; the float64 blocker gets the control it never had
+
+Bobby's decision: hold the ISA gate as the intended shape, do not write it until the isolation runs
+confirm the attribution, and treat the float64 population on x86 as a separate blocker that closes
+on its own. Recorded because both halves constrain what may be committed.
+
+### Why the gate is one constant and not three, and why it is not overfitting
+
+Checked in the source rather than assumed:
+
+| constant | ARM status | evidence |
+|---|---|---|
+| `SCORCH_SPMM_MULTIROW_ROWS_F32` | already inert | its dispatch is inside `#if defined(__AVX2__) && defined(__FMA__)` |
+| `SCORCH_SPMM_HALFVEC_F32` | already inert | its kernel is inside the AVX2 block, as its own comment claims |
+| `SCORCH_NARROWK_EXACT_HI_F32` | **live on ARM** | the exact kernel is guarded `(AVX2 && FMA) \|\| __ARM_NEON`, with a second call site under `defined(__ARM_NEON) && !defined(__AVX2__)` |
+
+So the ARM regression can only come from the band, and a gate is one value at one site.
+
+**It is not overfitting, and the reason is that the constant is not a magnitude.** It decides *which
+kernel* handles widths 2 and 3, and the two instruction sets hand that work to different kernels --
+the masked 256-bit register block at one call site, the NEON path at the other. A constant whose
+optimum depends on which kernel it displaces, where the displaced kernel differs by instruction
+set, is mechanistically ISA-dependent rather than host-fitted. The house rule endorses precisely
+this: gate a sub-regime win behind a condition that provably cannot fire where it hurts. Four
+precedents in the tree -- `HALFVEC` inside the AVX2 block, the NEON row kernel proven x86-inert by
+`objdump`, the E-core recruit built to be byte-neutral on x86 all-physical-core pools, and the
+float64 register kernel with ARM deliberately unchanged.
+
+Note the sign: ARM currently *gains* about 30% at width 2 from the exact kernel. Leaving ARM alone
+preserves a win rather than forgoing one.
+
+**What would make it overfitting, stated so it can be held against this work:** gating on ISA
+without knowing which constant regresses and why. That is "it broke on ARM so we turned it off
+there" -- a shrug with a `#if` around it. Hence the gate waits on the isolation run, whose
+prediction is sharp because two of the three constants are already ARM-inert: on ARM `bandf32`,
+`bandmr` and `shipcand` must all read the same. If they differ, one of the inertness claims above
+is false and there is a second defect to find. Also prefer keying the gate off the existing
+capability guards rather than `__x86_64__`, so it stays correct if a future instruction set gains
+the same capability.
+
+### The float64 blocker: the control that did not exist
+
+Float64's source path is untouched by all three constants, yet its regression population on MKT is
+13 points above its own same-code control. Two candidate explanations -- binary layout, or a leak
+where some shared non-template path reads a `_F32` constant -- and no data separating them, because
+**`c0` and `c0b` cannot: they are two builds of identical source at the same fixed path, and
+mrbuild refuses if their `.text` differs.** They measure run-to-run noise and say nothing about
+layout.
+
+`c0pad` is the missing arm, added to mrbuild and queued as job 17282530: identical source, identical
+flags, built at a path **one character longer**, which shifts embedded strings and every
+RIP-relative displacement while emitting the same instructions. The harness verifies it is a
+control by requiring the same `.text` **size** with a **different** digest -- same size and
+different bytes is what a layout shift is, and what a semantic change is not. It is exempted from
+the distinct-defines-imply-distinct-code rule, since it shares c0's empty defines by design.
+
+This deliberately does the thing the harness exists to prevent. Building each arm at one fixed path
+is why three earlier build-identity failures were spurious; `c0pad` inverts that on purpose to
+measure the effect those failures were confounded by.
+
+**Reading rule, registered now.** If `c0pad` reproduces float64's excess, the effect is layout, it
+is not attributable to the candidate, and the honest report is that any change to this file costs
+float64 that much on this host. If `c0pad` is clean and `shipcand` is not, there is a leak to find,
+and that is a defect rather than a cost.
