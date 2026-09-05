@@ -19408,3 +19408,71 @@ the pooled numbers and the reason the shipping pair keeps float64 width 2 with t
 The harness that produced this table printed one geomean under two labels on its first run. Fixed
 before the numbers above were read, and worth recording: a script written to check for mislabelled
 numbers had one.
+
+## chain122: the shipping arm was built against a tree that did not contain its constant, and the seven-waiter chain fired a stage onto a live measurement
+
+Two defects, both in the harness, both caught before they produced a number. Recording them
+because each is a general form, not a one-off.
+
+### A `-D` naming a macro the tree does not read
+
+`shipcand` is three float32 constants: `SCORCH_NARROWK_EXACT_HI_F32=1`, `SCORCH_SPMM_HALFVEC_F32=2`,
+`SCORCH_SPMM_MULTIROW_ROWS_F32=2`. The per-dtype pair is new -- it was added earlier in this session
+and committed as 2537d60. The tarball staged on both hosts predates it.
+
+So `-DSCORCH_NARROWK_EXACT_HI_F32=1` named a macro no source file read. It compiled without a
+warning, changed nothing, and left `shipcand` byte-identical to `hvmr`, which sets the other two.
+Both arms would have been timed, and the interaction the whole arm exists to measure -- the band's
+top lowered so that multi-row can reach widths 2 and 3 -- would have been reported as reproducing
+at 1.00 against its own duplicate.
+
+The existing check did not catch it. mrbuild.sh already refused a candidate whose `.text` equals
+c0's, on the grounds that its define did not take. `shipcand` passes that check: its other two
+defines took, so it differs from c0. It differed from c0 in exactly the way `hvmr` does.
+
+Two checks added, and the second is the one that matters:
+
+- Every macro a config names must appear somewhere under `src/scorch/csrc` in the tree about to be
+  compiled. Verified locally: fires on the stale tarball, passes on the fresh one, and fires on an
+  invented macro name.
+- **Two configs with different define strings must produce different `.text`.** Comparing each arm
+  against the baseline is not enough when arms differ from the baseline in overlapping ways.
+
+The fresh tarball carries the split, and the job that is now running prints the positive control:
+
+| build | defines | `.text` |
+|---|---|---|
+| c0 | | `dcdd393cb7e1ffc1` |
+| c0b | | `dcdd393cb7e1ffc1` |
+| hi1hv | `EXACT_HI=1 HALFVEC_F32=2` | `7f0013cdc04716a4` |
+| shipcand | `EXACT_HI_F32=1 HALFVEC_F32=2 MULTIROW_ROWS_F32=2` | `f8e4b7e69b114a5e` |
+| hvmr | `HALFVEC_F32=2 MULTIROW_ROWS_F32=2` | `e8a902fe4b913241` |
+
+`shipcand` and `hvmr` are distinct, which under the stale tree they were not. Correctness: 120
+cases each over dtype x rows x density x width, zero mismatches, all three arms.
+
+Note for the analysis: `hi1hv` lowers the band for *both* dtypes (it predates the split and sets the
+unsuffixed `EXACT_HI`), while `shipcand` lowers it for float32 only. The two are not a clean
+one-knob comparison at float64.
+
+### Seven waiters, each keyed on the previous one's process name
+
+redwood's queue was seven `nohup` scripts, each polling `pgrep -f` for its predecessor's *name*.
+Killing the first to reorder the queue satisfied the second's wait condition, which launched the
+byte-curve stage on top of the running measurement: an mrbuild compile at `-j16` for about two and a
+half minutes alongside a live timing arm. The intruder was killed; the arm it overlapped
+(`ex4b float64 p2`) is re-measured rather than kept and caveated, and its own floor arms `c0` and
+`c0b` come later in that group's rotation (`mrhv ex4b c0 c0b mr2`) so they never saw the compile.
+Re-running the one arm restores the group.
+
+Replaced by a single sequential runner holding the stages in one process, keyed on the pid of the
+stage actually running rather than on any name, with a refusal that will not start a stage while any
+timing process is alive. Dropped from the order: `mr2i` (superseded by `shipcand`, which contains
+the mechanism it tested), the floor sweep and the floor arm.
+
+Two smaller things in the same hour, both the same shape as the above:
+
+- `pkill -f "[r]w_mr2i_after.sh"` killed the shell that issued it. The bracket trick stops a pattern
+  from matching *itself*, but the loop that built the pattern had the plain name in its own argv, so
+  the pattern matched the ssh command text. Killing by pid has no such failure mode.
+- Two `zsh`/`tail` poller pairs from eight days ago were still resident and were killed.
