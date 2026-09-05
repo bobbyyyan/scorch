@@ -19383,3 +19383,28 @@ one claim does not qualify it for another.** `an_stable.py` was written to make 
 reproducible and it does that correctly. Reading a ratio off the cells it admits is a different
 question, and it needs its own test -- which is now `an_resid_stable.py`, and which should have run
 before any cell was called a defect.
+
+### And chain118 re-tested against the same rule, since retracting one result with a test obliges applying it to the others
+
+Per matrix: is the arm's gain large next to that matrix's own same-code spread? Geomean of `c0/arm`
+over the big group, all matrices against only those that pass:
+
+| | all | passing | passing / total |
+|---|---|---|---|
+| MKT float32 k=3 | 1.4657 | **1.4970** | 17 of 18 |
+| MKT float32 k=2 | 1.1588 | 1.1738 | 16 of 18 |
+| MKT float64 k=3 | 1.2263 | 1.2970 | 14 of 18 |
+| MKT float64 k=2 | 1.0850 | 1.0950 | 16 of 18 |
+| redwood float32 k=3 | 1.1581 | **1.1714** | 35 of 37 |
+| redwood float32 k=2 | 1.0157 | 1.0144 | 28 of 37 |
+| redwood float64 k=3 | 1.0294 | 1.0374 | 25 of 37 |
+
+**The effect is larger on the cells that pass**, on six of seven columns -- excluding the unstable
+ones sharpens the result rather than deflating it, which is what a real effect does and what
+chain120's two cells conspicuously did not do. float32 k=2 on redwood remains the marginal column
+(1.014 against a 1.0008 floor, and only 28 of 37 stable), which is the same conclusion reached from
+the pooled numbers and the reason the shipping pair keeps float64 width 2 with the exact kernel.
+
+The harness that produced this table printed one geomean under two labels on its first run. Fixed
+before the numbers above were read, and worth recording: a script written to check for mislabelled
+numbers had one.
