@@ -18968,3 +18968,112 @@ which is 12 to 28 bytes and squarely inside the band -- with 32 along as the out
 The normalization is imported from `bench_gcn`, not restated. A guardrail that recomputes the matrix
 it guards keeps passing after the bench stops agreeing with it, which is the failure this project has
 now hit in four separate forms.
+
+## chain117: the deficit is two mechanisms, and at widths 2 and 3 we run a scalar kernel that costs more than doing more work
+
+The byte curve counted cells. Re-reading the same MKT ladder for *times* rather than counts splits
+those cells into two mechanisms with nothing in common, and finds the largest single kernel deficit
+in the project sitting at the two widths that carry the most cells.
+
+### First, a method correction on my own analysis
+
+The first version of this fit the deficit against nnz over the cells that are *below* MKL. That is
+conditioning on the outcome: at small nnz a cell only enters that set when a fixed cost dominates,
+so the intercept is biased up by construction. It produced "70-98% of the deficit is fixed cost" at
+almost every width, with R2 of 0.1-0.4 -- a flat cloud being read as an intercept. Refitting over
+**all** cells, and reporting a non-parametric statement alongside it, changes the answer.
+
+### Mechanism one: a per-call floor, which decides the small and middle thirds
+
+Five smallest matrices on the corpus, float32, ours/MKL in microseconds:
+
+| matrix | nnz | rows | k=1 | k=2 | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|---|---|---|---|
+| large_A_07 | 19637 | 4249 | 26.1/14.3 | 26.6/19.5 | 25.2/21.8 | 26.7/41.8 | 27.7/41.8 | 29.1/45.6 |
+| as-735_G_517 | 19979 | 7716 | 27.2/21.2 | 27.3/23.7 | 27.9/27.4 | 30.4/44.3 | 30.4/44.3 | 31.8/49.4 |
+| rn50 bottleneck | 23596 | **256** | 14.8/12.1 | 15.7/13.5 | 16.3/14.9 | 16.6/18.3 | 16.5/19.9 | 18.2/31.9 |
+| as-735_G_683 | 24077 | 7716 | 28.3/23.1 | 28.0/24.9 | 28.4/28.0 | 31.9/44.6 | 30.8/44.2 | 32.7/50.7 |
+| deter6 | 24771 | 4255 | 25.8/20.7 | 26.8/24.4 | 25.9/25.3 | 26.9/42.4 | 26.1/42.1 | 28.8/43.8 |
+
+**Thirty-two times the arithmetic costs three microseconds.** Our time is flat in k from 26.1 to
+29.1 while MKL's rises from 14.3 to 45.6. And the floor tracks ROWS, not nnz: 4249 rows costs 26 us,
+7716 rows costs 28, and the 256-row DLMC matrix with *more* nonzeros costs 15. So there is a
+per-call floor of roughly 14 us plus about 2.8 ns per row, and at k=1 MKL's is about 12 us lower.
+
+It is not the ABI validation: `checked_csr_view` memoizes its O(rows) and O(nnz) structural scans on
+the index pair, so in a batch loop only the O(1) checks re-run. Whatever the floor is made of, it
+decides every below-MKL cell on the small and middle thirds at k=1 and at k>=4 -- and we win the
+largest third at those widths, by 22.7 us at k=1 and 17-185 us from k=8 up.
+
+### Mechanism two: widths 2 and 3 float32, where the deficit grows with nnz
+
+Same corpus in thirds by nnz, float32, median over each third:
+
+| k | small third gap | middle third gap | largest third: ours | MKL | gap | cells below |
+|---|---|---|---|---|---|---|
+| 1 | +5.8 | +3.1 | 309.5 | 332.2 | **-22.7** | 4/18 |
+| 2 | +3.6 | +10.5 | 450.7 | 283.6 | **+167.1** | 17/18 |
+| 3 | +3.2 | +8.3 | 574.6 | 378.7 | **+195.9** | 17/18 |
+| 4 | +1.2 | -0.6 | 374.2 | 364.2 | +10.0 | 10/18 |
+| 5 | +0.2 | +1.8 | 553.3 | 546.7 | +6.6 | 12/18 |
+| 8 | -3.4 | -3.3 | 536.0 | 553.6 | -17.6 | 2/18 |
+| 11 | -6.3 | -10.6 | 719.6 | 904.7 | -185.1 | 0/18 |
+
+The fit agrees: at k=2 and k=3 the deficit is 0.0199 and 0.0254 us per thousand nonzeros with R2
+0.903 and 0.943 -- the only two widths in either dtype where a per-nonzero model explains the gap.
+
+**And the absolute times name the cause without any model. On the same matrices we take 574.6 us at
+k=3 and 374.2 at k=4.** More arithmetic, less time, by 53%. k=4 is the only one of the three that
+runs a vector kernel: `halfvec_exact` instantiates the register block on the 128-bit type. Widths 2
+and 3 run `scorch_spmm_row_narrow_exact`, which is scalar by construction -- K scalar loads and K
+scalar FMAs per nonzero where the vector form needs one of each.
+
+### The emitted loops, x86-64 AVX2 at the extension's flags
+
+| symbol | insns | packed FMA | scalar FMA | spill-st | reload | nnz/iter | insns/nnz |
+|---|---|---|---|---|---|---|---|
+| `hv_full_k4` (shipped at k=4) | 23 | 2 | 0 | 0 | 0 | 2.0 | **11.50** |
+| `hv_over_k3` (unmasked load, masked store) | 23 | 2 | 0 | 0 | 0 | 2.0 | **11.50** |
+| `hv_masked_k3` (128-bit, 3 lanes of 4) | 27 | 2 | 0 | 0 | 0 | 2.0 | 13.50 |
+| `v_masked_k3` (256-bit, 3 lanes of 8) | 27 | 2 | 0 | 0 | 0 | 2.0 | 13.50 |
+| `exact_k3_u2` (shipped at k=3) | 231 | 6 | 6 | 4 | 4 | 8.0 | **28.88** |
+| `exact_k3_u4` | 444 | 16 | 4 | 16 | 15 | 17.3 | 25.62 |
+| `exact_k3_u8` | 908 | 32 | 8 | 61 | 57 | 34.7 | 26.19 |
+| `exact_k2_u4` (shipped at k=2) | 330 | 12 | 0 | 8 | 8 | 12.0 | 27.50 |
+| `exact_k2_u8` | 627 | 24 | 0 | 28 | 27 | 24.0 | 26.12 |
+
+The scalar kernel costs **2.3 times the instructions per nonzero** and spills at every unroll it can
+pick. The divisor is stated per symbol here rather than inherited from `count_hot.py`, which divides
+scalar FMAs by four because it was written for the k=4 question; at K=3 three scalar FMAs are one
+nonzero, and reusing the old divisor would have flattered the scalar kernel by a third.
+
+Subtracting a common per-nonzero term for the A stream reconciles the two measurements: if about
+40 ps/nnz is the shared cost of streaming A, then 103.5 - 40 = 63.5 at k=3 against 67.4 - 40 = 27.4
+at k=4 is a ratio of 2.3, which is the instruction ratio exactly.
+
+### What that indicates, and the one measurement that stands against it
+
+`SCORCH_NARROWK_EXACT_HI`'s own comment says the exact kernel "wins 6-8% at k=2 and k=3 on both
+dtypes". That measurement was against the **masked 256-bit** block, which is what the alternative
+was before the half-vector type existed -- and `halfvec_under`, the value that would route 2 and 3
+to the 128-bit block, cannot fire today at all: it requires `!exact_width`, and exact owns those
+widths. **So widths 2 and 3 have never been measured on the 128-bit block**, because the two
+constants have to move together and no arm has moved both.
+
+Three arms, in increasing order of what they need:
+
+1. `EXACT_HI=1` alone -- widths 2 and 3 to the masked 256-bit block. This is the arm the old
+   measurement already rejected, and it is worth running only as that measurement's control.
+2. `EXACT_HI=1 + HALFVEC=2` -- the masked 128-bit block. 13.5 instructions per nonzero, and the
+   mask is 3 lanes of 4 rather than 3 of 8.
+3. `EXACT_HI=1 + HALFVEC=2 + an unmasked load` -- 11.50, identical to the kernel that reaches
+   parity with MKL at k=4. B is only read and the extra lane is discarded at the masked store, so
+   the only cost is reading up to `LH-K` floats past the end of B, which can only happen when a
+   nonzero names the last row of B. `A1_crd` is validated sorted, so a row's last coordinate is its
+   largest, and one compare per ROW -- `A1_crd[pA_end-1] != J-1` -- decides it. Rows that touch the
+   last column keep the masked kernel. That is one compare per row against 15 instructions per
+   nonzero saved, on 85 of the corpus's below-MKL float32 cells.
+
+The masked-load cost is the whole question between arms 2 and 3: `vmaskmovps` is multi-uop and
+cannot fold its address, which is the only way the old 6-8% measurement and this instruction count
+can both be right.
