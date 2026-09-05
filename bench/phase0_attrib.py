@@ -91,12 +91,21 @@ def load_matrix(spec):
             if os.path.exists(path):
                 return scipy.sparse.load_npz(path)
             m = _load_matrix_uncached(spec)
-            tmp = path + ".tmp%d" % os.getpid()
+            # The suffix has to be ".npz" or scipy appends one: save_npz("x.tmp7", m) writes
+            # "x.tmp7.npz", and the os.replace below then looks for a file that does not exist.
+            # That raised FileNotFoundError, which is an OSError, which the handler below swallowed
+            # -- so results stayed correct while the cache never populated and every call leaked a
+            # temp. Found with 418 temp files and zero finished cache entries on one host, 24 GB of
+            # them, meaning a minute of Matrix Market parsing per matrix per run for months.
+            tmp = path + ".tmp%d.npz" % os.getpid()
             scipy.sparse.save_npz(tmp, m)
             os.replace(tmp, path)
             return m
-        except OSError:
-            pass
+        except OSError as exc:
+            # Still non-fatal -- a read-only or full cache directory must not fail a benchmark --
+            # but no longer silent, because the silence is what hid the above.
+            sys.stderr.write("  note: matrix cache unusable for %s (%s: %s)\n"
+                             % (spec, type(exc).__name__, exc))
     return _load_matrix_uncached(spec)
 
 
