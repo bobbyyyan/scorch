@@ -19826,3 +19826,103 @@ measure the effect those failures were confounded by.
 is not attributable to the candidate, and the honest report is that any change to this file costs
 float64 that much on this host. If `c0pad` is clean and `shipcand` is not, there is a leak to find,
 and that is a defect rather than a cost.
+
+## chain129: the candidate is two constants, not three -- halfvec is a loss, and the ARM regression is provably the band
+
+Two isolation runs, both complete, both with the arms nested so each successive difference is one
+constant: `bandf32` (`EXACT_HI_F32=1`), `bandmr` (plus `MULTIROW_ROWS_F32=2`), `shipcand` (plus
+`HALFVEC_F32=2`).
+
+### MKT, job 17279494: what each constant is actually worth
+
+Target group, geomean of c0/arm, floor 1.006-1.013:
+
+| f32 | c0b | bandf32 | bandmr | shipcand | band adds | multirow adds | **halfvec adds** |
+|---|---|---|---|---|---|---|---|
+| k=1 | 0.9945 | 1.0000 | 1.0111 | 0.9915 | +0.0% | +1.1% | **-1.9%** |
+| k=2 | 1.0134 | 0.8897 | 1.0608 | 1.0405 | -11.0% | +19.2% | **-1.9%** |
+| k=3 | 1.0121 | 1.0551 | **1.2729** | 1.2458 | +5.5% | +20.6% | **-2.1%** |
+| k=4 | 1.0112 | 1.0120 | 1.0016 | 1.0073 | +1.2% | -1.0% | +0.6% |
+| k=8 | 1.0062 | 1.0117 | **1.3542** | 1.3483 | +1.2% | +33.9% | -0.4% |
+
+**`SCORCH_SPMM_HALFVEC_F32=2` does not earn its place.** It is -1.9%, -1.9% and -2.1% at widths 1,
+2 and 3 against a floor near 1.2%, and neutral above. It was in the candidate because chain104 and
+chain110 measured it in company, never alone. Dropped.
+
+**Multi-row is the win and the band is its precondition, not an effect.** The band alone *regresses*
+width 2 by 11% and gains 5.5% at width 3; multi-row alone cannot reach widths 2-3 at all while the
+exact band owns them. Together: +19.2% and +20.6%. chain125 credited width 3 to the band on the
+strength of `hi1hv` ~ `shipcand`; that comparison held halfvec fixed in both arms and so could not
+see that the band's own contribution is small and negative at width 2.
+
+Cell counts agree, float32, 42 matrices: at width 3, `c0` 34 of 42 below MKL becomes **22** with the
+band alone, **15** with band plus multi-row, and 16 once halfvec is added. At width 1, `bandmr` 16
+against `shipcand` 18. `bandmr` dominates `shipcand` on every width and ties nowhere worse.
+
+**The candidate is `bandmr`: `EXACT_HI_F32=1` + `MULTIROW_ROWS_F32=2`.** Two constants.
+
+### The M5: the ARM regression is the band, and the other two are provably inert
+
+The three ARM objects have **identical `__text` digests** (`110d587ad036b7d1`). Multi-row's dispatch
+and halfvec's kernel are both inside AVX2 blocks, so on ARM all three arms are the same binary --
+inertness proven by digest rather than measured over 60 matrices. The residual differences between
+them (0.43% and 0.80% worst case) are therefore a pure noise reading between identical objects, and
+usefully consistent with the 1% cross-build floor.
+
+So the ARM regression belongs entirely to `EXACT_HI_F32=1`:
+
+| ARM f32 | b1 13-44K | b2 44-130K | b3 131K-1.5M |
+|---|---|---|---|
+| k=2 | 0.9640 | 0.9197 | **0.7229** |
+| k=3 | 0.9867 | 0.9470 | **0.8349** |
+| k=8 | 1.0126 | 1.0123 | 1.0066 |
+
+float64 is neutral throughout (0.9873-1.0081), and the rotation fix worked: those floors read
+0.993-1.001 where the previous run's reached 1.3641.
+
+**This is what licenses the ISA gate**, and it licenses it for exactly one constant. `MULTIROW_ROWS_F32`
+needs no gate -- it is already AVX2-only. So the shipping change is one gated constant and one
+ungated one, and the ARM object can be required to be byte-identical to today's.
+
+### A statistic of mine that does not reproduce, and chain127's row 3 revised
+
+chain127 recorded x86 float64 as FAILING on a regression population 13 points above its same-code
+control. **The same arm, same digest, reads -32 points in this job.** The control itself moved (49%
+to 55%). A statistic that swings 45 points between two runs of the same object on the same host is
+not measuring the object.
+
+So row 3's status is **unresolved**, not FAIL and not PASS, and the number that produced it is
+withdrawn. Note what does reproduce: the geomeans. `shipcand` at float32 width 3 read 1.2212 then
+1.2458; at width 8, 1.3351 then 1.3483. The per-cell-population count is the fragile instrument and
+the geomean with a per-cell spread test is the sound one -- which is the same lesson as chain121,
+arriving from the opposite direction. The `c0pad` layout control (job 17282530) still runs, because
+the layout question is worth an answer even though the evidence that motivated it has evaporated.
+
+### Three defects in the interlock, all mine, all found by testing it rather than trusting it
+
+The stage lock added in chain122 had three:
+
+1. **Its trap did `read -r P`** -- and `P` is the pass tag in every stage script. Firing the handler
+   overwrote p1/p2/p3 with the lock's pid, so every arm afterwards was written under one bogus tag,
+   collapsing the interleaved pass structure. Caught by seeing `--pass-tag 12006 --slice gcn12006`
+   in a live command line. Variables are now prefixed.
+2. **The `INT`/`TERM` handler did not exit**, so `kill` was caught, cleaned up, and *resumed* the
+   stage. That is why redwood survived being killed. INT and TERM now exit 130 and 143.
+3. **`STAGE=name . stage_lock.sh` does not persist `STAGE`** -- a prefix assignment on the `.`
+   builtin is temporary -- so the trap referenced an unbound variable and aborted *inside the
+   handler* under `set -u`. Captured into a variable assigned inside the sourced file, where
+   assignments do persist.
+
+Also learned, and it explains defect 2's symptom: **a stage blocked in a long `python` call defers
+its own trap until that call returns**, so stopping a stage means killing the child first and the
+script second. And `pkill -f` matched the ssh command text carrying the pattern -- the same defect
+as chain122, committed twice in one day. Kill by pid.
+
+The partial redwood run written under the corrupted pass tag was discarded rather than repaired.
+
+### Gate status
+
+Rows 1, 2, 5 pass. Row 3 is unresolved rather than failed. **Row 4 now has a licensed remedy**
+rather than a failure: the ARM regression is one constant, and gating it makes the ARM object
+byte-identical, which also satisfies row 10. Rows 7, 8, 9 pending -- and row 8 is now satisfiable,
+since every constant that would ship has been measured alone.
