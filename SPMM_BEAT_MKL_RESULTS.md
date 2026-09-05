@@ -19274,3 +19274,74 @@ importing its own `load_dataset` and `compute_normalized_adj` on the host that h
 shipped as npz -- cora 13264 nonzeros, citeseer 12431, pubmed 108365. **The header's own worked cliff
 is in it**: a Cora output layer is 13264 nonzeros at k=7, which the ungraded adoption gives 24
 workers, one grain size gives 6, and another gives 1.
+
+## chain120: on the unselected population the residual is 97 cells of 2980, median 2.25 us, and almost none of it is the kernel
+
+Every MKT count in this document runs on `c94_keys.txt`: 50 matrices chosen *because* they were
+below MKL. redwood's 298-matrix corpus is not chosen that way, so it is the only honest denominator
+either host has -- and now that the deficit is known to be two mechanisms, the count can say which
+one owns each cell. Below-MKL means **both** same-code builds read below MKL, which is the rule this
+host's crossing statistic needs.
+
+| float32 | floor group (nnz < 1e6) | kernel group (>= 1e6) | float64 | floor group | kernel group |
+|---|---|---|---|---|---|
+| k=1 | 1 of 261 | 0 of 37 | k=1 | 3 of 261 | 0 of 37 |
+| k=2 | 5 of 261 | 0 of 37 | k=2 | 4 of 261 | 0 of 37 |
+| k=3 | 19 of 261 | 0 of 37 | k=3 | 5 of 261 | 0 of 37 |
+| k=4 | **31 of 261** | 1 of 37 | k=4 | **16 of 261** | 1 of 37 |
+| k=8 | 5 of 261 | 1 of 37 | k=8 | 4 of 261 | 1 of 37 |
+
+**The kernel-dominated matrices already beat MKL nearly everywhere on this host: 0 or 1 of 37 per
+width.** So chain118's 1.16-1.47x at widths 2 and 3 is a speed win on cells we were already winning
+here, and its cell-count value was a property of MKT's selected corpus. That does not retract it --
+the arm is real and improves 36 of 37 of redwood's big matrices -- but it reprioritises it.
+
+### What is actually left
+
+97 below-MKL cells of 2980 across both dtypes and five widths, **3.3%**. Median deficit **2.25 us**
+where MKL itself takes 18.2; median ratio 1.099. Rows, median: **512**.
+
+The 32 cells at the float32 peak are the DLMC transformer family, every one of them, and they are
+floor cells by their own profile -- our time at k=8 over k=1 is **1.03** (a floor cell stays near 1;
+arithmetic-bound would be near 8). Our times run 13-19 us across all five widths while MKL's run
+14-21, so the crossing at k=3-4 is where MKL's dip meets our peak: two comparable flat floors whose
+wiggles differ by a microsecond.
+
+The tail is three known things, not a fourth mechanism:
+
+| cell | nnz | rows | deg | ours | MKL | EXACT_HI=1 |
+|---|---|---|---|---|---|---|
+| ffn_conv2, f64 k=2 | 104857 | 512 | 205 | 73.3 | 31.8 | **0.623** |
+| connectus, f32 k=8 | 1127525 | 512 | 2202 | 168.0 | 126.8 | 1.132 |
+| nw14, f64 k=2 | 904910 | 73 | 12396 | 104.5 | 76.6 | 1.292 |
+| bottleneck_3, f64 k=1 | 94620 | 2048 | 46 | 37.2 | 17.2 | 3.689 |
+
+`nw14`, `connectus` and `lp_osa_14` are the whole-row balance ceiling's three matrices, already
+diagnosed and already exhausted on thread count and B footprint. The `ffn_conv2` cell is the largest
+single deficit in the corpus and the exact-band arm takes it to **0.623 of MKL** -- from losing 2.3x
+to winning 1.6x. And `bottleneck_3` at float64 k=1 is the worst ratio anywhere at 3.689, on 2048
+rows at degree 46, which is width-1 exact-kernel territory and has not been looked at.
+
+Only **4 of the 97** cells sit on matrices above 1e6 nonzeros, though they carry 18% of the total
+deficit. The exact-band arm flips **7 of 97**.
+
+### What this changes
+
+The goal as set is a cell count, and on the honest population it now reads: *beat MKL on about 50
+cells that lose by one to two microseconds on fifteen-microsecond calls, plus three matrices with a
+known structural cap, plus a handful of narrow-k float64 cells a queued arm already fixes.* That is
+per-call overhead engineering, not kernel engineering.
+
+So MKT's **census moved ahead of the exact-band arm** in its queue. Until that host has its own
+unselected denominator, every cell-count claim about it is a claim about a corpus selected for
+losing -- and that corpus has now misled this work twice, once in the byte curve's monotone shape
+and once in the pooled geomean that retired mr2h.
+
+One caution on the floor arm, from this same data. Grading the adoption by real arithmetic helps
+where `work_true` is small, and on these cells `work_true` is 400000 units at k=4 -- so `ADOPT_GRAIN`
+at 15000 leaves them at the full team and changes nothing, while a grain large enough to cut them to
+six workers is large enough to cut a Cora output layer to one. Worse, the arithmetic argues against
+the cut: at redwood's recorded 0.26 us per worker, the optimum team for 400000 units is about 21, not
+6. **The floor arm's premise is strong on the M5, weak on redwood, and unmeasured on MKT** -- which
+is exactly what the sweep queued first on both hosts is for, and a reason to read its answer before
+releasing the arm rather than after.
