@@ -19555,3 +19555,78 @@ redwood one, because the standing goal is a cell count on an unselected corpus a
 selected for already losing (chain123). And it does not treat the M5 as a confirmation: that host
 has two matrices above 1e6 nonzeros, so it can refute the candidate and cannot support it, and its
 result above ~1.5M nonzeros is absent rather than neutral.
+
+## chain125: MKT's verdict on the candidate -- two constants earn their place at different widths, and the third is unmeasured
+
+Job 17278858, 42 matrices on the pre-registered split (18 target at nnz >= 1e6, 24 seeded control),
+5 arms, 2 dtypes, 2 passes, plus the GCN guardrail in the same allocation. Every gate passed: five
+distinct `.text` digests, 120 correctness cases per arm with zero mismatches, 2520 corpus rows and
+144 guardrail rows per build.
+
+### Every arm at every width, target group, geomean of c0/arm
+
+| dtype | k | c0b (floor) | hi1hv | hvmr | shipcand | us: c0 -> shipcand |
+|---|---|---|---|---|---|---|
+| f32 | 1 | 0.9830 | 0.9974 | 0.9777 | 0.9800 | 95.4 -> 97.8 |
+| f32 | 2 | 0.9851 | 1.0341 | 0.9698 | 1.0229 | 122.2 -> 117.5 |
+| f32 | 3 | 0.9921 | **1.2347** | 0.9758 | **1.2212** | 157.1 -> 127.0 |
+| f32 | 4 | 1.0145 | 1.0008 | 1.0011 | 1.0003 | 115.0 -> 115.4 |
+| f32 | 8 | 1.0092 | 0.9991 | **1.3386** | **1.3351** | 144.0 -> 108.4 |
+| f64 | 2 | 1.0031 | **0.8336** | 0.9918 | 0.9903 | 111.9 -> 114.8 |
+| f64 | 3 | 0.9990 | 0.9803 | 0.9939 | 0.9840 | 141.7 -> 143.4 |
+
+**Each constant owns a different width, and the ownership is unambiguous.**
+
+- **k=3 belongs to the band.** `hi1hv` 1.2347 against `shipcand` 1.2212 -- multi-row adds nothing
+  there. 17 of 18 matrices pass the spread test. Cell count: **34 of 42 below MKL becomes 16**, and
+  `hvmr` (no band change) stays at 35, so the eighteen recovered cells are the band's.
+- **k=8 belongs to multi-row.** `hvmr` 1.3386 against `shipcand` 1.3351, and `hi1hv` is 0.9991 --
+  the band is irrelevant there. 17 of 18 pass. This reproduces chain74's independent finding that
+  multi-row is a float32 win at k=8.
+- **k=2 is not resolvable.** 1.0229 against a cross-build floor of 1.5-2.2%. The band alone reads
+  1.0341, which is the same story one standard error better and still not clear of the floor.
+- **k=1 and k=4 are null**, and both sit below their own floor.
+
+### The per-dtype split is vindicated by measurement rather than by argument
+
+`hi1hv` sets the **unsuffixed** `SCORCH_NARROWK_EXACT_HI=1`, so it lowers the band on float64 too.
+Float64 at width 2: **0.8336**, and its below-MKL count goes from 15 of 42 to 34 of 42. A 17%
+regression and nineteen cells lost. `shipcand`, which sets only the `_F32` constant, is 0.9903 there
+-- inert, as designed. Same source line, opposite sign by dtype, which is the entire reason these
+are two constants.
+
+### The GCN guardrail passes, and on float32 it is a win
+
+Twelve cells per dtype at the widths a two-layer GCN calls. Float32: `shipcand` at or above 1.0 on
+all twelve, with pubmed at width 3 reading **1.2122** (43.0 -> 35.5 us). Float64: 0.9632 to 1.0190,
+worst cell citeseer width 6 at 0.9632 against its own same-code floor of 0.9825 -- about 1% below
+its floor, in a code path the candidate does not touch, on a 25 us kernel. That is a binary-layout
+effect and it is the honest cost of any code change, not a defect in this one.
+
+### What this does NOT establish, and why nothing ships yet
+
+`SCORCH_SPMM_HALFVEC_F32=2` has **no measurement of its own in this job.** Both arms carrying it
+also carry something else. And there is a specific reason to suspect it: chain118 measured the band
+with multi-row and *without* halfvec at 1.4657 at float32 width 3, where this job's band *with*
+halfvec reads 1.2347. Cross-job comparison is exactly what this file forbids -- different tarball,
+different job, and a 1.5x discrepancy has been traced to that before -- so this is a question and
+not a finding. But it is a question about a constant that would ship.
+
+The decisive arm is the band **without** halfvec, in one job, against the band with it. Queued as
+`bandf32` (`EXACT_HI_F32=1` alone) and `bandmr` (`EXACT_HI_F32=1` + `MULTIROW_ROWS_F32=2`), so
+`shipcand` minus `bandmr` is exactly halfvec's contribution and nothing else.
+
+Per chain124's registered rule the flip also still needs redwood, and the object check comparing a
+build of the flipped defaults against this arm's `.text`. Two of three constants are earned; the
+third is unexamined, and shipping a constant nobody has measured is the thing this file exists to
+prevent.
+
+### One methodological note that changes how these numbers are read
+
+The cross-build floor here is **1.5-2.2% on float32**, while the same-code spread *within* one
+object is 0.2-1.0% -- two to four times smaller. The cost of being a separate object is most of the
+floor. That is why 1.0229 at width 2 is not a result and 1.2212 at width 3 is. It also means the
+rotation cannot balance: five builds across four (pass, dtype) groups leaves the order incompletely
+crossed, which is consistent with the floor being *signed* (c0b reads 0.983-0.985 at widths 1-2
+rather than straddling 1.0). Widths whose effect does not clear that margin by several times should
+not be read at all.
