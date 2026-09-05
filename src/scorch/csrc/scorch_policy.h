@@ -639,12 +639,23 @@
 //
 // Why the width is worth a second mechanism. The dense width sweep on MKT (23 widths, both dtypes,
 // 50 matrices) puts the below-MKL count on ONE curve once it is plotted against the B row's
-// footprint in bytes rather than its element count: 43 and 30 cells at 8 bytes, 15 and 10 at 32, 3
-// and 3 at 64, zero by 80. A gathered B row pulls a 64-byte line and uses N*sizeof(T) of it, so the
-// waste is 64/bytes -- 4x at float32 k=4 -- and multi-row is what amortises it, being worth
-// 1.09-1.13x at every width where the admission test lets it act. The single-row 128-bit kernel
-// removes the mask instead (11.5 emitted instructions per nonzero against the masked path's 13.5),
-// which is the smaller of the two costs at that width.
+// footprint in BYTES rather than its element count: 43 and 30 cells at 8 bytes, 15 and 10 at 32, 3
+// and 3 at 64, zero by 80. Both dtypes lose at the same byte width, not the same element count, so
+// the cause is at cache-line granularity: a gathered B row pulls a 64-byte line and uses
+// N*sizeof(T) of it.
+//
+// Multi-row does NOT fix that by reuse, and it is worth being exact about this because the obvious
+// story is wrong. The kernel loads ROWS *different* B rows per iteration -- one per output row's
+// stream, at A1_crd[p[r] + t] -- so there is no line to share unless the grouped rows happen to
+// name the same column, which is a property of the matrix and not of the width. What it adds is
+// memory-level parallelism: ROWS independent streams, ROWS loads outstanding, ROWS independent FMA
+// chains. That predicts a gain roughly flat in width, and that is what is measured -- 9.2%, 8.2%,
+// 7.7%, 12.4% at 20, 24, 28 and 32 bytes, correlating with the waste factor at -0.45, the wrong
+// sign for a reuse story.
+//
+// So the two mechanisms at this width are independent: the single-row 128-bit kernel drops the mask
+// (11.5 emitted instructions per nonzero against the masked path's 13.5), and multi-row adds
+// streams. Being unable to have both is the gap this constant closes.
 //
 // Ships at 0: the mechanism is new and unmeasured, and the exclusion it lifts was measured.
 #ifndef SCORCH_SPMM_MULTIROW_HALFVEC

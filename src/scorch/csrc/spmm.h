@@ -4531,13 +4531,12 @@ torch::Tensor spmm_csr_v2_core(
                      (size_t)C1_size, i, mask_last))
           bool took = true;
           // The half-vector width, taken by multi-row rather than by the single-row 128-bit kernel.
-          // These are two different fixes for the same cost and until now the code could only apply
-          // one: the single-row kernel drops the mask (11.5 instructions per nonzero against the
-          // masked path's 13.5, measured on the emitted loop), while multi-row amortises the 64-byte
-          // line that a short B row wastes -- 4x waste at float32 k=4. The dense width sweep put the
-          // below-MKL count on one curve in BYTES for both dtypes, zero by 80 bytes, which says the
-          // waste is what is left to fix. `multirow_ok` excluded this width precisely so that no arm
-          // would swap two kernels at once; this branch is the arm that swaps them deliberately.
+          // These are two independent fixes and until now the code could apply only one here: the
+          // single-row kernel drops the mask (11.5 instructions per nonzero against the masked
+          // path's 13.5, measured on the emitted loop), while multi-row adds streams -- ROWS loads
+          // outstanding and ROWS independent FMA chains. NOT line reuse: this kernel loads ROWS
+          // *different* B rows per iteration. `multirow_ok` excluded this width precisely so that no
+          // arm would swap two kernels at once; this branch is the arm that swaps them deliberately.
           if (multirow_halfvec && B1_size == scorch_simd_half<scalar_t>::lanes) {
             using VH = scorch_simd_half<scalar_t>;
             // A flag of its own, NOT `took`. The general switch below only ever assigns false, so a
