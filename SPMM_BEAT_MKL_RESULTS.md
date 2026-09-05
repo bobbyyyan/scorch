@@ -18034,3 +18034,51 @@ unswitching fixes it.
 `mrf64` also confirms independently that float64 can reach the kernel -- +12/-9 with k=4 at 1.0202
 -- which is the timing counterpart to `nm` finding 12 `multirow_regblock<double>` instantiations in
 the mr2 object.
+
+## Every cell count in this document is conditioned on six of sixty-four widths
+
+chain104's k=3 result is not a lucky find, and treating it as one would waste it. It is the first
+time anyone in this project measured a width between the powers of two, and it was the largest
+single effect of the week: 1.1884 on float32, eighteen cells cleared, none broken.
+
+The grid every gate here has used is **1, 2, 4, 8, 16, 64**. That is six of the sixty-four widths at
+or below 64. So "faster than MKL everywhere" has been checked on under a tenth of the width axis,
+and every below-MKL count in this file -- 113 on the caller path, 159 over five widths on MKT, 49 on
+redwood -- is conditioned on that grid. A power-of-two grid cannot see a boundary placed at 3, and
+the constant that placed it there (`SCORCH_NARROWK_EXACT_HI`, shipping at 3) has been in the tree
+the whole time.
+
+Read off the constants rather than guessed, the SpMM kernel's width-dependent dispatch boundaries
+are:
+
+```
+  float32 (SL=8)   1        nonzero-axis gather (narrowk_gather is B1_size==1)
+                   2-3      exact-width band (NARROWK_EXACT_HI=3)
+                   4        half-vector (scorch_simd_half<float>::lanes)
+                   5-7      GENERAL PATH -- and the exact kernel is instantiated to 7
+                            (exact_cap_ = 7) and simply not used, because the band top is 3
+                   8        full vector, nvec=1
+                   9-16     nvec=2      17-24  nvec=3      25-32  nvec=4
+                   33+      outside narrow_k (B1_size <= 4*SL)
+
+  float64 (SL=4)   1        exact-width (K1) or a one-lane register tile
+                   2-3      exact-width band (exact_cap_ = 3)
+                   4        nvec=1
+                   5-8      nvec=2      9-12   nvec=3      13-16  nvec=4
+                   17+      outside narrow_k
+```
+
+**Widths 5, 6 and 7 on float32 are the exact analogue of k=3** -- a kernel that exists, is
+instantiated, and is excluded by a shipped constant -- and no gate has ever timed them. Neither has
+any gate put a width on both sides of the nvec boundaries at 8/9, 16/17 and 24/25, or of the
+narrow_k boundary at 32/33.
+
+So the general rule, and it is worth more than the k=3 number: **read the dispatch constants and put
+a width on each side of every boundary into the grid, rather than sweeping the widths that are
+conventional to sweep.** Queued on MKT as the shipped build against MKL over 1..17 plus 20, 24, 32,
+33, 48, 64, both dtypes, two passes, with the same-code floor. One build, because the question is
+not whether a candidate helps but where we lose.
+
+Until that reports, the honest statement of this project's position is that scorch beats MKL on the
+widths it has measured, and that the widths it has measured were chosen by convention rather than by
+the code.
