@@ -19684,3 +19684,80 @@ x86-only and multi-row's width-8 win can be examined on its own.
 
 Until that returns, the shippable claim is: two constants earned on x86 at named widths, one
 unmeasured, and a global default refuted by ARM.
+
+## chain127: the no-regression gate, with each item's current status -- and a correction to chain125
+
+Bobby's instruction: be more careful, and ship no regressions. Nothing has been flipped, committed
+as a default, or pushed. But the near-miss was procedural, not just lucky: the plan described to him
+would have flipped a **global** default on x86-only evidence, and the ARM check that refuted it was
+added mid-flight because the macros turned out not to be ISA-gated. That is a habit, not a gate.
+This section is the gate.
+
+### A correction to chain125 first
+
+chain125 called float64 on MKT "inert, as designed" on the strength of geomeans of 0.9903 and
+0.9840 against floors near 1.00. **That was wrong**, and the reason it was wrong is a test this file
+already knows how to run.
+
+Counting cells where an arm is slower than `c0` by more than that cell's own same-code spread gave
+163 of 444 on MKT and 186 of 600 on the M5 -- alarming numbers. They are mostly the test's own
+noise: a per-cell spread is a single-draw estimate, so a small one admits any deficit. Running the
+identical test on a **same-code arm** (`c0b`), with both arms judged against the same independent
+yardstick `|c0(ours) - c0(oursb)|`:
+
+| host | dtype | same-code arm | candidate | excess |
+|---|---|---|---|---|
+| MKT x86 | float32 | 88 of 222 (40%) | 86 of 222 (39%) | **-1 pp** |
+| MKT x86 | float64 | 109 of 222 (49%) | 137 of 222 (62%) | **+13 pp** |
+| M5 ARM | float32 | 95 of 300 (32%) | 154 of 300 (51%) | **+20 pp** |
+| M5 ARM | float64 | 61 of 300 (20%) | 60 of 300 (20%) | **-0 pp** |
+
+So the raw count was 40% artifact and there are **two** populations, not one: the known ARM float32
+regression, and **a real float64 regression population on x86** in a dtype whose constants the
+candidate never sets. chain125's "inert" claim is withdrawn. Its width-3 and width-8 wins stand --
+those clear their floors by 10x and pass the spread test on 17 of 18 matrices -- but the float64
+half of that section was read too generously.
+
+The mechanism for the x86 float64 excess is **not established.** It is plausibly binary layout: the
+float64 source path is unchanged, and this project has measured a dead branch adding ten x86
+instructions and reshuffling every stack slot. Two things argue for layout rather than a gating
+bug -- the effect appears on x86 and not on ARM, where a genuine `_F32`-macro leak would appear on
+both. But that is an argument, not a measurement. Static confirmation was attempted and abandoned
+honestly: `spmm_csr_double_v2_core` is a three-instruction thunk, the kernel is inlined into a
+larger function, so a symbol-level instruction comparison cannot isolate the float64 path cheaply.
+
+### The gate. Every row must pass before any default moves.
+
+| # | requirement | status |
+|---|---|---|
+| 1 | x86 float32: zero regression population beyond the same-code control | **PASS** (-1 pp on MKT) |
+| 2 | x86 float32: the claimed win present, clearing its floor severalfold | **PASS** (1.2212 at width 3 against a 1.7% floor, 17 of 18 matrices) |
+| 3 | x86 float64: zero regression population beyond the control | **FAIL** (+13 pp, mechanism unknown) |
+| 4 | ARM float32: zero regression population | **FAIL** (+20 pp, up to 0.7041) |
+| 5 | ARM float64: zero regression population | **PASS** (-0 pp) |
+| 6 | GCN / autoencoder guardrail neutral-or-better on both dtypes | **PARTIAL** -- float32 is a win (pubmed width 3 at 1.2122); float64's worst cell is 0.9632 against a 0.9825 floor |
+| 7 | second x86 host agrees in sign | **PENDING** (redwood) |
+| 8 | every shipped constant has a measurement of its own, not shared with another | **PENDING** (halfvec, job 17279494 and the M5 isolation run) |
+| 9 | a build of the flipped defaults has the same `.text` as the measured arm | **NOT RUN** |
+| 10 | any region left unmeasured is named, and the change is provably inert there | **NOT MET** -- ARM above ~1.5M nonzeros is unmeasured, because the local cache holds two matrices above 1e6 |
+
+Four of ten pass. **Nothing ships.**
+
+### The remedy for rows 4, 5 and 10, which is better than measuring harder
+
+For ARM the right answer is not a better measurement, it is **provable inertness**. If the constants
+are gated so the ARM build is byte-identical to today's, then ARM neutrality stops being a claim
+about 60 matrices and becomes a property checkable with a digest -- and row 10's unmeasured region
+above 1.5M nonzeros stops mattering, because nothing there changed. The precedent is in this tree
+already: `SCORCH_SPMM_HALFVEC_F32`'s own comment records that "the kernel is inside the AVX2 block,
+so both values are inert on ARM by construction", and the NEON work was proven x86-inert by
+`objdump` rather than by timing.
+
+**Which yields a prediction, registered now, before the isolation runs return.** If halfvec is
+already AVX2-gated, it cannot be causing the ARM regression, so on ARM `shipcand` must equal
+`bandmr`, and the regression must belong to the band or to multi-row. If instead `shipcand` differs
+from `bandmr` on ARM, then that comment is false and there is a second defect to find.
+
+Rows 3 and 6 are about float64 on x86, where the source path does not change but the object does.
+If more passes do not dissolve the +13 pp, the honest options are to declare the cost and let Bobby
+weigh it against a 22% width-3 win, or to abandon the flip. Not to describe it as inert.
