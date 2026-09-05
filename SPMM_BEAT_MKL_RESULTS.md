@@ -19241,3 +19241,36 @@ reads inside the floor at every live width, these kernels are latency-bound at t
 and the instruction budget is not the thing to spend effort on; if it reads above 1.08, the loop is
 issue-bound and the unmasked-load variant at widths 2-3 becomes worth building rather than merely
 worth costing.
+
+### The floor arm, five arms rather than three, and its guardrail in the same allocation
+
+Queued on both hosts, and on MKT deliberately held **outside** the serializer's order until the
+sweep says the mechanism is there -- one edit to release, one `scancel` to drop.
+
+Five arms, because the pair is ambiguous on its own. `ADOPT_GRAIN` and `BASE_WORK_TRUE` are two
+gates whose cliffs point opposite ways: the adoption over-threads a tiny product today, and pricing
+it on real arithmetic under-threads a real layer. A null on the pair could be both fixes working or
+the two cliffs cancelling on a corpus that straddles them, and no guardrail distinguishes those
+readings, so the set is `ag15k` (the adoption alone), `bwt` (the base bound alone -- the arm already
+measured neutral, kept as the control that says so on this corpus), `agbwt` (the candidate), and the
+`c0`/`c0b` pair. The peer session asked for this; it is right, and the extra arm is nearly free
+because `bwt`'s number already exists.
+
+Three pre-registered groups, each with its own widths and its own reason:
+
+| group | matrices | widths | why |
+|---|---|---|---|
+| floor | the 24 smallest | 1, 2, 4, 8, 16 | the target: where the floor is most of the call |
+| big | every one at nnz >= 1e6 | 1, 4 | the harm case: grading on real arithmetic can take threads a product needs, and at k=1 the real measure is 16x smaller than the proxy |
+| gcn | cora, citeseer, pubmed | 3, 6, 7, 16 | the guardrail, at the widths a two-layer GCN calls |
+
+The guardrail runs **in the same allocation and on the same builds** as the arm, rather than as a
+separate job ordered before or after it. That is the stronger form: the concern that a guardrail
+ordered later would be the weakest instrument in the chain at the moment it matters is exactly right,
+and sharing the allocation removes the ordering question instead of answering it.
+
+The `gcn` group is not a proxy. It is the normalized adjacency `bench_gcn` itself builds, exported by
+importing its own `load_dataset` and `compute_normalized_adj` on the host that has the datasets and
+shipped as npz -- cora 13264 nonzeros, citeseer 12431, pubmed 108365. **The header's own worked cliff
+is in it**: a Cora output layer is 13264 nonzeros at k=7, which the ungraded adoption gives 24
+workers, one grain size gives 6, and another gives 1.
