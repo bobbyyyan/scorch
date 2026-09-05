@@ -877,6 +877,30 @@
 // different purpose, and the arm that isolates EXACT_HI from multi-row is queued on both hosts with
 // the nnz split pre-registered. This is the mechanism, defaulted to the current behaviour, so that
 // the decision is a value and not a refactor.
+// FOUR PLACES WHERE THE SAME QUANTITY IS DISCRETISED, and one place where it is not.
+//
+// SCORCH_SPMM_HALFVEC_F32/_F64, SCORCH_SPMM_MULTIROW_ROWS_F32/_F64, the pair below, and the
+// ISA-conditional SCORCH_NARROWK_EXACT_K1_MINDEG all split by dtype, and they all split at the same
+// underlying thing: how a B row of N elements sits in a vector register. A gathered B row pulls a
+// 64-byte line and uses N*sizeof(T) of it, and the dense width sweep on MKT put the below-MKL COUNT
+// on one curve against that footprint in bytes -- 43 and 30 cells at 8 bytes, 15 and 10 at 32, 3
+// and 3 at 64, zero by 80 -- for both dtypes at the same byte width and not the same element count.
+// So the four pairs are neighbours: each is a boundary on one quantity, discretised where its own
+// mechanism changes sign, and whoever moves one should look at the other three rather than treat
+// them as unrelated knobs.
+//
+// They are NOT one expression, and should not be replaced by one. Four independently measured
+// constants beat one unmeasured formula, and each measured a different sign change: the mask's
+// waste (HALFVEC), the number of B-row streams in flight (MULTIROW_ROWS), scalar issue against a
+// masked vector load (EXACT_HI), and the exact kernel's per-row setup against a row's length
+// (K1_MINDEG). Two of them also disagree across hosts, which no single expression in bytes can say.
+//
+// And the byte curve is not the whole story it first looked like. It counted CELLS, and the cells
+// are two populations: on matrices where a per-call floor dominates, our time is flat in k -- 22.4
+// us at k=1 and 24.5 at k=16 on 26214 nonzeros -- and a cost that does not vary with the width
+// cannot be a cache-line-utilisation cost. Only float32 widths 2 and 3 have a deficit that grows
+// with nnz. The byte reading governs the constants here, which are all about the vector register;
+// it does not govern the floor, which is a thread-policy question in another part of the code.
 #ifndef SCORCH_NARROWK_EXACT_HI_F32
 #  define SCORCH_NARROWK_EXACT_HI_F32 SCORCH_NARROWK_EXACT_HI
 #endif
