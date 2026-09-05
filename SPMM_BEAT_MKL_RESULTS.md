@@ -18772,3 +18772,67 @@ in its message, where it stays as written with this section as its correction.
   packing or blocking over the contraction index -- reordering so that the lines a row's gathers pull
   are used more fully. That is the tile-j family, aimed the other way round from how it ships (it is
   gated for wide B), and it is now the indicated direction rather than a deeper multi-row.
+
+## chain114: the structure that matches the byte curve, and what it is actually worth
+
+chain113 leaves the deficit without a mechanism: it is byte-shaped, and the fix that was supposed to
+explain it does not. So what *would* have the shape `64 / row_bytes`?
+
+If two nonzeros in the same A row have **consecutive column indices**, their B rows are adjacent in
+memory -- at float32 k=4 that is 32 contiguous bytes, and one 32-byte load serves both. The reach of
+that is exactly `64 / row_bytes`: eight nonzeros per line at 8 bytes, four at 16, one at 64. Same
+shape as the deficit, and it needs no timing to measure -- it is a property of the matrices.
+
+Over MKT's 50-matrix corpus as resolved on redwood (46 matrices, 133M nonzeros), nnz-weighted:
+
+| | share of nonzeros in a run of >= n |
+|---|---|
+| n=2 | 0.931 |
+| n=3 | 0.910 |
+| n=4 | 0.838 |
+| n=8 | 0.572 |
+| n=16 | 0.315 |
+
+Mean run length 5.28. **But the pooled figure is not a description of the cells that lose**, because
+four FEM matrices carry 132 of the 133 million nonzeros and are essentially fully blocked. By family:
+
+| family | matrices | nnz | share in runs >=2 | mean run | loads saved at k=1 / 4 / 8 / 16 |
+|---|---|---|---|---|---|
+| suitesparse | 34 | 132.5M | 0.934 | 9.08 | 0.890 / 0.750 / 0.500 / 0.000 |
+| dlmc transformer | 10 | 1.08M | 0.589 | 1.66 | 0.396 / 0.396 / 0.396 / 0.000 |
+| dlmc rn50 | 2 | 63k | 0.225 | 1.14 | 0.124 / 0.124 / 0.124 / 0.000 |
+
+The width dependence only appears where runs are long: with a mean run below the rows-per-line the
+saving is set by the run length instead, which is why the two DLMC rows are flat until the line holds
+one row and the lever dies. **It dies at exactly the width the deficit dies at.**
+
+### What it is worth, estimated honestly rather than hopefully
+
+Loads saved is not time saved. From chain111's emitted-loop counts the shipped half-vector kernel
+runs 11.5 instructions per nonzero, of which about one is the B load. So saving 0.75 of a load per
+nonzero on the SuiteSparse family is **6-7% of the instruction stream**, and 0.40 on the transformer
+family is about 3.5%. The deficits those cells carry are 8-25%.
+
+So this is a real mechanism with the right shape and the right death point, and on this accounting
+it is worth roughly half of the smaller deficits and a fifth of the larger ones. Worth building, not
+sufficient, and worth saying so before it is built rather than after. It also has a cost the estimate
+ignores: detecting a run is itself work unless the run structure is precomputed, and the natural
+place for that is the format rather than the kernel.
+
+### And a coverage defect that would have shrunk the next grid by 40% in silence
+
+The first run of this analysis read **30 of 50 matrices** and reported its corpus figures without
+complaint. Three causes at once, all in the addressing rather than the data:
+
+* redwood's SuiteSparse cache is **mixed**: some matrices at `ss/<name>/<name>.npz`, others at
+  `ss/<group>/<name>/<name>.npz`. `pwtk` is at the first and `connectus` at the second.
+* MKT's key file uses the group form throughout, so half of it cannot be addressed here as written.
+* and this host's copy of that file has a stray `key` line at line 13 -- a CSV header concatenated
+  into a key list, which resolves to nothing and is counted as a matrix.
+
+Resolving each key against both layouts and dropping the header takes it to **46 of 50**; the four
+that remain (`large_A_07`, `case39_A_09`, two `as-735` subgraphs) are genuinely absent here and are
+named in `c94_dropped_rw.txt`. The dense width ladder queued for this host was pointed at the raw
+file and would have run 30 matrices while its log said 50 -- and its whole purpose is to be
+comparable to MKT's 50. It now refuses below 40 and prints what it dropped, and the comparison will
+restrict MKT's curve to the same 46.
