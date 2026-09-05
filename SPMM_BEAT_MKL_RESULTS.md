@@ -18653,3 +18653,66 @@ timing: the local host is ARM and cannot compile any of this -- the block is ins
 so redwood is the first machine that can say whether the new dispatch is correct, and its stage runs
 a targeted numeric sweep over the shapes that reach the new branch and then the full suite, and
 refuses on either.
+
+## chain112: the GCN guardrail is nine-twelfths structural null, and its one alarm is a bimodal median
+
+The guardrail re-ran on redwood: `c0` and `mr2`, two passes each, six datasets, non-fused and fused.
+Read naively it says ROWS=2 costs pubmed **2.24x** and citeseer 1.40x. Neither survives.
+
+### First, most of the grid cannot test anything
+
+`bench_gcn`'s configs set `hidden=16` for cora/citeseer/pubmed and `hidden=256` for
+ogbn-arxiv/reddit/ogbn-products. `narrow_k` is `B1_size <= 4 * SL`, which is 32 for float32, and
+`multirow_ok` requires it. So on the three big graphs **both layers are outside narrow k** -- 256
+wide in layer one, 40 to 47 classes in layer two -- and `mr2` is *identical code* to `c0` there.
+
+Those six cells read 0.967 to 1.004 against same-code floors of 0.930 to 1.038. They are not a
+neutrality result; they are the harness measuring itself, and they say its floor on the big graphs is
+about 4%.
+
+The live cells are the three small graphs: layer one at k=16, layer two at the class count -- 3 for
+pubmed, 6 for citeseer, 7 for cora. **Which matters more for `mr2i` than for `mr2`**, because
+pubmed's second layer is at width 3, the one width both hosts want multi-row to have.
+
+### Second, the alarm is a bimodal distribution read through its median
+
+pubmed, non-fused, every pass this harness has produced:
+
+| arm | median ms | min ms | std/median |
+|---|---|---|---|
+| c0 (stale) | 0.605 | 0.586 | 0.32 |
+| c0 p1 | 0.617 | 0.585 | 0.25 |
+| c0 p2 | 0.832 | 0.591 | 0.37 |
+| mr2 p1 | 1.601 | 0.603 | 0.29 |
+| mr2 p2 | 1.639 | 0.585 | 0.26 |
+
+**The minima are the same number.** 0.585 to 0.603 across every arm, while the medians span 2.7x.
+The distribution has a fast mode both arms reach and a heavy tail whose mass differs, and on a
+bimodal sample the median reports which side of the boundary most samples landed on -- a statistic
+that flips on a scheduling accident. std/median is 0.25-0.37 for *every* arm including the same-code
+ones, and this host's pubmed cell has a recorded history of exactly this: the deficit there was
+diagnosed as a thread-pool transition and not a kernel effect.
+
+citeseer is less clear-cut: c0 minima 0.507/0.509/0.518 against mr2's 0.544 and 0.643. That is a
+7-20% gap in the fast mode, but the two mr2 passes disagree by 18% between themselves, so it is
+unresolved rather than refuted.
+
+### So the guardrail's verdict is "neutral where it can see, blind where it matters"
+
+Nine of twelve Scorch cells are structural nulls. Of the three that can move, one is a distribution
+artifact and two are inside the harness's own spread. **This design cannot guard a narrow-k change.**
+
+What it needs, and what is queued behind mr2i on redwood: the three small graphs only, arms
+alternating in short passes rather than one long pass each, and the **fast mode** reported -- minima
+and the fraction of repetitions within 10% of the minimum -- instead of a median over a bimodal
+sample. Cheap, because dropping the big graphs takes a pass from twenty minutes to about one.
+
+### And one contamination, caught by a row count
+
+`gcn_c0_p1.csv` held 36 rows where every other file held 18. The runner opens the CSV in append
+mode, and the earlier run of this stage -- the one killed when I found two measurement processes on
+this host at once -- had already written a pass into it. The stale rows are the file's first half,
+in the same cell order, so they separate cleanly, and they turned out to be worth keeping: two
+same-code samples of every cell, taken hours apart, which is where the floor column above comes
+from. An append-mode harness plus a killed run is a silent mixing of two machine states, and the
+only reason it was noticed is that the stage prints rows per build and one number was not 36.
