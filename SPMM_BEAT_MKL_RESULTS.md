@@ -18896,3 +18896,75 @@ The curve's shape, its crossover and its zero at 80 bytes are identical. **Both 
 record**: the 50-matrix one because it is what the reframing was derived from, and the 46-matrix one
 because it is what the two hosts will be compared on. Rewriting the first retroactively would make
 the derivation unreproducible.
+
+## chain116: the prefetch arm reaches three of five widths, and the GCN guard had two more ways to measure nothing
+
+Two pieces of desk work while MKT runs `mr4h` and redwood works through its queue. Both are of the
+kind this sequence keeps finding cheaper than a machine: read the dispatch, read the harness.
+
+### Which widths the prefetch arm can actually move
+
+`SCORCH_SPMM_ROW_PREFETCH` guards one site, in `scorch_spmm_row_regblock`. The row loop's dispatch
+order is halfvec, then exact-width, then the width-1 gather, then the general register block, so the
+guarded prefetch is reached at:
+
+| dtype | width | kernel | prefetch present |
+|---|---|---|---|
+| float32 | 1 | `narrow_exact` (K1) or `gather_f32` | no |
+| float32 | 2, 3 | `narrow_exact` | no |
+| float32 | 4 | `regblock` on the 128-bit type (`halfvec_exact`) | **yes** |
+| float32 | 5..32 | `regblock` | **yes** |
+| float64 | 1 | `narrow_exact` when the mean-degree test passes, else `regblock` | mixed |
+| float64 | 2, 3 | `narrow_exact` | no |
+| float64 | 4..16 | `regblock` (`HALFVEC_F64` ships 0) | **yes** |
+
+`scorch_spmm_row_narrow_exact` and `scorch_spmm_row_gather_f32` contain no `__builtin_prefetch` at
+all, and neither does `scorch_spmm_multirow_regblock`. The other three prefetching kernels --
+`regblock_deep`, `regblock_pf`, `regtile` -- are either hook arms that ship off or serve widths above
+the band. So of the widths the arm runs, **k=1 and k=2 are structural nulls and k=4, 8, 16 are live**,
+and both stage scripts now carry this table so the analysis cannot read a null as a neutral result.
+
+Against the byte curve that is 48 of the below-MKL float32 cells (30 at k=4, 15 at k=8, 3 at k=16)
+and 13 float64 cells. Not the whole deficit -- widths 1 to 3 carry more of it than that -- but the
+largest share any single mechanism on the table addresses.
+
+**And the mapping itself says the prefetch is not the cause of the deficit.** The kernels that own
+8 and 12 bytes, where the below-MKL count is at its worst, do not prefetch; the one that owns 16 to
+64 bytes does. Whatever explains widths 1 to 3, it is not this. The arm's question is narrower and
+still worth asking: whether the prefetch is spending issue slots in the part of the band it serves.
+
+### The queued GCN redesign had two ways to report DONE having measured nothing
+
+chain112 prescribed the fix for the whole-model guardrail -- three small graphs, short alternating
+passes, every repetition emitted -- and the stage was written and queued. Reading it before it ran:
+
+1. **`gcn_reps_run.py` puts a relative `"bench"` on `sys.path`, and the build tarball has no
+   `bench/`** -- it carries `src`, `tests`, `tools`. Every pass would have raised `ImportError`,
+   written a header-only CSV, and the stage would have printed its row counts and finished. Fixed by
+   symlinking the repo's `bench` into each build tree, which also fixes the data root for free:
+   `bench_gcn` resolves `DATA_DIR` and `WEIGHT_DIR` from its own `__file__`, and that resolves
+   through the link to the populated `data/` and `weights/` rather than to a fresh download inside
+   the build tree.
+2. **`benchmark_dataset` prints `SKIP` and returns** when `load_canonical_weights` raises. A missing
+   weight file is not an error to it. Added a pre-flight that imports the bench and asks for all
+   three weight files once, and a refusal on a row count below 100.
+
+That is the fifth and sixth entry in this project's list of drivers that would have reported success
+having measured nothing, and again the check that catches them is the one that looks at the OUTPUT.
+
+**The third fix is not a bug, it is the control.** The stage's framework list was `scorch` and
+`scorch (fused)`. PyTorch was what proved the *previous* design invalid -- its two arms read 1.66x
+apart on pubmed under defines that cannot reach it -- so dropping it would have removed the only
+thing that can tell a real regression from a drifting host. It is back in the list.
+
+### And a second unit for the same guard: the SpMM at the widths a GCN calls
+
+The whole-model number is the workload claim, and it is the one the performance convention asks for.
+But the unit the change lives in is the SpMM, and there is already a harness that interleaves per
+cell and rotates which build leads. So the small graphs' adjacency now also goes through that
+harness at the widths the model uses -- hidden 16, and the class count: 7 cora, 6 citeseer, 3 pubmed,
+which is 12 to 28 bytes and squarely inside the band -- with 32 along as the out-of-band control.
+
+The normalization is imported from `bench_gcn`, not restated. A guardrail that recomputes the matrix
+it guards keeps passing after the bench stops agreeing with it, which is the failure this project has
+now hit in four separate forms.
