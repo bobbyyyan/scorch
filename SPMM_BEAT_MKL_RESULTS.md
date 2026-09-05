@@ -19077,3 +19077,81 @@ Three arms, in increasing order of what they need:
 The masked-load cost is the whole question between arms 2 and 3: `vmaskmovps` is multi-uop and
 cannot fold its address, which is the only way the old 6-8% measurement and this instruction count
 can both be right.
+
+## chain118: the retired arm was the largest kernel win in the sequence, and a geomean over the wrong corpus hid it
+
+chain110 retired mr2h -- `EXACT_HI=1` with multi-row -- because MKT liked it and redwood reversed it
+at width 2. Both readings were geomeans over all 50 (MKT) and 298 (redwood) matrices. Splitting the
+**same measurements** by whether the kernel is most of the call changes the verdict completely.
+
+The split is `nnz >= 1e6`, and it comes from chain117's floor measurement, not from this arm: the
+DLMC transformer family is 512 rows and 26214 nonzeros and takes 22.4 us at k=1 and 24.5 at k=16 on
+MKT, so its arithmetic is invisible next to a ~22 us per-call floor, while af_2_k101 at 17.5M
+nonzeros spends over 99% of the call in the kernel. **A kernel change cannot move a floor, and
+pooling the two dilutes it away.**
+
+Geomean of `c0/mr2h` (above 1 = the arm is faster), with the same-code `c0/c0b` pair beside it:
+
+| | MKT big (18) | MKT small (32) | redwood big (37) | redwood small (261) |
+|---|---|---|---|---|
+| float32 k=2 | **1.1588** (17/18) | 1.0327 | 1.0157 (28/37) | 0.9675 |
+| float32 k=3 | **1.4657** (18/18) | 1.1094 | **1.1581** (36/37) | 1.0521 |
+| float64 k=2 | 1.0850 (11/18) | 1.0845 | **0.9566** (9/37) | 0.9433 |
+| float64 k=3 | 1.2263 (14/18) | 1.1244 | 1.0294 (27/37) | 0.9936 |
+| same-code floor | 1.015-1.026 | 0.994-1.002 | 0.998-1.009 | **0.923-0.980** |
+
+Read the bottom row first. On redwood's 261 floor-dominated matrices the c0-against-c0b floor moves
+**7.7%** -- the harness against itself, on the same object -- and the "reversal" that retired the arm
+is a 3.3% reading inside it. The float32 k=3 column, meanwhile, is 1.4657 on MKT and 1.1581 on
+redwood against floors of 1.026 and 1.009, improving **18 of 18 and 36 of 37 matrices**.
+
+Per matrix at MKT float32 k=3, largest first, with the arm's own ratio against MKL:
+
+| matrix | nnz | c0 us | c0/c0b | c0/mr2h | mr2h/MKL |
+|---|---|---|---|---|---|
+| msdoor | 19173163 | 1577.6 | 0.988 | 1.614 | 0.860 |
+| af_2_k101 | 17550675 | 1501.6 | 0.987 | 1.681 | 0.918 |
+| halfb | 12387821 | 1123.6 | 1.118 | 1.886 | 0.690 |
+| Hardesty1 | 12143314 | 1342.1 | 1.149 | 1.504 | 0.912 |
+| fcondp2 | 11294316 | 1002.1 | 1.085 | 1.900 | 0.680 |
+| pwtk | 11524432 | 922.3 | 1.056 | 1.761 | 0.834 |
+| ... | | | | | |
+| connectus | 1127525 | 186.6 | 1.041 | **1.023** | 1.076 |
+
+**Fifteen of the eighteen go from losing to MKL at k=3 to beating it.** The one that barely moves is
+`connectus`: 512 rows at mean degree 2202, which is the matrix family the whole-row partition's
+balance ceiling already owns -- it cannot be helped by a kernel.
+
+### What ships, and what it needs
+
+Width 3 wants the vector kernel on both hosts and both dtypes. Width 2 wants it on float32 on both
+hosts and does **not** want it on float64 on redwood, where it improves 9 of 37 matrices at 0.9566.
+A single `EXACT_HI` has to give up one of those; `EXACT_HI_F32=1` with `EXACT_HI_F64=2` gives up
+neither, and that pair is now expressible -- the constant is split per dtype, defaulted to the
+combined value, and the instruction stream is unchanged (164121 instructions, identical).
+
+It is not shipped as that pair yet, for two reasons worth stating. The numbers above are a
+**re-analysis of an arm that ran for a different purpose**, and mr2h moves two things at once --
+multi-row and the exact band -- even though `mr2` alone is null at k=3 (MKT 1.0128, redwood 0.9881),
+which attributes the effect to the band. And the split, though motivated independently, was applied
+after seeing the data. So the isolating arm is queued on both hosts with the split **pre-registered
+in the stage script**: `hi1` (EXACT_HI=1 alone) and `hi1hv` (also HALFVEC_F32=2, so widths 2 and 3
+run the 128-bit block rather than the 256-bit one -- a value that has never been able to act,
+because `halfvec_under` requires `!exact_width` and the exact band owns those widths unless
+EXACT_HI is lowered). It runs on the 298-matrix corpus rather than the 50-matrix residual family,
+with the target group taken at nnz >= 1e6 and 24 seeded controls below it.
+
+MKT's queue was reordered to put it first: measuring `mr2i` before it would decide the smaller
+question with the machine and the larger one from a re-analysis. `mr2i` -- `EXACT_HI=2`, which keeps
+the exact kernel at width 2 -- is exactly the arm that gives up MKT's 1.1588 and redwood's 1.0157 at
+float32 k=2 to protect redwood's float64 k=2, which is what the per-dtype pair does without the
+trade.
+
+### The lesson, which is the third form of it in this project
+
+A cell count and a geomean over a corpus that is two populations answers neither population's
+question. The corpus here is 36% kernel-dominated and 64% floor-dominated at narrow k, and the two
+respond to a kernel change by 1.47 and by 1.11. This is the same defect as measuring a kernel swap
+on a corpus selected for already losing, and as pricing a lever off a mean run length when 41% of
+the mass sits at length one: **the summary statistic was computed over the wrong set, and it was the
+set that made the arm look small.**
