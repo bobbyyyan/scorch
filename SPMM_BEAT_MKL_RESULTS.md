@@ -17935,3 +17935,40 @@ the harness that already exists. It is a much narrower claim than "the largest r
 it is the honest residue of chain101. The 4.5%-above-ten-million-nonzeros harm is a property of the
 worker count itself rather than of how it was set, so it should be expected to survive and to need
 the same nonzero gate; that is a reason to expect a gated win at best, not an unconditional one.
+
+## chain103: the chunk lever, re-measured at the right team -- starvation is real and fixing it buys nothing
+
+The withdrawn version of this experiment pinned every cell to a 16-worker team because a leaked
+`SCORCH_SPMM_NT_FORCE` answered the rule's own query. With the variable cleared and a refusal on a
+flat resolved team, the teams now come back as `[4, 5, 6, 8, 9, 11, 12, 16, 18, 24, 32]` -- eleven
+values, matching the release build's distribution. So the harness is now measuring the policy it
+claims to. 500 cells, 94 of them starved rather than 44.
+
+```
+  STARVED (claims < team), n=94        per_worker   half_worker   floor
+  float32  k=1/2/4/8/16               0.9989 0.9992 0.9964 1.0049 1.0007   0.9998-1.0013
+  float64  k=1/2/4/8/16               0.9971 0.9990 0.9982 0.9992 0.9999   1.0000-1.0009
+
+  FED (claims >= team), n=406         per_worker in 1.0016-1.0073, floor 0.9997-1.0003
+```
+
+**The starvation is real and it costs nothing to leave alone.** The widest starved cells are now
+exactly the family the mechanism was designed for -- `body_decoder_layer_1_self_attention` and
+friends, 512 rows, team 32, chunk 64, so 8 claims for 32 workers and 24 of them unable to take any
+work -- and narrowing the chunk to a worker's share reads 0.997 and 0.999 on them against floors of
+0.999 and 0.998. Every starved reading sits inside its own floor, and several are on the wrong side
+of 1.0. `SCORCH_SPMM_CHUNK_GUARD_FEED` stays at 0 and the lever is closed.
+
+This is the same verdict the withdrawn section reached, and it is worth being explicit that reaching
+the right answer for the wrong reason was still worth withdrawing: that version could not have
+distinguished "the fix does nothing" from "the fix was never given the condition it targets",
+because at a 16-worker team the condition barely occurred and never occurred on the family in
+question (2 of 120 dlmc cells, both null). Now the condition occurs, on the intended family, at the
+intended severity, and the fix still does nothing.
+
+**And that is a real finding about the residual, not just about the chunk.** Those 512-row attention
+layers run with three quarters of the team unable to claim a single row, and giving them work
+changes the clock by less than the noise floor. Whatever puts that family below MKL, it is not
+worker participation. Two mechanisms are now excluded for it -- the chunk width here, and the
+multi-row register block, which declines k=4 on float32 by its own admission test -- so the next
+attempt on it should not be a parallelism or a blocking change.
