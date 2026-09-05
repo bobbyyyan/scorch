@@ -19630,3 +19630,57 @@ rotation cannot balance: five builds across four (pass, dtype) groups leaves the
 crossed, which is consistent with the floor being *signed* (c0b reads 0.983-0.985 at widths 1-2
 rather than straddling 1.0). Widths whose effect does not clear that margin by several times should
 not be read at all.
+
+## chain126: the candidate is a large float32 regression on ARM, at exactly the widths it wins on x86
+
+The three constants have no ISA condition, so flipping their defaults changes the ARM build too, and
+every confirming measurement was x86. The M5 was measured over 60 matrices in six nnz bands
+(13.1K to 1.51M nonzeros), widths 1, 2, 3, 4, 8, both dtypes, two passes, 3600 rows per build.
+
+### float32, geomean of c0/arm by nnz band, `[n/15]` = matrices clearing their own same-code spread
+
+| k | b1: 13.1K-32.8K | b2: 32.8K-73.7K | b3: 78.6K-133K | b4: 134K-1.51M |
+|---|---|---|---|---|
+| 1 | 0.9842 [8/15] | 0.9854 [3/15] | 1.0158 [2/15] | 1.0669 [4/15] |
+| 2 | 0.9472 [12/15] | 0.9195 [8/15] | **0.8268** [14/15] | **0.7041** [14/15] |
+| 3 | 0.9710 [11/15] | 0.9257 [10/15] | 0.9264 [3/15] | **0.8250** [13/15] |
+| 4 | 0.9874 [7/15] | 0.9806 [3/15] | 0.9996 [2/15] | 1.0363 [7/15] |
+| 8 | 0.9792 [7/15] | 0.9713 [5/15] | 1.0110 [2/15] | 1.0440 [6/15] |
+
+The ARM cross-build floor is 1.0392-1.0438 on float32 -- about 4%, roughly twice x86's 1.5-2.2% --
+and a 0.7041 with 14 of 15 matrices clearing their own spread is nowhere near it. **This is a 30%
+regression at width 2 and 17% at width 3, on the same build that gains 22% at width 3 on MKT.**
+
+Opposite signs on the same source. That is not a surprise in this kernel: the thread raise wins on
+x86 and loses on ARM, tile-ijk's inner loop is +22% on ARM and was rejected on x86, and `HALFVEC`
+already carries per-dtype defaults for the same reason. ARM has no gather instruction, so what the
+exact band displaces there is a NEON register-block tile rather than `vgatherdps`, and the two
+displacements are not the same trade.
+
+**chain124's registered rule fires: the default must be ISA-conditional.** x86 takes the values,
+ARM keeps the current ones. That was written down before this data was read, which is the only
+reason it can be applied to it.
+
+### The float64 half of this run is not readable, and the reason is worth recording
+
+The float64 cross-build floor reaches **1.3641** in the largest band -- c0b apparently 36% faster
+than byte-identical code. That is an order effect, not noise: three builds rotated across four
+(pass, dtype) groups is `i % 3` over four values, so c0 leads twice and never gets the compensating
+position. The spread test caught it -- 0 to 4 of 15 matrices clear their own floor in those cells,
+against 13 and 14 for the float32 regression -- so the analysis refused the numbers rather than
+reporting them, but the design should not have produced them.
+
+Fixed in the isolation run now going: five builds over six groups, so every build leads at least
+once.
+
+### What is still unknown, and the experiment for it
+
+"ARM regresses" is not actionable while all three constants move together. The isolation run on the
+M5 uses the same nesting as the x86 job -- `bandf32` then `bandmr` then `shipcand`, each adding one
+constant -- at widths 2, 3 and 8, so each successive difference is one constant on both ISAs. If it
+is halfvec on ARM as well as being the unmeasured constant on x86, then one arm accounts for both
+open questions and the remaining pair may well ship globally. If it is the band, then the band is
+x86-only and multi-row's width-8 win can be examined on its own.
+
+Until that returns, the shippable claim is: two constants earned on x86 at named widths, one
+unmeasured, and a global default refuted by ARM.
