@@ -21659,3 +21659,102 @@ band2mr sits about 1% below its own floor at width 2 and slightly below bandmr a
 which is the same direction MKT measured (0.9805 against a 0.9996 floor at width 2). The single-host
 gap flagged in chain142 is closed, and it closes against band2: lowering the band to 2 does not
 help on either host. `29384fe` stays reverted.
+
+## chain158 -- width 1 is not two-host, and the neutrality instrument now reconciles the immediates
+
+**A correction to how the deficit has been summarized.** Comparing `bandmr` against `c0` at
+float32 with the same analyzer on both hosts:
+
+    width | MKT      floor    | redwood  floor
+      1   | 1.0089   0.9891   | 0.9766   1.0006
+      4   | 0.9894   0.9951   | 0.9907   1.0028
+
+Width 4 is below its floor on both hosts. **Width 1 has opposite signs** -- MKT clears its floor
+there, redwood sits 2.4% below. The doc already recorded this at the level of the individual
+prediction table ("second x86 host agrees in sign: FAIL at widths 1 and 4", and "MKT's width 1 is
+the one place it does not appear"), but the running summary has been saying "the width-1 and
+width-4 deficit", which asserts two hosts for a fact that has one.
+
+It sharpens rather than weakens the target. `unsw`'s surviving penalty was also two-host *only* at
+width 4. Two experiments, different comparisons, both isolate width 4 as the single cost the two
+machines agree on; width 1 is a property of redwood.
+
+### Three owed x86 neutrality claims, not one
+
+The tarball lineage, by line count of the two headers:
+
+    tarball  adds                              spmm.h        scorch_policy.h
+    mr6      (baseline)                        6681          --
+    mr7      MULTIROW_RAGGED + MULTIROW_MINDEG 6725  (+44)    (+71)
+    mr8      MULTIROW_UNSWITCH                 6753  (+28)    (+57)
+    mr9      MULTIROW_HOIST                    6780  (+27)    (+25)
+
+Three constants were added at default 0, each with the argument that it emits nothing there, and
+**every one of those arguments was checked on ARM only** -- where neither the multi-row kernel nor
+its dispatch is compiled, so it is the weaker ISA for exactly this question. The +27 matches the
+hoist commit's ARM reconciliation exactly, which is the check that the lineage is read correctly.
+
+The old `rw_s_attrib.sh` covered only mr6->mr7, had **no A/A control** -- which
+`neutral_disasm.sh`'s own header says the verdict requires -- and printed "neutrality unchecked"
+and continued when a build failed. An unrun check rendered as a clean line, again.
+
+### The instrument was doing the weaker half of its own argument
+
+`neutral_disasm.sh` checked that every difference is a bare immediate move, and stopped there. But
+an immediate that changed for a *real* reason -- a folded constant, a literal branch target --
+matches that pattern too. The strong claim, the one the hoist commit actually made in prose, is
+that every changed immediate moved by exactly the number of lines added, which only a `__LINE__`
+shift can produce. That reconciliation was done **by hand** and lived in a commit message.
+
+It is now in the instrument, with four properties worth naming:
+
+- **Deltas are reconciled against the source.** `--expect-delta` takes the lines added; every
+  observed delta must be one of them.
+- **A SET, not a value.** `__LINE__` is per-file, so a change touching two headers shifts each
+  file's immediates by a different amount and produces two legitimate deltas. All three pairs here
+  move both headers, so a single expected value would have reported a pure line shift as a real
+  change. This was not defensive generality -- it was wrong before the generalization.
+- **Identical disassembly plus an expected shift REFUSES.** If the caller says 27 lines were added
+  and nothing differs, the two objects are not the pair the caller thinks they are. This is the
+  branch that catches the defect from chain156, where a flag variable holding `-S -o -` made the
+  check diff two empty files and print NEUTRAL.
+- **Classifier/parser disagreement REFUSES.** The classifier's `[#$]?` is optional and the
+  reconciler's is not, so `mov w2, 100` is an immediate move the parser cannot read. Rather than
+  skipping it -- which would quietly shrink the denominator -- it fails closed.
+
+Ten fixtures, each built to falsify one branch, all firing correctly: A/A identical, identical
+against a nonzero expectation, all-shifted with a matching and a non-matching expectation, mixed
+deltas against a set that covers them and one that does not, a real instruction change, differing
+instruction counts, the unparsable immediate, and a malformed set.
+
+**Two instrument bugs found while building it, both in my own probes rather than the code:**
+`tar --wildcards` is GNU-only, so bsdtar errored, `2>/dev/null` swallowed it, and the resulting
+`HOIST=0` for all four tarballs read as "the constant is absent" rather than "tar failed" --
+including for mr9, which is named after it. Then zsh does not word-split unquoted parameter
+expansions, so passing two paths in one variable made tar look for a single file with a space in
+its name. Both were caught only because the answer was impossible on its face; neither would have
+been caught by a plausible one. And a third, in the new code: BSD sed has no `\|` any more than it
+has `\+`, so a single alternating expression matched nothing on the mac while working on the linux
+host, and the reconciler reported every difference as unparsable. Same family as the `\b` trap.
+
+### Queued
+
+`rw_s_attrib2.sh` on redwood, behind heldout, waiting on the stage lock. Part 1 is the three
+neutrality pairs plus the A/A control, with each tarball's constant proven present through the
+preprocessor first so a verdict cannot be vacuous. Part 2 is the placement / code-presence /
+admission-test attribution for redwood's width-1 deficit -- `c0pad` (identical source at a
+build path one character longer), `mrf64` (kernel and dispatch compiled in, float32's row count
+constexpr 0 so the branch folds away), and `bandmr`.
+
+That third arm is the one the hoist was built to fix, and the hoist failed by 9.0% and 5.1% at
+these widths. So if part 2 selects the admission test, the mechanism is open and the fix was aimed
+at the wrong instruction; if it selects placement or code presence, the reload story was never
+right and the hoist's failure is explained rather than mysterious.
+
+The waiter blocks on the lock file rather than on a process name. stage_lock.sh refuses rather
+than waits by design, so something must do the waiting, and every earlier queue defect here came
+from a waiter keyed on the previous stage's process name. Verified detached: PPID 1, SigIgn
+ending in 7 so SIGHUP is ignored, own session with no controlling terminal. The check that found
+those properties initially read the wrong process -- `pgrep -f` matched the `zsh -c` wrapper whose
+command line contains the script name, which is the pattern-matches-itself trap, in the
+verification of a fix for the pile-up it was written to avoid.
