@@ -21604,3 +21604,58 @@ and with several the verdicts would silently describe only the first. Five verdi
 named `unsw` in their message text after that, so the first hoist run printed "P1 FAILED: unsw
 0.9668" for the hoist build. A label that names the wrong build is the same defect the copied
 sbatch had an hour earlier, and it would have gone into this section verbatim.
+
+## chain157 -- the second host revises chain151: the gain is two-host, the penalty mostly is not
+
+redwood finished band2 at 09:47 and unsw at 12:23 (63 matrices, 7320 corpus rows per build).
+Heldout is running there now. Both results change what chain151 concluded.
+
+**The low-degree gain is two-host and holds firmly.** unsw against bandmr, above 1 meaning unsw
+faster, per matrix:
+
+    deg < 20, float32     MKT (Zen4)                  redwood (hybrid)
+      k=1                 faster 22/26 median 1.0188 | faster 34/38 median 1.0163
+      k=4                 faster 25/26 median 1.0207 | faster 32/38 median 1.0201
+
+**The high-degree penalty that killed it does not replicate.** At degree >= 20, float32:
+
+      k=1                 faster  3/16 median 0.9874 | faster  9/22 median 0.9986
+      k=2                 faster  3/16 median 0.9843 | faster 11/22 median 0.9996
+      k=3                 faster  4/16 median 0.9829 | faster 10/22 median 0.9979
+      k=8                 faster  1/16 median 0.9766 | faster 11/22 median 1.0017
+      k=4                 faster  4/16 median 0.9850 | faster  5/22 median 0.9864
+
+Four of the five widths are neutral on redwood where MKT read 0.977 to 0.987. Only width 4
+carries the penalty on both hosts, and there it is about 1.4%. On float64 redwood is
+neutral-to-faster, including 19 of 22 at 1.0218 for width 2.
+
+So chain151's verdict -- "net regression, does not ship" -- was a single-host verdict, and the
+second host declines to confirm the part that condemned it. The honest statement now: a ~2%
+low-degree gain confirmed on two x86 hosts, a high-degree cost that is Zen4-specific at four
+widths, and a two-host ~1.4% cost at width 4. That is not a clean rejection and it is not a ship
+either. The width-4 penalty is the blocker, because it is the one finding both hosts agree on.
+
+This is the two-host rule working in the direction I do not usually get to report: it stopped a
+rejection, not a claim. Had unsw been measured only on MKT it would be recorded as a failed
+experiment.
+
+**And it sharpens the chain156 result rather than overturning it.** The hoist still fails on MKT
+by 9.0% and 5.1% at the widths where unsw gains, unanimously, so the reload was still not the
+mechanism. What changes is the other half: chain156 reasoned that unsw's high-degree cost was the
+price of the second instantiation. If that cost is largely absent on redwood, then the
+duplication is not intrinsically expensive -- it is expensive on Zen4 -- and the explanation has
+to be about that machine's front end rather than about instantiation in general. The hoist arm
+has not run on redwood yet; it is not in any queued chain, so that is a gap to close before the
+mechanism question is settled either way.
+
+**band2 is now two-host and it agrees.** redwood, float32 geomean against c0:
+
+    k | floor  band2mr bandmr
+    2 | 0.9984 0.9883  0.9999
+    3 | 0.9958 1.1023  1.1102
+    8 | 0.9949 1.1746  1.1824
+
+band2mr sits about 1% below its own floor at width 2 and slightly below bandmr at widths 3 and 8,
+which is the same direction MKT measured (0.9805 against a 0.9996 floor at width 2). The single-host
+gap flagged in chain142 is closed, and it closes against band2: lowering the band to 2 does not
+help on either host. `29384fe` stays reverted.
