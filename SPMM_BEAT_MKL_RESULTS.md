@@ -21758,3 +21758,51 @@ ending in 7 so SIGHUP is ignored, own session with no controlling terminal. The 
 those properties initially read the wrong process -- `pgrep -f` matched the `zsh -c` wrapper whose
 command line contains the script name, which is the pattern-matches-itself trap, in the
 verification of a fix for the pile-up it was written to avoid.
+
+## chain159 -- a peer's defect report finds the same shape here, with its sign reversed
+
+The sparse-kernel-bench session reported one of its own: a corpus build finished with 2807
+matrices and zero failures while producing zero MoE routing matrices, because the extraction hook
+matched no module and an empty capture was not counted as a failure. Its note was that a stage
+which cannot run looks exactly like a stage that had nothing to do, and that anything aggregating
+over a glob or a capture is worth checking. That is the same class this project keeps producing,
+so I tested for it rather than reasoning about it.
+
+**All six live analyzers already refuse a wholly empty input directory.** That case was fixed
+earlier in the sequence. The defect is one level in: not the whole input missing, but **one
+subgroup missing while the aggregate looks healthy** -- which is exactly the shape the peer hit.
+
+Constructed by taking a real 63-matrix dataset and removing all of one build's rows at one width:
+
+    an_band2.py, k=3 stripped from bandmr
+      before:  3 | 0.9958  1.1023  nan  | FAILED: differs from bandmr
+      after:   3 | 0.9958  1.1023  nan  | n=60/60/0 | REFUSE: bandmr has no readings at this width
+
+**The interesting part is the sign.** The familiar version of this defect is absent data producing
+a false PASS. Here it produced a false **FAILURE** -- a verdict asserting that `band2mr` differs
+from `bandmr` at a width where `bandmr` had no readings at all. Both directions have one cause, a
+verdict computed from a value that does not exist, but the failing direction is the more dangerous
+one to leave in place: a fabricated finding gets acted on, and the `nan` sitting beside it in the
+table does not travel into the summary that quotes the verdict string.
+
+Two fixes, and one thing that was already right:
+
+- `an_band2.py` now names, per width, which arms its prediction actually reads, refuses when any
+  of them has zero readings, and prints `n=` per arm. On intact data every verdict is unchanged,
+  which is the check that the fix did not buy safety with accuracy.
+- `an_attrib.py` did guard the nan, but with `continue` -- so a width that could not be judged was
+  **dropped from the verdict table**, where it reads as a width that was never part of the
+  analysis. Quieter than a wrong verdict and no better. It now prints the row and names what is
+  missing. Fired on an input whose candidate has no readings at width 1.
+- `an_attrib.py`'s absent-arm guard was already correct and still fires: width 4 reads "cannot
+  attribute: mrf64 absent from this stage" rather than treating an absent arm as a flat one.
+
+**The printed denominators immediately paid for themselves.** `n=60/60/60` on a dataset whose
+header says 63 matrices -- three contribute no readings at any width, which was true before and
+invisible before.
+
+Fifteen analyzers construct a geomean that returns `nan` for an empty list. Only `an_band2.py`
+rendered a HELD/FAILED string from one, which is why it was the one that manufactured a claim; the
+others print `--` or refuse. The general lesson is narrower than "handle nan": a nan is safe in a
+DISPLAY and unsafe in a VERDICT, and the two are worth separating deliberately rather than
+hardening every site equally.
