@@ -20235,3 +20235,25 @@ which is the same failure mode from a different cause.
 The x86 disassembly check has not run -- both x86 hosts are timing -- so on x86 the patch is
 "expected neutral because the term is `constexpr 0`", which is an argument and not a measurement.
 It runs when a host is free.
+
+## chain134 -- the flipped defaults are reverted, because a candidate must be an arm
+
+`29384fe` set `SCORCH_NARROWK_EXACT_HI_F32` to 1 and `SCORCH_SPMM_MULTIROW_ROWS_F32` to 2 as
+**defaults**. Chain 131 established it does not ship. This reverts the defaults and keeps every
+additive mechanism added since, all of which default to off.
+
+The reason is not tidiness. The next stages build their arms from a tarball of this tree, and a
+build with no defines is the baseline arm in every one of them. With the flip still in the defaults,
+`c0` would silently BE the candidate: every ratio would read about 1.000 and the stage would report
+a null result for a change worth 15-35%. The tarball the currently running band-2 stages use
+(`scorch_mr6.tgz`) predates the flip and is unaffected -- checked, its `_F32` constants still fall
+through to the unsuffixed ones -- but the new tarball is cut from this tree, so the defaults have to
+be the thing being changed FROM.
+
+That is the same defect as a `-D` naming a macro no source reads, which cost this project two
+cancelled jobs, arriving from the opposite direction: there, the arm was accidentally the baseline;
+here, the baseline would have been accidentally the arm.
+
+Reverted, verified: `SCORCH_NARROWK_EXACT_HI_F32` and `SCORCH_SPMM_MULTIROW_ROWS_F32` fall through
+to the unsuffixed constants again, and `MULTIROW_RAGGED`, `MULTIROW_MINDEG` and `MULTIROW_MAXDEG`
+survive at 0.

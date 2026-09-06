@@ -619,29 +619,8 @@
 #ifndef SCORCH_SPMM_MULTIROW_ROWS
 #  define SCORCH_SPMM_MULTIROW_ROWS 0
 #endif
-// SHIPPED VALUE, float32, x86 only: 2. Measured in chain129 by nesting the arms so that each
-// successive difference is one constant. Multi-row is the win, on MKT's pre-registered nnz >= 1e6
-// group against a same-code floor of 1.006-1.013:
-//
-//     width 2   +19.2%      width 3   +20.6%      width 8   +33.9%
-//
-// and by cell count at float32 width 3, 34 of 42 below MKL becomes 15. It needs the exact band
-// lowered to reach widths 2 and 3 at all -- see SCORCH_NARROWK_EXACT_HI_F32 below -- which is why
-// the two ship together and why neither number is attributable alone.
-//
-// GATED TO x86 THOUGH ITS DISPATCH ALREADY IS. `multirow_ok`'s dispatch sits inside the AVX2 block,
-// so a non-zero value could not act on ARM. The gate is here anyway because SCORCH_SPMM_MULTIROW_ANY
-// keys off this value and the kernel template carries no ISA guard of its own, so an ungated 2 would
-// make the claim "the ARM object is unchanged" depend on reasoning about which templates get
-// instantiated. Gated, it depends on the preprocessor, and is checkable with a digest -- which is
-// how it was checked: the ARM object built from these defaults is byte-identical to the previous
-// release's.
 #ifndef SCORCH_SPMM_MULTIROW_ROWS_F32
-#  if defined(__AVX2__) && defined(__FMA__)
-#    define SCORCH_SPMM_MULTIROW_ROWS_F32 2
-#  else
-#    define SCORCH_SPMM_MULTIROW_ROWS_F32 SCORCH_SPMM_MULTIROW_ROWS
-#  endif
+#  define SCORCH_SPMM_MULTIROW_ROWS_F32 SCORCH_SPMM_MULTIROW_ROWS
 #endif
 #ifndef SCORCH_SPMM_MULTIROW_ROWS_F64
 #  define SCORCH_SPMM_MULTIROW_ROWS_F64 SCORCH_SPMM_MULTIROW_ROWS
@@ -993,36 +972,8 @@
 // cannot be a cache-line-utilisation cost. Only float32 widths 2 and 3 have a deficit that grows
 // with nnz. The byte reading governs the constants here, which are all about the vector register;
 // it does not govern the floor, which is a thread-policy question in another part of the code.
-// SHIPPED VALUE, float32, x86 only: 1. This constant is not a magnitude -- it decides WHICH KERNEL
-// handles widths 2 and 3. At the default of 3 the scalar exact-width kernel owns them; at 1 they go
-// to the vector path, which is the precondition for multi-row reaching them.
-//
-// ON ITS OWN IT IS NOT A WIN. MKT, target group: -11.0% at width 2 and +5.5% at width 3. Combined
-// with SCORCH_SPMM_MULTIROW_ROWS_F32=2 it is +6.1% and +27.3%. The win belongs to the pair, and
-// chain125 mis-credited it to this constant alone because the arms it compared held a third
-// constant fixed in both.
-//
-// GATED TO x86, AND THAT GATE IS THE POINT. The exact kernel is guarded
-// `(AVX2 && FMA) || __ARM_NEON` and has a second call site under `__ARM_NEON && !__AVX2__`, so
-// unlike the other two constants this one is LIVE on ARM -- and on ARM it is a large regression:
-//
-//     M5, float32, by nnz band     13-44K    44-130K   131K-1.5M
-//       width 2                    0.9640    0.9197    0.7229
-//       width 3                    0.9867    0.9470    0.8349
-//
-// against a 4% ARM cross-build floor, with 14 of 15 matrices in the worst band clearing their own
-// same-code spread. Opposite sign from the same source, which is not new in this kernel: the thread
-// raise wins on x86 and loses on ARM, and tile-ijk's inner loop is +22% on ARM and was rejected on
-// x86. The mechanism is that the two instruction sets hand widths 2-3 to different kernels -- the
-// masked 256-bit register block on x86, a NEON tile using two or three of four lanes on ARM -- so a
-// constant selecting between them is ISA-dependent by construction rather than host-fitted. ARM
-// currently GAINS about 30% at width 2 from the exact kernel; leaving it alone preserves that.
 #ifndef SCORCH_NARROWK_EXACT_HI_F32
-#  if defined(__AVX2__) && defined(__FMA__)
-#    define SCORCH_NARROWK_EXACT_HI_F32 1
-#  else
-#    define SCORCH_NARROWK_EXACT_HI_F32 SCORCH_NARROWK_EXACT_HI
-#  endif
+#  define SCORCH_NARROWK_EXACT_HI_F32 SCORCH_NARROWK_EXACT_HI
 #endif
 #ifndef SCORCH_NARROWK_EXACT_HI_F64
 #  define SCORCH_NARROWK_EXACT_HI_F64 SCORCH_NARROWK_EXACT_HI
