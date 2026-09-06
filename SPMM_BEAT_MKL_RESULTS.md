@@ -20873,3 +20873,47 @@ closed, and the question that picks between them is not safety but whether the t
 cannot run has a legitimate reason to be off. A GCN guardrail and a gate-firing check have
 none, so unrun is not evidence and both refuse. Their policy switch does, so theirs labels
 instead. I would have argued fail-closed for their case and been wrong.
+
+## chain145 -- the bootstrap collapsed to a point, and the chain141 defect came back
+
+Auditing `an_attrib.py` for the same uneven-disclosure shape found it in the same file
+twice over, and then the test written to check the fix found something worse in the
+verdict itself.
+
+**The disclosure gap, third instance in one file.** The work-scaling table prints
+`used / seen` -- cells that survived the curvature test over cells that carried three
+levels. The discriminator below it, which is the block that actually emits
+DISPATCH / KERNEL / MARGINAL, printed neither, and skipped a width entirely and silently
+when fewer than five pairs survived. So a verdict resting on 5 cells of 35 read exactly
+like one resting on all 35, and a width that could not be resolved at all simply had no
+row. Now the verdict line carries `6/9 cells (3 non-additive)` and the short case says so:
+
+    bandmr vs c0 | NOT RESOLVABLE at this width: 2 of 3 cells carried both arms' levels
+                   and survived the curvature test (0 rejected as non-additive); 5 needed
+
+**What the test found.** The synthetic case gives both arms the same per-nonzero cost and
+different fixed costs, so the right answer is DISPATCH. It printed "both moved". The t
+ratio is exactly 1 by construction, but `(0.32-0.12)/2` and `(0.35-0.15)/2` differ by
+4e-16 in binary floating point, so every bootstrap resample returned the same median, the
+interval collapsed to a single point 4e-16 below 1.0, and `moved` -- "the boundary lies
+outside the interval" -- was satisfied. Displayed as `[1.0000,1.0000]`, which contains 1.0
+to every digit shown.
+
+A zero-width bootstrap interval is a point estimate, so this is chain141's defect wearing
+the bootstrap's clothes: a hard boundary applied to a point. The mechanism is not the
+rounding, it is that resampling over cells captures the spread BETWEEN cells and nothing
+of the measurement noise WITHIN one. Cells that agree closely therefore produce an
+interval narrower than any single cell's own replicate spread, and in the limit narrower
+than the smallest difference the harness can resolve at all.
+
+The fix uses the quantity that was already being printed and not used: no interval may be
+tighter than the replicate floor, so each is widened to at least +/- floor/2 around its
+median. That is the one number in the chain measured directly rather than propagated,
+which is the peer's argument for printing it in the first place -- it turns out to also be
+the right bound. On the synthetic case the interval becomes `[0.9990,1.0010]` against a
+0.0020 floor, contains 1.0, and the verdict becomes DISPATCH, which is the correct answer.
+The widening is 0.001 wide here, so it cannot move a verdict that rests on real
+between-cell spread; it only bites when the bootstrap has stopped being one.
+
+Both fixes are deployed to redwood, where attrib has not started. Neither host analyses
+in-stage, so both pending runs get them.
