@@ -20787,6 +20787,32 @@ silent-open to loud-open: report the number, attach an explicit note that the ch
 not run. Mine takes the closed branch instead, because a GCN guardrail has no policy
 reason to be switched off; if it cannot run, the run is not evidence of anything.
 
+**The same defect is latent in the analyzer that gated the ship candidate, and it did
+not fire.** `an_ship.py` ends its guardrail with `if worst: ... else: "no GCN cell
+regresses by more than its own same-code spread"`, and `worst is None` also covers every
+cell failing the `(a and o and fl)` filter -- so a non-empty GCN group with the candidate
+series missing prints a clean guardrail. Harder to reach than the band2 one, and it
+matters more, because that line gated 29384fe.
+
+It did not fire, and the reason is worth keeping. `rw_s_ship.sh` only collects; the
+analysis is a separate step. The collection stage ends with rows-per-build:
+
+    c0        corpus 5490   gcn 216
+    c0b       corpus 5490   gcn 216
+    bandf32   corpus 5490   gcn 216
+    bandmr    corpus 5490   gcn 216
+    shipcand  corpus 5490   gcn 216
+
+Every build carried its full GCN count, so the comparisons were real and the ship
+decision rests on measured cells. That rows-per-build line is the same disclosure as the
+`h/n` denominator, one layer earlier -- it is what makes the latent defect unreachable on
+this run rather than merely unobserved. Fixed anyway, and verified in all three
+directions: candidate absent from every GCN cell now refuses ("this is not a clean
+guardrail; it is an absent one"), a constructed regression reports
+`cora float32 k=7 0.8850 (its own floor reads 0.9950) [4 cells compared]`, and the clean
+path reads "no GCN cell regresses ... (4 cells compared)". An empty GCN group, which
+previously skipped the whole section in silence, now says so.
+
 **A consequence for a reading already in hand.** MKT's band2 ran under the old analyzer,
 so its GCN guardrail line cannot be trusted to distinguish clean from unrun. Its data has
 to be re-analyzed with the fixed version. That is now the second reason MKT's band2 needs
