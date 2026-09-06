@@ -20718,3 +20718,27 @@ yet why heldout is wrong.
 MKT at the time of writing: unsw 17287573 running 59:50 of a 9-hour limit, heldout
 17286960 pending on its dependency. Reading MKT's band2 output needs a job on mkt1,
 where unsw is measuring, so it waits rather than becoming a co-tenant.
+
+**Why chains 6-8 died, exactly, since I will otherwise re-derive it.** Four numbers
+separate a queued remote shell that survives from one that does not:
+
+    pid    ppid  sid    tpgid  SigIgn            verdict
+    38908  1     38908  -1     0000000000000007  nohup'd AND its own session leader
+    543302 1     543302 -1     0000000000000006  own session leader, HUP not ignored
+
+`SigIgn` bit 0 is SIGHUP, so an odd last hex digit means `nohup`. Chains 4 and 5 have it;
+chains 9-12 do not. But all six are session leaders (`sid == pid`) with no controlling
+terminal (`tpgid -1`), so a terminal hangup cannot reach any of them -- that is why 9-12
+have survived several sessions closing. Chains 6-8 had neither property: they were plain
+children of the launching shell, so they took SIGHUP when it closed. Hardening 9-12 would
+mean relaunching them, and a chain that is still waiting holds no data, so a death there
+costs the relaunch and nothing else. Detectable and recoverable, so left alone.
+
+**Queue order left as it stands**, deliberately. Redwood runs chain4 -> band2 -> unsw ->
+heldout -> attrib -> exunroll. band2 sitting ahead of unsw is what closes the single-host
+gap above, and MKT delivers unsw first regardless, so the primary read is not waiting on
+redwood. chain4 is healthy rather than stuck: its prefetch arm is 154 matrices x widths
+1/2/4/8/16 x builds c0/c0b/pf0 x two dtypes x two passes, pass p1 took 5h18m (19:43 ->
+01:01) and p2 was 85% through at 01:44, with two stages after it. Reordering to get
+redwood's unsw sooner would mean five relaunches on a host where I have already made two
+queue mistakes today, to save one stage's duration on a confirmation run.
