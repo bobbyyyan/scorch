@@ -21352,3 +21352,59 @@ Those numbers rest on equal sample counts of finite readings, as checked facts.
 
 Archive at `~/.cache/scorch-codex/spmm-beat-mkl/`, 106 files verifying, fixtures README updated
 with the three new constructed inputs.
+
+## chain153 -- the heldout job died 39 seconds in, and the guard was right to kill it
+
+The MKT queue emptied, which I first read as heldout having run. `sacct` says otherwise:
+
+    17286960  heldout   FAILED   1:0   00:00:00   2026-09-06T02:40:19
+    17287573  unsw      COMPLETED 0:0  01:58:20   2026-09-06T02:39:40
+
+Exit 1 with zero elapsed, 39 seconds after unsw completed -- so the dependency was satisfied and
+the job died in its opening commands. The log, at the `/matx` staging path its `#SBATCH -o` names:
+
+    note: /matx/u/bobbyy/staging/heldout_keys_mkt.txt not staged
+    note: /matx/u/bobbyy/staging/gcn_keys.txt not staged
+    excluded as derivation/prior-selection keys: 110
+    size-filtered candidates: 913
+    held out at nnz >= 1e6: 473
+    selected 40; degree median 25.8; below 4: 5, 4-20: 14, 20-128: 14, above 128: 7
+    REFUSE: no gcn key list
+
+The guard was right. Without the list the GCN guardrail would not have run, and an eight-hour
+heldout verdict with an absent guardrail is precisely the thing chains 143 and 144 exist to
+prevent -- it would have printed a clean guardrail line under the old analyzer. Failing in 39
+seconds beat succeeding in eight hours.
+
+**But the dependency it enforced should not have existed.** `gcn_keys.txt` contains three fixed
+strings -- `gcn/cora`, `gcn/citeseer`, `gcn/pubmed`. The unsw job, which ran fine, generates them
+inline with a `printf` and then checks the matrices themselves are present. heldout instead
+hard-depended on a staged file with constant contents, and that cost a run. Now it generates the
+list and checks the real input:
+
+    gcn guardrail inputs: 3 graphs, all present under /scr/bobbyy/mklsweep/csrcache
+
+The npz files were there the whole time -- I had checked `/scr/bobbyy/suitesparse/gcn/` and found
+zero, which is the wrong path; unsw extracts `gcn_npz.tgz` into the csrcache, where all three sit.
+Checking the wrong path nearly had me conclude the GCN guardrail could not run on this host at all.
+
+**Two things fixed while the job was not queued, which is the only safe moment.** The sbatch's
+pre-flip guard checked both delegation lines rather than one, so it was stronger than the `.sh`
+stages' version, but still could not see a parent flip. Replaced with the resolved-value probe
+over six constants, and -- unlike chain142, where I verified the guard against reconstructions --
+this one was tested against the exact bytes the job reads:
+
+    redwood/local  8f5775f57fab187202d56a9c8c1a99572aa77b121ccea24ab26c99bc2380a7d1
+    MKT staging    8f5775f57fab187202d56a9c8c1a99572aa77b121ccea24ab26c99bc2380a7d1
+
+and on good / parent-flipped / f32-flipped / constants-absent it accepts, refuses, refuses,
+refuses.
+
+**And the header was asserting a corpus the job derives differently.** It claimed 510 candidates
+at nnz >= 1e6 with degree coverage 5 / 18 / 13 / 4. The job actually found 913 size-filtered, 473
+held out, and selected 5 / 14 / 14 / 7, because the cache has grown since the header was written.
+A header that states a corpus the job then re-derives is a stale claim that reads as a
+specification. The counts are gone from the header; the job prints its own coverage and that
+printed line is the record.
+
+Resubmitted as 17290869.
