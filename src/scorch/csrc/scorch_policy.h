@@ -703,6 +703,36 @@
 #  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
 #endif
 
+// The multi-row kernel's raggedness refusal: the largest ratio of a group's nonzeros to its
+// common-prefix nonzeros that the group may have and still be taken. 0 disables the test, which
+// is what ships today, so a release object is byte-unchanged until a measurement moves it.
+//
+// WHY THIS AND NOT A DEGREE THRESHOLD. The kernel's win is memory-level parallelism -- ROWS
+// independent B loads in flight where the per-row kernel has one row's worth -- and it only has
+// that over the COMMON PREFIX, min(len) iterations with every stream live. Past the prefix each
+// row's tail runs serially through one stream, so a group of unequal rows pays the register
+// pressure of ROWS accumulators and collects the parallelism of one. The kernel's own comment
+// says so: "on a power-law matrix [the tails] are not [nearly empty], and the kernel degrades
+// toward the per-row one; that is a property to measure per family, not to hide."
+//
+// The measurement that made this necessary. EXACT_HI_F32=1 with MULTIROW_ROWS_F32=2 wins 11-20%
+// at float32 width 2 and 10-35% at width 8 on uniform-degree matrices, on both x86 hosts, and
+// loses on exactly the irregular ones: connectus 0.602 (redwood) and 0.817 (MKT) against
+// same-code floors of 1.080 and 0.983, the lhr family 0.820-0.845, cari 0.850, lp_osa_14 0.852,
+// com-Amazon 0.885, as-caida 0.934. The loss is flat per NONZERO, 0.01-0.04 ns, not per row --
+// connectus has 512 rows and loses 49 microseconds, which no per-row cost can pay for. A
+// per-nonzero loss on ragged rows is the serial-tail mechanism and nothing else.
+//
+// Mean degree separates the two populations in the data (0 losers of 46 between degree 8 and 16,
+// 7 of 12 above 128) but it is not the mechanism, and a first attempt to justify a degree bound
+// from row-amortisation arithmetic was refuted by its own fit: it put the per-row saving at
+// -0.00 ns and predicted 0.982 where 1.068 was measured. Raggedness is per-GROUP, is what the
+// kernel actually depends on, and costs one extra A1_pos load inside a test that already loads
+// its neighbours.
+#ifndef SCORCH_SPMM_MULTIROW_RAGGED
+#  define SCORCH_SPMM_MULTIROW_RAGGED 0
+#endif
+
 // The deep register-block kernel: the vector counts it serves, its depth, and its prefetch.
 //
 // It exists (spmm.h, guarded on AVX2+FMA) but has never been reachable outside a

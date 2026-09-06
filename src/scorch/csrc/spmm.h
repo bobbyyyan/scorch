@@ -2582,6 +2582,26 @@ static inline void scorch_spmm_row_regblock_deep(
 // exactly the half-vector -- four floats, two doubles -- 128-bit registers need no mask and waste no
 // FMA width, and that width is where the deficit against MKL is deepest. The body only uses V's
 // operations, so the substitution is mechanical; the default keeps every existing caller unchanged.
+// Whether a multi-row group's common prefix carries enough of its nonzeros to be worth taking.
+//
+// See SCORCH_SPMM_MULTIROW_RAGGED in scorch_policy.h for the measurement. `ragged` is the largest
+// ratio of group nonzeros to prefix nonzeros allowed: at 2 the prefix must carry at least half.
+// A group holding an empty row has no prefix at all and is refused for any positive ragged, which
+// is correct -- such a group runs entirely through the serial tails.
+//
+// The loop folds for the instantiated depths, and A1_pos[i..i+rows] is what the caller's own
+// admission test already reads either side of.
+static inline bool scorch_multirow_prefix_ok(const int* SCORCH_RESTRICT A1_pos, int i, int rows,
+                                             int ragged) {
+  int minlen = A1_pos[i + 1] - A1_pos[i];
+  for (int r = 1; r < rows; r++) {
+    const int len = A1_pos[i + r + 1] - A1_pos[i + r];
+    if (len < minlen) minlen = len;
+  }
+  const long total = (long)A1_pos[i + rows] - (long)A1_pos[i];
+  return (long)rows * (long)minlen * (long)ragged >= total;
+}
+
 template <typename T, int NVEC, bool FULL_LAST, int ROWS, typename V = scorch_simd<T>>
 static inline void scorch_spmm_multirow_regblock(
     const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
@@ -4137,11 +4157,13 @@ torch::Tensor spmm_csr_v2_core(
                                                       : SCORCH_SPMM_MULTIROW_ROWS_F64;
   long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
   int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
+  int multirow_ragged = SCORCH_SPMM_MULTIROW_RAGGED;
 #else
   constexpr int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
                                                                 : SCORCH_SPMM_MULTIROW_ROWS_F64;
   constexpr long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
   constexpr int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
+  constexpr int multirow_ragged = SCORCH_SPMM_MULTIROW_RAGGED;
 #endif
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
@@ -4208,6 +4230,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0) multirow_minnnz = v; } }
   { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_HALFVEC");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 1) multirow_halfvec = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_RAGGED");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 64) multirow_ragged = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4533,6 +4557,11 @@ torch::Tensor spmm_csr_v2_core(
             i + multirow <= end &&
             (!REDIRECT || (long)(i + multirow) <= sp_row_units) &&
             A1_pos[i + multirow] > A1_pos[i] &&
+            // The group's rows must be near enough the same length that the common prefix, which
+            // is the only part of the kernel that has ROWS loads in flight, carries most of the
+            // group's nonzeros. Off by default; see SCORCH_SPMM_MULTIROW_RAGGED.
+            (multirow_ragged <= 0 ||
+             scorch_multirow_prefix_ok(A1_pos, i, multirow, multirow_ragged)) &&
             (!REDIRECT ||
              (long)A1_pos[i + multirow] - (long)A1_pos[i] <= sp_wide_deg)) {
           #define SCORCH_MR(NV, RR) \
