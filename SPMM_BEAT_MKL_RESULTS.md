@@ -20437,3 +20437,88 @@ Also fixed while setting this up: the MKT job carried **no rationale header at a
 generator that produced it from its redwood twin split on `set -u` and silently dropped everything
 above. It now carries the same 35 lines, including the same falsifiable predictions. A stage whose
 stated predictions are absent is a stage that can be reinterpreted after the fact.
+
+## chain138 -- the prediction failed, and the failure found a per-row tax on both hosts
+
+MKT job 17286204: `c0`, `c0b`, `band2mr`, `bandmr`, 45 matrices, **four** passes over two dtypes so
+each of four builds leads exactly twice, 5040 corpus rows and 288 GCN rows per build.
+
+### The prediction, and which part of it failed
+
+| width | predicted | measured (`band2mr` vs `c0`) | floor |
+|---|---|---|---|
+| 2 | its own floor | **0.9805** | 0.9996 |
+| 3 | equals `bandmr` | 1.1458 vs 1.1460 | 1.0010 |
+| 8 | equals `bandmr` | 1.2083 vs 1.2050 | 0.9986 |
+
+Widths 3 and 8 held exactly, and `connectus` at width 2 held exactly as designed -- 1.102 against
+its floor of 1.107, where `bandmr` reads 0.859 -- so the reading of the dispatch is right for the
+population the arm was built for. Width 2 as a whole failed, and the stage said in advance that
+if it did, the decomposition had to be redone.
+
+### What the failure is
+
+`band2mr` keeps the exact-width kernel at width 2, so its executed path is the shipped default's.
+It still reads 0.9805, and the deficit has a shape:
+
+| mean degree | `band2mr` at width 2 | floor |
+|---|---|---|
+| 0-4 | **0.9119** | 0.9884 |
+| 8-20 | **0.9754** | 0.9980 |
+| 20-128 | 1.0057 | 0.9989 |
+| 128+ | 1.0224 | 1.0174 |
+
+That falls as 1/degree, which is a **per-row** cost. And the low-degree matrices lose under *both*
+arms -- `relat8` 0.825 and 0.892, `as-caida_G_084` 0.913 and 0.927, `_083` 0.918 and 0.937, `_073`
+0.919 and 0.934 -- while under `band2mr` multi-row provably cannot execute at width 2. **So their
+loss was never the kernel choice.**
+
+The same signature is present at every width where the kernel declines, on both hosts, reading
+across degree bands 0-4 / 8-20 / 20-128 / 128+:
+
+| host, width | `bandmr` | the band-only arm |
+|---|---|---|
+| redwood, width 1 | 0.9635 / 0.9652 / 0.9882 / 1.0036 | 0.9985 / 0.9989 / 1.0038 / 1.0152 |
+| redwood, width 4 | 0.9566 / 0.9756 / 1.0145 / 1.0032 | 1.0084 / 0.9975 / 1.0058 / 0.9813 |
+| MKT, width 4 | 0.9696 / 0.9751 / 1.0101 / 1.0153 | -- |
+
+The band-only arm is flat. **The tax belongs to the multi-row constant, at widths where the kernel
+it enables cannot run.** MKT's width 1 is the one place it does not appear (0.9851 / 1.0191 /
+1.0066 / 0.9937), so four of five host-width combinations show it, not five.
+
+### The cause is not the branch
+
+`multirow_ok` is already hoisted out of the row loop -- there is a comment at the hoist site
+recording that -O3 does not hoist this lambda's invariants by itself -- and a perfectly-predicted
+not-taken branch does not cost 8.8%. What costs is that the guarded block **stores to `C_values`
+and reads `A1_pos`**, so the compiler must assume they alias and reload per row through the whole
+loop. The split plan's scalars carry a comment about exactly this hazard a few hundred lines above:
+*"a store to C_values may alias them -- and per-row loads are what decide a matrix of mean degree
+9."*
+
+`SCORCH_SPMM_MULTIROW_UNSWITCH` instantiates the worker body twice, with `if constexpr` removing
+the block from one, and picks per call -- one test per worker instead of one per row. Off by
+default and emission-neutral there: 164596 instructions either way, differing only in shifted
+`__LINE__` immediates. **The first attempt was not neutral**: wrapping the worker in a forwarding
+lambda cost 14 instructions of 164596 with the constant off, so the off path now keeps the lambda's
+original signature and has no wrapper at all.
+
+The arm also **discriminates**, which the three structural arms cannot do alone: `unsw` contains
+*more* code than `bandmr`. If the deficit were the multi-row code merely being present in the
+object, `unsw` would be worse. Recovery localises the cost inside the row loop.
+
+### Why this reordered both queues
+
+If the tax is what the low-degree matrices were losing to, then `MULTIROW_MINDEG` -- built to refuse
+multi-row below degree 4 -- is aimed at a population whose loss does not come from multi-row firing.
+Measuring it on a held-out corpus before knowing that would characterise a gate against the wrong
+cause. So `unsw` now runs **before** the held-out validation on both hosts: redwood chain 9 ahead of
+chain 10, and on MKT job 17287573 with the held-out job's dependency moved onto it.
+
+Three defects in the reordering itself, all mine, all caught before anything ran. A remote heredoc
+left literal `\$` and every new chain died on a syntax error, so the chain scripts are now written
+locally and copied. `pgrep -f "rw_chainN.sh"` matched **the launching shell**, whose command text
+contains every chain name, so three chains were left waiting on the launcher and would have started
+simultaneously -- the interlock would have let one run and refused the other two, losing two stages
+silently. Each chain now publishes its own pid to a file and the launcher reads that. And the MKT
+job's staging target was again the inherited `halfvec_mkt.tgz`; this one writes `unsw_mkt.tgz`.
