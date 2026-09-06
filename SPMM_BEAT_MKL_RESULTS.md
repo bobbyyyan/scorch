@@ -20961,3 +20961,55 @@ attempts. Same sentence, opposite blind spot. Mine was fixable by flooring becau
 was a quantity already in hand; theirs is not, because no term inside a single run knows what
 varies between runs. Six threshold or estimator failures over these two days, four mine and
 two theirs, and every one was a derived quantity standing on a measurement that was fine.
+
+## chain147 -- the unsw result had nothing to read it, and the analyzer's own test caught it lying
+
+No analyzer knew the `unsw` build, so the measurement both hosts are running would have
+landed with nothing able to read it. Wrote `an_unsw.py` (211 lines) carrying every
+disclosure rule installed today, with the four predictions stated in the file before any
+data exists, each falsifiable in a named direction:
+
+    P1  at widths 1 and 4, unsw returns to its floor IN EVERY DEGREE BAND -- aggregate-only
+        recovery leaves a band-shaped confound live
+    P2  the recovery is largest below degree 4, because a per-row tax over fewer nonzeros per
+        row is a larger fraction of the row's work
+    P3  at widths 2, 3 and 8, unsw EQUALS bandmr, because the instantiation that runs there is
+        the one bandmr already had
+    P4  unsw is not WORSE than bandmr at widths 1 and 4 -- the discriminator the three
+        structural arms cannot provide, since unsw contains strictly MORE code
+
+Also written down: equality at 2/3/8 tests a kernel that does run, so it is a genuine test,
+while recovery at 1/4 concerns a kernel that does not, so a null there is evidence about the
+tax and not about multi-row.
+
+**Validated against both possible worlds before trusting it.** One synthetic corpus where
+the tax hypothesis holds -- bandmr taxed 8.0/3.0/1.0/0.3 percent by descending degree band,
+unsw at its floor -- and one where it is false, with unsw carrying the same tax. World A
+reads P1 HELD in all four bands, P3 HELD at every firing width, and annotates the two bands
+where bandmr was never below floor with "nothing to recover", which is the correct reading
+rather than a pass. World B reads P1 FAILED in the two bands where the tax is larger than
+tolerance.
+
+**And World B caught the new file lying.** P2 asks whether the recovery is monotone in
+degree, computed as `all(cols[i] >= cols[i+1])`, which is trivially true of a flat series.
+With unsw recovering nothing, every band difference is +0.0000 and P2 printed "HELD:
+monotone in the predicted direction" -- a claim about the shape of a recovery, made where
+there is no recovery to have a shape. The same vacuous truth as `(not ref) or ...` in the
+gate-firing check, in code written twenty minutes after fixing that one, by the person who
+had just written the commit message about it.
+
+P2 now requires the largest band recovery to exceed the floor tolerance before it will
+speak, and says so otherwise:
+
+    P2 NOT APPLICABLE: the largest band recovery is +0.0000, inside the 0.015 floor
+    tolerance -- there is no recovery whose shape this could test
+
+and when it does hold it names the size and location of the largest recovery, which is what
+P2 actually claims, rather than reporting monotonicity alone.
+
+That is the sixth instance of this shape in two days and the second I introduced while
+fixing another one. The recurrence is not carelessness about any single line; it is that
+"the check passed" and "the check had nothing to check" are the same value in every
+language I am writing in, so the only reliable defence is constructing the input where the
+subject is absent and watching what the check says. Deployed to redwood; neither host
+analyses in-stage, so both pending runs get it.
