@@ -20559,3 +20559,18 @@ which is the strongest evidence available that the decomposition measures someth
 absorbing residual, and it is evidence this project cannot produce, because on a synchronous CPU
 call the same quantity is tens of nanoseconds and a cross-check for it recovers the machine's load
 instead.
+
+## chain140 -- the x86 suite baseline, which no previous number could be read against
+
+Job 17286215, on the unchanged tree, x86, after installing pytest into the venv (the previous
+attempt died on `REFUSE: no pytest in this env` and had never run):
+
+**1110 passed, 73 skipped, in 1:36:57.**
+
+The ARM run that has been quoted for two chains reads 1108 passed, 72 skipped. The two differ
+because the platforms skip different tests, which is exactly why a bare "N passed" from one tree
+means nothing: there was no number to compare it against, and had a candidate tree produced 1108 on
+x86 it would have looked like a match to the ARM figure while being two tests short of this host's
+baseline.
+
+Any suite run on a candidate tree is now read against **1110 / 73 on x86** and **1108 / 72 on ARM**.
