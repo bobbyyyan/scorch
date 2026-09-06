@@ -21013,3 +21013,42 @@ fixing another one. The recurrence is not carelessness about any single line; it
 language I am writing in, so the only reliable defence is constructing the input where the
 subject is absent and watching what the check says. Deployed to redwood; neither host
 analyses in-stage, so both pending runs get it.
+
+## chain148 -- a missing A/A floor silently became a hardcoded constant, in four analyzers
+
+The peer's phrasing for the `widen()` hole -- "a fix that is conditional on data being
+present is not the same fix as the one you tested" -- pointed at a class I had not swept:
+not a verdict that cannot tell a pass from an absence, but a *calibration* that quietly
+degrades when its input is missing.
+
+Every tolerance in these analyzers is derived from the same-binary A/A floor, in the form
+
+    tol = max(0.015, abs(1 - fl) * 2)
+
+and `max(0.015, nan)` returns `0.015`. Python's `max` keeps the first argument because
+`nan > 0.015` is False, so a group whose A/A floor is absent gets a hardcoded ratio
+constant with nothing on the line to say the calibration was gone. That is precisely what
+the house convention forbids: perf gates are calibrated against same-binary A/A noise-floor
+controls, never a fixed ratio constant. The violation was silent and it read as a normal
+verdict.
+
+Four sites, one per analyzer: `an_band2.py` (0.012), `an_heldout.py` (0.015), `an_unsw.py`
+P2 (0.015, which I had written as an explicit `else 0.015` an hour earlier), and
+`an_attrib.py` (0.010). The attrib one is the sharpest instance of the peer's point: it
+already guarded `math.isnan(cand)` and not `math.isnan(fl)`, so the nan check was there and
+covered the wrong operand.
+
+All four now call one helper returning `(tol, calibrated)`, and no caller may compare
+against the base when `calibrated` is False -- the band table refuses the row, the
+gate-firing check flags `NOFLOOR` and excludes the group from its count, P2 refuses to
+speak of "inside the floor tolerance", and the three-way verdict refuses to attribute.
+Re-ran all eight synthetic corpora built today; every verdict reads as before.
+
+**Absence is the input nobody builds.** Roughly half of the defects across these two days
+needed an input constructed by *removing* something rather than by breaking it -- the
+no-replicate corpus, the empty refused-cell population, the GCN group without the candidate
+series, a tarball cut before a constant existed, and now a group with no A/A arm. Breaking
+an input is the natural test to write; deleting one is not, and the checks that only fail
+on absence are therefore the ones that ship untested. Every fix today was verified by
+constructing the absent case, which is the only reason any of them are known to work rather
+than believed to.
