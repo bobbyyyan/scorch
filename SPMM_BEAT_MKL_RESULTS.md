@@ -20099,3 +20099,69 @@ no per-host constant to invent.
 
 **`29384fe` does not ship.** The commit stays on the branch as the measured candidate; the next
 work is the skew guard, not a wider grid.
+
+## chain132 -- the layout control lands, float64 clears, and a same-source build reads 1.2% slow
+
+Job 17282530 on MKT: `c0`, `c0b`, `c0pad`, `shipcand`, 42 matrices, three passes, both dtypes,
+3780 corpus rows and 216 GCN rows per build. `c0pad` is the layout-only control -- identical source
+and flags, built at a path one character longer, admitted only if `.text` is the same size with
+different bytes.
+
+### Gate row 3 clears
+
+float64 geomeans against `c0`, corpus:
+
+| width | `c0b` (object floor) | `c0pad` (layout floor) | `shipcand` |
+|---|---|---|---|
+| 1 | 0.9930 | 0.9976 | 0.9963 |
+| 2 | 0.9976 | 0.9995 | 0.9907 |
+| 3 | 0.9921 | 0.9975 | 0.9972 |
+| 4 | 0.9941 | 0.9932 | 0.9939 |
+| 8 | 0.9881 | 0.9952 | 0.9909 |
+
+`shipcand` is inside both floors at every width. x86 float64 is neutral, and the regression
+population that failed this row two chains ago was floor-level. **Row 3 passes.** That was the last
+unresolved row of the old gate; the gate is void anyway because the commit it gated does not ship,
+but the float64 question itself is closed and does not need re-asking.
+
+### How big a pure layout change is
+
+Per-cell absolute log ratio, float32, 210 cells:
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| layout only (`c0pad`) | 1.0114 | 1.0323 | 1.0766 | **1.1318** |
+| separate object, same path (`c0b`) | 1.0082 | 1.0252 | 1.0464 | 1.0595 |
+
+A build that differs in nothing but code placement moves one cell in ten by more than 3.2% and its
+worst cell by 13.2%. Placement is therefore a live explanation for redwood's width-1 deficit at the
+cell level, and the control has to run on redwood before that deficit is attributed to anything.
+
+### The finding that mattered more: the rotation was not balanced
+
+`c0pad`'s float32 geomeans are **0.9964 / 0.9892 / 0.9880 / 0.9884 / 0.9953** at widths 1 / 2 / 3 /
+4 / 8. That build's source is identical to `c0`'s. A pure placement difference should be
+sign-symmetric across a 42-matrix geomean, and this is one-sided at four of five widths.
+
+The cause is the lead-build advantage and an unbalanced rotation. The stage rotates which build
+runs first in each (pass, dtype) group, which cancels the advantage only if every build leads
+equally often. Four builds over three passes times two dtypes is six groups: `c0` and `c0b` lead
+twice, `c0pad` and `shipcand` lead once. Both once-leading arms read low. `c0b` at 0.9934-0.9984 is
+the same effect at half the size, which is what leading twice out of six instead of once predicts.
+
+This is the M5 defect again -- three builds over four groups left `c0` leading twice and made that
+run's float64 unreadable -- and it is worth about 1%, which is the size of the effects these stages
+have to resolve. It also means **`shipcand`'s float64 column above is biased low by roughly the same
+1%, so float64 clearing its floor is if anything understated.**
+
+Both band-2 stages were relaunched before measuring anything with the group count made a multiple
+of the build count -- four passes over two dtypes is eight groups over four builds, two leads each
+-- and both now refuse to run if that does not divide. A harness that silently biases its late arms
+is worse than one that stops.
+
+### Unrelated, and still open
+
+Job 17283539 (the full x86 suite with a pre-flip baseline arm) failed immediately: `REFUSE: no
+pytest in this env`. The MKT venv has no pytest, so the x86 suite has never been run on either the
+pre-flip or the flipped tree. The 1108-passing run is ARM, where the object is byte-identical, so it
+proves the source compiles and that no test pins the old constant values, and nothing more.
