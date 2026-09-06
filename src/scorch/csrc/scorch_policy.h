@@ -733,6 +733,47 @@
 #  define SCORCH_SPMM_MULTIROW_RAGGED 0
 #endif
 
+// The multi-row kernel's mean-degree window: admitted only when nnz/rows is at least MINDEG and
+// below MAXDEG. 0 disables each end independently, which is what ships, so a release object is
+// byte-unchanged until a measurement moves it.
+//
+// TWO BOUNDS, TWO MECHANISMS, AND THEY FIRE ON DIFFERENT HOSTS. The kernel wins by having ROWS
+// independent B loads in flight where the per-row kernel has one row's worth. That fails at both
+// ends of the degree range and the two x86 hosts lose on disjoint sets of matrices:
+//
+//   MINDEG -- below about four nonzeros a row a two-row group holds eight nonzeros in total and
+//   frequently contains an empty row, so the common prefix cannot cover the kernel's own prologue:
+//   2*NVEC accumulators zeroed, the minimum-length scan, two tail loops. MKT's width-2 losers are
+//   exactly this population and none of them is ragged -- com-Amazon at mean degree 0.2 (0.885),
+//   as-caida_G_084 at 3.1 (0.934), _G_083 at 3.1 (0.935), _G_073 at 3.0 (0.945), _G_038 at 2.8
+//   (0.945), relat8 at 3.9 (0.905, and it admits 1.000 of its nonzeros at every raggedness
+//   setting). A floor at 4 takes MKT's width-2 loser count from 7 to 1 and costs nothing anywhere:
+//   at width 3 the effective geomean is 1.1196 against 1.1198 for admitting everything.
+//
+//   MAXDEG -- a long row issues enough independent loads by itself, so the extra streams add
+//   nothing while their register pressure is paid per nonzero. redwood's losers are this
+//   population: connectus at mean degree 2202 (0.602), cari at 382 (0.850), body_decoder at 323
+//   (0.858), lp_osa_14 at 136 (0.852), bottleneck at 133 (0.895), the lhr family at 21 (0.82-0.85).
+//
+// The two bounds are NOT symmetric in how well they are established, and the difference matters:
+//
+//   The floor is supported by a mechanism, by six matrices on one host, and by being free on the
+//   other -- nothing between degree 0 and 4 wins at any width on either host.
+//
+//   The ceiling is not settled. Getting redwood to zero losers at width 2 needs it at 20 or below,
+//   and redwood's winners stop at mean degree 18.6 while its losers start at 21.3 -- the boundary
+//   sits in a gap, which is the best case for a cut chosen against the data that defines it, and
+//   still a cut chosen against that data. At widths 3 and 8 the same host wants it near 128, where
+//   it would be separating lp_osa_14 at 136 and bottleneck at 133 from everything below: two
+//   matrices deciding a constant. So MAXDEG exists to be measured out of sample, at each width,
+//   before any value of it ships. Do not read the numbers above as a chosen value.
+#ifndef SCORCH_SPMM_MULTIROW_MINDEG
+#  define SCORCH_SPMM_MULTIROW_MINDEG 0
+#endif
+#ifndef SCORCH_SPMM_MULTIROW_MAXDEG
+#  define SCORCH_SPMM_MULTIROW_MAXDEG 0
+#endif
+
 // The deep register-block kernel: the vector counts it serves, its depth, and its prefetch.
 //
 // It exists (spmm.h, guarded on AVX2+FMA) but has never been reachable outside a

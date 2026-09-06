@@ -4158,12 +4158,16 @@ torch::Tensor spmm_csr_v2_core(
   long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
   int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
   int multirow_ragged = SCORCH_SPMM_MULTIROW_RAGGED;
+  int multirow_mindeg = SCORCH_SPMM_MULTIROW_MINDEG;
+  int multirow_maxdeg = SCORCH_SPMM_MULTIROW_MAXDEG;
 #else
   constexpr int multirow = std::is_same<scalar_t, float>::value ? SCORCH_SPMM_MULTIROW_ROWS_F32
                                                                 : SCORCH_SPMM_MULTIROW_ROWS_F64;
   constexpr long multirow_minnnz = SCORCH_SPMM_MULTIROW_MINNNZ;
   constexpr int multirow_halfvec = SCORCH_SPMM_MULTIROW_HALFVEC;
   constexpr int multirow_ragged = SCORCH_SPMM_MULTIROW_RAGGED;
+  constexpr int multirow_mindeg = SCORCH_SPMM_MULTIROW_MINDEG;
+  constexpr int multirow_maxdeg = SCORCH_SPMM_MULTIROW_MAXDEG;
 #endif
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
@@ -4232,6 +4236,10 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 1) multirow_halfvec = (int)v; } }
   { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_RAGGED");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 64) multirow_ragged = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) multirow_mindeg = (int)v; } }
+  { const char* e = std::getenv("SCORCH_SPMM_MULTIROW_MAXDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) multirow_maxdeg = (int)v; } }
   // A/B hook: prefetch distance in NONZEROS for the narrow-k register kernel.
   // 0 (unset) keeps the shipped kernel and its next-but-one prefetch.
   int narrowk_pf = 0;
@@ -4304,6 +4312,13 @@ torch::Tensor spmm_csr_v2_core(
   const bool multirow_ok =
       multirow > 1 &&
       (multirow_minnnz <= 0 || nnz_total >= multirow_minnnz) &&
+      // The mean-degree window. Per call, so it costs one divide-free comparison against a
+      // product and folds away entirely when both ends are 0. See scorch_policy.h: the floor and
+      // the ceiling have different mechanisms and very different amounts of evidence.
+      (multirow_mindeg <= 0 ||
+       nnz_total >= (long)multirow_mindeg * (long)A0_size) &&
+      (multirow_maxdeg <= 0 ||
+       nnz_total < (long)multirow_maxdeg * (long)A0_size) &&
       narrow_k && !exact_width && !force_workspace &&
       !(narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) &&
       !(spmm_halfvec > 0 && !multirow_halfvec &&
