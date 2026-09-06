@@ -739,13 +739,35 @@
 //   The floor is supported by a mechanism, by six matrices on one host, and by being free on the
 //   other -- nothing between degree 0 and 4 wins at any width on either host.
 //
-//   The ceiling is not settled. Getting redwood to zero losers at width 2 needs it at 20 or below,
-//   and redwood's winners stop at mean degree 18.6 while its losers start at 21.3 -- the boundary
-//   sits in a gap, which is the best case for a cut chosen against the data that defines it, and
-//   still a cut chosen against that data. At widths 3 and 8 the same host wants it near 128, where
-//   it would be separating lp_osa_14 at 136 and bottleneck at 133 from everything below: two
-//   matrices deciding a constant. So MAXDEG exists to be measured out of sample, at each width,
-//   before any value of it ships. Do not read the numbers above as a chosen value.
+//   The ceiling is HOST-CONDITIONAL and therefore stays 0. A cost model in mean degree -- per-row
+//   cost P/deg plus per-nonzero cost W, fitted to ns-per-nonzero against 1/deg, weighted by
+//   nonzeros because the variance of ns-per-nonzero is far larger on a short kernel -- says
+//   multi-row costs redwood +0.0049 ns a nonzero and saves it 0.08 ns a row, which crosses at mean
+//   degree 16.7. That estimate is stable on that host: 18.1, 18.1, 16.7 and 18.7 as the residual
+//   trim goes 1.0, 0.9, 0.8, 0.7, and a 200-sample bootstrap over matrices implies a crossover in
+//   173 of them with median 17.6 (p10 13.5, p90 47.9). It also lands on the gap in the measured
+//   data, where the winners stop at 18.6 and the losers start at 21.3.
+//
+//   On MKT the same fit implies NO crossing under any weighting or trim -- multi-row is 0.0086 ns a
+//   nonzero CHEAPER there -- and the bootstrap implies one in 12 of 200 resamples. That is not a
+//   weaker version of redwood's answer, it is the opposite answer, and it matches the measured
+//   populations: MKT's losers are all at the low-degree end and it has 12 winners above degree 20 at
+//   width 3 that a ceiling would give away.
+//
+//   So a compiled-in ceiling would be right on one x86 host and a pure give-away on the other. This
+//   is the same conclusion SCORCH_NARROWK_EXACT_MINDEG reached about its own value a few hundred
+//   lines above -- "host-conditional, so a value chosen on one host must not be compiled in for
+//   both" -- and it gets the same answer: the constant stays 0 and exists so a compiled-in A/B can
+//   measure it. Without weighting by nonzeros the same fit swings between no crossing and 7.6, so
+//   the estimate is weighting-dependent and the weighting is justified as inverse-variance rather
+//   than by the answer it gives.
+//
+//   The withdrawal of this model two chains ago was wrong, and specifically it was wrong about the
+//   estimator rather than the model. That fit was unweighted and it was fitted across TWO kernel
+//   swaps at once -- the band replaces the exact-width kernel with the general path, and multi-row
+//   then replaces that -- with a model that has terms for one. It returned a per-row saving of
+//   -0.00 ns and no implied crossing. Weighted, the same two-swap difference is the one that
+//   predicts the boundary, because at width 2 both swaps are what actually happens.
 #ifndef SCORCH_SPMM_MULTIROW_MINDEG
 #  define SCORCH_SPMM_MULTIROW_MINDEG 0
 #endif
