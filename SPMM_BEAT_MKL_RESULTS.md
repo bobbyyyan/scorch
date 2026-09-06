@@ -20165,3 +20165,73 @@ Job 17283539 (the full x86 suite with a pre-flip baseline arm) failed immediatel
 pytest in this env`. The MKT venv has no pytest, so the x86 suite has never been run on either the
 pre-flip or the flipped tree. The 1108-passing run is ARM, where the object is byte-identical, so it
 proves the source compiles and that no test pins the old constant values, and nothing more.
+
+## chain133 -- the mechanism is memory-level parallelism, and a .text digest is the wrong instrument
+
+### What the multi-row kernel actually buys
+
+The kernel's own comment says it, and it is not what chain131 guessed:
+
+> ROWS accumulators, ROWS gather streams, one iteration issuing ROWS independent B loads that
+> share no dependency. ... Rows of unequal length are handled by running the common prefix --
+> min(len) iterations with every stream live and no branch in the loop -- and then finishing each
+> row's tail serially. ... On a power-law matrix [the tails] are not [nearly empty], and the kernel
+> degrades toward the per-row one; that is a property to measure per family, not to hide.
+
+Memory-level parallelism, to cover an L3 hit that a short row cannot supply enough independent
+loads to hide. That explains all three signs at once:
+
+- **wins on short uniform rows** -- one row cannot issue two independent B loads, two rows can;
+- **loses on ragged rows** -- the common prefix is short, so most nonzeros go through the serial
+  tails, which have ROWS accumulators of register pressure and one stream of parallelism;
+- **loses per NONZERO rather than per row** -- which is what the tails predict, and what the
+  measurement showed: 0.01-0.04 ns/nonzero, with `connectus` losing 49 microseconds across 512
+  rows, an amount no per-row cost can pay for.
+
+An amortisation model was fitted first and refuted by its own numbers: it put multi-row's per-row
+saving at -0.00 ns and predicted 0.982 at degree 8-16 where 1.068 was measured. Mean degree does
+separate the two populations in the data -- 0 losers of 46 between 8 and 16, 7 of 12 above 128 --
+but it is a correlate, not the mechanism, and a bound justified by a refuted model is a tuned
+constant wearing a derivation.
+
+`SCORCH_SPMM_MULTIROW_RAGGED` is therefore per-GROUP, not per-call: the largest ratio of a group's
+nonzeros to its common-prefix nonzeros that still admits the group. For two rows, `RAGGED=2` admits
+a pair whose longer row is at most three times the shorter; `RAGGED=1` admits only equal rows;
+`RAGGED=4` admits up to seven times. It costs one extra `A1_pos` load inside a test that already
+reads that array either side of it, and it sits behind `multirow_ok`, so a width where the kernel
+declines pays nothing. **It defaults to 0, which is off.**
+
+### The neutrality instrument had to be replaced first
+
+Proving the patch emits nothing new looked routine and was not. Two builds of the patched and
+unpatched trees, same flags, paths of equal length: **same `.text` size (652264), no section
+differing in size at all, and different bytes.** A digest check calls that a regression.
+
+The disassembly says what actually happened. Of 164596 instructions, **20 differ, all of them
+`mov w2, #imm`, every delta exactly +29** -- and the patch adds 30 lines to `scorch_policy.h`.
+They are `__LINE__` values that assertion macros in `spmm.h` pass as an immediate, shifted because
+the header above them grew. Nothing else moved.
+
+So a `.text` digest cannot answer "does this change what we emit" for any change that adds lines to
+a header. Every neutrality claim in this file rests on digests; none of them is wrong, because none
+of them added header lines, but the instrument has been lucky rather than sound.
+
+`scratchpad/neutral_disasm.sh` replaces it: diff the disassembly, and require every difference to be
+a bare immediate move. It carries both controls, because a detector with only one is not tested --
+
+| control | expectation | result |
+|---|---|---|
+| same commit, two directories, equal path length | neutral | `NEUTRAL: 164596 instructions, identical disassembly` |
+| the patch, ARM | neutral but for line numbers | `NEUTRAL: every difference is a bare immediate move` |
+| `-DSCORCH_NARROWK_EXACT_HI_F32=1`, which is ARM-live | caught | `NOT NEUTRAL: instruction counts differ, 164595 -> 164596` |
+
+Two traps inside building those controls, both already on the books and both hit again anyway.
+`sed -E` on macOS has no `\b`, so a first attempt's "masked" comparison masked nothing and silently
+compared raw text; and `objdump`'s trailing `; =6487` comment had to be stripped or every line
+number reads as an unrecognised instruction. The equal-path-length requirement is the third: a
+directory one character longer shifts rodata and changes `.text` bytes without changing its size,
+which is the same failure mode from a different cause.
+
+The x86 disassembly check has not run -- both x86 hosts are timing -- so on x86 the patch is
+"expected neutral because the term is `constexpr 0`", which is an argument and not a measurement.
+It runs when a host is free.
