@@ -21145,3 +21145,25 @@ above comes from, plus the refusal path:
 
 Archive refreshed at `~/.cache/scorch-codex/spmm-beat-mkl/harnesses/`, 79 files verifying
 against `SHA256SUMS`.
+
+**The constructed absences are now fixtures rather than things I thought of once.** All
+twelve are archived under `.../spmm-beat-mkl/fixtures/` with a README mapping each to the
+verdict it must produce, and each one is built by REMOVING something rather than by
+perturbing a value:
+
+    b2data     corpus rows for all four builds, no gcn group     -> guardrail must refuse
+    shipdata   gcn cells present, candidate series absent        -> guardrail must refuse
+    ho_nofire  every matrix degree >= 4, so MINDEG refuses none  -> gate check must not pass
+    ho_arm     one arm dropped at only the widths a section reads -> that section must refuse
+    at3        3 cells, below the 5-pair minimum                 -> NOT RESOLVABLE
+    at9nr      the same-code replicate removed                   -> verdict carries NO REPLICATE
+    u_bad      the tax hypothesis false                          -> P1 fails, P2 not applicable
+    u_broken   5% of readings nan                                -> the run refuses
+
+Verified by running the archived analyzers against the archived fixtures, from the archive:
+nine pairs, nine expected verdicts, all reproduced. 102 files verify against `SHA256SUMS`.
+
+That matters because the natural way to generate a test input is to perturb a value, not to
+delete a column -- so the inputs that catch this whole class are the ones neither a reviewer
+nor a fuzzer produces. Keeping them as fixtures is the only way the next edit gets checked
+against them.
