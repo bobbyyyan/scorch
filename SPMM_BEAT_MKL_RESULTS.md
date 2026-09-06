@@ -21539,3 +21539,68 @@ if that is empty. The completion marker still said `MKT_UNSW_DONE`, which is the
 poller greps for.
 
 Submitted as MKT 17295447. Tarball sha256 `88cb4b24...803d7c` identical local and staged.
+
+## chain156 -- the hoist is rejected, and it falsifies chain151's mechanism
+
+MKT 17295447 finished at 11:04:47. Four builds at `corpus 5040 gcn 288` each, same shape as
+17287573, so the two are directly comparable. `bandmr_time / candidate_time`, above 1 meaning
+the candidate is faster, per matrix rather than per geomean:
+
+    deg < 20, float32      hoist                      unsw (chain151)
+      k=1                  faster  1/26 median 0.9103 | faster 22/26 median 1.0188
+      k=4                  faster  0/26 median 0.9492 | faster 25/26 median 1.0207
+    deg >= 20, float32
+      k=1                  faster  1/16 median 0.9877 | faster  3/16 median 0.9874
+      k=8                  faster  3/16 median 0.9893 | faster  1/16 median 0.9766
+
+**All four predictions failed.** P1: hoist does not reproduce the gain at the non-firing widths
+-- it is 9.0% and 5.1% SLOWER, faster on 1 of 26 and 0 of 26 matrices, against A/A floors of
+about 0.7%, so 7 to 13 times the floor and unanimous. P4: it is worse than bandmr there, which is
+the same finding stated as a comparison. P3: at the firing widths it is 1.5-1.7% behind bandmr in
+the 4-20 band. P2: it is not neutral at degree >= 20 either -- 0.7-1.3% slower, faster on 1 to 6
+of 16 -- though it is consistently LESS bad there than unsw (0.9893 against 0.9766 at k=8).
+
+**P2 was the prediction carrying the discrimination and it fired in the falsifying direction.**
+The claim it tested was chain151's account of why unsw gained: that the guarded block's store to
+`C_values`, which the compiler cannot prove does not alias `A1_pos`, forced a per-row reload of
+`A1_pos[i]` and `A1_pos[i+1]`. If that were the mechanism, keeping those two values in registers
+would reproduce the gain. It does the opposite, by 5 to 9 percent, on essentially every matrix.
+
+So the reload was not the mechanism. The likely reason it was never a reload: at the non-firing
+widths `multirow_ok` is a runtime false, and it is the FIRST term of the guard, so `&&`
+short-circuits before `A1_pos` is read at all. There was no reload to remove. What the hoist adds
+instead is two unconditional loads and a live boolean in the hot loop on every row, which
+lengthens live ranges and costs most where rows are short -- which is exactly the shape of the
+damage, worst at low and mid degree.
+
+That leaves what unsw actually did as something coarser: removing the branch and its block from
+the instantiation changes the scheduling and register allocation of the whole row loop. That is a
+real effect -- 22 of 26 and 25 of 26 matrices measured it -- but it is not a specific cost that
+can be paid for separately, which is why the cheap version of it does not exist. The 1-2.3%
+high-degree penalty was the price of the second instantiation, and hoist being less bad than unsw
+at high degree while duplicating nothing is consistent with that half of the story surviving.
+
+**Verdict: hoist does not ship.** Reported as a finding rather than tuned around; the constant
+stays at 0, where it is emission-neutral. Combined with chain151 and chain154, three consecutive
+attempts on the width-1 and width-4 deficit are now rejected: unswitching (net regression), the
+degree window and the raggedness window (both worse than no window at all out of sample), and now
+the hoist (regression, and it refutes the mechanism).
+
+**What is actually established about that deficit, stated without the refuted part.** It is real
+and it survives a held-out corpus: `bandmr` reads 0.9965 with 4 losers of 40 at width 1 and 0.9503
+with 2 of 40 at width 4 on matrices that had no part in any derivation. It is float32-specific and
+concentrated below mean degree 20. Removing the multi-row admission code from the instantiation
+cures it and costs more elsewhere than it saves. Its microarchitectural cause is now unknown --
+the reload explanation is dead, and no measurement has replaced it.
+
+One host. The unsw and hoist arms are both queued on redwood behind band2, and the two results
+that matter most for a second host are now unsw's high-degree penalty and hoist's low-degree
+regression, since those are what the ARM instruction stream could plausibly change.
+
+**One defect in the analyzer, fixed before reading the numbers.** `an_unsw.py` hardcoded `"unsw"`
+as the candidate build, so it was parameterised to detect whichever build is not one of the three
+controls -- and to refuse when there is not exactly one, since with none there is nothing to test
+and with several the verdicts would silently describe only the first. Five verdict strings still
+named `unsw` in their message text after that, so the first hoist run printed "P1 FAILED: unsw
+0.9668" for the hoist build. A label that names the wrong build is the same defect the copied
+sbatch had an hour earlier, and it would have gone into this section verbatim.
