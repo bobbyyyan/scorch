@@ -20329,3 +20329,61 @@ So `MULTIROW_MAXDEG` remains a boundary chosen against the data that defines it,
 between 18.6 and 21.3, and the held-out run is its arbiter. `MULTIROW_MINDEG` is in a different
 position: a mechanism (a two-row group at degree under four holds eight nonzeros and often an empty
 row, so the prefix cannot cover the prologue), six matrices on one host, and free on the other.
+
+## chain136 -- the withdrawal was wrong, and the ceiling is host-conditional
+
+Chain 133 withdrew the cost model in mean degree on the strength of a fit that returned a per-row
+saving of -0.00 ns. **The model was fine; the fit was not**, in two specific ways.
+
+It was fitted across **two kernel swaps at once**. At float32 width 2, going from the shipped
+default to the candidate replaces the exact-width kernel with the general path (the band) and then
+replaces that with the multi-row kernel. A model with one per-row term and one per-nonzero term has
+terms for one swap. And it was **unweighted**, so a 1M-nonzero matrix whose ns-per-nonzero is
+inherently noisier counted the same as a 2.7M-nonzero one.
+
+Weighted by nonzeros -- justified as inverse-variance, since the variance of ns-per-nonzero is far
+larger on a short kernel, not by the answer it produces -- the two-swap difference is exactly the
+one that predicts the boundary:
+
+| host | multi-row's row cost | its nonzero cost | implied crossover |
+|---|---|---|---|
+| redwood | **-0.08 ns** (a saving) | **+0.0049 ns** | **mean degree 16.7** |
+| MKT | +0.02 ns | **-0.0086 ns** (cheaper) | none implied |
+
+redwood's estimate is stable: 18.1, 18.1, 16.7, 18.7 as the residual trim goes 1.0, 0.9, 0.8, 0.7,
+and a 200-sample bootstrap over matrices implies a crossover in 173 of them, median 17.6, p10 13.5,
+p90 47.9. It lands on the gap in the measured data, whose winners stop at 18.6 and whose losers
+start at 21.3.
+
+Two honest qualifications. Without the nonzero weighting the same fit swings between "none implied"
+and 7.6, so the estimate is weighting-dependent -- the weighting has an independent justification,
+but a reader should know the number moves without it. And a bootstrap p90 of 47.9 is a wide upper
+tail: the crossover exists on that host, its location is known to within roughly a factor of two.
+
+### The consequence, which is not the one I was heading for
+
+**MKT implies no crossing under any weighting or trim** -- multi-row is 0.0086 ns a nonzero
+*cheaper* there -- and its bootstrap implies one in 12 of 200 resamples. That is the opposite
+answer, not a smaller version of the same one, and it agrees with the measured populations: MKT
+loses only at the low-degree end, and it has 12 winners above degree 20 at width 3 that a ceiling
+would throw away.
+
+So a compiled-in `MULTIROW_MAXDEG` would be right on one x86 host and a pure give-away on the
+other. `SCORCH_NARROWK_EXACT_MINDEG` reached this conclusion about its own value already -- "the
+plausible reason the hosts disagree is what the kernel displaces ... either way the constant stays 0
+and this is host-conditional, so a value chosen on one host must not be compiled in for both" -- and
+this gets the same answer. **`MULTIROW_MAXDEG` stays 0.** It exists so a compiled-in A/B can measure
+it, not as a value to ship.
+
+`MULTIROW_MINDEG` is in the opposite position and is the shippable half: it takes MKT's width-2
+loser count from 7 to 1, and on redwood the degree band it refuses reads 0.9742 rather than winning,
+so refusing it is a small gain there too. Neutral-or-better on both hosts, with a mechanism.
+
+That also sharpens what the held-out run tests. `md20` should now show a **predicted host
+asymmetry**: zero losers and a gain at redwood's width 2, and a give-away at MKT's widths 3 and 8.
+An arm that behaves the same on both hosts would refute the fit above.
+
+Note on the tarball: this chain changed only a comment, which shifts `__LINE__` and nothing else.
+The staged `scorch_mr7.tgz` was deliberately **not** re-cut, because swapping a tarball under queued
+stages makes their results unattributable for no gain. Its constants and defaults are what the
+stages check for.
