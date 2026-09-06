@@ -20574,3 +20574,53 @@ x86 it would have looked like a match to the ARM figure while being two tests sh
 baseline.
 
 Any suite run on a candidate tree is now read against **1110 / 73 on x86** and **1108 / 72 on ARM**.
+
+## chain141 -- a hard boundary on a point estimate, found in code written the same day
+
+The attribution analyzer's verdict took a median distortion over cells and applied a hard 1%
+boundary to it. That is the defect this file has been documenting all day -- a derived criterion
+standing on a measurement, with no width -- and it was sitting in code written while the chain about
+it was being written.
+
+It now bootstraps the median over cells and reads the boundary against the interval:
+
+- **DISPATCH** when the interval on the kernel-time ratio contains 1.0 and the distortion's does not;
+- **KERNEL** for the reverse;
+- **MARGINAL** when neither interval excludes 1.0 and at least one is wider than the boundary;
+- and the same-code replicate's own spread prints beside all of it, as the floor the comparison can
+  possibly resolve.
+
+The flipping is not removed -- no threshold on a measured quantity can be flip-free -- it is moved
+into the reported number instead of hidden in the verdict. A verdict that lands differently on
+different days was always reporting an interval; it just was not printing one.
+
+Better where it is available, and not available here: the arm and its replicate are two measurements
+of each side's median, so the uncertainty on the distortion propagates in closed form without
+resampling. This harness has the replicate at the first level only, so it yields a floor rather than
+a full propagation, and a bootstrap over cells is what the data supports. Same intent, weaker
+instrument, and worth recording which is which.
+
+### A withdrawal
+
+I told the peer session that their plateau -- four decades of stored entries with the median flat --
+was checkable from the levels they already have. **It is not, and I withdraw it.** One attempt's `o`
+and `t` cannot see that `t` failed to grow, because a single sample has nothing to compare against;
+forty-seven microseconds of dispatch and forty-seven of kernel are indistinguishable from inside one
+measurement. It is a cross-case property over `t` against work and it needs a pass across the suite.
+The consequence I named was right -- a plateau pulls the scored population toward 1.0 and dilutes
+the statistic the bound is applied to -- but "checkable from data in hand" was doing real work in
+that sentence and it was false.
+
+### Thresholds, counted
+
+Four hard criteria have failed on contact in this project so far, and every one of them stood on a
+measurement that was fine:
+
+1. a crossing count, blind inside its own step, which hid an 18% regression and reported a pass;
+2. a cell-population statistic that swung 45 points between two runs of the same object;
+3. a degree ceiling that wants opposite signs on two hosts of the same ISA;
+4. a curvature tolerance normalised by `t`, which flags a cell for being charged rather than for
+   being non-additive.
+
+The pattern is not that thresholds are wrong. It is that a threshold is a claim about a distribution
+and gets recorded as a claim about a number.
