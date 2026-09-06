@@ -21475,3 +21475,67 @@ Note the width-4 floor: 0.9608, a 3.9% same-code spread, giving a 7.8% tolerance
 weakly resolved on this corpus and its numbers should not be leaned on.
 
 One host. Redwood's heldout is chain10, still behind chain4, chain5 and chain9.
+
+## chain155 -- the other half of the unswitch result, and four defects in verifying it
+
+chain151 left one experiment implied rather than invented. The unswitch gained ~2% at the widths
+the multi-row kernel declines by removing a per-row reload of `A1_pos[i]` and `A1_pos[i+1]` --
+the guarded block stores to `C_values` and the compiler cannot prove that store does not alias
+`A1_pos` -- and it paid for that by instantiating the whole worker body twice, which cost 1-2.3%
+at mean degree >= 20 at every width on both dtypes. The gain and the cost come from different
+halves of one change, so `SCORCH_SPMM_MULTIROW_HOIST` takes the first without the second: read
+the row's own bounds ONCE, before the guarded block, and keep them in registers.
+
+Committed as `b9e7910`, default 0, with its predictions in the constant's comment. **P2 is the
+one carrying the discrimination**: if degree >= 20 is neutral here then the duplicated
+instantiation really was the high-degree cost, and if it is not then chain151's explanation for
+why unsw failed was wrong. P1 alone would only say the fix works.
+
+**Emission-neutral at the default, proven and reconciled.** 185452 instructions on both sides,
+20 differing lines, every one a bare immediate move into `w2`, single delta +27, and exactly 27
+lines were added to `spmm.h`. So `__LINE__` shifted and nothing else -- no instruction added,
+removed or reordered. Compiles clean at HOIST 0 and 1, with and without
+`SCORCH_SPMM_SPLIT`, and introduces no new diagnostic. The `A1_pos[i + 1]` read stays behind the
+region test, because under `REDIRECT` the claim index runs past the row region where `A1_pos` is
+not indexed by it -- the same ordering hazard the multi-row guard's own comment records getting
+wrong once.
+
+**Four defects in my own verification of it, all caught, all the same shape as the rest of the
+session.**
+
+*The hoist landed 400 lines from where it belonged.* `s.index()` found the first of eighteen
+occurrences of `#if defined(__AVX2__) && defined(__FMA__)` in the file, not the one inside the
+row loop. Redone as a line-number insertion with three context assertions -- the row loop above
+it and the `#endif` before it -- because the file also has a SECOND row loop at 6098 with its own
+AVX2 block, and that one must not be touched.
+
+*The compile check compiled `/dev/null`.* `-fsyntax-only ... -x c++ /dev/null` returns 0 for any
+value of any constant. It reported "driver ok" twice for a tree whose hoist was in the wrong
+scope. Same class as py_compile standing in for a run, one layer down: a check that cannot fail.
+
+*The neutrality check compared two empty files and printed NEUTRAL.* `-S -o -` inside a flag
+variable produced nothing, stderr went to /dev/null, and the diff of two zero-line files is
+empty. I caught it only because I had printed the line counts. It now refuses under 1000
+instructions per side, which is the rule `neutral_disasm.sh` already carried and this ad-hoc
+check did not.
+
+*`sed 's/[[:space:]]\+/ /g'` silently did nothing,* because BSD sed has no `\+`. The whitespace
+was never collapsed, so the pattern matching "bare immediate move" matched none of the 20 lines
+and declared them NOT NEUTRAL. Same family as the `\b` trap already recorded: a GNU regex
+extension failing open on macOS.
+
+**And a fifth, in the guard itself.** `preflip_check.sh --require SCORCH_SPMM_MULTIROW_HOIST`
+returned OK on a tarball, and the require did nothing at all -- HOIST was not in the table of
+shipped defaults, so the name silently matched no check. A `--require` that cannot be honoured now
+refuses, because the caller believes a check ran that never did. Verified: a bogus name refuses,
+mr9 passes with 9 constants, and mr7 -- which predates both HOIST and UNSWITCH -- still passes with
+7 and both absences listed as unarmed.
+
+**Two stale references in the copied sbatch, one of which would have lied about the cause.** The
+correctness loop still read `for B in bandmr unsw`, so it would have tried `$R/unsw/src`, failed
+to import, and refused with "unsw disagrees with a dense reference" -- blaming correctness for a
+stale build name. It now derives the candidate list from `BUILDS` minus the controls and refuses
+if that is empty. The completion marker still said `MKT_UNSW_DONE`, which is the string the
+poller greps for.
+
+Submitted as MKT 17295447. Tarball sha256 `88cb4b24...803d7c` identical local and staged.
