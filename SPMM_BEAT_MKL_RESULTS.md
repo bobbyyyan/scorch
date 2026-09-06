@@ -20522,3 +20522,40 @@ contains every chain name, so three chains were left waiting on the launcher and
 simultaneously -- the interlock would have let one run and refused the other two, losing two stages
 silently. Each chain now publishes its own pid to a file and the launcher reads that. And the MKT
 job's staging target was again the inherited `halfvec_mkt.tgz`; this one writes `unsw_mkt.tgz`.
+
+## chain139 -- the curvature check's denominator is not a choice
+
+The work-scaling estimator's falsification test was normalised by `t`. It should be normalised by the
+median, and not because the median is the better of two arbitrary options -- because it is the only
+one that makes the check equal its own statement.
+
+The model puts `m2` at `(m1 + m3)/2`. So "does m2 sit where the model puts it, as a fraction of the
+measurement" is `(m2 - (m1+m3)/2)/m1`, which is exactly `-curvature/(2*m1)`. Dividing by `t` is a
+different rescaling whose only property is that it inflates on cells with a large offset, which is
+the class of cell the check exists to *keep*.
+
+It produced a false positive in the smoke data:
+
+| matrix | width | o/t | curv/t | curv/median | m2/m1 measured | model predicts | truth |
+|---|---|---|---|---|---|---|---|
+| mid_d40 | 8 | 1.33 | -0.214 | -0.092 | 1.476 | 1.430 | additive; `/t` flagged it |
+| small_d9 | 8 | 4.80 | -2.014 | -0.347 | 1.346 | 1.173 | not additive; both catch it |
+
+Tolerance is now **0.20 of the median, and recorded as picked**: over the six smoke cells the
+additive ones reach 0.107 and the one real violation reads 0.347, so it separates them with margin
+on both sides and it is calibrated on six cells rather than derived. The null is exactly zero; the
+tolerance around the null never is, and writing "0.20, picked, separation 0.107 against 0.347" is
+the whole of what a reader needs to decide whether to inherit it.
+
+`wsprobe.py` now also prints, once per run before any cell is timed, the per-call time at
+N = 1, 2, 3, 6, 12 identical calls, and names its own conclusion: on this path it reads
+"flat or rising: each call pays its own fixed cost, so the work per call must change." That is the
+premise the whole estimator rests on, it costs about a second, and it was previously an argument in
+a comment rather than a line in the log.
+
+Both corrections came from the peer session running the same instrument on a GPU, where its fixed
+cost holds at 42.0-45.9 microseconds across fourteen cases whose medians span a factor of 440 --
+which is the strongest evidence available that the decomposition measures something rather than
+absorbing residual, and it is evidence this project cannot produce, because on a synchronous CPU
+call the same quantity is tens of nanoseconds and a cross-check for it recovers the machine's load
+instead.
