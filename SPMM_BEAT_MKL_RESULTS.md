@@ -19981,3 +19981,121 @@ The x86 object is 23072 bytes larger, which is the multi-row kernel being instan
 
 Eight pass, one unresolved, one pending. **This commit is not to be pushed until row 7 lands.** The
 x86 evidence is currently one host, and the standing rule in this file is two.
+
+## chain131 -- row 7 fails, and the cell-count scoreboard is why I did not see it on the first host
+
+Redwood ran the same five nested arms over its own 60-matrix unselected corpus, three interleaved
+passes, 5490 corpus rows and 216 GCN rows per build, five distinct `.text` digests
+(`c0`/`c0b` `6f5206e9f675fb42`, `bandf32` `d5443f9593c02bce`, `bandmr` `3ab954933d75f3e2`,
+`shipcand` `141d60f1790f8fa1`), 120 correctness cases per arm with zero mismatches.
+
+**The verdict is no flip.** Not because the second host disagreed in size, which the registered rule
+allows, but because there is a regression population at width 2 that **both** hosts show, and the
+statistic I shipped the first host's verdict on could not see it.
+
+### The win is real and large
+
+float32 corpus, `bandmr` against `c0`, cells more than 5% apart with the same-code floor at least
+half that far:
+
+| host | width 1 | width 2 | width 3 | width 4 | width 8 |
+|---|---|---|---|---|---|
+| redwood, faster | 0 of 60 | 20 | 43 | 1 | 43 |
+| redwood, slower | 7 | 10 | 2 | 5 | 2 |
+| MKT, faster | 0 of 42 | 22 | 31 | 0 | 32 |
+| MKT, slower | 0 | 7 | 1 | 0 | 0 |
+
+Target-group geomeans, `bandmr`/`c0`, with the same-code floor beside each:
+
+| width | redwood | rw floor | MKT | MKT floor |
+|---|---|---|---|---|
+| 1 | 0.9739 | 0.9991 | 1.0111 | 0.9945 |
+| 2 | 1.0215 | 0.9978 | 1.0608 | 1.0134 |
+| 3 | 1.1585 | 0.9970 | 1.2729 | 1.0121 |
+| 4 | 0.9881 | 1.0027 | 1.0016 | 1.0112 |
+| 8 | 1.2657 | 1.0098 | 1.3542 | 1.0062 |
+
+Widths 3 and 8 confirm on the second host with the same sign and a smaller size -- +15.9% and
++26.6% against +27.3% and +35.4%. That is the expected case and it is not the problem.
+
+### The regression: extreme row skew at width 2, on both hosts
+
+| matrix | host | width | c0 (ms) | bandmr (ms) | ratio | same-code floor |
+|---|---|---|---|---|---|---|
+| connectus | redwood | 2 | 0.0738 | 0.1225 | **0.602** | 1.080 |
+| connectus | MKT | 2 | 0.1460 | 0.1788 | **0.817** | 0.983 |
+| connectus | redwood | 3 | 0.0918 | 0.1246 | 0.737 | 0.912 |
+| lp_osa_14 | redwood | 2 | 0.0324 | 0.0381 | 0.852 | 0.956 |
+| lp_osa_14 | redwood | 8 | -- | -- | 0.843 | 0.952 |
+| cari | redwood | 2 | 0.0185 | 0.0218 | 0.850 | 0.971 |
+| lhr34c / lhr71 / lhr71c | redwood | 2 | -- | -- | 0.820 / 0.834 / 0.845 | 0.994 / 1.001 / 1.003 |
+| com-Amazon / relat8 / as-caida_G_08x | MKT | 2 | -- | -- | 0.885 / 0.905 / 0.934 | 1.024 / 1.006 / 1.003 |
+
+The population is coherent: `connectus` and `lp_osa_14` are two of the three matrices in the
+whole-row balance ceiling, `lhr*` is an irregular chemical-process family, `as-caida` and
+`com-Amazon` are power-law. All of them have a degree distribution with a long tail.
+
+The multi-row group is admitted per row by
+`A1_pos[i + multirow] > A1_pos[i] && (... A1_pos[i+multirow] - A1_pos[i] <= sp_wide_deg)`,
+a data-dependent test whose outcome on a long-tailed degree distribution alternates
+unpredictably from row to row. The kernel it guards is not the cost; the branch is the hypothesis,
+and it is testable.
+
+### Why the first host reported a pass
+
+The scoreboard is below-MKL cell counts, because the goal is a cell count. `connectus` at width 2
+was **already** below MKL on MKT before the flip. Making it 18% slower moved no cell, so a
+two-host regression sat inside a column that read "width 2 unchanged at 35 of 42".
+
+**A cell already below MKL can be made arbitrarily worse without changing the cell count.** Any
+scoreboard that counts crossings is blind in exactly the cells it has already given up on, which
+are the cells the work is aimed at. Every verdict in this file that rests on a crossing count needs
+the >5%-slower-than-its-own-floor scan beside it, and from here on that scan runs on every arm.
+
+On redwood, where the corpus is unselected and almost nothing is below MKL to begin with, the same
+four matrices show up as crossings -- 0 of 61 to 4 of 61 at width 2 -- which is the same fact
+arriving through the statistic that can see it.
+
+### The other open item: widths 1 and 4 on redwood only
+
+redwood reads 0.9739 at width 1 (7 cells past their floor, 28 of 61 below 0.97) and 0.9881 at
+width 4, against a floor of 0.9991 and 1.0027. MKT reads 1.0111 and 1.0016. Opposite signs.
+
+**Multi-row provably cannot execute at either width for float32.** `multirow_ok` requires
+`!exact_width`, and width 1 is exact under `SCORCH_NARROWK_EXACT_HI_F32=1`; it also refuses
+`B1_size == scorch_simd_half<float>::lanes`, which is width 4. So whatever costs redwood 2.6% at
+width 1 is not the kernel this constant selects -- it is the object around it. The x86 `.text` is
+23072 bytes larger, and the candidate explanation is code placement.
+
+That hypothesis has a control already built and never yet run on this host: `c0pad`, identical
+source and flags at a build path one character longer, verified by requiring an equal `.text` size
+with a different digest. The `c0`/`c0b` floor cannot see a placement effect, because both are built
+at the same path -- it measures the cost of being a separate object, not the cost of being a
+differently-placed one. That is the next measurement, and until it runs widths 1 and 4 are
+unattributed rather than either a pass or a fail.
+
+A second instrument belongs here, from a peer session with the measurement to back it: an A/A
+replicate cannot detect a **shared** additive per-call cost, because the offset cancels and the
+replicate reads 1.000 regardless. If the two objects differ in fixed per-call cost rather than in
+per-nonzero cost, the width-1 deficit is a dispatch cost and not a kernel cost, and nothing in the
+current arm structure distinguishes them. The discriminator is a work-scaling arm: run the same
+call on a vertically stacked copy of the matrix, exactly twice the nonzeros and rows at the same
+width, so `m1 = o + t` and `m2 = o + 2t` give `o/t = (2*m1 - m2)/(m2 - m1)` per arm per cell, with
+no per-host constant to invent.
+
+### Gate status
+
+| # | requirement | status |
+|---|---|---|
+| 1 | x86 float32: no regression population beyond the control | **FAIL** -- 7 cells on MKT and 10 on redwood at width 2, led by `connectus` at 0.602 / 0.817 |
+| 2 | x86 float32: the win present, clearing its floor severalfold | PASS on both hosts, widths 2 / 3 / 8 |
+| 3 | x86 float64: no regression population | UNRESOLVED |
+| 4-5 | ARM, both dtypes | PASS by construction (byte-identical object) |
+| 6 | GCN guardrail neutral-or-better | PASS on MKT (24 of 24 at or above 1.0); on redwood one 13-microsecond cell (`cora` width 3) is unresolvable at three passes and is not read either way |
+| 7 | second x86 host agrees in sign | **FAIL at widths 1 and 4** (0.9739 / 0.9881 against 1.0111 / 1.0016), sign-confirmed at 2 / 3 / 8 |
+| 8 | every shipped constant measured alone | PASS |
+| 9 | flipped defaults produce the measured object | PASS on both ISAs |
+| 10 | unmeasured regions named and provably inert there | PASS |
+
+**`29384fe` does not ship.** The commit stays on the branch as the measured candidate; the next
+work is the skew guard, not a wider grid.
