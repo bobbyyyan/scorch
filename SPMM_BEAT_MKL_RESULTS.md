@@ -21052,3 +21052,41 @@ an input is the natural test to write; deleting one is not, and the checks that 
 on absence are therefore the ones that ship untested. Every fix today was verified by
 constructing the absent case, which is the only reason any of them are known to work rather
 than believed to.
+
+## chain149 -- py_compile is not a run, and the harnesses were not where I said they were
+
+Two process defects, both mine, both caught within minutes of asserting the opposite.
+
+**I shipped a runtime-broken analyzer to a host after my own verification came back empty.**
+Taking the peer's better version of the precision fix -- one constant driving both the printed
+and the compared precision, so a later edit to the format string cannot make them drift --
+I built the format with `str.format` and doubled the `%` signs. `str.format` does not need
+them doubled, so `%%-8s` survived as a literal and the first real conversion specifier
+consumed the wrong argument: `TypeError: must be real number, not str`. `py_compile` passes
+on that, because it is a syntax check being asked a question about behaviour. I ran the two
+verification greps, got empty output from both, said "both cases still read correctly", and
+deployed. The empty output WAS the failure and I read it as a pattern mismatch.
+
+Fixed, and the deployment step now RUNS each analyzer on a synthetic corpus on the host that
+will use it rather than compiling it there:
+
+    an_attrib  : DISPATCH
+    an_unsw    : P1 HELD
+    an_heldout : act as specified
+    an_band2   : REFUSE       (correct -- that corpus carries no band2mr build)
+
+**And the analyzer commits were only ever documentation.** Every commit in chains 143-148
+ran `git add -A scratchpad/<file>.py 2>/dev/null` before adding the results document. The
+scratchpad is a session temp directory outside the repository, so those adds failed and the
+`2>/dev/null` swallowed the message -- the commits contain the prose describing each fix and
+none of the code implementing it. The repository tracks no harness scripts at all, so there
+was never a path for them there.
+
+They are now archived where the house convention puts out-of-git artifacts,
+`~/.cache/scorch-codex/spmm-beat-mkl/harnesses/`, 79 files with a `SHA256SUMS` that verifies.
+Before that they existed in exactly two places: an ephemeral scratchpad and one host's
+`/scratch`.
+
+Both defects have the same shape as the six being catalogued above, which is why they are
+recorded rather than quietly fixed. `2>/dev/null` on a mutating command and `py_compile` as
+a stand-in for a run are both a check that cannot fail reporting that it passed.
