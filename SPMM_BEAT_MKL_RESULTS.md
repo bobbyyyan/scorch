@@ -21408,3 +21408,70 @@ specification. The counts are gone from the header; the job prints its own cover
 printed line is the record.
 
 Resubmitted as 17290869.
+
+## chain154 -- the held-out corpus rejected both windows, and rejected my reading of the failure first
+
+MKT 17290869 ran 03:06 to 05:19 on 43 held-out matrices, six builds at `corpus 3600 gcn 216`
+each, rotation balanced at 6 groups over 6 builds. Every guard cleared, including the new
+resolved-value policy check and the generated GCN key list.
+
+**Delivery, float32, geomean against c0 with losers beyond their own floor:**
+
+     k | floor  | bandmr           | mdlo             | rag2             | ragmd
+     1 | 1.0014 | 0.9965 lose 4/40 | 0.9933 lose 4/40 | 0.9579 lose 15/40| 0.9594 lose 13/40
+     2 | 0.9999 | 1.1221 lose 5/40 | 1.0795 lose 5/40 | 1.0434 lose 5/40 | 1.0187 lose 5/40
+     3 | 0.9983 | 1.3379 lose 2/40 | 1.2873 lose 5/40 | 1.2418 lose 5/40 | 1.2138 lose 5/40
+     4 | 0.9608 | 0.9503 lose 2/40 | 0.9532 lose 2/40 | 0.9314 lose 10/40| 0.9322 lose 9/40
+     8 | 1.0054 | 1.4264 lose 0/40 | 1.3551 lose 0/40 | 1.3218 lose 0/40 | 1.2890 lose 0/40
+
+`bandmr` -- band plus multi-row with no window at all -- is the best of the four at every
+width. Both refinements are worse everywhere, and `rag2` turns width 1 into 15 losers of 40.
+Neither ships.
+
+**The mechanism, and it is the exact failure a held-out corpus exists to catch.** The window
+MINDEG=4 was derived from corpora that showed low-degree matrices losing under multi-row. On
+matrices that had no part in choosing it, those same low-degree matrices *gain* from multi-row,
+and the window takes the gain away. Isolated to the refusal alone -- arm against its ungated
+sibling, on only the cells the rule refuses:
+
+    mdlo vs bandmr  float32  k=1..8  1.000  1.352  1.364  0.998  1.692
+    mdlo vs bandmr  float64  k=1..8  0.989  1.003  1.010  1.016  1.037
+    ragmd vs rag2   float32  k=1..8  1.005  1.211  1.203  1.002  1.232
+
+Refusing costs 35%, 36% and 69% on float32 at the three widths where multi-row fires, is
+neutral on float64, and does NOTHING at widths 1 and 4 -- which are the widths whose deficit
+motivated the window in the first place. It neither helps where it was aimed nor is neutral
+where it fires. The five matrices are `debr_G_16` at mean degree 4.0 and four of the
+`Spielman_k100/k200` family at 3.0, reading 0.62-0.71 against c0 under mdlo where bandmr reads
+0.889-1.005.
+
+**The gate itself is not the defect, and my check said it was.** Section 2 shipped with the
+premise "a refused cell runs the baseline path, so build/c0 should read ~1.000", and on that
+premise it printed GATE DID NOT FIRE AS SPECIFIED for nine build-width groups. The premise is
+wrong: a refused cell still carries `EXACT_HI_F32=1`, which c0 does not, so its reference is
+bandf32 and not c0. The answerable firing test is the admitted cells against the ungated
+sibling, where the same code runs on both -- and there mdlo matches bandmr to within 0.7% at
+every width and both dtypes (0.9932 to 1.0079). The gate fires exactly as specified.
+
+So the check conflated two opposite conclusions under one verdict:
+
+    "the gate did not fire"           -- the constant is not doing what it names
+    "the refusal path is not neutral" -- the constant fires, and refusing is expensive
+
+The data says the second and the check reported the first. Now separated: the firing test runs
+on admitted cells against the sibling, the refusal question is answered against bandf32 when a
+stage carries it, and declared unanswerable when it does not -- this stage has no bandf32 arm,
+so its refused-cell deviation is the band and the refusal together and is reported rather than
+attributed. That is a stage design gap worth fixing before the next window is tested.
+
+**And the width-1 and width-4 deficit survives everything.** `bandmr` still reads 0.9965 with
+4 losers and 0.9503 with 2 losers there, on held-out data, and neither window moves it. Chain151
+found the per-row tax is what causes it and that unswitching fixes it at low degree while
+costing more at high degree. So the deficit's real fix remains open, and these two windows were
+the wrong instrument for it -- they were fitted to the symptom's population rather than to its
+mechanism.
+
+Note the width-4 floor: 0.9608, a 3.9% same-code spread, giving a 7.8% tolerance. Width 4 is
+weakly resolved on this corpus and its numbers should not be leaned on.
+
+One host. Redwood's heldout is chain10, still behind chain4, chain5 and chain9.
