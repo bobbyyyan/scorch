@@ -21167,3 +21167,91 @@ That matters because the natural way to generate a test input is to perturb a va
 delete a column -- so the inputs that catch this whole class are the ones neither a reviewer
 nor a fuzzer produces. Keeping them as fixtures is the only way the next edit gets checked
 against them.
+
+## chain151 -- the per-row tax is real, the unswitch fix is a net regression, and it does not ship
+
+MKT job 17287573 finished at 02:39:40. Every build carried its full count -- `c0`, `c0b`,
+`bandmr`, `unsw` at `corpus 5040  gcn 288` each -- so the comparisons are real, which is the
+rows-per-build disclosure doing its job before any analysis ran. 45 matrices, widths
+1/2/4/3/8, both dtypes, four passes. Read with `an_unsw.py`, whose four predictions were
+written into the file before the data existed.
+
+Statistic: `bandmr_time / unsw_time`, so above 1 means unsw is faster, paired with each
+cell's own `c0`-vs-`c0b` displacement as the A/A control.
+
+**P1 and P2 hold, and the mechanism is confirmed.** At the widths where the multi-row kernel
+cannot run, below degree 20:
+
+    float32 k=1  unsw faster on 22/26  median 1.0188  beyond own A/A 15/26
+    float32 k=4  unsw faster on 25/26  median 1.0207  beyond own A/A 21/26
+    float64 k=1  unsw faster on 21/26  median 1.0141  beyond own A/A  5/26
+    float64 k=4  unsw faster on 18/26  median 1.0064  beyond own A/A 10/26
+
+Removing the admission code from the row loop is worth about 2% on float32 exactly where a
+per-row tax predicts it -- low degree, kernel not running -- and it is broadly based rather
+than a geomean artefact. The guarded block inside the row loop was costing per-row work
+whether or not the guard fired. float64 carries the same sign at half the size, with most
+cells inside their own A/A.
+
+**P3 and P4 fail, and that is what settles it.** At degree >= 20 unsw is SLOWER, at every
+width, on both dtypes:
+
+           k=1     k=2     k=3     k=4     k=8      (median bandmr/unsw, deg >= 20)
+    f32  0.9874  0.9843  0.9829  0.9850  0.9766
+    f64  0.9926  0.9890  0.9862  0.9882  0.9932
+
+unsw is faster on only 1 to 5 of 16 matrices in every one of those ten cells, and 9 to 15 of
+16 are beyond their own A/A displacement. P3 predicted equality at widths 2, 3 and 8 because
+the instantiation that runs there is the one bandmr already had; instead unsw loses 0.7% to
+2.3% wherever degree is high. The per-band table flagged only k=8, because its tolerance
+there was loose enough to absorb k=2 and k=3 -- the per-matrix count is what shows it is the
+same effect at all five widths.
+
+So the two effects are separable and both real: removing the admission from the row loop
+gains ~2% at low degree, and emitting the worker body twice costs 1-2.3% at high degree,
+where the loop is hot and the extra instantiation is decode and instruction-cache pressure
+that buys nothing. The trade is 26 low-degree matrices at two widths against 16 high-degree
+matrices at five widths, on both dtypes.
+
+**On the standing goal it also loses ground.** Cells below MKL, float32:
+
+    k=1   k=2   k=3   k=4   k=8
+    bandmr  18/42 29/42 14/42 15/42 12/42
+    unsw    18/42 33/42 15/42 15/42 13/42
+
+Four more cells below MKL at width 2, one more at widths 3 and 8. And neither arm is clean on
+the GCN guardrail: bandmr's worst is citeseer float64 k=7 at 0.9731 against a 1.0031 floor,
+unsw's is pubmed float64 k=7 at 0.9792 against a 0.9897 floor, both beyond their own spread,
+24 cells compared each.
+
+**Verdict: unsw does not ship.** Reported as a finding rather than tuned around. It stays
+behind its constant, defaulting to 0, where it already is.
+
+**The next experiment is implied rather than invented.** The gain and the loss come from
+different halves of one change. The gain needs the admission code out of the row loop; the
+loss comes from duplicating the entire worker body to get it out. Hoisting only the guarded
+store -- or removing the store to `C_values` that forces the aliasing reload, without
+duplicating the loop -- would take the first without the second. That is the arm to build,
+and it has a prediction: low-degree gain preserved at widths 1 and 4, high-degree loss gone
+at all five.
+
+One host. Redwood's copy is queued behind chain4 and chain5, and the high-degree regression
+wants its second host before it is called a two-host result, though its consistency across
+ten cells and both dtypes on this host is already past what a single noisy cell could produce.
+
+**Two corrections found while reading this.** First, my own helper script counted
+`unsw_time / bandmr_time > 1.0` as "unsw faster", which is backwards for a ratio of times, so
+its first output said 4 of 26 where the truth was 22 of 26. The geomeans in `an_unsw.py` were
+right; the ad-hoc script written to check them was inverted, and it inverted the conclusion I
+was about to report. Caught only because the two disagreed.
+
+Second, chain150 states that `statistics.median([1.0, nan])` is nan. That is true for an
+even-length list, which averages the two middle values. For an ODD-length list it is worse:
+sorting with a nan is undefined, so the middle element is whatever lands there --
+`median([1.0, 2.0, nan])` is 2.0 and `median([nan, 1.0, 2.0])` is 1.0. The reps here are 13
+per cell, which is odd, so in this harness a non-finite reading would not have propagated a
+nan at all; it would have returned a plausible finite median that no bound could catch. The
+ingestion refusal from chain150 is what makes that unreachable, but the reason it mattered is
+stronger than what I wrote. The peer reports `statistics.stdev` raising instead on their
+version; none of these analyzers computes a standard deviation, so the silent path is the only
+one they had.
