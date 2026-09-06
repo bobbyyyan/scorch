@@ -21268,13 +21268,87 @@ its first output said 4 of 26 where the truth was 22 of 26. The geomeans in `an_
 right; the ad-hoc script written to check them was inverted, and it inverted the conclusion I
 was about to report. Caught only because the two disagreed.
 
-Second, chain150 states that `statistics.median([1.0, nan])` is nan. That is true for an
-even-length list, which averages the two middle values. For an ODD-length list it is worse:
-sorting with a nan is undefined, so the middle element is whatever lands there --
-`median([1.0, 2.0, nan])` is 2.0 and `median([nan, 1.0, 2.0])` is 1.0. The reps here are 13
-per cell, which is odd, so in this harness a non-finite reading would not have propagated a
-nan at all; it would have returned a plausible finite median that no bound could catch. The
-ingestion refusal from chain150 is what makes that unreachable, but the reason it mattered is
-stronger than what I wrote. The peer reports `statistics.stdev` raising instead on their
-version; none of these analyzers computes a standard deviation, so the silent path is the only
-one they had.
+Second, chain150 states that `statistics.median([1.0, nan])` is nan. The correction I first
+wrote for it -- that parity decides, even-length propagating and odd-length returning a
+plausible finite value -- is also wrong, and the peer caught it. It is POSITION, not parity.
+Python's sort orders with `<` alone and every comparison against nan is false, so where the nan
+ends up depends on where it started. Measured on 3.13.12, thirteen reps being exactly the count
+this harness uses:
+
+    median([1.0, 2.0, nan])              = 2.0
+    median([nan, 1.0, 2.0])              = 1.0
+    median([1.0, nan, 2.0])              = nan
+    median([1.0]*6 + [nan] + [2.0]*6)    = nan     <- 13 reps, nan in the middle
+    median([nan] + [1.0]*6 + [2.0]*6)    = 1.0     <- 13 reps, nan first
+    median([1.0]*6 + [2.0]*6 + [nan])    = 2.0     <- 13 reps, nan last
+
+So with 13 reps you get either outcome depending on arrival order. The operational conclusion
+is unchanged -- a bound cannot be relied on to catch it, so refuse at ingestion -- but the
+parity version was worse than merely wrong: it implies some sample count could make you safe,
+and none can. Recorded because the wrong version was already written down.
+
+The peer reports `statistics.stdev` raising `AttributeError` on their version where mine raises
+`ValueError: inf or nan encountered in data`, so that symptom is version-dependent. None of
+these analyzers computes a standard deviation, so the silent path is the only one they had.
+
+## chain152 -- a finiteness check on a derived statistic protects nothing
+
+Three things, and the middle one overturns the fix I had just written.
+
+**The parity claim was wrong and is corrected above.** It is position, not parity: Python sorts
+with `<` alone, every comparison against nan is false, so where the nan lands depends on where
+it started. With thirteen reps -- this harness's count -- a nan in the middle gives nan, first
+gives 1.0, last gives 2.0. The operational conclusion is unchanged, but the parity version
+implied some sample count could make you safe, and none can.
+
+**`max` over measured values discards a non-finite second argument and propagates a first.**
+`max(0.006, nan)` is 0.006; `max(nan, 0.006)` is nan. Two sites here take a max over measured
+quantities. `an_gcnguard.py` is safe by accident -- it filters with `a == a` before the max,
+which excludes nan because nan is unequal to itself. `an_resid.py` was not:
+
+    aa_reach = max(abs(q(aa, A.lo) - 1.0), abs(q(aa, A.hi) - 1.0))
+
+A failed low quantile would have handed back the high one alone as the measured A/A reach --
+narrower than anything measured, order-dependent, nothing on the record -- and `aa_reach` is
+the control that decides whether a below-MKL cell is real.
+
+**And the fix I wrote for it was the wrong fix.** I guarded the two components for finiteness
+and skipped the cell otherwise. Built the corpus to prove it fires: nine reps, one nan in the
+A/A pair of three cells. It did not fire, and the poisoned cell reported a FINITE A/A reach of
+0.002. The nan never reached a quantile position; it only perturbed the sort order, and the
+quantiles came from finite neighbours. So an ordering-based statistic returns a plausible
+finite value from poisoned input, and checking the statistic for finiteness protects nothing.
+Moved to ingestion, like the other five, where the drop is now reported:
+
+    READINGS DROPPED: 6 non-finite or non-positive, refused at ingestion
+
+I would have committed the output check and believed it worked, because it is the obvious fix
+and it fails closed. Only building the input showed it never runs.
+
+**Pairing by repetition index is structurally immune to the imbalance problem.** `an_resid.py`
+computes `set(a) & set(b)` over rep indices, so a dropped reading removes that pair from both
+arms and no median rests on samples the other lacks. The analyzers that compare two
+independently-computed medians -- `an_unsw`, `an_band2`, `an_heldout` -- are exposed, which is
+where the imbalance check belongs and where it now lives. Worth stating because it decides
+which files need the check rather than adding it everywhere.
+
+**The imbalance check now separates two conditions**, on the peer's point that only one is a
+defect. An arm can be legitimately short because a pass produced fewer rows for it; refusing
+that is a guard that refuses correct input. So the split is on whether the cell actually lost a
+reading, and both branches are demonstrated:
+
+    u_imbal  five reps, one build given three by the stage, nothing refused
+             -> REP-COUNT SHORT BUT INTACT in 3 of 60 cells, and 0 refusals
+    u_lost   five reps, two of five NON-FINITE for one build
+             -> READINGS DROPPED: 6 non-finite (0.25%)
+             -> REP-COUNT IMBALANCE FROM REFUSED READINGS in 3 of 60 cells
+             -> REFUSE
+
+The 0.25% drop rate sits under the 1% ingestion refusal, so the two checks catch different
+things in sequence rather than one masking the other.
+
+On the chain151 result none of this fires: zero dropped readings, zero imbalanced cells of 450.
+Those numbers rest on equal sample counts of finite readings, as checked facts.
+
+Archive at `~/.cache/scorch-codex/spmm-beat-mkl/`, 106 files verifying, fixtures README updated
+with the three new constructed inputs.
