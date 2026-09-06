@@ -20818,3 +20818,58 @@ so its GCN guardrail line cannot be trusted to distinguish clean from unrun. Its
 to be re-analyzed with the fixed version. That is now the second reason MKT's band2 needs
 re-reading rather than quoting -- the first, from chain142, being that it is the only host
 that has it. Redwood's band2 has not started, so it will run the fixed analyzer.
+
+## chain144 -- "refusals that look adjacent aren't a chain", applied to the pending stage
+
+The peer's phrasing for the near-miss in chain143 -- two existing refusals, neither
+covering the gap between them, because the build check asks whether each build appears
+*somewhere* -- generalises, so I ran it against the two analyzers that are about to read
+results still in flight rather than against ones whose verdicts are already spent.
+
+`an_heldout.py` had three, and the middle one is the load-bearing check of the stage.
+
+**Section 2 is titled "did the gate FIRE?" and a gate that refused nothing passed it.**
+
+    ok = (not ref) or abs(1 - geo(ref)) <= tol
+
+`ref` is the refused-cell population. Empty `ref` scored `ok`, and the summary below then
+printed "every gated build's refused cells sit at their floor: the constants act as
+specified". Vacuously true and read as evidence. The per-row `n=0` was visible, but the
+summary is the line that gets quoted -- exactly the split the peer found between a
+`0.000` column and the `n/a (denominator 0)` helper one function up in the same file.
+
+The input is reachable and, worse, likely: `mdlo` gates on degree >= 4, so a held-out
+corpus in which every matrix has degree >= 4 refuses nothing. Constructed it (6 matrices,
+all degree 8) and the old code reported the constants acting as specified on a corpus
+where the constant never engaged once. Now:
+
+    mdlo  1 | geo nan n=0  --  | geo 1.0256 n=6
+    ...
+    GATE REFUSED NOTHING on this corpus: mdlo
+    REFUSE: no gated build refused a single cell, so nothing here verified that any
+    constant fired. This is not a clean gate check; it is an absent one.
+
+and it is deliberately called neither a pass nor a failure -- a held-out corpus that
+lacks the population a gate targets is a fact about the corpus. The other direction is
+pinned too: half the matrices below degree 4 gives "act as specified across 5
+build-width groups", with the group count now printed.
+
+**Section 1** printed `lose 0` with no denominator; `geo()` returns nan on empty, so the
+geomean column was honest while the loser column beside it read clean. Now `lose 0/6`.
+
+**Section 3** printed "no cell is more than 5% behind the baseline under any arm" when
+`rows` was empty, which also happens when every cell failed the `all(r)` filter. Dropping
+one arm at only the three widths that section reads -- so the build-presence REFUSE stays
+satisfied, which is the same gap as chain143's -- previously produced a clean line. Now it
+refuses and says the blank is missing data.
+
+Neither host analyses in-stage: MKT's sbatch and redwood's stage script both collect only,
+and analysis runs locally, so the fixed analyzer applies to both pending runs without
+touching a queued script. The corrected file is on redwood as well, where heldout has not
+started.
+
+The peer's taxonomy is the thing worth keeping from these two days. Silent-open, loud-open,
+closed, and the question that picks between them is not safety but whether the thing that
+cannot run has a legitimate reason to be off. A GCN guardrail and a gate-firing check have
+none, so unrun is not evidence and both refuse. Their policy switch does, so theirs labels
+instead. I would have argued fail-closed for their case and been wrong.
