@@ -21239,6 +21239,29 @@ One host. Redwood's copy is queued behind chain4 and chain5, and the high-degree
 wants its second host before it is called a two-host result, though its consistency across
 ten cells and both dtypes on this host is already past what a single noisy cell could produce.
 
+**One check added on the strength of the peer's detail, and demonstrated firing.** They keep
+device and host readings together because their agreement check compares one list's median
+against another's, and the two have to describe the same samples. My equivalent gap: a dropped
+reading leaves its cell with fewer reps than the build it is compared against, both medians
+still compute, and nothing in the output says they rest on different sample counts -- so an
+imbalance reads as a difference between builds.
+
+Added to `an_unsw.py`, `an_band2.py` and `an_heldout.py`: report any cell whose builds carry
+unequal `ours` rep counts, and refuse above 2% of cells. The first fixture written for it could
+not exercise it -- one rep per cell means a drop removes the build entirely rather than
+unbalancing it, which is the check-that-cannot-fire defect again, so a second fixture gives five
+reps per cell and takes two of five from one build on three matrices:
+
+    REP-COUNT IMBALANCE in 3 of 60 cells -- paired medians would rest on different sample counts
+    REFUSE: more than 2% of cells are unbalanced across builds
+
+**On the result above, it does not fire: zero imbalanced cells of 450.** So chain151's numbers
+rest on equal sample counts across all four builds, which was previously an assumption and is
+now a checked fact. Also kept from their note: refusing `<= 0` is right for a wall-clock
+duration here but would be wrong on their device-event path, where an interval below the timer
+tick genuinely reads zero and dropping those would bias the smallest cases -- the same value
+means different things on the two instruments.
+
 **Two corrections found while reading this.** First, my own helper script counted
 `unsw_time / bandmr_time > 1.0` as "unsw faster", which is backwards for a ratio of times, so
 its first output said 4 of 26 where the truth was 22 of 26. The geomeans in `an_unsw.py` were
