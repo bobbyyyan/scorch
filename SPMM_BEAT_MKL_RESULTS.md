@@ -21090,3 +21090,58 @@ Before that they existed in exactly two places: an ephemeral scratchpad and one 
 Both defects have the same shape as the six being catalogued above, which is why they are
 recorded rather than quietly fixed. `2>/dev/null` on a mutating command and `py_compile` as
 a stand-in for a run are both a check that cannot fail reporting that it passed.
+
+## chain150 -- nan is truthy, so a broken reading read as a clean cell
+
+The peer found their `max(bound, nan)` class in five bare orderings -- `deviation > bound`,
+`curvature > bound`, and three more -- because every comparison against nan is False, so all
+five reported "within tolerance" for a value that has none. Chain148 fixed how my tolerance
+was *derived*. It did not touch what the tolerance was compared *against*.
+
+The guard in front of every scan here is
+
+    if not (a and o and fl): continue
+
+which catches `None` and `0.0` and lets nan through, because `bool(nan)` is True. Then:
+
+    nan < 0.95                 -> False
+    abs(1-nan) > 2*abs(1-nan)  -> False
+
+so a non-finite reading counts in the denominator and never in the numerator. A broken
+measurement reads as a clean cell, and the crossing count and the beyond-floor scan both
+report it as fine. Eighteen such orderings across the five analyzers, and
+`statistics.median([1.0, nan])` is nan, so a single bad reading contaminates its whole cell
+and the contamination then reads as cleanliness.
+
+Fixed at ingestion rather than at eighteen comparison sites: `reading()` refuses any value
+that is not finite, and also any value <= 0, since a zero duration is not a measurement and
+makes every ratio infinite. Drops are counted by kind and reported, and more than 1% of
+readings unusable is a refusal rather than a note -- that is a broken stage, not a stray.
+
+    READINGS DROPPED: 1 non-finite, 1 non-positive, of 528 total (0.38%)
+    READINGS DROPPED: 24 non-finite, 0 non-positive, of 528 total (4.55%)
+    REFUSE: more than 1% of readings were unusable. That is a broken measurement, not a
+    stray -- fix the stage rather than analysing around it.
+
+**I did not first work out whether nan can reach these files, and that is deliberate.** The
+peer's reasoning, which I am adopting: a reachability argument is a claim about every future
+caller of a file that is still being edited. They have a precedent in their own project where
+"this can only ever be a digit" produced 27 tests silently reporting a missing GPU on a
+machine that enumerated the card perfectly.
+
+The peer also named why chain148's sharpest site was sharp, better than I had: a present
+`math.isnan(cand)` guarding the operand that cannot be nan is not a missing check. It is a
+check that demonstrates the author knew the hazard, and its presence is what makes the gap
+invisible to a reviewer, who sees a nan check and moves on.
+
+**And the process fix from chain149 immediately earned itself.** All five analyzers compiled.
+Running them found `an_ship.py` dead on a `NameError`: it never imported `math`, because it
+had never needed it, and my patch introduced the first use. `py_compile` cannot see that. The
+deployment step now runs all five on synthetic corpora on redwood, which is where the run
+above comes from, plus the refusal path:
+
+    an_unsw P1 HELD | an_band2 cells compared | an_heldout act as specified
+    an_attrib DISPATCH | an_ship cells compared | refusal REFUSE: more than 1
+
+Archive refreshed at `~/.cache/scorch-codex/spmm-beat-mkl/harnesses/`, 79 files verifying
+against `SHA256SUMS`.
