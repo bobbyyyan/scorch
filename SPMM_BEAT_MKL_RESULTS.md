@@ -20624,3 +20624,97 @@ measurement that was fine:
 
 The pattern is not that thresholds are wrong. It is that a threshold is a claim about a distribution
 and gets recorded as a claim about a number.
+
+## chain142 -- auditing my own refusals: three defects in the guard, and a single-host band2
+
+The peer session reported a test of theirs that asserted the opposite of the truth and
+passed for an incidental reason, and noted their per-side guard has never fired on
+anything either device can produce. The general form is a guard credited with work it
+has not done. That is checkable rather than merely agreeable, so I checked mine: build
+the input each refusal names and see whether it actually refuses.
+
+**The pre-flip guard was live, but not for the reason I would have said.** The first
+test fed it the tree at 29384fe, which carries the flipped defaults, and it refused --
+but the message came from the *macro-presence* loop, because 29384fe also predates
+UNSWITCH. A guard credited for a refusal a different guard performed. Isolating it
+needed a tree with all three macros present and only the defaults flipped; on that
+input it does fire.
+
+**Isolating it also exposed a coverage gap.** Constructing the isolating input, my
+edit of `SCORCH_SPMM_MULTIROW_ROWS_F32` silently matched nothing, because in this tree
+neither f32 constant holds a literal:
+
+    #  define SCORCH_SPMM_MULTIROW_ROWS_F32  SCORCH_SPMM_MULTIROW_ROWS   // -> 0
+    #  define SCORCH_NARROWK_EXACT_HI_F32    SCORCH_NARROWK_EXACT_HI     // -> 3
+
+Both delegate to a generic parent. The guard grepped for the first of those two lines
+and treated its presence as proof the tree was un-flipped -- so flipping the *parent*,
+which is the natural "turn it on everywhere" edit, leaves the grepped line intact and
+the guard accepts the candidate tree as the control. Measured on a constructed parent
+flip: four resolved constants move and the grep sees none of them. Two of the four are
+the f64 specialisations, which 29384fe deliberately left alone because ARM regressed to
+0.7229 -- so the edit the guard is blindest to is also the one that would silently take
+float64 with it.
+
+Grepping a `#define` is the wrong instrument for a question about a resolved value.
+Same shape as the `.text` digest: the right instrument is the one that resolves it.
+`scratchpad/preflip_check.sh` now preprocesses a probe translation unit and compares
+resolved values against the shipped defaults, so a flip at any level of the chain is
+caught. Validated on five inputs -- shipped tree accepts; f32 flip, parent flip,
+UNSWITCH-on, and constants-absent all refuse.
+
+**Two bugs in the replacement, both caught only because it fails closed.** It refused
+the good tree at first: I had written the macro name on both sides, so
+`SCORCH_PROBE X = X` preprocessed to `SCORCH_PROBE 3 = 3` and the lookup key was gone --
+the probe was eaten by the mechanism it was probing. Then, fixed locally, it refused
+both real tarballs on redwood: the header includes `<cstdio>` and I had invoked `cc`,
+which finds a C++ header on macOS and not on Linux. Neither bug is interesting; the
+direction of failure is. A guard written to accept when its instrument fails would have
+passed everything on redwood and said nothing.
+
+**Absence is not the same defect as a wrong value.** The fixed guard then refused
+`scorch_mr7.tgz`, correctly by its own table and wrongly in fact: mr7 predates the
+unswitch commit, and the stages that use it do not arm UNSWITCH, so it is a good
+control for them. A guard that refuses correct inputs gets skipped by whoever hits it.
+Absence is now fatal only for constants named in `--require`, which is the list the
+calling stage actually sets.
+
+Both live inputs then verify, with the require-list each stage arms:
+
+    scorch_mr8.tgz (unsw:    EXACT_HI_F32, ROWS_F32, UNSWITCH)  8/8 at shipped defaults
+    scorch_mr7.tgz (heldout: EXACT_HI_F32, ROWS_F32, MINDEG, RAGGED)
+                                                                7/7, UNSWITCH absent and unarmed
+
+So the queued stages are safe under their weaker grep, because their inputs are in fact
+correct. The stronger guard buys nothing for these runs and I did not swap a script
+under a queued stage to install it.
+
+**A correction to an alarm of my own.** Chains 6, 7 and 8 name the same stage scripts
+and the same log files as chains 10, 11 and 12, which read as the reorder having
+appended the new queue instead of replacing the old -- heldout, attrib and exunroll each
+running twice, with the first run landing before unsw, the exact ordering the reorder
+existed to prevent. They are not running. Each wrote one waiting line and died: they
+were launched without `nohup` and took SIGHUP when their session closed. The live queue
+is chain4 -> 5 -> 9 -> 10 -> 11 -> 12 = band2, unsw, heldout, attrib, exunroll, which is
+the intended order. No duplication, and nothing to kill.
+
+**band2 is a single-host result.** Redwood holds no band2 artifact at all -- only the
+stage script -- so the width-2 failure (0.9805 against a 0.9996 floor, with the
+1/degree gradient 0.9119 / 0.9754 / 1.0057 / 1.0224) is MKT only. Under the two-host
+rule it is not confirmed, and I have been treating it as though it were. Redwood's
+band2 is chain5, still queued behind chain4, which has been on the prefetch arm for ten
+hours. The reading stands as the reason the ship candidate was reverted -- that decision
+also rests on the two-host width-2 regression population and on redwood's own
+0.9739/0.9881 at widths 1 and 4 -- but the gradient itself wants its second host.
+
+**A consequence for heldout worth stating before its result arrives.** Its arms --
+mdlo, rag2, ragmd -- are built from mr7, which has no unswitch. If unsw shows the
+widths-1-and-4 deficit is the per-row tax, then MINDEG and RAGGED were fitted against a
+taxed baseline, and a degree floor that looks like it recovers the losers may be
+recovering the tax instead. Heldout's verdict then has to be re-read against an
+unswitched base rather than taken at face value. That is why unsw runs first; it is not
+yet why heldout is wrong.
+
+MKT at the time of writing: unsw 17287573 running 59:50 of a 9-hour limit, heldout
+17286960 pending on its dependency. Reading MKT's band2 output needs a job on mkt1,
+where unsw is measuring, so it waits rather than becoming a co-tenant.
