@@ -20387,3 +20387,53 @@ Note on the tarball: this chain changed only a comment, which shifts `__LINE__` 
 The staged `scorch_mr7.tgz` was deliberately **not** re-cut, because swapping a tarball under queued
 stages makes their results unattributable for no gain. Its constants and defaults are what the
 stages check for.
+
+## chain137 -- the two gates that are host-invariant, chosen before measuring them
+
+With the ceiling ruled out as host-conditional, the question became which gate can fire on the
+losers *without* a host-dependent constant. Both candidates were evaluated **offline against the
+matrices themselves**, by computing each gate's own admission rule over the corpus -- no host time,
+and the answer arrives before the arm is built rather than after.
+
+`RAGGED=2` admits a two-row group only when its longer row is at most three times its shorter,
+which is where the kernel's common prefix carries at least half the group's nonzeros. Per matrix,
+the fraction of nonzeros living in groups it would admit:
+
+| matrix | mean degree | bandmr | admitted at RAGGED=2 | the refusal |
+|---|---|---|---|---|
+| connectus | 2202 | 0.602 rw / 0.816 MKT | **0.240** | fires on most of it, both hosts, widths 2/3/8 |
+| lhr34c / lhr71 / lhr71c | 21 | 0.820 / 0.834 / 0.845 | **0.108** | fires on most of it |
+| as-caida_G_081 | 2.7 | 0.929 (width 4) | **0.311** | fires on most of it |
+| lp_osa_14 | 136 | 0.852 | 0.806 | fires on some |
+| cari | 382 | 0.850 | **1.000** | cannot help -- rows are uniform |
+| body_decoder_layer_3 | 323 | 0.858 | **1.000** | cannot help |
+| bottleneck_1 | 133 | 0.895 | 0.971 | cannot help |
+| relat8 | 3.9 | 0.905 MKT | **1.000** | cannot help |
+
+And the give-away, which is the number that decides whether it is worth having: over the width-2
+winners, **median admitted 0.999 and a refused share of 0.1%** on both hosts. A gate that reaches
+the worst loser on both hosts while touching a thousandth of the winners' work is a different class
+of proposition from one that trades 2.4-5.9%.
+
+Two things follow.
+
+**The two gates are complementary, not redundant.** `relat8` admits 1.000 of its nonzeros at every
+raggedness setting and is reached only by the degree floor; `connectus` and the `lhr` family are
+uniform in degree terms and are reached only by the raggedness test. MKT's `as-caida` and
+`com-Amazon` losers are floor cases. So the candidate is both, and the held-out stage measures each
+alone and the pair.
+
+**The residual is now named and it is one population**: `cari`, `body_decoder`, `bottleneck` -- high
+mean degree with uniform rows, on redwood only. Neither host-invariant gate can reach them, and the
+gate that can is the host-conditional ceiling. That is the honest boundary of this approach.
+
+The held-out stage was repointed onto `mdlo` / `rag2` / `ragmd` before it ran; `md20` and `md128`
+were dropped, because measuring a constant that wants opposite signs on two hosts of the same ISA
+on a held-out corpus would characterise an arm that cannot ship. `an_heldout.py`'s gate-firing check
+now says explicitly that it cannot verify `RAGGED` from per-matrix metadata -- the rule is per
+group, over consecutive row pairs -- rather than passing an arm it did not check.
+
+Also fixed while setting this up: the MKT job carried **no rationale header at all**, because the
+generator that produced it from its redwood twin split on `set -u` and silently dropped everything
+above. It now carries the same 35 lines, including the same falsifiable predictions. A stage whose
+stated predictions are absent is a stage that can be reinterpreted after the fact.
