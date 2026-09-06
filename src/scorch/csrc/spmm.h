@@ -4539,6 +4539,23 @@ torch::Tensor spmm_csr_v2_core(
           continue;   // unreachable
         }
 #endif
+#if SCORCH_SPMM_MULTIROW_HOIST
+        // This row's bounds, read here rather than after the guarded block below, whose store to
+        // C_values the compiler cannot prove does not alias A1_pos. See
+        // SCORCH_SPMM_MULTIROW_HOIST in scorch_policy.h for the measurement this acts on.
+        //
+        // Reading A1_pos[i + 1] is in bounds only when this claim IS a row. REDIRECT is a template
+        // parameter and false in every existing caller, so with it false both lines fold to two
+        // loads and mrh_have folds to true. Under REDIRECT the claim index runs past the row region
+        // into the extra units, where A1_pos is not indexed by it, so the read stays behind the
+        // region test exactly as the multi-row guard's does.
+        int mrh_begin = 0, mrh_end = 0;
+        bool mrh_have = true;
+#  if SCORCH_SPMM_SPLIT_ENABLED
+        if (REDIRECT && (long)i >= sp_row_units) mrh_have = false;
+#  endif
+        if (mrh_have) { mrh_begin = A1_pos[i]; mrh_end = A1_pos[i + 1]; }
+#endif
 #if defined(__AVX2__) && defined(__FMA__) && \
     (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
         // A/B hook: take ROWS consecutive rows at once, so the independent B loads come from
@@ -4658,8 +4675,13 @@ torch::Tensor spmm_csr_v2_core(
           pA_end   = sp_x_end[x];
           out_row  = (int)(sp_slot_base + x);
         } else {
+#  if SCORCH_SPMM_MULTIROW_HOIST
+          pA_begin = mrh_begin;
+          pA_end   = mrh_end;
+#  else
           pA_begin = A1_pos[i];
           pA_end   = A1_pos[i + 1];
+#  endif
           // A row is split exactly when its degree exceeds its fair share, so its first unit needs
           // no lookup: it is the first `seg` nonzeros. This is what lets the plan's arrays be sized
           // by the split segments and lets the caller find the wide rows without scanning any.
@@ -4668,8 +4690,13 @@ torch::Tensor spmm_csr_v2_core(
           out_row = i;
         }
 #else
+#  if SCORCH_SPMM_MULTIROW_HOIST
+        const int pA_begin = mrh_begin;
+        const int pA_end   = mrh_end;
+#  else
         const int pA_begin = A1_pos[i];
         const int pA_end   = A1_pos[i + 1];
+#  endif
         const int out_row  = i;
 #endif
         if (pA_begin == pA_end) {

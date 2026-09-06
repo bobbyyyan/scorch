@@ -803,6 +803,31 @@
 // twice, so the object grows, and code size is itself one of the candidate mechanisms for the
 // deficit above. Whether unswitching wins net has to be measured, per width and per degree band,
 // on both x86 hosts.
+// Read each row's own nonzero bounds ONCE, before the multi-row guarded block, instead of after
+// it. Default 0.
+//
+// The mechanism, measured rather than supposed. The guarded block stores to C_values, and the
+// compiler cannot prove that store does not alias A1_pos, so on the widths where the multi-row
+// kernel DECLINES it reloaded A1_pos[i] and A1_pos[i+1] after the branch -- a cost per ROW, in
+// inverse proportion to row length. MKT job 17287573 put it at 2%: unswitching the block out of
+// the loop entirely made 22 of 26 and 25 of 26 low-degree matrices faster at widths 1 and 4
+// (median 1.019 and 1.021, float32).
+//
+// But unswitching pays for it by instantiating the whole worker body twice, and that cost 1-2.3%
+// at mean degree >= 20 at every width on both dtypes -- faster on only 1 to 5 of 16 matrices per
+// cell -- so it was rejected as a net regression. This constant is the other half of that result:
+// keeping the two bounds in registers removes the reload without duplicating any code, so it
+// should take the low-degree gain and leave no high-degree cost.
+//
+// PREDICTIONS, each falsifiable in a named direction. At widths 1 and 4 below mean degree 20 it
+// reproduces the unswitch gain, ~2% on float32, on a similar majority of matrices. At mean degree
+// >= 20 it is NEUTRAL at every width, where the unswitch read 0.977 to 0.987 -- if it is not, the
+// high-degree cost was never the duplicated instantiation and that explanation is wrong. And at
+// widths 2, 3 and 8 it equals the ungated arm, because the bounds it caches are the ones the
+// single-row path was going to read anyway.
+#ifndef SCORCH_SPMM_MULTIROW_HOIST
+#  define SCORCH_SPMM_MULTIROW_HOIST 0
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_UNSWITCH
 #  define SCORCH_SPMM_MULTIROW_UNSWITCH 0
 #endif
