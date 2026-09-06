@@ -4376,7 +4376,22 @@ torch::Tensor spmm_csr_v2_core(
   // enters after the last chunk is claimed contributes nothing and the exit barrier still waits for it.
   double wstat_region_t0 = 0.0;
 #endif
+  // With SCORCH_SPMM_MULTIROW_UNSWITCH set, this is generic in a compile-time tag so the multi-row
+  // dispatch can be removed from the instantiation entirely rather than branched around per row.
+  //
+  // With the constant at 0 the lambda keeps its ORIGINAL signature and there is no wrapper. That is
+  // not cosmetic: wrapping it in a forwarding lambda cost 14 instructions of 164596 with the
+  // constant off, which fails this file's own rule that a default-off mechanism must emit exactly
+  // what shipped before it. `MR_LIVE` is then a plain `true` and `if constexpr (true)` is
+  // transparent, so the emitted code is unchanged.
+#if SCORCH_SPMM_MULTIROW_UNSWITCH && defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
+  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto mr_tag) {
+    [[maybe_unused]] constexpr bool MR_LIVE = decltype(mr_tag)::value;
+#else
   auto scorch_spmm_worker = [&](int worker_id, int team_size) {
+    [[maybe_unused]] constexpr bool MR_LIVE = true;
+#endif
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
     // row, and on NEON scorch_spmm_row_neon does, so neither shipped build touches
@@ -4568,6 +4583,9 @@ torch::Tensor spmm_csr_v2_core(
         // claim index runs past the last row into the extra units, so the region test has to come
         // BEFORE the A1_pos read or the read is out of bounds. && evaluates left to right; the first
         // version of this had the region test last.
+        // `if constexpr` and not `&&`: the point is to keep the block out of the instantiation,
+        // so the compiler never has to consider whether its store to C_values aliases A1_pos.
+        if constexpr (MR_LIVE)
         if (multirow_ok &&
             i + multirow <= end &&
             (!REDIRECT || (long)(i + multirow) <= sp_row_units) &&
@@ -5015,6 +5033,16 @@ torch::Tensor spmm_csr_v2_core(
     }
 #endif
   };
+
+  // One test per WORKER instead of one per row. Absent entirely when the constant is off, so the
+  // launch sites below call the same lambda they always did.
+#if SCORCH_SPMM_MULTIROW_UNSWITCH && defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
+  auto scorch_spmm_worker = [&](int worker_id, int team_size) {
+    if (multirow_ok) scorch_spmm_worker_t(worker_id, team_size, std::true_type{});
+    else             scorch_spmm_worker_t(worker_id, team_size, std::false_type{});
+  };
+#endif
 
   // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
   // pre-composition kernel. When this is a drop-in pipeline op (the caller sets

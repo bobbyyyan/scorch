@@ -771,6 +771,41 @@
 #ifndef SCORCH_SPMM_MULTIROW_MINDEG
 #  define SCORCH_SPMM_MULTIROW_MINDEG 0
 #endif
+
+// Unswitch the multi-row admission out of the row loop: instantiate the worker body twice, once
+// with the multi-row dispatch compiled in and once without, and pick per call. 0 keeps the single
+// instantiation that ships today, so a release object is byte-unchanged until a measurement moves
+// it.
+//
+// THE DEFECT THIS ADDRESSES. Enabling the multi-row kernel costs the widths where it PROVABLY
+// CANNOT RUN, and the cost scales as 1/degree -- the signature of a per-row tax, not of a kernel:
+//
+//   redwood, width 1 (exact kernel owns it, multi-row refused)   0.9635 / 0.9652 / 0.9882 / 1.0036
+//   redwood, width 4 (half-vector width, multi-row refused)      0.9566 / 0.9756 / 1.0145 / 1.0032
+//   MKT,     width 4                                             0.9696 / 0.9751 / 1.0101 / 1.0153
+//   MKT,     width 2 with the band at 2, so exact owns it        0.9119 / 0.9754 / 1.0057 / 1.0224
+//
+// reading across mean-degree bands 0-4 / 8-20 / 20-128 / 128+, against same-code floors inside 1%
+// except where noted. The band-only arm, which carries no multi-row, reads 0.9985 / 0.9989 /
+// 1.0038 / 1.0152 at redwood width 1 -- flat. So the tax belongs to the multi-row constant and not
+// to the band, at a width where the kernel it enables cannot execute.
+//
+// WHY IT IS NOT SIMPLY A BRANCH. `multirow_ok` is already hoisted out of the row loop, and a
+// perfectly-predicted not-taken branch does not cost 8.8%. What costs is that the discarded block
+// STORES to C_values and reads A1_pos, so the compiler must assume the two alias and reload per
+// row throughout the loop -- the same hazard the split plan's scalars carry a comment about a few
+// hundred lines above: "a store to C_values may alias them -- and per-row loads are what decide a
+// matrix of mean degree 9". A comment at the multirow_ok hoist site already records that -O3 does
+// not hoist loop invariants out of this lambda on its own. `if constexpr` removes the block from
+// the instantiation rather than asking the optimizer to prove it dead.
+//
+// THE COST, which is why this is a constant and not just a fix: the worker body is instantiated
+// twice, so the object grows, and code size is itself one of the candidate mechanisms for the
+// deficit above. Whether unswitching wins net has to be measured, per width and per degree band,
+// on both x86 hosts.
+#ifndef SCORCH_SPMM_MULTIROW_UNSWITCH
+#  define SCORCH_SPMM_MULTIROW_UNSWITCH 0
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_MAXDEG
 #  define SCORCH_SPMM_MULTIROW_MAXDEG 0
 #endif
