@@ -20742,3 +20742,53 @@ redwood. chain4 is healthy rather than stuck: its prefetch arm is 154 matrices x
 01:01) and p2 was 85% through at 01:44, with two stages after it. Reordering to get
 redwood's unsw sooner would mean five relaunches on a host where I have already made two
 queue mistakes today, to save one stage's duration on a confirmation run.
+
+## chain143 -- a clean guardrail and an unrun guardrail printed the same line
+
+The peer session found, in their own code, a boolean that was false both when a check
+passed and when the check had nothing to compare -- so a run in which the cross-side
+check never executed was indistinguishable from one in which it executed and passed.
+That is a distinct defect from the ones already on the list: not a criterion blind to
+what it measures, but a *result* blind to whether it was measured. Worth turning on my
+own analyzers immediately, because the scan carrying the most weight here is the
+beyond-floor check I added as the fix for the crossing count's blindness. If it reported
+a pass when a cell had no floor to compare against, the fix would have inherited the
+defect it was fixing.
+
+It does not. That scan prints `h/n` -- hits over cells actually compared -- so a zero
+denominator is visible as `0/0` rather than as a pass. Exposing the denominator is what
+makes it safe, which is the same reason the replicate's own spread has to be printed
+beside a bootstrap interval.
+
+**One real instance across 25 analyzers, and it is next door to the safe one.** The GCN
+guardrail in `an_band2.py`:
+
+    w = None
+    for ... : if r < 1.0 and abs(1 - r) > 2 * abs(1 - f): w = min(...)
+    print("none beyond its own spread" if not w else ...)
+
+`w is None` is true when every GCN cell sits inside its own same-code spread, and also
+when no GCN cell was comparable at all. So the disclosure was uneven inside a single
+file: the scan above it prints its denominator, and the guardrail below it does not.
+
+**The input is reachable, not hypothetical.** The file already refuses when no CSVs
+exist and when a required build is absent -- but the build check tests whether each build
+appears *somewhere*, so a corpus-only run satisfies it while the `gcn` group is empty.
+Constructed that input (80 corpus rows across all four builds, no `sg_*.csv` at all):
+the old code printed a clean GCN guardrail for a guardrail that never ran. The fixed code
+refuses, naming which of the three series was missing. Positive path re-checked on a
+constructed regression -- cora at 0.9200 against a 0.9950 floor -- which is reported with
+`[3 cells compared]`, and the clean build now reads "none of 3" rather than "none".
+
+The peer could not fail closed on their equivalent, because the field it depends on is a
+policy switch and withholding every result when it is off makes the switch unusable --
+the same trap as refusing a tarball that is actually a valid control. They went from
+silent-open to loud-open: report the number, attach an explicit note that the check did
+not run. Mine takes the closed branch instead, because a GCN guardrail has no policy
+reason to be switched off; if it cannot run, the run is not evidence of anything.
+
+**A consequence for a reading already in hand.** MKT's band2 ran under the old analyzer,
+so its GCN guardrail line cannot be trusted to distinguish clean from unrun. Its data has
+to be re-analyzed with the fixed version. That is now the second reason MKT's band2 needs
+re-reading rather than quoting -- the first, from chain142, being that it is the only host
+that has it. Redwood's band2 has not started, so it will run the fixed analyzer.
