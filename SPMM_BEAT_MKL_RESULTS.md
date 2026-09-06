@@ -20257,3 +20257,75 @@ here, the baseline would have been accidentally the arm.
 Reverted, verified: `SCORCH_NARROWK_EXACT_HI_F32` and `SCORCH_SPMM_MULTIROW_ROWS_F32` fall through
 to the unsuffixed constants again, and `MULTIROW_RAGGED`, `MULTIROW_MINDEG` and `MULTIROW_MAXDEG`
 survive at 0.
+
+## chain135 -- what is queued, and what the degree dependence is and is not
+
+Four stages are queued behind the two band-2 runs, in this order on redwood (chain5 through
+chain7) and behind each other on MKT:
+
+| stage | question | arms |
+|---|---|---|
+| band2 | does the band have to go to 1? | `c0` `c0b` `band2mr` `bandmr` |
+| suitebase | what does the x86 suite pass on the unchanged tree? | -- |
+| heldout | does the degree window survive a corpus it was not derived from? | `c0` `c0b` `bandmr` `mdlo` `md20` `md128` |
+| attrib | widths 1 and 4: placement, code presence, or the branch? | `c0` `c0b` `c0pad` `mrf64` `bandmr` |
+
+The held-out corpus is 40 matrices drawn from the 457 cached matrices at nnz >= 1e6 that appear in
+no derivation or prior-selection key list, shuffled under a fixed seed and cut at 40, with degree
+coverage 5 below 4, 18 in 4-20, 13 in 20-128, 4 above 128. On MKT the list is derived **inside the
+job** from that host's own cache under the same rule, so it cannot be reshaped after seeing a
+result and it adapts to what is actually cached there.
+
+`an_heldout.py` checks two things, and the second is the one that matters. Delivery is the geomean
+and the loser count. But a cell the gate REFUSES runs the baseline path, so its ratio against the
+baseline must sit at its own floor -- and whether a cell is refused is computable from the `nnz` and
+`rows` that every CSV row already records. If a refused cell does not read its floor, the constant
+is not doing what it says and any win the build shows belongs to something else. That check is free
+and it tests the binary against the define rather than assuming they agree.
+
+### The peer instrument: an A/A replicate cannot see a shared fixed cost
+
+Owed to a peer session that measured it rather than assuming. If both arms carry the same offset
+`o` on top of kernel time `t`, A-vs-A reads 1.000 exactly -- the offset cancels -- while the A/B
+ratio is compressed by `(1 + o/t_a)/(1 + o/t_b)`. So `c0`/`c0b` reading 0.9991 at width 1 is **not**
+evidence that there is no offset there, and the compression is worst where the widths are narrowest,
+which is exactly where the open question is.
+
+`wsprobe.py` adds the discriminator: time the same call on a vertical stack of two copies of the
+matrix -- exactly twice the rows and nonzeros, same B, same call count -- so `m1 = o + t`,
+`m2 = o + 2t`, and `o/t = (2*m1 - m2)/(m2 - m1)` per arm per cell with no constant to invent. It is
+folded into the attribution stage's rotation so it inherits the balanced lead order.
+
+Two limits, stated because the number is useless without them. The **level is biased upward**: the
+stacked copy re-walks a warm B, so `m2 < o + 2t`. That bias is a property of the input and identical
+for every build, so a *difference* in `o/t` between builds is meaningful and the level is not. And
+per-call work that scales with nonzeros -- the ABI validation walks the caller's arrays -- doubles
+with the kernel and lands in `t`, so `o` is fixed cost in the strict sense: dispatch, marshalling,
+thread-team entry. That is the right split for asking whether an object's prologue got more
+expensive. A local smoke test reads `m2/m1` of 1.96 and 2.07 on a degree-9 matrix at widths 1 and 2
+(`o/t` 0.04 and -0.07) and flags a degree-9 width-8 cell at 1.39 as a cache transition rather than
+an offset, which is the guard doing its job.
+
+### What the degree dependence is, and three explanations that do not survive
+
+The dependence is real: monotone, present on both hosts, and it separates the populations. What it
+*is* remains open, and three candidate mechanisms have now been tried and found wanting.
+
+1. **Row-overhead amortisation.** Fitted and refuted by its own numbers -- per-row saving -0.00 ns,
+   predicting 0.982 where 1.068 was measured.
+2. **Serial tails in the multi-row prefix.** Real, and the kernel's comment says so, but
+   insufficient: six of eleven losers have essentially uniform rows and admit 90-100% of their
+   nonzeros at any raggedness setting (`cari` admits 1.000 at every value and still reads 0.850).
+   It explains `connectus` and the `lhr` family and nothing else.
+3. **The exact kernel's unroll depth.** At width 2 under a narrowed band, multi-row is competing
+   against the exact-width kernel, whose unroll is already adapted per call to the largest power of
+   two no greater than the mean row. That makes its per-row setup grow *with* degree, which bounds
+   the setup-to-work ratio between about one and two rather than making it fall -- so it predicts a
+   sawtooth in degree, not the single monotone crossing that is measured. It does explain why width
+   2 behaves differently from widths 3 and 8, where the comparison is against the general
+   register-block path instead, but it does not give a crossover value.
+
+So `MULTIROW_MAXDEG` remains a boundary chosen against the data that defines it, sitting in a gap
+between 18.6 and 21.3, and the held-out run is its arbiter. `MULTIROW_MINDEG` is in a different
+position: a mechanism (a two-row group at degree under four holds eight nonzeros and often an empty
+row, so the prefix cannot cover the prologue), six matrices on one host, and free on the other.
