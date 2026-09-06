@@ -20917,3 +20917,47 @@ between-cell spread; it only bites when the bootstrap has stopped being one.
 
 Both fixes are deployed to redwood, where attrib has not started. Neither host analyses
 in-stage, so both pending runs get them.
+
+## chain146 -- decide on the displayed numbers, and the floor that was not always there
+
+The peer separated two defects I had merged into one. Widening the interval fixed the
+collapse; it did not fix the fact that `[1.0000,1.0000]` was printed beside a verdict that
+excluded 1.0. A rendering that contradicts the verdict next to it cannot be audited by the
+person reading it, whatever the code did internally.
+
+Fixing that also closed a hole in the widening. `widen()` returns its bounds unchanged when
+the replicate floor is nan, and the floor is nan whenever the cell carries no same-code
+pair -- so with no replicate arm the collapse was fully back and the verdict was
+unqualified.
+
+Two changes. The bounds are rounded to the printed precision before the boundary test, so
+the interval that is displayed IS the interval that decided, and contradiction is
+impossible by construction. That costs nothing physical: 1e-4 is twenty times finer than
+the replicate floor these cells resolve, so a difference the display cannot show is one the
+instrument cannot see. And when the floor is nan the verdict now carries
+`[NO REPLICATE: ... this verdict is unbounded below by the instrument]`.
+
+Deciding on the displayed numbers turns out to be the stronger of the two fixes, which I
+had backwards. On the no-replicate case the interval still prints `[1.0000,1.0000]`, the
+rounded bounds now contain 1.0, and the verdict is DISPATCH -- correct -- with no floor
+involved at all. The floor widening still earns its place for cells that agree closely but
+not to four decimals; it is not what saves the degenerate case.
+
+**The peer's own result, recorded because it kills a recommendation rather than confirming
+one.** They had argued for reporting a distortion as `4.9% +/- 0.4%`, and checked both
+routes to that width before building it. The replicate difference is bit-identical in 20 of
+72 arm readings on their card, so the width collapses to a point in most attempts -- their
+identical-to-the-last-bit and my 4e-16 are the same event, an input to the width with no
+variation to see. The arm's own dispersion predicts a standard deviation of 0.032 to 0.048
+percentage points against an observed across-pass 0.095 to 0.476, i.e. 2x to 10x too
+narrow, and worst on the smallest cases, which are the ones nearest the bound. They dropped
+the interval and will publish measured across-pass reproducibility as a property of the
+instrument instead.
+
+The symmetry is worth keeping because it bounds what widening can do. Mine: resampling over
+cells captures spread between cells and none of the measurement noise within one. Theirs:
+sampling within one attempt captures noise within it and none of the variation between
+attempts. Same sentence, opposite blind spot. Mine was fixable by flooring because the floor
+was a quantity already in hand; theirs is not, because no term inside a single run knows what
+varies between runs. Six threshold or estimator failures over these two days, four mine and
+two theirs, and every one was a derived quantity standing on a measurement that was fine.
