@@ -22829,3 +22829,52 @@ Checked before it is measured:
 **What is NOT checked: the split path has never been compiled.** It is guarded on `__AVX2__`
 because the multi-row kernel is, and the only ARM host cannot build it. An x86 compile and
 correctness run come before any timing, and both x86 hosts are currently running `dgmult`.
+
+## chain174 -- the row split's NO-GO names a testable mechanism, and the answer to three data points is to count them
+
+Prepared while `dgmult` runs, not yet executed. Recording the reasoning because it touches a closed
+verdict and the framing matters.
+
+The width-2 high-degree regression (`connectus` 0.602, `TSOPF_FS_b300` 0.712, two-host) is the
+oldest open ship blocker here, and the mechanism built for exactly it -- the row-split partition --
+is in the tree and off. I went looking for whether its threshold had ever been swept, expecting to
+find it unmeasured. It is thoroughly measured: the verdict is NO-GO, arm-variant across hosts, with
+float64 gaining 8.8% on MKT and losing 9.0% on redwood on the same cells with the same code. That
+is a sound rejection and this does not reopen it.
+
+What it does take up is one sentence of the verdict:
+
+> A gate that admitted connectus and excluded nw14 would be worth having, and I could not find one
+> that was a mechanism rather than a fit to three matrices.
+
+The verdict then names the separating quantity: the typical length of the rows the split is **not**
+splitting, against the segment width. `connectus` averages 1971 nonzeros over its other 511 rows and
+wins on both x86 hosts; `nw14` averages 11305 over its other 72 and loses on both. The mechanism
+that implies is specific -- a split helps only when a segment is comparable to or wider than a
+typical unsplit row, because otherwise it replaces work the kernel already does at its most
+efficient with units an order of magnitude shorter. On those two matrices the ratio is 0.90 against
+6.4, a sevenfold separation.
+
+**That is a stated mechanism, and it was refused for having three data points. The answer to three
+data points is not to fit them more carefully -- it is to find out how many points exist.** So the
+next step is a count, not a measurement: `splitcensus.py` walks the corpus, calls production's own
+`scorch_spmm_row_imbalance` and `scorch_spmm_seg_width` rather than restating either (ops.cpp
+exports both for precisely this reason, and its comment notes the imbalance probe is "easy to get
+almost right" because it is the longest run of equal-nonzero cuts landing in one row, not max degree
+over mean), and reports where every gate-firing matrix sits on the ratio.
+
+It is structural -- indptr only, no timing -- so it cannot be confounded and does not need a quiet
+host. `maxdeg` is computed by a direct scan, which production deliberately avoids; that is a census
+quantity rather than a policy, and the per-call cost production is avoiding does not exist offline.
+
+**Pre-registered before any of it runs**, so what follows is a test and not a fit:
+
+- Fewer than 5 matrices on each side of ratio = 2, *excluding the three the verdict rested on*, and
+  there is no population. The NO-GO stands unchallenged, and reporting that is the outcome rather
+  than a reason to lower the bar.
+- With a population, the timed stage predicts a GAIN below 1 and a LOSS above 3, with 1 to 3
+  unclaimed. A rule that predicts correctly on matrices it was not derived from is a mechanism; the
+  same rule fitted to `connectus` and `nw14` is what the verdict correctly refused.
+
+Both verdict branches were exercised on constructed inputs before the real corpus was touched, and
+the analyzer refuses an empty census rather than reporting a clean nothing.
