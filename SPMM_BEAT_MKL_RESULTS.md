@@ -23398,3 +23398,90 @@ edge are indistinguishable, and that limit is worth stating rather than resolvin
 A watcher is waiting and will distinguish the cases that matter once the host answers: the driver
 still running (wait), the driver gone with 54 CSVs (pull and analyse), or the driver gone with fewer
 (relaunch, and do NOT analyse the partial CSVs as a whole run).
+
+## chain179 -- the loop split is rejected for the thing it was built for, and pays off somewhere nobody proposed
+
+The multi-row loop split has been built, compiled and correctness-checked since chain173 and had
+never been put on a clock. MKT, four builds over eight passes, redwood down.
+
+**The stage needed four builds and the reason is the finding that nearly wasn't.**
+`SCORCH_SPMM_MULTIROW_ROWS` is **0** on this branch, and a zero row count folds `multirow_ok` and
+the whole dispatch out of the instantiation. So `-DLOOPSPLIT=1` alone is **inert here**: a two-build
+stage would have measured a dormant switch and reported a clean null, which reads as "the split
+does not help" and is in fact "the split was never compiled in". Multi-row therefore has to be on
+in both arms, making the reference `mrf2` and not `c0`:
+
+    c0 / c0b   tip default                                    the A/A floor
+    mrf2       -DSCORCH_SPMM_MULTIROW_ROWS_F32=2              the reference
+    mrf2ls     the same plus -DSCORCH_SPMM_MULTIROW_LOOPSPLIT=1
+
+L3 was pre-registered to catch exactly that failure, and it passed loudly -- multi-row moved at all
+four firing widths on the target group, by a lot: **1.1925 / 1.1910 / 1.3377 / 1.2241** at k=5, 6,
+8, 16 against floors within 0.5%. So the precondition is live and L1 is falsifiable.
+
+**L1, the claim, is NOT SUPPORTED.** Hoisting the per-row `multirow_ok` test out of the row loop:
+
+    k=5   0.9902     k=6   0.9926     k=8   1.0046     k=16  1.0133
+                     (floors 0.9989 / 1.0016 / 1.0053 / 0.9985, tol 0.010-0.011)
+
+Three of four inside the floor, one at +1.3%. A test that runs once per row and is loop-invariant
+turns out to cost about nothing -- the branch predictor gets it right every time, which is what a
+`const bool` fixed before the parallel region should produce.
+
+### The half of the mechanism I mis-specified
+
+L2 was pre-registered as an INERTNESS control: widths 2 and 4 cannot reach multi-row, since
+`exact_width` claims 1-3 and `SCORCH_SPMM_HALFVEC_F32=1` excludes width 4 by name, so a move there
+would mean the arm was touching code it does not name. **That reasoning was wrong, and the code says
+so in its own comment:** under the split those calls take the `false_type` instantiation, where
+`if constexpr (MR_LIVE && MR_ROWS_LIVE)` *deletes* the multi-row block rather than predicting it
+away -- "the false arm compiles the block away entirely". Widths 1-4 are therefore **in scope**, and
+they are the half of the split's mechanism nobody proposed it for.
+
+    k=4   1.0921    17 of 18 target matrices more than 1% faster, 0 slower
+    k=2   0.9800     0 of 18 faster, 15 of 18 more than 1% slower
+
+Both are broad rather than a cell or two. The single k=4 exception is `connectus`, whose own
+c0-against-c0b floor reads 1.0998 on that width -- the bimodal wide-row matrix from chain178, noise
+by its own control. So: **the dead multi-row block was costing width 4 about 9%**, and width 4 is
+precisely the width the multi-row dispatch refuses on purpose. In a shipped-with-multi-row
+configuration, the half-vector width pays to carry code it never executes.
+
+Width 2 goes the other way by 2%, consistently, and runs the exact-width kernel rather than the
+register block.
+
+**L4, the GCN guardrail, fails.** This guardrail is on-mechanism here, unlike the unroll ladder's:
+k=6, 7 and 16 are all inside the firing range 5..32, and k=3 is inside the dead-block-removal case.
+
+    k=3   0.9830      k=6   0.9867      k=7   0.9893      k=16  0.9977
+                      (floors within 0.7%, tol 0.010-0.013)
+
+Three of four regress, 1.1 to 1.7 percent, on real citation graphs at real layer widths.
+
+### Verdict, and what one host can decide
+
+**Rejected as it stands, on two independent grounds**: the claim it was built for is not supported,
+and it regresses the GCN guardrail at three of four widths. One host is enough for that -- a single
+host can kill an arm, it just cannot ship one -- so redwood is not needed to close this.
+
+What survives is a lead, not a result: **the dead-block cost at width 4 is worth ~9% and is
+mechanically explained.** The right change is narrower than this arm -- remove the multi-row block
+from instantiations where `multirow_ok` is provably false, without restructuring the row loop that
+the exact-width path and the 5-7 widths share, which is where all of this arm's costs sit. That is
+a different patch and it needs its own stage.
+
+And the whole question is conditional: **multi-row does not ship on this branch.** Everything above
+describes a configuration that only exists if `MULTIROW_ROWS_F32=2` ships first, which is its own
+open arm with its own history. Worth stating because L3's 1.19-1.34 is the largest number in this
+chain and it belongs to multi-row, not to the split.
+
+### Three analyzer defects, all of which flattered the arm
+
+- **L1 read "HOLDS -- faster at 1 of 4 firing widths."** The pre-registration named widths 5, 6, 8
+  AND 16; one of four is not the claim holding, and that line is exactly what gets quoted as "the
+  split is faster". Now requires all four and reports NOT SUPPORTED otherwise.
+- **L2's mis-specification** turned the split's own mechanism into a confound verdict, which would
+  have voided L1 for the wrong reason and buried the 9% finding as noise. Re-specified as a
+  two-sided finding that does not gate L1.
+- **The GCN table labelled k=3 "outside; a move here is a confound"**, which was the same error one
+  layer down. Widths below 5 are in scope through the dead-block removal.
