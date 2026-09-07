@@ -22743,3 +22743,89 @@ sets it to **1** through a compile-time define, which bypasses that validation e
 turns out to be meaningful and the correctness grid passes on it at every width and row count in the
 straddle. But a build-defines arm can reach configurations the runtime hook is written to reject,
 and no part of the three-build path checks that the value it is measuring is one the code admits.
+
+## chain173 -- the held-out stage's GCN guardrail was never printed either, and the loop-split arm is built
+
+Two pieces of work, one prompted by the other.
+
+### The same defect, in the analyzer whose conclusion is still live
+
+chain172 found `an_exunroll.py` ingesting a GCN guardrail group and reading it only to decide
+whether to print an absence warning. That is a class of defect, not an incident, so I audited every
+analyzer that ingests `s[hg]_*.csv` for it:
+
+    an_band2.py      2 mentions, 1 consuming   -- computes a real guardrail
+    an_unsw.py       2 mentions, 1 consuming   -- computes a real guardrail
+    an_dgmult.py     6 mentions, 3 consuming   -- table + verdict (written in chain172)
+    an_exunroll.py   6 mentions, 3 consuming   -- fixed in chain172
+    an_heldout.py    1 mention,  0 consuming   -- INGESTED AND NEVER READ
+
+`an_heldout.py` is worse than the one already fixed: it has no absence warning either, so the
+held-out stage's GCN guardrail was collected on **both hosts**, across four arms and 24 cells each,
+and reported nowhere at all. Nothing in its output ever mentioned a guardrail, so there was not
+even a blank to notice.
+
+Printed, using `an_unsw.py`'s worst-cell-against-its-own-floor form:
+
+    redwood                                            MKT
+    bandmr  pubmed   f64 k=7   0.9589 (floor 0.9850)   bandmr  none of 24 beyond its spread
+    mdlo    pubmed   f64 k=7   0.9617 (floor 0.9850)   mdlo    none of 24 beyond its spread
+    rag2    cora     f64 k=16  0.9831 (floor 0.9961)   rag2    none of 24 beyond its spread
+    ragmd   citeseer f32 k=3   0.9825 (floor 1.0073)   ragmd   citeseer f32 k=16  0.9435
+
+**It does not establish a regression, and the reason is in the shape of the flags.** `bandmr` and
+`mdlo` flag the *identical* cell at nearly the same ratio against the same floor. Two different arms
+regressing one cell alike is a cell whose own same-code floor is understated, not two independent
+regressions -- and 4 of 4 arms flagging *something* says the same more weakly. On the second host
+three of the four are clean. No cell is flagged on both hosts, so by this project's own rule nothing
+here is confirmed.
+
+So the honest reading is narrow and it is still worth having: **the held-out stage's per-cell
+guardrail threshold is too tight on redwood**, `pubmed float64 k=7` is a cell to re-measure, and
+`ragmd` -- already rejected on aggregate -- is the only arm flagged on both hosts, at two different
+widths.
+
+Both cautions are now emitted rather than narrated: the worst-of-24 line says it is a multiple
+comparison and points at re-measurement instead of a verdict, and the shared-cell case prints its
+own diagnosis. The reason to emit the caution rather than suppress the finding until it is
+significant is that suppressing it is exactly what left the guardrail unprinted.
+
+### The loop-split arm, built
+
+The arm chain162 identified and chain168-171 did not get to: unswitch the multi-row admission test
+out of the **row loop** rather than templating the entire worker.
+`SCORCH_SPMM_MULTIROW_LOOPSPLIT`, default 0.
+
+`multirow_ok` is a `const bool` fixed before the parallel region, so the row loop can be entered
+through a compile-time tag once per **claim** -- a claim is a chunk of rows, so on the short-row
+matrices where the branch costs most this is one test against thousands. The worker's workspace
+setup, its work-stealing claim loop and its zero-slice drain stay single-bodied, which is strictly
+less duplication than UNSWITCH for the same branch removal.
+
+Two constants that differ only in the default build, which is the whole trick: `MR_ROWS_LIVE` gates
+whether the multi-row block is in the instantiation at all, `MR_PRETESTED` whether `multirow_ok`
+has already been tested. With the split off they are `true` and `false`, so
+`if constexpr (MR_LIVE && true)` and `(false || multirow_ok)` restore the shipped condition exactly.
+
+The `#if` surrounds only the lambda's opening and closing lines; the loop header and its 500-line
+body are **shared text, not duplicated source**. Two reasons, both learned here: UNSWITCH measured a
+forwarding lambda at 14 instructions of 164596 with its own constant off, so a default-off mechanism
+cannot afford to wrap anything; and two `#if` arms holding the same 500 lines drift apart silently,
+which is worse than either cost.
+
+Checked before it is measured:
+
+- **Control flow survives the wrap.** Every `break` in the body is switch-local and every `continue`
+  targets the row loop; there is no `return`, no `goto`, and no `break` aimed at the enclosing claim
+  loop.
+- **Default emission is neutral**, proven rather than asserted: 20 differing instructions of
+  169165, all bare immediate moves, every delta exactly 41 -- which reconciles against the source as
+  31 lines inserted above the row loop plus 10 below it, with all ten of `spmm.h`'s `TORCH_CHECK`
+  macros sitting below both. The A/A control at equal-length build paths reports identical
+  disassembly on the same pair, so the instrument was working.
+- **Correctness**: 576 cases over both dtypes, twelve row counts straddling every plausible unroll
+  factor, three densities and eight widths. Zero mismatches.
+
+**What is NOT checked: the split path has never been compiled.** It is guarded on `__AVX2__`
+because the multi-row kernel is, and the only ARM host cannot build it. An x86 compile and
+correctness run come before any timing, and both x86 hosts are currently running `dgmult`.
