@@ -22310,3 +22310,73 @@ regenerate this" and "we can prove the regenerated copy is the same corpus". Wit
 post-rebuild corpus is unverifiable and any comparison spanning the rebuild is quietly invalid; with
 them the bulk data becomes genuinely re-derivable rather than nominally so. Same distinction as
 reproducible-versus-idempotent: idempotent is the weaker property and the one that looks identical.
+
+## chain167 -- five analyzers pooled two populations, and it inverted chain161's ship verdict
+
+A peer session described a stratified sampler that sorted and strided and so silently dropped
+whichever category sorted last -- invisible in the output because every count looked reasonable.
+Checking for the same class here found `mkkeys_split.py` clean (it draws with
+`rng.choice(replace=False)`, not a stride) and then found something worse one level up.
+
+**`mkkeys_split.py` splits the corpus at nnz >= 1e6 and says in its own docstring why: "Both groups
+are reported separately and neither is dropped; the point of the split is that pooling them dilutes
+a kernel effect into a floor."** Control matrices take about 22us per call against a per-call floor
+of about 22us, so their time is mostly floor. Of seven analyzers, **only `an_ship.py` ever read
+`groups.txt`.** `an_attrib`, `an_band2`, `an_heldout`, `an_unsw`, `an_resid` and `an_exunroll` all
+pooled -- so every geomean behind chains 151, 154, 157, 158, 160 and 162 was diluted.
+
+**The direction of the bias is what makes this serious.** Dilution pulls every ratio toward 1. So
+an effect reported as real is real-or-larger -- harmless. An arm reported as **FLAT** may simply
+have been diluted below tolerance, which is a **false negative**. And `an_attrib`'s three-way
+verdict turns on exactly that reading -- "placement flat, presence nearly flat, candidate moves" --
+so pooling could have manufactured the verdict it reported.
+
+### chain161 was understated by more than double, and its ship verdict was the wrong population
+
+float32, `exu1` against `c0`, redwood:
+
+    k | TARGET (37)   pooled (60)   CONTROL (23)
+    1 | 0.9368        0.9143        0.8792
+    2 | 1.1145        1.0497        0.9532
+    3 | 1.1465        1.0839        0.9902
+
+The two groups move in **opposite directions**, which is the whole reason the split exists. On the
+matrices where the kernel is most of the call, removing the unroll is **+11.5% and +14.7%**, not
+the +5.0% and +8.4% recorded. By degree, target group: **1.2215 at degree 4-20 width 2** and
+**1.2079 at width 3**, on 26 matrices.
+
+**And the ship verdict inverts.** chain161 said `exu1` puts 5 of 60 cells below MKL against the
+default's 1, so the geomean improved while the goal got worse. Split:
+
+    below MKL, exu1   TARGET 1/37, 1/37, 1/37     CONTROL 4/23, 4/23, 4/23
+    below MKL, c0     TARGET 0/37, 0/37, 0/37     CONTROL 0/23, 1/23, 2/23
+
+**80% of the damage was control-group cells** -- matrices whose call is mostly per-call floor. On
+the group that can express a kernel effect it is one new cell per width against a 22% gain on 26 of
+37 matrices. That is a completely different trade from "five cells for five percent".
+
+**The stated blocker is also one matrix.** chain161 reported -27% above degree 128 as the reason a
+blanket change cannot ship. In the target group that band has **n=1** (0.5581); the -27% was
+carried by the control group's n=5. So the population claimed to block this is a single matrix in
+the group that matters, and the real target-group loss is at **degree 20-128 width 1** (0.7865,
+n=9) -- a different band than the one recorded.
+
+### chain162 survives, and sharpens
+
+    redwood TARGET | placement 0.9987 pf 0 | presence 0.9957 pf 0  | candidate 0.9738 pf 19/37
+                   | placement 0.9995 pf 0 | presence 0.9948 pf 1  | candidate 0.9870 pf 17/37
+    MKT     TARGET | (no c0pad)            | presence 0.9629 pf 14/18 (k=4) | candidate 0.9769 pf 5
+
+On the target group placement and presence are **cleaner** than pooled (past-floor 0 rather than 1
+and 3), so "the per-row branch" is better supported, not worse. MKT's width-4 finding strengthens:
+code presence costs **3.7%** and is past-floor on **14 of 18** target matrices, against the
+candidate's 0.9769 on 5. And MKT width 1 reads 1.0051 past-floor 0 -- the host asymmetry is cleaner
+still.
+
+**An unplanned cross-validation.** The work-scaling probe independently classified `mrf64`'s cost as
+DISPATCH rather than KERNEL. A per-call cost should therefore be *larger* in the floor-dominated
+group, and it is: redwood `mrf64` reads 0.9860 in control against 0.9957 in target. Two instruments
+built for different questions agree on the mechanism.
+
+The remaining analyzers still pool. That is a known defect now rather than an unknown one, and the
+priority is `an_unsw` and `an_heldout`, whose conclusions include flat readings.
