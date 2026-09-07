@@ -22278,3 +22278,35 @@ on a constructed input:
 That is the difference between "no evidence of contamination" and "an instrument demonstrated to
 detect contamination". The same distinction the neutrality tool needed, and the same fix: an input
 the live system cannot produce has to be constructed.
+
+## chain166 -- why a contaminated pass cannot be dropped, and the manifest-versus-bulk distinction
+
+A peer asked whether a 22 GB sequential read off mkt1's `/scr`, streamed over ssh, would perturb
+`unroll2`. The answer is worth recording because the reasoning is not the obvious one.
+
+**Throughput is not the issue, and their own number shows it.** 22 GB in 15-30 minutes is 12-24
+MB/s -- about 0.02% of mkt1's memory bandwidth, three orders of magnitude below the effect being
+resolved. The risks that do *not* scale with throughput are LLC pollution from DMA writes and
+page-cache churn, and on EPYC 9334 the narrow widths this stage measures are specifically an
+L2-miss/L3-hit band, which is where cache pollution would land. Small, but pointed at the right
+place.
+
+**What actually decides it is that a contaminated pass cannot be excised.** The rotation is five
+passes over five builds with each build leading exactly once, because the lead build in a group
+reads systematically fast -- an earlier job in this sequence had four builds over six groups and
+both once-leading arms came out 0.5-1.2% slow **on identical source**, which is the size of the
+effect at stake. So if a transfer overlapped two of five passes, discarding them would not leave
+three clean passes; it would leave an **unbalanced rotation carrying a bias the same size as the
+signal**. The only remedy is rerunning the whole stage.
+
+That is a general property of interleaved-rotation designs and it cuts against the usual instinct:
+robustness to a bad pass is exactly what the balanced rotation trades away for cancellation of the
+lead-build bias. Worth knowing before assuming a contaminated subset can be dropped.
+
+**The alternative offered is the more useful half.** Rather than copying 37 GB of derived data off
+node-local scratch, transfer the **manifests and a per-file digest list** -- kilobytes, no
+meaningful I/O, safe to run beside a live measurement. That is the difference between "we can
+regenerate this" and "we can prove the regenerated copy is the same corpus". Without digests a
+post-rebuild corpus is unverifiable and any comparison spanning the rebuild is quietly invalid; with
+them the bulk data becomes genuinely re-derivable rather than nominally so. Same distinction as
+reproducible-versus-idempotent: idempotent is the weaker property and the one that looks identical.
