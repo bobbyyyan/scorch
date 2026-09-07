@@ -1017,8 +1017,68 @@
 // something the compiler cannot see is not a gate, it is a build flag someone has to remember.
 // Leaving float64 at 1 makes it bit-identical to what ships today, which is a stronger guarantee
 // than any host predicate would give.
+// float32's multiplier is 8 on x86 and the shared 1 everywhere else, and BOTH halves of that are
+// measured. This is the ladder's threshold, not its depth: at 8 a matrix of mean degree under 16
+// gets unroll 1, 16-32 gets 2, and 32 up keeps the shipped 4.
+//
+// x86, mean degree 8-16, target group, against the shipped multiplier. Five builds over five
+// passes on each host, and the numbers survive one-vote-per-family weighting (9 families on
+// redwood, 3 on MKT), so they are not one generated family repeated:
+//
+//               per-matrix          per-family
+//   redwood     k=2 1.2186          1.2181        k=3 1.2061 -> 1.2496
+//   MKT         k=2 1.1708          1.2004        k=3 1.0999 -> 1.1013
+//
+// Against MKL that moves the cell count, which is the goal it serves: on MKT's target group,
+// width 2 goes from 18 of 18 below MKL to 2 of 18, and width 3 from 18 to 3. The two survivors,
+// connectus and relat8, are far outside the band and the threshold cannot reach them.
+//
+// ARM is EXCLUDED because it was measured and it loses. Same 34 matrices, 27 in the band, on the
+// M5: 0.8495 / 0.8152 / 0.8591 at widths 1 / 2 / 3 against a 1.0026 / 0.9997 / 0.9994 same-code
+// floor -- a 15 to 18 percent regression. Widths 4 and 8 are inside the floor and degree >= 64 is
+// inert against an exchangeability null, so the loss is exactly in-band and carried by the
+// threshold. Mechanically that is not surprising: removing the unroll leaves one dependent FMA
+// chain, and NEON's four float32 lanes and issue width need more independent chains to stay
+// throughput-bound than AVX2's eight do. This is the same ISA split as
+// SCORCH_NARROWK_EXACT_HI_F32, which is an x86 win that reads 0.7229 on ARM.
+//
+// The MULT=2 arm is what makes all of the above attributable rather than correlational. It cannot
+// reach the 8-16 band -- at that multiplier a matrix of mean degree 8-16 still gets unroll 4 --
+// and it reads inside the floor in the band on all three hosts and both dtypes.
+//
+// A gate the compiler can see, so nothing has to be remembered at build time. Only ONE host in
+// this project is ARM, so the ARM half is a single-host reading; that is why it is used to EXCLUDE
+// rather than to claim, which is the direction a single host can support.
+//
+// What the gate emits, checked rather than argued, because a define inside an #ifndef is exactly
+// the kind of thing that silently does not fire:
+//
+//   x86 fires.  Three objects from this tree: the default, the same tree with _F32 forced to 8,
+//   and forced to 1. The default and the forced-8 build are BYTE-IDENTICAL (sha 700d8b5d, 1536048
+//   bytes) and both differ from forced-1. A presence count of the ladder's own comparison
+//   immediates was tried first and is worthless -- `cmp $0x1` occurs 615 times in the object for
+//   unrelated reasons, so its presence proves nothing and its absence was never expected.
+//
+//   ARM is untouched.  Pre-gate against gated, same source otherwise: identical disassembly over
+//   169165 instructions.
+//
+//   float64 is untouched ON x86 TOO, which is the strong form of the exclusion above. Holding the
+//   tree fixed and moving only _F32 from 1 to 8, all 23 float64 SpMM symbols are identical. So
+//   float64 needs no timing run to be called neutral here; nothing in its code changed.
+//
+// One assumption this falsified, and it is the reason the shipped configuration was timed on its
+// own rather than inferred from the sweep arm: a runtime `long` comparison was expected to leave
+// every kernel's code shape alone. It does not, at -O3. The constant feeds the inliner's budget,
+// and moving it trades exactly one unroll-2 instantiation between inlined and out-of-line --
+// <float,4,2> for <float,6,2>, 15 of the 18 width/unroll combinations out-of-line either way --
+// which is a 67-instruction difference in spmm_csr_v2_core<float,false>. Semantically the same
+// eighteen kernels; not the same object.
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32
-#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#  if defined(__AVX2__) && defined(__FMA__)
+#    define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32 8L
+#  else
+#    define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#  endif
 #endif
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
