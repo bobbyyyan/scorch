@@ -22183,3 +22183,62 @@ the two, and the distinction is cheap to make.
 A follow-up that costs nothing later: `mrgate.py` should record locality alongside `deg` so this
 join is never needed again. Not done now -- both hosts are executing that file in a loop, and
 editing a harness mid-run is its own defect.
+
+## chain165 -- "the node was idle" was an assumption on both hosts; now it is a record on one
+
+A peer session pointed out that the A/A control measures the noise floor of the instrument and
+**cannot tell you the node was idle**. That gap matters more than it sounds: a co-tenant present
+for a whole run does not add visible noise, it *inflates the A/A floor*, and the real effect then
+reads as inside the floor. The failure mode is a **false negative**, which is the kind that does
+not announce itself.
+
+The right instrument differs by host, and the difference is not cosmetic.
+
+### MKT: ask the scheduler, and it is retroactive and free
+
+Slurm knows what it placed and when, so there is nothing to sample and nothing to miss.
+`scratchpad/cotenancy.sh <jobid>` reads the job's own window out of accounting and returns every
+other job whose window overlapped it **on the same node**.
+
+**Validated on both a positive and a negative control before being trusted**, because a detector
+with only one is not tested:
+
+    17306306  (cancelled for landing beside skb-amp)  -> CO-TENANT FOUND: skb-amp, 16 cpus,
+                                                          20:36:25 -> 20:45:21 vs mine 20:39:13 -> 20:39:29
+    17304145  (attrib2b, believed exclusive)          -> CLEAN
+
+Then run over every MKT job behind a recorded conclusion in this file:
+
+    17287573  unsw          00:41 -> 02:39   CLEAN
+    17290869  windows       03:06 -> 05:19   CLEAN
+    17295447  hoist         09:06 -> 11:04   CLEAN
+    17299344  neutrality    14:24 -> 14:32   CLEAN
+    17304145  attribution   17:39 -> 18:51   CLEAN
+
+So chain151, chain154, chain156, chain160 and chain162's MKT halves are **certified**
+co-tenant-free rather than believed to be. That is a real upgrade in what those numbers mean, and
+it cost one query.
+
+### redwood: no scheduler, so the record has to be built, and it starts now
+
+redwood has no Slurm and **nine logged-in tmux sessions across three users**, so exclusivity there
+has rested on a single `top` snapshot taken once today. `scratchpad/rw_loadsample.sh` samples
+`/proc/loadavg` and any non-self process above 10% CPU once a minute, nice'd to 19.
+
+Two properties it needed:
+- **It terminates on its own**, when the stage it was named for stops holding the stage lock, or at
+  a hard deadline. A sampler that outlives its subject is the stale-poller defect this project has
+  hit repeatedly, and it decides via the same lock file every other waiter here reads, so it cannot
+  outlive its subject by a *different* rule.
+- **Its co-tenant count is a floor, not a measurement.** `ps` `%cpu` is a lifetime average, so it
+  understates a process that just started. Better to say so than to report the number as exact.
+
+First samples during `unroll2`: load 16.98 and 12.08 of 32 cpus, own processes at ~1700%, **zero
+other-user processes above 10%**. So redwood is currently ours.
+
+**The honest gap: every redwood run already recorded in this file has no exclusivity record.**
+band2, unsw, heldout, exunroll and attrib2 all completed before sampling existed, and the first 19
+minutes of `unroll2` are unsampled too. Nothing suggests they were contended -- the one snapshot
+taken mid-session showed only our own load -- but "nothing suggests" is not evidence, and on the
+host with three users and no scheduler it is the weaker claim of the two hosts, which is the
+opposite of how it has been treated.
