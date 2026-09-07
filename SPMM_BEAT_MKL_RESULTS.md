@@ -23373,9 +23373,28 @@ it reads 28 of 42 against a null of 28 +- 3.1.
 
 ### What is missing
 
-**redwood was unreachable from 06:10, at 5 of 54 CSVs** -- 100% packet loss, port 22 filtered, DNS
-resolving, and unreachable from the myth jump host too, so it is the host and not the route. MKT is
+**redwood became unreachable at some point after 06:10, and the run's fate is UNKNOWN.** MKT is
 therefore the only x86 host with a verdict, and the house standard is two. Nothing ships on one
-host. A watcher is waiting for redwood and will distinguish the two cases that matter: the driver
-survived and the stage finishes on its own, or the host rebooted and the partial CSVs must not be
-analysed as a whole run.
+host.
+
+The first version of this paragraph said "unreachable from 06:10, at 5 of 54 CSVs", which claims
+more than was observed and in the direction that reads as a lost run. What was actually seen:
+redwood answered at 06:08 with 4 CSVs and at 06:10 with 5, and the next attempt was at 10:14 and
+failed. **The outage began somewhere in that four-hour window and nobody watched it start.** At the
+measured pace -- about 6 minutes per build-pass, three builds per pass, six passes -- the stage was
+due to finish around 07:47, so the likeliest case is that it COMPLETED and all 54 CSVs plus c5.txt
+are sitting on /scratch, unreachable rather than lost.
+
+Reachability, from two vantages with different networks and healthy egress:
+
+    myth54   171.64.15.19    ICMP 100% loss   tcp/22 timeout
+    sc       10.79.12.70     ICMP 100% loss   tcp/22 timeout   (reaches myth:22 fine)
+
+The failure mode is a TIMEOUT and not a refusal, so nothing answers at the IP layer -- this is not
+sshd dying on a live host. Traceroute cannot narrow it further because campus filters the probes:
+hop 1 is already `*`. From outside, a powered-off host and a host firewalled off at its own subnet
+edge are indistinguishable, and that limit is worth stating rather than resolving by guess.
+
+A watcher is waiting and will distinguish the cases that matter once the host answers: the driver
+still running (wait), the driver gone with 54 CSVs (pull and analyse), or the driver gone with fewer
+(relaunch, and do NOT analyse the partial CSVs as a whole run).
