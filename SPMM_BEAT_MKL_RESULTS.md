@@ -22116,3 +22116,27 @@ idea, and the reason redwood was unaffected.
 
 One asymmetry worth recording: a dependency protects *my* numbers from someone else's job, not
 theirs from mine. Mutual protection needs both parties to use it, or an outright agreement.
+
+### chain163 amendment -- the dependency rule as stated would deadlock
+
+The rule recorded above -- "compute the dependency from whatever is running or pending" -- is
+**wrong as written**, and the peer session caught it before it cost anything. `afterany` is
+satisfied when a job *terminates*. Bobby's four `JobHeldUser` jobs on `mkt` are PENDING and may
+stay so indefinitely, so depending on them does not delay a job, it **deadlocks it forever**.
+
+The current submission is unaffected because its dependency was a single hand-picked job id, but
+the general rule needed fixing before it was used. Held jobs must be excluded by **reason**, not by
+state -- `squeue -p mkt -h -o "%i|%T|%r|%j"` and drop `JobHeld*`. Jobs pending on `Dependency` must
+NOT be dropped: such a job will eventually run and co-tenant, so it has to be waited for. That is
+the one case where the naive answer is right, which is what makes the distinction easy to get
+backwards.
+
+`scratchpad/sbatch_after.sh` implements it and was fired against the live queue rather than
+reasoned about: it keeps `17306323:17306296` and drops all four held jobs. That set is exactly what
+the peer's independently written helper computes, which is the closest thing to a cross-check
+available for a rule with no test corpus.
+
+Worth naming the shape, because it is the third instance in this sequence: **a safety mechanism
+whose failure mode is worse than the hazard it prevents.** Co-tenancy costs one contaminated run;
+a deadlocked dependency costs every run until someone notices the job never started -- and a job
+stuck in PENDING looks exactly like a job politely waiting its turn.
