@@ -22242,3 +22242,39 @@ minutes of `unroll2` are unsampled too. Nothing suggests they were contended -- 
 taken mid-session showed only our own load -- but "nothing suggests" is not evidence, and on the
 host with three users and no scheduler it is the weaker claim of the two hosts, which is the
 opposite of how it has been treated.
+
+### chain165 amendment -- the accounting is complete, and mkt1 is shared more widely than assumed
+
+The peer session asked the right question about the tool before relying on it: does `sacct -a`
+actually return every user here, or does it degrade silently into returning only your own jobs? On
+a cluster that restricts accounting the two are indistinguishable -- every verdict reads CLEAN.
+
+**Checked: unrestricted.** 186 distinct users and 32,941 records since Sep 5. So the CLEAN verdicts
+above are complete lists rather than floors.
+
+**And a correction to something I asserted one message earlier.** I said mkt co-tenancy could only
+come from within this account, because the `mkt` partition's only user is `bobbyy`. That is true of
+the partition and false of the machine: **`mkt1` serves both `mkt` and `mkt-interactive`**, and
+three users have run on it since Sep 1 -- `azeinali`, `bobbyy`, `usman25`, the latter via
+interactive jobs. So coordinating with the peer session is **necessary but not sufficient** for
+mkt1 exclusivity.
+
+`cotenancy.sh` was already node-scoped rather than partition- or account-scoped, which is the only
+reason it is sound. A query written the way I had just described the problem -- scoped to the `mkt`
+partition, or filtered to this account -- would have missed a real co-tenant while looking
+identical. Direct recheck of all five measurement windows for foreign-user jobs on mkt1: **zero in
+every window.**
+
+**The live cross-user control was inconclusive and I nearly recorded it as a pass.** Running the
+tool on another user's job returned CLEAN -- but that means "nothing overlapped that window", not
+"the filter can see foreign users", and this cluster has never actually produced a foreign-user
+overlap on mkt1 to test against. So the tool now takes `COTENANCY_SELFTEST=<table>` and was fired
+on a constructed input:
+
+    foreign user on the same node       -> FOUND (both the foreign job and a same-account sibling)
+    foreign user on a DIFFERENT node    -> CLEAN (mkt2 correctly ignored)
+    empty table                         -> CLEAN, not an error
+
+That is the difference between "no evidence of contamination" and "an instrument demonstrated to
+detect contamination". The same distinction the neutrality tool needed, and the same fix: an input
+the live system cannot produce has to be constructed.
