@@ -989,6 +989,40 @@
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT 1L
 #endif
+// Per dtype, because the multiplier's effect DISAGREES IN SIGN ACROSS HOSTS on float64 while it
+// agrees on float32. Both default to the shared constant above, so a build that sets neither is
+// byte-identical to one that has never heard of these -- the same construction as
+// SCORCH_NARROWK_EXACT_HI_F32/_F64 and SCORCH_SPMM_HALFVEC_F32/_F64, and for the same reason.
+//
+// The measurement, target group, mean degree 8-16, MULT=8 against the shipped MULT=1, five builds
+// over five passes on each host:
+//
+//              float32                      float64
+//   redwood    k=2 1.2186  k=3 1.2061       k=2 1.0712  k=3 1.0458
+//   MKT        k=2 1.1708  k=3 1.0999       k=2 0.9603  k=3 0.8819
+//
+// float32 is a two-host gain of 10-22%. float64 is +5 to +7% on one host and -4 to -12% on the
+// other, and it is not noise: the MULT=2 arm, which cannot reach that band because a matrix of
+// mean degree 8-16 still gets unroll 4 at that multiplier, reads inside the floor in all four
+// cells on both hosts. So the effect is carried by the threshold and the two x86 hosts genuinely
+// disagree about it on float64. float64 also regressed GCN k=7 on BOTH hosts, at 0.9871 and
+// 0.9891.
+//
+// A single constant cannot express that, which is what these two are for. The header's own note on
+// the four neighbouring vector constants says it first: "Two of them also disagree across hosts,
+// which no single expression in bytes can say."
+//
+// Why not gate on the HOST instead: nothing the compiler knows distinguishes these two machines --
+// both x86-64 with AVX2, differing in microarchitecture, cache hierarchy and pool shape. A gate on
+// something the compiler cannot see is not a gate, it is a build flag someone has to remember.
+// Leaving float64 at 1 makes it bit-identical to what ships today, which is a stronger guarantee
+// than any host predicate would give.
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#endif
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
 #endif

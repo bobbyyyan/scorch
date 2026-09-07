@@ -3963,7 +3963,12 @@ torch::Tensor spmm_csr_v2_core(
   // k=4 where this kernel fires.
   bool narrowk_exact_short = SCORCH_NARROWK_EXACT_SHORT != 0;
   bool narrowk_exact_degunroll = SCORCH_NARROWK_EXACT_DEGUNROLL != 0;
-  long narrowk_exact_degunroll_mult = SCORCH_NARROWK_EXACT_DEGUNROLL_MULT;
+  // Per dtype; see scorch_policy.h for the grid. std::is_same is a compile-time constant inside
+  // the instantiation, and both per-dtype macros default to the shared one, so with neither set
+  // this folds to exactly the constant it replaced.
+  long narrowk_exact_degunroll_mult =
+      std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32
+                                           : SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64;
   long narrowk_exact_mindeg = SCORCH_NARROWK_EXACT_MINDEG;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
