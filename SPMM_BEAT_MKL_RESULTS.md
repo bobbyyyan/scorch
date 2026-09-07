@@ -22569,10 +22569,29 @@ the output by a human step, that step is where the errors are. The `[constant]`/
 marker, the `MIN_POP` refusal, and now the direction column all move a derivation out of prose and
 into the tool.
 
-**And it paid for itself immediately.** With the column present, a cell nobody had looked at is
-legible: float64, width 2, degree 20-128, `unsw +2.78% clears tol` -- `unsw` at 1.0178 against
-`bandmr` at 0.9903 on nine matrices. A real gain that had been sitting unread across two adjacent
-columns, in a table that has been quoted repeatedly.
+**And it paid for itself immediately** -- though less dramatically than I first wrote it. With the
+column present, one cell reads as a gain: float64, width 2, degree 20-128, `unsw +2.78% clears
+tol` -- `unsw` at 1.0178 against `bandmr` at 0.9903 on nine matrices.
+
+I recorded that as a finding nobody had looked at. It is not. **chain157 already states it in
+aggregate** -- "on float64 redwood is neutral-to-faster, including 19 of 22 at 1.0218 for width 2"
+-- same statistic, same direction, same host, fourteen sections earlier. The effect was not unread.
+What the column added is the **per-band target-group version that clears its own tolerance**, which
+is the form a claim has to take here before it counts: 19-of-22 at 1.0218 is a pooled count over a
+corpus whose control half is mostly per-call floor, and it carries no tolerance. The aggregate
+existed; the measurement did not.
+
+That distinction is the whole reason for the split and the tolerance column, so it is worth not
+blurring: promoting an aggregate to a measurement is a real step, and it is a smaller one than
+discovering the effect.
+
+**What the arm's ledger now says**, all of it on the target group: a ~2% two-host low-degree
+float32 gain; a ~2% float32 cost at width 4, localised to degree 20-128 on nine matrices; and a
+~2.8% float64 gain at width 2 on those same nine matrices in that same band. The float32 cost and
+the float64 gain share a degree band and a population but differ in width and dtype, so I am
+recording that as a **coincidence of position, not a mechanism** -- I have no account that predicts
+both. Worth flagging because the float64 half of this work has been treated throughout as a
+smaller-signed echo of float32, and this cell does not fit that: it moves the other way.
 
 ### The other session's own finding, accepted
 
