@@ -22988,3 +22988,92 @@ default changes float64 as well, and this stage ran float32 only. The policy com
 was derived from an x86 **float64** width-1 sweep (+12.4% at degree 2-4, -15.7% at 4-8, +4.8% above
 8), so float64 is not a formality here -- it is the dtype the constant was first reasoned about.
 That measurement comes next, on the same corpus and rotation.
+
+## chain176 -- float64 contradicts float32 and the two x86 hosts disagree in sign, so the constant splits by dtype
+
+`dgm64` finished on both hosts, same corpus, same rotation, same arms as the float32 stage. **It
+contradicts float32, and the contradiction is not noise.** Target group, mean degree 8-16:
+
+    band 8-16          float32                        float64
+    redwood   k=2      1.2186   k=3  1.2061           1.0712   k=3  1.0458
+    MKT       k=2      1.1708   k=3  1.0999           0.9603   k=3  0.8819
+
+float32 is a two-host gain of 10-22%. **float64 is +7.1%/+4.6% on one x86 host and -4.0%/-11.8% on
+the other**, with floors of 1.0034/1.0082 and 0.9863/1.0036. Opposite signs, same code, same
+matrices, both x86-64 with AVX2.
+
+**It is attributable to the threshold, which is what makes it a finding rather than a puzzle.**
+`dgm2` cannot reach the 8-16 band -- at MULT=2 a matrix of mean degree 8-16 still gets unroll 4 --
+and it reads inside the floor in all four float64 cells on both hosts (1.0029, 0.9958, 1.0015,
+0.9980). So the arms act through the threshold and the two hosts genuinely disagree about what
+depth that band wants in float64.
+
+There is a plausible mechanism and I am not claiming it: float64 halves the lanes per vector, so a
+row of degree 8-16 offers half as many vector iterations, and the deeper unroll's independent
+accumulator chains matter more. That predicts the *direction* of MKT's loss and says nothing about
+why redwood gains, so it is half an explanation.
+
+**float64 also regresses the GCN guardrail at k=7 on BOTH hosts** -- 0.9871 on redwood and 0.9891
+on MKT, past tolerances of 0.010 and 0.011. Two hosts agreeing is this project's confirmation
+standard, so unlike the single-cell flags in chain173 that one counts.
+
+### The response is a per-dtype constant, and the precedent is in the same header
+
+Committed as `SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32` and `_F64`, both defaulting to the shared
+`SCORCH_NARROWK_EXACT_DEGUNROLL_MULT`, which stays at 1. Same construction as
+`SCORCH_NARROWK_EXACT_HI_F32`/`_F64` and `SCORCH_SPMM_HALFVEC_F32`/`_F64` -- and the header already
+said why, about the four neighbouring vector constants: *"Two of them also disagree across hosts,
+which no single expression in bytes can say."* This is a third.
+
+**Not host-gated, deliberately.** Nothing the compiler knows separates these two machines; they
+differ in microarchitecture, cache hierarchy and pool shape, all invisible at compile time. A gate
+on something the compiler cannot see is a build flag someone has to remember. Leaving float64 at 1
+makes it bit-identical to what ships today, which is a stronger guarantee than any host predicate.
+
+Proven rather than asserted: 20 differing instructions of 169165 against `HEAD`, all bare immediate
+moves, every delta exactly 5 -- the lines added above `spmm.h`'s ten `TORCH_CHECK` macros, with
+`scorch_policy.h` contributing none because it has no line-sensitive macros at all. A/A control at
+equal-length build paths reports identical disassembly. Correctness 432 cases, 0 mismatches.
+
+### The analyzer was float32 in twelve places, so it would have skipped every verdict
+
+`an_dgmult.py` had `"float32"` written into twelve conditions. Run on a float64-only stage it
+printed every aggregate table and then **silently skipped all five predictions, the GCN guardrail
+verdict, the band tests and the inertness check.** Tables with no verdicts reads as "nothing
+wrong" -- the third instance this week of the same shape, after the guardrail that was collected
+and never reported and the two-width control tested at one width.
+
+Fixed with an explicit `PDT`, announced on its own line, and a **refusal** when the requested dtype
+is absent: "a verdict block that silently skips is indistinguishable from one that passed." The
+float32 verdicts are unchanged after the edit, which is the check that the parameterisation did not
+quietly alter what it had already concluded.
+
+One cross-dtype trap caught in the same pass. The band table reports each arm as a percentage of
+`exu1`'s gain, and `exu1` was measured on **float32 only** -- `unroll2` ran that dtype. On the
+float64 stage that column would have divided a float64 reading by a float32 baseline and labelled
+it a fraction. It is now withheld, printing "exu1 float64 unmeasured" instead of a number.
+
+### Still open: ARM is affected, and it is being measured rather than assumed
+
+The multiplier is not ISA-gated and the exact-width kernel compiles on NEON. Flipping `MULT_F32` to
+8 changes ARM emission in **exactly four instructions**, all of them the ladder's own comparison
+immediates -- `cmp #0x3 -> #0x1f` and `cmp #0x2 -> #0x10`, the thresholds moving from 4 and 2 to 32
+and 16 -- and nothing else. So the define reaches ARM, and the neighbouring constant has form:
+`SCORCH_NARROWK_EXACT_HI_F32` 3 -> 1 is a two-host x86 win that regresses ARM to 0.7229 and ships
+x86-gated for exactly that reason.
+
+So `MULT_F32=8` cannot ship globally on a two-x86-host result. Running now on the M5 -- the only
+NEON host, so this is a single-host reading by construction -- over **the same 34 matrices pulled
+from redwood's cache**, 27 in the mean-degree 8-16 band where the arm fires and 7 at degree >= 64
+where the ladder provably cannot, as the inertness control. Same matrices rather than a local
+substitute, so the ARM number lines up against redwood's 1.2186 and MKT's 1.1708 instead of being
+a third corpus nobody can compare.
+
+Two things already passed there: the two no-define trees at equal-length paths emit **identical
+disassembly**, so the ARM A/A floor is measuring the machine and not the build; and both candidates
+are correct over 360 cases each.
+
+One label in that stage must not be misread: `mrgate.py`'s third arm is `torch.sparse.mm`, recorded
+in the CSV as `mkl`. **On ARM that is not MKL** -- there is none on this machine -- it is torch's own
+fallback, and its column cannot be compared against the x86 stages' MKL numbers. The ARM question
+is arm-vs-arm, so nothing depends on it.
