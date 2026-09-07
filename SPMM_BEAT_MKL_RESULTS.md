@@ -22431,3 +22431,61 @@ the split**, with the same derive-at-`nnz >= 1e6` fallback when no groups file i
 two of seven, and chains 125 and 129 -- the per-width ownership numbers for the candidate -- are
 already target-group and were never diluted. The flip's rejection and its attribution stand as
 written.
+
+## chain169 -- my floor-constant caveat named the wrong widths, and unifying the constant flipped two verdicts
+
+The documentation session could not reconstruct my own caveat from my own table, and was right not
+to be able to. I wrote that the tolerance is floored at the constant "at widths 1 and 8". Computed
+from the printed target-group floors under the analyzer's actual rule, `max(0.010, |1-floor|*2)`:
+
+    k | floor    spread*2  tol      binds       |1-cand|
+    1 | 0.9984   0.0032    0.0100   CONSTANT    0.0060
+    2 | 1.0057   0.0114    0.0114   spread      0.0046
+    3 | 1.0008   0.0016    0.0100   CONSTANT    0.0017
+    4 | 0.9972   0.0056    0.0100   CONSTANT    0.0195
+    8 | 1.0089   0.0178    0.0178   spread      0.0044
+
+**The constant binds on {1, 3, 4}, not {1, 8}.** Width 8 has the widest measured spread of all
+five, so I named the single cell where the constant is *least* relevant. Their two alternative
+explanations -- that the tolerance is not the doubled form, or that the deciding floor is not the
+printed column -- are both false: it is the doubled form and it does read the printed column, so
+the table and the verdict rest on the same numbers. The error was mine in naming the widths, which
+is the smaller of the two possibilities and the one that needed checking to establish.
+
+Width 4's marker is worth noting: the constant binds there, but the candidate is 0.0195 away --
+nearly twice the tolerance -- so that verdict holds under any rule in the range.
+
+### And the check found something the caveat was hiding
+
+`an_unsw.py` carried **two different tolerance minimums**: `max(0.010, ...)` in the re-score table I
+added and `max(0.015, ...)` in the pre-existing per-band table. The same question -- is this cell at
+its floor -- answered against different floors depending on which table you read. I introduced the
+second one next to the first without noticing.
+
+Unified to a single `TOL_FLOOR = 0.010`, defined once with its rationale: the constant exists only
+so an implausibly tight A/A spread cannot manufacture a significant-looking difference, it is not
+the gate (the gate is `|1-floor|*2`, and CLAUDE.md forbids a fixed ratio as the gate itself), and
+0.010 sits about 3x above the tightest A/A spread observed on these hosts (0.16%, doubled 0.32%).
+0.010 rather than 0.015 because **the looser value makes a FLAT reading easier to obtain**, and a
+false flat is the failure this sequence keeps meeting.
+
+**Tightening it flipped two of twenty band cells, both HELD to FAILED:**
+
+    k=3, degree >=128   P3 HELD "unsw == bandmr"  ->  FAILED: 0.9752 vs 0.9899, apart by 0.0147
+    k=4, degree 20-128  P1 HELD "unsw at floor"   ->  FAILED: 1.0148 outside 0.010
+
+The first is the substantive one: a **1.5% high-degree cost at width 3 that the looser constant was
+absorbing**, which is the same direction as MKT's high-degree penalty and had been reading as
+agreement. The second is a failed prediction rather than a regression -- unsw is *faster* than the
+floor there. Five further lines changed only because the constant's value is printed in the message
+text.
+
+**chain168's conclusion is unaffected**: the aggregate re-score used 0.010 on both sides, so widths
+1/2/3/8 sitting inside their floor at degree >= 20 does not depend on this change. What changes is
+one per-band cell, in the direction of unsw costing more rather than less.
+
+Two lessons worth separating. A tolerance floor is defensible and a *second* tolerance floor in the
+same file is not -- and the straddle band between two such constants is precisely where a marginal
+arm lands. And where the constant binds rather than the measurement, the output now says so on the
+line, because a verdict that rests partly on a chosen number should not require recomputing the
+rule to discover that.
