@@ -22878,3 +22878,113 @@ quantity rather than a policy, and the per-call cost production is avoiding does
 
 Both verdict branches were exercised on constructed inputs before the real corpus was touched, and
 the analyzer refuses an empty census rather than reporting a clean nothing.
+
+## chain175 -- the threshold retune works: `dgm8` takes all of `exu1`'s gain and none of its cost
+
+`dgmult` finished on both hosts, 50 CSVs each, five builds over five passes, balanced rotation,
+equal row counts per build. **The arm the mechanism pointed at is confirmed on both hosts and it is
+the one that could ship.**
+
+### P2: the gain, in the band, on two hosts
+
+Mean degree 8-16, widths 2 and 3, target group, against `c0`:
+
+    host      k   dgm2 (control)   dgm8              dgm16             floor    % of exu1 (dgm8)
+    redwood   2   0.9955  n=22     1.2186            1.2181            0.9958   106%
+    redwood   3   1.0036  n=22     1.2061            1.1936            0.9979   104%
+    MKT       2   1.0058  n=16     1.1708            1.1787            0.9987   111%
+    MKT       3   1.0024  n=16     1.0999            1.1037            0.9995    92%
+
+**A pure threshold change recovers 92-111% of what `exu1` got by changing the depth outright.** The
+mechanism was read correctly: the shipped ladder gives the 8-16 band an unroll of 4 and the band
+wants 1, and moving the threshold is enough.
+
+**P5 held on both hosts**, which is what makes that attributable. `dgm2` cannot reach the 8-16 band
+by construction -- at MULT=2 the band still gets unroll 4 -- and it reads inside the floor in all
+four cells. So the arms act through the threshold and not through something they happen to correlate
+with. (P5 is also now a two-sided test; it was written one-sided, and a `dgm2` moving the band
+*down* 10% would have printed "held, does not reach this band".)
+
+### P1 and the GCN guardrail: both separate `dgm8` from `dgm16`, and both vindicate the prediction
+
+chain172's attribution said `exu1`'s out-of-band cost on MKT was alignment, and predicted that a
+runtime `long` compared per call would not pay it. Confirmed:
+
+    MKT, width 4 (outside the exact-width band)     exu1 0.9701      dgm8 1.0089 (floor 1.0043)
+    MKT, GCN k=6 / k=7 / k=16                       exu1 0.9857/0.9830/0.9518    dgm8 0.9902/0.9964/0.9986
+
+`dgm8` passes P1 at both control widths on both hosts and passes the GCN guardrail on both hosts at
+all four widths. `exu1` failed three MKT GCN widths including k=16, the real hidden dimension.
+
+**`dgm16` is out, on two independent signals.** It moves out-of-band on MKT at width 4 (1.0202) and
+width 8 (1.0126) -- faster, but P1 says a threshold cannot reach those widths -- and it regresses
+GCN k=16 on MKT at 0.9889 past a 0.010 tolerance. It buys nothing over `dgm8` in the band.
+
+One label in the guardrail was wrong and is fixed: all three arms gain 2-7% at GCN k=3, and the
+analyzer called that "an arm reaching code it does not name". cora, citeseer and pubmed have mean
+degree 4.90, 3.74 and 5.50, and these arms change the unroll for exactly those degrees, so the gain
+is **on-mechanism** -- it is the guardrail's good news, not a confound, and the note read as the
+opposite.
+
+### The standing goal: the cell count, stated honestly
+
+MKT target group, cells below MKL:
+
+    build    k=1     k=2      k=3      k=4     k=8
+    c0       1/18    18/18    18/18    3/18    2/18
+    dgm8     1/18     2/18     3/18    1/18    2/18
+
+Sixteen cells at width 2 and fifteen at width 3. **The honest form: three distinct families**, since
+14 of MKT's 18 target matrices are `uni_chimera_i1_A`. The two that are not are `G_n_pin_pout`
+(degree 10.0, 117.6 -> 98.7 us against MKL's 106.6) and `n4c6-b10` (degree 11.0, 141.1 -> 113.2
+against 118.5) -- both in the 8-16 band, as the mechanism requires. What still loses is `connectus`
+and `relat8`, both far outside the band, both untouched by this arm because its threshold cannot
+fire there. `connectus` is chain174's question, not this one.
+
+redwood recovered **zero** cells, and that is not a failure: `c0` already loses 0 of 37 at widths 1
+and 2 there. Its gain shows up as raw speed instead, 1.22x.
+
+### The inertness check took three versions and my own hand-check was wrong twice
+
+Worth recording because the wrong answers were the comforting ones.
+
+Above mean degree 4*MULT the ladder keeps the unroll at 4, so the arm runs `c0`'s code and any
+difference is the instrument. Getting that comparison right took three attempts:
+
+1. **Min/max ranges.** An outlier statistic over 36 cells that says nothing about whether any
+   single cell moved. It reported "the arm exceeds its own A/A spread" for all three arms.
+2. **The arm left inside its own control set.** `o > max(vs)` then compared a value against a range
+   containing it, so it could never be true: **the check answered "0 of 36 outside, INERT" on any
+   input whatsoever.** Same family as a guard credited for its neighbour's refusal, and worse,
+   because the vacuous answer is the reassuring one.
+3. **Calibrated.** Above degree 64 all five builds are code-identical, so their spread is a pure
+   instrument reading -- 1.28x on one 20-microsecond cell. Under the null the arm and its controls
+   are exchangeable, so the chance the arm is the min or max is 2/(controls+1); accumulating that
+   gives the count to expect, and the count is a sum of Bernoulli trials so its sd comes free.
+
+    host      arm     n    extreme   null expects
+    redwood   dgm2    36   15        16 +- 3.0     INERT
+    redwood   dgm8    36   18        16 +- 3.0     INERT
+    redwood   dgm16   21    9         8 +- 2.2     INERT
+    MKT       dgm2    42    8        18 +- 3.2     INERT
+    MKT       dgm8    42   10        18 +- 3.2     INERT
+    MKT       dgm16   33   13        13 +- 2.8     INERT
+
+All six inside one sd. That also resolves P3's flag: `dgm8` read -3.29% in the >=128 band on
+redwood (n=5, control group) and the worst individual cell is 0.8602 on a 20-microsecond matrix
+where five code-identical builds span 1.28x. It is noise, and the null says so rather than my saying
+so.
+
+**My two hand-checks were both wrong**, in ways the tool then caught. The first pooled the `ours`,
+`oursb` and `mkl` readings into one median because the scratch script had no `arm` filter. The
+second truncated matrix names to 24 characters, so I read a different matrix's row and concluded the
+opposite. Both are arguments for emitting the derivation rather than doing it at the prompt -- the
+same point as chain171, arrived at from the other direction.
+
+### What is still missing before this could ship
+
+**float64 is unmeasured.** `SCORCH_NARROWK_EXACT_DEGUNROLL_MULT` is not dtype-gated, so flipping its
+default changes float64 as well, and this stage ran float32 only. The policy comment's own ladder
+was derived from an x86 **float64** width-1 sweep (+12.4% at degree 2-4, -15.7% at 4-8, +4.8% above
+8), so float64 is not a formality here -- it is the dtype the constant was first reasoned about.
+That measurement comes next, on the same corpus and rotation.
