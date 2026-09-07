@@ -23077,3 +23077,83 @@ One label in that stage must not be misread: `mrgate.py`'s third arm is `torch.s
 in the CSV as `mkl`. **On ARM that is not MKL** -- there is none on this machine -- it is torch's own
 fallback, and its column cannot be compared against the x86 stages' MKL numbers. The ARM question
 is arm-vs-arm, so nothing depends on it.
+
+## chain177 -- the row split's firing set is SIX matrices, and my census restated the gate the code warns about restating
+
+chain174 asked a counting question: the row-split NO-GO named a discriminator and refused it for
+having three data points, so how many points exist? Answered, and the first answer was wrong by a
+factor of 290.
+
+### The mistake, which the source had already written down
+
+My census decided "does the gate fire" as `imbalance >= 2`. **That is one term of the gate.** The
+shipped rule also carries `SCORCH_SPMM_SPLIT_MIN_NNZ` (150000) and `SCORCH_SPMM_SPLIT_MIN_DEGREE`
+(256). So the first run reported **1745 firing matrices of 8384**, and `spmm.h` says exactly why not
+to do that, in the comment directly above the gate call:
+
+> One call, because the gate lives in one place: `scorch_spmm_split_seg` answers "how wide a segment,
+> or leave the rows whole" and is the same function a harness or a test asks. **Splitting this rule
+> into a copy here and a copy in the harness is how a firing set ended up with two firing matrices in
+> its inert group and reversed the sign of its own conclusion.**
+
+I had read that comment, quoted its neighbour in chain174's write-up as the reason to call
+production rather than restate it, and then restated it anyway -- one term of it, which is the form
+that looks like calling production. `scorch_spmm_split_seg` is exported for this and returns a
+positive segment width exactly when the split would run.
+
+Two consequences worth keeping. Calling *some* of a production rule is not a weaker version of
+calling it, it is a different rule -- and it is harder to spot than an outright reimplementation,
+because the names match. And a census against a **default** build would have returned zero
+everywhere, since `MIN_IMBALANCE` ships at 0 and 0 disables the mechanism; the corrected census
+therefore refuses an all-zero result rather than reporting an empty population, and that refusal
+was fired on a default build before the real run.
+
+### The answer
+
+With production's own gate, built at `MIN_IMBALANCE=2`, over all 8407 cached matrices:
+
+    matrix     rows    nnz       deg       imb  ceiling  other_deg/seg   prior result
+    rail582     582    402290     691.22    2    45.1     0.862          never measured
+    connectus   512   1127525    2202.20    7     9.4     0.895          WON on both x86 hosts
+    rail516     516    315412     611.26    2    40.4     0.970          never measured
+    us04        163    297538    1825.39    2    25.6     3.038          never measured
+    nw14         73    904910   12396.03    6     9.9     6.398          LOST on both x86 hosts
+    kl02         71    212536    2993.46    2    27.8     7.053          LOST
+
+**Six matrices, in a corpus of 8384.** 23 were unreadable and are reported as refused, not skipped.
+
+Two things follow, and they pull in opposite directions.
+
+**The discriminator separates the three measured matrices perfectly.** connectus at 0.895 won;
+nw14 at 6.398 and kl02 at 7.053 lost. There is no overlap and the gap is a factor of seven, which
+is what the NO-GO observed with two matrices and is now three.
+
+**And the pre-registered bar cannot be met, because it asks for more matrices than exist.**
+chain174 registered "5 new matrices on each side of ratio = 2 or there is no population". The three
+never-measured matrices are `rail582` (0.862) and `rail516` (0.970) below, and `us04` (3.038) above
+-- 2 and 1. The analyzer prints NO POPULATION and that is the pre-registration working as intended.
+
+But the reason it fails is not the reason the bar was written. I set 5-per-side expecting a corpus
+of candidates and got a universe of six, of which three are already spent. **A bar that demands
+more data than the population contains is not a standard, it is an impossibility**, and reporting
+"no population" without saying that would imply more data could settle it. More data cannot: this
+is every matrix in 8400 that fires the rule.
+
+What is actually available is a **3-matrix out-of-sample test covering half the firing set**, with
+the prediction registered in advance and the mechanism stated a priori. Two-and-one can **refute**
+the discriminator -- if `us04` gains or either `rail` loses, the rule is dead -- but it cannot
+establish it. That asymmetry is the honest description, and it is worth stating rather than
+converting into either a green light or a dead end.
+
+### And it would not revive the split anyway
+
+Worth saying plainly, because a discriminator that separates connectus from nw14 addresses the
+*second* of the NO-GO's two reasons. The first was **arm-variance across hosts on float64** -- MKT
+gaining 8.8% against a 1.0004 floor where redwood lost 9.0% against 0.9956, on the same cells with
+the same code. A rule that excludes nw14 and kl02 leaves connectus as the firing set, and it is
+possible that the float64 disagreement was an artifact of pooling three matrices -- but the
+per-matrix float64 breakdown is not in this document and no split-stage CSVs are in the ledger, so
+that is a hypothesis I cannot test for free and am not going to assert. **The NO-GO stands**, on the
+ground it was decided on.
+
+The census is the contribution here: the number that was missing, which is six.
