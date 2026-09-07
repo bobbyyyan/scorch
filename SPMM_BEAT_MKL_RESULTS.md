@@ -21806,3 +21806,81 @@ rendered a HELD/FAILED string from one, which is why it was the one that manufac
 others print `--` or refuse. The general lesson is narrower than "handle nan": a nan is safe in a
 DISPLAY and unsafe in a VERDICT, and the two are worth separating deliberately rather than
 hardening every site equally.
+
+## chain160 -- the UNSWITCH constant is not emission-neutral on Zen4, and the windows are rejected on both hosts
+
+Three results landed together: MKT's part 1 before its part 2 refused, and redwood's heldout.
+
+### The three x86 neutrality verdicts, under Zen4 instruction selection
+
+    A/A control   mr9 built twice   NEUTRAL, 231253 instructions, identical disassembly
+    mr6 -> mr7    RAGGED+MINDEG     NEUTRAL, 20 immediates, every delta +44 = spmm.h lines added
+    mr7 -> mr8    UNSWITCH          NOT NEUTRAL, 231254 -> 231253
+    mr8 -> mr9    HOIST             NEUTRAL, 20 immediates, every delta +27
+
+**The hoist's claim now holds on x86**, which is what it was owed -- and the reconciliation is
+exact on both ISAs: 20 immediates, single delta, equal to the 27 lines added to `spmm.h`. The
+RAGGED+MINDEG claim holds too.
+
+**`SCORCH_SPMM_MULTIROW_UNSWITCH` at default 0 emits one instruction fewer on Zen4.** Commit
+`eddf47a` says "Off by default and emission-neutral there: 164596 instructions either way" --
+and 164596 is the **ARM** count. So that claim was ARM-only and the second ISA falsifies it. One
+instruction in 231254 is not a performance claim; it falsifies a stated one, which is the part
+that matters. The instrument stops at differing counts by design and cannot say which instruction,
+so the resubmission diffs the two disassemblies with context and reports the mnemonic histogram.
+
+Note which way the A/A control cuts here: it was NEUTRAL with **identical** disassembly, so the
+231254 -> 231253 difference cannot be build noise on this host.
+
+### MKT's part 2 refused, and the refusal was right
+
+`mrbuild.sh` admits the `c0pad` placement control only if its `.text` has the same size and a
+different digest from `c0` -- identical source at a build path one character longer, so only
+layout can differ. On MKT it came out **byte-identical**, so there is no control, and it refused
+rather than report a flat placement arm that was really a second copy of `c0`.
+
+That is a host difference, not a defect: `c0pad` is admitted on redwood, where chain142 has its
+numbers. Two consequences, and neither costs the experiment:
+1. **The placement question is redwood-only** -- which is where it matters, since the width-1
+   deficit that motivates it is redwood's and MKT clears its floor there (chain158).
+2. **On MKT, arm-vs-arm numbers carry no unmeasured layout term from path length**, because path
+   length provably does not reach `.text` there. Worth having established rather than assumed.
+
+Resubmitted as 17304145 with `c0 c0b mrf64 bandmr`, four builds over four passes so each leads
+once. `mrf64` is the arm carrying MKT's question and it does not need `c0pad`.
+
+### The degree windows are now rejected on two hosts
+
+redwood's held-out corpus, 43 matrices, 3600 corpus rows per build. `bandmr` with no window is
+best or inside the floor at every width, exactly as MKT found:
+
+    k | c0b floor | bandmr           | mdlo             | rag2             | ragmd
+    1 | 1.0310    | 0.9916 lose 6/40 | 0.9858 lose 5/40 | 0.9906 lose 1/40 | 1.0164 lose 2/40
+    2 | 1.0076    | 0.9785 lose12/40 | 0.9584 lose16/40 | 0.9636 lose13/40 | 0.9453 lose13/40
+    3 | 1.0101    | 1.1022 lose 1/40 | 1.0832 lose 3/40 | 1.0774 lose 4/40 | 1.0675 lose 4/40
+    4 | 0.9992    | 0.9898 lose 2/40 | 0.9826 lose 7/40 | 0.9913 lose 0/40 | 0.9877 lose 4/40
+    8 | 1.0089    | 1.1169 lose 1/40 | 1.1243 lose 1/40 | 1.0886 lose 1/40 | 1.0825 lose 1/40
+
+The gate fires exactly as specified on this host too -- every gated build matches its ungated
+sibling on every admitted cell -- and **the refusal is what costs**: refused cells read 0.8102 and
+0.8031 at width 2 and 0.8616 to 0.8982 at width 3, so refusing is 10-20% slower rather than
+neutral. Same conclusion as MKT, reached from a different corpus.
+
+**A limit of this dataset, stated because the table invites the wrong reading.** The A/A floor at
+width 1 is **1.0310** -- the same code against itself is 3.1% off unity. Every width-1 number
+above sits inside that, `ragmd`'s 1.0164 included. Width 1 is **not resolvable on this corpus**,
+so nothing here bears on the width-1 deficit either way.
+
+### One new mechanism signal, and it is the first thing to partly address the width-2 population
+
+The worst held-out cells are all width 2 at high degree, and `bandmr` is badly hurt on them --
+`TSOPF_FS_b300` at 0.712, `gupta2` 0.779, `symbol_modality` 0.804, four TSOPF cells below 0.87.
+The windows do not rescue them in aggregate, but `rag2` is **consistently better than `bandmr` on
+exactly these cells**: 0.869 against 0.712, 0.867 against 0.779, 0.914 against 0.830.
+
+So the trade is now visible: `rag2` spreads bandmr's concentrated damage rather than removing it,
+which is why its geomean is worse (0.9636 against 0.9785) while its worst cells are much better.
+That is not a ship. It is the first evidence that the width-2 high-degree population is
+*addressable* by a raggedness test rather than being intrinsic to the band, and it says the thing
+to look for is a test that keeps rag2's behaviour on the tail without paying for it in the middle
+-- which is a different search than any of the four arms so far attempted.
