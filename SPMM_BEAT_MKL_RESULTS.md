@@ -22489,3 +22489,53 @@ same file is not -- and the straddle band between two such constants is precisel
 arm lands. And where the constant binds rather than the measurement, the output now says so on the
 line, because a verdict that rests partly on a chosen number should not require recomputing the
 rule to discover that.
+
+## chain170 -- the width-3 high-degree cost is a control-group artefact, and the top band has no target population
+
+The documentation session asked whether the per-degree-band table splits by population, because if
+it pools then the newly-flipped width-3 cell is a diluted figure and -- by the direction rule --
+a diluted *cost* is a floor rather than an estimate, so the target-group number could be worse.
+That would make the host asymmetry a difference of degree rather than of kind and drop the
+loop-split arm's expected value.
+
+**It pooled.** `series()` took a `pop` argument but the band table called it without one, so it
+defaulted to pooled. Now split. And the answer runs the other way.
+
+**The `>=128` band has n=1 in the target group** (against n=5 in control), at every width. So the
+cell that flipped cannot be given a target-group figure at all, and the table now refuses rather
+than printing one:
+
+    band    | target | control
+    <4      |      1 |       5
+    4-20    |     26 |       6
+    20-128  |      9 |       7
+    >=128   |      1 |       5
+
+A `MIN_POP = 3` refusal replaces the geomean wherever a population is too small to be a rate. The
+point is not the threshold but that **a single matrix must not be printed wearing a percentage** --
+the previous output would have rounded it into a rate indistinguishable from the n=26 cells.
+
+So the pooled 0.9752 at width 3 and degree >= 128 is **five sixths control-group matrices**, whose
+call is mostly per-call floor. In the two target bands that are actually populations, width 3 reads:
+
+    k=3, 4-20   (n=26) | bandmr 1.1961 | unsw 1.2035 | P3 HELD: unsw == bandmr
+    k=3, 20-128 (n=9)  | bandmr 1.1393 | unsw 1.1359 | P3 HELD: unsw == bandmr
+
+**No duplication tax at width 3 in either real target band.** The refinement being worried about
+does not survive the split; it was a control-group effect, which is consistent with `mrf64` reading
+DISPATCH rather than KERNEL -- a per-call cost belongs in the floor-dominated group.
+
+So "the duplication tax is absent on redwood" stands for the target group, the host asymmetry
+remains a difference of kind, and the loop-split arm keeps its expected value.
+
+**And the width-4 blocker localizes.** The only target-group failure at the two-host width:
+
+    k=4, 20-128 (n=9) | bandmr 1.0081 | unsw 0.9881 | P4 FAILED: unsw WORSE than bandmr
+
+About 2% at degree 20-128 on nine matrices. That is the whole of the two-host cost, in one band, and
+it is now specific enough to design against rather than a width-level aggregate.
+
+Worth noting what the split did to width 1: `unsw` fails P1 in both target bands (0.9875 at 4-20,
+0.9800 at 20-128, both outside the floor) while still being better than `bandmr` there (0.9728,
+0.9835). A failed prediction and an improvement at the same time -- which is why "P1 FAILED" must
+not be read as "the arm is worse".
