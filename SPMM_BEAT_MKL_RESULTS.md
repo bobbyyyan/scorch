@@ -22601,3 +22601,145 @@ understates a cost" presumes the target group has a population to dilute. At n=1
 is not a diluted target number -- it is a control number wearing a pooled label, and no reasoning
 about direction recovers a measurement that was never taken. That generalises past this file: the
 direction rule is a statement about mixtures, and it says nothing when one component is empty.
+
+## chain172 -- the unroll lead confirms on both hosts and dies as a blanket constant, and the corpus split I added concentrates what it un-diluted
+
+`unroll2` finished on both hosts: 50 CSVs each, five builds over five passes, balanced rotation,
+61 matrices on redwood and 42 on MKT. It answers chain161 and produces four separate defects in the
+analysis it was analysed with. Taking the defects first, because two of them change other chains.
+
+### The GCN guardrail was measured on both hosts and never reported
+
+`an_exunroll.py` ingested `sg_*.csv` into a `"gcn"` group at line 77 and then read that group in
+exactly one place: a test for whether to print `NO GCN GUARDRAIL IN THIS STAGE`. There was no GCN
+table. So while the stage measured nothing the warning fired and said so; the moment the stage DID
+measure the guardrail, the warning fell silent and **nothing took its place**. Arriving data turned
+the honest warning off without turning any reporting on.
+
+That is the worst shape a guard can take, and it is worse than the ones already recorded in this
+file, because the failure is invisible in exactly the runs that matter. A blank where four
+predictions print green reads as a fifth pass. The rule that catches the class: **a guard's silence
+has to mean the thing was CHECKED, never just that its input showed up.** The absence warning and
+the table are now one decision in one place -- if the table has no rows, that is what prints.
+
+### The pre-registered inertness check was over two widths and only one was tested
+
+`unroll2_body.sh` registers P1 as "widths 4 and 8 are FLAT", and calls it the reading that can void
+the stage. The analyzer tested width 8. Widths 4 and 8 are both outside the exact-width band --
+`SCORCH_NARROWK_EXACT_HI` is 3 and all three arms live inside `if (exact_width && ...)` -- so both
+are controls and half the control was never read.
+
+The untested half is the half that fails. Width 4, target group:
+
+    host      c0b floor   exu1      exu8      dgu0
+    redwood   1.0008      0.9989    1.0003    0.9989     all flat
+    MKT       1.0110      0.9701    1.0042    0.9658     exu1 and dgu0 MOVE
+
+Testing one width of a two-width control and printing "flat" is the same defect as the guardrail
+above, wearing different clothes. The numbering disagreed too -- the harness pre-registers P1/P2/P3/
+P4 and the analyzer printed its own P2/P3/P3/P4 against different content, so "P4 passed" meant
+different things in the two files. Both are fixed; the labels now follow the pre-registration.
+
+### The split I introduced in chain167 fixed dilution by concentrating the corpus
+
+chain167 split every corpus at `nnz >= 1e6` because pooling diluted the kernel effect. It does. It
+also concentrates, and nothing said so:
+
+    stage group     matrices   families   biggest family
+    MKT   target    18          5         uni_chimera_i1_A x14  (78%)
+    rw    target    37         22         uni_chimera_i1_A x14  (38%)
+
+That is not this stage's corpus, it is **every stage's**: `attrib2bmkt`, `band2mkt`, `f64lay`,
+`hoistmkt`, `hv`, `mkthi1`, `mktprobe`, `shipmkt`, `unswmkt` and `unroll2mkt` all read 18 matrices
+in 5 families, 78% one generated family; every redwood stage reads 37 in 22. Only the held-out
+stages escape (5% and 10%). So a per-matrix target geomean on MKT counts one synthetic family
+fourteen times, and I have been reporting those as the trustworthy half of the split.
+
+Two consequences, which must not be conflated:
+
+- **Within a degree band the concentration is harmless here.** At degree 4-20 `exu1` reads 1.2147
+  per-matrix and 1.2004 per-family on redwood (11 families), 1.1438 and 1.1827 on MKT (3). The
+  non-chimera matrices move the same way, so the band effect is not a family artefact.
+- **The aggregate is not harmless**, because the family sits entirely in ONE band. 14 of redwood's
+  26 matrices at degree 4-20 are chimera and the 20-128 band has 9, so a per-matrix aggregate
+  over-weights the band where `exu1` wins against the band where it loses. Family-weighting
+  redwood's width-2 aggregate takes it from **1.1088 to 1.0358**.
+
+chain171's cell is unaffected and worth saying so explicitly: its band is degree 20-128 on
+`unswrw`, n=9 in **9 distinct families**. The chimera family is entirely inside 4-20.
+
+`an_exunroll.py` now prints the composition and a per-family table beside the per-matrix one, so the
+reweighting a careful reader would do by hand is in the output. Three families is a thin basis and
+the column says `fam=3` rather than leaving it to be noticed.
+
+### What the stage actually found: the effect is real, two-host, and `exu1` still cannot ship
+
+chain161's lead reproduces on its own host across two independent stages and confirms on a second.
+By fine degree band, `exu1` against `c0`, all matrices:
+
+    band      redwood  k=1     k=2     k=3    | MKT  k=1     k=2     k=3
+    8-16      n=27     1.0135  1.2069  1.1990 | n=19 1.0059  1.1538  1.1082
+    16-32     n=14     0.8412  0.9908  1.0879 | n=2  0.9943  0.9963  1.0306
+    128-512   n=5      0.7231  0.7879  0.8497 | n=4  0.9435  1.0058  1.0189
+
+**The effect is not "widths 2-3" and not "degree 4-20". It is mean degree 8-16 at widths 2 and 3**,
+worth 11-21% on both hosts, and it is gone by 16-32. redwood's high-degree collapse does not
+replicate on MKT, so the loss that made chain161 refuse to ship is single-host; the gain is not.
+
+And then `exu1` fails P1 on MKT at every width outside the band, in one direction:
+
+    corpus width 4   0.9701      GCN k=6    0.9857
+    corpus width 8   0.9923      GCN k=7    0.9830
+                                 GCN k=16   0.9518
+
+Five widths, two different workload sets, one sign, 1-5%. redwood is flat on all five (0.9964 to
+1.0053). None of those widths executes the code `exu1` changes. `exu8`, which changes MORE code in
+the same kernel, is inert on all of them -- so it is not code volume; the two arms that move are
+the two that SHRINK the exact kernel, which reads as alignment rather than mechanism, and MKT's own
+A/A floor is widest exactly at width 4 (1.0110, the largest in its table).
+
+**This retires chain162's `mrf64` reading from curiosity to supported.** That was one arm, one
+width, one stage, and I recorded it as "on Zen4, compiling in code that float32 never runs costs
+2.3% at width 4". Here the same host charges an unrelated constant 1-5% across five widths while the
+other host charges nothing. Same host, same direction, different mechanism entirely.
+
+It also kills the arm. GCN k=16 is the real hidden dimension, not a probe width, and 0.9518 is a
+4.8% regression on the workload the library is for. The standing gate is that a regression is a
+finding to report, not a shape to tune around, and it does not matter that the mechanism is
+probably layout: the binary is slower there. `exu1` does not ship.
+
+### The arm that can ship was already in the tree
+
+`spmm.h` line 4128 does not use a fixed unroll. It reduces one by mean degree:
+
+    while (exact_unroll > 1 && mean_deg < (long)exact_unroll * narrowk_exact_degunroll_mult)
+      exact_unroll >>= 1;
+
+with `SCORCH_NARROWK_EXACT_DEGUNROLL_MULT` shipping at 1. Starting from 4 that gives unroll 4 to
+every matrix of mean degree 4 or more -- so the 8-16 band, where two hosts agree the right depth is
+1, is handed 4. **The mechanism the measurement asks for already ships; its threshold is wrong.**
+The multiplier has never been swept.
+
+    MULT       unroll 1    unroll 2    unroll 4
+    1 (ships)  deg < 2     2-4         >= 4
+    2          deg < 4     4-8         >= 8
+    8          deg < 16    16-32       >= 32
+    16         deg < 32    32-64       >= 64
+
+`MULT` is a `long` compared at runtime, not a template parameter, so no kernel's code changes shape
+and the out-of-band widths have nothing to align differently -- which is the entire reason to prefer
+it to `exu1`, and P1 tests it rather than assuming it. `dgm2` is a graded control: at MULT=2 the
+8-16 band still gets unroll 4, so it must NOT move that band.
+
+Launched on both hosts as `dgmult` (redwood pid 1650248, MKT job 17308803, submitted through the
+dependency rule with the four held jobs excluded by reason). Five predictions, P1 being the
+discriminating one: if a pure threshold change also moves MKT's out-of-band widths, the layout
+attribution above is wrong and the cost belongs to something the arms share.
+
+### One more thing about `exu1`, recorded because it nearly went unnoticed
+
+The env hook for this constant accepts `0`, `2`, `4` and `8` and refuses everything else. `exu1`
+sets it to **1** through a compile-time define, which bypasses that validation entirely. The value
+turns out to be meaningful and the correctness grid passes on it at every width and row count in the
+straddle. But a build-defines arm can reach configurations the runtime hook is written to reject,
+and no part of the three-build path checks that the value it is measuring is one the code admits.
