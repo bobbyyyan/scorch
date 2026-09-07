@@ -21918,3 +21918,73 @@ that node again.
 What survives regardless: `eddf47a`'s "164596 instructions either way" is an ARM count presented
 without its ISA, and the Zen4 count is 231254/231253. A number quoted in a commit message with no
 host attached is the defect whatever the classification says, because nothing re-derives it.
+
+## chain161 -- the exact-width kernel's unroll is wrong at widths 2 and 3, and it is a lead rather than a result
+
+`exunroll` finished on redwood and had no analyzer, so `an_exunroll.py` was written for it, reusing
+`an_band2.py`'s ingestion verbatim -- the non-finite refusal, the floor calibration, the
+rep-imbalance split -- rather than re-deriving any of it.
+
+60 matrices, five builds, five passes, balanced rotation. float32 geomean against `c0`, above 1
+meaning faster than the shipped default:
+
+    k | c0b floor    exu1          exu8          dgu0
+    1 | 0.9987       0.9143        0.8619        1.0034
+    2 | 1.0018       1.0497        0.9452        0.9907
+    3 | 0.9998       1.0839        0.9265        0.9729
+
+**Removing the unroll entirely is 5.0% faster at width 2 and 8.4% faster at width 3.** The shipped
+depth is right at width 1 -- `exu1` loses 8.6% there -- and a deeper unroll (`exu8`) is worse at
+every width. So the default is tuned for width 1 and is carrying that tuning into widths 2 and 3
+where it costs.
+
+By mean-degree band the effect is much larger and it reverses:
+
+    k=2 | <4 0.9957 | 4-20 1.1947 | 20-128 0.9468 | >=128 0.7305
+    k=3 | <4 0.9893 | 4-20 1.1879 | 20-128 1.0303 | >=128 0.8339
+
+**19.5% at degree 4-20 and minus 27% at degree above 128.** That is the largest unexploited
+per-width effect this sequence has found, and it is in the BASELINE kernel rather than in any
+candidate -- it does not depend on the band or the multi-row question at all.
+
+### Why it does not ship, and what it means for the width-2 story
+
+On the standing goal, which is a cell count against MKL, `exu1` is a **net loss**:
+
+    build   k=1    k=2    k=3
+    c0      0/60   1/60   2/60
+    exu1    5/60   5/60   5/60
+
+Five cells below MKL where the default has zero, one and two. The concentrated high-degree damage
+is exactly what crosses cells, so the geomean improves while the thing being optimized gets worse.
+Same shape as `rag2` in chain160: spread the win, concentrate the loss, lose the count.
+
+**It does change the width-2 diagnosis.** The premise behind four rejected arms was that narrowing
+the band makes width 2 leave the exact kernel, and the exact kernel was treated as the thing worth
+keeping. At degree 4-20 it is 19.5% short of a trivially available variant. So part of what has
+been booked as bandmr's width-2 regression is a weak baseline at mid degree, and the two need
+separating before another arm is spent on the departure.
+
+But not at high degree, and that matters: `bandmr`'s width-2 regression population is
+high-degree -- `TSOPF_FS_b300` at 150, `TSOPF_RS_b678_c2` at 246, the `lhr` family -- and `exu1`
+is 27% WORSE there. So this is a different population, not the same problem seen twice, and a
+blanket unroll change cannot address bandmr's deficit.
+
+### Three reasons this is a lead and not a result
+
+1. **There is no inertness control.** The stage measured widths 1, 2 and 3 only -- the widths the
+   exact kernel owns under the default band of 3. Nothing was measured at a width the constants
+   provably cannot reach, so there is no evidence they do not reach code they do not name. The
+   analyzer refuses P4 rather than reporting it flat, which is the correct outcome and also means
+   the stage cannot support a claim on its own.
+2. **No GCN guardrail was measured.** `an_exunroll.py` says so on its own output rather than
+   leaving a reader to assume it passed.
+3. **One host.** redwood only.
+
+So the follow-up is a proper stage: widths 1, 2, 3, 4 and 8 with 8 as the inertness control, both
+dtypes, the GCN widths, and both hosts. The interesting arm is not `exu1` -- it is a
+degree-conditioned unroll, which is what the bands say should exist. The obvious hazard is that
+unroll depth is a compile-time constant, so conditioning it at runtime means two instantiations,
+and a second instantiation is precisely what sank `unsw`. Whether that cost is real here is
+measurable and unmeasured: `unsw` duplicated the whole worker body, and an unroll variant
+duplicates a much smaller one.
