@@ -4528,6 +4528,37 @@ torch::Tensor spmm_csr_v2_core(
       }
 #endif
 
+      // The row loop, optionally entered through a compile-time tag so the multi-row admission
+      // test leaves it. See SCORCH_SPMM_MULTIROW_LOOPSPLIT in scorch_policy.h for what this is
+      // separating and why it is a third arm on a question two others already answered.
+      //
+      // The `#if` covers only these opening lines and the closing ones after the loop: the loop
+      // header and its 500-line body are SHARED TEXT, not duplicated source. That is deliberate.
+      // UNSWITCH measured a forwarding lambda costing 14 instructions of 164596 with its own
+      // constant off, so a default-off mechanism cannot afford to wrap anything; and duplicating
+      // the body in the two arms of an `#if` would let them drift apart silently, which is worse
+      // than either cost.
+      //
+      // The lambda takes NO range parameters and reads `start`/`end` from the capture, so the two
+      // forms cannot disagree about the range. An earlier draft passed `rstart`/`rend` while the
+      // body still tested `i + multirow <= end` -- correct only because every call site passed
+      // the same values, i.e. correct by coincidence.
+      //
+      // Two constants, and they differ only in the default build, which is the whole trick.
+      // MR_ROWS_LIVE says whether this instance may contain the multi-row block at all;
+      // MR_PRETESTED says whether `multirow_ok` has already been tested by the caller. Under the
+      // split both come from the tag, so the false arm compiles the block away entirely. With the
+      // split off MR_ROWS_LIVE is `true` and MR_PRETESTED is `false`, which restores exactly the
+      // shipped condition.
+#if SCORCH_SPMM_MULTIROW_LOOPSPLIT && defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
+      auto scorch_spmm_rows_t = [&](auto mr_rows_tag) {
+        [[maybe_unused]] constexpr bool MR_ROWS_LIVE = decltype(mr_rows_tag)::value;
+        [[maybe_unused]] constexpr bool MR_PRETESTED = decltype(mr_rows_tag)::value;
+#else
+      [[maybe_unused]] constexpr bool MR_ROWS_LIVE = true;
+      [[maybe_unused]] constexpr bool MR_PRETESTED = false;
+#endif
       for (int i = start; i < end; i++) {
 #ifdef SCORCH_TUNE_HOOKS
         // See the hook's comment above. dummy_never is always 0, so this never fires; the point is
@@ -4602,8 +4633,8 @@ torch::Tensor spmm_csr_v2_core(
         // version of this had the region test last.
         // `if constexpr` and not `&&`: the point is to keep the block out of the instantiation,
         // so the compiler never has to consider whether its store to C_values aliases A1_pos.
-        if constexpr (MR_LIVE)
-        if (multirow_ok &&
+        if constexpr (MR_LIVE && MR_ROWS_LIVE)
+        if ((MR_PRETESTED || multirow_ok) &&
             i + multirow <= end &&
             (!REDIRECT || (long)(i + multirow) <= sp_row_units) &&
             A1_pos[i + multirow] > A1_pos[i] &&
@@ -5043,6 +5074,16 @@ torch::Tensor spmm_csr_v2_core(
           memcpy(C_row + k_out, ws, kw * sizeof(scalar_t));
         }
       }
+#if SCORCH_SPMM_MULTIROW_LOOPSPLIT && defined(__AVX2__) && defined(__FMA__) && \
+    (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
+      };
+      // One test per CLAIM instead of one per row. A claim is a chunk of rows, so on a matrix with
+      // short rows -- the population the branch costs most on -- this is the difference between
+      // one test and thousands. `multirow_ok` is a `const bool` fixed before the parallel region,
+      // so both arms are reachable and neither is speculative.
+      if (multirow_ok) scorch_spmm_rows_t(std::true_type{});
+      else             scorch_spmm_rows_t(std::false_type{});
+#endif
     }
     // Mode 6 only: the arithmetic ran out before the zero slices did, and
     // whatever is left is still this worker's to finish.

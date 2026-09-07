@@ -831,6 +831,41 @@
 #ifndef SCORCH_SPMM_MULTIROW_UNSWITCH
 #  define SCORCH_SPMM_MULTIROW_UNSWITCH 0
 #endif
+// Take the multi-row admission test out of the ROW loop without duplicating the whole worker.
+//
+// Why a third arm on the same question. Direct attribution (two hosts, three stages) says the two
+// hosts pay for different things, and UNSWITCH does one good thing and one bad thing at once:
+//
+//   redwood -- the cost is the PER-ROW ADMISSION BRANCH. Placement is flat (identical source at a
+//     build path one character longer read 0.9951/0.9995 at widths 1 and 4, past-floor 1 and 0),
+//     code presence is nearly flat (0.9920/0.9972), and only the candidate moves, 0.9711 at width
+//     1 with 29 of 60 cells past their own floor. UNSWITCH removes that branch, so it gains here.
+//   MKT -- the cost is the code being PRESENT. At width 4 the arm with the branch folded away at
+//     compile time reads 0.9772, WORSE than the candidate's 0.9822 (15 cells past floor against
+//     8). UNSWITCH instantiates the worker body twice, so it loses here.
+//
+// So the gain is branch removal and the cost is the second instantiation, and they are separately
+// priced. This splits at the ROW LOOP instead: `multirow_ok` is decided once per call, before the
+// parallel region, so the loop can be entered through a compile-time tag and the test disappears
+// from the loop while the worker's setup, its work-stealing claim loop and its zero-slice drain
+// stay single-bodied. That is strictly less duplication than UNSWITCH for the same branch removal.
+//
+// Two things this deliberately does NOT assume. The duplication that remains is the row loop, and
+// the row loop is where every kernel lives -- so this is less code than UNSWITCH but not a little
+// code, and whether that is enough is a measurement, not a deduction. And a later reading changed
+// what "code presence" means on Zen4: shortening an unrelated kernel there costs 1-5% on five
+// widths that never execute it while lengthening it costs nothing, which is alignment rather than
+// volume. Under that reading a duplicating arm need not be charged at all. Both readings predict
+// something, they disagree, and this arm is how they get separated.
+//
+// 0 leaves the row loop exactly as it shipped: no lambda wraps it, and `MR_PRETESTED` is a plain
+// `false` so `(false || multirow_ok)` folds back to `multirow_ok`. The wrapper matters -- UNSWITCH
+// measured a forwarding lambda at 14 instructions of 164596 with its own constant off, which is
+// why the `#if` here surrounds only the lambda's opening and closing lines and the loop body is
+// shared text rather than duplicated source.
+#ifndef SCORCH_SPMM_MULTIROW_LOOPSPLIT
+#  define SCORCH_SPMM_MULTIROW_LOOPSPLIT 0
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_MAXDEG
 #  define SCORCH_SPMM_MULTIROW_MAXDEG 0
 #endif
