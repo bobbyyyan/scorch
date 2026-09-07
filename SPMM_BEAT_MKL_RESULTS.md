@@ -21988,3 +21988,91 @@ unroll depth is a compile-time constant, so conditioning it at runtime means two
 and a second instantiation is precisely what sank `unsw`. Whether that cost is real here is
 measurable and unmeasured: `unsw` duplicated the whole worker body, and an unroll variant
 duplicates a much smaller one.
+
+## chain162 -- the two hosts have DIFFERENT mechanisms, and that explains everything chain157 could not
+
+Both attribution stages finished. Together they close the mechanism question that has been open
+since chain151, and they do it by direct attribution rather than by inference from a failed fix.
+
+### redwood: the cost is the per-row admission branch
+
+    k | placement(c0pad)      presence(mrf64)       candidate(bandmr)     | reads as
+    1 | 0.9951 past-floor 1   0.9920 past-floor 3   0.9711 past-floor 29  | THE PER-ROW BRANCH
+    4 | 0.9995 past-floor 0   0.9972 past-floor 2   0.9895 past-floor 23  | THE PER-ROW BRANCH
+
+Placement is flat. Code presence is nearly flat. Only the candidate moves, and it moves on half
+the corpus. The `c0pad` arm is what makes this readable: identical source at a build path one
+character longer, so a layout term would have shown up there and did not.
+
+### MKT: at width 4 the cost is the code merely being PRESENT
+
+    k | c0b floor            presence(mrf64)        candidate(bandmr)
+    1 | 0.9956 past-floor 0  0.9800 past-floor 5    0.9994 past-floor 1
+    4 | 0.9962 past-floor 0  0.9772 past-floor 15   0.9822 past-floor 8
+
+Width 1 is flat for the candidate -- 0.9994 against a 0.9956 floor, one cell past floor of 42 --
+which is chain158's host asymmetry confirmed on a third dataset. But at **width 4, `mrf64` is
+worse than the candidate itself**: 0.9772 against 0.9822, with 15 cells past their own floor
+against 8. `mrf64` has the per-row admission test **folded away at compile time** -- float32's
+constexpr row count is 0 -- and only the unexecutable float64 instantiation present. So on Zen4,
+compiling in code that float32 never runs costs 2.3% at width 4.
+
+### Which resolves chain157 completely
+
+The two hosts do not have one deficit measured twice. They have **two different dominant
+mechanisms**, and every previously confusing result follows:
+
+- `unsw` unswitches the admission test out of the row loop. On redwood that is exactly the cost,
+  so it gains. It also **instantiates the worker body twice**. On MKT code presence is itself
+  expensive, so the duplication costs there and not on redwood.
+- Hence chain157's finding: the low-degree gain replicates on both hosts (both remove the branch)
+  while the high-degree cost is 0.977-0.987 on MKT and 0.998-1.002 on redwood. chain151's
+  explanation was right **about MKT** and wrong to generalise.
+- And the hoist's failure stops being mysterious: it removed a per-row *reload of A1_pos*, not the
+  *branch*. attrib2 says the branch is the cost. The hoist was aimed at the wrong instruction, and
+  chain156 inferred that from its failure -- this measures it directly.
+
+The work-scaling probe agrees and adds a split: `mrf64` reads **DISPATCH** on both hosts (kernel
+time's interval includes 1, the wrapper's excludes it) while `bandmr` reads **KERNEL** on both. One
+limit worth stating -- the probe stacks two copies of the matrix vertically, doubling rows and
+nonzeros together, so "KERNEL" here means "scales with the matrix", not "per nonzero specifically",
+and it cannot separate a per-row branch from per-nonzero work.
+
+### What this makes actionable
+
+`unsw`'s gain and `unsw`'s cost are now **separately priced**, which they never were before. The
+gain is branch removal, worth ~2% at low degree on two hosts. The cost is the second instantiation,
+and `mrf64` prices exactly that in isolation at 2.3% on MKT at width 4. So the question is no
+longer "does unsw work" -- it is whether the branch can be unswitched **without** duplicating the
+whole worker body. Hoisting only the multi-row-eligible inner loop, or branching once outside the
+row loop over two *small* bodies rather than two full workers, would take the gain without the
+thing that is measured to cost. That is a different arm from any of the five attempted.
+
+### chain160's amendment was wrong, and instruction count is a bad instrument
+
+The classification jobs ran on both hosts and overturn what I recorded. Adding
+`SCORCH_SPMM_MULTIROW_UNSWITCH` at default 0:
+
+    host      differing instructions   of total    count delta
+    MKT       ~34,335                  231,254     -1
+    redwood   2,582                    163,194     -2
+
+**15% of MKT's instructions differ while the count differs by one.** My amendment read the
+mnemonic histogram as "one mov plus padding" -- but a histogram cannot see register renaming
+(`mov %ebx,%r9d` -> `mov %r11d,%r9d` is still a `mov`) and my classifier did not recognise
+`lea 0x...(%rip)` displacement shifts as the same benign relocation as a branch target, so
+they landed in "unclassified" and drove an H2 verdict.
+
+What the differences actually are: RIP-relative displacements shifting by exactly `0x10`, branch
+and call targets shifting, register reallocation on redwood, and immediate moves whose deltas are
+`0x1922 -> 0x193e` = 6434 -> 6462 = **+28 exactly**, the lines added to `spmm.h`. Nothing yet
+indicates different *work*, but "byte-different" is now established at a scale I had dismissed.
+
+Two lessons. **Instruction count is a near-useless proxy for emission neutrality** -- it moved by
+one while 15% of the object changed. And the fact that HOIST and RAGGED+MINDEG produced exactly
+**20** differing instructions on both hosts, against these numbers, is what makes those two
+verdicts strong: the instrument does discriminate, by three orders of magnitude.
+
+The behavioural question is still open and instruction counting cannot close it. The right
+instrument is the clock: time mr7-at-default against mr8-at-default and see whether the churn is
+worth anything. That is the next stage, and it is cheap.
