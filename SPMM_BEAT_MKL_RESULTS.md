@@ -22076,3 +22076,43 @@ verdicts strong: the instrument does discriminate, by three orders of magnitude.
 The behavioural question is still open and instruction counting cannot close it. The right
 instrument is the clock: time mr7-at-default against mr8-at-default and see whether the churn is
 worth anything. That is the next stage, and it is cheap.
+
+## chain163 -- the unroll follow-up is launched, and check-then-submit is racy
+
+`unroll2` runs the same design on both hosts from a shared body, `unroll2_body.sh`, sourced by a
+thin per-host wrapper -- so the two hosts run one design rather than two that agree today. It
+fixes all three of the reasons chain161 was a lead rather than a result:
+
+- **Widths 4 and 8 are added as the inertness control.** The exact-width kernel provably cannot
+  reach them under the default band of 3. These are the readings that can *void* the stage: an
+  unroll constant that moves width 8 is touching the generic path, and every chain161 number
+  would be confounded. chain161 measured only widths 1, 2 and 3 -- every width the kernel under
+  test owns -- so it had no such control by construction.
+- **The GCN guardrail is measured**, at the widths a two-layer GCN calls. Width 3 is inside the
+  band, so this is a gate and not an accompaniment.
+- **Both hosts.**
+
+The correctness grid also straddles every plausible unroll factor -- row counts 1, 2, 3, 5, 7, 8,
+9, 15, 16, 17, 64, 257 -- because an unroll constant is exactly the change that is right on
+average and wrong on the remainder.
+
+### A co-tenancy near-miss, and the protocol was the defect
+
+`unroll2` was submitted to MKT at 20:38 and landed on `mkt1` beside a peer session's
+bandwidth-heavy job that had started at 20:36. My error: MKT was genuinely free when they
+submitted, and I then went straight to `sbatch` without re-reading the queue. Caught it at 5
+seconds, while still compiling, so nothing was contaminated; cancelled and resubmitted as
+`17306323` with `--dependency=afterany` on their job.
+
+**The lesson is not "check more carefully".** Check-then-submit is racy: the gap between reading
+`squeue` and `sbatch` landing is unbounded, and no amount of care closes it. A Slurm dependency has
+no such gap. So the rule now is to never submit a timing job to MKT bare -- always compute the
+dependency from whatever is running or pending and pass it, *even when the queue looks empty*,
+because an empty dependency is a no-op and costs nothing.
+
+This is the same shape as several defects in this file: a guarantee that depends on someone
+remembering, replaced by one the system cannot get wrong. The stage lock on redwood is the same
+idea, and the reason redwood was unaffected.
+
+One asymmetry worth recording: a dependency protects *my* numbers from someone else's job, not
+theirs from mine. Mutual protection needs both parties to use it, or an outright agreement.
