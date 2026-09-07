@@ -21884,3 +21884,37 @@ That is not a ship. It is the first evidence that the width-2 high-degree popula
 *addressable* by a raggedness test rather than being intrinsic to the band, and it says the thing
 to look for is a test that keeps rag2's behaviour on the tail without paying for it in the middle
 -- which is a different search than any of the four arms so far attempted.
+
+### chain160 amendment -- what the one instruction actually is
+
+Part 0 of the resubmission named it, and it weakens the claim I recorded above. The mnemonic
+histogram for mr7 -> mr8:
+
+    mov    53021 -> 53020  (-1)
+    nop      578 ->   577  (-1)
+    nopw     832 ->   833  (+1)
+
+Net minus one. And every difference in the diff's visible portion is a `call` target moving by
+exactly `0x10` -- functions relocated 16 bytes, not code changed. `nop` -> `nopw` is the assembler
+padding to an alignment boundary with one wider no-op instead of two narrower ones, which is why
+the instruction count falls with nothing semantic behind it.
+
+So "NOT NEUTRAL" as stated above is **too strong a reading of its own evidence**. Two hypotheses
+remain and the histogram cannot separate them:
+
+- **byte-different, semantically identical** -- the `mov` is a materialized constant the compiler
+  common-subexpression-eliminated in one build and not the other, because every `__LINE__` below
+  the insertion shifted by 28 and two of them coincidentally became equal, or stopped being. On
+  this reading the object is a relocation of the same code and the commit's *behavioural* claim
+  stands even though its instruction count does not.
+- **a real difference in emitted work** -- that would be the finding.
+
+`17304209` decides it by classifying every differing line rather than the first forty, with the
+unclassified count as the verdict: zero unclassified means the first hypothesis. It is compile-free,
+reuses the disassemblies part 0 left on node-local scratch, and carries `afterany` on the timing
+job so it cannot co-schedule onto it. It also copies them to `/matx`, so the question never needs
+that node again.
+
+What survives regardless: `eddf47a`'s "164596 instructions either way" is an ARM count presented
+without its ISA, and the Zen4 count is 231254/231253. A number quoted in a commit message with no
+host attached is the defect whatever the classification says, because nothing re-derives it.
