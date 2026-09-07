@@ -22539,3 +22539,46 @@ Worth noting what the split did to width 1: `unsw` fails P1 in both target bands
 0.9800 at 20-128, both outside the floor) while still being better than `bandmr` there (0.9728,
 0.9835). A failed prediction and an improvement at the same time -- which is why "P1 FAILED" must
 not be read as "the arm is worse".
+
+## chain171 -- two summary reversals in one review, and the fix is to emit the comparison
+
+The documentation session caught my own width-1 wording in the trap I had just warned them about.
+I wrote that `unsw` fails P1 in both target bands "while still being better than `bandmr` there
+(0.9728, 0.9835)". Their reading and their pairing are both correct:
+
+    band    n    bandmr   unsw     unsw vs bandmr
+    4-20    26   0.9728   0.9875   +1.52%  clears tol
+    20-128   9   0.9835   0.9800   -0.36%  inside tol
+
+**Better in one band and 0.36% behind in the other.** Inside tolerance, so it changes nothing about
+the arm -- and it is exactly the shape I had flagged one message earlier: a summary line that
+reverses one of the cells it summarises.
+
+**That is the second such reversal in this review.** The first named the wrong widths for the bound
+tolerance ({1,8} for {1,3,4}); this one reversed a direction. Both were caught by a reader
+recomputing from my own printed columns, which is the wrong place for that work to happen -- and
+both survived my writing them down, so proofreading is not the fix.
+
+The fix is the same one that worked for the tolerance marker: **emit the comparison instead of
+narrating it.** The band table now carries a `CAND vs bandmr` column giving the signed percentage
+and whether it clears the tolerance. A column that states the direction cannot be summarised
+backwards, and the reader no longer has to divide two other columns to check a claim.
+
+This is the third instance of one pattern worth naming plainly: where a conclusion is derived from
+the output by a human step, that step is where the errors are. The `[constant]`/`[A/A spread]`
+marker, the `MIN_POP` refusal, and now the direction column all move a derivation out of prose and
+into the tool.
+
+**And it paid for itself immediately.** With the column present, a cell nobody had looked at is
+legible: float64, width 2, degree 20-128, `unsw +2.78% clears tol` -- `unsw` at 1.0178 against
+`bandmr` at 0.9903 on nine matrices. A real gain that had been sitting unread across two adjacent
+columns, in a table that has been quoted repeatedly.
+
+### The other session's own finding, accepted
+
+They recorded their error rather than only the correction, and it is the more useful half:
+they flagged the pooling correctly and then inferred the wrong *direction* from it. "Dilution
+understates a cost" presumes the target group has a population to dilute. At n=1 the pooled figure
+is not a diluted target number -- it is a control number wearing a pooled label, and no reasoning
+about direction recovers a measurement that was never taken. That generalises past this file: the
+direction rule is a statement about mixtures, and it says nothing when one component is empty.
