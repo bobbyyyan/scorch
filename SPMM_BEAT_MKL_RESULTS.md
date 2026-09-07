@@ -22140,3 +22140,46 @@ Worth naming the shape, because it is the third instance in this sequence: **a s
 whose failure mode is worse than the hazard it prevents.** Co-tenancy costs one contaminated run;
 a deadlocked dependency costs every run until someone notices the job never started -- and a job
 stuck in PENDING looks exactly like a job politely waiting its turn.
+
+## chain164 -- every degree band in this file is blind to locality, and that is testable
+
+A peer session reported that its block-amplification statistic is a **pure function of row
+lengths**, with the consequence that two structurally different generators came out bit-identical
+in every column of its results table -- identical constant row length, mean per-row column span
+3900 against 575. Its note was that any statistic reducing a matrix to a row-length profile is
+silent about locality by construction.
+
+**That applies directly here.** Every banded conclusion in this file bands on `deg = nnz/rows`,
+and the harness records `rows, nnz, deg` and nothing else. All three are pure row-length
+statistics. So the axis is blind to locality in precisely the way described -- and SpMM is
+bandwidth-bound, which makes locality the thing that ought to drive these effects.
+
+The specific claim at stake is chain161's unroll reversal: `exu1` reads **1.1947 at degree 4-20 and
+0.7305 above degree 128** at width 2. That is currently attributed to degree because degree is the
+only axis measured. If locality correlates with degree across this corpus -- and on a corpus that
+is largely DLMC pruned-ResNet blocks plus SuiteSparse, there is no reason to assume it does not --
+the attribution is **unfalsified rather than established**, and a degree-gated fix would be gating
+on a proxy for the wrong thing.
+
+This is not a claim that the attribution is wrong. It is a claim that nothing so far distinguishes
+the two, and the distinction is cheap to make.
+
+`locfeat.py` computes per-matrix locality for both measured corpora and is queued on redwood behind
+`unroll2`. Three things about how:
+
+- **It imports production's `_locality_ratio` rather than reimplementing it.** That function is
+  simultaneously the analytic tile-j gate and a learned-model feature, so a harness with its own
+  version would be measuring a second definition that agrees today and drifts silently later. The
+  npz-to-CSR load *is* replicated from `mrgate.py`, deliberately -- that is deserialization, not
+  policy, and the distinction is the whole point.
+- **It refuses a locality outside [0,1]** rather than writing it. The proxy's precondition is
+  column-sorted CSR; a value that cannot be what it claims means the precondition failed, and
+  since position within a band decides a verdict later, a bad value is worse than a missing one.
+- **It waits for the stage lock** even though it is cheap and CPU-light, because it loads every
+  matrix in the corpus from disk and that I/O beside a bandwidth-bound timing run is the exact
+  perturbation this file keeps warning about. Locality is a property of the matrix rather than the
+  machine, so it runs on one host and its output joins to both.
+
+A follow-up that costs nothing later: `mrgate.py` should record locality alongside `deg` so this
+join is never needed again. Not done now -- both hosts are executing that file in a loop, and
+editing a harness mid-run is its own defect.
