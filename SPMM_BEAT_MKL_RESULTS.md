@@ -23157,3 +23157,225 @@ that is a hypothesis I cannot test for free and am not going to assert. **The NO
 ground it was decided on.
 
 The census is the contribution here: the number that was missing, which is six.
+
+## chain178 -- the arm that was measured is not the arm that ships, and proving it took fixing the instrument
+
+`dgm8` was chosen on `-DSCORCH_NARROWK_EXACT_DEGUNROLL_MULT=8`, the **shared** macro, which moves
+both dtypes. chain176 then established that float64 disagrees in sign across the two x86 hosts and
+regresses GCN k=7 on both, so what ships is the **float32** macro alone behind an AVX2+FMA gate.
+Those are different objects, and the number 1.2186 belongs to the first one.
+
+The gate is committed as `28762af`. What follows is what it took to be able to say that.
+
+### The gate fires, and a presence count could not have told me
+
+The first check I ran was worthless and it is worth recording why, because it looked like evidence.
+I grepped the built object for the ladder's comparison immediates and got `24 cmp $0x10`,
+`2 cmp $0x1f`, `615 cmp $0x1`, `248 cmp $0x3`. The 31 and 16 are the MULT=8 thresholds, so the
+presence reads as confirmation -- but `cmp $0x1` occurs **615 times** in that object for entirely
+unrelated reasons, so its presence proves nothing and its absence was never expected. A check whose
+negative outcome was never possible is the "check passed == nothing to check" shape.
+
+What settles it is three builds and a digest:
+
+    default build (the gate)                       700d8b5dfb7c9c79  1536048 bytes
+    same tree, -D..._MULT_F32=8 forced             700d8b5dfb7c9c79  1536048   <- byte-identical
+    same tree, -D..._MULT_F32=1 forced             e7ec77af15775bda  1537272   <- differs
+
+Byte-identity on the first pair is the proof the `#ifndef` resolved to 8; the inequality is the
+proof the value reaches code. And a fourth build with **both** per-dtype macros forced to 8 is
+byte-identical to the shared-macro build (`40b3eca08fe85306`), which is what shows the two macros
+are consumed independently rather than one shadowing the other.
+
+### The instrument was wrong, and it was wrong in the direction that costs a run
+
+The float64 exclusion needs float64 emission to be untouched. `symneutral.py` compares two objects
+symbol by symbol, normalising `0x`-prefixed hex and `<sym+0x..>` branch targets. Asking it whether
+a float32-only define touches float64 code returned **9 of 23 float64 SpMM symbols changed**, at
+identical instruction counts.
+
+Identical count with a changed digest is the tell, and the differences were all of this form:
+
+    < call   310c3 <spmm_csr_double_v2_core(...)+0x43>
+    > call   310d3 <spmm_csr_double_v2_core(...)+0x43>
+
+The **within-symbol offsets are identical** (`+0x43`, `+0x61`, `+0x66`); only the absolute address
+moved, by 0x10, because unrelated code above it changed size. objdump writes a destination as a
+*bare* hex token, which carries no `0x` prefix, so the normaliser never saw it. Fix is a lookahead
+so only a hex token objdump follows with `<` is treated as an address:
+
+    ADDR = re.compile(r"\b[0-9a-f]{4,}\b(?=\s*<)")
+
+After the fix: **23 of 23 float64 symbols identical**. The verdict inverted, and the wrong verdict
+was the one that would have sent a float64 timing stage after a null. Re-running the detector's
+controls mattered as much as the fix -- byte-identical objects read neutral on every needle, and
+the pair that must still differ kept 4 changed float32 symbols while shedding 24 address-noise ones.
+
+### A runtime `long` comparison does change code shape at -O3
+
+The sweep's own DEF entry stated its safety argument in these words: "MULT is a `long` compared at
+runtime, so no kernel's code changes shape and the out-of-band widths exu1 regressed on MKT have
+nothing to layout differently." **That is false.** Holding the tree fixed and moving only the
+float32 macro:
+
+    scorch_spmm_row_narrow_exact<float,4,2>      out-of-line at MULT=8, INLINED at MULT=1
+    scorch_spmm_row_narrow_exact<float,6,2>      inlined     at MULT=8, out-of-line at MULT=1
+    spmm_csr_v2_core<float, false>               6334 vs 6401 instructions
+
+Fifteen of the eighteen width/unroll combinations are out-of-line either way, and exactly one
+unroll-2 instantiation trades places. The constant feeds the inliner's budget. Semantically the
+same eighteen kernels; not the same object -- so the sweep's number does not transfer, and the
+shipped configuration has to be timed as itself.
+
+This also retro-explains chain175's loose end. `exu1` regressed **out-of-band** widths on MKT
+(0.9701 at width 4, 4.8% at GCN k=16) and the session attributed that to alignment rather than
+mechanism without a mechanism to name. This is the mechanism: an unroll constant that cannot reach
+width 4 arithmetically can still move width 4's code, because it moves what the inliner does with
+the whole translation unit.
+
+### Scope, bounded from the source rather than assumed
+
+The performance convention names GCN, autoencoder and attention, and only GCN was measured. It
+turns out the other two cannot be reached, and the bound is exact:
+
+- `spmm.h:4091` sets `exact_width` only when `B1_size <= exact_hi_`, and `exact_hi_` is
+  `SCORCH_NARROWK_EXACT_HI`, which **ships at 3**. The ladder at `spmm.h:4124` sits inside
+  `if (exact_width && ...)`. So the constant is unreachable at k >= 4.
+- The only two call sites of `scorch_spmm_row_narrow_exact` are both inside `spmm_csr_v2_core`.
+  `spmm_csr_linear_fused_float` -- the AE path -- does not call it.
+
+AE and attention run at widths in the hundreds, so they are out of scope by construction, and
+widths 4 and 8 in this stage are the empirical check of exactly that claim.
+
+**And an inherited comment in the analyzer had this backwards.** It said GCN widths 3, 6 and 7 all
+sit inside the band, citing `exact_cap_` = 7. But `exact_cap_` is the *instantiation* cap -- the
+widths a template exists for -- and it only ever clamps `exact_hi_` **down**: `if (exact_hi_ >
+exact_cap_) exact_hi_ = exact_cap_` turns 3 into 3. The band is widths 1-3. That inverts how the
+guardrail table reads: only k=3 is in scope, and a movement at k=6, 7 or 16 is a confound rather
+than news.
+
+### C5: the stage proves it is timing the ship, per host, before it times anything
+
+Every number about a build is a claim about a binary, so the stage's first act is to build the
+**gated tree with no defines** -- literally what ships -- and require it to be disassembly-identical
+to the `gate` arm it is about to time. Three details make it real rather than decorative: it builds
+at the same path string the other arms used (`$R/wk`), it greps the gated default out of the
+extracted header so a stage handed the pre-gate tree twice cannot pass for the wrong reason, and
+it exits non-zero rather than continuing.
+
+    redwood   NEUTRAL: 163100 instructions, identical disassembly
+    MKT       NEUTRAL: 231236 instructions, identical disassembly
+
+**It also proves the ISA predicate holds on each host, for free.** If `__AVX2__ && __FMA__` were
+not defined, the gated tree's default would resolve F32 to 1 and differ from the forced-8 arm, so
+C5 would fail. It passed on both, so the gate demonstrably fires on redwood and on Zen4 -- which is
+a stronger statement than the three-build digest, and automatic.
+
+ARM is the other half: pre-gate against gated on the M5 gives identical disassembly over 169165
+instructions, so the exclusion is byte-proven and not argued.
+
+### The analyzer's own C5 guard passed a failing proof
+
+Worth recording because it is a one-character class of bug in a check written to be strict. The
+guard was `if "NEUTRAL" not in _c5`. `neutral_disasm.sh`'s failure line is
+**"NOT NEUTRAL: instruction counts differ"**, which *contains* the substring the guard looks for,
+so a c5.txt reporting a real emission difference read as a pass. Anchoring on the line's first
+token and refusing `NOT NEUTRAL` and `REFUSE` by name fixes it; all four possible file contents
+(fail / refuse / empty / pass) now discriminate.
+
+Two more guard defects in the same block, both found by testing them rather than reading them. The
+freshness check answered for the content check when the file was fresh-but-failing, leaving the
+content path untested -- so content is now checked first. And the freshness direction is the
+non-obvious one: C5 runs *before* the timing loop, so in a coherent run c5.txt is **older** than
+every CSV, and a c5.txt *newer* than the CSVs means stale timings from an earlier run in a reused
+directory.
+
+### MKT confirms the shipped object. redwood went down mid-stage, so this is half a claim
+
+`c0` is the pre-gate default, `c0b` the same source again as the A/A floor, `gate` the shipped
+constant -- and C5 proved on this host that `gate` is disassembly-identical to what the committed
+tree builds by default (231236 instructions). Six passes, three builds, rotation balanced.
+
+**C1, the claim.** float32, target group, mean degree 8-16:
+
+              gate     per-family   floor    tol     fraction of the sweep arm
+    k=2      1.1490    1.1901 fam=3  0.9978   0.010   87%
+    k=3      1.0874    1.0902 fam=3  1.0071   0.014   87%
+
+87% of a number produced by a different object is the right kind of answer: the same sign, well
+outside the floor, and slightly short -- which is what the instantiation trade predicts and why
+this stage was run instead of inheriting 1.1708.
+
+**And the cell count, which is what the standing goal is measured on.** Below-MKL cells, target
+group, float32:
+
+    build     k=1     k=2     k=3     k=4     k=8
+    c0        1/18    18/18   18/18   1/18    3/18
+    c0b       1/18    18/18   14/18   1/18    2/18
+    gate      1/18     2/18    3/18   2/18    2/18
+
+In the effect band alone (degree 8-16, 16 of the 18) it is **16/16 -> 0/16 at k=2 and 16/16 ->
+1/16 at k=3**. The A/A floor has to be read alongside it: at k=3 identical code moves 4 cells on
+its own (18 -> 14), because those matrices sit at parity, so k=3 is honestly "the gate moves 15
+where the control moves 4". At k=2 the control moves none and the gate moves 16.
+
+**C2, the out-of-band control the blanket arm failed.** k=4 reads 0.9821 against a 0.9890 floor
+(tolerance 0.022) and k=8 reads 0.9928 against 1.0016. Inside, both. This is the width where
+`exu1` read 0.9701 and lost its case.
+
+**C4, the GCN guardrail.** Clean at all four widths, and k=3 is 1.0812 -- faster, on-mechanism:
+cora, citeseer and pubmed have mean degree 4.90, 3.74 and 5.50, which a multiplier of 8 gives
+unroll 1. k=6, 7 and 16 sit outside the band and read 1.0082, 1.0114, 1.0120.
+
+**C3 fails, and one matrix is the entire reason.** float64 k=2 reads 1.0126 against a 1.0%
+tolerance -- a GAIN, on a dtype whose 23 SpMM symbols are byte-identical between the two builds.
+Leave-one-out puts all of it on `connectus`:
+
+    all 18 target matrices              1.0126
+    minus connectus                     1.0064   (floor 0.9964, n=17)
+
+`connectus` is 512 rows holding 1127525 nonzeros -- mean degree 2202 -- and it is the matrix
+family that holds a tenth of itself in one row, so the whole-row partition is a scheduling coin
+flip. Its readings are **bimodal**, two modes about 10% apart, and the mode is drawn once per run
+and then applies to every width in that run:
+
+    connectus float32 k=4, ms by pass    p1      p2      p3      p4      p5      p6
+      c0                                0.1333  0.1467  0.1462  0.1337  0.1328  0.1332
+      c0b                               0.1318  0.1469  0.1331  0.1323  0.1343  0.1335
+      gate                              0.1459  0.1330  0.1476  0.1464  0.1327  0.1464
+
+Every build reaches both modes; `gate`'s minimum is below `c0`'s; p5 has all three builds low.
+`gate` drew the high mode in 4 of 6 runs against 3 of 12 for the other two, which is Fisher
+p ~ 0.13 -- suggestive of nothing. The effective sample is 6 runs per build, not 30 cells, because
+one draw covers all five widths, and that is also why the ratio is nearly constant across k=1..8
+including the widths the constant cannot reach.
+
+So C3's failure is not a float64 regression. **It is the tolerance being too tight for a corpus
+containing a matrix whose own spread is 15%**, and the reason the tolerance did not notice is worth
+recording: the floor is `2 * |1 - c0b/c0|` computed from MEDIANS, so it inherits exactly the
+blindness to bimodality described below. C1 is immune by construction -- it is judged in the
+degree 8-16 band and connectus sits at 2202.
+
+### The inertness check was wrong twice more, in opposite directions
+
+The per-cell null reported `connectus` k=2 at 0.9048 "where the code-identical builds span 1.01x",
+which reads as a 9-sigma regression. **1.01x is the span of two MEDIANS.** The raw readings of the
+same two builds span 1.12x. A median is the right statistic for the cell and the wrong one for its
+spread, so the span now comes from raw readings.
+
+Then I widened the outside-the-null ENVELOPE to raw readings as well, which looked like the same
+fix and destroyed the check: it read **0 of 42 outside where the null expects 28**, because a
+median of six runs is far less variable than a single run and essentially always sits inside a raw
+envelope. That is the vacuous-and-reassuring answer for the third time in this comparison's
+history. Exchangeability is a statement about LIKE QUANTITIES -- the arm's median against each
+control's median -- so the envelope stays on medians and only the reported span is raw. Restored,
+it reads 28 of 42 against a null of 28 +- 3.1.
+
+### What is missing
+
+**redwood was unreachable from 06:10, at 5 of 54 CSVs** -- 100% packet loss, port 22 filtered, DNS
+resolving, and unreachable from the myth jump host too, so it is the host and not the route. MKT is
+therefore the only x86 host with a verdict, and the house standard is two. Nothing ships on one
+host. A watcher is waiting for redwood and will distinguish the two cases that matter: the driver
+survived and the stage finishes on its own, or the host rebooted and the partial CSVs must not be
+analysed as a whole run.
