@@ -22380,3 +22380,54 @@ built for different questions agree on the mechanism.
 
 The remaining analyzers still pool. That is a known defect now rather than an unknown one, and the
 priority is `an_unsw` and `an_heldout`, whose conclusions include flat readings.
+
+## chain168 -- chain157's revision survives the split, and width 4 is worse than recorded
+
+The documentation session raised the sharpest possible objection to chain167's own finding: chain157
+does not merely *contain* a flat reading, it **turns entirely on one**. Its contribution is that
+redwood read 0.9986 / 0.9996 / 0.9979 / 1.0017 at widths 1/2/3/8 for degree >= 20 where MKT read
+0.977-0.987, and flat is exactly what pooling manufactures. If the target group were materially
+below 1, `unsw` would return to being a two-host net regression, chain162's host asymmetry would
+lose the leg that made it a host difference rather than a shared cost, and the actionable arm would
+change -- "branch once over two small bodies" would be paying the same tax in a smaller
+denomination rather than avoiding it.
+
+Re-scored on the split. This stage has no `groups.txt`, so the split is **derived** at the same
+pre-registered `nnz >= 1e6` and labelled as derived, because a derived split and a read one are not
+the same evidence. `unsw` against `bandmr`, degree >= 20, float32, with the A/A floor measured on
+the **same population and the same band**:
+
+    k | A/A floor (target) | TARGET        | control       | pooled (recorded) | verdict
+    1 | 0.9984 (n=10)      | 0.9940 (n=10) | 0.9952 (n=12) | 0.9947 (n=22)     | inside floor
+    2 | 1.0057 (n=10)      | 0.9954 (n=10) | 1.0044 (n=12) | 1.0003 (n=22)     | inside floor
+    3 | 1.0008 (n=10)      | 0.9983 (n=10) | 1.0103 (n=12) | 1.0048 (n=22)     | inside floor
+    4 | 0.9972 (n=10)      | 0.9805 (n=10) | 0.9932 (n=12) | 0.9874 (n=22)     | BEYOND floor, SLOWER
+    8 | 1.0089 (n=10)      | 1.0044 (n=10) | 1.0018 (n=12) | 1.0030 (n=22)     | inside floor
+
+**The revision holds.** Widths 1, 2, 3 and 8 sit inside their own same-code floor on the target
+group, so the flat reading was not an artefact of pooling. chain162's host asymmetry keeps its leg,
+and the loop-split arm remains the right one -- the duplication tax is real on Zen4 and genuinely
+absent on redwood at those widths.
+
+**Width 4 is worse than recorded, not better.** 0.9805 on the target group against 0.9874 pooled
+and 0.9850 on MKT -- so the single two-host cost is about 2.0% on redwood and 1.5% on MKT, and
+pooling had been *understating* it. It remains the one thing both machines agree on and the blocker
+for `unsw`.
+
+Two caveats on the line rather than in a footnote: the target group at degree >= 20 is **n=10**, so
+this is ten matrices deciding a revision, and the tolerance at widths 1 and 8 is floored at the
+0.010 minimum rather than set by the A/A spread, which means "inside floor" there rests on the
+floor constant and not purely on measurement.
+
+**And my own re-score table printed ratios with no floor beside them on the first attempt** -- a
+sub-1% number against nothing, which is the uncalibrated-tolerance defect this file keeps
+producing, in the very analysis written to fix a different one. Caught before concluding, but only
+because the missing column was conspicuous; had the numbers been larger it would have read fine.
+
+### A correction accepted
+
+chain167 said only `an_ship.py` of seven analyzers read `groups.txt`. **`an_hi1.py` also honours
+the split**, with the same derive-at-`nnz >= 1e6` fallback when no groups file is present. So it is
+two of seven, and chains 125 and 129 -- the per-width ownership numbers for the candidate -- are
+already target-group and were never diluted. The flip's rejection and its attribution stand as
+written.
