@@ -23612,3 +23612,45 @@ the proof (if it is `spmm_csr_v2_core<float,...>` the story is layout; if it is 
 story is different), and it was thrown away by the harness rather than missing from the tool. Now
 filtered on `CHANGED|ONLY IN ONE|symbols matched|VERDICT` instead of truncated. The surrounding
 `if [ -f "$SYMNEUTRAL" ]` also skipped silently when absent; made loud.
+
+### chain180 addendum: the "remove the dead block" lead is a layout lottery, not a mechanism
+
+Written after reading the dispatch rather than after another run, because it changes what the lead
+is worth and would otherwise be re-derived wrongly.
+
+`spmm.h:4641` guards the block with `if constexpr (MR_LIVE && MR_ROWS_LIVE)`, and `MR_ROWS_LIVE` is
+only ever `false` when `SCORCH_SPMM_MULTIROW_LOOPSPLIT` is on -- the caller at 5082-5089 dispatches
+on the runtime `multirow_ok` into a `std::true_type` / `std::false_type` pair. **So the loop split
+IS the excision mechanism; there is no separate narrower patch to write.** "Remove the block where
+`multirow_ok` is provably false" and "restructure the row loop" are the same switch, which means
+chain179 did not reject a bundle it could be un-bundled from.
+
+That also relocates chain179's costs. At the GCN widths 6, 7 and 16 `multirow_ok` is *true*, so the
+`true_type` instantiation runs -- it still contains the block, and the only differences are that
+`MR_PRETESTED` skips the per-row test and that the row loop now exists in two instantiations.
+chain179 established the per-row test is free (that was L1, and it is why L1 was NOT SUPPORTED). So
+the 1.1-1.7% GCN regression at firing widths is not the hoist and not the excision: it is the cost
+of the loop existing twice.
+
+And the excision's own sign is not consistent. Every one of these is a width where multi-row cannot
+fire, so all three are pure excision effects:
+
+    k=4        +9.2%   (chain179)
+    k=2        -2.0%   (chain179)
+    GCN k=3    -1.7%   (chain179)
+
+Helps one, hurts two, all in the same "cannot fire" class. Nothing about instruction-cache pressure
+or removed code predicts a sign flip between widths 2, 3 and 4 that all take the same excision.
+What does predict it is layout: which instantiations the inliner keeps, where the branch targets
+land, how the loops pack. chain178 already established that a *runtime `long` comparison* changes
+code shape at -O3, trading one unroll-2 instantiation between inlined and out-of-line. This is the
+same phenomenon a layer up.
+
+**So the lead is weaker than chain180 recorded it.** Not "the dead block costs width 4 about 9%,
+go and take it", but "removing the block moves widths 2, 3 and 4 by -2 to +9 percent with no
+predictable sign, and the +9 at width 4 is one draw from that distribution." Tuning on it would be
+overfitting to a layout draw, which is exactly what the performance convention in CLAUDE.md
+forbids. If it is worth pursuing at all, the stage is a **duplication-only control** -- build with
+the split on but the `false_type` arm still containing the block, so both instantiations are
+behaviourally identical and only the duplication differs. If GCN still regresses there, the cost is
+duplication and the excision half can never pay at a firing width.
