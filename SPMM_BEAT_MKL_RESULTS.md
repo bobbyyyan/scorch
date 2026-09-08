@@ -23734,15 +23734,52 @@ most of the effect they were measuring.
 
 mrf2 reads **-1.97% [-2.54%, -1.25%]** at width 2 and mrdead **-1.63%**, so mrdead reproduces 83%
 of the cost: if the cost is real it is mostly **presence**, the block being compiled in, rather than
-the kernel executing. chain179's -2.0% at width 2 has therefore **reproduced** on a properly
-balanced rotation, and chain180's 0.9977 is the outlier of the three. GCN k=3 also leans the same
-way (mrf2 -0.82 to -1.60%, mrdead -0.15 to +0.50%, A/A -0.02 to -0.87%).
+the kernel executing. GCN k=3 leans the same way (mrf2 -0.82 to -1.60%, mrdead -0.15 to +0.50%,
+A/A -0.02 to -0.87%).
 
-Read together: **chain131's rejection ground is corroborated rather than overturned.** The effect
-is roughly 2.5x the demonstrated build-identity artefact, it appears in two independent stages, and
-83% of it is presence. Multi-row stays blocked, and it is blocked by a code-layout cost at a width
-it deliberately refuses to serve -- which, per the chain180 addendum above, is a layout draw whose
-sign varies across widths and is therefore not something to tune against.
+That pooled number is roughly 2.5x the demonstrated build-identity artefact, so a width-2 cost of
+about a percent and a half is the most probable reading. What it is **not** is a reproduction of
+chain131 -- see the amendment immediately below, which is the more important result of this stage.
+
+### Amendment: this corpus was never chain131's, and chain131's worst matrix reverses sign
+
+Two conflations, caught by going back to chain131's own table rather than to its conclusion.
+
+**First, chain179's -2.0% at width 2 is a different quantity from chain181's -1.97%.** chain179's
+arm was `mrf2ls` against `mrf2`, so its number is what the loop split costs *given multi-row is
+already on*. chain181 compares `mrf2` against the default, which is what chain131 measured. The two
+values being within 0.03 of each other is a coincidence, and reading it as a reproduction was wrong.
+
+**Second, and this is the substantive one: chain131 did not reject multi-row on a small pooled
+effect. It rejected it on a coherent regression POPULATION** -- long-tailed degree distributions at
+width 2, on both hosts: connectus 0.602 / 0.817, lp_osa_14 0.852, cari 0.850, lhr34c/lhr71/lhr71c
+0.820 / 0.834 / 0.845, com-Amazon 0.885, relat8 0.905, as-caida_G_08x 0.934. Those are 10-40%
+regressions on named matrices, not a 2% average.
+
+Only **two of those nine** matrices are in chain181's target group, and one of them reverses:
+
+    matrix       chain131          chain181 mrf2 at width 2   its own A/A
+    connectus    0.817 (MKT)       1.0289  = +2.89% FASTER    1.0008
+    relat8       0.905 (MKT)       0.9677  = -3.23% slower    1.0176
+    the other seven                not in this corpus at all
+
+**connectus was the anchor of chain131's rejection and it now reads faster, on a tight floor.**
+relat8 keeps the sign at a third of the magnitude, but against a 1.76% A/A floor of its own, so it
+is marginal by its own control. `com-Amazon` is in the control group, which this stage does not
+judge; the remaining six are absent.
+
+So the honest status is not "corroborated" and not "overturned": **chain131's ground is largely
+UNTESTED, and its single worst matrix does not reproduce.** The corpus is why. chain181 inherited
+chain180's `nnz >= 1e6` target group, which was chosen to make a big-matrix presence effect
+visible, while chain131's finding was about *long-tailed degree distributions at small-to-mid
+size*. Three stages in a row have been measuring a width-2 question on a corpus that excludes most
+of the population the question is about.
+
+**That, and not another estimator, is the next stage: run this design on chain131's own regression
+population.** It is cheap -- those matrices are small -- and it is the only corpus on which the
+verdict means anything. The single-object instrument described below is still needed to get inside
+a percent, but on the right corpus the effects were 10-40%, which is far above the 0.8%
+build-identity artefact and needs no such precision to see.
 
 ### The instrument that would settle it
 
