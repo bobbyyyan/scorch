@@ -23991,3 +23991,119 @@ So: a 1.42-1.47x oracle gap on the small MKL-losing cells, mechanically explaine
 a caller-path question that has already killed one thread-width change. The follow-up worth running
 is narrow -- five identical arms for a proper null, the same sweep on the caller path rather than
 the ABI, and a guardrail set of larger cells to show a runtime rule could not fire on them.
+
+## chain184 -- redwood's half of the gate, salvaged from the outage: it confirms the win AND finds a shipped 12% regression MKT could not see
+
+redwood came back on 2026-09-08 at 15:40 with one memory stick lost to overheating. Two questions
+had to be answered before any of its numbers could be used, and then a third came out of the data.
+
+### Is it still the same machine?
+
+For a bandwidth-bound kernel a missing stick is not a capacity question, it is a channel question:
+the i9-14900K is dual-channel with four slots, so three surviving DIMMs is the asymmetric case, and
+Intel flex mode would leave part of the address space single-channel at roughly half bandwidth --
+which would make every measurement depend on where the allocator happened to put the arrays.
+
+Measured rather than assumed, with a parallel streaming-read probe:
+
+    8 GB allocation:    low slice 58.82 GB/s   high slice 59.04 GB/s   high/low 1.004
+    110 GB allocation:  low slice 59.17 GB/s   high slice 56.18 GB/s   high/low 0.950
+
+**No cliff.** 0.950 across a 110 GB span, not the ~0.5 a single-channel tail would give, and
+56-59 GB/s throughout against the ~56 GB/s on record for this host before the failure. So there is
+no placement hazard and redwood is materially the same machine for this work. The log postmortem is
+a dead end -- `wtmp` has impossible dates and there is no persistent journal for the previous boot
+-- but it is not needed.
+
+### What the outage interrupted, and what survived
+
+The gate-configuration stage died with **41 of 54 CSVs**, and all four builds, the keys, the groups
+and the C5 proof intact. 41 is not a usable number: the rotation is cyclic over three builds, so
+passes 1-4 give `c0` two leads and the others one each, and an unbalanced rotation is worth 0.5-1.2%
+on identical source -- larger than several of the effects here. **Passes 1-3 are balanced** (one
+lead each, all three builds, all three slices), so that subset is analysable and the rest is
+discarded. No new machine time was needed.
+
+C5 holds on redwood: the timed `gate` arm is disassembly-identical to what the committed tree builds
+by default, 163100 instructions, which also proves `__AVX2__ && __FMA__` on this host. Correctness
+480 cases, 0 mismatches. All of this data predates the repair and every arm in it was measured
+within one run, so the missing stick cannot touch it.
+
+### The gate's win confirms on the second host, more strongly than on the first
+
+    float32 target group, geomean against c0 (floors in brackets)
+      width   MKT                    redwood
+        1     1.0010 [1.0133]        0.9824 [1.0026]
+        2     1.1259 [0.9967]        1.1937 [0.9995]
+        3     1.0721 [1.0056]        1.1998 [1.0005]
+        4     0.9821 [0.9890]        1.0024 [1.0012]     out of band, inert
+        8     0.9928 [1.0016]        1.0034 [1.0012]     out of band, inert
+
+Widths 2 and 3 are the gate's target and both hosts agree it wins there -- redwood by 19.4% and
+20.0%. The out-of-band inertness control holds on both. **That is the two-host confirmation the gate
+was missing, and it is a real result.**
+
+### And the regression, which is the more important half
+
+redwood's width 1 reads **0.9824 against a 1.0026 floor**, and the by-band breakdown says exactly
+where it comes from:
+
+    float32 k=1, target group, by mean-degree band
+      band     c0b floor     gate        n
+      <4       1.0019        1.0018       1
+      8-16     0.9989        1.0402      22
+      16-32    1.0085        0.8792      12     <-- 12% slower
+      32-64    1.0116        1.0177       1
+      >=128    1.0044        1.0040       1
+
+Every matrix in that band is slower, across ten distinct families, so it is not a family artefact:
+
+    lhr71 0.8157 | lhr71c 0.8158 | TSOPF_FS_b39_c19 0.8193 | shipsec8 0.8514 | qa8fk 0.8816
+    filter3D_E 0.8850 | barrier2-12 0.8947 | barrier2-9 0.8981 | barrier2-10 0.9080
+    qa8fm 0.9166 | xenon2 0.9212 | 2cubes_sphere 0.9562
+    band geomean 0.8792, per-family geomean 0.8750, floor 1.0085
+
+**The mechanism is exact.** The ladder is
+`while (u > 1 && mean_deg < u * MULT) u >>= 1` from a start of 4, and `MULT_F32` went from 1 to 8:
+
+    mean degree      unroll at MULT=1 (pre-gate)     unroll at MULT=8 (shipped)
+    4 .. 15                    4                              1
+    16 .. 31                   4                              2
+    32 and up                  4                              4
+
+Every one of those twelve matrices has mean degree between 16.2 and 28.8 -- precisely the band where
+the gate halves the unroll from 4 to 2. At widths 2 and 3 that same halving is what buys 19-20%; at
+width 1 it costs 12%, because width 1 has one multiply-add per nonzero to hide the per-row setup
+behind instead of two or three. float64 is untouched, its multiplier still being 1, which is why
+redwood's float64 rows all read within a percent.
+
+**Why MKT could not have caught it: MKT's target group contains no matrices in the 16-32 band at
+all.** Its width-1 reading of 1.0010 is an average over bands the mechanism does not move, and its
+only 16-32 coverage is two control matrices, which read 0.9954. This is the same failure as
+chain182's -- a verdict taken on a corpus that does not contain the population the mechanism acts on
+-- and it is the second time in three days. A degree-banded mechanism must be judged on a corpus
+whose bands are populated, and the band census has to be printed before the verdict, not after.
+
+### Status
+
+`28762af` is committed and local, never pushed. It is right about widths 2-3 on two hosts and wrong
+about width 1 in one degree band, by 12%, on ten families. Under the standing rule that a regression
+is a finding to report rather than a shape to tune around, that is reported here first.
+
+The fix belongs in the same layer as the bug: the ladder trades per-row setup, which scales with the
+unroll, against useful work, which scales with degree *times width* -- and the shipped threshold
+ignores the width entirely. The narrow correction is to keep `MULT_F32 = 8` only where it was
+measured to win and let width 1 keep the pre-gate constant, which is provably neutral at widths 2-3
+because the value there is unchanged and provably restores width 1 because the value there is the
+one it had before the gate. The general correction is to compare `mean_deg * exact_width` against
+`u * C`, which is the actual trade the comment describes; that changes widths 2 and 3 as well and so
+needs its own grid rather than an argument.
+
+### One instrument defect, found by tripping over it
+
+The MKT gate fixtures in the evidence ledger **cannot be re-analysed**: the analyzer requires
+`c5.txt` to be older than every CSV, since C5 runs before the timing loop, and archiving with a
+plain `cp` flattens every mtime to the copy time, so the check reads "newer by 0 s" and refuses.
+The guard is right and the archive is wrong. The MKT data used above was re-pulled from the
+original run directory, whose mtimes are intact (c5.txt 05:58:44, first CSV 06:02:07). **Archive
+with `cp -p`** -- otherwise the ledger holds bytes that no longer satisfy their own provenance test.
