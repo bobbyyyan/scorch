@@ -23809,10 +23809,14 @@ mrdead 255694), the changed symbol named at last (`spmm_csr_v2_core<float, false
 instructions -- exactly the live MINNNZ test), mrbuild's five checks confirmed present, 112
 correctness cases per candidate with 0 mismatches, rotation balance checked rather than assumed.
 
-**The population is 8 of 13 keys and the harness said so by name.** `lp_osa_14`, `cari`, `lhr34c`,
-`lhr71` and `lhr71c` are not cached on MKT, and those are the severe end of chain131's range
-(0.820-0.852). What ran is connectus, com-Amazon, relat8 and all five cached `as-caida_G_08*`
-members -- four of chain131's nine table entries. Controls are size-matched from inside the target
+**The population is 8 of 13 keys, the harness named the absentees, and checking why turned the
+caveat into a stronger claim.** `lp_osa_14`, `cari`, `lhr34c`, `lhr71` and `lhr71c` are not cached
+on MKT, and their `.mtx` sources are absent from MKT's SuiteSparse root entirely -- so this is not
+a fetch that failed. Going back to chain131's table, **those five are exactly its redwood-only
+rows.** chain131's MKT rows were connectus, com-Amazon, relat8 and `as-caida_G_08x`, and chain182
+has all four. So this stage covers **100% of chain131's MKT evidence** and none of its redwood-only
+evidence, which is a host split rather than a coverage gap, and it needs redwood rather than a
+download. Controls are size-matched from inside the target
 group's own nnz range (median ratio 1.27), because these matrices are small and otherwise "small
 behaves differently at width 2" could not be told apart from "this population behaves differently".
 
@@ -23899,6 +23903,14 @@ where it provably cannot fire -- and per the chain180 addendum that is the loop 
 cost at *firing* widths chain179 measured and which is loop duplication rather than the hoist.
 
 **It does not clear multi-row to ship.** This is one host, and a shipping claim needs two; redwood
-has been down throughout. The five missing population members are the severe end of chain131's
-range and they are exactly the matrices most likely to move the verdict, so completing the cache is
-a prerequisite rather than a nicety. And the GCN disagreement above is unresolved.
+has been down throughout. And the missing half of chain131's population is precisely the redwood
+half -- `lp_osa_14` 0.852 and 0.843 at k=8, `cari` 0.850, `lhr34c`/`lhr71`/`lhr71c` 0.820/0.834/
+0.845, the severe end of its range -- so the same host that would confirm the win is the host that
+holds the unreproduced regressions. Those two needs are one need. The GCN disagreement above is
+also unresolved.
+
+Worth stating plainly, because it is the useful part: **on MKT, chain131's own four matrices now
+read -0.22% (connectus), -0.79% (com-Amazon), -2.79% (relat8) and -1.35 to -2.75% (as-caida), where
+chain131 recorded -18.3%, -11.5%, -9.5% and -6.6%.** Every one is smaller, two are inside their own
+floor, and the anchor is one of the two. Whatever redwood eventually says, the MKT half of
+chain131's case has not survived re-measurement at anything like its original size.
