@@ -23914,3 +23914,80 @@ read -0.22% (connectus), -0.79% (com-Amazon), -2.79% (relat8) and -1.35 to -2.75
 chain131 recorded -18.3%, -11.5%, -9.5% and -6.6%.** Every one is smaller, two are inside their own
 floor, and the anchor is one of the two. Whatever redwood eventually says, the MKT half of
 chain131's case has not survived re-measurement at anything like its original size.
+
+## chain183 -- an abandoned M5 stage, recovered from disk: the shipped team width leaves 1.42-1.47x on the small cells
+
+No new machine time. A hygiene sweep for stale background pollers found one that had been spinning
+for **4 days 3 hours** on an `until [ -f X ] && grep -q DONE` loop, waiting for a marker that a
+stage which died on Sep 4 was never going to write. Its construction cannot tell "not yet" from
+"died", which is the same defect class as the four silent-null drivers already recorded here. The
+poller is killed. The stage's two output files -- 810 float32 cells and 270 float64 cells over 135
+matrices -- were on disk and complete enough to analyse, so this section is what they say.
+
+`threadfloor.py` asked three things: the best OpenMP team width per cell, what the shipped policy
+picks instead, and how much of the deficit against MKL a per-cell oracle would remove. **The third
+is not answerable from these files**: the run was invoked with `--no-rival`, so there is no `mkl`
+arm, and none of the arms present (`nt`, `ship`, `pool`, `poolb`, `basetrue`) stands in for one.
+Stated as unanswerable rather than approximated.
+
+### The number, and the control that has to sit next to it
+
+    per-cell oracle over swept widths {1,2,3,4,6} vs the shipped policy   1.5813  (+58.1%)
+    NULL oracle -- best of two IDENTICAL arms (pool vs poolb)             1.0734  (+7.3%)
+    net, after selection noise                                    between 1.4205 and 1.4731
+
+An oracle that picks the fastest of five widths **using the same readings it is then scored on** is
+optimistically biased: with one pass per cell, part of its gain is picking the low tail of the
+noise. The data carries the control for that -- `pool` and `poolb` are the same configuration timed
+twice -- and choosing the better of those two fabricates 7.3% out of nothing. That is the floor the
+real number has to clear, and it clears it by a wide margin.
+
+Two honest limits on the control, because it is the load-bearing part. It picks the best of **two**
+arms while the oracle picks the best of **five**, and min-of-5 is strictly more biased, so `R/N`
+overstates the net -- hence the range, whose lower bound scales the null by the model ratio at the
+measured per-cell sigma of 6.24%. And the measured two-arm null (7.3%) is about **twice** what a
+lognormal at that sigma predicts (3.7%), so the spread is heavier-tailed than the model and even
+the lower bound may be optimistic. **A real five-arm null needs a stage that runs five identical
+arms; this data has two.** That is the first thing the follow-up needs.
+
+### The shape of the gap, which is mechanically consistent
+
+    k     oracle    null      net       and the effect dies with k
+    1     2.1009   1.0953   1.9181
+    2     2.0905   1.0884   1.9207
+    4     1.5314   1.0755   1.4239
+    8     1.5123   1.0834   1.3959
+    16    1.4251   1.0577   1.3473
+    64    1.0784   1.0413   1.0356      <-- essentially gone
+
+    the oracle wants width 1 in 26% of cells and width <= 3 in 59%
+    the shipped policy ships width 6 in 662 of 810 cells (and 18 in 39)
+
+This is exactly what the known mechanism predicts. Widening the team on the M5 costs about 4.75us
+per worker with a cliff at 6 -- the fast-core count -- and these cells are small enough that the
+per-call floor dominates the arithmetic. So the shipped policy pays team-setup cost on cells too
+small to use a team, the penalty is worst at k=1 and k=2 where there is least arithmetic to amortise
+it, and by k=64 there is enough work that the team pays for itself and the gap closes to nothing.
+Nothing here is surprising; what is new is the size.
+
+### Why this is a lead and not a result
+
+- **The corpus is not the general space.** 95% of it is DLMC (`rn50` and `transformer`), 133 of 135
+  matrices are under 1e6 nonzeros, and the medians are 128 rows and 78643 nonzeros. That is the
+  family whose arithmetic is invisible next to a ~22us per-call floor. The stage's own docstring
+  says the shapes were "drawn from the cells that lose to MKL". So the 1.42-1.47x is measured on
+  cells selected for already losing, which is on-goal for a cell count against MKL and says nothing
+  about whether the same change is neutral anywhere else.
+- **It is a native-symbol number, not a caller-path number**, because the width is set through the
+  ABI argument. The precedent is discouraging and directly applicable: the physical-core cap read
+  1.24-1.35x on the native symbol and **-9 to -11% on the caller path**, and was rejected for it.
+  This is the single most likely way the 1.4x evaporates.
+- **One pass, one host, and the M5 is the only ARM machine we have**, so no ARM claim here can ever
+  get a second host.
+- **Thread-bound work on this kernel has been refused four times** (chain59), and for reasons that
+  still apply: there are three bounds rather than two, and the adoption undoes `BASE_WORK_TRUE`.
+
+So: a 1.42-1.47x oracle gap on the small MKL-losing cells, mechanically explained, sitting behind
+a caller-path question that has already killed one thread-width change. The follow-up worth running
+is narrow -- five identical arms for a proper null, the same sweep on the caller path rather than
+the ABI, and a guardrail set of larger cells to show a runtime rule could not fire on them.
