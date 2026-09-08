@@ -1083,6 +1083,48 @@
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
 #endif
+
+// The ladder above trades per-row setup, which scales with the UNROLL, against useful work, which
+// scales with the mean degree TIMES THE WIDTH: an exact-width row does `exact_width` multiply-adds
+// per nonzero, not one. SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32 = 8 ignores the width, and chain184
+// measured the cost of that at the narrowest width.
+//
+// redwood, float32, the pinned corpus's target group, one balanced 3-pass rotation, gate against
+// the tip it ships on. Widths 2 and 3 -- what the constant was raised for -- read 1.1937 and 1.1998
+// against A/A floors of 0.9995 and 1.0005. Width 1 reads 0.9824 against a 1.0026 floor, and the
+// whole of it is one degree band:
+//
+//   k=1 by mean-degree band   c0b floor    gate      n
+//     <4                        1.0019    1.0018     1
+//     8-16                       0.9989    1.0402    22
+//     16-32                      1.0085    0.8792    12   <-- every matrix slower
+//     32-64                      1.0116    1.0177     1
+//     >=128                      1.0044    1.0040     1
+//
+// Twelve of twelve slower, across TEN families, so it is not one shape: lhr71 0.8157, lhr71c
+// 0.8158, TSOPF_FS_b39_c19 0.8193, shipsec8 0.8514, qa8fk 0.8816, filter3D_E 0.8850, barrier2-12
+// 0.8947, barrier2-9 0.8981, barrier2-10 0.9080, qa8fm 0.9166, xenon2 0.9212, 2cubes_sphere 0.9562.
+// Per-family geomean 0.8750. Mechanism is exact: MULT=8 makes the ladder take unroll 2 rather than 4
+// for mean degree 16..31, and every one of those matrices sits at 16.2-28.8. At widths 2 and 3 that
+// same halving is the win, because there are two or three multiply-adds per nonzero to hide the
+// per-row setup behind; at width 1 there is one.
+//
+// MKT could not have caught it -- its target group holds NO matrices in the 16-32 band, so its
+// width-1 reading of 1.0010 is an average over bands this mechanism cannot move.
+//
+// So width 1 keeps the pre-gate constant. Neutral at every other width by construction (the value
+// there is unchanged) and it restores width 1 exactly (the value there is the one it had before the
+// gate). float64's multiplier is already the shared 1, so this is a no-op for float64.
+//
+// The GENERAL correction is to compare `mean_deg * exact_width` against `unroll * C`, which is the
+// trade the ladder's own comment describes. That moves widths 2 and 3 as well, so it needs its own
+// grid and is deliberately NOT what this does.
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F32
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F32 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#endif
+#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64
+#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0
 #endif
