@@ -23654,3 +23654,104 @@ forbids. If it is worth pursuing at all, the stage is a **duplication-only contr
 the split on but the `false_type` arm still containing the block, so both instantiations are
 behaviourally identical and only the duplication differs. If GCN still regresses there, the cost is
 duplication and the excision half can never pay at a firing width.
+
+## chain181 -- width 2 cannot be judged by comparing builds, and that is the answer
+
+MKT job 17324491, four builds over 24 passes, 2h21m, redwood still down. Every precondition passed:
+split byte-identical to chain180's, mrbuild's five build checks confirmed present rather than
+re-implemented, instruction counts reproducing chain180's exactly (c0 250637 / mrf2 255838 /
+mrdead 255694), 56 correctness cases per candidate with 0 mismatches, and the rotation's balance
+checked rather than assumed.
+
+**The stage was reframed before it ran, and the reason is worth stating.** chain180 asked "is there
+a width-2 cost" and could not answer. Measured from chain180's own passes, the per-matrix paired
+spread at width 2 is 3.39%, of which only 1.46% is within-process, against an effect of 0.23%. An
+exact sign test needs ~200 paired passes per matrix for 0.35 power at 0.5%: detection was never
+buyable. So this stage asks the question the decision turns on -- is the width-2 cost small enough
+that it cannot justify blocking 19-34% at widths 5..32 -- as an **equivalence test at a
+pre-registered +/-1% margin**, with the CI from a bootstrap over matrices.
+
+Three design changes, each from measurement rather than preference:
+
+- **24 passes = every permutation of the four builds exactly once.** chain180's cyclic rotation
+  balanced each build's lead count but never varied *who ran before whom*: `c0b` ran immediately
+  after `c0` in every pass where it did not lead. 4! = 24 balances position (6 each) and all 12
+  ordered adjacent pairs (6 each). The harness generates the permutations and then checks both
+  counts, because a rotation believed to be balanced is how the fixed predecessor survived.
+- **The reference is both identical-source builds**, `sqrt(c0 * c0b)` per pass, so the reference
+  carries half the process noise a single build would and a symmetric split between them cancels.
+- **The estimator is chosen at width 4 and applied unlooked-at.** `ours/MKL` cancels between-process
+  state; on chain180's data it tightened width 2 from 1.0149 to 1.0031 and *loosened* width 4 from
+  1.0034 to 1.0088. Choosing per width on that basis is selecting the estimator on the outcome. At
+  the control width here `raw` wins outright -- A/A bias **0.006%** against `vsmkl`'s 0.675% -- so
+  `raw` is what the verdict uses.
+
+**The redesign worked, and width 4 is the proof.** The A/A floor there is **1.0001 [0.9974,
+1.0026]** -- two byte-identical builds agreeing to 0.01% with a 0.26% half-width, against
+chain180's 1.0032. N2, the power control, holds: mrf2 reads **-0.96% [-1.54%, -0.27%]** at width 4,
+reproducing chain180's presence cost with a CI clear of parity.
+
+### And then width 2 refused, for a reason that is the result
+
+    width 2, target group, estimator raw
+      c0/c0b   1.0080  [1.0051, 1.0107]   +0.80%     <-- IDENTICAL .text
+      mrf2     0.9803  [0.9746, 0.9875]   -1.97%
+      mrdead   0.9837  [0.9772, 0.9902]   -1.63%
+
+The A/A arm -- two builds mrbuild proved have identical `.text` -- differs by **+0.80% with a CI
+that excludes parity**. The pre-registered gate says an equivalence verdict is void if an
+identical-source pair cannot itself be shown equivalent at the margin, so no answer is given. That
+gate was written before the run and it caught exactly what it was for.
+
+Four diagnostics locate it, and it is not any of the usual suspects:
+
+- **Not an ordering effect.** If it were warmup or position, reversing the order would reverse the
+  sign. It does not: c0/c0b reads +0.66% in the passes where c0 ran first and **+1.02%** in the
+  passes where c0b ran first. Positive both ways.
+- **Not a few matrices.** 17 of 18 have c0 slower, up to +1.76% (`relat8`, `uni_chimera_i1_A_08/09`).
+- **Not within-process arm order.** `ours` against `oursb` -- same code, same process -- reads
+  +0.15% / -0.39% / +0.07% / -0.51% across the four builds at width 2, and +/-0.09% at width 4. So
+  width 2 carries a half-percent-scale artefact per build object that does not average away, and
+  width 4 does not.
+- **It moves the answer by the whole margin.** mrf2 against c0 reads 0.9826, against c0b 0.9732,
+  against their geometric mean 0.9803 -- a **0.97% spread from nothing but which identical-code
+  build is the reference.** At width 4 that spread is 0.51%.
+
+**So the finding is about the instrument, and it is more useful than either verdict would have
+been: at float32 width 2, the identity of the build object is worth about 0.8% even when `.text` is
+byte-identical.** The `.text` is the same; what differs is everything around it -- the object lives
+at `$R/c0` versus `$R/c0b`, so the containing ELF, and therefore the mapped layout of code that at
+width 2 is short enough to be alignment- and ITLB-sensitive, is not the same. chain178 already
+established that a runtime `long` comparison reshapes code at -O3; this is the same class one level
+out, and it is consistent across stages: chain180's paired A/A read +1.49% at width 2, same sign.
+
+**No build-versus-build comparison can resolve width 2 to better than about a percent.** That is
+the real reason chain131's width-2 rejection of multi-row has never settled -- chain131, chain179
+and chain180 were all build-versus-build comparisons at a width where build identity alone is worth
+most of the effect they were measuring.
+
+### What the numbers say anyway, stated as evidence and not as a verdict
+
+mrf2 reads **-1.97% [-2.54%, -1.25%]** at width 2 and mrdead **-1.63%**, so mrdead reproduces 83%
+of the cost: if the cost is real it is mostly **presence**, the block being compiled in, rather than
+the kernel executing. chain179's -2.0% at width 2 has therefore **reproduced** on a properly
+balanced rotation, and chain180's 0.9977 is the outlier of the three. GCN k=3 also leans the same
+way (mrf2 -0.82 to -1.60%, mrdead -0.15 to +0.50%, A/A -0.02 to -0.87%).
+
+Read together: **chain131's rejection ground is corroborated rather than overturned.** The effect
+is roughly 2.5x the demonstrated build-identity artefact, it appears in two independent stages, and
+83% of it is presence. Multi-row stays blocked, and it is blocked by a code-layout cost at a width
+it deliberately refuses to serve -- which, per the chain180 addendum above, is a layout draw whose
+sign varies across widths and is therefore not something to tune against.
+
+### The instrument that would settle it
+
+Build identity has to leave the comparison. The way to do that is **one object, not four**: a single
+release `.so` in which the multi-row row count is read once at load time into a global and then
+used as a plain runtime value, with the arms differing only in that value. Then mrf2 and c0 are
+literally the same mapped code and the 0.8% cannot exist. Two known hazards, both already
+documented: a hooks build is unusable here (54 getenv per call is 17-26us and manufactured a 1.57x
+MKL deficit on short kernels), so the read must be at static initialisation and not per call; and
+the number of environment variables an arm *sets* is itself worth ~1.1% on x86, so the arms need
+padded environments. `multirow` is already a runtime `const bool` term at `spmm.h:4317`, so the
+mechanism is a load-time global rather than a new branch in the hot path.
