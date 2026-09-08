@@ -23485,3 +23485,130 @@ chain and it belongs to multi-row, not to the split.
   two-sided finding that does not gate L1.
 - **The GCN table labelled k=3 "outside; a move here is a confound"**, which was the same error one
   layer down. Widths below 5 are in scope through the dead-block removal.
+
+## chain180 -- the dead block does cost the widths it cannot serve, and it still does not explain why multi-row was rejected
+
+chain179 ended with a lead nobody had proposed: with multi-row compiled in, *removing* the dead
+multi-row block was worth about 9% at width 4 -- a width the multi-row dispatch refuses on purpose.
+The obvious next thought is that this is what killed multi-row in the first place: chain131 rejected
+`MULTIROW_ROWS_F32=2` on a width-2 regression, and if merely *carrying* the block taxes the widths
+below 5, then multi-row's cost is a code-layout artefact rather than anything the kernel does, and
+the arm deserves reopening with the block excised.
+
+This stage tests that. MKT, four builds over eight passes, redwood still down.
+
+**Isolating presence from behaviour needs a build where the block exists and cannot run.**
+That is what the fourth build is:
+
+    c0 / c0b   tip default                                              the A/A floor
+    mrf2       -DSCORCH_SPMM_MULTIROW_ROWS_F32=2                        the reference
+    mrdead     the same, plus -DSCORCH_SPMM_MULTIROW_MINNNZ=4e18L       present, unreachable
+
+`MINNNZ` is a runtime `nnz >=` threshold, so setting it past any real matrix disables multi-row
+*without* letting `if constexpr` fold the block away. If the compiler had proved the branch dead
+anyway and deleted it, the whole stage would be measuring `c0` twice under another name.
+
+**D1, the precondition, holds: the block survived.**
+
+    instructions: c0 250637    mrf2 255838    mrdead 255694
+    mrdead is -0.056% of mrf2's count, and +2.018% of c0's
+
+`mrdead` carries essentially all of `mrf2`'s extra code (it is 144 instructions short of it, and
+5057 instructions above `c0`), which is the fact the whole stage rests on. Per-symbol, 126 of 127
+matched symbols are byte-identical between `mrf2` and `mrdead` and exactly one changed. Correctness:
+624 cases each for `mrf2` and `mrdead`, 0 mismatches. `.text` digests distinct for all three configs.
+
+**D2, the suppression, holds.** Where `mrf2` moves 19-34%, `mrdead` reproduces -11% to +3% of that
+move -- i.e. none of it, in both directions:
+
+    k=5   mrf2 1.2022   mrdead 0.9884   floor 1.0009
+    k=6   mrf2 1.1972   mrdead 0.9790   floor 1.0035
+    k=8   mrf2 1.3430   mrdead 0.9923   floor 1.0054
+    k=16  mrf2 1.2256   mrdead 1.0061   floor 1.0119
+
+So the runtime threshold really did turn the kernel off. Note the residual: at k=5 and k=6 `mrdead`
+is 1.2% and 2.1% *below* `c0`, outside a 1.0% floor -- the presence cost showing up at firing widths
+too, where it is normally hidden by the 20% the kernel wins back.
+
+**D3, the question, splits.** At the widths multi-row cannot fire, is the cost still there with the
+block merely present? Fraction is `(1 - mrdead) / (1 - mrf2)`, so 1.0 means presence explains all of
+it and 0.0 means none:
+
+    k=4   mrf2 0.9867   mrdead 0.9819   floor 1.0032   tol 0.010   fraction 1.36   PRESENCE
+    k=2   mrf2 0.9977   mrdead 0.9953   floor 1.0201   tol 0.040   fraction 2.04   UNRESOLVABLE
+
+**Width 4 answers yes.** The block costs that width without ever executing, and `mrdead` is if
+anything slightly worse than `mrf2` there (fraction above 1), consistent with pure code layout --
+`mrdead`'s extra live threshold compare buys nothing back. Taken with the firing-width residuals,
+**a 1-2% presence cost is real at k=4, 5 and 6.**
+
+**Width 2 does not answer at all, and width 2 is the whole reason the stage exists.** `mrf2` reads
+0.9977 there against an A/A floor of 1.0201 -- the floor is *three times looser than the effect
+being attributed*, so there is no cost at width 2 to assign to either mechanism. chain179's 0.9800
+at k=2 did not reproduce here.
+
+The looseness is *led* by one matrix but not caused by it. Leave-one-out on the k=2 floor:
+
+    full floor (18 target matrices)          1.0201    tol 0.040
+    without connectus (own ratio 1.0984)     1.0157    tol 0.031
+    next three worst are the chimera family, each ~1.03; dropping any one leaves 1.019
+
+So even with the single worst contributor removed, the floor is 1.6% against an effect of 0.23%,
+and dropping a matrix for reading badly on its own control is not something to do anyway. Width 2
+is unresolvable on this corpus, full stop.
+
+The k=4 verdict survives the same test, which is the reason to trust it: dropping connectus there
+moves the floor from 1.0032 to 0.9982, tolerance unchanged at the 0.010 minimum, while `mrf2` and
+`mrdead` sit at 0.9867 and 0.9819. **PRESENCE at k=4 is not connectus.**
+
+**D5, GCN, reported.** k=3 is presence-only, k=6/7/16 are in the firing range.
+
+    k=3   mrf2 0.9957   mrdead 0.9948   floor 0.9949
+    k=6   mrf2 1.0427   mrdead 0.9916   floor 1.0010
+    k=7   mrf2 1.0370   mrdead 0.9946   floor 0.9994
+    k=16  mrf2 1.0612   mrdead 0.9979   floor 0.9993
+
+Multi-row is worth 3.7-6.1% on the citation graphs at layer widths 6-16, and `mrdead` gives it all
+back, which is D2 again on a different corpus.
+
+### Verdict
+
+**The presence cost is confirmed and it is not an explanation for chain131.** Both halves matter.
+A block that is compiled in but never entered costs 1-2% at k=4, 5 and 6, which is a real and
+slightly surprising result -- it is the instruction-cache and layout tax of code that never runs.
+But chain131 rejected multi-row on width 2, and width 2 is where this stage has no resolving power.
+So **re-opening multi-row on a presence theory is not supported by this run.** The next thing width
+2 needs is its own measurement with a floor tighter than the effect, not another mechanism stage.
+
+The `~9% at width 4` from chain179 also shrinks on re-measurement to ~1.3-1.8% at that width
+(`mrf2` 0.9867, `mrdead` 0.9819 against a 1.0032 floor, versus chain179's 1.0921 for removing the
+block). Those are different comparisons -- chain179 measured *removing* the block via the loop
+split, this stage measures *disabling* it at runtime -- but the gap is large enough that the width-4
+opportunity should be sized by the excision patch itself, not quoted from either stage.
+
+### Four analyzer mis-specifications, each of which would have been read as a result
+
+- **D2 demanded that `mrdead` sit inside the A/A floor**, which conflates "the kernel didn't fire"
+  with "the block costs nothing". `mrdead` is 1-2% below `c0` at firing widths *because of the very
+  presence cost the stage is measuring*, so the check would have declared the stage void for showing
+  its own finding. Re-specified as "reproduces less than 25% of `mrf2`'s move".
+- **Width 2 was labelled BEHAVIOURAL while `mrf2` was itself flat there.** With no effect to
+  explain, a fraction near 2.0 is a ratio of two noise readings and means nothing. Added
+  UNRESOLVABLE, gated on `abs(1 - mrf2) > tol`.
+- **The final ANSWER invoked chain131 -- a width-2 result -- while width 2 was unresolvable.** The
+  conclusion is now gated on width 2 actually resolving, which is why it reads "neither explained
+  nor overturned" instead of "explained".
+- **A guard checked the wrong entry.** A `sed`-derived copy left `grep -q "\[mrf2ls\]"` under a
+  `[mrdead]` error message, and since `mrf2ls` *is* present in the build table, it would have passed
+  for the wrong reason on every run. Fixed, then verified by confirming it refuses on its own input.
+  Same edit had duplicated `[mrf2]`; the two lines were identical, so one was deleted.
+
+### And one instrument gap
+
+D1's per-symbol block reported "126 identical, 1 changed" but **never named the changed symbol** --
+the call site piped `symneutral.py` through `tail -n 3`, which drops the `CHANGED  n -> m insns
+<symbol>` line the script does emit. The identity of that one symbol is the most informative line in
+the proof (if it is `spmm_csr_v2_core<float,...>` the story is layout; if it is something else the
+story is different), and it was thrown away by the harness rather than missing from the tool. Now
+filtered on `CHANGED|ONLY IN ONE|symbols matched|VERDICT` instead of truncated. The surrounding
+`if [ -f "$SYMNEUTRAL" ]` also skipped silently when absent; made loud.
