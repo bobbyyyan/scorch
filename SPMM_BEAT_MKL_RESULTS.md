@@ -23718,15 +23718,21 @@ Four diagnostics locate it, and it is not any of the usual suspects:
   build is the reference.** At width 4 that spread is 0.51%.
 
 **So the finding is about the instrument, and it is more useful than either verdict would have
-been: at float32 width 2, the identity of the build object is worth about 0.8% even when `.text` is
-byte-identical.** The `.text` is the same; what differs is everything around it -- the object lives
+been: on this corpus at float32 width 2, the identity of the build object is worth about 0.8% even
+when `.text` is byte-identical.** (Scope corrected by chain182 below, which ran the same four
+builds and the same 24 permutations at the same width on a *different* corpus and got an A/A floor
+of 0.9989 [0.9971, 1.0018]. The artefact belongs to the `nnz >= 1e6` group -- the chimera family
+and connectus -- not to width 2. As first written this sentence claimed the width, which was too
+broad.) The `.text` is the same; what differs is everything around it -- the object lives
 at `$R/c0` versus `$R/c0b`, so the containing ELF, and therefore the mapped layout of code that at
 width 2 is short enough to be alignment- and ITLB-sensitive, is not the same. chain178 already
 established that a runtime `long` comparison reshapes code at -O3; this is the same class one level
 out, and it is consistent across stages: chain180's paired A/A read +1.49% at width 2, same sign.
 
-**No build-versus-build comparison can resolve width 2 to better than about a percent.** That is
-the real reason chain131's width-2 rejection of multi-row has never settled -- chain131, chain179
+**On this corpus, no build-versus-build comparison can resolve width 2 to better than about a
+percent.** (chain182 shows that qualifier matters: on chain131's own population the same
+comparison resolves to 0.23%.) That is the real reason chain131's width-2 rejection of multi-row
+had not settled here -- chain131, chain179
 and chain180 were all build-versus-build comparisons at a width where build identity alone is worth
 most of the effect they were measuring.
 
@@ -23792,3 +23798,107 @@ MKL deficit on short kernels), so the read must be at static initialisation and 
 the number of environment variables an arm *sets* is itself worth ~1.1% on x86, so the arms need
 padded environments. `multirow` is already a runtime `const bool` term at `spmm.h:4317`, so the
 mechanism is a load-time global rather than a new branch in the hot path.
+
+## chain182 -- chain131's population, and the trade is finally quantified
+
+MKT job 17325624, four builds over 24 passes, redwood still down. chain181's statistics reused
+unchanged -- the 24 permutations, the dual identical-source reference, the equivalence test at
++/-1%, the estimator chosen at the control width -- so the only difference from chain181 is the
+corpus. Preconditions: instruction counts reproducing for the third time (c0 250637 / mrf2 255838 /
+mrdead 255694), the changed symbol named at last (`spmm_csr_v2_core<float, false>`, 1551 -> 1570
+instructions -- exactly the live MINNNZ test), mrbuild's five checks confirmed present, 112
+correctness cases per candidate with 0 mismatches, rotation balance checked rather than assumed.
+
+**The population is 8 of 13 keys and the harness said so by name.** `lp_osa_14`, `cari`, `lhr34c`,
+`lhr71` and `lhr71c` are not cached on MKT, and those are the severe end of chain131's range
+(0.820-0.852). What ran is connectus, com-Amazon, relat8 and all five cached `as-caida_G_08*`
+members -- four of chain131's nine table entries. Controls are size-matched from inside the target
+group's own nnz range (median ratio 1.27), because these matrices are small and otherwise "small
+behaves differently at width 2" could not be told apart from "this population behaves differently".
+
+### First: chain181's headline was scoped too broadly, and this stage is the correction
+
+chain181 concluded that *at float32 width 2* the identity of the build object is worth ~0.8% with
+byte-identical `.text`. Same width, same four builds, same 24 permutations, different corpus:
+
+    A/A floor (c0 vs c0b, identical .text), estimator raw
+      width 2   0.9989  [0.9971, 1.0018]   BOUNDED
+      width 3   0.9980  [0.9944, 1.0020]   BOUNDED
+      width 4   1.0040  [1.0002, 1.0075]   BOUNDED
+      width 8   1.0015  [0.9998, 1.0034]   BOUNDED
+
+Every floor is inside the margin, at a 0.23% half-width at width 2 against chain181's 0.80% bias.
+**So the artefact is a property of the `nnz >= 1e6` corpus at width 2, not of width 2.** The
+chimera family and connectus carry it; these small long-tailed matrices do not. chain181's finding
+stands as measured and its scope was wrong, which is worth more than the original claim: it means
+build-versus-build comparison is fine at width 2 *on the right corpus*, and the single-object
+instrument chain181 proposed is a refinement rather than a prerequisite.
+
+`raw` beat `vsmkl` at the control width again (bias 0.402% against 1.370%), for the second stage
+running. MKL-normalisation is settled: it is not the fix once the rotation is balanced.
+
+### The result: a cost at every width multi-row refuses, and a large win where it serves
+
+    float32 target group, estimator raw, mrf2 and mrdead against sqrt(c0*c0b)
+      width      mrf2                        mrdead      A/A       verdict
+        2      0.9827 [0.9769, 0.9889]      0.9807     0.9989    COSTS   -1.73%
+        3      0.9801 [0.9737, 0.9886]      0.9685     0.9980    COSTS   -1.99%
+        4      0.9807 [0.9735, 0.9885]      0.9728     1.0040    COSTS   -1.93%
+        8      1.1517 [1.0649, 1.2837]      0.9787     1.0015    FASTER  +15.17%
+
+Widths 2, 3 and 4 are widths multi-row cannot fire at -- `exact_width` claims 1-3 and
+`SCORCH_SPMM_HALFVEC_F32=1` excludes 4 by name. Width 8 is inside the firing range 5..32. So the
+shape is clean: **about two percent of cost at every width it refuses, and fifteen percent of win
+at a width it serves**, with the suppression control confirming it (mrdead gives the entire +15.17%
+back at -2.13%).
+
+**And the cost is entirely presence.** mrdead reproduces **111%** of it at width 2, and at widths 3
+and 4 mrdead is markedly *worse* than mrf2 (-3.15% against -1.99%, -2.72% against -1.93%). The
+block being compiled in is the whole cost; the kernel executing is no part of it. That is the
+third stage to say so and the first to say it on a clean floor.
+
+Per matrix against its own floor -- the pre-registered primary readout, because chain131's finding
+was per-matrix -- 6 of 8 are outside their own floor at width 2 and all 6 are slower; 7 of 8 at
+width 3; 6 of 8 at width 4; and at width 8, 7 of 8 are outside and **none** is slower.
+
+### chain131's magnitudes do not reproduce, and its anchor does not reproduce at all
+
+    matrix                          chain131      chain182 width 2    own A/A     verdict
+    connectus                    0.817 / 0.602        0.9978          0.9993     inside its floor
+    com-Amazon                       0.885            0.9921          0.9982     inside its floor
+    relat8                           0.905            0.9721          1.0081     outside, slower
+    as-caida_G_08* (five)            0.934        0.9725 - 0.9865   0.9961-0.9981 outside, slower
+
+The direction survives for relat8 and the as-caida family. The **size does not**: chain131 recorded
+7-10% on those and this stage reads 1.4-2.8%, a factor of three to five. And **connectus, the
+matrix chain131's rejection was anchored on at 0.817 on MKT and 0.602 on redwood, reads -0.22% and
+is inside its own floor** -- neutral, not an 18-40% regression. com-Amazon likewise.
+
+So chain131's *conclusion* -- that multi-row costs the narrow widths -- is confirmed, on its own
+population, with a clean instrument, for the first time. chain131's *numbers* are not, and the two
+matrices it leaned on hardest are the two that read neutral here. Both halves matter: the earlier
+stage was right about the sign and wrong about the size by three to five times, which is the
+difference between "unshippable" and "a two percent tax on the narrow widths".
+
+### GCN disagrees with chain181 and that is left as a disagreement
+
+    GCN k=3   mrf2 +0.39 to +0.84%   mrdead -0.70 to +1.11%   A/A -0.78 to +0.31%
+
+chain181 read mrf2 at -0.82 to -1.60% on the same three graphs at the same width. Here it is
+positive at all three. The two stages differ only in corpus, and the GCN slice is *identical*
+between them -- same graphs, same width, same builds -- so this is a straight disagreement between
+two runs of the same measurement, not a corpus effect. Three readings each is too few to resolve it
+and neither is used to support anything below.
+
+### What this changes, and what it does not
+
+**The trade is now a number instead of a question**: multi-row costs about 2% at widths 2, 3 and 4
+and wins 15% at width 8, with chain180's 19-34% at widths 5-16 on the big-matrix corpus beside it.
+The cost is pure presence, which means it is in principle removable by not instantiating the block
+where it provably cannot fire -- and per the chain180 addendum that is the loop split, whose own
+cost at *firing* widths chain179 measured and which is loop duplication rather than the hoist.
+
+**It does not clear multi-row to ship.** This is one host, and a shipping claim needs two; redwood
+has been down throughout. The five missing population members are the severe end of chain131's
+range and they are exactly the matrices most likely to move the verdict, so completing the cache is
+a prerequisite rather than a nicety. And the GCN disagreement above is unresolved.
