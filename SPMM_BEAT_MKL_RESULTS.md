@@ -24107,3 +24107,80 @@ plain `cp` flattens every mtime to the copy time, so the check reads "newer by 0
 The guard is right and the archive is wrong. The MKT data used above was re-pulled from the
 original run directory, whose mtimes are intact (c5.txt 05:58:44, first CSV 06:02:07). **Archive
 with `cp -p`** -- otherwise the ledger holds bytes that no longer satisfy their own provenance test.
+
+## chain186 -- MKT was silently running 248 of 298 corpus keys, and the 50 it dropped were the ones that mattered
+
+Asked why the two hosts' target groups differed at all, since both run the same selector on the same
+corpus list with the same seed. The answer is a path-convention mismatch, and it is the root cause
+of chain184's missed regression and of chain182's truncated population.
+
+    key resolution on MKT, before      exact 248, absent 50      -> target group 18
+    key resolution on MKT, after       exact 248, basename 50    -> target group 37
+    redwood, either way                exact 298                 -> target group 37
+
+**MKT's cache stores SuiteSparse matrices group-qualified** -- `ss/Mallya/lhr71/lhr71.npz`,
+`ss/Ronis/xenon2/xenon2.npz`, `ss/Cunningham/qa8fk/qa8fk.npz` -- while `ladder_slash.txt` uses flat
+keys, `ss/lhr71/lhr71`. redwood's cache happens to use the flat convention. `mkkeys_split.py`
+resolved keys with a bare `os.path.exists`, so on MKT 50 of 298 keys missed, were counted, and were
+skipped. The count was printed on every run ("not cached here: 50"). **The composition was not.**
+
+And the drop was not a random 17%. The 19 dropped keys at nnz >= 1e6 are, in degree order:
+
+    8-16 band   torso2 8.9, d_pretok 9.0, twotone 9.9, matrix_9 11.7, power9 12.2, cage12 15.6
+    16-32 band  2cubes_sphere 16.2, barrier2-10 18.6, barrier2-12 18.6, barrier2-9 18.6,
+                lhr71 21.2, lhr71c 21.4, xenon2 24.6, qa8fk 25.1, qa8fm 25.1, filter3D_E 25.4,
+                TSOPF_FS_b39_c19 25.9, shipsec8 28.8
+    32-64 band  s3dkt3m2 40.8
+
+Those are the real-world FEM, circuit and structural matrices, and **all twelve of the 16-32 band
+are among them.** What was left on MKT was a target group of 18 whose composition is:
+
+    by family   uni_chimera_i1_A x14, connectus, n4c6-b, relat, G_n_pin_pout
+    by band     8-16 x16, >=128 x1, 0-4 x1
+
+**Seventy-eight percent one synthetic family, and essentially one degree band.** MKT's target set is
+a strict subset of redwood's -- 18 of 37, with none of its own -- so this was never two corpora, it
+was one corpus and one host silently reading two thirds of it.
+
+That is the whole explanation for chain184. The gate's width-1 regression lives in the 16-32 band;
+MKT's target group has no matrices there; so MKT's width-1 reading of 1.0010 was an average over
+bands the mechanism cannot move, and a two-host confirmation passed over an effect that was
+**structurally unobservable on one of the hosts**. Not bad luck and not noise -- a coverage hole
+shaped exactly like the blind spot.
+
+### It also corrects chain182, and that correction is worth stating plainly
+
+chain182 reported that five of chain131's thirteen population members were "not cached" on MKT, and
+I concluded from the absence of their `.mtx` sources that this was "a host split, not a fetch gap"
+which "needs redwood rather than a download". **That was wrong.** `lp_osa_14`, `cari`, `lhr34c`,
+`lhr71` and `lhr71c` are all cached on MKT, at `ss/LPnetlib/lp_osa_14/...`, `ss/Meszaros/cari/...`
+and `ss/Mallya/...`. The `.mtx` check that misled me is irrelevant: MKT holds 8420 cached `.npz` and
+only 24 `.mtx`, because its cache was built elsewhere and copied. With the fallback the population
+resolves **13 of 13** on MKT. chain182 could have run chain131's complete case on the reliable host,
+and its "largely untested" verdict was reached on 8 of 13 for no reason but a path string.
+
+### The fix, and the part of it that matters more than the fallback
+
+`mkkeys_split.py` and `mkkeys_pop.py` now resolve a key by exact path first and then by a **unique**
+basename match under the cache, refusing an ambiguous one. Verified on MKT: 298 of 298 resolved,
+target group 37 at median nnz 1205518 -- identical to redwood's 37 at median 1205518 -- and
+`not cached here: 0`.
+
+But the fallback is the smaller half. The selector now also **reports what the drops are made of**,
+by top-level SuiteSparse group and by reason, because a silent 17% loss is survivable and a silent
+*biased* 17% loss is not. A count alone could never have shown this: "50 dropped" looks like corpus
+housekeeping, while "50 dropped, all of them the real-world matrices, taking a whole degree band to
+zero" is the finding. Every stage that prints a corpus size should print its composition next to it.
+
+### Consequences
+
+- **MKT becomes the primary host** -- it has Slurm, it is cluster-grade, and redwood has just
+  demonstrated the alternative by losing a DIMM to overheating mid-run. The only reason MKT was not
+  primary is the bug above.
+- **chain180, chain181 and chain182 all ran on the 18-matrix subset.** Their internal comparisons
+  are still valid, every arm having been measured on the same corpus within one run, but their
+  coverage is far narrower than reported: a target group that is 78% one synthetic family is not a
+  general claim about sparse matrices. chain181's "width 2 cannot be judged by comparing builds"
+  and its 0.8% build-identity artefact in particular were measured on that family.
+- **The gate's MKT confirmation needs redoing on the full corpus**, which is now queued as
+  chain185's MKT arm, with the width-1 fix as its candidate.
