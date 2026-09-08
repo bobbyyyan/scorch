@@ -24184,3 +24184,34 @@ zero" is the finding. Every stage that prints a corpus size should print its com
   and its 0.8% build-identity artefact in particular were measured on that family.
 - **The gate's MKT confirmation needs redoing on the full corpus**, which is now queued as
   chain185's MKT arm, with the width-1 fix as its candidate.
+
+### chain186 addendum: the same lookup existed in three places, and fixing each one exposed the next
+
+The path-convention bug was not one bug. `os.path.exists(cache + key + ".npz")` was written
+independently in three consumers, and on MKT each failed in turn as the one in front of it was fixed:
+
+    1. mkkeys_split.py   silently skipped 50 of 298 keys, printing the count and never the
+                         composition -- the failure described above
+    2. the band census    reported the 16-32 band EMPTY on a corpus from which the selector had
+                         just resolved 37 target matrices, because it reopened the .npz files
+                         itself; the stage refused at its own gate, correctly and for the wrong reason
+    3. mrgate.py          refused "24 of 61 keys missing" -- but per pass, so eight timing passes
+                         ran writing GCN-only CSVs before failing. Twenty minutes for nothing.
+
+So the fix is a single `csrresolve.py` that all three import, resolving exact-path then **unique**
+basename and refusing an ambiguous match rather than guessing. **A consumer that cannot import it
+refuses**, because falling back to the exact path is precisely the defect. Unit-tested on a
+synthetic cache for all four outcomes (exact, basename, ambiguous, absent), then verified on MKT:
+298 of 298 corpus keys resolve, and all 61 selected keys resolve for the timing loop (37 exact, 24
+basename, 0 unresolved) -- the 24 being exactly what mrgate had refused.
+
+Two further changes, both about not repeating the shape of the mistake. The selector now **emits
+rows and mean degree as trailing columns of `groups.txt`**, so no downstream consumer re-derives
+what the producer already computed. And the stage body gained a **pre-flight** that resolves every
+key before any timing runs: mrgate's per-pass refusal was fail-closed and still cost a job, so the
+precondition is worth having even where the late failure is correct.
+
+One operational note recorded because it nearly caught me: redwood's stage was mid-flight and
+invokes `mrgate.py` once per pass, so replacing that file on redwood would have changed the
+instrument between passes of one run. Only MKT's copy was updated; redwood keeps the old one, which
+resolves exactly there anyway.
