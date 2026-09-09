@@ -24361,9 +24361,13 @@ pre-gate behaviour at width 1 is established by construction from P1 and the dec
 that ratio. Likewise `w1pg` reading +0.87% at width 4, above `SCORCH_NARROWK_EXACT_HI`=3 where the
 multiplier is not consulted at all, is the artefact and is the reason P4 records a failure.
 
-Guardrail: GCN at width 3 reads A/A 1.0155, `w1s8` 1.0130, `w1pg` 1.0903 -- the fix is inside GCN's
-own floor, and reverting the gate would cost GCN 9%. The gate itself is worth keeping; it is the
-width-1 correction that is wrong.
+Guardrail: GCN at width 3 reads A/A 1.0155, `w1s8` 1.0130, `w1pg` 1.0903. Only three matrices, so
+the A/A floor there is +-6.18% and the numbers carry accordingly: the fix is comfortably inside
+that floor (good -- it does not disturb GCN), while `w1pg`'s +9.03% has a CI of [0.9948, 1.1424]
+and is therefore a point estimate consistent with parity, **not** an established 9% cost of
+reverting the gate. At width 16 every arm is flat (A/A 1.0012, `w1s8` 1.0080, `w1pg` 0.9977). What
+the guardrail supports is the narrow claim that the fix does not harm GCN; the gate's value to GCN
+was established elsewhere, not here.
 
 Verdict on redwood: **P2 half holds, P3 fails, P4 fails.** MKT is still running the same stage; the
 commit decision waits for it, but nothing MKT can report would make a 5.16% deficit on 22 of 37
