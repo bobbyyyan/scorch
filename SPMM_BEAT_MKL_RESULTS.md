@@ -25606,3 +25606,71 @@ hurt.
 The remaining MKL deficit is not one problem with one fix. It is four cells wanting a row-splitting
 partitioner with 2.5-2.9x of structural headroom, and three cells wanting the dispatch to notice
 that a matrix is two-thirds full. Neither is a constant to flip, and neither has been tried.
+
+## It is not density and it is not the matrix: there is a kernel discontinuity at width 4
+
+The density story above does not survive contact with the grid. Joining chain190's readings (MKL in
+every cell, shipped build, 3 passes) against the density census of all 298 corpus matrices:
+
+```
+  density band          n    median ours/mkl   cells behind
+     0.0% -  0.1%     230        0.607              0
+     0.1% -  1.0%      15        0.873              6
+     1.0% -  5.0%      10        0.746              0
+     5.0% - 10.0%       5        0.328              0
+    10.0% - 25.0%      20        0.665              0
+    25.0% - 50.0%      15        0.878              2
+    50.0% -101.0%      10        0.785              2
+```
+
+**A density threshold is the wrong instrument.** At 25-50% density we are ahead with a median of
+0.878, and at 50-100% ahead at 0.785. A gate at 25% would fire on 21 cells we already win by
+12-22%, and would have to beat a dense GEMM on every one of them or it is a regression. Density
+identifies the matrices but not the losses.
+
+### The same matrix, every width
+
+```
+  matrix                          density    k=1    k=2    k=3    k=4    k=8
+  cari                              31.8%  0.870  0.924  0.997  1.047  0.878
+  body_decoder_layer_3_self_attn    63.1%  0.785  0.991  1.038  1.083  0.837
+  body_decoder_layer_5_encdec_attn  30.0%  0.995  0.875  0.994  1.142  0.912
+```
+
+Every one peaks at width 4 and recovers at width 8 -- which does twice the arithmetic. A 19-25%
+swing between adjacent widths on the same matrix is not a property of the matrix.
+
+Corpus-wide, by width, geomean with a bootstrap CI over matrices:
+
+```
+    k    n   geomean   95% CI             behind   kernel that runs at that width
+    1   61    0.5627   [0.5269, 0.6006]      0     exact-width, inlined by -O3
+    2   61    0.5491   [0.5152, 0.5855]      0     exact-width, scalar
+    3   61    0.6038   [0.5657, 0.6447]      3     exact-width, scalar
+    4   61    0.6425   [0.5916, 0.6955]      5     HALF-vector register block, 128-bit
+    8   61    0.6436   [0.5969, 0.6904]      2     FULL-vector register block, 256-bit
+```
+
+The geomeans at k=4 and k=8 are indistinguishable and the CIs overlap heavily, so "k=4 is the worst
+width" is **not** supported as a geomean claim. What is supported is the cell count: **5 of the 10
+cells behind MKL on redwood are at width 4**, more than any other width, and width 4 is the only
+width served by a 128-bit kernel while its neighbour at width 8 gets the full 256-bit one.
+
+### The experiment this implies, and why it is a good one
+
+`SCORCH_SPMM_HALFVEC_F32` ships at 1 and selects that half-vector path. Its firing condition is
+`halfvec_exact = (B1_size == LH)` with `LH = 4` for float, and the only other entry needs
+`spmm_halfvec >= 2`. **At the shipped value it therefore fires at width 4 and nowhere else.** So
+`-DSCORCH_SPMM_HALFVEC_F32=0` -- which the header documents as the supported way to turn it off --
+gives arms one immediate operand apart whose *inert widths are the control*, on the same build pair,
+at four widths instead of a separate concept. That is the design chain191 just validated, with the
+control built in rather than bolted on.
+
+The header records the per-dtype split being measured and `=2` being tried. It records no
+measurement of `=0`. **Whether the half-vector path is worth having at all appears never to have
+been asked.**
+
+Two things must not be assumed on the way in. The direction is **not** pre-registered: the path was
+presumably added because it won, so this is two-sided. And unlike the width-1 rule, width 4 is a
+width the GCN and autoencoder layers actually use, so the guardrail is load-bearing here rather than
+decorative -- it cannot be waved through with "provably inert".
