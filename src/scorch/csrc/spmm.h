@@ -3969,6 +3969,12 @@ torch::Tensor spmm_csr_v2_core(
   long narrowk_exact_degunroll_mult =
       std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32
                                            : SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64;
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_ANY
+  // Width 1 takes the full unroll from this mean degree up; see scorch_policy.h for the grid.
+  long narrowk_exact_unroll_w1_hi_mindeg =
+      std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32
+                                           : SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F64;
+#endif
   long narrowk_exact_mindeg = SCORCH_NARROWK_EXACT_MINDEG;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
@@ -4018,6 +4024,8 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL_MULT");
     if (e && *e) { long v = std::atol(e); if (v >= 1) narrowk_exact_degunroll_mult = v; } }
+  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0) narrowk_exact_unroll_w1_hi_mindeg = v; } }
   // A/B hook with no candidate policy: price the cost of ASKING, in a loop where the compiler was
   // caught not hoisting a question it could have. chain71 found the multi-row dispatch's eight
   // loop-invariant terms costing 0.7-7% per row -- most on the shortest rows -- at a width the
@@ -4136,6 +4144,16 @@ torch::Tensor spmm_csr_v2_core(
     // bands (degree 2-4 from unroll 2 to 1, and 4-8 from 4 to 2).
     while (exact_unroll > 1 &&
            mean_deg < (long)exact_unroll * narrowk_exact_degunroll_mult) exact_unroll >>= 1;
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_ANY
+    // Width 1 is the one width with a single multiply-add per nonzero to hide the per-row setup
+    // behind, and the loop above lands it on unroll 2 for mean degree 16-32 where unroll 4 is
+    // 1.13x faster. Unroll 2 is not merely suboptimal there, it is never optimal at width 1 at
+    // all -- it loses to 1 below degree 16 and to 4 above -- so this is a correction the halving
+    // loop cannot make, not a constant it could be retuned to. Numbers in scorch_policy.h.
+    if (exact_width == 1 && narrowk_exact_unroll_w1_hi_mindeg > 0 &&
+        mean_deg >= narrowk_exact_unroll_w1_hi_mindeg)
+      exact_unroll = narrowk_exact;
+#endif
   }
 #if SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE
   // A measurement hook, 0 in a release build; see scorch_policy.h for why the ladder cannot

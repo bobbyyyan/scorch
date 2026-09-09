@@ -24638,3 +24638,70 @@ That is the third harness defect in this stage of the same family -- a check tha
 against the inputs it was written for. The first two were the pre-flight looking for its resolver in
 the wrong directory, and the pre-flight reading a guardrail list a previous failed run had left
 behind.
+
+### chain187: the width-1 unroll, measured per mean-degree bin, and the rule it supports
+
+Four builds differing in one immediate operand -- `f1`, `f2`, `f4` forcing unroll 1, 2 and 4 at
+width 1, plus `f4b` as a second build of `f4` for the identical-source control. 37 target matrices,
+8 passes counterbalanced in both position and predecessor, both hosts, identical corpus.
+
+**redwood (i9-14900K, AVX2 only), width 1, ratios against unroll 4:**
+
+    mean degree   n    unroll 1                 unroll 2                 winner
+    8-16         22    0.9594 [0.9423,0.9777]   1.0336 [1.0204,1.0447]   unroll 1, by 4.06%
+    16-32        12    1.1925 [1.1143,1.2860]   1.1265 [1.0958,1.1591]   unroll 4, by 12.65%
+
+Both bins' identical-source controls flat at the +-1% margin (0.9989 and 1.0028). Two of two bins
+decided.
+
+**Unroll 2 is never the best choice at width 1.** It loses to unroll 1 below degree 16 and to
+unroll 4 above it. That is why no multiplier can fix this: the halving loop steps 4 -> 2 -> 1 and
+always lands on 2 on the way down, so the value that gets the upper bin right gets the lower bin
+wrong. It is a correction the loop cannot make, not a constant it could be retuned to.
+
+**The one-immediate design paid off.** At widths 2, 3, 4 and 8 -- where the forced-unroll macro is
+not consulted -- the arms' spread is at most **0.51%**, against the 2.61% that chain185 saw when it
+compared an object carrying a hook against one with no hook compiled in at all. That 0.51% bounds
+the code-layout contribution to the numbers above, and the effects are 4-19%.
+
+**MKT (EPYC 9334, Zen4, AVX-512): zero of two bins decided.** The 8-16 bin separates by 0.17%. The
+16-32 bin is unreadable -- its identical-source control sits 2.12% off parity [0.9614, 0.9944], CI
+excluding parity. A second job of Bobby's, `skb-refusal` on 8 CPUs, started seven minutes into the
+run and shared the node's memory bandwidth and L3; the node was not CPU-oversubscribed (40 of 128
+allocated), so bandwidth and cache are the mechanism, and this is the co-tenancy candidate that
+chain185 could not distinguish from NUMA placement. MKT already read every width-1 cell flat in
+chain185, so this run adds no information either way and the effect stays AVX2-only.
+
+This exposed a defect in the analyzer worth naming: it printed a winner for that 16-32 bin, using a
+GLOBAL noise estimate in place of the bin's own control. A bin whose identical-source pair is 2.12%
+apart cannot rank anything in it. The recommendation is now gated on the bin's own control and
+prints `UNREADABLE` instead.
+
+### The rule as shipped, and how it is gated
+
+After chain185's revert the loop gives, at width 1: unroll 1 below degree 16, unroll 2 in 16-32,
+unroll 4 above 32. The lower bin is already right. So the change is one cell:
+
+    SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32 = 16   on AVX2 without AVX-512
+                                                 = 0    everywhere else, and for float64
+
+At width 1, a mean degree at or above the threshold takes the full `SCORCH_NARROWK_EXACT_UNROLL`
+instead of whatever the halving loop left. Worth 1.13x on 12 of the 37 target matrices.
+
+The gating is not an argument, it is a compile-time absence. A companion macro is true only when
+some dtype enables the constant, and the rule sits inside `#if` on it, so a build where it is off
+everywhere -- every AVX-512 build, every ARM build, all of float64 -- does not contain the branch.
+Verified on ARM: **222 of 222 SpMM symbols identical over 164497 instructions** against the tree as
+it stood before the rule existed.
+
+The positive control for that took two attempts, and the first failure is instructive. Forcing the
+constant on while leaving ARM's multiplier at 1 produced an *identical* object -- correctly, because
+with a multiplier of 1 the loop already leaves unroll 4 at every degree at or above 4, so
+`exact_unroll = 4` is provably dead and the compiler deletes it. The control has to be a
+configuration in which the rule has work to do: multiplier 8 (the x86 value) with and without the
+constant, which changes **29 of 222 symbols and adds 10 instructions**. That is the second time in
+two days a control pair failed to differ for a real reason rather than a broken tool, and the rule
+is the same both times -- the pair must be known to differ on this host, in this configuration.
+
+Correctness: 288 cases across both dtypes, six row counts, four densities and six widths, zero
+mismatches.

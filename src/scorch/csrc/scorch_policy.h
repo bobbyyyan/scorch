@@ -1152,6 +1152,52 @@
 // candidate can be read off per band directly. 0 is the shipped value and the #if in spmm.h means
 // a release object cannot contain the branch at all, which a .text digest against the tree before
 // this existed is what proves.
+// At width 1, a mean degree at or above this takes the FULL unroll (SCORCH_NARROWK_EXACT_UNROLL)
+// instead of whatever the halving loop above leaves behind. 0 disables it entirely.
+//
+// Measured by forcing the width-1 unroll to 1, 2 and 4 in four builds that differ only in one
+// immediate operand, on 37 SuiteSparse matrices over 8 passes counterbalanced in both position and
+// predecessor. On redwood (i9-14900K, AVX2 only), ratios against unroll 4:
+//
+//     mean degree  8-16, n=22   unroll 1  0.9594 [0.9423, 0.9777]   unroll 2  1.0336
+//     mean degree 16-32, n=12   unroll 1  1.1925 [1.1143, 1.2860]   unroll 2  1.1265 [1.0958, 1.1591]
+//
+// So unroll 1 wins below 16 and unroll 4 wins at/above it, and **unroll 2 is never the best choice
+// at either degree** -- it loses to 1 below 16 and to 4 above. That is exactly what the halving
+// loop cannot express: it steps 4 -> 2 -> 1 and always lands on 2 on the way down. With
+// ..._MULT_F32 = 8 the loop already gives unroll 1 below degree 16, which is right, so the only
+// cell this constant changes is 16-32, worth 1.13x there on 12 of the 37 matrices.
+//
+// Both identical-source controls were flat at the +-1% margin (0.9989 and 1.0028), and the arms'
+// spread at widths 2, 3, 4 and 8 -- where this constant is not consulted -- was at most 0.51%,
+// which bounds the code-layout contribution to the numbers above.
+//
+// ZERO ON AVX-512 AND ON FLOAT64, deliberately. MKT (EPYC 9334, Zen4) reads every one of these
+// cells flat, because `-march=native` gives it AVX-512 there and masking removes the remainder
+// structure the per-row setup trade is made of; its 16-32 bin was additionally unreadable, its
+// identical-source control sitting 2.12% off parity under a co-tenant job. float64 was never in
+// this grid. An unmeasured regime gets the constant compiled out, not shipped on a guess.
+//
+// The threshold is the bin boundary, not a directly measured optimum: the 8-16 bin prefers unroll 1
+// as a whole and the 16-32 bin prefers unroll 4 as a whole, and the members of the upper bin sit at
+// 16.2-28.8, so the crossover lies somewhere in (8, 16.2] and 16 is the best-supported single value
+// in it. Narrowing it needs its own threshold sweep.
+#ifndef SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32
+#  if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512F__)
+#    define SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32 16L
+#  else
+#    define SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32 0L
+#  endif
+#endif
+#ifndef SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F64
+#  define SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F64 0L
+#endif
+// Whether ANY dtype enables it, so a build where it is off everywhere does not carry the branch at
+// all and can be proven byte-unchanged rather than argued to be.
+#define SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_ANY \
+  (SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32 != 0 || \
+   SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F64 != 0)
+
 #ifndef SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE
 #  define SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE 0
 #endif
