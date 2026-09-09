@@ -25537,3 +25537,72 @@ Bobby's call and the revert is one commit.
 free where it cannot fire, and is worth nothing against MKL. The three chains that pursued it are
 closed. The remaining deficit is the eight cells chain189 and chain190 named, at k=3, 4 and 8 on
 five matrices -- none of them width 1.
+
+## The eight cells are two different problems, and three of them may not be kernel problems at all
+
+Structure of the five matrices behind the eight host-invariant cells, read from the cached CSR on
+redwood. This is exact arithmetic on the matrices, not a timing, so it needs no arms or controls.
+
+```
+  matrix                        rows    cols       nnz      deg   density   max_row  top1%
+  connectus                      512  394792   1127525   2202.2      0.6%    120065  10.65
+  lp_osa_14                     2337   54797    317097    135.7      0.2%     38336  12.09
+  cari                           400    1200    152800    382.0     31.8%       382   0.25
+  body_decoder_layer_3_self...   512     512    165516    323.3     63.1%       371   0.22
+```
+
+Two groups, and they are opposites.
+
+### Group A -- connectus k=3/4/8 and lp_osa_14 k=3: one row owns a tenth of the work
+
+Genuinely sparse (0.2-0.6%), but a single row holds 10.65% and 12.09% of all nonzeros. A row cannot
+be split by the current partitioner, so the critical path is at least the longest row. With the 24
+workers the binary reports for these cells:
+
+```
+  matrix                      k    P      nnz/P   max_row   utilisation   ceiling
+  connectus                   3   24      46980    120065      39.1%       2.56x
+  connectus                   4   24      46980    120065      39.1%       2.56x
+  connectus                   8   24      46980    120065      39.1%       2.56x
+  lp_osa_14                   3   24      13212     38336      34.5%       2.90x
+```
+
+We are behind MKL by 1.32x, 1.18x, 1.07x and 1.06x on those four cells. **The structural headroom is
+2.56-2.90x, comfortably more than the deficit.** Splitting a row across workers is the lever, it has
+never been tried, and it is a different lever from counting workers -- which is why chain189 and
+chain190 found nothing. That the thread sweep was flat is exactly what this structure predicts: the
+bound is not how many workers there are, it is that one of them owns a tenth of the work.
+
+### Group B -- cari k=4 and body_decoder_layer_3 k=3/4: perfectly balanced, and barely sparse
+
+The same calculation gives **100.0% utilisation**. `cari` has 382 nonzeros in every single row --
+`max_row` equals the mean exactly -- and the transformer block is within 15% of uniform. Against an
+ideal share of 6367 and 6896 nonzeros, the longest rows are 382 and 371. **There is no load-balance
+headroom here at all, and no thread policy or partitioner can help.**
+
+What they have instead is density: **31.8% and 63.1%**. A 63% dense matrix stored in CSR pays an
+index load and an indirect B access per nonzero in order to skip 37% of the work. That is the
+regime where a dense GEMM should win, and it is a plausible reading of why MKL is ahead on exactly
+these cells while we beat it by 2x on the genuinely sparse ones.
+
+**There is no density-based fallback anywhere in the codebase.** `density`, `to_dense` as a dispatch
+decision, and any density threshold are all absent from `src/scorch/ops.py`, `src/scorch/tiling.py`
+and `src/scorch/csrc/scorch_policy.h`. `matmul` has a both-dense fast path, but nothing that notices
+a *sparse-typed* matrix which is 63% full. So these cells run the sparse kernel because nothing ever
+asks whether they should.
+
+This is stated as a lead with a mechanism, not a result: the structural argument is strong but the
+measurement has not been made. Two independent things make it worth making. The AE work already
+found a crossover near 30% density for the Apple dense paths, which is the same neighbourhood. And a
+gate at, say, 25% density with a cap on the densified size would be **provably inert** on every
+workload family this project protects -- GCN graphs are near 0.1% dense, the autoencoder at 0.99
+sparsity is 1%, reddit and products are sparser still, and `connectus` at 0.6% would be untouched
+even before the size cap (its dense form is 808 MB, `cari`'s is 1.9 MB). That is the same shape as
+the gates already shipped in `spmm.h`: a runtime condition that cannot fire on the shapes it would
+hurt.
+
+### What this does to the plan
+
+The remaining MKL deficit is not one problem with one fix. It is four cells wanting a row-splitting
+partitioner with 2.5-2.9x of structural headroom, and three cells wanting the dispatch to notice
+that a matrix is two-thirds full. Neither is a constant to flip, and neither has been tried.
