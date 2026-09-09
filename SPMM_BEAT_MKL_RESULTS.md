@@ -24368,3 +24368,49 @@ width-1 correction that is wrong.
 Verdict on redwood: **P2 half holds, P3 fails, P4 fails.** MKT is still running the same stage; the
 commit decision waits for it, but nothing MKT can report would make a 5.16% deficit on 22 of 37
 matrices shippable.
+
+### chain187 design: measure the width-1 unroll per band instead of guessing a third multiplier
+
+chain185 leaves the width-1 policy genuinely open, and the ladder cannot express the answer. What is
+known: at mean degree 16-32 unroll 4 beats unroll 2 by 12.6%; at 8-16 unroll 1 beats unroll 4 by
+5.2%. What is not known is unroll 2 at 8-16 and unroll 1 at 16-32 -- the two cells the ladder never
+visits. And no multiplier can produce "1 below 16, 4 above": the ladder halves, so every value it
+admits passes through unroll 2. A third constant would be a guess between two measured points.
+
+So the next stage forces the width-1 unroll directly, via
+`SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE` -- a measurement hook, 0 in a release build, `#if`'d so a
+release object cannot contain the branch. Proven on ARM: flat `__text` differs at **identical size**
+(652264 bytes both), which added lines alone cause, and all **222** SpMM symbols are identical with
+addresses normalised, including all 135 float32 instantiations. Flat digests remain necessary but
+not sufficient; this is the third time in this line that a `__LINE__` shift has moved bytes without
+moving code.
+
+The design point that matters is which four builds to use. The obvious set -- the shipped default
+plus forced 1, 2 and 4 -- is wrong, because the default has no hook compiled in at all while the
+others carry an extra statement, and chain185 just measured that kind of difference at up to 2.61%.
+So instead:
+
+    f1, f2, f4   forced unroll 1, 2 and 4 at width 1 -- IDENTICAL instruction shape, differing
+                 only in one immediate operand, which is as close as two measurable objects get
+    f4b          a second build of f4, giving the A/A floor from the same source
+
+Four builds, so the existing 8-permutation rotation balanced in both position and predecessor is
+reusable. `f4` stands in for the shipped default, which it differs from only below mean degree 4 --
+one matrix in this corpus.
+
+Pre-registered:
+
+    P0  band census before timing; refuse if EITHER the 16-32 or the 8-16 target band is under 8.
+        chain184 pre-registered only the band where the gate hurt, which is how the neighbouring
+        band's regression went unmeasured until now.
+    P1  each build's forced value took: preprocessor expansion per build, plus .text distinct
+        across f1/f2/f4 and identical for f4/f4b.
+    P2  correctness on every arm at every width.
+    P3  THE CLAIM: at width 1, per band, rank unroll 1 against 2 against 4, each against the
+        f4/f4b floor. The sawtooth model predicts 4 wins at 16-32 and loses at 8-16; whether 2 or
+        1 wins at 8-16 is the open cell and has no pre-registered direction.
+    P4  CONTROL: at widths 2, 3, 4 and 8 the hook is provably inert, so every arm must sit inside
+        the floor. This is not just a control -- it MEASURES the residual layout artefact for these
+        specific objects at widths where no decision differs, which is the discount the width-1
+        readings need. chain185 found that artefact reaching 2.61%, about ten times the
+        identical-source floor, so assuming it is zero is not available.
