@@ -25134,3 +25134,71 @@ already retracted one mechanism today that fitted the data.
 2. If they are, write a 512-bit variant of ONE exact-width kernel and measure it on MKT against the
    256-bit one, with redwood as the byte-identical control -- it has no `__AVX512F__`, so a variant
    gated on that macro is provably absent there.
+
+## chain188's result: the rule works where it fires, moves zero cells against MKL, and cannot be shown free elsewhere
+
+Eight passes, four builds, 7320 corpus rows per build, zero refusals. The estimator was chosen at
+width 8 (a control the rule cannot reach): `raw` at a 0.831% A/A half-width against `norm`'s 1.309%.
+
+**P3b HOLDS, decisively.** At width 1 in the 16-32 bin -- the one cell where the rule changes a
+decision -- the pre-rule object is slower than what ships:
+
+```
+  16-32  k=1  n=12   A/A (c0 vs c0b)  1.0022 [0.9978, 1.0067]   flat
+                     w1off /c0        1.1232 [1.1001, 1.1489]   +12.32%   SLOWER
+                     w1offb/c0        1.1264 [1.1027, 1.1527]   +12.64%   SLOWER
+```
+
+The two independent off-builds agree to 0.32%, and chain187's forced-unroll proxy predicted 12.65%
+against the shipped object's 12.32%. The proxy was honest, which is what chain188 existed to check.
+
+**P3a DOES NOT HOLD.** Everywhere the rule cannot change a decision, the pre-rule object reads
+faster (averaging both off-builds): k=2 -0.74%, k=3 -2.05%, k=4 -0.51%, k=8 -1.01%, and width 1
+below mean degree 16 -0.63%. The A/A controls are flat at 0.1-0.6% throughout, so this is not
+scatter -- it is systematic and one-directional.
+
+**P4 is the one that decides, and it is zero.**
+
+```
+  POOLED over every target matrix and widths 1, 2, 3, 4, 8:
+    c0     at or below MKL parity 170 of 170;  decisively ahead 170;  behind 0
+    w1off  at or below MKL parity 170 of 170;  decisively ahead 170;  behind 0
+    the shipped rule moves the at-or-below-parity count by +0 cells
+```
+
+Both arms beat MKL everywhere on this corpus, by 0.49x to 0.72x. The rule widens a margin on cells
+already won by roughly 2x. **P5** GCN guardrail: inside the floor at both widths (+0.48%, +0.60%).
+
+### Why P3a's failure does not yet establish a cost
+
+The off-arm sets the threshold to 0, which makes the companion `_ANY` macro false and removes the
+branch from the object **entirely**. So the two arms differ in source, not in one operand. This
+milestone's own calibration: an identical-source rebuild differs ~0.3% (which is exactly what the
+A/A control reads here), while two objects whose source differs and whose decisions do not read
+1-2.6% apart. The observed -0.5% to -2.05% sits inside that range.
+
+There is also a mechanical reason to doubt a 2% execution cost at k=3: the rule is in the
+per-call unroll selection, not in a per-row loop. A single not-taken branch executed once per call
+cannot be 2% of a kernel over a matrix with a million nonzeros. Code layout can be.
+
+### chain191, which is built to be able to say "revert"
+
+Set the threshold to **1000000** rather than 0. `_ANY` is `(F32 != 0 || F64 != 0)`, so the branch is
+compiled **in**, and `mean_deg >= 1000000` cannot fire -- the corpus's largest mean degree is 2202
+(connectus), 454x below it. Measured, not assumed. `c0` and `w1hi` then differ in **one immediate
+operand**, the design chain187 measured at 0.51% spread where chain185's source-differing arms read
+2.61%.
+
+Its P3 has two halves that must both hold: the cost half (w1hi inside the control at every inert
+width) and a replication half (w1hi must read the same ~12.3% at the firing cell as w1off did --
+same decision, so the same effect, and disagreement there would mean the two off-configurations are
+not measuring the same thing).
+
+If the cost survives arms that are one immediate apart, it is real and `9f50a83` should be reverted.
+Given P4 already reads +0 cells, a rule that costs anything at all has nothing on the other side of
+the ledger.
+
+One defect fixed in the staging rather than discovered on the host: the build-check list is now
+**derived from the arm names** instead of typed. Typed, it still named chain188's arms and would have
+refused a correct chain191 run while looking for output mrbuild never prints -- the same shape as
+chain187 inheriting chain185's rotation-table names and refusing after paying for four builds.
