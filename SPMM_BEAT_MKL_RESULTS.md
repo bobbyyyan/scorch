@@ -24215,3 +24215,71 @@ One operational note recorded because it nearly caught me: redwood's stage was m
 invokes `mrgate.py` once per pass, so replacing that file on redwood would have changed the
 instrument between passes of one run. Only MKT's copy was updated; redwood keeps the old one, which
 resolves exactly there anyway.
+
+### chain185 on MKT, third attempt: a guard that refused the correct file
+
+Job 17331790 died before timing anything, at this line of the sbatch:
+
+    grep -q "_resolve" "$MKKEYS" || { echo "REFUSE: ... has no basename fallback"; exit 1; }
+
+The guard was written when the corpus-key resolution lived in a private `_resolve` function inside
+`mkkeys_split.py`. Extracting that resolution into the shared `csrresolve.py` -- the fix for the
+three-consumer cascade above -- removed the pattern the guard was matching, so the guard refused
+precisely the fixed file it existed to demand. `sha256sum` on both ends confirmed the staged
+selector was the correct one; the guard was asking the wrong question, not reading the wrong file.
+
+A text pattern was standing in for a behavioural property, and the property takes a second to
+measure, so it is now measured. `resolvecheck.py` resolves every corpus key against the cache the
+run is about to read and refuses on either of two conditions:
+
+    unresolved == 0          an exact-only resolver leaves 50 keys unresolved on MKT, so this
+                             catches a consumer that reverted to os.path.exists
+    basename >= --min        24 of the selected keys resolve ONLY by basename here; if that count
+                             is zero the fallback is not firing and the run is the old 248-key
+                             subset wearing the right name. --min is 0 for redwood, whose flat
+                             cache makes basename 0 correct -- one check, host-adapted by argument
+
+It also refuses an empty corpus, a corpus of unexpected length, an ambiguous basename, and any
+listed consumer that does not import `csrresolve` or still holds its own exact-path lookup.
+
+Tested in both directions before resubmitting: 11 synthetic cases (group-qualified cache, flat
+cache, fallback-not-firing, absent key, ambiguous basename, empty corpus, wrong key count, good
+consumer, consumer with its own lookup, unstaged consumer, missing cache directory), all behaving;
+then run by hand inside an `srun` on the real cache, which reported **298 keys, 50 by basename, 0
+unresolved** and, alongside it, the old guard refusing that same correct file. The sbatch invokes
+the same script with the same arguments, so what gates the job is what was tested. Resubmitted as
+job 17331834.
+
+Two conventions this adds. **A guard that greps for an implementation detail has an expiry date** --
+it goes stale the moment the implementation is refactored, and it fails closed on correct input,
+which looks exactly like a real defect. **And a guard tested only by the job it gates is not
+tested**: run it by hand on the real input first, and on synthetic input in both directions, because
+a guard that has only ever seen valid input has never shown it can refuse, and one that has only
+ever seen invalid input has never shown it can pass.
+
+### chain185 on redwood: every precondition passed before any timing
+
+redwood's half started before those fixes and is deliberately untouched -- its stage invokes
+`mrgate.py` once per pass, so replacing anything mid-run would change the instrument inside a
+single run. Its cache is flat, so it never had the resolution problem. It reported, before timing:
+
+    target group: 37 matrices at nnz >= 1e6 (median nnz 1205518), control 24, not cached here: 0
+    band census   0-4:1  4-8:0  8-16:22  16-32:12  32-64:1  64-128:0  >=128:1
+    P0 holds: the 16-32 target band has 12 matrices, at or above the pre-registered 8
+    .text: c0 == c0b (identical source, identical code), w1s8 and w1pg each differ from c0
+    P1 holds: the preprocessor expands the width-1 multiplier to `long v = 1L;` in a default build
+    correctness: 100 cases per arm, 0 mismatches, on all three arms
+    rotation: 8 passes, position counts [2], ordered-pair counts [2] over 12 of 12 pairs
+
+That is the coverage MKT should always have had and now has: 37 target matrices at median nnz
+1205518 on both hosts, and a 16-32 band that exists on both.
+
+The analyzer `an_w1fix.py` was written and validated against synthetic data with a **planted**
+12% width-1 regression in the 16-32 band -- it recovers P2 and reports P2 failing on a null dataset
+built the same way. It bands matrices from the `deg` column mrgate writes per reading rather than
+re-deriving degrees, since redwood's `groups.txt` predates the columns MKT's selector now emits, and
+a consumer that recomputes its producer's work is how this whole cascade started. It also reports,
+labelled as not pre-registered, width 1 across **every** band: the ladder makes w1s8 differ from the
+fix for all degrees in [2,32), and at 4-16 by a larger unroll step (1 against 4) than in the band
+the claim names (2 against 4), so those bands must move too and a band that refuses to move is
+evidence about the mechanism.
