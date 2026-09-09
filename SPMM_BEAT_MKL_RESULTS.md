@@ -24904,3 +24904,96 @@ Two limits on the claim. It is a **kernel-level** comparison -- `mrgate` times
 `scorch_ops.spmm_csr_float_v2` directly against `torch.sparse.mm`, so it is not a statement about
 `scorch.matmul` end to end, which is measured separately and reads differently. And it is float32
 only; float64 has its own census.
+
+## The residual deficit is a thread-count decision, asked of the binary rather than inferred
+
+The census above located the deficit but not its cause. `scorch_spmm_nthreads` is exported to Python
+precisely so a harness can ask the shipped resolver instead of restating it, so `threadask.py` asks
+it -- and the binary it asked is **the same `f4` object that produced chain187's MKT timings**, still
+on `/scr/bobbyy/c187/f4`, under the same 32-CPU allocation. Nothing about the policy is recomputed
+here; the only thing the harness contributes is the real arithmetic in grains (`nnz*k / 150000`) and
+the ratio of workers to grains.
+
+First cut, all 305 MKT cells:
+
+```
+  workers/grain  cells   geomean   behind MKL (>1.01)
+  0-1               78    0.9350   21 of 78  (27%)
+  1-2               70    0.9355    9 of 70  (13%)
+  2-4               43    0.9132    5 of 43  (12%)
+  4-8               39    0.9047    5 of 39  (13%)
+  8-16              24    0.9631    8 of 24  (33%)
+  >=16              51    1.0738   30 of 51  (59%)
+```
+
+30 of MKT's 55 losing cells sit in the last row. But that row is also the shortest-kernel row, so on
+its own it cannot separate "too many workers" from "any fixed overhead on a short kernel".
+
+### The discriminator
+
+Hold the arithmetic near-constant -- every cell under one grain of real multiply-adds, median kernel
+12.5 us -- and split by the worker count the binary resolved. If the deficit were just a short
+kernel meeting a fixed cost, the count would not matter inside that slice.
+
+```
+  MKT, grains < 1        cells   ours/mkl   median us   behind MKL
+    1 worker                25     0.8391       10.1     0 of 25   (0%)
+    5-8 workers             15     1.0837       13.5    15 of 15   (100%)
+    17-99 workers           14     1.4480       23.3    13 of 14   (93%)
+
+  MKT, grains >= 4 (a wide team has work to do)
+    17-99 workers          226     0.9269      121.3    40 of 226  (18%)
+```
+
+It matters, monotonically, at fixed duration: one worker is **1.19x ahead** of MKL, five to eight are
+1.08x behind, seventeen or more are **1.45x behind**. The same wide team on cells with four or more
+grains is fine at 0.927. A wide team is not the problem; a wide team with nothing to feed it is.
+
+### Why the policy does this, from its own source
+
+`scorch_policy.h:1814` already says it, and says it has never been priced:
+
+> `work` is nnz*max(k,16): a time proxy that floors the k term at a cache line, which is right for
+> throttling a bandwidth-bound product and overstates a k=1 product SIXTEENFOLD. At k=1 the proxy
+> therefore never binds, and rows/SCORCH_ROWS_PER_THREAD alone sets the count... The raise gate below
+> already reads work_true for exactly this reason; the same correction on the base bound has never
+> been priced. Off by default.
+
+and at line 1841, naming the class outright: *"It is what strands the high-degree narrow-k class."*
+
+Resolving the three bounds by hand for the five `>=128` matrices, with `SCORCH_GRAIN_SPMM = 150000`
+and `SCORCH_ROWS_PER_THREAD = 16`:
+
+| matrix | rows | nnz | real arithmetic, grains (k=2..4) | workers adopted, rw(24)/mkt(32) | ours/mkl |
+|---|---|---|---|---|---|
+| bottleneck_1_block_group2_3_1 | 128 | 17081 | 0 | 8 / 8 | **0.64-0.72 (wins)** |
+| decoder_l3_self_attention | 512 | 165516 | 2-4 | 24 / 32 | 1.05 |
+| decoder_l5_encdec_attention | 512 | 78643 | 1-2 | 24 / 32 | 1.05 |
+| cari | 400 | 152800 | 2-4 | 24 / 25 | 1.05 |
+| lp_osa_14 | 2337 | 317097 | 4-8 | 24 / 32 | 1.06-1.19 |
+
+The only one that wins is the only one whose row count holds the team down. `min(pool, rows/16)` is
+the binding constraint on all five, and it is a row count -- it has no idea how much arithmetic
+there is.
+
+### What this does and does not establish
+
+It establishes that the worker count predicts the deficit at fixed kernel duration, on one host,
+from the shipped resolver's own answers. It does **not** yet establish that lowering the count
+recovers the cells: that requires timing them at a lower count, which needs no rebuild because
+`nthreads_override` is an ABI argument the harness already passes.
+
+Three known blockers, from the four times this was attempted before (see the chain59 record):
+
+1. **`BASE_WORK_TRUE` alone is a structural null.** The composition adoption at the end of
+   `scorch_spmm_nthreads` can only raise, and production always passes
+   `nthreads_override = torch.get_num_threads()`, so the adoption always fires. Only the pair
+   (`BASE_WORK_TRUE` + `ADOPT_GRAIN`) moves a count.
+2. **That pair moves 27 guarded GCN/AE cells**, taking cora/pubmed output-layer widths from 18
+   workers to 1 -- and `e795127` shipped the opposite change there for a pipeline-composition
+   reason, not an arithmetic one. An SpMM grid prices one side of a two-sided trade.
+3. **A per-cell oracle over team width needs a five-arm null**, not a two-arm one; chain183's
+   two-arm null (7.3%) was already twice what a lognormal at the measured sigma predicts, so the
+   selection bias is heavier-tailed than the model.
+
+So the next stage measures, and does not propose a ship.
