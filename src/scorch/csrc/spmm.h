@@ -4149,6 +4149,13 @@ torch::Tensor spmm_csr_v2_core(
     while (exact_unroll > 1 &&
            mean_deg < (long)exact_unroll * degunroll_mult) exact_unroll >>= 1;
   }
+#if SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE
+  // A measurement hook, 0 in a release build; see scorch_policy.h for why the ladder cannot
+  // express what chain185 measured. Guarded with #if rather than a folded `if` so a release
+  // object cannot contain it even in principle, which a .text digest against the pre-hook tree
+  // is what proves.
+  if (exact_width == 1) exact_unroll = SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE;
+#endif
 #endif
 #if !defined(SCORCH_TUNE_HOOKS) && defined(__AVX2__) && defined(__FMA__) && \
     SCORCH_SPMM_MULTIROW_ANY

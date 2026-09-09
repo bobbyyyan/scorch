@@ -1109,8 +1109,12 @@
 // same halving is the win, because there are two or three multiply-adds per nonzero to hide the
 // per-row setup behind; at width 1 there is one.
 //
-// MKT could not have caught it -- its target group holds NO matrices in the 16-32 band, so its
-// width-1 reading of 1.0010 is an average over bands this mechanism cannot move.
+// MKT's reading of 1.0010 is an average over bands this mechanism cannot move, because its target
+// group held NO matrices in the 16-32 band. That was NOT a property of the machine: MKT's cache
+// stores SuiteSparse group-qualified while the corpus list is flat, and the selector's exact-path
+// lookup silently dropped the 50 keys that differ -- every real-world FEM and circuit matrix, hence
+// the whole band. With the resolution fixed MKT resolves 298 of 298 and its census matches
+// redwood's exactly: 12 matrices in 16-32, 37 target at median nnz 1205518.
 //
 // So width 1 keeps the pre-gate constant. Neutral at every other width by construction (the value
 // there is unchanged) and it restores width 1 exactly (the value there is the one it had before the
@@ -1124,6 +1128,22 @@
 #endif
 #ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64
 #  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
+#endif
+// A MEASUREMENT HOOK for the width-1 unroll, not a policy. chain185 put the ladder's two reachable
+// width-1 decisions against each other over 37 matrices and 8 balanced passes, and the trade is
+// not monotonic in degree: at mean degree 16-32 unroll 4 beats unroll 2 by 12.6%, while at 8-16
+// unroll 1 beats unroll 4 by 5.2%. The 8-16 band holds 22 of the 37 target matrices, so the
+// multiplier that fixes one band breaks the other, and over the whole group width 1 comes out a
+// wash. That is the sawtooth this file's ladder comment already describes -- setup is 2*UNROLL-1
+// scalar operations per row, so the ratio peaks just above each threshold -- but no multiplier the
+// ladder admits can express "1 below 16, 4 above": every one of them passes through unroll 2.
+//
+// Rather than guess a third constant, a build sets this to force one unroll at width 1 so each
+// candidate can be read off per band directly. 0 is the shipped value and the #if in spmm.h means
+// a release object cannot contain the branch at all, which a .text digest against the tree before
+// this existed is what proves.
+#ifndef SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE
+#  define SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE 0
 #endif
 #ifndef SCORCH_NARROWK_EXACT_SHORT
 #  define SCORCH_NARROWK_EXACT_SHORT 0

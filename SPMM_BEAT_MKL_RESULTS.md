@@ -24414,3 +24414,35 @@ Pre-registered:
         specific objects at widths where no decision differs, which is the discount the width-1
         readings need. chain185 found that artefact reaching 2.61%, about ten times the
         identical-source floor, so assuming it is zero is not available.
+
+### The neutrality tool was answering without reading: symneutral.py on macOS
+
+The hook's neutrality claim above is correct, but for an hour it rested on nothing, and the way that
+surfaced is worth recording because it generalises.
+
+Having proved the hook does not change a release object, I asked the same tool the opposite
+question as a control: compare the default build against one with the hook forced to 2, which
+*must* differ. It reported **1038 symbols matched, 1038 identical, 0 changed** -- on two objects
+whose flat `__text` was 652264 against 652312 bytes, 48 bytes apart with different digests.
+
+The cause: `symneutral.py` matched instruction lines with `(?:[0-9a-f]{2} )+`, the space-separated
+byte columns **GNU objdump** prints. Apple's LLVM objdump prints one packed encoding word --
+`     918: d10443ff     \tsub\tsp, sp, #0x110` -- so nothing matched, every symbol body was empty,
+every digest was `sha256("")`, and unanimity meant silence rather than agreement. Every earlier
+verdict in this document was produced on redwood or MKT, where the GNU format matches, so those
+stand; the macOS runs from today are the only affected ones.
+
+Three fixes, all needed. Key the instruction text on the first tab, which both disassemblers use to
+separate encoding from mnemonic. Refuse an empty extraction at both levels -- zero instructions over
+the object, and any kept symbol with an empty body -- the same guard the otool digest already
+carried, for the same reason. And print the instruction and symbol counts on every run, so "neutral
+over 164497 instructions" is distinguishable from "neutral over nothing" without reading the source.
+
+With the parser fixed, the control reports `spmm_csr_v2_core<double,false>` going 1152 -> 1158
+instructions, and the real answer for the `#if`'d hook at its default of 0 is **222 SpMM symbols
+matched, 222 identical, over 164497 instructions** -- the same verdict, now with evidence behind it.
+
+**Run the positive control before believing the negative result.** A neutrality tool that has not
+demonstrated on this host, on these objects, that it can say CHANGED has demonstrated nothing. The
+only reason I looked further was a flat digest difference at identical byte size, which is the
+weakest signal in the toolbox and this time the only one telling the truth.
