@@ -25202,3 +25202,81 @@ One defect fixed in the staging rather than discovered on the host: the build-ch
 **derived from the arm names** instead of typed. Typed, it still named chain188's arms and would have
 refused a correct chain191 run while looking for output mrbuild never prints -- the same shape as
 chain187 inheriting chain185's rotation-table names and refusing after paying for four builds.
+
+## chain189: the thread count is not a lever, and the launch-path worry is cleared
+
+MKT, 32 CPUs (the same allocation the cell count was computed under), 305 measurements over 3
+repeats, 17 arms per measurement: six thread settings at production's launch, four forced-launch
+arms, six identical copies of the shipped setting, and MKL in every measurement. No refusals.
+
+**The count, which is what the stage was for.**
+
+```
+  78 measurements sit behind MKL at the shipped setting (+-1% margin)
+   1 RECOVERED by another thread setting -- connectus k=4, 1.084 -> 0.998 at 16 workers
+  77 have no setting that reaches parity
+   0 unreadable
+```
+
+**And the ceiling, which closes the line rather than just this attempt.** A per-cell oracle that
+picked the best of the six settings for every measurement:
+
+```
+  oracle over 6 settings, 305 measurements: 1.0046 [1.0024, 1.0075]   (+0.46%)
+  six-arm selection-bias floor (median):                               +0.40%
+  net available after the floor:                                       +0.06%
+```
+
+Picking the best of six identical arms is worth +0.40% by itself. The oracle is worth +0.46%. So
+**there is essentially nothing there** — not "the rule we tried was wrong", but "no rule of this
+kind can pay". That is the useful form of a negative result, and it is why the six identical arms
+were worth their machine time: without them +0.46% would have looked like a small win.
+
+**The instrument check (P4) holds hard.** One worker is 10.557x [9.380, 11.789] slower than the
+shipped setting on the 226 well-fed measurements. The sweep can see large effects; it simply did
+not find one.
+
+### The launch path, and why the earlier concern is cleared
+
+`mrgate` has passed `atparallel=False` since it was written, while `ops._composition_hints` ships
+`True`. Forcing each path:
+
+```
+                          private / at::parallel_for      verdict
+  STARVED  shipped        0.9892 [0.9830, 0.9944]         inside the margin
+  LEAN     shipped        0.8970 [0.8456, 0.9487]         private 10% FASTER
+  MID      shipped        0.9778 [0.9627, 0.9882]         private 2% faster
+  FED      shipped        0.9952 [0.9918, 0.9987]         inside the margin
+```
+
+The 10% on the LEAN class looks like a serious instrument bias until the gate is read. Production
+takes `at::parallel_for` only when `work_nnz >= SCORCH_GRAIN_SPMM` **and**
+`rows >= nthreads_override * SCORCH_ROWS_PER_THREAD`. The LEAN class fails the first test by
+construction -- under one grain of real arithmetic -- so **production uses the private team on
+exactly those measurements too**, the same as the harness. On the class where production does take
+the other path, FED, the two launches are within 0.5%.
+
+So `atparallel=False` did not materially flatter this line of work. Worth having measured rather
+than argued: the alternative was to carry an unquantified doubt over every MKL number in the series.
+
+### The GCN check has no trade in it
+
+```
+                  s1     s2     s4     s8     s16    s0 (shipped)
+  citeseer k=3   1.364  2.097  1.652  1.346  1.220  1.034
+  cora     k=16  0.935  1.295  0.971  0.798  0.729  0.629
+  pubmed   k=16  0.608  0.382  0.214  0.124  0.083  0.077
+```
+
+Every graph prefers the shipped thread count at both widths, pubmed at k=16 by 13x against MKL.
+This is what blocked chain59 four times -- the fear that a thread change helping SpMM would cost the
+GCN layers -- and on this axis the fear is unfounded, because the shipped setting is already the
+best of the six.
+
+### One caveat on the host
+
+The six identical copies spread 2.34% median, 5.76% at p90, 16.14% at worst -- against 0.1-0.6% for
+redwood's controls in chain188. MKT's co-tenancy is real and it is why the count here (78 behind at
+the +-1% margin) exceeds the earlier census's 55 on the same corpus. A count at a fixed margin moves
+with the host's noise, so the two numbers are not in conflict; they are the same corpus read through
+a wider and a narrower instrument.
