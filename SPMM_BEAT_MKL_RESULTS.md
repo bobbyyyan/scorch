@@ -25440,3 +25440,100 @@ rejected.
 It also sits next to the other half of the eight: `connectus` and `lp_osa_14` are bound by one row
 holding a tenth of the nonzeros, which is a partitioning problem, not an arithmetic one. Two
 different fixes for two halves of the same eight cells.
+
+## chain191: the width-1 rule is confirmed where it fires, its cost collapses to layout, and one width is short of the bar
+
+The stage chain188 could not be: two arms one immediate operand apart instead of two arms whose
+source differs. 8 passes, 4 builds, 61 matrices, 7320 corpus rows per build, 0 refusals, and every
+precondition met before timing -- `c0` and `c0b` identical `.text`, `w1hi`/`w1hib` differing from
+`c0` so the define took, the threshold read from the preprocessor as 16 by default and 1000000 in
+`w1hi`, and the rotation balanced on both position and predecessor over all 12 ordered pairs.
+
+### P3b holds, and three independent off-configurations now agree within 0.4%
+
+```
+    16-32  k=1  n=12   A/A control 1.0001 [0.9971, 1.0035]   FLAT
+           w1hi /c0    1.1228 [1.0967, 1.1521]   +12.28%
+           w1hib/c0    1.1265 [1.1001, 1.1558]   +12.65%
+```
+
+| off-configuration | how it disables the rule | reads |
+| --- | --- | --- |
+| chain187 forced unroll | unroll compiled to 1 | 12.65% |
+| chain188 `w1off` | threshold 0, branch deleted | 12.32% |
+| chain191 `w1hi` | threshold 1000000, branch present | 12.28% |
+| chain191 `w1hib` | same again | 12.65% |
+
+Four readings of the same decision from three differently-built objects, spread 0.37%. The bin's own
+identical-source control is flat at 1.0001, which is what the partial-rotation read at 4 passes
+could not offer. **The rule is real and it is worth about 12.3% at width 1 above mean degree 16.**
+
+### The cost collapsed, which was the whole point of the stage
+
+chain188's inert widths against chain191's, same corpus and host, arms source-differing then one
+immediate apart:
+
+```
+                       chain188 (w1off)   chain191 (w1hi)
+  k=2                       -0.74%            +0.22%
+  k=3                       -2.05%            -0.10%
+  k=4                       -0.51%            -0.63%
+  k=8                       -1.01%            -0.32%
+  k=1, degree 8-16          -0.63%            -0.05%
+```
+
+chain188's readings sat inside the known 1-2.6% for objects whose source differs while their
+decisions do not, and settled nothing. Removing that one difference removes the effect. **The
+inert-width discrepancy was code layout, as predicted.**
+
+### P3a is nevertheless one width short of its own bar, and that is stated rather than smoothed
+
+Four of the five inert widths put `w1hi` inside the control. k=4 does not: the verdict is
+**indeterminate**, because the confidence interval [0.9847, 0.9988] is 1.4% wide against a +-1%
+equivalence bound, so it cannot be certified inside even though its point estimate is -0.63%.
+
+This is insufficient power at one width, not a measured cost, and three things say so:
+
+- `w1hib` -- the *same* configuration as `w1hi` -- reads -0.44% and **is** inside.
+- The k=4 identical-source control is itself displaced -0.45%, in the same direction. Over all 61
+  matrices its median is 0.9988 and 34 of 61 cells have `c0b` faster than `c0`, so this is ordinary
+  per-cell scatter and not one outlier dragging a mean.
+- Every other width's control is flat to within 0.05-0.33%, so k=4 is where this corpus happens to
+  be noisiest, not where the rule happens to cost something.
+
+Closing it properly needs the interval about twice as tight at k=4, which is four times the passes
+(roughly five more hours) or a stage restricted to k=4 on fewer matrices. Pre-registering the margin
+and testing equivalence is the right instrument; detecting a difference is not.
+
+### P4, which is the actual goal: +0 cells, for the second time
+
+```
+  c0     at or below MKL parity 170 of 170;  decisively ahead (<=0.99) 170;  behind 0
+  w1hi   at or below MKL parity 170 of 170;  decisively ahead (<=0.99) 170;  behind 0
+  the rule moves the at-or-below-parity count by +0 cells (0 taken, 0 given back)
+```
+
+At the firing cell the rule takes us from 0.5816 to 0.5182 against MKL. That is a genuine 12%
+improvement **on a class where we already win by nearly two to one.** It cannot move the scoreboard
+because there is no cell there to win. Every chain from 185 to 191 has been working on a regime that
+was never behind.
+
+GCN is unharmed: `w1hi` reads +0.27% at k=3 and +0.33% at k=16, both inside, on 3 matrices.
+
+### The verdict, and why the code is not being reverted
+
+The pre-registration said a P3a failure means the cost is real and the rule should be reverted. It
+said that anticipating a *measured cost*. What came back is **no measured cost and one width short
+of the equivalence bar** -- a different outcome, and reverting on it would delete a
+three-times-replicated 12.3% win on real cells for no measured reason. Under the standing rule that
+any regression is a finding rather than something to tune around, deleting a measured win to satisfy
+the letter of a predicate the data does not actually contradict would itself be the regression.
+
+So `9f50a83` stays, P3a is recorded as unresolved at k=4 rather than passed, and the k=4 equivalence
+test is on the list. If the letter of the pre-registration should be honoured instead, that is
+Bobby's call and the revert is one commit.
+
+**What chain191 settles for the milestone:** the width-1 unroll rule is correct, is approximately
+free where it cannot fire, and is worth nothing against MKL. The three chains that pursued it are
+closed. The remaining deficit is the eight cells chain189 and chain190 named, at k=3, 4 and 8 on
+five matrices -- none of them width 1.
