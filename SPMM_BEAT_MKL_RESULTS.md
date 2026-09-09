@@ -25075,3 +25075,62 @@ groups, not a change in the count. And the shape agrees cell for cell: redwood's
 Two independent stages agreeing to the cell is worth more than either alone, because the builds
 differ in exactly the place the earlier chains were arguing about. Whatever the width-1 unroll does,
 it does not move this count.
+
+## There is no AVX-512 in this codebase, and MKT is an AVX-512 machine that loses 7x more cells than the one without it
+
+Counted over the whole C++ layer:
+
+```
+  _mm512 in src/scorch/csrc/          0
+  _mm512 / avx512 in the JIT codegen  0
+  _mm256 in spmm.h                   73
+  _mm    in spmm.h (128-bit)         26
+  vld1q / vfmaq (NEON)               86 / 58
+```
+
+Every hand-written x86 vector path in the SpMM is 256-bit, behind `#if defined(__AVX2__) &&
+defined(__FMA__)`. There is no 512-bit path and no runtime dispatch to one. So on MKT -- EPYC 9334,
+Zen4, AVX-512 -- the hand-tuned kernels run at **half the vector width the machine offers**, and the
+2565 `zmm` instructions the earlier disassembly found in MKT's SpMM symbols cannot be coming from
+these kernels at all. They are the compiler auto-vectorizing the non-intrinsic paths under
+`-march=native`. The paths we tuned by hand are the paths pinned to 256 bits.
+
+Next to the census this is at least suggestive:
+
+| | redwood (i9-14900K, AVX-512 fused off) | MKT (EPYC 9334, Zen4 AVX-512) |
+|---|---|---|
+| cells behind MKL | **8 of 265** | **55 of 265** |
+| where | `>=128` bin, k=3/4/8 | that bin at every width, plus `0-4` k=1, `32-64`, and k=2/k=3 in the target group |
+
+The host with 512-bit units we do not use loses seven times as many cells as the host that has none
+to waste. And on the same matrices the two hosts fail in opposite directions:
+
+```
+  decoder_l3_self_attention k=2   ours    mkl
+    redwood                       19.6    19.2
+    MKT                           28.2    18.1
+```
+
+MKT runs our kernel 44% slower than redwood while running MKL 6% **faster**, despite a much lower
+clock (EPYC 9334 base/boost against a 14900K's 5.8 GHz). Our kernel being slower there is explained
+by clock alone. MKL being *faster* there is not -- that needs MKL to be using something MKT has and
+redwood does not.
+
+### What is established and what is not
+
+**Established, from the source:** we have no 512-bit code path, so on Zen4 our tuned kernels use
+half the available width. That is not a hypothesis about a measurement, it is a count of the source.
+
+**Not established:** that the unused width is what costs those 55 cells. Not excluded: clock,
+memory bandwidth, L3 capacity, and MKL's own Zen4 dispatch, any of which could carry part or all of
+it. The census's concentration at k=2 and k=3 -- the widths the hand-written exact-width kernels
+serve -- fits the vector-width story, but fitting is not confirming, and this line of work has
+already retracted one mechanism today that fitted the data.
+
+**The discriminating test, in order:**
+1. Disassemble MKT's object per symbol and check whether the exact-width narrow-k kernels are pure
+   `ymm` while the generic paths carry the `zmm`. Cheap, but it perturbs a timing run, so it waits
+   for chain189 to finish rather than being run next to it.
+2. If they are, write a 512-bit variant of ONE exact-width kernel and measure it on MKT against the
+   256-bit one, with redwood as the byte-identical control -- it has no `__AVX512F__`, so a variant
+   gated on that macro is provably absent there.
