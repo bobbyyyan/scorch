@@ -25280,3 +25280,90 @@ redwood's controls in chain188. MKT's co-tenancy is real and it is why the count
 the +-1% margin) exceeds the earlier census's 55 on the same corpus. A count at a fixed margin moves
 with the host's noise, so the two numbers are not in conflict; they are the same corpus read through
 a wider and a narrower instrument.
+
+## chain190: redwood confirms it, and the two hosts together shrink the target to 8 cells
+
+chain189 was one host. chain190 is the same 17-arm sweep on redwood -- 3 passes, 5185 rows a pass,
+0 refusals, correctness 270 cases 0 mismatches before any timing. It replicates chain189's negative
+and then does something chain189 could not: joined against chain189's grid it names the cells that
+are behind MKL on *both* machines, which is the only list a fix can be held to.
+
+### The negative replicates, to the same second decimal
+
+|                                   | MKT (chain189) | redwood (chain190) |
+| --- | --- | --- |
+| per-cell oracle over 6 overrides  | +0.46%         | +0.97%             |
+| six-identical-arm selection floor | +0.40%         | +0.90%             |
+| **net available after the floor** | **+0.06%**     | **+0.06%**         |
+| one worker vs shipped, fed cells  | 10.557x        | 9.020x             |
+| duplicate spread, median          | 2.34%          | 1.91%              |
+
+The two hosts differ in noise by a factor of two, differ in oracle by a factor of two, and agree on
+the net to the second decimal -- because the floor moves with the noise and the oracle moves with
+it identically. There is +0.06% on the table for a rule that could see everything the oracle sees.
+No rule can, and no rule would be worth writing if it could.
+
+The instrument check passes on both: forcing one worker costs 9-10x where there is work to do, so
+the flat sweep elsewhere is a property of the policy and not of a harness that fails to change
+anything.
+
+### The one recovered cell does not survive the second host
+
+Each host recovers exactly one cell, and it is a different cell.
+
+```
+                                                   redwood            MKT
+                                              ship  best  arm    ship  best  arm
+  body_decoder_layer_3_self_attn      k=3     1.038 0.958  s16    1.416 1.416  s0
+  connectus                           k=4     1.320 1.289  s16    1.084 0.998  s16
+```
+
+redwood recovers the attention block MKT cannot move at all (1.416, flat across all six settings).
+MKT recovers connectus k=4 that redwood is 32% behind on and cannot fix. **Recovered on both hosts:
+none.** The two-host rule this branch has used to accept wins applies with the same force to a
+negative's single exception, and it deletes this one.
+
+### What the join is actually for: 8 cells, 5 matrices, three widths
+
+295 cells resolve on both hosts (one basename, `bottleneck_1_block_group2_3_1`, names two different
+DLMC matrices and is dropped rather than averaged into one cell). Of those, 10 are behind MKL on
+redwood, 67 on MKT, and **8 on both**:
+
+```
+                                                  redwood         MKT
+                                             ship  best  arm  ship  best  arm
+  connectus                            k=4   1.320 1.289  s16  1.084 0.998  s16
+  connectus                            k=8   1.176 1.176   s0  1.122 1.019  s16
+  connectus                            k=3   1.073 1.073   s0  1.253 1.138  s16
+  body_decoder_layer_5_encdec_attn     k=4   1.142 1.142   s0  1.331 1.331   s0
+  body_decoder_layer_3_self_attn       k=4   1.083 1.083   s0  1.293 1.293   s0
+  body_decoder_layer_3_self_attn       k=3   1.038 0.958  s16  1.416 1.416   s0
+  cari                                 k=4   1.047 1.047   s0  1.320 1.320   s0
+  lp_osa_14                            k=3   1.060 1.029  s16  1.081 1.081   s0
+```
+
+Five matrices, widths 3, 4 and 8 only. Nothing at width 1, 2 or 16, which is a third independent
+statement that the width-1 regime chains 185, 187 and 188 worked on was never the deficit.
+
+The other 59 of MKT's 67 are host-specific, and the shape of them is worth stating because it is
+where the remaining work is: on cells like `shipsec8` k=3, `xenon2` k=2, `filter3D_E` k=3, redwood
+reads 0.60-0.65 against MKL while MKT reads 1.11-1.17. Same source, same corpus, same harness,
+opposite verdict. That is the AVX-512 asymmetry from the section above, sized: it is worth roughly a
+factor of two on the same cell, and it accounts for 59 of the 67.
+
+### Three of the eight were already explained, in a different chain
+
+`connectus` and `lp_osa_14` are two of the three matrices in the whole-row balance ceiling -- they
+hold about a tenth of their nonzeros in a single row, so a partition that never splits a row caps
+them near 40% of the machine no matter how many workers it has. Four of the eight host-invariant
+cells are those two matrices. That is consistent with the thread sweep finding nothing: the bound
+is not how many workers there are, it is that one of them owns a tenth of the work. Splitting a row
+across workers is a different lever from counting them, and it is untested.
+
+The remaining four are three transformer attention blocks and `cari`, all at k=3 or k=4, all
+512-row or 400-row matrices. Those are small enough that per-call setup is a large share, and the
+census's `>=128` mean-degree finding points at the B footprint rather than at the partition.
+
+**Verdict: chain189 and chain190 CLOSED together.** The thread count is not a lever on either host;
+the ceiling on any rule of that kind is +0.06%; and the target has gone from "8 or 55 or 78 cells,
+depending which host you ask" to eight named cells on five named matrices at three widths.
