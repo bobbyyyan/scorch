@@ -25054,3 +25054,24 @@ two-sided guardrail (one worker must be far slower on the well-fed cells, which 
 should hold by 5.3x, making it a sharp instrument check), a six-arm selection-bias null for the
 per-cell oracle, the launch factor, and the GCN guardrail -- because chain59's pair moved 27 guarded
 GCN/AE cells and a thread-count stage that does not time them prices one side of a two-sided trade.
+
+## The census replicates across two independent stages, which upgrades it from a reading to a measurement
+
+The cell count above came from chain187's release builds. chain185's ledgers hold a different build
+set on the same corpus and the same two hosts -- its `c0` is the committed tree as it stood before
+the width-1 rule, where chain187's `f4` forces the width-1 unroll to 4. Different objects, different
+runs, same question. Running the same census over both:
+
+| host | chain187, `f4` arm | chain185, `c0` arm |
+|---|---|---|
+| redwood | 0 of 170 target + 8 of 95 control = **8 of 265** | 0 + 8 = **8 of 265** |
+| MKT | 23 + 32 = **55 of 265** | 22 + 33 = **55 of 265** |
+
+The totals are identical on both hosts; MKT's single cell of difference is a shuffle between the two
+groups, not a change in the count. And the shape agrees cell for cell: redwood's eight are the
+`>=128` control bin at k=3, 4 and 8; MKT's are that bin at every width plus `0-4` at k=1 and the
+`32-64` bin, with k=2 and k=3 carrying its target-group losses.
+
+Two independent stages agreeing to the cell is worth more than either alone, because the builds
+differ in exactly the place the earlier chains were arguing about. Whatever the width-1 unroll does,
+it does not move this count.
