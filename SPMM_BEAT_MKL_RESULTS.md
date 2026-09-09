@@ -24705,3 +24705,120 @@ is the same both times -- the pair must be known to differ on this host, in this
 
 Correctness: 288 cases across both dtypes, six row counts, four densities and six widths, zero
 mismatches.
+
+## chain188 -- the stage that refused itself, and the two defects that made the refusal invisible
+
+chain188 exists because chain187 did not time the shipped object. chain187's arms *force* the
+width-1 unroll to a constant; commit `9f50a83` keeps the halving loop and adds a runtime test on
+mean degree. Same decision, different code, and this line of work has already been burned once by
+timing an arm that was not the shipped arm (chain178's sweep set a shared macro and so measured a
+different object than the one committed). So the shipped default build gets timed, against the same
+tree with the threshold defined to 0.
+
+The first launch **refused at P1 and I reported it as running.** Both halves of that are defects.
+
+**The probe was asked with the wrong flags.** P1 asks the preprocessor what the threshold constant
+is, by running `g++ -E -I. probe.cpp`. The constant is guarded on
+`__AVX2__ && __FMA__ && !__AVX512F__`; without `-march=native` none of those are defined, so the
+probe read `0L` and the stage concluded this host is not the AVX2 configuration the constant was
+measured on. It is. Measured after the fix, on redwood:
+
+```
+without -march=native: long v = 0L;
+with    -march=native: long v = 16L;
+```
+
+The same log already contained the contrary evidence. mrbuild had compared `.text` digests four
+builds deep and printed `w1off: .text differs from c0 (the define took)` -- which is only possible
+if the constant is non-zero in c0. Two checks in one log disagreed and the weaker one won, because
+it was the one wired to `exit 1`. A probe of the compiler must carry the flags of the build it
+speaks for, and print them next to the answer.
+
+**The pass message printed underneath the refusal.** P1 has two checks and one pass line, and the
+pass line sat inside the second `case`. So the log read:
+
+```
+  REFUSE: the default is not 16, so this host is not the AVX2 configuration the
+          constant was measured on and c0 is not the object the claim is about
+  with the constant off: long v = 0;
+  P1 holds: 16 by default here, 0 in w1off
+```
+
+and I read the last line. The fix is structural: the pass message goes after the exit gate, where it
+is unreachable when the gate does not open. And when reading a stage log, `grep -n REFUSE` comes
+before `grep -n holds` -- a refusal followed by a pass line means the pass line is lying, not that
+the run recovered.
+
+**The poller then sat on a corpse.** Its liveness test was `pgrep -f 'rw_s_chain188|chain188_body'`
+sent over ssh, so the remote shell's own command line matched the pattern: the producer read alive
+forever and the poller would have waited its full 360-minute cap on a stage that exited in three
+minutes. Replaced with the stage lock file's pid, whose name cannot collide with the query. The
+first attempt at that read the pid with `tr -dc '0-9'`, which splices the timestamp onto the pid --
+the file is `pid stage timestamp` -- so it now takes the first field and refuses a non-numeric one.
+Tested in all four states on the host: no lock, lock naming a live pid, lock naming a dead pid, lock
+removed.
+
+### The relaunch
+
+Same tree, cleared directory, fixed probe. `/scratch/bobbyy/c188` was removed first so the
+pre-flight ran on a fresh tree rather than inheriting the refused run's artefacts -- the borrowed
+pass has already happened once in this line of work, where a pre-flight read a file twelve lines
+before the body created it and passed only because an earlier failed run had left the file behind.
+
+The tarball was proved to be the committed tree before launch, not assumed: `spmm.h` and
+`scorch_policy.h` inside it hash to `7d14feafca50cd26` and `b9019186551fbdaa`, byte-identical to
+`git show 9f50a83:` on both files.
+
+What the relaunch reports:
+
+```
+  P1 holds: 16 by default here, 0 in w1off      (probing with: g++ -march=native -E)
+  c0:    100 cases, 0 mismatches
+  w1off: 100 cases, 0 mismatches
+  8 passes; position counts [2]; ordered-pair counts [2] over 12 of 12 pairs
+  P0 holds: the 16-32 target bin has 12 matrices, at or above the pre-registered 8
+```
+
+### The analyzer, written before the data landed and tested against known answers
+
+`an_c188.py` reads the pre-registered predicates over the shared `spmmstat` machinery. Two notes on
+its design.
+
+**Where the rule can change a decision is narrower than the pre-registration says.** The rule reads
+`exact_width == 1 && mean_deg >= 16`, and the halving loop it follows already yields unroll 4 from
+mean degree 32. So the decision differs in exactly one cell: width 1, mean degree 16-32. Width 1
+below 16 does not fire; width 1 from 32 up re-assigns the value the loop already chose; every width
+above 1 tests false. The analyzer reports all of those as cost checks and labels the `>=32` ones as
+an implication of the heuristic rather than as pre-registered predicates.
+
+**A pass at the firing cell is `w1off` reading SLOWER.** Ratios are arm/c0, so the direction that
+confirms the rule is the one that normally means a regression. Stated in the output, because a
+reader scanning for the word SLOWER would otherwise draw the opposite conclusion.
+
+It was tested on five synthetic plants with known answers before it ever saw the real data:
+
+| plant | what is planted | what the analyzer must say |
+|---|---|---|
+| `real` | `w1off` 1.13x slower at width 1 in 16-32 only; MKL straddling parity there | P3a holds, P3b holds, +12 cells |
+| `null` | `w1off` identical to `c0` everywhere | P3b does NOT hold, +0 cells |
+| `cost` | the real effect plus 2% at width 2, where nothing can change | P3a fails, naming width 2 |
+| `giveback` | the shipped arm 2% slower at width 2 with MKL just under it | net **-14** cells, the lost ones named |
+| `noisy` | the two identical-source builds 1.5% apart in the firing bin | P3b refuses to read the bin at all |
+
+All five read correctly. The `noisy` case is the one worth keeping: the analyzer sees `+13.02%
+SLOWER` sitting right there and still refuses, because a bin whose own identical-source control is
+off parity cannot be read whatever the arms say. That is the check that stopped a false verdict on
+MKT in chain187.
+
+`giveback` was written backwards the first time -- it made the *pre-rule* arm slower, which is a copy
+of `cost` and left the loss-reporting branch of the analyzer completely unexercised. A plant that
+does not exercise the branch it names is worth nothing.
+
+The `spmmstat` additions (`vs_mkl`, `below`) are purely additive, and that was checked rather than
+asserted: `an_c187.py` on chain187's ledger and `an_w1fix.py` on chain185's both reproduce their
+recorded output line for line under the new module.
+
+One tool defect fell out of the testing. `fmtcheck.py` validates `%`-operator format strings, and an
+analyzer line read `about 12.65%% behind` inside a plain `print()` with no operand -- escaping is
+only correct under the operator, so it printed two characters. The check now also refuses `%%` in a
+string no `%` operator ever touches, and both directions are self-tested.
