@@ -24997,3 +24997,60 @@ Three known blockers, from the four times this was attempted before (see the cha
    selection bias is heavier-tailed than the model.
 
 So the next stage measures, and does not propose a ship.
+
+## RETRACTION: the worker-count mechanism above was a between-matrix correlation, and the within-cell answer is different
+
+The section above concluded that the residual MKL deficit is a thread-count decision, on the
+strength of grouping cells by the count `scorch_spmm_nthreads` resolves and finding ours/mkl
+monotone in it at matched arithmetic. **The numbers in that table are right and the causal reading
+of them is wrong.**
+
+The resolved count is `min(pool, rows / 16)`. So grouping by it groups by ROW COUNT, and every other
+property of the shape moves with the row count. Holding the arithmetic constant does not hold the
+matrix constant: the 1-worker group is a set of matrices with fewer than 32 rows and the 17+ group
+is a different set with 272 rows or more. It was never the same cell at two counts, which is the
+only comparison that can support the claim I made.
+
+A two-cell smoke run on MKT, same binary, six identical arms for the floor, gives the within-cell
+answer:
+
+```
+  lp_osa_14 k=3   rows 2337   mkl 55.7us        cari k=3   rows 400   mkl 20.4us
+    1  worker     296.1us   5.313                1  worker    133.6us   6.555
+    2             195.6     3.509                2             91.4     4.485
+    4             123.7     2.220                4             55.4     2.719
+    8              74.3     1.332                8             38.1     1.867
+    16             53.2     0.954  <-- parity    16            30.3     1.487
+    32 shipped     63.0     1.130  <-- loses     25 shipped     29.4     1.442  <-- its best
+  six duplicates spread 1.03%                  six duplicates spread 0.52%
+```
+
+Fewer workers is not better. The curve is U-shaped and the shipped pool sits **past** the optimum on
+`lp_osa_14` and **at** it on `cari`. What survives is narrower and still useful: on `lp_osa_14`, 16
+workers crosses parity (0.954) where the shipped 32 does not (1.130), a 15% recovery on a cell the
+census counts as behind. On `cari` no setting reaches parity at all -- we are simply slower there.
+
+Two things this also settles.
+
+**The launch path is a small bias, not a large one.** At the shipped override, the private libgomp
+team and `at::parallel_for` are within 0.2% to 6% of each other, with the private team slightly
+*faster* on `cari` (27.2 vs 28.8 us). So mrgate having passed `atparallel=False` while
+`ops._composition_hints` ships `True` is a real discrepancy in what path gets timed, and it is worth
+single-digit percent on these cells rather than the launch cost the retracted mechanism needed. It
+still has to be measured across the population, which chain189 does as its P6.
+
+**The instrument is tight enough for this.** Six builds of the same setting spread 0.47% to 1.26%
+across four cells, so the 15% recovery on `lp_osa_14` is far outside the floor.
+
+### What chain189 asks instead
+
+Submitted to MKT as job 17339182, 32 CPUs -- the same allocation the census was computed under,
+because a different `--cpus-per-task` changes `omp_get_num_procs()` and with it every decision.
+
+P3's direction is deliberately **not** pre-registered, since the obvious one is already refuted. The
+question is a count: across the population, how many of the cells the census marks behind have SOME
+override that reaches parity while the shipped override does not, and what is that setting? Plus the
+two-sided guardrail (one worker must be far slower on the well-fed cells, which the smoke run says
+should hold by 5.3x, making it a sharp instrument check), a six-arm selection-bias null for the
+per-cell oracle, the launch factor, and the GCN guardrail -- because chain59's pair moved 27 guarded
+GCN/AE cells and a thread-count stage that does not time them prices one side of a two-sided trade.
