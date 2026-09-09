@@ -24450,3 +24450,33 @@ matched, 222 identical, over 164497 instructions** -- the same verdict, now with
 demonstrated on this host, on these objects, that it can say CHANGED has demonstrated nothing. The
 only reason I looked further was a flat digest difference at identical byte size, which is the
 weakest signal in the toolbox and this time the only one telling the truth.
+
+### What the width-2 reading implies about how a width-1 rule must be implemented
+
+The 2.61% at width 2 is worth pinning down, because it decides both the interim commit and the shape
+of any eventual fix.
+
+At width 2 the fix and `w1s8` select the same unroll for every degree, so no decision differs. What
+does differ is the code. In `w1s8` the ternary is `(exact_width == 1) ? mult_w1 : mult` where both
+operands are release-build constants equal to 8, so it folds and the object is effectively the
+pre-fix shape. In the fix they are 1 and 8, so the select survives. `w1s8` being 2.61% faster at
+width 2 therefore reads as **the cost of the select, paid at every width, for a decision that only
+matters at width 1** -- and paid at exactly the width where the gate earns its 19-20%.
+
+That is not a per-call arithmetic cost; a ternary on a loop-invariant is nanoseconds. It is that the
+extra live value shifts register allocation and inlining for the whole function, which is the same
+mechanism as the layout artefact elsewhere in this stage. The consequence is the same either way.
+
+So the implementation constraint for whatever chain187 recommends: **the width-1 rule must live
+inside a code path that already knows the width is 1**, not in a select evaluated on every call.
+The dispatch below the ladder already branches on `exact_width`, so a width-1 rule placed there
+leaves widths 2 and 3 emitting what they emitted before, and that can be checked per symbol rather
+than argued. The current fix's placement -- one line above, in code common to all widths -- is why
+it is not free.
+
+This also settles the interim question. The fix buys a wash at width 1 (it wins one band and loses
+a larger one) and costs 2.61% at width 2. Reverting removes that cost and restores a 12.64% deficit
+in the 16-32 band while removing a 5.16% deficit in 8-16, which is a wash by the same arithmetic.
+Neither state is right, so the tie-breaker is the width-2 cost, which only one of them carries.
+**`1fe74c0` reverts once MKT confirms**, and the width-1 policy stays open until chain187 measures
+it -- which is what "committed UNVERIFIED, reverts if it does not hold" was for.
