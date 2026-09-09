@@ -24616,3 +24616,25 @@ One process note. The first attempt at the poller was launched with a trailing `
 backgrounded command, which detached it from the harness and meant no completion notification would
 arrive. Relaunched without it. The tell was that the "poller" task exited immediately, carrying the
 tail of redwood's log -- which is how the `FileNotFoundError` surfaced at all.
+
+### The rotation table named its arms, so it was wrong for every stage but the first
+
+chain187's first launch refused at its own balance check -- `a pass does not list exactly the
+builds` -- after paying for four builds. `orders8.txt` held chain185's build NAMES
+(`c0 c0b w1s8 w1pg`); chain187's arms are `f1 f2 f4 f4b`. The check was right and fired in the right
+place; the table was simply written for one stage and inherited by another.
+
+Fixed at the root rather than by copying the file: the table now holds **indices** (`1 2 3 4`) and
+the stage maps them onto `$BUILDS`, so a table cannot name arms that do not exist. The balance check
+still runs, on the mapped result, because the mapping is now the thing that could be wrong.
+
+Tested four ways before relaunching: the mapping produces the expected 8 lines; the mapped table is
+still balanced in position and in ordered-adjacent pair (position counts [2], all 12 of 12 pairs at
+[2]); a line that is not a permutation refuses; and a table whose arity does not match `$BUILDS`
+refuses. Both hosts relaunched on cleared directories, and redwood has since confirmed
+`position AND predecessor balanced` and begun timing.
+
+That is the third harness defect in this stage of the same family -- a check that had only ever run
+against the inputs it was written for. The first two were the pre-flight looking for its resolver in
+the wrong directory, and the pre-flight reading a guardrail list a previous failed run had left
+behind.
