@@ -24822,3 +24822,85 @@ One tool defect fell out of the testing. `fmtcheck.py` validates `%`-operator fo
 analyzer line read `about 12.65%% behind` inside a plain `print()` with no operand -- escaping is
 only correct under the operator, so it printed two characters. The check now also refuses `%%` in a
 string no `%` operator ever touches, and both directions are self-tested.
+
+## The scoreboard, finally counted: 8 cells behind on redwood, 55 on MKT, and not where the last four chains were working
+
+chain185, chain187 and chain188 all worked on the width-1 unroll at mean degree 8-32. Nobody had
+counted, on either host, how many cells that regime is actually behind MKL in. `an_mklcensus.py`
+counts them: `ours/mkl` per mean-degree bin per width, over chain187's release builds, with the
+identical-source pair as the floor and the bootstrap CI over matrices in every cell.
+
+A cell is one (matrix, width) pair, because that is the resolution at which "beats MKL everywhere"
+is either true or false. A cell within ±1% of parity is called level, not won and not lost.
+
+**float32, 61 matrices, both hosts, same corpus (verified: 61 shared, 0 host-only — the corpus
+resolution defect of chain186 is gone).**
+
+| host | target group, nnz≥1e6 | control group, nnz<1e6 | total behind |
+|---|---|---|---|
+| redwood | **0 of 170 behind** | 8 of 95 behind | **8 of 265** |
+| MKT | 23 of 170 behind | 32 of 95 behind | **55 of 265** |
+
+Read the width-1 column with care: chain187's arms *force* the width-1 unroll, so at width 1 these
+are not the shipped decision. Widths 2, 3, 4 and 8 are inert to that force and do stand for the
+shipped object.
+
+### Where the deficit is
+
+**Both hosts lose in the `>=128` mean-degree bin, on the same five matrices.**
+
+```
+redwood, >=128 control bin, ours/mkl per matrix, f4 arm
+  matrix                                                    deg      nnz   k=1    k=2    k=3    k=4    k=8
+  dlmc/rn50/variational_dropout/0.9/bottleneck_1_...       133.4    17081  0.691  0.644  0.698  0.703  0.716
+  dlmc/transformer/l0_regularization/0.5/...output_transform 323.3  165516  0.985  0.996  1.047  1.054  0.887
+  dlmc/transformer/magnitude_pruning/0.7/...v_fully_connected 153.6  78643  0.888  0.934  1.003  1.054  0.892
+  ss/cari/cari                                             382.0   152800  0.886  0.966  1.054  1.023  0.877
+  ss/lp_osa_14/lp_osa_14                                   135.7   317097  0.826  0.966  1.056  1.188  1.190
+```
+
+Four matrices, eight cells, all at k=3 or k=4 except lp_osa_14 which also loses k=8. `lp_osa_14` is
+already characterized and already exhausted: it holds a tenth of its nonzeros in a single row, so
+whole-row partitioning caps it near 40% of the machine regardless of the kernel.
+
+**MKT loses the same bin far harder, at every width**, 1.09x to 1.39x with tight CIs and an
+identical-source floor of 0.99-1.00:
+
+```
+MKT, >=128 control bin          geomean  95% CI            ahead/level/behind
+  k=1                            1.2468  [0.9523, 1.5679]  1/0/4
+  k=2                            1.3850  [1.1767, 1.6305]  0/0/5   BEHIND
+  k=3                            1.2938  [1.1683, 1.4329]  0/0/5   BEHIND
+  k=4                            1.2035  [1.0849, 1.3238]  0/1/4   BEHIND
+  k=8                            1.0914  [1.0778, 1.1136]  0/0/5   BEHIND
+```
+
+**MKT additionally loses k=2 and k=3 in the bins the recent chains have been polishing.** 12 of its
+23 target-group losses are there:
+
+```
+MKT, target group               geomean  95% CI            ahead/level/behind
+  8-16   k=2                     0.9594  [0.9443, 0.9774]  19/0/3
+  8-16   k=3                     0.9728  [0.9521, 0.9959]  16/1/5
+  16-32  k=2                     1.0204  [0.9838, 1.0682]  6/2/4
+  16-32  k=3                     1.0361  [1.0021, 1.0719]  3/2/7
+```
+
+Note the geomeans are near parity while the cell counts are not: the bin wins on average and loses
+on individual matrices. A geomean is the wrong statistic for a goal stated as "everywhere", which is
+why the count is what is reported.
+
+### What this means for what to work on
+
+On redwood the width-1 regime the last three chains addressed is **ahead of MKL by 1.4x to 2.0x in
+every one of its 170 cells** (geomeans 0.50 to 0.71). The shipped width-1 rule improves a margin
+there, not a deficit. That is worth having and it is not worth another chain.
+
+The deficit that remains is, on both hosts, **high mean degree at narrow k**, and on MKT also **k=2
+and k=3 generally**. One of the four redwood matrices is a known row-skew ceiling. That is where the
+next stage should aim, and it is a different mechanism from anything chain185-188 touched.
+
+Two limits on the claim. It is a **kernel-level** comparison -- `mrgate` times
+`scorch_ops.spmm_csr_float_v2` directly against `torch.sparse.mm`, so it is not a statement about
+`scorch.matmul` end to end, which is measured separately and reads differently. And it is float32
+only; float64 has its own census.
