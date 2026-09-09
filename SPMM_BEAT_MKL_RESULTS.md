@@ -24283,3 +24283,88 @@ labelled as not pre-registered, width 1 across **every** band: the ladder makes 
 fix for all degrees in [2,32), and at 4-16 by a larger unroll step (1 against 4) than in the band
 the claim names (2 against 4), so those bands must move too and a band that refuses to move is
 evidence about the mechanism.
+
+### chain185, redwood half: the fix does not do what it was committed to do
+
+37 target matrices, 8 position- and predecessor-balanced passes, four builds (`c0` = the fix as
+committed, `c0b` = the same source built again, `w1s8` = the width-1 multiplier back at 8,
+`w1pg` = the whole gate reverted). Estimator chosen at width 4, a control: raw gave an A/A
+half-width of 0.273% there against 0.890% for `ours/mkl`, so raw, applied unlooked-at to widths
+1-3. Every A/A arm came out equivalent at every width, so the floors below are real floors.
+
+What makes the readings interpretable is the decision table. `SCORCH_NARROWK_EXACT_UNROLL` is 4,
+the generic multiplier is 1, `..._MULT_F32` is 8 on AVX2, and the fix's `..._MULT_W1_F32` defaults
+to the generic 1 (which P1 confirmed by preprocessor expansion). So at width 1:
+
+    mean degree     c0 (the fix)   w1s8 (pre-fix)   w1pg (gate reverted)
+    2-4                 2               1                  2
+    4-16                4               1                  4
+    16-32               4               2                  4
+    >=32                4               4                  4
+
+`c0` and `w1pg` therefore make **identical** width-1 decisions, and `c0` and `w1s8` make identical
+decisions at widths 2 and 3. That matters for reading what follows: where the decisions agree, a
+ratio measures the difference between two OBJECTS, not between two policies.
+
+    width 1, 16-32 band, n=12   w1s8/c0  1.1264 [1.0980, 1.1567]  +12.64%   SLOWER
+    width 1,  8-16 band, n=22   w1s8/c0  0.9484 [0.9336, 0.9658]   -5.16%   FASTER
+    width 1, all target, n=37   w1s8/c0  1.0071 [0.9799, 1.0374]   +0.71%   indeterminate
+    width 2, all target, n=37   w1s8/c0  0.9739 [0.9640, 0.9841]   -2.61%   FASTER
+    width 3, all target, n=37   w1s8/c0  1.0064 [1.0009, 1.0113]   +0.64%   indeterminate
+    width 4, all target, n=37   w1s8/c0  1.0039 [1.0020, 1.0057]   +0.39%   inside
+    width 8, all target, n=37   w1s8/c0  1.0004 [0.9960, 1.0048]   +0.04%   inside
+
+**The regression is real and the fix does address it.** In the 16-32 band at width 1 the pre-fix
+arm is 12.64% slower, which reproduces chain184's 12% on a corpus three times the size. Unroll 4
+beats unroll 2 there, decisively.
+
+**But the fix introduces a new deficit in the band next door.** At mean degree 8-16 the pre-fix arm
+is 5.16% FASTER than the fix -- unroll 1 beats unroll 4 -- and that band holds 22 of the 37 target
+matrices against the claim's 12. Over the whole target group at width 1 the fix is a wash:
++0.71% with a CI from -2.01% to +3.74%, and the CI is wide precisely because it averages two
+populations moving in opposite directions. **The fix moves the deficit from one band to another
+rather than removing it.** On 22 of 37 matrices it is a regression, which is the thing this line of
+work is under standing instruction not to ship.
+
+This was not pre-registered and it should have been. The ladder's own comment in `spmm.h` predicts
+it: setup is `2*UNROLL-1` scalar operations per row (UNROLL zero stores, UNROLL-1 adds), so the
+setup-to-work ratio is **sawtoothed in degree, peaking just above each threshold**. Forcing the
+multiplier to 1 makes unroll 4 apply from degree 4 upward, which lands 8-16 on the worst point of
+the sawtooth. chain184 measured the band where the gate hurt and pre-registered that band; the
+mechanism was there in the source saying the neighbouring band would move too.
+
+Two further readings, both about objects rather than policies:
+
+**The width-2 give-back is real but is not a decision.** At width 2 `c0` and `w1s8` select the same
+unroll for every degree, yet differ by 2.61% with a CI excluding parity -- against an A/A floor of
++0.27% at that width. A per-call ternary on a loop-invariant cannot cost 2.61% of a kernel, so the
+mechanism is code layout: the fix's extra variable and select shift register allocation and inlining
+downstream. It is still a measured 2.61% cost of the shipped object at the width where the gate
+collects its 19-20%, so P3's pre-registered condition -- "if w1s8 differs from the fix at widths 2-3
+then the branch cost something and the fix is not free" -- fails, and fails in the direction that
+matters.
+
+**Layout sensitivity dominates the identical-source floor by about tenfold.** Byte-identical `.text`
+pairs read 0.27% at width 2 here; two objects differing only in a branch not taken at that width
+read 2.61%. Any arm-vs-arm comparison in this line where the arms differ by a define therefore
+carries up to ~2.6% of layout artefact at width 2, which is larger than several effects previously
+chased. It also bears on chain182, which found a byte-identical pair differing +0.80% at width 2
+with a CI excluding parity: on the full 37-matrix corpus the same comparison is +0.27%
+[-0.01%, +0.69%] and equivalent, so that +0.80% looks like a property of the 18-matrix subset --
+78% one synthetic family -- rather than of the width. Different stage and different builds, so this
+is evidence rather than a replication.
+
+`w1pg`'s width-1 numbers (-1.14% in 16-32, -1.04% in 8-16, -0.99% overall) are the same class of
+artefact: it makes identical width-1 decisions to the fix, so the distance is the object, and P2's
+second half -- "w1pg must be INSIDE the A/A floor of the fix" -- was mis-specified. Recovery to
+pre-gate behaviour at width 1 is established by construction from P1 and the decision table, not by
+that ratio. Likewise `w1pg` reading +0.87% at width 4, above `SCORCH_NARROWK_EXACT_HI`=3 where the
+multiplier is not consulted at all, is the artefact and is the reason P4 records a failure.
+
+Guardrail: GCN at width 3 reads A/A 1.0155, `w1s8` 1.0130, `w1pg` 1.0903 -- the fix is inside GCN's
+own floor, and reverting the gate would cost GCN 9%. The gate itself is worth keeping; it is the
+width-1 correction that is wrong.
+
+Verdict on redwood: **P2 half holds, P3 fails, P4 fails.** MKT is still running the same stage; the
+commit decision waits for it, but nothing MKT can report would make a 5.16% deficit on 22 of 37
+matrices shippable.
