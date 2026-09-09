@@ -1109,26 +1109,36 @@
 // same halving is the win, because there are two or three multiply-adds per nonzero to hide the
 // per-row setup behind; at width 1 there is one.
 //
-// MKT's reading of 1.0010 is an average over bands this mechanism cannot move, because its target
-// group held NO matrices in the 16-32 band. That was NOT a property of the machine: MKT's cache
-// stores SuiteSparse group-qualified while the corpus list is flat, and the selector's exact-path
-// lookup silently dropped the 50 keys that differ -- every real-world FEM and circuit matrix, hence
-// the whole band. With the resolution fixed MKT resolves 298 of 298 and its census matches
-// redwood's exactly: 12 matrices in 16-32, 37 target at median nnz 1205518.
+// REVERTED. There is no width-1 multiplier, and the measurements are why.
 //
-// So width 1 keeps the pre-gate constant. Neutral at every other width by construction (the value
-// there is unchanged) and it restores width 1 exactly (the value there is the one it had before the
-// gate). float64's multiplier is already the shared 1, so this is a no-op for float64.
+// chain185 gave the shipped constant (1 at width 1, so unroll 4 from mean degree 4 upward) a proper
+// grid: 37 target matrices, 8 position- and predecessor-balanced passes, both hosts, and for the
+// first time an identical corpus on both. Against the pre-gate behaviour at width 1 it reads, on
+// redwood (i9-14900K, AVX2 only):
 //
-// The GENERAL correction is to compare `mean_deg * exact_width` against `unroll * C`, which is the
-// trade the ladder's own comment describes. That moves widths 2 and 3 as well, so it needs its own
-// grid and is deliberately NOT what this does.
-#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F32
-#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F32 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
-#endif
-#ifndef SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64
-#  define SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64 SCORCH_NARROWK_EXACT_DEGUNROLL_MULT
-#endif
+//     mean degree 16-32, n=12    unroll 4 beats unroll 2 by 12.6%   [1.0980, 1.1567]
+//     mean degree  8-16, n=22    unroll 1 beats unroll 4 by  5.2%   [0.9336, 0.9658]
+//     whole target group         a wash: +0.7%, CI -2.0% to +3.7%
+//
+// So the constant wins the band chain184 measured and loses the band next door, which holds nearly
+// twice as many matrices. That is the sawtooth this file's ladder comment describes -- setup is
+// 2*UNROLL-1 scalar operations per row, so the setup-to-work ratio peaks just above each threshold
+// -- and a multiplier of 1 lands 8-16 on the worst point of it.
+//
+// On MKT (EPYC 9334, Zen4) every one of those cells is flat: 1.0005 in 16-32 and 1.0018 in 8-16,
+// both inside the floor. The hosts do not compile the same kernel. `-march=native` defines
+// __AVX512F__ and __AVX512VL__ on Zen4 and nothing on Raptor Lake, whose AVX-512 is fused off, and
+// MKT's object carries 2565 zmm instructions and 56 mask-register uses in the SpMM symbols. The
+// unroll trade is scalar per-row setup against vector work, and AVX-512 masking removes the
+// remainder structure the trade is made of. THE WIDTH-1 UNROLL QUESTION IS AVX2-ONLY, so anything
+// that ever ships for it must be gated on !defined(__AVX512F__) and be provably inert on an
+// AVX-512 build.
+//
+// What IS confirmed on both hosts is the gate above at the widths it was raised for: reverting it
+// costs 15.1-16.6% at width 2 and 11.1-22.1% at width 3. The gate stays. Only its width-1 side
+// effect is open, and the ladder cannot express the answer -- it halves from 4, so every multiplier
+// it admits passes through unroll 2, while the measured cells want 1 below 16 and 4 above.
+// SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE below is how that gets measured directly.
 // A MEASUREMENT HOOK for the width-1 unroll, not a policy. chain185 put the ladder's two reachable
 // width-1 decisions against each other over 37 matrices and 8 balanced passes, and the trade is
 // not monotonic in degree: at mean degree 16-32 unroll 4 beats unroll 2 by 12.6%, while at 8-16

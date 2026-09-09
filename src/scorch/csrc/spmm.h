@@ -3969,12 +3969,6 @@ torch::Tensor spmm_csr_v2_core(
   long narrowk_exact_degunroll_mult =
       std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F32
                                            : SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_F64;
-  // The same constant for the narrowest width, which has one multiply-add per nonzero to amortise
-  // the per-row setup instead of two or three. See scorch_policy.h for what the shared value costs
-  // at width 1 on redwood's degree-16-32 band (0.8792 over 12 matrices, 10 families).
-  long narrowk_exact_degunroll_mult_w1 =
-      std::is_same<scalar_t, float>::value ? SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F32
-                                           : SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1_F64;
   long narrowk_exact_mindeg = SCORCH_NARROWK_EXACT_MINDEG;
   // How many scalars the kernel may keep live across a row. acc[UNROLL][K] is UNROLL*K
   // of them, and choosing UNROLL without reference to K spills: at K=6 with UNROLL=4 that
@@ -4024,8 +4018,6 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) narrowk_exact_degunroll = std::atol(e) != 0; }
   { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL_MULT");
     if (e && *e) { long v = std::atol(e); if (v >= 1) narrowk_exact_degunroll_mult = v; } }
-  { const char* e = std::getenv("SCORCH_NARROWK_EXACT_DEGUNROLL_MULT_W1");
-    if (e && *e) { long v = std::atol(e); if (v >= 1) narrowk_exact_degunroll_mult_w1 = v; } }
   // A/B hook with no candidate policy: price the cost of ASKING, in a loop where the compiler was
   // caught not hoisting a question it could have. chain71 found the multi-row dispatch's eight
   // loop-invariant terms costing 0.7-7% per row -- most on the shortest rows -- at a width the
@@ -4142,12 +4134,8 @@ torch::Tensor spmm_csr_v2_core(
     // degree 2-4, -15.7% at 4-8, +4.8% and above from 8 up. MULT=2 requires a row to hold two
     // unrolls before taking one, which caps the ratio at 7/8 instead of 7/4 and moves only two
     // bands (degree 2-4 from unroll 2 to 1, and 4-8 from 4 to 2).
-    // Width 1 uses its own multiplier; see scorch_policy.h. Every other width reads the shared
-    // one, so this branch cannot change what they select.
-    const long degunroll_mult = (exact_width == 1) ? narrowk_exact_degunroll_mult_w1
-                                                   : narrowk_exact_degunroll_mult;
     while (exact_unroll > 1 &&
-           mean_deg < (long)exact_unroll * degunroll_mult) exact_unroll >>= 1;
+           mean_deg < (long)exact_unroll * narrowk_exact_degunroll_mult) exact_unroll >>= 1;
   }
 #if SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE
   // A measurement hook, 0 in a release build; see scorch_policy.h for why the ladder cannot

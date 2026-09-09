@@ -24480,3 +24480,108 @@ in the 16-32 band while removing a 5.16% deficit in 8-16, which is a wash by the
 Neither state is right, so the tie-breaker is the width-2 cost, which only one of them carries.
 **`1fe74c0` reverts once MKT confirms**, and the width-1 policy stays open until chain187 measures
 it -- which is what "committed UNVERIFIED, reverts if it does not hold" was for.
+
+### chain185, MKT half: the hosts do not compile the same kernel, and the whole width-1 story is AVX2-only
+
+MKT ran the identical stage on the identical corpus -- 37 target matrices at median nnz 1205518,
+the same band census, 8 balanced passes -- and it disagrees with redwood on every width-1 cell.
+
+    cell                          redwood                        MKT
+    width 1, 16-32 band  w1s8     1.1264 [1.0980,1.1567] SLOWER  1.0005 [0.9864,1.0167] inside
+    width 1,  8-16 band  w1s8     0.9484 [0.9336,0.9658] FASTER   1.0018 [0.9887,1.0138] indeterminate
+    width 2, all target  w1s8     0.9739 [0.9640,0.9841] FASTER   1.0133 [1.0067,1.0202] indeterminate
+    width 2, all target  w1pg     1.1656 [1.1426,1.1877] SLOWER   1.1513 [1.1247,1.1774] SLOWER
+    width 3, all target  w1pg     1.2211 [1.1925,1.2454] SLOWER   1.1107 [1.0902,1.1310] SLOWER
+    widths 4 and 8       w1s8     inside both hosts              inside both hosts
+
+**Confirmed on both hosts:** the gate 28762af earns its keep at the widths it was raised for --
+reverting it costs 15.1% (MKT) to 16.6% (redwood) at width 2, and 11.1% to 22.1% at width 3 -- and
+nothing happens at widths 4 or 8, above `SCORCH_NARROWK_EXACT_HI`. The gate stays.
+
+**Redwood-only:** everything about width 1, and the 2.61% width-2 "select cost" as well. MKT reads
+that at +1.33%, the opposite sign, so **the tie-breaker I used for the revert two sections above is
+refuted.** It was a one-host layout artefact and I should have waited for the second host before
+building an argument on it. The revert still happens, on the simpler ground below.
+
+The mechanism is not subtle once looked for. **`-march=native` compiles a different kernel on the
+two hosts.** MKT is an EPYC 9334 (Zen4), where it defines `__AVX512F__` and `__AVX512VL__`; redwood
+is an i9-14900K, whose AVX-512 is fused off, so it defines neither. That is not a guess about
+availability: MKT's SpMM symbols carry **2565 `zmm` instructions and 56 mask-register uses**, and
+redwood's object cannot carry one. The unroll trade is scalar per-row setup (`2*UNROLL-1` operations)
+against vector work, and AVX-512 masking dissolves the remainder structure the trade is made of. So
+the trade flattens, which is exactly what MKT measures.
+
+Two consequences that outlive this chain.
+
+**"Two-host confirmation" is weaker than it reads for anything AVX2-gated.** The gate itself is
+guarded by `__AVX2__ && __FMA__`, true on both hosts, but the code that guard admits is not the
+same code. For a claim about the exact-width kernel's unroll, redwood is the only host we have --
+the same coverage limitation already recorded for ARM, in a place nobody had looked. Anything that
+ships for width 1 must therefore be gated on `!defined(__AVX512F__)`, provably inert on an AVX-512
+build, which is the house pattern for a sub-regime win.
+
+**MKT's identical-source floor is 3 to 5 times redwood's, and it is biased, not merely wide.** Its
+A/A arm sits +0.69% off parity over the whole target group at width 1, +0.70% at width 4 and
++1.50% in the 16-32 band, with CIs excluding parity, against redwood's +0.03% to +0.27% and flat
+everywhere. Two builds of identical source, verified identical `.text`, differing by 1.5%. The
+rotation is balanced in position and predecessor, so it is not an order effect; the remaining
+candidates are NUMA placement of the two build directories' pages and co-tenancy on a shared
+cluster node, and this stage does not distinguish them. Until it does, **MKT cannot resolve an
+effect below about 1.5%**, and its role in this line is confirmation of large effects, not
+arbitration of small ones. That is worth knowing before the next stage treats a null there as
+evidence of absence.
+
+This also exposed a defect in my own analyzer, which is why the bias was visible at all. It printed
+`(equivalent)` for every A/A arm, because it judged the A/A arm against a floor **derived from that
+same arm** -- a tautology. Judged against the pre-registered 1% margin instead, redwood reads flat
+everywhere and MKT reads off-parity at four of five widths. A floor that certifies itself is not a
+floor.
+
+### The revert, on the ground that survives both hosts
+
+`1fe74c0` is reverted. Not because of the width-2 cost, which MKT refuted, but because of what is
+left after both hosts report: **it helps nowhere.** On MKT every cell it could move is inside the
+floor. On redwood it wins the 16-32 band by 12.6% and loses the 8-16 band -- nearly twice as many
+matrices -- by 5.2%, netting a wash with a CI straddling parity. An unverified performance change
+with no demonstrated benefit on either host does not stay in the tree; that is what committing it
+labelled UNVERIFIED was for.
+
+What is kept is the knowledge. The macro is gone from `scorch_policy.h` and its place now records
+the measured band numbers, the host asymmetry, the disassembly evidence, and the gating requirement
+for anything that ships later. The revert is verified as a revert rather than asserted: the
+reverted tree's object is compared per symbol against the tree as it stood before the fix, with the
+pre-fix-versus-fix comparison run FIRST as a positive control, because a neutrality tool that has
+not shown it can say CHANGED on this host has shown nothing.
+
+### A background job holding the worktree, and a commit that recorded the wrong tree
+
+The revert's first commit, `d965525`, said "revert" and recorded a tree in which the mechanism was
+still present. The cause is mine and it is worth stating plainly.
+
+`revertproof.sh` verifies a revert by building three trees in the SAME directory -- the reverted
+one, the pre-fix one, and the fix itself as a control -- switching between them with
+`git checkout <rev> -- src/scorch/csrc/`. It has to build in one directory, because build-path
+length alone changes bytes. I launched it in the background and then, while it was running, staged
+and committed. `git add -A src/scorch/csrc` therefore captured whatever revision the script had
+checked out at that instant, and the script's closing `git checkout HEAD -- src/scorch/csrc/`
+restored the worktree to that wrong commit, which is why nothing looked amiss afterwards.
+
+Caught by the source-level check that was supposed to be a formality: `git diff 1fe74c0^ HEAD`
+showed the mechanism as an ADDITION in HEAD. Re-applied, verified, and the commit amended -- nothing
+had been pushed.
+
+Two rules. **A script that mutates the worktree must not run in the background**, or must work in
+its own `git worktree` -- a build that switches revisions is exactly such a script, and the fact
+that it restores the tree afterwards makes the damage invisible rather than absent. And **for a
+revert, check the source diff against the pre-revert parent, not just a grep of the file you
+edited**: a grep of a file the tree no longer contains passes for the wrong reason.
+
+The revert is now verified twice over. At source level the only non-comment difference from the
+pre-fix tree is the `#if SCORCH_NARROWK_EXACT_UNROLL_W1_FORCE` block and its `#ifndef ... 0`
+default, which a release object cannot contain. At object level the reverted tree's build is
+identical to the pre-fix build across all **222 SpMM symbols over 164497 instructions** -- and this
+time with a positive control that genuinely differs on this host (FORCE=0 against FORCE=2, **34 of
+222 symbols changed**), because the control I used first -- pre-fix against the fix -- is
+ARM-inert by construction: on ARM both multipliers resolve to the generic 1, so the ternary folds
+and the two trees really are the same object. A control chosen from a change's semantics on
+*another* host proves nothing on this one.
