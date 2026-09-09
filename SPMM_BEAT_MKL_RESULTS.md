@@ -25367,3 +25367,76 @@ census's `>=128` mean-degree finding points at the B footprint rather than at th
 **Verdict: chain189 and chain190 CLOSED together.** The thread count is not a lever on either host;
 the ceiling on any rule of that kind is +0.06%; and the target has gone from "8 or 55 or 78 cells,
 depending which host you ask" to eight named cells on five named matrices at three widths.
+
+## The per-symbol disassembly of MKT's object: the narrow widths are scalar, and AVX-512 is not the lever
+
+Deferred until MKT was idle so it could not perturb a measurement. Two corrections came out of it
+before any finding did, and both are recorded because each would have produced a confident wrong
+answer.
+
+**First: I disassembled the wrong object.** `find /scr/bobbyy -name 'scorch_ops*.so'` returns
+`/scr/bobbyy/mr2h/c0` first -- a Sep 4 build whose `scorch_policy.h` is 1940 lines. chain189 built
+its own tree at `/scr/bobbyy/c189/c0` on Sep 9, from a 2443-line header. The two are different
+objects. Redone against the right one, and the right one's header md5 is
+`ae25d3ac62d1bdbcb32904994a7f3099`, **identical to this branch's tip**, so chain189 and chain190 did
+time the shipped configuration and the 8-cell list stands. This is the same trap as "the sweep arm
+is often not the shipped arm", one layer out: the object was picked by a glob rather than named by
+the stage.
+
+**Second: a per-symbol census is blind to the kernels that were inlined.** The object contains
+`narrow_exact<float,K,U>` for K=2..7 and **no `<float,1,*>` at all**, although the dispatch plainly
+has `case 1: SCORCH_RNE_U(1)`. Likewise `regblock<...,scorch_simd_half<float>>` -- the k=4
+half-vector path that `HALFVEC_F32=1` selects -- has zero symbol-table entries. Both were fully
+inlined into `spmm_csr_v2_core<float,false>` at `-O3`. So the widths this milestone cares about most
+are exactly the ones a per-symbol vector-width count cannot see, and the count must not be read as
+"that path is dead".
+
+### Asked of the preprocessor with the build's own `-march`, on MKT
+
+```
+  EXACT_HI_F32 = 3    EXACT_HI_F64 = 3    MULTIROW_ROWS_F32 = 0
+  HALFVEC_F32  = 1    NARROWK_EXACT_UNROLL = 4    __AVX512F__ = yes
+```
+
+So k=2 and k=3 take the exact-width kernel at unroll 4, k=4 takes the half-vector register block,
+k=5-8 take the full-vector one, and MKT compiles with AVX-512 available.
+
+### The hot loops, on the object chain189 timed
+
+```
+  kernel                                  loop insns   scalar-suffix   packed-suffix
+  narrow_exact<float, 2, 4>                    34            10              5
+  narrow_exact<float, 3, 4>                    46            14              8
+  regblock<float, 1, true, simd<float>>        42             4              4
+  regtile<float>                               23             0              8
+```
+
+`narrow_exact<float,3,4>`'s loop is `vmulss` x8, `vfmadd231ss` x2, `vmovss` x4, `vunpcklps` x4,
+`movslq` x8 -- the arithmetic is **scalar**, and a third of the loop assembles vectors lane by lane.
+`regtile` by contrast is 23 instructions with 4 `vmaskmovps` and 4 `vfmadd132ps` on `ymm`: masked
+loads and packed FMAs, nothing wasted.
+
+**This does not make the exact-width kernel a defect.** Its own source comment records it beating
+the packed alternative by 6-8% at k=2 and k=3, and the reason is in the numbers above: at k=3 the
+register-block kernel fills 3 lanes of 8 and pays an `imul` per nonzero for a runtime stride, so
+scalar-but-tight wins against packed-but-mostly-empty. The measurement stands.
+
+**And it means AVX-512 is not the lever for these cells.** A 512-bit register holds 16 floats; at
+k=3 a single B row is 3. Widening the vector makes the lane waste worse, not better -- 3 of 16
+instead of 3 of 8. The earlier note that `_mm512` appears zero times in the C++ layer is still a
+true source fact, but the inference from it to "that is why MKT loses 55 cells" does not survive
+this reading, because the cells MKT loses are at k=3, 4 and 8, and none of those widths can use a
+512-bit lane on one B row.
+
+### What the reading actually points at
+
+Neither kernel vectorizes across **nonzeros**. Both vectorize across k, which is 3 or 4 wide on
+every one of the eight host-invariant cells. The untried shape is to hold several nonzeros'
+contributions in one packed register -- gather `B[col[j]*k + c]` over j at fixed c -- which is full
+lanes at any k. That is a kernel design with its own correctness and measurement obligations, not a
+constant to flip, and it is the first thing on this list that has not already been measured and
+rejected.
+
+It also sits next to the other half of the eight: `connectus` and `lp_osa_14` are bound by one row
+holding a tenth of the nonzeros, which is a partitioning problem, not an arithmetic one. Two
+different fixes for two halves of the same eight cells.
