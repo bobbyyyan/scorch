@@ -24585,3 +24585,34 @@ time with a positive control that genuinely differs on this host (FORCE=0 agains
 ARM-inert by construction: on ARM both multipliers resolve to the generic 1, so the ternary folds
 and the two trees really are the same object. A control chosen from a change's semantics on
 *another* host proves nothing on this one.
+
+### chain187 launched, after two staging bugs that had been passing on borrowed state
+
+Both hosts are running chain187 (redwood directly, MKT as job 17333551). Getting there took two
+fixes, and both are the same shape: a check that had never actually run on its own input.
+
+**The pre-flight looked for its harnesses in the wrong place.** It did `sys.path.insert(0, ".")` and
+imported `csrresolve`. MKT's sbatch copies every harness into the run directory and cds there, so
+"." held them; redwood keeps harnesses in `/scratch/bobbyy` and runs the stage in
+`/scratch/bobbyy/c187`, where "." holds none. It refused, correctly, for a reason about staging
+rather than about resolution. Fixed by having both launchers export `HARNESS_DIR` and the body read
+it -- explicitly on MKT too, where it had been working by accident.
+
+**The pre-flight read a file the body created twelve lines later.** It resolves both key lists,
+including the GCN guardrail's `keys_gcn.txt`, which was written *after* it. On both hosts, a fresh
+run directory now dies with `FileNotFoundError`. It had passed on MKT during chain185 only because
+an earlier failed attempt -- the job that ran eight timing passes before `mrgate.py` refused -- had
+left that file behind in `/scr/bobbyy/w1fix`. **The check was reading a leftover from a previous
+run.** Both hosts reproduced the failure identically once their directories were cleared, which is
+the confirmation that the earlier pass was borrowed.
+
+chain185's MKT numbers are unaffected: the leftover file contained the same three keys the same
+`printf` writes, and the timing used the file its own run wrote. Only the check was hollow, not the
+data. The guardrail list now sits immediately before the pre-flight, with a comment saying why, and
+both run directories were cleared before relaunching so the fixed ordering is tested on a fresh
+tree rather than on the state that hid the bug.
+
+One process note. The first attempt at the poller was launched with a trailing `&` inside the
+backgrounded command, which detached it from the harness and meant no completion notification would
+arrive. Relaunched without it. The tell was that the "poller" task exited immediately, carrying the
+tail of redwood's log -- which is how the `FileNotFoundError` surfaced at all.
