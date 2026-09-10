@@ -26005,3 +26005,123 @@ width 8 and 0.4% at width 4. A mechanism that is about outstanding loads and ind
 should not care which kernel is emitting them; this one does.
 
 `SCORCH_SPMM_MULTIROW_HALFVEC` stays at 0, now for a measured reason rather than an unmeasured one.
+
+## chain195: the register block's B-row prefetch costs 15%, and removing it moves no cells
+
+Redwood, 8 passes, 61 matrices plus a three-graph GCN guardrail, four builds, 7320 rows each, 0
+refusals. The arms differ in one immediate: `SCORCH_SPMM_REGBLOCK_PFD` at 2 (`c0`, what ships), 0
+(`pfd0`) and 8 (`pfd8`), with `c0b` the identical-source floor.
+
+### Gates
+
+`.text` digests: `c0` and `c0b` identical, `pfd0` and `pfd8` each distinct from `c0`. The
+preprocessor, asked with the build's own `-march=native`, reads 2 by default, 0 in `pfd0`, 8 in
+`pfd8`. Correctness 100 cases per arm over dtype x rows x density x width, 0 mismatches on all four.
+Rotation: 8 passes, position counts all 2, ordered-pair counts all 2 over 12 of 12 pairs -- position
+and predecessor both balanced. P0 refused unless each of the five named matrices resolved to exactly
+one key, which is the gap chain192 had (its 1e6-nonzero split put three of them in the control
+group, so its per-cell report never reached them).
+
+The default was proven byte-neutral before the stage was written, with the prediction stated first:
+spmm.h gained a net 4 lines above 10 assertion sites, so their baked `__LINE__` immediates must move
+by exactly 4 and nothing else may differ. Two builds of the default at the same absolute path:
+`.text` 715033 bytes each, 162930 instructions each, 10 differences, every one a `$imm` moved by
+exactly +4, 0 unexplained. **The two objects' `.text` digests differ** (`d4417fc6` against
+`5c3094fb`) at identical size, because those 10 immediates live in `.text` -- a digest check would
+have failed a neutral object, which is why the instrument classifies differences instead of hashing
+them.
+
+### P3a does not hold: the inert widths move up to 3.69%
+
+At widths 1, 2 and 3 the exact-width scalar kernel and the nonzero-axis gather kernel claim the row
+first, so the constant provably cannot fire. It reads:
+
+| k | `pfd0`/`c0` | `pfd8`/`c0` | A/A |
+|---|---|---|---|
+| 1 | -1.64% | -1.42% | 1.0030 [0.9978, 1.0082] |
+| 2 | +2.26% | **+3.69%** | 0.9972 [0.9927, 1.0019] |
+| 3 | -1.39% | -2.40% | 0.9979 [0.9942, 1.0013] |
+
+That is the layout artefact, and 3.69% is larger than the 1-2.6% this project has previously
+measured for it. It is stated as a failure rather than tuned around, and it sets the bar the firing
+widths have to clear.
+
+### P3b: the answer is less prefetch, not more
+
+No direction was pre-registered and both were supported by something already measured. Latency-bound
+predicted `pfd8` wins; issue-bound predicted `pfd0` wins.
+
+| k | `pfd0`/`c0` | 95% CI | `pfd8`/`c0` | 95% CI | A/A |
+|---|---|---|---|---|---|
+| **4** | **0.8542 (-14.58%)** | [0.8422, 0.8667] | 1.0253 (+2.53%) | [1.0153, 1.0360] | 1.0008 [0.9969, 1.0046] |
+| **8** | **0.8379 (-16.21%)** | [0.8287, 0.8481] | 0.9632 (-3.68%) | [0.9526, 0.9771] | 1.0055 [0.9987, 1.0149] |
+
+Removing the prefetch is worth **14.6% at width 4 and 16.2% at width 8**, against a ±1% A/A floor
+and the 3.69% artefact ceiling above -- four times the artefact, at both firing widths, on two
+different instantiations of the same loop (the 128-bit half-vector one at width 4, the 256-bit one
+at width 8). Deepening it to 8 nonzeros is *slower* at width 4 and only 3.68% faster at width 8, so
+the ordering across the three values of one macro is monotone in the same direction: 0 beats 2 beats
+8 at width 4.
+
+**Issue-bound was the right prediction.** The prefetch and its bounds test are 9 of 23 instructions
+per two nonzeros; removing them takes 11.50 instructions per nonzero to 7.00. The latency argument
+was not wrong about the latency -- connectus at width 4 really does gather over a 6.32 MB B, an L2
+miss and an L3 hit -- it was wrong that a prefetch could pay for the attempt. A run-ahead of two
+nonzeros cannot cover 40 cycles, and the fix is not a longer one; it is not paying.
+
+`SCORCH_SPMM_ROW_PREFETCH` guards exactly one site in the whole file, the one this constant now
+parameterises, so `pfd0` is the same object `SCORCH_SPMM_ROW_PREFETCH=0` builds. That matters
+because **MKT job 17274394, held, is the `pf0` arm** -- the second host's reading of this exact
+result is already queued and is Bobby's to release.
+
+### P4: it moves no cells, and the named cells cannot resolve one
+
+Pooled over every target matrix at widths 1, 2, 3, 4 and 8, `c0` is at or below parity on 170 of 170
+cells and so is `pfd0`: **+0 cells, 0 taken and 0 given back.** The target group is one we already
+win everywhere, so a 15% kernel win there cannot show up as a count.
+
+The five named matrices are the cells the goal is about, and per cell the answer is also +0 -- but
+here the reason is resolution, not the effect. The identical-source pair moves up to **0.285** on
+`lp_osa_14` at width 8 (`c0` 1.3456 against `c0b` 1.0604) and 0.062-0.065 on `cari` and `lp_osa_14`
+at width 3. Eight passes pool well over 37 matrices and resolve single cells on these matrices
+badly. Two readings show the size of the problem rather than an effect: `cari` at width 3 goes
+1.0074 to 0.9923, which crosses parity but by less than that cell's own 6.2% A/A; `lp_osa_14` at
+width 3 goes 1.0047 to 1.1315, 12.7% the wrong way at a width the constant **cannot fire at**.
+
+So: a large, well-resolved pooled win at the two firing widths, and no cell moved. Both halves are
+the result.
+
+### P5: the GCN guardrail is neutral-to-better at the firing widths
+
+| k | `pfd0`/`c0` | `pfd8`/`c0` | floor |
+|---|---|---|---|
+| 3 | -1.61% | +0.31% | ±1.00% |
+| 4 | -1.41% | -0.82% | ±2.86% |
+| 8 | -2.97% | -1.71% | ±2.96% |
+| 16 | -0.56% | +0.17% | ±1.00% |
+
+Nothing is slower. Note the shape: the win falls from 15% on the target corpus to 1.4-3.0% on the
+GCN graphs at the same widths, and to 0.56% at width 16.
+
+### Two instrument fixes, both proven number-preserving
+
+The analyzer derived its control widths as "everything except the firing width" and refused only if
+the estimator was chosen *at* that one width. This constant fires at **two** widths, so the old code
+would have pooled width 8 into the control -- understating the artefact and hiding a real cost
+inside its own control -- and would have accepted the default `--est-k 8`, choosing the estimator on
+a width the constant acts at. It now takes `--also-fires-at`, derives the control as the complement
+of the whole firing set, and checks the estimator against every firing width.
+
+The guardrail block reported a typed `(3, 16)`. The stage was changed to measure 4 and 8 -- the two
+firing widths -- and the analyzer stayed silent about them, so the guardrail was reporting only the
+widths where the change is inert. It now reads the widths out of the data.
+
+Both patched files reproduce chain192's analysis byte for byte (106 lines, identical), and the new
+refusal was positive-controlled by asking for `--est-k 8 --also-fires-at 8`.
+
+### What this is not yet
+
+Not a shipping candidate. The kernel serves widths 4 through 32 (NVEC 1..4) and this stage measured
+4 and 8; the GCN reading at 16 is only -0.56%, which is where the win appears to fade. Before the
+default could move: widths 16 and 32 on the main corpus, float64, the autoencoder and transformer
+families, and the second host. The constant stays at 2.
