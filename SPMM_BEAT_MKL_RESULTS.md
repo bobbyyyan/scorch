@@ -25674,3 +25674,84 @@ Two things must not be assumed on the way in. The direction is **not** pre-regis
 presumably added because it won, so this is two-sided. And unlike the width-1 rule, width 4 is a
 width the GCN and autoencoder layers actually use, so the guardrail is load-bearing here rather than
 decorative -- it cannot be waved through with "provably inert".
+
+## chain192: the half-vector kernel is decisively earned, and my width-4 hypothesis is dead
+
+Redwood, 8 passes, 4 builds, 61 matrices, 7320 rows per build, 0 refusals, every precondition met.
+The prediction was that the 128-bit half-vector path at width 4 was leaving the machine idle and
+that removing it would help. **It is the opposite, and not marginally.**
+
+### P3b: removing the path costs 23.92%
+
+```
+    width 4, all bands   n=37   A/A control 0.9999 [0.9983, 1.0015]   FLAT
+             hv0 /c0     1.2392 [1.2239, 1.2538]   +23.92%
+             hv0b/c0     1.2383 [1.2221, 1.2533]   +23.83%
+```
+
+The two off-builds differ by 0.09%. Against MKL on the target group the path is worth
+**0.7086 with it against 0.8757 without**.
+
+And on the three cells that motivated the whole stage, removing it makes every one **worse**:
+
+```
+  matrix                              c0/mkl   hv0/mkl   hv0/c0
+  body_decoder_layer_3_self_attn       1.073     1.168    1.093
+  body_decoder_layer_5_encdec_attn     1.011     1.081    1.064
+  cari                                 1.054     1.122    1.092
+```
+
+So the half-vector kernel is not the cause of the width-4 deficit -- it is **mitigating** it by
+6-9% on exactly the cells that are behind. The reasoning that produced this stage ("width 4 is the
+only width on a 128-bit kernel, and its neighbour at width 8 gets the full 256-bit one, so the
+narrow vector is the deficit") is refuted. Width 4 is behind MKL *despite* this kernel, not because
+of it, and the cause is still unidentified.
+
+This is why no direction was pre-registered. Had the stage assumed the hypothesis, a +23.92% result
+would have been scored as a failure of the measurement rather than as a refutation of the idea.
+
+### Two gaps in the stage's own design, both mine
+
+**The stage did not report the cells that motivated it.** Its target group is nnz >= 1e6, and all
+three motivating matrices are 152-165K nonzeros -- so they fell in the *control* group and P4 never
+printed them. The numbers above came from a separate pass over the control group after the fact.
+The general result is unaffected, but a stage should measure where its question came from, and this
+one had to be asked twice.
+
+**The GCN guardrail does not cover the firing width.** The stage was written flagging that width 4,
+unlike the width-1 rule, is a width the GCN and autoencoder layers actually use, so "provably inert
+on the protected families" was not available and the guardrail would be load-bearing. The guardrail
+then ran **widths 3 and 16 only**. Width 4 is untested on the protected workloads. Since the
+verdict is "keep what ships", nothing is at risk here -- but had the result gone the other way the
+guardrail could not have cleared it, and that would have been discovered at the end.
+
+### P3a fails, and the reason is a design error in the arms
+
+`hv0` reads 0.95-1.58% faster than `c0` at widths 1, 3 and 8, where the constant cannot fire, while
+the identical-source control is flat at all four. Both off-builds move together, so it is
+systematic.
+
+The cause: `spmm_halfvec` is initialised from the compile-time constant
+(`spmm.h:3994`), so at `=0` the compiler folds `if (spmm_halfvec > 0)` to false and **deletes the
+block**. `hv0` is therefore a source-differing object, which is the exact confound chain191 existed
+to remove. Calling these arms "one immediate operand apart" was true of the macro and false of the
+emitted code, and the 0.95-1.58% spread sits squarely in the known 1-2.6% band for
+source-differing/decision-identical objects.
+
+Worse, **this experiment cannot be done with a decision-identical arm.** chain191's fix was a value
+that keeps the branch compiled in while preventing it firing; here `halfvec_exact = (B1_size == LH)`
+depends on `scorch_simd_half<T>::lanes`, a type property, not on the constant. No value of the
+constant keeps the block while stopping it firing at width 4. The knob is inherently on/off.
+
+**The conclusion survives anyway**, and it is worth being explicit about why rather than waving at
+it: the effect is +23.92% against a largest-artefact of 1.58% -- fifteen-fold -- and the artefact
+points the *other way*. A layout effect that makes `hv0` look 1.5% faster cannot manufacture a
+23.9% slowdown.
+
+### Where this leaves the width-4 deficit
+
+Unexplained, and now with one fewer candidate. What is known: it is not load balance (utilisation
+is 100.0% on those matrices), not density as a predicate (we beat MKL at 25-100% density), not the
+thread count (chains 189/190), and not the half-vector kernel, which is worth 24%. The same
+matrices at widths 2 and 8 beat MKL by 8-13%. Something specific to width 4 on 400-512 row matrices
+remains, and every cheap explanation is now spent.
