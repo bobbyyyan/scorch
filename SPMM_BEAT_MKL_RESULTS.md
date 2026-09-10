@@ -25883,20 +25883,24 @@ The standing plan named bandwidth as the remaining candidate for `connectus` and
 reasoning that a worker idled by imbalance frees no time if the workers beside it are themselves
 stalled on memory. That is testable from the matrix sizes.
 
-| matrix | rows | nonzeros | A bytes (values + int32 indices + indptr) | fits last-level cache |
-|---|---|---|---|---|
-| `connectus` | 512 | 1,127,525 | 9.02 MB | redwood 36 MB: yes; MKT 32 MB per CCX: yes |
-| `lp_osa_14` | 2337 | 317,097 | 2.56 MB | yes, both |
-| `cari` | 400 | 152,800 | 1.23 MB | yes, both |
-| transformer layer 3 | 512 | 165,516 | 1.33 MB | yes, both |
-| transformer layer 5 | 512 | 78,643 | 0.63 MB | yes, both |
+B has one row per *column* of A, so its size is a property of the shape and not a constant. At
+width 4, in float32:
 
-Every one of the five fits. B at width 4 is 8 KB and C is 8 KB, so the whole working set is
-cache-resident. Reading the rate off chain192's own sealed medians for `connectus` at width 4 gives
-100.0 GB/s for us and 125.1 GB/s for MKL on redwood, against roughly 56 GB/s of achieved DRAM
-bandwidth on that host: both sides are already running two to three times faster than DRAM can
-supply, which is only possible if A is being served from cache. On MKT the same cell reads 69.0 and
-66.7 GB/s, within 3.5% of each other.
+| matrix | rows x cols | nonzeros | A bytes | B bytes | C bytes | total | fits last-level cache |
+|---|---|---|---|---|---|---|---|
+| `connectus` | 512 x 394,792 | 1,127,525 | 9.02 MB | 6.32 MB | 8 KB | 15.34 MB | redwood 36 MB: yes; MKT 32 MB per CCX: yes |
+| `lp_osa_14` | 2337 x 54,797 | 317,097 | 2.56 MB | 0.88 MB | 37 KB | 3.47 MB | yes, both |
+| `cari` | 400 x 1200 | 152,800 | 1.23 MB | 19 KB | 6 KB | 1.25 MB | yes, both |
+| transformer layer 3 | 512 x 512 | 165,516 | 1.33 MB | 8 KB | 8 KB | 1.34 MB | yes, both |
+| transformer layer 5 | 512 x 512 | 78,643 | 0.63 MB | 8 KB | 8 KB | 0.64 MB | yes, both |
+
+Every one of the five fits, `connectus` with less than half the cache used. Reading the rate off
+chain192's own sealed medians for `connectus` at width 4 gives 100.0 GB/s for us and 125.1 GB/s for
+MKL on redwood counting **A alone**, against roughly 56 GB/s of achieved DRAM bandwidth on that
+host. Counting A alone makes those figures a lower bound on the traffic, since the gathers also pull
+lines out of a 6.32 MB B, so the real rate is higher still: both sides are running at least two to
+three times faster than DRAM can supply, which is only possible if the working set is being served
+from cache. On MKT the same cell reads 69.0 and 66.7 GB/s, within 3.5% of each other.
 
 **DRAM bandwidth is not the ceiling on these cells, so there is no bandwidth measurement to go and
 make.** The honest limit on the claim: this is the warm regime, where a repeated call finds A in
