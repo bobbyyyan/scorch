@@ -25869,3 +25869,135 @@ remaining candidate and it has not been measured on these cells.
 **The pre-test did its job.** It cost one two-hour stage and it killed a lead that the arithmetic
 made look like a 2.5x opportunity. Building the kernel first would have cost days and produced a
 change worth 3-8% of its predicted value, indistinguishable from splitting rows for no reason.
+
+## chain194: the multi-row half-vector kernel was built, proven correct, and never read
+
+Two things came out of looking for the next stage rather than building one. The first is that the
+last candidate mechanism for four of the eight cells can be settled with arithmetic. The second is
+that a committed kernel with a written prediction had been sitting unmeasured on redwood for five
+days.
+
+### The bandwidth candidate is answered without measuring anything
+
+The standing plan named bandwidth as the remaining candidate for `connectus` and `lp_osa_14`, on the
+reasoning that a worker idled by imbalance frees no time if the workers beside it are themselves
+stalled on memory. That is testable from the matrix sizes.
+
+| matrix | rows | nonzeros | A bytes (values + int32 indices + indptr) | fits last-level cache |
+|---|---|---|---|---|
+| `connectus` | 512 | 1,127,525 | 9.02 MB | redwood 36 MB: yes; MKT 32 MB per CCX: yes |
+| `lp_osa_14` | 2337 | 317,097 | 2.56 MB | yes, both |
+| `cari` | 400 | 152,800 | 1.23 MB | yes, both |
+| transformer layer 3 | 512 | 165,516 | 1.33 MB | yes, both |
+| transformer layer 5 | 512 | 78,643 | 0.63 MB | yes, both |
+
+Every one of the five fits. B at width 4 is 8 KB and C is 8 KB, so the whole working set is
+cache-resident. Reading the rate off chain192's own sealed medians for `connectus` at width 4 gives
+100.0 GB/s for us and 125.1 GB/s for MKL on redwood, against roughly 56 GB/s of achieved DRAM
+bandwidth on that host: both sides are already running two to three times faster than DRAM can
+supply, which is only possible if A is being served from cache. On MKT the same cell reads 69.0 and
+66.7 GB/s, within 3.5% of each other.
+
+**DRAM bandwidth is not the ceiling on these cells, so there is no bandwidth measurement to go and
+make.** The honest limit on the claim: this is the warm regime, where a repeated call finds A in
+cache. A genuinely cold first touch would stream A from memory. Warm is the regime the scoreboard is
+counted in and the one that was said to matter more, so the conclusion holds where it is being
+applied, and does not extend to a cold single call.
+
+### Who owns the deficit: our cost per multiply-add against MKL's, width by width
+
+Free from data already sealed. For each of the five matrices, time per scalar multiply-add
+(ms x 1e6 / (nonzeros x width)), each side also shown against **its own** value at width 1, so the
+comparison is within a side and cannot be read off the ratio we already have.
+
+redwood:
+
+| matrix | k | ours ns | mkl ns | ours/mkl | ours vs own k=1 | mkl vs own k=1 |
+|---|---|---|---|---|---|---|
+| `connectus` | 1 | 0.049 | 0.070 | 0.701 | 1.000 | 1.000 |
+| | 4 | 0.020 | 0.016 | 1.194 | 0.400 | 0.235 |
+| | 8 | 0.015 | 0.014 | 1.023 | 0.300 | 0.206 |
+| `lp_osa_14` | 1 | 0.090 | 0.111 | 0.811 | 1.000 | 1.000 |
+| | 4 | 0.030 | 0.027 | 1.139 | 0.338 | 0.240 |
+| `cari` | 1 | 0.111 | 0.131 | 0.849 | 1.000 | 1.000 |
+| | 4 | 0.029 | 0.027 | 1.055 | 0.257 | 0.207 |
+
+The A/A twin sits at 0.952-1.041 on every row above, so the width-1 lead and the width-4 deficit are
+both outside it.
+
+The shape is the same on MKT for the two fat-row matrices: `connectus` 0.678 at width 1 rising to
+0.984 at width 4, with our own amortisation at 0.378 of width 1 against MKL's 0.261; `lp_osa_14`
+0.778 rising to 1.022, ours 0.336 against MKL's 0.256. **On both hosts we start 1.2-1.5x ahead at
+width 1 and lose the lead because our cost per nonzero falls more slowly with dense width than
+MKL's.** It is not a width-4 pathology; it is a shortfall present at every width whose crossing
+happens to land at 3 and 4.
+
+The three thin matrices do not share this. On MKT they are behind at *every* width including 1
+(1.44-1.68) and improve with width, and our amortisation there is better than MKL's, not worse
+(0.275 against 0.327 at width 4). So the eight cells are two populations with two mechanisms, and
+only the fat-row pair has a host-invariant one.
+
+### The arm that was never read
+
+`SCORCH_SPMM_MULTIROW_HALFVEC` was committed on 2026-09-05 (1c01014) with `scorch_spmm_multirow_regblock`
+parameterised on the SIMD type so multi-row could take the one width the single-row 128-bit kernel
+owns -- float32 width 4, which is where five of the eight cells are. It ships at 0. The stage that
+would judge it built five objects on redwood, proved the new dispatch numerically correct (1108
+passed, 72 skipped), wrote its results to `/scratch/bobbyy/mrhv`, and then the queue was rebuilt
+after seven waiters collided and **the timing was never analysed**. Twenty CSVs, 113,652 float32
+rows per build, two passes, round-robin over 154 matrices at widths 2, 4 and 8 in both dtypes, zero
+refusals in any build log.
+
+Its pre-registration is on the record in this file: widths 2 and 8 inert (the exact band owns 2, and
+8 is not a half-vector width so the arm is the same object as `mr2`), all of float64 inert
+(`HALFVEC_F64` ships 0, so the exclusion being lifted was never applied), and a result near 1.09
+supports the memory-level-parallelism account while one near 1.20 would mean something specific to
+that width.
+
+float32, `mrhv` against `mr2`, which differ in one define. Above 1.0 means `mrhv` is faster. The
+floor is `c0` against `c0b` -- identical source, same rotation, same width.
+
+| k | n | mrhv/mr2 | 95% CI | A/A | A/A 95% CI | verdict |
+|---|---|---|---|---|---|---|
+| 2 | 154 | 0.9930 | [0.9851, 1.0006] | 1.0000 | [0.9926, 1.0074] | null (declared inert) |
+| **4** | 154 | **1.0039** | **[0.9954, 1.0127]** | 1.0036 | [0.9984, 1.0092] | **null at the firing width** |
+| 8 | 154 | 0.9892 | [0.9839, 0.9945] | 1.0018 | [0.9955, 1.0088] | null (declared inert) |
+
+**The positive control passes, which is what makes the null mean anything.** `mr2` against `c0`, same
+files, same floor:
+
+| k | mr2/c0 | 95% CI | verdict |
+|---|---|---|---|
+| 2 | 1.0063 | [0.9977, 1.0149] | null -- the exact band owns this width |
+| 4 | 1.0126 | [1.0060, 1.0192] | inside the floor -- the half-vector kernel owns this width |
+| 8 | **1.0733** | **[1.0611, 1.0872]** | **faster, outside the floor** |
+
+So multi-row is worth +7.3% one width up, on the same corpus, in the same rotation, measured by the
+same instrument -- and lifting its exclusion at width 4 buys 0.4%, inside a 0.92% floor.
+
+**float64 is refused, not reported.** Its own identical-source pair reads 0.9733-0.9798 at all three
+widths -- `c0` slower than `c0b` by 2-2.7%, the same direction every time, which is a position
+effect in a two-pass rotation and not noise. An arm cannot be judged against a floor that is itself
+2.7% off parity, so the float64 columns say nothing here either way. The float32 pair reads
+1.0000/1.0036/1.0018 and is clean.
+
+Per-cell resolution is also inadequate in this stage: on one transformer cell the identical-source
+pair reads 0.17 against 0.34. Two passes pool to 154 matrices well and resolve single cells badly,
+so no cell is claimed from it. What can be said is that the arm does not help where it was aimed:
+`connectus` at width 4 reads 1.2187 of MKL under `c0` and 1.3731 under `mrhv`.
+
+### What this settles
+
+The commit message's own claim was that the single-row 128-bit kernel and multi-row are "two
+different fixes for the same cost" and that "being unable to have both is the gap this constant
+closes." Having both is worth nothing. They are not two fixes for the same cost -- at width 4 they
+are **substitutes**, and the 128-bit kernel is already collecting what multi-row would have
+collected. That is consistent with chain192, where deleting the half-vector kernel cost +23.9% on
+redwood and +31.4% on MKT.
+
+It also refutes the memory-level-parallelism account as stated. That account predicted a gain
+roughly flat in width -- "about the same 8-12% it is worth everywhere else." It delivers 7.3% at
+width 8 and 0.4% at width 4. A mechanism that is about outstanding loads and independent FMA chains
+should not care which kernel is emitting them; this one does.
+
+`SCORCH_SPMM_MULTIROW_HALFVEC` stays at 0, now for a measured reason rather than an unmeasured one.
