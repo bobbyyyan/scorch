@@ -25791,3 +25791,81 @@ quantitatively rather than as a matter of interpretation.
 P3a fails on MKT as it did on redwood, for the same reason and at the same size (largest artefact
 1.56% against redwood's 1.58%, `hv0` reading faster at the inert widths because `=0` deletes the
 block). Again the effect is twenty times the artefact and points the other way.
+
+## chain193: the whole-row balance ceiling is not binding, and the pre-test cost one stage instead of a kernel
+
+Matrix surgery on the shipped build: rows longer than the ideal share `ceil(nnz/P)` cut into pieces
+of at most that, every nonzero and column index and value preserved. 4 passes, 19 matrices, 7 arms
+per cell, 798 rows a pass, 0 refusals. P1 verified the surgery is arithmetically invisible with the
+real kernel -- 57 checks, 9 matrices genuinely split, worst relative error 5.06e-06.
+
+**The predicted ceiling is not reached, not even approached.**
+
+```
+  pooled over the 5 matrices with a predicted ceiling of 1.5x or more
+    k     n   mean predicted   mean measured   realised
+    1     5        2.19x           1.015x         1%
+    2     5        2.19x           1.037x         3%
+    3     5        2.19x           1.096x         8%
+    4     5        2.19x           1.052x         4%
+    8     5        2.19x           1.036x         3%
+   16     5        2.19x           1.149x        12%
+```
+
+`nw14`, whose predicted ceiling is 2.41x, gets **slower** when split at five of six widths
+(0.929-0.999). The arithmetic that said whole-row partitioning uses 34-39% of the machine is not
+wrong about utilisation -- it is wrong that utilisation converts into time.
+
+### The control that settles it
+
+`halfsplit` cuts every row in half regardless of length, so it raises the row count without
+touching balance. On the ten balanced matrices, where `split` is a byte no-op and reads flat
+(0.986-1.002 against an A/A of 0.975-1.013, floor 2.46%), **`halfsplit` is 1.06x to 1.38x faster.**
+Doubling the row count is worth 6-38% with no balance change whatsoever.
+
+And on the fat matrices the two arms are the same size:
+
+```
+  matrix        k    split    halfsplit
+  lp_osa_14     3    1.293x     1.269x
+  lp_osa_14    16    1.478x     1.436x
+  connectus     3    1.195x     1.180x
+  connectus     4    1.181x     1.419x     <- the balance-neutral control is BETTER
+```
+
+So the gain that does exist is a row-count effect, reproduced in full by an arm that fixes no
+imbalance at all. Without `halfsplit` this stage would have read as "row splitting is worth
+1.2-1.5x, a third of its ceiling" and pointed straight at a kernel. It is worth nothing of the kind.
+
+### MKL is subject to the same structure
+
+```
+  matrix        mkl/mklsplit across k=1..16
+  lp_osa_14     1.136  1.263  1.158  1.107  1.324  1.111
+  connectus     1.213  1.119  0.970  0.941  1.101  1.119
+  nw14          0.948  1.250  1.143  1.137  1.066  1.049
+```
+
+MKL also gets faster on the split matrix, by much the same margin. So MKL is **not** immune to the
+fat row, which kills the accompanying hypothesis that MKL wins on these matrices because it splits
+rows internally and we do not. Whatever MKL is doing better on `connectus` and `lp_osa_14`, it is
+not row splitting.
+
+### What this closes, and what is left for these two matrices
+
+**Row splitting is not the lever.** Four of the eight host-invariant cells lose their candidate
+fix, and the standing note that whole-row partitioning "caps them at ~40% of the machine" needs
+reading as a statement about worker occupancy and not about achievable time.
+
+The likeliest reason the two diverge is bandwidth: if the kernel is memory-bound on these matrices,
+a worker idled by imbalance is idle next to workers that are themselves stalled on memory, so
+removing the imbalance frees no time. That is consistent with the row-count effect being the only
+thing that shows -- shorter rows change the access pattern, not the work distribution.
+
+For `connectus` and `lp_osa_14` the list is now: thread count exhausted (chains 189/190),
+B-footprint exhausted (the narrow-k chunk work), row balance exhausted (here). Bandwidth is the
+remaining candidate and it has not been measured on these cells.
+
+**The pre-test did its job.** It cost one two-hour stage and it killed a lead that the arithmetic
+made look like a 2.5x opportunity. Building the kernel first would have cost days and produced a
+change worth 3-8% of its predicted value, indistinguishable from splitting rows for no reason.
