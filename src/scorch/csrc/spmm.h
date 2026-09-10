@@ -2274,9 +2274,13 @@ static inline void scorch_spmm_row_regblock(
     // instructions per nonzero become 7.00 without them. The guard is what makes it expensive --
     // it costs a compare, a branch, a second index load, a second multiply and a jump back,
     // because the compiler lays it out as a side block.
-#if SCORCH_SPMM_ROW_PREFETCH
-    if (pA + 2 < pA_end)
-      __builtin_prefetch(B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size, 0, 1);
+#if SCORCH_SPMM_ROW_PREFETCH && SCORCH_SPMM_REGBLOCK_PFD > 0
+    // The run-ahead is SCORCH_SPMM_REGBLOCK_PFD nonzeros. It ships at 2, so this instantiation
+    // emits exactly what the hardcoded literal emitted; see the constant's comment for why 2 was
+    // never chosen and what the two competing predictions are.
+    constexpr int PFD = SCORCH_SPMM_REGBLOCK_PFD;
+    if (pA + PFD < pA_end)
+      __builtin_prefetch(B_val + (size_t)A1_crd[pA + PFD] * (size_t)B1_size, 0, 1);
 #endif
     const typename V::vec a0 = V::splat(A_val[pA]);
     const typename V::vec a1 = V::splat(A_val[pA + 1]);

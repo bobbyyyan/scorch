@@ -678,6 +678,32 @@
 #ifndef SCORCH_SPMM_ROW_PREFETCH
 #  define SCORCH_SPMM_ROW_PREFETCH 1
 #endif
+
+// How far ahead that prefetch reaches, in NONZEROS. Ships at 2 -- one loop iteration -- which is
+// what the literal in the loop has always been, and which nothing ever chose: the depth-swept
+// kernel (scorch_spmm_row_regblock_pf) is a different function, it exists only in the instrumented
+// build, and at float32 width 4 it is unreachable because the half-vector kernel claims the row
+// before that dispatch is reached. So the one width where five of the eight cells behind MKL on
+// both hosts live has never been measured at any run-ahead but 2.
+//
+// The two predictions are opposite and both are supported by something already measured, which is
+// why this is worth an arm rather than an edit:
+//
+//   * LATENCY-BOUND. Two nonzeros is about four cycles, and the gathers on the fat-row cells walk a
+//     B of 6.32 MB (connectus at width 4), which is an L2 miss and an L3 hit -- roughly 40 cycles.
+//     A run-ahead that covers four of forty covers nothing. This predicts DEEPER wins, and it fits
+//     the shape of the deficit: our cost per nonzero falls more slowly with dense width than MKL's,
+//     which is what a latency bound looks like when wider k gives more work per gather to hide it
+//     behind.
+//   * ISSUE-BOUND. On the emitted AVX2 loop at float32 width 4 the prefetch and its bounds test are
+//     9 of 23 instructions per two nonzeros; removing them takes 11.50 instructions per nonzero to
+//     7.00. This predicts ZERO wins.
+//
+// A depth of 0 disables the prefetch, which is the same object SCORCH_SPMM_ROW_PREFETCH=0 builds --
+// two spellings of one arm, kept because the sweep wants 0 in the same axis as 8/16/32.
+#ifndef SCORCH_SPMM_REGBLOCK_PFD
+#  define SCORCH_SPMM_REGBLOCK_PFD 2
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_MINNNZ
 #  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
 #endif
