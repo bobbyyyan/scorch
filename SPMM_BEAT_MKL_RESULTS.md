@@ -25755,3 +25755,39 @@ is 100.0% on those matrices), not density as a predicate (we beat MKL at 25-100%
 thread count (chains 189/190), and not the half-vector kernel, which is worth 24%. The same
 matrices at widths 2 and 8 beat MKL by 8-13%. Something specific to width 4 on 400-512 row matrices
 remains, and every cheap explanation is now spent.
+
+### MKT confirms it, and larger: removing the path would put that host behind MKL at width 4
+
+Job 17352272, 8 passes, 4 builds, 7320 rows per build, 0 refusals, contract guard clean.
+
+```
+  host       hv0/c0   hv0b/c0    c0 vs MKL   hv0 vs MKL
+  redwood    1.2388    1.2378       0.7086       0.8757
+  MKT        1.3162    1.3176       0.9179       1.2104
+```
+
+Both hosts, both off-builds, same direction, agreeing within 0.35%. On MKT the path is worth
+**31.6%** against redwood's 23.9% -- and the last column is the one that matters: removing it takes
+MKT's whole width-4 target group from **0.9179 (ahead of MKL) to 1.2104 (behind it)**. A change I
+proposed as an improvement would have lost 37 cells on one host.
+
+The three motivating cells, both hosts, all worse without it:
+
+```
+  matrix                             rw c0   rw hv0   mkt c0   mkt hv0
+  cari                               1.054    1.122    1.344     1.381
+  body_decoder_layer_3_self_attn     1.073    1.168    1.266     1.338
+  body_decoder_layer_5_encdec_attn   1.011    1.081    1.317     1.331
+```
+
+**The ordering of the two hosts is itself the mechanism, inverted from my hypothesis.** MKT is the
+AVX-512 host, so its full-vector alternative wastes proportionally more of the register at width 4 --
+and that is exactly where the exactly-filled 128-bit kernel is worth more. Filling a narrow vector
+completely beats masking a wide one, which is the same principle the exact-width family's own source
+comment states for k=2 and k=3: dropping the lane mask and the runtime-stride multiply is worth more
+than the extra lanes. I had the mechanism backwards, and the two-host ordering says so
+quantitatively rather than as a matter of interpretation.
+
+P3a fails on MKT as it did on redwood, for the same reason and at the same size (largest artefact
+1.56% against redwood's 1.58%, `hv0` reading faster at the inert widths because `=0` deletes the
+block). Again the effect is twenty times the artefact and points the other way.
