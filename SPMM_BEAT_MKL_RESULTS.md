@@ -26369,3 +26369,86 @@ the run-ahead at `pA_end`, so the matrices that most need coverage — many shor
 the bound to the worker's segment end removes the per-iteration cost everywhere **and** extends the
 coverage to exactly the population that lacks it, in one change, with no width, degree or footprint
 case in the kernel.
+
+## chain197: the prefetch gets a third form, and a dead argument turns out to cost 67 instructions
+
+The edit the previous section argued for is in, behind `SCORCH_SPMM_REGBLOCK_PFSTREAM`, defaulting
+to 0 (commit `efa3cf1` on `perf/spmm-probe-and-kernel`). With the constant at 1 the register block's
+run-ahead is clamped to the end of the **nonzero array** instead of the end of the row:
+
+```c
+const int pf_ = pA + PFD < pA_limit ? pA + PFD : pA_limit - 1;
+__builtin_prefetch(B_val + (size_t)A1_crd[pf_] * (size_t)B1_size, 0, 1);
+```
+
+`A1_crd` is contiguous across rows and a worker walks a contiguous range of it, so the row boundary
+is not a boundary the memory system has. The clamped form is a compare and a cmov against a
+loop-invariant bound; the shipped form is a compare, a branch, a redundant index load, a redundant
+multiply and a jump back, laid out as a side block. This removes control flow rather than adding a
+case — there is no width, degree or footprint test anywhere in it. The bound comes from the caller
+(`nnz_total` in the drop-in SpMM, `total_nnz` in the fused Linear), both of which already bound
+every `pA_end` in scope, including the segmented-wide-row path where `pA_end` is deliberately
+clipped below the row's true end. The four call sites belonging to
+`scorch_spmm_row_regblock_deep` and `scorch_spmm_row_regblock_pf` share the argument list and are
+untouched.
+
+### A dead argument is not free, and the first version of this change shipped a regression
+
+The neutrality check on the default configuration **failed the first time it was run**, and the
+reason is worth keeping. The kernel took the bound as an ordinary parameter, which the shipped
+configuration never reads — a textbook dead argument, and dead-code elimination was simply assumed
+to remove it. Two builds of the default at one fixed absolute path:
+
+| | `.text` bytes | instructions |
+|---|---|---|
+| before the edit | 715033 | 162930 |
+| with the bound passed unconditionally | 715513 | 162997 |
+
+**+480 bytes, +67 instructions, in an object whose behaviour is unchanged.** The A/A control —
+the same source built twice at the same path — was instruction-identical, so this is not build
+noise. The value stays live across the row loop, and that loop has no register to spare; the
+compiler pays for it rather than proving it away.
+
+The fix is `SCORCH_SPMM_PFLIM_PARAM` / `SCORCH_SPMM_PFLIM`, which are empty at the default, so with
+the constant at 0 the signature and all six call sites are textually what they have always been.
+Re-run:
+
+```
+post  .text 715033 bytes      postb  .text 715033 bytes      pre  .text 715033 bytes
+A/A control: 162930 instructions each, identical disassembly
+pre vs post: 162930 each, 10 differing pairs, every one `mov $imm,%edx`, every delta exactly +24
+             0 real code differences
+```
+
++24 was **predicted from the source before the build** — 14 lines for the macro pair at spmm.h:2252
+and 10 inside the loop body below it, with nothing carrying `__LINE__` between the two insertion
+points, checked in the source so there could be no second legitimate delta. The wider lesson is the
+one this file already records about digests, one step further: *neither* a digest, *nor* an
+instruction count, *nor* an argument being unread proves a change is neutral. Only classifying every
+differing instruction does.
+
+### The stage, pre-registered
+
+Four builds in one grid on all 4584 cached SuiteSparse matrices at widths 2, 4, 8, 16 and 32 —
+`c0` (shipped), `c0b` (the identical-source floor), `pfd0` (prefetch removed), `stream` (the
+candidate) — in four passes of a Williams design, so each build appears once in each position and
+each of the 12 ordered pairs is adjacent exactly once. All 24 permutations would be nine days of
+timing and are not needed for that balance.
+
+The claim has two halves and **either can fail**:
+
+1. `stream` is no slower than `pfd0` in every degree band and every nonzero band at widths 4, 8, 16
+   and 32. The per-iteration guard is gone, so the saving `pfd0` gets by deleting the prefetch
+   should be available without deleting it.
+2. `stream` is no slower than `c0` on the **115 matrices frozen from chain196** at width 32 — the
+   population where the shipped prefetch earns more than 10%. The coverage is extended rather than
+   removed, so that population must keep what it has.
+
+The frozen list is an input to the stage, written before it ran, with chain196's criterion
+(`pfd0/c0 > 1.10` at width 32, identical-source control inside 5%). Selecting that population from
+this stage's own numbers would make the second half unfalsifiable. Correctness runs on every arm at
+every width in the grid **and** on the fused Linear kernel through `sparse_linear_fm`, because the
+edit changed call sites in both and `scorch.matmul` cannot reach the second one at any width.
+
+If both halves do not hold, the answer is that the prefetch has no defensible form and deleting it
+is what is left. That is a result, not a licence to reach for a width rule.
