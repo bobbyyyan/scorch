@@ -26327,3 +26327,45 @@ not do both, the prefetch has no defensible form and option 1 is what is left.
 `usroads` at width 32 gets its own investigation either way. A 3.4x swing from removing 14
 instructions per instantiation is not explained by instruction count, and naming it matters more
 than gating around it.
+
+### Correction to the addendum: `usroads` is not an outlier, and the mechanism is a surface
+
+The addendum above called the `usroads` regression "an outlier inside a null bin". That was read off
+a bin average, and the bin pools two populations — the trap this file has been caught by before.
+
+At width 32, **115 of 4584 matrices are more than 10% slower without the prefetch with an A/A under
+5%**, and they have structure: road networks (`usroads` 3.43x, `usroads-48` 3.30x, `sx-superuser`
+2.85x), circuit and DAE matrices (`hvdc2` 1.93x, `rajat17` 1.78x, `ASIC_100ks` 1.75x, `rajat23`
+1.72x, `bayer01`, `memplus`, `mult_dcop_01`), the entire FlowIPM22 `uni_chimera` family at 100,000
+rows each, and large-row-count FEM (`shipsec1`, `para-5`, `barrier2-9/11`, `power9`). The recurring
+feature is a **large row count with low-to-moderate degree**. The width gate stays withdrawn, but
+not because the harm is noise.
+
+Crossing the two physical quantities the prefetch-utility condition actually names — is there a miss
+to cover, and is there slack to cover it — gives a surface rather than a bin. `ship/arm` pooled over
+all widths, with each cell's A/A beside it:
+
+| B/LLC \ nnz-per-row | 0-4 | 4-8 | 8-16 | 16-64 | >64 |
+|---|---|---|---|---|---|
+| 0-0.05 | 1.016 | 1.030 | 1.037 | 1.059 | 1.084 |
+| 0.05-0.25 | 1.045 | 1.081 | 1.098 | 1.078 | 1.039 |
+| 0.25-1 | 0.978 | 1.008 | 0.969 | 1.006 | 1.010 |
+| 1-4 | 0.972 | 0.990 | 1.009 | 0.997 | — |
+| >4 | 0.986 | 1.002 | — | — | — |
+
+(A/A is 0.994-1.014 in the top two rows and 0.962-0.989 in the bottom two, so the bottom rows are
+less resolvable than the top.)
+
+**B footprint carries the sign.** Below roughly a quarter of the cache there is no miss to cover, so
+the prefetch is pure cost and removing it wins 1.6% to 9.8% — that is 90% of all cells and where the
+whole measured win lives. Above it the average is null: the coverage now roughly cancels the cost,
+with individual matrices swinging both ways by 10% to 240%. The rise with degree at fixed B/LLC is
+the per-iteration guard being paid more times per row.
+
+**This makes the two defects one edit, which is why option 2 is the answer and not a compromise.**
+The cost is a loop-invariant bound evaluated once per iteration. The benefit is crippled by clipping
+the run-ahead at `pA_end`, so the matrices that most need coverage — many short rows, B out of cache
+— get **no prefetch at all** on a two-nonzero row and exactly one on a three-nonzero row. Hoisting
+the bound to the worker's segment end removes the per-iteration cost everywhere **and** extends the
+coverage to exactly the population that lacks it, in one change, with no width, degree or footprint
+case in the kernel.
