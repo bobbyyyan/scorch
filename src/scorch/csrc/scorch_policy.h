@@ -704,6 +704,40 @@
 #ifndef SCORCH_SPMM_REGBLOCK_PFD
 #  define SCORCH_SPMM_REGBLOCK_PFD 2
 #endif
+
+// Whether that run-ahead walks the NONZERO STREAM or stops at the row boundary. Ships at 0, which is
+// the row-clipped form the loop has always had.
+//
+// Two separate defects, and one edit fixes both, which is why this is a constant and not a gate.
+//
+//   THE COST is a loop-invariant bound evaluated once per iteration. `pA + PFD < pA_end` cannot
+//   change inside a row, yet it costs a compare, a branch, a redundant index load, a redundant
+//   multiply and a jump back on every iteration, because the compiler lays the guarded prefetch out
+//   as a side block. Measured over 4584 SuiteSparse matrices, removing the prefetch and its guard
+//   outright is worth 1.6% to 9.8% wherever B fits comfortably in cache -- which is 90% of all
+//   cells, because there is no miss there for a prefetch to cover.
+//
+//   THE BENEFIT is crippled by the clip. A row of two nonzeros gets NO prefetch at all and a row of
+//   three gets exactly one, so the population that most needs coverage -- many short rows with a B
+//   footprint outside the cache -- is the population the current code least serves. At width 32,
+//   115 of those 4584 matrices are more than 10% SLOWER without the prefetch (usroads 3.43x,
+//   sx-superuser 2.85x, hvdc2 1.93x, the whole FlowIPM22 uni_chimera family), all of them with a
+//   large row count and a low-to-moderate mean degree.
+//
+// The row boundary is not a boundary the memory system has: A1_crd is contiguous across rows, and a
+// worker walks a contiguous range of it. So the fix is to clamp the run-ahead to the end of the
+// nonzero array rather than to the end of the row, which is branch-free (a compare and a cmov
+// against a loop-invariant bound) and strictly less control flow than what ships. Any index it
+// reads is a valid column index, so the address it prefetches is always inside B.
+//
+// PRE-REGISTERED PREDICTION, and it can fail: this must be at least as fast as the no-prefetch build
+// wherever B is under a quarter of the cache (the guard is gone) AND at least as fast as the shipped
+// build on those 115 (the coverage is extended rather than removed). One object beating both arms
+// everywhere. If it does not do both, the prefetch has no defensible form and deleting it is what is
+// left -- which is a result, not a reason to reach for a width rule.
+#ifndef SCORCH_SPMM_REGBLOCK_PFSTREAM
+#  define SCORCH_SPMM_REGBLOCK_PFSTREAM 0
+#endif
 #ifndef SCORCH_SPMM_MULTIROW_MINNNZ
 #  define SCORCH_SPMM_MULTIROW_MINNNZ 0L
 #endif

@@ -2249,11 +2249,25 @@ template <> struct scorch_simd_half<double> {
 // row's B loads masked for no reason, plus one masked store per row, and on a
 // short row the store is amortized over only a handful of FMAs. Both collapse to
 // plain vmovups when FULL_LAST holds. Ragged k keeps the mask, unchanged.
+// The nonzero-array bound is a parameter ONLY in the configuration that reads it, and that is a
+// measurement rather than a style choice. Passing it unconditionally -- a dead argument in the
+// shipped configuration, which any reading of dead-code elimination says costs nothing -- added 67
+// instructions and 480 bytes of .text to the DEFAULT object: 162930 instructions before, 162997
+// after, two builds at one fixed absolute path with an instruction-identical A/A control beside
+// them. The value stays live across the row loop, and this loop is register-starved enough that one
+// more live value moves code. So the default signature is exactly the one it has always had.
+#if SCORCH_SPMM_REGBLOCK_PFSTREAM
+#  define SCORCH_SPMM_PFLIM_PARAM , int pA_limit
+#  define SCORCH_SPMM_PFLIM(x)    , (int)(x)
+#else
+#  define SCORCH_SPMM_PFLIM_PARAM
+#  define SCORCH_SPMM_PFLIM(x)
+#endif
 template <typename T, int NVEC, bool FULL_LAST, typename V = scorch_simd<T>>
 static inline void scorch_spmm_row_regblock(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
-    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
+    T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end SCORCH_SPMM_PFLIM_PARAM,
     typename V::mask mask_last) {
   constexpr int L = V::lanes;
   typename V::vec acc0[NVEC], acc1[NVEC];
@@ -2275,12 +2289,22 @@ static inline void scorch_spmm_row_regblock(
     // it costs a compare, a branch, a second index load, a second multiply and a jump back,
     // because the compiler lays it out as a side block.
 #if SCORCH_SPMM_ROW_PREFETCH && SCORCH_SPMM_REGBLOCK_PFD > 0
-    // The run-ahead is SCORCH_SPMM_REGBLOCK_PFD nonzeros. It ships at 2, so this instantiation
-    // emits exactly what the hardcoded literal emitted; see the constant's comment for why 2 was
-    // never chosen and what the two competing predictions are.
+    // The run-ahead is SCORCH_SPMM_REGBLOCK_PFD nonzeros. It ships at 2, so the default
+    // instantiation emits exactly what the hardcoded literal emitted.
     constexpr int PFD = SCORCH_SPMM_REGBLOCK_PFD;
+#if SCORCH_SPMM_REGBLOCK_PFSTREAM
+    // Clamped to the end of the nonzero array rather than the end of the ROW: A1_crd is contiguous
+    // across rows and a worker walks a contiguous range of it, so the row boundary is not a
+    // boundary the memory system has. Branch-free -- a compare and a cmov against a loop-invariant
+    // bound -- where the row-clipped form costs a compare, a branch, a redundant index load, a
+    // redundant multiply and a jump back, laid out as a side block. Every A1_crd entry is a valid
+    // column index, so the clamped index always names an address inside B.
+    const int pf_ = pA + PFD < pA_limit ? pA + PFD : pA_limit - 1;
+    __builtin_prefetch(B_val + (size_t)A1_crd[pf_] * (size_t)B1_size, 0, 1);
+#else
     if (pA + PFD < pA_end)
       __builtin_prefetch(B_val + (size_t)A1_crd[pA + PFD] * (size_t)B1_size, 0, 1);
+#endif
 #endif
     const typename V::vec a0 = V::splat(A_val[pA]);
     const typename V::vec a1 = V::splat(A_val[pA + 1]);
@@ -4817,8 +4841,8 @@ torch::Tensor spmm_csr_v2_core(
             // hoists and each row runs one straight-line instantiation.
             #define SCORCH_RB(NV) \
               (full_last \
-                 ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
-                 : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+                 ? scorch_spmm_row_regblock<scalar_t, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end SCORCH_SPMM_PFLIM(nnz_total), mask_last) \
+                 : scorch_spmm_row_regblock<scalar_t, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end SCORCH_SPMM_PFLIM(nnz_total), mask_last))
             // The widths where regblock's mask covers the whole row: float k=1..7 and
             // double k=1..3. Float k=1 is instantiated but only routed when asked for
             // separately, because the nonzero-axis gather kernel owns it -- otherwise
@@ -4840,12 +4864,12 @@ torch::Tensor spmm_csr_v2_core(
               if (halfvec_exact || halfvec_under) {
                 if (halfvec_exact) {
                   scorch_spmm_row_regblock<scalar_t, 1, true, VH>(
-                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
-                      VH::lane_mask(LH));
+                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin,
+                      pA_end SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(LH));
                 } else {
                   scorch_spmm_row_regblock<scalar_t, 1, false, VH>(
-                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end,
-                      VH::lane_mask(B1_size));
+                      A1_crd, A_val, B_val, B1_size, C_row, pA_begin,
+                      pA_end SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(B1_size));
                 }
                 continue;
               }
@@ -6217,8 +6241,8 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
           // unmasked full-vector dispatch; see the drop-in SpMM above.
           #define SCORCH_RB(NV) \
             (full_last \
-               ? scorch_spmm_row_regblock<float, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last) \
-               : scorch_spmm_row_regblock<float, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, mask_last))
+               ? scorch_spmm_row_regblock<float, NV, true>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end SCORCH_SPMM_PFLIM(total_nnz), mask_last) \
+               : scorch_spmm_row_regblock<float, NV, false>(A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end SCORCH_SPMM_PFLIM(total_nnz), mask_last))
           switch (nvec) {
             case 1: SCORCH_RB(1); break;
             case 2: SCORCH_RB(2); break;
