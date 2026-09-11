@@ -26255,3 +26255,75 @@ Six regressions at widths 4 and 8 would survive such a gate, `cari` the worst. T
 before anything moves, and MKT needs to say the same thing — its cache holds 4594 SuiteSparse
 matrices, so the identical stage can run there with no fetching. Job 17274394 (`pf0`), held, is the
 same object on that host.
+
+### chain196 addendum: the width gate is withdrawn, because there is no regime behind it
+
+The gate proposed above was read off a table of cell counts by width. Asked for a mechanism instead,
+the data does not support one, and the gate would have been a rule fitted to outliers.
+
+**First, the arm is clean, which had to be checked before anything else.** Inside the float32 SpMM
+symbol specifically:
+
+| | insns | prefetch | vfmadd | ymm | stack moves |
+|---|---|---|---|---|---|
+| `c0` | 5941 | 8 | 537 | 2379 | 266 |
+| `pfd0` | 5830 | 0 | 542 | 2384 | 267 |
+
+Eight prefetch sites and 111 instructions removed, with the FMA count, the vector-register traffic
+and the spill traffic all unchanged. So `pfd0` really is `c0` minus the prefetch and its guard, not a
+different schedule. (A whole-object count showed +250 FMAs and briefly looked like a compiler
+re-optimisation; that delta is in the float64 and other paths, not in the kernel under test.)
+
+**Second, the sign does not track a physical quantity.** The candidate mechanism from the `usroads`
+cliff was that the prefetch pays only when the gathered B row comes from DRAM, which predicts the
+effect flips as the working set A + B + C crosses the cache. The binary reports 37.75 MB; every
+(matrix, width) cell binned by that ratio, widths pooled:
+
+| ws / LLC | n | ship/arm | A/A | verdict |
+|---|---|---|---|---|
+| 0-0.1 | 17564 | 1.0235 | 0.9977 | faster 2.3% |
+| 0.1-0.25 | 1855 | 1.0629 | 0.9996 | faster 6.3% |
+| 0.25-0.5 | 1301 | 1.0911 | 1.0009 | faster 9.1% |
+| 0.5-0.8 | 670 | 1.0895 | 0.9985 | faster 9.0% |
+| 0.8-1.2 | 448 | 1.0525 | 1.0063 | faster 5.2% |
+| 1.2-2 | 354 | 1.0179 | 1.0018 | inside the floor |
+| >2.0 | 728 | 0.9933 | 0.9849 | inside the floor |
+
+**There is no bin in which removing the prefetch is slower.** Split both ways, the cell at
+ws/LLC 0.8-1.2 and width 32 -- the bin `usroads` sits in -- reads 0.989 over 175 cells, which is
+null. So the 3.4x on `usroads` at width 32 (117.0 µs to 401.6 µs, its A/A pair at 114.7) is **an
+outlier inside a null bin, not a regime**, and two of the three worst regressions are the same road
+network family at the same width. A gate at width <= 8 would have been a rule with two matrices
+behind it.
+
+**Third, what the data does support is one sentence with no cases in it.** The prefetch's cost is
+per-iteration and constant -- 9 of 23 instructions per two nonzeros at NVEC=1 -- and its benefit
+requires an uncovered long-latency miss. The win therefore rises with mean degree (more iterations
+per row paying the fixed cost: +2.9% at degree 0-4 to +14.2% at 64-128) and shrinks as NVEC rises
+(more real work per iteration to amortise against: +15% at widths 4-8, +5-7% at 16, null at 32).
+Both dependences are the same fixed-cost-amortisation statement seen along two axes. Across 22,920
+cells the cost is nearly always real and the benefit nearly never is.
+
+**Why the benefit is nearly never real is the part that names a fix.** The run-ahead is two nonzeros,
+about four cycles, and it is additionally clipped at the row boundary -- `pA + PFD < pA_end` -- so a
+row of two nonzeros gets no prefetch at all and a row of three gets exactly one. A prefetch too
+shallow to cover a miss, stopping at a boundary the memory system does not have, is not a prefetch;
+it is overhead. chain195 already tried a deeper run-ahead *within* the row (`pfd8`: slower at width
+4, less good at width 8), which leaves the interesting variant untested.
+
+So there are two honest options and the gate is not among them:
+
+1. **Delete it.** Defensible on this evidence, contingent on the second host and on the outliers.
+2. **Make it a real prefetch**: run ahead over the nonzero stream rather than within the row -- the
+   stream is contiguous in `A1_crd` and the row boundary is irrelevant to it -- with the bound
+   hoisted out of the inner loop so no per-iteration guard is paid. One mechanism, no width case, and
+   it removes the cost everywhere while giving coverage wherever a miss exists.
+
+Option 2's prediction is sharp enough to fail: it should be at least as fast as `pfd0` everywhere
+`pfd0` won, because the guard is gone, **and** at least as fast as `c0` on `usroads` at width 32,
+because real coverage replaces the clipped one. One object beating both arms everywhere. If it does
+not do both, the prefetch has no defensible form and option 1 is what is left.
+
+`usroads` at width 32 gets its own investigation either way. A 3.4x swing from removing 14
+instructions per instantiation is not explained by instruction count, and naming it matters more
+than gating around it.
