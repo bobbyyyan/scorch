@@ -26125,3 +26125,133 @@ Not a shipping candidate. The kernel serves widths 4 through 32 (NVEC 1..4) and 
 4 and 8; the GCN reading at 16 is only -0.56%, which is where the win appears to fade. Before the
 default could move: widths 16 and 32 on the main corpus, float64, the autoencoder and transformer
 families, and the second host. The constant stays at 2.
+
+## chain196: the same arm on all 4584 cached SuiteSparse matrices — the direction holds, the size was overfit, and the real board is 116 cells not 8
+
+Prompted by a fair objection: chain195's 15% was pooled over 37 matrices. Those 37 are the
+nnz >= 1e6 half of a 298-key curated list, and the cache already held **4584 SuiteSparse matrices**
+plus 3820 DLMC ones. The claim rested on 0.8% of what was on disk, selected by size, and the
+excluded population is not a fringe — 2014 of the 4584 have a mean degree under 4.
+
+Redwood, 6 passes (all six permutations of three builds, so position and predecessor are both
+exactly balanced), 4584 matrices, widths 2/4/8/16/32, 412,560 rows per build, 0 refusals. Same
+objects as chain195 by `.text` digest (`5c3094fb` and `a5b0447d`), so this is one arm re-measured on
+75 times the corpus. Widths 16 and 32 had never been measured at all.
+
+Integrity checked on the output rather than the log: all 18 files at 68,760 rows and 4584 keys, no
+duplicate (build, pass, key, width, arm) tuple, and all three builds covering the identical key set
+on every pass. One file read short at 52,500 rows — that was a mid-write pull, not a loss, which is
+the third time this session that distinction has mattered.
+
+**The rotation was necessary.** Within one pass, identical source read up to **6.7% apart** by
+degree band; over the balanced six the A/A sits at 0.986-1.019 everywhere and mostly within 0.5% of
+parity. The position effect cancelled, which is what makes the rest readable.
+
+### The direction holds everywhere. No band regresses.
+
+`ship/arm` above 1.0 means removing the prefetch is faster. By mean degree:
+
+| degree band | n | k=2 (inert) | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|---|---|
+| 0-4 | 2010 | +0.7% | +2.0% | +2.9% | +2.0% | +0.9% |
+| 4-8 | 1151 | null | +5.1% | +6.7% | +4.7% | null |
+| 8-16 | 688 | null | +6.5% | +8.0% | +5.5% | null |
+| 16-32 | 318 | null | +8.0% | +10.5% | +6.2% | null |
+| 32-64 | 218 | null | +10.8% | **+13.0%** | +5.2% | null |
+| 64-128 | 114 | null | +12.1% | **+14.2%** | +7.2% | null |
+| >=128 | 85 | null | +8.7% | +10.1% | +5.4% | null |
+
+**P4 passes: no band at any width, in any of the three views, is slower than what ships by more than
+its own control.** The family-capped view (one matrix per family, 1864 of 4584 — `as-735` alone is
+733 matrices and would otherwise be 16% of any pooled number) gives the same picture, +3.3% to
++14.1%. By nonzero count the same, with one addition worth noting: **the 75 matrices above 1e7
+nonzeros read inside the floor at every width.** Nothing to gain there, which fits a kernel that has
+become DRAM-bound.
+
+### The size was overfit, and so was the width
+
+chain195's -14.58% / -16.21% is the **high-degree end**, not the typical case. The monotone rise with
+mean degree is what a per-nonzero saving should do — longer rows execute the inner loop more times —
+and it means the honest figure is a range, not a number: **+2.9% at degree 0-4, where 2010 of the
+4584 matrices live, up to +14.2% at degree 64-128, where 114 do.** The largest nonzero band
+(1e4-1e5, 1933 matrices) gets 1.4-2.2%.
+
+The width was overfit too. chain195 measured 4 and 8, which turn out to be exactly the two widths
+where the win lives.
+
+### The real MKL scoreboard: 116 of 22,920, not 8 of 265
+
+The census this project has been scoring itself against covers 265 cells. Over the whole collection,
+at the same five widths:
+
+| build | cells | behind MKL (>1.01) | ahead (<0.99) | level |
+|---|---|---|---|---|
+| `c0` (ships) | 22920 | **116** | 22771 | 33 |
+| `pfd0` | 22920 | **66** | 22833 | 21 |
+
+So the shipped build loses **116 cells**, not 8. The 298-key list was hiding 108 of them.
+
+Two per-build counts are not a crossing count, so the crossing is computed per cell and only counted
+when the move exceeds what the identical-source pair moves **on that cell** (median 0.0101, 90th
+percentile 0.0394, max 0.8815 — per-cell noise on this collection is large and very unevenly
+distributed):
+
+| widths | taken from MKL | given back | net |
+|---|---|---|---|
+| firing (4, 8, 16, 32) | 45 | 11 | **+34** |
+| inert (2) | 8 | 12 | -4 |
+
+The inert row is the calibration: the constant cannot fire at width 2, so those 20 crossings are the
+intrinsic churn of this count. **+34 is a real movement with roughly ±10 cells of noise on it** — the
+first cell-count movement anything in this line of work has produced.
+
+By width it is concentrated, and that matters more than the total:
+
+| k | taken | given back | net |
+|---|---|---|---|
+| 4 | 31 | 5 | +26 |
+| 8 | 11 | 1 | +10 |
+| 16 | 2 | 2 | 0 |
+| 32 | 1 | 3 | -2 |
+
+### Eleven cells regress at firing widths, and the convention says report them
+
+The per-band view averages these away. Worst first, with each cell's own identical-source movement
+beside it:
+
+| cell | k | c0 | pfd0 | slower vs MKL | that cell's A/A |
+|---|---|---|---|---|---|
+| `usroads-48` | 32 | 0.335 | 1.080 | **3.22x** | 0.022 |
+| `usroads` | 32 | 0.315 | 1.019 | **3.23x** | 0.012 |
+| `rail507` | 16 | 0.861 | 1.555 | 1.81x | 0.004 |
+| `cari` | 4 | 0.937 | 1.469 | 1.57x | 0.075 |
+| `bibd_17_8` | 16 | 0.808 | 1.239 | 1.53x | 0.027 |
+| `rail507` | 32 | 0.890 | 1.070 | 1.20x | 0.125 |
+| `bibd_18_9` | 4 | 0.937 | 1.107 | 1.18x | 0.159 |
+| `bas1lp` | 4 | 0.964 | 1.111 | 1.15x | 0.129 |
+| `spiral_E` | 4 | 0.957 | 1.099 | 1.15x | 0.114 |
+| `G52` | 4 | 0.893 | 1.013 | 1.14x | 0.007 |
+| `CAG_mat1916` | 8 | 0.931 | 1.043 | 1.12x | 0.009 |
+
+The two `usroads` road networks and `rail507` are not noise: their A/A pairs move 0.004-0.022 against
+changes of 0.18 to 0.75. These are real, large, single-cell regressions, and under this project's
+performance convention a change that causes them does not ship on the strength of a favourable
+average.
+
+`cari` is the one to note: it is one of the eight cells this whole line of work is chasing, and this
+arm takes it from ahead to 1.469 behind. (Its absolute level is not comparable to chain195's 1.0370
+— that stage used 13 reps at 25 ms and this one 4 at 6 ms, so the MKL comparison is differently
+calibrated. The crossing here is internally controlled; the level is not portable between stages.)
+
+### What it points to
+
+Not "ship it" and not "abandon it". The win is +26 cells at width 4 and +10 at width 8; width 16 is
+neutral and width 32 is slightly negative, and the three worst regressions are at 16 and 32. **A
+width gate — drop the prefetch at widths <= 8 and keep it above — would capture the whole cell gain
+and avoid the k=16/32 damage entirely, and it is provably inert above 8 rather than tuned to be.**
+That is the shape the convention prescribes for a sub-regime win.
+
+Six regressions at widths 4 and 8 would survive such a gate, `cari` the worst. Those need a mechanism
+before anything moves, and MKT needs to say the same thing — its cache holds 4594 SuiteSparse
+matrices, so the identical stage can run there with no fetching. Job 17274394 (`pf0`), held, is the
+same object on that host.
