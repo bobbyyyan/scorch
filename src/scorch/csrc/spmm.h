@@ -2522,13 +2522,21 @@ static inline void scorch_spmm_row_gather_f32_ms(
 // the scalar tail, which has LESS instruction-level parallelism than the 2-stream
 // form it replaces, so a deep unroll is expected to lose on short rows -- that is
 // what the A/B measures, and it is why this is a hook and not yet a policy.
-template <typename T, int NVEC, bool FULL_LAST, int UNROLL, bool PF = false>
+// V is a parameter, not a fixed vocabulary, for the reason chain192 measured: at k=4 float32 the
+// shipped path is a 128-bit block with all four lanes live, and this kernel hardcoded the 256-bit
+// one, so it could only offer a vector with half its lanes masked off. The 302-matrix sweep read
+// nvec=1 at 0.8034 (k=4) and charged it to DEPTH; masking four of eight lanes is worth about that
+// on its own (removing the half-vector block entirely costs 24% on this host), so depth was never
+// the thing measured there. With V supplied by the caller the depth question can be asked at the
+// width the shipped kernel actually uses.
+template <typename T, int NVEC, bool FULL_LAST, int UNROLL, bool PF = false,
+          typename V = scorch_simd<T>>
 static inline void scorch_spmm_row_regblock_deep(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
     T* SCORCH_RESTRICT C_row, int pA_begin, int pA_end,
-    typename scorch_simd<T>::mask mask_last) {
-  using V = scorch_simd<T>;
+    typename V::mask mask_last) {
+  static_assert(UNROLL >= 2, "the remainder below runs two streams, so UNROLL cannot be 1");
   constexpr int L = V::lanes;
   typename V::vec acc[UNROLL][NVEC];
   for (int u = 0; u < UNROLL; u++)
@@ -2566,9 +2574,34 @@ static inline void scorch_spmm_row_regblock_deep(
       }
     }
   }
-  for (; pA < pA_end; pA++) {
+  // THE REMAINDER RUNS TWO STREAMS, and that is a correction rather than a tuning. A row of six
+  // nonzeros at UNROLL=4 leaves two here; the shipped kernel would have run those two as one
+  // iteration with two independent accumulator chains, so a single-chain remainder makes this
+  // kernel strictly worse than the one it replaces on every row whose length is not a multiple of
+  // UNROLL -- and a row SHORTER than UNROLL falls entirely into it. That is the cost the whole-
+  // corpus sweep charged to depth: this kernel's own comment predicts a loss on short rows, which
+  // is a property of the remainder, not of the streams. acc[1] exists for any UNROLL >= 2, so the
+  // second chain costs nothing.
+  for (; pA + 1 < pA_end; pA += 2) {
+    const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+    const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+    const typename V::vec a0 = V::splat(A_val[pA]);
+    const typename V::vec a1 = V::splat(A_val[pA + 1]);
+    #pragma unroll
+    for (int v = 0; v < NVEC; v++) {
+      const bool masked = (v == NVEC - 1) && !FULL_LAST;
+      const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                        : V::load(B0 + L * v);
+      const typename V::vec b1 = masked ? V::maskload(B1 + L * v, mask_last)
+                                        : V::load(B1 + L * v);
+      acc[0][v] = V::fma(a0, b0, acc[0][v]);
+      acc[1][v] = V::fma(a1, b1, acc[1][v]);
+    }
+  }
+  if (pA < pA_end) {
     const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
     const typename V::vec a0 = V::splat(A_val[pA]);
+    #pragma unroll
     for (int v = 0; v < NVEC; v++) {
       const bool masked = (v == NVEC - 1) && !FULL_LAST;
       const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
@@ -4862,6 +4895,46 @@ torch::Tensor spmm_csr_v2_core(
               const bool halfvec_under = (spmm_halfvec >= 2 && B1_size < LH &&
                                           B1_size >= 2 && !exact_width);
               if (halfvec_exact || halfvec_under) {
+                // The deep-stream form OF THIS KERNEL, at this width, which is the combination the
+                // 302-matrix sweep could not ask about: the deep kernel hardcoded the full-width
+                // vocabulary, so at k=4 float32 it could only offer a 256-bit vector with four of
+                // eight lanes masked, and it read 0.8034 there. Same vector as the line below it,
+                // same mask, UNROLL independent nonzero streams instead of two. Depth is the only
+                // difference, which is what makes the comparison attributable.
+                //
+                // #if, not a folded `if`. With the constant off, `narrowk_unroll` is a
+                // compile-time 0 and the block below IS dead -- but dead is not absent: the 31
+                // lines still feed the inliner's cost model for this lambda, and they moved the
+                // shipped object by exactly two instructions (`cmp %rbx,%r14 / jle` became
+                // `cmp %r14,%rbx / jge`, a commuted compare with its branch sense inverted --
+                // semantically identical, same count, same .text size, and still a difference the
+                // neutrality proof cannot wave through). Absent from the source, there is nothing
+                // to argue about. SCORCH_TUNE_HOOKS keeps it reachable where the constant is a
+                // runtime value.
+#if SCORCH_NARROWK_DEEP_UNROLL || defined(SCORCH_TUNE_HOOKS)
+                if (narrowk_unroll &&
+                    (narrowk_deep_hi <= 0 || (1 >= narrowk_deep_lo && 1 <= narrowk_deep_hi))) {
+                  #define SCORCH_RBDH(UN, PFV) \
+                    (halfvec_exact \
+                       ? scorch_spmm_row_regblock_deep<scalar_t, 1, true, UN, PFV, VH>( \
+                             A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, \
+                             VH::lane_mask(LH)) \
+                       : scorch_spmm_row_regblock_deep<scalar_t, 1, false, UN, PFV, VH>( \
+                             A1_crd, A_val, B_val, B1_size, C_row, pA_begin, pA_end, \
+                             VH::lane_mask(B1_size)))
+                  #define SCORCH_RBDH_PF(UN) \
+                    (narrowk_unroll_pf ? SCORCH_RBDH(UN, true) : SCORCH_RBDH(UN, false))
+                  bool took_d = true;
+                  switch (narrowk_unroll) {
+                    case 4: SCORCH_RBDH_PF(4); break;
+                    case 8: SCORCH_RBDH_PF(8); break;
+                    default: took_d = false; break;   // depth not instantiated: fall through
+                  }
+                  #undef SCORCH_RBDH_PF
+                  #undef SCORCH_RBDH
+                  if (took_d) continue;
+                }
+#endif
                 if (halfvec_exact) {
                   scorch_spmm_row_regblock<scalar_t, 1, true, VH>(
                       A1_crd, A_val, B_val, B1_size, C_row, pA_begin,
