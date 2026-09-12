@@ -26452,3 +26452,104 @@ edit changed call sites in both and `scorch.matmul` cannot reach the second one 
 
 If both halves do not hold, the answer is that the prefetch has no defensible form and deleting it
 is what is left. That is a result, not a licence to reach for a width rule.
+
+## chain197 verdict: the claim fails, the guard was never the cost, and the scoreboard has 176 cells of churn
+
+Four builds, all 4584 cached SuiteSparse matrices, widths 2/4/8/16/32, four passes of a Williams
+design, 275040 rows per build, 0 readings refused, 0 correctness mismatches on any arm (224 cases
+each, 84 of them through the fused Linear). Pass times 2h02m each, 11:34 to 17:40.
+
+**P3a holds.** At the inert width 2 both arms sit inside the identical-source control: `pfd0` 1.0019
+[0.9998, 1.0039] and `stream` 1.0021 [1.0002, 1.0040] against an A/A of 1.0017 [0.9999, 1.0037].
+
+**P3b (i) FAILS, decisively and almost everywhere.** `stream` against `pfd0`, by mean degree — above
+1.0 would mean `stream` is faster:
+
+| degree | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|
+| 0-4 | 0.9818 | 0.9722 | 0.9743 | 0.9934 |
+| 4-8 | 0.9470 | 0.9352 | 0.9372 | 0.9859 |
+| 8-16 | 0.9332 | 0.9250 | 0.9267 | 0.9783 |
+| 16-32 | 0.9239 | 0.9044 | 0.9248 | 0.9651 |
+| 32-64 | 0.8967 | 0.8881 | 0.9283 | 0.9689 |
+| 64-128 | 0.9176 | 0.8707 | 0.9162 | 0.9782 |
+| >=128 | 0.9226 | 0.8928 | 0.9140 | 0.9460 |
+
+Band A/A floors are ±0.2% to ±2.8%, so 24 of these 28 cells are outside the floor in the wrong
+direction. 64 band-width cells across the three views go the wrong way. And `stream` is not merely
+short of `pfd0`: it is **slower than what ships** at width 16 in five of seven degree bands, by 2.1%
+to 3.5%.
+
+**P3b (ii) holds, weakly and without meaning much.** On the 115 frozen matrices `stream` is inside
+the floor at every width (0.9698 at width 16 against a ±0.5% floor is the closest call). Per matrix
+at width 32, 21 of the 115 are still more than 10% slower than what ships and 46 are faster, so it
+neither keeps nor loses the coverage cleanly. With (i) failed this half decides nothing.
+
+### The premise was wrong: the guard was never the cost
+
+The edit emitted exactly what it was designed to emit. Instruction mix of the out-of-line
+`scorch_spmm_row_regblock<float, 1, true>`:
+
+| build | instructions | prefetch | fma | jcc | cmov |
+|---|---|---|---|---|---|
+| `c0` | 137 | 4 | 8 | 9 | 0 |
+| `stream` | 142 | 4 | 9 | **6** | **4** |
+| `pfd0` | 99 | 0 | 9 | 6 | 0 |
+
+Three conditional branches became four conditional moves, which is the transformation, and the
+symbol got **five instructions longer rather than shorter**. That is the whole answer. The guarded
+form skips the index load, the multiply and the address arithmetic on the iterations where the
+prefetch would fall outside the row; the clamped form does that arithmetic unconditionally and
+lengthens the dependency chain with a `cmov`. And the branch it replaced is **taken on every
+iteration of a row except the last one or two**, so the predictor gets it right nearly always and it
+costs about one issue slot.
+
+So chain195's "9 of 23 instructions per two nonzeros" was a static listing count being used as a
+cost model, and it named the wrong nine instructions. The cost `pfd0` removes is the prefetch
+*itself* — the instruction, plus the index load and multiply that compute its address — not the test
+that guards it. 137 to 99 instructions at NVEC=1 with four prefetches gone. **There is no cheaper
+form of "prefetch on every iteration": the clamp was the cheapest available and it is more
+expensive than the branch.** A form with *fewer* prefetches is a different design, not a fix to this
+one.
+
+### What ships: nothing changes
+
+`pfd0` is the only arm that wins time, and it is still not shippable — it costs more than 10% on 115
+matrices at width 32, up to 3.4x on `usroads`, which fails the project's neutral-or-better
+convention on its own. `stream` is rejected by its own pre-registered test. **The prefetch stays as
+it is, and this line of work is closed.** `SCORCH_SPMM_REGBLOCK_PFD` and
+`SCORCH_SPMM_REGBLOCK_PFSTREAM` both remain at their shipped defaults with the alternatives behind
+them, which is where a measured dead end belongs.
+
+### The scoreboard's own noise is 176 cells wide, against a stable core of 61
+
+This is the more consequential number and it does not depend on the prefetch at all. The board is a
+per-cell threshold test — `ours/mkl > 1.01` — and `c0` and `c0b` are **the same code**:
+
+    c0       144 cells behind MKL of 22920
+    c0b      154 cells behind MKL of 22920
+    behind in BOTH (a stable deficit)      61
+    behind in c0 only                      83
+    behind in c0b only                     93
+
+**176 cells of churn around a stable core of 61.** So "116 of 22920 behind MKL", the number the
+previous section put on the board, is mostly the threshold test flipping on cells whose ratio sits
+near 1.01 — the same mistake as "8 of 265", in the opposite direction. The stable core is
+concentrated where the narrow-k kernels live: **21 cells at width 2, 28 at width 4, 10 at width 8,
+1 each at 16 and 32.**
+
+Behind MKL in **all four** builds — a deficit no prefetch choice touches — is **23 cells over 22
+matrices**, worst first: `us04` k=32 1.486, `raefsky1` k=2 1.447, `gen4` k=4 1.431, `Pd_b` k=2
+1.352, `m3plates` k=2 1.326, `HFE18_96_in` k=4 1.262, `lp_osa_30` k=4 1.252, `boyd1` k=4 1.199,
+`nw14` k=4 1.191, `raefsky1` k=4 1.168, `FX_March2010` k=8 1.128, `poli` k=2 1.127, **`connectus`
+k=8 1.123** — which is one of the original eight — `nemsemm1` k=4 1.121, `kl02` k=4 1.120.
+
+Measured against that core rather than the raw count, both arms are net harmful: `pfd0` fixes 30 of
+the 61 and breaks 72 cells that were fine; `stream` fixes 19 and breaks 75. **That is the real
+reason neither ships, and it is a stronger statement than either pooled geomean.**
+
+**Consequence for how this project measures.** Any target list drawn from a single build is a list
+of which cells that build's noise happened to push over 1.01. A list is only usable if it is the
+intersection over both identical-source builds, and a claim to have "fixed a cell" needs the same
+treatment. The 23-cell list above is the first target list on this branch that has been through that
+filter.
