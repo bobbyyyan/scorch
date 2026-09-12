@@ -26553,3 +26553,74 @@ of which cells that build's noise happened to push over 1.01. A list is only usa
 intersection over both identical-source builds, and a claim to have "fixed a cell" needs the same
 treatment. The 23-cell list above is the first target list on this branch that has been through that
 filter.
+
+## chain198: the board, measured well enough to work on — 33 cells, and 27 of them fixable-and-detectable
+
+chain197 left the board unusable: the per-cell test churned 176 of 22920 cells on identical source,
+and only 19 of the 61 stable cells had a deficit larger than their own churn. So this stage measures
+no change at all. 89 matrices instead of 4584 — the 49 carrying those 61 cells plus **40 controls we
+beat MKL by more than 2x at every width** — two builds of identical source, **30 passes**, reps 10 /
+target-ms 20 instead of 4 / 6. 40050 rows per build, 0 readings refused, 0 correctness mismatches.
+
+**The estimator was fixed before the data and it is the main methodological change.** Per cell and
+per build the ratio `ours/mkl` is formed **within each pass**, and the median is taken over passes —
+not the ratio of two medians. Both arms are timed in the same process, so a pass that is slow for
+one is slow for the other, and pairing inside the pass removes that shared component. chain197
+divided medians, which is why MKL's own churn appeared as a floor under every deficit.
+
+The rule, also pre-registered: a cell is behind MKL only if the bootstrap CI lower bound of that
+paired ratio exceeds 1.01 **in both identical-source builds**.
+
+**The negative control holds: 0 of 200 control cells come out behind.** The instrument does not
+invent deficits on matrices we clearly win, which is what makes the rest readable.
+
+### 33 cells confirmed behind MKL, of 445 measured
+
+| width | cells |
+|---|---|
+| k=2 | 10 |
+| k=4 | 19 |
+| k=8 | 2 |
+| k=16 | 1 |
+| k=32 | 1 |
+
+**29 of 33 sit at k≤4.** And 27 of the 33 have a deficit larger than their own identical-source
+interval, so a fix there would be detectable; 6 are real but not measurable one cell at a time even
+at 30 passes. The workable list:
+
+| width | cells | deficit range | largest |
+|---|---|---|---|
+| k=2 | 9 | 5.6% – 34.6% | `m3plates` +34.6% (A/A ±1.22%), `Pd_b` +31.0% (±0.86%), `Pd_rhs` +30.3%, `nw14` +26.0%, `p6000` +14.9%, `poli` +12.1%, `ins2` +11.9% |
+| k=4 | 14 | 3.5% – 36.6% | `kl02` +36.6% (A/A ±0.81%), `nw14` +27.8%, `lp_osa_14` +13.6%, `lp_osa_30` +11.9%, `lp_osa_07` +11.2%, `nemsemm1` +6.4%, `bibd_19_9` +5.6% |
+| k=8 | 2 | 11.5% – 16.9% | `nw14` +16.9%, `connectus` +11.5% |
+| k=16 | 1 | 13.9% | `connectus` |
+| k=32 | 1 | 22.7% | `connectus` |
+
+**33 of chain197's 61 stable-core cells did not confirm**, and several are now at or below parity:
+`aa3` k=4 0.998, `FX_March2010` k=8 0.997, `rlfddd` k=4 0.997, `lp_d6cube` k=4 0.983, `aa03` k=4
+1.002. Those were the threshold test's noise, exactly as chain197 predicted they would be. In the
+other direction, cells at **other widths of the same 49 matrices** confirmed for the first time —
+`connectus` at 4, 8, 16 and 32, `nw14` at 2, `p6000` at 2, `heart1`, `raefsky2`, `comsol`,
+`rail516`, `rail582` at 4 — because the paired estimator resolves what dividing medians could not.
+
+### The workable list is three populations, by geometry alone
+
+- **Mostly-empty rows at k=2**: `m3plates` (11107 rows, mean degree 0.60), `Pd_b` and `Pd_rhs`
+  (8081 rows, 0.78), `TSOPF_RS_b162_c3_b` (15374 rows, 0.50). Mean degree below one means most rows
+  hold nothing, so per-row overhead is the whole kernel. Deficits ~30%.
+- **Fewer rows than workers**: `nw14` (73 rows, degree 12396), `kl02` (71 rows, degree 2993), `us04`
+  (163 rows, degree 1825). 24 workers over 71 rows cannot balance, whatever the inner loop does.
+- **Long rows, enough of them**: the `lp_osa_*` family (135–139 nnz/row), `nemsemm1` (267),
+  `cegb2919` (110), `raefsky1` (90), `connectus` (2202). This is the population chain199 is aimed at.
+
+The three are different problems and only the third is about the inner loop. That the first two show
+up at k=2 and the third dominates k=4 is consistent with them being separate.
+
+### Method: what 30 passes bought, stated plainly
+
+The deficits did not change much; the **confidence** did. `heart1` at k=4 reads +4.9% with an A/A of
+±0.71%, `TSOPF` +5.6% with ±0.44%, `poli` +12.1% with ±0.65% — at four passes none of those was
+distinguishable from the 4–6% per-cell churn. The cost was 4h15m of one host for 89 matrices. The
+same resolution over the full 4584 would be about nine days, which is the real argument for screening
+on a derived corpus with a control group rather than measuring everything at the resolution of the
+thing you care least about.
