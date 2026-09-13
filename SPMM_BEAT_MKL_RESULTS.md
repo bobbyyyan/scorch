@@ -29124,3 +29124,52 @@ centres exceed the margin outright.
 
 Sealed at 143 files, 142 of 142 verifying, manifest
 `b7245a953c4a769f29ffe26004221fbc2127e7999f4e5316262a6897cca26eb1`.
+
+### chain203 launched, and its margin table amended before it had data
+
+chain203 runs the ladder with a **rung-wise control**: 11 arms (`ovp` plus a duplicate at each of
+2/4/8/16/24), one object, 89 keys, widths 2/4/32, **22 passes** in two balanced halves of 11.
+Position balance needs the pass count divisible by the arm count, so 14 was not an option at 11 arms.
+
+**The rotation needed a derivation.** The stage body checks adjacent-ordered-pair balance, and the
+condition is *not* all-distinct consecutive differences — that is impossible for odd arm counts,
+since the n−1 distinct non-zero residues sum to n(n−1)/2, a multiple of n for odd n, forcing
+last = first while every element is distinct. Confirmed: 0 of 4000 random bases and 0 by exhaustive
+search. The real condition pairs across the reversal, `mult(d) + mult(n−d) = 2`, which chain202's
+own 7-arm base satisfies with differences {1,1,3,3,5,5}. Enumerated under it, 19% also reach the
+55-at-5/55-at-6 precedence optimum. The stage's own check printed `position counts [2]; ordered
+pairs [2] over 110 of 110`.
+
+**Amendment 1, written while chain203 was in its first passes and before any of its data existed** —
+as a separate file, because the body script is being *sourced* by the running stage and bash reads a
+sourced file incrementally, so editing it mid-run can corrupt execution. The stamped original is
+byte-identical.
+
+- **The margin construction was an approximation and is now exact.** `|dev| + half-width` equals the
+  largest deviation from parity a CI admits only for an interval symmetric about the point estimate,
+  which a bootstrap percentile interval is not. The exact form is the max CI excursion,
+  `max(|lo−1|, |hi−1|)`. Largest change +0.0015 and −0.0018.
+- **Two conventions are now named,** because each moves the number more than the effect does: the
+  estimator is pass-paired (span across four defensible estimators is **2.9x**, against a group
+  effect of 3.3x), and the group rule is per-cell with ADOPT meaning `RES[ovp] < RES[ov24]` at that
+  (key, width).
+- **The margin is the maximum over both independent readings, which is fail-closed.** The two differ
+  at ADOPT k=32 — 0.0111 here, 0.0150 on the other side, the gap being the group rule, not the
+  construction. Nothing inside either reading settles which population is right, and the cost is
+  asymmetric: too small a margin declares an effect inside the artefact, too large only costs power.
+
+| margin | k=2 | k=4 | k=32 |
+|---|---|---|---|
+| NULL | 0.0023 | 0.0042 | 0.0051 |
+| CAPONLY | 0.0115 | 0.0099 | 0.0175 |
+| ADOPT | 0.0148 | 0.0142 | 0.0150 |
+
+**And one magnitude correction to the promoted chain202 result.** `ms(ov24)/ms(ovp) = 0.8531` on
+ADOPT at k=32 makes `ov24` the faster arm — the direction as stated — but "14.7% faster" is the
+(1−ratio) reading and understates it: the faster-by figure is **17.2%**, equivalently `ovp` takes
+17.2% longer. And "opposite direction" holds only against chain202's own hypothesis; it is the
+*same* direction as the pooled ladder, so it is a strong confirmation of the ladder on the ADOPT
+population rather than a new direction, and it does not by itself justify pre-registering both
+directions — which stands on its own merits.
+
+Sealed at 148 files, 147 of 147 verifying.
