@@ -29325,3 +29325,46 @@ The per-rung HIGHER/LOWER groups are untouched — genuinely rung-specific, 24�
 spanning 7.3x. The non-independence is confined to the treatment-free column.
 
 Sealed at 151 files, 150 of 150 verifying.
+
+### Amendment 5: the decomposition is correct and produces nothing
+
+A declared limit rather than a changed rule, and better said now than discovered at 22:15.
+
+**`fringe(ov24)` *is* chain202's CAPONLY group** — set-identical at all three widths, n = 29/29/40.
+It follows from the definitions, but neither reading had stated it. With it stated, amendment 4's
+fifteen cells read: one rung-invariant core (already known), one measurable fringe that **is a
+population already named and measured**, and four informative fringes holding 2/3/5/6, 2/3/3/6 and
+1/2/2/1 cells — **all void** at the floor of 8. The decomposition is the right one and it yields
+zero new numbers.
+
+**And chain203 will not fix it, by construction.** Fringe membership is a function of `resolved`
+alone, and a duplicate arm resolves identically to its partner — so duplicates change *which pair
+measures a group*, never how many cells are in it. Demonstrated: dropping `ov24b` from the
+all-arms-agree test leaves the core at 29/29/24. So the comparison amendment 4 pre-registered as the
+informative one is **unavailable in chain203**, in the same class as amendment 3's limit on
+`ov2`/`ov4` HIGHER at narrow widths — a property of the mechanism, not the corpus, and not a defect
+in the run.
+
+**What would fix it, priced and not proposed.** Uniform scaling to bring the smallest fringe to 8
+cells, binding on `ov2` both times: **356 keys (4.0x)** at k=2 and k=4, **712 keys (8.0x)** at k=32 —
+roughly 34 h and 67 h against the current ~8.4 h. Assumption named: that the fringe *fraction* is
+corpus-invariant, which is not established. The cheaper route is to **select** for fringe membership
+rather than scale: `resolved` is deterministic (1869 of 1869 across 14 invocations) and reading it
+needs no timing, so an untimed resolve-only probe over the cache turns forty-keys-per-fringe into a
+selection problem. That comes with a requirement: a fringe-selected corpus is not a random sample,
+so it can support "do the fringes agree" and must not be reused for any pooled or ladder claim — two
+corpora, two declared purposes. Neither is started; a 34–67 h run is Bobby's to authorise, and even
+an untimed probe would run on the host currently timing chain203, where the harmless-looking job is
+the perturbation.
+
+**Nothing here blocks chain203** — the verdicts ride on the HIGHER/LOWER groups, 24–56 cells,
+rung-specific and non-overlapping.
+
+**The design rule the argument arrives at, recorded because it outlives the stage:** the arm chosen
+as a reference is chosen for being unremarkable, and unremarkable is precisely the property that
+stops it witnessing a mechanism firing. `ov24` is the continuity anchor *because* its request equals
+the pool, and useless as the invariance witness for the same reason. **A design of this kind needs
+two distinguished arms — a reference that is inert and a witness that is not — and they can never be
+the same arm.** chain202 had one and used it for both roles.
+
+Sealed at 152 files, 151 of 151 verifying.
