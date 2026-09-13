@@ -28692,6 +28692,46 @@ the one width whose control holds — that is a `no/YES`, which the pre-registra
 *chain200 was measuring the pool*: 24 workers existing rather than being used, which belongs to the
 caller and not to this kernel. **Nothing ships.**
 
+**Correction: the control fails at ALL THREE widths, and my predicate was the reason it looked
+like two.** `inside()` tested whether a CI *overlaps* the floor band — failure-to-reject, not
+evidence of absence — so it passes on imprecision. At k=4 it passed a NULL worst-arm CI of
+[0.9405, 0.9996], **8.4x wider than the ±0.35% band it was judged against and excluding parity
+outright**. A control that a sufficiently wide CI always passes is not a control. Replaced with
+three outcomes — `effect` (CI excludes parity), `nopower` (CI contains parity but is wider than the
+band), `flat` (CI contained in the band, the only pass) — after which the verdict line reads
+`NO (nopower,effect)` at k=2, `NO (nopower,effect)` at k=4 and `NO (effect,effect)` at k=32.
+CAPONLY also fails at k=2 and k=4, having been passed by the same overlap test. This is the
+equivalence-versus-detection error that this project has a standing note about, made in the one
+place it decides a control.
+
+One limit of the corrected test, stated because it bounds what a pass could ever have meant:
+containment is **not achievable at n = 24–29 on this data for any pair**, including the
+same-argument A/A. So `nopower` is the honest outcome rather than a near-miss, and no margin at this
+n could have certified the control. The load-bearing statistic is therefore parity exclusion, for
+which the A/A pair is the positive control — and `ov24`/`ov24b` **never excludes parity at any
+width**, while 11 of 21, 6 of 21 and 17 of 21 of the other pairs do.
+
+**The artefact grows strongly with width, and it reaches the pair the gain is measured across.**
+On NULL cells, where every arm delivers one worker, `ov16`/`ovp` — the pair carrying the whole k=4
+gain — reads −0.22% [0.9940, 1.0029] at k=2, **+1.65% [0.9968, 1.0532]** at k=4, and **+7.22%
+[1.0168, 1.1471]** at k=32, the last excluding parity. At k=4 that neither demonstrates an artefact
+nor rules one out below +5.3%, against a +6-cell gain — so the k=4 result is unattributable for
+want of control power, not because an artefact is proven. `ov16`/`ov24` at k=4 does exclude parity
+at +2.19%, reproducing the checker's +2.08% independently. The earlier "0.5–0.7% at resolved 1" was
+the k=2 end of a range reaching six times that.
+
+**So nothing at any width is attributable, and the pre-registered NO is the only thing standing.**
+The mechanism claim is unaffected and now better measured: a positive override declines into a
+private-team launch, so the argument moves more than the worker count, across a six-fold width
+dependence.
+
+The original sealed capture is kept unmodified at `c202_analysis.txt` with the corrected read
+alongside it as `c202_analysis_corrected.txt` and a `CORRECTION.txt` stating what changed —
+re-sealed at 116 files, 115 of 115 verifying, manifest
+`5e0e7daf79db12228c474727c60df18fa7e58daae94f3186d560f1d9e0fa2046`. Replacing the original would
+have destroyed the record of a defect found within the hour, which is the same reason the nine
+CRC-32 manifests were reported rather than regenerated.
+
 **The negative control fails at k=2 and k=32, and the failure is localized.** NULL is the group
 where every arm resolves to the same team, so every arm must be flat. The headline `ov24/ovp` pair
 is inside the floor at all three widths, but the control is over *every* arm and the worst arm is
