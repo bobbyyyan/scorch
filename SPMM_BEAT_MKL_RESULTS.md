@@ -27067,3 +27067,104 @@ real, it was avoidable, and one extra call to the exported policy per row restor
 carries the column.
 
 Nothing ships from chain200. The next stage is the override, not the thread count.
+
+### A positive override is not a cap on the largest cells, and `ASIC_100k` is not an adoption cell
+
+Two corrections to the section above, both found before chain202 ran and both traced in
+`scorch_policy.h` rather than measured after the fact.
+
+**First: `ASIC_100k` belongs in the group where the adoption does nothing.** The sentence two
+subsections up gives its redwood answer as 24 and that is right, but the framing around it —
+this is the matrix where "the host-pool adoption raises a count the policy already had right" —
+is wrong, and it was wrong about the one matrix the write-up quoted most often. Working both arms
+on redwood:
+
+    override -1   the adoption gate needs override > 0, so it is skipped. base 32,
+                  NT_CAP -> omp_get_max_threads() = 24.                            resolved 24
+    override 24   the adoption fires, cand = min(24, 99340/16) = 24, but the raise is
+                  conditional on cand > nthreads and 24 > 32 is false. base stays 32,
+                  NT_CAP -> 24.                                                    resolved 24
+
+The two arms resolve identically, so nothing is overridden. What over-threads this matrix is the
+**base** `by_work` bound — 940621 × 16 / 150000 = 100, clipped to `omp_get_num_procs()` 32 — and
+the final cap merely clips that to the pool. Its measured optimum is 16 workers, so there is a
+real 24 → 16 lever here, and **no change to the adoption reaches it.** That makes the large-row
+matrices a second, independent lever from the mostly-empty-row population, and it is the one that
+governs the biggest matrices on the board. `SCORCH_SPMM_ADOPT_GRAIN` is `0L` by default, so the
+graded-adoption block is skipped and cannot reduce `cand` either; `p6000` (2 → 24) and `aa3`
+(7 → 24) are unaffected and remain genuine adoption cells.
+
+The consequence is for chain202's negative control, which is why this mattered before the run and
+not after. Defining the control as `resolved(-1) == resolved(24)` puts `ASIC_100k` inside it while
+a lower override still moves its team, so `ov16` beating `ov24` there would read as the instrument
+failing when it is a second mechanism working. chain202 now partitions every cell three ways,
+entirely from the recorded `resolved` column:
+
+| group | definition | what it is |
+|---|---|---|
+| `ADOPT` | `resolved(-1) < resolved(24)` | the adoption raises the team — the claim |
+| `CAPONLY` | those two tie, but some other arm differs | the base bound over-threads and both arms are clipped to the pool — a second lever |
+| `NULL` | every arm resolves alike | the only true negative control |
+
+`NULL` is tight without needing an argument: the lowest arm caps the team at 2, so a cell can
+only land there if every arm resolves to 2 or fewer, which is the work-gated population —
+`nnz × max(k,16)` below the grain, one worker everywhere. The stronger control this buys is that
+*every* arm must read flat in `NULL`, not just the `-1`/`24` pair; that check would have been
+invalid under the two-group split, because `ov16` legitimately wins on the `CAPONLY` cells the
+old grouping swept into the same bucket. Both directions are self-tested on planted data: a 7%
+slow arm inside `NULL` reads the control `NO`, and a 12% `ov16` win inside `CAPONLY` leaves it
+`YES`.
+
+**Second, and larger: the final cap DECLINES, so a low positive override can raise the worker
+count and change the launch path.** `scorch_policy.h:2127` drops the cap entirely —
+
+    if (recruit_min_work > 0 && work_true >= recruit_min_work) {
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_max_threads();
+      if ((long)nthreads >= 2 * pool) nt_cap = 0;   // 0 means "no cap", below
+    }
+
+with `SCORCH_SPMM_RECRUIT_MIN_WORK` at `10000000L`. The comment says why: the drop-in and fused
+SpMM kernels launch their own OpenMP team instead of using `at::parallel_for` when the count
+reaches twice the caller's pool, to reach cores the pool excludes, and capping at the pool would
+make that unsatisfiable. The launch site (`spmm.h:5268`) gates the recruit on the same condition.
+Its inertness argument — "can NEVER fire on an all-physical-cores pool (x86: pool=24, gate at 48,
+nthreads<=32 < 48)" — holds for a caller passing the real pool. It does **not** hold for a sweep
+arm passing a low override, because then `pool` *is* the override and the gate is at twice that.
+
+Measured through the exported policy on `ASIC_100k`'s shape (99340 rows, 940621 nonzeros), pool
+pinned so the arithmetic is visible:
+
+| k | `work_true` | ov2 | ov4 | ov8 | ov16 |
+|---|---|---|---|---|---|
+| 2 | 1881242 | 2 | 4 | 8 | 16 |
+| 4 | 3762484 | 2 | 4 | 8 | 16 |
+| 32 | 30099872 | 18 | 18 | 18 | 16 |
+
+At k=32 the low arms do not run on 2, 4 and 8 workers. They run on every processor the host has,
+on a private team, down a different launch path — two things moving at once. (18 is this reading's
+host; on redwood the same three arms land on 32 and `ov16` declines too, because 32 ≥ 2 × 16.)
+
+Detecting it needs no constant and restates no policy: a positive override *is* the final cap, so
+`resolved > override` can only mean the cap declined, and the decline condition is exactly the
+launch site's condition. `an_c202.py` reports those cells per arm and never pools them with the
+same resolved count reached through the cap; the stage's pre-flight now counts them at every width
+it measures.
+
+**What this does to chain200.** Its arms passed `nthreads_override = POOL`, so `t1` declines at a
+count of 2, `t2` at 4, `t4` at 8, `t8` at 16 and `t16` at 32 — whenever `work_true` clears ten
+million. Over its 89 matrices that threshold is crossed by **0 cells at k=2, 3 at k=4 and 21 at
+k=32**. The held-out headline is at k=2, so it is untouched. Any reading of the low arms at k=4
+or k=32 on those 24 cells is not a low-thread arm and must be re-read as the base count on a
+private team.
+
+**And the pre-flight now asks rather than asserts.** Saturating every input drives the base count
+to `omp_get_num_procs()`; with a huge *positive* override the final cap cannot bind, so that
+reading is the processor count, and with `-1` the cap is `omp_get_max_threads()`, so that reading
+is the pool. The stage prints both, refuses if the pool it sees is not the pool it pinned, and
+refuses outright on a host whose processor count reaches twice its pool — because there the `-1`
+probe declines and returns the processor count, saying nothing about the pool. That is the M5 (18
+against 6) and not redwood (32 against 48), which is a third reason the two hosts do not give an
+override of `-1` the same meaning, and it is why a chain202 confirmation run on the M5 would not
+measure the same arm. Both refusals and the passing path are exercised on the real header before
+the stage is allowed to run.
