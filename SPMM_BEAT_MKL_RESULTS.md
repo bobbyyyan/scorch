@@ -29224,3 +29224,49 @@ bands the stage is built on. The arm inventory will report `resolved` per rung a
 declared counts.
 
 Sealed at 149 files, 148 of 148 verifying.
+
+### Amendment 3: the partition is rung-specific, so four of five rungs had the wrong population
+
+The largest of the three amendments, and the same argument amendment 2 accepted one level down.
+Amendment 2 established *compute the margin on the population the verdict is computed on*. chain203
+computes a verdict **per rung**, and its partition was defined once, from `ov24`.
+
+**The amendment-2 refusal test is withdrawn: it was blind where the mechanism lives.** Cells where an
+arm resolves *above* the pool — `ov2` 24, `ov4` 24, `ov8` 24, `ov16` 24, **`ov24` 0, `ov24b` 0**. The
+only duplicate pair that existed sits at the one rung where adoption-above-pool is inert, so
+"a duplicate cannot change the partition" was demonstrated exactly where there is nothing to diverge
+about. The replacement evidence was already in chain202 and is stronger: `resolved` is
+**single-valued across the 14 separate invocations for every build — 1869 of 1869**, including on the
+24 cells where adoption above the pool fires.
+
+**"LOWER 0" was true only for the `ov24` reference.** Cells where a rung delivers fewer than ambient:
+`ov24` [0,0,0], `ov16` [27,24,28], `ov8` [45,44,33], `ov4` [53,50,35], `ov2` [56,53,38]. `ov24`
+requests exactly the pool so it can never deliver fewer; at the low rungs it is the majority
+behaviour.
+
+**The partitions are rung-specific by 2.5x and not nested.** Treated counts run `ov24` [31,31,25]
+against `ov2` [58,58,64], and `ov2` treats **29/29/40** cells the global partition calls untreated.
+Structural: `ov24` requests the pool and differs from ambient only where ambient fell below it, while
+`ov2` requests 2 and differs almost everywhere.
+
+**And the artefact moves with the defining rung** — same pair, same estimator, only the partition
+changed: `ov24`-treated 0.0148 / 0.0142 / 0.0111 against `ov2`-treated 0.0074 / 0.0084 / 0.0127, a
+factor of 2 at k=2, with `ov2`-untreated collapsing to n=2/2/1 where no margin exists at all. NULL is
+**reference-free** by construction and identical under both — now the third independent reason the
+treatment-free restriction earns its place, after estimator-stability and width-stability.
+
+**What chain203 will use.** For each rung X, the sign of `resolved[X] − resolved[ovp]`: `NULL_X`,
+`HIGHER_X`, `LOWER_X`; X's verdict on X's groups against a margin from X's **own** duplicate pair
+X/Xb on those same groups. The `ov24`-referenced partition is retained as a second labelled reading
+for continuity, not as the population. The proxy artefact across all 45 (rung, group, width) cells
+spans **0.0028 to 0.0207 — a factor of 7.4** — which is why one global margin could not have served.
+
+**Seven cells cannot carry a margin, named in advance:** `ov24` LOWER at all three widths (a rung
+requesting the pool can never deliver fewer), and `ov2`/`ov4` HIGHER at k=2 and k=4 (requesting 2 or
+4 rarely exceeds what the base policy picks). Those get no verdict; 38 of 45 can carry one.
+
+**Not claimed:** no per-rung artefact has been measured — every figure above uses chain202's single
+duplicate pair. What is established is that the partition is rung-specific and that an artefact
+measured with one fixed pair moves substantially across partitions.
+
+Sealed at 150 files, 149 of 149 verifying.
