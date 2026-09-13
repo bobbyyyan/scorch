@@ -27300,3 +27300,30 @@ adding noise to it, and only the count needs hedging.
 
 Headline figures hold under every order, because `FED` reads only `grains` and every reported number
 sits on `FED` or on the whole corpus.
+
+**The sign has a proof, and the proof gives the statement that needs no hedging.** The buggy map is
+a subset of the true map — it keeps one arm or none — so `max(buggy) <= max(true)`, with `or [0]`
+giving 0 for empty, and the classifier thresholds on that maximum. Therefore buggy STARVED implies
+true STARVED, and the only reachable error is a truly-starved cell reported as lean. Dropping
+elements from a set under a monotone threshold on its maximum can only move the verdict one way.
+Checked across 22 row orders: **184 transitions, every one LEAN → STARVED, none reversed, and
+`buggy STARVED` a subset of `true STARVED` in every order.**
+
+That also fixes what to report. `|true STARVED| = 14` is order-invariant, because it reads only the
+true maximum, which is data; and
+
+    reclassified  ==  |true STARVED| - |buggy STARVED|      exactly, in every order
+    as-ordered    |buggy STARVED| = 5  ->  9 reclassified
+    reversed      |buggy STARVED| = 3  -> 11 reclassified
+    22 orders     |buggy STARVED| ranged 2 to 9
+
+So the sentence is **"the corpus holds 14 truly-starved cells and the buggy analyzer recognised 5 of
+them"** — which 5 was a draw, and in principle it could have recognised none. Exact, unhedged, and
+one-sided on its face. The reclassified count is the derived noisy quantity and makes a poor
+headline, which is what "nine cells changed class" was.
+
+General form, worth keeping past this defect: **subset corruption under a monotone threshold gives a
+nondeterministic magnitude with a deterministic sign.** The sign follows from the mechanism and
+needs no confirming draws; the magnitude needs no hedging either, because the invariant side of the
+relation is data. The trap is that "nondeterministic" reads as "random", so a signed bias gets
+reported as noise.
