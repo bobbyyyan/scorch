@@ -27768,3 +27768,44 @@ compiler's identity: redwood is Linux and `setup.sh` forces clang only on macOS,
 banner has been read from `mrbuild.log`. Under clang the same effects appear as `.cold.N` from
 `-fsplit-cold-code` and `OUTLINED_FUNCTION_N` from the machine outliner — which is precisely why the
 comparison must not be a grep, and why the instrument is right before the compiler is known.
+
+**Amendment, and a correction to the amendment above: `--core-bytes` was never the unsuffixed
+symbol.** The census that produced these numbers states it — "Sizes of the `spmm_csr_v2_core`
+symbol group, summed over its **12 symbols**". So 62183 is a group sum, not one symbol's size, and
+the concern that one route measured the function while the other measured a neighbouring symbol
+does not apply as posed. My own amendment above over-corrected in the same motion: under GCC all
+three suffix families append to the *mangled* name — `.cold`, `._omp_fn.N`, `.part.N`,
+`.constprop.N` — so a substring selector on the mangled prefix captures them, and the sum does not
+automatically miss them.
+
+That partially restores the sign as a puzzle rather than dissolving it. If the group already
+contains the cold and outlined parts of the instantiation, then code moving into `.cold` moves
+*within* the group and cannot produce a −11155 group total. The third branch explains the sign only
+if the selector missed a family.
+
+**What was verified locally, and its scope.** The claim that this function splits across many
+symbols is true and now checked directly: `nm` on `src/scorch_ops.cpython-311-darwin.so` (Sep 8,
+read-only) gives exactly **six** symbols for `spmm_csr_v2_core<float, false>` — the function's own,
+two `.omp_outlined` forms, an `.omp_outlined.99`, an `at::parallel_for<…lambda(long long, long
+long)>`, an `at::internal::invoke_parallel<…>(.omp_outlined)`, and the lambda
+`operator()(int, int) const`, which is the signature of `scorch_spmm_worker` at `:4483`. Object-wide:
+134 `.cold`, 63 `omp_outlined`, 30 `OUTLINED_FUNCTION` (clang's machine outliner), and **zero**
+`_omp_fn`, `.part.`, `.constprop`, `.isra` — the GCC names, absent because this is a clang build.
+Scope: this is an Apple-clang Mach-O ARM object, where the AVX2 dispatch at `:4861-5100` is
+preprocessed out entirely, so it establishes the structural split and nothing about how redwood's
+objects divide. The redwood census found 12 symbols for the same instantiation against 6 here,
+which is consistent with a different compiler splitting differently.
+
+**Seal-time checklist, sharpened rather than replaced.** The selector behind the 12 symbols is not
+recorded anywhere, which is the gap.
+
+1. `size -A` per object — no selector at all, accounts for every byte, separates `.text` from
+   `.text.unlikely`.
+2. The whole symbol table as a multiset, and the group re-derived with the selector **written down
+   this time**.
+3. Read the compiler banner from `mrbuild.log`; under clang, `OUTLINED_FUNCTION_N` carries no
+   prefix and escapes any name selector, which would be the one mechanism a group sum cannot catch.
+
+Decision rule: if the group sum's arm-to-arm change matches the section totals' change, the number
+was complete and the sign needs a real explanation. If the section totals are flat while the group
+differs by 11 KB, the selector missed a family and the sign is ordinary.
