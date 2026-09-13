@@ -27522,3 +27522,76 @@ the template argument had already eliminated — the half-vector branches pass
 `scorch_simd_half<scalar_t>`, so turning them off cannot change the count of
 `scorch_simd<float>` instantiations — and it would have had to compile next to a live
 measurement on the same host.
+
+### Retraction: the NV=1 question was well-posed, and the answer is `spmm.h:5026`
+
+The section above closed the question by retiring it — the call sites looked identical across the
+four vector counts, so which ones the inliner emitted out of line looked like its cost model.
+**That close is wrong.** The independent audit located a fifth site I had listed but not
+distinguished, and with it the whole pattern is dead-code elimination under each arm's own
+compile-time constants. No appeal to the inliner is needed.
+
+**The four `SCORCH_RB(1)` sites are not an equivalence class.** The one at `:5026` sits inside a
+block opened at `:4996`:
+
+```
+if (narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value) {
+```
+
+Two properties make it unlike the others. It is **`NV=1`-exclusive** — the block is `nvec == 1`
+gated, so it contains no `SCORCH_RB(2)`, `(3)` or `(4)` counterpart, and the only regblock call in
+it is the inner switch's `default:` at `:5026`. And it is **window-independent**: `narrowk_gather`
+is a runtime `int` (`:4351`, `(B1_size == 1) ? 1 : 0`, reassigned at `:4371`/`:4374` off
+`mean_row`), not a macro, so no build can fold the block away; and the block `continue`s at
+`:5032`, *before* the deep block opens at `:5034`, so its guard never consults `narrowk_unroll`,
+`narrowk_deep_lo` or `narrowk_deep_hi`.
+
+**The arms' constants are compile-time, and the deep block `continue`s.** In a build without
+`SCORCH_TUNE_HOOKS` the four controls take the `#else` branch at `:4275` and are `const` from
+macros (`:4279-4282`), which the header's own comment at `:4276` says is so the guard folds. No
+arm carries `-DSCORCH_TUNE_HOOKS`: `mrbuild.sh` gives `dp1` `UNROLL=4 LO=HI=1`, `dp1e`
+`UNROLL=8 LO=HI=1`, `dp2` `UNROLL=4 LO=HI=2`, `dp3` `UNROLL=4 LO=HI=3`, `dp4` `UNROLL=4 LO=HI=4`,
+and `c0`/`c0b` no defines at all, so `SCORCH_NARROWK_DEEP_UNROLL` is its default `0`
+(`scorch_policy.h:982`). The deep block ends with `continue` at `:5061`, so the tail switch at
+`:5095-5100` is reached **only when the deep guard was false**. That is the fact my close missed:
+the tail switch's source is identical for all four vector counts, but its *reachability* is not.
+
+Every symbol the census recorded now follows:
+
+| arm | inside the deep guard | `case nvec*16+UNROLL` | inner `default:` `:5053` | tail `case N` `:5096` | `:5026` | own `NV` |
+|---|---|---|---|---|---|---|
+| `c0`, `c0b` | guard is `0 && …`, folds false | — | dead | **live**, all four | live | all four present |
+| `dp1` | `nvec == 1` | `1*16+4` always matches | dead | dead (needs `nvec != 1`) | **live** | `NV=1` **present** |
+| `dp1e` | `nvec == 1` | `1*16+8` always matches | dead | dead | **live** | `NV=1` **present** |
+| `dp2` | `nvec == 2` | `2*16+4` always matches | dead | dead | `NV=1` only | `NV=2` **absent** |
+| `dp3` | `nvec == 3` | `3*16+4` always matches | dead | dead | `NV=1` only | `NV=3` **absent** |
+| `dp4` | `nvec == 4` | `4*16+4` always matches | dead | dead | `NV=1` only | `NV=4` **absent** |
+
+The prefetch block's `:5085` is `#ifdef SCORCH_TUNE_HOOKS` (`:5064-5094`) and absent from all six.
+So a window arm kills exactly its own vector count's two live sites, and **only `NV=1` has a third
+site no window can reach** — which is why `dp1`/`dp1e` keep their window's symbol while
+`dp2`/`dp3`/`dp4` lose theirs. Symbol presence *did* distinguish these arms. It distinguished them
+by call-graph reachability, which is a property of the source and the arm's own constants, and is
+computable without a build or a timing host.
+
+**The one link that is empirical rather than proven.** Under `nvec == 1` the inner switch's cases
+`1..8` cover every reachable `B1_size`, since `nvec == 1` means `B1_size <= 8` for float32. A
+compiler that derived that through the ceiling division would fold `:5026` away, and then
+`dp1`/`dp1e` would have no live `NV=1` site and the symbol would be absent. It is present, so GCC
+did not make that derivation. That is evidence, not proof, and it is the right kind: the mechanism
+made a prediction about five arms and the census matches on all five.
+
+**A sharper prediction, stated before anyone builds it.** The deep switch instantiates only six
+`(nvec, UNROLL)` pairs — `1*16+4`, `1*16+8`, `2*16+4`, `2*16+8`, `3*16+4`, `4*16+4`. An arm with
+`LO=HI=3` and `UNROLL=8` therefore has *no* matching case, its inner `default:` at `:5053` stays
+live, and it would keep `NV=3` despite being a window-3 arm. Nothing in the cost-model story
+predicts that; reachability does.
+
+**My error, precisely.** I computed source presence and called the sites identical across vector
+counts. Reachability under each arm's compile-time constants is what the question was about, and
+the two differ exactly where the arms differ. The earlier lesson survives in weaker form —
+`regblock_deep` still has no symbol anywhere despite being the code under test, so a symbol count
+is not a body count — but it does not license the stronger claim I drew from it, that symbol
+presence could not discriminate. **The repaired rule: compute reachability under the arm's own
+constants, not source presence.** A grep answers the first question and looks like it answered the
+second.
