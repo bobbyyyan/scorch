@@ -28241,3 +28241,40 @@ And **why the census missed them** was wrong in the way that matters: the claim 
 symbols persist either way and so are invisible to a census. They do not persist — they are absent
 from `c0` and appear in `dp2`. The census missed them because they were never named, not because
 they were always there.
+
+**The exchange is 96% conserved, which is why the donor-side number was arbitrary rather than
+merely imprecise.** Gross movement is 16329 + 15106 = **31435 bytes across 20 symbols** for a net
+of −1223, so net over gross is **3.9%**, and 226 of 246 symbols do not move at all. The range of
+answers available to a one-sided selector therefore spans −16329 to +15106 — a 31 KB window — and
+the group's −10659 was one draw from it. When that much of the movement cancels, a partial view's
+**sign and magnitude are not approximations of the truth; they are arbitrary**. That is the number
+to put in front of the rule, and the concentration (20 of 246 moving) is what made the balance
+sheet tractable at all.
+
+**The single non-mover: the direction survives, the test does not exist.** `gather_f32<1>` is the
+one arm of the switch absent from the gainer list, and the proposed reading was that an inlining
+budget evicts expensive bodies first and keeps the cheapest — falsifiable, it was argued, because
+`gather_f32<1>` should then be well under the movers' 1113-byte floor. Measured: **`gather_f32<1>`
+has zero symbols in either object**, and so does every other `gather_f32<K>` in `c0`:
+
+| arm | `gather_f32<K>` symbols |
+|---|---|
+| `c0` | none, for any K |
+| `dp2` | K2=1266 K3=1537 K4=1190 K5=1367 K6=1521 K7=1581 K8=1594 |
+
+So the cleaner statement is that in `c0` the **entire** gather switch is inlined into the worker
+lambda, and in `dp2` seven of its eight arms are emitted out of line while K=1 stays inlined. The
+budget story's direction holds — the arm never evicted is the narrowest, one column and scalar —
+but the specific test proposed cannot be run, because K=1's body size is *unobservable* when it has
+no symbol. That is the `regblock_deep` fact for the third time in this document: **absence of a
+symbol is not a measurement of size**, so a prediction about the size of an inlined body is not
+falsifiable by `nm`. What is observable and consistent: every evicted arm is at least 1190 bytes,
+and the sizes are not monotone in K (K4 is the smallest mover at 1190, not K2), so "cheapest stays"
+is supported in direction and not established in form.
+
+The coherence with `:5026` is correspondingly tighter than stated above. The movers are not merely
+the arms of the switch whose `default:` answered the `NV=1` question — they are **every arm of that
+switch except the one the source singles out**. `narrowk_gather` is initialised
+`(B1_size == 1) ? 1 : 0` at `:4351`, and the half-vector guard's comment at `:4886` says `B1_size
+>= 2` keeps k=1 with the gather kernel that owns it. The case the source treats specially is the
+case the compiler treats specially, arrived at independently.
