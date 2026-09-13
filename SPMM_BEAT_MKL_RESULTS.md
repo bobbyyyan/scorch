@@ -29817,3 +29817,74 @@ partial — 2 theorems, 4 code-mutation guards, 0 real gaps**; 3 of 3 relations 
 on its own mutant; spike **4482 / 0**; calibration flip in (1.000, 1.001]; one digest across three
 `PYTHONHASHSEED` values. Staged: `an_c203.py` `3d50a5f0cc914ce0`, `spike_c203.py` `e49534b035e476b3`,
 `checks_c203.py` `4d650dab9475871f`.
+
+#### Correction: the 5.2× swap is the 98.5th percentile, not what a swap costs
+
+The entry above gives "swapping one cell out of all-arms-agree and one in — count unchanged at 24 —
+moves the core excursion from 0.0051 to 0.0263, a factor of 5.2" with no indication that it is the
+extreme. Sweeping **all 1560 count-preserving single swaps** on the k=32 core (24 out × 65 in, nboot
+2000, baseline reproduced at 0.0052):
+
+    min 0.0027   p25 0.0049   med 0.0053   p75 0.0060   p90 0.0076   p95 0.0097   p99 0.0265   max 0.0273
+    as a multiple of baseline:   med 1.03x   p90 1.48x   p95 1.87x   max 5.30x
+    swaps at or above 0.0263:  23 of 1560 = 1.5%      swaps BELOW baseline:  584 = 37.4%
+
+**0.0263 sits at the 98.5th percentile. The median swap costs 1.03×, and 37% of swaps make the
+control look *better*.** The argument is unchanged and the extreme is the right figure for it — a
+count check cannot distinguish the p99 swap from the median one, so the digest is still the fix — but
+a reader would have taken 5.2× as the cost of a swap. The tail is also not a property of swapping:
+the worst decile is carried by **10 of 65 candidate in-cells**, so it is a property of a few
+high-variance cells.
+
+#### The reference-free control is exactly the always-1-worker cells, and they are the quiet third
+
+Verified by digest at all three widths, independently on both sides:
+
+    k=2    all-arms-agree n=29  85caabeb9184bc4e     always-1-worker n=29  85caabeb9184bc4e
+    k=4    all-arms-agree n=29  85caabeb9184bc4e     always-1-worker n=29  85caabeb9184bc4e
+    k=32   all-arms-agree n=24  8c4a01a7d3e19de0     always-1-worker n=24  8c4a01a7d3e19de0
+
+Set-identical, and 29 + 29 + 24 = **82**, which is the "82 cells deliver 1 worker in every override
+arm" line that has been in the durable measurements all along. Two facts held separately and never
+multiplied together.
+
+The consequence is measured. Coefficient of variation of raw ms over the 14 passes, `ov24/ours`,
+1-worker cells against the rest: **1.213% vs 5.330% (4.39×) at k=2, 1.208% vs 3.454% (2.86×) at k=4,
+1.680% vs 4.506% (2.68×) at k=32.** So chain202's treatment-free restriction did not merely narrow
+the band — it selected the quietest third of the corpus and called its variance the floor.
+
+**The direction matters and it favours the closed verdict.** A floor that is too tight makes an
+equivalence test *more* willing to declare an effect. chain202 declared none at all three widths, so
+its NO is stronger than the narrow floor made it look, not weaker. Worth stating plainly, because a
+reader who notices the composition later will assume the opposite.
+
+**chain203's design already answers this, by construction rather than by luck.** Amendment 3's bar is
+each rung's own X/Xb pair *on the same group the effect is computed on*, so bar and effect always
+share the cells — which is exactly what chain202's control lacked. The band table now prints each
+group's own CV beside its band, and the rung's all-89 X/Xb band beside that: the all-89 figure is
+treatment-free by construction (X and Xb pass the same override, so there is no treatment to keep
+out) but does not share a population with the effect it would gate, so it is printed as a comparison
+and not substituted for the pre-registered bar.
+
+#### The five treatment-free groups are one control, quantified
+
+`matches-ambient(X)` for the five rungs, k=32: sizes 25, 26, 26, 25, 64, and the set **common to all
+five is n=24, digest `8c4a01a7d3e19de0` — identical to the all-arms-agree core**, at all three
+widths. Pairwise Jaccard at k=32: **0.923 / 0.889 / 0.889** among the four rungs whose mechanism is
+live, against **0.369 / 0.364 / 0.364** for every pair involving ov24. The one rung with a genuinely
+distinct control is ov24 — the rung whose request equals the pool and whose mechanism is therefore
+inert. **No rung offers both a live mechanism and a control distinct from the others'**, which is the
+reference-arm problem one level up, and it means five bands agreeing is close to guaranteed. The
+analyzer now prints the common set and its digest beside the five sizes, so the agreement cannot read
+as corroboration.
+
+#### A schema trap worth recording: `resolved` carries a sentinel on a subset of rows
+
+`resolved` is meaningful only on `arm=ours`; the `mkl` rows carry **-1**. A consumer that builds the
+group table without filtering by arm gets last-writer-wins across the three inner arms and reads
+all-arms-agree as **2/1/2** with a k=32 margin of 0.0096 — a plausible number sitting right next to
+the true 0.0051. The local discriminator is that a correct consumer reproduces 29/29/24 and
+`85caabeb9184bc4e`; `an_c203.py` filters on `arm != "mkl"` at ingestion and does reproduce both.
+chain203's body is being sourced by the live run and must not be edited, so this is recorded for the
+next stage's writer: **a column with a sentinel on a subset of rows needs a comment where it is
+written, not only where it is read.**
