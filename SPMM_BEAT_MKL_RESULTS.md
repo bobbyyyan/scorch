@@ -28629,3 +28629,48 @@ counts with `sort -u`. That would undercount silently: a spurious refusal, or wo
 exact duplicate the guard exists to find. Measured on the live data the counts agree at 801 either
 way, so this is a hazard that is not currently firing rather than a defect that was; recorded as
 such.
+
+### Nine of twenty-two `SHA256SUMS` manifests are CRC-32, and the check that reads them as verified
+
+Classified by content rather than by filename, the ledger tree under
+`~/.cache/scorch-codex/spmm-beat-mkl/` holds 22 files named `SHA256SUMS`:
+
+| attestation | manifests | attested lines |
+|---|---|---|
+| genuine SHA-256 | 13 | 777 |
+| `cksum` output (CRC-32 + byte count) | 9 | 2346 |
+
+The nine are `chain185-w1fix-mkt` (76), `chain185-w1fix-redwood` (72), `chain187-w1unroll-mkt`
+(73), `chain187-w1unroll-redwood` (78), `chain188-w1ship-redwood` (67), `chain189-tsweep-mkt` (12),
+`fixtures/` (661), `harnesses/` (184), and the **top-level milestone manifest** (1123). The
+transition is clean at chain190 — every chain from there on is genuine, including 191–201.
+
+So three quarters of the attested lines in this tree carry a 32-bit error-detecting code under a
+filename claiming a cryptographic hash. CRC-32 detects accidental truncation; it does not resist
+substitution, where a collision is cheap to construct. For those nine, "sealed" means "not
+accidentally corrupted", not "not replaced". **This is reported, not repaired** — regenerating a
+historical attestation would destroy the only record of what was actually attested at the time, and
+that is not a call to make silently.
+
+**The check that reads them as verified.** `shasum -a 256 -c` on a `cksum` manifest exits 1 with
+`no properly formatted SHA checksum lines found`. That message contains **zero `FAILED` tokens and
+zero `OK` tokens.** A driver that greps for `FAILED` and treats its absence as a pass therefore
+reads a CRC-32 manifest as fully verified — loud to a human reading stderr, silent to the check.
+The seal's own form counted non-OK lines instead, which did refuse, but only because `shasum`
+emits that error into the captured stream; had it exited quietly the count would have been zero and
+the check would have passed vacuously. It now requires the **OK count to equal the manifest's line
+count**, which cannot pass on an empty or unparsed result. Verified in both directions: chain189
+reads 0 of 12 and refuses, chain201 reads 62 of 62 and passes.
+
+**And the locale hazard, with two claims tested rather than reasoned.** The `comm`/`join` mismatch
+is real and reproducible: with the corpus and target key lists both `LC_ALL=C`-sorted, `comm -23`
+under the ambient locale reports 22 keys unique to the target where `LC_ALL=C comm` and a Python
+set difference both report 0. **But `comm` warns** — `file 1 is not in sorted order`, 107 bytes on
+stderr. The wrong number arrived with a warning attached that nothing was reading, so the rule is
+"route stderr where a check can see it", not "these tools fail quietly".
+
+What is *not* real here is `sort -u` merging byte-distinct strings. Eight inputs forming four pairs
+differing only by `_` or `-` give 8 distinct under both `en_US.UTF-8` and C, on GNU coreutils 8.32
+and macOS BSD sort, and the real object's demangled symbol list gives 525 distinct either way.
+Collation changes order, not uniqueness. `LC_ALL=C` is still pinned on every sort in the seal, but
+for the digest reason rather than the merging one.
