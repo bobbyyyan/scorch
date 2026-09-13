@@ -29642,3 +29642,57 @@ where an additive offset is most visible — puts the flip in **(1.000, 1.001]**
 additive offset in the consumed margin satisfies **c ≤ 9.8e-6, below 0.10% of the band**. The
 `c = 1e-5` row predicts a flip at 1.0010, which is *at* the observed upper end and is therefore not
 excluded. The bound is set by the step in D/A, not by the number of artefact sizes.
+
+### Condition coverage found a real defect: a lookup that created the entry its own guard tests for
+
+The residual after branch coverage was 17 compound or ternary conditions, where `coverage.py`
+measures arcs and cannot say whether an operand was ever the deciding one. Rather than classify them
+by reading, they were instrumented: every operand of every `and`/`or` and every ternary test wrapped
+in a recorder that returns its value unchanged, so short-circuiting is preserved exactly — `_R(1, a)
+or _R(2, b)` evaluates the second call only when the first is falsy, which is precisely when `b` is
+decisive. The instrumented copy is checked against the original's output byte for byte before any of
+it is believed.
+
+**The second operand of the absent-cell guard in `groups_for` had never once evaluated True**, over
+every fixture and every synthetic corpus. A fixture built specifically to make it fire — the ambient
+arm missing 19 of its 89 cells at k=32 — still did not. The reason is a defect:
+
+```python
+def res1(b, c):
+    v = RES[b][c]          # RES is a defaultdict, so this CREATES the entry
+```
+
+`RES` is a `defaultdict`, and `partition_c202` calls `res1(A.ambient, ...)` unguarded for every key
+at every width. A plain subscript of a missing cell creates an empty entry, after which
+`c not in RES[A.ambient]` is False downstream and **the absent-cell guard cannot fire at all**. The
+cell then fell through to the next branch, which counts it as *disagreeing with itself across
+passes* — the counter this file prints as "STRUCTURALLY ZERO, because stage 1 refuses the whole stage
+if any arm has a multi-valued cell". On the ambient-gap input that counter read **285**. The claim
+beside it was false, and no data-only test could show it, because the guard that would have
+separated the two reasons had been silently disabled by a lookup.
+
+Fixed three ways: `res1` uses `.get` and no longer creates entries; the absent-cell skip is counted
+separately from the multi-valued one (285 now appears under "never reported them", and the dropped
+count is 0 as claimed); and a **conservation check** compares each arm's cell count at the end
+against what the inventory saw, because a lookup that creates the entry it is testing for turns
+every downstream absence check into a no-op. Measurement rows on the clean fixture are byte-identical
+before and after.
+
+The conservation check fires on a mutant that restores the subscript, with the exact counts:
+`REFUSE: ovp held 248 cells at the inventory and 267 now`. That also means the final `REFUSALS` exit
+is no longer a theorem — it now has a contributor with a firing input.
+
+**Where the battery stands.** Census **34 checks: 32 FIRES, 2 THEOREM, 0 UNTESTED**. Condition
+coverage: **48 operands instrumented, 38 evaluated both ways, 10 did not — and of those 10, 0 sit in
+a guard with no firing input**; the two guard operands remaining are both on `if rx is None or ra is
+None`, which stage 1's refusal makes unreachable. Branch coverage: `coverage.py` reports **5 partial
+branches** (its unit: a branch with a missing destination), sitting on **6 source lines** (one
+contributes two arcs) — **2 theorems, 4 regression guards whose firing input is a code mutation
+rather than a data input, and 0 with no firing input of any kind.** Both units named, because a count
+in an unnamed unit beside another count is how three values for one quantity happened earlier today.
+
+Staged on redwood: `an_c203.py` `743f5259a50d57f1`, `checks_c203.py` `31e3b3243f14d326`,
+`cond_c203.py` `2141ec84a2c65075`, `branch_c203.sh` `64eb87d024f68f80`, `cal_c203.py`
+`cc8e3fcfbe632f78`, `meta_c203.py` `84a2bbf81f23fe97`, `metafire_c203.py` `dbc3e94060c9269f`,
+`synth_c203.py` `1399d11d5af4a05c`, `fixture_c203.py` `f22aa0ca7e1090c1`, `cover_c203.py`
+`3ce3f87c74c2590e` (retired), and seven output files.
