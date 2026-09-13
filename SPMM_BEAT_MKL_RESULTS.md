@@ -26702,21 +26702,66 @@ different corpus and before chain199 fixed the deep kernel's hardcoded full-widt
 its one-chain remainder. Two independent chains, two kernel versions, the same direction and
 a similar size.
 
-### Why `dp2` does not ship yet
+### `dp2`'s artefact is confined to one width, and it is not a layout gradient
 
-Its object carries a degree-dependent layout artefact in the same direction as the gain. At
-k=4, where `dp2`'s dispatch provably cannot fire, it still reads 1.0259 over all 89 matrices
-— and the artefact concentrates in exactly the bands where the k=16 gain is largest: 1.0357
-at degree 64-256 and 1.0387 above 256, against 1.0056-1.0085 in the three bands below degree
-16. So in the low-degree bands the k=16 gain (3.2-6.2%) clears its artefact comfortably, and
-in the high-degree bands most of it could be code placement.
+The numbers above divide two medians over passes — `median(shipped) / median(arm)` per
+matrix. Re-estimating the same data by forming the ratio *inside* each pass and taking the
+median over passes changes the picture, and that estimator was chosen on k=2, a width where
+none of the three arms can fire, so the choice is not selection on the outcome. It is the
+tighter of the two there (0.637% against 0.765% half-width on the identical-source control)
+and it is the one used from here on.
 
-Separating the two needs a control this run does not contain: a build that instantiates the
-same deep-kernel template and carries the same `__LINE__` shifts but cannot dispatch at any
-measured width. `SCORCH_NARROWK_DEEP_NVEC_LO=3, _HI=3` is that build — it fires at k=17-24
-only. `dp2` against that control at k=16 is the depth effect with the object held fixed;
-that control against the shipped object is the artefact alone. Nothing about `dp2` earns a
-second host until this reads clean on redwood.
+`dp2` over the shipped object, paired within pass, by mean-degree band. `dp2` fires only at
+k=16; the bracketed number is that cell's own identical-source floor, and `+` marks a
+reading that clears it.
+
+| band | n | k=2 | k=4 | k=8 | k=16 (fires) | k=32 |
+|---|---|---|---|---|---|---|
+| degree <4    | 31 | 1.0040 (1.0) | 1.0217 + (0.7) | 1.0135 (0.6) | **1.0339 +** (0.7) | 0.9965 (0.7) |
+| degree 4-8   | 14 | 1.0023 (1.0) | 1.0092 (0.5)   | 1.0011 (0.9) | **1.0609 +** (0.5) | 0.9985 (1.0) |
+| degree 8-16  | 14 | 0.9929 (3.3) | 1.0083 (3.0)   | 1.0038 (2.9) | **1.0551 +** (1.6) | 0.9928 (2.0) |
+| degree 64-256| 16 | 1.0101 (2.5) | 1.0389 + (2.3) | 1.0059 (2.7) | **1.0482 +** (2.1) | 1.0008 (2.2) |
+| degree >256  | 14 | 1.0015 (0.8) | 1.0366 (1.5)   | 1.0064 (5.0) | **1.0828 +** (1.9) | 0.9993 (1.7) |
+| all          | 89 | 1.0027 (0.6) | 1.0230 + (0.6) | 1.0075 (0.8) | **1.0516 +** (0.7) | 0.9974 (0.6) |
+
+Three of the four inert widths are clean in every band, and the two that bracket the firing
+width — k=8 below it and k=32 above it — are among them. The firing width gains in all five
+bands and every one of those five clears its own band's floor. That is the no-overfitting
+requirement met within this run, not argued around it.
+
+The one contaminated width is k=4, and it has a specific cause rather than being placement
+noise. k=4 is the 128-bit half-vector path, and it is the only width where setting
+`SCORCH_NARROWK_DEEP_UNROLL` to 4 adds a *second* dispatch block to the translation unit —
+the half-vector deep dispatch guarded by `#if SCORCH_NARROWK_DEEP_UNROLL`. With the window
+at 2..2 that block's runtime guard folds to false and the compiler drops it, so `dp2`'s k=4
+path executes the same instructions the shipped object does. But dead source is not absent
+source: chain199's own neutrality check found 31 dead lines flipping a compare's operand
+order through the inliner's cost model, which is exactly this mechanism and exactly this
+block. So k=4 reading 2.3% fast is expected, is not the k=16 result, and is the reason a
+control priced at one width cannot be carried to another.
+
+An earlier draft of this section described the artefact as a degree-dependent layout
+gradient across widths. That was the ratio-of-medians estimator; it does not survive the
+paired one.
+
+### What `dp2` still needs
+
+Not a cleaner control at k=16 — the two inert widths bracketing it are already clean. What
+is missing is the mechanism's other prediction and a second host.
+
+The mechanism that would explain both of chain199's signs is that the three loads per
+nonzero are paid once per nonzero whatever the width, while the FMAs scale with the vector
+count. At NVEC=1 the loads dominate, so depth is dead weight — which is what `dp1` and
+`dp1e` measured. At NVEC>=2 each nonzero feeds 2, 3 or 4 FMAs against the same three loads,
+so the dependency chain becomes the limiter and depth should pay. That predicts the gain
+**continues at three and four vectors**, and nothing has measured k=17-32 at depth 4.
+
+chain201 tests it with three arms whose vector-count windows are disjoint — 2..2, 3..3,
+4..4 — so at each of k=4, 8, 12, 16, 20, 24, 32 exactly one arm fires and the other two are
+its controls, and any two of them differ by exactly two immediate constants. A firing arm
+over an inert sibling cancels the layout term by construction. A gain on the diagonal at all
+three vector counts with the off-diagonal clean is the mechanism; a gain only at two vectors
+is a single point, and a single point does not ship.
 
 Both `SCORCH_NARROWK_DEEP_UNROLL` and the NVEC window stay at their defaults. Nothing ships
 from chain199.
