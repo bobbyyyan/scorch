@@ -28428,6 +28428,31 @@ One correction to my own measurement in passing: a first pass put the per-class 
 13.8%, which was a denominator error — the loop count was used instead of the number of trials
 actually tested, and only 14.3% of random permutations of 7 points are full cycles (720 of 5040).
 
+**The reduction: of eight lines about the rotation, exactly three can fail.**
+
+| | line | status |
+|---|---|---|
+| check 1 | the generator is a full 7-cycle | can fail |
+| check 2 | the row-wise reversal, `h2[i] == reverse(h1[i])` | can fail, detects 100% |
+| check 3 | per-half base optimality, `c_d in {3,4}` | can fail, 300 of 720 bases |
+| corollary | position balance / Latin square | from check 1 |
+| corollary | class uniformity | from check 1 |
+| corollary | within-half complement `c_d + c_(7-d) = 7` | holds for every base |
+| corollary | across-half per-class complement | from check 2 |
+| corollary | pooled 42-at-7 | from check 2 |
+
+The pooled and per-class detectors are not two tests of equal power but **the same test**: over
+4000 broken-reversal trials the agreement table is 3803 both-fail / 197 both-pass, with **zero
+disagreements**. Equal rates alone would not have established that.
+
+**And a retraction of my own, one layer up.** I had written that the position check was "load-bearing
+and not a duplicate" of the orbit gate. That was true only on the premise that the gate was missing.
+With the gate present the two are logically **equivalent** — all 720 full cycles give a Latin square
+and none of the other 4320 do — so position balance cannot fail independently. It is still printed,
+because it states the property the halves comparison needs in the design's own terms, but as a
+corollary. The analyzer now prints the three-and-five split explicitly and ends with the test that
+generated it: a line is a check only if an input exists that makes it fail.
+
 **Pooled pair balance is the weaker statement, so it is reported per class.** The (4,3) design uses
 only 25 of 49 arm-position cells and is thoroughly broken, yet its pooled precedence still reads a
 flat `[7]`. A wrong-but-symmetric design gives a flat pooled count. What actually shows the reversal
