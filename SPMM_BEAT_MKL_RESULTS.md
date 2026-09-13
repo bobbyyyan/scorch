@@ -26624,3 +26624,99 @@ distinguishable from the 4–6% per-cell churn. The cost was 4h15m of one host f
 same resolution over the full 4584 would be about nine days, which is the real argument for screening
 on a derived corpus with a control group rather than measuring everything at the resolution of the
 thing you care least about.
+
+## chain199 verdict: deeper accumulator chains lose at one vector and win at two, and the winning arm's object is not clean yet
+
+Five builds, one tree each, 10 passes of a balanced Williams rotation over 89 matrices
+(49 of chain198's target keys plus 40 controls) at widths 2, 4, 8, 16, 32. 13350 rows per
+build, 0 readings refused at ingestion, 0 duplicate (key, width, arm, pass) tuples.
+
+The three arms differ from the shipped object only in `SCORCH_NARROWK_DEEP_UNROLL` and the
+`SCORCH_NARROWK_DEEP_NVEC_LO/HI` window, so each one fires at some widths and is compiled
+but unreachable at the others. That gives every arm its own layout control at widths where
+the code cannot change a decision.
+
+| arm | accumulator chains | vector count | fires at | inert at |
+|---|---|---|---|---|
+| `dp1`  | 4 | 1 | k=4, 8 | k=2, 16, 32 |
+| `dp1e` | 8 | 1 | k=4, 8 | k=2, 16, 32 |
+| `dp2`  | 4 | 2 | k=16 (k=9-16) | k=2, 4, 8, 32 |
+
+### The pre-registered falsifier fired
+
+It was stated before the run: *"dp1 null or slower at k=4 and k=8 on long rows with its
+inert widths clean. That would say the two-chain limit isn't what the k<=8 concentration is
+made of, and the next suspect is the three loads per nonzero rather than the chains."*
+
+Ratios below are `shipped_time / arm_time` per matrix formed inside each pass, median over
+passes, geometric mean over matrices, with a bootstrap 95% CI. Above 1.0 means the arm is
+faster.
+
+| arm | group | k | ratio | 95% CI | own A/A | verdict |
+|---|---|---|---|---|---|---|
+| `dp1`  | target (49)   | 4 | 0.9528 | [0.9313, 0.9736] | 1.0023 | slower 4.7% |
+| `dp1`  | target (49)   | 8 | 0.8701 | [0.8187, 0.9173] | 0.9996 | slower 13.0% |
+| `dp1`  | control (40)  | 8 | 0.7674 | [0.7339, 0.8029] | 0.9989 | slower 23.3% |
+| `dp1e` | target (49)   | 4 | 0.8323 | [0.7623, 0.8966] | 1.0023 | slower 16.8% |
+| `dp1e` | target (49)   | 8 | 0.8503 | [0.8003, 0.8977] | 0.9996 | slower 15.0% |
+| `dp1e` | control (40)  | 4 | 0.7193 | [0.6816, 0.7603] | 0.9992 | slower 28.1% |
+
+The dose-response runs the wrong way and runs that way everywhere: 8 chains are slower than
+4 chains on every group at every firing width (target 0.8323 vs 0.9528 at k=4, 0.8503 vs
+0.8701 at k=8; control 0.7193 vs 0.9488 and 0.7491 vs 0.7674). A single arm moving alone
+would be a layout accident. An ordering that holds across two groups and two widths is a
+mechanism, and the mechanism points away from the hypothesis: at one vector the limiter is
+not the dependency chain, so extra accumulators buy nothing and their prologue, remainder
+loop and register pressure are charged in full. `dp1`'s inert widths are *not* clean either
+(2.1% slow at k=32 over all 89 matrices, 3.2% at k=16 and k=32 on the control group), but
+the firing deficit is an order of magnitude larger than the artefact, so the refutation does
+not rest on the artefact's size.
+
+**The next suspect is the three loads per nonzero** — the gather of the B row, `A_val`, and
+`A1_crd` — which is what the shipped two-chain form is already limited by at NVEC=1.
+`scorch_spmm_row_regblock` keeps 2 accumulators at every width, which is ~2 cycles/nonzero
+from dependency alone, against the ~1.5 the three loads allow. Chain199 says the gap between
+those two numbers is not where the k<=8 concentration lives.
+
+### The arm nobody pre-registered as the interesting one
+
+`dp2` — 4 chains at two vectors, firing at k=9-16 — gains, and gains broadly:
+
+| group | k | ratio | 95% CI | own A/A | |
+|---|---|---|---|---|---|
+| control (40)      | 16 | 1.0465 | [1.0375, 1.0564] | 0.9995 | faster 4.6% |
+| target, deg>=64   | 16 | 1.0594 | [1.0463, 1.0717] | 0.9989 | faster 5.9% |
+| target (49)       | 16 | 1.0725 | [1.0400, 1.1256] | 0.9835 | inside a loose A/A |
+
+79 of 89 matrices read above 1.01 at k=16, median 1.0483, and every mean-degree band moves
+the same way (1.032 at degree under 4, 1.062 at 4-8, 1.050 at 8-16, 1.047 at 64-256, 1.081
+above 256). The identical-source control build reads 12 of 89 above 1.01 with a median of
+0.9978 at the same width. `dp2` is inside the floor at k=2, 4, 8 and 32 on the control group,
+so it takes nothing back. Its single-build behind-MKL count is the lowest of the five (37 of
+445 against 47 for the shipped object), though chain197 showed that count churns by more
+cells than that and it is reported, not claimed.
+
+This replicates a reading the kernel's own header already carried from an earlier chain —
+nvec=2 at k=16 float32 at 1.0396 with the deep kernel's prefetch off — measured on a
+different corpus and before chain199 fixed the deep kernel's hardcoded full-width vector and
+its one-chain remainder. Two independent chains, two kernel versions, the same direction and
+a similar size.
+
+### Why `dp2` does not ship yet
+
+Its object carries a degree-dependent layout artefact in the same direction as the gain. At
+k=4, where `dp2`'s dispatch provably cannot fire, it still reads 1.0259 over all 89 matrices
+— and the artefact concentrates in exactly the bands where the k=16 gain is largest: 1.0357
+at degree 64-256 and 1.0387 above 256, against 1.0056-1.0085 in the three bands below degree
+16. So in the low-degree bands the k=16 gain (3.2-6.2%) clears its artefact comfortably, and
+in the high-degree bands most of it could be code placement.
+
+Separating the two needs a control this run does not contain: a build that instantiates the
+same deep-kernel template and carries the same `__LINE__` shifts but cannot dispatch at any
+measured width. `SCORCH_NARROWK_DEEP_NVEC_LO=3, _HI=3` is that build — it fires at k=17-24
+only. `dp2` against that control at k=16 is the depth effect with the object held fixed;
+that control against the shipped object is the artefact alone. Nothing about `dp2` earns a
+second host until this reads clean on redwood.
+
+Both `SCORCH_NARROWK_DEEP_UNROLL` and the NVEC window stay at their defaults. Nothing ships
+from chain199.
