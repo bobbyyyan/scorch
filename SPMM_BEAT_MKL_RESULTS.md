@@ -28674,3 +28674,80 @@ differing only by `_` or `-` give 8 distinct under both `en_US.UTF-8` and C, on 
 and macOS BSD sort, and the real object's demangled symbol list gives 525 distinct either way.
 Collation changes order, not uniqueness. `LC_ALL=C` is still pinned on every sort in the seal, but
 for the digest reason rather than the merging one.
+
+## chain202: the override ladder. Verdict NO at all three widths, and the control fails at two of them
+
+Sealed at `chain202-adoptladder-redwood`, 113 files, manifest
+`2e16dba596a1dcc73aaab1387ff06308398fcfc115458778b01fbc7379e0fede`, 112 of 112 lines verifying.
+Stage finished 11:03:10 against an 11:03:09 prediction. 98 of 98 files at exactly 802 rows and 801
+distinct `(key, k, arm)` triples; writer accounting 98 of 98; corpus digest matching chain198/199/200;
+metamorphic relations 0 of 3 violated. One object, `98f8eb8670b1060e`, single build with
+`defines=''`, so every arm is that binary called with a different `nthreads_override` and no layout
+artefact is possible.
+
+**The pre-registered verdict is NO at every width.** `ok_r` requires the ADOPT group's CI lower
+bound to exceed `1.0 + floor`, and over the whole ADOPT population it does not: k=2 reads 0.9945
+[0.9057, 1.0803], k=4 reads 1.0160 [0.9348, 1.0963], k=32 reads 0.8531 [0.7770, 0.9375]. At k=4 —
+the one width whose control holds — that is a `no/YES`, which the pre-registration reads as
+*chain200 was measuring the pool*: 24 workers existing rather than being used, which belongs to the
+caller and not to this kernel. **Nothing ships.**
+
+**The negative control fails at k=2 and k=32, and the failure is localized.** NULL is the group
+where every arm resolves to the same team, so every arm must be flat. The headline `ov24/ovp` pair
+is inside the floor at all three widths, but the control is over *every* arm and the worst arm is
+outside it: k=2 `ov24/ov4` reads 0.9954 [0.9933, 0.9974] against a ±0.23% floor, and k=32
+`ov24/ov16` reads 0.9578 [0.9163, 0.9906] against ±0.51%. Only k=4 is clean.
+
+P4 localizes it exactly. Grouped by resolved count rather than by arm, at resolved **1** — where
+every arm runs a single worker — the arms still differ: at k=2, `ov16` 1.0006, `ov8` 1.0024, `ov24`
+1.0000, `ov24b` 0.9991, `ov2` 0.9980, `ov4` 0.9954, `ovp` 0.9809. Several carry disjoint CIs. **At
+the same resolved team count, different override arguments give different times**, so something
+other than the team is moving. The mechanism is already documented: a positive override is not a
+hard cap — it declines into a private-team launch — so the argument changes more than the worker
+count. That was known qualitatively and is now measured at 0.5–0.7%.
+
+**The ladder itself is monotone in the resolved team and saturates at 16.** At k=2, against 24
+workers as the reference: 2 workers read 0.4070 (2.46x slower), 4 read 0.6623 (1.51x), 8 read 0.9264
+(1.08x), 16 read 1.0221 and 24 read 1.0000, both inside the floor. So worker count is the mechanism
+on the population, and everything above 16 is flat. k=4 reproduces it: 0.4047, 0.6679, 0.9637,
+1.0273, 1.0000.
+
+**The A/A timing floor is clean at all three widths** — 0.9994 [0.9953, 1.0041], 1.0012 [0.9978,
+1.0053], 1.0016 [0.9959, 1.0086]. Worth recording that at 3 passes the k=2 A/A had read 0.9874
+[0.9790, 0.9961], a 1.3% control failure with a CI excluding parity, which resolved entirely by 14
+passes. A control failure on partial data is not a control failure.
+
+### The cell count, which is the scoreboard, and why it still does not ship
+
+| arm | behind MKL of 267 (rom / mor) | k=2 | k=4 | k=32 |
+|---|---|---|---|---|
+| `ov16` | **23 / 23** | 8 | 11 | 4 |
+| `ovp` (the default) | 28 / 27 | 8 | 17 | 3 |
+| `ov8` | 30 / 28 | 12 | 13 | 5 |
+| `ov24` | 35 / 33 | 12 | 20 | 3 |
+| `ov24b` | 37 / 35 | 11 | 23 | 3 |
+| `ov4` | 78 / 77 | 42 | 30 | 6 |
+| `ov2` | 131 / 129 | 55 | 43 | 33 |
+
+The A/A bar at 14 passes is **2 cells** under both estimators, and `ov16` carries zero estimator
+disagreement (23/23), so pooled 28 -> 23 clears it. But the per-width decomposition removes the
+result: **the entire gain is at k=4** — 6 cells under both estimators against that width's own A/A
+bar of 3 (`ov24` 20 vs `ov24b` 23) — and it **costs 1 cell at k=32 under ratio-of-medians and 2
+under median-of-ratios, against a k=32 A/A bar of 0.** A regression against a zero bar is a
+finding, not a shape to tune around, so a thread cap at 16 does not ship on this evidence.
+
+The bar also did not tighten with pass count: 2/2 over all 14 passes against 2/2 and 1/4 on the two
+balanced halves. So fourteen passes bought essentially nothing on the cell-count statistic, which
+is the second number that says whether the first one was worth collecting.
+
+**And the confirmed board cells move the other way from the population, which is reported and not
+gated.** Within ADOPT, restricted to the confirmed cells, the ambient policy is *faster* than
+forcing 24 workers: 15.4% at k=2 (n=9, floor ±3.87%) and 26.6% at k=4 (n=8, floor ±4.81%), both
+CIs excluding parity. At k=32 the ADOPT population reverses decisively the other way — forcing 24 is
+faster, `ovp` slower by 14.7% — but that width's control is dirty, so it is not interpretable. The
+pre-registration put the verdict on the population, so these subgroup readings are recorded as
+observations, not as a result; they are also the small-n regime where the bootstrap's own resampling
+noise runs 4-6% of the CI width.
+
+CAPONLY is flat at all three widths (1.0082, 1.0121, 0.9993, all inside their floors), so the second
+lever stays where it was: read in P4 by resolved count, not here.
