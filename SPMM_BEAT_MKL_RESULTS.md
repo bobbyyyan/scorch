@@ -29173,3 +29173,54 @@ population rather than a new direction, and it does not by itself justify pre-re
 directions — which stands on its own merits.
 
 Sealed at 148 files, 147 of 147 verifying.
+
+### Amendment 2: the max-over-readings rule was wrong here, and the estimator is part of the margin
+
+Also written before chain203 had data, also a separate file for the sourced-script reason.
+
+**Amendment 1's max-over-readings rule is withdrawn and ADOPT k=32 goes back to 0.0111.** Taking the
+larger of two independent readings is valid when both estimate the *same* quantity. These did not:
+the 0.0150 was measured on a per-key partition of 21 keys keyed on `resolved > pool`, and chain203's
+ADOPT verdicts are computed on the per-cell partition. A margin bounding the artefact on cells the
+verdict never uses is pure power loss with no safety gain. **Compute the margin on the population
+the verdict is computed on**; if two partitions are reported, each needs its own margin, and one
+margin over a mixture bounds neither. It is moot on the numbers too — under this stage's rule the
+independent reading now measures 0.0110 against 0.0111 here, so there was never an under-margin.
+
+**The group rule, in the phrasing that cannot be misread:** ADOPT = cells where
+`resolved[ov24] != resolved[ovp]`; NULL = every build resolves equal; CAPONLY = the rest. Per-cell.
+Every disagreement between the two readings traced to this and nothing was left for the construction
+or the estimator — two other plausible rules both keyed on `resolved > pool`, which is strictly
+rarer (only 24 cells resolve to 32, none at k=2, so that rule's per-cell ADOPT is *empty* at k=2).
+
+**The estimator moves the margin by up to 3.99x, so it is now part of the pre-registration.**
+Pass-paired against ratio-of-medians, same cells, with the independent reading's `rom` beside:
+
+| group | k | n | paired | rom | ratio | indep. rom |
+|---|---|---|---|---|---|---|
+| NULL | 2 | 29 | 0.0023 | 0.0022 | 0.97x | 0.0022 |
+| NULL | 4 | 29 | 0.0035 | 0.0039 | 1.12x | 0.0039 |
+| NULL | 32 | 24 | 0.0051 | 0.0070 | 1.36x | 0.0071 |
+| CAPONLY | 2 | 29 | 0.0115 | **0.0460** | **3.99x** | 0.0457 |
+| CAPONLY | 4 | 29 | 0.0069 | 0.0146 | 2.13x | 0.0145 |
+| CAPONLY | 32 | 40 | 0.0175 | 0.0258 | 1.47x | 0.0263 |
+| ADOPT | 2 | 31 | 0.0148 | 0.0181 | 1.22x | 0.0182 |
+| ADOPT | 4 | 31 | 0.0142 | 0.0182 | 1.28x | 0.0173 |
+| ADOPT | 32 | 25 | 0.0111 | 0.0107 | 0.96x | 0.0105 |
+
+Nine of nine agree with the independent reading to within 0.0009. 3.99x against a between-group
+effect of 3.3x means the estimator is the measurement. Pass-paired is pre-registered, for the rung
+bands and for anything judged against them, and **CAPONLY k=2 is flagged in advance as the cell
+where this choice alone decides a verdict**. NULL is the stable row at 0.97–1.36x — a second,
+independent reason the treatment-free restriction earns its place.
+
+**A prediction about chain203's own partition, recorded before its data exists.** A duplicate arm
+cannot change the partition: it passes the same override as its partner and so resolves identically
+to it — verified on the one duplicate that existed, 267 of 267 cells, `pool` 24 on all 267. So
+chain203's partition is predicted **identical** to chain202's: NULL 29/29/24, CAPONLY 29/29/40,
+ADOPT 31/31/25, LOWER 0. **If chain203 disagrees, that is a refusal and not a new partition** — it
+would mean a duplicate arm is not passing the override its name says, which invalidates the rung
+bands the stage is built on. The arm inventory will report `resolved` per rung against those
+declared counts.
+
+Sealed at 149 files, 148 of 148 verifying.
