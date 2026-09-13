@@ -28738,15 +28738,42 @@ own A/A bar of 3 (`ov24` 20 vs `ov24b` 23) — and it **costs 1 cell at k=32 und
 and 2 under median-of-ratios, against a k=32 A/A bar of 0.** A regression against a zero bar is a
 finding, not a shape to tune around.
 
-Second, **the estimator gap is itself unstable between arms that are identical by construction.**
-At the 1.00 threshold `ov24` reads 41 / 35 — a ratio-of-medians-minus-median-of-ratios gap of **+6**
-— while `ov24b` reads 40 / 40, a gap of **0**. Same object, same argument, same override value. So
-the median-of-ratios A/A bar is 5 cells, not 2, and `ov16` against the default reads 3 cells better
-under ratio-of-medians (bar 1) and 5 better under median-of-ratios (bar 5). By the rule this
-document has applied throughout — a count that clears a floor under one estimator and not the other
-has not cleared it — **`ov16` does not clear.** A thread cap at 16 does not ship on this evidence,
-and the zero-estimator-disagreement figure I cited for it carries no information, since an
-identical-arm pair produced gaps of both 0 and 6.
+Second, **the estimator gap is unstable between arms that are identical by construction**: at the
+1.00 threshold `ov24` reads 41 / 35, a ratio-of-medians-minus-median-of-ratios gap of **+6**, while
+`ov24b` reads 40 / 40, a gap of **0**. Same object, same argument. So the zero-estimator-disagreement
+figure I cited for `ov16` carries no information.
+
+**Both of the paragraphs above are wrong as written, and the corrections came from splitting on the
+balanced halves.** They are kept rather than deleted because the errors are the instructive part.
+
+*The threshold mismatch.* I wrote that the median-of-ratios A/A bar is "5 cells, not 2" and
+concluded `ov16` does not clear. The 5 is a bar computed at the `> 1.00` threshold; the gain it was
+compared against is at `> 1.01`, the analyzer's pre-registered value. At the pre-registered
+threshold the between-arm bar is **2** and the gain clears in **all six realisations** — rom +5/+3/+7
+against bars 2/2/1, mor +4/+5/+7 against bars 2/2/4, over all 14 passes and each balanced half. At
+`> 1.00` it clears in five of six, the exception being all-14 median-of-ratios at +5 against a bar
+of 5. So the conflation was mine, between a bar at one margin and a gain at another.
+
+*The two statistics are also not the same quantity.* The within-arm estimator gap asks how much the
+*estimator choice* moves one arm's count; the between-arm count difference asks how much two
+identical arms differ *under one estimator*. The first is a caution about reading a gap as evidence;
+it does not license using it as the second. The measured between-arm median-of-ratios bar is 2 over
+all 14 passes, ranging 1 to 4 across halves.
+
+*And the k=32 regression changes sign.* Across the balanced halves it reads −1, −1, 0 under
+ratio-of-medians and −2, −2, **+1** under median-of-ratios, while the bar it is measured against
+takes both 0 and 1. A 1-to-2 cell cost against a bar with that much of its own variation is inside
+it, so "a regression against a zero bar" does not hold here — the zero was a single draw, and the
+halves being position-balanced is what makes that demonstrable rather than a fished subset.
+
+**What actually blocks shipping, after those two arguments are struck.** The pre-registered verdict
+is NO at all three widths and decides on its own terms. The control fails at two of three widths.
+And the effect lives at exactly one width: k=2 is **+0 in all six realisations**, k=32 is
+sign-unstable, and k=4 carries everything at +6/+4/+7 (rom) and +6/+7/+6 (mor) against bars of
+3/0/3 and 3/2/4. A gain at one of three widths with another null and the third sign-unstable is a
+width-specific effect, which is the overfitting case this project's performance convention exists to
+refuse — not a pooled margin problem. A thread cap at 16 does not ship, for those three reasons and
+not for the two I first gave.
 
 The bar also did not tighten with pass count: 2/2 over all 14 passes against 2/2 and 1/4 on the two
 balanced halves. So fourteen passes bought essentially nothing on the cell-count statistic, which
