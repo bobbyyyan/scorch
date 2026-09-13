@@ -28407,6 +28407,27 @@ square -- 0 across all fourteen other cycle types, for a random base as well as 
 so position balance happens to be an exact detector for the same condition. Deleting either because
 "the other covers it" reopens the hole, and the analyzer now says so in place.
 
+**Both derived pair-balance lines are theorems of the reversal, so neither is a check.** This
+supersedes the paragraph below, which treated the per-class complement as the version that can
+fail. Reversing the base commutes with applying sigma elementwise, so half 2's row i is exactly
+half 1's row i reversed, and each of the seven row-*pairs* contributes exactly 1 to every ordered
+pair's precedence — total 7, **for any generator and any base, with no property of sigma entering**.
+Verified over all 5040 permutations of 7 points, 0 deviating. The per-class version is equally
+implied: under the reversal `c_d(h2) = c_(7-d)(h1)`, and `c_d + c_(7-d) = 7` holds for all 720
+bases, so the complement is `[7]*6` necessarily.
+
+Their only discriminating power is against a *broken* reversal, and there they are equally
+probabilistic — **95.0% each** over 556 full-cycle trials with an unrelated second base. So the
+deterministic check is the row-wise reversal itself, `half2 row i == reverse(half1 row i)`, at 556
+of 556, and it is the exact property the proof uses. That check is now in the analyzer; the other
+two print labelled `(IMPLIED by the reversal, not an independent check)`, because reported as
+passing checks they invite a reader to count them as independent corroboration of a design property
+when they are consequences of the construction.
+
+One correction to my own measurement in passing: a first pass put the per-class detection rate at
+13.8%, which was a denominator error — the loop count was used instead of the number of trials
+actually tested, and only 14.3% of random permutations of 7 points are full cycles (720 of 5040).
+
 **Pooled pair balance is the weaker statement, so it is reported per class.** The (4,3) design uses
 only 25 of 49 arm-position cells and is thoroughly broken, yet its pooled precedence still reads a
 flat `[7]`. A wrong-but-symmetric design gives a flat pooled count. What actually shows the reversal
