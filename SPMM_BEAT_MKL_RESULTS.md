@@ -28141,3 +28141,61 @@ over the `<float,false>` instantiation gives 35238 for `c0`, where the earlier c
 figure was 62183 — a broader selector spanning more than one instantiation. Its Δ of 11155 and this
 one's 10659 are the same effect measured over different symbol sets, which is why the number was
 unquotable without its selector.
+
+### The −10659 has a destination, and the sign puzzle is closed
+
+Two corrections first, both to the entry above.
+
+**Retracted: "dp4's `.text` is larger than c0's by 752, the sign the ~3.5 KB deep-body estimate
+predicted."** That holds for `dp4` alone. `dp2` is −1232 and `dp3` is −1056, the opposite sign, so
+two of three arms contradict it. All three sit within ±1232 of `c0`: flat and non-monotone. `.text`
+confirms **no net change** and cannot confirm a deep body of any size, because a flat total cannot
+separate a body arriving from plain-body elimination offsetting it. A prediction two arms
+contradict is not a prediction that survived.
+
+**P5's null is stronger than reported, and the statistic is estimator-fragile.** An independent
+re-derivation from the raw CSVs under a different estimator — per-key median over the ten passes,
+then counting `ours_ms > mkl_ms` — gives c0 41, c0b 45, dp2 32, dp3 35, dp4 35; at k=4, 16/16 for
+the identical-source pair against 9–10 for the deep arms; excluding k=4, **25 and 29** for the
+identical-source pair. My own numbers had c0b at 22, so the ranges merely coincided; under that
+estimator the build-to-build spread is 4 cells and **strictly exceeds** the 3-cell c0-to-dp2
+difference. Same conclusion, no room left in it. And c0b reading 22 under one estimator and 29
+under another — a 7-cell swing on identical data, in the arm that carries the null — is itself the
+finding: **threshold counts near parity are decided by the estimator**, so excluding k=4 is
+necessary and not sufficient, and the statistic cannot resolve 3 cells either way.
+
+**Now the destination.** `nm --print-size` diffed per symbol over the `spmm` family, `c0` against
+`dp2`, with no name filter narrower than the family:
+
+| Δ bytes | c0 | dp2 | symbol |
+|---|---|---|---|
+| **−10659** | 27850 | 17191 | `spmm_csr_v2_core<float,false>::'lambda'(int,int)::operator()(int,int) const` |
+| −1354 | 1354 | 0 | `scorch_spmm_row_narrow_exact<float,6,8>` |
+| −1045 | 1045 | 0 | `scorch_spmm_row_narrow_exact<float,6,2>` |
+| −671 | 671 | 0 | `scorch_spmm_row_regblock<float,2,false,scorch_simd<float>>` |
+| −611 | 611 | 0 | `scorch_spmm_row_regblock<float,2,true,…>.constprop.0` |
+| +1367 | 0 | 1367 | `scorch_spmm_row_gather_f32<5>` |
+| +1266 | 0 | 1266 | `scorch_spmm_row_gather_f32<2>` |
+| +1190 | 0 | 1190 | `scorch_spmm_row_gather_f32<4>` |
+| +1357 | 0 | 1357 | `scorch_spmm_row_gather_f32_ms<1,4>` |
+| +1131 | 0 | 1131 | `scorch_spmm_row_gather_f32_ms<1,8>` |
+| +1113 | 0 | 1113 | `scorch_spmm_row_regtile_partial<double,6,false>` |
+
+**The entire −10659 is one symbol: the OpenMP worker lambda's `operator()`, which is where the
+dispatch lives.** And the gainers are row kernels that are **absent from `c0` entirely** and
+present in `dp2` — inlined into the lambda in one arm and emitted out of line in the other. So the
+mechanism is inlining redistribution inside the worker lambda: the deep body's arrival changed the
+inliner's budget and pushed a set of gather and regtile kernels out of line, while some
+`narrow_exact` and `regblock` bodies went the other way. `.text` flat to ±1232 and the whole `spmm`
+family flat to ±1349 (`c0` 280116, `dp2` 278893, `dp3` 278767, `dp4` 280588) are the same fact
+measured two ways.
+
+Three things this settles. The mechanism is **redistribution**, as the audit originally proposed,
+though by neither the route it named (cold partitioning — `.text.unlikely` is 0 everywhere) nor the
+one it proposed next (the `regblock` template — that sums to 5108 in `c0` against 3826 in `dp2`,
+which *deepens* the deficit rather than filling it). The destination symbols carry **no
+`spmm_csr_v2_core` prefix at all**, so every selector defined from that instantiation excluded them
+by construction — which is why a count was unquotable without its selector, one last time. And
+`dp2` losing `NV=2` is now visible at the byte level: `regblock<float,2,false>` at 671 bytes and
+`regblock<float,2,true>.constprop.0` at 611 both go to zero, with a `.constprop` clone present
+exactly as GCC's naming predicted.
