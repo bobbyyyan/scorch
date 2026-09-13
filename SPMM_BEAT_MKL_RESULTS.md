@@ -29270,3 +29270,58 @@ duplicate pair. What is established is that the partition is rung-specific and t
 measured with one fixed pair moves substantially across partitions.
 
 Sealed at 150 files, 149 of 149 verifying.
+
+### Amendment 4: the n-floor gets a reason, and five controls turn out to be one
+
+**The n-floor is 8, and now has a derivation rather than a provenance.** Amendments 1–3 marked groups
+"unusable" below 8 cells without saying why 8 — and the void count moves from 4 to 7 across
+defensible floors, so the threshold was the next unnamed convention in a series that has cost four
+already. At small n the lower 2.5% bootstrap tail is dominated by **degenerate resamples**, where the
+bound is set by one cell repeated rather than by spread across cells:
+
+| n | P(1 distinct) = n^(1−n) | P(≤2 distinct) |
+|---|---|---|
+| 3 | 0.1111 | 0.7778 |
+| 4 | **0.0156** | 0.3438 |
+| 5 | 0.0016 | 0.0976 |
+| 6 | 0.0001 | **0.0201** — first n under the 2.5% tail |
+| 8 | 0.0000 | 0.0004 |
+
+At n=4 a single-cell resample alone has probability 0.0156, *inside* the 2.5% tail, so the lower
+bound there is literally one cell repeated. 6 is the first defensible floor, 8 is comfortable. The
+void count is now always reported with the floor it assumes.
+
+**Two populations were sharing the name NULL.** `all-arms-agree` = every arm resolves alike, 29/29/24
+cells, rung-invariant by construction. `matches-ambient(X)` = rung X resolves equal to `ovp`,
+31/32/34/35/58 at k=2 and 25/26/26/25/64 at k=32 — varying 1.9x and 2.6x across rungs. Amendment 3
+called both NULL, and its claim that "NULL is reference-free by construction" is true of the first and
+**false** of the second.
+
+**And the five per-rung treatment-free groups are not five controls — they are one core plus five
+fringes.** `all-arms-agree` is a *subset* of `matches-ambient(X)` for every rung and width (checked,
+15 of 15; it follows from the definitions once anyone states them, which neither reading had):
+
+| k=2 | n(matches) | exc | fringe n | exc(fringe) |
+|---|---|---|---|---|
+| core | 29 | **0.0023** | — | — |
+| `ov2` | 31 | 0.0031 | 2 | VOID |
+| `ov4` | 32 | 0.0028 | 3 | VOID |
+| `ov8` | 34 | 0.0065 | 5 | VOID |
+| `ov16` | 35 | 0.0061 | 6 | VOID |
+| `ov24` | 58 | 0.0053 | 29 | 0.0115 |
+
+The core column is constant by construction. The four lower rungs contribute 2, 3, 5 and 6 cells of
+their own at k=2 and 1–2 at k=32 — all under the floor. Only `ov24` has a measurable fringe, and its
+excursion is 5x the core's.
+
+**Pre-registered consequence, so it cannot be claimed afterwards: if chain203's five per-rung
+treatment-free artefacts come out close to one another, that is not five-fold corroboration.** It is
+the shared core showing through, 29 of ~31 cells being common at the lower rungs — the data form of
+"two readings running the same derivation are not independent". The informative comparison is between
+the fringes, and four of five cannot be made at these sizes. Reporting: the core once as the
+rung-invariant control, each fringe separately with its n, VOID below the floor.
+
+The per-rung HIGHER/LOWER groups are untouched — genuinely rung-specific, 24–56 cells, artefacts
+spanning 7.3x. The non-independence is confined to the treatment-free column.
+
+Sealed at 151 files, 150 of 150 verifying.
