@@ -29888,3 +29888,62 @@ the true 0.0051. The local discriminator is that a correct consumer reproduces 2
 chain203's body is being sourced by the live run and must not be edited, so this is recorded for the
 next stage's writer: **a column with a sentinel on a subset of rows needs a comment where it is
 written, not only where it is read.**
+
+#### Corrections to the three figures above, and a resampling-scheme finding
+
+**The Jaccard ranges were the k=32 row, quoted without their width.** All three:
+
+| width | four live rungs | ov24 pairs (ov2 / ov4 / ov8 / ov16) | separation |
+|---|---|---|---|
+| k=2 | 0.784 – 0.917 | 0.483 / 0.500 / 0.559 / 0.576 | 1.36× |
+| k=4 | 0.784 – 0.882 | 0.483 / 0.500 / 0.525 / 0.576 | 1.36× |
+| k=32 | 0.857 – 0.923 | 0.369 / 0.364 / 0.364 / 0.391 | 2.19× |
+
+"0.86–0.92 against 0.36–0.48" was k=32 on both halves. The ov24 pairs reach **0.576** at the narrow
+widths, so the separation there is 1.36× rather than 2.19×. The conclusion is unchanged — ov24's
+control is plainly the distinct one at every width — but the margin is width-dependent and the
+analyzer prints the Jaccard extremes per width, which is where the three rows come from.
+
+**The percentile rank of 0.0263 is "about p99" and no more.** Across five bootstrap seeds at nboot
+2000 the rank spans **p98.5 to p99.7** and the max multiple spans **5.19× to 5.54×**. So the max is
+stable to two figures and neither decimal of the rank is a property of the data. My p98.5 and the
+peer's p99.0 were the same claim.
+
+**The below-baseline fraction depends on the resampling SCHEME, not on the seed — and that is the
+useful part.** Two ways to sweep 1560 swaps against one baseline:
+
+    paired    (one seed drives the baseline AND every swap)   37.4%   37.9%   37.8%     range 0.5 pt
+    unpaired  (a fresh seed per swap)                         40.7%   46.3%   34.4%     range 12 pt
+
+The median swap is 1.03× baseline, so the distribution's mode sits on the comparison boundary and
+each swap's side is decided by bootstrap noise — **unless the resample indices are shared, which
+cancels that noise in the comparison.** So the figure is not inherently unstable; it is stable to
+half a point when paired and swings twelve points when not. The right report is **37.6% ± 0.3 under
+paired resampling**, with the scheme named. Same principle as holding the resample fixed across two
+estimator conventions so the ratio between them is about the estimator.
+
+**A "first N passes" figure is a function of how the pass labels sort.** The `slice` column holds
+`ov1 … ov14`, and lexical order is `ov1, ov10, ov11, ov12, ov13, ov14, ov2, …`, so
+`sorted(slices)[:6]` is passes **1, 10, 11, 12, 13, 14** — the first pass plus the last five, not the
+first six. That is why an earlier pass-count sensitivity check read 4.35× / 4.15× / 4.39× where a
+chronological subset gives different intermediate values; both are non-monotone, which is sampling
+noise in the median of a heavy-tailed quantity rather than a trend. `an_c203.py` takes **no** subset —
+it uses every shared pass — and its CV line now names the pass count and this trap, because the
+figure moves with both.
+
+**An index-based percentile is a function of group size.** `sorted(v)[int(0.9*n)]` is p92.86 on a
+29-cell group and p90.62 on a 65-cell group, so a column labelled p90 compares two different
+quantiles when the groups differ in size by more than 2×. Replaced with an n-independent quantile in
+the cross-check script, after which its p90 figures agree with the peer's to the third decimal. The
+analyzer reports medians, which do not have this property.
+
+**And ov8 is the cross-width exception, confirmed by digest:** `matches-ambient(ov8)` is 34 cells at
+k=2 and 32 at k=4 with different digests, while all-arms-agree and the other four rungs' groups are
+identical across those widths. So "k=2 and k=4 are one reading" holds for chain202's three groups —
+which is the scope it was stated in — and must not be carried into the per-rung table, where ov8 is
+two readings. The analyzer checks all eighteen groups by digest and prints which are identical.
+
+**Process note:** the commit body for `d88f1ae` lost the word `resolved` to shell expansion — an
+unquoted heredoc expanded the backticks. The document text was written through a quoted heredoc and
+is intact. Not correctable in place; commit messages now go through `git commit -F -` with a quoted
+heredoc.
