@@ -28871,3 +28871,65 @@ independent reading used `> 1.00` where this analysis uses `> 1.01`; at `> 1.00`
 reproduce to the cell — `ovp` 30/31, `ov2` 132/131, `ov4` 79/79, `ov8` 32/31, `ov16` 27/26, `ov24`
 41/35, `ov24b` 40/40. Two independently written pipelines over one sealed dataset, agreeing on every
 figure, which is a stronger check than the shared-specification 267 was.
+
+### Correction 2: the control's *reachability*, and the same defect in the printing function
+
+The overlap-for-equivalence fix in the previous section left three things wrong. None of them moves
+the verdict — NO at all three widths, nothing attributable, no thread cap ships — and all three
+were found by a second independently written reading disagreeing with a number.
+
+**Containment was asserted to be unreachable and is reachable at the narrowest width.** The fix's
+comment said containment — the only passing outcome — was unachievable at n = 24–29 for any pair
+including the same-argument pair. Measured over all 21 arm pairs it is **2 of 21 contained at k=2**
+in that width's ±0.23% band (3 of 21 against a fixed ±0.35%), and **0 of 21 at k=4 and k=32 in both
+bands**. So `nopower` at k=2 is a shortfall of power for that particular pair, while at the two
+wider widths no design at this n could have certified the control and parity exclusion is the
+load-bearing statistic. The analysis now prints the count per width beside the verdict instead of
+asserting it, with the consequence of a zero spelled out.
+
+**The A/A pair's own containment must not be read at all.** The band is `max(|lo−1|, |hi−1|)` of
+that pair's CI, so its containment in it holds by construction up to two asymmetries — the
+reciprocal, since a band is symmetric in ratio space and a reciprocal is not, and the seed offset
+the floor is computed under. At k=2 those two suffice to flip its verdict, at a margin of 4e-5.
+
+**`row()` had the identical overlap defect and the fix had not reached it.** Every printed row's
+label came from `else: "inside the floor"`, so a CI that excludes parity printed as quiet. Of the 45
+rows so labelled, **only 12 are contained in their band; 24 contain parity while being wider than
+it; 9 exclude parity** — among them the k=32 control row itself, `ov24/ovp` n=24 **1.0267 [1.0026,
+1.0568]**, a 2.7% difference on cells where no argument can change the team. The verdict block had
+already used the fixed predicate, so the capture contradicted its own verdict line rather than
+reaching a wrong one. Labels are now FASTER / SLOWER / `under floor, EXCLUDES parity` / `flat,
+contained in band` / `no power (contains parity)`.
+
+**The parity-exclusion count is not seed-stable, and neither is the count of stable pairs.**
+Reported as 11 / 6 / 17 of 21 at k=2 / 4 / 32; at k=32 that is 16 over 9 seeds and **15 over 25**.
+The ratio list per pair is fixed and only the resample draw changes, so the statistic to read is the
+margin by which the pinned seed's CI clears parity against the seed-to-seed spread of the bound
+deciding it. Exactly one pair per width sits inside its own resampling noise:
+
+| width | boundary pair | CI at the pinned seed | margin | seed spread |
+|---|---|---|---|---|
+| k=2  | `ov24b`/`ov16` | 1.0021 [1.0001, 1.0039] | +0.00007 | 0.00018 |
+| k=4  | `ovp`/`ov4`    | 0.9961 [0.9908, 0.9999] | +0.00006 | 0.00013 |
+| k=32 | `ov4`/`ov16`   | 0.9814 [0.9598, 0.9998] | +0.00019 | 0.00099 |
+
+Which is why the two pipelines differed by **exactly one pair at all three widths**: not a
+convention difference, one pair per width whose side of the boundary the resample picks.
+
+**What none of it touches: the positive control holds.** The boundary pair is never the
+same-argument pair. `ov24b`/`ov24` contains parity at every width and every seed tried (25 of 25
+non-exclusions at k=32, margin −0.00147). So the arm-identity artefact lives between *different*
+arguments, not between two spellings of one, and it grows six-fold with width — **0.75% → 2.11% →
+4.35%** — which supersedes the earlier pooled "0.5–0.7%" quoted from the narrowest width alone.
+
+**And the seal reported "2 checked" for three metamorphic relations**, having counted a phrase only
+the two text-diff relations emit; the authoritative `0 of 3 relations violated` was correct
+throughout. The count is now declared in the script, each relation emits a uniform verdict line, and
+declared-vs-reported is cross-checked on both sides. Both halves were demonstrated to refuse on
+doctored input. All three relations still pass against the new code, which also tests it: `reorder`
+shuffles rows within each file, which cannot change a pooled statistic, and the new loops and seeds
+are invariant under it.
+
+Sealed at 125 files, 124 of 124 verifying, manifest
+`340510303f440ae1868307291f54713470ea7b0c0908b20f4f6f06f32fa50f44`. The original defective capture
+is preserved unmodified at `6a7063ab787e61c4` beside both rounds of correction.
