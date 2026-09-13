@@ -27970,3 +27970,22 @@ that could not contain the answer. The first three return a wrong number; the fo
 right number about the wrong thing, which is the failure that survives review. This is
 "hosts compile different kernels" in its most direct form: redwood is AVX2, the M5 is NEON, and an
 AVX2-only region cannot be studied on the NEON object however carefully the symbols are counted.
+
+**The 57 resolved, and it inverts the earlier lesson.** Same tool, same target — `/usr/bin/nm`
+(llvm-nm) on `/Users/bobby/scorch-beat-mkl/src/scorch_ops.cpython-311-darwin.so`, 1029360 bytes,
+Sep 8 23:15. The difference is **case sensitivity**: `nm -jU | grep -c spmm` gives 182 and
+`grep -ci spmm` gives 239, difference exactly 57, and the extra lines are `SpmmCsrPlan` (123
+occurrences) and `SpmmPlanKind` (2). Not a tool difference, not a target difference — the audit's
+three hypotheses (external-only, duplicate names, the other object in `/Users/bobby/scorch`) were
+each correctly eliminated, and the answer was a fourth thing neither of us tested.
+
+The inversion is the part worth keeping. Earlier in this same exchange, case-insensitivity was the
+**fix** — `grep -c 'spmm'` returned 0 `.cold` symbols where `grep -ci` found the 4 on
+`SpmmCsrPlan`. Here case-insensitivity is the **over-match**, because `SpmmCsrPlan` is the plan and
+pybind11 dispatch layer, not a kernel, so for a kernel-family census the case-sensitive 182 is the
+number you actually want. Both counts are correct for their own filter and neither is correct
+without it. So the rule is not "always use `-i`" — it is **print the tool and the target beside
+every number**, which is the same discipline as the target axis one level down: state what was
+measured, not only what was found. Two sessions quoted 239 and 182 at each other six times tonight
+without either naming its command, and the only reason the gap surfaced is that it was suspiciously
+exact.
