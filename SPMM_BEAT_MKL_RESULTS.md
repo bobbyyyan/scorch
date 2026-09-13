@@ -27845,3 +27845,41 @@ redwood but is not the build's compiler of record, since the extension goes thro
 **The definitive compiler check, which neither of us named:** `readelf -p .comment <obj>`. ELF
 objects carry the producer string in `.comment` — `GCC: (GNU) x.y.z` — so the answer is in the
 objects themselves and needs no build log. One read per object, at seal time, alongside `size -A`.
+
+**Convergence: `size -A` alone settles the sign, and the mechanism hunt is conditional on its
+answer.** The audit retracted its own cold-partitioning account with local evidence, which I
+re-ran and confirm with one amendment. On `src/scorch_ops.cpython-311-darwin.so`: the mangled
+prefix `spmm_csr_v2_coreIfLb0E` selects 6 symbols, 3 of them `.omp_outlined` and **0 of them
+`.cold`**. So a substring selector on the mangled prefix does capture the outlined family, which
+means under a 12-symbol group selected that way, redistribution into `.cold` or `._omp_fn.N` moves
+code *within* the group and cannot change the total — and a −11155 group sum means code left the
+group. The amendment: `.cold` symbols on `spmm`-matching names are **4**, not 0 — but they belong
+to `SpmmCsrPlan::run`, the `SpmmCsrPlan` constructor and a pybind11 `class_<SpmmCsrPlan>` helper,
+i.e. the plan layer, not the kernel. The conclusion holds: this build put no cold partition on
+`spmm_csr_v2_core`. Clang and GCC differ here, so it is local evidence, not a redwood fact.
+
+What survives of that exchange is narrower and was still worth the instrument change: `core` is
+multi-symbol and the dispatch is not in the function's own symbol, so a single-symbol size is the
+wrong quantity whatever the selector was.
+
+**The reordering.** Two mechanisms do survive a substring selector — the function being inlined
+into its callers in one arm and emitted out-of-line in another (its code moving to symbols with no
+prefix at all), and GCC's `-fipa-icf`, on by default from `-O2`, folding identical functions and
+leaving an alias whose bytes leave a group total with nothing leaving the object. The second is a
+live candidate precisely because these arms' dead-code elimination makes surviving bodies converge.
+Both have cheap signatures in the same unfiltered dump: for the first, whether the unsuffixed symbol
+exists in all five arms and whether the *callers* differ in size; for the second, two names at one
+address. A jump table moving to `.rodata` as switch cases fold is real but is tens to hundreds of
+bytes and should be excluded explicitly rather than left open.
+
+But none of that is needed first, because **the whole-object `.text` total answers the question
+independent of every selector, alias and outlining decision**. If code merely moved between
+symbols, the total is unchanged; if it left, the total drops. `size -A` reports every section, so
+the one escape — code moving between sections rather than out of the object — is covered in the
+same read. So the pass is: `size -A` first and the verdict comes from it; the mechanism hunt runs
+only if the answer is "moved", and then it is looking for which of the two survivors did it.
+
+Locally, for calibration of the signature: 54 addresses in that object carry more than one symbol,
+3 of them in the `spmm` family, including `.cold.1` and `.cold.2` of `SpmmCsrPlan::run` at the same
+address — so two-names-at-one-address is common enough that it needs the *sizes* read alongside it
+rather than being treated as folding on sight.
