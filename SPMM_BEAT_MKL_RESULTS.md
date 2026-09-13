@@ -29696,3 +29696,63 @@ Staged on redwood: `an_c203.py` `743f5259a50d57f1`, `checks_c203.py` `31e3b3243f
 `cc8e3fcfbe632f78`, `meta_c203.py` `84a2bbf81f23fe97`, `metafire_c203.py` `dbc3e94060c9269f`,
 `synth_c203.py` `1399d11d5af4a05c`, `fixture_c203.py` `f22aa0ca7e1090c1`, `cover_c203.py`
 `3ce3f87c74c2590e` (retired), and seven output files.
+
+### The hazard was the container, not the lookup — and the branch-coverage sentence above is wrong
+
+Two corrections and one better fix, all from the peer session pushing on the previous entry.
+
+**The defect was container-level.** `RES` is `defaultdict(lambda: defaultdict(set))` and `T` is a
+three-level nest, so a missing key is created on **read** at any depth. Repairing `res1` repaired one
+site; an enumeration of the file finds **43 distinct subscript-read sites on `T` and `RES`**, every
+one of which carried the same property. The relevant distinction, which is why a plainer container
+would have been safe: `defaultdict(dict)` read as `R[b][c]` raises `KeyError` — loudly, on the first
+input — and creates the arm key but not the cell. Only a nest where the *inner* mapping also
+defaults produces the silent form, where the cell is present by the time a downstream guard tests
+for it.
+
+So the fix is one line at the right level: **freeze both containers to plain dicts once the inventory
+has passed.** A stray read then raises at the line that caused it rather than quietly turning a guard
+somewhere downstream into a no-op. Verified: the mutant that restores `RES[b][c]` now dies with
+`KeyError: ('ss/lp_d6cube/lp_d6cube', 32)` at `res1`, instead of producing a plausible wrong count
+285 lines later. The conservation check is kept and is not redundant — **the freeze catches
+accidental reads, conservation catches writes and rebuilds**, which the freeze cannot see. Each has
+its own firing input in the census: the read mutant for the freeze, a `setdefault` write mutant for
+conservation (`REFUSE: ovp held 248 cells at the inventory and 267 now`). Loud at the cause beats
+loud at the end when the next reader has a traceback rather than a counter.
+
+**The branch-coverage sentence in the previous entry does not reconcile, and there are three numbers
+rather than two.** It said "5 partial branches sitting on 6 source lines, one contributing two arcs",
+which is arithmetically impossible: with one line contributing two arcs, arcs = lines + 1. Settled
+from the coverage JSON:
+
+| number | unit |
+|---|---|
+| 7 | missing **arcs**, each a (line → destination) pair |
+| 6 | distinct **source lines** bearing those arcs |
+| 5 | **partial branches** — lines that *ran* and had a destination never taken |
+
+The sixth line never executed at all, so it is dead code rather than a one-sided condition and is
+not partial; `coverage.py`'s own `num_partial_branches` is 5, which agrees. `arcs ≥ lines ≥ partial`,
+always. The report now prints all three with their definitions, because the conflation happened one
+message after fixing the same class of error on the line-coverage figure.
+
+**And a theorem classification can be an artefact of a defect.** The final `REFUSALS` exit was filed
+as a theorem on the grounds that its only contributor was the core-subset self-test. It was only a
+theorem *because the absent-cell guard could not fire*; fixing the container gave it a real
+contributor. So the theorem category is a property of the current code and has to be re-derived
+whenever the code changes, never carried forward as a label.
+
+**Where each layer was blind, which predicts where to look next rather than only recording where we
+looked.** Each blind spot is exactly what the layer cannot express: a pass/fail census cannot express
+"the outcome was right for the wrong reason"; line coverage cannot express "the line ran but the
+guard was inert"; branch coverage cannot express "which operand decided". Two measurements suggested
+by the peer found defects rather than confirming cleanliness, in that order.
+
+Battery after the freeze: census **35 checks — 33 FIRES, 2 THEOREM, 0 UNTESTED**; condition coverage
+**48 operands, 38 both ways, 0 of the remaining 10 in a guard with no firing input**; branch coverage
+**7 arcs / 6 lines / 5 partial — 2 theorems, 4 code-mutation regression guards, 0 real gaps**;
+metamorphic 3 of 3 holding and each firing on its own mutant; calibration flip in (1.000, 1.001] so
+any additive offset is `c ≤ 9.8e-6`; one output digest across three `PYTHONHASHSEED` values.
+
+Staged: `an_c203.py` `d8dabbb3f83e055d`, `checks_c203.py` `b51948f1bf653006`, `branch_c203.sh`
+`f1133257b3308e8b`, `cond_c203.py` `2141ec84a2c65075`, and the rest of the battery.
