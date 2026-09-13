@@ -29756,3 +29756,64 @@ any additive offset is `c ≤ 9.8e-6`; one output digest across three `PYTHONHAS
 
 Staged: `an_c203.py` `d8dabbb3f83e055d`, `checks_c203.py` `b51948f1bf653006`, `branch_c203.sh`
 `f1133257b3308e8b`, `cond_c203.py` `2141ec84a2c65075`, and the rest of the battery.
+
+### Membership, not cardinality — and a spike test for the cell-to-row data path
+
+The declared-count partition check is invariant to a permutation between two equal-size groups, and
+that is not a theoretical exposure. On chain202's k=32 cells, swapping one cell out of all-arms-agree
+and one in — **count unchanged at 24** — moves the core excursion from **0.0051 to 0.0263, a factor
+of 5.2**, on the control the whole stage rests on. The peer session measured that and it invalidates
+the form of the check we had both pre-registered.
+
+**Every group now prints a digest of its sorted membership beside its count.** The convention is
+stated in the output, because two implementations must be able to disagree about *membership* rather
+than about format: the `key` column verbatim, Python `sorted()` (identical to `LC_ALL=C sort` for
+these ASCII keys), joined with a single newline, no trailing newline, `sha256`, first 16 hex. Two
+independent implementations agree on chain202's k=32 groups — `all-arms-agree` n=24
+`8c4a01a7d3e19de0` and `caponly` n=40 `65ffdf46afa127d3`, computed here from the CSVs and by the peer
+from theirs.
+
+**The digest block immediately produced a structural identity.** Reporting the groups that share a
+digest — the same cells under two names — shows `k=32 adopt n=25` and `k=32 ov24/HIGHER n=25` are
+set-identical, and likewise at k=2 and k=4. chain202's ADOPT is `resolved[ov24] ≠ resolved[ovp]` and
+HIGHER is `resolved[ov24] > resolved[ovp]`, so the two coincide exactly when ov24 never resolves
+*below* ambient — **which is data, not definition**: `ov24/LOWER` is empty at all three widths. Same
+family as amendment 5's `fringe(ov24) ≡ CAPONLY`, and it means those two rows are one reading. The
+k=2 and k=4 partitions also share all three digests, so those are the same cells at both widths.
+
+**A digest proves the analyzer knows the members; it does not prove it used their numbers.** That
+needs a spike test, and it is the one thing neither the census, nor line/branch/condition coverage,
+nor the metamorphic relations can express. Multiply one `(cell, arm)` by f = 8 on every pass. The
+pass-paired estimator takes a median over passes of the per-pass ratio and then a geometric mean over
+cells, so the closed form is exact:
+
+    row over group G, computed as base/subject, n cells after filtering
+      spiked arm is the SUBJECT and the cell is in G  ->  point * f**(-1/n)
+      spiked arm is the BASE    and the cell is in G  ->  point * f**(+1/n)
+      otherwise                                      ->  unchanged, exactly
+
+Sweeping one representative cell per (rung, group) and spiking both the rung and the ambient arm:
+**4482 row comparisons, 0 off the closed-form prediction.** One case is worth reading — spiking the
+*ambient* arm on a cell that is NULL for ov24 moves `ov16/LOWER`, `ov2/LOWER`, `ov4/LOWER`,
+`ov8/LOWER` and `ov24/NULL`, because one cell has five different group memberships. That is the
+per-rung partition doing exactly what it was built for.
+
+**And the spike test fires on its own input.** A mapping mutant that computes every rung's stage-3
+row on ov2's cells of the same group name leaves the printed membership digest **byte-identical**
+(`ov16/NULL n=25 1ff238af3401e452` under both) and is caught at **28 of 4320 comparisons**. That is
+the complementarity in one pair of runs: the digest sees the names, the spike sees the arithmetic.
+
+Two corrections to the spike test's own first version, both of the class it exists to find: it keyed
+rows by `(arm, group)` and so demanded that a k=2 row move because a cell at k=32 was spiked, and it
+applied the per-rung group membership to stage-4 rows, which are computed on chain202's partition
+instead. 120 of 830 comparisons read as failures and the analyzer was right in every one. Rows are
+now keyed by `(stage, width, arm, group)`. The first version also had a `break` that stopped after
+each rung's first non-empty group, so twelve of the fifteen groups were never the spiked cell's home
+and the sweep's sensitivity depended on alphabetical order.
+
+Battery: census **37 checks — 35 FIRES, 2 THEOREM, 0 UNTESTED**; condition coverage **50 operands, 39
+both ways, 0 of the remaining 11 in a guard with no firing input**; branch **7 arcs / 6 lines / 5
+partial — 2 theorems, 4 code-mutation guards, 0 real gaps**; 3 of 3 relations holding and each firing
+on its own mutant; spike **4482 / 0**; calibration flip in (1.000, 1.001]; one digest across three
+`PYTHONHASHSEED` values. Staged: `an_c203.py` `3d50a5f0cc914ce0`, `spike_c203.py` `e49534b035e476b3`,
+`checks_c203.py` `4d650dab9475871f`.
