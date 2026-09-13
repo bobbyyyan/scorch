@@ -26897,8 +26897,24 @@ population the deficit is **entirely** the fixed per-call term.
 
 ### The result the stage was not designed to find
 
-Across all 89 matrices at k=2, **34 have a thread count that beats 24 with a bootstrap CI lower
-bound above 1.02**, and 28 of the 34 are matrices carrying behind-MKL cells:
+Six real arms and one duplicate means an oracle that picks the best of six is being compared
+against a null that picks the best of *one*, which understates selection bias. So the headline
+is the **held-out** count, not the in-sample one: choose each matrix's arm on passes 1-7, test
+that arm on passes 8-14, and require the second half's bootstrap CI lower bound above 1.02.
+
+| test at k=2 | count |
+|---|---|
+| in-sample oracle, best of six over all 14 passes | 33 of 89 |
+| **held out — arm chosen on passes 1-7, tested on 8-14** | **30 of 89** |
+| identical-arm null, `t24b` against `t24`, no selection at all | **0 of 89** |
+
+The held-out figure is immune to selection by construction and keeps 30 of the 33. With the null
+at zero, best-of-six cannot manufacture 30. Among those 30 the winning arm **flips between the
+two halves for only 3** — so "24 is the wrong count here" is stable, while "N is the right count
+for this matrix" is stable in 27 of 30 rather than all of them, which matters for any rule that
+would ship a specific number.
+
+The in-sample list, with 28 of the 33 carrying behind-MKL cells:
 
 | matrix | rows | nnz | mean degree | best T | gain vs 24 | 95% CI |
 |---|---|---|---|---|---|---|
@@ -26968,9 +26984,41 @@ need it while leaving it off where the policy's count is far below the pool and 
 small. That condition has to be provably inert on the shapes the adoption was built for, which is
 the standing requirement for a sub-regime gate.
 
-It also revises, rather than contradicts, chain189 and chain190. Their oracle swept the thread
-count with the adoption in place, so every arm it compared had already been raised to the pool; an
-oracle over a variable that the code then overrides measures the override, and +0.06% is what that
-looks like. The question was never closed — it was measured through a clamp.
+### Why this does not contradict chain189 and chain190, and the wrong reason I first gave
+
+My first write-up said their oracle swept a variable the code then overrode, so every arm had
+already been raised to the pool. **That is false, and their own sealed data refutes it.**
+`tsweep.py` passes `nthreads_override = POOL if o == 0 else o` into the timed call and records the
+resolved count per row; in that column an override of 1 resolves to 1 worker on all 61 k=2 cells,
+and 53 of the 61 resolved to six distinct counts across the sweep. Nor did they pass `-1`: it
+appears in exactly 915 rows, one arm's worth, and that arm is `mkl`.
+
+The real reason there is no contradiction is **population**. chain190's corpus is 61 keys — 50
+SuiteSparse plus 11 DLMC transformer and ResNet layers — and chain199/200's is the 89-key board
+corpus. They share **three** keys: `connectus`, `cond-mat-2005`, `lp_osa_14`. Not one of
+`p6000`, `aa3`, `lp_d6cube`, `ASIC_100k` or `m3plates` appears in chain190's corpus at all. Two
+measurements of different populations, each with a working instrument.
+
+That framing is also the durable one. "Their oracle was clamped" is refutable by their own
+`resolved` column the first time anyone opens it, and refuting it would cost this stage's result
+too; "chain190 never measured these matrices" gives up nothing and cannot be overturned.
+
+### What chain200 cannot separate, and what chain202 must record
+
+chain190's CSV carries a `resolved` column because an override is not a worker count: the
+adoption takes the minimum of the override and the row-axis capacity, so two overrides can
+resolve to the same team. chain200's schema is
+`build,slice,key,k,rows,nnz,deg,arm,ms,batch` — **no resolved count**, which was a mistake.
+
+Asking the exported policy how much it costs: **34 of the 89 matrices resolve to the same worker
+count at pool 16 as at pool 24**, so for those two arms the only difference is pool width, and
+"fewer workers helped" and "a smaller pool helped at the same team" are the same observation in
+the data as recorded. Those are largely the few-row matrices, one of the board's three geometric
+populations.
+
+It does not reach the headline: **0 of the 30 held-out confirmed matrices is pool-ambiguous** —
+every one of them has a winning arm that provably changes the resolved count. But the gap is
+real, it was avoidable, and one extra call to the exported policy per row restores it. chain202
+carries the column.
 
 Nothing ships from chain200. The next stage is the override, not the thread count.
