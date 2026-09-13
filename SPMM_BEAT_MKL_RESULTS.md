@@ -27168,3 +27168,81 @@ against 6) and not redwood (32 against 48), which is a third reason the two host
 override of `-1` the same meaning, and it is why a chain202 confirmation run on the M5 would not
 measure the same arm. Both refusals and the passing path are exercised on the real header before
 the stage is allowed to run.
+
+### The detector over chain189 and chain190, and a defect it found in their analyzer
+
+The open item at the end of the last section — whether the earlier thread chains had the same
+exposure — is answered, from the sealed ledgers and with no new machine time. **They do: the same
+24 cells on both hosts.** Running `resolved > override` over `chain190-tsweep-redwood`:
+
+    over the six SWEPT arms           over every arm passing a positive override
+    k=1    0 of 1098 rows             k=1    0 of 2928
+    k=2    0 of 1098                  k=2    0 of 2928
+    k=3   30 of 1098                  k=3   42 of 2928
+    k=4   60 of 1098                  k=4   84 of 2928
+    k=8  270 of 1098                  k=8  378 of 2928
+
+Both columns are right and name different arm sets; the wider one includes the four forced-launch
+arms, which also pass an override. The figure to quote is the **cell** count, 24 of 305, because the
+rows-per-cell factor is an arm-set choice while the cell is the unit the oracle ranks. On every one
+of the 24, the swept arms resolve to
+
+    override   1   2   4   8  16  24
+    resolved  32  32  32  32  32  24
+
+— five of six collapsed onto 32, only the shipped arm distinct. On MKT (chain189) it is the same 24
+matrices of 311 and the collapse is total: `num_procs` there is 32 inside a 32-CPU allocation, so
+the shipped arm reaches 32 through the cap while the five low arms reach it by declining, and **all
+six arms are one configuration.** On those cells chain189's oracle over six overrides was an oracle
+over six identical settings.
+
+The 18 matrices are `2cubes_sphere`, `TSOPF_FS_b39_c19`, `barrier2-9/10/12`, `cage12`, `d_pretok`,
+`filter3D_E`, `lhr71`, `lhr71c`, `n4c6-b10`, `power9`, `qa8fk`, `qa8fm`, `relat8`, `s3dkt3m2`,
+`shipsec8`, `xenon2` — large structural and FEM matrices at the widest widths measured. k=1 and k=2
+are clean on both hosts, so chain200's held-out k=2 headline is untouched and the population framing
+stands. The defect cannot explain `+0.06%` by arithmetic — 24 of 305 cells contributing no gain
+moves it to about `+0.065%` — but it removed the ladder on the cells with the most room for a thread
+lever, and **it is not recoverable by re-analysis**: those cells never ran at 1/2/4/8/16 workers on
+either host, so the readings do not exist.
+
+**Their own instrument guard was built to catch exactly this and was pooled into blindness.**
+chain190's P4 is the right check — "on well-fed cells one worker must be far slower than the shipped
+setting; if it were free there, the measurement is wrong rather than the policy" — and it reported
+`s1/s0 over 226 fed cells: 9.020 [8.176, 9.887]` and passed. Per cell:
+
+| group | n | s1/s0 median | range | geomean |
+|---|---|---|---|---|
+| cap declined | 24 | 1.28 | 1.15 – 1.40 | 1.28 |
+| the other fed cells | 202 | 12.42 | 2.39 – 15.94 | 11.37 |
+| pooled, all 226 fed | 226 | | | **9.020** |
+
+The pooled geomean reproduces the reported number to three decimals, which is what makes this a
+reconstruction rather than a guess. On the affected cells the one-worker arm was 1.28× slower
+because it was never one worker — it was 32 workers in a 24-thread pool, oversubscribed by about
+28%. All 24 sit inside the guard's own fed population, and within that population the two groups
+are **disjoint**, 1.40 against 2.39, so the per-cell form separates them with a 9× margin and flags
+every one with no threshold to tune.
+
+The general rule, which is the transferable part: **a guard that asserts a large effect must be
+evaluated per unit.** Pooling lets the units where the effect is absent hide inside the units where
+it is present, and the failure is invisible in the direction that matters — the guard reports
+HOLDS, and a passing guard is not re-examined. `an_c189.py` now carries the decline census as P0 and
+evaluates P4 per cell; on chain190's own data it reads **DOES NOT HOLD**, naming all 24.
+
+**And adding a second consumer of one dict found a defect in that analyzer.** Its loader did
+
+    meta[cell] = dict(rows=..., nnz=..., deg=..., grains=...)
+    if r["arm"] in SWEEP or r["arm"] in DUPS:
+        meta[cell].setdefault("resolved", {})[r["arm"]] = int(r["resolved"])
+
+— assigning a **fresh** dict on every row, which destroys the per-arm `resolved` map the next line
+accumulates. Over the whole corpus 90 of 305 cells ended with no `resolved` entry at all and 215
+with exactly one, never the six the sweep wrote. `classify()` reads `max()` over that map to tell a
+starved cell from a lean one, so it was deciding off whichever arm's row happened to come last. The
+effect, with the loader corrected to update instead of replace: **9 cells change class, STARVED
+5 → 14 and LEAN 49 → 40**, and LEAN's forced-launch ratio moves 0.9189 → 0.9020 (same direction,
+same verdict). `FED` depends only on `grains` and is untouched, and **every headline number is
+byte-identical** — oracle `1.0097 [1.0053, 1.0152]`, null `+0.90%`, net `+0.06%`, 10 cells behind
+MKL, 1 recovered, P4's pooled 9.020. A real defect with a contained blast radius, and the reason the
+census read 9 cells before the fix and 24 after. The sealed ledger is unmodified and its
+`SHA256SUMS` still verify; the correction is in the working copy.
