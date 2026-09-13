@@ -26855,3 +26855,113 @@ hosts is what the confirmation would establish, not what it may assume.
 
 Both `SCORCH_NARROWK_DEEP_UNROLL` and the NVEC window stay at their defaults. Nothing ships
 from chain199.
+
+## chain200: the thread count is not dead — the host-pool adoption overrides a policy that was right
+
+One object, seven arms differing only in `OMP_NUM_THREADS` (1, 2, 4, 8, 16, 24, and 24 again as
+the identical-arm floor), 14 passes of a rotation balanced in position and predecessor, 89
+matrices, widths 2/4/32. 11214 rows per arm, 0 readings refused, 0 duplicate tuples, 42 of 42
+ordered adjacent pairs present exactly twice.
+
+The stage was opened to decompose the eleven k=2 cells chain198 confirmed behind MKL, deliberately
+re-asking a question chain189 and chain190 closed — their oracle over thread counts netted +0.06%
+over its own selection floor on two hosts. Those ran on the 298-key corpus that chain196 showed is
+3.5% of the cache and unrepresentative by size and degree.
+
+### The pre-registered prediction, and where it was wrong
+
+Written before any ratio was computed (`c200_prediction.md`), from three costs measured elsewhere
+in this line: ~14 µs fixed per call, 0.26 µs per worker of team, ~2.8 ns per row unit. For
+`m3plates` (11107 rows, degree 0.60, the +34.6% cell) that gives 57% fixed, 25% team, 5% work, and
+three predictions: an interior optimum near T=11 with t1 and t2 *much slower*; a gain of 5-8%; and
+therefore that threads cannot close this population.
+
+Held: the gain is small where it was predicted small, and threads cannot close `m3plates`. Its own
+best arm is t1 at 1.030, against a deficit of 1.346 — and MKL at 8 threads on the same matrices is
+itself 1.23× faster than MKL at 24, so restricting the pool *widens* the gap rather than closing it.
+
+Wrong: the shape. `m3plates` prefers **t1**, not t11, and by only 3.0%. Going from 24 workers to 1
+changes its time by 0.7 µs out of 24.7, so neither the team nor the parallel work is where its time
+goes — about 24 of its 24.7 µs is fixed per-call cost. The row-loop term was over-estimated by an
+order of magnitude. That is a sharper conclusion than the prediction: for the mostly-empty-row
+population the deficit is **entirely** the fixed per-call term.
+
+### The result the stage was not designed to find
+
+Across all 89 matrices at k=2, **34 have a thread count that beats 24 with a bootstrap CI lower
+bound above 1.02**, and 28 of the 34 are matrices carrying behind-MKL cells:
+
+| matrix | rows | nnz | mean degree | best T | gain vs 24 | 95% CI |
+|---|---|---|---|---|---|---|
+| `p6000`       |  2095 |   19826 |    9.46 | t4  | **1.615** | [1.58, 1.62] |
+| `aa3`         |   825 |   70806 |   85.83 | t8  | 1.420 | [1.34, 1.43] |
+| `gen4`        |  1537 |  107103 |   69.68 | t8  | 1.407 | [1.34, 1.53] |
+| `lp_d6cube`   |   415 |   37704 |   90.85 | t4  | 1.404 | [1.32, 1.50] |
+| `lp_osa_07`   |  1118 |  144812 |  129.53 | t8  | 1.356 | [1.26, 1.37] |
+| `pcb3000`     |  3960 |   57479 |   14.51 | t8  | 1.354 | [1.31, 1.47] |
+| `c-30`        |  5321 |   65693 |   12.35 | t8  | 1.351 | [1.26, 1.39] |
+| `boyd1`       | 93279 | 1211231 |   12.98 | t16 | 1.318 | [1.18, 1.37] |
+| `ASIC_100k`   | 99340 |  940621 |    9.47 | t16 | 1.300 | [1.28, 1.34] |
+| `m3plates`    | 11107 |    6639 |    0.60 | t1  | 1.030 | — |
+
+The gains sort by geometry, not by whether the matrix is on the board: matrices with a few hundred
+to a few thousand rows want **t4 or t8**; matrices with tens of thousands of rows want **t16**; the
+mostly-empty-row matrices want t1 and gain almost nothing.
+
+### The mechanism, named from the source and confirmed on the other host
+
+The drop-in SpMM resolves its team through `scorch_spmm_nthreads`, which is exported to Python so a
+harness can ask for the number rather than restate it. Asking it for these matrices — pure policy,
+`nthreads_override = -1`:
+
+    p6000      2095 rows,  19826 nnz, k=2   ->  2 threads
+    aa3         825 rows,  70806 nnz, k=2   ->  7 threads
+    lp_d6cube   415 rows,  37704 nnz, k=2   ->  4 threads
+    ASIC_100k 99340 rows, 940621 nnz, k=2   -> 18 threads (the machine's count)
+
+**The policy's own answers are close to the measured optima** — 2 against t4, 7 against t8, 4
+against t4, 18 against t16. What overrides them is the host-pool adoption in the same function: the
+caller passes the ambient thread count so one warm team spans the pipeline (`spmm.h:3800-3811`,
+which avoids a libgomp team reshape at every op boundary, worth ~15% of a sub-ms GCN forward), and
+the adoption fires for any product clearing `SCORCH_GRAIN_SPMM`. `p6000` at k=2 has
+work = 19826 × 16 = 317216 against a grain of 150000, so it clears, and its team goes from 2 to the
+pool's 24.
+
+`OMP_NUM_THREADS` moves the pool and the override together, so chain200 alone cannot say which of
+the two costs the time. Separating them needs the pool held fixed and only the override swept —
+which the exported argument allows directly. Run on the M5 at a fixed pool of 6, timing
+`spmm_csr_float_v2` with `nthreads_override = -1` against `= 6`, on synthetic matrices matching the
+four shapes:
+
+| shape | rows | nnz | k | policy picks | adoption picks | pure | adopted | ratio |
+|---|---|---|---|---|---|---|---|---|
+| p6000-like    |  2095 | 19955 | 2 | 2 | 6 | 10.45 µs | 28.46 µs | **2.724** |
+| p6000-like    |  2095 | 19955 | 4 | 2 | 6 | 13.78 µs | 29.64 µs | **2.151** |
+| aa3-like      |   825 | 70657 | 2 | 6 | 6 | 29.57 µs | 31.75 µs | 1.074 |
+| pcb3000-like  |  3960 | 57650 | 2 | 6 | 6 | 31.13 µs | 32.02 µs | 1.029 |
+| m3plates-like | 11107 |  6715 | 2 | 1 | 1 | 29.38 µs | 25.11 µs | 0.855 |
+| identical-arm floor (pure against pure) | | | | | | | | 0.984 |
+
+The design has its own negative control built in: three of the four shapes are ones where the
+policy and the adoption **agree**, and those read 0.86-1.07 — nothing. The only shape where they
+disagree is the only one that moves, and it moves by 2.7×. So the cost is the **override**, not the
+pool, and it appears exactly where the override raises the count.
+
+Two hosts, two architectures, two different vector kernels, the same shape-selectivity and the same
+direction. This is a mechanism, not a redwood artefact.
+
+### What this does and does not license
+
+It does **not** license removing the adoption. The adoption exists for a measured reason and the
+shapes it was built for are real. What it licenses is a stage: hold the pool at 24, sweep the
+override, and find whether a condition exists that keeps the adoption on the GCN-layer shapes that
+need it while leaving it off where the policy's count is far below the pool and the product is
+small. That condition has to be provably inert on the shapes the adoption was built for, which is
+the standing requirement for a sub-regime gate.
+
+It also revises, rather than contradicts, chain189 and chain190. Their oracle swept the thread
+count with the adoption in place, so every arm it compared had already been raised to the pool; an
+oracle over a variable that the code then overrides measures the override, and +0.06% is what that
+looks like. The question was never closed — it was measured through a clamp.
+
+Nothing ships from chain200. The next stage is the override, not the thread count.
