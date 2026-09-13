@@ -29583,3 +29583,62 @@ Staged on redwood with digests: `an_c203.py` `762a4e3f5229ebd4`, `checks_c203.py
 `meta_c203.py` `84a2bbf81f23fe97`, `metafire_c203.py` `dbc3e94060c9269f`, `branch_c203.sh`
 `98704dad241ef034`, and the five output files. `coverage` 7.16.1 is installed into a scratch target
 directory on `PYTHONPATH`, not into the `scorch` conda env.
+
+#### Correction: the coverage figure above is in a retired unit, and it is in the tracked record
+
+The section before last says "**390 of 400 executable lines, and the 10 unreached lines**". That
+number is in a unit of my own making — lines bearing an ast node, counted by a homemade tool — and
+the section after it reports "**357 statements, 8 missing**" from `coverage.py`. Both describe the
+same three checks on a file whose digest never changed, which leaves three values for one quantity:
+
+| figure | unit | tool |
+|---|---|---|
+| 12 | physical lines in the ranges 278-279, 376-381, 531-534 | none, just the ranges |
+| 10 of 400 | lines bearing an ast node | `cover_c203.py`, now retired |
+| 8 of 357 | statements | `coverage.py --branch`, via `branch_c203.sh` |
+
+The gap is continuation lines: 377, 378, 380 and 381 are argument lines of the multi-line
+`REFUSALS.append` at 376 and `print` at 379. So it is a unit difference, not a disagreement about
+what ran. **`cover_c203.py` is retired** — it now refuses to run and carries the reconciliation as
+its docstring, so the figure cannot be produced again, and `coverage.py` is the only coverage tool.
+The rule it cost: **name the unit and the tool beside a coverage number**, the same way an estimator
+or a noise floor has to be named.
+
+The peer session checked the most recent commit body, found only "120 branches, 3 partial" there,
+and cleared this as a correspondence artefact. That clearance is wrong: the retired figure is in the
+tracked record twice — at line 29513 of this document, and in the body of commit `bd9cc38`
+("390 of 400 executable lines and the 10 unreached..."). A commit body cannot be corrected without
+rewriting history, so the correction lives here instead, which is the same rule the sealed ledger
+follows: the record stands and the next entry corrects it.
+
+Also completing the blind-spot audit, which listed three of the four categories it measured: the
+fourth is **26 `if` statements with no `else`**. Those are not a blind spot — branch coverage reports
+the not-taken arc for each — which is why they were left out, but a reader reconciling the four
+numbers should find them accounted for rather than missing.
+
+#### What each artefact size in the calibration actually buys, which is not what I said
+
+"Four times the artefact, four times the effect it takes to clear it" was the wrong warrant for the
+second artefact size. Writing the consumed margin as `m·band + c` and solving for the flip ratio
+exactly:
+
+| error in the margin | flip at A=0.01 | flip at A=0.04 | excluded by |
+|---|---|---|---|
+| none, as declared | 1.0000 | 1.0000 | the surviving hypothesis |
+| multiplicative m=1.5 | 1.5075 | 1.5306 | one size |
+| multiplicative m=100 | 10000 | ∞ | one size |
+| additive c=1e-3 | 1.1021 | 1.0271 | one size |
+| additive c=1e-4 | 1.0102 | 1.0027 | one size |
+| additive c=1e-5 | 1.0010 | 1.0003 | the smaller A |
+
+A **multiplicative** error moves the flip to nearly the same ratio at both artefact sizes, so a
+single size excludes it — the second size adds nothing against that failure mode. An **additive**
+offset moves the flip by an A-dependent amount, so two sizes are what *identify* which form an
+error takes if the flip is not at 1.0. **The second size is diagnostic, not a second
+confirmation.**
+
+And the result is a bound, not a calibration. Refining the step at the smallest artefact size —
+where an additive offset is most visible — puts the flip in **(1.000, 1.001]** at A = 0.01, so any
+additive offset in the consumed margin satisfies **c ≤ 9.8e-6, below 0.10% of the band**. The
+`c = 1e-5` row predicts a flip at 1.0010, which is *at* the observed upper end and is therefore not
+excluded. The bound is set by the step in D/A, not by the number of artefact sizes.
