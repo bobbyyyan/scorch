@@ -28729,12 +28729,24 @@ passes. A control failure on partial data is not a control failure.
 | `ov4` | 78 / 77 | 42 | 30 | 6 |
 | `ov2` | 131 / 129 | 55 | 43 | 33 |
 
-The A/A bar at 14 passes is **2 cells** under both estimators, and `ov16` carries zero estimator
-disagreement (23/23), so pooled 28 -> 23 clears it. But the per-width decomposition removes the
-result: **the entire gain is at k=4** — 6 cells under both estimators against that width's own A/A
-bar of 3 (`ov24` 20 vs `ov24b` 23) — and it **costs 1 cell at k=32 under ratio-of-medians and 2
-under median-of-ratios, against a k=32 A/A bar of 0.** A regression against a zero bar is a
-finding, not a shape to tune around, so a thread cap at 16 does not ship on this evidence.
+The A/A bar at 14 passes is 2 cells under both estimators, and `ov16` carries zero estimator
+disagreement (23/23), so pooled 28 -> 23 looks like it clears. **It does not, for two reasons found
+by the independent reading, and the second is the stronger.**
+
+First, per width the gain is entirely at k=4 — 6 cells under both estimators against that width's
+own A/A bar of 3 (`ov24` 20 vs `ov24b` 23) — and it **costs 1 cell at k=32 under ratio-of-medians
+and 2 under median-of-ratios, against a k=32 A/A bar of 0.** A regression against a zero bar is a
+finding, not a shape to tune around.
+
+Second, **the estimator gap is itself unstable between arms that are identical by construction.**
+At the 1.00 threshold `ov24` reads 41 / 35 — a ratio-of-medians-minus-median-of-ratios gap of **+6**
+— while `ov24b` reads 40 / 40, a gap of **0**. Same object, same argument, same override value. So
+the median-of-ratios A/A bar is 5 cells, not 2, and `ov16` against the default reads 3 cells better
+under ratio-of-medians (bar 1) and 5 better under median-of-ratios (bar 5). By the rule this
+document has applied throughout — a count that clears a floor under one estimator and not the other
+has not cleared it — **`ov16` does not clear.** A thread cap at 16 does not ship on this evidence,
+and the zero-estimator-disagreement figure I cited for it carries no information, since an
+identical-arm pair produced gaps of both 0 and 6.
 
 The bar also did not tighten with pass count: 2/2 over all 14 passes against 2/2 and 1/4 on the two
 balanced halves. So fourteen passes bought essentially nothing on the cell-count statistic, which
@@ -28751,3 +28763,44 @@ noise runs 4-6% of the CI width.
 
 CAPONLY is flat at all three widths (1.0082, 1.0121, 0.9993, all inside their floors), so the second
 lever stays where it was: read in P4 by resolved count, not here.
+
+### The override is declined on 36-44% of cells, and the null is the tightest of fifteen pairs
+
+Two findings from the independent reading, both reproduced here from the sealed CSVs.
+
+**`resolved` is not `override`, and the decline is deterministic.** `resolved` takes a single value
+across all 14 passes in **1869 of 1869** `(build, key, k)` cells, so this is structure and not noise.
+Declined cells of 267: `ov16` 117, `ov8` 111, `ov2` 106, `ov4` 106, `ov24` 95, `ov24b` 95. Two
+distinct declines exist — **82 cells deliver 1 worker in every override arm** regardless of the
+request, and **24 cells deliver 32**, above the pool of 24, so on those a request for *2* workers
+delivers *32*. Any monotone-in-thread-count claim must therefore be stated over delivered counts.
+P4 already is — its rows are grouped by resolved count, with the arm named only as the route, so
+the ladder above stands as written — but the requested-count reading of an arm name does not.
+
+**And the dedicated null is the most agreeable of the fifteen override-arm pairs, by a factor of
+three.** On the 82 cells where every override arm delivers the same count, so no thread-count effect
+can exist, the maximum per-cell deviation runs: `ov24`/`ov24b` **0.0278**, then 0.0896, 0.1139,
+0.1515, … up to `ov16`/`ov2` at 0.8336, with a median across the fifteen of **0.2223**. That is
+expected rather than anomalous — `ov24`/`ov24b` is the only pair passing the *same* argument, and a
+positive override declines into a private-team launch, so every other pair traverses a different
+dispatch route even where the delivered count is identical. But the consequence is real: **the A/A
+pair bounds measurement noise at identical argument, and does not bound the artefact between two
+arms passing different arguments.** Using it as the bar for a `ov16`-versus-`ovp` *ratio* would
+understate the artefact by roughly an order of magnitude.
+
+That objection applies to the ratio statistic and not to the cell count, which is a different
+quantity: on the same 82 cells every override arm reads **5 of 82** behind MKL and `ovp` reads 4, so
+the count bar on that population is 0 to 1 cell. The ratio spread over those cells runs 0.028 to
+0.834 while the count is near-constant — which is the check that the 82 carry no effect, and the
+reason the count comparison survives a bar the ratio comparison does not.
+
+One caveat to keep with the 82: `resolved = 1` in two arms does not prove identical execution, since
+the route that declines a request for 2 differs from the one declining a request for 24 and the
+timing includes it. So that spread bounds arm-identity artefact rather than being a pure noise
+floor — an upper bound on artefact, which is what makes it the right bar and the wrong name.
+
+**The two pipelines agree exactly on the counts once the threshold convention is matched.** The
+independent reading used `> 1.00` where this analysis uses `> 1.01`; at `> 1.00` all seven arms
+reproduce to the cell — `ovp` 30/31, `ov2` 132/131, `ov4` 79/79, `ov8` 32/31, `ov16` 27/26, `ov24`
+41/35, `ov24b` 40/40. Two independently written pipelines over one sealed dataset, agreeing on every
+figure, which is a stronger check than the shared-specification 267 was.
