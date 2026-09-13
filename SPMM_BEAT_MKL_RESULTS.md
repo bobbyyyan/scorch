@@ -29368,3 +29368,43 @@ two distinguished arms — a reference that is inert and a witness that is not �
 the same arm.** chain202 had one and used it for both roles.
 
 Sealed at 152 files, 151 of 151 verifying.
+
+### Amendment 6: the invariance prediction gets a negative control, and the boundary named
+
+**The prediction now has a case where it fails.** Amendments 3–5 predicted chain203's partition is
+identical to chain202's because a duplicate resolves identically to its partner — asserted with no
+perturbation that moves it. Removing arms is the perturbation:
+
+| build set | core k=2/4/32 | verdict |
+|---|---|---|
+| all 7 builds | 29 / 29 / 24 | reference |
+| drop `ov24b` (the duplicate) | 29 / 29 / 24 | invariant |
+| drop `ov24b` + `ov16` | 29 / 29 / 24 | invariant |
+| drop `ov24b` + `ov2` + `ov4` | **33 / 31 / 24** | **moves** |
+
+**The mechanism is sharper than "duplicates don't matter."** The core is *every arm agrees*, so
+removing an arm removes a constraint and the core is **monotone non-decreasing** in arms dropped —
+a duplicate is the *unique* removal that cannot grow it, because its constraint is imposed
+identically by its partner. So invariance under a duplicate is a fact about the definition, while
+`ov16`'s removal changing nothing is a fact about this data. Scope attached: the partition is a
+function of the set of **distinct override values**, not the arm count. chain203 adds values
+2/4/8/16, all already present, so `{−1,2,4,8,16,24}` is unchanged and the prediction transfers *for
+that reason*; a stage adding a new rung value would not inherit it.
+
+**And why six amendments changed nothing about the run.** They changed the estimator, the grouping
+predicate, the margin construction, the n-floor, two group names and a declared limit — not one arm,
+width, corpus entry or rotation row. Not because the findings were small: the estimator moved a
+margin 4.0x and the grouping rule moved a population 2.5x. Because **every one landed on the
+analysis side of the pre-registration boundary, and a running stage reads none of it.**
+
+The caveat bounds the practice rather than recommending it. **A stage-side finding could not have
+been repaired in flight at all** — had the rotation failed its adjacency condition, the corpus digest
+not matched, or a duplicate not passed the override its name says, the only options would be to stop
+the run or accept a compromised stage. So: do the stage-side checks before launch. This stage did.
+**One stage-side risk remains open** — whether each duplicate actually passes its named override —
+which is why the arm inventory is read first and a partition disagreement is a refusal, not a new
+partition to analyse. The case for cross-reading in flight is strong for analysis-plan defects and
+worth nothing for design defects; six clean amendments is a fact about this stage, not a property of
+the method.
+
+Sealed at 153 files, 152 of 152 verifying.
