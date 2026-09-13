@@ -27246,3 +27246,31 @@ byte-identical** — oracle `1.0097 [1.0053, 1.0152]`, null `+0.90%`, net `+0.06
 MKL, 1 recovered, P4's pooled 9.020. A real defect with a contained blast radius, and the reason the
 census read 9 cells before the fix and 24 after. The sealed ledger is unmodified and its
 `SHA256SUMS` still verify; the correction is in the working copy.
+
+**The loader defect was two defects in series, and the split bounds what each fix buys.** The
+classifier read
+
+    return "STARVED" if max(m.get("resolved", {}).values() or [0]) >= 17 else "LEAN"
+
+and that `or [0]` is a default standing in for data the structure no longer held. 54 cells reach the
+branch; **17 of them had an empty map**, so `max([0]) >= 17` answered False for every one, with no
+error and no note. Neither defect alone produces a wrong answer — the loader bug under a strict
+`max()` raises on the first starved cell and surfaces in the first run, and the default under a
+correct loader never fires. It took both to convert a corrupted structure into a specific wrong
+classification that survived two chains and two hosts.
+
+Of the 9 misclassified cells, **6 came through the empty-map default and 3 came from a map holding
+one surviving arm whose value happened to fall below the threshold** — `body_decoder_layer_0_ffn_conv1`
+at k=3 and k=8 (surviving `{s4: 4}` and `{s2: 2}` against a real maximum of 24) and `as-caida_G_081`
+at k=1 (`{s1: 1}`). No default catches those three: a single plausible value is exactly what a
+default cannot tell from a real one. So the two rules compose and neither subsumes the other — *a
+default standing in for absent data must be loud or must refuse*, which fixes two thirds of this in
+the first run, and *a structure with one consumer should be given a second*, which is what caught
+the rest.
+
+Both are in the working `an_c189.py` now: `classify()` refuses and names the cell rather than
+defaulting, and the loader carries a guard that every arm which produced a timing also produced a
+resolved count, checked against what was read rather than against a list of expected arms. Verified
+in both directions — inert on correct data, with the whole report byte-identical to the previous
+corrected run, and loud on the re-planted bug, refusing on all 305 cells before classifying
+anything.
