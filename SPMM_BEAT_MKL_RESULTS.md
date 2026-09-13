@@ -28017,3 +28017,127 @@ So the closing rule needs one more clause than it had. The flag is part of the t
 the stream**: `nm -jU` and `nm -jU | c++filt` are different targets, and the same `grep -o` returns
 57 against one and 123 against the other. Naming the tool and the object is not sufficient if the
 pipeline transforms the text in between, and a count of matches is not a count of symbols.
+
+## chain201: depth pays at the level, and the pre-registered gradient test REFUTES the mechanism
+
+Sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain201-deepwindows-redwood`, digest
+`d1f16d9d7064869a7f19c2c05143d2a6507ba75c21f830728eb883c21f35c02a`, 63 files, `shasum -c` clean,
+analyzer COMPLETE. 50 files, 10 passes, 0 readings refused at ingestion, 161 matrices in 7 degree
+bands, widths 4/8/12/16/20/24/32. Estimator `medmed`, chosen at k=8 where no arm fires.
+
+**P3a HOLDS — the design's premise is now measured rather than assumed.** All three sibling pairs
+sit inside the identical-source floor at both inert widths, so a firing-arm-over-inert-sibling
+ratio carries no layout term by construction. The two floors:
+
+| inert width | identical-source (build) | within-process | layout share |
+|---|---|---|---|
+| k=8 | ±1.01% | ±0.36% | 0.66% of the build floor |
+| k=4 | ±0.29% | ±0.32% | 0.00% |
+
+Against chain199's ±0.35–0.65% within-process and ±0.52–0.78% build: k=8's build floor is looser
+than chain199's, k=4's is tighter, and both within-process floors sit at or below chain199's range.
+
+**The size verdict is `cannot resolve`, exactly as pre-registered.** −0.047% per KB at k=8 and
+−0.100% at k=4, whole-range effects 0.09% and 0.19%, both inside their widths' floors, over the
+three within-window pairs spanning 1932 bytes. The analyzer's own gate declined to name a
+direction. So the size covariate question that consumed the night changes no verdict.
+
+**P3b — depth wins at the level at every firing width**, against an inert sibling:
+
+| arm | width | nvec | over sibling | floor |
+|---|---|---|---|---|
+| dp2 | 12 | 2 | **+6.3%** [1.0546, 1.0718] | ±1.31% |
+| dp2 | 16 | 2 | **+6.1%** [1.0520, 1.0699] | ±0.40% |
+| dp3 | 20 | 3 | +1.6% [1.0095, 1.0230] | ±0.73% |
+| dp3 | 24 | 3 | **+5.0%** [1.0402, 1.0613] | ±1.41% |
+| dp4 | 32 | 4 | +2.3% [1.0124, 1.0330] | ±0.40% |
+
+P3c holds too: the inert pair agrees at every firing width, so no width's diagonal is placement.
+
+**P3d — the gradient inverts, which was pre-registered as a refutation.** The reading was written
+one-directional before the data existed: falling with the vector count fails the mechanism whatever
+the size sign; rising is consistent with it but not conclusive.
+
+| width | nvec | gradient (deg≥64 minus deg<16) | vs bars | verdict |
+|---|---|---|---|---|
+| 12 | 2 | **+5.63 pts** | 1.35 global / 0.91 local, CIs disjoint | SURVIVES |
+| 16 | 2 | +2.71 pts | CIs overlap | not established |
+| 20 | 3 | −1.10 pts | inside | not established |
+| 24 | 3 | −0.95 pts | inside | not established |
+| 32 | 4 | **−6.92 pts** | 1.35 global / 0.14 local, CIs disjoint | SURVIVES |
+
+Both surviving cells clear both bars with disjoint band confidence intervals, and they have
+**opposite signs**. At nvec 2 the high-degree bands gain most (d64-256 +10.4%, d>256 +8.6%); at
+nvec 4 they lose — `dp4 over dp2` at deg≥64 reads 0.9836 [0.9702, 0.9949], a confidence interval
+entirely below parity. **The degree structure of the gain is not the mechanism's.** chain199's
++1.90-point gradient at one vector count was never evidence for it, and this stage was built to
+find that out.
+
+**Nothing ships, on the stage's own pre-registered standard.** P3b required every degree band
+faster than the inert sibling, because a gain in some bands and a loss in others is a rule fitted
+to a degree regime. That holds for **1 of 5** firing widths (dp2 at k=16) and fails for the other
+four.
+
+**A regression to report rather than tune around.** At nvec 4, high-degree matrices are slower with
+the deep kernel: pooled deg≥64 reads 0.9836 with the interval excluding parity, and per band
+d64-256 is 0.9850 [0.9670, 1.0019] and d>256 is 0.9824 [0.9612, 0.9984]. The per-band floors there
+are wide enough (±0.78%, ±2.21%) that the analyzer calls them indeterminate, but the pooled
+gradient clears both bars, so the direction is established even where the level is not.
+
+**P4 passes and is the one clean result for shipping:** no arm is slower than the shipped object at
+any width beyond that width's own floor, including the five widths each arm cannot reach.
+
+**P5 — and the apparent MKL gain is entirely a layout artefact at a width where nothing fires.**
+
+| arm | behind MKL | at k=4 | excluding k=4 |
+|---|---|---|---|
+| c0 | 40 / 1127 | 15 / 161 | 25 |
+| c0b | 37 / 1127 | 15 / 161 | 22 |
+| dp2 | 31 / 1127 | 9 / 161 | 22 |
+| dp3 | 34 / 1127 | 9 / 161 | 25 |
+| dp4 | 32 / 1127 | 9 / 161 | 23 |
+
+The identical-source pair spans 22–25 outside k=4 and the three deep arms span 22–25 — the same
+range, so the effect there is null. The whole 6-to-9 cell difference sits at k=4, where **no arm
+can fire**, and it agrees with the +2.0–2.3% speed artefact P3a measured at that width. Reading the
+pooled 40 → 31 as depth buying nine cells would have been wrong, and it is only visible because P5
+is reported by width and ungated.
+
+**chain199's k=4 artefact replicated.** The pre-registered expectation was 1.023, measured on a
+different chain; the three arms read 1.0212, 1.0233 and 1.0199 — off by −0.2%, +0.0% and −0.3%.
+
+### The object census, which settles the sign puzzle and the compiler in one read
+
+`size -A`, `nm --print-size --defined-only` with the selector written down
+(`grep spmm_csr_v2_coreIfLb0`, the `<float,false>` instantiation, 6 symbols), and
+`readelf -p .comment`, on the five arms:
+
+| arm | `.text` | `.text.unlikely` | group (6 syms) | Δ`.text` | Δgroup |
+|---|---|---|---|---|---|
+| c0 | 715033 | 0 | 35238 | — | — |
+| c0b | 715033 | 0 | 35238 | 0 | 0 |
+| dp2 | 713801 | 0 | 24579 | −1232 | −10659 |
+| dp3 | 713977 | 0 | 25003 | −1056 | −10235 |
+| dp4 | **715785** | 0 | 25639 | **+752** | −9599 |
+
+**The verdict is `moved`, not `left`.** `.text` is flat to within ±1232 bytes while the symbol
+group moves ~10 KB, so roughly 90% of the group delta is code relocating to symbols outside the
+group and the object's total code is nearly unchanged. Three further readings:
+
+- **The compiler is GCC 11.4.0** (Ubuntu 22.04), from `.comment`. So GCC's suffix naming and
+  `-fipa-icf` apply and clang's machine outliner does not. `readelf -p .comment` answered in one
+  read what no build log recorded.
+- **`.text.unlikely` is 0 in every arm.** Cold partitioning contributes nothing here, so that
+  mechanism is dead on redwood as well as locally — a prediction that could have gone either way
+  given the two compilers differ.
+- **dp4's `.text` is larger than `c0`'s by 752 bytes**, which is the sign the ~3.5 KB deep-body
+  estimate predicted for a window arm and the opposite of the −11155 that started the puzzle. The
+  net code change across all five arms is within ±1.2 KB.
+- The unsuffixed symbol count is **3 in every arm**, so the function is not inlined away in any of
+  them: inlining-into-callers is not the mechanism either.
+
+And the selector is now recorded, which resolves the discrepancy it was gating: this 6-symbol sum
+over the `<float,false>` instantiation gives 35238 for `c0`, where the earlier census's 12-symbol
+figure was 62183 — a broader selector spanning more than one instantiation. Its Δ of 11155 and this
+one's 10659 are the same effect measured over different symbol sets, which is why the number was
+unquotable without its selector.
