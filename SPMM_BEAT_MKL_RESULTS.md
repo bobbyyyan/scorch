@@ -27456,7 +27456,8 @@ path (`:6315-6318`).
   did not grow to absorb a body the core stopped calling.
 - **The half-vector path is not the caller either.** It does call `NV=1` explicitly, but as
   `scorch_spmm_row_regblock<scalar_t, 1, ·, VH>` with `VH = scorch_simd_half<scalar_t>`
-  (`:4756`) — a different fourth template argument, so a different mangled symbol from the
+  (the alias at `:4890`, calls at `:4939` and `:4943`) — a different fourth template
+    argument, so a different mangled symbol from the
   `scorch_simd<float>` instantiations counted above.
 
 So why `<float, 1, ·, scorch_simd<float>>` survives in `dp1` and `dp1e` is open, and both obvious
@@ -27469,3 +27470,55 @@ a property of the whole call graph and the inliner's choices, not of the dispatc
 `regblock_deep` has no symbol anywhere despite being the code under test, which is the same fact
 from the other side. Reasoning about one dispatch and reporting a conclusion about the object is
 the error to avoid; `nm` plus one size comparison is the cheap way not to.
+
+### The NV=1 caller, answered from source — and the question it turns out to have been
+
+The previous entry left open which caller keeps an out-of-line reference to
+`scorch_spmm_row_regblock<float, 1, ·, scorch_simd<float>>`, with both obvious answers
+eliminated. A build was proposed to settle it. A census of the call graph settles it for
+nothing, and the answer is the dispatch the chain was already studying.
+
+`grep -n "scorch_spmm_row_regblock\s*<"` returns exactly six sites in the whole C++ layer.
+Two are macro definitions that leave the fourth template argument defaulted — `SCORCH_RB`
+in the core at `:4875-4878` and a second `SCORCH_RB` in the fused Linear path at
+`:6315-6318`. The other two pairs are half-vector calls that pass `scorch_simd_half<scalar_t>`
+explicitly. So every `scorch_simd<float>` instantiation in the object comes from one of the
+two `SCORCH_RB` macros, and the fused Linear one is already ruled out by its byte-identical
+function size.
+
+The core's `SCORCH_RB(1)` is reached from four places:
+
+| line | context | when it runs |
+|---|---|---|
+| `:5026` | `default:` of the exact-width float32 gather switch on `B1_size` | the gather kernel does not own this width |
+| `:5055` | `default:` of the deep switch on `nvec * 16 + narrowk_unroll` | the requested (vector count, depth) pair is not instantiated |
+| `:5085` | `default:` of the prefetch switch on `nvec * 64 + narrowk_pf` | the requested (vector count, distance) pair is not instantiated |
+| `:5096` | the tail dispatch on `nvec` | reached unconditionally |
+
+`:5095-5100` sits after the `#endif` at `:5094`, which closes the `#ifdef SCORCH_TUNE_HOOKS`
+opened at `:5064`. The only preprocessor conditional still enclosing it is
+`#if defined(__AVX2__) && defined(__FMA__)` at `:4861`, which holds on both confirmation
+hosts. **The call site is therefore present in every AVX2 build whatever the deep-unroll
+bounds are**, and two of the other three are the arms taken exactly when the deep or
+prefetch switch declines — so configuring a deep arm *adds* reasons to keep the plain
+instantiation rather than removing one. No setting of `narrowk_deep_lo`/`_hi` can make the
+`NV=1` instantiation unnecessary.
+
+**The limit, which matters more than the answer.** This explains why every object *can*
+carry the symbol. It does not explain the asymmetry that prompted the question — why the
+inliner left `NV=1` out of line in `dp1`/`dp1e` while inlining the `NV=2` body into the
+lambda in `dp2` — because `:5096` presents the identical call site for all four vector
+counts. Which of them the inliner emits out of line is its cost model's decision, and the
+cost model changed when a deep body was inlined next to them. That is not decidable from
+source, and it is not worth a build, because the quantity it would decide is not evidence
+about anything: **symbol presence never distinguished these arms.** `regblock_deep` has no
+symbol in any of the nine objects while being the code under test; the `NV=1` symbol has one
+in all of them while its call site is identical to three siblings that vary. Both directions
+say the same thing. The question was mis-posed, and the honest close is to retire it rather
+than to fund it.
+
+The proposed `SCORCH_SPMM_HALFVEC_F32=0` rebuild would additionally have tested a hypothesis
+the template argument had already eliminated — the half-vector branches pass
+`scorch_simd_half<scalar_t>`, so turning them off cannot change the count of
+`scorch_simd<float>` instantiations — and it would have had to compile next to a live
+measurement on the same host.
