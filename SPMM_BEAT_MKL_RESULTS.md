@@ -28307,3 +28307,58 @@ the arm that added code to it.** By the standard this document has been applying
 whether the quantity can distinguish the candidates before spending a read — three explanations
 predicting the same observation makes this not worth measuring rather than worth measuring
 carefully. Closed.
+
+---
+
+## chain202: the reading order and the bars, recorded before the data and with the peek disclosed
+
+The stage is 7 arms x 14 passes over 89 keys x 3 widths, one binary called with seven different
+`nthreads_override` values, finishing about 11:03. `ov24` and `ov24b` are the same object with the
+same argument, so the negative control is a floor by construction and the k=4 layout artefact that
+spoiled chain201's cell count cannot exist here.
+
+**The peek, stated first because it changes what this section is worth.** To exercise two new
+analyzer blocks I ran them on the 22 complete files available at 3 of 14 passes, which printed all
+seven arms' behind-MKL counts. So this is not a blind pre-registration. What protects the bars from
+it is that they are *derived by the analyzer from the sealed data* rather than chosen by me: the
+A/A bar is `ov24` against `ov24b` at the full pass count, and the estimator bar is the two
+estimators' disagreement count on the arm in question. Neither is a number I can set.
+
+**The reading order, unchanged from before the peek.** The estimator-spread line must be nonzero
+first — a zero disagreement count beside a zero spread means the check did not fire and says
+nothing. Then the seal. Then the NULL group under both estimators as the floor. Nothing from ADOPT
+or CAPONLY until that floor is in.
+
+**Two bars, and a count claim must clear both.** They are different quantities. P3a bounds a
+*ratio*; the cell count is a sum of threshold crossings, so cells sitting near the 1.01 boundary
+move it with no timing difference large enough to appear in P3a.
+
+At 3 passes the A/A bar reads 1 cell (ratio-of-medians) and 0 (median-of-ratios), against 3 and 4
+at 2 passes. Both are computed from the same data, which is the point: an A/A spread shrinks with
+pass count, so a bar taken at 2 passes and applied at 14 is too loose in a known direction, making
+the gate over-strict and hiding real effects rather than admitting false ones. The 2-pass row stays
+printed beside the bar because if it has *not* shrunk by 14 passes, the pass count bought no
+tightening and no count claim is safe at any margin.
+
+**Completeness is checked against a DECLARED row count, not a modal one.** 89 keys x 3 widths x 3
+inner arms + 1 header = 802, each factor read from the file that declares it (`keys.txt`, the `KS=`
+line in the stage body, the `ARMS` list in the timing harness). A modal guard was the first version
+and it has a defect that matters: the mode is a majority statistic, so a stage that died early
+enough for *every* file to be short makes the truncated length the mode and passes the whole run.
+Twenty-one files uniformly cut to 442 rows give the modal guard zero disagreements and the declared
+guard twenty-one refusals. The observed mode is still printed, beside the declared count, as the
+evidence the derivation is right rather than as the thing being trusted.
+
+Two details only visible in the writer: the timing harness legitimately drops rows on a calibration
+or timing failure and prints a `SKIP` line for each, so a declared count alone would refuse an
+honest short file — the seal branches on the SKIP count, currently zero, which makes every shortfall
+a truncation unambiguously. And the harness prints `wrote <path> (801 rows)` as its last act, so the
+log carries the writer's accounting while the length check carries the file's. Those fail in
+opposite directions — truncated after the writer finished, versus killed before its final print —
+and requiring both closes each other's blind spot.
+
+**One statistic was zero by construction and is fixed at the source.** The estimator-spread median
+read exactly 0 on chain201's data because 294 of 534 cell-arms had a single reading, and at one pass
+ratio-of-medians and median-of-ratios are identical by algebra. Above half the sample contributing a
+structural zero does not dilute a median, it defines it. The spread now runs over cells with at
+least two passes and prints the excluded count beside itself.
