@@ -29076,3 +29076,51 @@ establishing before treating it as a cost to the conclusion.
 Sealed at 140 files, 139 of 139 verifying, manifest
 `632005f7986e39e705ffee88e170ac7e0221461e25984dbce4e8664bf9f5c641`. All five earlier captures
 unmodified.
+
+### Sizing the next control: the current one compared two different quantities
+
+Not a correction — chain202's verdict stands after six rounds — but the reason its control could not
+be certified, and what a working one costs. All of it from chain202's sealed data.
+
+**The diagnosis.** chain202 judged *different*-argument pairs (`ov16` against `ov24`) against a band
+derived from a *same*-argument pair (`ov24` against `ov24b`). Those measure different things: a
+different-argument pair carries the argument-dependent launch path and a same-argument pair does not.
+
+| width | A/A half-width | rank of 21 | median pair / A/A | A/A \|dev\| | median \|dev\| | ratio |
+|---|---|---|---|---|---|---|
+| k=2 | 0.001443 | 2 | 1.4x | 0.00088 | 0.00239 | 2.7x |
+| k=4 | 0.002806 | **1 (tightest)** | 3.6x | 0.00102 | 0.00499 | 4.9x |
+| k=32 | 0.003317 | **1 (tightest)** | 6.3x | 0.00165 | 0.02360 | **14.3x** |
+
+The band is essentially the **minimum of 21 widths**, taken from the most agreeable pair and applied
+to pairs whose typical deviation is up to 14x larger.
+
+**Why more cells cannot fix it.** If the point estimate is already outside the band, more cells
+tighten the interval *around that centre* and sharpen the failure:
+
+| width | of 20 pairs | already outside | contained | could be, with more cells |
+|---|---|---|---|---|
+| k=2 | 20 | **11** | 1 | 8 — median 795 cells (27.4x) |
+| k=4 | 20 | **15** | 0 | 5 — median 581 cells (20.0x) |
+| k=32 | 20 | **17** | 0 | 3 — median 319 cells (13.3x) |
+
+And `nboot` cannot help at all: it shrinks the Monte-Carlo error *of* the interval, not the interval.
+The A/A half-width is flat over a 100-fold `nboot` range — 0.001558→0.001447, 0.002770→0.002742,
+0.003364→0.003386.
+
+**What a rung-wise control costs, which is the number that decides the design.** A duplicate arm per
+rung gives each rung its own same-argument A/A, making the comparison like-for-like. Sized against
+the ±0.35% margin chain202 pre-registered:
+
+| width | n available | \|dev\| | half-width | n needed | factor |
+|---|---|---|---|---|---|
+| k=2 | 29 | 0.00088 | 0.00146 | already contained | 1.0x |
+| k=4 | 29 | 0.00101 | 0.00272 | 35 | 1.2x |
+| k=32 | 24 | 0.00163 | 0.00334 | 77 | **3.2x** |
+
+**1.0x to 3.2x against a cached corpus of 8407 matrices** — versus 13x–27x for the different-argument
+route, which additionally leaves 7, 15 and 17 of 20 pairs uncontainable at *any* n because their
+centres exceed the margin outright.
+
+Sealed at 143 files, 142 of 142 verifying, manifest
+`b7245a953c4a769f29ffe26004221fbc2127e7999f4e5316262a6897cca26eb1`.
