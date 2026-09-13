@@ -29408,3 +29408,41 @@ worth nothing for design defects; six clean amendments is a fact about this stag
 the method.
 
 Sealed at 153 files, 152 of 152 verifying.
+
+### Amendment 7: "unique" was a structural word for a contingent fact
+
+Amendment 6 said the core is monotone non-decreasing in arms dropped, "making a duplicate the
+**unique** removal that cannot grow it". Monotonicity is right — **0 violations in 1197 nested
+(superset, subset) × width comparisons**, and that tested count belongs beside the zero. "Unique" is
+wrong, in exactly the way amendment 6 had criticised one paragraph earlier.
+
+| removal | core k=2/4/32 | |
+|---|---|---|
+| `ovp` | 29/29/24 | unchanged |
+| `ov2` | **30/30/24** | **grows** |
+| `ov4` | 29/29/24 | unchanged |
+| `ov8` | 29/29/24 | unchanged |
+| `ov16` | 29/29/24 | unchanged |
+| `ov24` | 29/29/24 | unchanged |
+| `ov24b` | 29/29/24 | unchanged **by definition** |
+
+**Six of seven** single-arm removals leave the core unchanged; only `ov2` grows it, by 1 cell at k=2,
+1 at k=4, 0 at k=32. The corrected sentence: a duplicate is the only removal **guaranteed** not to
+grow the core — the only one whose invariance holds by definition rather than by contingency. That is
+precisely the distinction amendment 6 drew against the independent reading's table and then failed to
+apply to its own next sentence. **Beside any uniqueness claim, report how many of the alternatives
+also satisfy it.**
+
+**The mechanism that explains the six:** `ov2` is the only arm ever the *sole* disagreer — 1 cell at
+k=2, 1 at k=4, none at k=32. Everywhere else outside the core at least two arms depart together, so
+no single removal restores agreement. Which is what one would expect if the most aggressive departure
+from the ambient policy is the most likely to be the only one departing. The core is fragile to
+exactly one arm on exactly two cells in the whole corpus.
+
+**Unaffected:** the prediction entirely. Duplicates cannot change the core either way, the distinct
+value set is unchanged, and chain203's partition is still predicted 29/29/24 with fringes 2/3/5/6,
+2/3/3/6, 1/2/2/1. The correction is to a warrant, not a number. Amendment 6 is left byte-identical at
+`cd6b186d0ee6658a` — its digest has been externally verified, and rewriting a verified file to fix a
+sentence would destroy the record of the fix.
+
+Sealed at 154 files, 153 of 153 verifying.
