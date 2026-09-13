@@ -26897,11 +26897,23 @@ It never had 24 workers. Asking the exported policy what each arm actually resol
     p6000        (2095, 19826)      2     1    2    4    8   16   18
     aa3           (825, 70806)      7     1    2    4    8   16   18
     lp_d6cube     (415, 37704)      4     1    2    4    8   16   18
-    ASIC_100k (99340, 940621)      18     1    2    4    8   16   18
+    ASIC_100k (99340, 940621)     [18]    1    2    4    8   16  [18]
     m3plates    (11107, 6639)       1     1    1    1    1    1    1
     nw14         (73, 904910)       6     1    2    4    6    6    6
 
-(`18` is this machine's processor count; on redwood it is 24. The pattern is what matters.)
+**This table was computed on the M5, not on redwood, and the bracketed cells are therefore
+wrong for the host the timings come from.** Every row topping out at 18 is the giveaway: 18 is
+the M5's `omp_get_num_procs()` (see this header's own note at `scorch_policy.h:1738`), while
+redwood is `nproc` 32 inside a pinned 24-thread pool. The base count is capped at
+`omp_get_num_procs()` and `SCORCH_SPMM_NT_CAP` at `-2` caps at `omp_get_max_threads()`, which
+are 18/6 on the M5 and 32/24 on redwood — so any cell that reaches a ceiling reads a different
+number there.
+
+The unbracketed rows are host-independent and stand: `p6000`'s base is
+317216/150000 = 2, `aa3`'s is 7, `lp_d6cube`'s is 4, all far below every cap on either machine,
+and `m3plates` and `nw14` are decided by gates that contain no host constant. **`ASIC_100k` is
+not**: on redwood its `by_work` is 15049936/150000 = 100, capped at `num_procs` 32 to a base of
+32, then capped by `NT_CAP` to the pool's 24. Its redwood answer is 24, not 18.
 
 **`m3plates` runs on one worker in every arm of this stage.** Its adoption never fires, because
 the gate needs `nnz × max(k,16) ≥ SCORCH_GRAIN_SPMM` and 6639 × 16 = 106224 against a grain of
@@ -26966,8 +26978,19 @@ harness can ask for the number rather than restate it. Asking it for these matri
     lp_d6cube   415 rows,  37704 nnz, k=2   ->  4 threads
     ASIC_100k 99340 rows, 940621 nnz, k=2   -> 18 threads (the machine's count)
 
-**The policy's own answers are close to the measured optima** — 2 against t4, 7 against t8, 4
-against t4, 18 against t16. What overrides them is the host-pool adoption in the same function: the
+**The policy's own answers are close to the measured optima on three of these four** — 2
+against t4, 7 against t8, 4 against t4. Those three are host-independent, so comparing them
+against a redwood measurement is legitimate.
+
+**`ASIC_100k` is not one of them and the earlier version of this sentence was wrong about it.**
+Its policy answer was quoted as 18 from an M5 evaluation; on redwood it is 24 against a measured
+optimum of t16. That is not the policy agreeing with the optimum — it is the *base* count
+already being too high before the adoption is consulted at all, since at an override of -1 the
+adoption never fires and the count still lands at 24. So the large-row matrices are a second
+sub-case: the adoption is not what raises them, the base `by_work` bound is, and `NT_CAP` merely
+clips it to the pool. That sub-case needs the policy queried on redwood for each of the 89
+matrices before it can be stated as more than an arithmetic worked by hand, and chain202 records
+exactly that column. What overrides them is the host-pool adoption in the same function: the
 caller passes the ambient thread count so one warm team spans the pipeline (`spmm.h:3800-3811`,
 which avoids a libgomp team reshape at every op boundary, worth ~15% of a sub-ms GCN forward), and
 the adoption fires for any product clearing `SCORCH_GRAIN_SPMM`. `p6000` at k=2 has
