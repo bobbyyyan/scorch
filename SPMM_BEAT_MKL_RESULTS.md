@@ -27327,3 +27327,67 @@ nondeterministic magnitude with a deterministic sign.** The sign follows from th
 needs no confirming draws; the magnitude needs no hedging either, because the invariant side of the
 relation is data. The trap is that "nondeterministic" reads as "random", so a signed bias gets
 reported as noise.
+
+### The three chain201 arms are not two immediates apart in the object, and what that costs chain199
+
+`nm` on the five built objects, read before any of chain201's data was looked at.
+`scorch_spmm_row_regblock_deep` has **no out-of-line symbol in any arm** — it is fully inlined, so
+a census of the symbol the stage is about returns zero for every arm and looks like an answer. The
+discriminator is the neighbouring template that does survive out-of-line:
+
+    c0, c0b   NV 1 2 3 4      dp2   NV 1 _ 3 4      dp3   NV 1 2 _ 4      dp4   NV 1 2 3 _
+
+Each arm is missing **exactly the NV matching its own window**, verified at the mangled level too
+(`regblockIfLi2E` appears twice in c0 and twice in dp3, zero times in dp2). The mechanism: each
+arm's window immediates fold its guard to `nvec == W`, the deep switch then has one reachable
+label, the deep body is inlined at that vector count, and the out-of-line non-deep instantiation
+for the same NV becomes unreachable and is dead-stripped. So each arm *loses* a kernel body
+relative to the control and gains an inlined one.
+
+Sizes of the `spmm_csr_v2_core` symbol group, summed over its 12 symbols:
+
+| object | bytes | vs `c0` |
+|---|---|---|
+| `c0`, `c0b` | 62183 | — |
+| `dp2` (window 2) | 51028 | −17.94% |
+| `dp3` (window 3) | 51532 | −17.13% |
+| `dp4` (window 4) | 52960 | −14.83% |
+
+Two things follow, and the second is a correction to chain199.
+
+**The immediates gate liveness, so the premise has to be restated.** This branch's own rule is that
+a two-immediate pair is a free control only if the immediate gates no code's liveness; here it
+removes a whole out-of-line function. So the design is not "the arms are interchangeable by
+construction and P3a confirms it" but **"the arms differ by two immediates in source, and P3a
+measures whether the resulting objects are interchangeable"**. If P3a passes it has passed on
+whatever the objects actually are, which is the useful form, and if it fails the reason is now
+named in advance. One consequence runs the design's way and is also now verified rather than
+assumed: at any firing width the two inert arms both contain *and execute* the non-deep body for
+that vector count — at k=12 (nvec 2) `dp3` and `dp4` both carry `regblock<float, 2, ...>` and run
+it while `dp2` runs its inlined deep body — so P3d's width-local inert pair really is two objects
+running the same code as each other.
+
+**The arm sizes are monotone in the window value, so the layout perturbation is indexed by the axis
+under test.** 51028 < 51532 < 52960, a 1932-byte spread, 3.79%. A layout difference that is random
+across arms averages out of a sibling ratio; one ordered by the window value does not, because the
+diagonal walks the same axis. That is worth having because the two explanations predict opposite
+orderings — under bigger-is-slower a size bias inflates the nvec-2 diagonal and deflates the nvec-4
+one, a *decreasing* pattern, while the loads-versus-FMAs mechanism predicts the gain *rising* with
+the vector count. The sign of bigger-is-slower cannot be assumed, but it is directly measurable at
+an inert width, where nothing fires and size is the only thing that differs, so `an_c201.py` now
+calibrates it there (least squares through the origin, percent per kilobyte, pairs listed) and
+prints the pre-registered reading of the diagonal against the *measured* sign rather than an
+assumed one. Where the whole arm-to-arm size range comes out under that width's floor, it says the
+ordering has no measurable direction rather than reporting the sign of noise.
+
+**And chain199's stated reason for its k=4 reading was right in kind and wrong in scale by orders
+of magnitude.** That write-up explained `dp2`'s 2.3% at k=4 as the `#if SCORCH_NARROWK_DEEP_UNROLL`
+block's 31 lines perturbing the inliner's cost model. The real difference between those two objects
+is **11155 bytes, 17.94% of the function containing the width-4 path** — a lost out-of-line body
+and a gained inlined one, against which 31 lines feeding a cost model is a rounding error. The
+conclusion is unchanged and better supported: this branch has measured 1–2.6% between objects with
+*identical decisions*, so 2.3% between objects differing by 18% of the core function is
+unremarkable rather than surprising. It applies to the k=16 headline too — 1.0516 was `dp2` over
+`c0`, across that same 18%. "Not a clean number" was the right verdict; the size figure says how
+unclean, and it is a stronger argument for chain201's sibling estimator than the one the design was
+sold on: `dp2` against `dp3` is a 504-byte, 0.99% difference in core size, not 18%.
