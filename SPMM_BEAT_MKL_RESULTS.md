@@ -27391,3 +27391,55 @@ unremarkable rather than surprising. It applies to the k=16 headline too — 1.0
 `c0`, across that same 18%. "Not a clean number" was the right verdict; the size figure says how
 unclean, and it is a stronger argument for chain201's sibling estimator than the one the design was
 sold on: `dp2` against `dp3` is a 504-byte, 0.99% difference in core size, not 18%.
+
+### chain199's own objects, measured rather than derived, and what that fixes
+
+chain199's five builds are still on redwood, so the same census ran on them directly. Its arm
+defines from the sealed `mrbuild.log` are `UNROLL=4 / window 1..1` (`dp1`), `UNROLL=8 / window
+1..1` (`dp1e`) and `UNROLL=4 / window 2..2` (`dp2`), with `PF=0` throughout.
+
+    arm    non-deep NV present   spmm_csr_v2_core
+    c0     1 2 3 4               62183
+    c0b    1 2 3 4               62183
+    dp1    1 2 3 4               54112
+    dp1e   1 2 3 4               56165
+    dp2    1 _ 3 4               51028
+
+**The obvious prediction is wrong for two of the three arms.** "The window strips the matching
+non-deep body" holds for `dp2` — which is also what chain201's `dp2` shows, at the identical 51028
+bytes, as its identical defines require — and **fails for `dp1` and `dp1e`, which keep all four.**
+So the mechanism is not simply that a live deep label kills its non-deep twin. `NV=1` survives
+because some other call site still instantiates it; `NV=2` has no such caller. Which caller is not
+established here, and the honest statement is that a derivation confirmed on one arm out of three
+is not a validated method — the direct census is what settles it, and it was as cheap.
+
+**What survives, and it explains something chain199 measured but could not account for.** Ranking
+its comparisons by how far apart the objects are:
+
+    pair            core-size difference        non-deep NV sets
+    c0 vs c0b            0 bytes,  0.00%        identical     <- the identical-source floor
+    dp1 vs dp1e       2053 bytes,  3.79%        identical     <- chain199's CLEANEST arm pair
+    dp1 vs c0         8071 bytes, 14.92%        identical
+    dp2 vs c0        11155 bytes, 21.86%        DIFFER        <- chain199's DIRTIEST
+
+That ordering matches the reliability chain199 actually reported. Its dose-response — eight
+accumulator chains against four at one vector — held **24 of 24 comparisons in the same direction
+across five degree bands, both widths and both estimators**, and that is the `dp1`-against-`dp1e`
+contrast: same symbol set, 3.79% apart, differing only in the inlined deep depth. Its level, the
+1.0516 at k=16, is the `dp2`-against-`c0` contrast: a different symbol set and 21.86% apart, and it
+is the number that turned out unattributable. **So chain199's dose-response deserves more weight
+relative to its level than its own write-up gives it, for a structural reason and not a
+statistical one** — the two claims were never resting on comparisons of the same quality.
+
+**And the tightest control this parameter space offers is a same-window, different-unroll pair**,
+which is exactly the `dp1`/`dp1e` relation: identical non-deep symbol sets, differing only in deep
+depth. chain201 has no such pair — its three arms each strip a different body, so all three of its
+pairwise sibling comparisons are of the symbol-sets-differ kind. Two things keep that from being
+alarming and both are measured: arm-against-arm is **504 bytes (0.99%)** for `dp2`/`dp3` and 1932
+bytes (3.79%) for `dp2`/`dp4`, against 11155 bytes for arm-against-`c0`, because both arms are
+missing one body rather than one of them having all four; and P3a measures interchangeability
+instead of assuming it. Note the two axes do not agree on which pair is tightest — `dp2`/`dp3` is
+smaller in bytes than `dp1`/`dp1e` (504 against 2053) while `dp1`/`dp1e` is the only non-identical
+pair whose symbol sets match — so "tightest" needs the axis named. For a follow-up wanting a
+reference tighter than P3a's on the symbol axis, one extra arm at the same window and a different
+unroll buys it.
