@@ -27933,3 +27933,40 @@ us ran tonight. Three instances in one exchange, all the same defect and each wi
 width — case (`spmm` versus `Spmm`), substring (`grep -F -f` over address strings matching a
 longer address), and vocabulary (`spmm` missing `spmspm`). **The ICF check at seal time filters by
 nothing**: it enumerates every colliding address, drops the all-cold clusters, and reads the sizes.
+
+**Scope correction to the entry above, and it is the largest one in this exchange: the local object
+cannot contain the code the five arms differ in.** `nm` on `src/scorch_ops.cpython-311-darwin.so`
+matches **`regblock` 0 times and `gather` 0 times**. That is the direct proof — the whole dispatch
+at `:4861-5100` sits inside `#if defined(__AVX2__) && defined(__FMA__)` (`:4861`), which is false
+on ARM, so `SCORCH_RB`, the deep switch, `:5026` and every symbol the arms vary are absent from
+that object. `regtile` matching 3 is the NEON path, a different kernel family.
+
+The measurements in the two entries above all stand as measurements — the 6-symbol split of
+`spmm_csr_v2_core<float, false>`, the 37-of-37 all-cold clusters, the 54 collisions, the folded
+`__sort5` instantiations. The lambdas at `:4480`/`:4483` and the OpenMP regions at `:5289`/`:5302`
+are outside the AVX2 guard and genuinely present. What does **not** stand is reading any of it as
+an observation of the code path under study, and the previous entry presented the folding finding
+without restating that limit.
+
+What survives, stated at its real strength: identical-code folding demonstrably folds kernel
+template instantiations in a real build of this source, and the mechanism is code-shape-driven, so
+it transfers in kind to redwood's objects. The **flag** does not transfer — clang has no
+`-fipa-icf`, so what folded those two `__sort5` instantiations here is ld64 coalescing or LLVM
+function merging. GCC's `-fipa-icf` is the analogue and is on from `-O2`, so the expectation for
+redwood is sound, but the local object demonstrates the phenomenon and not the flag.
+
+**The vocabulary gap, measured.** On this object `spmm` matches 182 symbols against 240 for
+`spmm|spmspm|spmv|sddmm|ttm|regblock|regtile|gather` — 58 missed, composed of 38 `spmspm`, 12
+`spmv`, 5 `sddmm` and 3 `regtile`. Non-cold collisions reaching the narrow filter: **0**. Reaching
+the broad one: **6**. So the narrow filter finds no kernel-family folding candidates at all where
+the broad one finds six. (The audit's absolute counts run 57 higher for both filters — 239 and 297
+— with the identical 58 gap and identical composition, so one of us is scanning a superset of the
+symbol table; it changes nothing here because the seal-time pass depends on no absolute count.)
+
+**So the filter defect has a fourth axis, and it is the worst of them.** Case (`spmm` versus
+`Spmm`), substring (`grep -F -f` over address strings matching inside a longer address), vocabulary
+(`spmm` missing `spmspm`), and now **target** — a filter that matched correctly, against an object
+that could not contain the answer. The first three return a wrong number; the fourth returns a
+right number about the wrong thing, which is the failure that survives review. This is
+"hosts compile different kernels" in its most direct form: redwood is AVX2, the M5 is NEON, and an
+AVX2-only region cannot be studied on the NEON object however carefully the symbols are counted.
