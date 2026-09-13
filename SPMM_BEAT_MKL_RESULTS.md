@@ -29531,3 +29531,55 @@ mid-run line now says it is a running figure and the total is printed after the 
 Staged on redwood: `an_c203.py` `762a4e3f5229ebd4`, `checks_c203.py` `52d298fc9bc73bba`,
 `cover_c203.py` `ba18776d9e4855f3`, `fixture_c203.py` `f22aa0ca7e1090c1`, with the census and
 coverage outputs beside them.
+
+### Branch coverage, calibration, and three metamorphic relations — the residual the census cannot reach
+
+Line coverage cannot see an unfired guard whose action shares a line with its condition, and the
+census and the coverage run are both functions of the same inputs and both answer *was this code
+exercised* rather than *would a wrong answer be caught*. Three measurements close most of that gap.
+
+**Branch coverage over the same 13 inputs: 357 statements, 8 missing; 120 branches, 3 partial.** A
+partial branch is a condition that only ever evaluated one way, which is exactly the set line
+coverage scores as covered while never firing. The three are lines 277, 372 and 527 — the three
+theorems, nothing new. The blind spot was also sized rather than assumed: the file has **0 `assert`
+statements and 0 single-line `if cond: action`**, 26 `if` without `else` (which branch coverage does
+report), and 17 compound or ternary conditions. That last group is the residual: `coverage.py`
+measures arcs, not condition-level decisions, so for `if a and b:` it shows the condition went both
+ways but not that `b` was ever decisive. No MC/DC claim is made.
+
+**Calibration locates the flip point, which is the one thing a pass/fail battery cannot show.** A
+units error in a margin — 0.0111 consumed as 1.11% — leaves every check passing and every verdict
+wrong by 100×. So a synthetic corpus sets both quantities by hand: an artefact **A** on the
+duplicate arm alone, and an effect **D** on *both* arms of the rung, since a δ applied to one member
+is indistinguishable from arm identity by construction. At σ = 0 the interval collapses to a point
+and the prediction is closed form — band = |1/(1+A) − 1|, effect = |1/(1+D) − 1|, flip at **D = A**.
+
+It flips there. A = 0.01: contained at D/A = 0.99 and 1.00, `SLOWER by 1.0%` at 1.01. A = 0.04:
+contained at 0.99, `SLOWER by 4.0%` at 1.01 — **four times the artefact, four times the effect it
+takes to clear it**, which is what rules out a flip that happens to sit at one value. Equality falls
+to the null, the right side for an equivalence test. With σ = 0.004 the flip moves out to between
+D/A = 1.0 and 1.5, i.e. band + half-width: the power curve, printed beside the noise-free case
+because a flip that moved *in* would be the defect.
+
+**Three metamorphic relations, each shown to fire.** `scale` (every ms × 1024 exact and × 1000
+inexact), `permute` (rows shuffled within every file), `swap` (two rungs' labels exchanged together
+with their declared overrides, at σ = 0 so the relation is exact despite the seed depending on rung
+position). All three hold, on the synthetic corpus and again on the 83-row chain203-shaped fixture.
+Then one mutant per relation: subtracting a constant inside the ratio violates `scale`; dropping the
+`sorted()` in `boot()` violates `permute`; making the estimate depend on an arm's name violates
+`swap`.
+
+**And a mutant found a defect neither the census nor coverage could reach.** The no-sort mutant
+violated `scale` as well as `permute`, which is only possible if the ratio vector's order differs
+between two *processes*. It does: the vector is built by iterating a `set` of cells, str hashing is
+randomised per process, so without the sort the interval is a function of `PYTHONHASHSEED`. Measured
+directly — the analyzer as written produces **one** output digest across seeds 0, 1 and 12345; the
+mutant produces **three**, with a band moving 0.0007 → 0.0008 and an estimator ratio 1.88× → 2.01×.
+chain202's row-order finding was a narrower statement of this. Added as census check C30: three hash
+seeds, one digest. Census now **32 checks, 29 FIRES, 3 THEOREM, 0 UNTESTED**.
+
+Staged on redwood with digests: `an_c203.py` `762a4e3f5229ebd4`, `checks_c203.py`
+`aa4daf34affe263a`, `synth_c203.py` `1399d11d5af4a05c`, `cal_c203.py` `317898f3ffb2e90a`,
+`meta_c203.py` `84a2bbf81f23fe97`, `metafire_c203.py` `dbc3e94060c9269f`, `branch_c203.sh`
+`98704dad241ef034`, and the five output files. `coverage` 7.16.1 is installed into a scratch target
+directory on `PYTHONPATH`, not into the `scorch` conda env.
