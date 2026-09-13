@@ -28336,9 +28336,25 @@ move it with no timing difference large enough to appear in P3a.
 At 3 passes the A/A bar reads 1 cell (ratio-of-medians) and 0 (median-of-ratios), against 3 and 4
 at 2 passes. Both are computed from the same data, which is the point: an A/A spread shrinks with
 pass count, so a bar taken at 2 passes and applied at 14 is too loose in a known direction, making
-the gate over-strict and hiding real effects rather than admitting false ones. The 2-pass row stays
-printed beside the bar because if it has *not* shrunk by 14 passes, the pass count bought no
-tightening and no count claim is safe at any margin.
+the gate over-strict and hiding real effects rather than admitting false ones.
+
+**But the shrinkage cannot be read off the 2-pass row, and this corrects the paragraph above as
+first written.** The rotation balances position and ordered-pair over all 14 passes, so a 2-pass
+subset is unbalanced *by construction* -- 7 positions against 2 passes leaves 35 of 49 arm-position
+cells never used -- and the 3/4-to-1/0 move therefore conflates sample size with rotation balance.
+The clean comparison is available for free and was verified against `orders_named.txt` rather than
+assumed: **each half of the rotation is position-balanced**, every arm-position cell used exactly
+once with none unused, so halves-against-whole isolates sample size with position balance held
+fixed. Worth recording that the route to this was not the one proposed: the halves are *not* cyclic
+shifts of pass 1 -- that test returns False -- they are Latin squares reached some other way, so a
+conclusion drawn from the cyclic-shift premise would have been right for the wrong reason.
+
+One caveat kept rather than smoothed: ordered-pair precedence is only approximately balanced inside
+a half, 21 pairs at 3 and 21 at 4 against a perfect 42-at-7 over all 14. So the halves hold position
+fixed while pair balance is still improving -- better isolation than the 2-pass row, not perfect
+isolation. The bar table prints all 14, both halves, and the 2-pass row relabelled UNBALANCED, and
+the shrinkage prose appears only when halves were actually printed. The halves also disagree with
+each other by however much a 7-pass bar varies, which is the uncertainty on the bar itself.
 
 **Completeness is checked against a DECLARED row count, not a modal one.** 89 keys x 3 widths x 3
 inner arms + 1 header = 802, each factor read from the file that declares it (`keys.txt`, the `KS=`
@@ -28349,10 +28365,18 @@ Twenty-one files uniformly cut to 442 rows give the modal guard zero disagreemen
 guard twenty-one refusals. The observed mode is still printed, beside the declared count, as the
 evidence the derivation is right rather than as the thing being trusted.
 
+The truncation test is only the negative control, and chain201 supplies the positive one: 50 files
+at 3382 lines, 0 at any other length, 50 of 50 writer lines reporting 3381, and `keys.txt` at 161
+giving 161 x 3 x 7 + 1 = 3382. Design, writer, and length agree at the declared value, 50 for 50.
+A guard needs both halves; this one had only the refusing half until that was checked.
+
 Two details only visible in the writer: the timing harness legitimately drops rows on a calibration
 or timing failure and prints a `SKIP` line for each, so a declared count alone would refuse an
 honest short file — the seal branches on the SKIP count, currently zero, which makes every shortfall
-a truncation unambiguously. And the harness prints `wrote <path> (801 rows)` as its last act, so the
+a truncation unambiguously. That zero is reported as *unexercised* rather than credited as a passed
+check: the drop paths emitted nothing in the nearest archived run either, so zero is equally
+consistent with no failures and with the path not firing in practice, and the count cannot separate
+them. The seal verifies that comparison against chain201's sealed log rather than asserting it. And the harness prints `wrote <path> (801 rows)` as its last act, so the
 log carries the writer's accounting while the length check carries the file's. Those fail in
 opposite directions — truncated after the writer finished, versus killed before its final print —
 and requiring both closes each other's blind spot.
