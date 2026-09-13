@@ -27809,3 +27809,39 @@ recorded anywhere, which is the gap.
 Decision rule: if the group sum's arm-to-arm change matches the section totals' change, the number
 was complete and the sign needs a real explanation. If the section totals are flat while the group
 differs by 11 KB, the selector missed a family and the sign is ordinary.
+
+**Correction to two claims above, both mine.** First, the outlining citation. `:494` is inside a
+different function — the template opening at `:220`, far above `spmm_csr_v2_core` at `:3512`. The
+pragmas lexically inside `spmm_csr_v2_core` are `#pragma omp parallel num_threads(nthreads)` at
+**`:5289` and `:5302`**, and both sit *after* the dispatch at `:4861-5100`, because the dispatch
+lives in the lambda defined at `:4480`/`:4483` and that lambda is *called* from inside the parallel
+region. So the dispatch's code is emitted into an outlined body or the lambda's `operator()` and
+cannot be in the function's own symbol. The split now has its launch site instead of an inferred
+one.
+
+Second, "the chain199 ledger is not on this machine" was wrong. It is at
+`/Users/bobby/.cache/scorch-codex/spmm-beat-mkl/chain199-deepchains-redwood/` with 66 entries,
+alongside eighteen other chain ledgers. The search failed for three independent reasons and
+reported an answer anyway: the patterns were one directory level too shallow (the ledgers sit under
+`spmm-beat-mkl/`, which contains no "199"); zsh aborts an entire command when *any* glob fails to
+match, so the first pattern killed the command and the `*199*` that would have matched never
+evaluated; and the follow-up `grep` was truncated with `head -5`, so it could not have shown a
+chain199 hit even if one existed. Verified afterwards in the right directory: `*199*` → 1 match,
+`*c19*` → 0.
+
+With the path corrected, the census claim holds and is now verified rather than taken: `grep -rIl`
+for `cold|omp_outlined|_omp_fn|constprop|isra`, unanchored and untruncated, matches **zero** of the
+66 files — analysis text, `mrbuild.log` and all 50 CSVs included. Every symbol census in that
+ledger was blind to the families that could explain the sign.
+
+Two things the ledger settles. **No `nm`, `size`, `objdump` or `readelf` output appears anywhere in
+it**, so the selector behind the 12-symbol group sum is confirmed unrecorded — `mrbuild.log` keeps
+per-arm defines, return codes and `.text` digests, nothing per-symbol. And the compiler is still
+not of record: the only `g++` in the ledger is a preprocessor probe at `chain199_body.sh:136`
+(`g++ $ARCH -E`) used to ask the header a question, which shows g++ is the system compiler on
+redwood but is not the build's compiler of record, since the extension goes through torch's
+`cpp_extension`.
+
+**The definitive compiler check, which neither of us named:** `readelf -p .comment <obj>`. ELF
+objects carry the producer string in `.comment` — `GCC: (GNU) x.y.z` — so the answer is in the
+objects themselves and needs no build log. One read per object, at seal time, alongside `size -A`.
