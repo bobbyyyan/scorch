@@ -29492,3 +29492,42 @@ spread is what arm identity alone costs); the ladder on each rung's own groups a
 and the second reading on chain202's groups against the margins the body pre-registered before
 launch, in the old `|dev| + half-width` estimator, printed beside this run's own excursion rather
 than substituted for it. Staged to redwood at `962c93b2a8a6e364` with the fixture and the dry run.
+
+### The denominator: 31 checks, 28 with a firing input, 3 theorems, 0 untested
+
+"Two fixtures found four defects" does not distinguish an analyzer that is now tested from one that
+has been barely probed, and the peer session pushed on exactly that. So every check in `an_c203.py`
+was enumerated and an input fabricated to make it **fail**, with three outcomes recorded: FIRES (an
+input exists, it was built, and the check fired with the expected message *and* exit code), THEOREM
+(no input can make it fire, with the argument), UNTESTED (an input should exist and none was
+written — the only category that otherwise has no size).
+
+**31 checks: 28 FIRES, 3 THEOREM, 0 UNTESTED.** The three theorems are the core-subset relation, the
+cells-dropped-for-no-single-resolved-count counter (stage 1 refuses the stage if *any* arm has a
+multi-valued cell, so it cannot be non-zero downstream), and the final `REFUSALS` exit (its only
+contributor is the core-subset self-test, so it is unreachable unless the set construction is
+broken). Every refusal is scored on its message, not its exit code: a wrong `--expect-partition` has
+to print `k=2 declared (29, 29, 30), counted (29, 29, 31)`, not merely exit 1.
+
+**A census can only score checks I noticed, so completeness was measured separately.** Line coverage
+over the 13 fabricated inputs reaches **390 of 400 executable lines, and the 10 unreached lines are
+exactly the bodies of those same three theorems** — 278-279, 376-381, 531-534, nothing else. Two
+independent methods, one answer. Coverage also found **three checks the enumeration had missed**: a
+cell present for one arm of a pair and absent for the other, the same absence seen from the
+partition side, and stage 4's own under-floor branch. The hand list said 28; the measurement said
+31.
+
+The census had three defects of its own, all of the kind it exists to find. Two of its regexes
+matched summary prose — the crossed-2×2 summary names all four branches in words whichever ones were
+taken, so searching for "the bar alone" is a match that cannot fail, and it scored two branches as
+exercised while their counts were zero. And the first fixture for the thin-pass drop removed 5 of 14
+passes against a threshold of 6, leaving 9 shared, so it dropped nothing.
+
+One real analyzer defect came out of it: **the (cell, pair) drop counter was printed inside stage 2
+only**, so every cell dropped while reading stages 3 and 4 was invisible. On the cells-absent fixture
+the stage-2 line reads 0 and the total after the last stage reads **303**, all on `ov8b/ov8`. The
+mid-run line now says it is a running figure and the total is printed after the last consumer.
+
+Staged on redwood: `an_c203.py` `762a4e3f5229ebd4`, `checks_c203.py` `52d298fc9bc73bba`,
+`cover_c203.py` `ba18776d9e4855f3`, `fixture_c203.py` `f22aa0ca7e1090c1`, with the census and
+coverage outputs beside them.
