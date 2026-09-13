@@ -27595,3 +27595,28 @@ is not a body count — but it does not license the stronger claim I drew from i
 presence could not discriminate. **The repaired rule: compute reachability under the arm's own
 constants, not source presence.** A grep answers the first question and looks like it answered the
 second.
+
+### Pre-registration: the size covariate for chain201's P3a may be a redistribution, not a total
+
+Recorded before chain201's data exists, because it changes how one verdict must be read and a
+caveat invented afterwards is worthless.
+
+`an_c201.py` is invoked with `--core-bytes c0=62183,c0b=62183,dp2=51028,dp3=51532,dp4=52960` and
+runs a size-association test over them. Two facts make raw core size a doubtful covariate for
+total emitted code. First, `SCORCH_NARROWK_DEEP_UNROLL` defaults to `0` (`scorch_policy.h:982`),
+so `c0`/`c0b` fold the deep guard to false and contain **no** deep bodies at all — yet their core
+is the largest of the five by about 18%. Adding a deep body cannot grow an object by −11 KB, so
+the difference is not "one body's worth of code". Second, the reachability table above says why it
+need not be: `c0` has all four tail cases live and therefore up to four plain bodies inlined into
+the lambda, while a window arm has three live plus one deep, so the delta is the difference
+between two inlined bodies and not the addition of one. Either way, some of the 11 KB is code
+moving between an inlined copy and an out-of-line symbol rather than code existing or not.
+
+**The check, to run after the seal and before reading P3a's size verdict:** per object, sum the
+core function's size and every `scorch_spmm_row_regblock*` symbol's size from `nm --print-size`.
+If the totals are flat across arms modulo one deep body, the core-size differences are a
+redistribution and raw core size must not be used as a proxy for total code in the association
+test; the analyzer's `size_order()` already states the adjacent confound (each pair also differs
+in which body is live) and its forbidden uses, and this would add one more. It needs one file read
+per object on the build host and no rebuild, no timing, and no corpus. The arm labels will be
+re-derived from the census at the same time rather than carried from a note.
