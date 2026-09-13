@@ -28493,3 +28493,46 @@ read exactly 0 on chain201's data because 294 of 534 cell-arms had a single read
 ratio-of-medians and median-of-ratios are identical by algebra. Above half the sample contributing a
 structural zero does not dilute a median, it defines it. The spread now runs over cells with at
 least two passes and prints the excluded count beside itself.
+
+### Metamorphic relations, and the analyzer defect they found
+
+Every guard in this line of work compares a number against a reference — a floor, a declared count,
+a conserved total — and the one failure mode that repeatedly got through is a plausible number
+computed from a wrong base, which is *defined* by there being no reference to compare against. A
+metamorphic relation replaces the reference with an invariance: transform the input so the answer
+cannot change, run the same code, require the answer not to change. It needs no second
+implementation, no known answer, and no known-good corpus.
+
+Three relations now run in the seal (`meta_c202.py`, ~13s against 3.2s for one analysis):
+
+- **scale** — multiply every `ms` by a constant. Every ratio statistic must be invariant. Catches a
+  normalization applied twice, not at all, or to one arm only.
+- **reorder** — shuffle CSV rows within each file. Every pooled statistic must be invariant. Catches
+  accidental position dependence in a reduction, which is the family the timing rotation exists to
+  defend against and which was otherwise unguarded on the analysis side.
+- **swap** — exchange the two A/A arms' labels, with `--ship`/`--aa` passed swapped so the roles
+  follow the data. Their counts must exchange and no other arm's may move. This tests the
+  *estimator* the way an A/A pair tests the machine.
+
+**They found a real defect on the first run.** `boot()` drew resample *indices* into `xs`, so with
+the seed fixed the CI was a function of the order `xs` arrived in rather than of its multiset — and
+that order came from a group list built by iterating a dict, so it moved with CSV row order.
+Demonstrated directly: the same nine ratios in three orders, same seed, gave `[1.0872, 1.2456]`,
+`[1.0869, 1.2490]` and `[1.0877, 1.2483]`. The point estimate was bit-identical throughout, which
+is why nothing else caught it — a geomean is order-independent and a percentile is not. Fixed by
+sorting inside `boot`, after which all three relations hold.
+
+**And a second finding that the fix does not remove.** At small n a bootstrap percentile is a coarse
+function of the resamples, so it moves under *any* perturbation. Measured over 40 seeds on nine
+scattered ratios, the CI bounds span 0.0061 (lower) and 0.0076 (upper) — noise in the third decimal
+behind four printed digits, and larger than some floors quoted here. The pre-registered `nboot` is
+deliberately **not** changed, since lowering the Monte-Carlo error mid-flight would make these
+numbers incomparable with chain201's at the same setting. Instead the analyzer now prints the
+bootstrap's own resampling spread beside each floor, with the standing rule attached: a verdict
+within that spread of a floor boundary has not cleared it. On the full-population floor at n=89 the
+spread is ~0.001, so the main floors are stable; it is the small subgroups where it binds.
+
+**The honest limit.** A metamorphic relation cannot catch an error invariant under its own
+transformation — a wrong-but-symmetric estimator passes renaming perfectly. So this is a detector
+for one class: indexing, labeling, ordering, normalization. That happens to be the class that
+produced both of the wrong-base errors in this review cycle, which is what makes it worth the lines.
