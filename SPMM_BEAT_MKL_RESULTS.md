@@ -28278,3 +28278,32 @@ switch except the one the source singles out**. `narrowk_gather` is initialised
 `(B1_size == 1) ? 1 : 0` at `:4351`, and the half-vector guard's comment at `:4886` says `B1_size
 >= 2` keeps k=1 with the gather kernel that owns it. The case the source treats specially is the
 case the compiler treats specially, arrived at independently.
+
+**Further correction, and the K=1 case is closed as unidentifiable rather than weak.** "Supported
+in direction, not established in form" was still one step too strong. The design has **no
+contrast**: outcome is *constant* across every measurable case — all seven observable arms were
+evicted — and the single case with the other outcome has no measurement. So relating body size to
+retention has **zero usable comparisons**, not a weak one, and the non-monotonicity note (K4 the
+smallest mover at 1190, K3 out of order) does not bear on it, because seven cases sharing one
+outcome carry no ordering information about retention. This is the same non-identifiability as the
+five-point size association earlier in this document, in a smaller frame: the contrast that would
+carry the information is exactly the one that cannot be measured.
+
+And the retained-versus-removed distinction is itself unobservable, which gives three stories where
+I had one. Zero symbols for `gather_f32<1>` is consistent with all of:
+
+1. **inlined because cheap** — the inlining-budget story;
+2. **inlined because its call site differs** — `narrowk_gather` is initialised
+   `(B1_size == 1) ? 1 : 0` at `:4351`, and the comment at `:4880-4883` states that float k=1 "is
+   instantiated but only routed when asked for separately, because the nonzero-axis gather kernel
+   owns it";
+3. **eliminated as provably unreachable** — if `case 1:` is dead under that routing, it is removed
+   rather than inlined.
+
+All three produce no symbol and the symbol table separates none of them. So K=1's behaviour is not
+evidence for the inlining budget in either direction, and the budget stays supported by what is
+actually observable: **10659 bytes left the lambda and 15106 appeared as out-of-line callees, in
+the arm that added code to it.** By the standard this document has been applying all night — ask
+whether the quantity can distinguish the candidates before spending a read — three explanations
+predicting the same observation makes this not worth measuring rather than worth measuring
+carefully. Closed.
