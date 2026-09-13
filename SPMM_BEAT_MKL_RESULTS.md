@@ -28569,3 +28569,40 @@ sevenfold — so the absolute number cannot travel to a subgroup with different 
 transformation — a wrong-but-symmetric estimator passes renaming perfectly. So this is a detector
 for one class: indexing, labeling, ordering, normalization. That happens to be the class that
 produced both of the wrong-base errors in this review cycle, which is what makes it worth the lines.
+
+### What constrains the corpus, and where the chain is actually open
+
+Two sessions computing 267 from the same `keys.txt`, `KS=` line and `ARMS` list is **not** two
+independent determinations of the count. It is two implementations of one specification: it catches
+a transcription slip or an off-by-one in either loop, and cannot catch anything wrong with those
+three files, because both sides inherit whatever they say. Worth having under that name and not the
+stronger one.
+
+**chain202's total is declared by a literal, which is stronger than the resolve guard suggests.**
+`chain202_body.sh` P0 contains `if len(keys) != 89: sys.exit("REFUSE: %d keys, not chain200's 89")`.
+So a short or padded key list fails closed before anything runs. The `resolvecheck.py` invocation
+below it passes `--expect-keys "$(grep -c . "$R/keys.txt")"` — the line count of the file it is
+checking — so that guard is exact for *resolution* failures and structurally vacuous for *list
+completeness*, exactly as the declared-versus-counted rule predicts. But it is not load-bearing for
+completeness here, because the literal above it already closes that.
+
+**The open layer is composition, not total, and it is quantifiable.** Of the 89 keys, **49 are
+pinned by name** through the cells-subset rule — every confirmed-cell key must appear in the corpus
+— and the remaining **40 are constrained only by the count**. No key is named explicitly in
+chain202's P0. So a substitution of those 40 passes every check the stage makes. The key list is
+`/scratch/bobbyy/c198_keys.txt`, 89 lines, shared by chains 198, 199, 200 and 202, with no
+generator for it present on the machine; its composition is not reconciled against anything.
+
+**And the two stages protect different things, neither protecting both.** chain201 has the
+distributional guard — seven degree bands, refusing if any holds fewer than 15 matrices — and no
+literal total, so its 161 keys could have been cut to the 105 floor with every P0 refusal passing.
+chain202 has the literal total and **no band rule at all** (`grep -c band` on its body is 0), so a
+biased drop of the kind that emptied a degree band on MKT would not be caught by composition here,
+only by the total. The right stage has both.
+
+**The remedy applied, labelled for what it is.** The seal now records the sorted-key-list digest,
+`6199541616c836e3e9890fdf8e95682126b5febf46a1da83f82993993b126e5e`. This does **not** validate
+chain202 — it is computed from the file it would be checking, which is the self-sourcing defect one
+level further up. What it does is make the composition reconcilable for every later chain: recorded
+once, a future stage comparing against it detects substitution. Sorted, so the digest is a property
+of the set rather than of line order.
