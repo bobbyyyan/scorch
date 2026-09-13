@@ -26763,5 +26763,17 @@ over an inert sibling cancels the layout term by construction. A gain on the dia
 three vector counts with the off-diagonal clean is the mechanism; a gain only at two vectors
 is a single point, and a single point does not ship.
 
+Its corpus is deliberately not this board's key list: 161 matrices drawn with a fixed seed
+from all 4584 cached SuiteSparse, stratified into seven mean-degree bands and three
+nonzero-count terciles inside each, capped at 8M nonzeros. The question is a width regime
+rather than a cell, so the sample has to span what the claim would generalise over; the two
+matrices carrying the four confirmed behind-MKL cells at k>=8 (`connectus` at 8, 16 and 32,
+`nw14` at 8) are forced in so the board is represented rather than assumed away.
+
+Evidence for chain199 at `~/.cache/scorch-codex/spmm-beat-mkl/chain199-deepchains-redwood`,
+66 files, `SHA256SUMS` verifying with 0 failures, itself `83b1c4d577a9afa2923a4d04f82076794a0f2f7c23b3bb56c85b0618ba958f6f`. It holds the five builds' CSVs,
+the stage and body scripts, the balanced rotation table, the analysis, the emission-neutrality
+log, and the analyzer chain201 will use together with its dry run on this data.
+
 Both `SCORCH_NARROWK_DEEP_UNROLL` and the NVEC window stay at their defaults. Nothing ships
 from chain199.
