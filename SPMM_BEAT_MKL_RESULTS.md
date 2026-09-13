@@ -28600,9 +28600,32 @@ chain202 has the literal total and **no band rule at all** (`grep -c band` on it
 biased drop of the kind that emptied a degree band on MKT would not be caught by composition here,
 only by the total. The right stage has both.
 
-**The remedy applied, labelled for what it is.** The seal now records the sorted-key-list digest,
-`6199541616c836e3e9890fdf8e95682126b5febf46a1da83f82993993b126e5e`. This does **not** validate
-chain202 — it is computed from the file it would be checking, which is the self-sourcing defect one
-level further up. What it does is make the composition reconcilable for every later chain: recorded
-once, a future stage comparing against it detects substitution. Sorted, so the digest is a property
-of the set rather than of line order.
+**Correction: "reconciled against nothing" is false, and the composition reconciles.** Three
+earlier ledgers on this machine hold the same 89-key list — chain198 (as `c198_keys.txt`), chain199
+and chain200 (as `keys.txt`) — and all three digest identically to chain202's under a pinned
+collation. The seal now performs that reconciliation and prints MATCHES for each. That is real
+independence: different stages, different seals, different times, where two sessions computing 267
+from one `keys.txt` had none. It does not close the layer above the list — nothing constrains what
+the 89 keys *should* be — but it removes substitution-since-chain198 from the open set.
+
+**And the digest I first recorded was wrong, for the reason this section is about.** I wrote
+`6199541616c836e3…`, taken from an unpinned `sort` over ssh. redwood's non-interactive shell carries
+`LANG=en_US.UTF-8`, and these keys are full of `_` and `-` — exactly the characters whose collation
+differs between C and UTF-8. The same byte-identical file digests to
+`07c545b95be6548252a1b6dd7faed3287a3ab761c41e4c145a2d96c0d7394239` under `LC_ALL=C`, which is the
+figure every sealed copy agrees on. The orders genuinely differ, first at `ss/adder_dcop_16` against
+`ss/Andrianov/ins2`, and neither `sort` errors. **A digest of a sorted list is a digest of the
+order, so an unpinned sort makes it environment-dependent rather than a property of the set.** The
+correct digest is the one above; the raw file is `d9184eb95ff6eb6b…`.
+
+The alternative reading of that mismatch was a substitution finding, not a formatting note, and it
+was resolved before the seal rather than after. `c202/keys.txt` is byte-identical to
+`c198_keys.txt`, verified with `cmp`.
+
+**Every sort in the seal is now `LC_ALL=C`, and the second reason matters more than the first.**
+Beyond the digest, `sort -u` decides *uniqueness* by collation rather than by bytes, so under a
+locale where two byte-distinct strings compare equal it merges them — and the distinct-cell guard
+counts with `sort -u`. That would undercount silently: a spurious refusal, or worse, masking the
+exact duplicate the guard exists to find. Measured on the live data the counts agree at 801 either
+way, so this is a hazard that is not currently firing rather than a defect that was; recorded as
+such.
