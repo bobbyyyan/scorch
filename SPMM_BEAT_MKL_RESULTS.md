@@ -1,5 +1,9 @@
 # CSR × dense SpMM vs MKL — before and after
 
+*This file began on branch `perf/spmm-beat-mkl` and the chain work from chain95 onward is on
+`perf/spmm-probe-and-kernel`, whose upstream tip is `b8ec714`; both branches exist and the
+history below spans them. Everything after the chain190 section is unpushed.*
+
 *Branch `perf/spmm-beat-mkl`, based on `04f321d`. The grid below was measured at
 `14e3ea6`; `6eec90f` fixed the selector, `d9450ca` extended the same fix to the JIT
 codegen path, and `ba59040` cut the Python dispatch cost the grid was still paying —
@@ -26373,7 +26377,7 @@ case in the kernel.
 ## chain197: the prefetch gets a third form, and a dead argument turns out to cost 67 instructions
 
 The edit the previous section argued for is in, behind `SCORCH_SPMM_REGBLOCK_PFSTREAM`, defaulting
-to 0 (commit `efa3cf1` on `perf/spmm-probe-and-kernel`). With the constant at 1 the register block's
+to 0 (commit `8b09cdb` on `perf/spmm-probe-and-kernel`). With the constant at 1 the register block's
 run-ahead is clamped to the end of the **nonzero array** instead of the end of the row:
 
 ```c
@@ -26773,9 +26777,14 @@ cannot), so under the better estimator the two explanations are **observationall
 
 What survives and what does not:
 
-- **The level survives, conditionally.** k=8 and k=32 bracket the firing width at 1.006 and
-  1.000 in every band, so no measured artefact accounts for ~5% of level at k=16. An artefact
-  that produced one would have to be width-selective in a way k=8 and k=32 rule out.
+- **The level survives, conditionally.** k=8 and k=32 bracket the firing width, and all ten of
+  their per-band cells sit inside their own floors — but "1.006" is the pooled figure and
+  corresponds to no band. The per-band range at k=8 is 1.0011 to **1.0135**, the top of it in
+  the lowest degree band, clearing only by 15 basis points on a ±0.54% floor; the same
+  knife-edge the `~` marks at degree >256, k=4. Written properly: every inert band is inside its
+  floor and the largest central departure among them is +1.35%, against a 5.16% gain at k=16.
+  An artefact large enough to explain the gain would have to be width-selective in a way k=8 and
+  k=32 rule out.
 - **The gradient does not survive.** No part of the gain's degree structure is evidence for
   depth, because the one contaminated inert width carries a gradient of the same sign and size.
 - So `1.0516` should not be quoted as a clean number. The claim chain199 supports is "about 5%
