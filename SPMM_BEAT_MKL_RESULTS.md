@@ -27989,3 +27989,31 @@ every number**, which is the same discipline as the target axis one level down: 
 measured, not only what was found. Two sessions quoted 239 and 182 at each other six times tonight
 without either naming its command, and the only reason the gap surfaced is that it was suspiciously
 exact.
+
+**Correction to the line above: it mixed three units, inside the entry that fixed a count by naming
+its flag.** "The extra lines are `SpmmCsrPlan` (123 occurrences) and `SpmmPlanKind` (2)" is wrong
+three ways. Measured with units labelled, `/usr/bin/nm` (llvm-nm) on the same object:
+
+| quantity | value |
+|---|---|
+| symbols matching `spmm`, case-sensitive | 182 |
+| symbols matching `spmm`, case-insensitive | 239 |
+| symbols matching `Spmm` | **58**, not 57 |
+| symbols matching both `Spmm` and `spmm` | 1 |
+| `SpmmCsrPlan` symbols | **57** |
+| `SpmmCsrPlan` occurrences, mangled stream | 57 |
+| `SpmmCsrPlan` occurrences, demangled stream | **123** |
+| `SpmmPlanKind` symbols | **3**, not 2 |
+
+The slips: occurrences read as symbols, the *demangled* stream's count reported for the mangled
+one, and 2 where the object holds 3. The last two have the same cause — the line was produced by a
+pipeline that pre-filtered with `grep -v spmm` and then demangled, so the third `SpmmPlanKind`
+symbol was the dual-case one and had already been removed. That symbol is
+`scorch_native::spmm_plan_kind_from_name(...)`, lowercase in the function name and capital in the
+`SpmmPlanKind` return type, which is also why the capital-`Spmm` set overshoots the gap by exactly
+one: 58 − 1 = 57.
+
+So the closing rule needs one more clause than it had. The flag is part of the target, **and so is
+the stream**: `nm -jU` and `nm -jU | c++filt` are different targets, and the same `grep -o` returns
+57 against one and 123 against the other. Naming the tool and the object is not sufficient if the
+pipeline transforms the text in between, and a count of matches is not a count of symbols.
