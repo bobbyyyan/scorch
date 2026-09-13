@@ -29446,3 +29446,49 @@ value set is unchanged, and chain203's partition is still predicted 29/29/24 wit
 sentence would destroy the record of the fix.
 
 Sealed at 154 files, 153 of 153 verifying.
+
+## chain203's analyzer, written and exercised on a fabricated input while the run was still timing
+
+chain203 launched at 11 arms (a duplicate at every rung) and 22 passes, ETA ~21:15. The analyzer for
+it was written during the run so the analysis would not be rushed when the data landed, and then run
+against an input built for the purpose — chain202's CSVs with the four missing duplicate arms
+fabricated by copying their source arm and perturbing only the timing column. Two fixtures: one with
+bit-identical duplicates, one with duplicates ~0.5% apart.
+
+The reason to bother is that the analyzer refuses at stage 1 on chain202's own directory (four arms
+are absent), so **stages 2 through 4 would otherwise have executed for the first time on the data the
+verdict depends on.** Four defects came out of twenty minutes of fixture running:
+
+- Cross-stage agreement was computed on verdict **labels**, and the two stages word the same outcome
+  as "wider than the band" and "wider than the bar". The table read 3 of 15 agreeing and 11
+  differing; the truth is 12 agreeing and 3 differing. Consolidated onto one `verdict()` returning a
+  `(code, label)` pair — stages compare the code, the reader sees the label. This is the third time
+  in two days that two copies of one predicate have drifted.
+- A measured band of exactly `0.0` is falsy, so `"%.4f" % b if b else "VOID (n<8)"` printed a real
+  reading of zero as *no reading*. Only the bit-identical fixture produces that value; the realistic
+  one never would.
+- The two readings differed in **two** factors at once — population (matches-ambient(X) against
+  all-arms-agree) and bar (this run's own duplicate pair against chain202's fixed table) — so no
+  disagreement between them was attributable, and the header I had written claimed they were "about
+  the convention". Replaced with the crossed 2×2, which also prices the mismatched cell: the fixed
+  bar was derived on all-arms-agree, so applying it to matches-ambient(X) is the one cell of four
+  whose bar and population disagree.
+- The core-subset check is a **theorem of its own definition**: all-arms-agree is a subset of
+  matches-ambient(X) because the ambient arm is inside the quantifier. The "15 of 15" was arithmetic
+  reported as evidence. Kept as a self-test of the set construction and relabelled BUG, since a
+  failure could only be a coding error. The measured quantity nearby is the fringe size.
+
+The refusal paths were exercised rather than assumed: a mutated fixture in which `ov4b` resolves 1
+thread on three cells produces `ov4/ov4b resolve differently on 3 cells — the pair is not a
+same-argument pair and its band is not a floor` and exits 1; a wrong `--expect-partition` produces
+the amendment-6 refusal and exits 1; the clean fixture exits 0.
+
+What the analyzer prints, in order: the arm inventory with each arm's declared override against its
+resolved set and every duplicate pair's per-cell agreement; the partition against the declared
+29/29/31, 29/29/31, 24/40/25, which is a refusal rather than a new partition if it disagrees; the
+fifteen per-rung bands under both estimator conventions with the ratio between them; all-arms-agree
+read under each of the five duplicate pairs in turn (same cells, five arm-identity pairs, so the
+spread is what arm identity alone costs); the ladder on each rung's own groups against its own band;
+and the second reading on chain202's groups against the margins the body pre-registered before
+launch, in the old `|dev| + half-width` estimator, printed beside this run's own excursion rather
+than substituted for it. Staged to redwood at `962c93b2a8a6e364` with the fixture and the dry run.
