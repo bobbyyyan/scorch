@@ -26706,10 +26706,13 @@ a similar size.
 
 The numbers above divide two medians over passes — `median(shipped) / median(arm)` per
 matrix. Re-estimating the same data by forming the ratio *inside* each pass and taking the
-median over passes changes the picture, and that estimator was chosen on k=2, a width where
+median over passes tightens the floors substantially — the firing width's floor in the lowest
+degree band goes from ±5.21% to ±0.69% — and that estimator was chosen on k=2, a width where
 none of the three arms can fire, so the choice is not selection on the outcome. It is the
 tighter of the two there (0.637% against 0.765% half-width on the identical-source control)
-and it is the one used from here on.
+and it is the one used from here on. **What it tightens is the interval, not the centre**; an
+earlier version of this section claimed it removed a degree gradient, which is wrong and is
+corrected two subsections down.
 
 `dp2` over the shipped object, paired within pass, by mean-degree band. `dp2` fires only at
 k=16; the bracketed number is that cell's own identical-source floor, and `+` marks a
@@ -26721,13 +26724,16 @@ reading that clears it.
 | degree 4-8   | 14 | 1.0023 (1.0) | 1.0092 (0.5)   | 1.0011 (0.9) | **1.0609 +** (0.5) | 0.9985 (1.0) |
 | degree 8-16  | 14 | 0.9929 (3.3) | 1.0083 (3.0)   | 1.0038 (2.9) | **1.0551 +** (1.6) | 0.9928 (2.0) |
 | degree 64-256| 16 | 1.0101 (2.5) | 1.0389 + (2.3) | 1.0059 (2.7) | **1.0482 +** (2.1) | 1.0008 (2.2) |
-| degree >256  | 14 | 1.0015 (0.8) | 1.0366 (1.5)   | 1.0064 (5.0) | **1.0828 +** (1.9) | 0.9993 (1.7) |
+| degree >256  | 14 | 1.0015 (0.8) | 1.0366 ~ (1.4) | 1.0064 (5.0) | **1.0828 +** (1.9) | 0.9993 (1.7) |
 | all          | 89 | 1.0027 (0.6) | 1.0230 + (0.6) | 1.0075 (0.8) | **1.0516 +** (0.7) | 0.9974 (0.6) |
+
+`~` at degree >256, k=4 marks a cell that clears its floor by 0.0002 (CI lower bound 1.0146
+against a threshold of 1.0144) — indeterminate rather than clean, so k=4 is contaminated in
+three of five bands, not two.
 
 Three of the four inert widths are clean in every band, and the two that bracket the firing
 width — k=8 below it and k=32 above it — are among them. The firing width gains in all five
-bands and every one of those five clears its own band's floor. That is the no-overfitting
-requirement met within this run, not argued around it.
+bands and every one of those five clears its own band's floor.
 
 The one contaminated width is k=4, and it has a specific cause rather than being placement
 noise. k=4 is the 128-bit half-vector path, and it is the only width where setting
@@ -26740,9 +26746,46 @@ order through the inliner's cost model, which is exactly this mechanism and exac
 block. So k=4 reading 2.3% fast is expected, is not the k=16 result, and is the reason a
 control priced at one width cannot be carried to another.
 
-An earlier draft of this section described the artefact as a degree-dependent layout
-gradient across widths. That was the ratio-of-medians estimator; it does not survive the
-paired one.
+### Correction: the degree gradient did not go away, and it makes the k=16 gain's *structure* unattributable
+
+An earlier version of this section said the paired estimator removed the degree gradient. It
+does not. Pooling the two bands above degree 64 (n=30) against the three below degree 16
+(n=59), `dp2` over the shipped object:
+
+| width | divided medians, >=64 / <16 | paired in pass, >=64 / <16 | CIs |
+|---|---|---|---|
+| k=2  (inert) | 1.0064 / 1.0030  (+0.33 pts) | 1.0061 / 1.0009  (+0.52 pts) | overlap |
+| k=4  (inert, contaminated) | 1.0375 / 1.0200  (**+1.75 pts**) | 1.0378 / 1.0155  (**+2.23 pts**) | **disjoint** |
+| k=8  (inert) | 1.0038 / 1.0131  (−0.93 pts) | 1.0061 / 1.0082  (−0.21 pts) | overlap |
+| k=16 (fires) | 1.0594 / 1.0614  (−0.20 pts) | 1.0642 / 1.0453  (**+1.90 pts**) | overlap |
+| k=32 (inert) | 0.9932 / 0.9914  (+0.18 pts) | 1.0001 / 0.9961  (+0.40 pts) | overlap |
+
+Pairing made the k=4 gradient *larger* and resolved it well enough for the two degree groups'
+intervals to separate. So the estimator's merit is variance, not bias, and the retraction
+above was inferred from an interval narrowing rather than from a centre moving.
+
+The consequence matters more than the error. Under the divided estimator the firing width's
+gradient was flat (−0.20 pts) while the contaminated width's was +1.75, so the effect's degree
+structure looked *unlike* the artefact's. Under the paired estimator they are +1.90 and +2.23 —
+same sign, same size. The mechanism being proposed predicts a positive gradient at the firing
+width too (long rows amortise the prologue and fill four chains, which a row of length 3
+cannot), so under the better estimator the two explanations are **observationally identical**.
+
+What survives and what does not:
+
+- **The level survives, conditionally.** k=8 and k=32 bracket the firing width at 1.006 and
+  1.000 in every band, so no measured artefact accounts for ~5% of level at k=16. An artefact
+  that produced one would have to be width-selective in a way k=8 and k=32 rule out.
+- **The gradient does not survive.** No part of the gain's degree structure is evidence for
+  depth, because the one contaminated inert width carries a gradient of the same sign and size.
+- So `1.0516` should not be quoted as a clean number. The claim chain199 supports is "about 5%
+  at k=16, level only, with its degree structure unattributable."
+
+chain201's sibling ratio separates both, because any artefact common to all three arms — which
+the `#if` block is, since all three set UNROLL=4 — cancels in a firing-arm-over-inert-sibling
+ratio. Its analyzer therefore compares the diagonal's degree gradient against the gradient
+measured at k=4 and k=8 where all three arms are inert, rather than only testing the
+diagonal's sign band by band.
 
 ### What `dp2` still needs
 
