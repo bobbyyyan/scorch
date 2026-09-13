@@ -27908,3 +27908,28 @@ on that 12-symbol figure has a sign nobody recorded.
 `grep -c 'spmm'` against `grep -ci 'spmm'`: the class is `SpmmCsrPlan`, so a case-sensitive filter
 against a mangled name misses it. A one-character-wide instance of the filtered census, and worth
 naming because a reported 0 is the shape that stops further looking.
+
+**The all-cold finding is right for the two `spmm` clusters and wrong as a general claim, and the
+difference matters for the check.** Confirmed 37 of 37: every symbol at `0x9f694` (6) and `0x9f814`
+(31) is `.cold`-suffixed, so those are cold labels collapsing onto one section offset because the
+functions have no cold blocks, not folded bodies. But object-wide the rate is not 37 of 37. Of
+**54** colliding addresses, **20** are all-cold and **34 are not**, and the not-all-cold ones are
+genuine identical-code folds:
+
+- `0x67bc8` — `std::__sort5<_ClassicAlgPolicy, spmspm_csr<float>(…)>` and the same instantiated
+  through `spmspm_csr<int>(…)`, two distinct template instantiations at one address.
+- `0x492d8` — four `unordered_map` / `unordered_set` / `unordered_multimap` helpers from pybind11's
+  type registry at one address.
+
+So identical-code folding is **live in this build and does fold kernel template instantiations**.
+The naive signature is not useless, it is contaminated: the all-cold clusters are the false
+positives and they are separable by inspection in the same pass. **The check is collisions where
+not every member is `.cold`, plus `st_size`** — two conditions, both available from one
+`nm --print-size` read on ELF.
+
+And the filter lesson recurs a third time, on my own filter: `spmspm_csr` does not contain the
+substring `spmm`, so the folded kernel instantiation above was invisible to every count either of
+us ran tonight. Three instances in one exchange, all the same defect and each with a different
+width — case (`spmm` versus `Spmm`), substring (`grep -F -f` over address strings matching a
+longer address), and vocabulary (`spmm` missing `spmspm`). **The ICF check at seal time filters by
+nothing**: it enumerates every colliding address, drops the all-cold clusters, and reads the sizes.
