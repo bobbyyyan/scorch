@@ -28933,3 +28933,41 @@ are invariant under it.
 Sealed at 125 files, 124 of 124 verifying, manifest
 `340510303f440ae1868307291f54713470ea7b0c0908b20f4f6f06f32fa50f44`. The original defective capture
 is preserved unmodified at `6a7063ab787e61c4` beside both rounds of correction.
+
+### Correction 3: the reachability count counted the pair that cannot fail
+
+Two amendments, both from the independent reading. The verdict is unchanged and not reopened.
+
+**The containment count included the A/A pair, whose CI defines the band.** Correction 2 named that
+circularity in a docstring and then enumerated all 21 pairs anyway, so a count meant to show
+containment is reachable could rest on a pair contained by construction. The independent reading hit
+the pure form — **1 of 21 contained at k=4 and k=32, and the one was the A/A pair**, i.e. 0 of 20
+once dropped. Mine was inflated at the narrowest width only: **2 of 21 was really 1 of 20**. The
+k=2 conclusion survives, since 1 of 20 is still non-zero, and the A/A pair's own containment is now
+printed separately so a reader sees it set aside rather than missed.
+
+**The boundary-pair diagnosis named one noise term, and it is the smaller one at two widths.** I
+said the deciding margin sits inside the bootstrap's seed spread. It sits inside the *combined*
+noise of the deciding bound, whose second component is the estimator convention. Measured within one
+pipeline rather than across two codebases — per-cell `median(base/subject)` over passes against
+`median(base)/median(subject)`, geomean over cells either way:
+
+| width | convention gap | seed spread | dominant | verdict under each |
+|---|---|---|---|---|
+| k=2  | 0.00049 | 0.00018 | **convention** | excludes 25/25 vs 0/25 |
+| k=4  | 0.00134 | 0.00023 | **convention** | excludes 25/25 vs 25/25 |
+| k=32 | 0.00013 | 0.00099 | resample | excludes 22/25 vs 0/25 |
+
+The medians-first convention reproduces the other reading's three boundary numbers to four decimals
+(1.0016 [0.9995, 1.0035], 0.9948 [0.9892, 0.9990], 0.9815 [0.9587, 1.0008]), which identifies its
+convention rather than leaving the gap attributed to an unspecified difference between two codebases.
+
+**And a point visible only with both conventions on one dataset: at k=32 they agree on the point
+estimate to 1.3e-4 and give opposite verdicts, 22 of 25 against 0 of 25.** The convention moves the
+CI bound while leaving the centre alone — so comparing point estimates understates the convention
+term for any verdict that depends on a bound, and **no number of reseeds can certify a
+parity-exclusion count.** That strengthens correction 2's conclusion rather than weakening it.
+
+Sealed at 130 files, 129 of 129 verifying, manifest
+`21aea6e91353e82adf212888e7bdb326fcc29e76cf7d2cb45f5d772410f715b8`. All earlier captures and both
+earlier correction files are unmodified.
