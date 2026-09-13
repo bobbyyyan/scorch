@@ -932,9 +932,12 @@
 
 // The deep register-block kernel: the vector counts it serves, its depth, and its prefetch.
 //
-// It exists (spmm.h, guarded on AVX2+FMA) but has never been reachable outside a
-// SCORCH_TUNE_HOOKS build, so a release binary does not contain the dispatch at all. Measured on
-// 302 matrices with the kernel timer, against the shipped register block:
+// It exists (spmm.h, guarded on AVX2+FMA). The dispatch now sits OUTSIDE the SCORCH_TUNE_HOOKS
+// guard so a release object can contain the mechanism and a compiled-in A/B can measure it without
+// the hooks per-call tax -- but with the depth below at 0 the guard is a `const int` zero, the `if`
+// folds, and none of the deep instantiations are emitted. That folding is what the per-symbol
+// emission check verifies; it is not assumed. Measured on 302 matrices with the kernel timer,
+// against the shipped register block:
 //
 //   nvec   float32 (8 lanes)      float64 (4 lanes)
 //   1      0.8034 (k=4), 0.8124 (k=8)   0.8392 (k=4)
@@ -949,6 +952,28 @@
 //
 // Decomposed, the gain is the prefetch's ABSENCE: at k=16 float32, depth alone reads 0.9633 and
 // turning the deep kernel's prefetch off is worth 1.0792 on top of that.
+//
+// chain199 re-measured both signs in RELEASE-shaped objects, on 89 matrices over 10 passes, after
+// correcting two handicaps that were not depth (the kernel hardcoded the full-width vector, and its
+// remainder ran one accumulator chain where the kernel it replaces runs two).
+//
+//   nvec=1, depth 4   0.9528 on the target group at k=4, 0.8701 at k=8, 0.7674 on the control at k=8
+//   nvec=1, depth 8   0.8323 and 0.8503 on the target group; 0.7193 and 0.7491 on the control
+//   nvec=2, depth 4   1.0516 pooled at k=16, and 1.0339/1.0609/1.0551/1.0482/1.0828 by degree band
+//
+// Depth 8 is worse than depth 4 on every group at every firing width, four comparisons out of four,
+// so the nvec=1 loss is an ordering and not a layout accident. The mechanism that fits both signs:
+// the three loads per nonzero (the B-row gather, A_val, A1_crd) are paid once per nonzero whatever
+// the width, while the FMAs scale with the vector count. At nvec=1 the loads dominate and extra
+// accumulators are dead weight carrying a prologue, a remainder loop and register pressure. At
+// nvec>=2 each nonzero feeds 2, 3 or 4 FMAs against the same three loads, the dependency chain
+// becomes the limiter, and depth pays. NOTHING has yet measured nvec 3 or 4 at depth 4, which is
+// the same mechanism's untested prediction -- so the range stays off.
+//
+// One caution for whoever measures this next: an object built with UNROLL=4 reads about 2.3% fast
+// at k=4 against an object built with UNROLL=0, at every window setting, INCLUDING windows that
+// exclude nvec=1 so the half-vector deep dispatch cannot fire. No instruction on that path changes;
+// the folded-away block moves the inliner's cost model. Do not price a layout control at k=4.
 //
 // SCORCH_NARROWK_DEEP_UNROLL 0 disables the kernel, which is what ships. NVEC_HI 0 means "no
 // vector-count restriction", so a hooks arm that sets only the depth behaves exactly as it did
