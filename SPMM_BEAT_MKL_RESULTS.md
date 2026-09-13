@@ -26889,11 +26889,33 @@ Held: the gain is small where it was predicted small, and threads cannot close `
 best arm is t1 at 1.030, against a deficit of 1.346 — and MKL at 8 threads on the same matrices is
 itself 1.23× faster than MKL at 24, so restricting the pool *widens* the gap rather than closing it.
 
-Wrong: the shape. `m3plates` prefers **t1**, not t11, and by only 3.0%. Going from 24 workers to 1
-changes its time by 0.7 µs out of 24.7, so neither the team nor the parallel work is where its time
-goes — about 24 of its 24.7 µs is fixed per-call cost. The row-loop term was over-estimated by an
-order of magnitude. That is a sharper conclusion than the prediction: for the mostly-empty-row
-population the deficit is **entirely** the fixed per-call term.
+Wrong: the shape — and the reason is the column this stage failed to record. `m3plates` prefers
+**t1** by 3.0%, and I first wrote that "going from 24 workers to 1 changes its time by 0.7 µs".
+It never had 24 workers. Asking the exported policy what each arm actually resolves to:
+
+    matrix (rows, nnz)         policy   ov1  ov2  ov4  ov8 ov16 ov24
+    p6000        (2095, 19826)      2     1    2    4    8   16   18
+    aa3           (825, 70806)      7     1    2    4    8   16   18
+    lp_d6cube     (415, 37704)      4     1    2    4    8   16   18
+    ASIC_100k (99340, 940621)      18     1    2    4    8   16   18
+    m3plates    (11107, 6639)       1     1    1    1    1    1    1
+    nw14         (73, 904910)       6     1    2    4    6    6    6
+
+(`18` is this machine's processor count; on redwood it is 24. The pattern is what matters.)
+
+**`m3plates` runs on one worker in every arm of this stage.** Its adoption never fires, because
+the gate needs `nnz × max(k,16) ≥ SCORCH_GRAIN_SPMM` and 6639 × 16 = 106224 against a grain of
+150000 — a machine-independent comparison, so this holds on redwood too. So its 3.0% is **pool
+width alone**: 24 workers existing and idle against 1. `nw14` shows the gate's other half, `rows
+≥ override × 16`: at 73 rows an override of 8 still resolves to 6.
+
+The conclusion survives and the reasoning does not. For the mostly-empty-row population the
+deficit is **entirely** the fixed per-call term — not because 24 workers failed to help, but
+because there was never more than one worker to help or hinder. The row-loop term in my
+prediction was over-estimated by an order of magnitude either way.
+
+This is precisely the cost of the missing `resolved` column, described two subsections down, and
+it landed on the one matrix I quoted most often.
 
 ### The result the stage was not designed to find
 
