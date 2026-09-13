@@ -27718,3 +27718,53 @@ measurable in `c0`), minus the ~3.5 KB deep body. With one live core site for `N
 tail `case N`, the deep inner default being dead where the guard folds false and the prefetch block
 being hooks-only — that is a few KB, not eleven. The earlier one-term phrasing ("should track
 `dp2`'s core plus its own") named the right statistic and omitted this residual.
+
+**Amendment: there is a third branch, it kills no premise, and the statistic above cannot see it.**
+"Two routes to the same quantity disagree five-fold, so a premise is wrong" missed the option that
+the two routes measure **different quantities**. Both accounts are about all machine code belonging
+to a function; `core` is one symbol's size. At `-O3 -fopenmp` those come apart by three mechanisms,
+each sensitive to exactly what these arms vary:
+
+- **Cold partitioning.** `-freorder-blocks-and-partition` is on from `-O2`, splitting low-frequency
+  blocks into `.text.unlikely` under a separate `<name>.cold` symbol. A guard folded to a known-false
+  constant in `c0` versus a live `nvec >= lo && nvec <= hi` compare in a window arm changes block
+  frequency estimates across the whole narrow-k region, so a different amount of code lands in
+  `.cold` per arm. The core symbol shrinks; the object does not.
+- **OpenMP outlining.** The dispatch is inside `scorch_spmm_worker_t` (`:4480`) — a *generic* lambda,
+  `auto mr_tag` — itself nested with `zero_one_slice` (`:4513`) and `scorch_spmm_rows_t` (`:4646`),
+  and `#pragma omp parallel` (`:494`) outlines its region into `<name>._omp_fn.N`. Which symbol holds
+  a given basic block is a compiler decision, and the lambda nesting makes it less of a source fact
+  than a plain function would.
+- **Clones.** `.constprop.N`, `.isra.N`, `.part.N` follow changed bodies and changed partial-inlining
+  decisions.
+
+Under the first or third the sign is ordinary: ~11 KB moved out of the measured symbol and stayed in
+the object. And then **nothing needs to be sacrificed** — `spmm_csr_linear_fused_float` holding at
+11705 bytes across nine objects is *expected*, since it is a different function whose body the deep
+dispatch does not touch, and the 2.9 KB cap on one inlined plain body is fine because the core delta
+was never one plain body's worth of code leaving.
+
+**So the statistic changes, and the reason is the one this project keeps relearning.** `core + every
+regblock symbol` misses all three: none of `.cold`, `._omp_fn.N`, `.constprop.N`, `.isra.N` or
+`.part.N` contains `regblock`, and a suffixed clone of the core matches a `core` filter only if the
+filter anticipated the suffix. Both of its branches can be produced by redistribution into symbols
+the sum never looked at, so the "totals differ by ~11 KB" branch would fire and retire the 11705
+premise for the wrong reason. A filtered census cannot see what the filter excludes, which is the
+same defect as a grep that answers source presence when the question was reachability.
+
+**The instrument, still zero builds and one file read per object:**
+
+1. `size -A <obj>` per object. Section totals account for every byte regardless of symbol naming and
+   separate `.text` from `.text.unlikely`. **If `.text` + `.text.unlikely` is flat across arms while
+   the core symbol differs by 11 KB, the sign is explained and no premise dies.**
+2. An **unfiltered** symbol-table comparison — every symbol with a size, compared as a multiset, not
+   a grep. A `<core>.cold` present in the window arms and absent in `c0`, or larger by ~11 KB,
+   settles it on sight.
+
+Two things not verified and checkable at seal time rather than asserted now. Whether these strings
+are absent from the chain199 ledger: that ledger is not on this machine, so the claim that every
+symbol census there was filtered to names that could not have shown them is unconfirmed. And the
+compiler's identity: redwood is Linux and `setup.sh` forces clang only on macOS, but no compiler
+banner has been read from `mrbuild.log`. Under clang the same effects appear as `.cold.N` from
+`-fsplit-cold-code` and `OUTLINED_FUNCTION_N` from the machine outliner — which is precisely why the
+comparison must not be a grep, and why the instrument is right before the compiler is known.
