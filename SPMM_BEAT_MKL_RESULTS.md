@@ -26775,5 +26775,40 @@ Evidence for chain199 at `~/.cache/scorch-codex/spmm-beat-mkl/chain199-deepchain
 the stage and body scripts, the balanced rotation table, the analysis, the emission-neutrality
 log, and the analyzer chain201 will use together with its dry run on this data.
 
+### Proving the two new arms can fire, before the stage runs rather than after
+
+A null at three or four vectors is the pre-registered falsifier, so it has to be distinguishable
+from an arm that never dispatched. The stage checks that `case 3 * 16 + 4:` and `case 4 * 16 + 4:`
+exist in the switch, but a case that exists is not a case that is reached — the deep dispatch sits
+at `src/scorch/csrc/spmm.h:5041`, deep inside the row-unit loop, behind several branches that each
+`continue`. Traced, for float32 on AVX2:
+
+- `narrow_k` is `B1_size >= 1 && B1_size <= 4 * SL` with `SL = scorch_simd<float>::lanes = 8`
+  (`spmm.h:3979`), so it is true for every width in the grid, and `nvec = ceil(B1_size / 8)` runs
+  1 to 4. k=20 and k=24 are nvec=3; k=32 is nvec=4.
+- `force_workspace` is a plain `false` outside the hooks guard (`spmm.h:4233`), so the branch that
+  would skip the whole narrow-k chain cannot be taken in a release object.
+- The multi-row block needs `SCORCH_SPMM_MULTIROW_ROWS_F32`, which is 0 by default, so it never
+  claims a row.
+- The half-vector block requires `B1_size == 4` exactly, or `< 4` with the second mode; the
+  exact-width kernel requires `B1_size <= 3`; the gather requires `nvec == 1`. All three are false
+  at nvec 3 and 4, and each falls through rather than continuing.
+
+So the switch is reached at every width in the grid, and a null there will mean depth did not pay,
+not that the arm was never selected.
+
+The window-to-width mapping is also **host-invariant for float32**: `scorch_simd<float>` is
+`__m256` with 8 lanes unconditionally, so `nvec = ceil(k/8)` on both x86 hosts and a window of 2..2
+means k=9-16 on each. That is worth stating because the mapping is *not* dtype-invariant — float64
+has 4 lanes, which is why this file's own note on the deep kernel states its range in vector counts
+rather than in k.
+
+One expectation to register now rather than discover later, if `dp2` or its siblings earn a second
+host: MKT compiles a different kernel. `-march=native` defines `__AVX512F__` there and its object
+carries 2565 zmm instructions and 56 mask-register uses in the SpMM symbols, and the same asymmetry
+already made the width-1 unroll question AVX2-only — masking removes the remainder structure that
+trade is made of. The deep kernel's remainder is exactly such a structure, so agreement between the
+hosts is what the confirmation would establish, not what it may assume.
+
 Both `SCORCH_NARROWK_DEEP_UNROLL` and the NVEC window stay at their defaults. Nothing ships
 from chain199.
