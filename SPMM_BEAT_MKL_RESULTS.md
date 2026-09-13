@@ -28532,6 +28532,15 @@ bootstrap's own resampling spread beside each floor, with the standing rule atta
 within that spread of a floor boundary has not cleared it. On the full-population floor at n=89 the
 spread is ~0.001, so the main floors are stable; it is the small subgroups where it binds.
 
+**Conservation, at the two places a denominator is formed by skipping.** `attempted = tested +
+skipped` is now printed beside every behind-MKL count, and `pair()` records the same decomposition
+for the n behind every CI. Stated precisely rather than oversold: neither can fail on any *data* —
+every loop iteration either skips or counts, so the identity holds by construction, and the assert
+is the same kind of structural invariant. Both guard a future edit that adds a skip path without a
+counter. The value is visibility: the wrong-denominator error divided by a loop count rather than
+by trials actually run, and `2000 attempted = 286 tested + 1714 skipped` printed beside the rate
+would have made that obvious on sight.
+
 **The honest limit.** A metamorphic relation cannot catch an error invariant under its own
 transformation — a wrong-but-symmetric estimator passes renaming perfectly. So this is a detector
 for one class: indexing, labeling, ordering, normalization. That happens to be the class that
