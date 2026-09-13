@@ -27443,3 +27443,29 @@ smaller in bytes than `dp1`/`dp1e` (504 against 2053) while `dp1`/`dp1e` is the 
 pair whose symbol sets match — so "tightest" needs the axis named. For a follow-up wanting a
 reference tighter than P3a's on the symbol axis, one extra arm at the same window and a different
 unroll buys it.
+
+**Both candidate explanations for the `NV=1` asymmetry are ruled out, which narrows the question
+without answering it.** The non-deep template has exactly three call-site families in the header:
+the core's switch (`spmm.h:4875-4878`), the half-vector path (`:4939-4943`) and the fused Linear
+path (`:6315-6318`).
+
+- **The fused Linear path is not the caller.** Its switch covers all four `NV` with no window gate,
+  so if it were producing these symbols it would produce all four in every arm and `dp2` could not
+  be missing `NV=2`. Measured directly: `spmm_csr_linear_fused_float` is **11705 bytes in every one
+  of the nine objects across both chains** — byte-identical — so nothing was inlined into it and it
+  did not grow to absorb a body the core stopped calling.
+- **The half-vector path is not the caller either.** It does call `NV=1` explicitly, but as
+  `scorch_spmm_row_regblock<scalar_t, 1, ·, VH>` with `VH = scorch_simd_half<scalar_t>`
+  (`:4756`) — a different fourth template argument, so a different mangled symbol from the
+  `scorch_simd<float>` instantiations counted above.
+
+So why `<float, 1, ·, scorch_simd<float>>` survives in `dp1` and `dp1e` is open, and both obvious
+answers are eliminated rather than untested. What the same measurement does settle is the claim
+that matters: **the missing symbol means missing code, not relocated code.** In `dp2`/`dp3`/`dp4`
+the core shrank by 11155 / 10651 / 9223 bytes against `c0` while the only other candidate caller's
+function did not change size at all, so the non-deep body was replaced by the inlined deep body
+rather than moved elsewhere in the object. The general form is worth keeping: **symbol presence is
+a property of the whole call graph and the inliner's choices, not of the dispatch under study** —
+`regblock_deep` has no symbol anywhere despite being the code under test, which is the same fact
+from the other side. Reasoning about one dispatch and reporting a conclusion about the object is
+the error to avoid; `nm` plus one size comparison is the cheap way not to.
