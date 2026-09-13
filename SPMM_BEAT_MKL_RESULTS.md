@@ -27883,3 +27883,28 @@ Locally, for calibration of the signature: 54 addresses in that object carry mor
 3 of them in the `spmm` family, including `.cold.1` and `.cold.2` of `SpmmCsrPlan::run` at the same
 address — so two-names-at-one-address is common enough that it needs the *sizes* read alongside it
 rather than being treated as folding on sight.
+
+**The folding-signature count, with units, because neither 1 nor 3 was right as stated.** Two
+counts were being compared across different objects. Measured properly on the local object, in one
+pass so the definitions cannot drift: **2** shared addresses carry at least one `spmm`-matching
+symbol, **3** `spmm` symbols sit at a shared address, and **both** of those addresses are mixed
+`spmm`/non-`spmm`. The mixed part is the one that matters for identical-code folding, since a
+kernel folded against a non-kernel function is still folded and a count filtered to kernel names
+first would miss exactly those. (My earlier 3 also came from a `grep -F -f` over address strings,
+which can match an address as a substring of a longer one — same number, weaker derivation.)
+
+The clusters themselves make the sizes mandatory rather than advisable. `0x9f694` holds 6 symbols,
+2 of them `spmm` — the `.cold.1`/`.cold.2` pair of `SpmmCsrPlan::run`. `0x9f814` holds **31
+symbols**, 1 of them `spmm`. Thirty-one names at one address is not thirty-one folded functions;
+it is almost certainly a set of zero-size cold stubs placed at the same offset. Mach-O carries no
+`st_size` here so the local object cannot tell those apart, which is the whole point: **two names
+at one address is not a folding signature without the sizes.** On ELF at seal time
+`nm --print-size` supplies `st_size` and the question resolves. Also the unstated dependency, the
+second thing the missing selector gates: an alias carrying a size makes a naive group sum
+double-count and an alias with `st_size` 0 makes it undercount, so identical-code folding's effect
+on that 12-symbol figure has a sign nobody recorded.
+
+**Case sensitivity, for the record.** The 4-versus-0 disagreement on `.cold` symbols was
+`grep -c 'spmm'` against `grep -ci 'spmm'`: the class is `SpmmCsrPlan`, so a case-sensitive filter
+against a mangled name misses it. A one-character-wide instance of the filtered census, and worth
+naming because a reported 0 is the shape that stops further looking.
