@@ -28199,3 +28199,45 @@ by construction — which is why a count was unquotable without its selector, on
 `dp2` losing `NV=2` is now visible at the byte level: `regblock<float,2,false>` at 671 bytes and
 `regblock<float,2,true>.constprop.0` at 611 both go to zero, with a `.constprop` clone present
 exactly as GCC's naming predicted.
+
+**The accounting closes, and the gainers are one switch statement.** The top-ten listing above does
+not close on its own — its rows sum to −5871 against a family delta of −1223, so it was a
+magnitude ranking and not a balance sheet. Every symbol, no truncation:
+
+| | n | sum |
+|---|---|---|
+| losers | 8 | −16329 |
+| gainers | 12 | +15106 |
+| unchanged | 226 | — |
+| **net** | | **−1223**, the family delta exactly |
+
+And the twelve gainers are not a scatter. They are `scorch_spmm_row_gather_f32<2,3,4,5,6,7,8>`,
+`scorch_spmm_row_gather_f32_ms<1,2>`, `<1,4>`, `<1,8>`, `scorch_spmm_row_regtile_partial<double,
+6,false>`, and a 45-byte pybind11 helper — that is, **the complete set of `SCORCH_RG(KK)` and
+`SCORCH_RGS(KK,SS)` instantiations from the switch at `:5010-5025`**, moving from inlined into the
+worker lambda in `c0` to out-of-line in `dp2`. `gather_f32<1>` is the one arm that does not move.
+
+Which lands on the same few lines twice: that switch is the block opened at `:4996`, whose
+`default: SCORCH_RB(1)` at `:5026` is the answer to the `NV=1` reachability question earlier in
+this document. The code that relocated and the code that settled the reachability asymmetry are the
+same statement — an independent coherence check on both readings.
+
+**The defect, stated better than I stated it.** I wrote that the destination carries no
+`spmm_csr_v2_core` prefix, so every selector defined from that instantiation excluded it. True but
+misleading: the **donor** does carry the prefix, was inside the group, and the group reported its
+loss correctly to the byte. The selector was not blind to the effect — it was blind to **one side
+of it**. When the underlying quantity is conserved, a view that captures only the donor turns
+redistribution into apparent loss, and no better prefix repairs it, because the gainers live in a
+different namespace by nature. The repair is to measure the conserved total, which `size -A` did on
+the first read. That is the general form of every filter defect in this document: the question is
+not whether the filter is correct but whether it spans both sides of whatever is conserved.
+
+Three corrections to the mechanism as it was first proposed, from its own author, recorded because
+the pattern of which parts survived is the useful part. The **mechanism** was right — an inlining
+budget in the worker lambda, and the lambda is exactly the symbol that lost the 10.6 KB. **Which
+bodies moved** was wrong: the plain `regblock` bodies were named, and `regblock` is a net loser at
+5108 against 3826, so the later candidate was wrong in the opposite direction from the earlier one.
+And **why the census missed them** was wrong in the way that matters: the claim was that those
+symbols persist either way and so are invisible to a census. They do not persist — they are absent
+from `c0` and appear in `dp2`. The census missed them because they were never named, not because
+they were always there.
