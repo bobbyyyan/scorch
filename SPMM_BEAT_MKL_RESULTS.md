@@ -28971,3 +28971,54 @@ parity-exclusion count.** That strengthens correction 2's conclusion rather than
 Sealed at 130 files, 129 of 129 verifying, manifest
 `21aea6e91353e82adf212888e7bdb326fcc29e76cf7d2cb45f5d772410f715b8`. All earlier captures and both
 earlier correction files are unmodified.
+
+### Correction 4: 25 draws cannot establish determinism, and three band tests became one
+
+Last substantive round. Two amendments and one refactor; the verdict has not moved through any of
+the four.
+
+**"Decided by the resample" is right at one width and wrong at two — and 25 draws cannot tell.**
+Correction 2 called all three boundary pairs resample-decided. The independent reading replied that
+all six convention-by-width readings are deterministic over 25 seeds, so the convention decides all
+three. At **200 seeds** per convention per width:
+
+| width | pair | paired convention | medians convention |
+|---|---|---|---|
+| k=2 | `ov24b`/`ov16` | 200/200 deterministic | 0/200 deterministic |
+| k=4 | `ovp`/`ov4` | 200/200 deterministic | 200/200 deterministic |
+| k=32 | `ov4`/`ov16` | **193/200, rate 0.965, Wilson [0.930, 0.983]** | 0/200 deterministic |
+
+They are right at k=2 and k=4 and my original diagnosis was wrong there. At k=32 they are not: 25
+draws cannot distinguish a rate of 0.965 from 1.000, since **0.965²⁵ = 0.41** — a clean sweep is the
+single most likely outcome. Both terms are live at k=32, only the convention at the narrower two.
+The general point: a determinism claim needs enough draws to exclude a high rate.
+
+**My bound-versus-centre claim is withdrawn, and the weaker replacement needs a refinement too.**
+Measured against the bound that actually decides each verdict — nearest parity, so the lower bound
+above it and the upper below:
+
+| width | centre gap | deciding-bound gap | ratio |
+|---|---|---|---|
+| k=2 | 0.000488 | 0.000549 (lower) | 1.1x |
+| k=4 | 0.001339 | 0.000968 (upper) | **0.7x — the centre overstates** |
+| k=32 | 0.000126 | 0.001048 (upper) | 8.3x |
+
+So "at least as large at every width" does not hold either. The accurate form is weaker than both:
+**the centre gap is no reliable proxy for the deciding-bound gap in either direction.** The
+conclusion drawing on it is unaffected, needing only that reseeding cannot certify a
+parity-exclusion count, which the table establishes alone.
+
+**Three implementations of the band test became one.** The durable form of the `row()` defect: the
+printing path must call the predicate, not re-derive its label, because the printed label is what a
+reader believes. Consolidated onto one `classify(e, floor)` returning `(code, label)`, called by the
+row labels, the control verdict and the reachability count. Looking for the second site turned up a
+**third** — the containment test inside `reachability()`, the site where drift would be hardest to
+see since its output is a count rather than a label. The refactor is byte-identical to the previous
+capture, and the predicate is now tested against the reading that defeated its first version:
+`[0.9405, 0.9996]` → `effect`, a CI 100x the band → `nopower`, `[0.9990, 1.0012]` → `flat`. What
+consolidation buys is stated narrowly: it removes the possibility of two sites drifting, and does
+not make the one remaining predicate correct — that is what the test cases are for.
+
+Sealed at 135 files, 134 of 134 verifying, manifest
+`729245365b5454a3eb1f825349e28d8a8d5ba0a9f8761faddbb36f6b7de4e274`. All four earlier captures
+unmodified.
