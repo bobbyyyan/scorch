@@ -27642,3 +27642,32 @@ prediction needs an object built with `LO=HI=3, UNROLL=8`, which is a build eith
 worth one: the mechanism is already determined by six objects matching six predictions with no
 free parameter, and a seventh would be confirmation of a case nobody ships. The prediction is
 recorded so that it is pre-registered if such an arm is ever built for another reason.
+
+**Correction to the sentence above: the size-association test never pooled the five arms.** The
+pre-registration said `an_c201.py` "runs a size-association test over them", naming all five
+`--core-bytes` values. That is wrong and it is the misleading kind of wrong. `ARMS` comes from
+`--windows` (`dp2:12,16;dp3:20,24;dp4:32`), so `ARMS = ['dp2','dp3','dp4']`; `c0` is `--ship` and
+`c0b` is `--aa`. `size_order(k, ARMS)` therefore forms exactly three pairs — 0.492, 1.887 and
+1.395 KB — over the three arms that all hold deep-body count at 1, and its printed range is
+1932 bytes. `CORE` is read nowhere else. The two floor arms' sizes are passed and never enter a
+fit, which is harmless but is what makes the pooled reading look possible from the command line
+alone.
+
+So the estimand is already the identifiable one: within-window, treatment held fixed, varying only
+which vector count is live. Had it pooled, the fit would have been almost entirely the treatment —
+least squares through the origin weights by the square of the size delta, and the six
+arm-against-reference pairs would carry `2*(10.89^2 + 10.40^2 + 9.01^2) = 616` against `5.74` for
+the three within-window pairs, or 99.1% of the weight. Worth writing down because it is the
+quantitative form of why the restriction matters, not just a disclosure.
+
+**What does survive, and it is about power rather than identification.** The within-window
+contrast is n=3 over 1932 bytes, and the analyzer's gate at `an_c201.py:375` already refuses to
+name a direction when `|slope| * range` is under the width's floor, printing that the ordering has
+no measurable direction and cannot order the diagonal — an inability, not an absence, which is the
+right phrasing. Against chain199's ±0.52-0.78% build figure a slope would have to clear roughly
+0.28-0.41% per KB to be declared. Independently, two objects with *identical* decisions and
+identical size already differ 1-2.6% on narrow-k SpMM from build-path and `__LINE__` shifts alone.
+A layout term that large at zero bytes of size difference swamps whatever 1932 bytes buys, so the
+within-window slope is dominated by layout differences that are not size. That is a second reason
+the sign may not be resolvable here, and it argues for reading P3a's size section as "cannot
+resolve" unless the slope clears the floor by a margin, rather than as evidence either way.
