@@ -27274,3 +27274,29 @@ resolved count, checked against what was read rather than against a list of expe
 in both directions — inert on correct data, with the whole report byte-identical to the previous
 corrected run, and loud on the re-planted bug, refusing on all 305 cells before classifying
 anything.
+
+**And the 6/3 split is a draw from row order, not a property of the defect.** The buggy assignment
+keeps whichever arm appeared last for a cell, and `tsweep.py:170` shuffles arm order per cell on a
+seed containing the pass tag and the build — so the surviving arm is arbitrary, and the arm order
+differs across all three passes for **every one of the 305 cells**. Re-running the buggy loader over
+the same sealed CSVs:
+
+    as the files are ordered (the sealed run)   empty 17   reclassified  9   caught 6, not caught 3
+    rows reversed                              empty 20   reclassified 11   caught 4, not caught 7
+    20 random orders                           empty 12-19   reclassified 5-12   caught 2-8
+
+So a loud default catches only the empty-map subset, whose size is a sample: 6 of 9 here, nearer 4
+of 8 typically, as few as 2 of 12. **The second-consumer rule is the larger half of the fix**, and
+the sentence "a loud default fixes two thirds of this" was specific to the order this run happened
+to draw. The nine named cells are likewise a sample — the same analyzer over another build's CSVs
+would misclassify a different set of a different size.
+
+**The direction, unlike the count, is a measurement.** Every transition under every order tried is
+LEAN → STARVED, because dropping arms from the map can only ever *under*-report `max()`. The sign is
+fixed while the set is not, which is why the corrected run moves STARVED 5 → 14 and LEAN 49 → 40
+with nothing going the other way. That is worth separating when reporting a defect: a
+nondeterministic blast radius with a deterministic sign biases a table in one direction rather than
+adding noise to it, and only the count needs hedging.
+
+Headline figures hold under every order, because `FED` reads only `grains` and every reported number
+sits on `FED` or on the whole corpus.
