@@ -27671,3 +27671,50 @@ A layout term that large at zero bytes of size difference swamps whatever 1932 b
 within-window slope is dominated by layout differences that are not size. That is a second reason
 the sign may not be resolvable here, and it argues for reading P3a's size section as "cannot
 resolve" unless the slope clears the floor by a margin, rather than as evidence either way.
+
+**Amendment to the 42 KB calibration: the count is 24, the deep term is ~3.5 KB, and every simple
+account gets the SIGN wrong.** Three sentences above are superseded.
+
+*The count.* "All six deep instantiations plus the dispatch" is wrong; it is 24. In the non-`const`
+build `narrowk_unroll` is unfoldable so all six `(nvec, UNROLL)` cases are reachable,
+`narrowk_unroll_pf` is unfoldable so `SCORCH_RBD` (`:5040`) fans each on `PFV`, and `full_last` is
+a runtime value in every build so `SCORCH_RBD1` (`:5034-5037`) fans each again. 6 x 2 x 2 = 24
+deep functions against all of them folded away.
+
+*The deep term.* `SCORCH_NARROWK_DEEP_PF` defaults to `1` (`scorch_policy.h:984-986`) and every arm
+sets `-DSCORCH_NARROWK_DEEP_PF=0`, so a window arm holds one case x `PFV=false` x 2 `full_last` =
+**2** of those 24, putting its deep body near **3.5 KB** rather than anywhere in the [0, 42 KB] the
+earlier bound allowed. Both endpoints of that interval were unreachable. The share is a count
+share and not a byte share — the six cases carry `NV*UN` accumulator counts 4, 8, 8, 16, 12, 16
+and `dp2`'s sits mid-range at 8 — so 3.5 KB is an estimate, not a measurement.
+
+*The sign, which is the part that matters.* With the deep term near 3.5 KB, every account we have
+predicts a window arm's core is **larger** than `c0`'s, and it is 11155 bytes smaller. The reason
+no version of "the plain `NV=2` body left `dp2`" rescues it: the fused Linear path's switch
+(`:6319-6324`) has a live `case 2` in *every* arm — it carries no window gate — yet `dp2` has no
+`<float, 2, ·, scorch_simd<float>>` symbol, so that call must be inlined, and
+`spmm_csr_linear_fused_float` is byte-identical at 11705 bytes in all nine objects. **Plain `NV=2`
+code is therefore present, inlined, and identical in every object.** Nothing about that body
+leaving the object can explain a shrinking core, and 11705 bytes holding four inlined bodies plus
+the function's own logic caps one body near 2.9 KB, which contradicts the ~14.7 KB the core delta
+would otherwise imply. Two routes to the same quantity disagree about five-fold, so at least one
+premise is wrong and the residual is not small.
+
+**So the `nm --print-size` sum is a diagnostic, not a confirmation, and the statistic to use is
+the total.** `core + sum of every regblock symbol` is invariant to inlining redistribution — an
+inlined copy adds to the core while the out-of-line copy remains a symbol either way — which is
+exactly the property that makes it decide between the two accounts:
+
+- **Totals nearly flat while cores differ 9-11 KB** — the delta is redistribution: the deep body's
+  arrival pushed the lambda past an inlining budget and the plain `NV=1/3/4` bodies went from
+  inlined to called, which the symbol census cannot see because their symbols persist either way.
+- **Totals also differ by ~11 KB** — code genuinely left the object, and then the fused function's
+  byte-identical 11705 is the premise that breaks, because that much plain code cannot both be
+  absent from `dp2` and inlined identically inside its fused function.
+
+The expected residual under the second account, stated so a nonzero one is readable: `Total(c0) -
+Total(dpN)` = `c0`'s inlined copies of plain `NV=N`, plus `S_N` (that symbol's own size, directly
+measurable in `c0`), minus the ~3.5 KB deep body. With one live core site for `NV=N` in `c0` — the
+tail `case N`, the deep inner default being dead where the guard folds false and the prefetch block
+being hooks-only — that is a few KB, not eleven. The earlier one-term phrasing ("should track
+`dp2`'s core plus its own") named the right statistic and omitted this residual.
