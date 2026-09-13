@@ -27620,3 +27620,25 @@ test; the analyzer's `size_order()` already states the adjacent confound (each p
 in which body is live) and its forbidden uses, and this would add one more. It needs one file read
 per object on the build host and no rebuild, no timing, and no corpus. The arm labels will be
 re-derived from the census at the same time rather than carried from a note.
+
+**Calibration for the same size check, and where the window-3/depth-8 prediction can actually
+live.** The comment at `:4276-4278` records a measured **42 KB** object growth from leaving the
+four controls non-`const`, because the dispatch sits inside the parallel region's lambda. That is
+the cost of *all six* deep instantiations plus the dispatch being present against all of them
+folded away. Each arm here has exactly one window live, so the growth from `c0` to a window arm
+should be a fraction of 42 KB and **positive**. The observed change is −11155 bytes. So the
+inlined plain bodies that dead-code elimination removed from the window arm's core are worth
+`11155 + (the one deep body added)`, i.e. between 11 KB and 53 KB — a bound rather than a number,
+but enough to say the spread is dominated by code *leaving* the core, not by the deep body
+arriving. That is the redistribution reading, and it is what the `nm --print-size` sum should
+show: `c0`'s out-of-line `<float, 2, ·, scorch_simd<float>>` symbols plus its core should track
+`dp2`'s core plus its own, not sit 11 KB above them.
+
+One correction to a hopeful reading: the window-3-with-depth-8 prediction cannot ride along in the
+existing per-symbol emission check. That instrument (`dis_symbols.py <before.so> <after.so>
+[substring]`) compares two objects that already exist; it does not build configurations, and the
+comment at `:4268-4269` describes it checking the *shipped* object's dead dispatch. Confirming the
+prediction needs an object built with `LO=HI=3, UNROLL=8`, which is a build either way. It is not
+worth one: the mechanism is already determined by six objects matching six predictions with no
+free parameter, and a seventh would be confirmation of a case nobody ships. The prediction is
+recorded so that it is pre-registered if such an arm is ever built for another reason.
