@@ -28390,7 +28390,30 @@ than stated in a comment and checked in a shell. The analyzer recovers the gener
 consecutive rows instead of assuming one, reports `c_d` beside the verdict, and says explicitly
 that the shrinkage reading is unverified when the orders file is absent. Exercised on four inputs:
 the real order (OPTIMAL both halves), an ascending base (DEGRADED at 2.5), a mid-range base
-(DEGRADED at 1.5), and a missing file. The bar table prints all 14, both halves, and the 2-pass row relabelled UNBALANCED, and
+(DEGRADED at 1.5), and a missing file.
+
+**Two preconditions, and the second is not implied by the first.** Recovering the generator
+establishes that *some* single permutation maps each row to the next; it does not establish that
+the permutation is a full 7-cycle, and `c_d` needs one, because the classes `d = (b-a) mod 7`
+presuppose a single cyclic order over all seven arms. A permutation of cycle type (4,3) maps every
+row to the next just as consistently as a 7-cycle -- verified -- so without a separate orbit-length
+gate `c_d` would be six plausible numbers indexed against a labeling that does not exist. The gate
+is exact for a reason needing no enumeration: among 7 points a single orbit of length 7 *is* the
+whole set, so `orbit(x) == 7` for any one x iff sigma is a full 7-cycle.
+
+The orbit gate and the position check overlap in coverage while testing different things, and both
+are load-bearing. Of all 5040 permutations of 7 points only the 720 full 7-cycles give a Latin
+square -- 0 across all fourteen other cycle types, for a random base as well as an ascending one --
+so position balance happens to be an exact detector for the same condition. Deleting either because
+"the other covers it" reopens the hole, and the analyzer now says so in place.
+
+**Pooled pair balance is the weaker statement, so it is reported per class.** The (4,3) design uses
+only 25 of 49 arm-position cells and is thoroughly broken, yet its pooled precedence still reads a
+flat `[7]`. A wrong-but-symmetric design gives a flat pooled count. What actually shows the reversal
+did its job is the per-class complement, `c_d(first) + c_d(second)`, which reads `[7,7,7,7,7,7]` on
+the real order. The severity note is also printed per failure class: a base-choice failure downgrades
+the halves comparison to suggestive, while a generator or position failure voids it, and leading
+with the base explanation when no base failed would send a reader to inspect something intact. The bar table prints all 14, both halves, and the 2-pass row relabelled UNBALANCED, and
 the shrinkage prose appears only when halves were actually printed. The halves also disagree with
 each other by however much a 7-pass bar varies, which is the uncertainty on the bar itself.
 
