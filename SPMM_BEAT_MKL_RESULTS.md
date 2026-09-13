@@ -28532,14 +28532,38 @@ bootstrap's own resampling spread beside each floor, with the standing rule atta
 within that spread of a floor boundary has not cleared it. On the full-population floor at n=89 the
 spread is ~0.001, so the main floors are stable; it is the small subgroups where it binds.
 
-**Conservation, at the two places a denominator is formed by skipping.** `attempted = tested +
-skipped` is now printed beside every behind-MKL count, and `pair()` records the same decomposition
-for the n behind every CI. Stated precisely rather than oversold: neither can fail on any *data* —
-every loop iteration either skips or counts, so the identity holds by construction, and the assert
-is the same kind of structural invariant. Both guard a future edit that adds a skip path without a
-counter. The value is visibility: the wrong-denominator error divided by a loop count rather than
-by trials actually run, and `2000 attempted = 286 tested + 1714 skipped` printed beside the rate
-would have made that obvious on sight.
+**Conservation, and the sourcing of `attempted` decides whether it is a check at all.** `attempted
+= tested + skipped` now prints beside every behind-MKL count, and `pair()` records the same
+decomposition for the n behind every CI. The first version took `attempted` from `len(T[arm])` — a
+count of the rows present — which makes the identity a tautology: a key absent from the CSV never
+becomes an iteration, so the identity holds at the smaller number and reports nothing. Confirmed by
+deleting one key's rows, after which the line read `264 = 264 + 0` rather than failing. It is now
+sourced from the **declared** count, 89 keys from `keys.txt` x 3 widths = 267, and the counted form
+survives only as a fallback that says in the output that it cannot detect a missing cell. Same
+printed number, opposite epistemic status — the modal-versus-declared distinction from the file
+level, one level down.
+
+**And the declared form catches what the 802-row guard structurally cannot.** A row count is a
+cardinality test, and 801 data rows are equally consistent with the correct 801 distinct
+`(key, width, inner-arm)` triples and with one triple duplicated plus another missing — the
+exchange preserves the cardinality exactly. Constructed and measured: duplicating one key's rows
+and deleting another's leaves the file at exactly 801 rows while distinct triples fall to 792 and
+distinct keys to 88. The run is then silently short one matrix and double-weighting another with
+every row-level guard passing. So the seal now also counts distinct triples per file, and the
+analyzer reconciles distinct cells per arm against the declared 267. That arithmetic is the same at
+both levels — 89 x 3 = 267 and 267 x 3 = 801 — which is exactly why the two guards look
+interchangeable and are not. On this sourcing the conservation line is not display discipline; it is
+the completeness check row counting cannot perform, and it belongs with the other checks.
+
+**The reproducibility-versus-accuracy distinction on the bootstrap fix.** The order defect measured
+0.0008 on the lower bound and 0.0034 on the upper, while the same estimator's seed-to-seed spread
+at that n is 0.0061 and 0.0076 — so the defect sat *inside* the resampling noise, 2.2 to 7.6 times
+smaller. Fixing it bought reproducibility, which is a precondition for everything else, and **not**
+accuracy: the interval is no better afterwards and the limiting error is `nboot`. Stated because
+"we found and fixed a defect in the bootstrap CI" otherwise reads as the CI being good to the digits
+shown. Relatedly, the resampling spread now prints as a fraction of the CI width it came from —
+measured at 4.7% of width at n=9 and 5.8% at n=89, comparable, while the absolute figures differ
+sevenfold — so the absolute number cannot travel to a subgroup with different dispersion.
 
 **The honest limit.** A metamorphic relation cannot catch an error invariant under its own
 transformation — a wrong-but-symmetric estimator passes renaming perfectly. So this is a detector
