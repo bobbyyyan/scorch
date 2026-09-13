@@ -29022,3 +29022,57 @@ not make the one remaining predicate correct — that is what the test cases are
 Sealed at 135 files, 134 of 134 verifying, manifest
 `729245365b5454a3eb1f825349e28d8a8d5ba0a9f8761faddbb36f6b7de4e274`. All four earlier captures
 unmodified.
+
+### Correction 5: the seed count was never the parameter
+
+The independent reading proposed that our disagreement over whether the k=32 boundary pair is
+seed-deterministic is `nboot` — 10000 on their side against this pipeline's pre-registered 4000.
+Confirmed. Their mechanism for it is not, and the consequence they drew from it does not hold.
+
+**The sweep, 200 seeds at each `nboot`, and the two runs agree.**
+
+| `nboot` | mine | theirs |
+|---|---|---|
+| 500 | 145/200 | 156/200 |
+| 1000 | 163/200 | 176/200 |
+| 2000 | 179/200 | 181/200 |
+| **4000** | **193/200** | — *(pre-registered here)* |
+| 5000 | 195/200 | 196/200 |
+| 10000 | 199/200 | 200/200 |
+| 20000 | 200/200 | 200/200 |
+
+Monotone on both sides, agreeing within a few counts wherever both ran. So a stability claim is
+underdetermined without `nboot`, and more seeds cannot repair it: **the seed count measures the
+rate, `nboot` sets it.**
+
+**Their mechanism is the wrong statistic; the right one is predictive.** The proposed rule —
+deterministic once the seed *range* of the deciding bound drops below its distance from parity — is
+false at every `nboot` including the deterministic one (range 0.000337 against a margin of 0.000321
+at 200/200). A range is wrong twice: two-sided, when only the excursion *toward* parity can flip
+anything, and it grows with the number of seeds drawn, which is no property of the estimator. The
+statistic it was standing in for is σ of the deciding bound:
+
+| `nboot` | σ(hi) | margin | m/σ | Φ(m/σ) | observed |
+|---|---|---|---|---|---|
+| 500 | 0.000779 | 0.000367 | 0.47 | 0.681 | 0.725 |
+| 2000 | 0.000230 | 0.000297 | 1.29 | 0.902 | 0.895 |
+| 4000 | 0.000170 | 0.000286 | 1.68 | 0.954 | 0.965 |
+| 10000 | 0.000104 | 0.000301 | 2.90 | 0.998 | 0.995 |
+| 20000 | 0.000073 | 0.000321 | 4.42 | 1.000 | 1.000 |
+
+Φ(m/σ) predicts the rate to within 0.01–0.09, and σ falls ×0.70–0.74 per doubling against the
+bootstrap's 1/√2 = 0.707. Determinism is m/σ passing about 3, which lets a run be **sized**:
+`nboot ≳ (3σ₀√n₀/m)²`.
+
+**And the consequence does not hold: the control verdict does not move with `nboot`.** They wrote
+that freezing `nboot` froze every bound-dependent verdict, and that the k=32 control verdict
+reproduces 96.5% of the time. That 96.5% belongs to one of the 21 pairs in the exclusion count.
+Measured directly — the pre-registered control verdict at 40 seeds × 7 `nboot` values × 3 widths —
+**21 of 21 cells unanimous, control clean = NO, 40 of 40 everywhere.** The `nboot` sensitivity is
+real and lives entirely in the parity-exclusion count, already withdrawn as not being a count. A
+parameter sensitivity is scoped to the statistics that depend on it, and that scope is worth
+establishing before treating it as a cost to the conclusion.
+
+Sealed at 140 files, 139 of 139 verifying, manifest
+`632005f7986e39e705ffee88e170ac7e0221461e25984dbce4e8664bf9f5c641`. All five earlier captures
+unmodified.
