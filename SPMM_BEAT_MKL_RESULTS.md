@@ -30937,9 +30937,35 @@ Measured with `recip_c203.py`, which reports |1/(num/den) − (den/num)| for eve
 | chain202 ledger, 14 shared passes | 1.5e-4 | 0.0067 |
 | chain203 snapshot, 6 shared passes | 2.0e-3 | 0.0658 |
 
-**The size is pass-count dependent and has no general bound** — it scales with the spread of the two
-middle values, so it is a property of the data and not only of the estimator. At 6 shared passes the
-aggregate gap reaches 88% of the smallest pre-registered margin (0.0023). A peer independently found
+The two rows differ by 13× because of the pass count, not the data — see the sweep below.
+
+**The 88%-of-a-margin figure is a 6-pass artefact and must not be carried to the read point.** The
+defect is exactly **zero at odd pass counts** — a median over an odd count is a single element, and
+reciprocating reverses the order so that element maps to its own reciprocal — and it decays with the
+count at even ones. Swept over prefixes of chain202's 14 passes, with the log-space form beside it:
+
+| passes | parity | registered | log-space |
+|---|---|---|---|
+| 2 | even | 1.2e-2 | 1.1e-16 |
+| 4 | even | 2.5e-3 | 2.2e-16 |
+| 6 | even | 1.8e-3 | 2.2e-16 |
+| 8 | even | 4.7e-4 | 2.2e-16 |
+| 10 | even | 3.2e-4 | 1.1e-16 |
+| 12 | even | 1.7e-4 | 2.2e-16 |
+| 14 | even | 1.5e-4 | 2.2e-16 |
+| any odd | odd | ~1e-16 | ~1e-16 |
+
+So at 6 passes the gap is 1.8e-3 — reproducing the snapshot figure on independent data — and by 14 it
+is 1.5e-4, about **6% of the smallest margin rather than 88%**. chain203 will be read at 22, which is
+even, so the defect is live there but smaller again; the figure Bobby should see is the one measured
+at 22, and `recip_c203.py --sweep` prints it with the parity of the count beside it. **Without the
+parity stated a later reader finds the battery reporting ~1e-16 at an odd prefix and concludes the
+defect was imagined.**
+
+The decay is monotone across all seven even prefixes on this reduction (0 rises in 6 steps) and a
+peer reports it *non*-monotone on theirs. Either way it cannot be extrapolated: the gap is set by the
+spread of whichever two values happen to land in the middle, which no trend predicts. A peer
+independently found
 the same defect in their own nesting, smaller by 5× to 140× depending on the pair, and confirmed the
 mechanism quantitatively: for one pair the two middle values are 0.98863959 and 0.99011021, and the
 arithmetic-versus-harmonic gap that spread predicts, `(d/2x)²`, is 5.52e-7 against an observed
@@ -30961,7 +30987,9 @@ verdict quantity is untouched. **Adopting the log-space reduction is a pre-regis
 is Bobby's to make, not a peer review's and not this document's.** The case for it: it changes no
 number materially, it removes an invisible direction convention, and it makes every reciprocal pair
 in this document self-consistent. The case against: it is a change to a registered estimator made
-while a measurement is in flight.
+while a measurement is in flight — and, on the sweep above, the defect it removes is worth about 6%
+of the smallest margin at 14 passes and less at 22, which is a smaller stake than an earlier draft
+of this section implied.
 
 ### Two readings that look identical and are not
 
