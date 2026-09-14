@@ -32571,3 +32571,42 @@ most bins — 18 of 22 strata are unusable — yet the four that are usable incl
 mechanism should be largest, and it is. The honest statement is that this stratification is
 **mostly unreachable and not uninformative**: its single above-floor effect is the largest
 reduction-independent reading in the chain.
+
+### The population-is-a-convention defect, third instance, and the cost escalated
+
+Three times in one session, on three unrelated questions, a population was defined by something
+that merely *correlates* with the thing being counted:
+
+| # | filter | held | actual | cost |
+|---|---|---|---|---|
+| 1 | `*/harness/*.py` | 3 | **17** argv-forging files | a miscount, and an instrument that read 15-of-15 UNDETERMINED outside its own glob |
+| 2 | `*/worktrees/*/` | 102 | **214** pinned git worktrees | a data-loss exposure reported at half size |
+| 3 | `ambient 2..23` | 20 | **22** strata present | **a false negative on a real effect** |
+
+The third was a literal `if a < 2 or a > 23: continue`, written because the step had been *named*
+"the identity population stratified across ambient 2–23" — a range inherited from chain202's
+stratum description and implemented as a hard bound without checking which ambient values this
+corpus contains. The stratum carrying the largest effect sits at **ambient 1**, one below the
+filter's floor.
+
+**The escalation is the point.** The first two produced numbers a reader could re-derive. The
+third produced a conclusion — *"the identity population gives no evidence of ambient-dependence"* —
+that was the opposite of what the data says, from an enumeration the filter had truncated at both
+ends. A miscount is recoverable; a false negative closes a question.
+
+**And the other end of the filter hid the finding a second way.** The dropped high stratum,
+ambient 24 with n=85, is the *same 85 cells* already measured under a different heading as the
+different-argument null. Verified: the two cell sets are identical, and the two readings are exact
+reciprocals — `ov24/ovp` 0.994462 against `ambient/ov24` 1.005569, difference **0.00e+00** under
+`exp(median(log r))`. So one stratum was excluded by a range bound and another was already in hand
+under another name, which is how a 22-stratum enumeration reported 20.
+
+*(That exact zero is itself a demonstration of the reciprocity result recorded earlier: the
+log-space reduction is reciprocal-invariant by construction, where the linear median is off by up
+to 3.3e-05 at 22 passes.)*
+
+**The rule, stated so it is checkable rather than agreeable: run the defining property over the
+complement before believing the enumeration.** `*/harness/` is where harnesses are usually kept.
+`*/worktrees/` is where worktrees are usually kept. `ambient 2..23` is where ambient usually lands.
+None of the three is what the thing *is*, and in all three cases the complement was one command
+away — `git worktree list`, an AST walk over the whole cache, `sorted(set(resolved[ovp]))`.
