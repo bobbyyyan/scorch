@@ -30068,21 +30068,88 @@ The `ov2 declines` conjunct in the arm-specific definition is what excludes thos
 carrying the work while the prose credited single-worker-ness — an unnamed conjunct doing the
 lifting, the same shape as chain202's deciding-bound error.
 
-**And the 9 cells are the most mechanically informative population in the corpus, not a wrinkle.**
-Ambient delivers 1 on all nine, and on every one of them **all ten** override arms disagree — not
-"some arm". What they deliver is:
+**The 9 cells are an extreme corner of a large clean population, and an earlier draft called them
+the only one.** Ambient delivers 1 on all nine and on every one of them **all ten** override arms
+disagree — not "some arm" — each delivering exactly its override, 2/4/8/16/24, with every b-arm
+matching its base. What was wrong was the uniqueness: that draft said this is the only place in the
+267 where request-to-delivery is the identity across the ladder, having only ever evaluated the
+predicate **on the nine candidates**. Evaluated on the corpus:
 
-| cell | ov2 | ov4 | ov8 | ov16 | ov24 |
+| population | cells | distinct keys |
+|---|---|---|
+| identity map holds across all five rungs | **148 of 267** | 60 |
+| of those, ambient delivers 1 (the nine) | 9 | 7 |
+| of those, ambient delivers 24 | **61** | 35 |
+
+So the clean dose-response population is 16× larger than claimed and spans ambient deliveries from 1
+to 24, which is *better* than a single-worker baseline because it separates "the request was
+honoured" from "ambient was wrong". The supporting reason in that draft — elsewhere the cap binds,
+the remembered ceiling floors the result at 32, or the request is declined — describes the 119 cells
+without the identity, and covers 106 of them (24 floored, 82 declined, 13 neither). It was written
+as though it described 258.
+
+**And the sample-size argument inverted.** "n = 9 clears the floor of 8 by one cell" counts cells.
+The nine come from **7 distinct matrices** — `adder_dcop_16` and `TSOPF_RS_b300_c2` each contribute
+k=2 and k=4, and cross-width cells of one matrix are not independent units (measured directly: the
+cross-width control-residual correlations run +0.002 to +0.140). Seven is *below* the floor, not
+above it. It is 6 if `ss/Pd/Pd_b` and `ss/Pd_rhs/Pd_rhs` are one problem, on which see the corpus
+scan below.
+
+#### The corpus holds 89 keys and at most 87 distinct problems
+
+Asking whether two keys are one matrix is worth doing corpus-wide rather than for one pair. On
+(rows, nnz) alone, **89 keys collapse to 83 shapes** — four groups share a shape:
+
+| shape | keys |
+|---|---|
+| 14454 rows, 147972 nnz | `case9`, `case9_A_02`, `case9_A_03`, `case9_A_11` |
+| 825 rows, 70806 nnz | `Meszaros/aa03`, `Meszaros/aa3` |
+| 8081 rows, 6323 nnz | `Pd/Pd_b`, `Pd_rhs/Pd_rhs` |
+| 5308 rows, 389 nnz | `hydr1c_Zeros_36`, `hydr1c_Zeros_69` |
+
+Shape equality is necessary and not sufficient, so two discriminators separate coincidence from
+duplication. `resolved` is deterministic in the matrix, so a disagreement would *prove* difference —
+it agrees in all four groups, which means it has no discriminating power here and only the second
+test does anything. That one is the ratio of ambient median times against the A/A floor measured at
+0.75% / 2.11% / 4.35% by width:
+
+| group | worst ratio | verdict |
+|---|---|---|
+| `case9` × 4 | 1.1401 at k=32 | **distinct** — far above the floor |
+| `aa03` / `aa3` | 1.1167 at k=4 | **distinct** — above the floor |
+| `Pd_b` / `Pd_rhs` | 1.0100 | at the floor, consistent with one problem |
+| `hydr1c` pair | 1.0148 | at the floor, consistent with one problem |
+
+So two of the four groups are *proven* distinct and two are consistent with duplication but not
+proven — a ratio at the floor cannot distinguish "identical" from "different and quiet". The corpus
+therefore holds between **87 and 89 distinct problems among 89 keys**, and the honest count for any
+independence assumption is 87. Not 83, which is what a shape scan alone would have reported.
+
+#### The dose-response, which is not the shape the delivery table suggests
+
+Delivery being monotone in the request says nothing about the response. On chain202's **completed**
+14 passes — so this is not an interim look — median speedup against ambient, pass-paired per cell:
+
+| stratum | ov2 | ov4 | ov8 | ov16 | ov24 |
 |---|---|---|---|---|---|
-| all 9 | 2 | 4 | 8 | 16 | 24 |
+| ambient = 1 (9 cells, 7 keys) | 1.01 | 0.99 | 0.94 | **0.78** | **1.49** |
+| slower than ambient on | 4/9 | 5/9 | 5/9 | **7/9** | 2/9 |
+| ambient = 24 (61 cells, 35 keys) | 0.31 | 0.53 | 0.89 | 1.00 | 0.99 |
+| slower than ambient on | 61/61 | 61/61 | 40/61 | 31/61 | 39/61 |
 
-**Every arm delivers exactly its override, on 9 of 9 cells, with each b-arm matching its base.**
-This is the only place in the 267 where the request-to-delivery map is the identity across the whole
-ladder: elsewhere the cap binds, or the remembered ceiling floors the result at 32, or the request is
-declined outright. So these nine are a clean dose-response population for the override — ambient
-picks one worker, and each rung gets precisely the team it asked for. At n = 9 it clears the
-sample-size floor of 8 by one cell, which is thin enough that it is reported as a mechanism reading
-and not as a band.
+Two separate readings. The **ambient = 24 stratum is a clean null**: capping below the pool costs
+time monotonically, and the two rungs at or near the pool land at 1.00 and 0.99 with 31 and 39 of 61
+cells slower — a coin flip. Where ambient already picks the pool, the override buys nothing, which
+is the expected answer and is now measured on 35 distinct matrices.
+
+The **ambient = 1 stratum is not monotone**: sixteen delivered threads are slower than a *single*
+thread on 7 of 9 cells while twenty-four are 1.49× faster. Delivery is the identity on those cells,
+so neither the cap nor the remembered ceiling is available as an explanation — the dip is in the
+timing. On a host whose pool is 24, a fall at 16 that recovers at 24 is worth a look, and it is
+invisible in the ladder tables elsewhere in this document because those normalise to 24 rather than
+to ambient. **Reported as a shape at 6–7 effective units and explicitly not a band.** These figures
+reproduce a peer's reading of the same ledger with different code, which is a code-level
+reproduction and not an independent measurement.
 
 **The two sets are disjoint by construction, not by measurement.** On a saturated cell the low rungs
 deliver 32 against a pool of 24 while ambient delivers 24, and ambient's cap *is*
