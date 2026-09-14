@@ -30920,3 +30920,64 @@ So the right label is **two estimators over the same data**, which is the weaker
 statement: the agreement is the deliberate convention variance this work relies on, not a
 reproduction. The dip at ov16 survives all three nestings (0.78, 0.87, 0.80), which is the part of
 the shape that does not depend on the choice.
+
+## The per-cell reduction is not reciprocal-invariant, and the fix is a pre-registration change
+
+`an_c203.py`'s pre-registered `how='paired'` reduces each cell with `statistics.median` over the
+per-pass **ratios**. At an even shared-pass count — 22 is, and 14 was — a median averages the two
+middle values, and the arithmetic mean of a set is not the reciprocal of the arithmetic mean of its
+reciprocals. So a band's point estimate depends on which arm is the numerator, by an amount the
+output never states, and a reader comparing a band against its reciprocal elsewhere finds a
+disagreement that is arithmetic rather than physical.
+
+Measured with `recip_c203.py`, which reports |1/(num/den) − (den/num)| for every pair:
+
+| data | worst aggregate reciprocal gap | worst per-cell gap |
+|---|---|---|
+| chain202 ledger, 14 shared passes | 1.5e-4 | 0.0067 |
+| chain203 snapshot, 6 shared passes | 2.0e-3 | 0.0658 |
+
+**The size is pass-count dependent and has no general bound** — it scales with the spread of the two
+middle values, so it is a property of the data and not only of the estimator. At 6 shared passes the
+aggregate gap reaches 88% of the smallest pre-registered margin (0.0023). A peer independently found
+the same defect in their own nesting, smaller by 5× to 140× depending on the pair, and confirmed the
+mechanism quantitatively: for one pair the two middle values are 0.98863959 and 0.99011021, and the
+arithmetic-versus-harmonic gap that spread predicts, `(d/2x)²`, is 5.52e-7 against an observed
+5.58e-7. So the defect is understood to 1%, not merely plausible.
+
+**The exact fix is one line: take the same order statistic in log space.** `exp(median(log r))`
+rather than `median(r)`. Negating every log reverses the order and negates the mean of the two middle
+values exactly, so it is reciprocal-invariant at every pass count — measured at 0 to 2e-16 across
+every pair on both datasets, against 1e-4 to 2e-3 for the pre-registered form. It also *matches the
+aggregation already in use*: cells are combined with a geometric mean, which is a mean in log space,
+so an arithmetic reduction inside a geometric aggregation is the inconsistency. Centres move by less
+than the gap removed — 0.98937490 to 0.98937463 on the peer's pair.
+
+**It has not been adopted, and that is deliberate.** The pre-registration names the paired median.
+Replacing it is an amendment however principled the replacement, and amendment 2 already set the
+precedent that a rival reduction is *printed beside* the registered one rather than substituted for
+it. So `recip_c203.py` measures the defect and its size, runs in the verification battery, and the
+verdict quantity is untouched. **Adopting the log-space reduction is a pre-registration decision and
+is Bobby's to make, not a peer review's and not this document's.** The case for it: it changes no
+number materially, it removes an invisible direction convention, and it makes every reciprocal pair
+in this document self-consistent. The case against: it is a change to a registered estimator made
+while a measurement is in flight.
+
+### Two readings that look identical and are not
+
+The ceiling-block confirmation above couples a data reading with a source reading — `kl02` at 71
+rows reading ambient 22 at k=32, against the pinned tarball's comment naming `kl02` and `nw14` as
+that block's targets. That is **structurally the same claim** as the build-versus-source check
+withdrawn earlier in this section, and the only difference is which artefact was opened: the
+withdrawn one read a local working tree, this one read `scorch_c199.tgz` itself, extracted on the
+host that ran the measurement. A peer confirms the data half independently on chain202 and reports
+the source half as unverified from their side, since they do not hold the tarball. Stated here so a
+later reader can tell the two apart without re-deriving which file each rested on.
+
+### A note on the structural counts in this section
+
+Every structural figure here — 148 identity cells, 24 saturated, 82 declined, 13 cappers, 87
+distinct problems — was computed from a **6-pass snapshot** of chain203's directory, because
+`resolved` is single-valued in all 267 cells across all 11 arms (0 multi-valued), which makes those
+counts pass-count independent by construction. They will be re-confirmed against the completed 22
+passes rather than recomputed, and a disagreement would mean the policy moved mid-run.
