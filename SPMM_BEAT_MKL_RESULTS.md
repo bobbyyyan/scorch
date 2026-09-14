@@ -29997,6 +29997,13 @@ one extra mechanism that can only raise, so `resolved[ov24] >= resolved[ovp]` fo
 data. It is a theorem *given* `override == pool`, so it is a statement about a 24-thread pool and
 not about the policy; a host whose pool differed would not force it.
 
+Independent corroboration turned up where it was not looked for: the per-population coverage table
+in the interval-level section below groups cells by rung and direction for an unrelated purpose,
+and `ov24/LOWER` reads **n = 0 at all three widths** there. That script reads `resolved` only to
+form its groups, knows nothing about the cap, and had no way to produce an empty group in that one
+position by accident. An empty row in a coverage table is a poor place to notice a theorem, but it
+is a construction with no stake in the answer.
+
 Second, delivery is neither monotone in the override nor `min(request, cap)`. Cells resolving below
 ambient, by rung and width:
 
