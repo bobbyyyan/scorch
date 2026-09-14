@@ -31714,3 +31714,49 @@ built for one refusal reaching an earlier one; the broken-baseline guard preempt
 guard; the refusal pre-filter short-circuiting the path predicates it was measured beside; four
 checks hidden behind earlier ones in the analyzer census. Standing form: order guards so the
 cheapest-to-satisfy precondition is verified first, and assert **which** refusal fired.
+
+### The fixes were not applied to every copy
+
+The harness population is not one directory. There are **17 harness directories** in the cache
+and the named scripts exist in several milestones each, so reconciling against the current one
+cannot see a stale copy in an earlier one — and a stale copy carries the original defect, is
+never run again, and nothing points at it. `strategy_correctness_reach.py`, which the previous
+section called a review-only name, is on disk in three other milestones; that conclusion was
+drawn from looking in one place.
+
+A file-level test — the file contains a ledger literal *and* contains `os.environ.get`,
+`argparse` or `sys.argv` *somewhere* — clears all 45 files that hold a ledger path. It is
+necessary and not sufficient, because it never establishes that the **specific** literal is the
+overridable one. The per-literal version walks each path constant outward and asks whether that
+constant is a default of an override construct:
+
+```
+17 harness dirs, 155 .py files scanned, 47 ledger literals
+11 files hold a literal that sits inside no override at all
+```
+
+`workspace-confound/harness/suppress_probe.py` holds three, and uses `sys.argv` elsewhere in the
+file, which is exactly how the co-occurrence test clears it:
+
+```python
+REACH = os.path.expanduser("~/.cache/scorch-codex/two-pass-position/harness")
+sys.path.insert(0, os.path.expanduser(".../workspace-confound/worktrees/base-5113e0c/src"))
+TREE  = os.path.expanduser(".../workspace-confound/worktrees/base-5113e0c")
+```
+
+So "caught four times" counts **fixes applied to four specific files**, not the absence of the
+defect from the tree. These are historical ledger artefacts under `SHA256SUMS` and are not being
+edited — the finding is about what the record means, not a repair to make.
+
+My own predicate needed the same correction twice over on the way: it first matched any string
+containing `scorch-codex`, so a docstring *explaining* where the ledger lives counted as a
+hardcoded path, 2 of the first 15 hits. **A literal that mentions a thing is not a use of it** —
+the mention-versus-use error for the third time tonight, this time in the predicate written to
+avoid it.
+
+**The symmetry, which is the general lesson.** A reconciliation compares two sets, and a
+one-spelling predicate on either side biases it in a different direction: on the *fix* side it
+under-reports the fixed population and manufactures apparent violations; on the *name* side it
+under-reports the named population and manufactures apparent gaps. Both of tonight's errors —
+keying on `os.environ.get`, requiring `\w+\.py` — are that. Enumerate by the thing that cannot
+be spelled two ways: the literal path on one side, the file on disk on the other.
