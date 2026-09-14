@@ -31411,3 +31411,53 @@ disagreeing cross-check is read as indicting the original, so a defective one do
 fail to confirm — it manufactures a defect in a working instrument, which is what the first
 version of the AST audit nearly did. Two deliberately broken scanners run against the real
 sources, one under-counting (11 files disagree) and one over-counting (2), and both are caught.
+
+### Correction: the `TAIL` leak does not exist
+
+The previous section reports that a prefix assignment to a shell function persists after the
+function returns, so `TAIL=24 stage x` was setting the abridgement window for every later stage
+that did not set its own. **That is wrong.** It was asserted from recollection of shell semantics
+and never tested.
+
+Tested: in bash 3.2.57, which is the shell this battery runs under, `TAIL=26 f` does not persist
+past `f`. The behaviour is real only under `set -o posix`, which the battery never enables. The
+battery's own log agrees — of **13 abridged stages, 0 used a window other than their own declared
+one**, and **10 stages carry no `TAIL` and follow one that sets it**, every one of them using the
+default 14. The follow-up explanation offered at the time, that nothing had been misread because
+every later stage happens to set its own window, was wrong in the same breath: ten do not.
+
+The `unset TAIL WANT_RC` added alongside is harmless and defensible under POSIX mode, but it
+fixed nothing, and the three abridgement incidents are **one design weakness, not one bug with a
+known fix**. An attempt to collapse them to a single root cause would have been wrong.
+
+### The consumer set, derived rather than grepped
+
+"All four snapshot consumers refuse at `--min-passes 22`" — four came from grepping the battery
+for stages passed `$LIVE`. That is a pattern match with precisely the completeness problem the
+AST pass had closed for refusals an hour earlier, and it is the wrong tool for the same reason.
+
+`readers_c203.py` counts every call that opens the corpus, by any route, and classifies each:
+
+```
+41 scripts read the corpus; 18 belong to this chain. Of those, 5 are protected
+against reporting a number from the wrong rotation -- 4 through the shared helper
+and 1 by a pass-count guard of its own; the rest cannot go stale (3 read a sealed
+directory, 3 construct a corpus, 6 build and read back their own fixture).
+```
+
+The one with its own guard is `an_c203.py`, whose `--min-passes` produced the "6 passes, below
+the 12" refusal that surfaced this entire family. An intermediate hand count of five was also a
+guess that happened to land: `an_c200` and `an_c202` carry the same guard but belong to earlier
+chains, so ordering the classifier by mechanism before era counted them as protected consumers of
+a corpus they will never read. Era has to be decided first.
+
+`UNCLASSIFIED` is a refusal rather than a shrug, and the scan root is an argument — wired to its
+own directory the census could only ever report the clean case, which is the defect it exists to
+detect, one level up. It carries a guard, so it is a census member: **25 refusals across 13
+scripts, 25 FIRES, 0 UNTESTED, regex 25 == AST 25.**
+
+**Coverage and protection are different numbers.** 25 of 25 refusals firing says every guard
+works. It says nothing about whether a reader calls one: a consumer that forgets `--min-passes`
+is unprotected by a guard the census scores as fully tested. Both are printed, with a line saying
+so, because the battery deliberately names no minimum for its own stages and `final_c203.sh`
+names 22 — the guard is inert by design in one caller and binding in the other.
