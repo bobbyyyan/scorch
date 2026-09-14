@@ -31978,3 +31978,48 @@ corpus. All four caller sites here resolve; a caller that computes its callee's 
 report UNDETERMINED. The `subprocess`/`runpy`/`exec` route carrying a constant tree **without
 touching argv** (51 invocation sites, no reliable count of violations) is still not covered by
 any of this, and is still recorded as unmeasured rather than zero.
+
+### The option form, and where 61 comes from
+
+**A callee can take its tree as an option, and the test collapsed that into "no tree".**
+`tree_slot` returned two outcomes — an argv index, or nothing — so a callee taking `--tree`
+reached the same CLEAR branch as a callee taking no tree at all. A forged
+`sys.argv = [prog, "--tree", TREE, "--out", args.out]` would then read as the legitimate
+clearance that `frontier_untaught_control.py` earns. Fourth instance of the same laundering,
+now through the option/positional distinction rather than through a slot.
+
+The contract is now three-way — positional index, option name, or none — and the option branch
+checks the element *after* the flag:
+
+| fixture | verdict |
+|---|---|
+| forge `["tilefix_differential.py", "--tree", TREE, "--out", args.out]` | **FLAG** — value after `--tree` is a constant |
+| same with `os.path.abspath(args.tree)` | CLEAR — derives from own input |
+
+Real corpus unchanged: **one flagged site.**
+
+One detail differs from how this was reported to me, and it makes the hole slightly worse.
+`blocker1-tilefix/harness/tilefix_differential.py:99` declares
+`add_argument("--tree", required=True, help="worktree root to measure")` but **never calls
+`assert_tree`**. So the branch was being reached by a file that plainly takes a tree *and* has
+no provenance assert at all. The detector now recognises an argument named `tree` as a tree
+contract independently of `assert_tree`, which is why it fires here.
+
+**Where the 61 comes from, since it is load-bearing and should be re-derivable.** Population:
+155 files in the 17 `*/harness` directories.
+
+| reading | count |
+|---|---|
+| text `assert_tree(` appears anywhere | 62 |
+| **AST: ≥1 call to a function named exactly `assert_tree`** | **61** |
+| contains `def assert_tree` | 9 |
+| definer files that *also* call it | 9 |
+
+The 62 and the 61 differ by exactly one file: `decision-survey/harness/probe_missing_cell.py`
+defines and calls **`_assert_tree`**, and the substring `assert_tree(` matches inside it.
+Mention versus use for the fourth time in this thread, now as substring-versus-identifier.
+
+Two corollaries. Subtracting the 9 definer files to get "genuine callers" removes 9 real
+callers, because **all 9 define and call**. And the single unparseable file contains no
+`assert_tree` at all, so it does not move this count — that was worth checking rather than
+assuming, since it moves several others.
