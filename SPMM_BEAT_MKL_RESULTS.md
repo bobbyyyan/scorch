@@ -31360,3 +31360,54 @@ presented as a passing stage and a plausible number.
 
 The table now ends in `BATTERY PASS -- 16 of 16 stages exited 0` and the script exits nonzero
 otherwise, so "green" is a claim the battery makes rather than one a reader assembles from rows.
+
+### Fail closed on the pass count, and a positive control for the status column
+
+Three claims tonight were built on a local snapshot holding six passes while the run had landed
+fifteen, and each was caught by someone writing a sentence about it. A sentence does not survive
+the next reader. One stage caught it mechanically instead — `nbootstab`, and only by accident of
+carrying a required pass count of its own, which is what surfaced the whole family.
+
+`snapshot_c203.py` gives that property to every stage that reads the corpus, at two levels:
+
+- `stamp()` — unconditional. Each stage names the rotation its numbers came from.
+- `require()` — fails closed at a minimum **the caller names**. These diagnostic stages have no
+  intrinsic minimum; the requirement belongs to the claim being made, not to the code, so a
+  default here would have been a fabricated number. `final_c203.sh` names 22 for all four, and
+  the battery names none, which is what separates a self-test from a result.
+
+All four refuse against the six-pass copy at `--min-passes 22` and run clean with no minimum.
+
+**The fix re-created the blind spot it was closing.** Moving the refusal into a shared helper
+made it invisible to a per-file scan of the four scripts that reach it — the exact class this
+census exists to find, produced by the act of removing a duplicate. `snapshot_c203.py` is now a
+census member: **24 refusals across 12 scripts, 24 FIRES, 0 UNTESTED, regex 24 == AST 24.**
+
+**And the stamp was printed first, so abridgement cut it.** The line whose whole purpose is to
+stop a six-pass number being read as a twenty-two-pass number was the line the log threw away —
+the third time in one evening that abridging ate the thing qualifying a number, and this time
+the victim was written two hours after the first two were found. It now re-prints at exit,
+beside the numbers it qualifies, and is not registered on the refusal path.
+
+**A positive control for the exit column.** A status line that can only report success is not a
+status line. `rc-control` is a stage that exits 3 on purpose and must read 3; if it ever reads 0
+the column is broken again and no other row on it means anything. `stage()` gained an expected
+exit code, so a stage whose passing case is a refusal can say so instead of being excused in
+prose. The table now ends:
+
+```
+  rc-control   exit 3   as expected
+BATTERY PASS -- 17 of 17 stages matched their expected exit code
+```
+
+Two defects surfaced while writing those. The scanner regex had become two copies, the
+inventory's and the cross-check's — the drift a cross-check exists to detect, sitting inside the
+cross-check. And a prefix assignment to a shell *function* persists after it returns, so
+`TAIL=24 stage x` was setting the abridgement window for every later stage that did not set its
+own; nothing has been misread by it, only because every stage after the first happens to set one.
+
+The cross-check also has its own positive control now, which it needed more than most: a
+disagreeing cross-check is read as indicting the original, so a defective one does not merely
+fail to confirm — it manufactures a defect in a working instrument, which is what the first
+version of the AST audit nearly did. Two deliberately broken scanners run against the real
+sources, one under-counting (11 files disagree) and one over-counting (2), and both are caught.
