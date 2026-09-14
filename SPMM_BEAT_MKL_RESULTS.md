@@ -32372,3 +32372,43 @@ analysis does not use — and a reader grepping for "noise floor" lands on a col
 consumes. **Recorded rather than fixed:** both the writer and its live copy produced a sealed
 result, and editing either next to that result is the perturbation, not the repair. The choice
 is the user's — have the analysis read the column, or have the writer stop calling it the floor.
+
+### "3 of 6 exclude parity" is a statement about intervals, not about effects
+
+The saturated-A/A entry above reports 3 of 6 pairs excluding parity with deviations to 2.2%.
+That is true and it reads as three effects. Run like-for-like against the same-argument pairs on
+the same 21 cells, it is one:
+
+| pair | kind | centre [lo, hi] | dev | parity |
+|---|---|---|---|---|
+| ov2b/ov2 | same-arg | 0.9923 [0.9794, 1.0021] | **0.77%** | contains |
+| ov4b/ov4 | same-arg | 0.9999 [0.9920, 1.0082] | 0.01% | contains |
+| ov8b/ov8 | same-arg | 1.0054 [0.9979, 1.0155] | 0.54% | contains |
+| ov16b/ov16 | same-arg | 1.0034 [0.9896, 1.0158] | 0.34% | contains |
+| ov8/ov2 | cross-arg | 0.9923 [0.9841, 0.9995] | **0.77%** | excludes |
+| ov8/ov4 | cross-arg | 0.9880 [0.9804, 0.9950] | 1.20% | excludes |
+| ov16/ov4 | cross-arg | 0.9778 [0.9485, 0.9993] | 2.22% | excludes |
+
+**`ov8/ov2` and `ov2b/ov2` have the same centre — 0.9923, deviation 0.77% — and differ in verdict
+only because the same-argument interval is wider.** Its exclusion is a narrower interval, not a
+larger effect, and its effect size *is* the largest same-argument deviation measured on the same
+cells. So:
+
+- **ov16/ov4 at 2.22%** — 2.9x the same-argument scale, the one pair clearly above arm identity
+- **ov8/ov4 at 1.20%** — 1.6x, marginal
+- **ov8/ov2 at 0.77%** — at the floor, not separable from arm identity whatever its interval says
+
+The substantive conclusion is unchanged — the declared argument moves the reading where delivered
+threads provably cannot differ — but it rests on **one pair, not three**, and the floor to quote
+is **0.77%**, the largest same-argument deviation on these cells, not the 2.2% maximum.
+
+This is the rule the rest of this document applies, turned on a row it had exempted: an exclusion
+is not an effect until its size is compared against a same-treatment bar on the same population.
+An interval and an effect are different objects, and "excludes parity" names the first.
+
+**The `batch` column, corrected to its stronger form.** `ours` and `oursb` are not merely
+set-equal in batch size — they are **equal cell by cell, 267 of 267**, both with 249 distinct
+values over min 1 / max 5948, while `mkl` has 213 distinct values over min 1 / max 1832 and
+coincides with `ours` on **2 of 267** cells. So the within-invocation replicate matches on
+per-cell batch as well as on code and argument, which is a stronger statement than either the
+set equality or the single-cell figure it was first reported as.
