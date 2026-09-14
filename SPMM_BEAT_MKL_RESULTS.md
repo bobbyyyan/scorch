@@ -32120,3 +32120,84 @@ contained, with 14 files and 15 sites unexamined**, 8 of them not decidable by a
 at all. No claim is made that any of the 14 is a violation; three of them are all-constant
 forges of the same syntactic shape as the one flagged, and whether that matters turns on a
 callee outside the scanned set.
+
+## chain203: the rung-wise ladder, completed rotation, sealed
+
+22 passes × 11 arms landed on redwood at 22:14:26; 242 files, 89 matrices, 3 widths, 0 readings
+refused at ingestion. The rotation is balanced as declared and as landed (110 of 110 pairs), and
+21 of 21 completed passes ran in exactly the row the orders table declares — confirmed from the
+writer's `wrote` sequence, which is an observation, not from the bracket, which is an echo of
+`$ORDERS` and could not have disagreed.
+
+**One positive finding out of 45 (width, rung, group) rows.**
+
+| width | rung | group | n | ambient/X | band | verdict |
+|---|---|---|---|---|---|---|
+| **32** | **ov24** | **HIGHER** | **25** | **1.1806 [1.0768, 1.2949]** | 0.0044 | **X FASTER by 18.1%** |
+| 2 | ov24 | HIGHER | 31 | 1.0110 [0.9314, 1.1093] | 0.0126 | no power |
+| 4 | ov24 | HIGHER | 31 | 0.9901 [0.9234, 1.0716] | 0.0067 | no power |
+
+The k=32 `ov24/HIGHER` group is **set-identical to chain202's ADOPT group** (digest
+`1ec8352efdd15bc6`), so this is the composition-adoption clause raising the team above ambient,
+not the cap. At override == pool the cap cannot bind, which is why the LOWER group is empty at
+all three widths — a theorem given `override == pool`, and a theorem about *this host*, whose
+pool is 24.
+
+**Everything the cap does is negative, monotonically in how hard it caps.** On the LOWER groups,
+where the override clips the team below ambient:
+
+| rung | k=2 | k=4 | k=32 |
+|---|---|---|---|
+| ov2 | −162.2% | −168.6% | −187.3% |
+| ov4 | −60.4% | −63.6% | −71.7% |
+| ov8 | −12.0% | −8.4% | −9.0% |
+| ov16 | no power | no power | no power |
+
+So the ladder reads: **capping below the pool is harmful and the harm scales with the cap;
+raising above ambient is worth +18.1%, and only at k=32.** The width dependence is the part
+that needs a second host before it is a claim about the kernel rather than about redwood.
+
+**Three caveats attached to the 18.1%, none of which is a reason to discard it.**
+Percentile-interval non-coverage at these group sizes runs 0.069 to 0.090 against a nominal
+0.050 — 1.4x to 1.8x — measured by an independent Monte Carlo construction on this run's own
+A/A pool (n=1335, kurtosis 17.63). The finding sits at n=25, where empirical non-coverage is
+0.080. Its interval `[1.0768, 1.2949]` clears parity by far more than that inflation, but the
+nominal 95% is not 95%. Second, the seed-stability sweep at nboot=2400 leaves 2 of 83 rows
+decided by the resampling rather than the data; **neither is this row.** Third, the
+pre-registered per-cell reduction carries a reciprocal-direction gap of 9.04e-05 in aggregate,
+4% of the smallest pre-registered margin — reported, not corrected, because changing a
+pre-registered estimator is not this script's call.
+
+### The seal
+
+`chain203-rungwise-redwood`, 257 files, manifest 256 lines, **256 of 256 report OK**, manifest
+digest `ca1a6cadee317690938f18cf04389f48f06ef9d9c56ee70c3c599129e54f0424`. Verified by requiring
+the OK count to *equal* the manifest's line count, not by the absence of `FAILED` — nine
+manifests in this tree are `cksum` output, on which `shasum -c` prints zero OK **and** zero
+FAILED. Field 1 is 64 hex characters, so this one is genuinely SHA-256.
+
+**With a negative control, because a verification that has never failed is not a verification:**
+appending one byte to `c203_analysis.txt` moved the count to 255 of 256; restoring it returned
+256 of 256.
+
+Data guards, all passing on declared values rather than observed modes: 242 of 242 files
+(11 arms × 22 passes); every file exactly 802 rows against 89 keys × 3 widths × 3 inner arms + 1
+header, derived from the three files that declare those factors; every file 801 **distinct**
+`(key,k,arm)` triples, which the row count structurally cannot check; and three-way agreement
+between design, the writer's own `wrote` accounting (242 of 242 at 801), and the file lengths.
+The corpus key list matches the sealed copies from chain198, chain199, chain200 and chain202;
+**chain201 differs**, which is recorded rather than explained.
+
+**Two defects in my own seal script, both caught by its positive classifier rather than by exit
+status.** The analysis was first reported `UNKNOWN -- truncated or killed mid-write` when it had
+completed fine: the classifier looked for chain202's `END OF ANALYSIS` marker, and `an_c203.py`
+has **no unconditional terminal marker** — it prints a verdict-specific tail and leaves through
+`sys.exit("REFUSE: ...")` on the other path. So "COMPLETE" here means "reached the no-refusal
+tail", which coincides with end-of-main only because nothing follows it. And the metamorphic
+stage reported `3 declared, 0 reported a verdict` because the seal passed a positional where
+`meta_c203.py` takes `--dir`; that reading was *correct* — the relations genuinely did not run.
+Fixed, it reports 3 of 3 declared relations present across 6 verdict lines, 0 VIOLATED. The
+count-equality guard was replaced by a **set-of-names** comparison, because each relation runs
+in two contexts and a count equality refuses a correct run while a set comparison still catches
+the defect that guard exists for: a declared relation that never ran cannot appear in the output
+being counted.
