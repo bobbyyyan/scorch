@@ -30449,3 +30449,104 @@ a change to this code — a flag would be the licence the scope confusion alread
 Stage 1, the partition, the refusal paths and everything else whose answer comes from `resolved` or
 from filenames rather than from `ms` are read at any prefix, which is why reading the partition at
 six passes was sound.
+
+## The bootstrap percentile interval's realised level, and what it does and does not change
+
+The bands in this document are 95% bootstrap percentile intervals on a geometric mean over cells.
+That nominal 95% is an assumption, and at the group sizes this design actually produces — 24 to 64
+cells — it is wrong in a measurable direction. Two independent constructions agree that the
+intervals are anti-conservative.
+
+**Measured on chain203's own A/A pairs**, with the null imposed on the generating distribution (the
+pool of per-cell pass-paired log-ratios is centred once, before any replicate draws from it, so the
+estimand is exactly 0 and every exclusion is a false positive), 4000 replicates per row, Monte
+Carlo standard error 0.003:
+
+| pool | n | non-coverage | against nominal |
+|---|---|---|---|
+| pooled across widths and arms | 24 | 0.092 | 1.8× |
+| pooled | 29 | 0.085 | 1.7× |
+| pooled | 40 | 0.082 | 1.6× |
+| pooled | 64 | 0.080 | 1.6× |
+
+Pooling across widths and arms describes no row the design reads, though. Done per (width, group)
+on each population's own residuals and at each group's own n, 34 populations were large enough to
+characterise and **every one of the 34 is at or above nominal**, spanning 0.056 to 0.131 — 1.1× to
+2.6×. The spread is the finding: a control row and an effect row at the same width and the same n
+draw from different populations and need different corrections, so no single widening constant is
+available.
+
+**Discreteness is not the cause, measured rather than assumed.** The empirical arm resamples a pool
+of discrete atoms while a normal comparison arm draws from a continuous distribution, so a two-arm
+comparison charges any granularity cost to the tail. Expected ties in a draw of n is about
+C(n,2)/atoms: 0.21 at n=24 on the 1335-cell pool, and 1.03 on a 267-cell one. A third arm — a
+normal discretised to the same atom count, resampled identically — reads within Monte Carlo error
+of the smooth normal at both granularities (−0.007 to +0.009 at 1335 atoms, −0.008 to +0.000 at
+267). A peer independently falsified the same hypothesis from the other side, discretising a
+lognormal to 267 atoms and finding the method's behaviour unchanged. So the tail attribution
+survives: +0.014 to +0.029 against a moment-matched normal.
+
+**Three standard interval methods were measured and none reaches nominal at these sizes**: the
+percentile interval at 1.4× to 2.6×, bootstrap-t at 0.101 to 0.131, and BCa *worse* than percentile
+on this data, up to 0.167 — which is not explained by the acceleration estimate's stability, the
+bias term's stability, or pool granularity, all three of which were measured and none of which
+accounts for it. The cause of BCa's behaviour here is unknown and is recorded as unknown. A level
+calibration against the A/A pair is therefore the remaining option **by elimination**, not by
+preference.
+
+### What this does not license: a direction
+
+An earlier draft of this analysis argued that the effect is biased toward a false NO, because a
+narrow interval is less likely to contain parity and a control passes by containing parity. Both
+halves of that are true and the conclusion does not follow, because it assumes every row is equally
+affected. Per population they are not: null groups span 0.066 to 0.131 and effect groups 0.075 to
+0.123, overlapping almost completely. Both error rates are inflated, neither uniformly, and reading
+a net direction off one pooled figure is choosing the estimator to suit the question. **The claim is
+withdrawn.**
+
+### chain202's NO is not weakened by this
+
+chain202's verdict rested on its NULL control failing at all three widths, and the obvious worry is
+that an anti-conservative interval manufactured exactly that. It did not, and the quantity that
+settles it is the **joint** probability rather than an expected count.
+
+The three control rows are the same matrices at three widths in the same passes on the same host,
+so they are not obviously independent, and under strong positive dependence three failures out of
+three would stop being surprising. Measured rather than assumed, by resampling matrix keys — a key
+carries its residual at every width, so whatever cross-width correlation exists is reproduced
+without being modelled — the correlations are +0.002 to +0.140 in one construction and −0.168 to
++0.221 in an independent one, two of three negative there. **The three rows are effectively
+independent**: at 40000 replicates the observed all-three rate is 0.0006 against an independent
+product of 0.000646, a dependence factor of 1.0×.
+
+So under a true null the interval alone produces three control rows failing about **6 in 10000 times
+— roughly one run in 1700**. chain202 observed it. The interval defect accounts for a negligible
+part of that failure and the control failure is real, which leaves chain202's NO standing on the
+same ground it was written on.
+
+One construction detail worth keeping: the first version of the joint measurement averaged the five
+duplicate pairs' residuals per key, leaving a pool of exactly 24 atoms drawn at n=24, and its own
+built-in validation caught it — the k=2 marginal read 0.123 where the per-population measurement on
+the same cells reads 0.076, a 15 standard-error disagreement. A pool no larger than the draw is far
+coarser than the pool that estimates the same population's shape, and coarseness inflates
+non-coverage on its own. Requiring the marginals of a joint construction to reproduce the
+independently measured per-row rates is what made that visible.
+
+### The general residue
+
+Across both constructions, synthetic populations matched to the real residuals on standard
+deviation, skew, kurtosis, and in one case on the tie rate exactly, all behaved differently from the
+real pool on this statistic. **A moment-matched synthetic population is not a substitute for the
+real one when validating an interval method** — which is an assumption both of these constructions
+rest on, and the reason neither is offered as more than a measurement of the real pool.
+
+Two limits on all of the above. The replicates draw cells i.i.d., which ignores the pass-level
+averaging the multi-pass design exists to provide, so the real correction may be smaller. And the
+intersection used for the joint rate is 24 keys, so k=2 and k=4 are evaluated at n=24 rather than
+their true n=29; that moves the independent product from about 0.0007 to about 0.0005, the same
+order either way.
+
+**No change was made to the analyzer's interval.** This is a finding about the instrument's realised
+level, recorded with the numbers, and `cover_level_c203.py` re-runs on the completed data. Tuning
+the interval on a partial prefix to a single construction's constant is the overfitting the
+pre-registered bootstrap floor was added to avoid.
