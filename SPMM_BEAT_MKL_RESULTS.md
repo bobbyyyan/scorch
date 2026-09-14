@@ -30056,8 +30056,33 @@ as ambient does — and most of the corpus is in the third bucket. Use 82, or na
 Two things fall out of that table. The five b-arms reproduce their bases exactly — 87/87, 90/90,
 92/92, 95/95, 180/180 — which is a duplication check independent of the one on the saturated cells.
 And the arm-invariant 82 turns out to be **the same set** as "the cells where ov2 declines and
-ambient delivers a single worker", reached by an arm-specific route: on this corpus the cells where
-every arm agrees with ambient are exactly the single-worker cells.
+ambient delivers a single worker", reached by an arm-specific route — symmetric difference zero.
+The reason is **not** that all-agree and single-worker are the same condition, which an earlier draft
+of this sentence claimed. That is a biconditional and only one direction holds:
+
+- all arms agree ⟹ ambient delivers 1: **true**, 0 exceptions.
+- ambient delivers 1 ⟹ all arms agree: **false**, and it fails on 9 cells. There are 91
+  single-worker cells and 82 all-agree cells.
+
+The `ov2 declines` conjunct in the arm-specific definition is what excludes those 9, so it was
+carrying the work while the prose credited single-worker-ness — an unnamed conjunct doing the
+lifting, the same shape as chain202's deciding-bound error.
+
+**And the 9 cells are the most mechanically informative population in the corpus, not a wrinkle.**
+Ambient delivers 1 on all nine, and on every one of them **all ten** override arms disagree — not
+"some arm". What they deliver is:
+
+| cell | ov2 | ov4 | ov8 | ov16 | ov24 |
+|---|---|---|---|---|---|
+| all 9 | 2 | 4 | 8 | 16 | 24 |
+
+**Every arm delivers exactly its override, on 9 of 9 cells, with each b-arm matching its base.**
+This is the only place in the 267 where the request-to-delivery map is the identity across the whole
+ladder: elsewhere the cap binds, or the remembered ceiling floors the result at 32, or the request is
+declined outright. So these nine are a clean dose-response population for the override — ambient
+picks one worker, and each rung gets precisely the team it asked for. At n = 9 it clears the
+sample-size floor of 8 by one cell, which is thin enough that it is reported as a mechanism reading
+and not as a band.
 
 **The two sets are disjoint by construction, not by measurement.** On a saturated cell the low rungs
 deliver 32 against a pool of 24 while ambient delivers 24, and ambient's cap *is*
@@ -30078,8 +30103,27 @@ assumed.
 Checked in its stronger form too, since the premise is load-bearing: **per cell over all 267 cells,
 not just the saturated 24, all five pairs agree on every cell — 0 differing, and no cell
 multi-valued in either arm** across 17622 timed rows. The per-arm count agreement noted above
-(87/87, 90/90, 92/92, 95/95, 180/180) is the weaker statement of the two, because two arms can
-decline on different cells and still decline on the same number of them. Both readings are from
+(87/87, 90/90, 92/92, 95/95, 180/180) is genuinely inadequate rather than merely weaker: move one
+cell out of an arm's declined set and one cell in, and the count is unchanged while two cells
+disagree. Any even number of compensating flips passes it, and the blindness does not shrink with
+corpus size.
+
+**What the per-cell check establishes is provenance, not validity.** `resolved` is a deterministic
+function of object, override, matrix and width — chain202 found it single-valued in 1869 of 1869
+cells over 14 passes — and both members of a pair are handed the same `--override`, so per-cell
+equality is *entailed*. What it can still catch is the harness passing an argument other than the one
+the table claims, which is the same class as the `sorted()`-versus-declared-order mapping defect
+found in this analyzer. The version of it with content reads the arguments rather than the results:
+arm identity is recorded twice, in the filename and in the `build` column, and over **52866 rows
+there are 0 mismatches**, with each arm carrying exactly one override value across every pass —
+`ovp` −1, then 2, 4, 8, 16, 24, and each b-arm the same as its base.
+
+Nothing about `resolved` speaks to timing, so none of this is evidence that the duplicate is a valid
+A/A. The bar rests on two premises and these checks address only the first: identical arguments
+(entailed, verified as provenance) and X-versus-Xb timing differences being pure measurement
+variation. The second is what the A/A *measures* rather than assumes, and it is conservative either
+way — any systematic arm-identity artefact is absorbed into the floor, which chain202 measured
+directly at 0.75% / 2.11% / 4.35%. Both readings are from
 chain203's **live** pass directory rather than a sealed ledger, so both are re-run against the
 sealed CSVs before any per-rung bar is computed. Unlike the always-1-worker control, which is quiet precisely because nothing
 happens, these cells are running a wide team on the noisy population the bands are applied to. They
