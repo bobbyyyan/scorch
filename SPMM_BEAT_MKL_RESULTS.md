@@ -32424,7 +32424,7 @@ There is one `objects` directory, 377 MB, and no bundle or mirror anywhere on th
 |---|---|
 | checkouts against that store (`git worktree list`) | **217** = 216 linked + 1 main |
 | of those, living under `~/.cache/scorch-codex` | **214** |
-| unpushed commits, single copy | 285 |
+| unpushed commits, single copy | **285 at `f715ac2`**, +1 per commit since |
 | remote refs containing HEAD | 0 |
 | local capacity | 39% used, 2.2 TiB free — space is not the constraint |
 
@@ -32454,3 +32454,15 @@ Two smaller units differences resolved the same way, by naming the unit rather t
 winner: **217 vs 216** is checkouts-including-main against linked-only, and **62 vs 61** was
 substring `assert_tree(` against calls to the exact identifier. Three units collisions in one
 session, none of them a disagreement about the data.
+
+**A count that its own recording invalidates.** The row above first read "unpushed commits: 285".
+Committing the sentence that said so made it 286, and committing this correction makes it 287. An
+unpushed-commit count written into a commit is stale the moment it lands — not because time
+passed, but because **the act of recording is the thing that moves it**. Anchored to a SHA it is
+a true statement that stays true: 285 at `f715ac2`.
+
+Same family as the manifest digest identifying a ledger at a moment, with the loop closed one
+turn tighter: there, re-sealing invalidated a verifier's claim to have checked the artefact;
+here, writing the number down is what falsifies it. The general form is that a measurement of a
+system you are inside needs the observation point named, and for a git count the observation
+point is a commit.
