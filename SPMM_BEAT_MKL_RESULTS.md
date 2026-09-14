@@ -31866,3 +31866,60 @@ One residual, stated because it bit twice: my first version of this detector als
 `suppress_probe.py:38`, the *restore* `sys.argv = _ARGV`, because a name bound from a bare
 `sys.argv` Load was not recognised as carrying the process's real input. Same Load-versus-
 subscript distinction as defect 1, one layer down, in the instrument written to fix it.
+
+### The predicate in the previous section had the wrong quantifier
+
+The test committed above asks whether **any** element of the forged `sys.argv` derives from
+the file's own inputs. `sys.argv[0]` is the program name and no callee reads it as data, so
+splicing it in front of three constants launders the entire list. This clears it:
+
+```python
+_SAVE = sys.argv
+TREE = os.path.expanduser("~/.cache/scorch-codex/workspace-confound/worktrees/base-5113e0c")
+sys.argv = _SAVE[:1] + [TREE, "/dev/null", "5113e0c"]
+```
+
+Same defect, same hardcoded tree, cleared. Verified against the committed code, not argued:
+**CLEARED**.
+
+The rule is positional. Element 0 is the program name and carries nothing; **at least one of
+slots 1..n must derive from this file's own inputs.** "At least one" rather than "all", because
+an option *name* like `"--out"` is part of the call protocol rather than data, and requiring
+every slot to be tainted flags the one correct forger in the corpus. With that quantifier:
+
+| input | verdict |
+|---|---|
+| `suppress_probe.py:35`, the real defect | FLAG — slots 1..3 all constant |
+| the slot-0 mutant above | FLAG — slots 1..3 all constant |
+| `frontier_untaught_control.py:129`, the correct forger | CLEAR — slot 2 carries input |
+| `suppress_probe.py:38`, the restore `sys.argv = _ARGV` | UNDETERMINED |
+
+The restore is benign but its length is not statically resolvable, so it reports
+**UNDETERMINED rather than CLEAR** — fail closed. Corpus verdict is unchanged in substance:
+one flagged site, and now a constructed defect that the previous version missed is caught.
+
+**The shape of the error is the point.** The residual recorded one section above — failing to
+recognise a bare `sys.argv` Load as carrying input — did not get fixed. It moved. Recognising
+the Load made the instrument over-credit the list that Load appears in: a false negative on
+recognition became a false positive on quantifier, same Load-versus-subscript distinction,
+same instrument, one layer up.
+
+**Two structural gaps, sized rather than asserted.** The predicate matches a Store whose target
+is the whole `sys.argv`. Two other spellings of the same handoff exist, and both detectors were
+first proven to fire on constructed instances before their corpus counts were believed:
+
+| spelling | detector fires on fixture | instances in corpus |
+|---|---|---|
+| `sys.argv[1] = TREE` / `sys.argv[1:] = [...]` | yes, 2 of 2 | **0** |
+| `sys.argv.insert/append/extend` | yes, 2 of 2 | **0** |
+
+**One route the predicate cannot see at all, stated as an open limit.** A harness can hand a
+constant tree to another harness without touching `argv` — `subprocess.run([sys.executable,
+other, "/hardcoded/tree"])`, `runpy.run_path`, `exec`. There are **51** such invocation sites
+in these files. This is not hypothetical and not a corner: the correct precedent above,
+`frontier_untaught_control.py`, dispatches through `runpy.run_path`, so it is the live
+mechanism in this corpus and an `argv`-shaped predicate is silent on it by construction. A
+crude taint pass over those 51 leaves 22, but that number has demonstrated false positives —
+the taint does not cross function parameters, and of 10 sampled, 4 carry a parameter name into
+the call. **So there is no count for this route, only its size.** Recorded as unmeasured rather
+than as zero.
