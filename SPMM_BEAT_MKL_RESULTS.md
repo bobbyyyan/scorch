@@ -30040,10 +30040,32 @@ actually binds, which inverts the cap-dominated reading that holds on the other 
 not touch the theorem — `ov24 >= ovp` still holds, both being 24 there.
 
 Call these the **saturated** cells, to keep them apart from the cells where the override is
-*declined*. Those are a different and disjoint population: 87 cells where ov2 delivers exactly what
-ambient delivers, 82 of them a single worker, treatment-free against ambient and quiet. Measured
-overlap with the saturated 24: **zero**. One set is untreated and quiet, the other treated and loud,
-so they must not share a name.
+*declined*. Those are a different population, and stating its size needs care, because the declined
+count is **not arm-invariant** while the saturated set is. `|{resolved[X] == resolved[ovp]}|` over
+the 267 cells:
+
+| arm | ov2 / ov2b | ov4 / ov4b | ov8 / ov8b | ov16 / ov16b | ov24 / ov24b |
+|---|---|---|---|---|---|
+| declined | 87 | 90 | 92 | 95 | 180 |
+
+So a sentence naming one arm's count reads anywhere from 87 to 180, and pairing it against the
+arm-invariant 24 invites the reader to treat the two as a partition. **The arm-invariant partition
+is 24 saturated + 82 declined + 161 neither**, where the 82 are the cells every arm resolves exactly
+as ambient does — and most of the corpus is in the third bucket. Use 82, or name the arm.
+
+Two things fall out of that table. The five b-arms reproduce their bases exactly — 87/87, 90/90,
+92/92, 95/95, 180/180 — which is a duplication check independent of the one on the saturated cells.
+And the arm-invariant 82 turns out to be **the same set** as "the cells where ov2 declines and
+ambient delivers a single worker", reached by an arm-specific route: on this corpus the cells where
+every arm agrees with ambient are exactly the single-worker cells.
+
+**The two sets are disjoint by construction, not by measurement.** On a saturated cell the low rungs
+deliver 32 against a pool of 24 while ambient delivers 24, and ambient's cap *is*
+`omp_get_max_threads()`, so `resolved[ovp] <= pool` cannot fail. That forces
+`resolved[ov2] > pool >= resolved[ovp]`, so a saturated cell can never also be a declined one. No
+input makes it come out otherwise, which is stronger than a count from this corpus — and it is the
+same distinction drawn for the cap theorem two paragraphs up, reproduced here on the next claim
+before being caught.
 
 **Any pair of those four rungs is an A/A on these cells**: four different declared arguments, one
 delivered treatment. Counted across all eleven of chain203's arms rather than the four, the
@@ -30051,7 +30073,8 @@ delivered team here is 32 for `ov2/ov2b/ov4/ov4b/ov8/ov8b/ov16/ov16b` and 24 for
 so **31 of the 55 arm pairs are an A/A and 24 are not** — every pair crossing that boundary carries
 a real difference in delivered width. All five b-arms duplicate their base on all 24 cells with zero
 disagreements, which is the premise a per-rung bar rests on and is therefore checked rather than
-assumed. Unlike the always-1-worker control, which is quiet precisely because nothing
+assumed. That reading is from chain203's **live** pass directory, not a sealed ledger, so it is
+re-checked against the sealed CSVs before any per-rung bar is computed. Unlike the always-1-worker control, which is quiet precisely because nothing
 happens, these cells are running a wide team on the noisy population the bands are applied to. They
 are *not* treatment-free against ambient — all 24 sit in `ov2/HIGHER`, `ov4/HIGHER`, `ov8/HIGHER`
 and `ov16/HIGHER` simultaneously — so the arm pair has to be named. The usable width is k=32 alone,
@@ -30597,11 +30620,13 @@ the derivative of their ratio in f has the sign of h_e|c_b| − h_b|c_e|: **the 
 rises with widening exactly when the bar is the more centre-dominated side, and falls when the
 effect is.** Both directions occur by construction, so no single sign statement covers the table.
 
-Measured on the one rung where amendment 3's structure already exists in chain202 — bar ov24/ov24b
-against effect ov24/ovp, both on the adopt group, same cells, same n, pass-paired over 14 passes —
-the effect-to-bar excursion ratio moves from 3.04 to 3.55 at k=2, 3.55 to 3.81 at k=4, and 19.99
-*down* to 16.70 at k=32 under a +30% widening. Both directions, by −16% to +17%, **flipping
-nothing**: no row in that table comes within 3× of its bar.
+The derivative is the useful form because it is independent of the widening factor: the direction is
+the same for every f, which a single evaluation at one f could not establish. As an illustration, on
+the **three rows** where amendment 3's structure already exists in chain202 — bar ov24/ov24b against
+effect ov24/ovp, both on the adopt group, same cells, same n, pass-paired over 14 passes — the
+effect-to-bar excursion ratio moves from 3.04 to 3.55 at k=2, 3.55 to 3.81 at k=4, and 19.99 *down*
+to 16.70 at k=32 under a +30% widening. Both directions, by −16% to +17%, **flipping nothing**: none
+of those three rows comes within 3× of its bar. Three rows at the one rung, not the verdict table.
 
 The fixed bars carried from chain202 do not share the cancellation at all, because they were measured
 at chain202's group sizes and are applied at chain203's — 31 against 29 at k=2 and k=4, 40 against 26
