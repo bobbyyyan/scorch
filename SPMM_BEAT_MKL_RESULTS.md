@@ -30073,8 +30073,15 @@ delivered team here is 32 for `ov2/ov2b/ov4/ov4b/ov8/ov8b/ov16/ov16b` and 24 for
 so **31 of the 55 arm pairs are an A/A and 24 are not** — every pair crossing that boundary carries
 a real difference in delivered width. All five b-arms duplicate their base on all 24 cells with zero
 disagreements, which is the premise a per-rung bar rests on and is therefore checked rather than
-assumed. That reading is from chain203's **live** pass directory, not a sealed ledger, so it is
-re-checked against the sealed CSVs before any per-rung bar is computed. Unlike the always-1-worker control, which is quiet precisely because nothing
+assumed.
+
+Checked in its stronger form too, since the premise is load-bearing: **per cell over all 267 cells,
+not just the saturated 24, all five pairs agree on every cell — 0 differing, and no cell
+multi-valued in either arm** across 17622 timed rows. The per-arm count agreement noted above
+(87/87, 90/90, 92/92, 95/95, 180/180) is the weaker statement of the two, because two arms can
+decline on different cells and still decline on the same number of them. Both readings are from
+chain203's **live** pass directory rather than a sealed ledger, so both are re-run against the
+sealed CSVs before any per-rung bar is computed. Unlike the always-1-worker control, which is quiet precisely because nothing
 happens, these cells are running a wide team on the noisy population the bands are applied to. They
 are *not* treatment-free against ambient — all 24 sit in `ov2/HIGHER`, `ov4/HIGHER`, `ov8/HIGHER`
 and `ov16/HIGHER` simultaneously — so the arm pair has to be named. The usable width is k=32 alone,
