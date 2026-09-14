@@ -32466,3 +32466,30 @@ turn tighter: there, re-sealing invalidated a verifier's claim to have checked t
 here, writing the number down is what falsifies it. The general form is that a measurement of a
 system you are inside needs the observation point named, and for a git count the observation
 point is a commit.
+
+**And the grep that justified that edit was itself truncated.** The claim above — "the document
+contains three other 285s" — came from `grep -n "285\|286" | tail -5`. That grep returns **40
+lines**; I described its tail as its result. The statement happened to be right about distinct
+statements and was derived from a view that could not have established it.
+
+Counted properly, the two readings are far apart:
+
+| reading | count |
+|---|---|
+| substring `285` | **22** occurrences — `1.2850` ×5, `1.285` ×5, `1.2851` ×2, `4285`, `1.0285`, `0.285` |
+| standalone token `285` | **7** lines: 3 in this correction, 1 table value, 2 the dropped-cell counter, 1 a line distance |
+
+So a find-and-replace on the digits would not have damaged three true statements, it would have
+rewritten **fifteen measured speedup ratios** into nonsense. The `286` half of the same grep hit
+`52866`, `4286`, `17286204` and `0.000286` — a row count, a matrix dimension, Slurm job IDs.
+
+That is **substring versus token, the fourth instance tonight**, after `assert_tree(` matching
+inside `_assert_tree(`, a `sys.argv[..] =` pattern matching the first `=` of `==`, and `p[0-9]+`
+matching the SuiteSparse key `p6000`. It is the first of the four to appear in an *editing*
+decision rather than in a census, where the cost is corrupted data rather than a wrong count. The
+fix is the same every time: ask what the token **is**, not what characters it contains.
+
+And the truncation is its own repeat — `tail -5` of a 40-line result is the same shape as the
+abridged battery output that ate three verdicts earlier in this chain. A qualifier that is
+discarded by the view you are reading through is indistinguishable from a qualifier that was
+never there.
