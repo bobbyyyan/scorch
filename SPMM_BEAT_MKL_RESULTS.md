@@ -32064,3 +32064,59 @@ executing a line, and the `scorch` env is 3.11.15. Whatever produced `decision-s
 results therefore ran a ≥3.12 interpreter. That is a question for whoever sealed that
 milestone, recorded here because it would otherwise only be found by accident. No claim is
 made about the milestone's provenance.
+
+### The population was a directory-name convention, and the test decides 3 of 18 sites
+
+Every count above rests on "155 files in the 17 `*/harness` directories". That is a naming
+convention, not a definition of the corpus. Walking all **40,577** `.py` files under the cache
+for a `sys.argv = ` Store:
+
+| where | files |
+|---|---|
+| inside `*/harness/` | **3** |
+| outside `*/harness/`, not a repo copy | **14** |
+| inside `*/worktrees/` (whole-repo copies, correctly excluded) | 0 |
+
+The 14 are unmistakably harness scripts by name and role — `run_clean_harness.py` ×3,
+`census_exact_tip.py` ×4, `run_clean_capture.py`, `run_exact_audit.py`, `gate_arm.py`,
+`compare_exact_emitter_latency.py`, three `capture_*_latency_activation.py` — living in
+`correctness-sweeps/scripts/`, `correctness-sweeps/census54/`, `schedule-audit/`, `gating/`,
+and milestone roots. So **"exactly one flagged site" was computed over 3 of 17 argv-forging
+files**, and the denominator was never established.
+
+**Running the callee-contract test on the other 14 decides nothing at all:**
+
+| | sites | FLAG | CLEAR | UNDETERMINED |
+|---|---|---|---|---|
+| inside `*/harness/` | 3 | 1 | 2 | 1 |
+| outside | 15 | 0 | 0 | **15** |
+
+Not one of the fifteen resolves. The reason is more basic than the splat: **the callee is not
+in the corpus**, because the corpus was defined as `*/harness/*.py`. `benchmark_compiler_ir.py`
+is named explicitly by three of them and is not in it.
+
+The shapes, which is where the instrument's limits show:
+
+| shape | count | example |
+|---|---|---|
+| starred splat | 8 | `[str(source), *sys.argv[1:]]` |
+| all-constant | 3 | `['benchmark_compiler_ir.py', 'latency', '--warmup', '1', ...]` |
+| mixed | 4 | `[sys.argv[0], '--output', str(temporary_output)]` |
+
+Eight use a splat, so **the slot count is not statically resolvable and an index-based contract
+test must return UNDETERMINED even with the callee in hand** — including
+`[str(source), *sys.argv[1:]]`, which is exactly the pass-through idiom named as the correct
+form two sections ago. The test would refuse to certify the thing it was built to prefer.
+
+**So the instrument's decisiveness was a property of the population, not of the instrument** —
+the same overfitting shape as the discriminator it replaced, one level up. On the 155 it read
+1 FLAG / 2 CLEAR / 1 UNDETERMINED; on the 18 real forging sites it reads 1 / 2 / 16.
+
+**What stands and what does not.** The flagged site stands: `suppress_probe.py:35` forges a
+constant tree into a callee that reads `argv[1]` as its tree root, and both those facts are
+read from the two files' own sources. What does not stand is the implied completeness — the
+headline should be **one flagged site among the 3 of 17 argv-forging files the population
+contained, with 14 files and 15 sites unexamined**, 8 of them not decidable by an index test
+at all. No claim is made that any of the 14 is a violation; three of them are all-constant
+forges of the same syntactic shape as the one flagged, and whether that matters turns on a
+callee outside the scanned set.
