@@ -32469,15 +32469,15 @@ point is a commit.
 
 **And the grep that justified that edit was itself truncated.** The claim above — "the document
 contains three other 285s" — came from `grep -n "285\|286" | tail -5`. That grep returns **40
-lines**; I described its tail as its result. The statement happened to be right about distinct
+lines at `3b2a33d`**; I described its tail as its result. The statement happened to be right about distinct
 statements and was derived from a view that could not have established it.
 
 Counted properly, the two readings are far apart:
 
 | reading | count |
 |---|---|
-| substring `285` | **22** occurrences — `1.2850` ×5, `1.285` ×5, `1.2851` ×2, `4285`, `1.0285`, `0.285` |
-| standalone token `285` | **7** lines: 3 in this correction, 1 table value, 2 the dropped-cell counter, 1 a line distance |
+| substring `285` (at `3b2a33d`) | **22** occurrences — `1.2850` ×5, `1.285` ×5, `1.2851` ×2, `4285`, `1.0285`, `0.285` |
+| standalone token `285` (at `3b2a33d`) | **7** lines: 3 in this correction, 1 table value, 2 the dropped-cell counter, 1 a line distance |
 
 So a find-and-replace on the digits would not have damaged three true statements, it would have
 rewritten **fifteen measured speedup ratios** into nonsense. The `286` half of the same grep hit
@@ -32493,3 +32493,25 @@ And the truncation is its own repeat — `tail -5` of a 40-line result is the sa
 abridged battery output that ate three verdicts earlier in this chain. A qualifier that is
 discarded by the view you are reading through is indistinguishable from a qualifier that was
 never there.
+
+**This is where the recursion stops, and the stopping move is the anchor rather than a recount.**
+The three counts above were measured at `3b2a33d` and are exact there. Publishing them in
+`732de77` made them 45 / 32 / 10, because the passage reporting them contains the digits it
+reports. This paragraph moves them again, and deliberately does not say to what.
+
+That is the third self-invalidating count in a row, each one level further out: the unpushed
+count went 285 → 286 → 287 → 288 through four acts of recording; then a count *about* the
+document changed the document. Four commit subjects in `main..HEAD` carry a figure about this
+file, and every one of them moved the figure it reported.
+
+The general form was already written here — *a measurement of a system you are inside needs its
+observation point named* — and the thing worth adding is that **it applies to itself, so
+correcting an unanchored count by publishing a fresher one cannot terminate.** `40 lines at
+`3b2a33d`` is true permanently. `40 lines` is true for exactly one commit. Anchoring is not a
+tidier way of writing the number; it is the only version of the sentence that survives being
+written down.
+
+No further count of this document appears below, which is the other half of the fix: the numbers
+that matter here are about **chain203's data**, and that data is sealed, byte-identical across
+three seals at `113531ec0ca8bf97…` under a stated convention, and cannot be moved by anything
+written about it.
