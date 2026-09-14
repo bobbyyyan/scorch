@@ -31923,3 +31923,58 @@ crude taint pass over those 51 leaves 22, but that number has demonstrated false
 the taint does not cross function parameters, and of 10 sampled, 4 carry a parameter name into
 the call. **So there is no count for this route, only its size.** Recorded as unmeasured rather
 than as zero.
+
+### No quantifier can decide this, because the property belongs to the callee
+
+Three caller-local tests were tried and each was cleared by a mutant one slot over:
+
+| test | defeated by |
+|---|---|
+| any element derives from input | prefixing `sys.argv[:1]` — slot 0 launders the list |
+| every slot 1..n derives from input | flags the corpus's one correct forger (slot 1 is `"--out"`) |
+| at least one of slots 1..n | pin slot 1, pass `args.out` in slot 3 |
+
+The third is verified, not conceded: `sys.argv = [abspath(args.harness), TREE, "--out",
+abspath(args.out)]` returns **CLEAR** from the committed predicate with the tree pinned.
+
+They fail for one reason. **Which slot is a tree is a fact about the callee**, and no
+quantifier over the caller's list can recover it. Each fix moved the exemption one position
+and the hole reopened next to it.
+
+**The corpus states the contract, so it is readable.** `tree_provenance.assert_tree(tree,
+commit, role=...)` is called by 61 files, and the callee's own source says which slot feeds it:
+
+```python
+TREE = os.path.abspath(sys.argv[1])                      # strategy_correctness_reach.py
+PROVENANCE = [assert_tree(TREE, sys.argv[3], role="tree")]
+```
+
+So: resolve the callee, read the argv index its tree argument comes from, and require **that
+one slot** of the caller's forged argv to derive from the caller's own inputs. Unresolvable
+callee gives UNDETERMINED, never CLEAR.
+
+| input | verdict | reason |
+|---|---|---|
+| `suppress_probe.py:35` | **FLAG** | callee reads its tree from `argv[1]`; caller's slot 1 is a constant |
+| frontier-shaped mutant, bound to that callee | **FLAG** | same, and slot 3 carrying input no longer launders it |
+| same shape with slot 1 carrying `args.tree` | CLEAR | slot 1 derives from own input |
+| `frontier_untaught_control.py:129` ×2 | CLEAR | callee `frontier_ext2.py` reads **no** tree from argv |
+| `suppress_probe.py:38`, the restore | UNDETERMINED | caller's slot not statically present |
+
+**And the mutant's own defect-hood turns out to be callee-dependent, which is the whole
+point.** Paired with its own default callee, `frontier_ext2.py`, the pinned tree sits in a slot
+that callee never reads — `frontier_ext2.py` takes only `--out`, and the real control conveys
+its tree by `sys.path.insert(0, join(tree, "src"))` rather than by argument. The same source
+text is a defect against one callee and inert against another. A caller-local test cannot be
+merely imprecise about that; it is answering a different question.
+
+Corpus verdict is unchanged: **one flagged site.** What changed is that the reason is now the
+contract it violates rather than a property of its own syntax, and the test survives a mutant
+that defeated all three previous versions.
+
+**Its limits, since it has them.** The callee must be resolvable statically — by an `import`, a
+`runpy.run_path` literal, an argparse default, or the forged `argv[0]` — and must be in the
+corpus. All four caller sites here resolve; a caller that computes its callee's path would
+report UNDETERMINED. The `subprocess`/`runpy`/`exec` route carrying a constant tree **without
+touching argv** (51 invocation sites, no reliable count of violations) is still not covered by
+any of this, and is still recorded as unmeasured rather than zero.
