@@ -30770,3 +30770,102 @@ order either way.
 level, recorded with the numbers, and `cover_level_c203.py` re-runs on the completed data. Tuning
 the interval on a partial prefix to a single construction's constant is the overfitting the
 pre-registered bootstrap floor was added to avoid.
+
+## The measured object is not the local tree, and three claims that follow from that
+
+### The local working tree's thread policy differs from the pinned tarball
+
+`scorch_c199.tgz` is the object every chain from 199 onward measures, and the harness verifies three
+of its defines. It does not verify the rest, and the rest differ from `/Users/bobby/scorch`:
+
+| | pinned tarball | local working tree |
+|---|---|---|
+| `scorch_nthreads` signature | takes a `rows_per_thread` parameter | does not |
+| `SCORCH_SPMM_ROWS_PER_THREAD` | **1** | absent |
+| `SCORCH_SPMM_CEIL_ROWBIND` / `_MAXROWS` / `_NT_CAP_PHYS` | present | absent |
+
+So **any derivation about the measurement from local source is unsound**, and one was made: a peer
+read the composition-adoption clause as source text in the local tree, this document read
+`ov24/LOWER = ∅` from redwood data, and the two were combined into "the redwood binary implements
+that clause as written". That conclusion compared a *different* source against the built binary and
+**is withdrawn**. The theorem itself is unaffected — `SCORCH_SPMM_NT_CAP (-2L)` and
+`SCORCH_GRAIN_SPMM 150000` are both confirmed in the tarball, and the harness checks them on every
+run — but the build-versus-source check it was said to supply does not exist.
+
+### The selector between capping and adopting is row-axis capacity, not density
+
+The 13 cells that follow `min(request, ambient)` exactly are the cappers with ambient above 1. An
+earlier attempt here proposed nonzeros-per-row as the selector, because within each ambient stratum
+the separation is clean — at ambient = 4 the two capping cells read 2993 nnz/row against adopters at
+1.00 to 90.85, and so on at every stratum. **That hypothesis is false.** Corpus-wide, 3 identity
+cells sit at or above the cappers' minimum density (the densest adopter reads 2202 against the
+cappers' minimum of 1287), so the within-stratum separation was an artefact of the stratified view.
+Rows alone does not separate them either — the ranges overlap.
+
+Read from the pinned source rather than inferred, `scorch_nthreads` is
+`min(rows / SCORCH_ROWS_PER_THREAD, work / grain)` clamped to `[nfloor, num_procs]`, and the
+adoption clause bounds the override by the same row proxy: `cand = min(override, rows/16, num_procs)`
+applied with `max` against the policy count. So the quantity that decides is the **row-axis parallel
+capacity**, and these are few-row products:
+
+| matrix | rows | rows/16 | ambient observed |
+|---|---|---|---|
+| `kl02` | 71 | 4 | 4 |
+| `bibd_15_7` | 105 | 6 | 6 |
+| `bibd_17_8` | 136 | 8 | 8 |
+| `us04` | 163 | 10 | 10 |
+| `nw14` | 73 | 4 | **6** |
+| `bibd_19_9` | 171 | 10 | **22** |
+
+Exact on four of six. The two that sit *above* their row proxy are the two densest in the corpus
+(12396 and 19448 nnz/row), and the pinned source's row-bound ceiling block describes precisely that
+effect — its comment states the rule "takes a few-row product from 4 workers to 22" and names
+**`kl02` and `nw14` at 71 and 73 rows getting 4 of 24** as its targets. So this is two mechanisms,
+the row proxy and a ceiling that raises some few-row products above it, with the target shapes named
+in the source. Not one selector, and not density.
+
+### The different-argument centre shift does not reproduce under the geomean
+
+A peer reads the ambient = 24 stratum as a different-argument, same-delivery pair — ambient delivers
+24 and so does ov24 — and reports the defect as a centre shift rather than a width deficit, with both
+different-argument centres below parity and the same-argument pair above it. On the same 61 cells and
+the same per-cell pass-paired ratios, that split is **statistic-dependent**:
+
+| pair | kind | geomean centre | median centre |
+|---|---|---|---|
+| `ovp/ov24` | different argument | 0.99507 | 0.99314 |
+| `ovp/ov24b` | different argument | 0.99787 | 0.99295 |
+| `ov24b/ov24` | same argument | 0.99815 | 1.00126 |
+
+Under the **median** the pattern is exactly as described: both different-argument pairs sit about
+0.7% below parity and the same-argument pair 0.13% above it. Under the **geomean** it vanishes — all
+three sit below parity and the same-argument pair is the closest to it. The analyzer's bands use the
+geomean, so under the statistic the verdicts are actually computed with, the recommendation to
+rebuild each per-rung bar from a different-argument pair does not follow from this data. The
+magnitudes also differ: 0.7% here against the 1.1% and 1.8% reported, and halfwidths of 0.008 to
+0.011 against 0.017.
+
+One coincidence worth resolving before any of this is acted on: the peer's row labelled
+`ov24/ov24b`, the same-argument floor, carries the centre **1.00496**, and the reciprocal of this
+document's `ovp/ov24` geomean is **1.004955**. A centre is a deterministic function of the data and
+the pair, so five matching digits across two independent implementations is evidence that row is
+computing ov24-against-ambient rather than ov24-against-ov24b. If so the sign split is a property of
+the row labelling rather than of the arguments, and that has to be settled first.
+
+### Which moved, the pass set or the estimator
+
+An earlier claim here called a timing-shape agreement a "code-level reproduction". That was too
+strong: the same ledger and the same estimand should be bit-identical and were not. The pass set is
+identical — 14 passes in the ledger — so the estimator moved. Three nestings of the same data:
+
+| nesting | ov2 | ov4 | ov8 | ov16 | ov24 |
+|---|---|---|---|---|---|
+| median over passes, then median over cells | 1.01 | 0.99 | 0.94 | 0.78 | 1.49 |
+| geomean over cells of the per-cell median | 1.04 | 1.17 | 1.07 | 0.87 | 1.45 |
+| median of all cell-pass ratios pooled | 1.01 | 1.04 | 0.96 | 0.80 | 1.51 |
+| the peer's reading | 1.01 | 1.00 | 0.94 | 0.77 | 1.44 |
+
+So the right label is **two estimators over the same data**, which is the weaker but more useful
+statement: the agreement is the deliberate convention variance this work relies on, not a
+reproduction. The dip at ov16 survives all three nestings (0.78, 0.87, 0.80), which is the part of
+the shape that does not depend on the choice.
