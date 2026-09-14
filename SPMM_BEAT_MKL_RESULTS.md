@@ -30962,10 +30962,31 @@ at 22, and `recip_c203.py --sweep` prints it with the parity of the count beside
 parity stated a later reader finds the battery reporting ~1e-16 at an odd prefix and concludes the
 defect was imagined.**
 
-The decay is monotone across all seven even prefixes on this reduction (0 rises in 6 steps) and a
-peer reports it *non*-monotone on theirs. Either way it cannot be extrapolated: the gap is set by the
-spread of whichever two values happen to land in the middle, which no trend predicts. A peer
-independently found
+**The decay is not monotone, and the claim that it was came from a max over a moving argmax.** An
+earlier draft of this section reported 0 rises in 6 steps. That sequence was the *maximum* gap over
+seven arm pairs, and its argmax changes at every prefix — `ovp/ov2` at n=2, `ov24b/ov24` at n=4,
+`ovp/ov2` at n=6, `ovp/ov24` at n=8 and 10, `ovp/ov4` at n=12, `ov24b/ov24` at n=14 — so the
+"sequence" compared a quantity that changes identity between the points being compared. A max over
+several decaying sequences can rise while every member falls, and can fall while members rise.
+
+Per pair, seven pairs over the seven even prefixes:
+
+| pair | rises |
+|---|---|
+| `ovp/ov2` | 1 of 6 |
+| `ovp/ov4` | 0 of 6 |
+| `ovp/ov8` | 0 of 6 |
+| `ovp/ov16` | 1 of 6 |
+| `ovp/ov24` | 0 of 6 |
+| `ovp/ov24b` | 1 of 6 |
+| `ov24b/ov24` | 1 of 6 |
+| **total** | **4 of 42 steps, 4 of 7 pairs rise at least once** |
+
+So the decay is **not** monotone on this reduction either, and a peer reaching the same verdict on
+theirs (11 of 42) means the two reductions agree rather than differ. Both sessions had published a
+one-line monotonicity verdict read off a max over pairs, and both were instruments rather than
+results. It cannot be extrapolated: the gap is set by the spread of whichever two values happen to
+land in the middle, which no trend predicts. A peer independently found
 the same defect in their own nesting, smaller by 5× to 140× depending on the pair, and confirmed the
 mechanism quantitatively: for one pair the two middle values are 0.98863959 and 0.99011021, and the
 arithmetic-versus-harmonic gap that spread predicts, `(d/2x)²`, is 5.52e-7 against an observed
@@ -31009,3 +31030,27 @@ distinct problems — was computed from a **6-pass snapshot** of chain203's dire
 `resolved` is single-valued in all 267 cells across all 11 arms (0 multi-valued), which makes those
 counts pass-count independent by construction. They will be re-confirmed against the completed 22
 passes rather than recomputed, and a disagreement would mean the policy moved mid-run.
+
+### Two namespaces in one CSV, overlapping
+
+chain203's `slice` column holds `ov1`..`ov22` and its `build` column holds `ovp`, `ov2`, `ov2b`, …
+so **`ov2` and `ov4` are simultaneously pass labels and arm names in the same file**, and `ov8` and
+`ov16` join them as the run lengthens. Confirmed on both chains' data.
+
+It is inert in `an_c203.py` today, and inert *by accident* rather than by design: the two namespaces
+sit at different levels of one dict (`T[build][cell][slice]`) and are never looked up against each
+other, and the landed-pass set is derived from filenames rather than labels. Any code that filters
+across the two — a `startswith`, a set intersection, a dict keyed by "the label or the arm" —
+silently returns the wrong rows.
+
+The second hazard is ordering, and it is currently hidden by the run's length. `ov1`..`ov14` sorts
+lexically to `ov1, ov10, ov11, ov12, ov13, ov14, ov2, …`, so "the first six passes" by string order
+is passes 1, 10, 11, 12, 13, 14 — the oldest plus the newest five, maximally spread in time rather
+than contiguous. This document already records that trap being hit once, on `sorted(slices)[:6]`. At
+chain203's current six labels the lexical and numeric orders **agree**, which is a property of the
+count and not of the scheme; they diverge the moment a label reaches two digits.
+
+Reported by `labels_c203.py` in the verification battery rather than as a refusal inside the
+analyzer. The analyzer is the instrument for a measurement in flight, its battery is green, and the
+hazard is inert — adding a refusal to a frozen instrument for an inert hazard trades a real
+regression risk against no present benefit. Both findings are a rename away from being impossible.
