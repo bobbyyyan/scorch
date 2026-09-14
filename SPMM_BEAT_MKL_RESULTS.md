@@ -31567,3 +31567,50 @@ call.
 `readers_c203.py`'s `SEALED` prefix. Both now take the same `os.environ.get` override the four
 historical fixes used. Our tree is clean under the repaired check, which it was not under the
 check that passed.
+
+### Correction to the citation, and `ast.Constant` as one predicate rather than two incidents
+
+**The citation above is wrong.** The previous section says
+`COMPILER_IR_REFACTOR_HANDOFF.md` "records four harnesses' hardcoded ledger paths ... and names
+the tree". Checked:
+
+| name | HANDOFF | DESIGN | PHASE6_REVIEW |
+|---|---|---|---|
+| strategy_emission | 0 | 0 | 3 |
+| legality_reach | 0 | 0 | 2 |
+| strategy_correctness | 0 | 0 | 4 |
+| two_phase_probe | 0 | 0 | 6 |
+
+The *count* sentence is in the handoff, at line 32655. The *names* are only in the PHASE6
+review — which is the right source anyway, being the definitive numbered document while the
+handoff is an append-only slice log. And the names did not come from either: I obtained them by
+listing the harness directory. One artefact was credited with two jobs, one of which was mine.
+
+**`ast.Constant` bit twice tonight, in two independent scripts, and it is one predicate.** The
+AST cross-check's first version tested `isinstance(arg, ast.Constant)` for a refusal message and
+would have condemned a correct scanner; `scanroot`'s parse accepted only `ast.Constant` for a
+path and missed all four real instances. `ast.Constant` matches a **literal**, and real code
+builds paths and messages with `os.path.expanduser`, `os.path.join`, f-strings or `%`. So an AST
+predicate over a path or a diagnostic string that keys on `Constant` matches the toy case and
+misses the realistic one — and the toy case is usually the fixture, which is the mechanism by
+which a synthetic control keeps firing while the check is broken. **Match the node that produces
+a string, not the node that is one.**
+
+### One definition of "what counts as a refusal"
+
+Three times in one evening, one census held knowledge another census's predicate lacked: the
+analyzer census's demonstrated refusing inputs were what the diagnostic census needed; the
+refusal census's parse was what the reader census needed; and the exit-path classifier knew
+about `raise SystemExit` while the scanner-root check's private copy tested only for the text
+`sys.exit("REFUSE` — which is why that check excluded all four of its real instances before
+examining a single path. Every one of those is a predicate implemented twice and diverging, the
+same root cause as the scanner regex having become two copies.
+
+`refusal_c203.py` now holds the classifier and both censuses import it. It is a census member
+from the start despite carrying no guard of its own: the denominator has to track a shared
+module **before** a guard lands in it, which is the order the pass-count helper taught the hard
+way. A member contributing zero is the correct reading, and the total is unchanged at 26 across
+15 scripts.
+
+"What counts as a root" and "what counts as a reader" are still duplicated. Unifying them is
+right and is not being done immediately before the completed read has to run.
