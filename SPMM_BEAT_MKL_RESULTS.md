@@ -32412,3 +32412,45 @@ values over min 1 / max 5948, while `mkl` has 213 distinct values over min 1 / m
 coincides with `ours` on **2 of 267** cells. So the within-invocation replicate matches on
 per-cell batch as well as on code and argument, which is a stronger statement than either the
 set equality or the single-cell figure it was first reported as.
+
+### The same filter defect, twice in one session, on unrelated questions
+
+**The unpushed work and every pinned tree share one object store.**
+`/Users/bobby/scorch-beat-mkl/.git` is a *file* — `gitdir:
+/Users/bobby/scorch/.git/worktrees/scorch-beat-mkl` — so this is a linked worktree, not a clone.
+There is one `objects` directory, 377 MB, and no bundle or mirror anywhere on the machine.
+
+| | |
+|---|---|
+| checkouts against that store (`git worktree list`) | **217** = 216 linked + 1 main |
+| of those, living under `~/.cache/scorch-codex` | **214** |
+| unpushed commits, single copy | 285 |
+| remote refs containing HEAD | 0 |
+| local capacity | 39% used, 2.2 TiB free — space is not the constraint |
+
+Losing that one directory loses the commits **and** the 214 pinned trees every ledger's
+`worktrees/` entry resolves through. The sealed CSVs and manifests survive; the trees they were
+measured against do not, which leaves a surviving ledger only partly re-derivable.
+
+**And the 214 is a correction to a number this document produced an hour ago.** The first count
+was **102**, taken as `~/.cache/scorch-codex/*/worktrees/*/`. That is a directory-name convention.
+113 further checkouts sit under the cache with other names — `address-review-full.nOgjSc/
+latency-base`, `c1-009802f/quality-base`, `c1-009802f/focused-worktree`, `emitter-5c6b26e/
+full-suite/worktree`, `phase6-exit-f218c2e/latency/candidate-worktree` — carrying exactly the same
+dependence on exactly the same object store.
+
+**This is the `*/harness/*.py` defect again, three hours later, on an unrelated question.** There
+the convention held 3 of 17 argv-forging files and made an instrument look decisive; here it held
+102 of 214 pinned trees and made a risk look half its size. The first understated a defect count,
+the second understates an exposure.
+
+**The tell was the same both times: a count that matches a directory name rather than the thing
+being counted.** `*/harness/` is where harnesses are *usually* kept; `*/worktrees/` is where
+worktrees are *usually* kept. Neither is what either word means. The reliable form is to ask the
+tool that owns the fact — `git worktree list` enumerates checkouts because git maintains that
+list, and it cannot be fooled by a directory name.
+
+Two smaller units differences resolved the same way, by naming the unit rather than picking a
+winner: **217 vs 216** is checkouts-including-main against linked-only, and **62 vs 61** was
+substring `assert_tree(` against calls to the exact identifier. Three units collisions in one
+session, none of them a disagreement about the data.
