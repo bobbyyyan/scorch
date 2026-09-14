@@ -32326,3 +32326,49 @@ nestings and the skew beside them.
 all four nestings agreeing in sign, per-cell skew **+0.884** — the one group here whose skew is
 positive and modest. So "**faster by 14.4% to 21.2% depending on the nesting**" is the honest
 form, against an arm-identity floor of 2.2%.
+
+### Three seals, one set of bytes — and a column documented as the floor that nothing reads
+
+**The data did not move across the three seals.** The ledger was sealed three times in twenty
+minutes as its own defects were fixed, and the manifest digest changed each time
+(`5bf54a1c…` → `ca1a6cad…` → `0ebd13f9…`). The 242 CSVs are byte-identical across all three, so
+every number computed against the first seal stands against the current one.
+
+**Establishing that needed the digest convention named, which it was not.** An independent
+digest-of-digests over the same 242 files gives six different answers depending on convention:
+
+| convention | first 16 |
+|---|---|
+| `shasum … \| shasum` — full lines, glob order | `113531ec0ca8bf97` |
+| digests only, `LC_ALL=C` sorted | `71b3c893b669bc2e` |
+| digests only, glob order | `03da884f05179cd4` |
+| full lines, `LC_ALL=C` sorted | `b18ad917f1073688` |
+| sorted digests, no separator | `523f8645bc2b84a1` |
+| `cat` of all files in sorted order | `cdb26700a4d87493` |
+
+Two parties can hold identical bytes and report different digests, with no defect on either
+side. The stage-1 membership digests **do** state their convention verbatim; a digest-of-digests
+used to certify a snapshot needs the same treatment. Third naming collision in this thread,
+after "half-width" and the stage-4 bar.
+
+**And a manifest digest identifies a ledger at a moment, not a ledger.** A verifier quoting one
+has evidence that it looked, not that a later citation refers to the same artefact. What
+survives a re-seal is a snapshot of the data files plus a digest-of-digests over them. The
+failure is silent: re-sealing does not invalidate a verifier's arithmetic, it invalidates the
+verifier's claim to have checked the thing being cited. **Seal reports should carry the manifest
+digest and the read time.**
+
+**`oursb` is documented as the noise floor and no analysis reads it.** `mrgate_ov.py:19` calls it
+"the noise floor"; `:155` binds `{"ours": ours, "oursb": ours, …}` to the same function object,
+and the `batch` column confirms the same batch size for both against a different one for `mkl`.
+It is a same-code, same-argument, same-batch replicate taken inside one invocation. In the
+sealed ledger, `oursb` appears in exactly one file — `mrgate_ov.py`, the writer — and in **zero**
+analysis artefacts.
+
+No number is affected, and the analysis made the **more conservative** choice: calibrating
+against the across-invocation X/Xb pairs rather than the within-invocation replicate, whose
+half-widths are narrower. But two sealed statements disagree — the writer names a floor the
+analysis does not use — and a reader grepping for "noise floor" lands on a column nothing
+consumes. **Recorded rather than fixed:** both the writer and its live copy produced a sealed
+result, and editing either next to that result is the perturbation, not the repair. The choice
+is the user's — have the analysis read the column, or have the writer stop calling it the floor.
