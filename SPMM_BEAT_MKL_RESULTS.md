@@ -32266,3 +32266,63 @@ per-cell `median(log r)` kept **in log space** (mean ≈ 0), n = 1335 = 267 cell
 pairs, and the kurtosis 17.63 is the raw fourth standardised moment (normal = 3). Computing the
 same pool in **ratio** space, `exp(median(log r))` with mean ≈ 1, gives ≈ 16.74 — a ~5% gap that
 is the space the moment is taken in, not a disagreement about the data.
+
+### The k=32 NULL verdicts are carried by the reduction, and arm identity alone costs 2.2%
+
+Both checks below are computed from the sealed CSVs.
+
+**1. The saturated A/A that stage 1 named and did not measure.** Stage 1 reported 24 declined-
+argument cells — 21 at k=32 — where ov2/ov4/ov8/ov16 all deliver **32** threads, and observed
+that "any pair of those rungs is an A/A on these cells". It never computed them. On those 21
+cells delivery is constant by construction and only the declared argument differs:
+
+| pair | centre [lo, hi] | parity |
+|---|---|---|
+| ov4/ov2 | 1.0027 [0.9926, 1.0117] | contains |
+| ov8/ov2 | 0.9923 [0.9841, 0.9995] | **excludes** |
+| ov16/ov2 | 0.9794 [0.9501, 1.0004] | contains |
+| ov8/ov4 | 0.9880 [0.9804, 0.9948] | **excludes** |
+| ov16/ov4 | 0.9778 [0.9485, 0.9993] | **excludes** |
+| ov16/ov8 | 0.9876 [0.9576, 1.0105] | contains |
+
+**3 of 6 pairs exclude parity where the thread count provably cannot differ**, with deviations to
+**2.2%**. This is arm identity alone — the cost of passing a different `SCORCH_SPMM_NT_CAP`
+argument that the kernel then declines.
+
+**Like-for-like, it is ~2.8x a same-argument replicate, not 3-12x.** Comparing these against the
+0.0011-0.0020 X/Xb half-widths reported over all 267 cells is not like-for-like: those are
+267-cell bands and these are 21-cell bands, so most of the ratio is n. On **the same 21 cells**,
+the same-argument pairs read 0.9923 / 0.9999 / 1.0054 / 1.0034 — deviations to 0.8%. So arm
+identity at identical delivery costs up to 2.2% against up to 0.8% for a same-argument
+replicate.
+
+A naming collision worth fixing while it is visible: "half-width" here means amendment 1's
+`max(|lo-1|, |hi-1|)`, the largest deviation from parity the interval admits. Reported as
+`(hi-lo)/2` the same rows read 0.0073-0.0264. Same intervals, same parity verdicts, different
+numbers — which is the same question raised about the stage-4 bar, in the other direction.
+
+**2. The k=32 NULL "X SLOWER" verdicts are a property of the reduction.**
+
+| rung | n | gm-cells / med-pass | med-cells / med-pass | per-cell skew |
+|---|---|---|---|---|
+| ov2 | 25 | 0.9814 | 0.9966 | −2.435 |
+| ov4 | 26 | 0.9592 | 0.9988 | −2.224 |
+| ov8 | 26 | 0.9526 | 0.9938 | −1.845 |
+| ov16 | 25 | 0.9341 | 0.9959 | −2.016 |
+| ov24 | 64 | 0.9958 | 1.0011 | −1.292 |
+
+The published verdicts — **X SLOWER by 4.3% / 5.0% / 7.1%** at ov4 / ov8 / ov16 — read **0.1% to
+0.6%** under median-over-cells. Same sign, an order of magnitude apart, and every median-reduced
+deviation sits inside the 2.2% arm-identity effect measured above. The skew column is the cause:
+at −1.8 to −2.4 a minority of cells with very low ratios carries the geometric mean while the
+median is untouched.
+
+**So those rows are statements about a tail, not about the typical matrix at k=32**, and the
+earlier entry should not have reported them as a single number. They are reported here with both
+nestings and the skew beside them.
+
+**The headline is unaffected and should also carry a range.** The k=32 ov24/HIGHER finding reads
+1.1805 under gm-cells and 1.1441 under med-cells, both bootstrapped intervals excluding parity,
+all four nestings agreeing in sign, per-cell skew **+0.884** — the one group here whose skew is
+positive and modest. So "**faster by 14.4% to 21.2% depending on the nesting**" is the honest
+form, against an arm-identity floor of 2.2%.
