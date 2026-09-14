@@ -31088,11 +31088,39 @@ N**, because the label for pass N is the string `ovN`.
 | **16** | `ov2` `ov4` `ov8` `ov16` |
 | 22 | unchanged since 16 — four |
 
-So at the completed 22 there are four, and there have been four since pass 16. `ov24` never
-collides only because the run stops at 22; a 24-pass rotation would give five. Stating the onset as
-a rule rather than a row is what makes that last point visible at all — and the error being in the
-*commit* while the correct figure was in a message is the wrong way round, since the commit is what
-outlives the exchange. So "inert because the run is short" is gone and only one guarantee remains.
+So at the completed 22 there are four, and there have been four since pass 16. Stating the onset as
+a rule rather than a row is what makes the next two points visible at all — and the error being in
+the *commit* while the correct figure was in a message is the wrong way round, since the commit is
+what outlives the exchange.
+
+**The hazard is bounded at five and saturates there.** The rule partitions the eleven arms: only
+those whose name is `ov` followed by digits can ever match a pass label, and the rest are immune for
+a reason that cannot change — no pass label carries a `b` suffix and there is no pass `p`.
+
+| | arms |
+|---|---|
+| can ever collide | `ov2` `ov4` `ov8` `ov16` `ov24` — **5** |
+| structurally immune | `ovp` `ov2b` `ov4b` `ov8b` `ov16b` `ov24b` — 6 |
+
+"Grows with the run" and "grows to five and stops" are different risk profiles, and an onset rule
+with no ceiling attached invites the first reading.
+
+**And the severity at run end is set by the rotation's design parameter, not by the labels.**
+Position balance requires the pass count to be a multiple of the arm count, so the reachable run
+lengths are multiples of 11:
+
+| balanced halves | passes | collisions |
+|---|---|---|
+| 1 | 11 | 3 |
+| 2 | **22** | **4** ← this run |
+| 3 | 33 | 5 |
+| 4 | 44 | 5 (saturated) |
+
+So `ov24` escapes only because the design chose two halves rather than three. A future chain adding
+a third half for tighter bands would **pick up the fifth collision as a side effect of a decision
+made about statistics** — nobody choosing "33 passes for a narrower interval" would think they were
+touching a label namespace. That coupling is invisible in any table of observations; it needs the
+rule. So "inert because the run is short" is gone and only one guarantee remains.
 
 That guarantee is now **audited rather than argued.** Every site in `an_c203.py` that touches a pass
 label, all fourteen of them:
