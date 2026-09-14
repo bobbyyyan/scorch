@@ -31522,3 +31522,48 @@ two scanner controls were updated to watch the channel each defect now travels o
 earlier pair stopped doing the moment the classification changed.
 
 **26 refusals across 14 scripts, 26 FIRES, 0 DID NOT FIRE, 0 UNTESTED. Battery 19 of 19.**
+
+### The scanner-root check caught 0 of its 4 real instances
+
+The previous section reported `scanroot_c203.py` at 0 violations with its positive control
+caught, after three narrowings from 16 hits to 8 to 4. A synthetic fixture is a weak control for
+a defect with real instances on disk, so the check was run against them.
+
+**They exist and they are identifiable.** `COMPILER_IR_REFACTOR_HANDOFF.md` records *"four
+harnesses' hardcoded ledger paths are now overridable — the fourth time that defect has been
+caught here"*, and names the tree: `strategy_emission.py`, `legality_reach.py`,
+`strategy_correctness.py`, `two_phase_probe.py`. `CLAUDE.md` line 197 still says the defect "has
+been caught three times", so **the count in CLAUDE.md is stale** and any search anchored on it
+under-counts. All four were fixed by making the path `os.environ.get(...)` overridable, so
+reverting that fix reconstructs the historical defect exactly — a control set of real code
+rather than a fixture.
+
+**Against that set the check caught 0 of 4.** Three independent mechanisms, each a narrowing
+made when the check knew one fewer shape of the defect than exists:
+
+| narrowing | what it assumed | what every real instance does |
+|---|---|---|
+| root must be `ast.Constant` | a bare string literal | `os.path.expanduser("...")`, a `Call` |
+| consumer must be `glob`/`walk`/`listdir` | a *scan* root | `sys.path.insert` — a *dependency* root |
+| "can refuse" = text `sys.exit("REFUSE` | one spelling of refusal | `raise SystemExit` |
+
+A fourth surfaced while fixing: a gate requiring at least one scan-or-inline root dropped
+`strategy_emission`, whose hardcoded ledger is *only* a module-level binding used further down.
+The refusal-spelling one is the worst of them — the census audit two sections above exists partly
+to test the `raise` route, and the text match went in anyway.
+
+The synthetic fixture was strictly easier than every real instance, which is exactly why it kept
+firing through all three narrowings. **A control that survives a narrowing only licenses it if
+the control is at least as hard as the thing being narrowed away.**
+
+Now **4 of 4 caught reverted, 0 of 4 flagged in their fixed form**, both directions, with the
+real instances as the standing control and the synthetic used only if the ledger is absent from
+the host. The predicate is a non-overridable path fixed at import — literal, `expanduser`, or
+`join` of those — that is absolute or home-relative and not under a scratch directory, in a
+script that can refuse, bound at module level and used, or passed inline to a path-consuming
+call.
+
+**It then found two real hits in our own tree**: `cond_c203.py`'s chain202 ledger root and
+`readers_c203.py`'s `SEALED` prefix. Both now take the same `os.environ.get` override the four
+historical fixes used. Our tree is clean under the repaired check, which it was not under the
+check that passed.
