@@ -32201,3 +32201,68 @@ count-equality guard was replaced by a **set-of-names** comparison, because each
 in two contexts and a count equality refuses a correct run while a set comparison still catches
 the defect that guard exists for: a declared relation that never ran cannot appear in the output
 being counted.
+
+### Corrections to the chain203 entry, and the writer is now in the seal
+
+**"21 of 21 completed passes" is wrong; it is 22 of 22.** The sealed log holds 22 bracket lines
+and the sealed read says `22 of 22 completed passes ran in exactly the row the table declares`.
+The 21 came from a **superseded first run** of the read whose output I quoted instead of the one
+I sealed.
+
+The cause is worth more than the correction. My wait fired on *"11 p22 CSVs exist"* at 22:12:37;
+the runner recorded `pass p22 of 22 done` at **22:14:26**, 109 seconds later. In that window
+every CSV was on disk and the run was not finished, so a read taken there saw 22 passes of data
+and 21 passes of rotation evidence — and reported the smaller number without complaint. **A
+completeness signal that is not one**: the file count was the wrong predicate for "the pass is
+done", and the check that would have caught it silently narrowed its own denominator instead of
+refusing. The fix is to wait on the runner's own completion line, not on an output count.
+
+A second, smaller slip in the same area: I grepped `^pass p[0-9]+ of` and got **0 matches**, and
+briefly took that as the log lacking the line. The line is indented. The log was right and the
+anchor was wrong.
+
+**The population phrasing overstates the width result.** "The same group at k=2 and k=4 shows no
+power" reads as one set of matrices going quiet at other widths. It is not the same set — the
+HIGHER rule selects different cells by width:
+
+| width | n | members-sha256 |
+|---|---|---|
+| 32 | 25 | `1ec8352efdd15bc6` |
+| 2 and 4 | 31 | `fa59aa79e3e262c8` |
+
+So the claim is about **the rule's behaviour across widths, not about 25 matrices going quiet** —
+a weaker statement than the phrasing implied, and one that still needs a second host.
+
+**The mechanism is confirmed from the data rather than inferred.** On those 25 cells
+`resolved[ov24]` is 24 on every one while `resolved[ovp]` spans 1..23, so the rung raises the
+team above ambient everywhere on the group. A cap cannot do that.
+
+**A third row-arm nothing reads.** Every CSV carries `ours`, `oursb`, `mkl` at 267 rows each, and
+`oursb` appears **0 times** in `c203_analysis.txt`, `an_c203.py`, `meta_c203.py`,
+`chain203_body.sh` and `c203_rw.log`. `mrgate_ov.py:19` says what it is — *"`oursb` is `ours`
+again — identical code, identical argument — and is the noise floor"* — and line 155 binds
+`{"ours": ours, "oursb": ours, ...}` to the same function object. So the run carries a free
+within-invocation A/A on 64614 cell pairs that the analysis never opens.
+
+**And the writer was not in the ledger, which is why that took reading an unsealed file.** The
+seal held every CSV and no program capable of writing one: `rw_s_chain203.sh:32` points at
+`/scratch/bobbyy/mrgate_ov.py` and `c203/mrbuild.sh`, both outside the sealed set. The column
+semantics of the primary data were therefore not re-derivable from the artefact. Both are now
+sealed, and a guard refuses a ledger without them. Re-sealed: **259 files, 258 of 258 manifest
+lines OK**, digest `0ebd13f91046ae4005f6ad4df11175159fbe1942bec61959d7f38fb943d5ccb8`.
+
+**That guard needed two fixes before it was worth having, both found by its own controls.** It
+first keyed on the comma-joined header and refused a ledger that already contained the writer —
+`mrgate_ov.py` emits the header through `csv.DictWriter.writeheader()`, so the joined string
+appears nowhere in its source. A literal predicate against programmatically built text, the same
+shape the forged-argv work hit four times. Re-keyed on column names one at a time, it still
+refused: `csv` writes RFC-4180 **CRLF**, so `head -1` yields `...,batch\r` and the last column
+never matched. Both were caught by a **positive** control — a directory with the writer added,
+which must pass — rather than by the negative one, which passed throughout while the guard was
+broken.
+
+**The A/A pool convention, since the non-coverage figure is calibrated off it.** The pool is the
+per-cell `median(log r)` kept **in log space** (mean ≈ 0), n = 1335 = 267 cells × 5 duplicate
+pairs, and the kurtosis 17.63 is the raw fourth standardised moment (normal = 3). Computing the
+same pool in **ratio** space, `exp(median(log r))` with mean ≈ 1, gives ≈ 16.74 — a ~5% gap that
+is the space the moment is taken in, not a disagreement about the data.
