@@ -32023,3 +32023,44 @@ Two corollaries. Subtracting the 9 definer files to get "genuine callers" remove
 callers, because **all 9 define and call**. And the single unparseable file contains no
 `assert_tree` at all, so it does not move this count — that was worth checking rather than
 assuming, since it moves several others.
+
+### "UNPARSEABLE" names a pair, not a file
+
+`decision-survey/harness/interaction.py` was reported above as UNPARSEABLE, 1 of 155
+unscanned. That is a property of the pair (file, interpreter):
+
+| interpreter | result |
+|---|---|
+| Python 3.9.6 (system) | SyntaxError — EOL while scanning string literal |
+| Python 3.11.15 (the `scorch` env, which CLAUDE.md requires) | SyntaxError line 457 |
+| **Python 3.12.13** | **parses** |
+
+```python
+f"         the control cell is {'clean' if control_clean else 'NOT clean -- '
+                                'the apparatus is suspect'}."
+```
+
+The replacement field spans two physical lines. PEP 701 legalised that in 3.12; under 3.11 an
+f-string expression cannot contain a newline. So the honest disposition was right — a named
+outcome rather than a silent clearance — but the label needed its interpreter printed beside
+it, the same way a count needs its population.
+
+**Re-run under 3.12, every number is unchanged:**
+
+| | 3.11 | 3.12 |
+|---|---|---|
+| files scanned / UNPARSEABLE | 154 / 1 | **155 / 0** |
+| substring `assert_tree(` | 62 | 62 |
+| AST calls to `assert_tree` | 61 | 61 |
+| `def assert_tree` | 9 | 9 |
+| forged-argv verdicts | 1 FLAG, 2 CLEAR, 1 UNDETERMINED | identical |
+
+The coverage gap closes to zero and moves nothing. Worth running rather than assuming: the
+gap was reported as a limit precisely because an unscanned file could have held anything.
+
+**The implication is larger than the scanner, and is not mine to resolve.** The file cannot be
+compiled by the interpreter this project pins — `python3.11 interaction.py` fails before
+executing a line, and the `scorch` env is 3.11.15. Whatever produced `decision-survey`'s
+results therefore ran a ≥3.12 interpreter. That is a question for whoever sealed that
+milestone, recorded here because it would otherwise only be found by accident. No claim is
+made about the milestone's provenance.
