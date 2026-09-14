@@ -31461,3 +31461,64 @@ works. It says nothing about whether a reader calls one: a consumer that forgets
 is unprotected by a guard the census scores as fully tested. Both are printed, with a line saying
 so, because the battery deliberately names no minimum for its own stages and `final_c203.sh`
 names 22 — the guard is inert by design in one caller and binding in the other.
+
+### The thirteen cleared readers, and a clearance that was false
+
+Thirteen of the eighteen in-chain corpus readers were cleared with one sentence — "the rest
+cannot go stale" — which is many items under one reason with no per-item evidence, the shape
+this census exists to break up. Checking each reason found two problems.
+
+**The "sealed" clearance was false.** Three scripts were cleared as reading a sealed directory.
+There is **no manifest naming that directory and it is writable**; a parent `SHA256SUMS` exists
+and does not cover it. So "sealed" was a claim about today's state, and unverified even as that.
+The clearance that survives is weaker and purely code-level: they never open *this* chain's
+snapshot, so no number of theirs can carry this chain's rotation. Immutability is not
+established, the census says so, and the check runs rather than being assumed.
+
+**A second clearance rested on nothing.** The fixture class accepted `"W = "` and `"def d("` as
+evidence — predicates that match almost any script — and one of six was classified on those
+alone. That one, `fixture_c203.py`, reads one corpus and *writes* another, reporting no
+measurement at all. **A clearance is only as good as the narrowest predicate that granted it.**
+The classes are now printed with counts and a code-versus-state column:
+
+```
+ 5 PROTECTED    4 call the pass-count helper; 1 carries its own --min-passes
+13 CLEARED      8 code        create a corpus directory; report no measurement
+                1 code        builds a fixture under a known root and reads it back
+                3 code+STATE  hardcoded to another chain's directory -- seal check above
+                1 code        is the pass-count helper; reading the corpus is its job
+```
+
+### Every scanner takes its root as an argument
+
+Caught four times in this project: three harnesses that hardcoded a ledger path, and the reader
+census above, which wired to its own directory could only ever have reported the clean case. A
+family with four instances earns a check. `scanroot_c203.py` reports **0 violations with its
+positive control CAUGHT** — a refusing scanner with a fixed root is detected, so the zero is
+evidence rather than a property of the check.
+
+Reaching that took three narrowings: 16 hits, then 8, then 4, nearly all false positives from
+function parameters and locals derived from them. A check with that false-positive rate gets
+switched off, which is worse than not having one. The scope that survives is precise — a script
+that *can refuse*, whose root is a module-level string literal it does not itself create. A
+script with no refusal makes no "clean" claim for a fixed root to falsely certify, and a root the
+script creates is its own scratch area.
+
+The first version recursed without bound and had to be killed: the positive control re-runs the
+script, and the child ran its own control. **A self-invoking check needs a base case** — obvious
+in a recursive function, easy to miss when the recursion is a subprocess.
+
+### The cross-check condemned the scanner it was built to confirm
+
+`scanroot_c203.py` contains `sys.exit("REFUSE` twice as **data** — once as a search pattern, once
+inside a fixture it generates. The text scan counted 3 refusals; the parse counts the 1 that
+exists. On eleven files the two agreed, which is what made the scan look adequate; the twelfth
+file it had never seen was enough to separate them.
+
+**The inventory is now AST-derived.** The text scan is kept as a reported cross-check that names
+where it over-counts, and over-counting is no longer fatal while under-counting still is — the
+parse only counts a literal in `sys.exit` position, where the scan counts the text anywhere. The
+two scanner controls were updated to watch the channel each defect now travels on, which the
+earlier pair stopped doing the moment the classification changed.
+
+**26 refusals across 14 scripts, 26 FIRES, 0 DID NOT FIRE, 0 UNTESTED. Battery 19 of 19.**
