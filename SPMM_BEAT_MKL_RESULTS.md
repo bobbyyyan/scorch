@@ -32515,3 +32515,59 @@ No further count of this document appears below, which is the other half of the 
 that matter here are about **chain203's data**, and that data is sealed, byte-identical across
 three seals at `113531ec0ca8bf97…` under a stated convention, and cannot be moved by anything
 written about it.
+
+### Row-level provenance is clean, and the ambient stratification is not empty
+
+**Duplication and provenance over the sealed CSVs, a layer nobody had checked.**
+
+| check | result |
+|---|---|
+| rows | 193,842 |
+| distinct `(arm, pass, key, k, row-arm)` keys | **193,842** — 0 duplicated |
+| two factorisations | 242 × 801 = 11 × 22 × 267 × 3 = 193,842, agree |
+| `(arm, pass)` groups carrying exactly 801 rows | 242 of 242 |
+| `build` column == the filename's arm | **0 violations** |
+| `slice` column == `ov<pass>` | **0 violations** |
+
+The last two are the addition: the columns that *name* the arm and the pass agree with the
+filename on every row, so no file's contents can have been written under a label other than the
+one it carries. Row-count and distinct-triple guards cannot see that.
+
+**The ambient stratification of the identity population — and it has one reachable finding, not
+none.** Restricting to ov24's 172 identity cells (`resolved[ov24] == 24 == its own override`) and
+stratifying by what ambient resolves to gives **22 strata, n = 1 to 85**. Four clear the
+pre-registered floor of 8:
+
+| ambient | n | ambient/ov24 | CI | |
+|---|---|---|---|---|
+| **1** | **9** | **1.4469** | **[1.1523, 1.7794]** | **excludes parity — ov24 faster by 44.7%** |
+| 10 | 8 | 1.0074 | [0.9173, 1.1124] | flat |
+| 15 | 12 | 0.9825 | [0.9532, 1.0024] | flat |
+| 24 | 85 | 1.0056 | [0.9989, 1.0127] | flat |
+
+**That pattern is the ambient-dependence.** Where ambient picks a single thread, forcing 24 is
+worth 44.7% on 9 cells above the floor; where ambient already picks 10, 15 or 24, the override is
+flat. It is the headline finding seen from the other side — adoption pays exactly where ambient
+under-provisions — and it is reachable at this corpus rather than void.
+
+**Everything below the floor is void, and the reason is stronger than the floor.** Eight further
+strata exclude parity at 5.3% to 21.1%, in both directions, and all are under n=8 with four at
+n=2. **At n=2 the percentile bootstrap over cells has three distinct resample outcomes, so the
+2.5/97.5 percentiles ARE the two per-cell centres** — verified, not argued:
+
+| ambient | per-cell centres | CI | CI == range? |
+|---|---|---|---|
+| 6 | 0.7657, 0.8222 | [0.7657, 0.8222] | yes |
+| 13 | 0.7814, 0.9194 | [0.7814, 0.9194] | yes |
+| 16 | 0.9405, 0.9533 | [0.9405, 0.9533] | yes |
+| 19 | 1.1441, 1.1507 | [1.1441, 1.1507] | yes |
+
+So "excludes parity" there means only *both cells fell the same side of 1*, which a null does half
+the time. Amendment 4's degenerate-resample regime exactly: **no effect measurable, not a small
+one.**
+
+**But "unreachable" overstates it.** 89 keys spread over 22 ambient values cannot put 8 cells in
+most bins — 18 of 22 strata are unusable — yet the four that are usable include the one where the
+mechanism should be largest, and it is. The honest statement is that this stratification is
+**mostly unreachable and not uninformative**: its single above-floor effect is the largest
+reduction-independent reading in the chain.
