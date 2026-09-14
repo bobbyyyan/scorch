@@ -29947,3 +29947,505 @@ two readings. The analyzer checks all eighteen groups by digest and prints which
 unquoted heredoc expanded the backticks. The document text was written through a quoted heredoc and
 is intact. Not correctable in place; commit messages now go through `git commit -F -` with a quoted
 heredoc.
+
+## chain203 stage 1 on live data, and the thread-override mechanism read out of the policy
+
+chain203 is running on redwood — eleven arms, 22 passes, 801 rows per arm-pass. The arms are the
+ambient policy `ovp` (no override) plus a *duplicate pair* at each of the five override rungs, one
+rung per requested worker count of 2, 4, 8, 16 and 24: `ov4` and `ov4b` pass the identical
+argument, so the pair measures what arm identity alone costs at that rung. Stage 1 — the arm
+inventory and the partition check — was run on the first six completed passes rather than at the
+end, because a partition refusal found early saves fifteen passes of compute, and stage 1 depends
+on the `resolved` column rather than on how many passes have landed.
+
+**The inventory holds on every check that could have invalidated the design.** 66 files, 89
+matrices, 3 widths, 267 cells per arm, 0 readings refused at ingestion. Every arm's resolved count
+is single-valued across invocations; all five duplicate pairs declare the same override and resolve
+identically on **0 of 267** cells differing. The partition matches the counts pre-registered from
+chain202 at every width: 29/29/31, 29/29/31, 24/40/25 core/cap-only/adopt.
+
+**All nine chain202 groups reproduce byte-identically on chain203's data, at all three widths.**
+Computed independently of the analyzer, chain202's ledger directory against chain203's live one:
+
+| width | all-arms-agree | cap-only | adopt |
+|---|---|---|---|
+| k=2 | 29 `85caabeb9184bc4e` | 29 `11c105734f6554d1` | 31 `fa59aa79e3e262c8` |
+| k=4 | 29 `85caabeb9184bc4e` | 29 `11c105734f6554d1` | 31 `fa59aa79e3e262c8` |
+| k=32 | 24 `8c4a01a7d3e19de0` | 40 `65ffdf46afa127d3` | 25 `1ec8352efdd15bc6` |
+
+Two independent runs, two independent implementations (a peer session reproduced all 54 stage-1 and
+per-rung digests from its own chain202 snapshot, 0 differing). The partition is a property of the
+thread policy, not of one run's decisions.
+
+### The override has three roles, and delivery is not monotone in it
+
+Read out of `scorch_policy.h` rather than inferred from the counts:
+
+1. **`SCORCH_SPMM_NT_CAP` defaults to `-2`, which resolves to the override when the override is
+   positive** and to `omp_get_max_threads()` when it is not. A positive override is therefore a
+   hard cap on the final count — *below* the base count as well as above it. The comment above it
+   says so: "Deliberately a cap: it can only lower the count, never raise one."
+2. The composition-adoption clause requires `nthreads_override > 0`, so it cannot fire at all for
+   the ambient arm, and inside it the candidate count is bounded by the override: it can only raise.
+3. The ceiling block's widening is remembered so the final cap declines to undo it — which is how a
+   cell delivers more workers than either the override or the pool.
+
+**Two consequences.** First, an override equal to the pool carries the same cap as ambient and has
+one extra mechanism that can only raise, so `resolved[ov24] >= resolved[ovp]` follows from the code:
+`LOWER_ov24 = ∅` is a **theorem**, and the identity `ADOPT ≡ ov24/HIGHER` that rests on it is
+**definitional**. Both chain202 and an earlier draft of this document reported that emptiness as
+data. It is a theorem *given* `override == pool`, so it is a statement about a 24-thread pool and
+not about the policy; a host whose pool differed would not force it.
+
+Second, delivery is neither monotone in the override nor `min(request, cap)`. Cells resolving below
+ambient, by rung and width:
+
+| rung | override | k=2 | k=4 | k=32 | total | gaps to the next rung |
+|---|---|---|---|---|---|---|
+| ov2 | 2 | 56 | 53 | 38 | 147 | +3 / +3 / +3 |
+| ov4 | 4 | 53 | 50 | 35 | 138 | +8 / +6 / +2 |
+| ov8 | 8 | 45 | 44 | 33 | 122 | +18 / +20 / +5 |
+| ov16 | 16 | 27 | 24 | 28 | 79 | +27 / +24 / +28 |
+| ov24 | 24 | 0 | 0 | 0 | 0 | — |
+
+Strictly monotone at every width, 12 of 12 pairwise gaps positive — **and the ordering among the
+four low rungs is a two-to-three-cell effect out of 89.** The fall is carried by the ov16→ov24 step.
+Quote the gaps, not the fall: a 2-cell separation does not make the low rungs separable populations.
+This table is **not** a second confirmation of the partition; it is the same partition the
+membership digests report, viewed as pooled counts. The digests are the stronger form because they
+compare membership rather than cardinality, and what the table adds is the ordering, which a digest
+cannot express.
+
+### 24 cells where the override's value is discarded: an A/A on a loud population
+
+The cells that resolve above the pool are where the remembered ceiling request floors the final cap.
+There are **24 of them, and they are the same 24 cells for ov2, ov4, ov8 and ov16**, delivering
+**exactly 32** workers against a pool of 24 in every case — 21 at k=32 and 3 at k=4. `ovp` and
+`ov24` both deliver 24 on those same cells, and `cells>pool` is 0 for both.
+
+So a cap of 2 yields 32 while a cap of 24 yields 24: **the tighter cap yields the larger team.** On
+those cells the low rungs are ceiling-dominated and the pool-valued rung is the only one the cap
+actually binds, which inverts the cap-dominated reading that holds on the other 243 cells. It does
+not touch the theorem — `ov24 >= ovp` still holds, both being 24 there.
+
+**Any pair of those four rungs is an A/A on these cells**: four different declared arguments, one
+delivered treatment. Unlike the always-1-worker control, which is quiet precisely because nothing
+happens, these cells are running a wide team on the noisy population the bands are applied to. They
+are *not* treatment-free against ambient — all 24 sit in `ov2/HIGHER`, `ov4/HIGHER`, `ov8/HIGHER`
+and `ov16/HIGHER` simultaneously — so the arm pair has to be named. The usable width is k=32 alone,
+where 21 clears the sample-size floor of 8. It is the same principle as before: one binary and
+different arguments, so the cells where the argument makes no difference to what runs give a
+control for free.
+
+### Common random numbers pair by position, so any reordering voids them
+
+`boot()` sorted its ratio vector by **value**, and `seed_for()` hands one seed to a band and to the
+effect that band gates specifically so both are resampled on the same indices. Under a value sort,
+index *i* addresses a different cell in each vector: the pairing was void while every seed was
+identical, and the docstring asserted it anyway.
+
+The two requirements look irreconcilable and are not. A canonical order is needed or the interval is
+a function of the order rows arrived in — that was a real chain202 defect, found by a metamorphic
+test that shuffled rows within each file and moved a CI bound by 0.0034 while the point estimate
+stayed bit-identical. A position-preserving order is needed or a shared seed pairs nothing.
+**Sorting by the cell key satisfies both; sorting by the value satisfies the first and silently
+breaks the second.**
+
+It is now measured rather than asserted, per (width, rung, group), and `boot()` reports back the
+order it actually addressed rather than the order `ci()` sorted — otherwise a value-sorting `boot`
+would still read clean, leaving the report vacuous against exactly the defect it describes. It
+reads **38 of 38** after the fix. It read **23 of 38** before, and those 15 were a second defect the
+report found on its first run: the comparison band taken over every matrix at that width, rather than over the group's cells,
+was computed with the group's own name, so
+it took the group's seed and overwrote the group's order record. Two populations sharing one seed,
+undeclared.
+
+**The fix cost an exact invariance, and the honest version had to be measured.** The within-group
+permutation test asserted that relabelling two cells of a group leaves the bootstrap bounds
+bit-identical. That held only under a value sort, where the permutation is a no-op and the
+assertion could not fail. Split into what each layer can claim:
+
+| claim | status |
+|---|---|
+| membership digests identical | exact |
+| group sizes identical | exact |
+| point estimates identical | exact — the geomean is symmetric in the multiset |
+| CI bounds | within the seed-to-seed spread, **measured** on the unpermuted input |
+| per-cell value digests differ | exact |
+
+Measured: the permutation moves a bound by median 0.00000 / max 0.00030, against a 4-seed spread of
+median 0.01150 / max 0.04100. "Within noise" with no number attached is how an assertion that
+cannot fail gets written.
+
+### nboot is a correctness parameter, not a speed knob
+
+A verdict compares an interval against a band that is itself an interval, so both halves move with
+the bootstrap seed. Sweeping the seed alone on chain203's own six landed passes, 83 rows, 4 seeds:
+
+| nboot | verdicts decided by the seed | median bound spread |
+|---|---|---|
+| 150 | 6 of 83 (7%) | 0.01150 |
+| 600 | 3 of 83 (4%) | 0.00580 |
+| 2400 | 0 of 83 (0%) | 0.00290 |
+
+The spread splits sharply by group kind at nboot=150 — NULL 0.0034, cap-only 0.0144, adopt 0.0171,
+HIGHER/LOWER 0.0174 — so the **verdict-bearing groups are 5.1× noisier than the treatment-free
+ones**, the same quiet-subpopulation ratio the CV column reports. A spread quoted from the control
+groups understates the groups a verdict rides on by that factor. The arm pair matters as much as the
+group: on the same adopt cells, the duplicate-pair A/A interval and the treatment interval are
+**12× apart** (0.00179 against 0.02156), so most of the level gap is the pair, not the kind, and the
+two are separable.
+
+The analyzer now **refuses** below the pre-registered 4000 unless `--fixture` is passed, and a
+`--fixture` run prints a banner saying the verdicts below are partly the seed. The bar is the
+pre-registered value and not the measured 2400 crossover: a crossover measured on one corpus is a
+property of that corpus's spread, and adopting it as a constant is how a threshold gets overfitted.
+
+**And a related percentile fix, with the reason corrected.** `out[int(0.025 * nboot)]` is the
+(i+1)/(n+1) quantile, so a nominal 95% interval was really p3.70–p97.53 at nboot=80 and p2.55–p97.50
+at nboot=2000. Replaced with an n-independent quantile. The reason to fix it is that a bound moving
+with `--nboot` beyond Monte Carlo error is not a property of the data — **not** that narrowing is
+anti-conservative, which holds for an interval and does not transfer to a one-sided excursion like
+`max(|lo-1|, |hi-1|)`, where narrowing moves the two bounds in opposite directions relative to
+parity. Measured effect on the margin: +0.00044, +0.00033, +0.00028, −0.00001 — mixed in sign and
+vanishing by nboot 2000.
+
+### Four defects in the verification apparatus itself
+
+**Three checks were passing against stale mutant copies on `/tmp`.** The mutants predated three
+later changes to the analyzer, so a newly added flag made them exit 2 from `argparse` — and exit 2
+with no message match scored as "did not fire", not as *this check has been exercising a program
+that is no longer the one under test*. Both mutants are now built from the analyzer's current text
+with an asserted anchor, so a moved anchor refuses loudly instead of degrading to a silent skip.
+This is the most dangerous class in the apparatus: it reports passing while testing nothing.
+
+**A fabricated fixture was taking its defining property from the caller's directory.** Three census
+checks read "did not fire" about the *input*: one needed a duplicate arm absent, two needed
+bit-identical duplicates, and the supplied directory had neither. The root cause was worse than a
+wrong argument — the generator's verbatim copy and its fabrication write the same destination
+filename, and `sorted()` glob collation decided which won, so `sh_ov2_*` sorting before `sh_ov2b_*`
+meant the copy landed last and a `--jitter 0` run silently produced a *jittered* directory. The
+generator now refuses a source already holding an arm it fabricates, each check builds and asserts
+the property it tests, and the bit-identity premise is reported as rows-compared / rows-differing.
+
+**A metamorphic transform was fabricating an impossible input, and a structural check caught it.**
+The swap relation exchanged two arms by rewriting `build` and `override` while leaving `resolved`
+alone, producing rows asserting "asked for 8 workers, got 4" — impossible under the cap. It is now a
+pure relabelling where every column travels with the row, which is the honest form of "exchange two
+arms". A column that must travel with its row is the same family as `resolved` being valid on only
+one arm.
+
+**And a refusal that should have been a report.** The cap check refuses when P1 fails — no cell
+resolves below ambient under an override at or above that cell's own pool — which follows from the
+cap plus the raise-only adoption. It initially also refused when |LOWER| failed to fall with the
+override, which follows from nothing in the source: `ceil_pool_ok` reads the override *as* the pool,
+so a larger override can enable a branch a smaller one declined. That is now reported, not refused.
+Refusing on an expectation is how a tool starts rejecting inputs for being surprising. Two more
+mistakes in the same block: the check compared the override against the corpus-wide **maximum** pool
+rather than each cell's own, which changed nothing on either corpus here (pool is 24 on all of them)
+and would be live on any corpus whose pool varies, including the M5's 6; and the census matched the
+refusal text from the end-of-run summary block, which a run that exits earlier never reaches.
+
+### The rotation balance certificate was about the schedule, not the landed passes
+
+The harness checks its rotation table before any pass runs and prints "position AND predecessor
+balanced, and just checked to be". That sentence is true of the *schedule* and says nothing about
+the passes on disk, so a partial directory carries a balance certificate for data that does not
+exist yet. The distinction matters more than a power argument: low statistical power widens a band,
+whereas **an incomplete rotation moves it, by an amount that does not shrink with more cells or
+more resamples.** The earlier rotation work measured it: an unbalanced lead position cost
+**0.5–1.2% in the geomean at four of five widths**, on a build whose source was identical to the
+baseline's. That is the same order as the bands here, so it inverts small verdicts.
+
+Balance of every prefix of chain203's 22×11 table (`orders_idx11x22.txt`, sha256
+`0a74b3f908f5a0c2`), computed independently by two sessions:
+
+| passes | position-balanced | position counts | predecessor-balanced | ordered pairs |
+|---|---|---|---|---|
+| 6 | no | [1] | no | 52 / 110 |
+| 9 | no | [1] | no | 68 / 110 |
+| **11** | **yes** | [1] | no | 77 / 110 |
+| 15 | no | [1, 2] | no | 98 / 110 |
+| 21 | no | [1, 2] | no | 110 / 110 |
+| **22** | **yes** | [2] | **yes** | 110 / 110 |
+
+The second half is the row-wise reversal of the matching row of the first on 11 of 11 rows, which
+is what closes the adjacency set. **Pass 11 is the first readable point, with the adjacency
+imbalance stated; 22 is the only clean one; 9, 15 and 21 are not read points at any sample size.**
+
+`an_c203.py` now takes `--orders` and computes balance on the **landed** passes, printing declared
+and landed side by side with the table's digest. It takes the landed pass set from the filenames,
+counting a pass only when every arm has it — a partially written pass has no position for the arms
+that did not run in it, and the `slice` column cannot serve because it is the pass label, not the
+position. A landed prefix that is not position-balanced **refuses** the band stages and names which
+prefixes of that table are balanced at all. A landed pass with no row in the table also refuses,
+rather than being dropped: dropping it would compute a balance for a prefix of a different schedule.
+With no `--orders` the analyzer prints that the balance was not checked and why it cannot be
+recovered from the readings.
+
+**Two independent reads of one file are one reading.** Both sessions verified the same digest, which
+established agreement about the bytes and not that those bytes were the table redwood sourced. The
+discriminator is the run's own filesystem: `/scratch/bobbyy/orders_idx11x22.txt` on redwood hashes
+to the same `0a74b3f908f5a0c2`, its mapped form `c203/orders_named.txt` to `5097fd2d3a719ef3`, and
+the live log's startup line reads `22 passes; position counts [2]; ordered pairs [2] over 110 of
+110`.
+
+**And the same question asked of chain202 turned up a positive control that had never been run.**
+Every chain202 margin — the NULL/cap-only/adopt bands, the ladder, the behind-MKL counts, the
+estimator-sensitivity work — rests on its own rotation, and nobody had checked it. Pulled from
+redwood rather than from a snapshot, `c202/orders_named.txt` (sha256 `0c6ba41bf200e006`, 14 rows ×
+7 arms) is **fully balanced**: every arm in every position exactly twice, all 42 ordered adjacent
+pairs exactly twice, all seven mean positions exactly 3.00 — the centre of 0..6 — and the same
+reversal structure. Its position-balanced prefixes are [7, 14]. So chain202's verdict is on a
+position-balanced schedule, and if a chain202 partial directory is ever read the same refusal
+applies with [7, 14] in place of [11, 22].
+
+chain203's construction is measurably better at the interim point: **21 of 42 ordered pairs at
+chain202's halfway mark against 77 of 110 at chain203's** — 50.0% versus 70.0%, and 77 rather than
+the 55 that a design covering each unordered pair once would give. Pass 11 of chain203 is therefore
+a stronger interim read than pass 7 of chain202 would have been.
+
+### The format scanner was blind to the commonest member of its own defect class
+
+Adding the landed-balance check, a `%` operator ended up on the wrong `print`: one string carried an
+orphaned `%d` and printed it literally, and the next received operands it could not use and raised
+`TypeError`. `fmtcheck.py` — which exists for exactly this class — reported **0 format defects**,
+because its mirror check looked only for `%%` in a never-formatted string and a bare `%d` sailed
+through.
+
+It now flags any conversion in a string no `%` operator ever touches, with two narrowings so that
+prose *about* formats is not flagged: the space flag is excluded (the flag set `[-+ #0]*` admits a
+space, so "0% at 2400" and "17.2% reading" parse as conversions), and a spec named inside backticks
+is an explicit opt-out — which makes the fix at a flagged prose site "backtick the spec", better
+writing as well as a quieter scanner. A string bound to a name that is `%`-formatted elsewhere is
+skipped, since its conversion is used, just not at the assignment.
+
+Then the test that should have come first: the exact edit that defeated the scanner was rebuilt as a
+mutant, and the widened scanner catches it at the right line. **A scanner never shown to fail on its
+own defect class is the same vacuous guard as a metamorphic relation that holds because the
+transform is a no-op** — the third instance of that shape here, after the value-sorted permutation
+and the stale mutant copies.
+
+### Two rotation tables can both be balanced, and one of them is the wrong chain's
+
+The ledger holds chain202's *named* table and chain203's *indexed* table under parallel names, and
+chain203's named table exists only on redwood:
+
+| file | shape | sha256 | chain |
+|---|---|---|---|
+| `orders_named.txt` (ledger) | 14 × 7 | `0c6ba41bf200e006` | chain202 |
+| `orders_idx11x22.txt` (ledger, and redwood) | 22 × 11 | `0a74b3f908f5a0c2` | chain203 |
+| `c203/orders_named.txt` (redwood only) | 22 × 11 | `5097fd2d3a719ef3` | chain203 |
+
+**Both ledger tables are balanced**, so a check asking "is this rotation table balanced?" answers
+yes on either, and pointing `--orders` at the wrong one during a chain203 analysis certifies
+chain202's schedule for chain203's data. That is a passing check describing the wrong chain — the
+same shape as a stale mutant, with a different artefact.
+
+The `--orders` path now refuses before computing any balance, on three discriminators, because any
+one of them can be satisfied by accident: the row width against the run's arm count, the table's
+**arm set** against the run's, and rows all being the same width. The arm set is the only one that
+catches a same-shape table under a different arm labelling, so it has its own fabricated input — a
+table of the right width with one wrong label.
+
+**And the generator that produced the table had a relative write path.** `mkorders11.py` wrote to
+`orders_idx11x22.txt` in the current directory, so invoking it from a ledger directory would have
+overwritten sealed evidence in place. The generator is deterministic, so an accidental in-place
+regeneration changes only the mtime and **`SHA256SUMS` still verifies** — a mutation of sealed
+evidence that passes every integrity check in use. It only causes damage if the output ever moves,
+under a different Python or a different iteration order, and then it causes it silently. It now
+requires `--out PATH`, absolutises it, and refuses a path that already exists.
+
+Running it under `--out` also settles the provenance question: its output is **byte-identical** to
+the sealed table, `0a74b3f908f5a0c2`. That matters for one specific claim rather than for validity —
+the 77-of-110 adjacency gain is a *causal* claim about the construction, and a hand-edited table
+would have left the property true and the attribution unsupported. Two facts from the generator's
+own output belong in prose rather than in a script's stdout: exact precedence balance is
+**impossible**, since 605/110 = 5.5 is not an integer, so 55-at-5 / 55-at-6 is an optimum and not a
+missed target; and **0 of 4000 random bases** met the reversal-paired-difference condition, with
+only 19.4% of those reaching the precedence optimum — so the construction is not reachable by
+sampling, and the two conditions are independent.
+
+### A shared scratch directory that one script rebuilds is a race that reports as a data defect
+
+Running the check census while the battery was running produced two failures that looked like
+neither. The census rebuilds its work directory from scratch and the spike test rebuilds its case
+directory per case, so each removed a directory the other was reading. The symptoms were
+`REFUSE: missing arm: ov2 or ov2b absent` — a corpus with five of eleven arms — and a check
+reporting `DID NOT FIRE: no summary line`. One reads as a broken corpus and the other as a broken
+check; neither reads as a collision, and the reader cannot tell from inside.
+
+Fixed structurally rather than by discipline: the spike case directory is now per-process, and the
+census takes an exclusive lock on its work directory and refuses if another census holds it, naming
+the scripts that depend on its subdirectory names. The work directory itself cannot be made
+per-process, because those names are the interface between four scripts. Same family as the stale
+mutant copies and a stale ledger snapshot, except the artefact is destroyed rather than outdated.
+
+### A named rotation table cannot be identified by its shape, and balance is relabelling-invariant
+
+Refusing a table of the wrong width with the wrong arm set turned out to pin the table's *shape
+and labels*, not its identity. One index table mapped through different arm orders yields
+different named tables with **identical width, identical arm set and identical balance**; only the
+content digest separates them:
+
+| mapping | position-balanced | predecessor-balanced | pairs | content digest |
+|---|---|---|---|---|
+| harness `$ARMS` | yes | yes | 110/110 | `7ae1273bc3bc90fd` |
+| `sorted()` | yes | yes | 110/110 | `51beadb47afbcb32` |
+| three shuffles | yes | yes | 110/110 | three more distinct digests |
+
+The mechanism is in the harness: it maps the index table to names through its `$ARMS` string, so any
+reordering of that string — grouping the duplicate arms differently, alphabetising it, inserting a
+rung — produces a different named table that passes every shape and label check.
+
+**So the index table is the right input, not merely the tidier one: the questions asked of the
+table do not depend on the mapping, so the input should not carry one.** `--orders` now requires the
+digit form and accepts a named table only against an asserted `--orders-sha256` that must match —
+printing a digest lets a reader check, asserting it stops the analysis.
+
+**And the invariance that makes this work is narrower than it looks.** Position and predecessor
+balance are invariant to relabelling, verified on this table under five mappings: identical balance
+at every prefix, five distinct digests. Every *per-arm* statement is not. On the 9-row prefix all
+**11 of 11** arms have a different position histogram under `sorted()` than under the harness's
+order, with mean positions differing by up to 0.66. The analyzer had been mapping through
+`sorted()` and getting the right answer for the right reason without saying so — which would have
+become wrong the moment the report answered the obvious next question, "not balanced *how?*", with
+a per-arm breakdown. It now takes `--arms`, checks its set against the run's, and when it is absent
+prints in the output that no per-arm figure may be derived.
+
+**One truncation case survives all of it.** An 11-row cut of the 22-row table is itself
+position-balanced, so it passes width, arm set and both balance tests. The only thing that catches
+it is a landed pass with no row in the table — a refusal added for the wrong-table case that turns
+out to be load-bearing for this one too.
+
+### The pattern: a check built for the partial case cannot be validated on the complete one
+
+Three defects here share a shape, and the shape is a testing-strategy conclusion rather than three
+anecdotes:
+
+| defect | inert while | live when |
+|---|---|---|
+| CV computed on a hardcoded 6 passes | every arm had ≥ 6 passes | the pass count differs from 6 |
+| override compared against the corpus-wide maximum pool | pool is 24 on every row | the pool varies per cell |
+| positions mapped through `sorted()` | the rotation is complete, where symmetry gives every arm the same histogram under any mapping | the prefix is partial |
+
+Each was added to serve a partial or interim read. Each is invisible on the complete artefact the
+suite normally runs against, and a test written on that artefact passes. **The fixture for a
+partial-case check has to be partial** — a complete fixture is evidence about the wrong regime.
+
+### Four ways a verification artefact goes wrong, and none of them fails a test
+
+| variant | what happens | how it reports |
+|---|---|---|
+| stale | the artefact is older than its subject | reports *passing*, tests nothing |
+| destroyed | the artefact is removed under a reader | reports a data defect one layer below the cause |
+| duplicated | the artefact is copied beside its source | never errors, only agrees |
+| degenerate | many artefacts satisfy the check | passes while describing the wrong object |
+
+All four occurred in this one session: stale mutant copies on `/tmp`, a work directory rebuilt under
+a concurrent reader, regenerated copies of a sealed rotation table sitting in a scratch directory,
+and the named rotation table. **None of them produces a failing test.** So the detector cannot be
+the suite — it is an inventory of which bytes were read, which is why naming the artefact and its
+digest beside each number did more work here than any assertion added. The duplicated case has the
+cheapest mitigation: rename the copy so its name carries its provenance (`MY_REGEN_…`) rather than
+deleting it, since deleting also destroys the evidence that the check was run.
+
+### The third rotation question: did the run execute the table?
+
+Three separate questions, and only two were being asked:
+
+| question | answered by |
+|---|---|
+| which bytes the table holds | the digest |
+| whether the design is sound | the balance check |
+| whether the run executed it | nothing |
+
+The third is not implied by the first two. A digest-verified, fully balanced table can sit beside a
+run that ordered its arms some other way — a different file read, a different arm list mapped
+through, a reorder inside a pass — and every check described above passes. It is the degenerate
+case one level up: the artefact is right and its relationship to the data is unverified.
+
+The evidence is in the run log, and the first version of this check read the wrong line of it. The
+harness prints each completed pass with a bracketed arm order:
+
+    pass p9 of 22 done 17:13:44  [ov16b ov24 ov24b ov2 ov8b ovp ov4b ov16 ov4 ov8 ov2b]
+
+**That bracket is an echo of the plan, not an observation.** The body does
+`ORD=$(sed -n "${P}p" "$ORDERS")`, then `for A in $ORD`, then `echo "... [$ORD]"` — so comparing
+the table against the bracket cannot fail by construction. It is the vacuous-guard shape again: a
+check that reports a match it could not have missed.
+
+The comparison is still worth making for two non-circular reasons. The log carries arm **names**
+while the table carries **indices**, so it confirms which arm list the harness mapped through —
+which makes `--arms` checkable rather than merely declared, and only
+`ovp ov2 ov2b ov4 ov4b ov8 ov8b ov16 ov16b ov24 ov24b` reproduces the log while `sorted()` fails on
+every pass. And the bracket comes from the run, so a *different* `$ORDERS` file than the one being
+analyzed is detected.
+
+**The non-circular record is the `wrote` sequence.** Inside the loop each arm emits
+`wrote .../sh_<arm>_float32_p<N>.csv` as its subprocess finishes, so that sequence is an
+observation where the bracket is a plan. The arms run sequentially, so completion order is
+execution order — were they to overlap this comparison would need to change rather than be
+trusted. `passlog_c203.py` now compares all three records:
+
+    totals over 9 passes: table==bracket 9, bracket==observed 9, table==observed 9
+    passes whose observed arm count != 11: none
+
+Firing inputs, one per claim the check makes:
+
+| input | result |
+|---|---|
+| two `wrote` lines of one pass swapped, bracket untouched | `bracket==observed` falls to 8, refuses |
+| one `wrote` line deleted | refuses: an incomplete record is not a wrong order |
+| the wrong arm order | refuses on every pass |
+| an empty log | refuses rather than reporting "0 of 0 match" |
+
+The first is exactly the case the bracket comparison is structurally blind to, and the third row
+matters for its own reason: comparing a short observed list against a full table row would report a
+*wrong order* where the truth is an *incomplete record*.
+
+**Run retroactively on chain202, whose log is on the same host: 14 of 14, table == bracket ==
+observed, no pass with an arm count other than 7.** So chain202 was designed balanced and executed
+as declared, established from an observation rather than an echo, on the chain whose verdict is in
+circulation. chain203's log exists only on redwood at the time of writing, so the same retroactive
+check needs it sealed with the ledger after the last pass.
+
+### An interim band read is not authorised, and the analyzer now says so
+
+A position-balanced prefix is free of position bias. That is a statement about rotation and not a
+licence to read bands there: an extra look is an extra look however clean its schedule, and
+amendment 3 puts the bands at the completed rotation.
+
+The price was measured on chain202's own duplicate-arm A/A pair, with each look centred on its own
+estimand so both are exact size tests and every rejection is multiplicity:
+
+| group | n | look 1 (7 passes) | look 2 (14 passes) | either | inflation |
+|---|---|---|---|---|---|
+| NULL k=2 | 29 | 0.066 | 0.054 | 0.100 | 1.85× |
+| NULL k=32 | 24 | 0.166 | 0.098 | 0.224 | 2.29× |
+| ADOPT k=2 | 31 | 0.068 | 0.124 | 0.182 | 1.47× |
+| ADOPT k=32 | 25 | 0.066 | 0.070 | 0.116 | 1.66× |
+
+**Two looks cost 1.47× to 2.29× the single-look false-positive rate** — modest rather than
+catastrophic, because the looks share their first passes and all their cells and are therefore
+strongly correlated, which is the same mechanism that limits it. It is not free, and it lands on
+the stage whose entire purpose is a null control.
+
+The inflation *ratio* is the robust part of that table; the absolute levels are approximate,
+because the centring uses the same cells it then resamples from. A first attempt at the same number
+centred the population on the 14-pass statistic and ran a 7-pass look against it — a different
+functional, so uncentred — and produced a **12.09× "inflation" that was entirely a bias term.**
+That is why the ratio rather than the level is the reportable quantity.
+
+A separate observation from the same table deserves following up after the completed run: the
+**single-look rates read 0.054 to 0.124 against a nominal 0.05**, which would make the final bands
+somewhat anti-conservative before any multiplicity is added. That needs a cleaner construction than
+the one that produced it, and it is queued rather than acted on.
+
+So with `--orders` given and fewer passes landed than the table declares, `an_c203.py` refuses the
+band stages, naming amendment 3 and the measured price. **Deliberately with no override flag:** an
+interim read requires an amendment, and an amendment is a change to the pre-registration followed by
+a change to this code — a flag would be the licence the scope confusion already granted once.
+Stage 1, the partition, the refusal paths and everything else whose answer comes from `resolved` or
+from filenames rather than from `ms` are read at any prefix, which is why reading the partition at
+six passes was sound.
