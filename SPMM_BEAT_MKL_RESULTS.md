@@ -29997,12 +29997,16 @@ one extra mechanism that can only raise, so `resolved[ov24] >= resolved[ovp]` fo
 data. It is a theorem *given* `override == pool`, so it is a statement about a 24-thread pool and
 not about the policy; a host whose pool differed would not force it.
 
-Independent corroboration turned up where it was not looked for: the per-population coverage table
-in the interval-level section below groups cells by rung and direction for an unrelated purpose,
-and `ov24/LOWER` reads **n = 0 at all three widths** there. That script reads `resolved` only to
-form its groups, knows nothing about the cap, and had no way to produce an empty group in that one
-position by accident. An empty row in a coverage table is a poor place to notice a theorem, but it
-is a construction with no stake in the answer.
+**What a second reading of it does and does not add.** The per-population coverage table in the
+interval-level section below groups cells by rung and direction for an unrelated purpose, and
+`ov24/LOWER` reads **n = 0 at all three widths** there. That is not corroboration of the theorem:
+no input could make the group non-empty unless the binary differs from the policy source, so a
+second script reading zero is one more observation of a theorem rather than evidence for it.
+
+What the two readings jointly establish is worth more than that. The theorem is read off the
+**source text** in the local tree, and the n = 0 is in **data produced by the redwood build** — so
+together they say the redwood binary implements that clause as written. Neither reading alone says
+it, and it is the only build-versus-source check either reading gives us for the thread policy.
 
 Second, delivery is neither monotone in the override nor `min(request, cap)`. Cells resolving below
 ambient, by rung and width:
@@ -30035,8 +30039,19 @@ those cells the low rungs are ceiling-dominated and the pool-valued rung is the 
 actually binds, which inverts the cap-dominated reading that holds on the other 243 cells. It does
 not touch the theorem — `ov24 >= ovp` still holds, both being 24 there.
 
+Call these the **saturated** cells, to keep them apart from the cells where the override is
+*declined*. Those are a different and disjoint population: 87 cells where ov2 delivers exactly what
+ambient delivers, 82 of them a single worker, treatment-free against ambient and quiet. Measured
+overlap with the saturated 24: **zero**. One set is untreated and quiet, the other treated and loud,
+so they must not share a name.
+
 **Any pair of those four rungs is an A/A on these cells**: four different declared arguments, one
-delivered treatment. Unlike the always-1-worker control, which is quiet precisely because nothing
+delivered treatment. Counted across all eleven of chain203's arms rather than the four, the
+delivered team here is 32 for `ov2/ov2b/ov4/ov4b/ov8/ov8b/ov16/ov16b` and 24 for `ovp/ov24/ov24b`,
+so **31 of the 55 arm pairs are an A/A and 24 are not** — every pair crossing that boundary carries
+a real difference in delivered width. All five b-arms duplicate their base on all 24 cells with zero
+disagreements, which is the premise a per-rung bar rests on and is therefore checked rather than
+assumed. Unlike the always-1-worker control, which is quiet precisely because nothing
 happens, these cells are running a wide team on the noisy population the bands are applied to. They
 are *not* treatment-free against ambient — all 24 sit in `ov2/HIGHER`, `ov4/HIGHER`, `ov8/HIGHER`
 and `ov16/HIGHER` simultaneously — so the arm pair has to be named. The usable width is k=32 alone,
@@ -30476,12 +30491,27 @@ Carlo standard error 0.003:
 | pooled | 40 | 0.082 | 1.6× |
 | pooled | 64 | 0.080 | 1.6× |
 
-Pooling across widths and arms describes no row the design reads, though. Done per (width, group)
-on each population's own residuals and at each group's own n, 34 populations were large enough to
-characterise and **every one of the 34 is at or above nominal**, spanning 0.056 to 0.131 — 1.1× to
+Pooling across widths and arms describes no row the design reads, though. Done per (rung, group,
+width) on each population's own residuals and at each group's own n, 34 populations were large
+enough to characterise and **none of the 34 reads below nominal**, spanning 0.056 to 0.131 — 1.1× to
 2.6×. The spread is the finding: a control row and an effect row at the same width and the same n
 draw from different populations and need different corrections, so no single widening constant is
 available.
+
+Read per row that claim would be too strong. At 4000 replicates the bottom of the span carries a
+standard error of 0.0036, so 0.056 sits 1.65 standard errors above 0.050 and is not individually
+distinguishable from nominal. Read as a set it is far stronger than the per-row version. Under a
+true null each population reads at or above nominal with probability about one half, so all 34
+doing so has probability 5.8e-11 if they are independent; collapsing the three widths to 11
+effective units gives 4.9e-4, and a deliberately conservative six effective units still gives
+1.6e-2. **The joint claim is decisive where the individual rows are not** — the same repair the
+chain202 control rows needed further down, arrived at from the other direction.
+
+An independent construction on chain202's data reaches 0.147 at k=32 where this one tops out at
+0.131, and that is not two measurements conflicting. The partitions differ: this table's groups are
+each rung's cells resolving equal to, above and below ambient, while the other uses the
+pre-registered null / cap-only / adopt partition, on a different corpus. Different definitions of
+the same cells, so the ceilings are not the same quantity.
 
 **Discreteness is not the cause, measured rather than assumed.** The empirical arm resamples a pool
 of discrete atoms while a normal comparison arm draws from a continuous distribution, so a two-arm
@@ -30541,23 +30571,43 @@ independently measured per-row rates is what made that visible.
 
 ### What the design already absorbs, and what it does not
 
-The realised level matters to a reader who takes 95% literally. It matters much less to the
-verdicts, and the reason is amendment 3's bar rather than luck. The operative bar for chain203 is
-**each rung's own X/Xb pair on the same group the effect is computed on** — so the bar and the
-effect are produced by the same bootstrap, at the same n, on the same population, with the same
-realised level. If the interval is systematically too narrow, both the effect's excursion and the
-bar's excursion shrink together, and the comparison between them is largely preserved. The fixed
-bars carried from chain202 do not have that property: they were measured on chain202's group sizes
-and are applied to chain203's, so for the groups whose n moved — 31 against 29 at k=2 and k=4, 40
-against 26 at k=32 — the level does not cancel exactly.
+**First, the size of the defect expressed as what it would change.** Everything above is a ratio of
+exclusion *rates*, and a rate ratio is not a width ratio. The widening a realised rate implies is
+the ratio of normal quantiles, z(0.975)/z(1-a/2):
 
-That is an argument from the construction, not a measurement, and it should not be read as more.
-The measurement that would settle it is a re-run of the verdict table with a calibrated level
-applied to **both** the bar and the effect, counting how many verdicts move; queued for the
-completed passes, alongside the margin calibration that already reports flips at D/A = 1.00 on
-every arm. Until then the statement is: the band's stated confidence is optimistic by 1.1x to 2.6x
-depending on the population, and the own-pair comparison the verdicts actually use is affected far
-less than that figure suggests.
+| realised non-coverage | as a rate ratio | implied widening |
+|---|---|---|
+| 0.056 | 1.1x | +2.6% |
+| 0.076 | 1.5x | +10.5% |
+| 0.092 | 1.8x | +16.3% |
+| 0.131 | 2.6x | +29.8% |
+| 0.147 | 2.9x | +35.2% |
+
+So the whole measured span of the defect is **a 3% to 35% widening of a band**, not a factor of 2.6
+in anything a reader would act on. That bounds the damage without waiting for the calibrated re-run,
+and it is the figure that belongs beside the rate.
+
+**Second, it does not shrink both sides alike, and an earlier draft of this section said it did.**
+The operative bar for chain203 is each rung's own X/Xb pair on the same group the effect is computed
+on, so bar and effect are produced by the same bootstrap at the same n on the same population. That
+much holds. But an excursion is |centre − 1| + halfwidth, and a width correction scales the
+halfwidth while leaving the centre alone, so the two sides scale differently whenever their
+centre-to-halfwidth ratios differ. Writing the effect as |c_e| + f·h_e and the bar as |c_b| + f·h_b,
+the derivative of their ratio in f has the sign of h_e|c_b| − h_b|c_e|: **the effect-to-bar ratio
+rises with widening exactly when the bar is the more centre-dominated side, and falls when the
+effect is.** Both directions occur by construction, so no single sign statement covers the table.
+
+Measured on the one rung where amendment 3's structure already exists in chain202 — bar ov24/ov24b
+against effect ov24/ovp, both on the adopt group, same cells, same n, pass-paired over 14 passes —
+the effect-to-bar excursion ratio moves from 3.04 to 3.55 at k=2, 3.55 to 3.81 at k=4, and 19.99
+*down* to 16.70 at k=32 under a +30% widening. Both directions, by −16% to +17%, **flipping
+nothing**: no row in that table comes within 3× of its bar.
+
+The fixed bars carried from chain202 do not share the cancellation at all, because they were measured
+at chain202's group sizes and are applied at chain203's — 31 against 29 at k=2 and k=4, 40 against 26
+at k=32. The measurement that would settle the whole question is a re-run of the verdict table with a
+calibrated level applied to **both** the bar and the effect, counting how many verdicts move; queued
+for the completed passes.
 
 ### The general residue
 
