@@ -30982,10 +30982,18 @@ Per pair, seven pairs over the seven even prefixes:
 | `ov24b/ov24` | 1 of 6 |
 | **total** | **4 of 42 steps, 4 of 7 pairs rise at least once** |
 
-So the decay is **not** monotone on this reduction either, and a peer reaching the same verdict on
-theirs (11 of 42) means the two reductions agree rather than differ. Both sessions had published a
-one-line monotonicity verdict read off a max over pairs, and both were instruments rather than
-results. It cannot be extrapolated: the gap is set by the spread of whichever two values happen to
+So the decay is **not** monotone on this reduction either, and a peer reaches the same verdict on
+theirs at 11 of 42. **The agreement is binary and not a shared rate**: 4 of 42 against 11 of 42 is
+nearly 3× apart, consistent with the two reductions themselves differing by about 3× at six passes,
+so "the reductions agree" means they agree on *non-monotone* and not that they behave alike.
+
+Both sessions had published a one-line monotonicity verdict read off a max over pairs, and **the two
+failures are not mirror images.** One max rose at 2 of 6 steps where members rose at 11 of 42 —
+invalid instrument, correct conclusion. The other, this document's, fell at 0 of 6 where members rose
+at 4 of 42 — invalid instrument, **wrong published conclusion**. Only one of the two changed a
+verdict, and the other is the more dangerous kind to leave in place: an invalid instrument that
+happens to agree with the truth emits nothing that flags it. That asymmetry is the argument for
+printing the member rows rather than only the summary, which is what both sides changed. It cannot be extrapolated: the gap is set by the spread of whichever two values happen to
 land in the middle, which no trend predicts. A peer independently found
 the same defect in their own nesting, smaller by 5× to 140× depending on the pair, and confirmed the
 mechanism quantitatively: for one pair the two middle values are 0.98863959 and 0.99011021, and the
@@ -31043,14 +31051,40 @@ other, and the landed-pass set is derived from filenames rather than labels. Any
 across the two — a `startswith`, a set intersection, a dict keyed by "the label or the arm" —
 silently returns the wrong rows.
 
-The second hazard is ordering, and it is currently hidden by the run's length. `ov1`..`ov14` sorts
-lexically to `ov1, ov10, ov11, ov12, ov13, ov14, ov2, …`, so "the first six passes" by string order
-is passes 1, 10, 11, 12, 13, 14 — the oldest plus the newest five, maximally spread in time rather
-than contiguous. This document already records that trap being hit once, on `sorted(slices)[:6]`. At
-chain203's current six labels the lexical and numeric orders **agree**, which is a property of the
-count and not of the scheme; they diverge the moment a label reaches two digits.
+The second hazard is ordering, and **it is already active.** An earlier draft of this paragraph said
+it was "hidden by the run's length — at chain203's six labels the lexical and numeric orders agree".
+That was read off the six-pass snapshot, one paragraph after this document warned against carrying
+snapshot figures forward. Read from the live directory instead, the labels are `ov1`..`ov13` and the
+orders diverge:
+
+| labels present | lexical order agrees? | first six by string order |
+|---|---|---|
+| 6 | yes | ov1 ov2 ov3 ov4 ov5 ov6 |
+| 9 | yes | ov1 ov2 ov3 ov4 ov5 ov6 |
+| 10 | **no** | ov1 ov10 ov2 ov3 ov4 ov5 |
+| 13 (live) | **no** | ov1 ov10 ov11 ov12 ov13 ov2 |
+| 22 (final) | **no** | ov1 ov10 ov11 ov12 ov13 ov14 |
+
+**Divergence began at pass 10**, some hours before the paragraph claiming otherwise was written. The
+collision count grew too: `ov2` and `ov4` at six labels, `ov2`/`ov4`/`ov8` at thirteen, and `ov16`
+joins at twenty-two. So "inert because the run is short" is gone and only one guarantee remains.
+
+That guarantee is now **audited rather than argued.** Every site in `an_c203.py` that touches a pass
+label, all fourteen of them:
+
+- ingestion uses the label as a **dict key** (`T[build][cell][slice][arm]`) — order-irrelevant;
+- the pass count is `len({...})` over a set — order-irrelevant;
+- `PASSES_LANDED` / `PASSES_PARTIAL` are **integers parsed from filenames**, not labels, and sorted
+  numerically;
+- the shared-pass set in `ratios_keyed` is a **membership** test, and the `sorted()` beside it sorts
+  the resulting *ratios*, not the labels;
+- the CV pass iterates a dict without ordering it.
+
+No code path orders or slices the label set, and none looks a label up against an arm name. That is
+a stronger statement than "the landed-pass set comes from filenames", and it is the reason the
+hazard is inert at thirteen labels as well as at six.
 
 Reported by `labels_c203.py` in the verification battery rather than as a refusal inside the
 analyzer. The analyzer is the instrument for a measurement in flight, its battery is green, and the
-hazard is inert — adding a refusal to a frozen instrument for an inert hazard trades a real
+hazard is audited-inert — adding a refusal to a frozen instrument for an inert hazard trades a real
 regression risk against no present benefit. Both findings are a rename away from being impossible.
