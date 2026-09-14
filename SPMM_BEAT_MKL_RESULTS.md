@@ -31760,3 +31760,56 @@ under-reports the fixed population and manufactures apparent violations; on the 
 under-reports the named population and manufactures apparent gaps. Both of tonight's errors —
 keying on `os.environ.get`, requiring `\w+\.py` — are that. Enumerate by the thing that cannot
 be spelled two ways: the literal path on one side, the file on disk on the other.
+
+### Correction: 11 files hold the literal, 1 defeats the rule
+
+The previous section's headline — "11 harness files still carry a hardcoded ledger path" — is
+true as a literal count and wrong as a statement about the rule. The rule is *"harnesses take a
+tree root as `$1`"*, and stratifying the 11 against that:
+
+| | |
+|---|---|
+| read `sys.argv` and hardcode only where **sibling harness code** lives | 10 |
+| never read `sys.argv`, pin the measured tree, and **forge** `sys.argv` | 1 |
+
+Ten of them take their tree root correctly. What they hardcode is the location of a sibling
+harness module they import — brittleness of exactly the kind the shared-predicate module
+inflicted on the ablation tonight, not a harness measuring the wrong tree. Counting them under
+the same heading over-states the rule's defect by ten.
+
+**The one real instance is worse than a literal.**
+`workspace-confound/harness/suppress_probe.py` is the only file of the eleven that never reads
+`sys.argv` — it has zero reads and **two writes**:
+
+```python
+TREE = os.path.expanduser("~/.cache/scorch-codex/workspace-confound/worktrees/base-5113e0c")
+sys.argv = ["strategy_correctness_reach.py", TREE, "/dev/null", "5113e0c"]
+import strategy_correctness_reach as SCR
+```
+
+It pins the measured tree to one worktree at one SHA, imports scorch from that tree, and then
+synthesises `sys.argv` to feed the constant into `strategy_correctness_reach` — one of the four
+harnesses this defect was historically caught and repaired in. **The repair is present, its
+signature is honoured, and the caller satisfies the `$1` contract with a constant.** No count of
+literals surfaces that, and it is the only site where "this harness cannot be pointed at a
+different tree" is actually true.
+
+So the numbers that mean something: fixes applied to **4** files; files presently defeating the
+`$1` contract, **1**; files holding a ledger literal in a use the rule does not forbid, **10**.
+These are sealed artefacts under `SHA256SUMS` and are not being edited. The forward rule is the
+deliverable: **a harness that invokes another harness passes its own `$1` through, and never
+synthesises one.**
+
+**Two limits of the scan, stated rather than left implicit.** `decision-survey/harness/
+interaction.py` has an unterminated string literal and cannot be parsed — it is reported as
+`UNPARSEABLE`, a named outcome, not as clear; 1 of 155 files is unscanned. And
+`probe_missing_cell.py` builds its ledger path component-wise, `Path.home() / ".cache" /
+"scorch-codex" / ...`, which resolves to the identical hardcoded location while containing no
+separator. A predicate keyed on path-shaped literals is **evadable by construction** by a `/`
+operator chain, with no intent to evade required.
+
+**And the discriminator I used to stratify contained the same error a fourth time.** Keying
+"takes a tree root" on the presence of `sys.argv` would have cleared `suppress_probe.py`, which
+mentions it more often than any other file in the set — every mention a **write**. Read versus
+write is mention versus use again, inside the predicate written to stratify the predicate
+written to avoid mention-versus-use.
