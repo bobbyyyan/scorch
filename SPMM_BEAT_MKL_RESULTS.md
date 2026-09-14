@@ -31813,3 +31813,56 @@ operator chain, with no intent to evade required.
 mentions it more often than any other file in the set — every mention a **write**. Read versus
 write is mention versus use again, inside the predicate written to stratify the predicate
 written to avoid mention-versus-use.
+
+### Correction to the correction: the literal scan was the wrong instrument
+
+Three things in the section above are wrong, and fixing them replaces the whole approach.
+
+**1. "Zero reads and two writes" is false as written.** `suppress_probe.py` has three
+`sys.argv` nodes, and one of them is a Load — `_ARGV = sys.argv` at line 33, the save half of
+a save-and-restore. The true statement is narrower and stronger: **zero subscript reads of
+`sys.argv`, one Load, two Stores.** Reading a positional argument is the rule's requirement;
+saving the list object is not.
+
+**2. The benign column is 11, not 10.** The count excluded `decision-survey/harness/
+probe_missing_cell.py` from *both* columns — it appeared only in the paragraph naming the
+evasion that hid it. It is benign (`root = Path(sys.argv[1]).expanduser().resolve()`, which is
+the rule itself) and it hardcodes only two sibling milestones' harness directories. **11 benign
++ 1 violating = 12.** Beside a count, the count of what the count could not see.
+
+**3. "0 positional reads" separates the 12 because it was built on the 12.** Run over all 154
+parseable harness files it flags **8**, of which 1 is real:
+
+| discriminator | flags, corpus-wide | real | controls proving it can clear |
+|---|---|---|---|
+| 0 subscript reads of `sys.argv` | 8 | 1 | 0 |
+| Stores a `sys.argv` built from constants | **1** | 1 | **3** |
+
+**The positive control is the finding.** `frontier_untaught_control.py`, present identically in
+two milestones, also forges `sys.argv` — and is correct:
+
+```python
+parser.add_argument("tree"); parser.add_argument("out"); parser.add_argument("commit")
+assert_tree(args.tree, args.commit, role="frontier-untaught-control")
+sys.argv = [os.path.abspath(args.harness), "--out", os.path.abspath(args.out)]
+runpy.run_path(os.path.abspath(args.harness), run_name="__main__")
+```
+
+It takes a tree root as `$1`, asserts its provenance, and builds the forged argv **out of its
+own arguments**. Forging is not the defect; forging from constants is. Without this file the
+second discriminator is unvalidated — a test that flags one file and has never cleared
+anything is indistinguishable from a test that flags that file for the wrong reason.
+
+**So the right test is not about ledger literals at all.** The defect is *"synthesises an argv
+instead of passing its own through"*, and an AST test for exactly that finds **one site,
+`workspace-confound/harness/suppress_probe.py:35`**, across the whole corpus. It needs no
+path-shaped-literal predicate, so the component-wise `Path.home() / ...` construction that
+evades the literal scan **cannot evade it** — a synthesised argv is synthesised however its
+strings were spelled. The literal scan's blind spot, reported honestly two sections ago as a
+limit, turns out not to be a limit of the finding but a reason the literal was never the right
+thing to scan for.
+
+One residual, stated because it bit twice: my first version of this detector also flagged
+`suppress_probe.py:38`, the *restore* `sys.argv = _ARGV`, because a name bound from a bare
+`sys.argv` Load was not recognised as carrying the process's real input. Same Load-versus-
+subscript distinction as defect 1, one layer down, in the instrument written to fix it.
