@@ -31666,3 +31666,51 @@ and silently agreed the control set was complete. **Widening a predicate because
 something inconvenient removes the report, not the cause.**
 
 **Battery 20 of 20; 29 refusals across 16 scripts, 29 FIRES, 0 UNTESTED.**
+
+### Six harnesses, two override mechanisms, and a detector that knew one
+
+Chasing a filename in the review turned up that the harness directory holds **six** scripts with
+a ledger path, not four. Two of them — `result_write_boundary_probe.py` and
+`result_write_reach.py` — have no `os.environ.get` at all, which briefly looked like two unfixed
+instances of the defect. They are not: the path is an argparse `--harness` **default**, equally
+overridable, just by flag rather than by environment. There are no live instances.
+
+The real finding is about the detector. It keyed on `os.environ.get` and therefore saw **4 of
+the 6**. **A detector that knows one spelling of the *fix* under-reports the population it is
+reconciling** — the same one-spelling problem as matching `\w+\.py`, now on the other side of
+the comparison, and the third time tonight a text predicate has been narrower than the thing it
+names. Both mechanisms are reported now.
+
+Also checked: `strategy_correctness_reach.py` is named in the review but does not exist on disk,
+so it is a review-only name and not a fifth instance.
+
+### Consolidation moves a risk, it does not remove one
+
+A shared predicate module was the fix for three divergence defects, and it is what broke the
+ablation: the ablation copies a script out of its directory and runs it elsewhere, where the
+sibling import does not resolve. The general statement is not "shared modules are risky" but
+**consolidation converts a divergence risk into a dependency risk, and anything that relocates,
+copies or sandboxes a file pays it.**
+
+That is the second cost of consolidation found here. The first was that removing a duplicate
+also removes the per-file evidence a guard is present, which is why a shared module joins the
+census the moment it exists rather than when it acquires a guard. Both costs are real, both are
+now guarded, and the divergence was still worth fixing — three defects against one.
+
+### Two families, named
+
+**A measurement whose failure mode is indistinguishable from its null result.** Six instances:
+the exit table that could only print 0; `shasum -c` on a CRC-32 manifest printing zero OK and
+zero FAILED; a driver refusing on its first call and printing a bare header; a census
+denominator fixed by construction; an ablation whose broken baseline made every variant score
+"not load-bearing"; and, already in the tracked record from earlier work, a suite runner that
+aborted before measuring and reported success. An absent check is visible — a check that runs,
+passes, and cannot fail is *more* reassuring than none. **The null result has to be
+distinguishable by construction**, which is what the failing-on-purpose stage, the
+not-vacuous count, and the baseline refusal each supply.
+
+**Preemption: a guard made unreachable by a guard in front of it.** Four instances — an input
+built for one refusal reaching an earlier one; the broken-baseline guard preempting the no-op
+guard; the refusal pre-filter short-circuiting the path predicates it was measured beside; four
+checks hidden behind earlier ones in the analyzer census. Standing form: order guards so the
+cheapest-to-satisfy precondition is verified first, and assert **which** refusal fired.
