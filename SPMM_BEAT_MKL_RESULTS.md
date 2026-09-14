@@ -30539,6 +30539,26 @@ coarser than the pool that estimates the same population's shape, and coarseness
 non-coverage on its own. Requiring the marginals of a joint construction to reproduce the
 independently measured per-row rates is what made that visible.
 
+### What the design already absorbs, and what it does not
+
+The realised level matters to a reader who takes 95% literally. It matters much less to the
+verdicts, and the reason is amendment 3's bar rather than luck. The operative bar for chain203 is
+**each rung's own X/Xb pair on the same group the effect is computed on** — so the bar and the
+effect are produced by the same bootstrap, at the same n, on the same population, with the same
+realised level. If the interval is systematically too narrow, both the effect's excursion and the
+bar's excursion shrink together, and the comparison between them is largely preserved. The fixed
+bars carried from chain202 do not have that property: they were measured on chain202's group sizes
+and are applied to chain203's, so for the groups whose n moved — 31 against 29 at k=2 and k=4, 40
+against 26 at k=32 — the level does not cancel exactly.
+
+That is an argument from the construction, not a measurement, and it should not be read as more.
+The measurement that would settle it is a re-run of the verdict table with a calibrated level
+applied to **both** the bar and the effect, counting how many verdicts move; queued for the
+completed passes, alongside the margin calibration that already reports flips at D/A = 1.00 on
+every arm. Until then the statement is: the band's stated confidence is optimistic by 1.1x to 2.6x
+depending on the population, and the own-pair comparison the verdicts actually use is affected far
+less than that figure suggests.
+
 ### The general residue
 
 Across both constructions, synthetic populations matched to the real residuals on standard
