@@ -31141,3 +31141,45 @@ Reported by `labels_c203.py` in the verification battery rather than as a refusa
 analyzer. The analyzer is the instrument for a measurement in flight, its battery is green, and the
 hazard is audited-inert — adding a refusal to a frozen instrument for an inert hazard trades a real
 regression risk against no present benefit. Both findings are a rename away from being impossible.
+
+## The census audited one file, and the battery had grown past it
+
+`checks_c203.py` reports 73 checks with 0 untested, and that number did not move when the
+verification battery grew from thirteen stages to fifteen. A peer asked which of three things that
+meant. It is the third: **the census enumerates checks of `an_c203.py` and nothing else**, so a new
+battery stage was never going to change it.
+
+The question found what the constant total was hiding. A static scan of the eleven diagnostic
+scripts — the ones that audit the analyzer — says they carry **23 refusals between them, of which
+exactly one had ever been demonstrated to fire.** "Beside every check, an input that makes it fail"
+was being applied to the instrument and to none of the things measuring it, including the two
+scripts written that evening *because* defects had just been found.
+
+`checks2_c203.py` is that census for the rest, and it now runs in the battery:
+
+| | |
+|---|---|
+| refusals in source, across 11 scripts | **23** |
+| FIRES | **13** |
+| DID NOT FIRE | 0 |
+| **UNTESTED** | **10** (was 22) |
+
+The inventory is **scanned from source** rather than listed, so a guard added later appears as
+UNTESTED instead of vanishing from the denominator. The ten that remain are almost all of one
+shape — "the analyzer refused, so I could not measure" in `spike`, `swapcells`, `meta` and `cond`,
+plus two corpus-thinness guards in `jointfail` — and they are reported rather than quietly dropped.
+
+Three defects in the census itself, found while building it, each the class it exists to catch:
+
+- **It reported 8 firing refusals and 23 untested in the same run.** Rows were keyed on a
+  hand-written label while the inventory was keyed on scanned source text, so the two sets never
+  intersected and the report described an object other than the one it measured. Fixed by having
+  each row name a substring of the *source* refusal it targets, with an assertion that the target
+  matches **exactly one** inventory entry — which immediately caught a mistyped target rather than
+  letting it mark nothing.
+- **One row read DID NOT FIRE because the test was wrong, not the guard.** `passlog`'s "holds no
+  rows" is about the rotation *table*; the input supplied an empty *log*. The input had been built
+  from the message's wording rather than from the code path above it.
+- **An input built for one refusal reached an earlier one** — an empty log with two arms tripped
+  the table-width check first. The same preemption hazard that hid four checks in the analyzer's
+  census, in the census of the censuses.
