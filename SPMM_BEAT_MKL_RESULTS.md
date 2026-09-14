@@ -31051,6 +31051,14 @@ other, and the landed-pass set is derived from filenames rather than labels. Any
 across the two — a `startswith`, a set intersection, a dict keyed by "the label or the arm" —
 silently returns the wrong rows.
 
+The live label set is read from the **first data row of each file** rather than by copying the
+directory, because `slice` and `build` are constant within a file — verified 0 exceptions in 66
+files here and independently 0 in 98 on the chain202 ledger. That makes the check a few hundred
+bytes per file instead of 29MB next to a live measurement. **The constancy check belongs inside the
+extraction, not before it:** a resume, a retry or a concatenation that put two slices in one file
+would make row 1 correct for the row and wrong for the file, and nothing in the output would say
+so.
+
 The second hazard is ordering, and **it is already active.** An earlier draft of this paragraph said
 it was "hidden by the run's length — at chain203's six labels the lexical and numeric orders agree".
 That was read off the six-pass snapshot, one paragraph after this document warned against carrying
@@ -31065,9 +31073,26 @@ orders diverge:
 | 13 (live) | **no** | ov1 ov10 ov11 ov12 ov13 ov2 |
 | 22 (final) | **no** | ov1 ov10 ov11 ov12 ov13 ov14 |
 
-**Divergence began at pass 10**, some hours before the paragraph claiming otherwise was written. The
-collision count grew too: `ov2` and `ov4` at six labels, `ov2`/`ov4`/`ov8` at thirteen, and `ov16`
-joins at twenty-two. So "inert because the run is short" is gone and only one guarantee remains.
+**Divergence began at pass 10**, some hours before the paragraph claiming otherwise was written.
+
+The collision count grows too, and an earlier version of this sentence gave the wrong onset for the
+last one — it said `ov16` joins at twenty-two, which is where it was *observed*, not where it
+*arrives*. The schedule is not a table but a rule: **an arm named `ovN` starts colliding at pass
+N**, because the label for pass N is the string `ovN`.
+
+| passes | collisions |
+|---|---|
+| 2 | `ov2` |
+| 4 | `ov2` `ov4` |
+| 8 | `ov2` `ov4` `ov8` |
+| **16** | `ov2` `ov4` `ov8` `ov16` |
+| 22 | unchanged since 16 — four |
+
+So at the completed 22 there are four, and there have been four since pass 16. `ov24` never
+collides only because the run stops at 22; a 24-pass rotation would give five. Stating the onset as
+a rule rather than a row is what makes that last point visible at all — and the error being in the
+*commit* while the correct figure was in a message is the wrong way round, since the commit is what
+outlives the exchange. So "inert because the run is short" is gone and only one guarantee remains.
 
 That guarantee is now **audited rather than argued.** Every site in `an_c203.py` that touches a pass
 label, all fourteen of them:
