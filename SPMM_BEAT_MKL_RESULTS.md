@@ -32570,7 +32570,8 @@ one.**
 most bins — 18 of 22 strata are unusable — yet the four that are usable include the one where the
 mechanism should be largest, and it is. The honest statement is that this stratification is
 **mostly unreachable and not uninformative**: its single above-floor effect is the largest
-reduction-independent reading in the chain.
+centre-stable reading in the chain — see the four qualifications below, which replace an earlier
+claim here that it was *reduction-independent*.
 
 ### The population-is-a-convention defect, third instance, and the cost escalated
 
@@ -32610,3 +32611,50 @@ complement before believing the enumeration.** `*/harness/` is where harnesses a
 `*/worktrees/` is where worktrees are usually kept. `ambient 2..23` is where ambient usually lands.
 None of the three is what the thing *is*, and in all three cases the complement was one command
 away — `git worktree list`, an AST walk over the whole cache, `sorted(set(resolved[ovp]))`.
+
+### The ambient-1 finding, qualified four ways
+
+The section above called it "the largest reduction-independent reading in the chain". **That word
+is wrong, and I had not run the check I applied to everything else.** Put through the same four
+nestings as the headline:
+
+| nesting | centre | CI | parity |
+|---|---|---|---|
+| gm-cells / med-pass | 1.4469 | [1.1523, 1.7794] | **excludes** |
+| med-cells / med-pass | 1.4750 | [0.8498, 2.0246] | **contains** |
+| gm pooled | 1.4271 | — | — |
+| med pooled | 1.4727 | — | — |
+
+**The centre is reduction-stable — 1.4271 to 1.4750, a 4.8-point spread, tighter than the
+headline's 14.4–21.2%. The exclusion is not: it rests on gm-cells alone.** At n=9 a
+median-over-cells has high resample variance, so the reading is that the median lacks power to
+exclude parity here rather than that the effect is absent — but "reduction-independent" is the one
+thing the table cannot support. Correct form: **centre reduction-stable at 1.43–1.48, exclusion
+under gm-cells only.**
+
+Three more qualifications it carries and the headline's did not:
+
+**9 cells are 7 distinct keys** — `Pd_b`, `Pd_rhs`, `TSOPF_RS_b162_c3_b`, `TSOPF_RS_b300_c2_b`,
+`adder_dcop_16`, `m3plates`, `poli`, two of them appearing at two widths. If amendment 4's floor
+of 8 counts *cells*, 9 clears it; if it counts *independent problems*, 7 does not. That is
+unresolved here and it decides whether this row is above the floor at all — the same
+cells-versus-keys question as chain202's nine-cell group.
+
+**It pools three widths** — 2 at k=2, 2 at k=4, **5 at k=32**. Every other band in this chain is
+per-width, and the headline is itself width-dependent (14.4–21.2% at k=32 against flat elsewhere).
+So this stratum is not comparable to the rows around it, and the majority of its cells are the
+width where adoption is known to be largest.
+
+**And it carries neither caveat the headline carried.** No non-coverage figure — measured
+percentile non-coverage ran 0.069–0.090 with 0.080 at n=25, so at n=9 it should be at or above the
+top of that range, and this row's interval is what decides it. And it is one host.
+
+**What survives is still the finding**: 7 of 9 per-cell centres above parity, ~45% on the centre
+under every reduction tried, and a real progression against the flat ambient-10/15/24 strata. It
+needs the same second-host qualification as the 18.1% and one more sentence of hedging than it
+was given.
+
+*This is the mirror of the correction two sections up: a step was declared void and recomputing it
+found an effect; then that effect was declared reduction-independent and running the nestings
+found it was not. Both errors were self-corrections forced by a second implementation, and
+neither would have surfaced from one.*
