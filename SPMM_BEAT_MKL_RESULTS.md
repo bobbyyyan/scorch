@@ -30785,10 +30785,18 @@ of its defines. It does not verify the rest, and the rest differ from `/Users/bo
 | `SCORCH_SPMM_CEIL_ROWBIND` / `_MAXROWS` / `_NT_CAP_PHYS` | present | absent |
 
 So **any derivation about the measurement from local source is unsound**, and one was made: a peer
-read the composition-adoption clause as source text in the local tree, this document read
+read the composition-adoption clause as source text in a local working tree, this document read
 `ov24/LOWER = ∅` from redwood data, and the two were combined into "the redwood binary implements
 that clause as written". That conclusion compared a *different* source against the built binary and
-**is withdrawn**. The theorem itself is unaffected — `SCORCH_SPMM_NT_CAP (-2L)` and
+**is withdrawn**. Both halves named the wrong object — the peer was reading
+`scorch-beat-mkl/src/scorch/csrc/scorch_policy.h`, last modified the previous day, and does not hold
+the tarball at all.
+
+The general form is worth keeping, because it is a failure mode specific to a two-party check. The
+joint claim was "source read by one party plus data measured by the other equals build-matches-
+source", and it fails if *either* half names the wrong artefact — while **looking stronger than
+either half alone**, which is what made it persuasive. Two sessions cross-checking is not
+independence when one is reading a different artefact than the other is measuring. The theorem itself is unaffected — `SCORCH_SPMM_NT_CAP (-2L)` and
 `SCORCH_GRAIN_SPMM 150000` are both confirmed in the tarball, and the harness checks them on every
 run — but the build-versus-source check it was said to supply does not exist.
 
@@ -30817,12 +30825,31 @@ capacity**, and these are few-row products:
 | `nw14` | 73 | 4 | **6** |
 | `bibd_19_9` | 171 | 10 | **22** |
 
-Exact on four of six. The two that sit *above* their row proxy are the two densest in the corpus
-(12396 and 19448 nnz/row), and the pinned source's row-bound ceiling block describes precisely that
-effect — its comment states the rule "takes a few-row product from 4 workers to 22" and names
-**`kl02` and `nw14` at 71 and 73 rows getting 4 of 24** as its targets. So this is two mechanisms,
-the row proxy and a ceiling that raises some few-row products above it, with the target shapes named
-in the source. Not one selector, and not density.
+That table takes one width per matrix, which flatters it. **Across all 13 capping cells the row
+proxy predicts the observed count on 7 of 13**, and it cannot do better in principle, because
+`rows/16` is width-independent and the observed count is not:
+
+| matrix | rows/16 | ambient at k=2, 4, 32 |
+|---|---|---|
+| `bibd_15_7` | 6 | 6, 6, **14** |
+| `kl02` | 4 | 4, 4, **22** |
+| `nw14` | 4 | **6**, **12**, 24 |
+| `bibd_19_9` | 10 | **22**, 24, 24 |
+
+Adding the width-dependent term makes it *worse*, not better: `min(rows/16, work/grain)` matches on
+**2 of 13**, because in 11 of the 13 the observed count is *above* that minimum. So the two terms of
+`scorch_nthreads` do not produce these counts — a third mechanism raises nearly all of them, and the
+pinned source's row-bound ceiling block is it. Its comment states the rule "takes a few-row product
+from 4 workers to 22" and names `kl02` and `nw14` at 71 and 73 rows as the targets; **`kl02` at k=32
+reads exactly 4 → 22.** That is the documented transition observed on the measured host.
+
+As a *separator* rather than a predictor the row proxy is strong: all 13 cappers fall in [4, 10] and
+**147 of 148 adopters sit above 10**, against nonzeros-per-row's three overlaps. The single boundary
+case settles the question though, and it settles it against the row proxy: the lone adopter at 10 is
+**`us04` at k=32**, and `us04` at k=2 and k=4 is one of the 13 cappers. Same matrix, same row proxy,
+both behaviours, width deciding — which is the width-dependence the table above shows, in its
+sharpest form. The selector is not the row proxy alone, and it is not density; it is the ceiling
+block, whose gate is the thing to read next.
 
 ### The different-argument centre shift does not reproduce under the geomean
 
@@ -30845,12 +30872,36 @@ rebuild each per-rung bar from a different-argument pair does not follow from th
 magnitudes also differ: 0.7% here against the 1.1% and 1.8% reported, and halfwidths of 0.008 to
 0.011 against 0.017.
 
-One coincidence worth resolving before any of this is acted on: the peer's row labelled
-`ov24/ov24b`, the same-argument floor, carries the centre **1.00496**, and the reciprocal of this
-document's `ovp/ov24` geomean is **1.004955**. A centre is a deterministic function of the data and
-the pair, so five matching digits across two independent implementations is evidence that row is
-computing ov24-against-ambient rather than ov24-against-ov24b. If so the sign split is a property of
-the row labelling rather than of the arguments, and that has to be settled first.
+**A five-digit coincidence, resolved: both labellings were correct.** This document briefly argued
+that a peer's same-argument row must be computing a different pair, because its centre 1.00496
+matched the reciprocal of this document's `ovp/ov24` geomean to five digits, and a centre is a
+deterministic function of the data and the pair. The peer ran the same argument back, since the
+value also matches their `ov24b/ov24`. **Both accusations were wrong, and the argument itself was
+invalid: a centre is deterministic in the data, the pair, AND the estimator.** Two different
+nestings were in use, so "same value implies same pair" does not follow.
+
+Settled by running the peer's nesting — geomean over cells within a pass, then median over passes —
+on this document's own code and data:
+
+| pair | peer reported | reproduced here |
+|---|---|---|
+| `ov24/ovp` | 0.989375 | 0.989375 |
+| `ov24/ov24b` | 1.004962 | 1.004962 |
+| `ov24b/ov24` | 0.995064 | 0.995064 |
+| `ovp/ov24` | 1.010740 | 1.010740 |
+
+Four of four to six digits, so the peer's labels are right and so are the ones here; the match was a
+genuine coincidence across two estimators. A cross-implementation digit match is a labelling
+discriminator **only under a fixed estimator**, and reporting the estimator alongside is what makes
+it one.
+
+**And it exposed a defect in the nesting used here: it is not reciprocal-invariant.**
+`1/(ovp/ov24)` reads 1.004955 while `ov24/ovp` reads 1.005032. Taking a per-cell median over an
+*even* number of passes averages the two middle values, and the mean of a set is not the reciprocal
+of the mean of its reciprocals. The peer's nesting takes a geomean within each pass, which is
+exactly reciprocal, and reads reciprocal to six digits. For a quantity that is a *ratio*, that is an
+argument for their nesting independent of anything about centres — and it is the kind of defect that
+never shows up until the same pair is computed both ways round.
 
 ### Which moved, the pass set or the estimator
 
