@@ -31183,3 +31183,180 @@ Three defects in the census itself, found while building it, each the class it e
 - **An input built for one refusal reached an earlier one** — an empty log with two arms tripped
   the table-width check first. The same preemption hazard that hid four checks in the analyzer's
   census, in the census of the censuses.
+
+### The census of the censuses closes: 23 of 23, and the 23 is measured
+
+The previous section left the second census reporting **13 of 23 refusals fired and 10 untested**,
+and left the 23 itself resting on a regex over source text. Both are now closed.
+
+**Is 23 the right denominator?** A regex can only miss, never invent, so its count is a lower
+bound. An AST pass over the same eleven files classifies *every* exit path rather than the ones
+matching a pattern:
+
+```
+34 exit paths = 23 refusals + 8 exit-status calls + 3 usage messages + 0 unclassified
+ 0 raise statements, so sys.exit is the only route a refusal can take
+ regex 23 vs AST 23 -- AGREE
+```
+
+The zero on `raise` is what makes the enumeration exhaustive rather than merely a second opinion:
+had any file refused by exception, a `sys.exit`-only scan would be incomplete by construction and
+no amount of agreement on the sites it *does* see would show it.
+
+The first version of this cross-check was wrong, in the direction that condemns the thing it
+validates. It tested `isinstance(arg, ast.Constant)` for the message, but `sys.exit("REFUSE: %s"
+% x)` is a **BinOp** whose `.left` holds the literal — so every *formatted* refusal was
+classified invisible, which is precisely the set the regex does see. It reported "scanner 23, AST
+34, difference 11" and would have filed a correct scanner as defective. **When a new validator
+disagrees with an established subject, suspect the validator: it is the newer code.** The audit
+now runs on four inputs built to defeat it — a single-quoted refusal the regex cannot see, a
+computed exit message, a refusal via `raise`, and a duplicate key — and each fires on its own
+branch.
+
+**The ten untested.** All ten lived in scripts that *drive* the analyzer rather than parse its
+output, so no fixture built from data could reach them: they fire when the analyzer misbehaves,
+and the analyzer does not misbehave. A wrapper wired to exactly one collaborator cannot
+demonstrate its own guards. Four wrappers now take the analyzer path from `C203_ANALYZER`,
+matching the `--analyzer` flag `meta_c203.py` already had, and the ten are reached by:
+
+| refusal | input that fires it |
+|---|---|
+| `spike` / `swapcells` / `meta` "the analyzer refused" | a stub analyzer that exits 1 |
+| `nbootstab` "analyzer exit %d" | the same stub |
+| `swapcells` "no estimate rows parsed" | a stub exiting 0 with no estimate rows |
+| `cond` "the instrumented copy does not reproduce" | an analyzer reporting its own line count — instrumentation inserts lines, so it cannot reproduce itself under instrumentation |
+| `meta` "relation(s) VIOLATED" | the `scale` mutant `metafire_c203.py` already builds |
+| `meta` "declared but produced no verdict" | a mutant of *meta*, one relation's bookkeeping suppressed — the guard watches meta's own conservation, so only a mutation of meta can reach it |
+| `jointfail` ×2 (two thinness guards) | subsetted corpora |
+
+The two `jointfail` fixtures are the ones that needed care. Both guards are thinness guards with
+the same threshold, so the second fixture must keep the common-key count *above* the first guard's
+limit or the first refusal preempts it and the row records a firing that never happened. It holds
+24 common keys against a threshold of 15, and fires the second guard on residual coverage instead.
+
+**A bookkeeping defect the fix exposed.** Tested-ness is keyed on `(script, key)`, where `key` was
+the refusal's literal text up to its first format conversion. `jointfail`'s two guards both begin
+`only %d`, so both keyed to `only` — firing either would have marked both tested and **removed a
+genuinely untested refusal from the denominator**, which is the single number this census exists
+to report. The key now collapses conversions (`%d` → `%`) instead of truncating at the first one,
+and key uniqueness is asserted, with the assertion exercised on a colliding pair.
+
+```
+23 refusals in source across 11 scripts: 23 FIRES, 0 DID NOT FIRE, 0 UNTESTED
+```
+
+### Two defects in the completion script, both found by the same question
+
+`final_c203.sh` was written before the data landed so the invocation would not be reconstructed
+from memory next to a result. Re-reading it against the live machine found two steps that would
+have run and produced something plausible.
+
+**The execution record was read from a stale local mirror.** The script's own header states the
+principle — "two reads of one file are one reading, so the digest has to come from the run's
+filesystem" — and applies it to the rotation table via `--orders-sha256`, but the `wrote`
+sequence, the *only* record in the set that observes what executed rather than echoing the
+schedule back, was read from `/tmp/c203_rw.log`. Nothing keeps that file current. At 19:12 it was
+**19264 bytes on redwood against 16195 locally, 88 minutes behind**. Earlier the same evening I
+had read progress from that mirror and announced a 3.4× slowdown that the host's file mtimes
+disproved, so this is the second time one stale copy produced a confident wrong statement. The
+step now takes the digest on redwood *before* copying and compares it after: a truncated transfer
+refuses, and so does a log still being appended to, which is the correct treatment of a run that
+has not finished.
+
+**The corpus-distinctness digest could not run at all.** It pointed at
+`/scratch/bobbyy/suitesparse`, which does not exist, and on failure did `|| echo "(cache absent
+locally; run on redwood)"` — so a step the script itself calls "an input to every effective n"
+could be absent while the bands printed underneath it. Worse, `patdigest_c203.py` only accepted
+`.mtx`/`.mtx.gz`, and the corpus the harness actually timed is scipy `.npz` under the
+group-qualified cache that `mrgate_ov.py` was given as `--cache`. There are 2513 Matrix Market
+files on the host, under `ss_extra` — but digesting those answers a different question, namely
+whether two SuiteSparse matrices are equal, not whether the two things this run timed are. The
+reader now loads the `.npz` the run read, all **10 of 10 keys resolve** (`ss/case9/case9_A_02.npz`,
+`ss/Meszaros/aa3/aa3.npz`, …), the cache layout being the same group-qualified one that silently
+dropped 50 keys on MKT, and the fetch derives its key list from `GROUPS` via `--keys` rather than
+repeating it.
+
+The reader is normalised so Matrix Market and scipy give the **same** digest for the same matrix
+— 0-based indices, one fixed value format — because otherwise a cross-format comparison reports
+"different" for every key and the disagreement is the encoding. Checked on a matrix stored both
+ways: pattern and value digests agree; changing one value moves the value digest and not the
+pattern; adding one entry moves the pattern.
+
+The digest itself is still deferred until chain203 finishes, for the reason the script already
+gave: reading those matrices off the filesystem the harness is timing against is the perturbation.
+Only the mechanics were exercised here, on a non-matrix file.
+
+### The battery's log was abridging away the verdicts it exists to record
+
+The battery prints each stage's output through `tail`, so a long stage contributes only its last
+lines. That is deliberate — the detail tables are long. It silently assumes every stage puts its
+conclusion last, and two did not.
+
+Moving the AST audit ahead of the census report, so the census total would survive abridgement,
+pushed the audit's own verdict out the other side: the log then carried "23 FIRES, 0 UNTESTED"
+without the line establishing that 23 is the right denominator. One end of a truncation fixed,
+the other broken, and caught only by grepping the log rather than reading the exit code — the
+stage was green throughout.
+
+Asking the question of every stage found the second: **`cond` logged 14 lines against a 14-line
+window, and all 14 were detail.** It computes a summary — how many condition operands were
+instrumented, how many went both ways, and how many of the one-way ones sit in a guard rather
+than a selector, which is the number that belongs beside the "no MC/DC" disclaimer — and then
+prints the list of one-way operands *after* it. So the battery log contained no statement of what
+the condition-coverage stage concluded, and had not since the stage was added. `recip` also hit
+its window exactly but puts its verdict last, so it loses only detail; a third apparent hit was
+my own parser absorbing the trailing exit-code table.
+
+Two changes, at the level of the class rather than the instance:
+
+- `cond` prints detail first and its verdict last, the convention that makes abridging safe for
+  any stage, present or future. Raising one stage's window would have fixed one stage.
+- `stage()` now announces abridgement: `[abridged: N lines produced, last T shown]`. A reader
+  cannot otherwise distinguish an abridged stage from a short one, and neither could I.
+
+The census stage is exempted from abridging entirely, because that stage *is* the completeness
+claim: its per-refusal rows, the audit, and the total are all load-bearing.
+
+### The battery's exit-code table could only ever print zero
+
+Making abridgement visible required rewriting `stage()`, and the rewrite changed a number that
+was not supposed to move. The old form was:
+
+```bash
+echo "### $n"; "$@" 2>&1 | tail -${TAIL:-14}
+NAME+=("$n"); RC+=("${PIPESTATUS[0]}")
+```
+
+`NAME+=("$n")` is a command, and every command resets `PIPESTATUS`. So `RC` recorded the exit
+status of an array append. Reduced to two lines: `false | cat` followed by that exact sequence
+records 0, and recorded directly it records 1. **The table was structurally incapable of
+reporting a failure**, and "all sixteen stages exit 0" had been a statement about array appends
+for as long as the battery had existed.
+
+Capturing the status properly turned one stage red on the next run, and it was a real one.
+`nbootstab` had been measuring nothing. The battery invoked it as `nbootstab_c203.py "$LIVE"`,
+but the sweep is built for the clean fixture — its partition string and its `--min-passes 12`
+both describe the fixture — while the local live snapshot holds **six** passes against a run
+that is at fifteen. The analyzer refused on the first call, the stage printed a table header
+with no rows under it, and the exit-code table reported success. Run on its designed input it
+sweeps three values over 83 rows: **4 unstable (5%) at nboot=150, 2 (2%) at 600, 0 at 2400**,
+with a bound spread of 0.0115 at 150 that matches the figure in the script's own docstring.
+
+Two corrections to that, both caught before they reached a conclusion:
+
+- The analyzer *does* refuse below the pre-registered nboot — `an_c203.py:82` — but only when
+  `--fixture` is absent. `nbootstab` passes it, which is how the sweep is permitted to run at
+  all. A first reading of this called the refusal imaginary.
+- The 5% does not contradict the 7% quoted as the pre-registration's justification. That 7% was
+  measured on chain203's **first six passes** (`an_c203.py:73`); 5% is the same sweep on the
+  fixture. Pointing the battery at the fixture silently changed which corpus the number
+  describes, so the completion script now runs the sweep again against the finished 22-pass
+  rotation, and the justification quotes each figure with the corpus it came from.
+
+That is the third instance today of one root cause: **a local copy of remote state that nothing
+keeps current.** The run log was 88 minutes behind, the corpus-cache path did not exist, and the
+live snapshot is nine passes stale. Only the first was visible as staleness; the other two
+presented as a passing stage and a plausible number.
+
+The table now ends in `BATTERY PASS -- 16 of 16 stages exited 0` and the script exits nonzero
+otherwise, so "green" is a claim the battery makes rather than one a reader assembles from rows.
