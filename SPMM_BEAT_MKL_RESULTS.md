@@ -31614,3 +31614,55 @@ way. A member contributing zero is the correct reading, and the total is unchang
 
 "What counts as a root" and "what counts as a reader" are still duplicated. Unifying them is
 right and is not being done immediately before the completed read has to run.
+
+### Which repair was load-bearing, measured rather than read
+
+`4 of 4 caught / 0 of 4 flagged` proves the repaired check works and says nothing about which of
+its three repairs mattered. Worse, the refusal pre-filter ran first and excluded all four
+instances before either other predicate saw a path — so two of the three were diagnosed by
+reading the code. A decomposition that adds up is not a mechanism.
+
+The ablation reverts one repair at a time against the four real instances:
+
+| ablation | reverts | caught |
+|---|---|---|
+| refusal test | parse-based `can_refuse` → the original text match | 0 of 4 |
+| path parse | `expanduser`/`join` accepted → `ast.Constant` only | 0 of 4 |
+| consumer set | `sys.path.insert` accepted → scanning calls only | 1 of 4 |
+
+**All three are load-bearing.** With the pre-filter fixed, the `Constant`-only parse alone still
+hides all four, so each is independently sufficient. That is the evidence the earlier claim
+lacked, and it could as easily have gone the other way.
+
+**Writing it produced the same defect it exists to prevent.** In the battery the ablation
+reported *"0 of 3 repairs are load-bearing"*, the opposite of the standalone run. The
+shared-predicate refactor two commits earlier had given `scanroot` a `from refusal_c203 import
+can_refuse`, and the ablation writes its mutant to a temp directory where that import fails.
+Every variant crashed, the baseline caught 0 of 4, and nothing could score below zero. **A
+measurement whose failure mode is indistinguishable from its null result** — the `PIPESTATUS`
+shape, one level up, and it passed once before an unrelated refactor moved a dependency under
+it. It now puts the source directory on the path and refuses when the baseline scores below the
+full control set, because "the baseline is broken" and "no repair matters" print the same thing
+otherwise.
+
+**And one of its guards was unreachable by construction.** Any target that fails to anchor also
+catches nothing, so the broken-baseline guard always preempted the no-op guard. Anchors are now
+checked before the baseline is measured, which is the right order regardless: a mis-anchored
+ablation is a property of the definitions, a broken baseline is a property of the control set.
+The census reported this correctly by naming which refusal fired instead of the intended one.
+
+### The control set is not fully reproducible from the repo
+
+The four instances are named in `COMPILER_IR_REFACTOR_PHASE6_REVIEW.md` — except that
+`legality_reach` appears there twice and both times as the prefix of an **output artefact**
+(`legality_reach_base.json`, `legality_reach_repin.json`), never as the harness. Three of the
+four are named as harness files; the fourth is only inferable. The check now reads the names
+from the review, lists the directory, and reports the difference standingly: *1 harness holds an
+overridable ledger path but is not named in the review.*
+
+I nearly deleted that finding. The first reaction was "a predicate matching one spelling again",
+and widening the match to bare stems would have counted the JSON artefacts as naming the harness
+and silently agreed the control set was complete. **Widening a predicate because it reports
+something inconvenient removes the report, not the cause.**
+
+**Battery 20 of 20; 29 refusals across 16 scripts, 29 FIRES, 0 UNTESTED.**
