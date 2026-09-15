@@ -33347,3 +33347,51 @@ branch HEAD carries about 25 lines more than the tarball somewhere between line 
 so citations agree exactly up to `:399` and need +25 after it — the header at HEAD is 2475 lines and
 158,658 bytes. Found by the checker session, whose positive controls on the same population
 (`mrbuild.sh` 7 copies, `csrresolve.py` 4, `spmmstat.py` 6) show the predicate fires.
+
+### Correction: the band I published was computed at nboot 400 and I did not say so
+
+The validation band above was quoted as **[1.0741, 1.3115]** with a floor of 0.44%. Those came from
+`--nboot 400`, against the script's own default of 2000, and the document stated neither the
+resampling count nor the seed. The checker session could not reach 1.3115 in roughly 160 bootstrap
+runs at nboot 2000, 4000 and 10000, under two percentile conventions and three resampling units,
+topping out at 1.3097 — a gap of 0.005–0.008 that was systematic rather than noisy. They were right,
+and the explanation is the missing parameter.
+
+Eight seeds at each count, on the same 25 cells:
+
+    nboot 400    lower [1.0609, 1.0839]   upper [1.2857, 1.3115]   upper spread 0.0258
+    nboot 2000   lower [1.0693, 1.0804]   upper [1.2942, 1.3018]   upper spread 0.0076
+
+**1.3115 is the maximum of the nboot-400 seed range.** A 97.5th percentile taken from 400 resamples
+is an unstable statistic, I happened to publish the extreme of its seed variation, and omitting
+nboot is what made it unfalsifiable rather than merely imprecise. The authoritative reading, at the
+script's default nboot 2000 and seed 204:
+
+    k=32 HIGHER  n=25, 550 rows
+      gm-rows 1.2123   med-rows 1.1486   gm-cells 1.1806   med-cells 1.1441
+      floor 0.42%   band [1.0748, 1.2979]   FASTER by 7.5-29.8%, all four nestings agreeing
+
+The four point estimates are unchanged, because none of them depends on the resample — which is
+also why every quantity the checker could reproduce was a non-bootstrap one. The verdict is
+unchanged: the lower bound is 18× the floor and excludes parity by a wide margin. **Every band in
+this document should carry its nboot and seed**; these are 2000 and 204.
+
+**And the floor deserves its name, because four candidates are in play and they differ by 9×.** On
+the same 25 cells the same-argument pair reads a point deviation of 0.05%, a band half-width of
+0.42%, and an outer band edge `max(|lo-1|, |hi-1|)` of 0.42%; the ambient pair on those cells reads
+0.26%/0.37%, and pooled over all 89 k=32 cells 0.23%/0.27%. "Floor 0.42%" alone does not say which.
+It is **the outer band edge of the identical-argument comparison on the same cells** — the most
+conservative of the four.
+
+**A blind spot in the 802-line guard, closed.** A line count cannot distinguish a complete file from
+one resumed by *appending*: 802 lines, 801 rows, 189 duplicated and 189 keys missing passes the
+count and is wrong. It is unreachable through this writer — `mrgate_ov.py:122` is `open(A.csv, "w",
+newline="")`, which truncates — but that makes the guard's sufficiency a property of a *different*
+file, holding only until an open mode changes or two runners share a path, with no symptom either
+way. Both analyses now require the right number of distinct `(key, k, arm)` triples per file: 801
+for chain204, 68760 for chain205. It costs one pass and reads `[801] ; files with duplicates or a
+short set: 0` across all 66 of chain203's files. Raised by the checker session.
+
+One phrasing correction to the paragraph that introduced the 802: 89 × 3 × 3 + 1 is also 802, so the
+measured anchor and the formula agree. What measuring bought was provenance, not a different number,
+and it would only diverge if the runner ever wrote a different number of row-arms per cell.
