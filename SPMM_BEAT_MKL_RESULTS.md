@@ -34479,3 +34479,37 @@ cannot depend on which arm is the numerator; the asymmetric form matches the sea
 keeps chain205 comparable with chain203 and chain202. **Both are defensible and the board is
 indifferent to the choice at 0.009%.** The revert stands on the pre-registration argument alone,
 which is the argument that was always doing the work.
+
+### An empty `git log -S` is two hypotheses, and one of them is an accusation
+
+Verifying the attribution turned up a better finding than the attribution. The sentence in question
+wraps in the hard-wrapped document:
+
+    dd88deb:SPMM_BEAT_MKL_RESULTS.md:34207  ...chain203 and chain202. The two are not reconcilable
+    dd88deb:SPMM_BEAT_MKL_RESULTS.md:34208  after the fact, because the choice changes the behind...
+
+So the searches disagree, and the disagreement is the whole point:
+
+    git log -S"not reconcilable after the fact"   0 commits
+    git log -S"The two are not reconcilable"      1 commit   dd88deb
+    git log -S"changes the behind counts"         2 commits  dd88deb
+
+**An empty `-S` result does not read as "my pattern cannot match".** It reads as "no commit
+introduced this text" — which, in an exchange about who wrote a sentence, is an accusation that the
+quoted sentence was never written. The zero is a conclusion, not a missed confirmation, and it was
+manufactured entirely by a line wrap.
+
+Fifth time tonight a wrap has eaten a prose search and the first where the empty result carried a
+verdict. The fix is the same shape as the rest of this family: **a `-S` or `grep` count of 0 is two
+hypotheses — absent, or unmatchable — and only a positive control separates them.** Search a short
+interior fragment with no wrap point first, then narrow.
+
+**The attribution itself:** the sentence is mine, introduced by `dd88deb`, whose subject is
+"reverted an estimator amendment I made while fixing conventions". The checker's record of it was a
+faithful copy and the refutation is theirs.
+
+**And the class distinction they drew is worth keeping.** The eight rule violations tonight were
+*correct questions answered wrongly* — errors of execution. Five rounds sizing a convention gap were
+*correct answers to a question nobody had checked was the operative one* — an error of selection.
+The second survived every cross-check precisely because cross-checking verifies an answer against
+the question asked, never against the question that should have been.
