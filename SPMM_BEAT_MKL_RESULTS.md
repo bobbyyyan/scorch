@@ -35146,3 +35146,45 @@ is the only defence. **This table is itself a number received across a boundary*
 independently computed here; chain196's `c0` set is on redwood in `c205an`, so the per-pass pooled
 board will be recomputed locally after the run closes, in the same program as chain205's, under one
 named reduction. If it does not reproduce, the disagreement is the finding.
+
+### The pooled board and the behind-count have opposite sensitivities, demonstrated not asserted
+
+The substitution bound in the previous section is a statement about the **pooled board**, and the
+pooled board is the statistic *least* sensitive to a substituted near-replicate: a geometric mean
+over 22,920 cells moves by about the pass-to-pass spread by construction. But the standing goal is a
+**cell-count** goal — scorch beats MKL everywhere — so the operative statistic is the count of cells
+below parity, which is a threshold-crossing count concentrated at 1.0 and has no such stability.
+
+Asserting that is cheap, so it was put on a fixture instead: twelve keys × two widths × six passes,
+with two keys clearly behind, **two keys placed at parity + 0.1%** so they change hands between
+passes, and eight ahead.
+
+    dataset    pass       pooled      behind         n
+    behindy    p1         1.6552           7        24
+    behindy    p2         1.6371           6        24
+    behindy    p3         1.6523           7        24
+    behindy    p4         1.6466           4        24
+    behindy    p5         1.6382           8        24
+    behindy    p6         1.6459           5        24
+    behindy    SPREAD             spread 1.10%   behind 4..8 over 6 passes
+
+**The pooled board moves 1.10% across the six passes while the behind-count runs 4 to 8 — it
+doubles.** Same readings, same cells, same passes; one statistic is stable to a percent and the
+other is not stable to a factor of two. The magnitude here is designed in, so this demonstrates the
+mechanism and not its size on real data; the size comes from chain205 and chain196 once both are
+bound. The consequence for reading a substituted dataset is the part that transfers: **a near-
+replicate is undetectable in the pooled board and may be very detectable in the behind-count**, and
+if it is, the behind-count is a provenance signal — a statistic that separates two near-replicate
+datasets is exactly what every consistency check lacked.
+
+The replication script invokes `an_c205.py --provenance-only` rather than restating the binding, so
+there is one implementation and this harness cannot drift from the one the board uses. Controls: the
+matching-digest case passes for both sides, binding one side with the other's digests refuses and
+names the offending passes, and the differing-cell-set path prints its NOTE and runs on the shared
+set rather than absorbing the difference.
+
+Two more shell-dialect defects caught in the test harness rather than the code, both mine and both
+in the *checking*: `set -- $a` does not split in zsh, and `${PIPESTATUS[0]}` is a bash name — zsh
+spells it `$pipestatus[1]`, so `${PIPESTATUS[0]:-$?}` silently reads the exit status of the last
+command in the pipe, which after `| head` is always 0. **A negative control whose exit-code check
+always reads 0 reports every refusal as a pass.** Re-checked without the pipe: rc=1, as required.
