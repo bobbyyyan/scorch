@@ -36265,3 +36265,39 @@ the harm it removes is the two thirds that was never worth much benefit anyway.
 The conclusion that survives: **the regressions are not width-separable.** Something other than k
 distinguishes the 1,548 winners from the 29 losers at k=8, and until that is identified there is no
 gate — a width condition is the only runtime predicate available for free, and it is not enough.
+
+### chain204's contamination is six regimes, not one, and the partition cannot be rebuilt from outside
+
+Read from the SC login node at 05:50:50, no allocation spent. Co-tenant CPUs beside chain204's 64:
+
+    02:08:58  chain204 starts                              16 co-tenant CPUs   (80 of 128 used)
+    04:43:04  ptbench array _0.._5 start, +48               64                 (128, node full)
+    05:03:14  _1 completes, -8                              56                 (120)
+    05:04:05  _6 starts, +8                                 64                 (128)
+    05:05:30  _3 completes, -8                              56                 (120)
+    05:41:35  _4 completes, -8                              48                 (112)
+    05:50:50  _0, _2, _5, _6 running                         48                 (112)
+
+**Six regimes, and more to come** — the four running tasks carry 10 h limits from 04:43 and 05:04, so
+the load will change again at each completion. The earlier note that the contaminated block "has at
+least three regimes" understated it by half.
+
+The practical consequence is worse than a labelling inconvenience. **The regime boundaries do not
+align with pass boundaries, and the pass boundaries cannot be computed from outside**: the 17.586
+min/pass mean was measured entirely in the clean regime, and the contention changes the rate, so
+extrapolating pass starts past 04:43 uses a rate the environment invalidated. `StdOut` is on `/scr`,
+node-local to mkt1, so the real pass timestamps are unreadable without spending an allocation next
+to the measurement.
+
+So chain204's analysis cannot carry a two-level clean/contaminated factor, and inventing one from
+extrapolated pass times would be a factor computed from a schedule rather than from the landed
+passes — the exact defect this milestone has already recorded once. **What it can carry is the
+within-pass ratio, which is immune by construction, plus its positive control** — and the control is
+now richer rather than harder: six step changes at known timestamps mean the absolute times should
+step six times while the ratios do not, which is a far stronger test than one step would be. The
+null distribution is still the eight clean passes.
+
+The 8/1/21 split stated earlier is therefore wrong in its second and third terms. Only the first is
+solid: **the eight passes before 04:43:04 are clean**, pass 9 straddles, and everything after is a
+sequence of at least six environments whose boundaries are knowable but whose alignment to passes is
+not.
