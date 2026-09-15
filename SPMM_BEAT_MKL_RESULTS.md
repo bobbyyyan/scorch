@@ -35414,7 +35414,7 @@ milestone claim.
 6. **Whether `/scratch/bobbyy/c205an` stays where it is.** It is chain196's `c0` set under a
    chain205 name, two characters from the live directory, and it will read as chain205 output to the
    next session as well. Renaming it is a one-line change on Bobby's data; nothing has been touched.
-7. **Whether to push.** 852 commits ahead of `main` on a single copy with no bundle or mirror, which
+7. **Whether to push.** 848 commits ahead of `main` (`git rev-list --count main..HEAD`, measured) on a single copy with no bundle or mirror, which
    is a real data-loss exposure. Not pushed, and `git push --all` would publish two additional
    branches — `perf/spmm-probe-and-kernel-pretrailer` carrying 27 `Co-Authored-By` trailers, whose
    stripped sibling is already on origin, and the in-progress `refactor/compiler-ir-phase3-std-move-call`.
@@ -35426,3 +35426,13 @@ in the codex; what should happen when a sealed analysis publishes a number from 
 exists nowhere; what quantity the stage-4 pre-registered bar bounds; whether amendment 4's floor of 8
 counts cells or independent problems; `oursb` versus its docstring; a second host for both
 width-dependent findings.
+
+**And a correction inside that list, three minutes after writing it.** Item 7 above first read "852
+commits ahead of `main`". The measured value is `git rev-list --count main..HEAD` = the number now in
+place; 852 was written from memory in a section whose entire subject is that numbers must carry their
+provenance. That is the fourth instance in this milestone of a rule being violated by the next number
+its author produced, and the mechanism is always the same: the rule governs *received* numbers and
+feels satisfied once it has been applied to someone else's. **A number you generate crosses the same
+boundary as a number you receive**, because the version of you that measured it is not the version
+writing it down. The predicate is now in the text beside the value, which is the only form that
+self-checks.
