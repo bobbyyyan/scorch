@@ -34006,3 +34006,66 @@ Caveat carried from the checker: chain196's object is the prefetch-era build (`R
 `ROW_PREFETCH 1`), not `c199`, so any per-width comparison mixes replication with a build
 difference. The floor comparison above is clean, because `oursb` is the same-object construction in
 both.
+
+### The matched floor is 2–11%, and `an_c205.py` already computes it
+
+Applying the "estimator must match the statistic it bounds" rule precisely: the board's cell
+statistic forms `mkl/ours` *inside* each pass and reduces over passes, so the matched floor forms
+`oursb/ours` inside each pass and reduces the same way. Two more candidates against the earlier
+three, on chain196's six sealed passes, 22,920 cells complete in all six:
+
+    D  median over passes of (oursb_p / ours_p)      ratio inside the pass, then reduce
+    E  median(oursb, p1..p6) / median(ours, p1..p6)  reduce, then ratio
+
+    band       cells   A p95    C p95    D p95    E p95    D/A    E/D
+    < 1e3      2835    0.0612   0.0483   0.0196   0.0273   0.32   1.39
+    1e3-1e4    4150    0.0827   0.0745   0.0233   0.0337   0.28   1.45
+    1e4-1e5    9665    0.4985   0.1982   0.0574   0.0813   0.12   1.42
+    1e5-1e6    3890    0.4561   0.3308   0.1138   0.1674   0.25   1.47
+    1e6-1e7    2005    0.3071   0.3653   0.0662   0.1205   0.22   1.82
+    > 1e7       375    0.0643   0.0846   0.0240   0.0280   0.37   1.17
+
+    pooled, 22920 cells:  A 0.4023   B 0.4902   C 0.1970   D 0.0569   E 0.0851
+
+**The four candidates spread 7× pooled.** D is 2.7–8.3× tighter than the within-pass A/A, so the
+operational floor is 2–11%, not the 20–37% I reported from A. Forming the ratio inside the pass
+cancels pass-level common mode before the reduction; C reduces the values in two pass groups and
+takes a ratio of the results, which keeps it. That reverses my "beyond floor cannot fire"
+conclusion — and this time on the stated principle rather than an accident of resolution.
+
+**`an_c205.py` already computes D, and the matching is structural.** `per_cell(num, den)` returns
+the median over passes of `num/den` with the pairing inside the pass, and `FLOOR_CELLS` and
+`BOARD_CELLS` are both produced by that same function. So the floor cannot drift from the board
+without the board drifting too. The script now prints the reduction beside the floor, for the same
+reason it prints the orientation.
+
+**One correction to the firability claim.** A 10% deficit is *not* outside the floor in every band
+under D:
+
+    band       D floor   is a 10% deficit outside D?   E floor   outside E?
+    < 1e3      0.0196    yes                           0.0273    yes
+    1e3-1e4    0.0233    yes                           0.0337    yes
+    1e4-1e5    0.0574    yes                           0.0813    yes
+    1e5-1e6    0.1138    NO                            0.1674    NO
+    1e6-1e7    0.0662    yes                           0.1205    NO
+    > 1e7      0.0240    yes                           0.0280    yes
+
+Under D it is 5 bands of 6 — `1e5-1e6` has a floor of 11.4%, wider than the deficit. Under E it is
+4 of 6, since `1e6-1e7` fails too. The peak band remains the one place a 10% result is unreadable,
+which is the same band under every matched estimator.
+
+**The peak is settled at 1e5–1e6.** A puts it at 1e4–1e5, B and both matched estimators D and E at
+1e5–1e6, C at 1e6–1e7. Three of five, including both matched ones, agree — so C's rightward shift
+was the estimator and there is a single peak at a few hundred KB to a few MB of nonzeros, which is
+a cache-boundary-shaped number on redwood. **The Zen4 prediction now has one clean form: the
+matched-estimator peak band should move with cache size.** One prediction, one estimator, rather
+than a shape read off three.
+
+Note the across-pass mechanism largely disappears under D and E, because forming the ratio within a
+pass is exactly what cancels pass-level common mode. So it is real, and the board's own statistic is
+already immune to most of it.
+
+**The rule, which is the durable part:** a floor must be computed by the same reduction, at the same
+resolution, as the statistic it bounds — and stating the reduction is part of stating the floor. Two
+sessions produced four floors from one dataset differing 7×, and every one of them was defensible in
+isolation.
