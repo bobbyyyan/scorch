@@ -34823,8 +34823,11 @@ sweep showed 1 for a reason that has nothing to do with trailers. **Neither numb
 the thing it was reporting**, and the check that settles it needs an anchor plus a control that
 fires on a real trailer. Now stated that way.
 
-The branch is clean: 836 commits ahead of `main`, tree clean, zero `Co-Authored-By` trailers by the
-structural predicate.
+The branch is clean: 836 commits ahead of `main` at the time of writing, tree clean, and zero
+`^Co-Authored-By:` trailers **in `main..HEAD`** by the structural predicate. The range is stated
+because the range is what the next section is about: the same sentence without it reads as a claim
+about the repository, which is false — 30 anchored trailers exist on other refs, and one of them is
+an ancestor of both `main` and `HEAD` and so lies outside any `main..HEAD` range by construction.
 
 ### The trailer census scoped to `main..HEAD` could not fail in the direction it claimed to check
 
@@ -35414,7 +35417,7 @@ milestone claim.
 6. **Whether `/scratch/bobbyy/c205an` stays where it is.** It is chain196's `c0` set under a
    chain205 name, two characters from the live directory, and it will read as chain205 output to the
    next session as well. Renaming it is a one-line change on Bobby's data; nothing has been touched.
-7. **Whether to push.** 848 commits ahead of `main` (`git rev-list --count main..HEAD`, measured) on a single copy with no bundle or mirror, which
+7. **Whether to push.** 849 commits ahead of `main` as of `72d4f8f` (`git rev-list --count main..72d4f8f`; a bare "commits ahead" numeral is wrong within a second, because recording the count increments it) on a single copy with no bundle or mirror, which
    is a real data-loss exposure. Not pushed, and `git push --all` would publish two additional
    branches — `perf/spmm-probe-and-kernel-pretrailer` carrying 27 `Co-Authored-By` trailers, whose
    stripped sibling is already on origin, and the in-progress `refactor/compiler-ir-phase3-std-move-call`.
@@ -35469,3 +35472,35 @@ lines, **18** in chain196 (`c0`/`c0b`/`pfd0` × passes 1–6) and **16** in chai
 (`c0`/`c0b`/`pfd0`/`stream` × passes 1–4 only). Six-pass sets exist only in chain196, so the copy
 could only have come from there — the elimination is exhaustive over the ledger rather than a lucky
 first guess.
+
+### A commit count written into a commit is off by one by construction
+
+The correction two sections up replaced 852 with 848 and **848 was also wrong**, for a reason
+re-measuring cannot fix:
+
+    git rev-list --count main..72d4f8f^   848   <- what was written
+    git rev-list --count main..72d4f8f    849   <- true once the commit recording it landed
+
+848 was true at the instant it was measured and false at the instant the commit containing it
+existed, because **the act of recording a commit count increments it.** No amount of re-measuring
+converges; the measurement is its own invalidating event. It is the validity-domain shape with the
+shortest possible domain — valid until the next line of work, and the next line of work was the
+same line.
+
+So the durable half of that fix was the whole of it: **the command in the text self-checks and the
+numeral beside it cannot.** Either drop the value or stamp it. "849 as of `72d4f8f`" is verifiable
+forever; "848 commits ahead" is wrong within a second. Corrected to the stamped form.
+
+**And one site the earlier correction did not reach**, found by the verifier rather than by me: a
+summary line read *"the branch is clean: 836 commits ahead of `main`, tree clean, zero
+`Co-Authored-By` trailers by the structural predicate"* — asserting a clean trailer state **with no
+range**, directly above the heading that documents the range as the defect. Naming the predicate
+does not name the scope, and the scope was the whole finding. Now reads *"zero `^Co-Authored-By:`
+trailers in `main..HEAD`"*, with the reason the range is stated given in place.
+
+**The mechanism, which covers every instance on both sides tonight.** The provenance rule governs
+*received* numbers, and it feels discharged once it has been applied to someone else's. But **a
+number you generate crosses the same boundary as a number you receive, because the version of you
+that measured it is not the version writing it down.** That is why "ask provenance" kept failing
+while "put the predicate in the text" keeps working: the first is addressed to a reader who may not
+be suspicious, the second is addressed to the document and re-runs on demand.
