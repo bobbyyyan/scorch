@@ -32728,10 +32728,9 @@ trailing text. So it is portable **only while no two files share a digest** — 
 filename and collation re-enters. Measured here: **242 lines, 242 distinct digests, 0 duplicates**,
 so it holds for this corpus. That number belongs beside the digest or the guarantee is untested.
 
-**One figure unreconciled.** I measure 66 of 242 positions differing between C and macOS-UTF-8;
-the independent count was 44. Both agree the effect is broad and neither number changes any
-conclusion, but they are not the same measurement and I have not identified which pair of orders
-the 44 compares. Recorded as unreconciled rather than split.
+**One figure, since reconciled — see below.** I measure 66 of 242 positions differing between C
+and macOS-UTF-8 against an independent 44. Both describe the same permutation under different
+operations.
 
 **What to carry**, with the conditions attached rather than implied:
 
@@ -32741,3 +32740,42 @@ the 44 compares. Recorded as unreconciled rather than split.
   **given 242 of 242 distinct digests**, which must be stated with it.
 - `113531ec0ca8bf97…` — full lines, glob order. Same-host rename detection only. Not a
   cross-host check, and not reproducible from a locale name.
+
+### 66 and 44 are the same permutation under two operations
+
+The 44 came from `diff <(… LC_ALL=C sort) <(… en_US.UTF-8 sort) | grep -c '^[<>]'` — 22 `<` lines
+plus 22 `>` lines. That counts **diff's minimal edit script**, not positional disagreement, and it
+was reported as "positions differing". Both numbers are correct measurements of one block move,
+and the arithmetic closes:
+
+| | |
+|---|---|
+| positions at a different index | **66**, one contiguous run, 0-based 44..109 |
+| `sh_ov2_*` names, shift | 22 names, **−44** |
+| `sh_ov24_*` and `sh_ov24b_*`, shift | 44 names, **+22** |
+| names that do not move | 176 |
+| 22 moved + 44 displaced | = **66** positions |
+| lines diff needs to describe that block move | 22 + 22 = **44** |
+
+*(The independent report attributed the +22 group to `sh_ov24_*`/`sh_ov2b_*`; measured, it is
+`sh_ov24_*` and `sh_ov24b_*`. `sh_ov2b_*` does not move. The counts and the arithmetic are
+unaffected — in ASCII `'4' < '_' < 'b'`, so C puts both ov24 groups ahead of `sh_ov2_` while
+leaving `sh_ov2b_` behind it.)*
+
+**Report 66, and say which operation produced it.** The two diverge exactly when a *block* moves,
+and a block move is what a collation change does to sorted filenames — so this discrepancy is
+systematic for the whole class of question, not a one-off.
+
+**And 44 is reachable three independent ways in this data**, which is how a mislabelled figure
+survives cross-checking: diff's edit lines (22+22), the displaced-name count (44), and the 0-based
+index of the first divergence (44). That third one lands on `C[44] = sh_ov24_float32_p1.csv`
+against `UTF8[44] = sh_ov2_float32_p1.csv` — independently confirming the corrected example above,
+and by coincidence rather than by derivation. Three routes to one number is a reason to go back to
+the command that produced it rather than accept whichever derivation matches.
+
+**The general form, which is the durable part.** Two mislabelled predicates surfaced within
+minutes of each other: a loose substring reported as an anchored trailer check, and an edit
+distance reported as a positional count. They fail in *opposite* directions — the first
+manufactured a violation, the second understated a real effect by a third — so direction is not
+the lesson. **The label has to name the operation, not the intent: when reporting a count over a
+population, state the operation that produced it in the same breath as the number.**
