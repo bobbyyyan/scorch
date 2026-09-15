@@ -34069,3 +34069,63 @@ already immune to most of it.
 resolution, as the statistic it bounds — and stating the reduction is part of stating the floor. Two
 sessions produced four floors from one dataset differing 7×, and every one of them was defensible in
 isolation.
+
+### The inverted U is a contamination rate, not a magnitude — and the ≥3-of-6 rule is one-way
+
+The best reframing of the floor tonight, and it reproduces: **a typical reading is equally quiet at
+every matrix size, and what varies tenfold is how often a large excursion happens.**
+
+    band       cells   median|dev|  rate>10%   A p95    >+10%    <-10%   ratio
+    < 1e3      2835    0.0097        2.4%      0.0612    1.2%     1.3%   0.96
+    1e3-1e4    4150    0.0135        4.0%      0.0827    2.1%     2.0%   1.04
+    1e4-1e5    9665    0.0130       20.3%      0.4985   10.3%    10.5%   0.98
+    1e5-1e6    3890    0.0185       26.1%      0.4561   13.6%    13.3%   1.03
+    1e6-1e7    2005    0.0087       14.0%      0.3071    7.5%     7.2%   1.04
+    > 1e7       375    0.0100        1.8%      0.0643    1.0%     0.9%   1.15
+
+Medians span 0.87% to 1.87% — a factor of 2.1 — and the *lowest* median sits in `1e6-1e7`, which
+has the second-highest p95. So "the noise is bigger in the middle" was the wrong description, mine
+included. The excursions are also direction-symmetric in every band (ratios 0.96–1.15), which is a
+positive control on the A/A construction itself: a same-function-object comparison with a *biased*
+excursion rate would have indicated something structural like arm order or a first-call effect, and
+there is none.
+
+**The ≥3-of-6 argument is a necessary condition, not an identity.** The median of six readings is
+`(x₃+x₄)/2`, so displacing it past 10% does require at least 3 readings past 10% on one side. The
+converse fails:
+
+    displaced but NOT >=3 same-side :   0 of 22920   <- necessity holds
+    >=3 same-side but NOT displaced : 576 of 22920   <- sufficiency fails
+
+The counterexample shape is a split: three readings at 1.2 and three at 0.9 put ≥3 on one side
+while the median lands at 1.05, undisplaced, because splits cancel in the middle order statistics.
+2.5% of cells are that shape.
+
+**And the 5% threshold has a false positive, inside the table that proposed it.**
+
+    band       >=3 same-side   D p95     predicts        actual
+    < 1e3           0.7%       0.0196    clean           no
+    1e3-1e4         0.8%       0.0233    clean           no
+    1e4-1e5         4.9%       0.0574    clean           no
+    1e5-1e6        12.4%       0.1138    contaminated    YES
+    1e6-1e7         5.8%       0.0662    contaminated    no    <-- false positive
+    > 1e7           0.3%       0.0240    clean           no
+
+`1e6-1e7` sits at 5.8%, above the 5% threshold, with D at 6.6% — so the rule predicts 5 of 6 bands,
+not 6 of 6. The band was listed in the proposing table with its own "no" beside it, and described
+as though 12.4% were the only value over the line. A threshold whose counterexample is in its own
+evidence table is worth more than a threshold that fits: the mechanism is real and directional, but
+"fraction > 5% ⟹ p95 contaminated" is not the law, because the split-cancellation cells inflate the
+fraction without displacing any median.
+
+**My own convention slip, in the same script.** Table 1 above counted `|x-1| > 0.10` and table 2
+counted `x > 1.10 or x < 1/1.10`, which differ systematically by 0.5pp because the first admits
+`x < 0.900` and the second only `x < 0.909`. Two thresholds for one quantity, in one script, in
+tables printed ten lines apart — and the checker's figures were internally consistent where mine
+were not. The log-symmetric form is the right one, since it is the only one that cannot depend on
+which arm is the numerator.
+
+**The prediction for MKT, in its sharpest form yet:** not that the peak band moves, but that **the
+per-reading excursion rate by band moves with cache size**, with D's readability following from it
+by the ≥3-of-6 necessary condition. Two measurable quantities with a derivable one-way relation, so
+a failure says which half was wrong.
