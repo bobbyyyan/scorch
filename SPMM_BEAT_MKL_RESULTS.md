@@ -32941,9 +32941,37 @@ The sixteenth is `harnesses/SHA256SUMS.sha256`, 186 lines, verifying 186 of 186 
 missed because the population was taken as "one `SHA256SUMS` per chain directory", and this manifest
 matches neither half of that: it is not named `SHA256SUMS` and it is not in a chain directory. Same
 shape as the three earlier population errors in this document — a count that matches where the thing
-is usually found. The fix is the same one: enumerate by the defining property (content parses as
-digest lines) over the whole tree, which here is 837 manifest-named files under
-`~/.cache/scorch-codex`, of which exactly 9 are `cksum` and 718 are SHA-256.
+is usually found. The fix is the same one: enumerate over the tree, then look at what the net
+caught. Under `spmm-beat-mkl/` that is 25 manifests, 16 + 9.
+
+**Correction to the paragraph above, which published a number that is not what its sentence says.**
+The first version of this passage read "837 manifest-named files under `~/.cache/scorch-codex`, of
+which exactly 9 are `cksum` and 718 are SHA-256", offered as the result of enumerating by the
+defining property. Two things are wrong with it and neither is the arithmetic, which is exact:
+718 + 109 unparseable + 1 empty + 9 = 837.
+
+First, it was a **name** net — filename contains `SUMS`, or contains `sha256`, or ends `.cksum` —
+reported as a content enumeration, which is the label-the-operation defect occurring inside the
+sentence prescribing the fix for the population defect. Second, and worse for a reader, 718 is not
+a count of manifests and so is not parallel to the 9 it is quoted beside: **177 of the 718 are
+single-line receipts** (one digest, one file: `base.so.sha256`, `activation.json.sha256`), 52 are
+two or three lines, and **489 have four or more lines**. A receipt and a ledger manifest are
+different objects and only the second is what "9 cksum manifests" is counting.
+
+The peer's independent net — `SHA256SUMS*`, `*.sha256`, `*MANIFEST*`, `*cksum*`, `*sums*` — gives
+819 files and 485 SHA-256, agreeing exactly on 9 `cksum`. The 233-file gap is entirely net width,
+not classification: my net catches `artifact-sha256.txt` (31), `receipt-sha256.txt` (29),
+`EVIDENCE_SHA256SUMS` (12), `script-sha256.txt` (8), `grid-base-SHA256SUMS` (7) and
+`corpus-base-SHA256SUMS` (7), none of which match a `.sha256` suffix or a `SHA256SUMS` prefix. Both
+nets under-collect, in different directions.
+
+**And a content-only net over-collects.** Enumerating all 2437 files in the milestone tree by first
+line yields 17 `cksum`-shaped files, 8 of which are not manifests at all: the `orders_idx*.txt`
+pass-order tables are whitespace-separated integers, so `chain203-rungwise-redwood/orders_idx11x22.txt`
+("1 2 3 5 10 4 8 11 7 9 6") satisfies "three fields, first two numeric" for a reason that has
+nothing to do with checksums. 17 − 8 = 9. So neither net alone settles a population: a name net
+misses members, a content net admits non-members, and the only thing that closes it is reading what
+the net caught.
 
 **Two structural points, both of which survive the arithmetic being right.**
 
