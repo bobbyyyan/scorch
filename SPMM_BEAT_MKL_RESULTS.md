@@ -35615,3 +35615,49 @@ finding about the account rather than a reason to widen it.
 What would earn a fourth population is a mechanism first and a boundary second — the unclassified
 group is concentrated at k=2 and k=4 (20 of 27), where the earlier narrow-k work already implicates
 three loads per nonzero rather than any row-geometry effect, so that is where to look.
+
+### Correction: the unclassified 27 are two groups with an empty band, and 89% are narrow-k
+
+Three corrections to the section above, all verified here, and two of them strengthen its conclusion.
+
+**The narrow-k share was understated.** The unclassified cells by width are `{k=2: 12, k=4: 12,
+k=8: 3}` and **nothing at k=16 or k=32** — so **24 of 27, or 89%**, are at the two narrowest widths,
+not the 20 of 27 stated. The conclusion that a mechanism would have to come from the narrow-k work
+is stronger than it was written.
+
+**The cell that makes the threshold argument unanswerable was missing from the list.** `cegb2802` at
+k=4 sits at **deg 98.99** — one hundredth of a degree unit below a cut at 100. The examples given
+(raefsky1/2 at 90.5, mycielskian11 at 87.8, aa03 at 85.8) all reproduce, but the nearest cell to the
+boundary was absent. One cell at 98.99 against a cut at 100 demonstrates that the classification is
+doing arbitrary work at its margin more sharply than three cells at 85–90 do.
+
+**And the 27 are not one residual.** Sorted by mean degree, the largest gap in the sequence is
+**34.56**, between **12.99 and 47.55**, and nothing lies inside it:
+
+    deg 47.55 - 98.99   14 cells   cegb2802 99.0, raefsky2 90.6, raefsky1 90.5 x2, air04 88.7 x2,
+                                   mycielskian11 87.8 x2, aa03 85.8, aa3 85.8, rat_A_3 85.8,
+                                   comsol 65.1, GT01R 54.0, msc00726 47.6
+    deg  2.04 - 12.99   13 cells   boyd1 13.0 x2, case9 family 10.2 x3, ASIC_100k 9.5, p6000 9.5,
+                                   Chebyshev3 9.0, ins2 8.9, rajat25 7.0, adder_dcop_04 5.8,
+                                   ASIC_680k 3.9, poli 2.0
+
+**So lowering the degree cut to 47 would absorb exactly 14 of the 27 and leave 13 that no
+row-geometry threshold can reach** — the low group's maximum degree is 3.7× below the high group's
+minimum. That makes the refusal to move the threshold stronger rather than merely principled: the
+move would be **visibly partial**, buying half the residual and leaving a group an order of magnitude
+away in the one variable being thresholded.
+
+The low group is where the interesting thing is. **12 of its 13 cells are at k=2 or k=4** (only
+`ins2` at k=8 is not), and it contains the two largest matrices in the whole beyond-floor set —
+`ASIC_680k` at 682,862 rows and `ins2` at 309,412 rows, at degrees 3.9 and 8.9. Very large, very
+sparse, very narrow k. That is a different regime from long rows, and it is the one the earlier
+narrow-k work already implicates through three loads per nonzero rather than any row-geometry effect.
+
+**The boundary here is an observation about the distribution, not a chosen cut**, and the difference
+matters: 12.99/47.55 is where the data has a hole, reported with its width, whereas 50 would be a
+number picked to make a classification look complete. It is offered as a description of the residual
+and **not** as a fourth population — a population needs a mechanism first and a boundary second, and
+no mechanism is being claimed for either group yet.
+
+Confirmed unchanged: `deg < 1` catches 4 cells, and the minimum row count over all 66 is **50**, so
+nothing falls in the fewer-rows-than-workers class on any plausible worker count.
