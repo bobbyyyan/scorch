@@ -33157,3 +33157,53 @@ Two artefact facts, both in the family of the `mrbuild.sh` divergence above:
    `38d1a01d9cc67703`, against 3811 bytes at `1872f707045dc14e` on redwood and in all four sealed
    copies. The probes above shipped the sealed copy and printed its digest before use; MKT's own
    copy was left untouched, since another stage may read it.
+
+### Correction: most of the section above was already established, and here is the part that is not
+
+The memory file `spmm_thread_bound_chains_dead.md` already carries a section titled "A POSITIVE
+OVERRIDE IS NOT A HARD CAP, and the exception is a different launch path", and it already records:
+the `SCORCH_SPMM_RECRUIT_MIN_WORK` mechanism and its `10000000L` value; that the source's inertness
+argument "is sound for a caller passing the real pool and **fails for a sweep arm passing a low
+override**"; the `resolved > override` detector; that chain200 crosses the threshold on **0 cells at
+k=2, 3 at k=4 and 21 at k=32**; and that chain189/190 were checked from their sealed ledgers at **24
+of 305 cells**, chain190 reading `{1:32, 2:32, 4:32, 8:32, 16:32, 24:24}` — five of six swept arms
+collapsed onto 32 — and chain189 reading all six arms at 32. So the chain200 table above re-measures
+a recorded result on chain200's own object rather than establishing a new one, and the claim that
+five of its arms are one treatment was already on file for chain190 in the same form. Stated here
+because presenting it as new would overstate it.
+
+Four things today added.
+
+**1. chain203's sealed analysis attributes its own 24 cells to a branch that cannot execute, and
+that branch is one of the override's three declared roles.** The analysis says "the remembered
+ceiling request floors the cap there", and the memory description likewise lists "a remembered
+ceiling widening survives the cap" as the third of the override's three roles. `ceil_request` is
+assigned only inside a block guarded by `nnz_per_thread > 0`, and `SCORCH_SPMM_NNZ_PER_THREAD` is
+`0L` in this object — so the role is **dead code here**, and the ceiling's own conditions hold on 1
+of the 24 cells anyway. The override has two live roles in this build, not three.
+
+**2. The attribution is now exact rather than consistent.** 243 cells below `work_true` 1e7 decline
+zero times; the 24 at or above decline 24 times; the straddling pair is 4.5% apart around the
+constant. Knowing the threshold is crossed by 21 cells is weaker than knowing no cell crosses in the
+wrong direction.
+
+**3. The exposure is not limited to sweep arms — it reaches an ordinary caller.** The recorded
+framing is "fails for a sweep arm passing a low override". But `ops.py` `_composition_hints` makes
+production pass `torch.get_num_threads()` on every drop-in SpMM, so the gate is at twice *the user's
+own thread setting*. Any caller who sets `torch.set_num_threads(n)` with `2n <= omp_get_num_procs()`
+is in the firing configuration. Confirmed on two hosts with the boundary one unit wide — redwood
+fires at 16 and not at 17, MKT delivers 64 where 8 was asked — which is the first time this has been
+read as a property of the shipped interface rather than of a harness.
+
+**4. `resolved` is the delivered worker count on these cells, which did not follow from the policy
+alone.** `at::parallel_for` spawns `min(nthreads, at::get_num_threads())`, so a resolved 32 against a
+pool of 8 could have meant 8 workers. It does not: `spmm.h:5288` takes `#pragma omp parallel
+num_threads(nthreads)` exactly when `nthreads >= 2 * at::get_num_threads()`, the same condition the
+policy declines its cap for. The decline exists so this launch gate is satisfiable — deliberate, not
+an oversight. The team really is 32.
+
+And the inertness claim is **duplicated at both launch sites**, `spmm.h:5284` for the drop-in and
+`spmm.h:6409` for the fused Linear-SpMM, each arguing from "pool = every physical core"
+("redwood: pool=24 = every physical core, omp_get_num_procs()=32 counts only SMT siblings,
+nthreads<=32 < 2*24=48 can never trigger"). Both hold at pool 24 and both fail together below 17, so
+a fix has three sites to reconcile and not one.
