@@ -35917,3 +35917,76 @@ n = 1 and no way to attach an uncertainty to it**, while the arm floor has a rep
 to one cell on the headline. That is a reason to report the arm-gated partition as the primary and
 the build-gated one beside it, and it is a requirement for the next chain: **two identical-source
 build pairs, not one**, if a build-identity floor is to carry an uncertainty rather than a value.
+
+## chain205: the full-collection board, 4,584 matrices x 5 widths, six passes on redwood
+
+Both completion signals agreed (six CSVs at 68,761 lines and `RW_C205_ALL_PASSES_DONE`, no
+refusals). Sealed on the producing host **before** transfer, all six verified against the seal after
+it, and bound to content by sha256 in the analyzer.
+
+    FLOOR  oursb against ours, same code twice under two labels, same reduction as the board
+      k        cells   gm       median   p95 |dev|   log-symmetric p95 (reported, not gating)
+      2        4584    1.0008   1.0000   0.0482      0.0498  (+3.4% relative)
+      4        4584    1.0005   1.0000   0.0355      0.0362  (+2.0%)
+      8        4584    1.0003   1.0000   0.0449      0.0459  (+2.2%)
+      16       4584    1.0001   1.0000   0.0576      0.0594  (+3.2%)
+      32       4584    1.0002   1.0000   0.0848      0.0912  (+7.5%)
+
+    BOARD  mkl/ours, above 1 means we are faster
+      k        cells   gm       median   behind  beyond  pct    band(gm)          worst
+      2        4584    1.7301   1.4894     35      18    0.4%   [1.7089, 1.7521]  lp1 @ 0.726
+      4        4584    1.9501   1.7357     51      31    0.7%   [1.9263, 1.9747]  nw14 @ 0.661
+      8        4584    2.3544   2.7187     11       9    0.2%   [2.3270, 2.3846]  raefsky1 @ 0.800
+      16       4584    2.7520   3.0354      5       2    0.0%   [2.7236, 2.7816]  connectus @ 0.877
+      32       4584    2.9303   3.1167      4       1    0.0%   [2.9037, 2.9565]  rail582 @ 0.767
+      ALL     22920    2.2978            106      61    0.27%
+
+    PARTITION under the arm-identity floor
+      behind beyond the floor            61   0.27%
+      indeterminate (inside it)         107   0.47%   of which 62 are AHEAD of parity
+      ahead beyond the floor          22752  99.27%
+      not-certainly-ahead               168   0.73%
+
+    THE GOAL'S COUNT UNDER EVERY REDUCTION
+      a single pass (range over six)   383-448   gated 60-80
+      per-cell median over passes          106   gated    61
+      behind in EVERY pass                  13
+      behind in ANY pass                  1736
+      -> 134x between the loosest and the tightest
+
+**Pooled 2.2978 over 4,584 SuiteSparse matrices at five widths, and 61 cells of 22,920 behind MKL
+beyond their own width's measurement floor.**
+
+### And 61 is not distinguishable from chain196's 66
+
+The comparison against chain196 `c0` was computed in one program under one named reduction, both
+sides bound to content:
+
+    per-pass pooled   c196c0 2.2605 2.2811 2.2817 2.2595 2.2556 2.2785   spread 1.16%
+                      c205   2.2649 2.2860 2.2704 2.2744 2.2929 2.2693   spread 1.24%
+    six-pass pooled   c196c0 2.2915   c205 2.2978   -> 0.28% apart
+    behind (per-cell) c196c0 119      c205 106      -> 13 cells apart
+
+**The control that settles it is chain196's own second build of the same source.** Each board gated
+by its own arm floor:
+
+    build   k=2  k=4  k=8  k=16  k=32   beyond   behind   pooled
+    c0       20   36    7     1     2      66      119    2.2915
+    c0b      29   34    8     0     1      72      118    2.2909
+    c205     18   31    9     2     1      61      106    2.2978
+
+**Recompiling the same source moves the gated count from 66 to 72 — a 6-cell spread — and the
+pooled board by 0.03%.** chain205's 61 is 5 below `c0` and 11 below `c0b`, so it sits inside the
+band that recompilation alone produces. The pooled difference, +0.28%, is also inside the 1.16–1.24%
+pass-to-pass spread.
+
+So the honest statement is: **chain205 reproduces chain196 and does not beat it.** 61 against 66 is
+not an improvement that this design can resolve, and saying otherwise would be reading a 5-cell move
+against a 6-cell noise band. The two-cell agreement of the arm floor's replicate (66 vs 65) does not
+help here, because that replicate holds the *board* fixed and varies only the floor; varying the
+object moves the count six.
+
+**What the pair does establish** is that the board is reproducible across chains at the pooled level
+to 0.28% and at the gated-count level to within build noise — which is what makes a future
+improvement measurable, and is the first time this milestone has had a two-chain baseline at full
+collection scale.
