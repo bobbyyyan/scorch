@@ -34825,3 +34825,45 @@ fires on a real trailer. Now stated that way.
 
 The branch is clean: 836 commits ahead of `main`, tree clean, zero `Co-Authored-By` trailers by the
 structural predicate.
+
+### The trailer census scoped to `main..HEAD` could not fail in the direction it claimed to check
+
+Every commit reachable from any ref, tested structurally for a `^Co-Authored-By:` line: **30
+trailers on 30 commits.** The three-way split, verified:
+
+    27  refs/backup/pre-trailer-strip AND refs/heads/perf/spmm-probe-and-kernel-pretrailer
+     1  b606b30 (2026-03-05) -- ancestor of HEAD and of main
+     2  bbfa606, e7673a2 (Nov 2025) -- refs/remotes/origin/exp only
+
+**`b606b30` is an ancestor of HEAD and no `main..HEAD` census can see it**, because that range
+excludes main's own history by construction. I have reported "anchored trailers: 0" after commits all
+session on exactly that range. The scope made the check unable to fail in the direction it claimed to
+check — a range reading 0 because the only mainline candidate lies outside it.
+
+**And it is already published, which settles what to do about it: nothing.** `b606b30` is on
+`refs/remotes/origin/main` — pushed six months ago, before this work — along with `origin/bench` and
+six other remote branches. Removing it would mean rewriting published history. The accurate claim is
+**"0 new trailers on the 837 commits this branch adds, and 1 pre-existing and already-published
+commit on mainline history that no `main..HEAD` census can see."**
+
+**The one live item, stated precisely.** The 27 are reachable from a normal local branch, not only
+from the `refs/backup/` ref:
+
+    perf/spmm-probe-and-kernel             local + origin   0 anchored trailers   (the stripped one)
+    perf/spmm-probe-and-kernel-pretrailer  local only      27 anchored trailers
+
+and enumerating every local branch with no `origin/` counterpart, that is **the only unpushed branch
+carrying trailers**. So `git push --all` would publish exactly one branch of trailers, whose stripped
+sibling is already on the remote. Recorded as a fact about the repository; I do not touch refs and am
+not proposing anything.
+
+**Also: the unanchored count is 2 now, not 1, and the range is 837.** `d16e695` — the commit
+documenting this finding — added a second prose mention of the phrase. That check's reading is a
+function of how much has been written about it, which is a property worth naming on its own: a
+text-matching metric over a corpus that includes commentary on the metric.
+
+**The sub-family is complete at four and they share one control gap.** A `git log -S` returning 0
+across a line wrap; a source audit firing on its own docstring; two claim-print censuses disagreeing
+on an unquoted regex; and this scope defect. Prose about a defect lives in the same text the search
+reads — and **the control set must include prose that mentions the defect without being it.** None of
+the four had such a case, and one would have caught all four.
