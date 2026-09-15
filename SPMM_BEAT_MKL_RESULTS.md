@@ -32779,3 +32779,24 @@ distance reported as a positional count. They fail in *opposite* directions — 
 manufactured a violation, the second understated a real effect by a third — so direction is not
 the lesson. **The label has to name the operation, not the intent: when reporting a count over a
 population, state the operation that produced it in the same breath as the number.**
+
+**The permutation is monolithic at the arm-block level**, which is a stronger statement than the
+shift table and explains why diff needs only 44 lines. Full census, 22 files per arm:
+
+| shift | groups |
+|---|---|
+| **−44** | `sh_ov2` |
+| **+22** | `sh_ov24`, `sh_ov24b` |
+| 0 | `sh_ov2b`, `sh_ov4`, `sh_ov4b`, `sh_ov8`, `sh_ov8b`, `sh_ov16`, `sh_ov16b`, `sh_ovp` |
+
+**Every group carries one shift — no group splits.** So all 22 passes of an arm move together and
+this is one block of 22 crossing a block of 44, not 66 independent reorderings. The block order
+follows the ASCII account exactly: C gives `ov24 ov24b ov2 ov2b`, macOS-UTF-8 gives
+`ov2 ov24 ov24b ov2b`, with `'4'=52 < '_'=95 < 'b'=98`.
+
+*(One correction to the census as it was reported to me: it said "exactly 2 of 11 groups move"
+while its own table listed three nonzero shifts. Measured, **3 of 11 arm groups move** — `ov2`,
+`ov24`, `ov24b`. They form **2 contiguous blocks** that swap, which is presumably what was meant,
+but the group count is three. Fourth summary in four messages that was wrong beside correctly
+measured data — the numbers were right every time and the sentence over them was not, which is
+exactly what makes that failure mode credible.)*
