@@ -33791,3 +33791,59 @@ amendment 4's floor of 8 counts cells or independent problems; `oursb` versus it
 log-space reduction; a second host for both width-dependent findings; whether to push. Added by
 this round: whether a ledger should be required to attest its cross-milestone dependencies, which
 would have caught all four rows above and none of which a per-chain manifest check can see.
+
+### Correcting the csrresolve.py row, and the ledger-local check run codex-wide
+
+**My `csrresolve.py` row said "nowhere" and that is wrong.** It is attested in 9 lines across 6
+manifests — 4 in the top-level `SHA256SUMS`, 1 each in `chain185-w1fix-mkt`,
+`chain187-w1unroll-mkt`, `chain187-w1unroll-redwood`, `harnesses/SHA256SUMS` and
+`harnesses/SHA256SUMS.sha256` — and all four on-disk copies are byte-identical at
+`1872f707045dc14e`, 3811 B. My own earlier finding was "in no chain203 ledger"; compressing that
+to "nowhere" for a table cell dropped the qualifier that made it true. So its row has the same
+shape as `mrgate.py`'s — attested at one generation while a different one ran (3811 B /
+`1872f707` sealed against 3611 B / `38d1a01d` on MKT) — which means three of the four rows are
+generation mismatches and only `mkorders11.py` is the cross-ledger case.
+
+**The `synth_c203.py` finding verified, and it is the sharper check.** `meta_c203.py:34` binds
+`SYN = os.path.join(HERE, "synth_c203.py")` and `:40` launches it with `sys.executable`. The file
+is absent from the sealed directory, and `shasum -a 256 -c SHA256SUMS` still passes 258 of 258.
+Every other gap in the table above is a `/scratch` path, so finding it needs knowledge of a host
+the ledger does not contain; this one resolves against the sealed directory itself, so a check
+with no external knowledge finds it.
+
+Run codex-wide, scoped to the unambiguous class — a sealed script naming a sibling **script**
+through a variable bound directly to `os.path.dirname(os.path.abspath(__file__))`:
+
+    sibling-script references checked   25
+    resolved inside the sealed dir      22
+    MISSING                              3
+
+    abi-jit-port/harness              confound_driver.py  expects confound_worker.py
+    workspace-decision/harness        confound_driver.py  expects confound_worker.py
+    spmm-beat-mkl/chain203-...        meta_c203.py        expects synth_c203.py
+
+All three launch the missing file with `sys.executable`, so each is a sealed directory holding a
+script that cannot run from its own ledger. The two `confound_driver.py` copies are byte-identical
+(`9f0d2cca14e9b74d`, 10518 B), so it is one defect sealed twice.
+
+**Three instrument iterations to get that number, and the drift is the lesson.** First pass: 33
+missing. That put `BASE` in the "script's own directory" alternation, but `BASE = HERE/base` is a
+*subdirectory*, so 21 references were tested against the wrong path — the `base/` and `candidate/`
+trees exist in 6 of 7 directories. Second pass resolved variable chains properly and reported
+1669 of 1857 missing, now following variables rooted at a parent directory or at `sys.argv[1]` —
+and a harness referencing `src` relative to a tree root passed as `$1` is this project's
+documented convention, not a gap. Third pass restricted to `__file__`-rooted variables and
+sibling `.py`/`.sh` names only, where a tree-root argument cannot produce a false positive: 3.
+
+33, then 1669, then 3, on one question. The two wrong numbers were not sloppiness in different
+places — they were the same error twice, a predicate whose name claimed a scope its pattern did
+not have. The reportable number is the one whose false-positive mechanism I can state and rule
+out.
+
+**A separate shape: a citation whose artefact is unsealed.** `an_c203.py:95` prints "not a
+reading. The measurement is in `nbootstab_c203.py`", and `:73` publishes a result from it — "83
+rows, 4 seeds, on chain203's own first six passes: 6 rows (7%)". That file has **0 manifest lines
+and 0 on-disk copies codex-wide**. It is not a missing input: the analysis runs without it, so no
+input-completeness check can see it. The document cites a number and the ledger cannot produce
+the artefact that made it. Same family as `scorch_c199.tgz`'s digest appearing in zero codex
+files.
