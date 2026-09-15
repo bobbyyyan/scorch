@@ -36621,3 +36621,72 @@ and is the one to quote.
 k=32 benefit does not survive its own pre-registered control. That does not change the reason it
 cannot ship — 247 regressions that are not width-separable — but it does change what it would be
 shipping for.
+
+### The build-identity floor is not a build floor: it is a cross-invocation floor
+
+The open decision ranked first in this document — which A/A test defines the noise floor, worth 19
+cells on the headline — is answerable from chain196's sealed bytes. No new run was needed. The
+control was in the data for five days.
+
+**The construction.** `chain196_body.sh:311-320` runs one `python` process per (build, pass) and
+each process emits all three labels — `mkl`, `ours`, `oursb`. So the two floors in use differ along
+an axis nobody had named:
+
+    arm floor    oursb/ours    both labels in ONE process      within-invocation only
+    build floor  c0/c0b        two DIFFERENT processes         within + cross-invocation
+
+**The free control.** MKL's library is byte-identical in every process; nothing about our build can
+change it. So `mkl(c0)/mkl(c0b)` is cross-invocation drift with **zero code difference**, on exactly
+the same paired per-cell construction as the build floor. Per-cell `exp(median(log ratio))` over the
+six passes, deviation `exp|ln x|-1`, floor = p95 nearest-rank, n = 4,584 cells per width:
+
+    pair                            k=2      k=4      k=8      k=16     k=32    what it carries
+    oursb/ours   in c0             0.0468   0.0372   0.0477   0.0620   0.0855   arm identity, 1 process
+    oursb/ours   in c0b            0.0484   0.0437   0.0445   0.0598   0.0855   arm identity, 1 process
+    oursb/ours   in pfd0           0.0422   0.0292   0.0363   0.0474   0.0687   arm identity, 1 process
+    ours(c0)/ours(c0b)             0.0868   0.0687   0.0750   0.0917   0.1394   2 processes + relocation
+    mkl(c0)/mkl(c0b)               0.0621   0.0734   0.1106   0.0951   0.1072   2 processes, ZERO code diff
+    mkl(c0)/mkl(pfd0)              0.0666   0.0711   0.1030   0.0920   0.1135   same, second build pair
+
+**The zero-code-difference control accounts for the whole of the build floor**, and at three of five
+widths it is *wider* than the two-object comparison:
+
+    share of build floor, mkl(c0)/mkl(c0b)    71.6%  106.9%  147.4%  103.7%   76.9%
+    build floor / arm floor                    1.86x   1.84x   1.57x   1.48x   1.63x
+    MKL drift  / arm floor                     1.33x   1.97x   2.32x   1.53x   1.25x
+
+The 1.5–1.9× increment that the build floor shows over the arm floor is reproduced, width by width,
+by a comparison in which **no byte of code differs**. There is no residual for the object to explain.
+That is independently consistent with the static result above: two identical-source builds at
+different path lengths execute an identical mnemonic sequence at identical addresses, so relocation
+has no mechanism by which to cost time.
+
+**So the two floors are not competing conventions. They answer two different questions.**
+
+    within-invocation floor   "is this cell behind MKL in this measurement?"
+                              The board's ratio mkl/ours is measured with BOTH arms in ONE process,
+                              so this is the matched floor and it is the arm-identity floor.
+    cross-invocation floor    "would a number from one process reproduce in another?"
+                              The right floor for comparing chain205's board against chain196's --
+                              which is exactly where it has been used, and correctly.
+
+**Consequence for the headline: the 19 cells are not given back.** The gated count stands at 68 on
+chain196 and 63 on chain205 under the published configuration, because the comparison being gated is
+within-invocation and the matched floor is the narrow one. The wider floor was never a stricter
+version of the same test; it was the right answer to the build-to-build reproducibility question,
+which is the question the 66–72 band already answers.
+
+**What is still open, and it is the one number not derivable from sealed data.** The control above is
+measured on *MKL's* code. Our kernel is the more drift-sensitive of the two at k=2, k=16 and k=32, so
+the drift share for our own code is not established by it. chain196 cannot supply that, because no
+two of its processes run the same object. chain206 (running, launched 06:15) does: `aa` and `bb` are
+distinct files with **identical `.text`**, so `ours(aa)/ours(bb)` is drift-only on our own kernel,
+and `ours(aa)/ours(aax)` adds relocation. That difference prices relocation on our code directly
+rather than by elimination.
+
+**And the design rule this produces, which is the transferable part.** An A/A test is named by what
+it holds fixed, and a *process boundary* is something it can fail to hold fixed while every code-level
+description of it stays true. "Two identical-source builds" sounds like a statement about objects; in
+practice it was a statement about processes, and the object term is zero. **State the process
+structure of an A/A test alongside its code structure**, or the floor will silently answer a question
+nobody asked.
