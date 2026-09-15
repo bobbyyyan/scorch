@@ -36766,3 +36766,74 @@ ceiling is occupancy, not time". Occupancy is exactly what is binding on the `FA
 is where splitting has the most room — 71 rows over 24 workers. Whether chain193's corpus weighted
 that population enough to close it there is not established by anything in this document, and it is
 the next thing to check rather than to assume in either direction.
+
+### Corrections to the population section, and what chain193 could and could not have closed
+
+Four corrections, all verified independently. One reverses the direction of a claim, one more than
+doubles an effect, and one retires a reading of a closed chain.
+
+**1. The corpus claim was wrong in its direction.** The previous section said the `FAT` and `EMPTY`
+populations were "under-weighted, not absent" in the curated 89-key corpus. Both are **over**-represented:
+
+    FAT     curated 11 of 89 = 12.4%    collection  91 of 4584 = 1.99%    OVER by 6.2x
+    EMPTY   curated 12 of 89 = 13.5%    collection 427 of 4584 = 9.32%    OVER by 1.4x
+
+So "the 2% corpus could not see these cells" is false in the strong direction, not merely unproven.
+Whatever is unsolved about these matrices is not a sampling artefact — they were over-sampled.
+
+**2. The `rows > 24` qualifier raises the effect rather than weakening it.** The degenerate case
+recorded earlier (`S10PI_n1_C`, 1 row and 1 nonzero, satisfying `1 > 1/2`) is not one matrix:
+**26 of the 91 `FAT` matrices have rows ≤ 2, and 55 have rows ≤ 24** — 60% have fewer rows than
+there are workers. Restricting to `rows > 24`:
+
+    FAT as written    455 cells over 91 matrices    all 8 core cells    lift 16.8x
+    FAT and rows>24   180 cells over 36 matrices    all 8 core cells    lift 42.4x
+
+The degenerate matrices contribute population and no core, so the qualifier needed before gating
+**more than doubles the lift, to 42.4x**.
+
+**3. Two scope errors in the descriptive ranges.** Core `FAT` rows span **71 to 1434**, not 71–582 —
+the 582 was `rail582`, a corpus matrix, not a core one, and `spiral_E` at 1434 rows is the core
+extremum. And `FAT`'s own A/A floor is wider than the collection's at **k=2 and k=4 only**:
+
+    k=2  0.0557 vs 0.0468 WIDER     k=8  0.0365 vs 0.0477 narrower
+    k=4  0.0467 vs 0.0372 WIDER     k=16 0.0412 vs 0.0620 narrower
+                                    k=32 0.0589 vs 0.0855 narrower
+
+The argument only needs k=2 and k=4, which is where the core lives, so it stands — but "wider at two
+of three widths" was stated from three printed widths and the scope belongs in the sentence. (Core
+`EMPTY` nnz/rows is 0.4973–0.7825, which the earlier section had right.)
+
+**4. chain193 did not close row splitting on `FAT`; it had no power there.** Its corpus is 19 keys,
+of which **3 are `FAT`** (`connectus`, `nw14`, `kl02`), **0 are `EMPTY`**, and 6 are DLMC entries not
+in the SuiteSparse collection at all. The sealed analysis quotes a floor of 2.46%, but that is a
+**bootstrap CI on a pooled geometric mean**, and the per-matrix effects in its own table are
+per-cell quantities. Computing the matched per-cell A/A floor from its own `origb` and `splitb` arms
+— max |dev| over its 19 cells per width, which at n=19 is effectively the p95:
+
+    k=1 0.2336   k=2 0.3187   k=3 0.7802   k=4 0.1472   k=8 0.1139   k=16 0.2670
+
+Against that, of the eighteen `FAT` cells **none clears**; `connectus` reads 1.089 and 1.100 at k=4
+and k=8 and `nw14` 1.119 at k=4, all inside the floor. The only cells in the whole corpus that clear
+are **`lp_osa_14` at k=4 (1.244) and k=8 (1.317)** — and `lp_osa_14` is not `FAT`. It has 2,337 rows
+and nnz/rows 135.7, squarely in the middle of the axis. The k=3 floor of 0.78 makes every k=3 reading
+from that chain unusable outright.
+
+So chain193's verdict is **not contradicted** — a ~10% effect on three matrices against a 11–78%
+floor is unmeasurable either way — and it is also not the closure it was recorded as for this
+population. Two things follow for where to look:
+
+- Its three `FAT` matrices all have **more** rows than workers (512, 73, 71 against 24). The **55
+  `FAT` matrices with rows ≤ 24** — where the occupancy argument is strongest, because they cannot
+  fill the team at all — are entirely unmeasured by it.
+- Its one gated positive is a **middle** matrix at k=4 and k=8, which argues the payoff is long rows
+  *with enough rows left to parallelise*, not the `FAT` extreme. That is the opposite of where the
+  `FAT` lift pointed, and the two are not in conflict: the lift says where we lose to MKL, this says
+  where splitting has measured headroom, and they are different populations.
+
+**Method note, and it is the reason 2.46% and 11–78% can both be correctly computed from one
+dataset.** A pooled bootstrap CI on a geometric mean narrows as `1/sqrt(n)`; a per-cell deviation
+floor does not narrow at all. Comparing a per-matrix effect against a pooled floor understates the
+noise by roughly `sqrt(n)`. **State the floor's unit of observation** — per cell or per pooled
+estimate — because the two differ by an order of magnitude here and only one of them matches a
+per-matrix claim.
