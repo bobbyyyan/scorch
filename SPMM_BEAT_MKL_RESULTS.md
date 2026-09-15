@@ -35661,3 +35661,29 @@ no mechanism is being claimed for either group yet.
 
 Confirmed unchanged: `deg < 1` catches 4 cells, and the minimum row count over all 66 is **50**, so
 nothing falls in the fewer-rows-than-workers class on any plausible worker count.
+
+### A floor alone cannot be a gate on a board that is winning
+
+The gate producing the 66 is `x < 1.0 − floor(k)`, one inequality rather than a conjunction, so it
+cannot lose its direction test. But it is worth recording what the other reading would do, because
+the failure would not look like a bug:
+
+    cells                                        22920
+    |x-1| > floor   (the FLOOR ALONE)            22805   99.5%
+      of which ahead,  x > 1 + floor             22739
+      of which behind, x < 1 - floor                66   <- the gate
+    x < 1           (direction alone)              119
+
+    119 behind      -> 66   the floor removing 53
+    22805 beyond    -> 66   the direction removing 22739
+
+**A gate written as "beyond the floor" without the direction would flag 99.5% of the collection** —
+because the board sits at 1.73–2.91 and almost everything clears a 4–8% floor on the *winning* side.
+The output would be "22,805 of 22,920 cells are beyond the noise floor", which reads as a
+catastrophic result rather than as a mistake, and a reader checking it against the pooled ratio of
+2.29 would find nothing wrong with either number.
+
+Both conditions are load-bearing and they remove very different populations: the floor takes 53 of
+the 119 behind cells, and the direction takes 22,739 of the 22,805 beyond-floor cells. **Beside a
+gate, report what each conjunct removes** — this is the same discipline as reporting the number that
+shows a count could have been non-zero, applied to a filter with two terms instead of one.
