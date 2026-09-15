@@ -35872,3 +35872,48 @@ behind" would take it for a better kernel, and the dataset is identical.
 So the partition is printed with its floor named and its identity stated — arm identity bounds
 measurement noise, build identity bounds what survives recompilation, the latter is wider and is not
 computable from a single-build run. This is the form chain205's board will carry.
+
+### The floor residual was the A/A's orientation, which my own analyzer already warns about
+
+The 2.5% build-floor disagreement is fully explained, and it is neither the p95 index nor the pass
+pairing nor the cell population (the cell sets are identical — all 22,920 in all three builds):
+
+    definition              k=2      k=4      k=8     k=16     k=32   behind  indet  above-band
+    c0 / c0b               0.0817   0.0668   0.0725   0.0867   0.1233     47     203     131
+    c0b / c0               0.0838   0.0666   0.0738   0.0884   0.1273     47     211     139
+    MAX of the two         0.0871   0.0706   0.0755   0.0931   0.1430     45     226     152
+    log-symmetric          0.0869   0.0693   0.0752   0.0917   0.1364     46     222     149
+
+**It is the orientation of the A/A ratio.** `median(y/x) ≠ 1/median(x/y)` at an even pass count —
+six here — because averaging two order statistics does not commute with inversion. `an_c205.py`'s
+stage 6 states exactly this, about the board, in the text it prints; the same fact was then walked
+into on the floor. **A rule published in one program about one quantity does not transfer itself to
+the adjacent quantity in the same program**, which is the fifth instance of that pattern in this
+milestone and the first where the rule and the violation were in the same file.
+
+**And for an A/A neither orientation is privileged**, because both arms are the same code — so a
+single-orientation floor is making an arbitrary choice that moves the middle column by 8 cells.
+chain203's sealed convention is `max(abs(lo − 1), abs(hi − 1))`, which is **orientation-symmetric by
+construction**; that is the property an A/A floor needs and the reason the sealed analyzer took a max
+rather than a side. It reads 0.0871 / 0.0706 / 0.0755 / 0.0931 / 0.1430 — wider than either side, as
+it must be.
+
+**The behind count spans 45–47 across all four definitions and the indeterminate count spans
+203–226.** Two cells against twenty-three: the same robustness asymmetry as before, now measured
+against four definitions of one A/A rather than a perturbation of one. (A line in the script that
+produced this table asserted "47 under all four" and "203 to 217"; both were written before the
+numbers existed and both are wrong. Corrected here — an assertion typed ahead of its output is not
+a measurement, which is the same defect as counting off one's own printed list.)
+
+Against the arm floor's genuine replicate, the headline is steadier still: `oursb/ours` measured
+inside `c0` gives 66 behind and inside `c0b` gives 65, while the floors themselves differ by up to
+**14.1%** at k=4 (0.0376 against 0.0429). **A 14% floor disagreement buys one cell.**
+
+**And the design point this exposes runs against the build floor.** chain196 supports exactly one
+identical-source build pair (`c0`/`c0b`) and two arm-identity replicates. The `pfd0` pairs are not
+spare build replicates — their p95 runs to 0.176, up to 3.7× the arm floor at k=8, because `pfd0`
+carries a real code difference. **So the build-identity floor is the one estimate in the design with
+n = 1 and no way to attach an uncertainty to it**, while the arm floor has a replicate that agrees
+to one cell on the headline. That is a reason to report the arm-gated partition as the primary and
+the build-gated one beside it, and it is a requirement for the next chain: **two identical-source
+build pairs, not one**, if a build-identity floor is to carry an uncertainty rather than a value.
