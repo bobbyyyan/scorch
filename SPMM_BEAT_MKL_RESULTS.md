@@ -32658,3 +32658,40 @@ was given.
 found an effect; then that effect was declared reduction-independent and running the nestings
 found it was not. Both errors were self-corrections forced by a second implementation, and
 neither would have surfaced from one.*
+
+### The agreed digest convention does not survive a host change
+
+The ledger's 242 CSVs were cross-checked against the source directory still on redwood
+(`/scratch/bobbyy/c203`), a copy neither seal nor verifier had touched. **The content is
+identical.** But the convention that two sessions had agreed on for certifying that — full
+`shasum` lines, glob order, unsorted — reports a mismatch:
+
+| form | local ledger | redwood source | |
+|---|---|---|---|
+| full lines, **glob order** | `113531ec0ca8bf97…` | `2e59154e87f2843d…` | **differ** |
+| full lines, `LC_ALL=C` sorted | `b18ad917f1073688…` | `b18ad917f1073688…` | match |
+| digests only, `LC_ALL=C` sorted | `71b3c893b669bc2e…` | `71b3c893b669bc2e…` | match |
+
+The cause is collation, not content. Glob order differs between the hosts:
+
+```
+local  : sh_ov16_float32_p1.csv  sh_ov16_float32_p10.csv  ...
+redwood: sh_ov16b_float32_p10.csv  sh_ov16b_float32_p11.csv  ...
+```
+
+macOS sorts `sh_ov16_` before `sh_ov16b_`; redwood, under `LANG=en_US.UTF-8` with `LC_ALL`
+unset, does the opposite. `_` is precisely the character whose collation differs between C and
+UTF-8, and every filename here is full of them.
+
+**So the unsorted form is usable for detecting a rename inside one directory on one host, and
+unusable for verifying a copy against its source.** It was chosen over the sorted form *because*
+it catches a rename — a real advantage — and the cost was never stated: it silently reports a
+mismatch on identical bytes the moment the comparison crosses a filesystem. On a night whose
+running theme was naming the convention, the convention we agreed on had an unnamed precondition:
+**one host, one locale.**
+
+The durable statement is the order-independent one. `71b3c893b669bc2e…` over content, or
+`b18ad917f1073688…` over lines under a pinned sort, both of which reproduce on both hosts. And
+the useful result underneath the digest argument: **the sealed ledger is byte-identical to the
+data still sitting in the directory the run wrote it to**, 242 files, verified from a route that
+cost nothing to reopen.
