@@ -36165,3 +36165,42 @@ boundary fitted to the exceptions** — and it still has to survive the 249 regr
 cases (`sgpf5y6` k=16 at 2.067×, `boneS10_B` k=16 at 1.986×, `sx-superuser_C2A` k=32 at 1.799×,
 `rail507` k=16 at 1.696×) sit at the widths where the benefit is already near zero, which is the
 first encouraging thing about them.
+
+### Orientation invariance needs two independent fixes, and neither alone is sufficient
+
+The A/A orientation problem has an exact answer, and it is a 2×2 with one working cell:
+
+    reduction          deviation      floor(c0/c0b)                     floor(c0b/c0)                     identical?
+    median(linear)     |x-1|          0.0817 0.0670 0.0725 0.0870 0.1235  0.0838 0.0668 0.0740 0.0886 0.1276  no (0.0041)
+    median(linear)     exp|ln x|-1    0.0869 0.0693 0.0754 0.0917 0.1366  0.0867 0.0688 0.0749 0.0909 0.1382  no (0.0015)
+    exp(median(log))   |x-1|          0.0824 0.0669 0.0723 0.0874 0.1257  0.0838 0.0662 0.0738 0.0879 0.1283  no (0.0026)
+    exp(median(log))   exp|ln x|-1    0.0868 0.0687 0.0752 0.0918 0.1396  0.0868 0.0687 0.0752 0.0918 0.1396  YES (1.7e-16)
+
+**Two asymmetries stack and they are independent.** `median` in linear space over an even count is
+not reciprocal-invariant, because the arithmetic mean of two values is not the reciprocal of the
+arithmetic mean of their reciprocals; and `|x − 1|` is not symmetric under `x → 1/x` regardless of
+what produced `x`. Fixing the reduction alone leaves a 0.0026 floor gap; fixing the deviation alone
+leaves 0.0015. **Only both together give exact invariance**, and `exp(median(log))` is not the
+geometric mean over all six passes — it is the geometric mean of the two *middle* values, so it keeps
+the median's rejection of the tails. (The geometric mean over all passes is also invariant, but it
+is a different estimand: its floor is 0.159–0.178 and the behind count collapses to 18.)
+
+Cost of the full fix on chain196 `c0`: **behind 119 → 125, beyond floor 66 → 67, pooled 2.2915 →
+2.2906.** The gated count moves by one cell and the ungated by six, so this is a correctness repair
+that does not rescue or destroy any conclusion — which is the only circumstance in which it can be
+adopted without re-opening the pre-registration question.
+
+**And the part about my own process, which is the more useful finding.** The reduction half of this
+was already in my own notes, twice, under the headings *"A linear median over an EVEN count is not
+reciprocal-invariant; exp(median(log)) is exactly"* and *"122. `median` over RATIOS is not
+reciprocal-invariant at an even count"* — with the magnitude mechanism `(d/2x)²` confirmed to 1%, the
+one-line fix spelled out, the observation that odd counts hide it, and the sentence *"It cost one
+function call and neither session ran it."* Tonight I walked into the same defect on the A/A floor,
+presented it as a discovery, and proposed `max(|lo − 1|, |hi − 1|)` as the principled fix — which is
+not symmetric at all.
+
+**The gap is specific and worth naming: both halves were recorded, separately, and the fact that they
+must be applied together was not.** A file of individually correct rules does not tell you which
+combinations are required, and each rule read alone looks sufficient for the problem it names. That
+is a different failure from forgetting a rule — it is the conjunction that was missing, and no amount
+of re-reading either entry would have supplied it.
