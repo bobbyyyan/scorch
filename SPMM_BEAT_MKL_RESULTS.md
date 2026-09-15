@@ -33304,6 +33304,10 @@ Pointed at `chain203-rungwise-redwood` with `--subject ov24 --ambient ovp` it re
       band [1.0741, 1.3115]   floor 0.44%   verdict FASTER, all four nestings agree in sign
       members 1ec8352efdd15bc6   resolved: ambient 1..23 -> subject 24
 
+    ^ SUPERSEDED. That band and floor were computed at --nboot 400 without saying so; at the
+      script's default nboot 2000, seed 204, they are [1.0748, 1.2979] and 0.42%. The four point
+      estimates are unaffected. See "the band I published was computed at nboot 400" below.
+
 chain203 published **14.4%–21.2% depending on nesting**: med-cells 1.1441 → 14.4% and gm-rows
 1.2123 → 21.2% are the two ends, and gm-cells 1.1806 against its published 1.1805 differs in the
 fourth decimal only. The membership digest `1ec8352efdd15bc6` is the same value chain203 recorded
