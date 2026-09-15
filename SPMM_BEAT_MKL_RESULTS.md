@@ -35990,3 +35990,76 @@ object moves the count six.
 to 0.28% and at the gated-count level to within build noise — which is what makes a future
 improvement measurable, and is the first time this milestone has had a two-chain baseline at full
 collection scale.
+
+### An mtime binding cannot survive the transfer it exists to protect
+
+The close-out refused at step 5. The six real chain205 passes had been sealed on redwood, pulled,
+and verified byte-for-byte against that seal — and the mtime binding then rejected them:
+
+    fc_c0_float32_p1.csv: mtime 05:32:52, the log closed p1 at 02:57:55 (9297s apart)
+    ...
+    fc_c0_float32_p6.csv: mtime 05:33:02, the log closed p6 at 05:30:23 (159s apart)
+
+**`scp` does not preserve mtime**, so a transferred copy of the *right* run fails exactly as a copy
+of the *wrong* run does. The board was then run on the content binding alone, which is not a bypass:
+the seal was taken on the producing host and the local copy verified against it, so provenance rests
+on the stronger of the two mechanisms. But **a binding that cannot survive the transfer it is meant
+to protect is half a mechanism**, and it was designed only hours after the substitution it was
+designed for — which is how the limitation "mtime is mutable" got written down while the sharper
+limitation "mtime is *not carried*" did not.
+
+The refusal now distinguishes the two cases instead of merging them:
+
+    EVERY input is NEWER than the log's last close and no row count is wrong. That is what a
+    TRANSFERRED COPY looks like (scp does not preserve mtime) and also what a substituted copy
+    looks like -- this check cannot tell them apart. If these files were copied from the
+    producing host, bind to CONTENT with --expect-sha256 against a seal taken THERE, which is
+    stronger, and drop --stage-log. Do not widen the tolerance.
+
+The last sentence is the load-bearing one. **The tempting repair is to widen the tolerance until the
+transfer fits, and that destroys the check** — a tolerance large enough to admit a 9,297-second
+transfer admits every copy ever made. The correct repair points at a different mechanism rather than
+a looser version of this one.
+
+### The MKL deficit and the register-block prefetch are largely the same question
+
+chain196 carried a third object, `pfd0`, with the register-block prefetch deleted. Gated by its own
+arm floor it reads **37 cells beyond floor against `c0`'s 66**, with a pooled board 3.0% higher —
+and its floor is *narrower* (0.0405/0.0288/0.0353/0.0465/0.0669 against c0's
+0.0451/0.0376/0.0470/0.0598/0.0830), so the improvement is not a gating artefact.
+
+    per-width beyond-floor count, each build gated by its OWN arm floor
+      build   k=2  k=4  k=8  k=16  k=32   ALL
+      c0       20   36    7     1     2     66
+      c0b      29   34    8     0     1     72
+      pfd0     20   10    3     2     2     37
+      c205     18   31    9     2     1     61
+
+**Deleting the prefetch removes 26 of the 36 beyond-floor cells at k=4 and 4 of the 7 at k=8** —
+which is most of the narrow-k deficit that the population analysis identified as the place a
+mechanism would have to come from.
+
+**And it cannot ship as it stands.** Against the orientation-symmetric build-identity floor
+(`max` over both orientations of `c0` vs `c0b`; 0.0871/0.0706/0.0755/0.0931/0.1430):
+
+    k     faster>floor   slower>floor   inside floor    gm       worst regression
+    2           138             74           4372    1.0040   Delor64K @ 0.593
+    4          1273             44           3267    1.0456   LargeRegFile @ 0.710
+    8          1560             30           2994    1.0597   wiki-topcats_Categories @ 0.600
+    16          794             48           3742    1.0395   sgpf5y6 @ 0.484
+    32          149             53           4382    1.0119   sx-superuser_C2A @ 0.556
+    ALL        3914            249          18757
+
+**3,914 cells faster beyond the floor against 249 slower, a 15.7:1 ratio — and `sgpf5y6` at k=16 is
+2.07× slower.** The project's standard is neutral-or-better everywhere with no regressions, so a
+15.7:1 ratio is not a licence; it is a finding to report. Consistent with what chain197 already
+recorded for this change ("deleting it wins 2.9–14.2% but harms 115 matrices at width 32" — a
+different predicate from the 53 measured here, and the difference between those two numbers is
+itself unresolved).
+
+The convention for this situation is already in the repository: gate a sub-regime win behind a
+runtime condition that **provably cannot fire** on the shapes it would hurt. So the next question is
+whether a mechanism separates the 3,914 from the 249 — and it has to be a mechanism, not a boundary
+fitted to the 249, or it is the special-case pile the standing instruction forbids. The named worst
+regressions span k=2 through k=32 and include both a 64K-row FEM matrix and two large power-law
+graphs, which is not an encouraging start for a single geometric predicate.
