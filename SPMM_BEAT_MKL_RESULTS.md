@@ -35042,3 +35042,54 @@ chain205 are two independent six-pass runs over the same 22,920 cells on the sam
 supports a **cross-chain replication of the full-collection board** at no measurement cost. That is
 worth more than the 0.19% pass-1 figure it started from, and it is reported as a replication, never
 as a second confirmation of the same run.
+
+### The binding gets a content mode, and nine controls of which six must refuse
+
+chain196's sealed digests make the stronger binding reachable, so `an_c205.py` now takes two modes
+and requires at least one:
+
+    --expect-sha256 FILE   binds to CONTENT      sha256 over full file bytes, per pass
+    --stage-log FILE       binds to the run log  row count + mtime, 120 s tolerance
+    neither                REFUSE                "an analysis that cannot name the run that
+                                                  produced its inputs must not print a board"
+
+Content is strictly stronger and is preferred wherever the producer sealed: **an mtime is mutable
+and a digest is not.** The refusal says so in place — "a digest names the run; a timestamp only
+names a moment, and an mtime can be forged by `cp -p`."
+
+    1  real log, 4 of 6 passes closed            REFUSE  "INCOMPLETE -- not a provenance failure"
+    2  six files all stamped 02:20:15            REFUSE  names all six, 2260s..11429s apart
+    3  mtimes matching the log                   PASS
+    4  one file at 24271 rows                    REFUSE  "24271 data rows, the log says 68760"
+    5  neither binding given                     REFUSE  cites the chain196 substitution by name
+    6  digests matching the bytes                PASS
+    7  one digest corrupted in the first nibble  REFUSE  names the pass and both prefixes
+    8  content and log, both agreeing            PASS    both lines print
+    9  chain196's real sealed digests vs other   REFUSE  names all six expected/got pairs
+       bytes
+    ---
+    6 of 9 controls must REFUSE, 3 must PASS, and all 9 do.
+
+Six failing controls to three passing is the ratio that makes the set worth anything. A guard whose
+controls all pass has been described rather than tested.
+
+### The same shell bug a third time, and this time it failed loud
+
+The control harness above first reported **4 of 4 mtime-mode controls as REGRESSIONS**. The script
+was fine. `set -- $a` does not split in zsh either:
+
+    a="bound LOG 1"
+    set -- $a      ->  $# = 1,  $1 = "bound LOG 1",  $3 = ""
+    set -- ${=a}   ->  $# = 3,  $1 = "bound",        $3 = "1"
+
+so every invocation got one malformed `--dir` and exited 2 on argparse, against an expected code
+that was the empty string. **Third instance of one root cause tonight** — the containment census,
+its bash "fix", and now the harness checking the fix.
+
+**The instructive part is the direction.** In the census the bug was silent: it printed 29 of 29,
+which is a well-formed answer that a reader accepts. In the harness it was loud: it printed
+REGRESSION four times for a script that had not regressed, and a false alarm gets investigated
+within a minute. Same defect, opposite consequence, and the difference is entirely whether the
+broken path's output is *indistinguishable from a real answer*. That is the same property that made
+the chain196 substitution dangerous at 0.19% and the 02:20:15 timestamp harmless — **what matters is
+never how wrong the mechanism is, it is whether being wrong looks different from being right.**
