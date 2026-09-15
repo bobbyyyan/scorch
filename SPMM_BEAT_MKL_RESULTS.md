@@ -36415,3 +36415,69 @@ sweep could only offer evidence about, so section 8's conclusion now rests on 32
 rather than 5. And the tails-versus-band asymmetry is quantified on the same data: **two values in
 the tails against ten in the band.** That is why the partition has to be printed with all five labels
 attached rather than reconstructed by a reader.
+
+### The p95 axis is two-valued and its whole consequence is three nameable cells
+
+The previous section closed the gated count over all 32 configurations with counts. A peer session
+disputed two of those rows, asserting that each was missing a different parameter, and the dispute
+ran on counts for three exchanges. It closes by naming cells instead, which is the form that cannot
+be disputed by a different tally.
+
+The full 2×2×2 grid, both datasets, n = 22,920 each, printed as
+`behind / indeterminate / ahead` under p95-lower and under p95-linear, with the difference in the
+behind count in the last column:
+
+    chain196 c0
+      median(linear)    |x-1|         66/115/22739   66/115/22739    +0
+      median(linear)    exp|ln x|-1   66/116/22738   66/116/22738    +0
+      exp(median(log))  |x-1|         67/118/22735   67/117/22736    -1
+      exp(median(log))  exp|ln x|-1   67/118/22735   67/117/22736    -1
+
+    chain205
+      median(linear)    |x-1|         61/107/22752   61/107/22752    +0
+      median(linear)    exp|ln x|-1   61/113/22746   61/111/22748    -2
+      exp(median(log))  |x-1|         62/111/22747   62/111/22747    +0
+      exp(median(log))  exp|ln x|-1   62/115/22743   62/113/22745    -2
+
+**Both previously published rows are located exactly where they were labelled:** chain196 under
+`exp(median(log))` + `exp|ln x|-1` + p95-lower reads 117 and chain205 under the same configuration
+reads 113. Neither row was missing a parameter. The peer's second claim — that the p95 choice moves
+exactly one of the four (reduction × deviation) cells per dataset — is also wrong: it moves two per
+dataset, and they are different pairs (both log-reduction rows on chain196, both log-deviation rows
+on chain205).
+
+**The three cells that the p95 choice is worth, by name.** A cell changes classification only if its
+deviation from parity lies strictly between the two floors. Over both datasets and all five widths
+in the full-fix configuration, three cells do:
+
+    dataset      width  key                        dev(S)     floor lower   floor linear
+    chain196 c0  k=4    TSOPF_RS_b162_c1           0.037265   0.037246      0.037489
+    chain205     k=2    higgs-twitter_retweet      0.049824   0.049813      0.050114
+    chain205     k=2    circuit_1                  0.049848   0.049813      0.050114
+
+Every other (dataset, width) pair has an empty gap. `TSOPF_RS_b162_c1` is the −1 on chain196, which
+contradicts the peer's claim of zero such cells there; the first chain205 row is the cell the peer
+named, and their three figures for it match to six decimals, so the two pipelines agree on the cell
+and differed only on how many others sit in similar gaps.
+
+**And the axis is narrower than it was being treated as.** Two nearest-rank conventions were in play,
+`d[int(0.95*(n-1))]` and `d[int(0.95*n)-1]`. At n = 4,584 they are the same index:
+
+    int(0.95 * 4583) = int(4353.85) = 4353
+    int(0.95 * 4584) - 1 = int(4354.8) - 1 = 4353
+
+They agree to every printed digit at all five widths in both datasets. So "p95 estimator method" is
+not a family of estimators at this n — it is one binary, nearest-rank against interpolated, and its
+entire consequence over 45,840 cells is the three rows above. It had been carried as a third free
+axis of the convention dispute; it is a two-valued axis whose two values differ by three cells.
+
+Nothing here moves the standing conclusion. The convention argument is worth one cell, the design
+gap — which A/A test defines the floor — is worth nineteen, and that remains the only one of the five
+open convention decisions that changes a number. chain205 still reads 61 against chain196's 61–72
+build-to-build band, so **chain205 reproduces chain196 and does not beat it.**
+
+**The method note, which is the transferable part.** Three exchanges of counts did not converge,
+because two pipelines can disagree on a count while agreeing on every cell, and a count carries no
+handle for locating the disagreement. Naming the three cells settled it in one pass and was cheaper
+to compute than the grid. Beside a disputed count, print the members — a membership list is
+falsifiable by one row, a count only by another count.
