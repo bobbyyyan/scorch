@@ -34560,3 +34560,46 @@ respectable-looking statistic answering a different question than the pre-regist
 now replaced: two agreeing signals for chain205, distinct-pass-tag counting with an explicit
 `TRUNCATED AT n OF 30` for chain204, and the chain204 monitor spends no allocation while the job
 runs so it cannot perturb the 64-core measurement it is watching.
+
+### Retracting "3 for 3": all three structural repairs are untested, and the scoreboard was the wrong argument
+
+I told Bobby twice that "make it unwritable" is 3 for 3 against "be careful" at 0 for 8. Applying my
+own predicate — a repair earns its record only after a number has tried to trip it — **all three are
+0 for 0**:
+
+    repair                          installed   trials since   why zero
+    per_cell, one shared reduction  pre-session  0             correct from the moment written; it
+                                                               never refused a wrong nesting because
+                                                               none was ever attempted through it
+    dev_prereg / dev_logsym         03:39:43     0             only the synthetic self-test has run;
+                                                               no real six-pass data exists yet
+    deleted the duplicate counts    04:04:28     0             file untouched since; adding an
+                                                               instance is the only event that trips it
+
+**Being already correct is not the same as having been tested.** `per_cell` made the "which nesting
+gates?" question determinate when it arose, which is the property being *queried and found to hold* —
+weaker than a violation attempting and being blocked. It plausibly prevented a wrong choice, given
+that I mixed two deviation conventions ten printed lines apart the same night, but a plausible
+counterfactual is not a trial.
+
+So I published a tally as evidence, on the next number after correcting the same overclaim in the
+checker's message. Fifth instance of the pattern, and mine.
+
+**And the comparison was not like-for-like in a way that matters more than the count.** "Be careful"
+is 0 for 8 because it was *invoked* eight times — every analysis step gives it a trial. The
+structural repairs are hours old and each guards one narrow path, so they have had almost no
+exposure. **A perfect record over zero trials and a perfect failure over eight are not comparable
+records; the denominators measure different amounts of exposure**, and putting them side by side
+implies an experiment that was never run.
+
+**The argument that actually carries is mechanical, and it needs no tally:** a defect that cannot be
+written cannot recur. `per_cell` makes a floor/board mismatch unexpressible rather than detectable;
+two named helpers make a mixed convention unexpressible; one count adjacent to its enumeration makes
+a drifting duplicate unexpressible. That is an argument from structure, and dressing it in a
+scoreboard gave it empirical support it does not have — which is the night's own pattern one more
+time, a number standing in for the thing it was supposed to summarise.
+
+**The honest statement for Bobby:** no structural repair has failed yet, their failure mode would be
+visible immediately rather than silently, and the reason to prefer them is the mechanism, not the
+record. The record will mean something only once they have been exercised as often as the vigilance
+rules were — which for `an_c205.py`'s two helpers is the moment chain205's six passes land.
