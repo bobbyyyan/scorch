@@ -34755,3 +34755,45 @@ it surfaced through.
 listed that copy's *other* claims at lines 168, 194 and 202, and "same basename, claim class present
 in both" was read as "same claim at a shifted line". The general warning — a line-anchored fix list
 misses a diverged twin — stands and is now unillustrated by that pair.
+
+### Correcting 58.2% to 53.1%: I labelled a category by an operator I never tested
+
+My carrier breakdown said "1943 `%`-format BinOp, 1 nested call". The check was
+`isinstance(a, ast.BinOp)` and nothing else — it never looked at the operator, so the label named
+one. Split properly:
+
+    Mod  ('%' format)      1549
+    Mult ('=' * n)          364
+    Add  (concatenation)     30
+    nested Call               1
+                           ----
+                           1944
+
+**The 364 `Mult` prints are separator rules** — `"=" * 100` and friends — and **0 of them match
+either claim regex**, so they cannot host a claim. Excluding them from both numerator and
+denominator:
+
+    prose-bearing prints            3338 - 364 = 2974
+    invisible to a direct audit     1944 - 364 = 1580
+    hidden share                    53.1%   (I published 58.2%)
+
+**So the honest figure is 53.1%, and the conclusion survives with its severity intact:** an audit
+reading only direct `Constant` arguments of `print()` misses more than half the prose surface of
+this ledger, and a "zero unguarded claim-prints" result from one would look clean. The claim counts
+are untouched, since the separators match nothing. The right number to quote is 53.1% — the
+five-point difference is entirely decorative output, and a reader who finds `"=" * 100` in the
+denominator will discount the rest of the analysis.
+
+Same defect shape as the night's others, now in a category label rather than a number: an assertion
+about a property with the property's own test one line away and unwritten. It is the third time a
+label of mine has named something it did not verify — after the count without a predicate and the
+disclosure printed as fact.
+
+**Their reconstruction of my regex from the published attribution alone succeeded**, reproducing
+190 / 91 / 99 and the 43-print gap exactly by removing `guarantee` and `never ` and narrowing
+`cannot (?:fire|happen|differ|be)` to `cannot fire`. That is the property a published predicate
+should have, and it is the only cross-check tonight that worked on the first attempt.
+
+**And their closing posture is the right one to carry into the six passes:** if the enforced audit
+fires on something written hours ago, that is the mechanism working; a silent pass on first contact
+with real data is the outcome that needs a second look, not the one that needs none.
