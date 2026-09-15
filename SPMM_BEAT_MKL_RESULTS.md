@@ -34603,3 +34603,52 @@ time, a number standing in for the thing it was supposed to summarise.
 visible immediately rather than silently, and the reason to prefer them is the mechanism, not the
 record. The record will mean something only once they have been exercised as often as the vigilance
 rules were — which for `an_c205.py`'s two helpers is the moment chain205's six passes land.
+
+### The positive control says my "structural" repairs were conventions, and they failed their first trial
+
+"Wait for exposure" was the wrong conclusion. A preventive mechanism's trial is a **positive
+control** — feed it the defect it forbids and check it refuses — which is cheap, available now, and
+my own standing rule. I ran it on both of my claimed repairs. **Both failed.**
+
+    injected defect                                        exit   refused?
+    inline abs(x - 1.0) bypassing dev_prereg                 0        no
+    floor by ratio-of-medians, board by median-of-ratios     0        no
+
+So they were 0 for 1, not 0 for 0. The named helpers made the right form *named*, not the wrong form
+*unwritable*; nothing in Python stops an inline expression, and `per_cell` being shared was a
+convention I had followed, not an invariant anything enforced.
+
+**And the wrong-nesting variant printed its own refutation as fact.** With the floor bypassing
+`per_cell` entirely, the run still emitted:
+
+    REDUCTION, stated with the floor: per_cell() forms the ratio INSIDE each pass ... so the
+    floor is matched to the statistic it bounds by construction rather than by coincidence.
+
+A sentence claiming a property is not a check on it. I had added that disclosure two hours earlier
+believing it made the property visible; under the defect it actively asserts the false thing, which
+is worse than silence.
+
+**Now enforced, and the mechanisms pass a positive/negative control pair.** `per_cell` returns its
+own `RECIPE` string and the program refuses unless the floor and the board carry the same one; a
+`_audit_own_source()` pass walks its own AST and refuses if a deviation-from-parity is written
+outside the two helpers:
+
+    negative control  unmodified script                   exit 0   table prints
+    positive A        inline deviation injected           exit 1   "REFUSE: deviation-from-parity
+                                                                   written outside dev_prereg/
+                                                                   dev_logsym -- line 283"
+    positive B        ratio-of-medians floor injected     exit 1   "REFUSE: the floor and the board
+                                                                   were not produced by the same
+                                                                   reduction (floor 'ratio-of-medians',
+                                                                   board 'median-over-passes...')"
+
+**The first hardening attempt had a false positive, caught by the negative control.** My audit was a
+regex over source lines, and it fired on its own docstring — the prose "inline `abs(x - 1.0)`"
+describing the defect is indistinguishable from the defect to a text search. Same
+pattern-cannot-match / matches-too-much family that has cost this analysis twice tonight, now in the
+guard against it. Rewritten over the AST, which sees expressions rather than sentences.
+
+**So the honest record is:** two mechanisms claimed as structural were conventions, they failed
+their first real trial, they are now actually enforced, and each has one positive control and a
+shared negative control behind it. That is 1 for 1 on a mechanism that exists, rather than 3 for 3
+on three that did not. The checker's push is what converted the claim into a thing.
