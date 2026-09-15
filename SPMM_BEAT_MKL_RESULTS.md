@@ -36968,3 +36968,70 @@ k=4). Two things to resolve before this is acted on: it is measured on 302 matri
 22,920-cell board, and it has to be reconciled with the separately recorded null for multi-row at
 width 4 (`mrhv/mr2 = 1.0039` against a 0.92% floor), which may be a different dispatch condition
 rather than a contradiction.
+
+### Correction: `multirow_ok` is false at exactly k=4, so the multi-row lever reaches 2 core cells, not 16
+
+The ranking in the previous section is wrong. It put `SCORCH_SPMM_MULTIROW_ROWS_F32 = 2` first on the
+grounds that its recorded 96 -> 59 cell reduction is at float32 k=4, where 14 of the 24 core cells
+sit. In the shipped configuration multi-row cannot run at k=4 at all.
+
+**The dispatch condition, `spmm.h:4403-4418`.** `multirow_ok` requires
+`narrow_k && !exact_width && !force_workspace` and then excludes
+
+    !(spmm_halfvec > 0 && !multirow_halfvec &&
+      (B1_size == scorch_simd_half<scalar_t>::lanes || ...))
+
+With the shipped values — `SCORCH_SPMM_HALFVEC_F32 = 1` (`policy.h:1332`),
+`SCORCH_SPMM_MULTIROW_HALFVEC = 0` (`policy.h:662`), `scorch_simd_half<float>::lanes = 4`
+(`spmm.h:2205`), `EXACT_HI = 3`, and `narrow_k` = `B1_size <= 4*SL` = k ≤ 32 (`spmm.h:3979`) — the
+width-by-width result over the board's widths is:
+
+    k=2      exact_width is set             -> multirow_ok FALSE
+    k=4      the halfvec clause fires       -> multirow_ok FALSE
+    k=8,16,32  nothing excludes it          -> multirow_ok can be true
+
+**And the two records are sequential, not contradictory** — the code says so itself at
+`spmm.h:4749-4754`, describing the branch guarded by
+`multirow_halfvec && B1_size == scorch_simd_half<scalar_t>::lanes`:
+
+> "These are two independent fixes and until now the code could apply only one here: the single-row
+> kernel drops the mask (11.5 instructions per nonzero against the masked path's 13.5, measured on
+> the emitted loop), while multi-row adds streams — ROWS loads outstanding and ROWS independent FMA
+> chains. ... `multirow_ok` excluded this width precisely so that no arm would swap two kernels at
+> once; this branch is the arm that swaps them deliberately."
+
+That branch is the `mrhv` arm. So the `ROWS=2` grid's k=4 numbers were taken against a baseline in
+which the single-row half-vector kernel did not occupy k=4; that kernel now ships and took the
+width, `multirow_ok` was amended to exclude it, and `mrhv/mr2 = 1.0039` against a 0.92% floor is
+multi-row measured against the **current** occupant. Both numbers are true about different code.
+**The 96 -> 59 headline is real and describes a configuration that no longer exists.**
+
+**The corrected reach of both levers, in the tree as it stands:**
+
+    lever                              core cells reachable
+    MULTIROW_ROWS_F32 = 2                  2   (both at k=8; none at k=16 or k=32)
+    + MULTIROW_HALFVEC = 1                16, but the enabling constant is the measured null (1.0039)
+    ISA-conditional MINDEG = 1              0 cleared; 2 cells improved by roughly 20%
+
+**So neither lever clears a single core cell, and each reaches two of the twenty-four.** The earlier
+section's ranking claim is withdrawn. What survives is narrower and worth stating plainly: the two
+available constants are small, well-evidenced, and aimed at the edges of the problem, and the 14
+core cells at k=4 are reachable only through a constant that has already been measured as null
+against the kernel currently serving that width.
+
+**The method error that produced the wrong ranking.** A recorded measurement was carried forward by
+its headline number without checking whether its dispatch precondition still holds. The measurement
+was not stale in the usual sense — it was correctly recorded, correctly attributed, and its corpus
+and floor were both stated. What changed was the code *around* it: another kernel took the width the
+measurement was about. **A performance record's validity domain includes the dispatch conditions
+under which it was taken**, and those are not part of how such records are normally written down.
+Before quoting a per-width gain, re-derive whether that width still reaches the kernel the gain was
+measured on. See the same failure shape in the validity-domain note for carried numbers.
+
+**Loose end closed rather than left as a discrepancy.** A peer reported the `1 <= nnz/rows < 2` band's
+p75 as 0.5236 against the 0.5057 in the table above, and suggested 3.5% was more than
+quantile-interpolation should buy. It is exactly what interpolation buys here: nearest-rank at index
+325 of 435 gives 0.5057, linear interpolation gives 0.5236, the exclusive method gives 0.5415, and
+the adjacent order statistics `v[325]` and `v[326]` are **7.10%** apart. Both numbers are correct
+under their own stated estimator, which is the fourth time in this document that a disagreement
+resolved to an unstated estimator rather than to an error.
