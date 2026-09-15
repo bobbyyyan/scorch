@@ -34292,3 +34292,44 @@ to.
 
 **Seventh instance of one quantity at two resolutions tonight, and the first where cross-checking
 made it more convincing rather than less.**
+
+### "The two numbers were never in conflict" is half right: the scale is necessary, not sufficient
+
+The single-reading algebra is exact — for a below-1 reading at deviation `d`, the log-symmetric form
+exceeds the asymmetric one by `1/(1-d) - 1 ≈ d`. The generalisation from that to "gap ≈ 0.5·d at
+every resolution, so 20% and 2–4% are the same fact read at two magnitudes" does not hold. Sweeping
+the quantile so `d` varies ~60× *inside* each resolution, k=32:
+
+    D per-cell                              A per-reading
+    q       d        gap/d   below-1        q       d        gap/d   below-1
+    p50     0.0067   0.60    49.6%          p50     0.0157   0.53    49.7%
+    p75     0.0157   0.36    49.6%          p75     0.0660   0.56    48.7%
+    p90     0.0430   0.74    48.1%          p90     0.2509   0.64    43.7%
+    p95     0.0831   0.52    47.0%          p95     0.3874   0.60    30.0%
+    p99     0.1821   0.83    29.8%          p99     0.7031   0.44     0.7%
+    p99.9   0.4251   0.05    33.3%          p99.9   1.3656   0.14     0.0%
+
+**`gap/d` ranges 0.05 to 0.83 within one resolution.** It is not a constant, so the p95 agreement at
+~0.5–0.6 across the two resolutions is a coincidence of tail composition rather than a law. The
+reason is that a p95 is a quantile of a *mixed* set: switching convention inflates only the below-1
+values, which re-ranks them, so the gap is not a per-element transformation of a fixed quantile and
+no single factor relates it to `d`. A mixture estimate does not close it either — at A's p99 the
+below-1 share is 0.7% while `gap/d` is 0.44.
+
+**So the useful half of the claim stands and the strong half does not.** A convention gap cannot be
+quoted without the deviation scale it was measured at — that is right, and it is the rule to keep.
+But naming the scale does not determine the gap: the tail composition near the quantile is a second
+free term, and both move. The 17–29% and the 1.5–4.3% were therefore *not* the same fact at two
+magnitudes; they were two different quantities that happen to sit at a similar `gap/d` because both
+p95 regions have a mid-range below-1 share.
+
+Their observation against their own story verifies and is worth keeping: the below-1 share in the
+p95 region is **higher** for cells (43.9 / 52.2 / 52.2 / 51.3 / 47.0%) than for readings (33.8 /
+37.6 / 39.6 / 35.8 / 30.0%). So the per-cell medians are the more symmetric population, and the
+gate's small gap is not the downside tail thinning — it is `d` shrinking 5–8× while composition
+moves the other way.
+
+Which sharpens the earlier statement rather than replacing it: the gate's convention gap is small
+because the gate's *deviation* is small, and that is a property the per-cell median earns by
+suppressing pass-level noise. Any statistic with a small `d` inherits a small gap, whatever its
+composition.
