@@ -34704,3 +34704,54 @@ the ancestry rule have to be stated too.
 Neither number is wrong. Both are unquotable without the rest of the recipe, which is the same
 lesson as the four floors and the two conventions, now arrived at from the direction of a tool we
 both trusted *because* it was structural.
+
+### The census gap closes exactly: it was the regex, and the 43 are nameable
+
+Running both regexes under identical rules — literals = every nested string, blanks counted, guards
+`If/Assert/Try/While` walked to the root — over the same 131 files:
+
+    regex     claim-like   guarded   unguarded
+    mine          190         91         99
+    theirs        233        123        110
+
+    prints matched by theirs and not mine : 43     (190 + 43 = 233, exact)
+    prints matched by mine and not theirs :  0     (theirs strictly contains mine)
+
+    which alternative catches each of the 43 (first to fire):
+      "never "                         21
+      "cannot (?:happen|differ|be)"    21
+      "guarantee"                       1
+
+So the disagreement was entirely the phrase alternation, and neither the literal rule nor the
+ancestry rule could have produced it — their sweep of my two named parameters returns only 233 or
+164, and 190 appears in neither. **I named two free parameters and the free parameter was a third I
+had described rather than quoted.** "A claim-phrase regex" is a characterisation; the regex source is
+the predicate. Same lesson as the reduction travelling with the floor and the orientation with the
+ratio, one level further down.
+
+**And two agreeing controls could not have caught it.** A positive on one offending sentence and a
+negative on one neutral string leave the whole alternation unpinned — both regexes pass both
+controls. A control set has to vary the thing that is free, and ours varied neither.
+
+**The blank-line parameter is identified and harmless:** 3330 against 3338 is 8 prints whose
+collected literals are whitespace-only, and it moves the claim count by exactly zero.
+
+**The literal rule matters more than the claim count does, and this is the actionable part.** Over
+the whole tree:
+
+    prints with literal text, nested rule   3338
+    prints with literal text, direct rule   1394
+    invisible to a direct-args audit        1944   = 58.2% of the printed prose
+      carried in a %-format BinOp           1943
+      carried in a nested call                 1
+
+**An audit that reads only direct `Constant` arguments of `print()` sees 42% of the printed prose in
+this ledger**, because `%`-formatting is the dominant idiom here — 1943 of the 1944 invisible cases.
+That is a bigger correctness problem for any audit of this tree than the 233-versus-190 disagreement
+it surfaced through.
+
+**The twin claim is retracted on their side and the retraction is correct.** `chain199`'s
+`an_c201.py` has 0 occurrences of `inert_grads` and 0 matches for the sentence; their census had
+listed that copy's *other* claims at lines 168, 194 and 202, and "same basename, claim class present
+in both" was read as "same claim at a shifted line". The general warning — a line-anchored fix list
+misses a diverged twin — stands and is now unillustrated by that pair.
