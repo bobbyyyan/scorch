@@ -32672,16 +32672,8 @@ identical.** But the convention that two sessions had agreed on for certifying t
 | full lines, `LC_ALL=C` sorted | `b18ad917f1073688…` | `b18ad917f1073688…` | match |
 | digests only, `LC_ALL=C` sorted | `71b3c893b669bc2e…` | `71b3c893b669bc2e…` | match |
 
-The cause is collation, not content. Glob order differs between the hosts:
-
-```
-local  : sh_ov16_float32_p1.csv  sh_ov16_float32_p10.csv  ...
-redwood: sh_ov16b_float32_p10.csv  sh_ov16b_float32_p11.csv  ...
-```
-
-macOS sorts `sh_ov16_` before `sh_ov16b_`; redwood, under `LANG=en_US.UTF-8` with `LC_ALL`
-unset, does the opposite. `_` is precisely the character whose collation differs between C and
-UTF-8, and every filename here is full of them.
+The cause is collation, not content — **but see the correction below: the mechanism stated here
+was wrong, and the example was not an instance of it.**
 
 **So the unsorted form is usable for detecting a rename inside one directory on one host, and
 unusable for verifying a copy against its source.** It was chosen over the sorted form *because*
@@ -32695,3 +32687,57 @@ The durable statement is the order-independent one. `71b3c893b669bc2e…` over c
 the useful result underneath the digest argument: **the sealed ledger is byte-identical to the
 data still sitting in the directory the run wrote it to**, 242 files, verified from a route that
 cost nothing to reopen.
+
+### The collation diagnosis was wrong three ways
+
+The conclusion above survives — 242 files byte-identical, the unsorted form unusable
+cross-host — but the mechanism named for it does not.
+
+**1. The example pair is not an instance.** I wrote that macOS sorts `sh_ov16_` before
+`sh_ov16b_` and redwood does the opposite, attributing it to C-vs-UTF-8. Both locales agree on
+that pair here:
+
+```
+LC_ALL=C           sh_ov16_float32_p1.csv  sh_ov16b_float32_p1.csv
+LC_ALL=en_US.UTF-8 sh_ov16_float32_p1.csv  sh_ov16b_float32_p1.csv
+```
+
+The effect is real but starts elsewhere. C and macOS-UTF-8 name order differ at **66 of 242**
+positions, first at `sh_ov24_float32_p1.csv` (C) against `sh_ov2_float32_p1.csv` (UTF-8) — a
+digit-versus-underscore comparison, not the `b` suffix I pointed at.
+
+**2. It is not C versus UTF-8 at all.** Measured on this machine:
+
+| order | digest |
+|---|---|
+| glob | `113531ec0ca8bf97` |
+| `LC_ALL=en_US.UTF-8` name sort | `113531ec0ca8bf97` — identical to glob |
+| `LC_ALL=C` name sort | `9c3c1221d68ef6df` |
+| redwood's glob | `2e59154e87f2843d` |
+
+macOS glob order **is** macOS UTF-8 order, and redwood's is a **third** order reproducible from
+neither. Both hosts run the same nominal locale (`en_US.UTF-8`), so the split is **glibc versus
+Darwin collation for one locale name**, not C versus UTF-8. That is a worse problem than the one
+I described: the locale string matching is no guarantee, and `LC_ALL=C` — the usual fix — gives
+an order matching *neither* host's glob.
+
+**3. The form I recommended carries the same kind of unnamed precondition I was complaining
+about.** `b18ad917…` survives the crossing for a specific reason: sorting full `shasum` lines
+sorts by the **digest**, which is hex and collates identically everywhere; the filename is only
+trailing text. So it is portable **only while no two files share a digest** — a tie breaks on the
+filename and collation re-enters. Measured here: **242 lines, 242 distinct digests, 0 duplicates**,
+so it holds for this corpus. That number belongs beside the digest or the guarantee is untested.
+
+**One figure unreconciled.** I measure 66 of 242 positions differing between C and macOS-UTF-8;
+the independent count was 44. Both agree the effect is broad and neither number changes any
+conclusion, but they are not the same measurement and I have not identified which pair of orders
+the 44 compares. Recorded as unreconciled rather than split.
+
+**What to carry**, with the conditions attached rather than implied:
+
+- `71b3c893b669bc2e…` — digests only, `LC_ALL=C` sorted. Content identity, order-independent,
+  portable unconditionally. Blind to renames.
+- `b18ad917f1073688…` — full lines, `LC_ALL=C` sorted. Keeps filenames in scope and portable
+  **given 242 of 242 distinct digests**, which must be stated with it.
+- `113531ec0ca8bf97…` — full lines, glob order. Same-host rename detection only. Not a
+  cross-host check, and not reproducible from a locale name.
