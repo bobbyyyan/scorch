@@ -36204,3 +36204,64 @@ must be applied together was not.** A file of individually correct rules does no
 combinations are required, and each rule read alone looks sufficient for the problem it names. That
 is a different failure from forgetting a rule — it is the conjunction that was missing, and no amount
 of re-reading either entry would have supplied it.
+
+### Correction: the regressions do not sit at the low-benefit widths, and a pure width gate does not work
+
+The previous section closes with "the worst cases sit at the widths where the benefit is already near
+zero, which is the first encouraging thing about them." **That is false.** Of the ten worst
+regressions:
+
+    sgpf5y6                   k=16  2.067x slower   width gm 1.0395   <- 2nd best benefit
+    boneS10_B                 k=16  1.986x           1.0395
+    sx-superuser_C2A          k=32  1.799x           1.0119
+    rail507                   k=16  1.696x           1.0395
+    Delor64K                  k=2   1.686x           1.0040
+    wiki-topcats_Categories   k=8   1.666x           1.0597   <- the PEAK benefit width
+    rajat23                   k=32  1.642x           1.0119
+    usroads-48                k=32  1.628x           1.0119
+    mult_dcop_02              k=2   1.624x           1.0040
+    Spielman_k100_A_01        k=32  1.613x           1.0119
+
+Three at k=16 where the benefit is second-largest, one at k=8 where it is largest. **Six of ten sit
+at mid-to-high benefit widths**, and the four I had named were three k=16 cells and one k=32. The
+claim was built from a hand-picked four and it did not survive the tenth.
+
+**The true statement is about all of them and is a better argument.** The regression *share* is
+anti-correlated with the benefit:
+
+    k      gm(pfd0 vs c0)   faster>floor   slower>floor   slower share of 4584
+    2         1.0040             138             73             1.59%    <- min benefit, MAX share
+    4         1.0456            1271             44             0.96%
+    8         1.0597            1548             29             0.63%    <- MAX benefit, min share
+    16        1.0395             794             48             1.05%
+    32        1.0119             149             53             1.16%
+
+The minimum share is at the maximum-benefit width and the maximum share at the minimum-benefit one.
+That is a claim about all 247 rather than about four. And at k=2 the comparison is nearly a coin flip
+— 138 faster against 73 slower on a width whose mean benefit is 0.40% — so **k=2 carries almost no
+signal in either direction**, which the geometric mean of 1.0040 already said and the counts confirm.
+
+**Two humps with different peaks, which matters for what a gate would key on.** The geometric mean
+and the faster-beyond-floor count both peak at k=8 (1.0597, 1,548 cells); the **net beyond-floor
+move peaks at k=4** (−26 against −4 at k=8). A mechanism argument resting on "a hump in k" has to
+name which quantity's hump, because the gate differs: on the net deficit count you would keep k=4
+hardest, on the geometric mean k=8.
+
+**And the width gate is computable, so here it is.** Delete the prefetch only at k ∈ {4, 8} and
+leave k ∈ {2, 16, 32} on the current kernel:
+
+                k=2  k=4  k=8  k=16  k=32   ALL
+    c0           20   36    7     1     2    66
+    pfd0         20   10    3     2     2    37
+    gate{4,8}    20   10    3     1     2    36     net -30 vs c0
+
+**Net −30, marginally better than the global −29**, and it excludes **174 of the 247 regressions by
+construction** — k is known at dispatch, so the gate is provably inert at the three excluded widths,
+which is exactly the form the repository's convention requires. But **73 regressions remain inside
+the gated region**, worst `wiki-topcats_Categories` at k=8 at 1.666× and `LargeRegFile` at k=4 at
+1.409×. So a pure width gate **does not clear the no-regressions standard**, and the two thirds of
+the harm it removes is the two thirds that was never worth much benefit anyway.
+
+The conclusion that survives: **the regressions are not width-separable.** Something other than k
+distinguishes the 1,548 winners from the 29 losers at k=8, and until that is identified there is no
+gate — a width condition is the only runtime predicate available for free, and it is not enough.
