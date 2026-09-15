@@ -34867,3 +34867,46 @@ across a line wrap; a source audit firing on its own docstring; two claim-print 
 on an unquoted regex; and this scope defect. Prose about a defect lives in the same text the search
 reads — and **the control set must include prose that mentions the defect without being it.** None of
 the four had such a case, and one would have caught all four.
+
+### The branch denominator differs by one ref, and it is the ref that decides the action
+
+Our branch censuses disagree — 29 local / 9 on-origin / 20 local-only here against 30 / 11 / 19 —
+and the parameter is identified:
+
+    git for-each-ref refs/heads                29
+    git branch --list                          29
+    refs/heads + refs/backup                   30   <- their denominator
+    same-named origin/<branch> exists           9
+    has an upstream configured                  9
+
+So the extra ref is `refs/backup/pre-trailer-strip`, counted as a local branch. **That is precisely
+the parameter that decides the actionable claim**, because `git push --all` pushes `refs/heads` only
+— a ref under `refs/backup/` does not go out with it. Under their denominator two refs carry the 27
+trailers and one of them is publishable; under mine one ref carries them and it is the publishable
+one. Same 27 commits, and the count of *refs* is what changes.
+
+**The conclusion is invariant under every predicate tried**, which is what makes it reportable:
+exactly one ref under `refs/heads` carries anchored trailers above `main`, and it is
+`perf/spmm-probe-and-kernel-pretrailer` with 27, local-only, whose stripped sibling
+`perf/spmm-probe-and-kernel` is already on origin with 0.
+
+**And the two censuses are complementary rather than redundant**, which is the useful structural
+point: a per-branch table counting trailers *above* `main` cannot see `b606b30`, which sits below it;
+a `main..HEAD` sweep cannot see it either. The below-`main` count was established separately and is
+1, already on `origin/main` since March. Two checks with complementary blind spots add to coverage —
+either alone reads clean, and neither alone is evidence.
+
+    27  above main, one publishable ref (-pretrailer), unpushed   -> the only actionable set
+     1  below main, ancestor of origin/main since March           -> nothing, it is published
+     2  on origin/exp only, published Nov 2025                    -> nothing
+    ---
+    30  no residue
+
+**Two rules out of this, and neither was written down before tonight.** First: **when two forms of
+one check disagree, the disagreement is the finding, and neither number is reportable until it is
+explained.** My per-commit and unanchored trailer readings disagreed 0 against 1 on the same screen,
+and I reported the one that matched what I expected. Second: the anchored form is not merely more
+accurate, it is **stable** — its reading does not depend on how much has been written about it, where
+the unanchored count went 1 → 2 because the commit documenting the finding mentioned the phrase.
+Stability is a stronger argument for structural matching than accuracy, because accuracy can be
+argued about and stability cannot.
