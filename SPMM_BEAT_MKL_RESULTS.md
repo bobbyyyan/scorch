@@ -34333,3 +34333,44 @@ Which sharpens the earlier statement rather than replacing it: the gate's conven
 because the gate's *deviation* is small, and that is a property the per-cell median earns by
 suppressing pass-level noise. Any statistic with a small `d` inherits a small gap, whatever its
 composition.
+
+### My refutation's range used thin quantiles; it survives on well-populated ones, at 2.1× not 17×
+
+I published `gap/d` spanning 0.05–0.83 to refute the claim that it is constant. Two of those six
+quantiles are too thin to quote — the exact defect I had written a rule about two rounds earlier,
+applied to my own number this time. With element counts attached, k=32:
+
+    cells (N=4584)                     readings (N=27504)
+    q       n above   d        gap/d   q       n above   d        gap/d
+    p50      2291     0.0067   0.60    p50     13751     0.0157   0.53
+    p75      1146     0.0157   0.36    p75      6876     0.0660   0.56
+    p90       458     0.0430   0.74    p90      2750     0.2509   0.64
+    p95       229     0.0831   0.52    p95      1375     0.3874   0.60
+    p99        46     0.1821   0.83    p99       275     0.7031   0.44
+    p99.9       5     0.4251   0.05    p99.9      28     1.3656   0.14
+
+**The honest span on quantiles with ≥100 elements above them is 0.36–0.74, a factor of 2.1** — not
+the 17× my endpoints implied. That still refutes constancy, because p75 and p90 sit at 0.36 and 0.74
+with 1,146 and 458 elements above them. The refutation never needed the thin rows and I should not
+have quoted them.
+
+**And there is a detail in the other column that explains the whole disagreement.** On *readings*
+the usable span is 0.44–0.64, only 1.5×, and across p50–p95 it is 0.53–0.60 — very nearly constant.
+So a session holding per-reading data would see constancy and a session holding per-cell data would
+not. The claim was not careless; it was true of the population it was measured on and asserted of
+one it was not. **Constancy observed along one axis is not a functional relationship**, and the axis
+never varied was the one the claim was about — ten points, all at p95, with `d` moved only by width
+and resolution.
+
+Which closes this thread with the refined statement standing: the gate's convention gap is small
+because the gate's **deviation** is small, not because its downside tail thins — the per-cell
+population is the *more* symmetric one (below-1 share 43.9–52.2% against 30.0–39.6%). Any statistic
+with a small `d` inherits a small gap regardless of composition, and the per-cell median earns its
+small `d` by suppressing pass-level noise. That is checkable in a way "the gate is well chosen" was
+not.
+
+**Running count of the same defect, since it is now the dominant one:** four times tonight I
+violated my own most recently written rule on the next number I produced — the orientation rule, the
+convention rule, the thin-verdict rule, and quoting a corroboration without checking its statistic.
+Writing a rule down does not install it; the repairs that held were the structural ones, where the
+defect became inexpressible rather than discouraged.
