@@ -35317,3 +35317,66 @@ And the contaminated block is **not one condition**: array task `_6` is PENDING 
 of `_0..5` finishes, so the co-tenant load changes again at a time readable from `sacct` at no
 allocation cost. Treating passes 10–30 as a single level would be the same defect as pooling a
 per-band statistic across bands.
+
+### The chain196 figures are now computed here, and they reproduce exactly
+
+Two sections above, chain196's per-pass table and its behind-count churn were flagged as received
+across a session boundary and not independently computed. They are now computed here, from the
+sealed ledger at `~/.cache/scorch-codex/spmm-beat-mkl/chain196-fullcollection-redwood` (read-only),
+by a program written for this purpose. Every figure reproduces:
+
+    PER-PASS: geometric mean over cells of (mkl/ours) WITHIN a single pass
+      build       p1      p2      p3      p4      p5      p6   spread      n
+      c0      2.2605  2.2811  2.2817  2.2595  2.2556  2.2785    1.16%  22920
+      c0b     2.2773  2.2769  2.2697  2.2599  2.2574  2.2755    0.88%  22920
+      pfd0    2.3326  2.3388  2.3542  2.3337  2.3420  2.3439    0.93%  22920
+
+    BEHIND (mkl/ours < 1 within a pass), c0:  431 410 402 435 398 410   range 398..435, 9.3%
+      pair      |A|   |B|   entered   left    net
+      p1->p2    431   410       329    350    -21
+      p2->p3    410   402       323    331     -8
+      p3->p4    402   435       338    305    +33
+      p4->p5    435   398       323    360    -37
+      p5->p6    398   410       325    313    +12
+      mean entries 327.6   mean |net| 22.2   churn/net 14.8x
+      Jaccard vs p1:  p2 0.107  p3 0.126  p4 0.129  p5 0.102  p6 0.123
+      union 1707   intersection 13   ratio 131x   marginal 1694 = 7.39% of 22920
+
+    SIX-PASS: geometric mean over cells of the per-cell MEDIAN over passes of (mkl/ours)
+      pooled 2.2915   behind 119 of 22920
+
+**Exact agreement on every value, from different code over the same bytes.** That rules out
+computational error and it does **not** rule out a data problem: this is two implementations, not
+two measurements. What it does establish is that the milestone statement can now be made without
+carrying anyone's number — 2.2605 at pass 1 against 2.2915 over six passes is the reduction
+mismatch itself, visible in one table, and 431 / 119 / 13 is the goal's count under three
+reductions.
+
+### A census that returned zero, for the third shell reason tonight
+
+Before that recomputation, a census of the ledger for full-collection CSVs printed **0 files**, and
+the conclusion drawn from it — "chain196's CSVs are not in my local cache" — was reported to the
+peer. There are **34** of them.
+
+    find ... -name "*_float32_p*.csv" | while read -r f; do
+      n=$(wc -l < "$f"); [ "$n" = "68761" ] && echo "HIT $f"      # 0 hits
+      n=$(wc -l < "$f"); [ "$n" -eq 68761 ] && echo "HIT $f"      # 34 hits
+    done
+
+**macOS `wc -l < file` pads its output to width 8**, so `n` is `"   68761"` with length 8 and the
+string comparison never matches, while `-eq` strips whitespace for arithmetic and does. Two
+compounding errors, actually: the first search also globbed at `maxdepth 1` when the milestone
+directories live one level down under `spmm-beat-mkl/` — the same depth assumption that moved a
+ledger-local count 33 → 1669 → 3 earlier in this milestone.
+
+Third distinct shell semantic tonight to produce a plausible wrong count, after zsh's
+non-splitting of unquoted parameters (twice) and `${PIPESTATUS[0]}` being a bash-only name. **And
+the failure mode is the family's signature again: zero files found is indistinguishable from zero
+files existing**, and it was caught only because an unrelated search by file *size* contradicted it.
+The 34 also matches the peer's independently-run survey exactly, which is the cross-check that
+should have been the first thing asked for rather than the last.
+
+The general form, now stated for the fourth time in this document and apparently needing it: **a
+count must be printed beside something that proves the count could have been non-zero.** Here that
+would have been the number of files the `find` produced before filtering — 127 CSVs over 2 MB in
+the same tree.
