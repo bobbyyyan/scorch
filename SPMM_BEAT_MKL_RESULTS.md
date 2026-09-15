@@ -36361,3 +36361,57 @@ winners; **at a 2% false-positive rate it gives back as much benefit as it prote
 hard constraint on "a cheap matrix property with a reason attached", and it is why a width predicate
 was never going to be enough: k=8 is where the benefit and the residual harm are most concentrated
 *together*, not where they separate.
+
+### The "all four" disagreement is a definition, and the interaction it exposed is real
+
+The verifier reported that my "all four at once" rows were mislabelled — that the log-space median
+was applied to the board statistic but not the floor, and that the chain205 figure "requires the
+flip" to reach 113. **Both published rows reproduce exactly and the orientation flip is a no-op in
+both**, which is the free self-check the theorem provides:
+
+    all four (log reduction + log deviation)      unflipped     flipped
+      chain196  p95 = linear                      125/67/118   125/67/118   no-op
+      chain196  p95 = lower                       125/67/117   125/67/117   no-op
+      chain205  p95 = linear                      109/62/115   109/62/115   no-op
+      chain205  p95 = lower                       109/62/113   109/62/113   no-op
+      floor gap between orientations              1.94e-16
+
+**The disagreement is what "all four" names.** The baseline is p95 = linear, so changing all four
+means p95 → **lower**, which gives 117 and 113 — the published rows. The verifier's "true all-four,
+p95-linear" rows hold p95 at its baseline value, so they vary three parameters, and they give 118 and
+115. Both sets are right for their own configuration, and neither is mislabelled once the baseline is
+stated. **A parameter sweep has to name the baseline as well as the varied set**, or "all of them"
+is ambiguous by one element.
+
+**But the inference drawn from my numbers was correct, and my caveat was wrong.** The observation was
+that a combination moving the band *less* than one of its components is the signature of a cancelling
+interaction. It is, and there is one:
+
+    band column, {reduction} x {p95 method}, deviation at baseline
+      chain196   median(linear)   p95-lin 115   p95-low 115    p95 effect  0
+                 exp(med(log))    p95-lin 118   p95-low 117    p95 effect -1
+                 reduction effect  +3 at p95-lin,  +2 at p95-low   ->  INTERACTION -1
+      chain205   median(linear)   p95-lin 107   p95-low 107                  0
+                 exp(med(log))    p95-lin 111   p95-low 111                  0
+                 reduction effect  +4 at both                     ->  INTERACTION  0
+
+**The p95 method moves nothing under a linear median and −1 under a log median on chain196**, so the
+two interact on the band and not on the tails. My caveat called the all-four row "evidence against
+interaction" when the row was in fact the only evidence *for* one — a one-cell cancellation is small,
+but reading it backwards is not. Corrected: **additive on chain205, one cell of cancellation on
+chain196, between the per-cell reduction and the p95 estimator, on the band column only.**
+
+**And the strong result stands, independently verified over all 32 configurations** (log median on
+the board statistic and/or the floor ratio × deviation scale × p95 method × orientation):
+
+    chain196   beyond floor = 66 in all configurations with a linear-median board statistic
+                            = 67 in all with a log-median one
+    chain205   beyond floor = 61 / 62 on the same split
+    band       chain196 takes 4 distinct values (115-118); chain205 takes 10 (107-116)
+
+**The gated count depends on exactly one convention parameter — which reduction the board statistic
+uses — and on nothing else, in every combination.** That rules out the interaction the one-at-a-time
+sweep could only offer evidence about, so section 8's conclusion now rests on 32 configurations
+rather than 5. And the tails-versus-band asymmetry is quantified on the same data: **two values in
+the tails against ten in the band.** That is why the partition has to be printed with all five labels
+attached rather than reconstructed by a reader.
