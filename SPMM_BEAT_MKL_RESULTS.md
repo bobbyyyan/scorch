@@ -32803,3 +32803,55 @@ inside which the 22-file `ov2` block and the 44-file `ov24`+`ov24b` block exchan
 halves. Exact structure: **3 groups, 1 run, 66 positions (0-based 44..109), 44 diff lines.** Fourth summary in four messages that was wrong beside correctly
 measured data — the numbers were right every time and the sentence over them was not, which is
 exactly what makes that failure mode credible.)*
+
+### Three ways a digest or a freshness check reads clean while measuring nothing
+
+**1. `find` in this shell is `bfs`, and it rejects relative `-newermt` arguments.** Measured on
+`~/.cache/scorch-codex/spmm-beat-mkl`, same argument, both binaries:
+
+| `-newermt` argument | shell `find` | `/usr/bin/find` | |
+|---|---|---|---|
+| `'7 days ago'` | **0** | **2150** | **disagree** |
+| `'2026-09-07'` | 2336 | 2336 | agree |
+| `'-7d'` | 0 | 0 | agree |
+| `'now'` | 0 | 0 | agree |
+
+`find` is a shell function from the session snapshot that execs with `ARGV0=bfs`. The English
+relative form is the one that breaks; absolute timestamps agree exactly. **Two refinements to how
+this was reported to me:** `-7d` and `now` do *not* diverge — both binaries return 0, and for
+`now` that is the correct answer — so the demonstrated failure is the English-phrase form alone.
+And it is **not silent**: bfs writes a pointed error to stderr and **exits 1**. Only a check that
+counts stdout lines is fooled; one that tests exit status or reads stderr catches it.
+
+The direction is still the dangerous one where it does bite — a genuine freshness null and a
+rejected argument both print 0, so the null reads confirmed *and* the control meant to prove the
+population non-empty also reads 0. **No harness of mine uses `-newermt`** (0 files), so nothing
+here is affected; the ledger-staleness readings in this document came from `ls`/`stat` mtimes and
+Python, not from `find`.
+
+**2. A 16- or 32-hex digest does not name its function.** On the identical input stream:
+
+| function | first 16 |
+|---|---|
+| `shasum -a 256` | `113531ec0ca8bf97` |
+| `md5` | `6671ab8b7d4e711e` |
+
+Nothing about the string says which produced it. Where this would bite hardest is precisely the
+cross-host collation digests above — a function mismatch there is **indistinguishable from a real
+host difference**, which is the exact confusion that section was written to resolve. All three
+forms re-derived under a named function: `113531ec0ca8bf97` (sha256, full lines, glob order),
+`b18ad917f1073688` (sha256, full lines, `LC_ALL=C` sorted), `71b3c893b669bc2e` (sha256, digests
+only, `LC_ALL=C` sorted).
+
+**3. And a corrupted pipeline produced a well-formed digest rather than an error — mine, just
+now.** Re-deriving the third form with the `awk` body written as `'{print \$1}'` inside a
+double-quoted string mangled the program. `awk` errored to stderr, contributed nothing to the
+pipe, and the result was **`e3b0c44298fc1c14`** — the SHA-256 of *empty input*. It is 64 valid hex
+characters, it sits in a column of digests, and by inspection it is a digest. The correct value is
+`71b3c893b669bc2e`.
+
+**`e3b0c44298fc1c14…` is the value to recognise on sight.** It is what any digest of a stream that
+turned out to be empty looks like: a broken filter, an empty glob, a `cd` that failed. The
+analyzer already prints it legitimately, once, labelled `(the empty group)` for `ov24/LOWER n=0` —
+so the same 64 characters are a correct result in one row and evidence of a broken command in
+another, and only the label distinguishes them.
