@@ -36063,3 +36063,105 @@ whether a mechanism separates the 3,914 from the 249 — and it has to be a mech
 fitted to the 249, or it is the special-case pile the standing instruction forbids. The named worst
 regressions span k=2 through k=32 and include both a 64K-row FEM matrix and two large power-law
 graphs, which is not an encouraging start for a single geometric predicate.
+
+### Retraction: `max(|lo−1|, |hi−1|)` is not orientation-symmetric, and neither is the log-symmetric form
+
+Two sections up, chain203's `max(abs(lo − 1), abs(hi − 1))` is called "orientation-symmetric by
+construction" and offered as the principled resolution of the A/A orientation problem. **That is
+wrong**, and it takes no data to show:
+
+    band      [1.0722, 1.3002]  ->  max dev 0.3002
+    inverted  [0.7691, 0.9327]  ->  max dev 0.2309
+    symmetric only when the band is GEOMETRICALLY CENTRED on 1:
+      [0.5000, 2.0000]  1.0000 vs 1.0000   symmetric
+      [0.8000, 1.2500]  0.2500 vs 0.2500   symmetric
+      [1.0722, 1.3002]  0.3002 vs 0.2309   NOT
+
+The band used is chain203's own published one. **And the error was a conflation of two different
+objects**: `max` over the two *endpoints of a band* is not `max` over the two *orientations of a
+per-cell ratio*. The second one *is* symmetric — swapping orientations swaps the arguments of `max`
+— and it is the estimator that was actually computed and used for the `pfd0` comparison. So the
+analysis used the right thing for the wrong stated reason, which is the more dangerous way to be
+right.
+
+**The log-symmetric form does not fix it either, and it fails silently.** `exp|ln r| − 1` is
+symmetric under `r → 1/r`, but the orientation choice happens **upstream of it**, inside the median
+over six passes, so `m₁ ≠ 1/m₂` and the transform inherits the asymmetry it was brought in to
+remove: 0.0869/0.0693/0.0752/0.0917/0.1364 one way against 0.0866/0.0686/0.0748/0.0908/0.1375 the
+other — different at all five widths, while the partition lands on 46/222/149 both ways. **Agreeing
+on the counts while differing on the floors is worse than disagreeing**, because a counts-based check
+passes it.
+
+The cause is arithmetic rather than statistical: with six passes the median averages the third and
+fourth order statistics, so `median(1/x) = (x₃+x₄)/(2x₃x₄)` against `1/median(x) = 2/(x₃+x₄)`, equal
+only when `x₃ = x₄`. **At an odd pass count the median is a single order statistic and inversion
+commutes exactly — seven passes would have hidden this entirely.**
+
+And the magnitude was overstated by quoting a ratio. Per cell the two orientations differ by
+0.00013–0.00399 **absolute**; expressed as a fraction of the floor that is 0.19% at k=4 and 3.23% at
+k=32, so the relative figure moves 17× across widths while the absolute gap moves 3×. The honest
+sentence is "the orientation moves each cell's deviation by one to five parts in a thousand, which is
+0.2–3.2% of the floor", not "the floor is 2.5% uncertain".
+
+### A fifth free parameter: the p95 estimator, inconsistent inside one file
+
+`an_c205.py` computes its floors with `statistics.quantiles(dev, n=100, method="inclusive")[94]` —
+linear interpolation — and line 459 carries a comment explaining that `int(0.95*(n-1))` **is not the
+95th percentile**, with the synthetic 3-matrix corpus that caught it. Seventy-nine lines later, the
+single-pass floor added tonight used `d[int(0.95 * (len(d) - 1))]`. **A comment condemning a form,
+and the form, in one file.** Unified to the interpolated estimator; the single-pass gated range moves
+60–80 → 60–79, and on the per-cell-max row it is worth two cells in the band columns.
+
+So the free parameters now number five, and every number in this document needs all five stated:
+**orientation, deviation scale, per-cell reduction, floor width (which A/A), and the p95 estimator
+method.**
+
+### The single-pass gated range was printed next to a number it cannot be compared with
+
+Stage 2b printed "a single pass 383–448, gated 60–79" beside "per-cell median 106, gated 61", with
+the note that a single-pass floor is "about twice as wide". Measured:
+
+    k      six-pass floor   single-pass floor range   ratio
+    2      0.0482           0.2958 - 0.3502           6.1 - 7.3x
+    4      0.0355           0.2682 - 0.2967           7.5 - 8.4x
+    8      0.0449           0.2683 - 0.3183           6.0 - 7.1x
+    16     0.0576           0.3165 - 0.3656           5.5 - 6.3x
+    32     0.0848           0.3589 - 0.4080           4.2 - 4.8x
+
+**4.2–8.4×, not twice.** And the comparable number — each single pass gated by *the board's own
+six-pass floor* — is **318–366**, not 60–79. The 60–79 range is a wide floor on noisy data and the 61
+is a narrow floor on averaged data; they move in opposite directions and their overlap is a
+coincidence of two constructions. Stage 2b now prints both columns with that stated in place.
+
+Also, the pooled figure's label has to travel: **2.2978 is the geometric mean of per-cell medians**,
+and the geometric mean over all readings on the same cells is **2.2763** — 0.94% away, which is
+larger than the entire cross-chain difference being discussed.
+
+### Prefetch deletion is a hump in k, not a uniform win — and it breaks 19 cells it did not break before
+
+The earlier figure "removes 26 of the 36 beyond-floor cells at k=4" was a **count difference**, not a
+membership count, and the membership numbers are both better and worse than it suggested. Of `c0`'s
+66 beyond-floor cells, under `pfd0`'s own arm floor (identical under both p95 conventions):
+
+    k        leave c0's set   of    pfd0's count   of which NEW    net
+    2             9           20         20              9          0
+    4            32           36         10              6        -26
+    8             4            7          3              0         -4
+    16            1            1          2              2         +1
+    32            2            2          2              2          0
+    ALL          48           66         37             19        -29
+
+**48 of the 66 leave and 19 arrive that were not there before** — 67 cells of membership churn for a
+net move of 29. The count difference, 66 − 37 = 29, is not the same quantity as the 48, and reporting
+only the net hides that the change creates new deficits.
+
+**And the net effect is localised in width: −26 at k=4, −4 at k=8, and zero or slightly worse at
+k=2, k=16 and k=32.** The per-width geometric mean has the same shape — 1.0040 / 1.0456 / 1.0597 /
+1.0395 / 1.0119, peaking at k=8. A hump in k that vanishes at both ends is a mechanism-shaped
+signature rather than a scatter, and it is mechanically plausible for a register-block prefetch:
+too few columns in flight to hide its latency at the narrow end, enough arithmetic to hide it at the
+wide end. **That is the first candidate all night for a gate with a reason behind it rather than a
+boundary fitted to the exceptions** — and it still has to survive the 249 regressions, whose worst
+cases (`sgpf5y6` k=16 at 2.067×, `boneS10_B` k=16 at 1.986×, `sx-superuser_C2A` k=32 at 1.799×,
+`rail507` k=16 at 1.696×) sit at the widths where the benefit is already near zero, which is the
+first encouraging thing about them.
