@@ -32859,11 +32859,17 @@ another, and only the label distinguishes them.
 
 **1. `/usr/bin/find` is not the safe default. The two binaries have complementary gaps.**
 
-| `-newermt` argument | `bfs` (shell `find`) | `/usr/bin/find` |
-|---|---|---|
-| `'7 days ago'` | 0, exit 1 | 2150, exit 0 |
-| `'@1788851438'` | 2150, exit 0 | **0, exit 1** |
-| `'2026-09-08'` (ISO) | 2150, exit 0 | 2150, exit 0 |
+Counts are over `~/.cache/scorch-codex/spmm-beat-mkl` with **no `-type` filter**, so they include
+directories; the `-type f` column is given beside them because correction 4 below quotes the file
+counts and a reader should not have to work out which question each answers.
+`1788851438` = 2026-09-08 00:10:38 PDT, so the epoch and ISO rows agree because no file falls in
+the ten minutes between them.
+
+| `-newermt` argument | `bfs` (shell `find`) | `/usr/bin/find` | `-type f`: bfs / sys |
+|---|---|---|---|
+| `'7 days ago'` | 0, exit 1 | 2150, exit 0 | 0 / 2121 |
+| `'@1788851438'` | 2150, exit 0 | **0, exit 1** | 2121 / 0 |
+| `'2026-09-08'` (ISO) | 2150, exit 0 | 2150, exit 0 | 2121 / 2121 |
 
 BSD `find` rejects the **epoch** form that bfs accepts. So "call `/usr/bin/find` explicitly" —
 which the section above recommends — breaks the epoch form, and only the **ISO absolute** form
