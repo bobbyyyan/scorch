@@ -33712,3 +33712,49 @@ over counts — "a declared-count check is invariant to a permutation between eq
 groups". The failure here is not a permutation but a misreading of the group definition, and
 the digest caught it anyway, at a width where the count check would also have caught it but
 the two agreeing widths would have reassured me first.
+
+### 139 of 140, and my "defect" was already disclosed by the artefact
+
+Three refinements from the checker's round, two of which correct me.
+
+**`sha256("")` is a data digest, so the CSV-reproducible count is 139, not 138.** My sweep
+carried `if not cells: continue`, which skipped the three empty groups and so could not emit
+the token. Re-run with empty groups included: 54 groups swept, 3 of them empty, and
+`e3b0c44298fc1c14` reproduces as the membership digest of `k=2 ov24/LOWER n=0`. The group is
+empty at every width — ov24/LOWER sizes are 0, 0, 0 against ov16's 27, 24, 28 — which is the
+P1 theorem, not an accident. One token left unreproduced from the CSVs, the rotation file.
+
+**And the collision I called a minor defect is one chain203 found first.** I wrote that
+`sha256("")` "cannot distinguish 'this group is empty' from 'this group was never computed'".
+The general point stands, but chain203 does not have the problem: every occurrence prints
+`n 0` beside the digest, and line 176 is a collision table that names all three of them —
+
+    e3b0c44298fc1c14  k=2 ov24/LOWER n=0 | k=4 ov24/LOWER n=0 | k=32 ov24/LOWER n=0 (the empty group)
+
+so the artefact detected the collision, enumerated its members and labelled it. Calling that
+a defect was an over-call.
+
+**That is the second over-call in one round on the same document, with the same cause.** I
+called the three-orientation table a document-wide convention error when the same document
+labels the other three tables correctly; I called the empty-group digest a defect when the
+same document publishes a collision census for it. Both times I compared the object I was
+diffing — a digest, a column label — and did not read the line next to it that explains it.
+The artefact was more careful than my reading of it, twice.
+
+**One correction going the other way: the rotation provenance is not split between the
+chains.** The checker's note says each chain pins one of the two side artefacts. It is not
+symmetric — chain202 pins all three and chain203 pins one:
+
+    file                   chain202              chain203
+    orders_idx11x22.txt    pinned, 528 B         pinned, 528 B  (cmp: byte-identical)
+    orders_named.txt       pinned, 448 B         absent
+    mkorders11.py          pinned, 10161 B       absent
+
+So the rotation both chains ran is identical and attested in both, but the generator and the
+human-readable form live only in chain202. chain203 cannot regenerate or read its own
+rotation without reaching into a different chain's ledger — a dependency across milestone
+directories that neither manifest records.
+
+Net: chain203's analysis reproduces at 140 of 140 tokens across two independent
+implementations — 139 from the sealed CSVs, plus the rotation file verified against itself and
+`cmp`-confirmed identical to chain202's copy.
