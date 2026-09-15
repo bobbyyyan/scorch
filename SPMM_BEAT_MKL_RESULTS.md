@@ -34431,3 +34431,51 @@ through a single reduction, and two *named* deviation helpers with one marked ga
 convention cannot be written. Every repair that consisted of knowing better failed within one
 number. That asymmetry is the durable finding of the night, and it is stronger than any individual
 result in it.
+
+### The convention choice changes 1–2 verdicts of 22,920, so my "not reconcilable" was wrong
+
+Five rounds sizing the convention gap never asked the question the decision actually turns on:
+**which cells change hands.** Computed on chain196's 22,920 cells complete in all three builds and
+all six passes, subject = per-cell median of `mkl/ours`, floor = p95 per width of the cross-build
+A/A pair **under the same convention as the subject**, so the convention moves both sides:
+
+    subject  floor pair   behind   flagged |x-1|   flagged logsym   verdicts changed
+    c0       c0/c0b         119         47              48                1
+    c0       c0b/c0         119         47              49                2
+    c0b      c0/c0b         118         40              41                1
+    c0b      c0b/c0         118         39              41                2
+    pfd0     c0/c0b          66         21              21                0
+    pfd0     c0b/c0          66         21              21                0
+
+**At most 2 verdicts of 22,920 change — 0.009% — and all six flips across all six combinations go
+one way: the log-symmetric form flags one more cell, never fewer.** The complete list, each sitting
+just under its `|x-1|` floor and just over its log-symmetric one:
+
+    ss/Meszaros/aa3      k=8   s=0.92763  dA=0.07237  dL=0.07801  floors 0.07255 / 0.07538
+    ss/Meszaros/nw14     k=8   s=0.92664  dA=0.07336  dL=0.07917  floors 0.07404 / 0.07490
+    ss/Meszaros/p6000    k=2   s=0.91979  dA=0.08021  dL=0.08720  floors 0.08172 / 0.08688
+    ss/lp_osa_60         k=4   s=0.93543  dA=0.06457  dL=0.06902  floors 0.06680 / 0.06877
+
+**And the mechanism is the theorem again, not the data.** A below-parity cell can only change hands
+if its deviation lands in `(t/(1+t), t]`, a window of width `t²/(1+t)` — 0.0024 at t=0.05, 0.0049 at
+t=0.0726, 0.0091 at t=0.10. The behind population is 119 of 22,920, so almost nothing lands in a
+half-percentage-point window.
+
+**This corrects a sentence of mine, not theirs.** `dd88deb` said "the two are not reconcilable after
+the fact, because the choice changes the behind counts the stage exists to produce." The counts
+change by one cell out of 22,920, in a known direction, on a named matrix. So a 1.7–4.3% gap in the
+threshold and a 0.009% change in the verdicts are both true, and **the gate gap was simply the wrong
+summary of the convention choice.** We sized a quantity whose consequence is one cell, for five
+rounds, having never computed the consequence.
+
+**Scope, because over-application is the failure mode this thread has been full of.** This settles
+the *board* gate — behind MKL beyond an A/A floor, a threshold crossing. It does **not** settle the
+chain203-style gate, where the convention enters bootstrap band endpoints rather than a threshold;
+there the displacement analysis is the relevant one and this table says nothing.
+
+**So the pending item for Bobby changes character.** It was recorded as a decision that moves the
+board. It is a decision about principle: the log-symmetric form is orientation-independent and
+cannot depend on which arm is the numerator; the asymmetric form matches the sealed predecessor and
+keeps chain205 comparable with chain203 and chain202. **Both are defensible and the board is
+indifferent to the choice at 0.009%.** The revert stands on the pre-registration argument alone,
+which is the argument that was always doing the work.
