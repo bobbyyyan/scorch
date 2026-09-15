@@ -32796,7 +32796,10 @@ follows the ASCII account exactly: C gives `ov24 ov24b ov2 ov2b`, macOS-UTF-8 gi
 
 *(One correction to the census as it was reported to me: it said "exactly 2 of 11 groups move"
 while its own table listed three nonzero shifts. Measured, **3 of 11 arm groups move** — `ov2`,
-`ov24`, `ov24b`. They form **2 contiguous blocks** that swap, which is presumably what was meant,
-but the group count is three. Fourth summary in four messages that was wrong beside correctly
+`ov24`, `ov24b`. My own first restatement of that was loose too: I called them "2 contiguous
+blocks that swap", which implies two separate regions. They are **one contiguous run** — C block
+order is `ov16 ov16b | ov24 ov24b ov2 | ov2b ov4 ov4b ov8 ov8b ovp`, movers at block indices 2–4 —
+inside which the 22-file `ov2` block and the 44-file `ov24`+`ov24b` block exchange adjacent
+halves. Exact structure: **3 groups, 1 run, 66 positions (0-based 44..109), 44 diff lines.** Fourth summary in four messages that was wrong beside correctly
 measured data — the numbers were right every time and the sentence over them was not, which is
 exactly what makes that failure mode credible.)*
