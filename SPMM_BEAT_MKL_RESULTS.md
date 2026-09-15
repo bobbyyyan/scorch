@@ -32910,3 +32910,87 @@ a digest column, which strengthens the point rather than weakening it.
 I reported 2336 and 2150; the file counts are 2304 and 2121. The gap is directories, which I did
 not filter or mention: **2304 files + 32 dirs = 2336**, and 2121 + 29 = 2150. Both are correct
 numbers for different questions, and I published one while describing the other.
+
+## Every manifest verifies, and none of them names the script chain203 ran
+
+The nine manifests in `~/.cache/scorch-codex/spmm-beat-mkl/` that are *named* `SHA256SUMS` and
+*contain* `cksum` output — CRC-32 plus a byte count, three fields — had been recorded here as
+"unverifiable by `shasum -c`". That records a property of the wrong tool. They verify with `cksum`,
+and running it closes 2346 attested lines that had been reported as covered while nothing had read
+them.
+
+Verified by shelling out to `cksum`, not by reimplementing the POSIX CRC, so the check does not
+restate the thing under test. **2339 of 2346 OK, 7 MISMATCH, 0 MISSING.**
+
+The 7 are 5 distinct files, all in `harnesses/`, all grown, every mtime after its manifest's, and
+the chronology reconciles exactly against the three manifest write times:
+
+    top-level SHA256SUMS         sealed 09-08 23:17   1123 lines   1118 OK   5 MISMATCH
+    harnesses/SHA256SUMS         sealed 09-09 10:41    184 lines    182 OK   2 MISMATCH
+    harnesses/SHA256SUMS.sha256  sealed 09-13 11:37    186 lines    186 OK   0 MISMATCH
+
+`fmtcheck.py` (1678→2640), `spmmstat.py` (9003→10215) and `mrbuild.sh` (32363→33621) were edited
+09-09 06:08–08:16, inside the eleven-hour window between the first two seals, which is why those
+three fail at top level and pass inside `harnesses/`. `mkt_attrib2b.sbatch` (10409→11584) and
+`rw_s_movid.sh` (5124→6299) were edited 09-13 11:36 and fail in both. No data directory has a
+single mismatch. Continued harness development, not corruption.
+
+**The count of genuine SHA-256 manifests recorded here was 15 at 1188 lines. It is 16 at 1374.**
+The sixteenth is `harnesses/SHA256SUMS.sha256`, 186 lines, verifying 186 of 186 — the file
+`MANIFEST_NOTE.txt` describes as the thing that gives the directory something that verifies. It was
+missed because the population was taken as "one `SHA256SUMS` per chain directory", and this manifest
+matches neither half of that: it is not named `SHA256SUMS` and it is not in a chain directory. Same
+shape as the three earlier population errors in this document — a count that matches where the thing
+is usually found. The fix is the same one: enumerate by the defining property (content parses as
+digest lines) over the whole tree, which here is 837 manifest-named files under
+`~/.cache/scorch-codex`, of which exactly 9 are `cksum` and 718 are SHA-256.
+
+**Two structural points, both of which survive the arithmetic being right.**
+
+**1. Attesting a manifest as a file says nothing about whether its claims hold.**
+`harnesses/SHA256SUMS.sha256` verifies 186 of 186, and one of those 186 lines is `SHA256SUMS`
+itself — the `cksum` manifest containing two false entries. Its digest is correct; the file's
+contents are stale. So a directory can be 100% attested by its newest manifest while an older
+manifest inside it asserts two things that are not true, and no check that verifies manifests
+against files can see the difference. `MANIFEST_NOTE.txt` intended exactly this and says so; the
+point is that the outer verification carries no signal about it, so the note is the only thing that
+does.
+
+**2. `MANIFEST_NOTE.txt` reached the diagnosis on 09-13 and still did not run the tool.** It names
+the format precisely — "CRC-32 plus a byte count, not SHA-256" — and concludes that `shasum -a 256
+-c` "was not verifying anything before these edits either; the edits did not break it." Both
+sentences are true. The inference that a three-field manifest wants the three-field tool is one step
+away and was not taken for two days. Knowing the format is not checking the file.
+
+### The reproduction hazard, which is the part that could have produced a wrong number
+
+Each chain pins its own copy of the harness it ran, and the copies differ. Enumerated over the whole
+tree with `-type f`:
+
+    mrbuild.sh   7 copies, 5 distinct generations
+      408f142f3f86d232  33621  chain191-w1hi-redwood/   AND  harnesses/   <- identical
+      a5e4b57ed9a88923  34248  chain192-halfvec-redwood/
+      2b990e9c5f0341a6  34453  chain195-prefetch-redwood/, chain196-fullcollection-redwood/
+      b57fc0542055e510  35255  chain197-prefetchstream-redwood/
+      3000b30332b61da2  36777  chain203-rungwise-redwood/                 <- what chain203 ran
+
+    spmmstat.py  6 copies, 4 distinct generations
+      fa9ff89341bf1a50   8955  chain185-w1fix-{mkt,redwood}/
+      d63496689fb68908   9003  chain187-w1unroll-{mkt,redwood}/
+      1f9a8b8f971f5928  10760  chain195-prefetch-redwood/
+      13814a88e9dab3de  10215  harnesses/                                 <- matches no chain
+
+`harnesses/mrbuild.sh` sits at the chain191-era version, 3156 bytes smaller than the script chain203
+actually ran (`chain203-rungwise-redwood/rw_s_chain203.sh:29` points at
+`/scratch/bobbyy/c203/mrbuild.sh`, whose sealed copy is the 36777-byte one). The top-level manifest
+attests a third, still-older generation at 32363 bytes. And `harnesses/spmmstat.py` matches no
+chain's pinned copy at all — it is a generation that exists only in the shared directory.
+`fmtcheck.py` has exactly one copy in the tree, so its top-level mismatch has no pinned counterpart
+anywhere: nothing here can reproduce whatever ran against the 1678-byte version.
+
+**So cite the chain's own pinned copy. The shared working directory is not a pointer to any chain.**
+Every chain's copy is inside a ledger that verifies 100%, so the correct citation is always
+available; the wrong one is merely the shorter path. No result in this document is affected — the
+chain203 numbers were computed from `chain203-rungwise-redwood/`, whose 258 lines verify 258 of 258
+at manifest digest `0ebd13f9…` — and nothing was edited to establish any of the above, because
+ledger artefacts are read-only evidence.
