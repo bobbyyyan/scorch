@@ -35408,6 +35408,12 @@ milestone claim.
    stratification chosen after seeing the tail. Default: per-width, with per-band reported as
    exploratory.
 
+8. **Which A/A defines the floor for the headline count.** Arm identity (`oursb/ours`, one binary
+   twice) gives 66 behind and 115 indeterminate; build identity (`c0/c0b`, two compilations of one
+   source) gives 47 and 203. A wider floor lowers the behind count and raises the indeterminate one
+   by construction, so the count alone cannot choose. Default if unanswered: report the three-way
+   partition under both, lead with arm identity, and state that 131 wins sit inside build variation.
+
 **Not blocking, but decided better now than later.**
 
 5. **chain204's clean-block choice**, which is a pre-registration and therefore expires: excluding
@@ -35738,3 +35744,65 @@ different things. The arm-identity floor answers "is this cell's deficit larger 
 measured twice", and the build-identity floor answers "larger than two compilations of the same
 source". The milestone's claim is about the kernel, so the arm-identity floor is the matched one for
 it, and the build floor belongs beside any claim that compares two objects.
+
+### A wider floor lowers the behind count by construction, so the behind count alone cannot choose a floor
+
+Two corrections and one result, all on chain196's `c0` with `c0b` supplying the build-identity A/A.
+
+**First, my "factor of three" was range-extreme against range-extreme.** Per pass, both floors:
+
+    pass          p1   p2   p3   p4   p5   p6      range
+    arm identity  52   71   46   63   68   55      46-71
+    build         15   52   35   35   50   45      15-52
+    ratio        3.47 1.37 1.31 1.80 1.36 1.22
+
+The per-pass ratio runs **1.22× to 3.47×**; quoting 71 against 15 gives 4.7× and describes no pass.
+Comparing the maximum of one range to the minimum of another is the same error as reading a span off
+thin quantiles.
+
+**Second, at the resolution the headline uses the gap is 1.40×, not 3×.**
+
+    k      arm floor  build floor  ratio   beyond(arm)  beyond(build)
+    2       0.0451     0.0817      1.81x        20            16
+    4       0.0376     0.0668      1.78x        36            24
+    8       0.0470     0.0725      1.54x         7             4
+    16      0.0598     0.0867      1.45x         1             1
+    32      0.0830     0.1233      1.49x         2             2
+    ALL                                         66            47
+
+The 3× lives only at single-pass resolution where both floors are noisy. And the floor ratio falls
+monotonically from **1.81× at k=2 to 1.45× at k=16** — the layout artefact's own signature, largest
+at the narrowest width, matching the 1–2.6%-on-narrow-k measurement already on record. **The
+per-cell gated count is also robust to the floor's exact value where the per-pass one is not:** the
+verifier's independently computed build floors differ from mine by 2–3% (0.0838 vs 0.0817 at k=2)
+and the per-cell counts agree exactly at 16/24/4/1/2, while the per-pass counts differ by up to 8
+cells. That is a third argument for the per-cell resolution, independent of the two already made.
+
+**Now the result, which inverts the case for the tighter count.** The argument for the
+build-identity floor is that Scorch is compiled on the user's host, so build-to-build variation is
+variation a user is exposed to, and 47 is therefore a *harder* claim than 66. That is right about
+the behind list and incomplete, because **the same variation that removes 19 cells from the behind
+list puts 131 currently-winning cells inside it**:
+
+    floor            behind   indeterminate   ahead    not-certainly-ahead
+    arm identity         66             115   22739     181   (0.79%)
+    build identity       47             203   22670     250   (1.09%)
+
+**A wider floor moves cells out of both tails into the middle, so it necessarily lowers the behind
+count and necessarily raises the indeterminate count.** Reporting only the first is favourable by
+construction — "all but 47" reads as better than "all but 66" while the set that is *not safely won*
+grows from 181 to 250. Choosing a floor to minimise the behind count is therefore not a neutral
+methodological preference; it is a direction, and the only report that cannot be gamed this way is
+the three-way partition.
+
+So both floors belong, with the partition attached to each rather than a single count:
+
+    beyond MEASUREMENT noise (arm identity)   66 behind, 115 indeterminate
+      "we really measured this deficit"
+    beyond BUILD variation (build identity)   47 behind, 203 indeterminate
+      "this deficit survives recompilation -- and 131 of our wins may not"
+
+The 19 in between — beyond measurement noise but inside build variation — are a named, checkable
+category rather than a rounding, and so are the 131. Which floor the milestone's claim is stated
+against is a decision about what is being promised to a user, and it is Bobby's, not a session's.
+It is now item 8 in the open-decisions list.
