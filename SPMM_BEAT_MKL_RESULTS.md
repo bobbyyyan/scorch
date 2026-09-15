@@ -33758,3 +33758,36 @@ directories that neither manifest records.
 Net: chain203's analysis reproduces at 140 of 140 tokens across two independent
 implementations — 139 from the sealed CSVs, plus the rotation file verified against itself and
 `cmp`-confirmed identical to chain202's copy.
+
+### The rotation generator is a fourth instance of one attestation shape, and the first attested elsewhere
+
+chain202's manifest is a genuine SHA-256 one (153 lines, 64-hex first field) and all three
+rotation lines verify: `mkorders11.py: OK`, `orders_idx11x22.txt: OK`, `orders_named.txt: OK`.
+chain203's carries one line, for the index file. So the asymmetry is attested, not merely
+present on disk.
+
+That makes four hard dependencies in this milestone that a chain ran without attesting in its
+own ledger:
+
+    dependency        chain that ran it       where it is attested
+    csrresolve.py     chain203 (and MKT)      nowhere; MKT's copy is a different 3611 B / 38d1a01d
+    mrbuild.sh        chain203                7 copies, 5 generations; harnesses/ is chain191-era
+    mrgate.py         chain203                attested copy is 7460 B / 4d5b05e3, running is 8173 B / a55e07bf
+    mkorders11.py     chain203's rotation     chain202's ledger, verifying OK -- a DIFFERENT milestone
+
+The fourth is the first where the artefact exists and verifies, just not in the ledger of the
+chain that depends on it. That is a different failure from the other three: nothing is stale or
+missing, and a reader checking chain203's manifest for completeness finds no gap to report,
+because the gap is a dependency the manifest does not mention rather than a line that fails.
+chain203 cannot regenerate or human-read its own rotation from its own ledger.
+
+The index file both chains ran is byte-identical (`cmp`) and attested in both, so no measurement
+is in question. What is missing is the ability to rebuild the rotation from chain203 alone.
+
+### Pending for Bobby, unchanged and now with a fourth item
+
+Left as decisions, not acted on: what quantity the stage-4 pre-registered bar bounds; whether
+amendment 4's floor of 8 counts cells or independent problems; `oursb` versus its docstring; the
+log-space reduction; a second host for both width-dependent findings; whether to push. Added by
+this round: whether a ledger should be required to attest its cross-milestone dependencies, which
+would have caught all four rows above and none of which a per-chain manifest check can see.
