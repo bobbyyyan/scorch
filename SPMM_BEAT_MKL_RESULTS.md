@@ -34374,3 +34374,60 @@ violated my own most recently written rule on the next number I produced — the
 convention rule, the thin-verdict rule, and quoting a corroboration without checking its statistic.
 Writing a rule down does not install it; the repairs that held were the structural ones, where the
 defect became inexpressible rather than discouraged.
+
+### The quantity retires: `gap/dA` is an attenuation under a ceiling of `1/(1−dA)`
+
+**The population finding verifies exactly.** At k=32 there are 4,584 complete cells; 694 have a
+median `ours` runtime at or above 0.1 ms and **3,890 below it**. So the checker's sweep was silently
+restricted to short kernels — 84.9% of the board — and compared against my whole-board table.
+Neither of us had published the population. They retracted the column rather than reconstructing it,
+which is right: with the population unnamed there is nothing to repair it against.
+
+**And the theorem retires the quantity rather than re-measuring it.** Elementwise, writing
+`dA = |x−1|` and `dL = exp|ln x|−1`: above parity `dL = dA`, and below parity `dL = dA/(1−dA)`
+exactly, since `1−dA = x`. So `dA ≤ dL ≤ dA/(1−dA)` elementwise; the pairing gives
+`quantile(dL) ≥ quantile(dA)`, and `a ↦ a/(1−a)` is monotone increasing for `a < 1` so the upper
+bound passes through the quantile. Hence for the relative gap `g = (dL−dA)/dA`:
+
+    0 <= g <= dA/(1-dA)        and       0 <= g/dA <= 1/(1-dA)
+
+Checked on chain196, three reductions × five well-populated quantiles:
+
+    reduction              q     dA       g        g ceiling   g/dA    attenuation
+    cells/med-of-ratios    p50   0.0067   0.0040   0.0068      0.598   0.59
+    cells/med-of-ratios    p75   0.0157   0.0056   0.0159      0.359   0.35
+    cells/med-of-ratios    p90   0.0430   0.0319   0.0450      0.740   0.71
+    cells/med-of-ratios    p95   0.0831   0.0431   0.0906      0.518   0.48
+    cells/med-of-ratios    p99   0.1821   0.1518   0.2226      0.834   0.68
+    readings               p95   0.3874   0.2331   0.6323      0.602   0.37
+    readings               p99   0.7031   0.3083   2.3684      0.438   0.13
+
+**0 of 15 points above the tight ceiling; attenuation spans 0.13 to 0.71.** For small `dA` the
+ceiling is ≈1, so `g/dA` simply *is* the attenuation — a fraction in [0,1] set by how much of the
+local composition near the quantile lies below parity. "≈0.5" was one reading of that fraction, and
+a fraction has no reason to be constant. The bound also says nothing once `dA ≥ 1`, which is exactly
+the thin `p99.9` rows we had already dropped on element counts — two independent reasons to drop the
+same rows, which is corroboration that means something because the mechanisms are unrelated.
+
+**My first verification of that theorem was vacuous.** I compared `g` against `1/(1−dA)` — the
+ceiling for `g/dA`, not for `g` — so the check passed against a bound roughly 25× too loose and
+reported "0 of 18" while testing almost nothing. Fifth instance tonight of one quantity at two
+resolutions, and this one occurred *inside the verification of a theorem about that very class*. The
+repair was to state both pairings once, in the output, before comparing anything.
+
+My earlier per-cell figures stand: `g/dA` of 0.598 / 0.359 / 0.740 / 0.518 on usable quantiles,
+matching the 0.36–0.74 span published in `d256604`.
+
+**Where this thread ends.** The surviving statement is the one that is checkable: the gate's
+convention gap is small because the gate's **deviation** is small — the ceiling is `1/(1−dA)`, so a
+small `dA` caps the gap regardless of composition — and the per-cell median earns its small `dA` by
+suppressing pass-level noise, not by thinning the downside tail, since the per-cell population is
+the *more* symmetric one.
+
+**Eight instances of one pattern between two sessions in one night**, four each by the same
+predicate: a rule written down and then violated on the next number produced. The repairs that held
+were the two that made the defect **unavailable** — one `per_cell()` forcing the floor and board
+through a single reduction, and two *named* deviation helpers with one marked gating so a mixed
+convention cannot be written. Every repair that consisted of knowing better failed within one
+number. That asymmetry is the durable finding of the night, and it is stronger than any individual
+result in it.
