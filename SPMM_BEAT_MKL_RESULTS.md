@@ -35822,3 +35822,32 @@ analysis**, so it is a decision that has to be made before a run rather than aft
 next chain: a run intended to support a claim about the shipped kernel rather than about one binary
 needs a second compilation of the same source in the arm set, and it costs one more build and no
 extra measurement time per pass beyond that arm's own.
+
+**Resolved: the whole discrepancy is one parameter acting on one side.** Two implementations
+reported the build-identity partition as 47/203/22670 and 47/211/22662. Widening the build floor by
+2.5% — the size of the difference between the two implementations' p95 — changes the counts like
+this:
+
+    floor x1.000   behind  47   band below parity  72   band above parity 131
+    floor x1.025   behind  47   band below parity  72   band above parity 141
+
+**The behind tail does not move at all and neither does the below-parity half of the band; every
+cell the wider floor picks up is above parity.** So the 203-vs-211 disagreement, and the 131-vs-139
+one inside it, are the same 2.5% floor-width residual landing entirely on the winning side. Behind
+agrees exactly at 47 under both.
+
+The reason is a density asymmetry that is worth stating on its own: **there are more cells just above
+parity than just below it**, so the indeterminate count is sensitive to the floor's exact value in a
+way the behind count is not. That is a fourth, mechanical argument for reporting the behind count at
+per-cell resolution — and simultaneously a reason the middle column of the partition needs its floor
+stated to 3 significant figures, since it is the column that moves. The 2.5% itself is unresolved;
+cross-build pass pairing and the p95 index convention are both candidates, and it is recorded as an
+open residual with its size rather than left implicit.
+
+And the monotonicity is a **theorem, not an observation**: the band is symmetric about parity, so
+widening the floor moves cells out of both tails into the middle and never out of it. `behind` is
+non-increasing in floor width and `indeterminate` is non-decreasing, for every floor and every
+dataset. Therefore **a behind count alone is not a measurement of the collection's state** — a free
+parameter moves it in a known direction, no bad faith required, and a reader cannot detect it from
+the number. The three-way partition is the only form in which widening the floor has a visible cost,
+because the cost must appear in the middle column.
