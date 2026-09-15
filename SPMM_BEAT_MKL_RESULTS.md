@@ -33022,3 +33022,138 @@ available; the wrong one is merely the shorter path. No result in this document 
 chain203 numbers were computed from `chain203-rungwise-redwood/`, whose 258 lines verify 258 of 258
 at manifest digest `0ebd13f9…` — and nothing was edited to establish any of the above, because
 ledger artefacts are read-only evidence.
+
+## The declined arguments are the E-core recruit firing on x86, and the inertness proof has an unnamed precondition
+
+chain203 found, counted and named the anomaly correctly. Its `c203_analysis.txt:74-76` reports
+**"DECLINED ARGUMENTS: 24 cells where the delivered count exceeds the pool, on 4 of the 5 rungs
+(ov2, ov4, ov8, ov16). Delivered counts there: [32]. Identical across those rungs on every cell:
+True. By width: {4: 3, 32: 21}."** Recomputed from the sealed CSVs here: 24 cells, {4: 3, 32: 21},
+delivered [32], arm set identical on every cell and equal to
+`{ov2, ov2b, ov4, ov4b, ov8, ov8b, ov16, ov16b}`. Every number reproduces.
+
+**The mechanism it names is the one branch that cannot have run.** The analysis says *"The
+remembered ceiling request floors the cap there, so on those cells the low rungs are
+ceiling-dominated"* — that is `SCORCH_SPMM_NT_CAP_FLOOR_CEIL` raising `nt_cap` to `ceil_request`.
+But `ceil_request` is only ever assigned inside a block guarded by `nnz_per_thread > 0`, and
+`SCORCH_SPMM_NNZ_PER_THREAD` is **`0L`** in the object chain203 ran — verified in the tarball and
+again in `/scratch/bobbyy/c203/c0/src/scorch/csrc/scorch_policy.h`. So `ceil_request` is 0 on every
+call, `floor_ceil && ceil_request > nt_cap` is never true, and the ceiling explains none of the 24.
+Independently: the ceiling's own conditions (`rows <= 128` and `nnz >= 192*rows`) hold on **1 of the
+24** cells — `nw14`, 73 rows — so even with the branch enabled it could account for one.
+
+**The branch that did run is the E-core recruit decline**, `scorch_policy.h` in
+`scorch_spmm_nthreads`:
+
+    if (recruit_min_work > 0 && work_true >= recruit_min_work) {
+      const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                              : (long)omp_get_max_threads();
+      if ((long)nthreads >= 2 * pool) nt_cap = 0;   // 0 means "no cap", below
+    }
+    if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
+
+`SCORCH_SPMM_RECRUIT_MIN_WORK` is `10000000L`. So the cap is **switched off entirely** — not raised
+— when the true work reaches ten million and the already-resolved count is at least twice the
+declared pool, leaving whatever the earlier raise block produced, which is bounded by
+`omp_get_num_procs()` = 32 on redwood.
+
+**The attribution is exact, with the complement measured.** Sorting all 267 arm-cells of `ov2` by
+`work_true = nnz*k`:
+
+    below 10,000,000 : 243 cells, 0 declined
+    at or above      : 24 cells, 24 declined
+
+Not one cell crosses in the wrong direction, and the straddling pair is `FX_March2010` at 9,660,768
+(capped to 2) against `rail516` at 10,093,184 (delivered 32) — a 4.5% gap around the constant. The
+arm set follows from the same rule without adjustment: the gate `nthreads >= 2*override` with
+`nthreads` = 32 is met for overrides 2, 4, 8 and 16 and not for 24, where 2·24 = 48 > 32. That is
+why `ov24` shows zero, and it is a theorem about this host rather than a property of the rung.
+
+### The same branch is on the shipped path, and its inertness argument is not general
+
+`scorch_policy.h` says of this rule: *"it is a hybrid-pool rule that is STRUCTURALLY INERT on a
+uniform one rather than a second policy… on x86 the pool is 24, the gate is at 48 and the count is
+at most 32, so this condition provably cannot fire there and the cap stays unconditional — which is
+the configuration every x86 number above was measured in."*
+
+The code does not read `omp_get_max_threads()` for the pool when an override is present; it reads
+the override. And **production passes one**: `ops.py` `_composition_hints` returns
+`torch.get_num_threads()` as `nthreads_override` for both drop-in SpMM symbols, which
+`prebuilt_kernels.py:303` hands to the kernel. So the substitution in the proof is valid exactly
+while `2 * torch.get_num_threads() > omp_get_num_procs()`, and that is a precondition the comment
+does not state. When a caller sets a thread count below half the affinity set, the branch fires on a
+uniform pool.
+
+Measured on both x86 hosts, resolve-only, no timing, on the same 89-matrix corpus:
+
+    host      num_procs   torch pool   cells delivering MORE than the pool (k=32)   team
+    redwood   32          24           0                                            --
+    redwood   32          16           21                                           32
+    redwood   32           8           21                                           32
+    MKT       64          64           0                                            --
+    MKT       64          16           21                                           64
+    MKT       64           8           21                                           64
+
+Same 21 cells at k=32 and 3 at k=4 on both hosts, same `work_true` threshold, and the delivered team
+tracks each host's `num_procs`. The boundary on redwood is one unit wide and lands where the rule
+predicts — `2*pool <= num_procs`:
+
+    pool 15 -> 21 cells exceed    pool 17 -> 0
+    pool 16 -> 21 cells exceed    pool 18 -> 0
+
+So on a 64-CPU allocation a caller asking for 8 threads gets **64** on these matrices, an 8× excess
+over the declared budget, on a pool with no E-cores to recruit.
+
+**What is not claimed: nothing here is timed.** Whether the wider team is faster or slower at a
+small pool is unmeasured, and the honest counterfactual is awkward — the only way to get the capped
+count through the shipped interface is to raise the override past the gate, so the natural arm pair
+is override 16 (delivers 32) against override 17 (delivers 17), a one-unit change in the argument
+for a fifteen-worker change in the team. That is a chain, not an addendum. The finding is that a
+documented "provably cannot fire" does fire, which is reportable on its own.
+
+### chain200's thread sweep: five of seven arms are one treatment on 21 cells
+
+chain200 built the same `scorch_c199.tgz` (`rw_s_chain200.sh:27`), set its arms with
+`OMP_NUM_THREADS` per invocation rather than by affinity (`chain200_body.sh:162`), and its harness
+was the shared `mrgate.py`, which passes `nthreads_override=POOL`. `OMP_NUM_THREADS` does not change
+`omp_get_num_procs()`, so `num_procs` stayed 32 in every arm while the override fell with the pool —
+which is exactly the configuration that meets the gate. Run against chain200's own build object at
+`/scratch/bobbyy/c200/c0` (`RECRUIT_MIN_WORK 10000000L` confirmed present in it):
+
+    arm t1  (OMP_NUM_THREADS=1)  -> 21 of 89 cells at k=32 deliver a team of 32
+    arm t2                       -> 21 cells, team 32
+    arm t4                       -> 21 cells, team 32
+    arm t8                       -> 21 cells, team 32
+    arm t16                      -> 21 cells, team 32
+    arm t24                      -> 0
+
+So on those 21 cells **five of chain200's seven arms delivered the identical 32-worker team**, and
+the arm labelled single-threaded ran 32 threads. Its CSV header is
+`build,slice,key,k,rows,nnz,deg,arm,ms,batch` — no `resolved` column — so its data cannot say this
+about itself, which is the gap chain203 added the column to close. chain203's own remark that "34 of
+its 89 matrices resolve to the same team at pool 16 as at pool 24" is a different and weaker
+statement about ambient resolution; this one is about the delivered team across five arms.
+
+### Two-host groundwork for chain203's headline, and two artefact facts found doing it
+
+MKT can now run the stage: `scorch_c199.tgz` shipped byte-identical
+(`a56c2326f6f09c015932b5a70ee06f53d9bf8e2ea1daf469ff88ea6158247bf6`, verified on arrival), all four
+of chain203's source predicates present, built clean under the venv's torch 2.13.0 and gcc 13.3 into
+`scorch_ops.cpython-312-x86_64-linux-gnu.so`. The precondition for the headline holds there: at k=32
+a pool-width override raises the resolved count on **40 of 89** matrices, median 3.12×, against
+redwood's 25. `/scr/bobbyy/scorch` could not have been used — its `scorch_policy.h` has no
+`SCORCH_SPMM_NT_CAP`, no `SCORCH_SPMM_ADOPT_GRAIN`, zero matches for the adoption gate, and its only
+built object is a **macOS** `scorch_ops.cpython-311-darwin.so` from July.
+
+Two artefact facts, both in the family of the `mrbuild.sh` divergence above:
+
+1. **`csrresolve.py` is a hard dependency of chain203's harness and is in no chain's ledger.**
+   `mrgate_ov.py` refuses to run without it — *"falling back to os.path.exists is the exact bug that
+   had MKT reading 248 of 298 keys"* — yet `chain203-rungwise-redwood/` does not contain it. It is
+   sealed only in `harnesses/`, `chain185-w1fix-mkt`, `chain187-w1unroll-{mkt,redwood}`, all four
+   byte-identical at `1872f707045dc14e`. So the resolver that decides which matrices were measured
+   is absent from the ledger of the stage that measured them.
+2. **MKT's copy is a different generation.** `/scr/bobbyy/csrresolve.py` is 3611 bytes at
+   `38d1a01d9cc67703`, against 3811 bytes at `1872f707045dc14e` on redwood and in all four sealed
+   copies. The probes above shipped the sealed copy and printed its digest before use; MKT's own
+   copy was left untouched, since another stage may read it.
