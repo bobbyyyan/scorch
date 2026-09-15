@@ -34206,3 +34206,38 @@ improvement does not get to be quiet.
 every width and cannot depend on which arm is the numerator; the asymmetric one matches the sealed
 predecessor and so keeps chain205 comparable with chain203 and chain202. The two are not reconcilable
 after the fact, because the choice changes the behind counts the stage exists to produce.
+
+### The self-diagnosis has two thin verdicts of six, and one of them is under my own claim
+
+Exact counts replacing rounded percentages, with the margin beside every verdict:
+
+    band       cells   n>=4  n_disp  n>=3   >=3%    margin to 5%   cells to flip   verdict
+    < 1e3      2835      3      10     21    0.74      -4.26pp          121        no
+    1e3-1e4    4150      4      20     34    0.82      -4.18pp          174        no
+    1e4-1e5    9665     80     267    474    4.90      -0.10pp            9        no
+    1e5-1e6    3890    100     248    482   12.39      +7.39pp          288        straddles
+    1e6-1e7    2005     31      59    117    5.84      +0.84pp           17        straddles
+    > 1e7       375      0       0      1    0.27      -4.73pp           18        no
+
+**`1e4-1e5` is 0.10pp under the line — nine cells of 9,665.** Had it straddled, the bracket would
+have demanded the percentile for a band where inference was in fact right, so that failure mode is a
+false alarm and the property degrades safely.
+
+**But the thin verdict that matters is the other one, and it is under my claim rather than
+theirs.** I wrote that the bracket "reports its own inadequacy in exactly the band where inferring
+was wrong" — that band is `1e6-1e7`, and it straddles by **+0.84pp, seventeen cells**. So the
+property I called the valuable one holds by seventeen cells out of 2,005. It is still true and still
+the right shape, but it is not the robust part of this result; `1e5-1e6` at +7.39pp and 288 cells is
+the only verdict with real margin on the straddling side. Two of six verdicts are decided by fewer
+than twenty cells, and the self-diagnosis is itself a threshold comparison — so the margins have to
+travel with the verdicts.
+
+**And my ratio range covered five bands while being quoted over six.** `> 1e7` has 0 displaced
+cells against 1 cell with ≥3 same-side, so `≥3 / displaced` is a zero denominator, not a value
+between 1.70 and 2.10. That band cannot support a 5%-threshold statement at all: 5% of 375 cells is
+18.75 against an observed count of one, and a single cell moves its fraction by 0.27pp — coarser
+than the entire 0.10pp margin at `1e4-1e5`. **Third degenerate statistic from a small-n band
+tonight**, after the `if not cells: continue` that skipped three empty groups and the `sha256("")`
+published for a group of zero. The pattern is consistent enough to state as a rule: a band whose
+count is smaller than the threshold's own resolution cannot be given a verdict, and printing one
+there is worse than printing nothing.
