@@ -34652,3 +34652,55 @@ guard against it. Rewritten over the AST, which sees expressions rather than sen
 their first real trial, they are now actually enforced, and each has one positive control and a
 shared negative control behind it. That is 1 for 1 on a mechanism that exists, rather than 3 for 3
 on three that did not. The checker's push is what converted the claim into a thing.
+
+### The printed-claim defect exists in the sealed ledger, but the named twin does not carry it — and two AST censuses of it disagree 23%
+
+**The divergence finding reproduces exactly.** Over the 131 `.py` files under the milestone: 102
+distinct basenames, 109 distinct contents, 12 basenames appearing more than once, and **3 diverged**
+— `an_c188.py` (5 files, 4 contents), `spmmstat.py` (6 files, 4 contents), `an_c201.py` (2 files, 2
+contents). So for those three names "the analyzer" is not one object and an audit of one copy says
+nothing about the other. That is the actionable half and it is confirmed.
+
+**The concrete instance is real.** `chain201-deepwindows-redwood/an_c201.py` conditions its prose on
+a computed count at 581-582 and then asserts a count unconditionally at 583:
+
+    :578  "the largest sibling gradient where NOTHING fires is %.2f pts, over %d measurable pairs"
+    :581  "a stronger reference than any single one%s" % (", though with one pair behind it that
+           is a single reading dressed as a max" if len(inert_grads) == 1 else ".")
+    :583  "THE WIDTH-LOCAL BAR BELOW IS ALWAYS EXACTLY ONE PAIR, by construction and not by luck:"
+    :584  "three arms with disjoint windows leave exactly two inert at any firing width. So it is"
+
+The remedy is five lines above the defect: 581 consults `len(inert_grads)`, 583 asserts what that
+count must always be and consults nothing. The basis is a configuration constant — three arms,
+C(2,2)=1 — so a fourth arm makes the bar three pairs while the sentence keeps printing "always
+exactly one, not by luck". Same shape as my own `per_cell` disclosure: a sentence claiming a
+property, with the property's own input in scope and unread.
+
+**But the twin does not carry it.** The claim is in `chain201`'s copy at line 583 and **not in
+`chain199-deepchains-redwood/an_c201.py` at all** — that copy is 356 lines against chain201's 805,
+contains zero references to `inert_grads`, and zero matches for the sentence. So the two copies have
+diverged, as reported, but the second is an earlier and much smaller program rather than the same
+program at a shifted line number. The general warning stands — a line-anchored fix list can miss a
+diverged twin — and this particular pair is not an instance of it.
+
+**And the census itself is not reproducible, which is the finding I did not expect.** Same tree,
+same stated predicate, both sides walking the AST:
+
+    quantity                          theirs   mine
+    prints with literal text           3330     3338
+    claim-like                          233      190
+      with an enclosing guard           123       91
+      with none                         110       99
+
+The regex controls agree — my own offending sentence matches, `rows 4584 width 32 median 1.234` does
+not — and all 131 files parse on both sides. So the 23% gap on the claim-like count is free
+parameters the predicate does not pin: whether a print's literals mean its direct arguments or every
+string nested anywhere inside the call (which is what makes 581-582's conditional one print or two),
+and what counts as an enclosing guard. **Going through the AST fixed the failure it was chosen for —
+a text search cannot distinguish a defect from prose describing the defect — and did nothing for
+reproducibility.** "AST-walked" is not a specification of a census; the literal-collection rule and
+the ancestry rule have to be stated too.
+
+Neither number is wrong. Both are unquotable without the rest of the recipe, which is the same
+lesson as the four floors and the two conventions, now arrived at from the direction of a tool we
+both trusted *because* it was structural.
