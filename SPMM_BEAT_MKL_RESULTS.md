@@ -35380,3 +35380,49 @@ The general form, now stated for the fourth time in this document and apparently
 count must be printed beside something that proves the count could have been non-zero.** Here that
 would have been the number of files the `find` produced before filtering — 127 CSVs over 2 MB in
 the same tree.
+
+## Open decisions, consolidated
+
+Tonight's work produced a number of questions that are not a session's to answer. They are collected
+here because they are otherwise spread across thirty commits, ranked by whether they block the
+milestone claim.
+
+**Blocking the milestone claim.**
+
+1. **Which reduction the goal's cell count is stated in.** "scorch beats MKL everywhere" resolves to
+   431, 119, or 13 cells behind on the same 22,920-cell dataset depending on whether it means a
+   single pass, the per-cell median over six, or behind-in-all-six. 33× apart. Default if unanswered:
+   report all three with the reduction named and lead with the per-cell median over six passes, since
+   that is the reduction the floor and the board already share.
+2. **Whether the gated count is used at all.** Gating by a single-pass A/A p95 floor swings 15–52
+   across passes — worse than the ungated count it was meant to clean up, because a single-pass floor
+   is about twice as wide as a per-cell one. Either compute the floor at the resolution of the count
+   it gates, or drop gating from the headline. Default: compute at matching resolution.
+3. **The deviation convention.** `|x−1|` matches the sealed predecessor and keeps chain205 comparable
+   with chain203/202; `exp|ln x|−1` is orientation-independent. The board is indifferent — it changes
+   1–2 verdicts of 22,920, 0.009%. Default: keep `|x−1|` as the gate, print the log-symmetric beside.
+4. **Per-width or per-size-band floor.** Per-band is ~5× tighter at the ends but is a post hoc
+   stratification chosen after seeing the tail. Default: per-width, with per-band reported as
+   exploratory.
+
+**Not blocking, but decided better now than later.**
+
+5. **chain204's clean-block choice**, which is a pre-registration and therefore expires: excluding
+   the straddled pass 9 breaks (arm, position) balance at 8 passes with 3 arms; including it imports
+   ~24% of a contaminated pass. Default: report both, disclose the imbalance — an imbalance is
+   measurable and a contamination is not.
+6. **Whether `/scratch/bobbyy/c205an` stays where it is.** It is chain196's `c0` set under a
+   chain205 name, two characters from the live directory, and it will read as chain205 output to the
+   next session as well. Renaming it is a one-line change on Bobby's data; nothing has been touched.
+7. **Whether to push.** 852 commits ahead of `main` on a single copy with no bundle or mirror, which
+   is a real data-loss exposure. Not pushed, and `git push --all` would publish two additional
+   branches — `perf/spmm-probe-and-kernel-pretrailer` carrying 27 `Co-Authored-By` trailers, whose
+   stripped sibling is already on origin, and the in-progress `refactor/compiler-ir-phase3-std-move-call`.
+   Nothing here touches refs.
+
+**Carried from earlier chains and still open:** the deferred k=4 equivalence test from chain191;
+chain191's `9f50a83` revert decision; whether a ledger should record dependencies satisfied elsewhere
+in the codex; what should happen when a sealed analysis publishes a number from an artefact that
+exists nowhere; what quantity the stage-4 pre-registered bar bounds; whether amendment 4's floor of 8
+counts cells or independent problems; `oursb` versus its docstring; a second host for both
+width-dependent findings.
