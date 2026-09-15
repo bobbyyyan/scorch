@@ -35001,3 +35001,44 @@ already on origin. Recorded as a fact and not a proposal: the third member of th
 is `refactor/compiler-ir-phase3-std-move-call`, the branch checked out in the main worktree, so a
 `push --all` from this repository would also publish that in-progress refactor. No refs were
 touched.
+
+### Identified: it was chain196's `c0` set, and it replicates chain205 to 0.19%
+
+The unprovenanced six-pass dataset in `/scratch/bobbyy/c205an/` is **chain196's `c0` six-pass
+full-collection set**, copied at 02:20:15 and renamed `sh_*` → `fc_*` into chain205's convention.
+The one-row probe hit the first candidate and md5 over full file bytes confirmed **6 of 6**:
+
+    c205an/p1..p6   06f49552 8f24f38f d888e022 6917e0e7 bd65394d 8b4cb946
+    chain196 c0     identical, all six          (sealed, sha256 in chain196's SHA256SUMS)
+    chain196 c0b / pfd0, twelve files           match nothing
+    one byte flipped in c0/p1                   matches nothing
+
+So the identification is **unique, not merely consistent** — the negative controls are in the same
+run. chain196 uses `corpusp1`…`corpusp6` as well, which is precisely *why* the filename-versus-
+`slice` guard passed: after the rename the two identifiers genuinely agreed. "Real measured data from
+a run I cannot account for" resolves to **real measured data from a run that is fully accounted for,
+just not this one** — not fabricated, not synthetic, not corrupt.
+
+**And this is the finding, not the forensics: chain196 replicates chain205's pass 1 to 0.19% pooled,
+every width inside 0.7%.** Had the copy been analysed as chain205, the full-collection board would
+have come out **within a fifth of a percent of the true answer**. No plausibility check on the
+result could have caught it — not the pooled ratio, not the per-width table, not the floor, not the
+behind counts, not the worst-cell list. **When the substituted input is a near-replicate of the
+right one, the output is indistinguishable from the correct output at every resolution anyone
+inspects.** Provenance is not a belt-and-braces check here; it is the only defence that exists.
+
+**The corollary inverts, in the binding's favour.** "A run that does not publish a digest per output
+cannot afterwards be bound to its outputs by anything stronger than a timestamp" is true of
+chain205 — but **chain196 did publish one, and that is what identified the intruder.** The mechanism
+is not a proposal for a future chain, it is a precedent one chain back. Write it as: **seal each
+output as it closes, as chain196 did.** And note what it bought, because integrity is not what was
+asked of it: **a per-output digest is an identity check, not only an integrity check.** It answered
+*which run this was*. No integrity check is ever asked to do that.
+
+Two consequences taken up now. First, chain205's six passes get sealed from outside the producer,
+the instant the run's completion marker lands — the earliest sealing point reachable without editing
+a live runner. Second, `c205an` stops being an intruder and becomes an asset: chain196's `c0` and
+chain205 are two independent six-pass runs over the same 22,920 cells on the same host, so the pair
+supports a **cross-chain replication of the full-collection board** at no measurement cost. That is
+worth more than the 0.19% pass-1 figure it started from, and it is reported as a replication, never
+as a second confirmation of the same run.
