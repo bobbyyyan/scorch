@@ -33946,3 +33946,63 @@ its size at the read point. Recorded here with both numbers so the decision has 
 Caveat on all of the above: `oursb/ours` within a single pass compares two measurements in the same
 process, so it bounds within-run A/A, not the across-pass floor the board will use. The across-pass
 floor is what the six passes measure, and it may be much tighter.
+
+### The across-pass floor is LOOSER than the within-pass one, and the peak's location is partly an estimator artefact
+
+chain196 has six sealed passes over the same 4,584 keys, so the residency prediction was testable
+tonight rather than at 05:33. Three floor estimators on the same 22,920 cells, all complete in all
+six passes, using the symmetric statistic `|ln(x/y)|` over unordered pairs so orientation cannot
+enter (reported back as `exp(|ln r|)-1`):
+
+    A  within-pass A/A      |oursb(p)/ours(p)|, pooled over 6 passes        1 vs 1
+    B  across-pass same-arm |ours(pi)/ours(pj)|, all 15 unordered pairs     1 vs 1
+    C  the 3-vs-3 split     |med(ours,p1-3)/med(ours,p4-6)|                 3 vs 3
+
+    band       cells   A p95    B p95    C p95    B/A    C/A
+    < 1e3      2835    0.0612   0.0804   0.0483   1.31   0.79
+    1e3-1e4    4150    0.0827   0.1157   0.0745   1.40   0.90
+    1e4-1e5    9665    0.4985   0.5545   0.1982   1.11   0.40
+    1e5-1e6    3890    0.4561   0.6347   0.3308   1.39   0.73
+    1e6-1e7    2005    0.3071   0.6326   0.3653   2.06   1.19
+    > 1e7       375    0.0643   0.1693   0.0846   2.63   1.32
+
+**B/A > 1 in all six bands.** Comparing like for like — both 1-vs-1 — the across-pass floor is
+*looser* than the within-pass A/A everywhere, by 1.11× to 2.63×. The checker's reading, that the
+across-pass floor is tighter by up to 2.1×, came from comparing C against A: C aggregates three
+passes on each side, and `C < B` in all six bands by 1.7–2.8×. That gap is the averaging, not a
+property of the floor. **So my caveat was right about direction of uncertainty and wrong about its
+sign** — the real pass-to-pass floor is wider than the within-pass proxy, which makes "behind
+beyond floor" *more* likely to be vacuous, not less.
+
+**The peak marches right with the estimator, so its location is not purely mechanistic:**
+
+    peak under A (within-pass, 1v1)   1e4-1e5
+    peak under B (across-pass, 1v1)   1e5-1e6
+    peak under C (across-pass, 3v3)   1e6-1e7
+
+Attributing the shift to superposed mechanisms reads a mechanism into a change of estimator.
+
+**But the superposition claim survives, and the evidence for it is `B/A` rather than where C
+peaks.** Adding across-pass variation barely moves the left flank (B/A = 1.11 at 1e4–1e5) and
+transforms the right (2.06 at 1e6–1e7, 2.63 above 1e7). So there is a distinct across-pass
+mechanism concentrated at large sizes, which is what the checker argued. My residency story
+predicts the > 1e7 band is quiet, and within-pass it is the quietest of all at 0.064 — that
+prediction holds; it is the across-pass component at those sizes that it does not explain.
+
+**And one point back the other way: C is not an arbitrary choice, it is the right floor for this
+board.** The board's cell statistic is a median over passes, so the floor must bound the
+variability of *that* statistic, which is what a 3-vs-3 split approximates — B would be the right
+floor for a single-pass board. The error was labelling C "the across-pass floor" and comparing it
+to A as though the comparison isolated pass-to-pass structure. **An estimator has to match the
+statistic it bounds**, and the two of us picked different ones and compared the results.
+
+With the board's own estimator, the floor to expect on the six passes is roughly 5% below 1e3
+nonzeros, 20–37% from 1e4 to 1e7, and 8% above — so at the peak band "beyond floor" stays hard to
+fire, while at both ends it is usable. That makes the per-band question sharper, not softer, and it
+remains Bobby's call. The checker's caveat also stands: per-band is a *post hoc* stratification
+chosen after seeing the tail, and needs that label wherever it appears.
+
+Caveat carried from the checker: chain196's object is the prefetch-era build (`REGBLOCK_PFD 2` /
+`ROW_PREFETCH 1`), not `c199`, so any per-width comparison mixes replication with a build
+difference. The floor comparison above is clean, because `oursb` is the same-object construction in
+both.
