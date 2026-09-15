@@ -33287,3 +33287,63 @@ measured and rejected on x86 at −9 to −11% on the caller path. So the neares
 right way and does not transfer, and the sign on x86 stays open. What does not depend on the sign is
 that four inertness arguments are false in a configuration a caller can reach with one call to
 `torch.set_num_threads`.
+
+## chain204 is running on MKT, and its analysis reproduces chain203's headline before it sees new data
+
+Job **17439864** on `mkt1`, three arms (`ovp` override −1, `ov64`, `ov64b`), 89 keys, k ∈ {2, 4, 32},
+30 passes, pool pinned at 64, 24-hour wall limit.
+
+**The analysis was validated against the sealed result before the new data existed.** `an_c204.py`
+is written independently of `an_c203.py` but copies its conventions deliberately — per-cell ratio as
+the median over shared passes, four reductions, bootstrap over the cell-key-sorted vector with
+`statistics.quantiles(n=1000, method="inclusive")` at q[24]/q[974], membership and value digests.
+Pointed at `chain203-rungwise-redwood` with `--subject ov24 --ambient ovp` it reads:
+
+    k=32 HIGHER   n=25 cells, 550 rows
+      gm-rows 1.2123   med-rows 1.1486   gm-cells 1.1806   med-cells 1.1441
+      band [1.0741, 1.3115]   floor 0.44%   verdict FASTER, all four nestings agree in sign
+      members 1ec8352efdd15bc6   resolved: ambient 1..23 -> subject 24
+
+chain203 published **14.4%–21.2% depending on nesting**: med-cells 1.1441 → 14.4% and gm-rows
+1.2123 → 21.2% are the two ends, and gm-cells 1.1806 against its published 1.1805 differs in the
+fourth decimal only. The membership digest `1ec8352efdd15bc6` is the same value chain203 recorded
+for chain202's ADOPT group. Every NULL group reads inside its own floor and every LOWER group is
+empty at all three widths, which is the theorem for an override equal to the pool. So a second
+implementation reproduces the headline, its floor, its group membership and its null controls.
+
+**The recruit decline is inert in chain204's allocation, and the analysis measures that rather than
+arguing it.** The decline needs `resolved >= 2*pool`; with pool 64 that is 128 and the policy caps
+at `omp_get_num_procs()`, which the runner refuses unless it equals 64 — the log line is `pool 64 ==
+affinity == policy num_procs ceiling`. The analysis then checks the observable directly: a positive
+override is the final cap unless the cap declined, so `resolved > override` on any cell *is* the
+decline, and the stage-0 check refuses if any appears. Both controls run:
+
+    ov24 / ov24b on chain203  ->  pool 24, 0 cells with resolved > override   (passes)
+    ov2  / ov2b  on chain203  ->  48 arm-cells with resolved > override, rc=1 (refuses)
+
+The 48 is arm-cells, not cells: the same 24 cells on each of the two arms. Naming that here because
+48 beside chain203's published 24 would read as a disagreement.
+
+**A defect I introduced and caught before it cost anything.** The first body skipped an arm-pass
+whose CSV was merely non-empty. `mrgate_ov.py` writes its header at open, so a wall-clock kill
+leaves a non-empty partial file that a resume would treat as complete and silently drop the rest of
+that arm-pass. The replacement requires exactly 802 lines — verified empirically as the only
+distinct line count across all 242 of chain203's CSVs, not computed as 89 × 3 × 3 + 1 — and rewrites
+anything else. It was then exercised for real: the first submission was given a 12-hour limit
+against a measured 8.6 minutes per arm-pass, which is 12.9 hours for 90 of them, so I cancelled my
+own job 17439687 and resubmitted at 24 hours. The resumed run's first log line is `ov64 p1 is
+PARTIAL (612 of 801 rows) -- rewriting`. The guard fired on its own input on its first opportunity,
+which is the only reason the 612-row file is not now part of the data.
+
+**And an attestation gap spanning both the source and the object.** `scorch_policy.h` has **0
+copies and 0 manifest lines** in the spmm-beat-mkl cache; `.h` files in this milestone number
+**0**, against 250 sealed `.py`/`.sh`/`.cpp`. It is not a convention — codex-wide there are 9
+manifest lines naming `scorch_policy.h` — this milestone simply does not seal headers. Put beside
+`.tgz` manifest lines codex-wide, which are also **0**, the consequence is that **neither the source
+of the policy argument nor the object built from it is attested anywhere in this milestone.** Every
+source citation in this document therefore rests either on branch HEAD or on the unattested tarball,
+whose digest is now recorded here only because it was computed by hand. The two copies also differ:
+branch HEAD carries about 25 lines more than the tarball somewhere between line 400 and line 1401,
+so citations agree exactly up to `:399` and need +25 after it — the header at HEAD is 2475 lines and
+158,658 bytes. Found by the checker session, whose positive controls on the same population
+(`mrbuild.sh` 7 copies, `csrresolve.py` 4, `spmmstat.py` 6) show the predicate fires.
