@@ -33476,3 +33476,58 @@ files 713 bytes apart, and `chain196-fullcollection-redwood/SHA256SUMS` names no
 all — it pins its body, its runner, `mrbuild.sh`, its waiter and three analysis scripts, but not the
 program that wrote its data. Codex-wide there are exactly two `mrgate*.py` files, so unlike
 `mrbuild.sh` there is no per-chain pinned copy to cite instead.
+
+### The fix reproduced the band and the check it shipped with did not
+
+The index-matrix convention worked on the first attempt: the checker session independently read
+**[1.0662, 1.3032]** for the effect and an outer floor edge of **0.43%**, identical to all four
+published decimals at both ends, with the same index matrix — `np.random.default_rng(253674).
+integers(25, size=(2000,25))`, matrix sum **599742** on both sides, first row `10 23 3 11 20 13 21
+16 …`. That is the first band in this document to land exactly on a second implementation, and it
+settles two things by reproduction rather than assertion: the shared-index convention between a
+floor and the effect it gates, which yields 0.43% and not 0.42% or 0.44%; and that the percentile
+rule still has to be *named*, because a plain order statistic `s[int(0.975*2000)]` moves the upper
+bound to 1.3033.
+
+**And the digests published to make it checkable were not checkable.** They tried ten
+serialisations of the sorted statistic vector — `float64.tobytes()`, `%.17g` with and without a
+trailing newline, `repr`, `%.12g`, `%.6f`, comma-joined, memoryview — and got ten values, none of
+them `b9e5e9fb3b7998ec` or `a212aeed3033ff30`. Since the band agreed to four decimals at both ends
+on both vectors, the vectors themselves agree, so **the digest as published turns a correct
+reproduction into a mismatch.**
+
+The recipe is `"\n".join("%.12e" % v)`, single newline, no trailing newline, and it reproduces both
+values exactly — verified here by recomputing from the sealed CSVs. `%.12e` was the one format they
+did not try, which is the whole point: a digest without its serialisation is not evidence, and this
+is the serialisation defect recorded two sections above **reappearing inside the fix built to close
+it**, one round later, in the check rather than in the band. Both analyses now print the recipe
+beside the values, with the reason.
+
+**The p95 rank defect, sized.** `int(0.95*(n-1))` against nearest-rank is a fixed off-by-one in
+rank, so its error in percentile terms goes as 1/n:
+
+    n        index used   nearest-rank   effective percentile
+    3            1             2              66.7%
+    6            4             5              83.3%
+    10           8             9              90.0%
+    20          18            18              95.0%   <- coincide
+    22          19            20              90.9%
+    40          37            37              95.0%   <- coincide
+    4584      4353          4354              95.0%
+
+So it was genuinely latent at n=4584 and catastrophic at small n — which is exactly why a small-n
+synthetic corpus is the control that finds it. Two details worth keeping: my 22-matrix corpus sits
+in the affected region at 90.9%, and the two indices *coincide* whenever 0.95n is an integer, so a
+control built at n=20 or n=40 would have passed and told me nothing.
+
+**One correction to a correction: the `mrgate.py` line counts do compare.** The concern was that
+"136 lines" against "125 lines" might pair a physical count with a non-blank one, in which case the
+11-line gap agreeing with the 135−124 offset would be coincidence. Both figures are `grep -c .`, and
+measured under both predicates the gap is 11 either way:
+
+    attested harnesses/mrgate.py   137 physical   125 non-blank   7460 bytes   RNG at physical 124
+    /scratch/bobbyy/mrgate.py      148 physical   136 non-blank   8173 bytes   RNG at physical 135
+
+So the RNG line moving by exactly 11 is a consequence of eleven lines inserted above it, not a
+coincidence, and the conclusion rests on three agreeing quantities rather than on the 713 bytes
+alone. The caution was the right shape and the check clears it.
