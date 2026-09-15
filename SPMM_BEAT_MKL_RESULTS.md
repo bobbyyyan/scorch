@@ -36481,3 +36481,80 @@ because two pipelines can disagree on a count while agreeing on every cell, and 
 handle for locating the disagreement. Naming the three cells settled it in one pass and was cheaper
 to compute than the grid. Beside a disputed count, print the members — a membership list is
 falsifiable by one row, a count only by another count.
+
+### Correction: the partition summed to n and still misrouted a cell between the tails
+
+The grid in the previous section is wrong in its `behind` and `ahead` columns, and the defect is
+mine. A peer session found it, and it reproduces on independent recomputation. The band column and
+the three named cells stand; the triples do not.
+
+**The defect.** Band membership was decided with the log-symmetric deviation, `exp|ln S| - 1 <= fl`,
+while `behind` was counted with a linear threshold, `S < 1 - fl`. Those two rules are the same rule
+under `|x-1|` and differ **only on the behind side**, because for every `S > 1`
+
+    exp|ln S| - 1 = exp(ln S) - 1 = S - 1     exactly
+
+so the ahead side cannot depend on which form is used. Mixing them means a cell can be outside the
+band by the deviation test and inside `1 - fl` by the threshold test. `ahead` was then computed as
+`n - behind - band`, so that cell was credited to **ahead** while being 3.6% slower than MKL. The
+partition still summed to 22,920, which is why it read as consistent.
+
+**The cell.** `ss/.../TSOPF_RS_b162_c1` at k=4 on chain196, `S = 0.964074`: deviation 0.037265
+against a nearest-rank floor of 0.037246, so it is beyond the floor on the **behind** side. On
+chain205 the same defect misrouted `circuit_1` at k=2, `S = 0.952519`, deviation 0.049848 against
+0.049813.
+
+**The corrected grid.** The site at which the deviation scale is applied is a fourth axis, not a
+detail: rule A is the threshold form (`behind` iff `S < 1 - fl`), rule B the deviation form
+(`behind` iff `S < 1` and `dev(S) > fl`). Sixteen configurations per dataset,
+`behind / band / ahead`:
+
+    reduction      devscale      p95      site A                site B            A->B moves
+    chain196 c0
+    med(lin)       |x-1|         nearest  66/115/22739          66/115/22739          0
+    med(lin)       |x-1|         interp   66/115/22739          66/115/22739          0
+    med(lin)       exp|ln x|-1   nearest  66/116/22738          66/116/22738          0
+    med(lin)       exp|ln x|-1   interp   66/116/22738          66/116/22738          0
+    exp(med(log))  |x-1|         nearest  67/117/22736          67/117/22736          0
+    exp(med(log))  |x-1|         interp   67/118/22735          67/118/22735          0
+    exp(med(log))  exp|ln x|-1   nearest  67/118/22735          68/117/22735          1
+    exp(med(log))  exp|ln x|-1   interp   67/118/22735          67/118/22735          0
+    chain205
+    med(lin)       |x-1|         nearest  61/107/22752          61/107/22752          0
+    med(lin)       |x-1|         interp   61/107/22752          61/107/22752          0
+    med(lin)       exp|ln x|-1   nearest  61/113/22746          63/111/22746          2
+    med(lin)       exp|ln x|-1   interp   61/113/22746          61/113/22746          0
+    exp(med(log))  |x-1|         nearest  62/111/22747          62/111/22747          0
+    exp(med(log))  |x-1|         interp   62/111/22747          62/111/22747          0
+    exp(med(log))  exp|ln x|-1   nearest  62/114/22744          63/113/22744          1
+    exp(med(log))  exp|ln x|-1   interp   62/115/22743          62/115/22743          0
+
+Under the configuration this milestone published — log reduction, log-symmetric deviation,
+nearest-rank floor, deviation form — the gated count is **68 on chain196 and 63 on chain205**, not
+67 and 62. The previously published triples `67/117/22736` and `62/113/22745` match neither rule:
+they carry rule B's band with rule A's behind count, which is the defect in one line.
+
+**Consequences for the two standing statements.** Over all sixteen configurations the gated count
+takes **three** values per dataset — {66, 67, 68} on chain196, {61, 62, 63} on chain205 — so the
+earlier "two-valued over 32 configurations" was rule-A-only. **The convention argument is worth two
+cells, not one.** Against the design gap's nineteen that is 9.5 to 1 rather than 19 to 1, which does
+not change the ordering: which A/A test defines the floor is still the only open convention decision
+that moves the headline materially. The band's 4 and 10 distinct values are unchanged.
+
+**The headline is unmoved.** chain205 reads 61 against chain196's 66–72 build-to-build band at the
+old baseline and 63 against 68 under the full fix. Same gap, same sign: **chain205 reproduces
+chain196 and does not beat it.**
+
+**Two checks now assert what the defect violated, and one of them is free.** The ahead-side
+invariance is an algebraic identity — `exp|ln S| - 1 = S - 1` for all `S > 1` — so `ahead` must be
+bit-identical between rules A and B in every configuration. That is now asserted and holds in all
+eight per dataset; it would have failed on the first run of the broken code, because the misrouted
+cell landed in exactly that column. The second is the floor-width monotonicity theorem: a wider
+floor cannot increase `behind` nor decrease `band`. It holds in all eight. A partition summing to
+`n` is not evidence of a correct partition — `ahead = n - behind - band` makes the total an identity
+and hides every misrouting inside it. Count each class from its own predicate and assert the sum
+separately.
+
+**The transferable rule, which is worth more than the two cells.** When the deviation scale is
+two-sided, every instrument built on `x - 1` is blind to exactly one tail, and on this board the
+tail it is blind to is the one the whole milestone is about.
