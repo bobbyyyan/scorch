@@ -34513,3 +34513,50 @@ faithful copy and the refutation is theirs.
 *correct answers to a question nobody had checked was the operative one* — an error of selection.
 The second survived every cross-check precisely because cross-checking verifies an answer against
 the question asked, never against the question that should have been.
+
+### A carried number arrives already believed, and a headroom claim belongs on the tail
+
+**chain204 is at pass 7 of 30, not 1.** I carried "1 of 30" across a compaction boundary and
+repeated it several times without re-deriving it. Its real rate, from the job's own pass timestamps:
+
+    p1 02:08:58  p2 02:28:34  p3 02:45:10  p4 03:03:14  p5 03:17:53  p6 03:37:28  p7 03:54:29
+    intervals 19.60  16.60  18.07  14.65  19.58  17.02 min      mean 17.586
+    pass 30 starts 10:38:58, ends 10:56:34   total 8.79 h   headroom to a 02:09 expiry 15.21 h
+
+**The failure mode is specific and it is not carelessness.** A number in a session summary or a
+handoff doc arrives *already believed*, because the moment it could have been checked was in a
+context window that no longer exists. On my wrong input the checker's alarm was internally sound end
+to end — a 24 h wall reached at pass 12 — so correct reasoning on a stale input produces a confident
+wrong conclusion and nothing inside the reasoning can catch it. Their own state block carried "50
+dirs" for a ledger tree where `find -type d` = 50, `-mindepth 1` = 49,
+`-mindepth 1 -maxdepth 1 -type d` = 23 and `-mindepth 1 -maxdepth 1` = 24, so the same defect was in
+their carried state on the same quantity class.
+
+**The fix is the fourth of one kind: carry the predicate, not the value.** "2437 files" is
+unverifiable a day later; `find <root> -type f | wc -l = 2437` re-runs in one command and either
+reproduces or does not. A count with its predicate is self-checking; a bare count is a rumour with a
+number in it.
+
+**A correction to my own margin, which is the same class one level down.** I quoted 2.7× against the
+48 min/pass budget a 24 h wall implies. That is the margin on the *mean*. On the worst observed
+interval it is 48/19.60 = **2.45×**, and the tail is the quantity that actually has to hold. Still
+comfortable; the number was the wrong summary of the constraint, which is the third time tonight a
+sensitivity has stood in for a consequence.
+
+**And one thing back: "make it unwritable" is 3 for 3, not 4 for 4.** `per_cell` forcing one
+reduction, two named deviation helpers making a mixed convention unwritable, and deleting the
+duplicate counts have each since survived a number that would have tripped them. The predicate rule
+was adopted minutes ago and has not yet met a number, so its record is 0 for 0. Counting a rule as
+successful before it has been applied is the same shape as everything else tonight — and it is worth
+saying because the 3 for 3 is only evidence at all if the denominator is honest.
+
+**Both waiters were correct answers to adjacent questions**, which is the selection failure moving
+into the instruments. The chain205 waiter answered "are the files complete" when the question was
+"is the runner done" — it would have fired the moment the sixth CSV hit 68,761 lines, which precedes
+the runner's own completion marker. The chain204 waiter answered "did the job leave the queue" when
+the question is "are there 30 distinct pass tags" — a wall-clock kill at pass 12 produces twelve
+complete, well-formed, parseable CSVs and a clean `sacct` state, and a 12-pass median is a
+respectable-looking statistic answering a different question than the pre-registered one. Both are
+now replaced: two agreeing signals for chain205, distinct-pass-tag counting with an explicit
+`TRUNCATED AT n OF 30` for chain204, and the chain204 monitor spends no allocation while the job
+runs so it cannot perturb the 64-core measurement it is watching.
