@@ -34171,3 +34171,38 @@ same-side count and `|median - 1| > 0.10` for displacement — the asymmetric fo
 conventions, both defensible, compared as though identical" occurred inside the script that found
 the third. The lesson is not to prefer the log-symmetric form once but to make it the only form
 available: a single helper, used everywhere, so a mixed convention is not expressible.
+
+### I nearly amended a pre-registered estimator while fixing the convention defect
+
+The structural fix for the mixed-convention defect is right: one helper, used everywhere, so a mixed
+convention is not expressible. Implementing it in `an_c205.py` I made the single helper the
+log-symmetric form — and the stage-1 floor moved:
+
+    k      pre-registered |x-1|   log-symmetric   relative
+    2      0.3163                 0.3850          +21.7%
+    4      0.2852                 0.3333          +16.9%
+    8      0.2782                 0.3258          +17.1%
+    16     0.3388                 0.4174          +23.2%
+    32     0.3616                 0.4678          +29.4%
+
+That is not a change of notation, it is a change of gate: the floor decides which cells count as
+behind. The sealed `an_c203.py:753` computes its margin as `max(|lo-1|, |hi-1|)` — the asymmetric
+form — so switching is an amendment to the convention the predecessor was pre-registered under. A
+verifier reports the size of such a thing; adopting it is Bobby's call. **Reverted.**
+
+`an_c205.py` now has exactly two named helpers, `dev_prereg` (|x-1|, chain203's, the operative
+floor) and `dev_logsym` (orientation-independent, printed beside every floor and never gating), with
+the relative gap shown per width. The structural property survives the revert — every deviation goes
+through one of the two named helpers, so a *mixed* convention is still not expressible, which is the
+defect that actually happened four times tonight. Preferring the right form was never the fix,
+because the form was already preferred both times it was mixed.
+
+Recorded with its timing, since that is what makes it a real constraint rather than a formality:
+this was decided with two of six passes landed and pass 1 already inspected. An estimator chosen
+after seeing part of the data is weaker than a pre-registered one, which is exactly why the
+improvement does not get to be quiet.
+
+**The decision for Bobby, with both numbers in hand:** the log-symmetric floor is 17–29% wider at
+every width and cannot depend on which arm is the numerator; the asymmetric one matches the sealed
+predecessor and so keeps chain205 comparable with chain203 and chain202. The two are not reconcilable
+after the fact, because the choice changes the behind counts the stage exists to produce.
