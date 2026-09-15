@@ -36690,3 +36690,79 @@ description of it stays true. "Two identical-source builds" sounds like a statem
 practice it was a statement about processes, and the object term is zero. **State the process
 structure of an A/A test alongside its code structure**, or the floor will silently answer a question
 nobody asked.
+
+### The replicated core is 24 cells, and three unfitted predicates cover 21 of them
+
+Choosing between floors was standing in for a question that replication answers directly, and three
+independent measurements already exist. Each is gated by **its own** within-process arm-identity
+floor — the matched null the decomposition above establishes — so no cross-measurement floor choice
+enters. A peer session proposed this; every figure below was recomputed independently and agrees.
+
+    measurement              beyond floor
+    c0                            68
+    c0b                           76
+    c205                          63
+    c0 & c0b                      37     within-chain REBUILD replication (one source, adjacent in time)
+    c0 & c205                     30     cross-chain (different chain, days apart)
+    c0b & c205                    31     cross-chain
+    ALL THREE                     24     the reproducible core
+    union                        133
+    in EXACTLY ONE of three       83     62% of everything ever flagged
+
+**Sixty-two percent of the cells ever flagged are flagged by only one of the three measurements.**
+The core is 24 cells over 21 distinct keys and 20 distinct `(rows, nnz)` shapes, so at most 20
+independent problems. By width it is **8 / 14 / 2 / 0 / 0** — twenty-two of twenty-four at k=2 and
+k=4, two at k=8, **none at k=16 or k=32**. The three labels are three different claims and 24 is the
+strongest: it survives a rebuild *and* a different chain days later.
+
+**Three predicates, none of them fitted to these 24 cells.** The standing constraint rules out a
+kernel that becomes a pile of if-cases with no fundamental reason, so a population counts here only
+if its predicate is a pure inequality between two counts of the matrix, or fixed by the ISA:
+
+    EMPTY   nnz < rows          most rows are empty, so per-row overhead is the whole cost
+    FAT     nnz > rows^2/2      rows are longer than the matrix is tall: too few work units for 24 threads
+    K4      k == 4              4 float32 = 128 bit = HALF of AVX2's 256-bit vector, on an AVX2-only host
+
+    predicate   population         union rate      core rate      core lift
+    EMPTY       2135 of 22920       0.19%           0.187%           1.8x
+    FAT          455 of 22920       7.03%           1.758%          16.8x
+    K4          4584 of 22920       1.35%           0.305%           2.9x
+
+**Together they cover 21 of 24 core cells (88%).** The three that remain are all k=2, mid-size and
+low degree: `case9` (nnz/rows 10.24), `poli` (2.04), `Chebyshev3` (8.99).
+
+**`FAT` is the finding.** It is 1.99% of cells and carries a 16.8× core lift; 7% of all `FAT` cells
+are behind MKL in at least one measurement. And it is not a noisier population — its own A/A floor
+is 0.0557/0.0467/0.0365 at k=2/4/8 against the collection's 0.0468/0.0372/0.0477, so it is *wider*
+at two of three widths while 12× more of its cells clear it. A noisy population produces fewer cells
+past its floor, not more.
+
+**The two structural families sit at opposite ends of one axis**, which is why this reads as a
+mechanism rather than two special cases:
+
+    EMPTY    nnz/rows  0.497 ..     0.782     4 cells
+    middle   nnz/rows  2.04  ..   389.46     12 cells
+    FAT      nnz/rows  793.4 .. 12396.0       8 cells
+
+A row-parallel register-blocked kernel is worst at both ends of the mean-degree distribution: at the
+low end every row costs dispatch overhead and carries almost no arithmetic; at the high end there
+are 71–582 rows to spread over 24 workers, so occupancy, not throughput, is binding. k=4 is then the
+width where the register block runs at half vector occupancy.
+
+**Two cautions that stop this being over-read.**
+
+First, **this is not a corpus-blindness story.** The curated 89-key corpus that every arm claim
+before 2026-09-10 used contains **11 of the collection's 91 `FAT` matrices** and 12 `EMPTY` ones,
+including every worst core offender — `connectus`, `nw14`, `kl02`, `bibd_17_8`, plus `us04` and
+`rail507/516/582`, which also dominate the worst readings in the prefetch arm. These matrices were
+measured all along. The population was under-*weighted*, not absent.
+
+Second, **`FAT` as written admits a degenerate case**: `S10PI_n1_C` is 1 row and 1 nonzero, and
+`1 > 1/2` holds. The predicate is sound as a description of the core and would need a minimum-size
+qualifier before it could gate anything. Recording that now rather than discovering it in a gate.
+
+**The open question this raises about a closed result.** chain193 closed row splitting with "the
+ceiling is occupancy, not time". Occupancy is exactly what is binding on the `FAT` population, which
+is where splitting has the most room — 71 rows over 24 workers. Whether chain193's corpus weighted
+that population enough to close it there is not established by anything in this document, and it is
+the next thing to check rather than to assume in either direction.
