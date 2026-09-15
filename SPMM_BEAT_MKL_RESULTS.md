@@ -32825,9 +32825,8 @@ counts stdout lines is fooled; one that tests exit status or reads stderr catche
 
 The direction is still the dangerous one where it does bite — a genuine freshness null and a
 rejected argument both print 0, so the null reads confirmed *and* the control meant to prove the
-population non-empty also reads 0. **No harness of mine uses `-newermt`** (0 files), so nothing
-here is affected; the ledger-staleness readings in this document came from `ls`/`stat` mtimes and
-Python, not from `find`.
+population non-empty also reads 0. **Two harnesses do use `-newermt`** — see the correction below; the
+claim of zero was a population error.
 
 **2. A 16- or 32-hex digest does not name its function.** On the identical input stream:
 
@@ -32855,3 +32854,53 @@ turned out to be empty looks like: a broken filter, an empty glob, a `cd` that f
 analyzer already prints it legitimately, once, labelled `(the empty group)` for `ov24/LOWER n=0` —
 so the same 64 characters are a correct result in one row and evidence of a broken command in
 another, and only the label distinguishes them.
+
+### Four corrections to the section above, including the fix that is not a fix
+
+**1. `/usr/bin/find` is not the safe default. The two binaries have complementary gaps.**
+
+| `-newermt` argument | `bfs` (shell `find`) | `/usr/bin/find` |
+|---|---|---|
+| `'7 days ago'` | 0, exit 1 | 2150, exit 0 |
+| `'@1788851438'` | 2150, exit 0 | **0, exit 1** |
+| `'2026-09-08'` (ISO) | 2150, exit 0 | 2150, exit 0 |
+
+BSD `find` rejects the **epoch** form that bfs accepts. So "call `/usr/bin/find` explicitly" —
+which the section above recommends — breaks the epoch form, and only the **ISO absolute** form
+works under both. That is the rule to carry.
+
+**2. "No harness of mine uses `-newermt` (0 files)" was a population error.** It is **2 of 187**,
+and both are live:
+
+```
+harnesses/poll_mkt.sh:21    ssh … sc "find /matx/u/bobbyy/staging/${STAGE}_mkt.tgz -newermt '@'$T0 … | wc -l"
+harnesses/poll_stage.sh:36  same form
+```
+
+I searched the scratchpad and both git worktrees and never searched
+`~/.cache/scorch-codex/spmm-beat-mkl/harnesses/` — the directory where this milestone's harnesses
+actually live. Positive controls on that population, so the predicate is not vacuous: 187 files,
+8 match `find `, 2 match `shasum`.
+
+**The conclusion survives, for two reasons I did not state instead of the one I did.** The form is
+absolute epoch, not an English phrase, and the `find` executes **inside `ssh … sc`** where it is
+GNU findutils, not the local bfs. Both guards are therefore fine as written.
+
+**But the local-failure shape is worth recording**, because `poll_mkt.sh:18-19` says what the
+guard is for: *"the tarball must be NEWER than this poller, or it is a previous stage's output
+under a name this stage inherited — a defect that has happened once here and reads as a complete
+run."* If that `find` ever ran under BSD find, `fresh` would be 0 unconditionally and
+`if [ "${fresh:-0}" = "0" ]` would take the refuse branch forever. **Fail-closed** — a stuck
+poller, not a stale pull — but the guard would have stopped being a test while still reading as
+one.
+
+**3. `e3b0c44298fc1c14` appears four times, not once, and only one is labelled.** All in
+`c203_analysis.txt`: bare table rows at lines 133, 148, 163 (`ov24/LOWER 0 e3b0c44298fc1c14` for
+k=2/4/32) and the summary at line 176 carrying `(the empty group)`. So "only the label
+distinguishes them" is true of **1 in 4** — three legitimate appearances are unlabelled entries in
+a digest column, which strengthens the point rather than weakening it.
+
+**4. My own `find` counts had an unnamed predicate — inside the section about unnamed predicates.**
+I reported 2336 and 2150; the file counts are 2304 and 2121. The gap is directories, which I did
+not filter or mention: **2304 files + 32 dirs = 2336**, and 2121 + 29 = 2150. Both are correct
+numbers for different questions, and I published one while describing the other.
