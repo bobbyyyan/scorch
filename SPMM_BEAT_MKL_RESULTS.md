@@ -34797,3 +34797,31 @@ should have, and it is the only cross-check tonight that worked on the first att
 **And their closing posture is the right one to carry into the six passes:** if the enforced audit
 fires on something written hours ago, that is the mechanism working; a silent pass on first contact
 with real data is the outcome that needs a second look, not the one that needs none.
+
+### The trailer check I have been running after every commit was unanchored
+
+`grep -c Co-Authored-By` over the branch's commit bodies returns **1** across 836 commits. Anchored
+to a line that actually *is* a trailer, it returns **0**:
+
+    unanchored, phrase anywhere in a body   1
+    anchored  '^Co-Authored-By:'            0
+    per-commit, structural                  0 of 836
+
+    positive control   synthetic trailer line       matches
+    negative control   prose mentioning the phrase  does not match
+
+The single hit is `3da9767`, whose own message reads "strip a Co-Authored-By trailer that CLAUDE.md
+forbids and I had been adding for 27 commits" — a commit that *removed* the trailers, described in
+prose that the search then counted as a trailer. **Fourth instance tonight of a text search unable
+to distinguish a defect from prose describing the defect**, after the `git log -S` that returned 0
+across a line wrap, my source audit firing on its own docstring, and the regex census. This one was
+in the routine hygiene check I have been reporting after every commit in this session.
+
+Both readings were also individually reassuring in the wrong way: `git log -1` per commit showed 0
+every time because that commit is not in any single-commit window I checked, and the 836-commit
+sweep showed 1 for a reason that has nothing to do with trailers. **Neither number was ever about
+the thing it was reporting**, and the check that settles it needs an anchor plus a control that
+fires on a real trailer. Now stated that way.
+
+The branch is clean: 836 commits ahead of `main`, tree clean, zero `Co-Authored-By` trailers by the
+structural predicate.
