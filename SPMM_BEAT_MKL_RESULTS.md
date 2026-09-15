@@ -33890,3 +33890,59 @@ own `0` and then my fallback `0` — two zeroes per file, the same two-line trap
 against themselves earlier tonight. I read it correctly, and the count is right, but the
 instrument was wrong in the same command where I was checking someone else's. Third appearance of
 that pattern tonight across two sessions.
+
+### chain205 pass 1 of 6: the pooled figure replicates chain196, and the A/A floor is not shaped how I said
+
+One pass has landed (68,760 rows, 22,920 cells, 4,584 matrices × 5 widths, all three labels).
+**One pass, so there is no across-pass floor and no CI** — everything below is preliminary and the
+board proper waits for six.
+
+    mkl/ours, pass 1 only, above 1 means we are faster
+    k      cells   gm       median   behind   pct behind
+    2      4584    1.7034   1.4859   209      4.6%
+    4      4584    1.9270   1.7278   117      2.6%
+    8      4584    2.3319   2.6399   40       0.9%
+    16     4584    2.7010   2.9309   28       0.6%
+    32     4584    2.8826   3.0245   16       0.3%
+    ALL    22920   2.2649   2.4790   410      1.8%
+
+The pooled 2.2649 sits **0.3% from chain196's sealed full-collection figure of 2.271×** — a
+different chain, a different build, different passes, same corpus. That is the first independent
+replication of that number, and it lands above the 1.5–2.1× band the 89-key corpus gave, which is
+the corpus-size effect already recorded rather than a new result.
+
+**The A/A floor within one pass is heavy-tailed, and I had its shape backwards.** Measuring
+`oursb/ours` — identical code under two labels:
+
+    k      p50|dev|  p95|dev|  p99|dev|  max|dev|
+    2      0.0128    0.3154    0.6068    1.6070
+    32     0.0170    0.3686    0.7070    1.9249
+
+A median deviation of 1.3–1.7% with a p95 of 28–37% is not a noisy population; it is a quiet one
+with a tail. I said the tail would be the tiny matrices the full collection adds. It is not:
+
+    nnz band     cells   p95|dev|   median|dev|
+    < 1e3        2835    0.0611     0.0113
+    1e3-1e4      4150    0.0775     0.0147
+    1e4-1e5      9665    0.3791     0.0123
+    1e5-1e6      3890    0.3868     0.0175
+    1e6-1e7      2005    0.2331     0.0084
+    > 1e7         375    0.0606     0.0080
+
+The tail peaks in the **middle** of the size range and both ends are quiet at ~6%. The plausible
+mechanism is cache residency rather than timer resolution: below ~1e4 nonzeros the working set is
+always resident, above ~1e7 it is always streamed from DRAM, and in between residency is marginal,
+so whether the previous arm left the data warm decides the reading. That is a mechanism, so it
+predicts the inverted-U rather than being fitted to it — and the prediction is testable on the
+remaining five passes.
+
+**The methodological consequence, flagged and not acted on.** Stage 2 counts a cell "behind beyond
+floor" against its **width's** pooled p95. At a pooled p95 of 28–37% almost nothing can ever count
+as behind, so that column would be vacuous — the guard would pass by being unable to fire. A floor
+computed per size band is roughly 5× tighter at both ends. **Changing the estimator is Bobby's
+call, not mine**: the pre-registered choice was per-width, and a verifier reports the defect and
+its size at the read point. Recorded here with both numbers so the decision has them.
+
+Caveat on all of the above: `oursb/ours` within a single pass compares two measurements in the same
+process, so it bounds within-run A/A, not the across-pass floor the board will use. The across-pass
+floor is what the six passes measure, and it may be much tighter.
