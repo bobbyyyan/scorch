@@ -36558,3 +36558,66 @@ separately.
 **The transferable rule, which is worth more than the two cells.** When the deviation scale is
 two-sided, every instrument built on `x - 1` is blind to exactly one tail, and on this board the
 tail it is blind to is the one the whole milestone is about.
+
+### chain196 pre-registered a control for the layout artefact, measured it non-zero, and never applied it
+
+A peer session found this in the sealed ledger and it reproduces. `chain196_body.sh:42-43`
+pre-registers two rules for the prefetch-deletion arm, quoted verbatim:
+
+    P3  (a) THE CONTROL: at width 2 the constant cannot fire, so pfd0 must sit inside the c0/c0b
+            control. Whatever it reads there is the artefact floor every other width must clear.
+
+The sealed analysis applies the first clause and never the second. A discount that is never applied
+is indistinguishable in the output from an artefact of zero.
+
+**The control does not read zero.** Of the 20 inert-width rows (all k=2, where deleting the prefetch
+provably cannot act, so the reading is pure object-level artefact):
+
+    - 10 of 20 have a pfd0/c0 CI that excludes parity
+    -  5 of 20 are disjoint from their own c0/c0b A/A CI
+    -  1 is printed as "FASTER by 0.7%" at a width where nothing can have changed:
+         degree 0-4, n=2010, 1.0066 [1.0047, 1.0087] against A/A 0.9981 [0.9962, 1.0001]
+    - widest inert reading: degree 64-128, n=84, 1.0380 [1.0194, 1.0603] -- 3.8%
+
+That 1–3.8% range is the scale already on record for two objects with identical decisions at narrow
+k, arriving here on the full collection.
+
+**Reproduced before being used.** The bootstrap CIs depend on the order of each band's ratio list,
+which depends on dict insertion order, which depends on CSV row order — so reproducing them is a
+real test of running the sealed pipeline rather than a lookalike. All **100 of 100** sealed rows
+reproduce exactly: n, both point estimates, both 95% CIs, and the verdict string. The sealed rule is
+
+    floor  = max(|alo - 1|, |ahi - 1|)        from the c0/c0b A/A bootstrap CI
+    FASTER iff lo > 1 + floor                  lo = lower 95% bound of c0/pfd0
+
+**Rule (ii) applied, under both readings of the sentence.** "A floor every other width must clear"
+supports widening the floor; treating the inert reading as a multiplicative offset supports dividing
+by it. Widening is the more literal reading and assumes neither that the artefact is multiplicative
+nor that it is width-independent.
+
+    (b) WIDEN  floor' = max(floor, |g(k=2) - 1|)      2 of 80 non-inert verdicts move
+          degree         0-4     k=32  n=2010  1.0094 (inert 1.0066)  FASTER by 0.9% -> inside the floor
+          degree-capped  32-64   k=32  n=176   1.0241 (inert 1.0143)  FASTER by 2.4% -> inside the floor
+
+    (a) DIVIDE g' = g / g(k=2)                        5 of 80 move
+          the two above, plus degree-capped >=128 at k=4, k=8 and k=32 (n=49, inert 1.0183)
+
+**The large claims are untouched.** Of the 31 rows at k=4 and k=8 reading above 1.05, **31 of 31
+still read FASTER under the widening reading**, and under division they fall from 1.0513–1.1425 to
+1.0446–1.1244. What was inside the artefact all along is the **k=32 margin** and the low-degree
+band — which is independently consistent with the per-width geometric means, where the benefit peaks
+at k=8 and k=2 is a coin flip.
+
+**Two cautions on the numbers in this section.** First, an earlier version of this audit reported 11
+verdicts moving. That count came from a "survives" predicate invented for the audit — comparing the
+discounted point estimate against the A/A upper bound — rather than the sealed lower-CI rule, and it
+is withdrawn. A re-derivation that cannot reproduce the original labels cannot be used to say a label
+changed, which is why the positive control runs first and the run stops if it fails. Second, dividing
+by the inert point estimate ignores that estimate's own uncertainty; the widening reading avoids that
+and is the one to quote.
+
+**The consequence for the prefetch lead.** Deleting the register-block prefetch remains a real
+5–12.4% effect at k=4 and k=8, now measured against its own artefact rather than against parity. Its
+k=32 benefit does not survive its own pre-registered control. That does not change the reason it
+cannot ship — 247 regressions that are not width-separable — but it does change what it would be
+shipping for.
