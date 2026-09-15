@@ -35255,3 +35255,65 @@ a single-pass floor is about twice as wide as a per-cell one, which is why the g
 more than the ungated one it was meant to clean up. All three counts go in the report with the
 reduction named on each, and a statement of which one the milestone is stated in. That last part is
 Bobby's to decide, not ours.
+
+### chain204 acquired 48 CPUs of co-tenant 2h34m into a bandwidth-bound timing run
+
+Read from the SC login node only, spending no allocation, so none of this perturbed the job it
+describes:
+
+    mkt1   CPUTot=128   CPUAlloc=128   ThreadsPerCore=2   CPULoad=44.84
+      17439864  c204_rungconf    64 CPUs   started 2026-09-15T02:08:58   limit 24h
+      17443267_0..5 ptbench-pred  8 CPUs each = 48        started 2026-09-15T04:43:04, limit 10h
+                                                          task _6 PENDING
+      17418470  bash (alexh06)   16 CPUs   started 2026-09-13T13:28  -- constant, predates the run
+
+chain204 therefore ran with 16 CPUs of unrelated work beside it for **02:08:58 → 04:43:04**, and
+with 64 from 04:43:04 on, and the array outlives chain204's projected finish so no later pass is
+clean.
+
+**Mechanism, not worry.** `OverSubscribe=OK` shares the *node*, not the CPUs: with
+`CPUAlloc=128=CPUTot` each job holds a disjoint cpuset, so no CPU is stolen. But **memory bandwidth
+and the memory controllers are not partitioned by any cgroup**, and SpMM is bandwidth-bound, so
+absolute times after 04:43:04 are contaminated whatever the pinning guarantees. The co-tenant
+requested **no GPUs** — `ReqTRES=cpu=8,mem=64G` on a node carrying `gres/gpu:l40s=8` — so it is
+CPU-side work and the contention is real rather than assumed. Wall clock is not at risk: elapsed
+2:47 against a limit of 2026-09-16T02:08:58.
+
+**The attribution, and the limit of it.** Every Slurm identity field returns the same value for
+every job on this allocation — `squeue -u bobbyy -O username,account | sort -u` is one row,
+`bobbyy mkt` — so Slurm metadata **cannot** attribute a job to a session, which is precisely why the
+standing rule is to cancel only job IDs one's own `sbatch` returned rather than any name pattern or
+`-u` sweep. What does attribute it is the submit path: `Command=/sailhome/bobbyy/ptbench/
+pred_array.sbatch`, `WorkDir=/sailhome/bobbyy/ptbench`, submitted 04:42:11 — a different project,
+not scorch. Nothing was cancelled and nothing of that project was read beyond its Slurm record.
+
+**What the within-pass reduction buys, and the control that makes it a claim.** The recipe already
+in use — `median-over-passes of (num/den)`, the ratio formed *inside* each pass — means every arm in
+a pass sees the same environment, so ratios survive what absolute times do not. chain204 has thereby
+acquired an unplanned natural experiment with a step change at a known timestamp. **The immunity is
+only demonstrated if the step is demonstrated first:** absolute `ms` must jump at 04:43:04 and be
+quantified, and only then does the ratio's flatness mean anything. Without that positive control
+there was nothing to be immune to, and the result would be an A/A comparison reported as robustness.
+The scale for "the ratio did not move" comes from passes 1–8, which contain no environment change
+and so supply the null distribution.
+
+**Two open items stated before the data lands rather than after.** First, the clean block is 8
+passes, not 9: pass 9 straddles 04:43:04 on the clean-period 17.586 min mean. That mean is only
+valid inside the regime it was measured in, which covers the boundary but **not** the projected
+10:56 finish — the contaminated passes will be slower, so the pass→time map does not extend past the
+boundary it was used to locate. Second, whether the 8/1/21 split costs anything depends on a design
+detail that is unreadable from the login node, because `StdOut` is on `/scr` (node-local to mkt1)
+and the AFS-side `sbatch` is a nine-line wrapper:
+
+    if every pass carries every arm (chain205's shape: 3 arms x 22920 cells every pass)
+        8 clean passes are 8 COMPLETE passes, divisibility over arms never arises,
+        and pass 9 drops as straddled at no cost beyond n=8
+    if arms rotate by pass
+        the clean block is unbalanced 3/3/2 -- excluding pass 9 loses balance,
+        including it imports ~24% of a contaminated pass. Report both and disclose
+        the imbalance: an imbalance is measurable, a contamination is not.
+
+And the contaminated block is **not one condition**: array task `_6` is PENDING and starts when one
+of `_0..5` finishes, so the co-tenant load changes again at a time readable from `sacct` at no
+allocation cost. Treating passes 10–30 as a single level would be the same defect as pooling a
+per-band statistic across bands.
