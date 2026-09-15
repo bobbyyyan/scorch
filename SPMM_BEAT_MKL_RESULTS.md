@@ -34129,3 +34129,45 @@ which arm is the numerator.
 per-reading excursion rate by band moves with cache size**, with D's readability following from it
 by the ≥3-of-6 necessary condition. Two measurable quantities with a derivable one-way relation, so
 a failure says which half was wrong.
+
+### The bracket: ≥3 necessary, ≥4 sufficient, both exact — and the bracket diagnoses its own insufficiency
+
+The threshold repair verifies as arithmetic rather than as a regularity. `statistics.median` of six
+is `(x₃+x₄)/2`, so displacement past 1.10 requires `x₄ > 1.10` (≥3 readings above) and is
+guaranteed by `x₃ > 1.10` (≥4). Over 22,920 cells, fully log-symmetric on both sides:
+
+    displaced but NOT >=3 same-side :   0     necessity at 3, exact
+    >=3 same-side but NOT displaced : 525     sufficiency fails at 3
+    >=4 same-side but NOT displaced :   0     sufficiency at 4, exact
+    totals: >=4 218  <=  displaced 604  <=  >=3 1129      bracket holds
+
+    band       >=4 frac  DISPLACED  >=3 frac  ratio  D p95    D>10%  bracket straddles 5%?
+    < 1e3        0.1%       0.4%      0.7%    2.10   0.0196   no     no
+    1e3-1e4      0.1%       0.5%      0.8%    1.70   0.0233   no     no
+    1e4-1e5      0.8%       2.8%      4.9%    1.78   0.0574   no     no
+    1e5-1e6      2.6%       6.4%     12.4%    1.94   0.1138   YES    yes
+    1e6-1e7      1.5%       2.9%      5.8%    1.98   0.0662   no     yes
+    > 1e7        0.0%       0.0%      0.3%      -    0.0240   no     no
+
+**The displaced fraction predicts contamination in 6 of 6 bands, and it is a tautology rather than
+a fitted threshold** — a 95th percentile lands in the tail exactly when more than 5% of cells are in
+it. The ≥3 and ≥4 counts bracket that fraction, so a cheap count can rule contamination in or out
+without computing the percentile.
+
+**And the bracket diagnoses its own insufficiency, which is the part worth keeping.** It straddles
+5% in exactly two bands — `1e5-1e6` (2.6 ≤ 5 ≤ 12.4) and `1e6-1e7` (1.5 ≤ 5 ≤ 5.8) — and
+`1e6-1e7` is precisely the band where the ≥3 proxy mispredicted. So the guard says "compute the
+percentile, do not infer it" in the one band where inferring it was wrong. A proxy that reports
+when it is not adequate is a different class of tool from a threshold that fits.
+
+The ≥3 count overstates the displaced fraction by 1.70–2.10× here, wider than the 1.8–2.0× claimed,
+and that ratio is an observation about this dataset rather than a rule. The bracket is what carries.
+
+**My 576 was the mixed convention, and it was inside the check that diagnosed the same defect.**
+Recounting with `exp|ln r| - 1 > 0.10` on *both* the same-side test and the displacement test gives
+**525**, matching the checker exactly. My earlier figure used the log-symmetric form for the
+same-side count and `|median - 1| > 0.10` for displacement — the asymmetric form excludes
+`0.900 < x < 0.909` where the log-symmetric admits it. So the fourth instance of "one quantity, two
+conventions, both defensible, compared as though identical" occurred inside the script that found
+the third. The lesson is not to prefer the log-symmetric form once but to make it the only form
+available: a single helper, used everywhere, so a mixed convention is not expressible.
