@@ -33207,3 +33207,83 @@ And the inertness claim is **duplicated at both launch sites**, `spmm.h:5284` fo
 ("redwood: pool=24 = every physical core, omp_get_num_procs()=32 counts only SMT siblings,
 nthreads<=32 < 2*24=48 can never trigger"). Both hold at pool 24 and both fail together below 17, so
 a fix has three sites to reconcile and not one.
+
+## One idiom, four decision points, and every inertness argument fails at the same pool
+
+The expression
+
+    const long pool = nthreads_override > 0 ? (long)nthreads_override
+                                            : (long)omp_get_max_threads();
+
+occurs at three separate decision points in this object, and a fourth reads
+`at::get_num_threads()` for the same purpose:
+
+    scorch_policy.h:2093   recruit decline      cap dropped when work_true >= 1e7 and nthreads >= 2*pool
+    scorch_policy.h:2391   partition work gate  gate active only when pool <= SCORCH_SPMM_PARTITION_GATE_MAXTHREADS
+    spmm.h:5288            drop-in launch       raw omp team when nthreads >= 2*at::get_num_threads()
+    spmm.h:6415            fused launch         same condition, same team
+
+Each is guarded by an argument that it cannot fire on x86, and each argument is stated in the same
+form — substitute the physical core count for the caller's pool:
+
+    policy.h:333   "on x86 the pool is 24, the gate is at 48 and the count is at most 32, so this
+                    condition provably cannot fire there"
+    policy.h:2093  "On an all-physical-cores pool no recruit is EVER at stake (x86: pool 24, gate at
+                    48, count at most 32) ... structurally inert on a uniform one, not a second policy"
+    policy.h:1401  "A ceiling between the two pools makes the gate PROVABLY INERT on the larger host:
+                    it cannot fire at a pool of 24, so the x86 measurement stands unchanged by
+                    construction rather than by a second grid agreeing"
+    spmm.h:6409    "makes the recruit fire ONLY on a P-core-only-subset pool: on a non-hybrid /
+                    all-physical-cores pool (e.g. x86 redwood: pool=24 = every physical core,
+                    omp_get_num_procs()=32 counts only SMT siblings) nthreads<=32 < 2*24=48 can
+                    never trigger"
+
+`SCORCH_SPMM_PARTITION_GATE_MAXTHREADS` is **16**. The recruit gate is met when `2*pool <=
+omp_get_num_procs()`, which on a 32-CPU host is `pool <= 16`. **The two constants land on the same
+pool value**, so the measured boundary of the recruit finding above — 15 and 16 fire, 17 and 18 do
+not — is simultaneously the partition gate's boundary. At a caller pool of 16 on redwood, x86
+hardware runs the ARM-calibrated branch of two independent rules at once, and the pool is the only
+thing that changed.
+
+**They do not, however, act on the same products, and that is worth being exact about.** The
+partition gate turns the row partition off below `MINGRAINS * GRAIN_SPMM` = 2 × 150000 = **300,000**
+units of work proxy; the recruit drops the cap at or above `RECRUIT_MIN_WORK` = **10,000,000** units
+of true work. At k=32 the two work measures coincide, so the regions are disjoint by a factor of 33
+and no cell is touched by both. "Both rules become live at pool 16" is right; "both fire on the same
+cell" is not.
+
+**One of the two has a measured x86 sign, and it is a cost — but not at this pool.** The partition
+gate's comment says of the ceiling-disabled configuration: *"0 disables the ceiling, which lets the
+gate fire at any pool (that is the configuration x86 measured at 4-9% cost, and it is not what
+ships)."* That measurement was taken with the gate firing **at pool 24**, which is the configuration
+the ceiling exists to prevent. What happens when the gate fires at pool 16 on x86 — which is what
+ships — is not measured by it. The ceiling was chosen "between the two pools", 6–12 on the M5 and 24
+on redwood, so a pool of 16 is neither host's natural pool and sits in the gap the constant was
+placed in.
+
+**The source refutes chain203's ceiling attribution in its own words, 1700 lines earlier.**
+`scorch_policy.h:399-403`, on flipping `SCORCH_SPMM_CEIL_CAP_POOL` to 1: *"It changes no emitted code
+today: `ceil_cap_pool` is read only inside `if (nnz_per_thread > 0 && ...)`, and
+SCORCH_SPMM_NNZ_PER_THREAD ships at 0, so the whole block folds away in a release build — verified
+by compiling an x86_64 -O3 object before and after."* So the header states that the ceiling block is
+absent from a release build, and `c203_analysis.txt:71` attributes 24 measured cells to it. The two
+sentences are in the same object.
+
+**And the recruit's calibration table has an inverted label.** `policy.h:2084-2089` introduces the
+autoencoder grid as "the ratio **of pool-launch over team-launch** by work", then tabulates
+`<10M 1.192, 10-20M 0.962, 20-40M 0.770, 40-80M 0.632, >80M 0.458` and concludes "the team is worth
+2.18x on the largest bucket and costs 19% on the smallest". 1/0.458 = 2.183 and 1.192 − 1 = 19.2%,
+so the numbers and the prose agree only if the ratio is team over pool. Read as labelled every
+bucket reverses and the rule contradicts the data it cites. The threshold and the conclusion are
+unaffected; the axis label is wrong.
+
+**What this does and does not say about the sign of the recruit newly firing on x86.** The 24 cells
+are at or above 1e7 by construction, so they fall on the side of the crossing where that grid found
+the wide team beneficial (10–20M reads 0.962, 20–40M reads 0.770 once the label is corrected). That
+grid is **ARM-only**, and the extra workers it recruited were the M5's twelve efficiency cores.
+The x86 equivalent at pool 16 recruits **SMT siblings**, which share execution resources rather than
+adding cores, and the separate attempt to exploit that difference — capping to physical cores — was
+measured and rejected on x86 at −9 to −11% on the caller path. So the nearest evidence points the
+right way and does not transfer, and the sign on x86 stays open. What does not depend on the sign is
+that four inertness arguments are false in a configuration a caller can reach with one call to
+`torch.set_num_threads`.
