@@ -35806,3 +35806,19 @@ The 19 in between — beyond measurement noise but inside build variation — ar
 category rather than a rounding, and so are the 131. Which floor the milestone's claim is stated
 against is a decision about what is being promised to a user, and it is Bobby's, not a session's.
 It is now item 8 in the open-decisions list.
+
+**And a constraint that decides which of the two floors chain205 can even report.** chain205 wrote
+one build — `fc_c0_float32_p1..p6` and nothing else — so it has `oursb/ours` and no second object.
+**The build-identity floor is not computable from chain205's data at all.** chain196 ran three
+objects (`c0`, `c0b`, `pfd0`) and therefore supports both floors; chain205 supports one.
+
+So the 66-versus-47 question is answerable only on chain196, and chain205's board will carry the
+arm-identity floor alone unless it is compared against chain196's `c0` — which the cross-chain
+replication does, but across chains rather than within one. That is a weaker pairing: two chains
+differ by more than a recompilation.
+
+**Whether the harder claim is computable is a property of the experiment's design, not of the
+analysis**, so it is a decision that has to be made before a run rather than after. Noted for the
+next chain: a run intended to support a claim about the shipped kernel rather than about one binary
+needs a second compilation of the same source in the arm set, and it costs one more build and no
+extra measurement time per pass beyond that arm's own.
