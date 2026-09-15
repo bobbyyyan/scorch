@@ -35093,3 +35093,56 @@ within a minute. Same defect, opposite consequence, and the difference is entire
 broken path's output is *indistinguishable from a real answer*. That is the same property that made
 the chain196 substitution dangerous at 0.19% and the 02:20:15 timestamp harmless — **what matters is
 never how wrong the mechanism is, it is whether being wrong looks different from being right.**
+
+### Correction: the 0.19% was published before its provenance was asked for, and it is withdrawn
+
+Two sections up, the near-replication of chain196 and chain205 is stated as **0.19% pooled, every
+width inside 0.7%**, and the whole framing rests on it. **That number is withdrawn as a
+measurement.** Re-derivation on the side that can be provenanced shows:
+
+    chain196 c0, 22920 complete cells, subject = per-cell median over passes of mkl/ours
+                                      PASS 1 ONLY   ALL SIX PASSES
+      geomean of per-cell medians       2.2605        2.2915
+      median of per-cell medians        2.4596        2.5452
+      geomean over all readings         2.2605        2.2695
+      total-time ratio                  2.1067        2.1200
+
+The pair of figures behind the 0.19% were **not the same reduction** — one was geomean of per-cell
+medians, the other geomean over readings — and **at pass 1 those two reductions coincide by
+construction**, since one reading per cell makes the median the reading. That identity is exactly
+what hid the mismatch. The other side of the comparison was a chain205 figure quoted from a report
+with its reduction unstated, compared across two programs: the shape that produced the earlier
+17–29% overstatement.
+
+**The defect that is mine is the order of operations.** The number arrived, it went into this
+document as the headline of a finding, and *then* its provenance was requested. The rule already
+written down says to ask provenance when a number drives an action — and **publishing a number as
+the load-bearing claim of a finding is the action.** Asking in the next breath is asking one step
+too late; the commit had already been made. See `carried_state_numbers_are_claims`: a number that
+crosses a boundary arrives already believed, and a peer message is a boundary.
+
+**What replaces it is derivable and stronger, because it needs neither chain205 nor a cross-program
+comparison.** From chain196 alone — same corpus, same host, same build tag, different run:
+
+    pooled board, geomean over 22920 cells, ONE PASS AT A TIME
+      build   p1     p2     p3     p4     p5     p6     spread
+      c0     2.2605 2.2811 2.2817 2.2595 2.2556 2.2785   1.16%
+      c0b    2.2773 2.2769 2.2697 2.2599 2.2574 2.2755   0.88%
+      pfd0   2.3326 2.3388 2.3542 2.3337 2.3420 2.3439   0.93%
+
+    across builds at fixed pass
+      p1   c0 2.2605  c0b 2.2773  pfd0 2.3326    spread 3.19%
+      p6   c0 2.2785  c0b 2.2755  pfd0 2.3439    spread 3.01%
+
+**Run-to-run movement of the pooled board is under 1.2%; swapping the object entirely moves it 3%.**
+So the statement the argument actually needs is an a priori one: **a substituted full-collection
+dataset from the same corpus and host cannot move the board by more than the pass-to-pass spread,
+about 1%, which is below the resolution at which anyone reads it.** No cross-chain difference
+required, and no reduction that cannot be seen.
+
+The conclusion is unchanged and now rests on something checkable: the timestamp is why the copy was
+noticed, near-replication is why noticing was the only thing that could have worked, and provenance
+is the only defence. **This table is itself a number received across a boundary** and has not been
+independently computed here; chain196's `c0` set is on redwood in `c205an`, so the per-pass pooled
+board will be recomputed locally after the run closes, in the same program as chain205's, under one
+named reduction. If it does not reproduce, the disagreement is the finding.
