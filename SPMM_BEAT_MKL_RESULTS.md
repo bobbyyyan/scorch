@@ -33584,3 +33584,56 @@ anything it understated it. Different object (the prefetch-era `REGBLOCK_PFD 2` 
 `ROW_PREFETCH 1` tarball) and one host, so it is not a prediction for the `c199` object. What it
 does establish, before the new numbers arrive rather than after, is that the coverage gap being
 closed is not a case of a favourable subset having been selected.
+
+### chain203's headers name (subject, base) while its code computes base/subject
+
+The checker was right and my previous section drew the wrong conclusion from the right premise. Both
+claims survive: `an_c204` is internally consistent at `base/subject` with the same subject, **and**
+chain203's published band-pair column is the reverse of `an_c204`'s floor. What reconciles them is
+a labelling convention that reads as the inverse of what it holds.
+
+Settled by computing all four value digests over the k=32 adopt group and matching them against the
+sealed table:
+
+    ratio computed    digest             chain203's column header for it
+    ov24 / ov24b      a99177f18a3908fa   "band ov24b/ov24"
+    ov24b / ov24      36e8c224310431ba   -- not published
+    ovp / ov24        2fc2d87f43f247e0   "ov24/ambient"
+    ov24 / ovp        17cae6ba8245fbdd   "ambient/ov24"
+
+So each header names `(subject, base)` and the code returns `base/subject`, which makes the header
+the inverse of the ratio underneath it — `ov24/ambient` holds `ambient/ov24`. The analysis text says
+so in words two paragraphs above the table ("subject ov24b, base ov24"), so it is documented rather
+than wrong; but a second implementation reading the header as a ratio gets the orientation backwards
+on every column, which is what happened here in both directions.
+
+**The consequence was concrete and is now closed.** `an_c204`'s pre-validation cross-checks against
+chain203's sealed output, and the floor digest would have mismatched on orientation alone at every
+group and every width — in the one comparison the pre-validation exists to perform. Stage 3 now
+prints **all four orientations, labelled by the ratio**, with the header convention spelled out, the
+way chain203 itself printed three ("all three orientations are printed rather than just the one this
+stage happens to use").
+
+**And with the orientations matched, the confirmation is now at the cell-value layer.** A keyed
+value digest sees a wrong number attached to a right cell, which neither a membership digest nor any
+bootstrap percentile can — swapping two cells' ratios inside a group leaves the geomean, the
+multiset and every percentile bit-identical. All twelve of chain203's named stage-3b and membership
+claims reproduce from an independently written analysis:
+
+    k=2  adopt   band-pair 04ebc145d06b03b2   ambient/ov24 324d43bde3b5c75f   ov24/ambient 82dc455214b0093e
+    k=4  adopt   band-pair 19e03a9fe410ec51   ambient/ov24 c71b9e503004db10   ov24/ambient a2ae9c0f971c40ea
+    k=32 adopt   band-pair a99177f18a3908fa   ambient/ov24 2fc2d87f43f247e0   ov24/ambient 17cae6ba8245fbdd
+    k=32 ov24 NULL         band-pair aaa2029fb0e0c056   ambient/ov24 8f705890f45995e7
+    k=32 adopt membership  1ec8352efdd15bc6
+
+19 of the 140 distinct 16-hex tokens in `c203_analysis.txt` reproduce; the remainder are digests
+this analysis does not emit — bootstrap vectors under chain203's own resampler, pass digests, and
+memberships under other conventions. So the headline group is confirmed at membership, value and
+statistic layers, and in every orientation.
+
+**One rule sharpened rather than added.** `an_c203.py:718` pins `%.12e` *in the code*, with the
+reason in its docstring: "repr and `%g` vary with platform and library version, so an unpinned
+format makes the digest a property of the environment rather than of the numbers." The convention
+was never undocumented — it was documented in the tool and did not travel with the published value.
+**A convention documented in the tool is not published with the number.** Same for the orientation:
+it was in chain203's prose and not in its column header, which is where a reader looks.
