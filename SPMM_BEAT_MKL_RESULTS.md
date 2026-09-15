@@ -35851,3 +35851,24 @@ dataset. Therefore **a behind count alone is not a measurement of the collection
 parameter moves it in a known direction, no bad faith required, and a reader cannot detect it from
 the number. The three-way partition is the only form in which widening the floor has a visible cost,
 because the cost must appear in the middle column.
+
+**The theorem, with its positive control.** The analyzer now prints the three-way partition, and the
+claim attached to it — that `not-certainly-ahead` is the number a wider floor cannot shrink — is
+provable and was also checked by sweeping the floor width over a 6× range on chain196 `c0`:
+
+    floor mult   behind   indeterminate   ahead    not-certainly-ahead
+    x0.5             87              65   22768     152
+    x1.0             66             115   22739     181
+    x1.5             49             177   22694     226
+    x2.0             44             261   22615     305
+    x3.0             29             819   22072     848
+
+`behind` falls monotonically and `not-certainly-ahead` rises monotonically, as it must:
+`not-certainly-ahead = total − ahead`, and `ahead` is non-increasing in floor width, so the sum can
+only grow. **At a floor 3× wider the behind count is 29 — less than half of 66 — while 848 cells are
+no longer safely won.** That is the demonstration the argument needed: a reader shown only "29 cells
+behind" would take it for a better kernel, and the dataset is identical.
+
+So the partition is printed with its floor named and its identity stated — arm identity bounds
+measurement noise, build identity bounds what survives recompilation, the latter is wider and is not
+computable from a single-build run. This is the form chain205's board will carry.
