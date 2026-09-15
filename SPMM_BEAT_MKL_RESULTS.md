@@ -35504,3 +35504,62 @@ number you generate crosses the same boundary as a number you receive, because t
 that measured it is not the version writing it down.** That is why "ask provenance" kept failing
 while "put the predicate in the text" keeps working: the first is addressed to a reader who may not
 be suspicious, the second is addressed to the document and re-runs on demand.
+
+## chain196 `c0`, the full-collection board at matched resolution
+
+The analyzer was rehearsed end to end on **real six-pass data** before chain205 landed, by
+symlinking chain196's sealed `c0` set under chain205's naming and binding it to **chain196's own
+sealed sha256** — so the rehearsal exercised every code path the live run will take, on 22,920 real
+cells, with correct provenance rather than a fixture. Every stage ran and **no refusal fired.** The
+by-product is a real result, and it is the closest thing to the milestone answer available before
+chain205 closes.
+
+    FLOOR  oursb against ours -- the same code twice under two labels, same reduction as the board
+      k        cells   gm       median    p95 |dev|    log-symmetric p95 (reported, not gating)
+      2        4584    1.0010   1.0002    0.0454       0.0464  (+2.3% relative)
+      4        4584    0.9997   1.0001    0.0377       0.0382  (+1.5%)
+      8        4584    0.9999   1.0000    0.0470       0.0484  (+2.9%)
+      16       4584    0.9998   1.0001    0.0598       0.0615  (+2.7%)
+      32       4584    1.0002   1.0001    0.0831       0.0866  (+4.3%)
+
+    BOARD  mkl/ours, above 1 means we are faster; behind = below 1; beyond = below 1 by more
+           than that width's own p95 A/A deviation
+      k        cells   gm       median    behind   beyond   pct     band(gm)          worst cell
+      2        4584    1.7275   1.4896    38       20       0.4%    [1.7064, 1.7493]  Pd/Pd_b @ 0.723
+      4        4584    1.9449   1.7313    56       36       0.8%    [1.9211, 1.9693]  Meszaros/nw14 @ 0.735
+      8        4584    2.3486   2.7017    17        7       0.2%    [2.3210, 2.3785]  Buss/connectus @ 0.817
+      16       4584    2.7472   3.0512     3        1       0.0%    [2.7189, 2.7766]  Buss/connectus @ 0.812
+      32       4584    2.9145   3.1188     5        2       0.0%    [2.8878, 2.9410]  Meszaros/us04 @ 0.766
+      ALL     22920                       119      66       0.29%
+      membership digest of the beyond-floor set 480f5a0a97f311a6, value digest 2d1822ffe2bf752e
+
+**66 cells of 22,920 are behind MKL beyond their own width's noise floor — 0.29% of the
+collection** — and that is the **first gated count computed at matched resolution**: the floor and
+the count come out of the same `per_cell()` reduction, the ratio formed inside each pass and the
+median taken over the six. The single-pass gated version of the same quantity swings 15–52 across
+passes, because a single-pass floor is about twice as wide as a per-cell one, so gating at the wrong
+resolution adds more noise than it removes. This is the version to state the milestone in.
+
+**Three independent programs now agree on this dataset**, which is worth recording because they were
+written for different purposes:
+
+    geomean of the five per-width board gms   2.2915
+    verify_c196.py six-pass pooled            2.2915
+    an_c205.py behind (per-cell median)         119
+    verify_c196.py behind (same reduction)      119
+
+Agreement across three implementations excludes computational error and says nothing about the data
+— the same limit as before. What it does buy is that the 05:30 analysis is not being run for the
+first time on the data it has to report.
+
+**The shape by width is the finding under it.** The deficit is concentrated at the narrow widths —
+56 of the 66 beyond-floor cells are at k=2 and k=4, and only 3 are at k=16 and k=32 combined — while
+the pooled ratio rises monotonically with width, 1.73 → 2.91. Narrow-k is where MKL is still
+competitive, which is consistent with everything this milestone has found about short kernels, and it
+is the opposite of a shape that could be tuned away by a threshold: the cells are spread across
+degree bands rather than clustered in one.
+
+For orientation: this is chain196's `c0`, the **predecessor** object. chain205 measures the current
+one over the same 22,920 cells, so the pair answers whether the current build improved on these 66
+— and it answers it as a replication with both sides computed in one program under one named
+reduction, never as a second confirmation of one run.
