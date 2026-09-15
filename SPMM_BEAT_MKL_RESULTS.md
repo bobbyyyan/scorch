@@ -33637,3 +33637,78 @@ format makes the digest a property of the environment rather than of the numbers
 was never undocumented — it was documented in the tool and did not travel with the published value.
 **A convention documented in the tool is not published with the number.** Same for the orientation:
 it was in chain203's prose and not in its column header, which is where a reader looks.
+
+### Correcting my own scope claim: one of chain203's four tables is inverted, not all of them
+
+Commit `a7d33dd` is titled "chain203's column headers are (subject, base), not ratios" and
+says "every header is the inverse of what it holds". That is true of one table and false of
+the other three. I checked the three I had not checked.
+
+`c203_analysis.txt` publishes four families of table. Verified against the sealed CSVs:
+
+    table                        header(s)                          holds it?   evidence
+    stage 3 headline  (3 blocks) ambient/X                          YES         9 of 9 rows recomputed
+    stage 3b          (3 blocks) band pair X/Xb, effect ambient/X   YES         38 of 38 n, 76 of 76 digests
+    stage 4           (3 blocks) ambient/X, own X/Xb                YES         k=32 ADOPT 1.1806 = gm(ambient/ov24)
+    three-orientation (9 rows)   band ov24b/ov24, ov24/ambient,     NO          all 3 columns inverted
+                                 ambient/ov24
+
+So the labelling defect is confined to the 9-row, 27-digest table, and the same two digests
+that table labels `ov24b/ov24` and `ov24/ambient` are labelled `X/Xb` and `ambient/X`
+twenty rows earlier in stage 3b — where the labels are right. `a99177f18a3908fa` is
+`ov24/ov24b` and `2fc2d87f43f247e0` is `ambient/ov24` under both labels; only one table
+names them correctly.
+
+The inverted table is the one whose own text says it exists as a cross-check surface: "all
+three orientations are printed rather than just the one this stage happens to use", so that
+"a second implementation can check against it". Worth stating the mitigation plainly,
+because it is real: since all three orientations *are* printed, the digest **set** is
+complete and correct. A second implementation that computes all three and compares as a set
+matches 3 of 3. Only a label-wise comparison fails — which is what I did, and it is why I
+read a systematic inversion into the whole document.
+
+### 140 of 140 tokens reproduce, not 19 and not 79
+
+I wrote 19 of 140. The checker corrected me to 79 of 140. Both are low. Sweeping the
+candidate space — membership and value digests, per-rung and chain202 partitions, all six
+ordered pairs among {ambient, X, Xb}, five widths — reproduces **138 of the 140** distinct
+16-hex tokens in the file. The remaining two are not data digests:
+
+    0a74b3f908f5a0c2   sha256 of orders_idx11x22.txt -- verified against the file (and it is
+                       byte-identical to chain202's copy, so the two chains shared a rotation)
+    e3b0c44298fc1c14   sha256("") -- published as the membership digest of an empty group
+
+Both verify by their own route, so the document's tokens are 140 of 140 accounted for.
+
+Minor defect in the second: `sha256("")` is the same token for every empty group, and the
+file prints it four times. It cannot distinguish "this group is empty" from "this group was
+never computed" — the null-result-indistinguishable family again, in a digest this time.
+
+### The chain202 partition is ov24-referenced in a way its group names do not say
+
+This is what the membership digests caught, and it is the finding worth keeping. I first
+reconstructed chain202's three groups as: all arms agree, else *any* rung raises the count →
+`adopt`, else → `caponly`. That reproduces k=2 exactly (29/29/31, all three digests) and is
+wrong at the other two widths:
+
+    k     declared (a-a-a/caponly/adopt)   "any rung raises"   off by
+    2     29/29/31                         29/29/31            0
+    4     29/29/31                         29/26/34            3
+    32    24/40/25                         24/19/46            21
+
+The errors are 3 and 21 — exactly the declined-argument census the same file reports, "by
+width: {4: 3, 32: 21}". On those cells the low rungs deliver 32 against a pool of 24 while
+ov24 delivers 24, so "any rung raises" calls them `adopt` while chain202 calls them
+`caponly`. The correct rule is the one the stage *title* states and the group name does not:
+the partition is ov24-referenced, so `adopt` means **the pool-valued rung** raises. With
+that rule all three widths reproduce, and the token count goes from 131 to 138.
+
+A width-invariant check would have missed this: k=2 passes under both rules, and k=2 and k=4
+publish identical membership digests, so a reader spot-checking the narrowest width or the
+two that agree sees nothing. It took the width where the declined arguments concentrate.
+
+This is the exact exposure the file argued for when it chose to print membership digests
+over counts — "a declared-count check is invariant to a permutation between equal-size
+groups". The failure here is not a permutation but a misreading of the group definition, and
+the digest caught it anyway, at a width where the count check would also have caught it but
+the two agreeing widths would have reassured me first.
