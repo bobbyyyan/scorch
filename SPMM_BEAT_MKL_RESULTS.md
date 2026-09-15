@@ -34241,3 +34241,54 @@ tonight**, after the `if not cells: continue` that skipped three empty groups an
 published for a group of zero. The pattern is consistent enough to state as a rule: a band whose
 count is smaller than the threshold's own resolution cannot be given a verdict, and printing one
 there is worse than printing nothing.
+
+### The 17–29% I published was my own fixture, and the independent corroboration was the same error from the other side
+
+`dd88deb` says switching the deviation convention moves the stage-1 floor "17–29% wider at every
+width". **That number is wrong by about 7×.** The gate is `an_c205.py`'s stage-1 floor, which is a
+p95 over *cells* of the deviation of the per-cell median ratio — statistic D. On chain196's six real
+passes:
+
+    k     A |x-1|  A logsym  A rel     D |x-1|  D logsym  D rel     A/D
+    2     0.3273   0.3920    +19.7%    0.0454   0.0464    +2.3%     7.2x
+    4     0.2967   0.3541    +19.4%    0.0377   0.0382    +1.5%     7.9x
+    8     0.3017   0.3637    +20.6%    0.0470   0.0484    +2.9%     6.4x
+    16    0.3299   0.4020    +21.9%    0.0598   0.0615    +2.7%     5.5x
+    32    0.3874   0.4776    +23.3%    0.0831   0.0866    +4.3%     4.7x
+
+**The convention gap on the gate is 1.5–4.3%, not 17–29%.** The large figure belongs to A, the
+per-reading statistic, which is not what gates anything.
+
+**My number came from the synthetic fixture.** It is four jittered copies of one real pass, so
+`oursb_p/ours_p` carries the same real ratio in every pass and the per-cell median collapses onto
+the single-pass value — D degenerates into A by construction. I had written that limitation down
+explicitly two commits earlier ("the self-test validates the plumbing, not the estimator") and then
+quoted a floor through that same fixture anyway.
+
+**And the independent corroboration was the identical error from the other side.** The checker
+reported +19.7% to +23.3% on chain196 as confirming my +16.9% to +29.4% on chain205 — "different
+dataset, different build, same band". Their five p95 values match the **A** column above to four
+decimals. So two implementations agreed on ~20% while both computing a statistic other than the one
+the gate uses: mine by fixture construction, theirs by choice of resolution. The agreement was not
+weak evidence, it was evidence of the shared error — two wrong resolutions coinciding because the
+wrong resolution is the natural one to reach for.
+
+**What survives and what does not.** The revert stands: an amendment to a pre-registered estimator
+is an amendment at any magnitude, and the direction was still the self-serving one — a wider floor
+means fewer deficits clear it, so the board gets easier. What does not survive is the *severity*. A
+1.5–4.3% gate shift discovered mid-analysis is a much smaller near-miss than a 17–29% one, and I
+published the alarming version. The correct report is: the convention question is real, its
+direction favours our own headline, and on the real estimator it is worth 1.5–4.3% — small enough
+that it is genuinely Bobby's call rather than something that had to be caught.
+
+The algebra the checker gave is exact and explains the whole pattern: for `x > 1` the two forms are
+identical, and for `x < 1` their ratio is exactly `1/x`. So the gap is entirely a measurement of the
+downside tail, and it shrinks by 5–8× when the per-cell median suppresses that tail — which is why
+the gate's gap is small precisely because the gate is the well-chosen statistic.
+
+Their census verifies: `an_c203.py` contains exactly **one** `abs(`, at line 753, and its only
+`math.log` is the geometric mean at 627. There is no second convention in the predecessor to appeal
+to.
+
+**Seventh instance of one quantity at two resolutions tonight, and the first where cross-checking
+made it more convincing rather than less.**
