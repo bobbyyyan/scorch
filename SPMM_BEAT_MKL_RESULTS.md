@@ -35563,3 +35563,55 @@ For orientation: this is chain196's `c0`, the **predecessor** object. chain205 m
 one over the same 22,920 cells, so the pair answers whether the current build improved on these 66
 — and it answers it as a replication with both sides computed in one program under one named
 reduction, never as a second confirmation of one run.
+
+### The 66 are at most 47 independent problems, and the three-population account covers 59% of them
+
+Two things the count alone hides, both computed from the same sealed chain196 `c0` set.
+
+**First, 66 cells are not 66 problems.**
+
+    66 cells beyond floor
+      -> 52 distinct matrix keys          11 keys appear at more than one width
+      -> 47 distinct (rows, nnz) shapes    4 shapes carry more than one key
+
+    keys at multiple widths   connectus x4, nw14 x3, and x2 each: FX_March2010, air04,
+                              bibd_17_8, boyd1, kl02, mycielskian11, raefsky1, rail507, us04
+    shapes with >1 key        case9 / case9_A_01 / case9_A_11   (rows 14454, nnz 147972)
+                              aa03 / aa3                        (rows 825,   nnz 70806)
+                              Pd_b / Pd_rhs                     (rows 8081,  nnz 6323)
+                              heart2 / heart3                   (rows 2339,  nnz 680341)
+
+A matrix that is behind at four widths is **one** structural problem observed four times, not four;
+and three near-duplicate `case9` variants at identical `(rows, nnz)` are not three problems either.
+So the honest statement of the deficit is **at most 47 independent problems**, and this is the same
+question as the open item about whether a pre-registered floor of 8 counts cells or independent
+problems — arriving at the milestone's own headline. The corpus-duplication issue recorded earlier in
+this milestone (an 89-key list being at most 87 distinct problems) recurs here at 22,920 cells.
+
+**Second, the three-population account does not cover the set.** The populations on record are
+mostly-empty rows at k=2, fewer rows than workers, and long rows with enough of them. Classified
+with the thresholds as stated (`deg < 1`, `rows < 24` for redwood's 24-way affinity, `deg >= 100`):
+
+    C  long rows (deg >= 100)                  35   53%
+       UNCLASSIFIED                            27   41%
+    A  mostly-empty rows (deg < 1)              4    6%
+    B  fewer rows than workers (rows < 24)      0    0%
+
+**Population B is empty** — no cell in the beyond-floor set has fewer rows than redwood has workers —
+and 41% of the set falls outside all three. The unclassified cells are mid-degree and mid-size:
+`raefsky1` k=2 at 0.7398 (rows 3242, deg 90.5), `msc00726` k=4 at 0.7480 (deg 47.5), `boyd1` k=4 at
+0.7840 (rows 93279, deg 13.0), `rajat25` k=2 at 0.8478 (deg 7.0), the three `case9` variants at
+deg 10.2.
+
+**The thresholds were deliberately not moved.** Several unclassified cells sit just under `deg = 100`
+— `raefsky1`/`raefsky2` at 90.5, `mycielskian11` at 87.8, `aa03`/`rat_A_3` at 85.8 — so dropping the
+cut to 50 would absorb most of the 27 and make the account look complete. That is the overfitting
+this milestone is explicitly constrained against: a classification whose boundary is chosen after
+seeing which points are outside it explains nothing, and a threshold with no mechanism behind it is
+not a finding. **The reportable result is that the three-population account was built on 33 cells
+from an 89-key corpus and covers 59% of the beyond-floor set on 4,584 matrices**, which is a
+finding about the account rather than a reason to widen it.
+
+What would earn a fourth population is a mechanism first and a boundary second — the unclassified
+group is concentrated at k=2 and k=4 (20 of 27), where the earlier narrow-k work already implicates
+three loads per nonzero rather than any row-geometry effect, so that is where to look.
