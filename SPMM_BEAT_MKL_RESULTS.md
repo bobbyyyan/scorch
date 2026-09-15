@@ -35188,3 +35188,70 @@ in the *checking*: `set -- $a` does not split in zsh, and `${PIPESTATUS[0]}` is 
 spells it `$pipestatus[1]`, so `${PIPESTATUS[0]:-$?}` silently reads the exit status of the last
 command in the pipe, which after `| head` is always 0. **A negative control whose exit-code check
 always reads 0 reports every refusal as a pass.** Re-checked without the pipe: rc=1, as required.
+
+### Correction: the fixture's transfer claim is wrong, and the caveat attached to it was the wrong caveat
+
+The section above concludes that "a near-replicate is undetectable in the pooled board and may be
+very detectable in the behind-count, and if it is, the behind-count is a provenance signal."
+**Measured on 22,920 real cells, it is not detectable there.** chain196 `c0`, six real passes,
+behind = per-cell `mkl/ours < 1` within a single pass:
+
+    pair      |A|   |B|   entered   left    net   |net|/|A|
+    p1->p2    431   410      329     350    -21     4.9%
+    p2->p3    410   402      323     331     -8     2.0%
+    p3->p4    402   435      338     305    +33     8.2%
+    p4->p5    435   398      323     360    -37     8.5%
+    p5->p6    398   410      325     313    +12     3.0%
+
+    mean entries per consecutive pair 328,  mean |net| 22  -- churn is ~15x the net movement
+
+**About 328 cells cross the parity line every pass and the total moves by 22.** Entries and exits
+balance, so the count is stable to 9% while the membership is almost entirely reshuffled: Jaccard
+0.10–0.13 against p1, 1,707 cells behind in at least one pass, **13 behind in all six.**
+
+**The fixture had the right marginal fraction and still gave the opposite answer.** Two marginal
+cells of 24 is 8.3%; the real marginal population is 1,694 of 22,920, or 7.4% — near enough that
+sizing was not the problem. **The stability is a cancellation over the churn, and cancellation
+cannot occur at n=2 by construction**: with two marginal cells each crossing is 25% of a base of 4,
+while with 1,694 of them the in-and-out flows average out and the residual is ±5%. So the caveat
+attached to that fixture — "the magnitude here is designed in, so this demonstrates the mechanism and
+not its size on real data" — **was the wrong caveat.** It hedged on size when the error was in kind:
+the mechanism itself is different at scale. **A fixture can prove that a mechanism exists and say
+nothing about whether it operates**, which is the same defect as the jittered-copy fixture that
+collapsed a per-cell median onto a single pass, arriving from the opposite direction.
+
+So the transfer sentence is replaced, not resized: **neither the pooled board nor the behind-count
+nor the behind set is a provenance signal.** The count moves 9%, the same order as the pooled board's
+1.2%, so it cannot separate two runs; the set churns 90% *between two passes of one run*, so it
+cannot either. That strengthens the digest-only conclusion rather than qualifying it.
+
+**What was verifiable here without touching the measuring host, and what was not.** The churn table
+above and the separately-reported Jaccard figures are mutually consistent: `|B| = |A| − left +
+entered` balances in **5 of 5 rows**, the means reproduce (327.6 → 328, 22.2 → 22), and the p1/p2
+Jaccard implied by the churn counts is 81/760 = 0.1066 against 0.107 reported from a different
+computation. Two separately-produced tables agreeing on a derived quantity is a real check and it is
+the check that was skipped earlier tonight on a branch table whose own split did not sum to its own
+total. **It is necessary and not sufficient** — the night's theme is that consistency does not
+establish correctness, and two tables from one wrong computation agree just as well. The independent
+recomputation runs when chain205 closes, in one program, over both datasets, under one named
+reduction.
+
+### The milestone's own number depends on a reduction nobody has named
+
+The goal is stated as a cell count — scorch beats MKL everywhere — and that count is:
+
+    single pass                          398 - 435   (spread 9% across six passes)
+    per-cell median over six passes            119
+    behind in ALL six passes                    13
+    gated by a single-pass A/A p95 floor    15 - 52   (a 3.5x swing on the noise-corrected one)
+
+**33× between the loosest and the tightest, and the goal does not say which.** A single-pass behind
+list is about 97% churn — 1,707 cells appear on one at least once and 13 survive every pass — so
+"everywhere except N" read off one pass is a list of the cells that happened to be behind during
+that half hour. This is the same argument that forced the floor and the board to share a reduction,
+arriving at the scoreboard: **the behind count and the goal it is measured against must share a
+reduction, and the gated count needs its floor computed at the resolution of the count it gates** —
+a single-pass floor is about twice as wide as a per-cell one, which is why the gated version swings
+more than the ungated one it was meant to clean up. All three counts go in the report with the
+reduction named on each, and a statement of which one the milestone is stated in. That last part is
+Bobby's to decide, not ours.
