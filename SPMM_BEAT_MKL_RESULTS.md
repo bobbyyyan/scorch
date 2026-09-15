@@ -34910,3 +34910,94 @@ accurate, it is **stable** — its reading does not depend on how much has been 
 the unanchored count went 1 → 2 because the commit documenting the finding mentioned the phrase.
 Stability is a stronger argument for structural matching than accuracy, because accuracy can be
 argued about and stability cannot.
+
+### A complete consistent copy of a run passes every consistency check, because agreement is what a copy has
+
+While waiting for chain205's six passes, `/scratch/bobbyy/c205an/` turned up on redwood — two
+characters from the live `/scratch/bobbyy/c205/`, sorting adjacent to it — holding **six CSVs at
+exactly 68,761 lines**, three arms (`mkl`/`ours`/`oursb`), 22,920 cells per pass, 22,920 shared
+across all six, slice tags `corpusp1`…`corpusp6` agreeing with their own filenames, and `build` =
+`c0` exactly as the live run stamps. All six are timestamped **02:20:15**, seven minutes *before*
+the live run wrote its first row (p1 started 02:27:32), and `c205an/p1` differs from `c205/p1`.
+Nothing names that directory: not `rw_s_chain205.sh`, not `c205_stage.log`, not any script on
+either host.
+
+**It is not the jittered fixture either.** Per-cell `oursb/ours` spread across the six passes reads
+p05/p50/p95 = 0.020 / 0.126 / 0.860, and **0 of 22,920 cells are identical across passes** — the
+signature that made the earlier synthetic fixture useless is absent, so this is real measured data
+from a run that no log accounts for.
+
+**And it defeats every guard in `an_c205.py`, by construction.** The filename-versus-`slice`
+cross-check, the rows/nnz single-value guard, the shared-reduction stamp, the duplicate-row check —
+all of them compare the inputs *against each other*. **A complete, internally consistent copy
+agrees with itself on all of them.** The missing predicate was never consistency; it is provenance.
+The strongest available identification is a single row: the same cell `1138_bus` k=2 arm `mkl` reads
+ms 0.014163 / batch 36 in the live pass 1 and ms 0.017659 / batch 29 in the copy — a
+six-significant-figure float plus an independent integer, which no coincidence supplies.
+
+**The binding that was added, with its controls.** `--stage-log` is now required, and every input
+CSV must match its own pass's `pass pN of M done HH:MM:SS (R rows)` line on **both** the row count
+and the file mtime, within 120 s:
+
+    1  real log, 4 of 6 closed, matching dir   REFUSE  "the run is INCOMPLETE -- not a provenance
+                                                        failure, it is 'not finished yet'"
+    2  six files all stamped 02:20:15          REFUSE  names all six, 2260s..11429s apart
+    3  mtimes matching the log                 PASS    "6 of 6 passes bound ... tolerance 120s"
+    4  one file at 24271 rows                  REFUSE  "24271 data rows, the log says 68760"
+
+Case 1 carries as much weight as case 2. **"Not finished yet" and "wrong run" are different
+refusals and must print different messages** — one generic refusal for both is how an incomplete run
+gets read as a substitution and a substitution gets waved through as impatience. The controls were
+built from metadata alone (six local files of the right line count, `os.utime` to set the stamps), so
+none of it read a byte on the host running the live bandwidth-bound pass.
+
+**Its limitation, stated because it is real: mtime is mutable.** `cp -p` or a `touch` forges the
+binding. This catches an accidental substitution — the thing that actually happened — and not a
+deliberate one. The content-based version requires the producer to publish a digest as each output
+closes, which chain205's runner does not do, and the runner is not being changed mid-run. Stated as
+a requirement rather than a suggestion: **a run that does not publish a digest per output cannot
+afterwards be bound to its outputs by anything stronger than a timestamp.**
+
+### Two bugs, one wrong answer, and it was the maximal one
+
+A census of "which local branches would `git push --all` actually publish" returned **29 of 29**.
+The correct answer is **3**. It was wrong twice, by unrelated causes:
+
+    REM=$(git for-each-ref ... refs/remotes); for r in $REM   # zsh does NOT word-split unquoted
+                                                              # params -- one iteration, 17 refs
+                                                              # as a single string, every
+                                                              # --is-ancestor fails
+    bash -c 'mapfile -t REM < <(...)'                          # macOS bash 3.2 has no mapfile --
+                                                              # empty array, inner loop runs zero
+                                                              # times
+
+**The defect that matters is neither bug: the failure mode of a containment census is its maximal
+answer.** "No remote ref contains this branch" is exactly what gets printed when there are no
+remote refs to check, so a broken census and a repository with nothing pushed are indistinguishable
+from the output. 29 of 29 should have stopped the report on sight, and `main` — whose tip is
+demonstrably on `origin/HEAD` — was sitting in the output one line from the top.
+
+The fix that holds is not a better loop. It is `git for-each-ref --count=1 --contains=<branch>
+refs/remotes`, which has no splitting step for a dialect to disagree about, **printed beside a
+control that must fail**: `main` must be excluded, and the run is unreadable without it.
+
+    heads total                                  29
+    tip contained in NO remote ref                3
+      perf/spmm-probe-and-kernel                  0 trailers above main
+      perf/spmm-probe-and-kernel-pretrailer      27 trailers above main
+      refactor/compiler-ir-phase3-std-move-call   0 trailers above main
+    positive control: main contained in refs/remotes/origin/HEAD  (correctly excluded)
+
+**And the predicate that decides an action must be the one the action uses.** "Local-only by name"
+(20 branches) was standing in for "would publish something"; the real answer is 3, because 17 of
+the 20 have tips already contained in some remote ref under a different name. Three predicates,
+three answers — 20, 20, and 3 — and only the last answers the question the number was being used
+for. `git push --all` publishes every `refs/heads`, but what it *adds* is only commits no remote ref
+already reaches.
+
+The trailer conclusion is unchanged and now rests on the right denominator: **exactly one branch
+would publish trailers**, `perf/spmm-probe-and-kernel-pretrailer` with 27, whose stripped sibling is
+already on origin. Recorded as a fact and not a proposal: the third member of the would-publish set
+is `refactor/compiler-ir-phase3-std-move-call`, the branch checked out in the main worktree, so a
+`push --all` from this repository would also publish that in-progress refactor. No refs were
+touched.
