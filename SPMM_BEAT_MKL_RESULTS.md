@@ -33847,3 +33847,46 @@ and 0 on-disk copies codex-wide**. It is not a missing input: the analysis runs 
 input-completeness check can see it. The document cites a number and the ledger cannot produce
 the artefact that made it. Same family as `scorch_c199.tgz`'s digest appearing in zero codex
 files.
+
+### The three instances are two defects, and they split into recoverable and not
+
+An independent implementation of the sibling-script check found the same three files (27
+references against my 25, the extra being `meta_c203.py:27`'s `an_c203.py`, which resolves). Two
+corrections to my instance list, verified here:
+
+**`confound_driver.py` has three byte-identical copies, not two** — `abi-jit-port/harness`,
+`workspace-decision/harness`, `workspace-confound/harness`, all `9f0d2cca14e9b74d` / 10518 B. The
+third is absent from the missing set because it is the one directory where the worker exists:
+`workspace-confound/harness/confound_worker.py`, 17474 B, `2c4dcd1733da7105`, the only copy
+codex-wide. So three instances are **two distinct defects**, one of them sealed three times with
+its dependency satisfied once.
+
+**And the two defects differ in kind, which changes the remedy.** Verified:
+
+    recoverable -- exists and verifies, but not from the ledger that depends on it
+      confound_worker.py   1 copy; attested in workspace-confound/SHA256SUMS, verifies OK;
+                           0 lines in abi-jit-port's or workspace-decision's manifests
+      mkorders11.py        1 copy; attested in chain202's SHA256SUMS, verifies OK;
+                           0 lines in chain203's manifest
+    unrecoverable -- no copy anywhere in the codex
+      synth_c203.py        0 copies; launched by meta_c203.py:40 via sys.executable
+      nbootstab_c203.py    0 copies, 0 manifest lines; an_c203.py:73 publishes its result
+
+The first class is a dependency the manifests do not record: writing it down fixes it, and the
+artefact is intact. The second is gone — no amount of recording recovers it, and for
+`nbootstab_c203.py` a published number ("83 rows, 4 seeds, 6 rows (7%)") has no reproducible
+provenance at all. Both classes pass `shasum -a 256 -c` in every directory involved.
+
+**The pending question for Bobby, restated in the form this taxonomy gives it.** Not "should a
+ledger attest its cross-milestone dependencies" but two questions with different answers: (a)
+should a ledger record dependencies satisfied elsewhere in the codex — cheap, and it would have
+caught `confound_worker.py` and `mkorders11.py`; and (b) what should happen when a sealed analysis
+publishes a number from an artefact that exists nowhere, which is `nbootstab_c203.py` today and is
+not fixable by a manifest rule.
+
+**Instrument note, since I have been holding a peer to this one.** The command that produced the
+"0 lines in the dependent manifests" row above was `grep -rc ... || echo 0`, which printed grep's
+own `0` and then my fallback `0` — two zeroes per file, the same two-line trap the peer reported
+against themselves earlier tonight. I read it correctly, and the count is right, but the
+instrument was wrong in the same command where I was checking someone else's. Third appearance of
+that pattern tonight across two sessions.
