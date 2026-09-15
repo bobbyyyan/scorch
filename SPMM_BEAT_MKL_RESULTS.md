@@ -36908,3 +36908,63 @@ code.
 Treating the 24 as one target list would have pointed a vector-register lever at eight cells whose
 own policy documentation says the cost there does not vary with width. The per-cell authoritative
 attribution is still `scorch_spmm_wstat` on the producing host, which waits for chain206.
+
+### A full-collection test of the exact-width kernel's own stated mechanism, and it does not find a threshold
+
+`spmm.h:4161-4168` records, in the shipped tree, that the exact-width narrow-k kernel's per-row setup
+"has nothing to amortise" on a matrix with fewer nonzeros than rows, with 13 float32 cells of 286
+reading 5-17% slower than the general path against a 1.004 A/A floor — naming `Pd_b` and `Pd_rhs` at
+k=2 (0.831, 0.834), and stating "every one has fewer nonzeros than rows." **`Pd_b` k=2 and `Pd_rhs`
+k=2 are both in the 24-cell replicated core.** The gate for it is written at `spmm.h:4183-4185` and
+`SCORCH_NARROWK_EXACT_MINDEG` is `0L`, so it is unreachable in a release build; the comment gives
+the reason (on ARM, withdrawing the kernel loses in every band) and says the value "must not be
+compiled in for both" hosts. The ISA-conditional construction it would need already exists in the
+same file for its sibling, `SCORCH_NARROWK_EXACT_K1_MINDEG`, which is `8L` under
+`__AVX2__ && __FMA__` and `0L` otherwise.
+
+**k=2 is the only board width where that kernel is selected** (`EXACT_HI = 3`; board widths are
+2/4/8/16/32). So the mechanism makes a prediction the board can test for free, within matrix, which
+removes every per-matrix effect. For each matrix, `R = S(k=2) / geomedian S(k=4,8,16,32)`, where
+`R < 1` means the matrix does worse against MKL at k=2 than at its own wider widths:
+
+    population                          n      p25      median   p75      frac R<1
+    nnz < rows   (exact kernel)         427    0.4451   0.5677   0.8107   0.934
+    1 <= nnz/rows < 2                   435    0.3668   0.3819   0.5057   0.908
+    2 <= nnz/rows < 8                  2299    0.3952   0.7976   1.0265   0.682
+    8 <= nnz/rows < 64                 1224    0.5749   0.8872   1.0743   0.641
+    nnz/rows >= 64                      199    0.8551   0.9547   1.0615   0.603
+    ALL matrices                       4584    0.4197   0.7890   1.0177   0.712
+
+**The prediction fails.** If the cost were the per-row setup going unamortised below one nonzero per
+row, `nnz < rows` should be the worst band. It is not — `1 <= nnz/rows < 2` is worse (0.3819 against
+0.5677), and above that band `R` rises monotonically with `nnz/rows`. That is the shape of a
+**width-amortisation gradient with no threshold at 1**, which is the alternative the test named in
+advance. A plausible reason the `nnz < rows` band is *better* than the band just above it: a matrix
+with more rows than nonzeros is mostly genuinely empty rows, and an empty row pays neither the
+per-row setup nor any arithmetic.
+
+**What this does and does not say.** It does **not** refute the comment's measurement, which compares
+the exact kernel against the general path on the same cells — a two-arm A/B, and a much cleaner
+instrument than this. This test cannot isolate the kernel, because moving from k=2 to k=4 changes the
+dispatch, the width amortisation and the vector utilisation at once; 71% of *all* matrices have
+`R < 1`, so `R` is dominated by the general fact that our margin over MKL grows with width.
+
+**What it does say is a prioritisation result, and it only appears at full-collection scale.**
+`MINDEG = 1` refuses the kernel exactly when `nnz < rows`. So it **provably cannot fire** on the
+`1 <= nnz/rows < 2` band — 435 matrices whose median k=2 deficit is the largest of any band measured
+here. The gate addresses the 427-matrix band at 0.5677 and cannot touch the 435-matrix band at
+0.3819. Combined with the bound already stated — recovering the comment's 1/0.831 puts `Pd_b` and
+`Pd_rhs` at roughly 0.870 and 0.893, still behind MKL beyond the k=2 floor of 0.0468 — the item is a
+real improvement on a population that is not the worst one, and it clears no core cell.
+
+**And there is a second item in the same file that is larger and points at the other half of the
+core.** `SCORCH_SPMM_MULTIROW_ROWS` ships at **0** (`scorch_policy.h:620`). Its own recorded
+measurement — redwood, 302 matrices, 1208 cells per dtype, against a 0.995-1.009 A/A floor — is
+neutral-or-better in every band for `ROWS=2` (every negative band `|z| < 1`), wins 9-14% at
+mid-to-large nonzero counts and moderate degree, and reports **"the cells behind MKL fall 96 -> 59
+at float32 k=4, 17 -> 6 at k=8 ... the largest reduction any single lever has produced."** k=4 and
+k=8 are where **16 of the 24 core cells** are. `ROWS=4` is explicitly not the same answer (0.9730 at
+k=4). Two things to resolve before this is acted on: it is measured on 302 matrices rather than the
+22,920-cell board, and it has to be reconciled with the separately recorded null for multi-row at
+width 4 (`mrhv/mr2 = 1.0039` against a 0.92% floor), which may be a different dispatch condition
+rather than a contradiction.
