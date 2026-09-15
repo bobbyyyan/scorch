@@ -35408,7 +35408,11 @@ milestone claim.
    stratification chosen after seeing the tail. Default: per-width, with per-band reported as
    exploratory.
 
-8. **Which A/A defines the floor for the headline count.** Arm identity (`oursb/ours`, one binary
+8. **Which A/A defines the floor for the headline count — and this is the only one of the five
+   convention parameters that changes a number.** Measured one at a time, the deviation scale, the
+   p95 estimator and the orientation each move the gated count by **zero** cells and the per-cell
+   reduction by **one**; the A/A choice moves it by **nineteen**. It is answerable only by running
+   two identical-source build pairs, which no existing chain has. Arm identity (`oursb/ours`, one binary
    twice) gives 66 behind and 115 indeterminate; build identity (`c0/c0b`, two compilations of one
    source) gives 47 and 203. A wider floor lowers the behind count and raises the indeterminate one
    by construction, so the count alone cannot choose. Default if unanswered: report the three-way
@@ -36301,3 +36305,59 @@ The 8/1/21 split stated earlier is therefore wrong in its second and third terms
 solid: **the eight passes before 04:43:04 are clean**, pass 9 straddles, and everything after is a
 sequence of at least six environments whose boundaries are knowable but whose alignment to passes is
 not.
+
+### One parameter at a time: four of the five free parameters are worth at most one cell, and the fifth is worth nineteen
+
+The five free parameters identified tonight were varied one at a time from the published baseline,
+on both datasets. Baseline is `median(linear)` / `|x−1|` / p95-linear / arm-identity A/A / orientation
+as published.
+
+    chain196 c0 -- baseline behind 119, beyond 66, indeterminate 115
+      parameter changed to                  behind  beyond  indet   d(beyond)  d(indet)
+      BUILD A/A instead of arm                119      47     203       -19       +88
+      exp(median(log)) reduction              125      67     118        +1        +3
+      exp|ln x|-1 deviation                   119      66     116         0        +1
+      p95 = lower order statistic             119      66     115         0         0
+      orientation flipped                     119      66     116         0        +1
+      all four convention parameters at once  125      67     117        +1        +2
+
+    chain205 -- baseline behind 106, beyond 61, indeterminate 107
+      exp(median(log)) reduction              109      62     111        +1        +4
+      exp|ln x|-1 deviation                   106      61     113         0        +6
+      p95 = lower order statistic             106      61     107         0         0
+      orientation flipped                     106      61     110         0        +3
+      all four at once                        109      62     113        +1        +6
+
+**The deviation scale — which absorbed more argument tonight than anything else — moves zero cells
+on the gated count.** The p95 estimator moves nothing at all. Orientation moves nothing in the
+tails. The reduction moves one. All four together move one. **The only consequential parameter is
+which A/A defines the floor: nineteen cells on the gated count and eighty-eight in the middle band,
+twenty to ninety times everything else combined.**
+
+Two conclusions follow, and they point in opposite directions from where the effort went.
+
+**First, the invariance fix should be adopted because it is free, not because it matters.** It costs
+one cell on the gated count, so it cannot rescue or destroy a conclusion, and it permanently removes
+two degrees of freedom. That is the whole case for it. The night's argument about which deviation
+scale is correct was worth zero cells, and the argument about orientation was worth zero in the tails
+— they were worth having as correctness questions and not as measurement ones.
+
+**Second, chain205's verdict is convention-independent.** Beyond-floor moves 61 → 62 under any single
+parameter or all four, so "61 does not beat chain196's 66" holds under every convention chain205 can
+express — because the one parameter that would move it requires a second compilation the chain does
+not have. **The convention question is worth one cell and the design gap is worth nineteen.** Open
+decision 8 is therefore not one of eight equals; it is the only one of the five that changes a
+number, and it is answerable only by running two identical-source build pairs.
+
+Caveat, stated because one-at-a-time at a single baseline does not exclude interactions: "all four at
+once" gives +1/+2 on chain196 against the reduction alone at +1/+3, and +1/+6 on chain205 against
++1/+4. That is evidence against interaction, not proof of its absence.
+
+### Why the width gate could not have worked, in one ratio
+
+At k=8 the prefetch-deletion comparison is **1,548 cells faster beyond the floor against 29 slower —
+53 to 1.** Any predicate meant to protect the losers has to find 29 in 1,577 without excluding the
+winners; **at a 2% false-positive rate it gives back as much benefit as it protects.** That is the
+hard constraint on "a cheap matrix property with a reason attached", and it is why a width predicate
+was never going to be enough: k=8 is where the benefit and the residual harm are most concentrated
+*together*, not where they separate.
