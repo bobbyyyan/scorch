@@ -36837,3 +36837,74 @@ floor does not narrow at all. Comparing a per-matrix effect against a pooled flo
 noise by roughly `sqrt(n)`. **State the floor's unit of observation** — per cell or per pooled
 estimate — because the two differ by an order of magnitude here and only one of them matches a
 per-matrix claim.
+
+### The k=4 lookup resolved: the exact kernel does not serve k=4, and the core is two problems
+
+The mechanism for the core's k=4 concentration was deliberately not asserted earlier, because
+`ffast_math_wont_reassociate_gathers` requires looking up which of the four inner loops serves a
+cell rather than recalling it, and records two prior citations that got this wrong. The lookup is
+now done from source at `206eb3e`, and it refutes the hypothesis that was queued.
+
+**The accumulator structure.** `scorch_spmm_row_narrow_exact` (`spmm.h:2102`) declares
+`T acc[UNROLL][K]`, steps the main loop `UNROLL` nonzeros at a time with `acc[u][j] += a * Bp[j]`,
+reduces across `u`, then runs a remainder loop over the trailing `(pA_end - pA_begin) mod UNROLL`
+nonzeros using `acc[0][j]` alone. With `SCORCH_NARROWK_EXACT_UNROLL 4`, `_ACCUM 0`, `_SHORT 0` and
+`_MINDEG 0L`, the halving ladder at `spmm.h:4961` never fires and the unroll is 4 unconditionally.
+So the main loop carries **four independent dependency chains of vector width K** — the single-scalar
+4 cyc/nnz ceiling does not apply, and the figure already recorded for this kernel, ~1 cyc/nnz at
+UNROLL=4, is the right one.
+
+(The chain count is **UNROLL = 4**, not `UNROLL × K`. `acc[u][0..K-1]` is one vector register; lanes
+within it are SIMD lanes of the same instruction, not independent chains. Counting lanes as chains
+overstates the parallelism and makes the count appear to grow with width, which it does not.)
+
+**But none of that reaches k=4.** `SCORCH_NARROWK_EXACT_HI` is **3** (`scorch_policy.h:1338`), and
+`exact_width` is set only when `B1_size <= exact_hi_` (`spmm.h:4160`). So for float32:
+
+    k=2, k=3      scorch_spmm_row_narrow_exact, acc[4][K]
+    k=4 and up    exact_width = 0 -> the register-block path, SCORCH_SPMM_HALFVEC_F32 = 1
+
+The widths 1..7 *are* instantiated for float32 — the kernel for k=4 exists and is simply not
+selected. Any accumulator argument about k=4 is therefore about a kernel that does not run there.
+
+**And the shipped direction of this constant is the opposite of what a k=4 concentration suggests.**
+`scorch_policy.h` records a re-analysis of the retired `mr2h` arm (`EXACT_HI=1`, so widths 2 and 3
+take the vector kernel instead of the exact one), over matrices where the kernel dominates the call
+(`nnz >= 1e6`), as geomean of `c0/arm` with the same-code pair beside it:
+
+                  MKT k=2   MKT k=3   redwood k=2   redwood k=3   floors
+      float32      1.1588    1.4657       1.0157        1.1581    1.015-1.026 / 1.001-1.009
+
+All above 1, so **for float32 the exact kernel is slower than the vector kernel at widths 2 and 3**,
+by 1.6% to 46.6%. An arm isolating `EXACT_HI` from multi-row is already queued on both hosts with the
+`nnz` split pre-registered, and is not yet run.
+
+**The finding: that queued lever and the core's k=2 half are disjoint populations.** Splitting the 24
+core cells by dispatch family and by the arm's own pre-registered threshold:
+
+    width   kernel family                     core   nnz>=1e6   nnz<1e6
+    k=2     narrow_exact  acc[4][2]              8       0          8
+    k=4     regblock / HALFVEC_F32=1            14       4         10
+    k=8     regblock / HALFVEC_F32=1             2       1          1
+
+**Zero of the eight k=2 core cells have `nnz >= 1e6`** — they run 6,323 to 212,536 nonzeros
+(`Pd_b`, `Pd_rhs`, `m3plates`, `TSOPF_RS_b162_c3_b`, `poli`, `Chebyshev3`, `case9`, `kl02`). So the
+measured `EXACT_HI` gain speaks to a population that contains none of them, and the policy file says
+why in its own words: on matrices where a per-call floor dominates, our time is **flat in k** (22.4 µs
+at k=1 against 24.5 µs at k=16 on 26,214 nonzeros), and a cost that does not vary with width cannot
+be a vector-register cost. That is named there as a thread-policy question in another part of the
+code.
+
+**So the core is at least two problems, and the split is by mechanism, not by width alone:**
+
+- **8 cells at k=2**, on `narrow_exact`, all small-`nnz`, in the per-call-floor regime. All four core
+  `EMPTY` cells are here — and for rows holding zero or one nonzero the `UNROLL=4` main loop never
+  executes at all, so the single-accumulator remainder loop is the *entire* arithmetic. If the
+  one-chain ceiling binds anywhere it binds here, at the opposite end of the degree axis from where
+  it was about to be applied.
+- **16 cells at k=4 and k=8**, on the register-block half-vector path, 5 of them with `nnz >= 1e6`
+  where the vector-register mechanism can act.
+
+Treating the 24 as one target list would have pointed a vector-register lever at eight cells whose
+own policy documentation says the cost there does not vary with width. The per-cell authoritative
+attribution is still `scorch_spmm_wstat` on the producing host, which waits for chain206.
