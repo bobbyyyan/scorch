@@ -33399,3 +33399,80 @@ short set: 0` across all 66 of chain203's files. Raised by the checker session.
 One phrasing correction to the paragraph that introduced the 802: 89 × 3 × 3 + 1 is also 802, so the
 measured anchor and the formula agree. What measuring bought was provenance, not a different number,
 and it would only diverge if the runner ever wrote a different number of row-arms per cell.
+
+### Correction to the correction: seed and nboot do not pin a bootstrap, and the band moves again
+
+The previous section concluded that "every band in this document should carry its nboot and seed".
+That is necessary and it is not sufficient, which the checker session established by obeying both
+and still not reproducing the number. At seed 204, nboot 2000, the same percentile convention and
+the same 25-cell vector, two implementations read **[1.0748, 1.2979]** and **[1.0729, 1.3022]**.
+Neither is wrong. `random.Random(seed).randrange(n)` once per element, `random.choices(v, k=n)`,
+and `np.random.default_rng(seed).integers(...)` consume one seed differently and produce different
+resamples, so the two parameters make a band **auditable** — they are what let the nboot-400 story
+be confirmed — without making it **reproducible by a second implementation**.
+
+What pins it is the index matrix. The analysis now builds it in one documented call,
+`np.random.default_rng(seed).integers(n, size=(nboot, n))` on numpy's PCG64, and publishes a digest
+of the sorted bootstrap statistic vector beside every band, so a second implementation either lands
+the same digest or can say which of seed, nboot, generator and draw order differs without guessing.
+Under that resampler the headline reads:
+
+    k=32 HIGHER  n=25   seed_for(32,"HIGHER") = 204 + 7919*32 + 31*2 = 253674   nboot 2000
+      gm-rows 1.2123   med-rows 1.1486   gm-cells 1.1806   med-cells 1.1441
+      floor 0.43%   band [1.0662, 1.3032]   FASTER by 6.6-30.3%, all four nestings agreeing
+      bootstrap vector sha256: claim b9e5e9fb3b7998ec   floor a212aeed3033ff30
+
+So the band has now moved three times — [1.0741, 1.3115] at nboot 400, [1.0748, 1.2979] at nboot
+2000 under Python's `random`, [1.0662, 1.3032] at nboot 2000 under numpy's PCG64 — while the four
+point estimates have not moved at all. That is the useful summary of the whole episode: **the
+resample-dependent digits were never cross-checkable quantities and the resample-independent ones
+always were.** Quote the point estimates to four figures and the band to two, or publish the digest.
+
+**Two further corrections from the same review, both adopted.**
+
+The floor is a bootstrap bound too, and it was drawn on its own seed here while the effect it gates
+was drawn on another — which makes their ratio a reading about two seeds. chain203's convention
+shares one seed per (width, group) between a band and the effect it gates precisely so the two are
+drawn on the same indices; this analysis now does the same. That also resolves 0.42 against 0.44
+completely: over 40 seeds the outer edge of the identical-argument pair on these 25 cells runs
+**0.41%–0.45%** at nboot 2000, both of us were quoting the outer edge, and the difference was seed.
+It reads 0.43% under the shared-seed numpy resampler. At a lower bound of 6.6% against 0.43% the
+margin is 15× and nothing turns on the second decimal, but the floor is the quantity a verdict is
+compared against, so it gets the same provenance as the effect.
+
+And the nboot-400 range is wider than I reported: eight seeds gave an upper bound spread of 0.0258
+and forty give **0.0363**, running to 1.3151. 1.3115 was the maximum of *my eight* seeds, not of the
+estimator.
+
+### Two scoping corrections, one of which contains its own counterexample
+
+**chain196 is itself a 4584-key ours-against-MKL board.** I wrote that "every ours-against-MKL
+number in this milestone since 2026-09-10 has been read on an 89-key corpus". chain196's ledger is
+dated 2026-09-10 22:15, so the sentence includes the one chain that refutes it. The accurate
+scoping is **chains 197 through 204** — eight consecutive chains on at most 87 distinct problems —
+which is a stronger statement than the dated one, and the dated form failed the same way
+`git log --since` does at the boundary second.
+
+chain205 is still new rather than a repeat, and for a reason worth stating: `rw_s_chain196.sh:49-56`
+refuses unless the tarball defines `SCORCH_SPMM_REGBLOCK_PFD 2` and `SCORCH_SPMM_ROW_PREFETCH 1`,
+so its three builds are prefetch-era objects and not the `c199` tree. The affordability precedent
+transfers; the numbers do not.
+
+**And chain196's settings, which is why chain205 was restarted.** Its full-collection family ran
+`--reps 4 --target-ms 6`, keeping the 13-rep 25-ms defaults only for its nine-matrix GCN family
+(`chain196_body.sh:314-320`). I launched chain205 on the defaults, measured 1726 rows in 7.5 minutes
+— about five hours a pass and thirty for six — and restarted it on chain196's settings at about
+28 minutes a pass. The 13.5× ratio in the settings matches the 12× I measured. Precision on a
+22,920-cell board comes from the number of cells rather than reps per cell (chain196 got ±0.2%
+intervals on n=2010 this way), and a noisier per-cell reading *inflates* the A/A floor, which makes
+the count of cells behind MKL conservative rather than generous.
+
+**A third generation divergence, and this one has no attested copy to fall back on.** The writer
+that produced chain196's eighteen full-collection CSVs and is producing chain205's is
+`/scratch/bobbyy/mrgate.py`: **a55e07bf**, 8173 bytes, 136 lines, B-matrix RNG seed at line 135.
+The only attested copy is `harnesses/mrgate.py`: **4d5b05e3**, 7460 bytes, 125 lines, the same RNG
+seed at line **124**. Both line citations in this exchange were therefore correct for different
+files 713 bytes apart, and `chain196-fullcollection-redwood/SHA256SUMS` names no `mrgate` copy at
+all — it pins its body, its runner, `mrbuild.sh`, its waiter and three analysis scripts, but not the
+program that wrote its data. Codex-wide there are exactly two `mrgate*.py` files, so unlike
+`mrbuild.sh` there is no per-chain pinned copy to cite instead.
