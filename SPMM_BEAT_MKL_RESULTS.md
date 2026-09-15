@@ -35687,3 +35687,54 @@ Both conditions are load-bearing and they remove very different populations: the
 the 119 behind cells, and the direction takes 22,739 of the 22,805 beyond-floor cells. **Beside a
 gate, report what each conjunct removes** — this is the same discipline as reporting the number that
 shows a count could have been non-zero, applied to a filter with two terms instead of one.
+
+### The convention audit fired on its author, on its first real trial
+
+A new stage was added to print the goal's count under every reduction. It was written with a fresh
+`abs(x - 1.0)` for the single-pass floor, and the analyzer refused to run:
+
+    REFUSE: deviation-from-parity written outside dev_prereg/dev_logsym -- line 515:
+            abs(x - 1) in <module>. One helper per convention, used everywhere, so a mixed
+            convention is not expressible rather than merely discouraged.
+
+**That is the trial this mechanism had not had.** Its record was 1 for 1 against an injected
+positive control and 0 for 0 against anything real; it is now 2 for 2, and the real violation was
+written by the same author who installed the guard, in the same session, minutes after publishing
+it. A convention that had been merely *documented* would have produced a mixed-convention floor and
+a plausible number — the single-pass gated count, which nothing downstream would have flagged. Fixed
+by routing through `dev_prereg`, with the incident recorded at the line so the next reader knows the
+call is not stylistic.
+
+(Recorded once more because it recurred within the same hour: the first check of the exit code read
+`rc=0` through a pipe to `tail`. The real code was 1. That is the `$?`-after-a-pipe defect again,
+now four times in this session, and it briefly hid the refusal entirely.)
+
+### The goal's count under every reduction, printed together
+
+    reduction                                       behind   gated at matched resolution
+    a SINGLE pass (6 passes, range shown)          398-435       46-71     <- ~97% churn
+    per-cell MEDIAN over passes  (the RECIPE)          119          66     <- floor and count matched
+    behind in EVERY pass                                13         n/a
+    behind in ANY pass                                1707         n/a
+    -> the count moves 131x between the loosest and the tightest reduction
+
+The analyzer now prints all four with the reduction named on each and states in place that **which
+one the milestone is stated in is not a session's decision.** The per-cell gated count, 66, sits
+inside the single-pass gated range 46–71, as it must.
+
+**And a discrepancy that is itself the finding: 46–71 here against 15–52 reported by the verifier,
+for the same quantity.** The cause is not resolution — both are single-pass — it is *which A/A
+defines the floor*:
+
+    oursb / ours   one binary, two labels        the arm-identity floor   -> 46-71
+    c0 / c0b       two builds of the same source the build-identity floor -> 15-52
+
+The build-identity floor is wider, so it admits fewer cells, which is consistent with the layout
+artefact already measured in this milestone: two objects with identical decisions differ 1–2.6% on
+narrow-k SpMM while identical-source rebuilds differ 0.3%. **So a gated count needs its floor named
+by A/A as well as by resolution** — "beyond the noise floor" is under-specified in two dimensions,
+not one, and the two choices move the count by a factor of three. Neither is wrong; they bound
+different things. The arm-identity floor answers "is this cell's deficit larger than the same code
+measured twice", and the build-identity floor answers "larger than two compilations of the same
+source". The milestone's claim is about the kernel, so the arm-identity floor is the matched one for
+it, and the build floor belongs beside any claim that compares two objects.
