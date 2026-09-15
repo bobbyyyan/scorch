@@ -33531,3 +33531,56 @@ measured under both predicates the gap is 11 either way:
 So the RNG line moving by exactly 11 is a consequence of eleven lines inserted above it, not a
 coincidence, and the conclusion rests on three agreeing quantities rather than on the 713 bytes
 alone. The caution was the right shape and the check clears it.
+
+### The digest earned its keep on first use, and the orientation it caught was consistent
+
+With the recipe attached, the claim digest matched immediately (`b9e5e9fb3b7998ec`, index matrix sum
+599742 on both sides). The floor digest did not: the checker read `9f43d54a347e4480` where this
+document publishes `a212aeed3033ff30`, and a sweep of nine candidates located the difference at the
+**orientation of the floor ratio**. That is the case for publishing a digest, made on its first use.
+
+**The direction of the finding is the opposite of the one proposed, and it matters because adopting
+the proposal would have introduced the defect it was guarding against.** Every reading here is
+`base/subject` with the same subject:
+
+    claim  = ovp   / ov24     above 1 means ov24 is faster
+    floor  = ov24b / ov24     above 1 means ov24 is faster
+
+Both put the arm under test in the denominator, so the floor has the same measurement shape as the
+claim it gates and their ratio is not a reading about two conventions. The checker's expected
+`ov24 / ov24b` is `subject/base` — the *inverted* one relative to the claim. So this analysis was
+self-consistent and the default guess was the mismatch. Verified by reading the code path: both
+stages call `cell_ratios(cells, subject, base)`, which returns `base/subject`, with `subject=ov24`.
+
+**Their substantive point stands entirely, and it is the part to keep: orientation is not a
+relabeling here.** The cell statistic is a median over shared passes, the pass count is 22, and
+averaging two middle order statistics does not commute with inversion, so
+`median(y/x) != 1/median(x/y)`. On the 25 k=32 cells all **25 of 25** differ, max 1.80e-04, mean
+2.42e-05, and the floor's outer edge reads **0.428%** one way against **0.433%** the other. Both
+round to 0.43%, which is exactly why the published statistic could not distinguish them and the
+digest could in one step. Under an odd pass count it *would* be a pure relabeling, so the
+convention has to be written down rather than inferred from the arm names. The provenance block now
+states it.
+
+### chain205's first pass needs no pass term, answered from chain196 before the run reports
+
+A pre-registered question about chain205 — whether the cold first pass, which reads all 4584 npz
+files from disk, biases its measurements — settled from chain196's sealed data rather than from
+chain205's own. Per pass over all 22,920 cells of `sh_c0`:
+
+    gm(ours ms)     p1 0.02047    p2..p6 0.02032 - 0.02053    pooled 2-6 0.02041
+    gm(ours/mkl)    p1 0.44238    p2..p6 0.43826 - 0.44335    pooled 2-6 0.44029
+    gm(oursb/ours)  p1 1.00073    p2..p6 0.99865 - 1.00016    pooled 2-6 0.99941
+
+Pass 1's ratio sits **inside** the per-pass range of the other five, so the npz reads fall outside
+the timed region and all six passes pool. The first pass costs wall-clock, not validity. Also
+22,920 of 22,920 cells are complete in all six passes — zero skips on the full collection, so that
+denominator is the population and not a filtered subset. Measured by the checker session.
+
+**And the datum chain205's board should be read against.** chain196's pooled full-collection result
+is **2.271× against MKL** (1/0.44029), with pass 1 alone at 2.260×. That sits *above* the 1.5–2.1×
+band recorded for the 89-key readings, so the small corpus was not flattering the result — if
+anything it understated it. Different object (the prefetch-era `REGBLOCK_PFD 2` /
+`ROW_PREFETCH 1` tarball) and one host, so it is not a prediction for the `c199` object. What it
+does establish, before the new numbers arrive rather than after, is that the coverage gap being
+closed is not a case of a favourable subset having been selected.
