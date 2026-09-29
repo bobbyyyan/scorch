@@ -37248,3 +37248,101 @@ another pass. What breaks comparability is a pass *straddling* a regime change. 
 matters is straddled passes, not contaminated passes, and with 9 observed regime changes over 24
 passes at most 9 can be straddled. Whether that is the right reduction depends on the per-pass
 timestamps, which is the measurement being deferred rather than an argument against it.
+
+## Two more preservation gaps, the substitution mechanism identified, and the published counts recounted (2026-09-28)
+
+### chain205 had no ledger entry at all, and its only analysis copy was already gone
+
+chain206's absence from the ledger led to an audit of the other 22 chain directories. chain205 --
+the source of the published **63 gated behind-MKL cells** -- had never been filed. Its scratchpad
+analysis directory is now empty, reaped. The raw data survived only because
+`redwood:/scratch/bobbyy/c205` had not been cleaned: six passes of build `c0`, three arms, five
+widths, 68,760 rows each.
+
+Now sealed at `chain205-boardrecount-redwood`, 11 files under `SHA256SUMS`, 30 MB, with digests
+computed **on redwood** before transfer (`c205.sha256`, 7 of 7 verify here), so custody reaches the
+producing host rather than starting at this machine.
+
+### The substitution was a symlink farm, not a renamed copy
+
+The finding previously recorded as "chain196's sealed six-pass set sat in chain205's analysis
+directory, byte-identical and renamed" now has its mechanism. `/scratch/bobbyy/c205an/` contains six
+**symlinks**:
+
+    fc_c0_float32_p1.csv -> /scratch/bobbyy/c196/sh_c0_float32_p1.csv        (p2..p6 likewise)
+
+created 2026-09-15 **02:20**, whereas the real chain205 run wrote its own outputs into
+`/scratch/bobbyy/c205` between **02:57 and 05:30**. So the substitution predated the data it
+displaced. It was not a copy that drifted in; it was a deliberate symlink set, which is why
+byte-identity held exactly and why every consistency check passed. A symlink farm is strictly harder
+to catch than a copy: it has no independent bytes, no independent mtime on the data, and `ls`
+shows the intended names.
+
+### Both published counts recount correctly from their own bytes
+
+The open question this raised is whether the published 63 was read off the symlinks. It was not, and
+that is settled by recount rather than by argument. Recomputed under the sealed estimator --
+per-cell `exp(median(log ratio))` over the 6 passes, deviation `exp|ln x|-1`, floor = per-width
+`sorted(d)[int(0.95*(len(d)-1))]` of `dev(oursb/ours)`, behind iff `dev(S) > floor` and `S < 1`
+with `S = mkl/ours`:
+
+    source                           k=2    k=4    k=8   k=16   k=32    TOTAL   published
+    genuine chain205  behind          20     31      9      2      1       63        63
+                      band            45     33     20      7      8      113
+                      ahead         4519   4520   4555   4575   4575    22744
+                                                             sum = 22920
+    chain196 c0       behind          21     37      7      1      2       68        68
+
+Both reproduce exactly. Had `c205an/` been read, chain205 would have printed 68. The three classes
+are each counted from their own predicate and sum to 22920, so the partition is a check rather than
+an identity.
+
+The two behind-sets overlap in only **30** cells -- 33 chain205-only, 38 chain196-only. Two runs of
+the same source disagreeing on more than half of their gated cells is why the analysis moved off
+single-chain counts onto replication.
+
+### The sealed analyzer could not run in the layout it was sealed into
+
+A second session found this and it is the same silent-null shape the analyzer's own copy check was
+written to catch. `an_c206.py:30` reads `C206 = os.path.join(D, "c206final")`, where `D` is the
+script's directory. In the ledger layout the CSVs sit directly in the chain directory and no
+`c206final` subdirectory exists, so the glob returns zero files and the comparison set is empty.
+Run in place, the filed artefact prints:
+
+    IDENTITY: 0 chain206 outputs; 18 other CSVs on disk compared by content
+      no chain206 output matches any other set's bytes -- this is not a renamed copy
+      builds: [] ; cells each: {}
+
+It asserts the outputs are not a renamed copy having compared **nothing**, with no error and no
+warning, and then prints an empty table. This is the fourth harness in this milestone to hardcode a
+ledger-relative path instead of taking the tree root as `$1`.
+
+`an_c206.py` is kept unmodified, because it is the artefact that produced the published numbers and
+editing it would break that binding. Added beside it: `an_c206_ledger.py`, which takes the tree root
+as `argv[1]`, asserts 18 input files and 22920 cells per build and refuses otherwise, and reports
+the **size-eligible candidate count** beside the match count. All three guards were fed the defect
+they forbid and refused: an empty directory, a 17-of-18 partial input, and the as-ran copy's own
+failure reproduced above. Its output reproduces every published figure and uses the corrected
+median-of-three denominator.
+
+Against the whole ledger it now reports 1290 other CSVs, **25 size-eligible**, 0 byte-identical --
+and the eligible count is the number that makes the zero mean something.
+
+### One consequence of filing, recorded because it inverts a check
+
+Before chain206 was filed, the only copy of its outputs was the scratchpad, so the correct answer to
+the renamed-copy scan was 0 matches. Two known-good copies now exist, so a scan that includes the
+scratchpad correctly finds 18 matches; when the scratchpad is reaped the answer returns to 0 for a
+third reason. The raw count is therefore uninformative in both directions, which is why the
+size-eligible count and `PROVENANCE.md`'s record of how many known-good copies exist are the parts
+that carry the meaning.
+
+### Tree-level attestation, verified and left alone
+
+The ledger root's `spmm-beat-mkl/SHA256SUMS` is cksum/CRC-32 despite its name: `shasum -a 256 -c`
+on it emits **0 lines, 0 OK, 0 FAILED** -- it verifies nothing while appearing to verify 1123
+entries. Anchoring on the path component, it names **4** chain directories (chain185 x2,
+chain187 x2) of the 22 present, so chain188 through chain206 have no tree-level attestation.
+Nothing it names is missing, so this is omission, not rot. Per-directory `SHA256SUMS` carries the
+load. Not repaired here: regenerating a manifest at the ledger root changes shared evidence
+infrastructure and is Bobby's call.
