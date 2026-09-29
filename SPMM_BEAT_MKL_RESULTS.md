@@ -37412,3 +37412,51 @@ right and this session's were vacuous.
 The general form, now on its fourth appearance in one day: **`shasum -c` reports success and failure
 on the same channel it reports "I could not find the file", and the third case prints as silence.**
 Any use of it must assert the emitted line count against the manifest line count.
+
+### The seal-through-a-symlink assumption, closed on the producing host
+
+A digest computed *through* a symlink records the target's content, so a seal can verify 18 of 18
+while the bytes belong to another run — every layer agreeing and every layer wrong together. Given
+that a symlink farm existed one directory away, this was the strongest claim in both filings resting
+on its one unexamined assumption. It is a fact about redwood, so it is checkable here even though the
+verifying session cannot reach that host:
+
+    /scratch/bobbyy/c205   regular files  7   symlinks 0
+    /scratch/bobbyy/c206   regular files 20   symlinks 0
+
+Both producing-host digest files were therefore computed over regular files. On the filed copies,
+`find -type l` returns nothing and every entry's `realpath` stays inside its own directory. The
+general point, which the symlink farm makes concrete: **"the bytes match what the host hashed at that
+path" is not "the path was a regular file when it hashed it."** A content check had been standing in
+for a provenance check.
+
+Also recovered while checking: `c206_run.log`, 10,218 bytes and 90 lines — the run's own log on
+redwood, distinct from and larger than the staging record filed earlier. Now sealed.
+
+### Content binding: strong for chain206, absent for chain205, and one instrument whose obvious reading is wrong
+
+chain206's `build` column is self-identifying. Across all 18 files the value matches the filename
+with **0 disagreeing rows out of 1,237,680**, so a link to another run's bytes would have to carry
+that run's build label.
+
+chain205 gets nothing from this, and that is the reason the substitution survived: chain205 and
+chain196 are **schema-identical**, both writing `build=c0` and `slice=corpusp1` over 68,760 common
+rows per pass with the same keys, widths and arms. No column labels chain205 as chain205.
+
+The `batch` column — repeat counts a run re-derives from its own timings — was proposed as the
+missing content-level cross-check. It works, but **not in the way the raw number suggests, and a
+negative control is what separates the two readings**:
+
+    chain205 vs chain196, all 6 passes   batch identical  30,268 / 412,560   7.34%
+    within-run baseline, chain205 p1-p2  batch identical   4,857 /  68,760   7.06%
+    within-run baseline, chain196 p1-p2  batch identical   4,496 /  68,760   6.54%
+
+The cross-run figure sits **inside** the within-run baseline, because `batch` is re-derived per
+*pass* from that pass's own timings and so varies between two passes of one run as much as between
+two runs. So 7.34% is not positive evidence of independence; it is the null.
+
+**The power is one-sided, and that is the claim worth keeping.** A literal substitution — symlink or
+copy — makes `batch` agree on 100% of rows. Against a 6.5-7.1% baseline, an observed 7.34% rules
+substitution out decisively while saying nothing in the other direction. The informative comparison
+is the gap to 100%, not the distance from zero. A right instrument with the wrong denominator reads
+as evidence when it is a baseline.
