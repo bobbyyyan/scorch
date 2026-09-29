@@ -37035,3 +37035,65 @@ quantile-interpolation should buy. It is exactly what interpolation buys here: n
 the adjacent order statistics `v[325]` and `v[326]` are **7.10%** apart. Both numbers are correct
 under their own stated estimator, which is the fourth time in this document that a disagreement
 resolved to an unstated estimator rather than to an error.
+
+### chain206: relocation prices at zero, and the build floor is reproduced with zero code difference
+
+chain206 ran on redwood 2026-09-15 06:15 to 15:23, uncontended, three objects over six passes using
+all six permutations of three so each object occupied each position exactly twice: 18 invocations,
+4,584 keys at five widths, 22,920 cells per object. Sealed on the producing host before transfer;
+the local copy verifies 18 of 18 against that seal; all 18 digests distinct; and no output is
+byte-identical to any file from chain196's, chain205's or the synthetic set, so this is not a renamed
+copy of anything already on disk.
+
+The three objects were separated statically first (`det1`, same host, 06:10): `aa` and `bb` have
+**identical `.text`** at equal path length and differ only in the build-path string in `.rodata`,
+which the kernel never reads; `aax` is one character longer and differs by **relocation only** —
+identical instruction count (160,155), identical mnemonic sequence, identical section size, 592 of
+715,033 bytes differing as single-byte operands encoding relocated static data. A rebuild at a fixed
+path was byte-identical, so rebuild nondeterminism does not exist on this toolchain.
+
+Estimand as everywhere else: per-cell `exp(median(log ratio))` over the six passes, deviation
+`exp|ln x|-1`, floor = p95 nearest rank, per width, n = 4,584 per width.
+
+    pair                          k=2      k=4      k=8      k=16     k=32    what it carries
+    oursb/ours within aa         0.0483   0.0410   0.0436   0.0575   0.0851   arm identity, 1 process
+    oursb/ours within bb         0.0454   0.0367   0.0416   0.0578   0.0863   arm identity, 1 process
+    oursb/ours within aax        0.0450   0.0392   0.0423   0.0584   0.0785   arm identity, 1 process
+    ours(aa)/ours(bb)            0.0818   0.0747   0.0756   0.0909   0.1387   DRIFT only, .text IDENTICAL
+    ours(aa)/ours(aax)           0.0862   0.0692   0.0751   0.0973   0.1428   drift + RELOCATION
+    mkl(aa)/mkl(bb)              0.0628   0.0721   0.1059   0.0916   0.1101   control, fixed library
+    mkl(aa)/mkl(aax)             0.0614   0.0730   0.1018   0.0913   0.1088   control, fixed library
+
+**The prediction was recorded in the driver before any timing, and all three parts hold.**
+
+    relocation / drift    1.053  0.927  0.994  1.071  1.029     predicted ~1.00
+    drift / arm floor     1.696  1.820  1.733  1.580  1.629     predicted > 1
+    drift / MKL control   1.304  1.036  0.714  0.992  1.260     predicted ~1.00
+
+**Relocation prices at zero.** The relocation-differing pair and the identical-code pair agree to
+within 7% at every width, scattered in both directions with no systematic sign. Two objects that
+execute the same instructions at the same addresses cost the same time, which is what the static
+result predicted and is now measured rather than inferred.
+
+**And the decisive row: chain196's "build identity" floor is reproduced, width for width, by a
+comparison with zero code difference.**
+
+    chain206 drift only (.text identical)   0.0818  0.0747  0.0756  0.0909  0.1387
+    chain196 build floor (c0 vs c0b)        0.0868  0.0687  0.0750  0.0917  0.1394
+    agreement                                 5.8%    8.7%    0.8%    0.9%    0.5%
+
+Three of five widths agree inside 1%. So the whole of that floor is **cross-invocation drift**, and
+the object term is zero — established now on our own kernel, not only on MKL's. The earlier
+conclusion from chain196's sealed bytes stands on two independent code paths.
+
+**Consequence, unchanged and now fully evidenced.** The board's `mkl/ours` ratio is measured with
+both arms in one process, so the matched null is the within-invocation arm floor
+(median over the three objects: 0.0454 / 0.0392 / 0.0423 / 0.0578 / 0.0851). The wider floor answers
+"would a number from one process reproduce in another", which is the build-to-build question the
+66–72 band already answers. **The 19 cells are not given back**, and the gated count stands at 68 on
+chain196 and 63 on chain205.
+
+**One new fact worth keeping.** Our kernel is more drift-sensitive than MKL at k=2 and k=32 (ratios
+1.30 and 1.26) and *less* at k=8 (0.71). So "the floor is the harness" is true in aggregate but not
+uniformly in width, and a cross-invocation floor borrowed from MKL would be wrong in both directions
+depending on the width. Each side's floor has to come from its own arm.
