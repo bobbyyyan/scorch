@@ -37364,3 +37364,51 @@ it was the separate per-arm reading count (45840 against an expected 137520). So
 count does not detect a partial-pass input, which is the likelier corruption when a run is
 interrupted. Both assertions are needed and only one of them fires on this case. This is the
 argument for feeding a guard the defect it forbids rather than reasoning that it covers it.
+
+### Attribution: the symlink farm is a report from redwood, its consequence is independently verified
+
+Stated because a reader would otherwise assume both halves were confirmed the same way. The
+verifying session is instructed never to touch redwood, so the **mechanism** — six links in
+`/scratch/bobbyy/c205an/` created 02:20 against a real run writing 02:57-05:30 — rests on this
+session's reading of that host and is not independently checked. What is independently checked, by a
+session that reimplemented the gating rule from the prose description alone, is the **consequence**:
+the filed bytes are chain205's own and print 63, chain196's bytes print 68, per-width vectors match
+digit for digit (20/31/9/2/1 and 21/37/7/1/2), both partitions sum to 22920 with 4584 cells at every
+width, and the intersection/only/only split reproduces at 30/33/38. Their independent floors for
+chain196 also matched a figure they had computed an hour earlier for an unrelated purpose.
+
+Their identity scan over both roots: **0 exact size matches, 913 files within 5% of the range, 0
+byte-identical.** The near-miss population is large, so the zero is informative — and it is only
+informative because chain196's `sh_*` family exists, which is the family the vacuity claim had
+written off.
+
+### The surviving-cell count, and an honest note on which guard actually fires
+
+`recount205.py` filtered cells to those with all six passes (`if len(rs)==6`) while printing
+`len(T)`, the cells *loaded*. A dataset missing a pass, or one key absent from one pass, would
+therefore board a confident count over a quietly smaller denominator with the printed cell count
+still looking right. Fixed: the post-filter surviving count is now printed per width for both the
+floor arm and the board, and it reads 4584 at every width for both chains, so nothing was dropped
+here — but it is now the printed number rather than an inferred one.
+
+**The assertion behind it has not been shown to fire, and that is worth saying rather than
+implying.** Both positive controls — deleting a whole pass, and deleting one key's 15 rows from one
+pass — were caught **upstream** by the per-arm reading count (114600 and 137515 against an expected
+137520) before the surviving-cell check was reached. For these corruptions the reading count is
+strictly stronger, so the surviving-cell assert is unreachable defence-in-depth. Being already
+covered is not being tested; what the fix genuinely delivers is the printed value the peer asked
+for, not a demonstrated guard.
+
+### And one in my own verification line, immediately after writing the section about it
+
+Reporting the two new seals, this session printed `OK 0` for both manifests. Cause:
+`shasum -a 256 -c $D/SHA256SUMS` was run from a different working directory, and the manifests hold
+relative paths, so it found no files and emitted **0 lines, 0 OK and 0 FAILED** — byte for byte the
+same failure mode as the ledger root's CRC-32 manifest reported two sections earlier, and the same
+shape as the analyzer that certified nothing. Verified from inside each directory: chain205 11 of 11
+and 7 of 7 against the redwood-side digests, chain206 26 of 26 and 18 of 18. The peer's figures were
+right and this session's were vacuous.
+
+The general form, now on its fourth appearance in one day: **`shasum -c` reports success and failure
+on the same channel it reports "I could not find the file", and the third case prints as silence.**
+Any use of it must assert the emitted line count against the manifest line count.
