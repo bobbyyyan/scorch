@@ -37557,3 +37557,51 @@ that causes the effect will separate from a population that was not, and the sep
 like the thing being tested for. The check that catches it is to enumerate the comparison class
 completely — 36 cross-run pairs, not the 6 that share an index — and here that turned a reported
 clean separation into a 6-of-36 overlap.
+
+### The guard set closes by proof, and the file-count premise is exactly the right strength
+
+Carrying the pigeonhole argument through its remaining degree of freedom closes the class. Given
+(a) exactly 6 input files, (b) cells == 22920, and (c) per-arm entries == 137520 for each of the
+three arms, every cell necessarily carries all six passes for every arm:
+
+- 6 files contribute at most 6 distinct pass indices, so each `(cell, arm)` holds at most 6 entries,
+  giving at most 22920 x 6 = 137520 per arm. **Equality forces exactly six for every cell.**
+- The cell count cannot be low: 22919 x 6 = 137514 falls short of 137520, so (c) forces
+  cells >= 22920, and (b) pins it.
+- The cell count cannot be high: with cells == 22925 and per-arm == 137520, 22920 cells at full
+  depth would consume every entry and leave none for the five phantom cells, so a phantom key must
+  cost completeness — and (b) fires on 22925 first.
+
+Verified on the filed data: 6 files, pass indices exactly `[1,2,3,4,5,6]`, 22920 cells, 137520
+entries for each arm, pass-depth distribution `{6: 22920}`, and zero cells short of six passes for
+any arm.
+
+**The surviving-cell check is therefore redundant-by-proof against the current guard set**, which is
+the backstop role it was assigned — it earns its place only for a future caller that widens the
+glob, since the proof's first premise is the file count. The earlier "uniquely necessary" reading
+was correct only against the guard set as it stood *before* the file count was asserted.
+
+One case neither of us named, and it shows the premise is exactly the right strength rather than
+merely sufficient: **six files need not mean six distinct pass indices.** `..._p1.csv` and
+`..._p01.csv` both parse to 1, giving five distinct indices from six files. The file-count assertion
+passes. What catches it is the per-arm count, since the maximum drops to 22920 x 5 = 114600 and the
+equality fails. So the file count bounds the index set from above, which is all the pigeonhole needs,
+and the per-arm equality detects any shortfall inside that bound. Neither assertion covers the case
+alone.
+
+### The mirrored failure, recorded because both halves are instructive
+
+The two errors that produced this exchange are duals, and each reached a defensible conclusion by a
+route that did not support it.
+
+- **Mine:** a two-point baseline for the `batch` agreement rate, reaching a verdict that survived
+  full enumeration for the unrestricted comparison. Right answer, inadequate sample.
+- **The peer's:** a harness that incremented once per **CSV row** while the guard counts once per
+  **dictionary insertion**, then predicted the guard's behaviour from the wrong quantity. On the
+  relabel construction those differ — 137520 raw rows against 137515 distinct `(cell, pass, arm)`
+  entries — so the prediction failed while the underlying instinct (that a reachable case exists)
+  was correct.
+
+The second is a harness measuring something other than what production computes, which this
+milestone has on record from three other directions. The operational form: **before predicting what
+a guard will do, check that your instrument counts the same quantity the guard counts.**
