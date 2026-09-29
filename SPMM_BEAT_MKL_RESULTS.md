@@ -37097,3 +37097,154 @@ chain196 and 63 on chain205.
 1.30 and 1.26) and *less* at k=8 (0.71). So "the floor is the harness" is true in aggregate but not
 uniformly in width, and a cross-invocation floor borrowed from MKL would be wrong in both directions
 depending on the width. Each side's floor has to come from its own arm.
+
+## chain206 verified by a second session: five corrections, two additions, one preservation fix (2026-09-28)
+
+An independent session re-derived the chain206 tables from the 18 raw CSVs and reproduced all
+35 entries within 0.001, including `relocation/drift` and `drift/MKL`, and confirmed the seal
+verifies 18 of 18 with a control that fails when a byte is appended. It then raised six points.
+All six were re-checked here against the sealed bytes using the estimator the analyzer states at
+`an_c206.py:31-33` — per-cell `exp(median(log ratio))` over the 6 passes, paired by pass index,
+deviation `exp|ln x| - 1`, floor `sorted(d)[int(0.95*(len(d)-1))]`, per width. Four of the six
+stand, one is wrong in its conclusion but right about the mechanism, and one is deferred pending a
+measurement that does not yet exist.
+
+### Preservation, which was the only urgent item
+
+chain206 was not in the evidence ledger. Its only copy was the session scratchpad under
+`/private/tmp`, which is reaped. This had already cost artefacts before it was noticed: the
+scratchpad's `c205final` directory is now empty, `synth205` is gone, and the chain206 driver,
+probe and determinism scripts had already been deleted. The 18 CSVs survived only because they
+were staged down on the day this was written.
+
+Now sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain206-relocdrift-redwood`: the 18 CSVs, the
+staging log, the staging digest file, the analyzer, and the three driver scripts recovered from
+`redwood:/scratch/bobbyy` (`rw_s_chain206.sh`, `det_build.sh`, `det_diff.sh`). 24 files under
+`SHA256SUMS`, 89 MB, verified 24 of 24 with a positive control: appending one byte to the staging
+log makes `shasum -c` print `FAILED`, and the file was restored and re-verified afterwards. The
+recovered driver is confirmed to be the one that produced these outputs by the six permutations at
+`rw_s_chain206.sh:100-101` and `EXPECT=68761` at line 105.
+
+### (1) The renamed-copy check: their conclusion is wrong, their mechanism complaint is right
+
+The claim was that the check was vacuous because it discriminated against nothing. Two of the
+analyzer's three comparison globs are indeed dead — `c205final` is empty and `synth205` does not
+exist. But the third is not. chain196's ledger holds **two** CSV families, and the checker read the
+wrong one: `sg_*.csv` are 18 summaries at 2151-2230 bytes, while `sh_*.csv` are 18 full per-cell
+files at 5,152,678-5,291,172 bytes, against chain206's 5,152,654-5,221,700. Every one of those 18
+is inside 5% of chain206's size range, so the check had 18 real chances to fire and found 0
+byte-identical matches. That carries information.
+
+It carries more than the original framing claimed, because chain196's `sh_*` set is exactly the
+population where this failure already happened once: chain196's sealed six-pass set was found
+sitting in chain205's analysis directory, byte-identical and renamed. The highest-prior candidate
+was in the comparison set.
+
+The mechanism complaint stands and is the part worth keeping. The analyzer printed the number of
+files compared, not the number of *size-eligible* files compared, so it would have printed a
+confident pass had the surviving population been `c205final` alone. A count whose predicate cannot
+distinguish 18 candidates from 0 is a silent null. Fix: report the size-eligible candidate count
+beside the match count.
+
+### (2) CONFIRMED: the `drift / arm floor` row divided by the wrong floor
+
+The Consequence paragraph names the median over the three objects as the matched null; the row
+divided by build `aa`'s floor alone. Both, re-derived:
+
+    quantity                                 k=2      k=4      k=8     k=16     k=32
+    drift  (aa vs bb, arm ours)           0.0818   0.0747   0.0756   0.0909   0.1387
+    arm floor, aa                         0.0483   0.0410   0.0436   0.0575   0.0851
+    arm floor, MEDIAN of three            0.0454   0.0392   0.0423   0.0578   0.0851
+    drift/arm using aa        published    1.6959   1.8205   1.7330   1.5803   1.6291
+    drift/arm using median    correct      1.8037   1.9041   1.7852   1.5714   1.6291
+      published low by, %                   6.36     4.59     3.01    -0.56     0.00
+
+The published figures were conservative at four of five widths: correcting the denominator moves
+drift *further* above the arm floor. The conclusion is unchanged and slightly strengthened.
+
+### (3) CONFIRMED: "within 7% at every width" is false, on both deviation scales
+
+    relocation / drift                    1.0530   0.9273   0.9936   1.0712   1.0293
+      |x-1|, %                              5.30     7.27     0.64     7.12     2.93
+      exp|ln x|-1, %                        5.30     7.84     0.64     7.12     2.93
+
+k=4 is 7.27% on `|x-1|` and 7.84% under `exp|ln x|-1`. k=16 is 7.12%, also above 7. So two widths
+break the claim, not one. **The smallest true statement is "within 8% at every width."** Corrected
+wherever the 7% figure appears. This is the two-sided-scale trap again: the width that breaks the
+claim is the one below parity, which is the tail an `|x-1|` instrument under-reads.
+
+### (4) CONFIRMED, and it is not a typo: two 95th-percentile *methods*
+
+The chain196 build floor appears twice with different last digits. Both are the same measurement
+over the same bytes; they differ only in how the 95th percentile is taken, and `numpy`'s default is
+not nearest-rank:
+
+    np.percentile(..., 95, method="linear")   0.0868   0.0687   0.0752   0.0918   0.1396   = line 36181
+    np.percentile(..., 95, method="lower")    0.0868   0.0687   0.0750   0.0917   0.1394   = lines 36647, 37082
+
+`method="lower"` is identical to the lambda `sorted(d)[int(0.95*(len(d)-1))]` that every chain206
+row uses, so **lines 36647 and 37082 are the figures consistent with the rest of the analysis** and
+line 36181 was produced by a script that reached for `np.percentile` and took its default. At
+n=4584 the two indices are 4353 and 4354, adjacent order statistics.
+
+This is the sixth disagreement in this milestone that resolved to an unstated quantile convention,
+and the first one located between two sections of this document rather than between two sessions.
+The mechanism is worth stating plainly because it will recur: a hand-written nearest-rank lambda and
+`np.percentile` disagree in the third decimal *by construction*, silently, with no error and no
+warning. The checker's own convention, `ceil(0.95n)` 1-indexed, is index 4354 — it agrees with
+`method="higher"`/`"nearest"`, not with the interpolated default and not with the lambda. Three
+conventions, three answers, one name.
+
+### (5) ADOPTED: the MKL control replicates across two runs 13 days apart
+
+This was not claimed before and it is the strongest available evidence that the cross-process floor
+is a property of the process boundary rather than of one run. Both pairs have **zero** code
+difference between their two members:
+
+    chain206 mkl(aa)/mkl(bb)    2026-09-15   0.0628   0.0721   0.1059   0.0916   0.1101
+    chain196 mkl(c0)/mkl(c0b)   2026-09-02   0.0621   0.0734   0.1106   0.0951   0.1072
+      |ratio-1|, %                             1.05     1.85     4.21     3.65     2.67
+
+Maximum disagreement 4.2%, on a quantity whose magnitude is 6-14%. A drift floor that reproduces to
+within 4% across 13 days, two separate job submissions and a different arm set is a measurement of
+the harness, not an artefact of a run.
+
+### (6) ADOPTED with its caveats: the paired sign test
+
+Comparing two marginal p95 values asks whether the tails have the same width. The paired test asks
+the stronger question directly — per cell, is the relocation deviation larger than the drift
+deviation? Under the hypothesis that relocation contributes nothing, the fraction should be one
+half:
+
+    fraction dev(reloc) > dev(drift)      0.4887   0.4998   0.4836   0.4784   0.4991
+    n paired cells                          4584     4584     4584     4584     4584
+    per-cell ratio, 5th percentile        0.0695   0.0607   0.0655   0.0735   0.0664
+    per-cell ratio, 95th percentile      13.3856  12.4453  14.2834  12.3437  12.3326
+
+Within 2.2 points of one half at every width. Two caveats, both required:
+
+- **This is a statement about direction, not about per-cell agreement.** The central 90% of the
+  per-cell ratio runs from about 0.06 to about 14. Individual cells disagree by more than two
+  orders of magnitude; what is absent is any systematic lean.
+- **The naive standard error does not apply.** Both deviations share the `aa` term, so the pairs are
+  not exchangeable and the nominal SD of 0.0074 is optimistic. Taken at face value k=16's 0.4784
+  sits 2.9 nominal SDs low, so this test does not license a claim tighter than "no systematic
+  direction at the 2-point level."
+
+### (7) DEFERRED: the chain204 contamination split
+
+The checker warns that chain204's clean subset may be only its first eight passes, in which case
+the six passes being added now do not repair it, and asks that the per-pass timestamps in `/scr` be
+read rather than their inferred split be taken. Agreed, and not yet done: job 17649043 is RUNNING on
+mkt1 (15:31 elapsed at the time of writing, 6 passes to go). `/scr` is node-local, so reading those
+timestamps means an allocation on the node currently running the timing job. That is the
+perturbation this milestone has a standing rule against, and the read costs nothing if deferred.
+The timestamps will be read after the job leaves the queue, before any chain204 number is used.
+
+One point of analysis to settle at that time, because it changes what the split means: for an
+arm-versus-arm design with a rotated order and an identical-argument floor arm, a pass in which all
+arms ran under the same co-tenancy is internally comparable even if its ambient level differs from
+another pass. What breaks comparability is a pass *straddling* a regime change. So the count that
+matters is straddled passes, not contaminated passes, and with 9 observed regime changes over 24
+passes at most 9 can be straddled. Whether that is the right reduction depends on the per-pass
+timestamps, which is the measurement being deferred rather than an argument against it.
