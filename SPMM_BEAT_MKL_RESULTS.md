@@ -37460,3 +37460,55 @@ copy — makes `batch` agree on 100% of rows. Against a 6.5-7.1% baseline, an ob
 substitution out decisively while saying nothing in the other direction. The informative comparison
 is the gap to 100%, not the distance from zero. A right instrument with the wrong denominator reads
 as evidence when it is a baseline.
+
+### Correction: the surviving-cell assertion is reachable, and finding the reaching case turned it into a theorem with a missing premise
+
+The preceding section called the surviving-cell assertion "unreachable defence-in-depth" on the
+evidence that two positive controls were caught upstream. **That verdict was wrong**, and a peer was
+right to challenge it, though not by the route they proposed. Their two constructions were run here
+against the actual script:
+
+    construction                          raw rows   cells loaded   per-arm readings   what fires
+    1. path prefix on one key, pass 1      412,560         22,925            137,520   cell count
+    2. relabel key A's rows to existing
+       key B, pass 1                       412,560         22,920            137,515   reading count
+
+Construction 2 was predicted to pass every upstream guard. It does not: the relabelled rows
+**overwrite** key B's existing pass-1 entry in the dictionary, so five readings per arm are lost and
+the reading count lands at 137,515. Their prediction counted raw CSV rows, which really are
+unchanged; the guard counts post-insertion `(cell, pass, arm)` entries, which are not.
+
+**Why every deletion- and relabel-shaped corruption fires upstream — the argument is pigeonhole, and
+it is worth stating because it says exactly when the assertion becomes reachable.** 22920 cells,
+each contributing at most one reading per arm per pass, with the pass index drawn from at most 6
+values, gives at most 137,520 readings per arm. So `readings == 137,520` **forces** exactly six
+passes for every cell. The surviving-cell count cannot then differ from 4584.
+
+**The premise is "at most 6 values", and nothing asserted it.** `load()` globbed the pass files
+without checking how many it found. With a seventh file, a cell carrying seven passes compensates
+for one carrying five and every upstream count sits exactly at expectation. Constructed and
+verified: key A's 15 rows removed from pass 1, a `_p7.csv` added carrying key B's 15 rows.
+
+    raw data rows            412,560  = expected      does not fire
+    cells loaded              22,920  = expected      does not fire
+    per-arm readings         137,520  = expected      does not fire
+    surviving cells / width    4,582 vs 4,584         FIRES, alone
+
+So the assertion is the unique guard for that case and is now a demonstrated guard rather than an
+untested one. Two details from the construction: the dropped count is **two** cells, not one,
+because `len(rs) == 6` is an equality — the cell with *seven* passes is discarded too, so the check
+catches over-coverage as well as under-coverage. And the corruption alters the estimate rather than
+merely shrinking the denominator, since one key's pass-1 weight is doubled while another's is
+dropped.
+
+Fixed at the source as well, which is cheaper than relying on the downstream check: `load()` now
+asserts the input file count and explains in place that the reading-count argument depends on it.
+The seven-file construction now fails at the file count instead. Both assertions are kept — the
+file count closes the class, the surviving-cell count is the backstop if a future caller widens the
+glob.
+
+**The general lesson, which is the reason this is recorded at length.** "Guard B is unreachable
+because guard A catches everything" is a proof obligation, not an observation, and here the proof
+existed and rested on an unasserted premise. Two controls firing upstream is evidence about those
+two controls. What settles reachability is the pigeonhole argument — and writing it down is what
+exposed the hole, because the argument names its own premise.
