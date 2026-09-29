@@ -37346,3 +37346,21 @@ chain187 x2) of the 22 present, so chain188 through chain206 have no tree-level 
 Nothing it names is missing, so this is omission, not rot. Per-directory `SHA256SUMS` carries the
 load. Not repaired here: regenerating a manifest at the ledger root changes shared evidence
 infrastructure and is Bobby's call.
+
+### Fifth instance of the hardcoded-path defect, in a script filed minutes after writing that section up
+
+`recount205.py` — the recount above, filed into the chain205 directory — opened with
+`L = os.path.expanduser("~/.cache/scorch-codex/spmm-beat-mkl")` and both chain directory names
+hardcoded. That is the same defect the preceding section reports as the fourth instance, committed
+into the ledger immediately after the write-up criticising it. Recorded rather than quietly fixed,
+because the pattern is that a rule gets broken by the very next artefact its author produces.
+
+Fixed: takes the ledger root as `argv[1]`, defaulting to the script's parent so it is correct in
+place, and refuses on a wrong-sized input.
+
+**The positive control found something the guard design had wrong.** Fed a 2-of-6-pass subset, the
+cell-count guard **passed** — all 22920 cells are present, each with fewer passes — and what caught
+it was the separate per-arm reading count (45840 against an expected 137520). So asserting the cell
+count does not detect a partial-pass input, which is the likelier corruption when a run is
+interrupted. Both assertions are needed and only one of them fires on this case. This is the
+argument for feeding a guard the defect it forbids rather than reasoning that it covers it.
