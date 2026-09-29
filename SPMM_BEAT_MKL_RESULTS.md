@@ -37512,3 +37512,48 @@ because guard A catches everything" is a proof obligation, not an observation, a
 existed and rested on an unasserted premise. Two controls firing upstream is evidence about those
 two controls. What settles reachability is the pigeonhole argument — and writing it down is what
 exposed the hole, because the argument names its own premise.
+
+### The `batch` baseline, resolved over all 66 pairs: the separation is a pass-index effect, and the population was selected on it
+
+Two successive claims about the `batch` column were both wrong, in opposite directions, and the full
+enumeration settles it. The earlier section sampled **two** within-run pairs (7.06% and 6.54%) and
+concluded the cross-run 7.34% "sits inside the within-run baseline". A peer then enumerated all 15
+within-run pairs per chain, found the cross-run value above the within-run maximum 6 times out of 6,
+and reported the two populations as separated. Both were computed here:
+
+    population                               n    min      max     median
+    chain205 within-run, all pairs          15   6.61%    7.06%    6.82%
+    chain196 within-run, all pairs          15   6.54%    7.01%    6.78%
+    pooled within-run baseline              30   6.54%    7.06%    6.78%
+    cross-run, MATCHED index p_i vs p_i      6   7.17%    7.48%    7.37%
+    cross-run, ALL 36 pairs                 36   6.51%    7.48%    6.80%
+    a file against itself (symlink/copy)     1              100.0%
+
+**Over all 36 cross-run pairs the two populations overlap almost exactly** — median 6.80% against
+the within-run 6.78%, ranges 6.51-7.48% against 6.54-7.06% — and only **6 of 36** exceed the
+within-run maximum. Those six are precisely the matched-index pairs.
+
+So the separation is not a property of the two runs. It is a property of **comparing passes at the
+same index**, and the peer's population was selected on exactly that feature. `p1` against `p1`
+agrees more than `p1` against `p4` because the pass index is a real covariate — same position in the
+run, same slice ordering, same state the repeat counts are re-derived from. Selecting the six
+matched pairs and comparing them to an unmatched baseline measures the index alignment, not the
+provenance.
+
+**Corrections, in both directions.** The earlier "sits inside the baseline" was right for the
+unrestricted comparison and was reached from a two-point baseline that happened to bracket the
+value — a correct conclusion from an inadequate sample, which is not the same as a correct
+argument. The peer's separation is arithmetically right and does not mean what it appears to; it
+also does not revive their retracted claim, since the excess is in the direction of **more**
+agreement, and more agreement cannot evidence independence.
+
+**What survives is the one-sided framing, now with both ends measured.** A file against itself —
+which is what a symlink or a copy delivers — gives **100.0%**. On a scale from 6.5-7.5% for any pair
+of genuinely separate passes to 100% for a substitution, the observed 7.34% is unambiguously at the
+separate end. The gap to 100% carries the conclusion; nothing in the third significant figure does.
+
+**The transferable point is the selection, not the statistic.** A population chosen on the feature
+that causes the effect will separate from a population that was not, and the separation will look
+like the thing being tested for. The check that catches it is to enumerate the comparison class
+completely — 36 cross-run pairs, not the 6 that share an index — and here that turned a reported
+clean separation into a 6-of-36 overlap.
