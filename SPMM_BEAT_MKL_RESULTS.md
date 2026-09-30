@@ -38169,3 +38169,98 @@ caution on testing 0.4929 against 0.5: the 90 passes share the same 267 cells, s
 binomial standard error is optimistic and the honest test uses the empirical scatter of the 90
 values. The control does not need a significance test — the contrast in both spread and level
 carries it.
+
+## chain204 CLOSED: the k=32 override fails its second-host gate, and the failure locates a real defect in the worker-count rule (2026-09-29)
+
+chain203 found on redwood that at k=32 an override setting the worker count equal to the caller's
+pool ran **14.4% to 21.2% faster** than the ambient policy on the 25 cells where it raises the
+resolved count. chain204 is the MKT gate on that, and its body script pre-registered three
+predictions and a falsification condition before any timing:
+
+- **P1 the floor** — `ov64` against `ov64b`: same object, same argument, so whatever it reads is the
+  instrument.
+- **P2 the claim**, direction fixed in advance and one-sided — on cells where `resolved[ov64] >
+  resolved[ovp]`, `ov64` is faster.
+- **P3 the built-in null** — on cells where `resolved[ov64] == resolved[ovp]` the override changes
+  nothing the kernel can see, so the arms must agree inside the floor.
+- **Falsifier** — "ov64 null against ovp on the raise group with the floor tight, or a sign flip."
+
+Run on the clean `p25-p30` segment (6 passes, idle node, the segment identified earlier as
+homogeneous), at k=32, 89 cells:
+
+    P1 FLOOR   ov64 / ov64b                    p95 dev 0.0312   median dev 0.0040     <- tight
+    P2 CLAIM   raise group, ov64/ovp           n=38  median 1.0367                    <- SIGN FLIP
+               faster beyond floor 5   slower beyond floor 21
+    P3 NULL    equal group                     n=32  p95 dev 0.2850                   <- fails
+
+**The falsification condition is met: a sign flip with the floor tight.** The override is 3.5%
+*slower* on MKT where chain203 measured 14.4-21.2% faster on redwood, faster on only 8 of 38 cells,
+and slower beyond the floor on 21 against 5.
+
+### P3's failure is a grouping defect, not an instrument defect
+
+Splitting the equal group by whether a worker count was actually resolved:
+
+    equal subgroup            n   p95 dev (ov64/ovp)   same cells on the floor arm
+    resolved > 0             26         0.0378                  0.0312
+    resolved = -1             6         0.2850                  0.0103
+
+**The built-in null passes on the 26 cells where the kernel resolved a count** — 0.0378 against a
+0.0312 floor. All of the failure is the six `resolved = -1` cells, and on the floor arm those same
+cells are *quieter* than average (0.0103), so they are not intrinsically noisy: they differ
+specifically between `ov64` and `ovp`. So `resolved = -1` does not mean "the override changes
+nothing the kernel can see"; it means no count was recorded, and the pre-registered partition
+mis-specified those cells as argument-identical when they are not. Excluding them, P3 holds and P2's
+verdict stands on the narrow floor.
+
+### A mechanism I proposed and then refuted
+
+The obvious explanation for a host-dependent sign flip is team-width cost: MKT's pool is 64 against
+redwood's 24, OpenMP team cost is paid per worker, so "raise to pool" should cost proportionally
+more on the wider pool and only repay itself when each worker gets enough nonzeros. That predicts
+**fewer nonzeros per worker gives a larger slowdown**.
+
+Measured, on the 19 raise-group cells where both arms resolve a real count: Pearson r between
+`log(nnz per worker)` and `log(ov64/ovp)` is **+0.734**. Positive. **More nonzeros per worker gives a
+larger slowdown** — the opposite of the prediction. The mechanism is refuted, and the cells with the
+most starved workers (99-628 nnz each) are exactly where the override wins biggest.
+
+### What the data actually say: the effect is bimodal in the ambient policy's own choice
+
+    ambient chose    n   median ov64/ovp   faster   slower   median nnz
+    1-8 workers      5       0.6591           5        0        14,209    ov64 FASTER by 52%
+    9-30 workers     7       1.3517           1        6        99,147    ov64 slower by 35%
+    31-63 workers    7       1.0654           1        6       206,670    ov64 slower by 7%
+
+Pearson r between `log(ambient resolved count)` and `log(ov64/ovp)` is **+0.734**: the lower the
+ambient policy set the worker count, the more the override wins.
+
+    ambient badly under-provisions            ambient is already well tuned
+    t3dl_e        4 workers   +95%            comsol       20 workers   -52%
+    m3plates      1 worker    +82%            vsp_c-30     26 workers   -42%
+    case39_b1_06  8 workers   +52%            aa03         15 workers   -40%
+    Pd_rhs        1 worker    +48%            lp_osa_07    30 workers   -35%
+    TSOPF_b300_c2 3 workers   +33%            case9_A_11   31 workers   -28%
+
+**So the median -3.5% is the average of a bimodal distribution, and the blanket override must not
+ship**: it would trade a 33-95% win on the under-provisioned cells for a 28-52% loss on the
+well-tuned ones. That is a regression, and per the standing convention a regression is a finding to
+report rather than a shape to tune around.
+
+### The finding worth acting on, and why it is not an if-case
+
+The override is the wrong instrument, but it exposes a real and structurally describable defect:
+**the ambient worker-count rule resolves 1 to 8 workers out of a 64-wide pool on matrices with
+roughly 6,000 to 40,000 nonzeros, where 64 workers run 33% to 95% faster.** That is not a tuning
+coincidence on a few matrices — it is one end of the rule's domain, it is monotone in the rule's own
+output (r = +0.734), and the rule is demonstrably *correct* on the adjacent band, which is what
+makes the low end a defect rather than a preference.
+
+**And it predicts why chain203 saw a blanket win on redwood.** redwood's pool is 24, so the
+over-provisioning band that costs 28-52% on MKT barely exists there — there is little room above the
+well-tuned range to push into. If chain203's redwood win is also concentrated on its low-ambient
+cells, then both hosts are showing **one** mechanism: the rule under-provisions at the low end
+everywhere, and the apparent host disagreement is an artefact of pool width truncating the loss
+band. That is a testable prediction against chain203's sealed data and it is the next thing to check,
+because a single mechanism explaining both hosts is the difference between a generalizable fix and
+two host-specific rules.
