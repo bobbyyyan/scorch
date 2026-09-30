@@ -39488,3 +39488,105 @@ LOWERED 0. That is the width-expanded analogue of chain204's 40/49 over 89 key-c
 a contradicting result. Guards held: `pool` is 64 on every row, `resolved_ours` is
 single-valued within each build on all 267 cells, all three builds are present on all
 267, and `assert not lowered` fired clean at 0.
+
+### CORRECTION: "the width-expanded analogue of 40/49" pooled three different 40-cell sets
+
+chain208's RAISED 120 was described as the width-expanded analogue of chain204's raised 40.
+The count is right and the description is wrong in the way that matters. Each width
+independently gives exactly 40 raised / 49 declined / 0 lowered, and **it is not the same
+40**: 35 keys are raised at all three widths and 10 keys FLIP class across width,
+contributing 5 raised cells at each width. 35x3 + 15 = 120. So the pooled 120 is three
+overlapping populations, not one replicated three times, and the 267 cells are not 267
+independent units because three widths share a key.
+
+chain204's population is **k=32**, verified from the artefact rather than inferred from
+the chain name: `K = 32` at line 46 of `an_c204_resolved.py`, which prints "POPULATION at
+k=32: 89 cells -> raised 40, declined 49, lowered 0". chain204's CSVs carry all three
+widths at 24030 rows each, so the single width is a choice inside the analyzer.
+
+**The regressor per width, and the pooled figure was misleading.** The earlier reading
+"median 0.8269 at 10.5x its A/A" is a pooled number dominated by the narrow widths:
+
+    k     arm    A/A p95dev   OVERRIDE p95dev   ratio     override median
+    2     ours     0.1039         0.5843        5.62x         0.7972
+    4     ours     0.0668         0.7698       11.53x         0.7308
+    32    ours     0.0689         0.8595       12.48x         0.9529
+    2     mkl      0.1086         0.2287        2.11x         1.1218
+    4     mkl      0.0995         0.2245        2.25x         1.0773
+    32    mkl      0.0852         0.2805        3.29x         1.0602
+
+On the k=32 raised 40 -- the population chain204's 1.1346 and the peer's predicted 1.0945
+both refer to -- the regressor is centred at 0.9529, a 4.7% median displacement, while the
+pooled figure implied 17%. The tail is the widest of the three at 12.48x its own
+byte-identical A/A, so the lever is not idle; but any slope-times-displacement prediction
+uses ln(0.9529) = -0.0482, not ln(0.8269) = -0.1902, a factor of 3.9 apart.
+
+### The 89-key corpus is selected on the outcome, and the enrichment survives it anyway
+
+The chain198 section records the selection rule verbatim: "89 matrices instead of 4584 --
+the 49 carrying those 61 cells plus 40 controls we beat MKL by more than 2x at every
+width". So the corpus is chosen ON the outcome and **bimodally** -- one group for being
+behind MKL, one for being at least 2x ahead everywhere, nothing sampled from the middle.
+Any within-corpus association between a structural property and being behind MKL can
+therefore be induced by the selection rather than revealed by it.
+
+The peer session reported that the 10 width-flipping keys contain 7 of the 10 board
+behind-MKL matrices in this corpus, hypergeometric P = 1.89e-06. Conditioning on
+proximity to parity does not remove it:
+
+    reference set                             N    K   n   x   expected   P(X>=x)
+    ALL 89 keys                               89   10  10  7     1.12     1.89e-06
+    not >2x-faster at every width             61   10  10  7     1.64     2.84e-05
+    behind MKL at >=1 width                   32    8   9  7     2.25     7.96e-05
+    worst-width ratio within 20% of parity    27    6   5  4     1.11     0.00398
+    inside the flippers' nnz range            51    8  10  7     1.57     7.8e-06
+
+Two caveats kept attached. Reconstructing the control group as worst-width ratio below 0.5
+yields 28 keys against the declared 40 -- a different host and era than the list was drawn
+from -- so the conditioning is approximate. And conditioning inside a curated corpus
+cannot undo selection that acted on the joint distribution; only the full collection
+settles it. **My first version of this ladder was circular**: K was set to the 7 overlap
+keys, making x = K by construction and every p-value an artefact of the definition.
+
+### The flip has TWO opposite mechanisms, and they map onto the board by width
+
+"Flipping means the resolved count crosses 64 as k varies, so the decision is marginal"
+describes 5 of the 10. Ambient resolved per width tells both stories:
+
+    FX_March2010   301899 nnz   32/32/64   raised at k=2,4    declined at k=32
+    bas1lp         587775 nnz   62/62/64   raised at k=2,4    declined at k=32
+    cegb2919       321543 nnz   34/34/64   raised at k=2,4    declined at k=32
+    cond-mat-2005  351382 nnz   37/37/64   raised at k=2,4    declined at k=32
+    lp_osa_14      317097 nnz   33/33/64   raised at k=2,4    declined at k=32
+    Pd_b             6323 nnz    1/1/1     declined at k=2,4  raised at k=32
+    Pd_rhs           6323 nnz    1/1/1     declined at k=2,4  raised at k=32
+    TSOPF_RS_b162_c3_b 7645 nnz  1/1/1     declined at k=2,4  raised at k=32
+    m3plates         6639 nnz    1/1/1     declined at k=2,4  raised at k=32
+    poli             8188 nnz    1/1/1     declined at k=2,4  raised at k=32
+
+The first five saturate the pool at k=32 so the override becomes a no-op -- that is the
+marginality story. The last five sit at ambient 1 at every width, nowhere near 64; what
+varies is whether the override is GRANTED, not where the ambient decision sits.
+
+**And the two groups match the board's two width clusters.** Of the 6 board behind-MKL
+cells at k=2, four are second-group matrices (Pd_b, Pd_rhs, m3plates, poli) at the width
+where ambient resolved is 1. Of the 7 at k=4, three are first-group (lp_osa_14, cegb2919,
+FX_March2010) at the width where ambient sits at 32-34. So a 6-8k-nonzero matrix running
+SINGLE-THREADED at k=2 and a ~320k-nonzero matrix at half the pool at k=4 are two
+different regimes, both computable at plan time, and neither is in the rows/nnz/degree
+space where every predicate came back at lift ~1. A single-threaded 6323-nonzero SpMM
+losing to MKL needs no exotic explanation.
+
+Structural fact for any predicate written on this: `work = nnz*max(k,16)` while
+`work_true = nnz*k`, so k=2, 4 and 8 share a work term. Only 3 of 89 keys change ambient
+resolved between k=2 and k=4 against 50 between k=4 and k=32, so a predicate phrased on
+"resolved varies with k" is nearly a k>=16 predicate unless it goes through `work_true` or
+the row-axis ceiling.
+
+**The decisive test and why it is cheap.** `scorch_spmm_nthreads` is already
+pybind-exported at `ops.cpp:704` as (work, rows, nthreads_override, work_true, nnz) -- a
+pure function, so resolved counts for all 4584 x 5 board cells are ~23k calls with no
+timing attached. The rule is queryable, so no harness needs to restate it. It must run on
+the host whose pool the claim concerns, because the base bound reads omp_get_num_procs()
+internally. Not being added to chain207, which is live; pre-registered for the next
+full-collection run with the predicate stated before the data.
