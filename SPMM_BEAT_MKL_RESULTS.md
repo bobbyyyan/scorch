@@ -40806,3 +40806,46 @@ Note on the residue count in this section: the SuiteSparse figures are chain196 
 which yields **18** residues under the headline criterion against the filed 14 from a
 different run pairing -- the same cross-run instability already on file (63 against 68 with
 overlap 30). Nine of the 18 are at k=4. The DLMC 10 is the sealed chain207 figure.
+
+### The thread-count mechanism for the k=4 floor penalty is NOT supported
+
+The +9.2 us floor penalty invited a thread-policy explanation, since 9.2 us is 26-39 workers
+at the team-widening rates measured the same night and `scorch_policy.h:1390` says the floor
+lives in thread policy. Queried directly on **the object that produced chain207** -- the
+`det1/aa` tree at `/scratch/bobbyy/det1/aa/src`, 1050960 bytes, `scorch_tune_hooks()` 0,
+policy `num_procs` ceiling 24 matching the run's recorded pool -- the answer is no.
+
+| set | n | median `resolved` | at pool (24) |
+|---|---|---|---|
+| DLMC k=4 residues | 8 | **17** | 37.5% |
+| DLMC k=4 non-residues, all | 400 | 5 | 10.5% |
+| DLMC k=4 non-residues, **matched on nnz decade (1e5)** | 119 | **14** | 30% |
+
+Against the unmatched control the residues look enriched at the full pool -- 37.5% against
+10.5%, a 3.6x reading. **Matched on nnz that enrichment almost entirely disappears**: median
+17 against 14, 37.5% against 30%. The residues' thread counts are close to normal for cells
+of their size, and the apparent anomaly was the nnz confound. Big cells get many threads; the
+residues are big cells. The eight residue counts are 13/15/17/17/18/24/24/24, spanning most
+of the pool rather than pinning at it.
+
+So the floor penalty is real and reproduced across two collections, and the first mechanism
+for it is refuted. What remains untested is whether the thread count is *too high for the
+benefit* on these particular cells, which a resolved-count query cannot answer -- a count
+being normal for its size says nothing about whether that size is right. That needs an
+ablation: cap the count on those cells and measure whether the floor drops. That is a run on
+redwood, not an analysis.
+
+**Two process notes, because the path here was wrong twice.** First, I queried
+`/scratch/bobbyy/scorch` and concluded "redwood exports neither `scorch_spmm_nthreads` nor
+`scorch_tune_hooks`, 44 exports, neither present" -- against a tree at commit `9c71ba1` with
+no `scorch_policy.h` at all and a `.so` dated **2026-07-11**, nearly three months stale. It
+was not the tree that produced chain207. The conclusion was void and I filed it as a blocker
+before checking. The correct trees are `det1/aa` and `det1/bb`, named in
+`/scratch/bobbyy/rw_s_dlmc2.sh`, and they export both functions.
+
+Second, and it is a gap in my own sealed chain: **chain207's artefacts do not bind the
+object.** `c207_run.log` records the driver path and `pool 24` but no `PYTHONPATH`, no tree,
+and no `.so` digest, so the sealed set proves the CSVs are intact and does not prove which
+binary produced them. The peer's battery verified 20/20 and could not have caught this. The
+producing trees are only recoverable from an unsealed launcher script outside the ledger.
+Every future chain should seal the `.so` digest for each named build alongside the data.
