@@ -38719,3 +38719,61 @@ the chain203 figure is used instead, so the pre-registered magnitude is 5 to 7%)
 bracket is much wider, the two maps differ in something other than the batch integer and the
 single-manipulated-variable claim has failed. This is the failure `batch_local` was added to catch,
 and until now nothing predicted a size for it.
+
+### The board's headline survives a second, independent instrument — and the cold/warm story does NOT generalise
+
+chain203's override looked 6.52x better on isolated calls than the 1.14x it showed batched, which
+raised a question about the whole milestone: is our ~2.6x advantage over MKL a property of batched
+timing? The board data answers it for free, because every row carries a `batch` column and
+`batch = target_ms / single_call_time`, so **the batch ratio between two arms measures the same
+comparison at isolated-call granularity.** Run over chain206's sealed board — 4,584 SuiteSparse
+matrices x 5 widths, 22,920 cells, six passes, redwood at pool 24.
+
+    build aa    batched median   isolated median    behind-MKL batched   behind-MKL isolated
+    k=2         0.6637           0.7232              42 (1.0%)            296 (6.7%)
+    k=4         0.5609           0.5501              49 (1.1%)             44 (1.0%)
+    k=8         0.3662           0.3603              15 (0.3%)             43 (1.0%)
+    k=16        0.3231           0.3094               5 (0.1%)             19 (0.4%)
+    k=32        0.3089           0.3015               2 (0.0%)            171 (4.2%)
+    POOLED      0.3840           0.3785             113 (0.5%)           573 (2.7%)
+
+**The two instruments agree at the centre.** Pooled 0.3840 batched against 0.3785 isolated, and the
+per-cell median of isolated/batched is **0.9938** — within 0.7%. It replicates on build `bb`
+(0.3842 / 0.3769, median 0.9937), which is a separate process with byte-identical `.text`.
+
+**The sign test needs no floor and says the same thing.** The isolated instrument reads *worse* for
+us on only **46.15%** of the 21,535 usable cells (9,939 of 21,535), which is 11.3 SE *below* half —
+it reads better for us more often than worse. And this is conservative by construction: `int()`
+truncation in `batch = int(target/t)` biases the isolated time **upward**, so the true single-call
+time is at most what this reads, and it still does not read slower than batched.
+
+**So the milestone's headline is not a batching artefact**, and chain203's 5.70x cold/warm divergence
+is a property of *that override comparison*, not of our kernel. Restricting the earlier finding
+accordingly.
+
+Three things that had to be got right for that conclusion to mean anything:
+
+- **Quantisation, stated and enforced.** `batch` is an integer, so relative error is 1/batch. Cells
+  count only when every pass has batch >= 10 on both arms; that keeps 21,535 of 22,920 and the
+  excluded count is reported per width (170 to 524, largest at k=32).
+- **The within-process A/A gives this instrument no floor at all.** The harness hands one batch to
+  `ours` and `oursb` inside a process, so `batch_oursb / batch_ours` is exactly 1 **by construction**
+  — a floor of zero that would have made every behind cell look significant. The only A/A available
+  is across builds, `aa` against `bb`, and it reads **0.2603** against the timed floor's **0.0876**.
+  The isolated instrument is 3.0x cruder, which is the whole explanation available for its larger
+  behind-MKL count (400 cells beyond its own floor against 43 for the timed one) in the absence of
+  any systematic tilt, and the sign test says there is none.
+- **A fixed per-call cost is refuted, and the number it produced must not be quoted.** Modelling
+  `t_isolated = t_batched + C` gives a no-intercept line in 1/t whose slope is C. Fitted per width on
+  our arm alone it returns C = 2.85 / 0.78 / 0.92 / 0.61 / 4.21 us — a 6.9x spread where a fixed cost
+  predicts one constant — and **r ranges from −0.077 to +0.099 at every width**, so the line explains
+  nothing and the slope is an artefact of forcing a fit through an unrelated cloud. The same fit on
+  MKL's arm returns 32 to 68 us. **I nearly reported that as MKL's per-call overhead.** It is not a
+  cost; it is what a no-intercept fit returns when there is no relationship, and printing `r` beside
+  the slope is the only reason it was caught.
+
+One correction to my own framing above: I checked the behind-MKL counts against the p95 floor's 5%
+false-positive budget (1,076 cells) and read them as "below budget, no deficit". **That comparison is
+a category error** — the budget applies to a population whose true effect is zero, and these cells
+sit at a true ratio near 0.38, far enough from parity that 26% noise cannot push them past it. The
+conclusion stands on the sign test and the replication, not on that budget.
