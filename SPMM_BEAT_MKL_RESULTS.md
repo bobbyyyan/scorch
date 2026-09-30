@@ -38403,3 +38403,54 @@ below the all-89 median and 221x below the raised median. The larger +0.3092% la
 the narrow floor this analysis discards anyway. No conclusion moves, and the next window selection
 checks balance on the landed passes. **This carries to chain207**, where any segment restriction has
 the same exposure.
+
+### Which floor is correct is OPEN: the 10x gap is neither population nor batch
+
+I called the declined-argument A/A "the correct floor" two commits ago. That was over-claimed. The
+evidence that the narrow floor is too tight stands; the identification of the declined A/A as its
+replacement does not survive its own diagnostics.
+
+**The population explanation is dead, which is the good news.** If the 49 declined cells were simply
+the small noisy ones, their wider A/A would be a size artefact. They are not: the relabelled-object
+floor is flat across all three populations.
+
+    pair                     population     n    p95 dev   median |batch dev|   median nnz
+    ov64b/ov64  relabel      all            89    0.0312   0.0128               99147
+    ov64b/ov64  relabel      declined       49    0.0312   0.0119               135135
+    ov64b/ov64  relabel      raised         40    0.0295   0.0133               98559
+    ov64/ovp    test         all            89    0.5913   0.0554               99147
+    ov64/ovp    test         declined       49    0.3122   0.0178               135135
+    ov64/ovp    test         raised         40    0.8164   0.2584               98559
+
+**Batch is a mediator on the raised cells, not a confound.** Batch divergence on the raised cells is
+25.84% against the relabel pair's 1.33%, and the causal order is fixed by the harness: the override
+changes the kernel's speed, calibration observes the new per-call time, and it therefore picks a
+different batch. The override *causes* the batch change. That path runs from treatment to
+measurement through an artefact the harness documents, so pinning the batch blocks an artefact path
+rather than removing real effect — the fix is still right, and the reason is better than the one I
+gave.
+
+**But batch divergence does not explain the declined pair's width.** On the declined cells the two
+pairs diverge in batch by 1.78% and 1.19% — nearly equal — while their floors are 0.3122 and 0.0312,
+a factor of ten. So whatever makes the declined A/A wide is not the thing I said it was.
+
+**It is concentrated on small matrices.** By nnz quartile, the test pair reads 0.5913 / 0.8164 /
+0.4215 / 0.0361 while the relabel pair reads 0.0079 / 0.0287 / 0.0117 / 0.0380. **They agree on the
+largest quartile and differ 75-fold on the smallest.** A floor that is 0.008 for one argument pair
+and 0.59 for another on the same 22 matrices is not measuring the hardware.
+
+**And "declined" is a reconstruction, not an observation.** The `resolved` column is
+`scorch_spmm_nthreads()` called by the harness with arguments rebuilt from outside the timed call,
+and `mrgate_ov.py`'s own comment records that the zero-row term spmm.h adds to `work` is not
+reconstructed, so the column is a **lower bound** wherever a matrix has empty rows. The declined set
+is therefore declined according to a model of the policy, not according to the kernel. `ov64b/ov64`
+is argument-identical by construction and needs no model. That is a real asymmetry in favour of the
+narrow floor, and it points at small matrices — exactly where the reconstruction is least reliable
+and where the gap lives.
+
+**So both of these stand and they do not pick a winner:** the narrow floor fails its own A/A (10
+declined cells beyond it slower, 0 faster), so it is too tight; and the declined floor is ten times
+wider for reasons that are not population, not batch divergence, and not yet named. P2's verdict is
+unaffected — the median sign flip survives under either floor — but **no per-cell gated count from
+this chain should be quoted until the floor question is settled by measurement**, which is what the
+batch-pinned re-run is now designed to do.
