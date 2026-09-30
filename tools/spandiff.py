@@ -11,6 +11,25 @@ Complete for the class: a span present in the intended text and absent from the 
 text. Does NOT cover reordering or duplication, which are separate axes (count/index/
 content) and need their own checks.
 
+PRESUPPOSES THE QUOTE-THEN-SUBSTITUTE WORKFLOW. The predicate is "every span in the
+intended source appears in the output", so the intended source must be the POST-
+substitution text. Point this at a heredoc TEMPLATE and every deliberate interpolation
+(a `$DIG` meant to be replaced by a digest) reports as MISSING -- a false positive, and
+a tool that cries wolf gets switched off. Quoting the heredoc and substituting values
+afterwards is what produces a sound input. The tool composes with that rule; it does not
+replace it.
+
+Also outside the predicate: damage to a bare $VAR that sits in no span at all. That is
+the same blind spot as a span expanding to nothing, which is why 1 of 13 missing spans
+in the planted tree emitted no shell diagnostic either.
+
+The DAMAGED set is not predictable from the span list. Backticks pair sequentially across
+the whole heredoc, so a pair can straddle prose between two intended spans and which
+spans die depends on the parity of everything before them. Historical damage therefore
+hits a subset (6 spans at bb7e5b2) while a fresh replay of repaired text exposes every
+span in the block (15). Both counts are correct for their own population; name which one
+a number came from.
+
 argv[1] = intended source, argv[2] = emitted file.
 """
 import re, sys, collections
