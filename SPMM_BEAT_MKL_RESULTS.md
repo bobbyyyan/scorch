@@ -39368,3 +39368,59 @@ there.**
 **And a backtick-parity check is vacuous by construction**, confirmed rather than argued:
 substitution consumes backticks in pairs, so the count always drops by an even number and the parity
 cannot change. Simulated — four backticks even before, zero even after. A check that can only pass.
+
+### The token assertion had an enumeration premise; the span check is now mechanical
+
+The repair of the unquoted-heredoc deletion was verified by asserting that six named
+tokens were present in the committed file: `t_dupcell`, `t_relabel`, `nan`, `t_partial`,
+`t_files`, `t_ok` and the `!! SHAPE CONSTANTS OVERRIDDEN` banner. The peer session
+identified the defect in that form, and it is real: the assertion can only catch the
+deletion of a token the author thought to list, so "all six present" carries no
+information about a seventh that neither party considered. The predicate's completeness
+is an untested assumption sitting underneath a check that reports PASS.
+
+`tools/spandiff.py` replaces it. It extracts the span set from the intended source,
+set-differences it against the emitted file in both directions, and compares
+multiplicities. There is no list left to be incomplete, because the list IS the source.
+
+**Proven non-vacuous by replaying the repaired section through the original defect** --
+an unquoted heredoc -- and requiring the tool to catch it. On that planted tree it
+reports 15 under-represented spans and 1 EXTRA. The extra span is the part the old form
+could not reach: `** is the orthogonality proof**`, the mangled bold run left behind
+when the subject of the sentence vanished. A presence-only assertion over typed tokens
+is blind to an ADDED span by construction, so that axis had no coverage at all.
+
+**The shell's own stderr is mechanical but incomplete, and the incompleteness is
+knowable.** It was tempting to treat the five `command not found` lines as the
+mechanical enumeration, since they did in fact name the five deletions. Two measured
+reasons they are not sufficient, both from the planted tree: stderr keys on the FIRST
+WORD and deduplicates, so five spans that were each deleted twice produced one line
+apiece and the multiplicity was lost; and a span that expands to nothing emits zero
+diagnostics, which is what an unset `$DIG` does -- 1 of 13 missing code spans had no
+diagnostic of any kind. The shell reports only the spans that FAILED, which is a
+different set from the spans that were DELETED.
+
+Scope, stated rather than implied: the tool is complete for "span present in the
+intended source, absent or under-represented in the output". Reordering and relocation
+are separate axes and are not covered by it.
+
+### A flag divided by a count reads as a large, plausible effect
+
+While checking that chain208's batch pinning was doing anything at all, the first
+comparison used `batch_local` against `batch_pinned` and reported a median ratio of
+589 with a maximum of 3506 -- a number that looks like a decisive effect. `batch_pinned`
+is a flag: `batch_pinned=(1 if BIN is not None else 0)`. The comparison divided a batch
+count by a boolean. The correct column is `batch`, the batch actually used.
+
+Re-run against the right column, the pin verifies: 534 map entries, 16821 pinned rows,
+`batch` used equal to the map value on 16821 of 16821 with zero lookup misses, and local
+calibration would have chosen differently on 97.1% of rows. Median local/used ratio
+1.002, p95 1.257, tails 0.003 and 363.5. So the pin is a TIGHT control that mostly
+reproduces what local calibration would have picked; if the batch explanation is real it
+lives in that few-percent tail, not in a gross across-the-board shift.
+
+The error was caught only because a flag's value of exactly 1.0 on every row was too
+clean to believe. A flag that happened to carry a mid-range value would have passed
+unnoticed, which puts this in the same family as reading a sentinel without its row
+type: the column name described the quantity loosely enough that the units were never
+checked.
