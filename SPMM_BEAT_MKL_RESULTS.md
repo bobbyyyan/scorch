@@ -40545,3 +40545,58 @@ unchanged), and right on the declined cells, which chain208 had no reason to exa
 `TSOPF_RS_b162_c3_b` k=4 is the cleanest single illustration -- +4.96 us at a batch ratio of
 0.829 unpinned, -7.1 us pinned. A cell that changes sign between an asymmetric-batch run and
 a pinned one is what the pin was built to catch.
+
+### Why DLMC's criterion sensitivity is 127x and SuiteSparse's is 4.9x: structure, not kernel length
+
+The peer session reproduced chain207 independently -- 12 files, 687600 rows, 19100 cells,
+114600 readings per build x arm, floors and all ten cells identical -- and then asked the
+right question. DLMC's headline rate (0.0524%) nearly matches SuiteSparse's (0.0611%), but
+the spread between the tightest and loosest of the seven criteria is **127x on DLMC against
+4.9x on SuiteSparse**, because DLMC's behind-at-all population is 1269 of 19100 (6.64%)
+against 69-75 of 22920 (0.30-0.33%), and DLMC's floors are 2-3x looser. Their question: is
+that DLMC's *structure* or DLMC's *kernel lengths*? Only the first is about the code.
+
+**It is not kernel length.** The same ratio floor, banded by median `aa/ours` kernel length
+(post-hoc, not part of the pre-registered criterion):
+
+| band | DLMC n | DLMC med ms | DLMC floor | SS n | SS med ms | SS floor | ratio |
+|---|---|---|---|---|---|---|---|
+| 0.00-0.02 ms | 14693 | 0.0134 | 0.2100 | 15847 | 0.0139 | 0.1102 | **1.91x** |
+| 0.02-0.05 ms | 3681 | 0.0265 | 0.4415 | 3369 | 0.0259 | 0.1783 | **2.48x** |
+| 0.05-0.15 ms | 657 | 0.0598 | 0.4537 | 2051 | 0.0806 | 0.1640 | **2.77x** |
+| all | 19100 | 0.0148 | 0.2840 | 22920 | 0.0152 | 0.1329 | 2.14x |
+
+The matched bands have near-identical median kernel lengths (0.0134 vs 0.0139; 0.0265 vs
+0.0259) and the aggregate medians agree to 3% (0.0148 vs 0.0152), yet DLMC's floor stays
+1.9-2.8x looser in every band. So the looser floor is a property of the DLMC population, not
+of how long its kernels run. The behind-at-all base rate separates the same way at matched
+length: 4.42% against 0.06% in the shortest band, 15.65% against 1.40% in the next.
+
+The one real distributional difference is the tail, and it runs the other way: SuiteSparse
+has 934 cells above 0.5 ms and 719 in 0.15-0.50 ms; DLMC has 57 above 0.15 ms and none above
+0.5. So DLMC is the *shorter-tailed* collection, which would make its floor tighter, not
+looser, if kernel length were the driver.
+
+**What this does to the headline.** It stands under its criterion, and it is more
+floor-dependent than the SuiteSparse figure: the floor removes 99.2% of DLMC's
+behind-at-all population against about 80% of SuiteSparse's. The proximate reason is margin
+-- pooled `S` is 0.8299, only 1.21x ahead of MKL, so a larger share of the board sits near
+parity, and a marginal population is exactly where a floor choice becomes load-bearing. That
+is an argument for having pre-registered the criterion, not against the result: on DLMC the
+pre-registration was worth 26x more than the docstring anticipated when it cited SuiteSparse.
+
+**k=4 convergence, both boards, both criteria.** Under the headline criterion k=4 carries
+7 of 14 on SuiteSparse (50%) and 8 of 10 on DLMC (80%); with no floor at all, 37 of 69 (54%)
+and 980 of 1269 (77%). Two independently collected corpora, different matrix families, same
+width, robust to the criterion that everything else is sensitive to.
+
+**And the ten cells confirm a prior that was recorded before launch**, which is worth stating
+so they are not read as a discovery: the 22:13 launch commit quoted the existing doc's
+description of "the dlmc transformer family -- 512 rows, 105-138k nonzeros, mean degree
+205-269, all at k=4". Nine of the ten are transformer encoder/decoder attention and ffn
+layers and one is a ResNet bottleneck, rows 512-2048, nnz 59k-513k.
+
+Note on provenance of the comparison figures: the SuiteSparse numbers in the table above are
+chain196 `c0`/`c0b` (75 behind-at-all, 0.33%); the peer's are chain206 `aa`/`bb` (69, 0.30%).
+Different runs of the same criterion, consistent with the ~30-of-63/68 cross-run
+reproducibility already filed, and not a discrepancy to reconcile.
