@@ -38582,3 +38582,80 @@ k=32.** `ss/S10PI_n1/S10PI_n1_C` has nnz = 1, `ss/M20PI_n1/M20PI_n1_B` has 3,
 7 to 23 microseconds and all resolving to a single worker. They are not measuring SpMM, the nnz = 4
 one was the single largest deviation in the declined set, and they are in the corpus that chain202,
 chain203 and chain204 all share.
+
+### chain203 re-verified: the "21.2%" endpoint does not exist, and the lever is mostly cold-start
+
+An independent recomputation of chain203 from its sealed bytes, checked here against the same data.
+Its mechanism claim and point estimate are exactly reproducible. Two published numbers are wrong and
+one new finding is larger than the headline.
+
+**What reproduces to the cell.** 242 CSVs, 11 builds x 22 passes, 801 rows each. Population at
+k=32: ov24 raises the resolved count on 25 cells, is null on 64, and **lowers on 0** — the theorem
+`an_c203.py:412` states. `resolved[ov24]` is 24 on all 25 raised cells while `resolved[ovp]` spans
+1 to 23. Point estimate 1.1805 against the filed 1.1806.
+
+**The rotation is perfect here, and it is the counter-case to chain204.** All 22 passes landed all
+11 builds with every build occupying each of the 11 positions exactly twice, verified from the
+`wrote` lines in `c203_rw.log`. Because the analysis used all 22 passes and 22 = 2 x 11, nothing was
+windowed and nothing broke. The constraint that follows is worth stating: **with 11 builds the only
+position-balanced windows are 11 and 22 passes**, so any segment restriction on this design
+necessarily breaks balance. chain204 got unlucky with a 6-pass window; chain203 did not.
+
+**The +21.2% endpoint is not reachable by any nesting.** Crossing the two named reductions with the
+two reduction orders gives four, and all four:
+
+    ratio-then-reduce + geometric mean over cells   1.1805   +18.05%
+    ratio-then-reduce + median over cells           1.1441   +14.41%
+    reduce-then-ratio + geometric mean over cells   1.1783   +17.83%
+    reduce-then-ratio + median over cells           1.1449   +14.49%
+
+**The range is +14.4% to +18.1%.** The lower endpoint is real; the upper one does not exist, and it
+is not the bootstrap CI either ([1.0768, 1.2949]). The sealed artefacts contain no 1.212 anywhere —
+only 1.1806, twice — so the range was computed at session time, never filed, and its upper endpoint
+is wrong. Note also that the spread is **entirely the across-cells statistic** (geometric mean
+against median, 3.6 points) and not the reduction order (0.2 points), so the reduction pair has to
+be named beside the number.
+
+**The batch exposure is worse here than on chain204 and cannot be conditioned away.** On the
+headline 25, `ov24/ovp` batch divergence is mean |log| 164.53% / median 196.60% / p95 230.58%
+against the duplicate pair `ov24b/ov24` at 3.47% / 1.75% / 9.06% — a factor of 47. And the mediation
+split that closed chain204's floor question cannot run: **1 of 25 cells is batch-matched within
+1.02x, 0 in the middle band, and 24 of 25 beyond 1.10x.** There is no overlap to condition on.
+
+**Two things say the effect is not merely the artefact.** The sign is wrong for a small-batch bias:
+`r[signed log batch ratio, log(ovp/ov24)] = -0.4882`, where the documented bias predicts positive.
+And the mediator argument applies in full — ov24 really is faster on the adoption group, so the
+calibrator picks a larger batch for it, putting the divergence downstream of the effect. Conditioning
+would be wrong even if there were cells to condition on.
+
+**But the two instruments inside each cell disagree by 5.70x, and that is the real finding.** Since
+`batch = target_ms / single_call_time`, the batch ratio measures the speedup that *calibration* saw
+on isolated calls, and the timed ratio measures it in back-to-back batches of hundreds:
+
+    median batch_ov24 / batch_ovp   6.5230    what calibration saw on isolated calls
+    median timed ovp / ov24         1.1441    what the batched timing saw
+    disagreement                    5.70x
+
+So **the override looks about 6.5x better on an isolated call and about 1.14x better in warm batched
+steady state.** `calibrate()` times five single calls; `timeit()` times batches. The honest reading
+is that most of the lever is per-call team spin-up, not steady-state throughput — a production caller
+issuing many SpMM calls back-to-back gets the 1.14x, and only a caller issuing isolated calls gets
+anything like the rest. That is consistent with the caller-path cold/warm split already on record and
+it makes the +18% a steady-state number sitting beside a much larger cold one. It is directly
+measurable and it changes what the lever is for.
+
+**chain204's floor result replicates here independently** — different host, different pool, different
+rung set, data collected sixteen days earlier for another purpose. The declined-argument A/A on the
+64 null cells reads p95 dev **0.1304** against the duplicate pair's **0.0398**, a 3.3x gap; split by
+batch, the matched half (n=32) reads **0.0209** against 0.0256 — the declined pair *tighter*, as on
+chain204 — while the diverged half (n=32) reads 0.1433 against 0.0463. Same finding, same direction,
+same mechanism, on independent data. That is the cross-chain confirmation the floor conclusion needed.
+
+**And chain208's calibration pre-pass prices the unpinned batch directly**, before anything is timed:
+across 267 cells of the shared corpus, `batch_ours` is identical under the two configurations on only
+**7 cells (2.6%)**, median ratio 1.0363, p95 1.5440. Tail-concentrated, which is the shape that
+caught me out once already.
+
+Corrections owed: the memory file carrying "14.4% to 21.2%" needs its upper endpoint fixed to 18.1%
+with the reduction pair named, and `headroom_c204.py`'s docstring quotes the same wrong "14-21%".
+That file is inside a sealed ledger and is not edited; the error is recorded here instead.
