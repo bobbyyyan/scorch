@@ -39709,3 +39709,52 @@ figure has the same shape as what `rajat26` turned out to be: a calibration read
 the timed one. It is a different measurement so nothing follows automatically, but whether
 that number carries comparable single-cell or single-pass leverage is not currently known,
 and it is load-bearing in the memory record. To be checked with the same jackknife.
+
+### CORRECTION to e68d0d1: a pass jackknife cannot license a TIGHTER interval
+
+The section above concluded that the narrow-width slopes are distinguishable from -1 at
+2.79 and 3.22 jackknife SE. **That is withdrawn.** The peer session supplied the argument
+and it is decisive: a pass-level jackknife holds the CELL SET FIXED, so it estimates the
+pass component of variance alone.
+
+- Where the jackknife EXCEEDS the OLS SE, it reveals a component OLS missed and the larger
+  value binds. That is k=32, and that conclusion stands.
+- Where it FALLS BELOW, it says the pass component is small. It does **not** retire the
+  cell component OLS was measuring. Taking the smaller of two estimates of DIFFERENT
+  components is not a choice between estimators at all.
+
+Combining in quadrature:
+
+    k      slope     OLS SE   jack SE   combined   |s+1|/OLS   /jack   /combined
+    k=2   -1.1440    0.0578    0.0516    0.0775       2.49      2.79      1.86
+    k=4   -1.0796    0.0347    0.0247    0.0426       2.29      3.22      1.87
+    k=32  -0.4306    0.0759    0.8520    0.8554       7.50      0.67      0.67
+
+**No width is distinguishable from -1 at 2 SE**: 1.86 / 1.87 / 0.67. So the earlier claim
+that the narrow widths reject slope -1 is wrong, and so was the peer's original 1.60 / 1.40
+-- both overstated, in opposite directions, from different errors. Theirs was a reduction
+order (reduce-then-ratio, which is the convention for a replication floor, applied to an
+EFFECT whose two builds share a pass; ratio-then-reduce reproduces the sealed block to four
+decimals at all three widths). Mine was the component confusion above.
+
+**And the jackknife's magnitude is not trustworthy at G=6.** Five degrees of freedom means
+0.8520 is a signal that a pass component EXISTS, not a measurement of its size. The caveat
+travels with the number wherever it is quoted. The surviving k=32 conclusion depends only on
+the sign of the comparison, not on the value.
+
+What does NOT change: the `rajat26` decomposition, which is a separate instrument reaching
+the same place -- the k=32 slope rests on one cell whose ovp calibration collapsed at that
+width alone, and dropping it puts all three slopes near -1.
+
+**The registered test is unaffected.** Model A's range over slopes [fitted, -1] against
+Model B:
+
+    k      worst-case A   B        gap      floor    gap/floor
+    k=2      1.1351     1.4239   25.44%    3.18%      8.00
+    k=4      0.9831     1.3452   36.83%    2.61%     14.11
+    k=32     1.1113     1.1346    2.10%    3.12%      0.67
+
+k=4 separates by at least 36.83% for any slope in [-1.08, -1.00], so the test is slope-free
+in the range that matters. k=32 separates by less than one floor and is reported as
+low-power with both model points printed. k=2 sits at 8.00 floors -- a test, not a bound,
+but carrying the least robust slope of the three.
