@@ -38122,3 +38122,50 @@ the identical header line, and neither records the body version or its digest. S
 now pinned by digest but **not attributed to jobs**, and the segment claim rests on the pass
 numbering in the logs rather than on knowing which script produced it. Recorded as a gap rather than
 guessed: a harness that does not record its own digest cannot be bound to its output after the fact.
+
+### A seal and a last edit can race, and the file that failed was the one rewritten to fix a defect
+
+Verification of the re-sealed chain204 directory read **148 OK, 1 FAILED**, and the failing file was
+`c204_matched.py` — the analyzer rewritten to close the vacuous-pass defect. Cause pinned by mtime:
+
+    SHA256SUMS        22:48:59
+    c204_matched.py   22:49:43
+
+The manifest was computed **44 seconds before** the script was rewritten, so it sealed the old copy.
+`find -newer SHA256SUMS` confirms that file was the only one newer. Re-sealed: **149 files, 149
+manifest lines, 149 OK, 0 failed, and 0 files newer than the manifest.**
+
+**The general form belongs next to the harness-digest rule, because it is the same failure at a
+different timescale.** A verification result is evidence about the moment it was run, not about the
+filed state — so "149 OK, 0 failed" was true when I printed it and false by the time anyone read it.
+The check that closes it is cheap and now part of the procedure: **assert that no file in the
+directory is newer than the manifest.** Digest equality alone cannot distinguish "sealed and
+unchanged" from "sealed, then changed, then re-verified against a stale manifest" — only the
+timestamp ordering can, and it costs one `find`.
+
+This is the same family as a commit count written into the commit that makes it wrong: a measurement
+whose own subsequent action invalidates it. Sealing is not idempotent with respect to editing, and
+the ordering has to be stated rather than assumed.
+
+**Two smaller precisions.**
+
+- The claim that "the `__pycache__/*.pyc` was deleted rather than attested" was true of one of two
+  entries and read as though it covered both. The top-level `__pycache__/csrresolve.cpython-312.pyc`
+  was deleted. `tree/__pycache__/scorch_build.cpython-312.pyc` (2026-09-15 01:43:38, 7,605 bytes) is
+  still present and **is** attested — which is the better call for that one, since it dates from the
+  original build rather than from later analysis, and so is part of the pinned tree rather than an
+  artefact of inspecting it.
+- The emitted-line count differs between the two sessions' readings — 149 here against 150 there —
+  because `shasum`'s `WARNING: 1 computed checksum did NOT match` summary goes to stderr, which my
+  `2>/dev/null` discarded. So an emitted count taken with stderr suppressed cannot see the warning
+  line, and the honest form of the emitted-count assertion has to say whether stderr was kept.
+
+**And the quantitative form of the positive control, which is stronger than the qualitative one.**
+chain206's per-pass sign fraction spans **0.1994 across two process boundaries**; chain204's spans
+**0.1274 across one** — a cross-process spread **1.57x** the within-process spread. The levels
+separate the same way: chain204's within-process A/A sits essentially at one half (mean 0.4929,
+median 0.4906, n=90) while chain206's cross-process reduced statistic sits at 0.4313-0.4533. One
+caution on testing 0.4929 against 0.5: the 90 passes share the same 267 cells, so a per-pass
+binomial standard error is optimistic and the honest test uses the empirical scatter of the 90
+values. The control does not need a significance test — the contrast in both spread and level
+carries it.
