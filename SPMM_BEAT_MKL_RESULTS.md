@@ -38777,3 +38777,56 @@ false-positive budget (1,076 cells) and read them as "below budget, no deficit".
 a category error** — the budget applies to a population whose true effect is zero, and these cells
 sit at a true ratio near 0.38, far enough from parity that 26% noise cannot push them past it. The
 conclusion stands on the sign test and the replication, not on that budget.
+
+### The 25 remaining behind-MKL cells have no structural signature except width
+
+With the board confirmed by a second instrument, the actual remaining work for "faster than MKL on
+all of SuiteSparse" is small and now enumerated. Taking chain206's two byte-identical builds and
+requiring a cell to be behind MKL on **both**, beyond the cross-build floor at its own width:
+
+    k       arm A/A   build A/A   behind aa   behind bb   BOTH
+    k=2     0.0483    0.0818      19          13           6
+    k=4     0.0410    0.0747      23          22          14
+    k=8     0.0436    0.0756       7           7           4
+    k=16    0.0575    0.0909       2           1           1
+    k=32    0.0851    0.1387       1           1           0
+    total                         52          44          25
+
+**25 cells of 22,920 (0.109%), 22 distinct matrices, and none at k=32.** The width distribution is
+{2: 6, 4: 14, 8: 4, 16: 1, 32: 0}, which reproduces the core-by-width shape already on record from a
+different chain and floor. Median excess over MKL is 1.1461 on `aa` and 1.1408 on `bb`.
+
+**I then proposed two structural regimes off the sorted head of that table and they are wrong.** The
+top entries are arresting — `nw14` has 73 rows at degree 12,396, `connectus` 512 rows at degree
+2,202, `bibd_17_8` 136 rows at degree 5,005, and at the other extreme `Pd_b` and `m3plates` sit at
+degree 0.78 and 0.60. So I named row-parallelism starvation and empty-row overhead as the two
+regimes. **Those five cells are 5 of 25.** Reading a mechanism off the visible extremes of a sorted
+list is selection on the head, and the test below is what it costs.
+
+Four predicates, each derived from a mechanism and written down before its coverage was computed,
+against a base rate of 0.109%:
+
+    predicate (mechanism)                                     fires   core hit   precision   lift
+    rows < 2 x pool (48): the row loop cannot fill the team      860         0      0.000%     0x
+    rows < 4 x pool (96)                                        1380         2      0.145%     1x
+    rows < 8 x pool (192)                                       1975         3      0.152%     1x
+    rows < 32 x pool (768)                                      4125         5      0.121%     1x
+    deg x k x 4B > 0.5 MB: the row's B-panel gather exceeds L2     16         0      0.000%     0x
+    deg x k x 4B > 1.0 MB                                         10         0      0.000%     0x
+    deg x k x 4B > 2.0 MB                                          5         0      0.000%     0x
+    deg < 1: more rows than nonzeros, row overhead dominates    2135         3      0.141%     1x
+    nnz x max(k,16) < 150000 (the shipped grain)                6567         4      0.061%     1x
+
+**Every one of them has a lift of about 1, which is to say none of them discriminates at all.** The
+cache predicate fires 5 to 16 times on the whole board and catches nothing. Splitting the core by the
+two named mechanisms leaves **20 of 25 cells in "neither"** — median nnz 501,111, 2,337 rows, degree
+120, 13 of the 20 at k=4. The bulk of the deficit is unremarkable mid-size, mid-degree matrices.
+
+**The only predictor that works is the width.** k=4 holds 14 of 25 core cells from 20% of the board —
+0.305% against the 0.109% base rate, a lift of 2.8 — and k=32 holds none.
+
+That is a useful negative for the standing constraint that optimizations must generalize. **A
+runtime-gated rule cannot be built for these cells out of rows, nnz, or degree**, because no
+threshold on those features selects them. So closing the k=4 half of the core requires a change that
+makes k=4 faster *generally*, not a condition that fires on 14 matrices — which is the outcome the
+no-overfitting rule was there to force, arrived at by measurement rather than by preference.
