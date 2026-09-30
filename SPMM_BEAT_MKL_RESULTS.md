@@ -38999,3 +38999,65 @@ schedule instead of from the landed passes.
 The cancellation figures also verify against the corrected A column: S's floor is 0.62 / 0.65 / 0.82 /
 0.74 / 0.68 of the naive sum of its component floors. **A ratio's floor is neither the sum of its
 factors' floors nor bounded by either one, and has to be measured.**
+
+### Correction: my SE was 2.24x too large, and the mechanism is sign-dependent rather than absent
+
+The previous section said the cross-build per-pass correlation was "within 0.8 SE of zero at every
+width" and concluded the common-mode mechanism is absent. **The SE was wrong and the conclusion does
+not follow.** I used `SE = 1/sqrt(n)`, which assumes the per-cell correlations have sd 1. Measured sd
+is **0.42 to 0.45** — the textbook `1/sqrt(n-1) = 0.447` for a correlation on six points — so every
+`t` I quoted was understated by 2.24x.
+
+chain204, p25-p30, correct SE:
+
+    pair            k      r        sd       SE       t        t I published
+    ov64/ovp        2   -0.0622   0.4202   0.0445   -1.40        -0.59
+    ov64/ovp        4   -0.0747   0.4308   0.0457   -1.64        -0.70
+    ov64/ovp        32  -0.0973   0.4229   0.0448   -2.17        -0.92
+    ov64b/ov64      2   +0.0664   0.3917   0.0415   +1.60        +0.63
+    ov64b/ov64      4   +0.0707   0.3480   0.0369   +1.92        +0.67
+    ov64b/ov64      32  +0.0406   0.4503   0.0477   +0.85        +0.38
+    ov64b/ovp       2   -0.0851   0.3943   0.0418   -2.04        -0.80
+    ov64b/ovp       4   -0.0397   0.4299   0.0456   -0.87        -0.37
+    ov64b/ovp       32  -0.0843   0.4165   0.0442   -1.91        -0.80
+
+And my all-30 figure was understated four-fold: `ov64b/ov64` reads **+10.03 / +12.29 / +12.01**, not
+the +2.4 to +2.9 I reported.
+
+**The structure I missed is the finding.** Ignore significance and read the signs: the
+**same-argument** pair is positive at all three widths (+0.041 to +0.071) and **both cross-argument**
+pairs are negative at all six (−0.040 to −0.097). **Nine of nine entries track argument identity.**
+
+So the mechanism is not absent — it is sign-dependent, and for the cross-argument pairs it runs
+backwards. That gives `B > A` an actual mechanism rather than an absence of one, and the mechanism is
+algebra: the paired datum is `log S_aa,p − log S_bb,p` with variance `var_a + var_b − 2cov`, so a
+**negative** covariance inflates it. Anti-correlation at the pass index makes pairing strictly worse,
+not merely useless.
+
+**And it reshapes my own replacement rule.** "Pair where the correlation is measurably positive" is
+right, but it does not return one answer per dataset — it returns one per pair, and **the pair
+carrying the floor (same-argument, +1.92 SE at k=4) and the pair carrying the effect (cross-argument,
+−2.17 SE at k=32) want opposite treatment.**
+
+**A further error of mine: I reported a median-centred cosine and called it a correlation.** Pearson
+centres on the mean, and on n=6 they are different statistics that disagree about significance. On
+chain206 at k=32 the median-centred version reads t = −0.72 and Pearson reads **t = −2.35**:
+
+    k              2         4         8        16        32
+    median-cos  +0.0063   +0.0102   +0.0119   +0.0114   -0.0044
+    Pearson     -0.0031   +0.0028   +0.0057   +0.0027   -0.0156
+
+The first row is what I published; the second is what an independent recomputation produced, and the
+gap between us was entirely the centring rather than the data.
+
+**What the decision actually needs is the bound, not the detection** — which is a rule already in
+this document and which I violated by framing this as a significance test at all. No correlation is
+required to decide it:
+
+    floor A (reduce each side, then ratio)   0.0896  0.0951  0.1493  0.1349  0.1689
+    floor B (pair per pass, then reduce)     0.1046  0.1081  0.1439  0.1470  0.1821
+    B/A                                        1.17    1.14    0.96    1.09    1.08
+
+**Pairing moves the floor by at most 17% and the gated count by one cell.** That claim survives every
+choice of correlation statistic, centring convention and standard error, and it is the one to quote.
+A is still the floor and the count is still 14; the reasoning behind it is what needed fixing.
