@@ -39171,3 +39171,44 @@ same-versus-cross contrast is p = 0.078, so the sign pattern is suggestive and n
 None of this touches the decision. `B/A` = 1.17 / 1.14 / 0.96 / 1.09 / 1.08 is a measured ratio of two
 floors with no significance test in it: pairing moves the floor by at most 17% and the gated count by
 one cell. A is the floor, the count is 14.
+
+### The contrast null is skewed, so two-sided p is not twice one-sided — and my stated cause was wrong
+
+I attributed the 0.9222-against-0.9444 quantile gap to tie handling at rank 56. **There are zero
+ties.** The exact decomposition of the two-sided count of 56:
+
+    upper tail (>= +|obs|, including the observed)      41
+    lower tail (<= -|obs|)                              15
+    sum                                                 56
+    exact ties at |obs| other than the observed          0
+    strictly above the observed SIGNED value            40
+
+My figure was `1 - 56/720 = 0.9222`, the fraction of permutations with **|contrast|** below the
+observed **|contrast|** — which is `1 - two-sided p`, not the quantile of the signed value. The
+quantile of the signed value is `1 - 40/720 = 0.9444`. Both quantities are well defined; my label was
+ambiguous and my diagnosis of the difference was simply wrong.
+
+**And the reason that matters is the part worth keeping.** Tie handling would have been arbitrary and
+small. This is neither: the tails split **41 against 15, a 2.7x asymmetry**, because the null is
+skewed **+0.3234** with median **−0.0092** rather than 0. Percentiles 2.5 / 50 / 97.5 are
+**−0.1374 / −0.0092 / +0.1750** — visibly off-centre. So on this null:
+
+    two-sided p       0.0778   (56/720)
+    one-sided p       0.0569   (41/720, counting the observed)
+    2 x one-sided     0.1139   -- the two-sided value is 32% SMALLER
+
+**Reconstructing either tail from the other is wrong here, in whichever direction one guesses.** A
+permutation null on a contrast of two pooled correlations has no reason to be symmetric, and this one
+is not. Any p quoted from it has to say which tail it counted.
+
+The filed statement now reads: *the same-versus-cross contrast is +0.1476 at exact two-sided
+p = 0.0778, quantile 0.944 of a null whose tails are asymmetric 41 against 15, so the two-sided value
+is not twice the one-sided 0.0569.* The conclusion is unchanged — suggestive, not established.
+
+**Two refinements to the lesson I recorded, both better than my version.** First, the tell was not
+that the standard error was approximate; it was that **six passes is enumerable**, and "is this design
+small enough to enumerate exactly" is a question askable *before* any estimator is chosen rather than
+after three of them fail. Second, and this is the limit of the whole exercise: **an exact test buys
+the uncertainty and never the estimate.** All three widenings — `1/sqrt(n)`, `sd/sqrt(n)`,
+permutation — moved exactly one column and left all nine point estimates untouched. Getting the
+interval right does not make a point estimate mean more than it did.
