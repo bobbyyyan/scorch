@@ -40744,3 +40744,65 @@ it licensed for an entire evening, until the peer asked the obvious question abo
 So a pre-registration log wants to record, for each prediction, **not just hit or miss but
 what it licenses if it lands either way.** A miss on a magnitude can be a pass on a
 mechanism, and the single-axis log cannot express that.
+
+## The k=4 deficit is a per-call FLOOR deficit, not a kernel-width one
+
+With both boards closed and k=4 identified as the only structural target, the next question
+is what k=4 is actually short of. The answer is recorded in `scorch_policy.h:1383-1390`,
+which I had not connected: *"on matrices where a per-call floor dominates, our time is flat
+in k -- 22.4 us at k=1 and 24.5 at k=16 on 26214 nonzeros -- and a cost that does not vary
+with the width cannot be a cache-line-utilisation cost."* That is a discriminator, and the
+residues answer it.
+
+**Our time is flat in k on the residues.** `ours(k=32)/ours(k=2)` for 16x the work:
+median **1.72x** on the 8 DLMC k=4 residues and **2.35x** on the 9 SuiteSparse ones. MKL on
+the same cells grows *faster* -- 2.48x and 3.35x. So both are floor-dominated and MKL is
+less so.
+
+**Fitting `ms = a + b*k` per matrix over the five widths** gives the floor directly:
+
+| set | n | floor ours | floor mkl | ours - mkl | slope ours | slope mkl |
+|---|---|---|---|---|---|---|
+| DLMC, all | 3820 | 13.56 us | 13.83 us | **-0.28** | 0.1340 | 0.2654 us/k |
+| DLMC, k=4 residues | 8 | 26.20 | 17.09 | **+9.11** | 0.3067 | 1.1145 |
+| SuiteSparse, all | 4584 | 14.10 | 21.38 | **-7.28** | 0.1307 | 1.3015 |
+| SuiteSparse, k=4 residues | 9 | 34.42 | 25.10 | **+9.32** | 1.8941 | 4.3678 |
+
+Corpus-wide our floor is *lower* than MKL's and our slope is 2-10x shallower, which is the
+99.943%. On the residues our slope is still better (0.28x and 0.43x of MKL's) while our
+**fixed cost is about 9.2 us higher** -- higher in 8 of 8 and 8 of 9 cells, and the two
+unrelated collections agree to 2%. That is the whole shape of the deficit: at k=4 the fixed
+cost dominates and a +9.2 us floor penalty is the loss; by k=32 the better slope has won it
+back, which is exactly the per-width median curve (0.92 at k=4 falling to 0.74 at k=32).
+
+**So the lever is not the vector register.** I had gone looking at
+`SCORCH_NARROWK_EXACT_HI`, which is 3 and therefore excludes k=4 from the exact-width kernel
+while widths up to 7 are already instantiated -- an inviting one-constant change. It is the
+wrong lever twice over. The measured direction for that constant is *downward*: the
+re-analysis at `scorch_policy.h:1351-1357` reads `c0/arm` with arm = `EXACT_HI=1` at 1.4657
+(MKT k=3) and 1.1581 (redwood k=3), so the exact kernel is *harmful* at k=2/3 on matrices
+with nnz >= 1e6, and the queued arm is to lower it, not raise it. And the flatness result
+says a mask-utilisation lever cannot be what these cells are losing to anyway.
+
+**The plausible mechanism, explicitly untested.** 9.2 us at the team-widening rates measured
+tonight (0.237-0.36 us per worker) is 26-39 workers, and redwood's pool is 24, so a full-pool
+team spin-up (~6.2 us at 0.26 us/worker x 24) is the same order and roughly two thirds of it.
+That would make the k=4 deficit a thread-policy question -- which is where
+`scorch_policy.h:1390` says the floor lives, in another part of the code from the four
+vector-register constants. **Causation is not established** and the per-worker rate is from a
+different host.
+
+**The decisive test needs an export redwood does not have.** Querying the resolved thread
+count for these cells requires `scorch_spmm_nthreads`, and redwood's tree exports neither it
+nor `scorch_tune_hooks` (44 exports, neither present) -- the mirror predates both. chain207's
+CSVs carry no `resolved` column either, which is exactly the gap the pre-registered
+three-layer contract named for the *next* full-collection run. Computing the policy locally
+instead is the defect this project has already been burned by: a harness that recomputes a
+production rule is wrong silently and flatteringly. So the options are a redwood rebuild plus
+a targeted run, or a new run carrying `resolved_ours`. Both touch the measurement host, so
+neither is taken here.
+
+Note on the residue count in this section: the SuiteSparse figures are chain196 `c0`/`c0b`,
+which yields **18** residues under the headline criterion against the filed 14 from a
+different run pairing -- the same cross-run instability already on file (63 against 68 with
+overlap 30). Nine of the 18 are at k=4. The DLMC 10 is the sealed chain207 figure.
