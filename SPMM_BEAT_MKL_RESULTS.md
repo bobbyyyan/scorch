@@ -38454,3 +38454,64 @@ wider for reasons that are not population, not batch divergence, and not yet nam
 unaffected — the median sign flip survives under either floor — but **no per-cell gated count from
 this chain should be quoted until the floor question is settled by measurement**, which is what the
 batch-pinned re-run is now designed to do.
+
+### The position effect I published does not exist, and neither does the opposite one
+
+I reported a position effect of −0.790% / −0.427% / +0.067% one commit ago and used it to bound the
+window's rotation imbalance. **That was a normalisation artefact and the number is withdrawn.** So
+was the opposite-signed estimate reached independently by the verifying session. Both of us
+normalised, and normalising cannot separate position from build in an imbalanced window: dividing by
+a build's own window median centres position *within* each build and absorbs the effect; dividing by
+the median of the three builds at one pass centres *across* builds and imports the build difference
+wherever build and position are correlated — and ov64b sits at position 3 in 4 of the 6 passes, which
+is exactly that correlation. One denominator hid it, the other manufactured it, and the opposite
+signs were the signature.
+
+The right instrument is a fit, because the imbalanced table is not proportional and the main effects
+are therefore separable. `log ms ~ cell + pass + build + position` on the k=32 `ours` arm over
+p25-p30, n=1602, rank 98:
+
+    position 2 vs 1     -0.1391%   (SE 0.6900%, t -0.20)
+    position 3 vs 1     -0.1628%   (SE 0.7628%, t -0.21)
+    build ov64 vs ovp   +5.619%    (SE 0.690%)
+    build ov64b vs ovp  +5.683%    (SE 0.763%)
+
+**No detectable position effect at |t| ≤ 0.21.** What should be published is the bound, not a point
+estimate: 0.690% SE per position step times the 0.167-position ov64-versus-ovp imbalance gives 95%
+bounds of **±0.23% on ov64/ovp** — an order below the 1.62% all-89 median and two below the 13.46%
+raised median. The conclusion I drew from the wrong number happens to be the conclusion the bound
+supports, which is luck rather than method.
+
+The build row is the more useful output: **ov64 and ov64b agree with each other to 0.06% while both
+sit about 5.6% above pure policy.** Two same-argument objects landing together is what a floor is
+supposed to show, and it is a cleaner statement of the override's cost than either position estimate.
+
+**The tension this exposes carries to chain207.** Over all 30 passes the rotation is balanced and
+build and position are orthogonal by design — and that window is unusable: position 3 reads +13.674%
+at t +3.43 and the ov64 build +80.022%, because p1-p24 holds whole-pass catastrophes. The balanced
+window is contaminated and the clean window is imbalanced, and **there is no window with both**. So
+for chain207: certify balance on the landed passes of whatever is analysed, and if a restriction is
+needed, **fit position as a factor rather than normalising it away** — normalising is what produced
+two confident estimates with opposite signs here.
+
+Three smaller corrections from the same exchange, all verified against the sealed bytes:
+
+- **`resolved[ov64]` on the raised cells is {25: 1, 51: 2, 64: 37}, not the constant 64.** So "the
+  predictor contains no worker variation at all" was too strong — it contains a little, on 3 of 40
+  cells. The consequence is exact: substituting the literal 64 reads the collinearity as +0.9978
+  while **the pair I actually named reads +0.9913**. Same conclusion, wrong pair; the analyzer now
+  quotes the named one.
+- **`nnz/ambient` is a better-posed predictor, not a re-description.** A joint fit loads log nnz at
+  **−0.9852** (SE 0.4671, t −2.11) and log ambient at **+1.0610** (SE 0.4280, t +2.48) — nearly
+  (−1, +1), so the data picks out `log(ambient/nnz)` as the direction that matters. VIF is 226.7, so
+  the individual coefficients are not identified but **that contrast is**. Its spread is a ninth of
+  its components (sd 0.133 against 1.161 and 1.267), and since nnz and the resolved count are exact
+  integers with no measurement error, the narrow spread is real structure rather than residual. The
+  refutation-is-unsupported conclusion is on firmer ground than I claimed.
+- **The batch rule is about the reduction *statistic*, not the reduction order.** On the batch
+  column the order is worth nothing: ratio-then-reduce with `exp(median(log .))` reads −0.6770 and
+  reduce-then-ratio with the same geometric reduction reads −0.6747. It is the **arithmetic** median
+  that moves it to −0.9289 (and the mean to −0.9262). `exp(median(log .))` is not `median`.
+  Separately, the "10 of 11 low-band" figure I quoted was not a slip: that group is *defined* by
+  whether the batch ratio diverges past 1.1x, so it does depend on the batch estimator — it is 9, 10,
+  10, 9 across the four conventions, and 10 under the arithmetic-median one I was describing.
