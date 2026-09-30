@@ -40849,3 +40849,85 @@ and no `.so` digest, so the sealed set proves the CSVs are intact and does not p
 binary produced them. The peer's battery verified 20/20 and could not have caught this. The
 producing trees are only recoverable from an unsealed launcher script outside the ledger.
 Every future chain should seal the `.so` digest for each named build alongside the data.
+
+## WITHDRAWN: the "+9.2 us per-call floor deficit" at k=4
+
+The peer session refuted this and I reproduce every number. The measurement was right; the
+estimand was wrong in three independent ways, and the word "floor" was wrong too.
+
+**1. Most of the gap is the size base rate.** The `ours - mkl` intercept gap rises
+monotonically with nnz, corpus-wide on build aa:
+
+| decile | nnz range | median gap | n positive |
+|---|---|---|---|
+| 1 | 6 - 5242 | **-9.130 us** | 0/382 |
+| 2 | 5242 - 10487 | -8.303 | 2/382 |
+| 5 | 26490 - 52428 | -0.712 | 89/382 |
+| 7 | 78643 - 104857 | +0.877 | 294/382 |
+| 10 | 281342 - 8521728 | **+3.820** | 264/382 |
+
+All eight k=4 residues sit in deciles 9-10, where the base rate is already **+2.897 us**.
+Their median gap is +6.505, so the residue-**specific** excess is **+3.621 us**, not +9.2.
+And the corpus-wide -0.28 us I quoted pools a quantity that swings -9.13 to +3.82 across
+size -- a 13 us range collapsed into one median. That is the same defect as the 0.358 us and
+p6000 withdrawals earlier tonight: pooling regimes. Ten size regimes instead of two batch
+regimes, and I had just written the rule.
+
+**2. The residue-specific excess is inside its own floor under this project's convention.**
+The arm-identity floor on the same statistic scales with size too -- median
+`|intercept(oursb) - intercept(ours)|` runs **0.022 us in decile 1 to 2.508 in decile 10**, a
+114x range -- so the floor must be size-matched. Five namings, every one reported:
+
+| floor | value | excess / floor | verdict |
+|---|---|---|---|
+| corpus median | 0.380 us | 9.52x | outside |
+| corpus p95 | 4.697 | 0.77x | **inside** |
+| deciles 9-10 median | 2.103 | 1.72x | outside |
+| deciles 9-10 p95 | 8.711 | 0.42x | **inside** |
+| the 8 residues' own median | 3.904 | 0.93x | **inside** |
+
+Every floor in this project is **p95 by nearest rank** -- `an_c207.py` uses it, chain204's
+analyzers use it, the board uses it. Under that convention, size-matched, the excess is
+**0.42x the floor**. It does not clear. Reporting the median-based readings alongside is not
+a hedge: it is the honest form, and the convention was fixed long before this number.
+
+**3. The linear model is rejected exactly where the claim was made.** R² of `ms = a + b*k`:
+
+| set | R² ours | R² mkl | intercept/measured(k=2) ours | mkl |
+|---|---|---|---|---|
+| corpus, n=3820 | 0.8344 | 0.9550 | 0.9773 | 0.9302 |
+| k=4 residues, n=8 | **0.3138** | 0.9536 | **1.1968** | **0.8411** |
+
+On the eight cells the claim was about, the line explains 31% of our variance against 95% of
+MKL's, and it biases the two arms in **opposite directions** -- ours 20% above our measured
+k=2 time, MKL's 16% below its own. Corpus-wide both are within 7% of 1, so the asymmetric
+distortion is specific to the claimed cells. k=32 carries 64.5% of the design's leverage, so
+a convex curve puts its intercept low and a flat-then-rising one puts it high; that is exactly
+the observed pair. **A five-point log-spaced design does not identify this estimand.** Read
+five ways, the "fixed cost" is -2.059 (measured k=2), +4.808 (fit on k=2,4,8), +5.459 (fit on
+k=8,16,32), +6.505 (fit on all five), +12.736 (measured k=4) -- one of them has the opposite
+sign, and the only reading clearly outside its floor is the measured k=4 deficit, which is
+the thing to be explained rather than an explanation of it.
+
+**4. "Floor" is the wrong word, independently of the thread question.** `intercept(ours)` by
+nnz decile is **4.37, 5.08, 12.45, 12.45, 13.06, 13.93, 15.30, 16.17, 18.18, 31.99 us** --
+monotone, smooth, 7.3x across three orders of magnitude, no plateau. A per-call cost cannot
+scale with nnz, and a team-width cost would be a step, flat between breaks. So `a` is
+absorbing the **k-independent part of the work** -- the O(nnz) traversal -- and calling it a
+per-call floor was a naming error that made a thread mechanism sound plausible. This is a
+second, data-only refutation of the spin-up story, on top of the nnz-matched thread-count
+result in `aaf8f4c`, and it is the stronger one because it rules out the category.
+
+**What actually survives, and it is a better claim.** Two things, neither needing a fixed
+cost or a thread count:
+
+- **Measured, not fitted:** the per-width median `ours/mkl` curve, 0.8864 / 0.9231 / 0.8849 /
+  0.7907 / 0.7409 at k = 2/4/8/16/32. k=4 is the worst width and k=32 the best.
+- **Fitted, corpus-wide where R² is 0.83:** our slope is **0.1340 us/k against MKL's 0.2654**,
+  2.0x shallower, reproduced to four decimals independently.
+
+Together: our time has a larger k-independent component and a much shallower k-proportional
+one, so at narrow k the k-independent term dominates and by k=32 the slope has won. That is a
+statement about the **work split**. It does not license a per-call floor, a 9.2 us magnitude,
+or any thread-policy claim, and the k=4 target itself is untouched -- what is gone is the
+explanation, not the finding.
