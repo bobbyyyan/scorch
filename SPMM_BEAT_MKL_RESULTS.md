@@ -39424,3 +39424,67 @@ clean to believe. A flag that happened to carry a mid-range value would have pas
 unnoticed, which puts this in the same family as reading a sentinel without its row
 type: the column name described the quantity loosely enough that the units were never
 checked.
+
+### WITHDRAWN: "median local/used is 1.002, so the pin is a tight control"
+
+The claim was that chain208's batch pin mostly reproduces what local calibration would
+have picked, so any batch explanation of the unpinned result must live in a few-percent
+tail. **That does not follow, and the peer session identified why.** `batch_local/batch`
+is a WITHIN-ROW quantity. The regressor the batch explanation was ever about is the
+CROSS-BUILD ratio within a cell, `batch(ov64)/batch(ovp)`, and the two are independent:
+a symmetric unbiased substitution can remove an arbitrarily large between-build
+difference while leaving the within-row median at exactly 1.000. If local calibration
+gives ov64 100 and ovp 150 and the pin gives both 120, the within-row ratios are 0.83
+and 1.25 with median ~1.0, while the cross-build ratio collapses from 1.5 to 1.0.
+
+So median 1.002 and "97.1% of rows differ" are both consistent with a pin that changes
+everything and a pin that changes nothing. A number that cannot discriminate was used to
+draw a directional conclusion. The correct statistic is below.
+
+**What pinning actually does, verified:** under a fixed map, the batch USED is identical
+across builds on 1602 of 1602 (cell, arm) pairs, 0 differing. The design is crossed --
+3 builds (ovp, ov64, ov64b) x 2 maps, file stem `bm_<mapsrc>_<build>` -- so a fixed map
+hands both builds the same batch and the cross-build ratio is 1 by construction. That is
+the intended intervention, not an artefact.
+
+### The regressor, with its own byte-identical A/A control
+
+`ov64b` and `ov64` are byte-identical objects, so `ov64b/ov64` is the floor for this
+exact statistic. Without it the raw reading "63% of cells more than 5% off 1" is mostly
+floor, because the A/A is itself 19.3% off by that much. Deviation is `exp|ln x| - 1`,
+p95 by nearest rank, per-cell estimator `exp(median(log .))` over landed passes.
+
+    population      arm    A/A p95 dev   OVERRIDE p95 dev   ratio    override median
+    ALL 267         ours      0.1638          0.6500        3.97x        0.9735
+    ALL 267         mkl       0.1340          0.2367        1.77x        1.0380
+    RAISED 120      ours      0.0738          0.7778       10.5x         0.8269
+    RAISED 120      mkl       0.1078          0.2633        2.44x        1.0876
+    DECLINED 147    ours      0.1790          0.3870        2.16x        0.9973
+    AMBIENT 1-8     ours      0.1642          0.6500        3.96x        0.9993
+    AMBIENT 1-8     mkl       0.1049          0.1767        1.68x        1.0310
+
+**The lever was engaged.** On the raised cells the cross-build local-batch ratio for our
+arm sits at median 0.8269 with a p95 deviation 10.5x its own byte-identical A/A. Since
+`batch = target_ms / single_call_time`, a ratio of 0.827 means ov64's calibration chose
+~17% fewer iterations, i.e. saw our kernel as ~1.21x SLOWER per isolated call -- a
+64-wide team's spin-up cost appearing in calibration, the same direction as chain203's
+6.52x calibration against 1.14x timed. MKL moves the other way (median 1.0876) at only
+2.44x its A/A, which is correct: the override does not touch MKL's team.
+
+This was reported to the peer BEFORE any timed ratio was read, at 25 of 36 object-passes,
+because it decides which of their three pre-registered outcomes is live. Their outcome
+that the lever was never engaged is ruled out, so on their own stated terms a null on the
+raised subset now falsifies their slope rather than excusing it.
+
+**Two negative controls inside the same table.** DECLINED sits at median 0.9973 --
+centred on 1, as it must be where the argument changes nothing, which is the regressor
+checking itself and passing. AMBIENT 1-8 is also centred at 1 (0.9993) but carries wide
+tails at 3.96x its A/A, so it is a MIXTURE rather than a uniformly engaged population and
+its null has to be read that way.
+
+**Count predicates, since chain204 will be compared against this.** chain208's cell is
+(key, k), so 89 keys x 3 widths = 267 cells and the split is RAISED 120 / DECLINED 147 /
+LOWERED 0. That is the width-expanded analogue of chain204's 40/49 over 89 key-cells, not
+a contradicting result. Guards held: `pool` is 64 on every row, `resolved_ours` is
+single-valued within each build on all 267 cells, all three builds are present on all
+267, and `assert not lowered` fired clean at 0.
