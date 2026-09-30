@@ -38264,3 +38264,101 @@ everywhere, and the apparent host disagreement is an artefact of pool width trun
 band. That is a testable prediction against chain203's sealed data and it is the next thing to check,
 because a single mechanism explaining both hosts is the difference between a generalizable fix and
 two host-specific rules.
+
+## RETRACTION of parts of cf9a0a2: the resolved column was read wrong, and the floor was the wrong floor
+
+An independent session recomputed chain204 from the sealed bytes without my analyzer and found four
+defects. All four reproduce here. The ship verdict survives and is stronger; three of the supporting
+claims do not.
+
+### The root defect: `resolved = -1` is the mkl arm, not a property of a cell
+
+`mrgate_ov.py:176` writes `resolved=(resolved if arm != "mkl" else -1)`. Checked directly:
+
+    arm mkl    24030 rows   resolved == -1 on 24030  (100.0%)
+    arm ours   24030 rows   resolved == -1 on     0  (  0.0%)
+    arm oursb  24030 rows   resolved == -1 on     0  (  0.0%)
+    cells whose non-mkl resolved is multi-valued across 30 passes: ov64 0, ov64b 0, ovp 0
+
+My loader assigned `RES[build][cell]` on **every** row, so it kept whichever arm was written last —
+and `mrgate_ov.py:166` shuffles arm order by `crc32(key|k|pass_tag|build)`. So the `resolved` value I
+partitioned on was a deterministic coin flip on a CRC seed, carrying **zero** information about the
+override. Non-mkl `resolved` is in fact single-valued across all 30 passes, so the correct read is
+trivial and I did not do it.
+
+**Consequences, in order of how badly they hurt:**
+
+- **The population was wrong.** Correct: 89 k=32 cells split **raised 40, declined 49, lowered 0**. I
+  reported raised 38, equal 32, lowered 19 — and **19 "lowered" cells are structurally impossible**,
+  since the override asks for 64 and the pool is 64, so it can never resolve below ambient. A
+  partition containing an impossible class should have stopped me; it did not.
+- **P3's "rescue" was noise.** I split the equal group by `resolved = -1` versus `> 0` and reported
+  that the null passes on the 26 resolved-positive cells. That split was the mkl-arm coin flip, so
+  **the gate's third prediction currently passes on a random partition.** P3 is withdrawn as a
+  passing prediction. The verifying session reports making the identical error an hour earlier and
+  getting 29 of 89, which is the same 1-in-3 draw.
+
+### The floor was the wrong floor, and the right one was free in my own data
+
+The 49 cells where the override **resolved identically** are a declined-argument A/A across the exact
+build pair under test — same code, same effective argument, same process structure as ov64-vs-ovp.
+That is the matched null, and I used the relabelled-object floor instead:
+
+    ov64b / ov64  (relabelled same object)    p95 dev 0.0312   median 0.0040   n=89
+    DECLINED-argument A/A, ov64 vs ovp        p95 dev 0.3122   median 0.0070   n=49
+                                              ratio 10.0x
+
+**And the narrow floor fails its own A/A**: 10 of the 49 declined cells sit beyond it on the slow
+side and 0 on the fast side. Re-gating P2 against the correct floor:
+
+    floor                    population   median    beyond floor
+    narrow ov64b/ov64        raised 40    1.1346    27 slower,  9 faster
+    declined A/A (correct)   raised 40    1.1346    10 slower,  8 faster
+    declined A/A (correct)   all 89       1.0162    13 slower,  8 faster
+
+**The median sign flip survives; my "21 against 5" per-cell asymmetry does not.** Against its own
+free A/A it is 10 against 8. I have the rule for this written down — a declined argument is a free
+A/A — and did not apply it to the case that hands it over directly.
+
+### A mechanical confound in the harness that the win figure rests on
+
+`batch_ours` is shared across arms within a build+pass but **not across builds**: equal on only
+**27 of 534** cell-passes (5.1%). The harness's own docstring records that a small batch reads
+systematically slower and once put two identical-code arms up to 3x apart, which is why it was fixed
+*within* a process. Across builds it is unfixed, and it predicts the effect:
+
+    r[log batch ratio, log ms ratio] on the 40 raised cells   -0.6770
+    batches agree within 1.1x    n=13   median ms ratio 1.0901
+    batches diverge  >1.1x       n=27   median ms ratio 1.2820
+    of the 11 ambient-1-8 cells, 9 sit in the diverging-batch group
+
+**So the 33-95% win that the rule-defect finding rests on is confounded with batch size**, and the
+figure cannot be quoted until a batch-matched re-measurement: pin the batch per (cell, k) in a
+pre-pass and hand the same integer to every build, which the harness already does across arms.
+
+### One regression used twice
+
+I reported r = +0.734 for `log(nnz per worker)` and again for `log(ambient resolved count)` as if
+they were two findings — refuting team-width cost with the first and installing the ambient-choice
+mechanism with the second. The two predictors correlate with **each other at +0.9913**. On this
+population they are the same variable, so the refutation is not independent evidence for the
+replacement. Neither figure reproduces as +0.734 either: here they are +0.6410 and +0.6589.
+
+The refutation of team-width cost stands on its own terms — a fixed per-worker cost should amortise
+*better* on bigger matrices, and the sign is wrong for that. What does not follow is that the ambient
+policy's choice is a **distinct** mechanism this data can resolve.
+
+### What survives
+
+- **The k=32 blanket override must not ship.** The median is slower on every population, window and
+  estimator tried: all 89 cells 1.0162, raised cells 1.1346. The pre-registered falsifier — a sign
+  flip with the floor tight — is met.
+- **The bimodal shape is real**, though my counts were wrong. On the correct population: ambient 1-8
+  gives median 0.6766 (9 faster of 11), ambient 9-30 gives 1.2880 (1 of 17), ambient 31-63 gives
+  1.1346 (1 of 12).
+- **Restricting to p25-p30 was right, for a stronger reason than dispersion.** In p1-p24 `ovp`'s MKL
+  arm is displaced 70-210x with a median calibrated batch of 1 against 139 and 176 for the other two
+  objects, so any ours-versus-MKL number from that segment is **invalid rather than merely wide**.
+
+**The low-ambient win is now a hypothesis awaiting a batch-matched measurement, not a finding.** It
+is the right thing to measure next and the design is already specified.
