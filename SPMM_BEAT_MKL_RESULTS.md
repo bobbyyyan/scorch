@@ -39061,3 +39061,40 @@ required to decide it:
 **Pairing moves the floor by at most 17% and the gated count by one cell.** That claim survives every
 choice of correlation statistic, centring convention and standard error, and it is the one to quote.
 A is still the floor and the count is still 14; the reasoning behind it is what needed fixing.
+
+### The correlation table, one estimator throughout (superseding the mixed one above)
+
+The table two sections up pairs Pearson means with median-centred-cosine standard deviations and
+`t` values. That is the mixed-estimator slip I identified on the `batch` column, one level down, and
+the third instance tonight. **Pearson throughout, on the log times, with the empirical sd** —
+chain204, p25-p30, n=89 per row:
+
+    pair          k     Pearson r    sd       SE       t        cosine t
+    ov64/ovp      2      -0.0692   0.4430   0.0470   -1.47       -1.40
+    ov64/ovp      4      -0.0876   0.4591   0.0487   -1.80       -1.64
+    ov64/ovp      32     -0.1259   0.4511   0.0478   -2.63       -2.17
+    ov64b/ov64    2      +0.0765   0.4010   0.0425   +1.80       +1.60
+    ov64b/ov64    4      +0.0519   0.3679   0.0390   +1.33       +1.92
+    ov64b/ov64    32     +0.0518   0.4666   0.0495   +1.05       +0.85
+    ov64b/ovp     2      -0.1030   0.4065   0.0431   -2.39       -1.16
+    ov64b/ovp     4      -0.0560   0.4536   0.0481   -1.16       -0.87
+    ov64b/ovp     32     -0.0831   0.4395   0.0466   -1.78       -1.91
+
+**Four of nine beyond 1.8 SE and two beyond 2.3** under Pearson, against two beyond 2.0 on the
+cosine — the mixed table understated, since the cosine `|t|` is smaller at seven of nine. The
+qualitative conclusion is unchanged and slightly stronger. **The sign pattern is identical under both
+estimators: same-argument positive at 3 of 3, cross-argument negative at 6 of 6.**
+
+One technical point in my favour, recorded because it bears on how to use the robust variant: the
+`t` above divides by the **empirical** sd of the per-cell values, not by the theoretical
+`1/sqrt(n-1)`. That makes it a valid test of "is the mean of these per-cell statistics zero" for
+*either* statistic — the theoretical value was only ever quoted as a sanity check that Pearson's
+measured sd matched what n=6 predicts (0.447, and it does). So the defect was mixing two estimators
+in one table, not the standard error of the robust one. **Pearson is still the right default** because
+it is the standard and its sampling distribution is known; the cosine needs no separate SE derivation
+when the sd is measured, but it does need to be named.
+
+The decision is unaffected. The surviving claim is still the bound rather than any of these
+correlations: `B/A` = 1.17 / 1.14 / 0.96 / 1.09 / 1.08, so **pairing at the pass index moves the floor
+by at most 17% and the gated count by one cell.** A is the floor, the count is 14, and the
+correlations explain why pairing does not help rather than establishing whether it does.
