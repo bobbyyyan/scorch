@@ -39917,3 +39917,45 @@ concerns.
 
 In all four unchecked emitters the sequence is already `out.close()` followed immediately by
 the `print`, so layer 3 replaces the counter in place with no restructuring.
+
+### Both sessions computed coverage against a manifest that verifies nothing
+
+A peer session reported a defence-in-depth gap in `harnesses/`: 187 files on disk, 184 in the
+local manifest, 163 under `harnesses/` in the top-level one, 21 singly sealed rather than
+doubly, with `harnesses/tsweep.py` among the 21. Those numbers reproduce exactly. The
+conclusion drawn from them does not hold, and neither did the concern.
+
+**`harnesses/SHA256SUMS` is not a SHA-256 manifest.** It is `cksum` output -- CRC-32 plus a
+byte count, digest fields 8 to 10 decimal digits wide. `shasum -a 256 -c` on it returns
+OK=0 FAILED=0, which is indistinguishable from a passing verification. The top-level manifest
+is the same format, 1123 entries, all cksum. So every coverage statistic either session
+computed was computed over a file that establishes nothing about integrity, and comparing two
+CRC manifests to each other measures nothing about whether either seals anything.
+
+**Verified with the right function, 2 of 184 mismatch.** `mkt_attrib2b.sbatch` at 10409 bytes
+in the manifest against 11584 on disk, and `rw_s_movid.sh` at 5124 against 6299 -- both
+**+1175 bytes exactly**, identical mtime, four days after the manifest was written. One
+operation, the same block appended to both.
+
+**And the ledger already documented all of it.** `MANIFEST_NOTE.txt` -- one of the three files
+both sessions dismissed as "manifest machinery" -- records the two stale entries with exactly
+those before-and-after values, notes the matching 1175-byte delta as an internal check that
+the two edits were one edit, names the change (`LC_ALL=C` pinned on two sorts and a join), and
+states that the CRC file is deliberately left unregenerated because a manifest recording a
+transition is worth more than a directory that looks clean.
+
+**The real seal is `SHA256SUMS.sha256` and it verifies completely:**
+
+    format      186 entries, all 64-hex SHA-256
+    shasum -c   OK=186   FAILED=0
+    coverage    187 files on disk, 186 sealed, the 1 uncovered being the manifest itself
+    tsweep.py   present in the real seal
+
+So the evidence is sealed, verifiably, by a file neither session had looked at -- and the "21
+singly sealed" finding dissolves as an artefact of the wrong comparison. There is no
+defence-in-depth gap.
+
+**The rule: identify a manifest by its digest FIELD WIDTH, not by its name.** 64 hex is
+SHA-256 and verifiable; 8-10 decimal digits is cksum, and `shasum -c` on it prints zero OK and
+zero FAILED. Then look for a differently-named file that is the actual seal. This is the same
+shape as every other check whose null result is indistinguishable from success.
