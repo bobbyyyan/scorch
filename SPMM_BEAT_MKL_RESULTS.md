@@ -39282,16 +39282,34 @@ beyond the floor" and names the headline with its predicate in the same sentence
     t_dupcell     one key duplicated, another dropped                     GUARD 3 fires: 15 cells, expected 20
     t_ok          none                                                    all five pass
 
-** is the orthogonality proof**: it carries the **correct** row count of 60 while holding
+**`t_dupcell` is the orthogonality proof**: it carries the **correct** row count of 60 while holding
 only 15 distinct cells, so the cell-count guard is not redundant with the row-count guard. And
- leaves both builds at six distinct pass indices while their intersection drops to five —
-the case a cardinality check cannot see, which would otherwise print  at n=0 and exit 0.
+`t_relabel` leaves both builds at six distinct pass indices while their intersection drops to five —
+the case a cardinality check cannot see, which would otherwise print `nan` at n=0 and exit 0.
 
 **My first version of that self-test was itself vacuous** and is worth recording as the reason to run
-it rather than describe it: the  generator compared a 2-tuple to a 3-tuple, so the
+it rather than describe it: the `t_partial` generator compared a 2-tuple to a 3-tuple, so the
 condition never fired, the tree was written complete, and the guard "passed" by having nothing to
 catch. The test reported exit 0 and I read it as a missing guard. Fixed, and the guard fires.
 
 Shape constants are overridable by environment variable **only** so the self-test can build a small
-tree, and any override prints  on the first line — so a real run
+tree, and any override prints `!! SHAPE CONSTANTS OVERRIDDEN` on the first line — so a real run
 cannot quietly assert the wrong shape.
+
+**The section above was committed with five words silently deleted, and the cause is the trap already
+recorded in this session's notes.** I needed `$DIG` interpolated into the document, so I used an
+unquoted heredoc — which enables backtick command substitution as well as variable expansion. Every
+backticked identifier in the prose ran as a shell command and was replaced by its empty output:
+`t_dupcell`, `t_relabel`, `nan`, `t_partial` and the `!! SHAPE CONSTANTS OVERRIDDEN` banner all
+vanished, leaving grammatical sentences with the subject missing. The shell printed
+`command not found` for each, which I read as harmless noise from the commit rather than as the
+document being rewritten.
+
+The note I had already written said to use a quoted heredoc. It did not say what to do when a value
+has to be interpolated, which is the case that bit: **quote the heredoc and substitute the value
+afterwards in a language that does not run backticks.** An unquoted heredoc is not a weaker version
+of a quoted one — it is a different tool with command execution enabled, and a document full of
+inline code spans is the worst possible input to it.
+
+It also failed silently in the direction that survives review: deleting a word leaves prose that
+still parses. Five sentences read as complete English with their subjects removed.
