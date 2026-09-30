@@ -40600,3 +40600,46 @@ Note on provenance of the comparison figures: the SuiteSparse numbers in the tab
 chain196 `c0`/`c0b` (75 behind-at-all, 0.33%); the peer's are chain206 `aa`/`bb` (69, 0.30%).
 Different runs of the same criterion, consistent with the ~30-of-63/68 cross-run
 reproducibility already filed, and not a discrepancy to reconcile.
+
+#### Two corrections to the section above, both from the peer session
+
+**1. My "56 of 258" carried no predicate, and 258 is also another chain's count.** The
+ladder, each rung with the predicate that produces it:
+
+| predicate | n |
+|---|---|
+| chain204 cells present | 267 |
+| both arms in at least one pass | 267 |
+| at least 1 pass where BOTH arms clear `batch` 64 | 263 |
+| at least 3 such passes -- **my unlabelled predicate** | 258 |
+
+The numerator is 56 either way, so the share is 21.3% or 21.7% and nothing substantive moves.
+It is worth naming anyway: **chain203's `SHA256SUMS` has exactly 258 lines**, so an unlabelled
+258 sitting in a chain204 sentence is indistinguishable from a value carried across chains --
+which is the failure neither of us catches by feel. Carry the predicate, not the value.
+
+**2. The monotone band table adjudicates nothing, and I claimed it did.** I wrote that it
+"destroys 0.299 monotonically, including the sign". It does not, and the reason is my own
+mediator model: if a slower arm fits fewer calls into the calibration window, then
+`ratio < 0.75` is *equivalent to* ov64 being slower by construction, and the sign reversal
+above 1.10 follows the same way. So 50/50 slower in the bottom band and 0/12 in the top is
+the signature **both** models predict, and it selects neither. The bracket [0.093, 0.299] is
+real; the table cannot locate a point inside it. That is precisely why the pin had to be
+built, and presenting the table as the adjudicator would have made the pin look redundant.
+
+**What the pin actually says, decomposed.** 0.237 sits at
+`(0.237 - 0.093) / (0.299 - 0.093)` = **0.699**, so roughly **70% of what conditioning
+removes on the raised cells was mediator** -- real effect deleted by conditioning on a
+consequence -- and about **30% was artefact**. That is Model B stated quantitatively on this
+specific quantity, and it is available only because pinning is an intervention rather than a
+filter. It replaces "0.299 is inflated and 0.093 is deflated", which is true but says less.
+
+**And the obvious objection to "pinning is an intervention" was already measured.** A pin
+takes its value from somewhere, so 0.237 could in principle be specific to whichever arm's
+calibration supplied the batch map -- an intervention at one level rather than an estimate of
+the effect. chain208 ran both maps for exactly this reason: they bracket by **0.46% (k=2),
+2.09% (k=4) and 0.73% (k=32)**, with the largest single move being k=32 map ov64 at 1.21%
+against a **2.86%** per-cell floor. Inside the floor at every width, so the pinned estimate
+does not depend on which arm's calibration set the batch. This belongs beside 0.237 rather
+than buried in chain208's pre-registered predictions, since it is the first thing a reader
+should ask.
