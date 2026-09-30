@@ -37986,3 +37986,68 @@ makes the bound useful anyway is that pass duration is an aggregate over all thr
 co-tenant stealing memory bandwidth would slow every arm at once — which is both why arm-versus-arm
 comparison survives a shifted ambient level, and why duration is the right observable for asking
 whether the ambient level shifted at all. It says it did not, to within 15%.
+
+### chain204 filed, and the matched instrument finds a regime change the duration test could not
+
+**Filed.** chain204 had no ledger entry and its duration series existed only on mkt1's `/scr` and in
+a commit message — a number across a boundary with no bytes to recompute from, which is the exact
+shape this milestone has been correcting all day. Now at `chain204-k32gate-mkt`: 90 CSVs, 4 logs,
+84 MB, 102 files under `SHA256SUMS`. Digests were computed **on mkt1** before transfer, staged
+through `/matx` because `/scr` is node-local, and checked twice on arrival — the tarball digest
+matched and then **95 of 95 files verified, 0 failed, 95 lines emitted**, with the emitted count
+asserted because `shasum -c` reports "not found" as silence.
+
+**Two corrections to how the duration result was stated**, both in the strengthening direction:
+
+- The right form is a **containment bound**, not a detectability floor. With df = 10.6 the critical
+  value is 2.211, so the 95% CI on the post-event shift is **[-3.86, +2.32] minutes** — the data
+  **exclude a slowdown larger than +2.32 min = +12.2%** of the pre-event mean (90%: +9.2%). The
+  earlier "an effect below 15% would be invisible" says what the instrument cannot see; this says
+  what the data rule out, which is the statement matched to the question.
+- The changepoint number must be reported **as a maximum with its cut count**: max |t| = 1.15 over
+  **22 cuts**. The null distribution of a maximum over that many correlated statistics runs near 2,
+  so 1.15 actively supports no level shift rather than merely failing to contradict one. Written
+  bare it reads as a single-cut t and undervalues the result.
+
+**And the limitation that mattered.** Duration is an average, so it is blind to the tail — and
+tonight established that the board count moves on the *tail* of per-cell dispersion, not the level:
+two objects with byte-identical `.text` give a 27.4% spread in behind counts while their dispersion
+base rate is 0.5019. A co-tenant could hold mean duration inside the ±12% bound while inflating
+dispersion, and the board would follow the dispersion. So the question was re-asked with the matched
+observable — per-pass A/A dispersion and sign fraction of `oursb/ours`, tested across p9 exactly as
+duration was:
+
+    object   p95 dev pre -> post      t       sign fraction pre -> post      t
+    ov64     0.1098 -> 0.1432      +0.74      0.5028 -> 0.4892           -1.41
+    ov64b    0.0670 -> 0.0683      +0.06      0.4981 -> 0.4958           -0.23
+    ovp      0.0865 -> 0.0835      -0.20
+
+**Nothing at p9 on the matched instrument either, on all three objects.** The no-contamination
+conclusion now rests on the observable that can see the failure mode, not only on the one that
+cannot.
+
+**But the matched instrument found a large regime change elsewhere, and the duration test at p9
+could not have found it:**
+
+    object   best cut      max|t|   cuts
+    ov64     after p24      4.08     25
+    ov64b    after p24      4.14     25
+
+Same cut, both well above the null maximum. Per-pass dispersion for p25-p30 is **0.0145-0.0283 on
+all three objects** against 0.03-0.60 for p1-p24 — **3 to 5 times tighter and far more stable**.
+That boundary is not the contamination event. It is the boundary between job 17439864 (2026-09-15,
+contended node) and job 17649043 (2026-09-28, node fully idle).
+
+**So chain204's 30 passes are two regimes and must not be pooled, and the split is at p24/p25 rather
+than at p9 — neither of the places either session was looking.** Two homogeneous segments exist:
+p1-p24 (24 passes, noisier, contended) and **p25-p30 (6 passes, 3-5x tighter, idle node)**. The
+second is better data by every available measure, and six passes is exactly the count chain196,
+chain205 and chain206 use, so it is directly comparable to the sealed SuiteSparse boards. Any
+chain204 number must declare its segment.
+
+**An open question left open.** p9 is the second-shortest of the 24 original passes (14.07m against
+a 19.12m mean). An *arriving* 48-CPU co-tenant should make the straddling pass longer, so p9's
+shortness is evidence against an arrival at 04:43:04 — which supports the no-contamination reading —
+but it does not explain what made p9 short, and a *departure* would still be a regime change in the
+favourable direction that breaks comparability for that pass. p9 is excluded from the p1-p24 segment
+regardless, leaving 23.
