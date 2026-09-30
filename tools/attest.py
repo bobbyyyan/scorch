@@ -66,14 +66,49 @@ def pick(d):
     return max(real, key=lambda s: s[1])[0]
 
 
+def denorm(raw):
+    """Strip the manifest's PREFIX markers only. `lstrip("*./")` is a character-set strip and
+    would turn `.hidden_p1.csv` into `hidden_p1.csv`, reporting a legitimately dot-prefixed
+    sealed file as ABSENT while naming the mangled form rather than the mangling."""
+    return raw.removeprefix("*").removeprefix("./")
+
+
+def contained(d, name):
+    """Is the sealed NAME backed by bytes inside the sealed directory? A sealed name is not
+    sealed bytes if the name is a symlink: shasum follows it, so the digest matches the
+    target's current contents and verification is clean while the bytes live outside the
+    ledger with nothing binding them there."""
+    p = os.path.join(d, name)
+    real = os.path.realpath(p)
+    root = os.path.realpath(d)
+    return real == root or real.startswith(root + os.sep)
+
+
 def verify(d, mf):
     entries = {}
+    parsed = 0
+    dups = []
     with open(os.path.join(d, mf), errors="replace") as fh:
         for line in fh:
             f = line.split()
             if len(f) >= 2 and HEX64.match(f[0]):
-                entries[" ".join(f[1:]).lstrip("*./")] = f[0]
+                parsed += 1
+                name = denorm(" ".join(f[1:]))
+                if name in entries:
+                    dups.append(name)
+                entries[name] = f[0]
+    # A dict collapses duplicate names, and len(entries) is then the DEDUPLICATED count. If it
+    # were compared only against itself, a 258-line manifest with 250 distinct names would
+    # report 250/250/250 clean, silently drop 8 entries, and print an invariant sentence that
+    # is untrue. Refuse on ambiguity WITHIN a manifest, as between manifests.
+    if parsed != len(entries):
+        print("  STEP 2  REFUSE: manifest has %d digest lines but only %d distinct names -- "
+              "%d duplicated" % (parsed, len(entries), parsed - len(entries)))
+        for n in sorted(set(dups))[:10]:
+            print("            DUPLICATE ENTRY: %s" % n)
+        return False, set()
     ok = bad = missing = 0
+    escaped = []
     failed = []
     for name, want in entries.items():
         p = os.path.join(d, name)
@@ -85,17 +120,24 @@ def verify(d, mf):
         with open(p, "rb") as fh:
             for blk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(blk)
-        if h.hexdigest() == want:
-            ok += 1
-        else:
+        if h.hexdigest() != want:
             bad += 1
             failed.append((name, "MISMATCH"))
+        elif not contained(d, name):
+            escaped.append((name, os.path.realpath(os.path.join(d, name))))
+            ok += 1
+        else:
+            ok += 1
     emitted = ok + bad + missing
-    print("  STEP 2  manifest lines=%d  emitted=%d  OK=%d  MISMATCH=%d  ABSENT=%d"
-          % (len(entries), emitted, ok, bad, missing))
-    clean = emitted == len(entries) == ok and bad == 0 and missing == 0
+    print("  STEP 2  digest lines=%d  distinct=%d  emitted=%d  OK=%d  MISMATCH=%d  ABSENT=%d  "
+          "ESCAPED=%d" % (parsed, len(entries), emitted, ok, bad, missing, len(escaped)))
+    for n, r in escaped[:10]:
+        print("            ESCAPES THE SEAL: %s -> %s" % (n, r))
+    clean = (emitted == parsed == len(entries) == ok and bad == 0 and missing == 0
+             and not escaped)
     if not clean:
-        print("  REFUSE: not a clean pass -- emitted, manifest lines and OK must all be equal")
+        print("  REFUSE: not a clean pass -- digest lines, distinct names, emitted and OK "
+              "must all be equal, with nothing escaping the directory")
         for n, why in failed[:10]:
             print("            %-8s %s" % (why, n))
     else:
@@ -114,7 +156,7 @@ def cover(d, patterns, sealed):
         hits = sorted(os.path.relpath(p, d)
                       for p in globmod.glob(os.path.join(d, pat), recursive=True)
                       if os.path.isfile(p))
-        n_in = sum(1 for h in hits if h in sealed)
+        n_in = sum(1 for h in hits if h in sealed and contained(d, h))
         total += len(hits)
         inside += n_in
         outside += [h for h in hits if h not in sealed]
