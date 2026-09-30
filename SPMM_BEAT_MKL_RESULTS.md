@@ -40108,3 +40108,69 @@ At map ovp chain204's 27 is a strict subset of chain208's 29. So the agreement i
 the set level, but it is 0.93 Jaccard with one to two cells of churn, not identity -- which is
 the size of the known 4-6% per-cell churn on identical source. Reporting the counts as
 "unchanged" without the overlap would have implied more than the data shows.
+
+### The 9612 collision recurred inside the correction that named it
+
+Correction 3 above diagnoses that two factorisations of chain208 collide on the integer 9612,
+and then quotes 9612 for both of them, two paragraphs apart, labelling neither. The peer
+session caught it with the decisive argument: "9558 of 9612 row-groups carry two distinct
+values, `ours`/`oursb` sharing one and `mkl` the other" **cannot** be the arm-indexed
+partition, because a group indexed by arm holds one arm and so cannot contain three arms'
+values. Re-derived, both partitions named:
+
+    28836 data rows = 267 cells x 3 arms x 36 object-passes
+    BUILD-indexed  (cell, map, pass, build)   9612 groups, of which 9558 hold two distinct batch values
+    ARM-indexed    (cell, map, pass, arm)     3204 comparisons per arm, 9612 across three arms, 0 differing
+
+Two partitions of the same rows with identical cardinality. Publishing a rule does not apply
+it, one paragraph after publishing it. Every sentence quoting the number now names its index.
+
+### The 54 single-value groups are coincidences, and the batch=1 hazard is outside the population
+
+`9612 - 9558 = 54` groups carry one distinct batch value rather than two. That count sat inside
+a reassuring sentence, and the peer session was right that it cannot distinguish two states:
+`mkl` and `ours` calibrating to the same integer, or a batch missing on one arm. The second
+would make those groups vacuous for the `mkl` arm, and the newly filed claim that a later
+ours-versus-MKL number can inherit the pin's coverage rests on `mkl`'s 3204 comparisons being
+real. The values settle it:
+
+    rows with a MISSING batch      0
+    rows with batch == 0           0
+    arms present in all 54         ('mkl', 'ours', 'oursb') in every group
+    the shared value               1.0 in 36 groups, 72.0 in 18
+    matrices involved              exactly 2: rajat29 (36 groups, k=32, map ovp), ins2 (18, k=2, map ov64)
+    groups missing an arm or zero  0
+    real mkl comparisons           3204, the full count
+
+So the 54 are genuine coincidences and the inheritance claim stands.
+
+**And a robustness check that was owed rather than requested.** `batch = 1.0` is the regime
+recorded in this project's notes as hazardous -- one build's MKL arm read 70-210x displaced at
+batch=1 in an earlier chain. **Neither `rajat29` nor `ins2` is in the raised set at any width**,
+so dropping both moves the pinned ratio by **+0.00% at all six map-by-width cells**. The
+batch=1 hazard sits entirely outside the population the verdict rests on.
+
+### chain208 is filed
+
+`~/.cache/scorch-codex/spmm-beat-mkl/chain208-batchpin-mkt/`, 55 files.
+`SHA256SUMS.producing` holds 49 digests computed ON mkt1 before transfer and verifies locally
+49/49 with 0 failures. The archive moved as 418118 bytes at sha256 `f954ef8b...`, matching the
+producing host byte for byte. The full-directory `SHA256SUMS` attests 54/54/54 through
+`tools/attest.py` with MISMATCH 0, ABSENT 0 and ESCAPED 0, and nothing is newer than the seal.
+`PROVENANCE.md` carries the job record, the pin guard with both partitions named, the results,
+the scope limits including the host and the outcome-selected corpus, the digest chain, and the
+k=4 lift erratum.
+
+**A transfer defect worth recording.** The first attempt returned **0 bytes**, because Slurm
+gives each job a private `/tmp` and the tarball did not survive between invocations. What
+caught it was asserting the digest: the local file hashed to `e3b0c442...`, which is the
+SHA-256 of the empty string. A byte count would also have caught it; a "file exists" check
+would not.
+
+**And the two-real-manifest case now exists in this ledger, created by this filing.** The
+heuristic flagged when `attest.py` was written -- selecting the candidate with the most 64-hex
+lines -- now has a live instance, and here it chooses correctly, because the two manifests have
+deliberately different scopes (producing-host subset, full directory) rather than being rival
+seals of the same set. That is a case where refusing on ambiguity would be wrong, so the
+heuristic stays, but it is no longer untested and the tool prints both candidates when it
+chooses.
