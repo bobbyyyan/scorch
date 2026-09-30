@@ -40408,3 +40408,75 @@ controls. That is its own finding and it is unexplained: the effect's *magnitude
 cells is not portable between runs, though its *sign and ordering* are. Every one of the
 four clears both 3.0 and 4.0 us, and TSOPF k=2 and m3plates k=4 sit below both, so the
 sorting filed above stands; three of its magnitudes should not be quoted without their run.
+
+## chain207 CLOSED: the DLMC half of the goal, 10 of 19100 cells behind MKL
+
+Sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain207-dlmc-redwood`, 19 entries, 19 OK,
+0 MISMATCH / 0 ABSENT / 0 ESCAPED, complement empty, top-level seal
+`ca1335ee6dabbe3dbcff387b374c47c67ab8457ee96619be52937fb2390f33a5`. Analyzer pre-registered
+by digest in `bb7e5b2` (`5207b049...`, 14116 bytes) and **not amended**; its four defects are
+in `ERRATA.md` and folded into `PROVENANCE.md`.
+
+**The run.** redwood, 3820 DLMC matrices x 5 widths = 19100 cells, float32, two builds with
+byte-identical `.text` in separate processes, six passes each, three arms per cell. All twelve
+object-passes carry exactly 57301 lines (57300 = 3820 x 5 x 3, plus header), checked by
+`wc -l` on the artefact itself on the producing host and again after transfer. 14 digests
+computed on redwood; archive byte-identical across the wire; 14 OK / 0 FAILED locally.
+
+**Pooled median `ours/mkl` = 0.8299** over all 19100 cells (below 1 means Scorch is faster),
+with the two builds agreeing to within 0.004 at every width:
+
+| k | median aa | median bb | behind aa | behind bb |
+|---|---|---|---|---|
+| 2 | 0.8864 | 0.8845 | 295 | 275 |
+| 4 | 0.9231 | 0.9260 | 1258 | 1282 |
+| 8 | 0.8849 | 0.8858 | 562 | 564 |
+| 16 | 0.7907 | 0.7940 | 105 | 136 |
+| 32 | 0.7409 | 0.7417 | 56 | 65 |
+
+**HEADLINE, predicate in the same sentence: 10 of 19100 DLMC cells (0.0524%), 10 matrices,
+are behind MKL on BOTH byte-identical builds beyond the cross-build A/A floor of the
+`ours/MKL` RATIO at their own width.** The count under the other six readings the analyzer
+prints, because on SuiteSparse this moved 14 to 69 on criterion alone: 99 (aa only) / 53
+(mean) / 210 (either) / 73 (both, arm floor) / 481 (either, arm floor) / 1269 (no floor).
+
+### Both collections now measured, and they agree on the target
+
+| collection | cells | behind, both builds beyond ratio floor | share | matrices |
+|---|---|---|---|---|
+| SuiteSparse | 22920 | 14 | 0.0611% | 13 |
+| DLMC | 19100 | 10 | 0.0524% | 10 |
+| **combined** | **42020** | **24** | **0.057%** | **23** |
+
+So the goal as stated -- faster than MKL on *all* of both collections -- is **not met**: 24
+cells remain, on 23 matrices. It is met on 99.943% of them.
+
+### Width is the only predictor, on both collections, and k=4 carries it
+
+Same four mechanism-derived predicate families as SuiteSparse, same base-rate comparison:
+
+- `width == 4`: 3820 fires, 8 hits, **lift 4.0x** -- the only predicate above 1.
+- every other width: lift 0.0x to 0.5x.
+- `rows < 32 x pool (768)`: 16045 fires, 7 hits, lift **0.8x**.
+- `deg < 1` and `nnz x max(k,16) < 150000` (the shipped grain): **0 hits each**.
+- three predicates **never fire** (`rows < 2 x pool`, `deg x k x 4B > 0.5/1.0/2.0 MB`) and
+  print as `-`, not `0.0000`, so a vacuous predicate is not misread as a refuted one.
+
+**Eight of the ten DLMC cells are k=4, and k=4 carries half of SuiteSparse's fourteen.** Two
+unrelated collections -- general sparse matrices and pruned neural-network weights -- with
+different populations, converging on one width and on no other structural feature. That is
+what makes k=4 a justifiable target rather than an overfit: there is no shape predicate to
+gate on, so the remaining work is a genuine narrow-k kernel improvement.
+
+The ten DLMC cells are all transformer or rn50 blocks with 512-2048 rows and degree 117-614
+-- dense-ish pruned blocks, not the near-empty or extreme-degree matrices that dominate the
+SuiteSparse core. So the two residues are the same *width* but not the same *shape*, which
+argues further against a gate.
+
+### GUARD 5 printed "19100 of 19100", as predicted before the run
+
+Predicted from the code and recorded in `ERRATA.md` before the data landed: the guard cannot
+fire. Line 74 forces every stored reading positive, GUARD 1b bounds each build's pass-index
+set to six values, and only then does GUARD 3's per-arm sum of `cells x 6` force exactly six
+per cell -- a sum alone would permit a 7-and-5 compensation. So `S()` never returns `None`
+and `ok == cells` identically. Treat it as a restatement of GUARD 3, not as a check.
