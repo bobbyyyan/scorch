@@ -37605,3 +37605,42 @@ route that did not support it.
 The second is a harness measuring something other than what production computes, which this
 milestone has on record from three other directions. The operational form: **before predicting what
 a guard will do, check that your instrument counts the same quantity the guard counts.**
+
+### The file count is not redundant: the two assertions are orthogonal, shown both ways
+
+A peer proposed replacing the file-count assertion with `len(set(indices)) == 6`, on the reasoning
+that six files cannot yield more than six distinct indices and fewer cannot yield six, so the file
+count adds nothing. The first half is right and the conclusion is wrong, because **more than six
+files can yield exactly six distinct indices.** Constructed and measured:
+
+    case                          files  distinct idx   file==6  distinct==6  cells   per-arm   depth
+    unmodified                        6  [1,2,3,4,5,6]    pass      pass      22,920  137,520   {6:22920}
+    _p6 -> _p01  (collision)          6  [1,1,2,3,4,5]    pass      FIRES     22,920  114,600   -
+    extra _p06   (7th, collides)      7  [1,..,6,6]       FIRES     pass      22,920  137,520   {6:22920}
+    _p6 -> _p7   (benign relabel)     6  [1,2,3,4,5,7]    pass      pass      22,920  137,520   {6:22920}
+
+Row 3 is the decisive one. A seventh file whose name parses to an existing index overwrites that
+pass for every cell and arm, so one file's data is **silently replaced by a duplicate of another** —
+and cells, per-arm readings and pass depth all land exactly at expectation. With only the
+distinct-index assertion it passes every check. That is the substitution failure mode this milestone
+has already had once, reached by a filename.
+
+So each assertion catches exactly what the other misses, and together they force a bijection between
+files and pass indices, which is the real requirement. Both are kept.
+
+**The peer's actual point was right and is adopted separately: the diagnosis was misattributed.** On
+the collision the per-arm count fires at 114,600 against 137,520, which reads as *missing data* —
+one pass short. The fault is a filename collision with all six passes present and readable, and
+re-running the "missing" pass does not fix it, because the new file lands under the same colliding
+name. The distinct-index assertion now names that fault at the point of loading, before any count is
+derived from it. A guard that fails closed and a guard that fails closed *and* points at the cause
+are different objects.
+
+Row 4 is why the weaker assertion is the right one: `_p6 -> _p7` is a correct dataset with one
+filename changed, and asserting the index set equals `{1..6}` would reject it. For a single-build
+script the pass label is only a grouping key. **That is not true of the cross-build analyzer**, where
+`floor_of` intersects pass indices between two builds: relabelling one build's `_p6` to `_p7` leaves
+all three builds at six distinct indices, so a cardinality check passes, while the intersection drops
+to five and every cross-build row reads `nan` with `n=0` — the within-build rows still printing
+normal values, and exit status 0. There the requirement is that all builds share the same index set,
+which cardinality cannot express.
