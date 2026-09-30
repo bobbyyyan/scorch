@@ -37707,3 +37707,66 @@ disagreeing across 63-79 is a 25% spread in the headline number, which is the re
 instability already on record and the reason the analysis moved onto the core of 24 rather than any
 single chain's count. Every DLMC figure from chain207 must be read against that spread, not against
 a point value.
+
+### Correction and redesign: chain207 restarted as a replicated pair, because one object is not enough
+
+**My attribution in the launch note was wrong.** I reported the headline spread as 63 / 68 / 79
+across chain196 c0, chain205 c0 and build aa, and called it a 25.4% disagreement between
+measurements. A second session boarded chain206's other two objects on the same collection with the
+same estimator, and the numbers are worse in a way that changes the diagnosis. Recomputed here from
+the sealed bytes, with the three-axis input guard passing on each set and the `build` column
+self-identifying on all 412,560 rows:
+
+    object   behind by width k=2..32      total   band   ahead
+    aa       30   34   10    4    1          79    108   22733
+    bb       21   31    8    1    1          62    113   22745
+    aax      25   33   10    3    3          74    107   22739
+                                     each class from its own predicate, each sum = 22920
+
+**aa and bb have byte-identical `.text`.** chain206's `det_diff` established it and the driver now
+re-asserts it with full SHA-256. So 79 against 62 is a **27.4% spread with zero bytes of code
+differing** — wider than the 25.4% I attributed to build differences. The spread is a property of
+the process boundary, not of three builds, and the null is available on the exact object chain207
+uses. Reported correctly it is **62-79 on aa/bb**, not a c0-versus-aa comparison, which would
+smuggle in a build difference the effect does not need.
+
+**And the behind-set barely replicates.** Union over the three objects is 139 cells; **22 (15.8%)
+appear in all three, 32 in exactly two, and 85 (61%) in exactly one.** Pairwise Jaccard is 0.356
+(aa/bb), 0.275 (aa/aax), 0.259 (bb/aax). Three-fifths of a single object's behind-set would not
+appear in a rerun of the same machine code.
+
+That is decisive against the design I launched. A one-object DLMC board would have produced a
+number, and 61% of its content would have been churn.
+
+**chain207 restarted with two objects, `aa` and `bb`, as a pure replication pair.** Identical
+machine code in `.text`, distinct object files at same-length build paths, so two independent
+process boundaries and no code difference to confound. A DLMC cell behind MKL on **both** is behind
+for a reason that survives the process boundary; behind on **one** is churn. That is the distinction
+a single board cannot draw, and it is what makes a deficit a finding rather than a number.
+
+The rotation is balanced — two objects over six passes, each in each position exactly three times —
+because the sliced-three-build result showed an unbalanced order makes the later object read
+systematically differently. 12 object-passes at 57,301 rows each. The partial output of the
+single-object run was discarded rather than reused.
+
+The driver now asserts the premise before timing anything: `objcopy --only-section=.text` on both
+objects, refusing if `.text` differs (not a replication pair) **or** if the whole-file digests match
+(the same file twice, so no second process boundary). Both printed, both hold.
+
+Two smaller corrections from the same check:
+
+- **The core-by-width profile reproduces on a different arm set.** Cells behind in all three
+  objects: `{k=2: 8, k=4: 12, k=8: 2, k=16: 0, k=32: 0}`; union `{51, 57, 20, 7, 4}`. This is the
+  earlier 8/14/2/0/0 profile obtained from aa/bb/aax rather than the c0/c0b measurements, so
+  **nothing at k >= 16 survives replication** on either arm set. Practical consequence: a k >= 16
+  DLMC deficit from chain207 is unreplicated by construction and is not reportable from one object.
+- **"43% at k=4" is a point inside a band.** The share is 43.0% (aa), 50.0% (bb), 44.6% (aax). What
+  is robust is that k=4 carries the largest replicating core — 12 of the 22 — and moves least in
+  absolute terms (34 / 31 / 33, range 3) while k=2 is the noisiest (30 / 21 / 25, range 9, which is
+  9 of the 17-cell total spread on its own). The percentage should travel with all three values.
+
+One provenance note resolved in passing: chain206's stage log records `aa whole 7f8f78d5...` and
+`.text a79b5d20...` as bare 64-bit labels that do not name their function, which was flagged as
+adequate for a run label but not as an integrity claim. Recomputing full SHA-256 over both objects
+reproduces exactly those prefixes, so **they are SHA-256 prefixes** — the label was sound and is now
+independently confirmed rather than assumed.
