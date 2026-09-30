@@ -38515,3 +38515,70 @@ Three smaller corrections from the same exchange, all verified against the seale
   Separately, the "10 of 11 low-band" figure I quoted was not a slip: that group is *defined* by
   whether the batch ratio diverges past 1.1x, so it does depend on the batch estimator — it is 9, 10,
   10, 9 across the four conventions, and 10 under the arithmetic-median one I was describing.
+
+### The floor question CLOSES: the narrow floor was right, and the 10x gap is the batch on 7 cells
+
+Two commits ago I said the narrow floor fails its own A/A and the 10x gap was "not batch, not
+population, and not yet named". The population half stands. The rest was my own error, and it was a
+specific one: **I compared a median batch divergence to explain a p95 width.** On the declined 49:
+
+    pair                  mean |log batch dev|   median   p95
+    ov64/ovp    test              13.78%          1.76%   24.52%
+    ov64b/ov64  relabel            3.04%          1.19%   12.08%
+
+Median to median says "nearly equal", which is what I reported. The mean is 4.5x apart and the p95
+2x apart — and the quantity I was explaining is a p95.
+
+**Conditioning on the batch is legitimate here, and my own causal argument is what licenses it.** I
+wrote that batch is a mediator on the raised cells: the override changes the kernel's speed,
+calibration observes it, so the treatment causes the batch change and conditioning would remove real
+effect. That is right. But on the **declined** cells the override changes nothing the kernel can see
+by construction, so a batch difference there is not caused by the treatment at all — it is
+calibration noise, a pre-treatment nuisance, and conditioning on it is valid. The same causal
+ordering forbids conditioning on one subset and permits it on the other. I stated the premise and
+did not draw the consequence.
+
+Splitting the declined cells by batch agreement:
+
+    batch agreement      n    test p95   relabel p95   ratio     median nnz
+    within 1.02x         27     0.0228      0.0380      0.6x        297538
+    1.02-1.10x           15     0.0374      0.0242      1.5x        135135
+    beyond 1.10x          7     0.5930      0.0101     58.7x           756
+
+**The entire 10x gap lives in 7 cells, and where the batch agrees the test pair is TIGHTER than the
+relabelled-object floor.** It is also not the small-matrix effect I proposed: inside the smallest nnz
+quartile of the declined set, batch-matched cells read 0.0074 at median nnz 174 and batch-diverged
+cells 0.5913 at median nnz 131 — **the same size, 80x apart, with batch agreement the only
+difference.** My small-matrix quartile row was additionally computed over all 89 cells while the
+sentence attached it to the declined pair, so the evidence for a claim about the declined set
+included the raised cells where the override genuinely fires. On the declined 49 alone the
+concentration survives in direction and not in magnitude.
+
+**So the narrow floor does not fail its own A/A.** Beyond it: all 49 declined gives 10 slower / 0
+faster, but batch-matched cells give **1 slower / 0 faster** and batch-diverged cells 9 / 0. The
+failure was the artefact, not the floor.
+
+**Both floors now agree, and the gated count is not in doubt.**
+
+    floor                                    p95 dev    raised 40 beyond it
+    relabelled object ov64b/ov64              0.0312     27 slower,  9 faster
+    batch-matched declined A/A (n=27)         0.0228     27 slower,  9 faster
+    unconditioned declined A/A (n=49)         0.3122     10 slower,  8 faster
+
+Two independently constructed floors give the same count; the one that disagreed was carrying the
+artefact. **The correct per-cell figure for chain204's k=32 override is 27 slower against 9 faster on
+the raise group**, gated by the relabelled-object floor. cf9a0a2's "21 against 5" was wrong for the
+population reason already retracted, and my "10 against 8" was wrong for this one. My "no per-cell
+gated count should be quoted" was over-cautious and is withdrawn; 27/9 is quotable with the floor
+named.
+
+**What still genuinely needs the batch-pinned re-run is the low-ambient win magnitude**, where batch
+*is* a mediator and conditioning is not available — that is the 0.6766 median on the 11 raised
+ambient-1-8 cells, 9 of which sit in the diverging-batch group.
+
+One finding about the corpus rather than the kernel: **four of the 89 shared keys are degenerate at
+k=32.** `ss/S10PI_n1/S10PI_n1_C` has nnz = 1, `ss/M20PI_n1/M20PI_n1_B` has 3,
+`ss/bips07_1998/bips07_1998_B` has 4, and `ss/Pajek/Tina_AskCog/Tina_AskCog` has 36 — all timed at
+7 to 23 microseconds and all resolving to a single worker. They are not measuring SpMM, the nnz = 4
+one was the single largest deviation in the declined set, and they are in the corpus that chain202,
+chain203 and chain204 all share.
