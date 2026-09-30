@@ -37932,3 +37932,57 @@ with identical machine code is a difference in noise, not in speed**, and the ~0
 a separate and much smaller effect riding on top of it. Both systematic effects — aa faster on the
 median, aa's floor higher — point toward aa having *fewer* behind cells, and on a fixed floor it has
 20 more.
+
+## chain204's contamination: no regime change in the duration series (2026-09-29)
+
+The deferred `/scr` read is done. mkt1 was fully idle (0 of 128 CPUs allocated) and nothing was
+timing on it, so this cost no perturbation — which is why it was worth waiting for.
+
+**What the logs settle first, before any timing question.** The requeued job 17649043 prints pass
+headers `p1` through `p23` all stamped `18:40:05`, its own start time. Those are the resume logic
+*skipping* already-complete passes, not running them. The original run 17439864 completed **p1
+through p24** and was cancelled during p25 (started 09:14:39 for p24, 09:31:14 for p25). So the
+requeue added p25-p30 on top of 24 complete passes, exactly as intended.
+
+**Per-pass wall duration, all three arms, original run:**
+
+    p1  19.60   p2  16.60   p3  18.07   p4  14.65   p5  19.58   p6  17.02
+    p7  26.28   p8  21.20   p9  14.07   p10 17.57   p11 20.65   p12 17.68
+    p13 19.32   p14 17.52   p15 16.47   p16 15.12   p17 19.55   p18 18.35
+    p19 17.05   p20 21.82   p21 20.82   p22 14.15   p23 22.57   p24 16.58   (minutes)
+
+The reported contamination event is 04:43:04, which falls inside **p9** (04:41:58-04:56:02), so p9
+is the one straddling pass.
+
+    segment              n    mean     sd     range
+    pre-event  p1-p8     8   19.12   3.54   14.65-26.28
+    straddling p9        1   14.07
+    post-event p10-p24  15   18.35   2.42   14.15-22.57
+
+    post - pre = -0.78m  (-4.1%)   Welch t = -0.56
+    best changepoint over ALL cuts: after p4, t = 1.15
+
+**Post-event passes are 4.1% faster, not slower, and no cut in the series produces a t above 1.2.**
+A 48-CPU co-tenant arriving on a 128-CPU node, with this job pinned to 64 CPUs, would be expected to
+lengthen subsequent passes. Nothing of the kind is present. p9 itself — the straddling pass — is
+14.07m, the second-shortest of all 24.
+
+**Consequences, and they revise two earlier positions including my own.**
+
+- The verifying session's inference that "the clean subset is the first eight passes", so the six
+  added passes do not repair the run, is **not supported**. It was a reasonable inference from a
+  known co-tenancy event, but the wall-clock observable does not show the event mattering.
+- My own straddled-pass framing was right in kind and far too pessimistic in degree. I bounded the
+  damage at "at most 9 of 24 straddled" from 9 regime changes. The duration series locates exactly
+  **one** straddling pass, p9, and shows no level shift on either side of it.
+- So **all 24 original passes plus the 6 added are usable**, with p9 the only candidate for
+  exclusion — and dropping it leaves 29 of 30.
+
+**The caveat, stated because absence of evidence is being used as evidence here.** This bounds the
+contamination rather than excluding it. With a pre-segment sd of 3.54m over n=8 and a post-segment
+sd of 2.42m over n=15, the difference detectable at 2 standard errors is about 2.8m, i.e. roughly
+**15% of pass duration**. A co-tenancy effect smaller than that is invisible to this instrument. What
+makes the bound useful anyway is that pass duration is an aggregate over all three arms, so a
+co-tenant stealing memory bandwidth would slow every arm at once — which is both why arm-versus-arm
+comparison survives a shifted ambient level, and why duration is the right observable for asking
+whether the ambient level shifted at all. It says it did not, to within 15%.
