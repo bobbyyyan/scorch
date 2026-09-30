@@ -37770,3 +37770,94 @@ One provenance note resolved in passing: chain206's stage log records `aa whole 
 adequate for a run label but not as an integrity claim. Recomputing full SHA-256 over both objects
 reproduces exactly those prefixes, so **they are SHA-256 prefixes** — the label was sound and is now
 independently confirmed rather than assumed.
+
+### What the aa/bb disagreement actually is: every pass tilts the whole collection, and pooling does not fully cancel it
+
+The natural hypothesis for the aa/bb spread was that the two objects occupy separated time windows
+inside each pass, so ambient drift between the windows inflates the difference. chain206's stage log
+contains a natural experiment for it — the aa and bb windows are about 30 minutes apart in p1/p3/p5/p6
+and about 61 minutes apart in p2/p4 — and **the hypothesis is refuted**: the far pair is *less*
+dispersed than the near four (p95 dev of the per-cell ratio 0.4580 against 0.4854, ratio 0.9436;
+on mean `|ln|` it is 1.0050, half a percent the wrong way). Weak design, 2 passes against 4, and only
+a 30-versus-61-minute contrast, so this bounds the effect rather than excluding a larger one at
+longer separations. Consequence: finer slice-level interleaving would buy nothing on this axis.
+
+**The test found something more consequential instead.** Fraction of the 22,920 cells where
+`aa.ours > bb.ours`, per pass — under paired noise with no systematic difference this should sit at
+0.5 in every pass, and the binomial SE at n=22,920 is 0.0033:
+
+    pass      p1       p2       p3       p4       p5       p6
+    fraction  0.4908   0.3795   0.5789   0.4283   0.5160   0.4593
+    SE from   -2.8    -36.5    +23.9    -21.7     +4.8    -12.3
+
+**These are collection-wide level shifts between two objects with byte-identical `.text`.** p2 tilts
+12 percentage points one way, p3 8 points the other. A whole-window ambient effect that does not
+average out inside a pass, on 22,920 paired cells.
+
+**Pooling over six passes reduces it but does not cancel it, and here the verifying session's figure
+and mine disagree in a way that matters.** They reported the pooled sign fraction as 0.469-0.479.
+Computed here on the six-pass reduced statistic — per-cell `exp(median(log(aa/bb)))` over all six
+passes:
+
+    width            k=2      k=4      k=8     k=16     k=32
+    median ratio  0.9974   0.9981   0.9982   0.9971   0.9978
+    sign fraction 0.4313   0.4496   0.4533   0.4398   0.4531
+
+So the residual is **4.7 to 6.9 points below one half, not 2.1 to 3.1**, and the median ratio says
+`aa` reads **0.18% to 0.29% faster than `bb` at every width** — consistently, with identical machine
+code. Balanced rotation takes the per-pass tilt from +-12 points down to a ~5-point residual with a
+sub-0.3% median offset. **It does not remove it.** That residual is the same size and sign as the
+layout artefact already on record, where two objects with identical decisions differ 1-2.6% on
+narrow-k SpMM.
+
+Two consequences for chain207, both now load-bearing:
+
+- **The "behind on both objects" test must be computed on the pooled six-pass reduced statistic and
+  never on a per-pass board.** One pass can tilt the entire collection by 12 points of sign
+  fraction, which is far larger than any gated effect.
+- **The intersection test must be symmetric between `aa` and `bb`.** Since `aa` reads ~0.2% faster
+  pooled, any procedure that privileges one object — using it for the floor, or breaking ties toward
+  it — imports that offset. Behind-on-both is symmetric by construction; a one-object floor would
+  not be.
+
+### A loose citation, corrected
+
+The restart commit justified the balanced rotation by citing "the sliced-three-build requirement".
+That citation is wrong in its particulars. The sliced-three-build result is about rotating builds
+*inside* 25-matrix slices, and chain206 and chain207 rotate at **pass** level, with one object
+sweeping the whole corpus per window. The balance argument still applies at pass level — each object
+in each position an equal number of times, so a monotone ambient trend cancels to first order, and
+the arithmetic checks (2 objects x 6 passes = 12 object-passes, 2 positions x 3 slots each; chain206's
+3 x 6 = 18, 3 positions x 2 each). But the requirement I named was written against a finer
+granularity than the one being used, and per the refuted drift hypothesis above the coarse
+granularity is measured to be harmless here rather than assumed to be.
+
+### What the floor is made of
+
+Worth printing beside the floor, because it says what the reduction buys:
+
+    width                              k=2      k=4      k=8     k=16     k=32
+    unreduced p95 dev, single pass  0.4493   0.3979   0.4055   0.4807   0.6027
+    six-pass reduced arm floor      0.0483   0.0410   0.0436   0.0575   0.0851
+    shrink                             9.3x     9.7x     9.3x     8.4x     7.1x
+
+k=32 is widest on both scales and k=4 narrowest, and the median-of-six reduction buys roughly an
+order of magnitude. The gated numbers live on the bottom row; the top row is what a single pass
+would have offered.
+
+### An open axis on the replication-pair premise, deliberately not closed yet
+
+The driver refuses if `.text` differs (not a pair) or if the whole-file digests match (same file, no
+second process boundary). Those are irredundant, but irredundant is not complete: `.text` identical
+plus whole-file differing means the difference lives in some **other section, and the assertion does
+not name which**. If it is `.comment`, `.note.gnu.build-id` or debug/relocation content, then "zero
+bytes of code differing" is exact and the pair is clean. If any of it were in `.rodata` or `.data`, a
+tuning constant could differ while `.text` stayed byte-identical, and "identical machine code" would
+be true of the instruction stream but not of behaviour.
+
+**Not measured yet, and deliberately so: chain207 is timing on redwood right now, and running
+`objdump` over multi-megabyte shared objects on the measuring host is the perturbation-next-to-a-live-run
+mistake.** The reasoning that it is debug and comment content — both objects built from byte-identical
+source at same-length paths, so every constant originates in identical source — is strong but is
+reasoning, not measurement. This is recorded as a **gate**: the section enumeration runs when the
+board finishes, and the replication-pair claim is provisional until it does.
