@@ -38051,3 +38051,74 @@ shortness is evidence against an arrival at 04:43:04 — which supports the no-c
 but it does not explain what made p9 short, and a *departure* would still be a regime change in the
 favourable direction that breaks comparability for that pass. p9 is excluded from the p1-p24 segment
 regardless, leaving 23.
+
+### Six corrections to the chain204 filing, five of them mine
+
+**1. The p9 test's post window spanned both regimes — my own straddling rule, broken one level up.**
+The window was `p10..p30`, which includes the six tight passes of the other regime, and they drag the
+post mean down and cancel the effect being tested for. Restricting the post window to `p10..p24`, so
+the comparison stays inside the noisy regime:
+
+    object   p9 dispersion pre -> post      t (post p10..p30)    t (post p10..p24)
+    ov64     0.1098 -> 0.1925                    +0.74                +1.46
+    ov64b    0.0670 -> 0.0872                    +0.06                +0.80
+    ovp      0.0865 -> 0.1101                    -0.20                +1.67
+
+**All three overrides are positive inside one regime**, where the spanning window gave one negative
+and one near-zero. Not individually resolvable, but 3-of-3 sign agreement is 1-in-8 by chance alone.
+So "nothing at p9 on the matched instrument" was too strong. The honest statement: **within the noisy
+regime the p9 dispersion increase is positive on all three objects and not individually
+resolvable** — weaker than a finding, and weaker than "found nothing". My own commit set the rule
+that any chain204 number must declare its segment, and this number straddled the boundary my own
+scan had just located.
+
+**2. I under-reported my own strongest result by a factor of 2.5.** The regime scan gives max|t| =
+4.08 (ov64), 4.14 (ov64b) and **10.53 (ovp)**. I quoted the two smaller ones because the output
+filter I used to read the results cut off the third object's line — a selection artefact in my own
+reporting, not in the analysis. Against a null maximum near 2 over 25 cuts, 10.53 is the decisive
+number and I omitted it.
+
+**3. "3-5x tighter" understated it.** The segment-mean ratios are **8.19x (ov64), 6.04x (ovp), 3.75x
+(ov64b)**. Both stated ranges were also too narrow at the low end: p1-p24 dispersion spans
+**0.0222-0.6012** (stated 0.03-0.60) and p25-p30 spans **0.0125-0.0283** (stated 0.0145-0.0283).
+
+**4. A positive control that came free, and it is the matched null for tonight's main result.**
+chain204's per-pass A/A sign fraction over all 90 object-passes runs **0.4419 to 0.5693, mean
+0.4929** — against chain206's **0.3795 to 0.5789**. chain204's A/A is `oursb` against `ours`
+**within one process**; chain206's `aa`/`bb` spanned **two**. So the absence of a per-pass tilt here
+is direct evidence that the chain206 tilt is a **process-boundary** effect rather than an ambient
+property of the host or the harness — measured on data collected for an entirely different purpose.
+And at the p24/p25 boundary the sign fraction does *not* move (t = -1.47 / -0.28 / -0.32) while
+dispersion moves by 4-10 SE: **only dispersion shifts, which is the signature of a contention change
+and not of a systematic one.**
+
+**5. The filed analyzer could not run where it was filed — the third instance.** `c204_matched.py`
+hardcoded `D = "/scr/bobbyy/c204"`, so run inside the sealed directory it globbed nothing, printed
+`builds: []` and `passes per build: {}`, and **exited 0**. A silent vacuous pass, after
+`an_c206.py`'s `c206final` and `recount205.py`'s hardcoded ledger root. I had already fixed this
+exact defect twice in this milestone and filed a third instance of it hours later. Rewritten to take
+the tree root as `argv[1]`, refuse on an empty glob, and assert the shape (3 builds x 30 passes x 267
+cells) before computing. It now runs in place and reproduces every figure above.
+
+**6. Both manifests covered outputs only, so the inputs that define what the outputs mean were
+sealed zero times.** My seal used an extension glob (`*.csv *.log *.sbatch *.sha256 *.py *.md`), which
+left **49 of 151 files unattested** — including the corpus `c198_keys.txt`, the rotation order
+`orders_idx3x30.txt` (i.e. the balance premise), all four harness scripts, the pinned `tree/` with
+`spmm.h` and `scorch_policy.h`, and **both built `scorch_ops*.so` files**. A changed corpus, rotation,
+harness or binary would have left both manifests verifying perfectly at 95/95 and 102/102.
+
+That is pointed rather than pedantic because **chain207's entire design rests on binding a binary to
+a board by `.so` digest**, and chain204's binary was the one thing not bound. Re-sealed with
+`find -type f` instead of an extension glob: **149 files, 149 manifest lines, coverage gap 0**, 149
+OK, 0 failed, 149 emitted. A stale `__pycache__/*.pyc` was deleted rather than attested, being a
+build artefact and not evidence.
+
+The binary is now bound: both `.so` copies digest to `83ff79d7...` and are **the same object at two
+paths**. Corpus `d9184eb9...`, rotation `f72f3fe5...`, and the two harness bodies are distinguishable
+at `fa3441af...` (5,580 bytes) and `2b19eb1b...` (5,879 bytes).
+
+**One thing I could not determine.** Which harness body ran which segment. Both job logs open with
+the identical header line, and neither records the body version or its digest. So the two bodies are
+now pinned by digest but **not attributed to jobs**, and the segment claim rests on the pass
+numbering in the logs rather than on knowing which script produced it. Recorded as a gap rather than
+guessed: a harness that does not record its own digest cannot be bound to its output after the fact.
