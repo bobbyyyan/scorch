@@ -39758,3 +39758,52 @@ k=4 separates by at least 36.83% for any slope in [-1.08, -1.00], so the test is
 in the range that matters. k=32 separates by less than one floor and is reported as
 low-power with both model points printed. k=2 sits at 8.00 floors -- a test, not a bound,
 but carrying the least robust slope of the three.
+
+### A completeness message that certifies 267 rows in a file holding none
+
+chain208's run log says, twice:
+
+    wrote /scr/bobbyy/c208/cal_ovp.csv (267 rows)
+    wrote /scr/bobbyy/c208/cal_ov64.csv (267 rows)
+
+Both files are **107 bytes, one line, header only**. The counter behind the message counts
+cells PROCESSED, not rows EMITTED, and in calibration mode no timing rows are written to
+`--csv` at all -- only the batch map goes out, through `--batch-out`. So a completeness audit
+conducted by reading the log would certify 267 rows in a file that contains none, and there
+is nothing in the log that could reveal it. The fix is to increment the counter at the
+`writerow` call or to make the message say "cells".
+
+It does not touch the analysis: the map is `batchmap_*.csv`, both carry 267 cells, and the
+batch actually used was verified against them on 16821 of 16821 rows with zero lookup
+misses. The defect is in the attestation, not the data -- which is the worse half to have
+wrong, because the attestation is what a later reader trusts.
+
+**What the integrity check did establish, with its population stated:** 28 of 28 complete
+object-pass files are exactly 802 lines = 801 rows = 267 cells x 3 arms. The one short file
+is the newest by mtime and grew from 10 to 73 lines across a 20-second observation, so it is
+the in-progress write rather than a silently truncated earlier pass. That was the thing worth
+ruling out, since one truncated file among the completed ones would bias the analysis with
+nothing in the log to show it.
+
+**And a third count of mine without its predicate.** chain208 progress was reported as "31 of
+36" and "32 of 36 object-passes" for an hour. The predicate was `grep -c "^wrote "` on the
+run log, which also matches the two batch maps and the two calibration files. The true figure
+was **28 of 36**, and the remaining time about 33 minutes rather than the 10 implied. The
+earlier instances tonight were a leading-space count whose quantifier went unstated and a
+board count published without its criterion; this one had a predicate that was simply wrong.
+
+### Spot-check the LARGEST effect, not the most convenient one
+
+Two convention errors were found tonight, and in both the width that agreed across the two
+conventions was the width where the effect is smallest:
+
+- reduce-then-ratio against ratio-then-reduce agreed at k=32 (-0.4317 against -0.4306) and
+  differed at the narrow widths (-1.1063 against -1.1440).
+- a log-scale gap-to-floor ratio against a dev-scale one agreed at k=32 (0.68 against 0.67)
+  and diverged 16% at k=4 (12.17 against 14.11).
+
+The general form: **a convention or scale error is proportional to effect size**, so
+verifying against the cell with the smallest effect is verifying where the error is
+definitionally invisible. Both times the one width that could be cross-checked cheaply was
+the one that could not reveal the discrepancy. A spot-check has to name why the cell it
+chose is capable of failing -- the same requirement as a guard firing on its own input.
