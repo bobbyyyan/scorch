@@ -39249,3 +39249,49 @@ either instance: shown a numeric discrepancy, I reached for one plausible cause 
 handling for the quantile gap (there were zero ties), then the observed convention for the percentage
 gap (it was the base). Both times the explanation was mechanical-sounding and unverified, and both
 times a two-line decomposition would have settled it. **Decompose a gap before naming it.**
+
+### chain207 PRE-REGISTRATION: the analyzer exists and is bound by digest before its data does
+
+`an_c207.py`, SHA-256 **`5207b0498db0dbc09e042df2c64d9c08fc55c7f9aba9c3733a065ed9c7c03a50`**, 14116 bytes, written while the run was on pass 4 of 6 with no
+DLMC timing yet read. Every choice it makes provably predates the numbers it will produce. That is
+not ceremony — the SuiteSparse count moved between 14 and 69 purely on a criterion chosen after
+seeing the data, and choosing it first is the only fix available.
+
+**What is fixed in advance.** The gated statistic is `S = ours/mkl` per cell, and the floor is
+`dev(S_aa/S_bb)` — S's own cross-build reproducibility, reduce-each-build-then-ratio, p95 by
+nearest rank, per width. A cell is behind MKL only if it is behind on **both** byte-identical builds
+beyond that floor at its own width. The arm-identity floor is printed beside it for contrast and is
+explicitly **not** the control. Estimator: per-cell `exp(median(log .))` over six passes,
+deviation `exp|ln x| - 1`.
+
+**The prior, stated so the result can disagree with something.** SuiteSparse under this exact
+criterion: 14 of 22,920 cells (0.0611%), 13 matrices, 6/7/1/0/0 by width, none at k≥16, no predicate
+on rows/nnz/degree above lift ~1, width the only predictor with k=4 at 2.4–2.9x. DLMC is pruned
+neural-network weight matrices — far more structurally uniform than SuiteSparse — so a materially
+different rate is the interesting outcome in either direction.
+
+**The file will not report a single count.** It prints all seven readings of "behind on both builds
+beyond the floor" and names the headline with its predicate in the same sentence.
+
+**Five guards, each proven to fire on its own violating input** — built as synthetic trees and run:
+
+    tree          violation introduced                                    result
+    t_files       one object-pass absent (11 files)                       GUARD 1 fires: "found 11, expected 12"
+    t_relabel     build bb's p6 renamed p7 (both still 6 indices)         GUARD 1b fires: pass-index sets differ
+    t_partial     build aa pass 3 truncated to 51 of 60 rows              GUARD 2 fires: wrong row count
+    t_dupcell     one key duplicated, another dropped                     GUARD 3 fires: 15 cells, expected 20
+    t_ok          none                                                    all five pass
+
+** is the orthogonality proof**: it carries the **correct** row count of 60 while holding
+only 15 distinct cells, so the cell-count guard is not redundant with the row-count guard. And
+ leaves both builds at six distinct pass indices while their intersection drops to five —
+the case a cardinality check cannot see, which would otherwise print  at n=0 and exit 0.
+
+**My first version of that self-test was itself vacuous** and is worth recording as the reason to run
+it rather than describe it: the  generator compared a 2-tuple to a 3-tuple, so the
+condition never fired, the tree was written complete, and the guard "passed" by having nothing to
+catch. The test reported exit 0 and I read it as a missing guard. Fixed, and the guard fires.
+
+Shape constants are overridable by environment variable **only** so the self-test can build a small
+tree, and any override prints  on the first line — so a real run
+cannot quietly assert the wrong shape.
