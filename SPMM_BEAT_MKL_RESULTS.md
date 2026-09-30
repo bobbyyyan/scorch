@@ -38830,3 +38830,59 @@ runtime-gated rule cannot be built for these cells out of rows, nnz, or degree**
 threshold on those features selects them. So closing the k=4 half of the core requires a change that
 makes k=4 faster *generally*, not a condition that fires on 14 matrices — which is the outcome the
 no-overfitting rule was there to force, arrived at by measurement rather than by preference.
+
+### The 25 needs its predicate in the sentence; the per-call diagnostic is confirmed as non-vacuous
+
+**The count is criterion-sensitive and I published it without its predicate.** All seven rows below
+require the cell to be behind MKL on *both* byte-identical builds; they differ only in how the floor
+is applied. Floors are p95 over cells at that width of `dev(exp median log(ms_bb_ours / ms_aa_ours))`
+requiring all six passes in both builds — cross-build 0.0818 / 0.0747 / 0.0756 / 0.0909 / 0.1387, and
+the arm-identity floor on `oursb/ours` within `aa` at 0.0483 / 0.0410 / 0.0436 / 0.0575 / 0.0851.
+
+    criterion                                  k=2/4/8/16/32   cells   matrices   k=4 lift
+    both beyond cross-build floor (published)  6/14/4/1/0        25       22         2.8
+    aa beyond cross-build floor               12/18/5/2/0        37       31         2.4
+    both beyond arm floor                     12/19/4/1/0        36       32         2.6
+    mean beyond cross-build floor             11/23/4/2/0        40       33         2.9
+    either beyond cross-build floor           14/25/5/2/1        47       38         2.7
+    either beyond arm floor                   17/29/6/2/1        55       45         2.6
+    no floor at all                           21/37/8/2/1        69       56         2.7
+
+**So "the remaining work is 25 cells" moves between 25 and 69 on the criterion alone**, and the
+sentence has to carry the predicate: *25 cells are behind MKL on both builds beyond the cross-build
+A/A floor at their own width.* The published 6/14/4/1/0 reproduces exactly under that criterion.
+
+**What survives every construction is the part the conclusion rests on:** the k=4 lift is **2.4 to
+2.9 in all seven**, and none at k=32 under the two strictest. So "width is the only predictor" and
+"no runtime-gated rule on rows, nnz or degree selects these cells" hold whichever criterion is
+chosen.
+
+An independent recomputation agrees with this board cell-for-cell — applying its ratios to my floors
+returns 400 against my 400 on the isolated instrument and 44 against my 43 on the timed one — while
+reporting different floors (k=8 at 0.1493 against my 0.0756, a factor of two). **The whole count
+discrepancy is in the floor, not the data.** My floor definition is stated above; the source of the
+difference is not yet identified and the number should be read with its floor attached until it is.
+
+**The per-call-cost diagnostic: which two vectors the correlation is between.** My `r` is
+`corr(1/t_batched, t_isolated/t_batched − 1)` — the regressor against the response, not the residual
+against the regressor. It is not zero by construction, and the check is one line of simulation:
+
+    model                                    corr(1/t, ti/t-1)   corr(t, ti)
+    additive, ti = t + C exactly                  +1.000000        +1.0000
+    multiplicative, ti = 1.05 t + 15% noise       +0.012057        +0.9848
+    mixed, ti = 1.02 t + C                        +1.000000        +1.0000
+
+**Under a perfect additive model it is exactly 1.** My measured −0.077 to +0.099 sits precisely where
+the multiplicative simulation lands, so it is evidence against a fixed per-call cost rather than an
+artefact — the diagnostic did its job.
+
+And `corr(t_batched, t_isolated)` reads **0.985 under pure multiplicative noise**, so it cannot
+discriminate the two models at all: both quantities are driven by cell size. A reported 0.986 for it
+is not evidence that a fixed cost explains the data. The refutation therefore has two independent
+legs — the 6.9x spread in fitted C where a constant is predicted, and `r ≈ 0` on the statistic that
+would read 1 if the model held. Both say the same thing, and neither C value should be quoted.
+
+One external correction worth recording because it confirms my numbers: the board harness sets
+`--target-ms 6` (`rw_s_chain206.sh:121`), not `mrgate_ov.py`'s default of 25. Taking the default
+inflates every isolated time by 4.17x. My C values were computed with 6 and stand; the lesson is that
+a constant has to come from the harness that produced the data, not from the harness that was read.
