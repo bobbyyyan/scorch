@@ -39959,3 +39959,41 @@ defence-in-depth gap.
 SHA-256 and verifiable; 8-10 decimal digits is cksum, and `shasum -c` on it prints zero OK and
 zero FAILED. Then look for a differently-named file that is the actual seal. This is the same
 shape as every other check whose null result is indistinguishable from success.
+
+### The evidence behind tonight's numbers verifies, and one filename means two things
+
+"Has a real seal" is not "verifies", which is the distinction that started this thread. For
+the four directories backing tonight's figures, with the emitted-equals-manifest-lines clause
+asserted so a pass cannot be the zero-OK-zero-FAILED artefact:
+
+    directory                    manifest   emitted   OK    FAILED
+    chain204-k32gate-mkt            151       151     151      0
+    chain206-relocdrift-redwood      27        27      27      0
+    chain203-rungwise-redwood       258       258     258      0
+    harnesses                       186       186     186      0
+
+So the 1.1346, the raised-40 classification, the three per-width unpinned ratios, the slope
+refits and the `rajat26` decomposition all rest on attested evidence.
+
+**And the rule is sharper than "identify by content, not by name".** In
+`chain204-k32gate-mkt` the file named `SHA256SUMS` IS a real SHA-256 manifest and verifies 151
+of 151. In `harnesses` the file named `SHA256SUMS` is CRC-32 and the real seal is
+`SHA256SUMS.sha256`. **The same filename denotes different functions in different directories
+of the same ledger**, so name-based identification is not merely unreliable in general -- it is
+actively wrong inside this tree, and a script hardcoding either convention would be right in
+one directory and silently wrong in the other. Count the 64-hex fields to pick the file, then
+assert emitted verdicts == manifest lines == OK.
+
+**Seal state across the tree, reported as state rather than acted on.** Of 24 chain
+directories, 18 carry a real 64-hex seal and 6 are CRC-only: `chain185-w1fix-mkt`,
+`chain185-w1fix-redwood`, `chain187-w1unroll-mkt`, `chain187-w1unroll-redwood`,
+`chain188-w1ship-redwood`, `chain189-tsweep-mkt`. All six are the width-1 / unroll era, a
+coherent block rather than a scatter, which is consistent with the convention changing at a
+point in time rather than with sporadic omission. `fixtures` is a seventh CRC-only directory
+at 661 entries. The tree root has no `SHA256SUMS.sha256` at all -- its only manifest is 1123
+cksum lines.
+
+**Deliberately not generating a tree-level seal.** It would seal the tree as it stands tonight,
+a different object from the tree as it stood when each chain was filed, and it would compete
+with the per-directory manifests that are the actual attestations. 18 of 24 chains carrying
+their own verified seal is the right granularity. Recorded for Bobby's list.
