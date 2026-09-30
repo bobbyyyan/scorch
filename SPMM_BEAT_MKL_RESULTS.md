@@ -40704,3 +40704,43 @@ Provenance: the SuiteSparse column is chain196 `c0`/`c0b`; the peer's independen
 same construction on chain206 `aa`/`bb` gives floors 0.1095 / 0.1886 / 0.1647 and ratios
 1.93 / 2.34 / 2.75 against my 1.91 / 2.48 / 2.77. Two runs, same direction and magnitude, not
 pooled.
+
+#### The ladder, complete -- and one evening with a clean example of each case
+
+| predicate | n | cells with batch ratio < 0.75 | share |
+|---|---|---|---|
+| chain204 cells present | 267 | -- | -- |
+| >= 1 back-to-back paired pass | 263 | 56 | 21.3% |
+| >= 2 | 262 | 56 | 21.4% |
+| >= 3 -- **what I quoted** | 258 | 56 | 21.7% |
+| >= 4 | 256 | 56 | 21.9% |
+| >= 5 | 255 | 56 | 22.0% |
+| >= 6 | 255 | 56 | 22.0% |
+
+**The numerator is invariant at 56 across every rung**, so the predicate choice is worth
+**0.7 percentage points**. My 258 was therefore right, and right by a margin that makes the
+choice immaterial -- but that was not visible from the sentence, and the peer's framing is
+the one to keep: the number was not wrong, it was **unfalsifiable as written**. The specific
+hazard is exact -- `chain203/SHA256SUMS` has 258 lines while chain204's has 151 -- so an
+unlabelled 258 in a chain204 sentence is indistinguishable from a value carried in from the
+chain next door.
+
+**And this sits directly opposite the DLMC criterion case, in the same evening.** There the
+same kind of choice spanned 10 to 1269 cells, a factor of 127. Here it spans 0.7 points. The
+two are indistinguishable from a single reported figure, and **only the ladder separates
+"the predicate does not matter here" from "the predicate is the whole result"**. So report
+the ladder in both cases, including -- especially -- when the answer is that it does not
+matter, because that is the case where the temptation to report one number is strongest.
+
+#### A registration log needs a second axis
+
+chain208 pre-registered P5: the two calibration maps would bracket by 5-7%. They bracket by
+0.46% / 2.09% / 0.73%, three to ten times tighter, and it was filed as **P5 MISSED**. That
+same measurement is the control showing 0.237 us/worker is not an artefact of which arm's
+calibration supplied the batch map -- the largest single move is 1.21% against a 2.86%
+per-cell floor, inside the floor at every width. Filing it under "MISSED" buried the thing
+it licensed for an entire evening, until the peer asked the obvious question about pinning.
+
+So a pre-registration log wants to record, for each prediction, **not just hit or miss but
+what it licenses if it lands either way.** A miss on a magnitude can be a pass on a
+mechanism, and the single-axis log cannot express that.
