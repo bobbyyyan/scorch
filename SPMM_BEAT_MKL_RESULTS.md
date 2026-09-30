@@ -39649,3 +39649,63 @@ a move in the TIMED RATIO clears its own noise, so the floor is the timed ratio'
 floor is 0.66x and cannot fire, so a k=32 null falsifies nothing. Their k=2 verdict flips
 from 0.89x to 2.92x and becomes testable. Same principle as the two earlier instances in
 this chain: measure the statistic the claim is about.
+
+### WITHDRAWN: "the batch confound is strongest at narrow widths". Slope -1 is the null.
+
+The r values -0.9547 / -0.9810 / -0.6770 at k=2/4/32 were read as the batch confound being
+strongest where r is largest. That inverts their meaning, and the peer session supplied the
+argument. `ms` is per-call and `batch = target_ms / t_calibration`, so
+`log(batch_ratio) = -log(t_calib_ratio)` **by construction**, and a slope of exactly -1 in
+`log(ms_ratio) ~ log(batch_ratio)` says the timed ratio EQUALS the calibration ratio. Slope
+-1 is the null of no measurement bias, not evidence of one. A high r with slope near -1 is
+two instruments agreeing.
+
+The premise checks out on chain204's own rows: `ms * batch` clusters on the target in every
+arm at every width -- ours 22.78 / 24.16 / 24.01, mkl 23.89 / 24.32 / 24.59, IQR 20.5-25.3,
+p05-p95 17.3-27.8.
+
+### A pass-level jackknife inverts which width the slope can speak about
+
+Both sessions quoted OLS standard errors that assume 40 independent cells, when all 40 share
+the same six passes. Leaving out one pass at a time and refitting:
+
+    k      slope     OLS SE   jack SE   jack/OLS   |slope+1| in jack SE   verdict
+    k=2   -1.1440    0.0578    0.0516     0.89x            2.79          distinguishable
+    k=4   -1.0796    0.0347    0.0247     0.71x            3.22          distinguishable
+    k=32  -0.4306    0.0759    0.8520    11.22x            0.67          NOT distinguishable
+
+**The dependence does not always inflate.** At the narrow widths the pass-to-pass wobble is
+smaller than the cell-to-cell residual scatter, so the jackknife SE comes in at 0.71-0.89x
+the OLS one; at k=32 it is 11.2x. Assuming the correction must widen an interval is itself a
+guess -- measure it.
+
+**The k=32 slope is one cell measured cold, and it is non-robust to dropping a PASS, not just
+a cell.** `rajat26` by width:
+
+    k=2    batch ov64/ovp = 467.7 / 479.5 = 0.96x    ms ratio 1.2401
+    k=4    batch ov64/ovp = 507.5 / 575.0 = 0.90x    ms ratio 1.1433
+    k=32   batch ov64/ovp = 367.0 /  36.8 = 9.99x    ms ratio 0.9839
+
+At k=32 the ovp build's calibration collapsed to batch 36.8 -- about 0.65 ms per call --
+while its timed time came out equal to ov64's. The same cell at k=2 and k=4 is unremarkable.
+Dropping it, the three slopes become -1.1498 / -1.0809 / -0.9385, so **every width sits near
+-1** and "the instruments disagree at k=32" is a single cold calibration reading. The drop-1
+fit is recorded, not adopted: choosing the fit one prefers after seeing the leverage is how a
+result gets manufactured.
+
+**Consequence for the registered test.** At k=4 the two competing models stay 37-40% apart
+for any slope in [-1.15, -1.00] -- batch-as-cause predicts 0.959 to 0.983, batch-as-symptom
+predicts 1.3452 -- against a 2.61% outcome floor, so at worst a 14x separation. The slope
+dispute does not touch the discriminating power of that cell.
+
+**Consequence at k=32.** The verdict that a pinning move "cannot fire" there rests on slope
+-0.4306. Under a slope of -1, which the jackknife cannot distinguish from, the predicted
+pinned value is 1.1346 x 0.9529 = 1.0811, a 4.72% move against a 3.12% floor, which is 1.51x
+and marginally live. So k=32 is a LOW-POWER TEST rather than a pure bound, and will be
+reported as both.
+
+**An open question raised rather than asserted.** chain203's 6.52-against-1.14 cold/warm
+figure has the same shape as what `rajat26` turned out to be: a calibration reading far from
+the timed one. It is a different measurement so nothing follows automatically, but whether
+that number carries comparable single-cell or single-pass leverage is not currently known,
+and it is load-bearing in the memory record. To be checked with the same jackknife.
