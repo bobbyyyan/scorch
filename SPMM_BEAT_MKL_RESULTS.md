@@ -39807,3 +39807,51 @@ verifying against the cell with the smallest effect is verifying where the error
 definitionally invisible. Both times the one width that could be cross-checked cheaply was
 the one that could not reveal the discrepancy. A spot-check has to name why the cell it
 chose is capable of failing -- the same requirement as a guard firing on its own input.
+
+### All three integrity axes on chain208, and four size collisions only the digests cleared
+
+"28 of 28 complete files at exactly 802 lines" was the COUNT axis alone, and identical line
+counts are the signature of a copy rather than evidence against one. Running all three:
+
+    AXIS 1  COUNT    29 of 29 at exactly 802 lines
+    AXIS 2  INDEX    29 files, 29 distinct (mapsrc, build, pass) triples, 0 duplicated
+    AXIS 3  CONTENT  29 files, 29 distinct sha256, 0 byte-identical groups
+
+**Size filter first, as chain205 established: 25 distinct byte sizes across 29 files.** So
+four size-collision pairs existed, and only the digest axis cleared them. Stopping at count,
+or at count plus index, would have passed those four unexamined.
+
+**Neither obvious shape discriminator separates chain208 from chain204.** Checked directly
+against a chain204 `sh_*` file:
+
+    distinct k values      both [2, 4, 32]            does NOT separate
+    build names            both {ovp, ov64, ov64b}    does NOT separate
+    arms                   both {ours, oursb, mkl}    does NOT separate
+    key count / row count  both 89 and 801            does NOT separate
+
+And the two totals are not two different decompositions coinciding -- both are 89 keys x 3
+widths x 3 arms. The earlier description of chain208's 801 as "267 cells x 3 arms" was that
+same product regrouped, not a second one. So **no shape feature distinguishes a chain208
+object-pass file from a chain204 one**, and a row-count audit would pass against the wrong
+corpus.
+
+The discriminator is the COLUMN SET: 13 columns against 16, with `resolved_ours`,
+`batch_local` and `batch_pinned` present only in chain208. That is a property of the
+producing code rather than of the corpus, so it cannot coincide the way a product of three
+small integers can. Shape checks get pinned on it.
+
+### The blast radius of the false row count, and why the proposed fix was half a fix
+
+Scanning every log under the ledger for `wrote X (N rows)`: **1884 claims, 1884 resolved to a
+local file, 0 mismatches.** The check is non-vacuous -- it resolved every claim it found and
+would have printed any disagreement -- so the counter is correct in TIMING mode and the defect
+is confined to the calibration mode new to the chain208 patch, where no rows reach `--csv` at
+all.
+
+**And incrementing the counter at the `writerow` call is not the robust fix.** It would have
+caught this particular bug while still reporting the producer's own counter, which reads 267
+just as happily if the handle was never flushed, if the close failed, or if something
+truncated the file afterwards. The form that cannot lie is to stat or `wc` the artefact AFTER
+closing it and print that number, so the line is a measurement of the file rather than a
+memory of the loop. Same principle as a harness asking production for a decision instead of
+recomputing it: read the thing, do not re-derive it.
