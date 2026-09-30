@@ -38362,3 +38362,44 @@ policy's choice is a **distinct** mechanism this data can resolve.
 
 **The low-ambient win is now a hypothesis awaiting a batch-matched measurement, not a finding.** It
 is the right thing to measure next and the design is already specified.
+
+### The retraction's own follow-ups: a filed analyzer, and one claim that gets worse on inspection
+
+`an_c204_resolved.py` is now in the chain204 ledger and reproduces every figure above from the
+sealed bytes. It takes the tree root as `argv[1]`, and its guards assert the things that went wrong
+rather than printing them: that `resolved < 0` holds on all 24,030 mkl rows and none of the 48,060
+non-mkl rows, that non-mkl `resolved` is single-valued across all 30 passes, and that the `lowered`
+class is empty. **A contaminated read announces itself through an impossible class**, so the
+partition is now checked against the mechanism that makes it impossible. Ledger re-sealed at
+151 of 151 with nothing newer than the manifest; the producing-host seal still verifies 95 of 95.
+
+**The conventions, named, because every disagreement on this chain resolved to an unstated one.**
+Ratio-then-reduce: per-pass ratio first, then `exp(median(log .))`. Reduce-then-ratio is a different
+quantity — it reads 1.0189 / 1.1386 against 1.0162 / 1.1346 and moves the gated count by one cell
+(9-against-8 rather than 10-against-8), with the verdict invariant. Ratio-then-reduce is preferable
+on a mechanism rather than on taste: the three builds inside one pass run close together in wall
+clock, so pass-to-pass machine drift is common-mode within a pass and pairing at the index removes
+it. Both orders are inversion-equivariant to 2.2e-16 over the 89 cells, so neither carries the
+even-count asymmetry that bit the board's A/A. **The same estimator must be used for the `batch`
+column as for the timings** — ratio-of-medians there reads r = −0.9289 against −0.6770.
+
+**The collinearity finding is worse than collinearity.** The worker count under the override is the
+constant 64, so the predictor I called "nnz per worker" is `log nnz` shifted by a constant and
+contains **no worker variation at all**. It is matrix size. The ambient policy picks its thread count
+from matrix size, which is why it and `log(ambient resolved)` correlate at **+0.9978**. The
+per-worker load that actually varies is `nnz / ambient`, and it correlates **−0.6800** — the
+opposite sign. So the team-width refutation and the mechanism installed in its place rest on one
+regression on matrix size, and the predictor named "per worker" was not per worker.
+
+**The window restriction broke the rotation's own guarantee.** Over all 30 passes the build rotation
+is exactly balanced, 10/10/10 per position for each build, read from the landed write order in
+`c204_run.log` rather than from `orders_idx3x30.txt`. Inside p25-p30 it is ovp 3/2/1, ov64 2/3/1,
+ov64b 1/1/4 against the 2/2/2 a balanced six-pass window needs. Two defences in tension, and
+invisible if balance is certified from the schedule instead of from the passes that landed. Bounded
+rather than asserted away: the measured position effect on the k=32 `ours` arm is −0.790% / −0.427%
+/ +0.067% (n=534 each, every reading over its own cell's window median), and pushing the actual
+imbalance through it gives **+0.0608% on ov64/ovp**, the comparison every conclusion rests on — 27x
+below the all-89 median and 221x below the raised median. The larger +0.3092% lands on ov64b/ov64,
+the narrow floor this analysis discards anyway. No conclusion moves, and the next window selection
+checks balance on the landed passes. **This carries to chain207**, where any segment restriction has
+the same exposure.
