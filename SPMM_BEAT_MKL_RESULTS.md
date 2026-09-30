@@ -40174,3 +40174,80 @@ deliberately different scopes (producing-host subset, full directory) rather tha
 seals of the same set. That is a case where refusing on ambiguity would be wrong, so the
 heuristic stays, but it is no longer untested and the tool prints both candidates when it
 chooses.
+
+## The override's cost is team spin-up, priced at 0.358 us per extra worker (chain204 data, re-analysed on mkt1)
+
+A peer session flagged four cells where passing `nthreads_override=64` costs 8-16 us
+at k=32 *while the override is declined* (`resolved` 1 either way) -- a cost where the
+lever provably does nothing, which inverts the gating convention in CLAUDE.md. Chasing
+it killed two of my own claims and produced a better result than the one I was chasing.
+
+**There are no two builds.** chain204 ran ONE object -- `OBJSRC=$R/tree/src`, sha256
+`83ff79d70e4b1f38bfca503e19b34304cbacf011c525303473a2d22453ad2f49`, 21287168 bytes,
+`scorch_tune_hooks()` 0 -- with `ARMS="ovp ov64 ov64b"` and
+`OV=( [ovp]=-1 [ov64]=64 [ov64b]=64 )`. The arms differ only in one integer argument.
+`ov64b/ov64` is byte-identical *and* argument-identical, which is why it is the right
+floor; `oursb/ours` is the within-arm measurement floor and roughly 30x too tight for a
+cross-argument claim. I had written "both builds" throughout, and so had the peer.
+
+**A mechanism I proposed was already measured and rejected in the source.**
+`scorch_zero_dense` (`header.h:241`) does take its team from `omp_get_num_procs()`
+rather than the resolved SpMM count, but the call at `spmm.h:3730` is guarded by
+`zero_mode <= 1` and a release object has `constexpr int zero_mode = 2`, so it is
+dead-code eliminated. The comment at `spmm.h:3722-3728` states the effect I was
+predicting and why mode 2 is the default: mode 1 "spawns a team of
+`omp_get_num_procs()` immediately before the kernel's own team of
+`scorch_spmm_nthreads()`, and 19 of those 205 float32 cells LOST by up to 1.9x".
+The `SCORCH_CODEGEN_ALLOC` ablation I had planned sits inside `#ifdef
+SCORCH_TUNE_HOOKS` and would have been an A/B hook compiled out of the object under
+test -- a guaranteed null. `mkt_s_chain204.sh:86` refuses a hooks object outright and
+three filed logs record `release object, hooks off`, so this is checkable, not assumed.
+
+**The one override-sensitive branch left on the declined path partly holds.**
+`spmm.h:3691-3703` is live at zero_mode 2 and decides `do_scan` by calling the policy
+twice *with the override*: `w_lo = nnz*max(k,16)`, `w_hi = w_lo + rows*k`, skip if the
+two resolve equal. Evaluated on mkt1 on 64 CPUs against the sealed object, with a
+positive control first -- the exported `scorch_spmm_nthreads` reproduces the CSV's own
+`resolved` column on 267 of 267 cells for the ovp arm. On the 82 cells declined in both
+arms, `do_scan` differs on 7. At a dev>0.10 threshold: **TP=4 FP=3 FN=1 TN=74**. The
+false negative is `bips07_1998_B`, the largest effect, where `do_scan` is true in both
+arms; the implied rate spans 0.42-4.68 ns/row, an 11x spread. Real branch, wrong
+magnitude, misses the biggest cell. Not adopted as the mechanism.
+
+**"k=32-only" was my own conditioning artefact.** The declined set is 29 cells at k=2,
+29 at k=4, 24 at k=32, and zero at k=8/k=16. Every table I had built conditioned on
+k=32. Unconditioned, `TSOPF_RS_b162_c3_b` at k=4 is +6.4 us at 4.3x its floor and at
+k=2 +1.6 us at 37.3x. Same error as the raised(k=2)=raised(k=4) identity, one level up.
+
+**The census that should have come first.** Over all 267 cells with all three arms, 98
+are slower under the override beyond 5x their own floor -- and 88 of those are where the
+override FIRES, not where it is declined. The cost is team spin-up, with a rate, a
+width-invariance check, and a negative control:
+
+| set | n | reading |
+|---|---|---|
+| override RAISED the resolved count | 120 | median **0.358 us per extra worker**, IQR 0.136-0.491 |
+| same rate at k=2 / k=4 / k=32 | 40 each | 0.403 / 0.378 / 0.288 us per worker |
+| override did NOT raise the count | 147 | median **-0.01 us** |
+
+A per-worker spin-up cost should not depend on k, and across a 16x width range it moves
+0.29-0.40. The 147-cell null is the negative control the question lacked: the cost
+appears only where the team widens. The extreme is `p6000` at k=2, `resolved` 2 to 64
+for +4970 us. This agrees with chain203's cold-start finding rather than adding to it.
+
+**Not a shipping regression.** Production passes `nthreads_override = -1` by default
+(`spmm.h:5542`, and likewise at 5636/5753/5959/6097/6555/6660/6739). These 98 cells
+price the override arm, which is what chain204 was built to measure. The general
+statement is that host-team adoption is not free wherever it widens the team.
+
+**Two numbers not to quote.** `m3plates` k=4 reads 1366x its floor, but that floor is
+0.000022 -- below the instrument's resolution, so the ratio is division by near-nothing
+and the effect is +1.3 us. And OLS through the origin on the per-worker fit returns
+4.872 us/worker with a median |residual| of 220 us, because `p6000`'s +4970 us dominates
+the sum of squares; the median rate is the estimator here, not OLS. I had 4.872 in a
+draft of this section.
+
+**Still open.** The four declined cells remain a 4-cell tail inside a 147-cell null at
+-0.01 us, unexplained. The discriminating experiment is a sweep of the override over
+several declined-but-positive values: if the cost is spin-up it should track
+`min(override, rows/SCORCH_ROWS_PER_THREAD) - resolved_base` and not the raw argument.
