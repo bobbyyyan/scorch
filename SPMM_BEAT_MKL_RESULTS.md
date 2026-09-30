@@ -39997,3 +39997,61 @@ cksum lines.
 a different object from the tree as it stood when each chain was filed, and it would compete
 with the per-directory manifests that are the actual attestations. 18 of 24 chains carrying
 their own verified seal is the right granularity. Recorded for Bobby's list.
+
+## chain208: the batch was a SYMPTOM, not a cause. Every result it was thought to threaten survives.
+
+Job 17661910, COMPLETED 0:0, 2h30m34s, 36 of 36 object-passes across six map-by-build
+combinations at six passes each. Guards: `batch` identical across builds within a fixed map on
+**9612 of 9612 cell-arm-passes, 0 differing**, so the cross-build batch ratio was 1 by
+construction; 0 lowered cells at every width; 36 ok-markers; 0 refusals and 0 correctness
+mismatches (all 38 hits for an error-word grep are one PyTorch `UserWarning` whose text
+contains "errors").
+
+Estimand identical to chain204's, so the pinned figures are directly comparable to the
+unpinned: `ours(ov64)/ours(ovp)` formed within each pass, reduced by `exp(median(log .))` over
+six passes, raised set of that width, floor = p95 deviation of the byte-identical pair
+`ours(ov64b)/ours(ov64)`.
+
+    map ov64                                    map ovp
+    k    n   PINNED  floor   unpinned  move      k    n   PINNED  floor   unpinned  move
+    2    40  1.4084  0.0319  1.4239   -1.09%     2    40  1.4019  0.0424  1.4239   -1.55%
+    4    40  1.3668  0.0392  1.3452   +1.61%     4    40  1.3388  0.0616  1.3452   -0.48%
+    32   40  1.1209  0.0286  1.1346   -1.21%     32   40  1.1291  0.0336  1.1346   -0.48%
+
+**Every move is inside its own floor, at both maps, at all three widths.** Pinning the
+calibration batch does not move the override's measured cost.
+
+### The pre-registered test, and it was decisive
+
+Two models were registered before the data existed. Batch-as-cause: pinning removes a
+measurement bias, so `pinned = unpinned * exp(-slope * ln r)`. Batch-as-symptom: the batch gap
+reflects a real per-call difference, so `pinned = unpinned`. At k=4, the load-bearing cell,
+they were 36.83% apart -- 14.11 floors:
+
+    Model A (cause)    [0.9588, 0.9831]
+    Model B (symptom)   1.3452
+    OBSERVED            1.3388 (map ovp)  and  1.3668 (map ov64)
+
+**Model B, unambiguously.** The observed values sit on Model B's point and are 0.36 to 0.41
+away from Model A's interval, which is 9 to 10 floors outside it. The batch difference between
+the two builds is a symptom of a genuine per-call speed difference, not a measurement bias that
+pinning could remove.
+
+### What this rescues
+
+- **The override's cost on raised cells is real.** 1.40 / 1.34 / 1.12 at k=2 / 4 / 32 survive
+  batch pinning. Asking for the whole pool genuinely hurts cells whose ambient count it raises,
+  and more as k narrows.
+- **The ambient-1-8 win at k=32 is real**, and it was the result most at risk. Pinned 0.6655 and
+  0.6681 against unpinned 0.6766, 9 faster and 2 slower of 11. Raising the thread count on cells
+  the base policy leaves at 1-8 threads genuinely wins about a third at k=32.
+- **chain203's k=32 adoption finding therefore stands.** Its calibration-versus-timed
+  disagreement (6.52 against 1.14) does not undermine the timed result, because the batch that
+  disagreement lives in has now been held fixed and the timed result did not move.
+
+### A pre-registered prediction that missed, in the conservative direction
+
+P5 stated the two maps must bracket by 5-7%. Observed bracketing is **0.46% at k=2, 2.09% at
+k=4 and 0.73% at k=32** -- three to ten times tighter than predicted. Which map is used barely
+matters, so no reading here turns on that choice. Recorded as a miss rather than quietly
+dropped: the direction is conservative, but the interval was wrong.
