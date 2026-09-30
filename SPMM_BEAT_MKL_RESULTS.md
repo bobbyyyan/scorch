@@ -40316,3 +40316,41 @@ the peer's point on width dependence is better than mine: the measured delta is 
 benefit, and the benefit grows with k, so a rate that *falls* with width (0.299 pooled;
 theirs 0.259/0.236/0.221) is what spin-up predicts rather than evidence against it. I had
 argued the opposite.
+
+### A resolution threshold, derived rather than declared (mkt1, chain204)
+
+Both this session and the peer session reached for "beyond 5x the per-cell floor" and both
+found it degenerate on short kernels, where the per-cell floor runs 0.00008-0.0014 and a
+1.3 us effect reads as 1366x. The fix is a **joint** criterion -- beyond the per-cell floor
+AND above a declared absolute resolution -- and the threshold has to come from a
+measurement rather than a feel. I first guessed "near 1 us" and it was wrong by about 6x.
+
+Arm-identity floor, `ov64b` vs `ov64` (one object, one argument, relabelled, so any nonzero
+delta is instrument), paired per pass, in absolute us, by kernel length:
+
+| kernel ms band | n | median | p90 | p95 | max |
+|---|---|---|---|---|---|
+| < 0.03 | 2274 | 0.068 | 0.253 | **0.676** | 12.4 |
+| 0.03 - 0.05 | 1907 | 1.139 | 5.614 | **6.930** | 5909 |
+| 0.05 - 0.10 | 1414 | 1.855 | 6.277 | 8.388 | 5965 |
+| 0.10 - 1.00 | 354 | 2.151 | 13.142 | 24.563 | 73.2 |
+
+Aggregated under 0.05 ms (n=4181) the p95 is **5.546 us**, giving a declared threshold of
+**6.0 us**. Stable under a stricter batch predicate: re-running with `min(batch) > 355`
+rather than `> 64` leaves the p95 at 5.546 and every band within 0.03 us, so the 5909 us
+maxima are a few outliers and not a population shift.
+
+**The threshold is not vacuous**, which is the check it needs on itself: 37.6-38.9% of
+cross-argument (`ov64` vs `ovp`) observations in the same band under the same batch
+predicate exceed 6.0 us. A threshold that admitted nothing would be indistinguishable from
+one that works.
+
+Applied, it separates the four cells that survive from the ones that do not:
+`bips07_1998_B` +26.2, `hydr1c_Zeros_36` +23.7, `hydr1c_Zeros_03` +19.9 us all clear it;
+`TSOPF_RS_b162_c3_b` k=2 at +1.57, `m3plates` k=4 at +1.3 and `lp_tuff` k=32 at +0.5 us are
+all below resolution and should never have been quoted as instances.
+
+**Quote it per band, not as one constant.** The floor steps 10x between the two shortest
+bands (0.676 to 6.930 us) across a small change in kernel length, so 6.0 us is conservative
+for kernels under 0.03 ms, where 1.0 us would be defensible. The four cells sit at
+0.022-0.038 ms and straddle the boundary, so they clear under either reading.
