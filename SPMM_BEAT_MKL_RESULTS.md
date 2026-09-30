@@ -40251,3 +40251,68 @@ draft of this section.
 -0.01 us, unexplained. The discriminating experiment is a sweep of the override over
 several declined-but-positive values: if the cost is spin-up it should track
 `min(override, rows/SCORCH_ROWS_PER_THREAD) - resolved_base` and not the raw argument.
+
+### CORRECTION to the section above: the per-worker rate pooled two regimes
+
+A peer session checked the raw CSVs and found my `p6000` figure off by ~300x. It is, and
+the cause invalidates three of the numbers I published one commit ago (`3ee21b5`).
+
+**The defect.** I reduced each arm's `ms` with a geometric median over all 30 passes and
+then subtracted. But chain204's `batch` column is bimodal, and it is a regime label rather
+than a nuisance: over the 8010 paired (cell, pass) observations, `min(batch)` is 1-8 on
+2182 of them and above 64 on 5803, with **25 observations in between**. Those two groups
+are not measuring the same thing -- median |delta| is **5660 us** in the isolated group
+against **1.91 us** back-to-back, a factor near 3000. `p6000` k=2 on ov64 carries `ms`
+values from 0.043 to 23.47 in one cell, the large ones all at `batch` 1 or 4. A median over
+the pooled set lands wherever the split falls, which is how a cell whose real back-to-back
+delta is +16 us was published at +4974 us. chain203 had already found this lever reads
+6.52x in calibration against 1.14x batched; I re-pooled the two anyway.
+
+**Corrected, paired per pass then reduced per cell, divisor `resolved_ov64 - resolved_ovp`:**
+
+| regime | n cells | median us/worker | IQR | slower / faster |
+|---|---|---|---|---|
+| back-to-back (`batch` > 64) | 120 | **0.299** | 0.170-0.391 | 105 / 15 |
+| isolated (`batch` <= 8) | 117 | **126.2** | 103-203 | 114 / 3 |
+
+So **0.358 us/worker is withdrawn and replaced by 0.299** for the back-to-back regime,
+which is the one a caller in a pipeline sees. The isolated regime is a different and much
+larger cost -- a cold 64-wide team, not a per-call one -- and belongs in its own row rather
+than averaged into the same figure.
+
+**Also withdrawn.** `p6000` k=2 at +4970 us becomes **+16.2 us** back-to-back (the peer
+reads +14.8). My OLS diagnosis was wrong for the reason I gave as well: I attributed a
+220 us median residual to `p6000` dominating a sum of squares, but per-call deltas are
+bounded by ~34 us, so the residual was computed on contaminated deltas and no cell
+dominates anything. The median is still the right estimator; the argument for it was not.
+
+**And the two largest back-to-back effects are SPEEDUPS**, which the "cost" framing hid:
+`TSOPF_RS_b300_c2_b` k=2 at **-34.0 us** and `t3dl_e` k=32 at **-31.7 us**. The partition
+over the 120 raised cells is 105 slower / 15 faster, and the median should always be quoted
+with that beside it.
+
+**One of my two withdrawals does not survive either.** I withdrew "k=32-only" partly on
+`TSOPF_RS_b162_c3_b` k=4 reading +6.4 us. Back-to-back it is +4.96 us with a per-pass range
+of **-7.6 to +11.1 us** -- it straddles zero, so it is not an instance in either direction,
+and the peer reads it as a clean speedup. The k=2 cell is +1.57 us on all 30 passes with no
+batch contamination, a real same-direction effect, but 1.57 us against a per-cell floor of
+0.0002 is below the instrument's resolution -- my own `m3plates` objection applied to my own
+evidence. **What still stands is the epistemic half**: every table I built conditioned on
+k=32, so I had no basis for "k=32-only" as a property of the effect. What does not stand is
+that these cells demonstrate it.
+
+**Two more corrections from the peer, both accepted.** "The declined set is 29 / 29 / 24 by
+width" is the declined **and single-threaded** set; the declined set is 49 / 49 / 49. And
+"zero declined cells at k=8/k=16" reports an empty set as an observation -- chain204's widths
+are {2, 4, 32}, so those columns do not exist in the experiment and cannot be evidence of
+anything.
+
+**What survives unchanged.** The 147-cell null (median -0.01 us where the override does not
+raise the count) is untouched by the batch defect and is the negative control the question
+lacked; the peer reproduces it at +0.001 / -0.015 by map. The concentration of beyond-floor
+slowdowns where the override fires reproduces (my 88, their 89). Production still passes
+`nthreads_override = -1` at all eight sites, so none of this is a shipping regression. And
+the peer's point on width dependence is better than mine: the measured delta is cost minus
+benefit, and the benefit grows with k, so a rate that *falls* with width (0.299 pooled;
+theirs 0.259/0.236/0.221) is what spin-up predicts rather than evidence against it. I had
+argued the opposite.
