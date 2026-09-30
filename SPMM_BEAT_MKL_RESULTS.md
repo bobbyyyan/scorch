@@ -37644,3 +37644,66 @@ all three builds at six distinct indices, so a cardinality check passes, while t
 to five and every cross-build row reads `nan` with `n=0` — the within-build rows still printing
 normal values, and exit status 0. There the requirement is that all builds share the same index set,
 which cardinality cannot express.
+
+## chain207: the full DLMC board, and why it was the missing half (2026-09-29)
+
+### The gap
+
+Every full-collection board to date is **SuiteSparse only** — chain196, chain205 and chain206 all
+measure 4584 matrices x 5 widths and nothing else. DLMC is cached on both hosts at **3820
+matrices** and has never been boarded at that scale. What the results doc records about DLMC comes
+from a sample of roughly **24 matrices** (15 rn50 + 9 transformer), and that sample is where Scorch
+is documented to *lose*:
+
+- "we lost 30 of 36 cells on the dlmc transformer family"
+- "every one of the worst cells is a dlmc transformer or pruned-ResNet layer, 512-2048 rows"
+- "the dlmc transformer family -- 512 rows, 105-138k nonzeros, mean degree 205-269, **all at k=4**"
+- "84 of the shipped gate's 121 cells are the dlmc rn50 pruned-ResNet family, rows 64-128"
+
+**A loss family characterised on 24 of 3820 matrices is the sampling problem running in the
+opposite direction.** The overfitting instruction warns against generalising a *win* from a few
+cells; a deficit generalised from 24 cells is the same error with the sign flipped, and it is
+currently load-bearing — it is the stated reason k=4 matters.
+
+The k=4 detail is the reason this board comes before any kernel change. 14 of the 24 replicated
+SuiteSparse core cells are at k=4, and the DLMC transformer losses are reported as "all at k=4".
+Two unrelated matrix populations failing at one width is either a real property of the kernel at
+half the AVX2 vector, or an artefact of a 24-matrix sample. Those have different fixes, and only a
+full board separates them.
+
+### Design: one binary, two collections, one estimator
+
+chain207 boards all 3820 DLMC matrices with **build `aa` from `/scratch/bobbyy/det1`** — the
+chain206 object whose `.text` was verified byte-identical to `bb`, `.so` digest `7f8f78d5...`.
+That choice is what makes the comparison sound: **aa's own SuiteSparse board is already inside
+chain206's sealed CSVs**, so the same binary's behind-MKL count can be computed on both collections
+under one estimator with no build difference to argue about. Same widths (2,4,8,16,32), dtype
+(float32), `--reps 4 --target-ms 6`, 6 passes and 24-thread pool as chain206.
+
+Rows per pass = 3820 keys x 5 widths x 3 arms + header = **57301**, asserted per pass with resume.
+
+Pre-flight, all asserted before any timing: 3820 keys; resolution **exact 3820, 0 unresolved** via
+the sealed `csrresolve` (the defect that silently dropped 50 of 298 keys for months); torch pool 24
+equal to `OMP_NUM_THREADS`; built `.so` present and digested.
+
+### The baseline this will be measured against, computed from sealed bytes
+
+Build `aa` on SuiteSparse, same estimator — per-cell `exp(median(log ratio))` over 6 passes,
+`S = mkl/ours`, floor = per-width p95 of `dev(oursb/ours)`, behind iff `dev(S) > floor` and `S < 1`:
+
+                      k=2      k=4      k=8     k=16     k=32     TOTAL
+    A/A floor      0.0483   0.0410   0.0436   0.0575   0.0851
+    behind MKL         30       34       10        4        1        79
+    in the floor       36       34       23        6        9       108
+    ahead of MKL     4518     4516     4551     4574     4574     22733
+                                                    sum = 22920, checked
+
+So **79 cells behind MKL, 0.345% of the collection**, and **34 of the 79 (43%) are at k=4** — the
+width concentration reproduces on this binary independently of the core analysis.
+
+**This is also a third count on one collection, and it widens the known spread.** chain196 c0 gave
+68, chain205 gave 63, and build aa gives **79**. Three measurements of the same 22920 cells
+disagreeing across 63-79 is a 25% spread in the headline number, which is the replication
+instability already on record and the reason the analysis moved onto the core of 24 rather than any
+single chain's count. Every DLMC figure from chain207 must be read against that spread, not against
+a point value.
