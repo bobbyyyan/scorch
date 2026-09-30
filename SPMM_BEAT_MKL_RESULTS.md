@@ -39590,3 +39590,62 @@ timing attached. The rule is queryable, so no harness needs to restate it. It mu
 the host whose pool the claim concerns, because the base bound reads omp_get_num_procs()
 internally. Not being added to chain207, which is live; pre-registered for the next
 full-collection run with the predicate stated before the data.
+
+### The unpinned override effect at all three widths, and 0.6766 is a k=32-only result
+
+chain204's analyzer was run at each width by copying the sealed file and changing one line,
+`K = 32` to `K = 2` and `K = 4`; `R()` already takes a width parameter so nothing else
+moved. **Positive control: the K=32 copy is byte-identical to the sealed analyzer** (empty
+`diff`) and reproduces 1.1346 / n=40 / 27 slower, 9 faster exactly, so the
+copy-and-substitute procedure is faithful and the sealed artefact was not modified.
+
+Estimand as filed: `ours(ov64)/ours(ovp)`, `exp(median(log .))` over passes 25-30, raised
+set of that width, floor = p95 deviation of `ours(ov64b)/ours(ov64)` on two byte-identical
+objects.
+
+    width   n    unpinned ratio   outcome floor   beyond-floor split
+    k=2     40      1.4239           0.0318       35 slower, 4 faster
+    k=4     40      1.3452           0.0261       32 slower, 6 faster
+    k=32    40      1.1346           0.0312       27 slower, 9 faster
+
+**Asking for the whole pool costs more at narrow widths, monotonically.** The penalty falls
+from 42.4% at k=2 to 13.5% at k=32, and the faster count rises 4 -> 6 -> 9. Every width is
+far beyond its own floor, so the override being harmful on raised cells is not a k=32
+artefact.
+
+**But the one result that was framed as a win IS a k=32 artefact.** The ambient-1-8 band on
+the raised cells:
+
+    width   n    ambient 1-8 ratio   faster/slower   median nnz of the band
+    k=2     11        1.3761              4 / 7           40215
+    k=4     11        1.3580              4 / 7           40215
+    k=32    11        0.6766              9 / 2           10899
+
+The sign REVERSES. At k=32, raising the thread count on cells ambient leaves at 1-8 threads
+wins 32%; at k=2 and k=4 the same intervention loses 36-38% with most cells slower. And it
+is not the same population: `work = nnz*max(k,16)` makes the k=2 and k=4 bands identical
+(n=11, median nnz 40215), while k=32's band is a different and much smaller-matrix set
+(median nnz 10899). So 0.6766 carries an unstated k=32 predicate, and any claim that
+"raising threads helps thread-starved cells" is false at the two narrow widths where it was
+never checked.
+
+**The batch confound is also strongly width-dependent**, which matters for what chain208
+can resolve. chain204's own confound block gives r[log batch ratio, log ms ratio] on the 40
+raised cells as -0.9547 at k=2, -0.9810 at k=4 and -0.6770 at k=32: the cross-build batch
+difference accounts for an r-squared of 0.91-0.96 at narrow widths against 0.46 at k=32.
+That is a slope-free reason to expect batch pinning to bite hardest at k=4, and it does not
+require transporting a k=32-fitted slope across width.
+
+**A label hazard worth recording.** At k=32 the raised-40 ratio is 1.1346 and the
+ambient-31-63 band ratio is also 1.1346 at n=12. Recomputed independently: two different
+populations landing on the same value. A reader moving between the headline and the band
+table could take one for the other, so either figure must name its population.
+
+**Floor discipline, applied against a peer's power calculation and in their favour.** The
+peer computed effect-over-floor for the predicted pinning move using the A/A floor of the
+REGRESSOR (the cross-build batch ratio, 0.1039 / 0.0668 / 0.0689). The question is whether
+a move in the TIMED RATIO clears its own noise, so the floor is the timed ratio's own, above
+(0.0318 / 0.0261 / 0.0312). Their k=32 verdict survives -- 2.06% predicted against a 3.12%
+floor is 0.66x and cannot fire, so a k=32 null falsifies nothing. Their k=2 verdict flips
+from 0.89x to 2.92x and becomes testable. Same principle as the two earlier instances in
+this chain: measure the statistic the claim is about.
