@@ -40055,3 +40055,56 @@ P5 stated the two maps must bracket by 5-7%. Observed bracketing is **0.46% at k
 k=4 and 0.73% at k=32** -- three to ten times tighter than predicted. Which map is used barely
 matters, so no reading here turns on that choice. Recorded as a miss rather than quietly
 dropped: the direction is conservative, but the interval was wrong.
+
+### Four corrections to the chain208 filing, all from the peer session
+
+**1. The "9 to 10 floors" separation mixed two conventions, and one sentence is withdrawn.** The
+numerator 0.36-0.41 is a LINEAR difference while the floor is a p95 of `dev(x) = exp|ln x| - 1`,
+which is log-scale -- the exact mixing this session corrected in a peer's table two hours
+earlier. And it divided both maps' distances by ONE map's floor. Log-dev to the nearest endpoint
+of Model A's interval, each map against its own floor:
+
+    map ov64   1.3668 vs 0.9831   dev 0.3903   floor 0.0392   9.96 floors
+    map ovp    1.3388 vs 0.9831   dev 0.3618   floor 0.0616   5.87 floors
+
+So the separation is **5.87 to 9.96 floors**, not 9 to 10. The verdict is untouched -- 5.87
+floors is decisive -- but the sentence "No floor choice or map choice moves that" is exactly
+the sentence a floor choice does move, and it is withdrawn. Twenty lines earlier the same
+filing states it correctly as "inside its own floor". Separately, the quoted floor range
+"3.19-6.16%" omits its own minimum of 2.86% at k=32 map ov64, which is the binding value for
+the claim that every move is inside its floor. It still holds there: 1.21% against 2.86%.
+
+**2. The chain203 rescue crossed a host silently.** chain208 is mkt1 at pool 64; chain203 is
+redwood at pool 24; and the filed block names no host at all. The two do not compile the same
+kernel -- redwood is AVX2-only, MKT is Zen4 AVX-512 under `-march=native`. What the pin
+licenses is: *the cross-build batch difference does not bias a within-pass cross-build ratio,
+on mkt1 at pool 64, over the 267-cell corpus.* So the correct claim is that chain203's finding
+is **not undermined by the batch mechanism as measured on mkt1**, which is weaker than
+"therefore stands". Amended rather than re-measured; a redwood pin is not worth the host time
+for this.
+
+**3. The pin guard's unit was mislabelled, and the ambiguity has a cause worth recording.** It
+was filed as "9612 cell-arm-passes". Re-derived: 28836 data rows = 267 cells x 3 arms x 36
+object-passes. The pin comparison indexed by arm gives **3204 per arm for `ours`, `oursb` and
+`mkl`, 9612 in total, 0 differing**. But 267 x 2 maps x 6 passes x 3 BUILDS is also 9612,
+because the number of arms and the number of builds are both 3. **The label was ambiguous
+because two different factorisations of the same experiment collide on one integer.**
+
+The substantive question this raised is answered in the reassuring direction: `batch` IS
+per-arm -- 9558 of 9612 row-groups carry two distinct values, `ours`/`oursb` sharing one and
+`mkl` the other -- and the guard did cover `mkl`, at 3204 comparisons with 0 differing. So a
+later ours-versus-MKL number can inherit the pin's coverage. That was not established by the
+label as written, only by re-deriving it.
+
+**4. "27 slower, 9 faster" unchanged is a COUNT identity with a one-cell swap underneath.** The
+raised populations are genuinely identical -- chain204's 40 and both chain208 maps' 40 overlap
+40 of 40. The beyond-floor partitions are not:
+
+    chain204 unpinned  27 slower (floor 0.0295)
+    chain208 map ov64  27 slower   overlap 26   Jaccard 0.929   1 left, 1 entered
+    chain208 map ovp   29 slower   overlap 27   Jaccard 0.931   0 left, 2 entered
+
+At map ovp chain204's 27 is a strict subset of chain208's 29. So the agreement is strong at
+the set level, but it is 0.93 Jaccard with one to two cells of churn, not identity -- which is
+the size of the known 4-6% per-cell churn on identical source. Reporting the counts as
+"unchanged" without the overlap would have implied more than the data shows.
