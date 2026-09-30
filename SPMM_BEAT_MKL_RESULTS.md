@@ -38947,3 +38947,55 @@ One bookkeeping note: the floors in the table above reproduce, to four decimals,
 verifying session first reported — so its original numbers were the ratio floor all along, and the
 inability to find a single criterion matching both my k=2 and my k=4 was because we were gating on
 two different statistics rather than applying two different rules to one.
+
+### The reduction order is decidable by measurement, and the mechanism we assumed is absent in the clean window
+
+The ratio floor has two constructions and they differ by up to 17%:
+
+    A   reduce each build's S over passes, then one ratio    dev(S_aa / S_bb)
+    B   ratio the two builds at each pass, then reduce       dev(reduce_p(S_aa,p / S_bb,p))
+
+    k         2        4        8       16       32
+    A    0.0896   0.0951   0.1493   0.1349   0.1689
+    B    0.1046   0.1081   0.1439   0.1470   0.1821
+    B/A    1.17     1.14     0.96     1.09     1.08
+
+**B is larger at four of five widths, so pairing at the pass index is adding variance rather than
+removing it.** A is the floor to use, and the count of 14 rests on A.
+
+**The premise is directly measurable and it fails.** Pairing helps only if the two builds' per-pass
+deviations are positively correlated at that index. Centring each build's six log values on its own
+median and correlating the two six-vectors per cell, then averaging over 22,920 cells:
+
+    k=2 +0.0063   k=4 +0.0102   k=8 +0.0119   k=16 +0.0114   k=32 -0.0044      SE 0.0148
+
+**Every width is within 0.8 SE of zero.** There is no common-mode at the pass index across runs, which
+is why pairing recovers nothing.
+
+**This undercuts the justification I adopted for `ratio-then-reduce` on chain204 an hour ago.** The
+mechanism I wrote down — three builds inside one pass run close in wall clock, so drift is
+common-mode and pairing at the index removes it — is testable on chain204 itself, and in the p25-p30
+analysis window it is absent:
+
+    pair                p25-p30 (clean)              all 30 passes (contaminated)
+    ov64  vs ovp        -0.062 / -0.075 / -0.097      +0.091 / +0.123 / +0.133
+    ov64b vs ov64       +0.066 / +0.071 / +0.041      +0.250 / +0.294 / +0.311
+    ov64b vs ovp        -0.085 / -0.040 / -0.084      +0.108 / +0.104 / +0.120
+    (k = 2 / 4 / 32, n=89 per cell-set, SE 0.1060)
+
+In the clean window every entry is inside ±0.9 SE of zero and four of six pairs are **negative**. Over
+all 30 passes there is real positive correlation — up to **+0.311 at +2.9 SE** on the same-argument
+pair — and that is coherent rather than contradictory: p1-p24 contains the whole-pass catastrophes,
+which are genuine shared disturbances and do correlate. **Common-mode exists exactly when there is
+something in common to remove, and a clean window has nothing.**
+
+So the convention, stated as a test rather than a mechanism: **pair at the pass index only where the
+within-cell cross-build correlation at that index is measurably positive; otherwise reduce each side
+first.** One line of arithmetic decides it per dataset. Nothing published turns on this — the choice
+was worth one gated cell on chain204 with the verdict invariant — but the *justification* I gave was
+an assumption dressed as a mechanism, and it is the same error as certifying rotation balance from the
+schedule instead of from the landed passes.
+
+The cancellation figures also verify against the corrected A column: S's floor is 0.62 / 0.65 / 0.82 /
+0.74 / 0.68 of the naive sum of its component floors. **A ratio's floor is neither the sum of its
+factors' floors nor bounded by either one, and has to be measured.**
