@@ -39855,3 +39855,65 @@ truncated the file afterwards. The form that cannot lie is to stat or `wc` the a
 closing it and print that number, so the line is a measurement of the file rather than a
 memory of the loop. Same principle as a harness asking production for a decision instead of
 recomputing it: read the thing, do not re-derive it.
+
+### Three guard strengths across nine emitters, and the fix lives in sealed evidence
+
+A first census of the row-count emitters reported 5 of 9 carrying a count cross-check. That
+was a loose predicate, and the peer's 1 of 9 is the right figure. Four of those five have a
+much weaker check:
+
+    sys.exit("REFUSE: wrote no rows -- the stage reached its end having measured nothing")
+
+That is a NONZERO test. It fires only when nothing at all was written, so it would have
+passed the chain208 calibration bug cleanly -- `nrow` was 267 there. Census with each
+predicate named separately:
+
+    file                                     exact   nonzero  post-close stat
+    chain189-tsweep-mkt/tsweep.py            False   True     False
+    chain190-tsweep-redwood/tsweep.py        False   True     False
+    chain193-rowsurgery-redwood/rowsurg.py   False   True     False
+    chain203-rungwise-redwood/mrgate_ov.py   False   False    False
+    chain204-k32gate-mkt/mrgate_ov.py        False   False    False
+    harnesses/locfeat.py                     True    False    False
+    harnesses/mrgate.py                      False   False    False
+    harnesses/tsweep.py                      False   True     False
+    harnesses/wsprobe.py                     False   False    False
+
+    EXACT-COUNT cross-check   1 of 9
+    NONZERO-only check        4 of 9
+    POST-CLOSE STAT           0 of 9
+    no check of any kind      4 of 9
+
+**Three distinct failure modes, separately uncovered.** Nonzero catches "measured nothing";
+exact-count catches "wrote 267 where 300 were expected"; the post-close stat catches
+truncation after close and the empty-calibration case. **Only the stat would have caught the
+chain208 bug**, because 267 is both nonzero and equal to the cell count the loop intended.
+
+**And all nine are sealed.** The worktree contains zero emitters; every one lives under
+`~/.cache/scorch-codex/spmm-beat-mkl/`, and all are covered by a manifest -- `harnesses/`
+carries its own `SHA256SUMS` and the top-level manifest holds 163 `harnesses/` entries. So
+generalising locfeat's check to the other eight cannot be done by editing them; that would
+modify sealed evidence. The right answer already exists in the LEDGER, which is the one place
+it cannot be propagated from. The fix relocates rather than weakens: it belongs in the next
+harness written, not as a retrofit, and this census is the durable record of what each sealed
+emitter did and did not check.
+
+### Pre-registered: the completeness contract for the next full-collection harness
+
+Recorded before the harness exists, so it cannot be shaped by what the data turns out to say.
+Three layers, because no one of them covers another's failure mode:
+
+1. **Nonzero** -- refuse if zero rows were written, naming the stage.
+2. **Exact count** -- refuse if rows written differs from the count derived from the
+   declaring factors (keys x widths x arms), not from a modal or observed count.
+3. **Post-close stat** -- after closing the handle, read the artefact's own line count and
+   byte size and print THOSE, not the loop counter. A counter reads 267 just as happily if
+   the handle was never flushed, the close failed, or something truncated the file
+   afterwards. Report the measurement, not the memory.
+
+Plus the already-pre-registered `resolved_ours` column, obtained by asking the exported
+`scorch_spmm_nthreads` rather than restating the policy, run on the host whose pool the claim
+concerns.
+
+In all four unchecked emitters the sequence is already `out.close()` followed immediately by
+the `print`, so layer 3 replaces the counter in place with no restructuring.
