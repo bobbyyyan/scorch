@@ -39212,3 +39212,40 @@ after three of them fail. Second, and this is the limit of the whole exercise: *
 the uncertainty and never the estimate.** All three widenings — `1/sqrt(n)`, `sd/sqrt(n)`,
 permutation — moved exactly one column and left all nine point estimates untouched. Getting the
 interval right does not make a point estimate mean more than it did.
+
+### Two free choices, not one — and the one I named pushes the wrong way
+
+I said the 43%-versus-32% gap between two statements of the same asymmetry was the
+observed-permutation convention. **It is two conventions, and mine was the minor one pointing
+backwards.**
+
+    observed conv.    percentage base      value
+    exclude obs       two-sided p          42.9%      <- the other session's 43%
+    exclude obs       doubled              30.0%
+    include obs       two-sided p          46.4%
+    include obs       doubled              31.7%      <- my 32%
+
+One at a time, net −11.1 points:
+
+    flip the observed convention, base held    42.9 -> 46.4    +3.6 pts
+    then flip the percentage base              46.4 -> 31.7   -14.7 pts
+
+**The observed convention is 3.6 of 11.1 points and pushes the wrong way** — holding the base fixed,
+*including* the observed permutation makes the gap larger, not smaller. The percentage base is 14.7
+points, **132% of the net gap.**
+
+**And the decomposition is order-dependent, which is the part to keep.** Flipping the base first gives
+42.9 → 30.0 (−12.9) then → 31.7 (+1.7). Same two factors, same endpoints, attributions of
++3.6/−14.7 against −12.9/+1.7. That is the ranked-one-at-a-time problem this document already records
+for the board's five free parameters: **two non-orthogonal conventions have no unique per-factor
+share, so the honest form is the 2x2 table and not an attribution.**
+
+The fix is to quote no percentage at all. Two-sided **0.0778** against a doubled one-sided of
+**0.1111** or **0.1139** depending on the convention — and doubling is simply the wrong operation on
+a null skewed +0.3234. The four cells say everything the percentage was reaching for.
+
+**This is the second consecutive instance of the same reflex**, and the pattern is worth more than
+either instance: shown a numeric discrepancy, I reached for one plausible cause and stopped — tie
+handling for the quantile gap (there were zero ties), then the observed convention for the percentage
+gap (it was the base). Both times the explanation was mechanical-sounding and unverified, and both
+times a two-line decomposition would have settled it. **Decompose a gap before naming it.**
