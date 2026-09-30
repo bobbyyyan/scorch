@@ -107,6 +107,33 @@ def verify(d, mf):
         for n in sorted(set(dups))[:10]:
             print("            DUPLICATE ENTRY: %s" % n)
         return False, set()
+    # A byte-string distinctness check treats a NAME as an identifier. The filesystem may
+    # not: on a case-insensitive volume `data_p1.csv` and `Data_p1.csv` are one file, and on
+    # macOS two names differing only by Unicode normalisation are too. Collapsing is then
+    # invisible to any string-level test -- shasum reads the single file twice and reports OK
+    # twice, certifying two entries against one file's bytes. Identity is the (device, inode)
+    # pair, which covers case collision, normalisation collision and hardlink aliasing
+    # uniformly rather than special-casing one of them. This ledger is produced on
+    # case-sensitive hosts and read on a case-insensitive one, so the trigger is ordinary use.
+    inodes = {}
+    aliased = []
+    for name in entries:
+        q = os.path.join(d, name)
+        if not os.path.isfile(q):
+            continue
+        st = os.stat(q)
+        key = (st.st_dev, st.st_ino)
+        if key in inodes:
+            aliased.append((inodes[key], name))
+        else:
+            inodes[key] = name
+    if aliased:
+        print("  STEP 2  REFUSE: %d manifest entries resolve to a file another entry already "
+              "names -- distinct names, one set of bytes" % len(aliased))
+        for a, b in aliased[:10]:
+            print("            SAME FILE: %r and %r%s"
+                  % (a, b, "  (differ only in case)" if a.lower() == b.lower() else ""))
+        return False, set()
     ok = bad = missing = 0
     escaped = []
     failed = []
