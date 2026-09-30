@@ -37861,3 +37861,74 @@ mistake.** The reasoning that it is debug and comment content — both objects b
 source at same-length paths, so every constant originates in identical source — is strong but is
 reasoning, not measurement. This is recorded as a **gate**: the section enumeration runs when the
 board finishes, and the replication-pair claim is provisional until it does.
+
+### The floor question is worth 3 cells, the data difference 20, and behind-on-both is robust to the choice
+
+The verifying session found its own estimand error — its 0.469-0.479 pooled sign fraction was over
+27,504 **raw** ratios, six per cell, not over the 4,584 per-cell reduced values. Reducing first
+strips the within-cell symmetric noise that was pulling the raw fraction toward one half, so the
+reduced statistic is *further* from 0.5, not closer. Both sides now agree on
+0.4313 / 0.4496 / 0.4533 / 0.4398 / 0.4531, at -9.3 / -6.8 / -6.3 / -8.2 / -6.4 SE. The median agreed
+under both estimands, which is why checking only the median missed it.
+
+**Orientation control passes**, so the residual is not the median-of-even artefact: `aa/bb > 1` plus
+`bb/aa > 1` sums to 1.0000 at k=4/8/16/32 and 0.9996 at k=2, where exactly 2 cells have a log-median
+of precisely zero. Log-space median-of-six negates exactly — the orientation trap lives in
+median-of-ratios, not median-of-logs.
+
+**The 2x2, whose data against whose floor**, which separates the two things the published gap
+conflated:
+
+    data  floor    k=2  k=4  k=8 k=16 k=32   TOTAL
+    aa    aa        30   34   10    4    1      79
+    aa    bb        31   36   10    4    1      82
+    bb    aa        20   29    8    1    1      59
+    bb    bb        21   31    8    1    1      62
+
+The pure floor effect is **exactly +-3 cells** on each object. Holding the floor fixed, the data gap
+is **20 either way**. A common midpoint floor gives aa 80, bb 59, gap 21. So the 17-cell gap first
+published is a **20-cell data gap partially masked by a 3-cell floor offset pointing the other
+way** — using each object's own floor *understates* the spread between them.
+
+**And the behind-on-both test barely moves with the choice**, which is the design result:
+
+    floor convention        intersection   union   Jaccard   by width k=2..32
+    each object's own            37         104     0.356     12, 20, 4, 1, 0
+    common midpoint              36         103     0.350     12, 19, 4, 1, 0
+
+One cell. The free parameter that consumed a long argument moves the headline statistic by a single
+cell on the intersection, against 3 cells on a single-object board. **That is the SuiteSparse prior
+chain207's DLMC intersection must be read against** — 37 of 104, concentrated at k=2 and k=4, with
+k=32 at zero and k=16 at one, consistent with the three-object core {8, 12, 2, 0, 0}.
+
+**A reduction-free confirmation of the residual**, no estimator and no floor involved. Cells where
+one object is faster in **all six** passes: aa 98/93/85/94/78 = **448**, bb 55/56/54/54/43 = **262**.
+Equal in expectation under the null; the difference of 186 at SE 26.6 is **7.0 SE**, same direction
+as the median. And only **710 of 22,920 cells (3.1%) are unanimous across six passes, so 97% flip
+sign at least once** — an independent argument for "behind on one object is churn" that routes
+through no reduction at all.
+
+### The mechanism, with one correction: it holds where the effect is large, not at every width
+
+The proposed resolution of why `aa` has *more* behind cells while being *faster* is that the behind
+count is a tail statistic, so it tracks dispersion rather than level, making aa's higher floor and
+its higher behind count one fact rather than two. Checked per width against a common floor:
+
+    width                    k=2      k=4      k=8     k=16     k=32
+    arm floor aa          0.0483   0.0410   0.0436   0.0575   0.0851
+    arm floor bb          0.0454   0.0367   0.0416   0.0578   0.0863
+    floor aa - bb        +0.0029  +0.0043  +0.0020  -0.0003  -0.0011
+    behind aa - bb            +10       +6       +2       +3       +0
+
+**The signs agree at 3 of 5 widths, not 5 of 5.** They agree at k=2, k=4 and k=8 — which carry 75 of
+aa's 79 cells — and disagree at k=16 and k=32. But the two disagreeing widths have floor gaps of
+-0.0003 and -0.0011 against +0.0029 / +0.0043 / +0.0020 for the agreeing ones, so those are ties
+rather than counterexamples and the sign carries no information there. Stated properly: the
+dispersion account is supported wherever the floor gap is larger than a rounding, and is untested
+where it is not.
+
+The substantive conclusion survives and is worth keeping. **The 27.4% spread between two objects
+with identical machine code is a difference in noise, not in speed**, and the ~0.2% median offset is
+a separate and much smaller effect riding on top of it. Both systematic effects — aa faster on the
+median, aa's floor higher — point toward aa having *fewer* behind cells, and on a fixed floor it has
+20 more.
