@@ -38659,3 +38659,63 @@ caught me out once already.
 Corrections owed: the memory file carrying "14.4% to 21.2%" needs its upper endpoint fixed to 18.1%
 with the reduction pair named, and `headroom_c204.py`'s docstring quotes the same wrong "14-21%".
 That file is inside a sealed ledger and is not edited; the error is recorded here instead.
+
+### chain208 pre-registration, AMENDED while the run is in flight (2026-09-29 23:52 local)
+
+Recorded before any chain208 **timed** output has been read. What I have read from the running job is
+its calibration map comparison, which times nothing: across 267 cells `batch_ours` is identical under
+the two configurations on 7 (2.6%), median ratio 1.0363, p95 1.5440. The run's own body script is
+**not** edited — it is a live measurement, and the amendment goes in the record with a timestamp
+instead.
+
+**P1's pass band was narrower than the uncertainty of the value it tests against.** I pre-registered
+"the pinned unconditioned declined A/A must fall to 0.023-0.031", taken from the two agreeing floors.
+But 0.0228 is a p95 over 27 cells and 4000 bootstrap resamples put its own 95% CI at **[0.0083,
+0.0361]** — my entire pass band sits inside the CI of its target, so P1 could pass or fail on
+sampling alone and a failure would not license "the batch was not what widened it". **Corrected pass
+band: [0.008, 0.036].** And the power stated rather than implied: at this n the test cannot
+distinguish 0.023 from 0.036, so only a reading above about 0.06 is evidence against the batch
+explanation. The comparison that actually carries weight is against the **unpinned 0.3122**, which is
+an order outside the band either way — P1 is a strong test of "the batch widened it" and a weak test
+of "it fell to exactly the floor".
+
+Two worries about P1 that I checked and killed, so the run is not spent on them:
+
+- **The population substitution is benign.** 0.0228 is a p95 over the 27 matched cells while chain208
+  pins all 49, and a p95 over 49 reaches further into the tail. Resampling the matched distribution
+  to n=49 gives median **0.0228**, CI [0.0123, 0.0361] — the nearest-rank index moves from 24-of-27
+  to 45-of-49, nearly the same quantile. Use 0.0228 for both.
+- **The four degenerate keys do not carry the gate statistic.** A p95 over 49 lands 2-3 cells from the
+  top and the nnz = 4 matrix was the largest deviation in the *unconditioned* declined set, so this
+  was the obvious way for the anti-selection decision to cost something. It does not: the p95
+  excluding all four is **0.0228**, identical to four decimals, and the top three deviations among the
+  matched cells are `cegb2919` (nnz 321543), `us04` (297538) and `bas1lp` (587775) — all large.
+
+**P3 now carries a pre-registered predicted value, which is what makes it falsifiable.** The batch
+slope is measurable from chain204, so the pinned value is predictable from chain204. Regressing
+log(ms ratio) on log(batch ratio) and reading the intercept at batch ratio = 1:
+
+    population            n    slope              r        intercept at batch=1        cells near 1
+    c204 raised 40        40   -0.4306 (0.0759)  -0.6770   1.0945 [1.0186, 1.1759]     13 of 40
+    c204 ambient 1-8      11   -0.9717 (0.0855)  -0.9669   1.0866 [0.9979, 1.1833]      2 of 11
+
+The observed **unpinned** median on those 11 low-ambient cells is **0.6766** — the 32% win the
+rule-defect finding rests on. **The prediction is that it inverts to about 1.087, i.e. 8.7% slower**,
+and r = −0.967 on 11 cells is as tight a relationship as anything in this milestone. If chain208
+returns those cells near 0.68 the slope story is dead and the win is real; near 1.09 and the
+rule defect evaporates.
+
+**The diagnostic that says how much to trust each intercept is how many cells sit near batch ratio
+1.** For the raised 40 it is 13 of 40, so the intercept is an interpolation. For the ambient 1-8 band
+it is **2 of 11** — the line is tight but only two points anchor the intercept, so that band is
+optimistic and the point prediction should be read as a direction with a wide band, not as a value.
+On chain203's headline 25 it is 1 of 25, a pure extrapolation resting on one influential point, so
+**no prediction is pre-registered there at all** — that population can only be settled by pinning,
+which is the same argument that built chain208.
+
+**P5, new: the two calibration maps must bracket the pinned value by about 5.5%.** The same slope
+predicts it — |−0.4306| x log(1.1346) = **5.59%** using chain204's own median speedup (about 6.5% if
+the chain203 figure is used instead, so the pre-registered magnitude is 5 to 7%). If the observed
+bracket is much wider, the two maps differ in something other than the batch integer and the
+single-manipulated-variable claim has failed. This is the failure `batch_local` was added to catch,
+and until now nothing predicted a size for it.
