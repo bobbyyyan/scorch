@@ -40643,3 +40643,64 @@ against a **2.86%** per-cell floor. Inside the floor at every width, so the pinn
 does not depend on which arm's calibration set the batch. This belongs beside 0.237 rather
 than buried in chain208's pre-registered predictions, since it is the first thing a reader
 should ask.
+
+#### Correction: DLMC's tail is not empty, the floor is non-monotone, and the cause is degree
+
+**My "none above 0.5 ms" was a filter artefact in my own script.** The banding carried
+`if len(pop) < 30: continue`, so DLMC's 12-cell band above 0.5 ms was **suppressed from the
+output**, and I read its absence from the table as absence from the collection. Corrected:
+DLMC has **69 cells above 0.15 ms and 12 above 0.50 ms, max 0.7198 ms**. My 57 was the
+0.15-0.50 band alone, quoted as the whole tail. SuiteSparse is still decisively longer-tailed
+(934 above 0.5 ms, max 73.87 ms on chain196), so the direction of that argument survives --
+but a suppressed band read as an empty one is the same defect as a count without its
+predicate, and the fix is to print every band with its `n` and its p95 rank.
+
+**And those two bands invert the floor story, which is why the slip mattered.** Every band,
+no `n` filter, with the p95's rank shown so a thin band cannot be read as solid:
+
+| band | DLMC n | DLMC floor | p95 rank | SS n | SS floor |
+|---|---|---|---|---|---|
+| 0.00-0.02 | 14693 | 0.2100 | 736 of 14693 | 15847 | 0.1102 |
+| 0.02-0.05 | 3681 | 0.4415 | 185 of 3681 | 3369 | 0.1783 |
+| 0.05-0.15 | 657 | 0.4537 | 34 of 657 | 2051 | 0.1640 |
+| 0.15-0.50 | 57 | **0.0873** | 4 of 57 | 719 | 0.2742 |
+| > 0.50 | 12 | **0.0334** | 2 of 12 | 934 | 0.1802 |
+
+So DLMC's floor is 1.9-2.8x **looser** in the three short bands, which hold 19031 of 19100
+cells, and 2.6-5.6x **tighter** in the two long ones. Within DLMC the floor is **non-monotone**
+in kernel length: 0.2100 -> 0.4415 -> 0.4537 -> 0.0873 -> 0.0334. The last two are thin, but
+a *low* p95 at n=12 means at least 11 of the 12 are tight, which is a signal and not scatter.
+**So "the looseness is structural" has to be scoped to short kernels** -- which is where the
+result lives, but the unqualified version was wrong.
+
+**The cause is degree, not rows.** The peer killed the rows-per-worker hypothesis (the gap
+survives at matched length *and* matched rows, 1.5x-6.5x). Adding degree as a third control,
+kernel length held under 0.02 ms:
+
+| rows | deg | DLMC n | DLMC floor | SS n | SS floor | ratio |
+|---|---|---|---|---|---|---|
+| 0-128 | 4-32 | 275 | 0.0413 | 635 | 0.0369 | 1.12x |
+| 128-512 | 4-32 | 535 | 0.0505 | 980 | 0.0444 | 1.14x |
+| 128-512 | **32-128** | 895 | 0.2610 | 98 | 0.1102 | **2.37x** |
+| 512-2048 | 0-4 | 315 | 0.0435 | 530 | 0.0555 | 0.78x |
+| 512-2048 | 4-32 | 3293 | 0.0641 | 2327 | 0.0804 | 0.80x |
+| 512-2048 | **32-128** | 3997 | 0.1892 | 220 | 0.0930 | **2.04x** |
+| 2048-8192 | 0-4 | 80 | 0.0756 | 5180 | 0.1393 | 0.54x |
+| 2048-8192 | 4-32 | 560 | 0.1568 | 2059 | 0.1200 | 1.31x |
+
+**At low degree DLMC is often TIGHTER than SuiteSparse** (0.54x-0.80x), so DLMC is not a
+noisier collection. The whole gap lives in `deg 32-128` at moderate row counts, where the
+ratio is 2.0x-2.4x -- and that is exactly where DLMC's mass sits (895 + 3997 = 4892 cells)
+while SuiteSparse has almost nothing (98 + 220 = 318). So the aggregate 2x is **part
+composition and part residual**: DLMC is concentrated in a region whose floor is intrinsically
+loose, and within that region it is still 2x looser than SuiteSparse.
+
+That turns the label into something checkable. It also lines up with the residues -- the ten
+DLMC cells sit at degree 117-614, at or above the top of the loose bucket -- though that is an
+observation about where they sit, not a mechanism, and the 128+ degree buckets were dropped
+here for insufficient `n` in one collection.
+
+Provenance: the SuiteSparse column is chain196 `c0`/`c0b`; the peer's independent run of the
+same construction on chain206 `aa`/`bb` gives floors 0.1095 / 0.1886 / 0.1647 and ratios
+1.93 / 2.34 / 2.75 against my 1.91 / 2.48 / 2.77. Two runs, same direction and magnitude, not
+pooled.
