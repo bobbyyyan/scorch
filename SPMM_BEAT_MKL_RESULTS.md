@@ -40354,3 +40354,57 @@ all below resolution and should never have been quoted as instances.
 bands (0.676 to 6.930 us) across a small change in kernel length, so 6.0 us is conservative
 for kernels under 0.03 ms, where 1.0 us would be defensible. The four cells sit at
 0.022-0.038 ms and straddle the boundary, so they clear under either reading.
+
+#### Correction to the threshold above: my banding put contaminated pairs in a clean band
+
+The peer session predicted the mechanism from the numbers alone and was exactly right. My
+banding assigned each pair to a band by `min(ms_ov64, ms_ov64b)`, so a pair whose *other*
+arm read 5.99 ms landed in the 0.03-0.05 ms band. The offending pairs are visible once
+looked for -- `CAG_mat1916` k=2 reads `ov64` 5.9884 ms at `batch` 4 against `ov64b` 0.0453
+at `batch` 4, and 406 pairs in that band differ by more than 100 us. Banding by one arm
+while the deviation comes from the other is how a 5.9 ms event on a 0.04 ms kernel ends up
+inside the population a resolution is derived from.
+
+Requiring **both** readings inside the band:
+
+| band | n | median | p95 | max |
+|---|---|---|---|---|
+| < 0.03 | 2206 | 0.065 | **0.362** | 4.9 |
+| 0.03 - 0.05 | 1591 | 0.881 | **5.467** | 15.2 |
+| 0.05 - 0.10 | 1385 | 1.805 | 7.740 | 20.2 |
+| aggregate < 0.05 | 3797 | 0.133 | **3.756** | 15.2 |
+
+The band max falls from 5909 us to 15.2 us and the aggregate p95 from 5.546 to **3.756**,
+so the chain204 threshold is **4.0 us**, not 6.0. The peer derives **2.853 / 3.0 us** by the
+same construction on chain208. My p95-stability argument was the right check and it did
+pass, but it never identified the outliers, and a stability argument is not a diagnosis.
+
+**The threshold is dataset-dependent and must name its run.** chain204 gives 4.0 us,
+chain208 gives 3.0, and the step across the 0.03 ms boundary is 15x here (0.362 to 5.467)
+against 3.7x there. So the criterion is: per-cell floor AND an absolute effect above a
+resolution derived **on the same run**, quoted per kernel-length band, **with the band's max
+beside its p95** so an event inside the floor population is visible rather than smoothed.
+Below 0.03 ms that is 1.0 us on either run.
+
+#### And the magnitudes on the four cells are not portable between runs
+
+The peer asked the deciding question -- what is `min(batch)` on those cells in chain204 --
+and the answer settles it against the regime explanation. `min(batch)` is 1, but the
+*median* is 473-528, so 25-26 of 30 passes are back-to-back and the median is unaffected:
+
+| cell | all 30 passes | `batch` > 64 only | chain208 |
+|---|---|---|---|
+| bips07_1998_B k=32 | +27.50 | **+26.21** | +16.21 |
+| hydr1c_Zeros_36 k=32 | +24.83 | **+23.72** | +12.75 |
+| hydr1c_Zeros_03 k=32 | +19.92 | **+19.08** | +8.41 |
+| TSOPF_RS_b162_c3_b k=2 | +1.57 | +1.57 | +1.54 |
+| m3plates k=4 | +1.28 | +1.28 | +0.99 |
+| lp_tuff k=32 | +0.53 | +0.53 | +0.60 |
+
+My filed figures were already the back-to-back ones, so the 0.42-0.62 ratio against chain208
+is **not** a regime artefact. Both runs are back-to-back and they differ by 1.6-2.4x on
+exactly the three cells under discussion while agreeing within 0.76-1.21 on the three
+controls. That is its own finding and it is unexplained: the effect's *magnitude* on those
+cells is not portable between runs, though its *sign and ordering* are. Every one of the
+four clears both 3.0 and 4.0 us, and TSOPF k=2 and m3plates k=4 sit below both, so the
+sorting filed above stands; three of its magnitudes should not be quoted without their run.
