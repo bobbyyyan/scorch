@@ -39313,3 +39313,58 @@ inline code spans is the worst possible input to it.
 
 It also failed silently in the direction that survives review: deleting a word leaves prose that
 still parses. Five sentences read as complete English with their subjects removed.
+
+### Label correction to the pre-registered prior, and the repair verified on four axes
+
+**"k=4 at 2.4–2.9x" reads as an interval estimate of one quantity and is not one.** Under the filed
+headline criterion the k=4 lift is a single exact number:
+
+    k=2    (6/4584) / (14/22920) = 2.1429
+    k=4    (7/4584) / (14/22920) = 2.5000      = 7 x 5 / 14 exactly
+    k=8    (1/4584) / (14/22920) = 0.3571
+    k=16, k=32                     0
+
+The 2.4–2.9 range was the spread of the k=4 lift **across the seven different criterion readings** —
+seven different quantities, not an uncertainty band on one. Correct phrasing: *2.50 under the
+headline criterion, 2.4–2.9 across the seven readings.*
+
+**The pre-registered file is not being amended.** `an_c207.py`'s docstring carries the same
+mislabelled range, and the file stays at digest `5207b049…` unchanged. The label is descriptive text
+about the SuiteSparse prior; the analyzer **computes** every lift itself from the data and prints
+them, so no output depends on it. Amending a digest-bound artefact to fix prose would cost the
+binding and buy nothing — the correction is recorded here instead, and will be carried in the
+ledger's `PROVENANCE.md` when chain207 is sealed.
+
+**The digest commits me and verifies nothing yet, which is the correct shape.** `an_c207.py` is not
+in the ledger, not in the worktree, and not tracked in git; the SHA-256, the byte count and all five
+guard results are claims that cannot be checked from outside this session until the file lands. The
+ordering claim — written on pass 4 of 6 with no DLMC timing read — is likewise unverifiable until
+chain207 files with its own per-pass timestamps. Both should be treated as recorded-but-unverified
+until then.
+
+**The repair is verified complete on four axes, and three of them were needed.** No two of the
+pattern-based checks catch all five deletions: a mid-sentence-gap regex catches 3, a broken-emphasis
+span at line start catches the `t_dupcell` one, and the `t_relabel` one is a leading space before a
+lowercase word and needs a third. That is the pairwise-irredundance problem this document already
+records — any two axes would have reported the file clean.
+
+    axis                       bc5c0a9   bb7e5b2   e669216
+    mid-sentence gap             114       117       114
+    broken emphasis span           0         1         0
+    leading-space lowercase        1         2         1
+
+The series localises the damage to `bb7e5b2` and shows the repair removed exactly what it added. The
+surviving leading-space hit is pre-existing legitimate content (`regex 23 vs AST 23 -- AGREE`),
+present before the damage and after the repair.
+
+**The fourth axis is the only clean one, and it is the one worth keeping:** assert the expected
+tokens are present. `t_dupcell` 3, `t_relabel` 3, `t_partial` 3, `t_files` 1, `t_ok` 1,
+`SHAPE CONSTANTS OVERRIDDEN` 2 — all back. A positive token assertion has no false-positive base,
+whereas the mid-sentence-gap scan carries a **114-hit baseline** on this file from aligned-column
+tables, so it can only be read as a delta against a known-good commit and never as an absolute test.
+**The check that catches a deleted word is never reading the prose; it is asserting the tokens are
+there.**
+
+**And a backtick-parity check is vacuous by construction**, confirmed rather than argued:
+substitution consumes backticks in pairs, so the count always drops by an even number and the parity
+cannot change. Simulated — four backticks even before, zero even after. A check that can only pass.
