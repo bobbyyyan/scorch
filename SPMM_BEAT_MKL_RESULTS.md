@@ -40480,3 +40480,68 @@ fire. Line 74 forces every stored reading positive, GUARD 1b bounds each build's
 set to six values, and only then does GUARD 3's per-arm sum of `cells x 6` force exactly six
 per cell -- a sum alone would permit a 7-and-5 compensation. So `S()` never returns `None`
 and `ok == cells` identically. Treat it as a restatement of GUARD 3, not as a check.
+
+### The 2x gap explained: arm-asymmetric batch -- and why the obvious fix is wrong
+
+The peer session found it and it reproduces exactly. In chain204, restricted to
+`min(batch) > 64` so this is not the isolated regime, the override arm ran **fewer calls per
+timing** than the base arm on precisely the cells whose magnitudes do not port:
+
+| cell | k | batch ov64 | batch ovp | ratio | c204 delta | c208 delta |
+|---|---|---|---|---|---|---|
+| bips07_1998_B | 32 | 493 | 687 | 0.718 | +26.21 | +16.21 |
+| hydr1c_Zeros_36 | 32 | 544 | 1136 | **0.479** | +23.72 | +12.75 |
+| hydr1c_Zeros_69 | 32 | 537 | 1134 | **0.474** | +23.28 | -- |
+| hydr1c_Zeros_03 | 32 | 528 | 947 | 0.558 | +19.08 | +8.41 |
+| lp_tuff | 32 | 1552 | 1604 | 0.968 | +0.53 | +0.60 |
+| m3plates | 4 | 553 | 567 | 0.975 | +1.28 | +0.99 |
+
+**The two ranges overlap and the honest form says so:** non-porting cells span 0.474-0.718,
+porting cells 0.697-0.975, and `TSOPF_RS_b162_c3_b` k=2 sits at 0.697 yet ports at 0.98. Its
+effect is 1.57 us, so a 2x inflation would be 0.8 us -- below the derived resolution on
+either run. The cell has no room to show the mechanism, so it is not a counterexample, but
+the separation is clean only after conditioning on the effect being resolvable.
+
+**And the asymmetry is general, not specific to these cells: 56 of 258 chain204 cells (22%)
+have a batch ratio below 0.75.** So chain204 is unreliable for cross-arm *magnitude*
+wherever the batch is asymmetric, which is about one cell in five.
+
+That bears directly on the 0.299 us/worker I filed. Split the raised cells by batch symmetry:
+
+| batch-ratio band | n | median us/worker | median delta | slower |
+|---|---|---|---|---|
+| < 0.75 (asymmetric) | 50 | 0.370 | +16.99 us | 50/50 |
+| 0.75 - 0.90 | 32 | 0.263 | +10.88 us | 32/32 |
+| 0.90 - 1.10 (symmetric) | 26 | **0.093** | +3.15 us | 23/26 |
+| > 1.10 | 12 | **-0.285** | **-17.83 us** | 0/12 |
+
+Monotone in the batch ratio and it **changes sign**: where the override arm ran *more* calls,
+the override arm is faster by 17.8 us.
+
+**But 0.093 must not be adopted, and the reason is the carve-out in chain208's own design
+note.** On cells where the override FIRES, `batch` is downstream of the effect -- a slower
+arm fits fewer calls into the calibration window -- so a low batch ratio is partly a
+*consequence* of ov64 being slower. Conditioning on batch symmetry there conditions on a
+mediator and removes the very effect being measured. On cells where the override is DECLINED
+the kernel is identical by construction, nothing real sits behind a batch difference, and
+conditioning is valid. That is exactly the split `chain208_body.sh` pre-registered.
+
+So the hierarchy, and the number to quote:
+
+| estimate | value | status |
+|---|---|---|
+| chain204, pooled over raised cells | 0.299 | **inflated** by the batch mechanism |
+| chain204, conditioned on symmetric batch | 0.093 | **deflated** by conditioning on a mediator |
+| **chain208, batch PINNED** | **0.237** | the estimate to quote -- pinning is an intervention, not a conditioning |
+
+The two chain204 readings bracket [0.093, 0.299] and the pinned value sits inside it. **0.237
+supersedes my 0.299.** Likewise the four declined cells' portable magnitudes are chain208's
+**+16.2 / +12.8 / +8.4 us**, not chain204's +26.2 / +23.7 / +19.1, because there the
+conditioning is licensed and the pin agrees with it.
+
+This also resolves the peer's earlier confound story precisely: it was wrong on the raised
+cells, where pinning moved everything inside its own floor (chain208's Model B result stands
+unchanged), and right on the declined cells, which chain208 had no reason to examine. And
+`TSOPF_RS_b162_c3_b` k=4 is the cleanest single illustration -- +4.96 us at a batch ratio of
+0.829 unpinned, -7.1 us pinned. A cell that changes sign between an asymmetric-batch run and
+a pinned one is what the pin was built to catch.
