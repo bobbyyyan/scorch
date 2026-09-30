@@ -40412,7 +40412,7 @@ sorting filed above stands; three of its magnitudes should not be quoted without
 ## chain207 CLOSED: the DLMC half of the goal, 10 of 19100 cells behind MKL
 
 Sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain207-dlmc-redwood`, 19 entries, 19 OK,
-0 MISMATCH / 0 ABSENT / 0 ESCAPED, complement empty, top-level seal
+0 MISMATCH / 0 ABSENT / 0 ESCAPED, complement exactly the two manifest files, top-level seal
 `ca1335ee6dabbe3dbcff387b374c47c67ab8457ee96619be52937fb2390f33a5`. Analyzer pre-registered
 by digest in `bb7e5b2` (`5207b049...`, 14116 bytes) and **not amended**; its four defects are
 in `ERRATA.md` and folded into `PROVENANCE.md`.
@@ -40974,3 +40974,29 @@ inside its own arm floor under a matched control and was never a per-call cost t
 as does the measured per-width curve. The deficit itself is unexplained, and the one question
 no analysis can settle is whether a size-typical thread count is nonetheless too high for the
 *benefit* on these particular cells. That is a capped-count ablation, a measurement run.
+
+
+### Two conventions worth stating, both raised by the peer
+
+**"Complement empty" is a convention, not a fact, and an actually-empty complement is
+impossible.** Every "complement empty" I wrote about chain207 means *the set of files on disk
+absent from the manifest, excluding the manifest and its own seal*. The literal complement is
+**2 of 22** -- `SHA256SUMS`, which cannot contain its own digest, and `SHA256SUMS.sha256`,
+which seals it. That is the minimal correct complement. A reader cannot distinguish a
+convention from a mistake, so the count belongs in the sentence. Corrected above; the sealed
+`PROVENANCE.md` never carried the loose form.
+
+**And the arm floor's loose tail is entirely in the top two size deciles**, which is why one
+number carried two different labels. The peer reported 8.711 us as the corpus p99 and I
+reported it as the deciles 9-10 p95. Both are right and it is **one observation**: nearest
+rank puts corpus p99 at index 3780 of 3820 and deciles 9-10 p95 at 724 of 764, which is the
+**40th largest in both cases** (their message says 41st -- nearest-rank gives 40). The two
+names denote the same order statistic because the entire loose tail of the A/A lives in the
+largest two deciles, which is the same fact as the 114x scaling. Recording it so the next
+reader meeting two labels on one figure does not reach for a transcription error.
+
+**And their stronger form of the refutation is the one to lead with:** a floor verdict routes
+through a convention and can be re-litigated by choosing differently -- we demonstrated that
+twice, reaching 0.93x and 0.42x on the same quantity -- whereas `intercept(ours)` running
+4.37 to 31.99 us with no plateau cannot be reinterpreted by any choice of floor. **Prefer the
+refutation that does not depend on a threshold.**
