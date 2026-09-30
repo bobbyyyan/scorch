@@ -39098,3 +39098,76 @@ The decision is unaffected. The surviving claim is still the bound rather than a
 correlations: `B/A` = 1.17 / 1.14 / 0.96 / 1.09 / 1.08, so **pairing at the pass index moves the floor
 by at most 17% and the gated count by one cell.** A is the floor, the count is 14, and the
 correlations explain why pairing does not help rather than establishing whether it does.
+
+### The 89 cells are not independent: an exact permutation test retracts every significance claim above
+
+`sd/sqrt(89)` assumes the 89 cells are independent, and they share the same six passes. Measured
+cross-cell correlation of the per-cell pass vectors, within a single build, at k=2/4/32:
+
+    ovp     +0.0673  +0.0830  +0.0674
+    ov64    +0.1396  +0.1641  +0.1643
+    ov64b   +0.0384  +0.0184  +0.0376
+
+**Positive at all nine build x width combinations**, so the direction is signed before the magnitude
+is known: positive dependence can only inflate the true standard error.
+
+**The magnitude is exact rather than bounded.** Centre and unit-normalise each cell's six-vector per
+arm to `Ahat`, `Bhat`; then the mean per-cell Pearson under a permutation `s` of arm B's pass labels
+is `theta_s = (1/n) * sum_j M[j, s(j)]` with `M = Ahat.T @ Bhat` — so all 720 permutations of six
+labels are one 6x6 product and a gather. Applying the **same** permutation to every cell destroys the
+A-to-B pass alignment while preserving each arm's own cross-cell pass structure, which is precisely
+the dependence that breaks the iid standard error.
+
+    pair          k     mean r    iid SE   perm SE   ratio   perm t   exact p
+    ov64/ovp      2    -0.0692   0.0470    0.0707    1.51    -0.98    0.3611
+    ov64/ovp      4    -0.0876   0.0487    0.0740    1.52    -1.18    0.2778
+    ov64/ovp      32   -0.1259   0.0478    0.0673    1.41    -1.87    0.0528
+    ov64b/ov64    2    +0.0765   0.0425    0.0770    1.81    +0.99    0.3778
+    ov64b/ov64    4    +0.0519   0.0390    0.0798    2.05    +0.65    0.4667
+    ov64b/ov64    32   +0.0518   0.0495    0.0800    1.62    +0.65    0.5583
+    ov64b/ovp     2    -0.1030   0.0431    0.0666    1.55    -1.55    0.1194
+    ov64b/ovp     4    -0.0560   0.0481    0.0519    1.08    -1.08    0.2972
+    ov64b/ovp     32   -0.0831   0.0466    0.0499    1.07    -1.67    0.0972
+
+**"Four beyond 1.8 SE and two beyond 2.3" becomes zero of nine at exact p < 0.05.** The point
+estimates are unchanged; only the standard error was wrong, by 1.07x to 2.05x. This is the third
+successive widening of the same floor — `1/sqrt(n)`, then `sd/sqrt(n)`, now the permutation SE — and
+each one moved against my significance claims while leaving the point estimates alone.
+
+**The substantive finding survives pooling and is stronger than any single entry.** Cross-argument
+pooled over its six entries: **−0.0875, exact p = 0.0042 (3 of 720)**. And the null it is measured
+against is biased toward positive, because a shared ambient pass effect correlates *any* two arms
+positively — that effect lives in the alternative here, not the null, so a negative result is
+conservative for this direction.
+
+**Two claims of mine that do not survive, and the second is the one that matters:**
+
+- **"Same-argument positive at 3 of 3" carries no weight.** Pooled it is +0.0601 at exact
+  **p = 0.3931** (283 of 720). Three agreeing signs over three non-significant numbers has a 1-in-4
+  base rate, and the shared ambient effect already predicts positive between any two arms, so that
+  half of the pattern needs no argument-identity story at all.
+- **"The sign tracks argument identity" is a contrast and has to be tested as one.**
+  `same − cross = +0.1476` at exact **p = 0.0778**, quantile 0.922 of its own null. Outside 0.05, and
+  not sitting on a cliff — the adjacent |contrast| order statistics are 0.1484 / 0.1480 / **0.1476** /
+  0.1468 / 0.1456.
+
+**Instrument floor:** with six passes there are 720 permutations, so the smallest reachable two-sided
+p is **1/720 = 0.00139**. The pooled 0.0042 is three permutations above that floor and must not be
+quoted as if the instrument could separate it from 0.0014.
+
+**A delete-one-pass jackknife is not a substitute and is recorded so nobody repeats it:** at G=6 it
+has 5 degrees of freedom, matched the exact SE to 0.3% on one entry (0.0705 against 0.0707) and was
+about 2x off on others (0.1512 against 0.0800, 0.0370 against 0.0519), with its SE swinging 4x across
+entries at identical n. That spread is the 5 df, not the standard error. Use the permutation value; it
+is exact.
+
+**This is a floor correction, not a result inside a floor.** What moved is the sampling floor on the
+mean per-cell correlation, 1.07x to 2.05x wider than quoted, and it moved toward leniency for the
+null. The recorded statement is now: *different-argument arms in the same pass are anti-correlated,
+pooled −0.0875 at exact p = 0.0042 over 720 permutations of the pass labels, measured and unexplained;
+the same-argument positive is indistinguishable from the shared ambient effect (p = 0.39) and the
+same-versus-cross contrast is p = 0.078, so the sign pattern is suggestive and not established.*
+
+None of this touches the decision. `B/A` = 1.17 / 1.14 / 0.96 / 1.09 / 1.08 is a measured ratio of two
+floors with no significance test in it: pairing moves the floor by at most 17% and the gated count by
+one cell. A is the floor, the count is 14.
