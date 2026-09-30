@@ -40931,3 +40931,46 @@ one, so at narrow k the k-independent term dominates and by k=32 the slope has w
 statement about the **work split**. It does not license a per-call floor, a 9.2 us magnitude,
 or any thread-policy claim, and the k=4 target itself is untouched -- what is gone is the
 explanation, not the finding.
+
+### The thread-count mechanism is CLOSED, not merely unsupported -- and two predicates on my own table were wrong
+
+The peer session pointed out that my control row labelled `DLMC k=4 non-residues, all` was
+**n=400 against 3810 actual non-residues** -- a 10% sample carrying the word "all" -- and that
+the nnz-matched row was n=119 against a matched population of 1193. Both corrected, on full
+populations with no sampling, queried against the object that produced chain207:
+
+| control population | n | median `resolved` | at pool (24) | at 1 |
+|---|---|---|---|---|
+| ALL non-residues (true *all*) | 3810 | 5.0 | 10.4% | 30.3% |
+| nnz decade [1e5, 1e6) | 1193 | 14.0 | 30.4% | 0.0% |
+| **residues' own nnz span [131072, 512834]** | **689** | **18.0** | **36.0%** | 0.0% |
+| the 8 k=4 residues | 8 | **17.5** | 37.5% | -- |
+
+**At the tightest size match the data supports, the residues' thread count is
+indistinguishable from their controls -- median 17.5 against 18.0, and slightly lower.** My
+earlier "17 against 14, almost disappears" understated it; it closes outright. So the thread
+count is not merely unexceptional for their size, it is exactly what their size predicts.
+
+**And a decade is a coarse match**, as the peer said. Quintiles within [1e5, 1e6): median
+resolved **11 / 13 / 14 / 24 / 24** and at-pool **0% / 0% / 0% / 51.7% / 99.6%** -- a step
+between q3 and q4 that a single decade average hides entirely. Matching on a decade when the
+quantity steps inside it is the same error as banding a floor by one arm's kernel length.
+
+On the coincidence they flagged: the true at-pool figure is 10.4% and my sample was 400 of
+3810 = 10.50%, so the two 10.5%s in my table were indeed different quantities landing on
+nearly the same number. The sample was accurate; only its label was wrong.
+
+**The same tightening applies to the intercept excess**, and the peer's ladder shows it going
+into the floor monotonically as the match tightens: +7.129 us against the whole corpus
+(1.83x the arm floor), +4.392 against the nnz decade (1.13x), **+3.812 against the residues'
+own nnz span (0.98x)**. A quantity that falls monotonically as the control tightens is what a
+confound looks like; a real effect does not behave that way. My +9.2 us was the first row of
+that table with no control at all.
+
+**So both proposed mechanisms for the k=4 deficit are now closed.** The intercept half is
+inside its own arm floor under a matched control and was never a per-call cost to begin with
+(it scales 7.3x with nnz). The thread count is exactly size-typical. The slope half --
+0.1340 against 0.2654 us/k, ours 2.0x shallower -- never needed a mechanism and still stands,
+as does the measured per-width curve. The deficit itself is unexplained, and the one question
+no analysis can settle is whether a size-typical thread count is nonetheless too high for the
+*benefit* on these particular cells. That is a capped-count ablation, a measurement run.
