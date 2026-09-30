@@ -38886,3 +38886,64 @@ One external correction worth recording because it confirms my numbers: the boar
 `--target-ms 6` (`rw_s_chain206.sh:121`), not `mrgate_ov.py`'s default of 25. Taking the default
 inflates every isolated time by 4.17x. My C values were computed with 6 and stand; the lesson is that
 a constant has to come from the harness that produced the data, not from the harness that was read.
+
+### Correction: the floor must measure the gated statistic, so the remaining work is 14 cells, not 25
+
+I gated a claim about `S = ours/mkl` with a floor computed on `ours` alone. That is the wrong floor
+and the error is against a rule already in this document: the floor is computed the same way as the
+effect it gates. Declaring a cell "really behind MKL" is a claim about S, so the control is S's own
+run-to-run reproducibility between two byte-identical builds, `dev(S_aa / S_bb)`, which inherits
+MKL's cross-build variation by construction through
+`S_aa/S_bb = (ours_aa/ours_bb) x (mkl_bb/mkl_aa)`.
+
+    k       ours bb/aa   mkl bb/aa   S_aa/S_bb   naive sum   cancellation   ratio/ours-only
+    k=2       0.0818      0.0628      0.0896      0.1446       0.62x            1.09
+    k=4       0.0747      0.0721      0.0951      0.1467       0.65x            1.27
+    k=8       0.0756      0.1059      0.1493      0.1815       0.82x            1.98
+    k=16      0.0909      0.0916      0.1349      0.1825       0.74x            1.48
+    k=32      0.1387      0.1101      0.1689      0.2488       0.68x            1.22
+
+**The two component floors do not add** — S's floor is 0.62 to 0.82 of their sum, measured partial
+cancellation from the shared process, which is consistent with the process-boundary result already
+recorded. And k=8 is where the correction bites hardest (1.98x) because k=8 is exactly where MKL's
+own cross-build floor peaks at 0.1059.
+
+**The count, both floors, predicate attached:**
+
+    floor                                    k=2/4/8/16/32   cells   matrices   share     k=4 lift
+    ours-arm A/A (previously published)      6/14/4/1/0        25       22      0.109%      2.8
+    ratio S_aa/S_bb A/A (correct)            6/7/1/0/0         14       13      0.061%      2.5
+
+**So the current state of "faster than MKL on all of SuiteSparse" is 14 cells of 22,920 behind
+(0.061%), across 13 matrices, and none at k=16 or k=32.** The correction is in our favour, but that
+is not why it is adopted — the `ours`-only floor answers chain206's original question, whether
+relocation moves our kernel's time, and is simply not the control for this gate.
+
+The fourteen, which are now the whole remaining target list:
+
+    matrix                              k    nnz        rows     deg        aa       bb
+    Meszaros/nw14                       4     904910      73    12396.03   1.4738   1.2724
+    Pd/Pd_b                             2       6323    8081        0.78   1.3606   1.3602
+    m3plates                            2       6639   11107        0.60   1.3541   1.3504
+    Pd_rhs                              2       6323    8081        0.78   1.3437   1.3097
+    ASIC_680k                           2    2638997  682862        3.86   1.2532   1.2541
+    lp_osa_14                           4     317097    2337      135.69   1.1994   1.1904
+    Meszaros/nw14                       8     904910      73    12396.03   1.1514   1.2202
+    lp_osa_07                           4     144812    1118      129.53   1.1461   1.1408
+    poli                                2       8188    4008        2.04   1.1383   1.1466
+    cegb2919                            4     321543    2919      110.16   1.1352   1.1094
+    Meszaros/aa01                       4      72965     823       88.66   1.1107   1.2670
+    TSC_OPF_1047                        4    2012833    8140      247.28   1.1105   1.1326
+    Davis/FX_March2010                  4     301899    1319      228.88   1.1038   1.1207
+    Andrianov/ins2                      2    2751484  309412        8.89   1.0998   1.1433
+
+**Every earlier conclusion survives the floor change.** Degree spans 0.60 to 12,396 and nnz spans
+6,323 to 2.75 million across fourteen cells, so there is still no structural signature; k=4 still
+carries half the list at lift 2.5 against the 2.4-2.9 range across all seven criteria; and one matrix
+(`nw14`) appears at two widths while the other twelve appear once. The four mechanism-derived
+predicates were already reported at lift ~1 and are unaffected.
+
+One bookkeeping note: the floors in the table above reproduce, to four decimals, the floors the
+verifying session first reported — so its original numbers were the ratio floor all along, and the
+inability to find a single criterion matching both my k=2 and my k=4 was because we were gating on
+two different statistics rather than applying two different rules to one.
