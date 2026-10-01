@@ -41446,3 +41446,62 @@ median.
 
 None of this touches the width profile, which is band-level estimand A on both builds with a 1.03%
 worst-case floor.
+
+### chain209's superset is derivable, and B-vs-A is the normalisation, not the spread
+
+**NO RESEAL. The 26 untimed rows are exactly the empty matrices.** Verified against the sealed
+table: all 26 have `nnz == 0`, no timed key has `nnz == 0`, the minimum nnz among timed keys is 6,
+and `{nnz > 0}` equals the timed set **exactly** -- 3820 of 3846, no remainder. All 26 sit in
+`dlmc/transformer/variational_dropout/0.98`, i.e. variational dropout at 0.98 sparsity pruned those
+tensors to nothing; the same name suffixes carry 2797-27165 nonzeros at 0.95.
+
+So the predicate is `nnz > 0` and it is already inside `ff167f71d50abf74...`. A `timed` column would
+have been strictly worse than a derivable predicate and not only for the digest churn: rows, cols
+and nnz are properties of the matrix and never go stale, while `timed` is a property of one run, and
+a stale flag inside a seal is worse than no flag because a consumer trusts it *because* it is
+sealed. The seal stays as it is -- it has already been independently verified and cited -- and the
+predicate is recorded here, in the live document, rather than by reopening a sealed artefact.
+
+This also pins P0's population deterministically: chain210 will drop the same 26 for the same
+reason, so the comparison is 3820 x 5 = 19100 cells on both runs, which is the figure the
+registration already uses.
+
+**899d802's floor column mixed two partitions.** It printed seven band-level deviations
+(0.24/0.57/0.40/0.18/0.02/0.32/0.09) while the effect was computed on the six-band partition, where
+the 0-5% band reads 0.35% whole rather than splitting into 0.24% and 0.57%. The correct column is
+**0.35/0.40/0.18/0.02/0.32/0.09, worst 0.40%**, so the dip is 59.5x its own band's floor and
+**13.6x** the column worst, not 10x. Same rule as the correction it appeared in -- floor and effect
+from the same construction -- one level finer.
+
+**AND MY "SPREAD" EXPLANATION WAS WRONG. It is the per-nnz normalisation.** Inserting
+`B' = red(ours) / red(mkl)` -- the same ratio of aggregates *without* the per-nnz step -- splits the
+A-to-B gap at k=4 on aa:
+
+    band          A       B'      B       B'/A-1   B/A-1    normalisation's share   p10-p90 nnz
+    0.00-0.05   0.5220  0.5385  0.6417   +3.16%   +22.94%        86.2%                 31.7x
+    0.05-0.10   0.9017  0.9102  0.9156   +0.95%    +1.54%        38.6%                 16.0x
+    0.10-0.20   0.9263  0.9395  0.9645   +1.43%    +4.13%        65.3%                 13.8x
+    0.20-0.35   0.9986  1.0204  1.0419   +2.18%    +4.33%        49.6%                 16.0x
+    0.35-0.60   1.0966  1.1267  1.1270   +2.75%    +2.77%         1.0%                  5.5x
+    0.60-1.01   1.0374  1.0942  1.1830   +5.47%   +14.04%        61.0%                 18.9x
+
+86% of the 0-5% band's divergence and 61% of band 6's is the normalisation, and **band 5 is the
+clean control**: a 1.0% share, and the only band whose internal nnz spread is small (5.5x against
+13.8-31.7x). A cancels nnz exactly, per key, before any reduction. B never cancels it -- it takes a
+median of `ours/nnz` and a median of `mkl/nnz` over keys whose nnz spans 5-32x inside one band, so
+the within-band nnz distribution enters numerator and denominator differently. **That makes A the
+better estimand on construction rather than by preference, and it means the ratio column of the
+nanoseconds-per-nonzero table is not a speedup in the strict sense.**
+
+**I have now been wrong twice about the explanation for the same gap** -- "smallest n", then
+"within-band spread" -- while the S-spread figures I quoted were themselves correct and reproduced
+(2.97/2.37/1.40/1.51/1.38/2.30). Both times I reached for the first plausible mechanical cause and
+stopped, which is exactly [[decompose_a_gap_before_naming_it]]. The decomposition settles it; the
+correlate did not.
+
+**One further thing band 1 cannot support.** Inside the 0-5% density band nnz runs 6 to 852171 and
+about half the band is under 1e4. By nnz quintile the median kernel runs 4.43 / 6.00 / 7.43 / 12.65 /
+13.57 microseconds while median ns-per-nonzero runs 3.377 / 1.145 / 0.855 / 0.965 / 0.331 -- a 10x
+swing inside one density band, from a fixed per-call cost amortised over very different nnz. Any
+per-nonzero figure for that band is reporting overhead, not a rate. This does not reopen the
+withdrawn per-call deficit; it is a statement about what the units mean at a few microseconds.
