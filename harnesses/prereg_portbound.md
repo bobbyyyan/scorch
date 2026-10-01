@@ -195,10 +195,39 @@ for both figures, which is the row nearest the instrument being validated. Separ
   ceiling is 4.05x / 5.16x / 5.01x, mean **4.68x** — not the single 4.07x figure published first.
   That spread is five to seven times the −18.4% this probe exists to measure.
 
-A fourth window, taken later while sampling frequencies, puts it at **11.9–13.7 busy cores** (the
-denominator is a range because the sweep overhead inside the window was not timed). So across four
-windows occupancy spans a factor of **2.5–2.9**, and sampling overhead cannot explain it: 320 `cat`
-forks at about 1 ms of CPU each is 32 ticks of 27445, 0.12%.
+A fourth window, taken later while sampling frequencies, was first published as **11.9–13.7 busy
+cores** because the sweep overhead inside it was not timed. **My own description of that loop
+excludes the slow end.** It is 10 × (32 reads at 1–5 ms, then `sleep 2`), so elapsed is 20.32–21.60
+s and the figure is **12.71–13.51 busy cores**, occupancy 52.9–56.3%, ceiling 1.78–1.89x. The
+published 11.93 would require 23.01 s, which the loop cannot produce. Peer session's catch; the
+tightening came free from a structure I had already described in prose while calling the measurement
+untaken.
+
+Three further windows were then taken with the denominator **measured** rather than inferred —
+`date +%s%N` either side, elapsed 10.002 / 10.004 / 10.004 s — and with the per-CPU detail retained
+for every window rather than reduced away:
+
+| window | busy cores | occupancy | ceiling | sibling share of P-logical | `T_E/T_P` raw | stripped |
+|---|---|---|---|---|---|---|
+| a | 7.097 | 29.6% | 3.38x | 3.99% | 2.110 | 2.197 |
+| b | 6.058 | 25.2% | 3.96x | 7.03% | 1.784 | 1.919 |
+| c | 4.581 | 19.1% | 5.24x | 5.70% | 1.614 | 1.712 |
+
+Across all six windows occupancy spans **4.58 to 13.51 busy cores, a factor of 2.9**, and the
+ceiling spans **1.78x to 5.24x**. Sampling overhead cannot explain any of it: 320 `cat` forks at
+about 1 ms of CPU each is 32 ticks of 27445, 0.12%.
+
+**And the time split is phase-dependent too, which the work-share conversion's input cannot
+survive.** `T_E/T_P` reads 1.778 / 1.660 / 1.532 in the first three windows and 2.110 / 1.784 /
+1.614 in the second three — a six-window span of **1.532 to 2.110, 38%**. So the "mean 1.656" used
+in the conversion was one phase rather than the run, and the resulting E work-share bound moves with
+the window set: 57.7% from the old mean unstripped, 58.7% old mean stripped, 61.5% new mean
+stripped, 64.4% at the highest single window. **No windowed figure feeds the conversion.** A
+whole-run per-core-type split needs exactly two `/proc/stat` reads bracketing a whole object-pass,
+which has no phase selection in it; an anchor was written at 02:45:03 with 8 passes complete, to be
+closed at the next check. Note that this quantity is *not* available from the sealed CSVs — they
+record per-cell kernel time, not per-core-type attribution — so it is the one input here that
+requires a reading taken while the run is live.
 
 **No 10-second window is a property of the run.** The run sweeps 3820 keys at five widths, so a
 window samples whichever matrix sizes happen to be in flight; three windows are three different
@@ -324,8 +353,26 @@ time split.
    [2.4, 4.4]). So the spec cannot supply a floor without the measurement, and the measurement's
    interval reaches down to 1.223.
 
-   Carried through, the defensible bound moves: with `r ≥ f_P/f_E ≥ 1.223` at 95%, E's work share is
-   **≤ 57.5%**, not the 55.6% published from the point estimate.
+   **The interior of the range is not constrained at all, which is stronger than "the floor needs
+   the measurement".** 1.2955 and 1.3333 are the ratios at two particular operating points. Between
+   them each core type's P-state is selected independently by the governor from its own utilisation,
+   so no mechanism makes the ratio at an intermediate pair lie between the ratios at the endpoints.
+   That the two endpoint ratios agree to 2.92% is a fact about how Intel set four numbers, not a
+   constraint on anything in between. So even granting the operating region, the bracket was never a
+   bracket, and the floor on `r` is the measurement's own lower limit and nothing else. Peer
+   session's strengthening of their own refuted rescue.
+
+   **Use the `t` interval, not the normal one.** With relative variances 1.0123e-3 and 4.5355e-4
+   (the P term is 69.1% of the total), Welch–Satterthwaite gives **14.64 df** and
+   `t(0.975) = 2.1361`, so the interval is **[1.2136, 1.4298]**, 16.4% of the point estimate rather
+   than 15.0%, and the floor on `r` is **1.2136**. Peer session's correction.
+
+   **The two adopted corrections were never composed.** The sibling strip multiplies the time split
+   by `1/(1 − sibling share)` and the clock interval supplies the floor on `r`; each was applied once
+   and the bound was then computed from the *unstripped* split. Composed, and with the sibling share
+   measured per window rather than taken from one — three further windows give 3.99%, 7.03%, 5.70%
+   — the bound rises rather than falls. Peer session's catch, and the direction is the one that
+   matters: E's share bound is **higher** than published, not lower.
 
    **One boundary on what the cpu13 test establishes.** It excludes TSC-normalisation; it does not
    by itself exclude a cached *requested* P-state. If the sysfs value were per-physical-core policy
@@ -423,6 +470,15 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 8**, digest `64a566d0f6e8c38b` superseded. The sibling strip and the clock floor were
+  each applied once and never composed; composed, with the sibling share measured per window
+  (3.99–7.03%), E's work-share bound rises. The `t` interval replaces the normal one (14.64 df,
+  [1.2136, 1.4298], floor 1.2136). The spec bracket is shown not to constrain the interior of the
+  range at all. The fourth window's denominator is tightened to 12.71–13.51 busy cores by my own
+  loop description, and three further windows were taken with the denominator measured and per-CPU
+  detail retained. `T_E/T_P` is shown to be phase-dependent over 1.532–2.110, so the work-share
+  bound spans 57.7–64.4% depending on the window set and no windowed figure may feed the conversion;
+  a whole-pass `/proc/stat` anchor was written instead.
 - **Amendment 7**, digest `e929ea9d753438bc` superseded. The "three routes bracket 1.30–1.33"
   reassurance is withdrawn: base and boost are 2.92% apart because the product holds the ratio
   constant, and the measurement's own 95% interval is [1.223, 1.421], 15.0% wide, containing the
