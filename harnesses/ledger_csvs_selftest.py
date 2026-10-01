@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger_csvs as L                                              # noqa: E402
 
 FAIL, CHECKS, NOTES = [], 0, []
-N_PLANTS = 10
+N_PLANTS = 12
 REAL = os.path.expanduser(
     "~/.cache/scorch-codex/spmm-beat-mkl/chain194-mrhv-redwood")
 
@@ -119,6 +119,37 @@ def t_the_REAL_sealed_directory_refuses(and_report=True):
     except SystemExit as e:
         eq("real-refuse", "raised", "raised")
         eq("real-names-it", "contaminated" in str(e), True)
+
+
+def t_a_symlinked_match_is_REFUSED_not_resolved():
+    """Shape five: a clean link name pointing at a marked target. The marker is a property of a
+    filename, so the name check reads the link's. Refusing is the ledger's own position -- its
+    sealer refuses links because shasum follows them, so a sealed NAME whose bytes live outside
+    the sealed set verifies clean forever while staying mutable."""
+    d = _dir(["a_float32_p1.csv", "real_float32_p2.contaminated.csv"])
+    os.symlink(os.path.join(d, "real_float32_p2.contaminated.csv"),
+               os.path.join(d, "a_float32_p2.csv"))
+    try:
+        L.glob_clean(d, "*_float32_p*.csv")
+        eq("symlink", "returned", "raised")
+    except SystemExit as e:
+        eq("symlink", "raised", "raised")
+        eq("symlink-named", "a_float32_p2.csv" in str(e), True)
+        # And it reports that the TARGET is marked, which is the information a reader needs.
+        eq("symlink-target-marker", "TARGET CARRIES MARKER" in str(e), True)
+
+
+def t_a_symlink_to_a_CLEAN_target_is_still_refused():
+    """ABLATION: the refusal is about the link, not about the target's name. A clean target does
+    not make the bytes sealed or immutable."""
+    d = _dir(["a_float32_p1.csv", "real_float32_p9.csv"])
+    os.symlink(os.path.join(d, "real_float32_p9.csv"), os.path.join(d, "a_float32_p2.csv"))
+    try:
+        L.glob_clean(d, "*_float32_p*.csv")
+        eq("symlink-clean", "returned", "raised")
+    except SystemExit as e:
+        eq("symlink-clean", "raised", "raised")
+        eq("symlink-clean-no-marker", "TARGET CARRIES MARKER" not in str(e), True)
 
 
 def main():

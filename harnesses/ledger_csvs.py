@@ -77,6 +77,28 @@ def glob_clean(d, pattern, label="", allow_excluded=False):
     import ledger_excluded_runs as LX
     LX.check_run(d, allow_excluded=allow_excluded, label=label)
     hits = _glob.glob(os.path.join(d, pattern))
+    # SYMLINKS ARE REFUSED, NOT RESOLVED, and the ledger already takes that position. A marker is
+    # a property of a filename, so a link under a clean name pointing at a marked file defeats
+    # this guard -- and the link is visible to glob and os.walk while a `find -type f` census
+    # omits it, which is why two counts of "the CSVs here" can disagree by exactly the class
+    # neither evaluates. Resolving the target is the obvious shape and it is the wrong one: a
+    # symlink in an evidence directory is itself the defect, because shasum follows it, so a
+    # sealed NAME whose bytes live outside the sealed set verifies clean forever while remaining
+    # mutable. seal_c210.sh refuses links for that reason, and measurement agrees it is not a
+    # restriction in practice -- every sealed directory in the ledger is symlink-free today, and
+    # the only linked CSVs are four pytest fixtures in an unsealed directory.
+    links = [h for h in hits if os.path.islink(h)]
+    if links:
+        raise SystemExit(
+            "REFUSE: %s%d of %d files matching %r under %s are SYMLINKS:\n%s\n"
+            "  A marker lives in a filename, so a clean link name hides a marked target, and the\n"
+            "  bytes are outside this directory and outside its seal. Resolve the link into a\n"
+            "  real file, or point the reader at the directory that holds the bytes."
+            % (label + ": " if label else "", len(links), len(hits), pattern, d,
+               "\n".join("    %s -> %s%s" % (
+                   os.path.basename(l), os.path.realpath(l),
+                   "  [TARGET CARRIES MARKER: %s]" % marker_in(os.path.realpath(l))
+                   if marker_in(os.path.realpath(l)) else "") for l in sorted(links))))
     clean, flagged = scan(hits)
     if flagged:
         raise SystemExit(
