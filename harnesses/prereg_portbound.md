@@ -222,12 +222,48 @@ survive.** `T_E/T_P` reads 1.778 / 1.660 / 1.532 in the first three windows and 
 1.614 in the second three — a six-window span of **1.532 to 2.110, 38%**. So the "mean 1.656" used
 in the conversion was one phase rather than the run, and the resulting E work-share bound moves with
 the window set: 57.7% from the old mean unstripped, 58.7% old mean stripped, 61.5% new mean
-stripped, 64.4% at the highest single window. **No windowed figure feeds the conversion.** A
-whole-run per-core-type split needs exactly two `/proc/stat` reads bracketing a whole object-pass,
-which has no phase selection in it; an anchor was written at 02:45:03 with 8 passes complete, to be
-closed at the next check. Note that this quantity is *not* available from the sealed CSVs — they
-record per-cell kernel time, not per-core-type attribution — so it is the one input here that
-requires a reading taken while the run is live.
+stripped, 64.4% at the highest single window. **No windowed figure feeds the conversion.**
+
+**The spread is 13x beyond counting noise, which is why it reads as phase and not as scatter.**
+Treating tick counts as Poisson, the per-window relative SE on `T` is `sqrt(1/n_E + 1/n_P)` =
+2.54–3.04%, mean 2.82%. The observed sd across six windows is 0.2022 = **11.6% of the mean, 4.1x
+counting noise**, and the span is **13.3x** it. So "the range is 38%" is not an argument from the
+spread looking large; it is four to thirteen times what the counters could produce, from numbers
+already in hand. Peer session's point, and the number that makes it was free.
+
+**A whole-run split needs two `/proc/stat` reads, and they must land on pass boundaries.** An
+object-pass is a complete sweep of 3820 keys at five widths, so a whole pass *is* the run's
+composition — but an interval of part of one pass plus `N` whole ones is missing a specific slice of
+the corpus, whichever keys the sweep visits first.
+
+My first anchor, at 02:45:03, was **376 s into p5 aa — 27.9% of the way through it** — so it
+reintroduced exactly the selection the design exists to remove. Carried through: the partial pass
+takes weight 0.419 at `N = 1` and 0.265 at `N = 2`, giving a bias coefficient on (tail − head) of
+0.117 and 0.074, and at the head/tail difference the six windows make plausible (0.578 in `T`) that
+is **0.043–0.068 in `T`**, roughly 1.5 points of E work share in an unknown direction. Small against
+a 38% phase span, and the only error in this design that was avoidable for free. Peer session's
+catch, flagged as time-critical with fourteen minutes to the next boundary.
+
+Re-anchored on the **done-line count incrementing**, not on a clock, since boundary times are
+estimates: a bounded script (deadline 04:23:15, at most four snapshots, PID recorded so it is killed
+by exact PID and never by a pattern that could match itself) writes a `/proc/stat` snapshot at each
+of the four remaining object-pass completions. That yields a one-pass interval and a three-pass
+interval, both phase-complete. The 02:45:03 read is kept: against a clean interval it is a positive
+control on whether the head/tail difference matters at all.
+
+Note that this quantity is *not* available from the sealed CSVs — they record per-cell kernel time,
+not per-core-type attribution — so it is the one input that requires a reading taken while the run
+is live. **Conditional on `r` coming entirely from the pinned pair.** If any in-situ frequency
+weighting survives into the final conversion, that is live-only too and must be taken **on the same
+interval as `T`**, not on a different window, which would be the window-mixing error in a new place.
+Peer session's correction to my scope claim.
+
+**And a better `T` does not remove the `r` precondition.** `T` comes from this run's workload on a
+loaded host; `r` will come from the pinned V0 pair on a free one. Composing them assumes the pinned
+`r` equals the in-situ `r`, which is the occupancy mismatch already adopted: solo rates exceed
+in-situ rates for a bandwidth- or latency-limited kernel, so the pinned `r` is an upper bound and E's
+share is understated by it. The final figure stays a bound in both directions it was already a bound
+in — a whole-run `T` reads like the last loose input and it is not.
 
 **No 10-second window is a property of the run.** The run sweeps 3820 keys at five widths, so a
 window samples whichever matrix sizes happen to be in flight; three windows are three different
@@ -470,6 +506,13 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 9**, digest `6449741246a44318` superseded. The whole-run anchor was 27.9% into an
+  object-pass rather than on a boundary, reintroducing phase selection worth 0.043–0.068 in `T`;
+  re-anchored on done-line increments by a bounded snapshot script, with the misaligned read kept as
+  a positive control. The 38% phase span is quantified against counting noise (4.1x on the sd, 13.3x
+  on the span). The scope claim is narrowed: a surviving in-situ frequency weighting would also be
+  live-only and would have to share `T`'s interval. And a whole-run `T` is recorded as not removing
+  the `r` precondition, so the composed figure stays a bound.
 - **Amendment 8**, digest `64a566d0f6e8c38b` superseded. The sibling strip and the clock floor were
   each applied once and never composed; composed, with the sibling share measured per window
   (3.99–7.03%), E's work-share bound rises. The `t` interval replaces the normal one (14.64 df,
