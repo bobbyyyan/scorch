@@ -463,3 +463,40 @@ that flatters my own coverage.)
 **Neither uncovered cell is optional before shipping**, and both carry a live result: the fused path
 closed the 0.99-sparsity autoencoder gap against MKL, and f64 is at 2.273x with nothing below
 parity.
+
+## AMENDMENT 9: an ETA pooled over builds presumes the null, and the pass wall times are the one
+## quantity proved unable to carry the signal
+
+Two estimator notes on the instruments that are *visible* while the real numbers are not.
+
+### The wall times are not an informal preview, and this follows from Amendment 3
+
+A pass's wall time is a mostly-unrecorded quantity whose **measured** portion is constructed to be
+insensitive to the effect. On the c211 board only **+3.6 s of a +14.0 s** gap was accountable at
+all, with 74% in overhead the CSVs never record, and the accountable part is pinned: `batch x ms`
+tracks the calibration target independently of kernel speed. So glancing at the landed durations as
+a preview reads the one quantity already *proved* unable to carry the signal. The screen's three
+landed durations (840, 841, 839 s — spread ~0.1%) are on screen; the arm's numbers are not. Written
+here because availability, not relevance, is what makes a number get read.
+
+### An ETA pooled over builds assumes the arms do not differ
+
+The screen's 840.0 s is a mean over `ship`, `shpb`, `strm` extrapolated to sixteen object-passes of
+which four are `nopf` — so it **imputes `nopf` = mean of the other three**, which presumes the null
+the screen exists to test. Immaterial in magnitude and free to fix, so: quote it as build-pooled, or
+per build.
+
+| estimator | board (7 landed) | screen (3 landed) |
+|---|---|---|
+| **build-pooled** | 18 × 1357.857 → **13:11:53** | 16 × 840.0 → **12:18:08** (imputes `nopf`) |
+| **build-balanced** (each build's own mean × its true share) | 6 × (1351.5 + 1351.5 + 1366.33) → **13:11:28** | *not available — `nopf` unmeasured* |
+
+**On the board the difference has a predictable sign, so it is not merely noise.** `deep` is 3 of 7
+landed (0.429) against a true share of 6 of 18 (0.333), and `deep` is the slow build — so the pooled
+mean **overstates** and its ETA is late by 25 s. Build-balanced is the correct estimator whenever the
+landed composition is unbalanced, which it is at every intermediate point of a rotation.
+
+Screen sensitivity to the imputation, since it cannot be removed yet: `nopf` running +2% moves the
+ETA +67 s, +5% moves it +168 s.
+
+**Henceforth: board 13:11:28 build-balanced; screen 12:18:08 build-pooled with `nopf` imputed.**
