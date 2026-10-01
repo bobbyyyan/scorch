@@ -5,7 +5,6 @@ target's own AST (every `raise Incoherent` site) and differenced against a line 
 a refusal added later with no plant fails this file.
 """
 import ast
-import math
 import os
 import sys
 
@@ -89,20 +88,39 @@ def t_negative_control_failing_invalidates():
 
 # ------------------------------------------------------------------ the arithmetic
 def t_detect_prob_matches_the_simulation():
-    """The three numbers the simulation produced, from the closed form: 2.5 / 50 / 97.5."""
+    """The three numbers the simulation produced, from the closed form: 2.5 / 50 / 97.5.
+
+    The value loop is LOAD-BEARING: measured over the mutation set in
+    pfs_criterion_mutations.py it is the SOLE catcher of a narrowed ci_z, and one of two
+    catchers of a dropped offset in detect_prob. The invariance check below reads as the
+    more structural of the two and catches strictly less -- it catches nothing the value
+    loop does not. Do not infer the attribution from how a check reads; that is the error
+    this docstring is replacing, and the first version of this very sentence got it
+    wrong too (it credited the value loop with being sole catcher of the offset).
+    """
     global CHECKS
     for mult, want in ((0, 0.025), (1, 0.5), (2, 0.975)):
         CHECKS += 1
         h = 0.4
         got = C.detect_prob(B + mult * h, B, h)
         if abs(got - want) > 5e-4:
-            FAIL.append("detect-prob: at b+%dh got %.6f, expected %.4f" % (mult, got, want))
+            FAIL.append("detect-prob-value: at b+%dh got %.6f, expected %.4f"
+                        % (mult, got, want))
     CHECKS += 1
     # Assumption-free in b and in h at delta == b, which is why the self-voiding case
-    # cannot be repaired by moving the bound.
+    # cannot be repaired by moving the bound. SCOPE: that is ALL this covers. It does
+    # not cover a wrong constant -- dropping the `- 1.0` from detect_prob leaves the
+    # probability flat in b and h too (0.5 rather than 0.025, spread 0.000e+00 under
+    # both formulas), so this check passes and the value loop above is what fails.
+    # Measured status over the 8 mutations in pfs_criterion_mutations.py: this assertion
+    # catches exactly one (`bound-not-subtracted`) and the value loop catches that one as
+    # well, so it is strictly dominated there and is the one of the pair that could go.
+    # Kept because the mutation set is hand-written and 'dominated over 8 mutations I
+    # thought of' is not 'dominated'.
     vals = [C.detect_prob(x, x, h) for x in (0.1, 1.489, 50.0) for h in (0.01, 0.4, 9.0)]
     if max(vals) - min(vals) > 1e-9:
-        FAIL.append("detect-prob: at delta==b the probability moved with b or h: %s" % vals)
+        FAIL.append("detect-prob-invariance: at delta==b the probability moved with b "
+                    "or h: %s" % vals)
 
 
 def t_underpowered_labels_and_does_not_void():
@@ -130,13 +148,38 @@ def t_underpowered_labels_and_does_not_void():
         FAIL.append("positive: margin in half-widths is wrong for 0-1e4")
 
 
+def t_the_bound_is_inclusive():
+    """An interval exactly on +-b is WITHIN, not INDETERMINATE.
+
+    Found by pfs_criterion_mutations.py, not by reading: tightening both comparisons in
+    `label` to strict changed the verdict on a touching interval and no assertion noticed.
+    It follows from the registration -- BEYOND is "entirely outside the bound", so an
+    interval whose endpoint IS the bound is not entirely outside it, and the complement
+    has to be inclusive or a touching interval belongs to neither side.
+    """
+    global CHECKS
+    c = ok_crit()
+    c.run_negative([C.WITHIN] * 4)
+    CHECKS += 1
+    v = c.label("0-1e4", 0.0, -B, B)
+    if v != C.WITHIN:
+        FAIL.append("inclusive-bound: [-b, +b] exactly gave %r, not WITHIN" % (v,))
+    CHECKS += 1
+    # The input that FAILS the check above, so its passing is not vacuous: one ulp past
+    # the bound must leave WITHIN.
+    v = c.label("0-1e4", 0.0, -B, B + 1e-9)
+    if v != C.INDETERMINATE:
+        FAIL.append("inclusive-bound: a hair past +b gave %r, not INDETERMINATE" % (v,))
+
+
 def t_structural_refusals():
     expect_refusal("no-bands", lambda: C.BeyondFloorCriterion(B, DELTA, []), "no bands")
     expect_refusal("bad-bound", lambda: C.BeyondFloorCriterion(0.0, DELTA, BANDS),
                    "must be MEASURED")
     expect_refusal("missing-hw", lambda: C.BeyondFloorCriterion(B, DELTA, BANDS)
                    .run_positive({"0-1e4": 0.2}), "no half-width for band")
-    c = ok_crit(); c.run_negative([C.WITHIN])
+    c = ok_crit()
+    c.run_negative([C.WITHIN])
     expect_refusal("inverted", lambda: c.label("0-1e4", 0.0, 1.0, -1.0), "inverted")
     expect_refusal("no-power", lambda: c.label("nosuch", 0.0, -1.0, 1.0),
                    "no power measurement")
