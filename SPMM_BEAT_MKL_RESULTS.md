@@ -41073,3 +41073,83 @@ hurt -- and the loser population is already characterised by name and by mechani
 real improvement at k=2 and k=8. **It is not a fix for the k=4 residues**, and conflating the
 two would be the overfitting error in reverse: shipping a win and claiming it closed a
 deficit it cannot touch.
+
+## The k=4 residues are a sub-cache-line B row, not a constant (2026-09-30)
+
+Four candidate mechanisms closed, and the regime named. No new timing: everything below comes
+from the sealed chain196/chain207 CSVs plus one static compilation and the matrix dimensions.
+
+**Four levers closed, each by evidence already in the tree.**
+
+1. *Pairing two nonzeros of the same row into one 256-bit accumulator* -- the design I stated last
+   session -- is already implemented as `scorch_spmm_row_gather_f32` (`spmm.h:2346`), which puts
+   eight nonzeros of one row in the eight lanes. Its recorded per-width readings are k=1 1.067,
+   k=2 0.819-1.008, **k=4 0.686-0.940**, k=8 0.495-0.824. It ships for k=1 only. The nonzero axis
+   is refuted at k=4 by measurement, not by my instruction count.
+
+2. `SCORCH_NARROWK_EXACT_HI_F32=4`. **The reason filed in `80b6134` was wrong** -- I wrote that
+   EXACT_HI is harmful above 1e6 nnz "which is where the residues sit", and the ten chain207
+   residues run 59884 to 512834 nonzeros, every one BELOW 1e6. Credit to the checker session for
+   catching it. The lever is nonetheless dead for a stronger reason stated in `mrbuild.sh`:
+   `scorch_spmm_row_narrow_exact` is **scalar**, K loads and K FMAs per nonzero at 26-29
+   instructions against the half-vector block's 11.5, and MKT takes LESS time at k=4 than at k=3
+   on five matrices (af_2_k101 864.9us against 1515.7) *because k=4 is the one width of the three
+   that runs a vector kernel*. EXACT_HI=4 would move k=4 off the vector kernel.
+
+3. The per-nonzero address multiply. The exact kernel's 6-8% win at k=2/3 decomposes into mask
+   removal plus imul removal; `HALFVEC_F32=1` already took the mask at k=4 (+10.1%), leaving the
+   imul unclaimed. Priced statically: the shipped template called with a literal stride instead of
+   a runtime one emits **97 instructions against 99, with 10 `imul` becoming 10 `shl`**. Latency
+   only (3 cycles to 1) on address chains that are already independent across nonzeros, since `pA`
+   is not data-dependent. Too small to be a 13-23% mechanism.
+
+4. The register-block prefetch stays closed (chain197). Its own "9 of 23 instructions" was a
+   static listing count used as a cost model and named the wrong nine.
+
+**DENSITY looked like the mechanism and does not survive matching.** On DLMC at k=4, S=ours/mkl
+rises monotonically with density -- 0.440/0.902/0.925/1.028/1.096 by quintile -- crosses parity in
+the 20-35% band, has every one of the 10 residues above the 60th percentile and 7 above the 86th,
+and **reverses sign at k=16** (0.490 to 0.781), which is the negative control a per-nonzero-overhead
+story predicts. All four pre-registered predictions passed. It still is not the cause:
+
+    density        SuiteSparse S(k=4)   DLMC S(k=4)
+    0-1%                 0.645             0.337
+    10-20%               0.258             0.926
+    35-60%               0.237             1.097
+    60-101%              0.335             1.037
+
+Matched on absolute density the two collections run in OPPOSITE directions and sit 4.6x apart.
+A density gate built on the DLMC evidence alone would have been overfitting to one collection.
+
+**But that comparison was itself unmatched, on size.** SuiteSparse's >=20%-dense population has
+median 190 rows and 13936 nonzeros; DLMC's has median 512 and 108439. Exactly **5** SuiteSparse
+matrices are >=20% dense AND in DLMC's size range, and on those the k=4 reading is **0.9195**, not
+0.2371 -- with the densest, `cari` at 31.8%, over parity at **1.0498**. So the regime reproduces
+across collections and SuiteSparse barely samples it, which is why its board carries 7-9 k=4
+residues against DLMC's 8 of 10. All 5 sit inside the 9.5% k=4 floor, so they fix the regime
+without establishing the deficit by themselves.
+
+**THE MECHANISM, from absolute time per nonzero.** MKL is not switching algorithms; both curves are
+smooth in density with no discontinuity. DLMC, k=4, nanoseconds per nonzero:
+
+    density      ours     mkl      ratio
+    2-5%         0.9563   1.0636   0.899
+    5-10%        0.4940   0.5396   0.916
+    10-20%       0.2748   0.2849   0.965
+    20-35%       0.2044   0.1962   1.042
+    35-60%       0.1556   0.1380   1.127
+    60-101%      0.1632   0.1379   1.183
+
+Density makes both implementations 6-8x faster per nonzero. MKL extracts **7.7x** where we extract
+**6.1x**. At k=16 the two gains are the same (6.4x against 6.5x) and the ratio is flat at 0.82-0.84.
+
+At k=4 float32 a B row is 16 bytes, so **one 64-byte line holds four consecutive B rows**. At 50%
+density consecutive column indices differ by about 2, so the line fetched for one nonzero already
+contains the next two or three. Our kernel issues one independent `_mm_loadu_ps` per nonzero and
+never reuses the line. At k=16 a B row is exactly one line and no sharing is possible -- which is
+why the gradient flattens there. The effect can only exist where `k * sizeof(T) < 64`, and it is
+largest at the narrowest vector width, which is k=4.
+
+So the next mechanism is line reuse across consecutive columns, and it is explicitly NOT the
+multi-row kernel, whose own comment says "NOT line reuse: this kernel loads ROWS *different* B rows
+per iteration". Nothing is implemented and nothing ships on this entry.
