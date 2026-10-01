@@ -41,6 +41,29 @@ import time
 LINE = re.compile(r"---\s+p(\d+)\s+(\S+)\s+(start|done)\s+(\d\d):(\d\d):(\d\d)")
 
 
+def _refuse(msg, *args):
+    """The ONE producer of a refusal string. Every error exit in this module calls it.
+
+    WHY A SINK RATHER THAN A SHAPE. Two coverage predicates in a row had a premise this
+    file could fall through, each found by a planted exit that the predicate could not
+    see. A LEXICAL one -- a string constant beginning "REFUSE:" -- missed an exit spelled
+    differently, and missed this module's own helper refusal, whose literal began with
+    two spaces. A STRUCTURAL one -- a `return` of a list display whose elements are
+    Constant or BinOp -- missed an f-string element, and would miss `"...".format(x)` (a
+    Call) or a message bound to a name first. Lexical to structural narrowed the premise
+    rather than removing it, and an enumeration of expression kinds cannot be completed.
+
+    A named sink has no premise. The coverage population is the set of CALL SITES of this
+    function: exact regardless of how the message is built, what the caller returns, or
+    how the literal is spelled. The projectors return `[_refuse(...)]` and the helpers
+    return `_refuse(...)`. And the convention is ENFORCED rather than assumed -- the
+    self-test fails if any "REFUSE" literal appears outside a call to this function,
+    which is the check that was missing when the lexical predicate silently dropped a
+    live path out of its own denominator.
+    """
+    return "REFUSE: " + (msg % args if args else msg)
+
+
 def _secs(h, m, s):
     return int(h) * 3600 + int(m) * 60 + int(s)
 
@@ -81,13 +104,13 @@ def durations(ev):
 def project(path, rounds, now=None):
     ev = parse(path)
     if not ev:
-        return ["REFUSE: no pass lines matched in %s" % path]
+        return [_refuse("no pass lines matched in %s", path)]
     per, running = durations(ev)
     builds = sorted(set(b for _p, b, _k, _t in ev))
     missing = [b for b in builds if not per.get(b)]
     if missing:
-        return ["REFUSE: no landed pass for build(s) %s, so their mean does not exist; "
-                "a pooled substitute would be a different estimator" % ",".join(missing)]
+        return [_refuse("no landed pass for build(s) %s, so their mean does not exist; "
+                "a pooled substitute would be a different estimator", ",".join(missing))]
     landed = sum(len(v) for v in per.values())
     total = rounds * len(builds)
     out = ["  estimator: finish = last-start + SUM_builds mean(landed) * remaining",
@@ -99,15 +122,15 @@ def project(path, rounds, now=None):
         mean = sum(v) / len(v)
         rem = rounds - len(v)
         if rem < 0:
-            return ["REFUSE: build %s has %d landed passes but only %d rounds were "
-                    "declared -- the rotation or the round count is wrong" % (b, len(v), rounds)]
+            return [_refuse("build %s has %d landed passes but only %d rounds were "
+                    "declared -- the rotation or the round count is wrong", b, len(v), rounds)]
         rem_s += mean * rem
         out.append("    %-5s landed %d  durations %-22s mean %8.3f  remaining %d"
                    % (b, len(v), ",".join(str(x) for x in v), mean, rem))
     if now is not None and rem_s >= 86400:
-        return ["REFUSE: %.0f s remain, which is a day or more. The log's timestamps "
+        return [_refuse("%.0f s remain, which is a day or more. The log's timestamps "
                 "are bare wall clocks, so the elapsed time on the open pass cannot be "
-                "distinguished from itself plus a multiple of 24 h" % rem_s]
+                "distinguished from itself plus a multiple of 24 h", rem_s)]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, total - landed))
     if running is None:
         base = max(t for _p, _b, _k, t in ev)
@@ -198,10 +221,9 @@ def _to_go_line(rem_s, elapsed, now_sod, exact=True):
     nothing in the figure revealed which one it was.
     """
     if elapsed < 0:
-        return ("  REFUSE: the open pass's start is %s AFTER the given `now` of %s. No "
+        return (_refuse("the open pass's start is %s AFTER the given `now` of %s. No "
                 "live run can be in that state -- check for clock skew between hosts, a "
-                "stale `now`, or a fixture built ahead of the real clock"
-                % (dur(-elapsed), hms(now_sod)))
+                "stale `now`, or a fixture built ahead of the real clock", dur(-elapsed), hms(now_sod)))
     left = rem_s - elapsed
     at = "" if exact else "at least "
     note = "" if exact else (" (`elapsed` is known only modulo 24 h: both endpoints "
@@ -245,28 +267,27 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
     """
     fs = read_mtimes(d, pattern)
     if len(fs) < 3:
-        return ["REFUSE: %d file(s) matched in %s -- a difference-of-completions "
-                "estimator needs at least two landed passes plus an open one" % (len(fs), d)]
+        return [_refuse("%d file(s) matched in %s -- a difference-of-completions "
+                "estimator needs at least two landed passes plus an open one", len(fs), d)]
     sizes = [x[1] for x in fs]
     openf = None
     if sizes[-1] < min(sizes[:-1]):
         openf = fs[-1]
         landed = fs[:-1]
     else:
-        return ["REFUSE: the newest file %s is %d bytes and not smaller than every "
+        return [_refuse("the newest file %s is %d bytes and not smaller than every "
                 "landed file (min %d), so the open pass cannot be identified by size; "
                 "its mtime is a moving target and including it would attribute a "
-                "near-zero duration to an unfinished pass"
-                % (fs[-1][4], sizes[-1], min(sizes[:-1]))]
+                "near-zero duration to an unfinished pass", fs[-1][4], sizes[-1], min(sizes[:-1]))]
     builds = sorted(set(x[2] for x in fs))
     per = {}
     for i in range(1, len(landed)):
         per.setdefault(landed[i][2], []).append(landed[i][0] - landed[i - 1][0])
     nolast = [b for b in builds if not per.get(b)]
     if nolast:
-        return ["REFUSE: build(s) %s have no pass with a measurable duration. A "
+        return [_refuse("build(s) %s have no pass with a measurable duration. A "
                 "completion-difference needs a predecessor, so the earliest file "
-                "contributes none" % ",".join(nolast)]
+                "contributes none", ",".join(nolast))]
     n_landed = len(landed) + 1          # the open pass counts against its build's rounds
     out = ["  estimator: finish = open pass's start + SUM_builds mean(landed) * remaining",
            "  input: per-pass COMPLETION mtimes, so each duration is a difference "
@@ -289,8 +310,8 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
         done = sum(1 for x in fs if x[2] == b)
         rem = rounds - done + (1 if b == openf[2] else 0)
         if rem < 0:
-            return ["REFUSE: build %s already has %d files but only %d rounds were "
-                    "declared" % (b, done, rounds)]
+            return [_refuse("build %s already has %d files but only %d rounds were "
+                    "declared", b, done, rounds)]
         rem_s += mean * rem
         rem_n += rem
         out.append("    %-5s durations %-34s mean %9.3f  remaining %d"
@@ -307,10 +328,9 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
     # is conditioned on a different stretch of the run.
     counts = {b: sum(1 for x in fs if x[2] == b) for b in builds}
     if max(counts.values()) - min(counts.values()) > 1:
-        return ["REFUSE: the rotation is not balanced -- file counts %s differ by %d. "
+        return [_refuse("the rotation is not balanced -- file counts %s differ by %d. "
                 "The schedule is meant to hold them within one, so each build's mean "
-                "would be conditioned on a different stretch of the run"
-                % (dict(sorted(counts.items())),
+                "would be conditioned on a different stretch of the run", dict(sorted(counts.items())),
                    max(counts.values()) - min(counts.values()))]
     base = landed[-1][0]
     fin = base + rem_s
@@ -318,9 +338,9 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
     # date, so a remainder over a day is no longer ambiguous and refusing would be
     # refusing a question the inputs can answer.
     if now is not None and now_epoch is None and rem_s >= 86400:
-        return ["REFUSE: %.0f s remain, which is a day or more, and `now` was given "
+        return [_refuse("%.0f s remain, which is a day or more, and `now` was given "
                 "as a bare clock. Pass a real clock instead -- an mtime carries a "
-                "date, so that route has no ambiguity to refuse" % rem_s]
+                "date, so that route has no ambiguity to refuse", rem_s)]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, rem_n))
     # LOCAL time, not `epoch % 86400`. st_mtime is epoch UTC and the log mode reads a
     # local wall clock out of the log text, so a UTC rendering here put the two modes

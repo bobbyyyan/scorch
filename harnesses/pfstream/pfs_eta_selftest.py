@@ -41,35 +41,40 @@ RX = r"dl_(?P<build>[a-z_]+)_float32_p(?P<pass>[0-9]+)\.csv"
 
 
 def early_exits():
-    """Line numbers of every EARLY ERROR EXIT in pfs_eta.py, found STRUCTURALLY.
+    """Line numbers of every EARLY ERROR EXIT: the CALL SITES of pfs_eta._refuse, plus
+    every sys.exit. A named sink, not a shape and not a spelling.
 
-    The predicate is `return [<...string literal...>]` plus any `sys.exit(...)` -- a
-    shape, not a spelling. The previous version matched string constants beginning
-    "REFUSE:", which removed the enumeration premise about WHICH refusals to list but
-    kept one about how a refusal is SPELLED. A reachable early exit added without that
-    prefix was absent from the DENOMINATOR rather than reported as uncovered, so the
-    file printed "10 of 10 / OK" with an unplanted path live -- the
-    null-indistinguishable-from-failure shape inside the instrument built to prevent it.
+    THREE PREDICATES, TWO OF WHICH HAD A PREMISE THE FILE FELL THROUGH. Each was found
+    by a planted exit the predicate could not see:
 
-    The shape is the right predicate here because every normal return in this module
-    returns a NAME (`out`), never a list display: the projectors accumulate their report
-    in a variable. So a returned list of literals is an error exit by construction, and
-    the convention being relied on is the module's structure rather than its wording.
-    If a normal path ever returns a list display, this will demand a plant for it and
-    that demand is the correct signal to re-read this docstring.
+      * LEXICAL -- a string constant beginning "REFUSE:". Missed an exit worded
+        differently, and missed the module's own helper refusal, whose literal began
+        with two spaces so `.startswith("REFUSE:")` was False. The unplanted path left
+        the DENOMINATOR rather than the numerator, so the ratio read 10 of 10 and OK.
+      * STRUCTURAL -- a `return` of a list display with a Constant or BinOp element.
+        Missed an f-string element (an ast.JoinedStr), and would miss `.format()` (a
+        Call) or a message bound to a name first. It also could not see a refusal in a
+        HELPER, which returns a string rather than a list -- and the justification it
+        rested on, "every normal return returns a NAME", holds exactly inside the two
+        projectors and NOT module-wide: all eight helper returns are BinOps. So the
+        reasoning was right about the projectors and overstated about the module, and
+        the gap is exactly where the newest refusal landed.
+      * THIS ONE -- call sites of a single named function. Exact regardless of how the
+        message is built, how the literal is spelled, or what the caller returns.
+
+    Enumerating expression kinds cannot be completed; naming the sink removes the need
+    to. The remaining assumption -- that every refusal goes through the sink -- is
+    CHECKED by t_refuse_sink_is_the_only_producer rather than assumed, which is the step
+    missing from both earlier predicates.
     """
     t = ast.parse(open(TARGET).read())
     out = set()
     for n in ast.walk(t):
-        if isinstance(n, ast.Return) and isinstance(n.value, ast.List):
-            if any(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                   for e in n.value.elts) or any(
-                       isinstance(e, ast.BinOp) and isinstance(e.left, ast.Constant)
-                       and isinstance(e.left.value, str) for e in n.value.elts):
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name) and n.func.id == "_refuse":
                 out.add(n.lineno)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
-                and n.func.attr == "exit":
-            out.add(n.lineno)
+            if isinstance(n.func, ast.Attribute) and n.func.attr == "exit":
+                out.add(n.lineno)
     return out
 
 
@@ -415,6 +420,62 @@ def t_usage_exits():
             FAIL.append("cli/usage %r: rc=%d stderr=%r" % (args, rc, e))
 
 
+def t_refuse_sink_is_the_only_producer():
+    """ENFORCE the convention the coverage predicate rests on, rather than assume it.
+
+    Both earlier predicates assumed something about refusals and neither checked it, so a
+    non-conforming exit silently left the population. The sink's population is exact only
+    while every refusal goes through the sink -- so this fails if any "REFUSE" literal in
+    pfs_eta.py sits outside a `_refuse(...)` call. Docstrings and the sink's own body are
+    excluded by SCOPE, computed from the AST, not by a list of allowed line numbers.
+    """
+    global CHECKS
+    CHECKS += 1
+    src = open(TARGET).read()
+    t = ast.parse(src)
+    ok = set()
+    for n in ast.walk(t):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_refuse":
+            ok.update(id(c) for c in ast.walk(n))
+        if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)):
+            d = ast.get_docstring(n, clean=False)
+            if d is not None and n.body:
+                ok.update(id(c) for c in ast.walk(n.body[0]))
+        if isinstance(n, ast.FunctionDef) and n.name == "_refuse":
+            ok.update(id(c) for c in ast.walk(n))
+    stray = [(n.lineno, n.value[:60]) for n in ast.walk(t)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)
+             and "REFUSE" in n.value and id(n) not in ok]
+    if stray:
+        FAIL.append("refuse-sink: %d REFUSE literal(s) outside a _refuse() call, so the "
+                    "coverage population is not exact: %s" % (len(stray), stray))
+
+
+def t_coverage_population_is_not_vacuous():
+    """The population must be non-trivial and must include the HELPER refusal.
+
+    A sink predicate that found zero call sites would print "0 of 0" and read as full
+    coverage -- the same vacuity as the ratio it replaced. And the specific path the
+    structural predicate could not see was the one in _to_go_line, so its presence is the
+    regression test for finding 7 at the population level rather than the verdict level.
+    """
+    global CHECKS
+    CHECKS += 1
+    t = ast.parse(open(TARGET).read())
+    in_helper = []
+    for f in ast.walk(t):
+        if isinstance(f, ast.FunctionDef) and f.name == "_to_go_line":
+            in_helper = [n.lineno for n in ast.walk(f) if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name) and n.func.id == "_refuse"]
+    n = len(early_exits())
+    if n < 8:
+        FAIL.append("population: only %d early exits found -- a ratio over a near-empty "
+                    "population reads as coverage" % n)
+    if not in_helper:
+        FAIL.append("population: _to_go_line has no _refuse call site, so the helper "
+                    "refusal is outside the coverage population again (finding 7)")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
@@ -429,7 +490,7 @@ def main():
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
     print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
-          "(found structurally, not by prefix)" % (len(TESTS), CHECKS, len(want)))
+          "(call sites of the _refuse sink, plus sys.exit)" % (len(TESTS), CHECKS, len(want)))
     print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:
