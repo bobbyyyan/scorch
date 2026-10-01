@@ -72,7 +72,7 @@ print()
 print("PAIRED CONTRAST %s/%s per width -- base cancels, so this is the arm against its own floor."
       % (ARM, FLOOR))
 print("  %-4s %8s %24s %14s %7s  %s"
-      % ("k", "n", "deep/bsb_  [95% CI]", "contains 1?", "frac<1", "index-matrix sha256"))
+      % ("k", "n", "deep/bsb_  [95% CI]", "contains 1?", "n<1/boot", "index-matrix sha256"))
 verdicts, ci = {}, {}
 for k in KS:
     keys = sorted(key for (key, kk) in A if kk == k)
@@ -94,11 +94,18 @@ for k in KS:
     # that "contains 1" can be a bare pass, and a control that passes at the edge is a different
     # statement from one that passes in the middle. Reported as the fraction of resampled medians
     # below 1, which is the one-sided p against the null directly.
-    frac = float(np.mean(meds < 0.0))
-    verdicts[k] = (inside, frac, point)
+    # THE COUNT, not a fraction. The estimate's resolution is 1/NBOOT, so the smallest nonzero
+    # value this can take is 0.0005 and "0.000" means "0 of 2000" -- p < 1/2000 and nothing finer.
+    # A decimal hides that resolution, reads as an exact zero probability, and keeps the resample
+    # count out of sight at exactly the point where a reader would ask whether it was enough.
+    # The display's floor and the estimate's floor are different quantities, and the display is the
+    # one being read.
+    nlt = int(np.count_nonzero(meds < 0.0))
+    verdicts[k] = (inside, nlt, point)
     ci[k] = (lo, hi)
-    print("  %-4d %8d %8.4f [%.4f,%.4f] %14s  %5.3f  %s"
-          % (k, n, point, lo, hi, "CONTAINS 1" if inside else "excludes 1", frac, dig))
+    print("  %-4d %8d %8.4f [%.4f,%.4f] %14s %9s  %s"
+          % (k, n, point, lo, hi, "CONTAINS 1" if inside else "excludes 1",
+             "%d/%d" % (nlt, NBOOT), dig))
 
 print()
 print("Serialisation of each digest: int32, C order, shape (%d, n), little-endian; keys sorted"
@@ -125,7 +132,7 @@ print()
 # cell IS that artefact, measured directly on these objects at n=3820 with an interval, which is
 # what chain185's own lesson says to do.
 if 2 in verdicts:
-    _, frac2, point2 = verdicts[2]
+    _, _nlt2, point2 = verdicts[2]   # the count is in the table; the control reports a magnitude
     lo2, hi2 = ci[2]
     disp = 100 * (point2 - 1)
     band = (100 * (lo2 - 1), 100 * (hi2 - 1))
