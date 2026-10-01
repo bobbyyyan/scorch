@@ -10,9 +10,23 @@ on the sd. A window samples whichever matrix sizes are in flight, so no window i
 run. An object-pass is a complete sweep of 3820 keys x 5 widths, so a whole pass IS the run's
 composition and an integer number of them has no phase selection in it.
 
-WHAT IT REFUSES ON. Snapshots whose done-counts are not consecutive integers; an interval that is
-not a whole number of object-passes; a missing done timestamp in the stage log; a CPU set that is
-not exactly 0-31; a snapshot with fewer than 32 cpu lines. A refusal is not a data point.
+WHAT IT REFUSES ON. Fewer than two snapshots; a snapshot whose CPU set is not exactly 0-31; a
+done-count with no corresponding done line; a snapshot offset outside the poll period; done
+timestamps that do not increase (a seconds-of-day wrap); and a done-line sequence that disagrees
+with the rotation the stage log declares. A refusal is not a data point.
+
+NON-CONSECUTIVE DONE-COUNTS ARE NOT REFUSED, DELIBERATELY: a 9->11 gap is two genuine object-passes
+and the whole-pass logic handles it. An earlier version of this file claimed that refusal and
+implemented it as `b["n"] - a["n"] != b["n"] - a["n"]`, a tautology that is always False -- a check
+that reads as verified and tests nothing. The claim is deleted rather than the check added.
+
+THE INDEX CROSSES BETWEEN TWO PATTERNS, WHICH IS WHY THE ROTATION ASSERTION EXISTS. pb_snap.sh
+counts done lines with `^    --- p[1-6] (aa|bb) done ` -- four literal spaces, no timestamp
+required. This file needs the timestamp, so a done line written without one would be counted by the
+poller and dropped here, leaving `done` short and every later index naming the WRONG PASS, silently.
+The label `(pass, object)` was already being captured and thrown away; it is now asserted against
+the order the stage log's own pass headers declare, which turns a silent misalignment into a
+refusal and is the only check here that is a function of the rotation rather than of counting.
 
 THE TWO OFFSETS ARE KNOWN, NOT BOUNDED. The poller tests every 15 s, so each snapshot lands delta
 seconds after its done line. Both deltas are computable here -- the stage log timestamps each done
@@ -40,8 +54,21 @@ for l in open(STAGE):
     if m:
         p, b, h, mi, s = m.groups()
         done.append(((int(p), b), int(h) * 3600 + int(mi) * 60 + int(s)))
+# the rotation the stage log DECLARES, from its pass headers -- an independent route to the order
+hdr = []
+for l in open(STAGE):
+    m = re.match(r"\s+=== pass p([1-6]) of \d+\s+order \[(aa|bb) (aa|bb)\]", l)
+    if m: hdr += [(int(m.group(1)), m.group(2)), (int(m.group(1)), m.group(3))]
 print("GUARDS")
-print("  stage log carries %d done lines" % len(done))
+print("  stage log carries %d done lines and declares %d object-passes in its headers"
+      % (len(done), len(hdr)))
+got = [k for k, _ in done]
+if got != hdr[:len(got)]:
+    sys.exit("  REFUSE: done-line order disagrees with the declared rotation.\n"
+             "    declared %s\n    observed %s\n"
+             "    a done line missing its timestamp is counted by the poller and dropped here, so "
+             "every later index would name the wrong pass." % (hdr[:len(got)], got))
+print("  G-ROT  done-line order matches the declared rotation for all %d landed passes" % len(got))
 
 # --- the snapshots
 snaps = []
@@ -68,8 +95,11 @@ P_EVEN = range(0, 16, 2)
 P_ODD = range(1, 16, 2)
 E_CPU = range(16, 32)
 
+POLL = 15          # pb_snap.sh's sleep, which calibrates both the offset guard and the bound
+OFFSET_MAX = POLL + 1   # one second for the grep that follows the sleep
+
 def interval(a, b):
-    if b["n"] - a["n"] != b["n"] - a["n"] or b["n"] <= a["n"]:
+    if b["n"] <= a["n"]:
         sys.exit("  REFUSE: non-increasing done-counts %d -> %d" % (a["n"], b["n"]))
     npass = b["n"] - a["n"]
     # the pass boundaries these snapshots followed
@@ -77,9 +107,15 @@ def interval(a, b):
         t_a, t_b = done[a["n"] - 1][1], done[b["n"] - 1][1]
     except IndexError:
         sys.exit("  REFUSE: stage log has no done line for count %d or %d" % (a["n"], b["n"]))
+    if t_b <= t_a:
+        sys.exit("  REFUSE: done timestamps %s -> %s do not increase; these are seconds-of-day with "
+                 "no date, so this is a midnight wrap and every elapsed figure below would be wrong."
+                 % (hms(t_a), hms(t_b)))
     da, db = a["tod"] - t_a, b["tod"] - t_b
-    if not (0 <= da <= 20 and 0 <= db <= 20):
-        sys.exit("  REFUSE: snapshot offsets %d s and %d s are outside the poll period" % (da, db))
+    if not (0 <= da <= OFFSET_MAX and 0 <= db <= OFFSET_MAX):
+        sys.exit("  REFUSE: snapshot offsets %d s and %d s are outside the %d s poll period, so a "
+                 "poll was missed and the residual bound below is not calibrated for them"
+                 % (da, db, POLL))
     elapsed = (b["ns"] - a["ns"]) / 1e9                      # exact, from epoch_ns
     pass_len = (t_b - t_a) / npass
     d = {c: b["cpu"][c] - a["cpu"][c] for c in range(32)}
@@ -96,8 +132,8 @@ def interval(a, b):
           % (tot, busy, 100 * busy / 24, 24 / busy))
     print("  P-even %d  P-odd %d (%.2f%% of P-logical)  E %d" % (pe, po, 100 * sib, e))
     print("  T_E/T_P  raw %.4f   sibling-stripped (both sides) %.4f" % (e / (pe + po), e / pe))
-    print("  residual phase term from |db - da| = %d s: %.4f in T (bound 0.003)"
-          % (abs(db - da), 0.003 * abs(db - da) / 15.0))
+    print("  residual phase term from |db - da| = %d s: %.4f in T (bound %.4f at the guard's %d s)"
+          % (abs(db - da), 0.003 * abs(db - da) / POLL, 0.003 * OFFSET_MAX / POLL, OFFSET_MAX))
     return {"npass": npass, "busy": busy, "T": e / pe, "Traw": e / (pe + po), "sib": sib}
 
 def hms(s): return "%02d:%02d:%02d" % (s // 3600 % 24, s // 60 % 60, s % 60)
