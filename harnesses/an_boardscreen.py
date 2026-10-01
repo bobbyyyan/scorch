@@ -29,13 +29,35 @@ multiplicity constant to hardcode, and the rate has to come from each board's ow
 max|r| with its permutation p is both correct and much stronger: chain207 reads p = 0.00011 at
 |r| = 0.963, chain210 p = 0.667 at 0.263, chain206 p = 0.894 at 0.204.
 
-A CLEAN SCREEN IS A BOUND, NOT A CLEARANCE. "chain206 stands" is a detection claim. The defensible
-form multiplies each board's wall-time spread in SECONDS by a reference sensitivity -- chain207's
-measured worst slope, 11.57% per 100 s at k=32 -- to get how much pass-varying contamination the
-spread admits: chain207 6.32%, chain210 1.04%, chain206 1.40%. chain206's bound sits BELOW the 2%
-P4 gate, which is the useful statement. Note that chain206's percentage spread equals chain210's at
-0.66% while its bound is 35% wider, because its passes are longer: seconds times slope is the
-comparable quantity across boards and a percentage spread is not.
+A CLEAN SCREEN IS A BOUND, NOT A CLEARANCE -- AND THE BOUND NEEDS NO SLOPE. "chain206 stands" is a
+detection claim. Two slope-based constructions were tried and both are withdrawn:
+
+  (a) wall spread in seconds x a REFERENCE slope (chain207's worst, 11.57%/100s). Not conservative:
+      that slope's own t-based 95% CI is [7.12, 16.01], so even chain207's bound is 8.48% at the
+      upper edge rather than 6.13%.
+  (b) wall spread x each board's OWN worst slope CI edge. This INVERTS the board ordering, because a
+      small wall spread gives little x-leverage and the slope CI widens faster than the spread
+      narrows: chain210's own k=4 CI is [-29.20, +35.92] against a 9 s range. Construction (a) ranks
+      chain210 cleanest at 1.04%; construction (b) ranks chain206 cleanest at 2.21%. An ordering
+      that depends on which slope is plugged in is not a measurement.
+
+What is used instead takes no parameter at all: a pass-varying mechanism can move a pass's ratio by
+at most the OBSERVED pass-to-pass spread of that ratio, which is measured directly. Worst width,
+(max-min)/mean: chain207 6.27%, chain210 5.79%, chain206 4.00%.
+
+The three constructions agree on the contaminated board and disagree on the clean ones, which is
+itself diagnostic: chain207's regression bound (6.13%) and its direct spread (6.27%) agree to 0.14
+points, because there the slope does capture nearly all the ratio movement. On the clean boards the
+regression bound is 4-6x TIGHTER than the quantity it claims to bound -- the signature of a bound
+resting on a parameter the data cannot pin.
+
+THE BOUND IS ON VARIATION, AND P4 GATES THE LEVEL. These are different quantities and must not be
+compared. A perturbation sitting on all twelve passes at 4% with +/-1% jitter has a 2% spread and a
+4% level, so no bound on pass-to-pass variation constrains it at all. An earlier version of this
+file put the variation bound next to the 2% P4 reproducibility gate; that was a category error and
+it is withdrawn. The two honest sentences are: this screen bounds within-run pass-to-pass variation
+at X%, and it bounds the LEVEL at nothing -- which is why a second run is the only thing that
+catches a constant offset, and why the screen and P4 are complementary rather than redundant.
 
 WHAT IT CANNOT DO. It detects a perturbation that VARIES across passes. A perturbation constant for
 a whole run shifts every pass equally, leaves no within-run slope, and is invisible here -- the
@@ -97,6 +119,11 @@ def perm_max_r(W, per, ks, draws, seed):
             series[k] = ys
     if not series:
         return float("nan"), float("nan"), {}
+    if set(series) != set(ks):
+        sys.exit("REFUSE: widths %s are complete in the table but incomplete across passes, so the "
+                 "permutation maximum would be taken over a SMALLER width set than the table shows. "
+                 "If the dropped width is the extreme one the p-value understates, which is a false "
+                 "clearance." % sorted(set(ks) - set(series)))
     obs = {k: abs(pearson(walls, series[k])[0]) for k in series}
     mobs = max(obs.values())
     rng = random.Random(seed)
@@ -110,7 +137,9 @@ def perm_max_r(W, per, ks, draws, seed):
     return mobs, (hits + 1.0) / (draws + 1.0), obs
 
 
-def screen(d, draws=20000, seed=20261001, ref_slope=11.57):
+# 200k draws: the add-one estimator floors at 1/(draws+1), and at 20k that is 5.0e-5 while
+# chain207 lands 2-3 hits above it, so the printed digits past the first moved with the seed.
+def screen(d, draws=200000, seed=20261001):
     stages = glob.glob(os.path.join(d, "*_stage.log"))
     if len(stages) != 1:
         sys.exit("REFUSE: %d files match *_stage.log in %s -- no unambiguous source of per-pass "
@@ -187,18 +216,32 @@ def screen(d, draws=20000, seed=20261001, ref_slope=11.57):
         print("  k=%-3d %11.3f %7d %15.4f %9s" % (k, r, len(xs), sl, "OVER" if hit else "-"))
     print()
     mx, pp, obs = perm_max_r(W, per, ks, draws, seed)
-    bound = (ws[-1] - ws[0]) * ref_slope / 100.0
-    print("  max|r| = %.3f at k=%s ; permutation p = %.5f (%d draws, pass labels permuted so the"
+    print("  max|r| = %.3f at k=%s ; permutation p = %.5f (%d draws; pass labels permuted, so the"
           % (mx, [k for k in obs if abs(obs[k]) == mx][0] if obs else "?", pp, draws))
-    print("    width-to-width dependence and the five-width maximum are both in the null)")
-    print("  P(>=1 width over the per-width critical value) under the same null: see the docstring --")
-    print("    it runs 0.111 to 0.197 on boards of this design, so a WIDTH COUNT is not evidence here.")
+    print("    width-to-width dependence and the five-width maximum are both carried by the null)")
+    print("    A WIDTH COUNT is not used: P(>=1 width over the per-width critical value) runs 0.111")
+    print("    to 0.197 on boards of this design, and P(>=2) runs 0.044 to 0.105, so neither is")
+    print("    evidence at n=%d and there is no multiplicity constant to hardcode." % len(W))
     print()
-    print("  ADMISSIBLE CONTAMINATION, which is what a clean screen actually licenses:")
-    print("    wall spread %.1f s x %.2f%%/100s (chain207's measured worst slope) = %.2f%% in the ratio"
-          % (ws[-1] - ws[0], ref_slope, bound))
-    print("    Compare against the 2% P4 reproducibility gate. Seconds x slope is the comparable")
-    print("    quantity across boards; a PERCENTAGE spread is not, since longer passes admit more.")
+    # The parameter-free bound: a pass-varying mechanism cannot move a pass's ratio by more than
+    # the ratio's own observed pass-to-pass spread.
+    worst, wk = 0.0, None
+    for k in ks:
+        ys = []
+        for key in per:
+            if key not in W or k not in per[key]: continue
+            o, m = per[key][k].get("ours"), per[key][k].get("mkl")
+            if not o or not m: continue
+            ys.append(med(o) / med(m))
+        if len(ys) < 6: continue
+        sp = (max(ys) - min(ys)) / (sum(ys) / len(ys))
+        if sp > worst: worst, wk = sp, k
+    print("  WHAT A CLEAN SCREEN LICENSES, with no slope and no regression in it:")
+    print("    observed pass-to-pass spread of the ratio, worst width (k=%s): %.2f%%" % (wk, 100 * worst))
+    print("    A pass-varying mechanism cannot move a pass's ratio by more than this, by definition.")
+    print("    This bounds VARIATION. It bounds the LEVEL at nothing: a perturbation sitting on every")
+    print("    pass equally has zero spread and an arbitrary level, so only a SECOND RUN catches it.")
+    print("    Do not compare this figure to a level gate -- that is a category error.")
     print()
     if pp <= 0.01:
         print("  SCREEN: FLAGGED at p = %.5f. A pass's own wall time predicts its ratio. Treat this" % pp)
@@ -206,10 +249,8 @@ def screen(d, draws=20000, seed=20261001, ref_slope=11.57):
     elif pp <= 0.05:
         print("  SCREEN: BORDERLINE at p = %.5f. Not a clearance and not a flag; replicate." % pp)
     else:
-        print("  SCREEN: no pass-varying signal (p = %.5f). The claim is the BOUND above, %.2f%%," % (pp, bound))
-        print("  not that the board is clean. And it is bounded only against a perturbation that")
-        print("  VARIES across passes: one constant for a whole run shifts every pass equally, leaves")
-        print("  no within-run slope, and is invisible here. Only a second run catches that.")
+        print("  SCREEN: no pass-varying signal (p = %.5f). The claim is the %.2f%% variation bound" % (pp, 100 * worst))
+        print("  above, not that the board is clean, and nothing here constrains a constant offset.")
 
     # Between-object confound: on a multi-object board the pooled slope could be picking up a
     # systematic difference BETWEEN objects rather than a within-run perturbation. Measured, not
