@@ -36,10 +36,13 @@ MEMOP = re.compile(r"-?(0x[0-9a-f]+)?\(%[a-z0-9]+(,%[a-z0-9]+(,[0-9])?)?\)")
 NOTMEM = ("lea", "nop")
 
 
-def hot_loop(ins):
-    """The hot loop is the body of the largest backward jump inside the function."""
+EPILOGUE = ("ret", "pop", "push", "call")
+
+
+def spans(ins):
+    """Every backward-jump span in the function, as (target, jump) address pairs."""
     addrs = {a for a, _, _ in ins}
-    best = None
+    out = set()
     for a, mn, ops in ins:
         if not mn.startswith("j"):
             continue
@@ -48,11 +51,48 @@ def hot_loop(ins):
             continue
         t = int(m.group(1), 16)
         if t in addrs and t < a:
-            if best is None or (a - t) > (best[1] - best[0]):
-                best = (t, a)
-    if best is None:
+            out.add((t, a))
+    return sorted(out, key=lambda s: s[1] - s[0])
+
+
+def hot_loop(ins):
+    """The INNERMOST loop that contains every FMA -- not the largest backward jump.
+
+    THE DEFECT THIS REPLACES, and it was live. The previous version took the body of the
+    LARGEST backward jump. For V0/V1/V5 that is the vector loop and the answer was right. For
+    V6 and V7 -- the 4- and 8-chain candidates -- the largest backward jump spans almost the
+    whole function, so the "hot loop" came back as 302 and 315 bytes containing `pop`, `ret`,
+    the horizontal accumulator fold-down (`vshufps`/`vunpckhps`/`vaddps`/`vaddss`) and the
+    scalar remainder: 72 and 73 instructions where the real loops are 37 and 36. A span
+    containing `ret` is not a loop.
+
+    Why the registered checks survived it anyway, which is luck and not design: the extra span
+    contributes zero memory operands, zero broadcasts and zero `vpor`, so mem/nnz, bcast/nnz
+    and vpor/nnz all read correctly at 3.00/1.00/0.00. Only the instruction count was
+    contaminated -- and that is the axis a reader would use to ask whether a candidate kernel
+    got bigger. 9.000 insn/nnz on a 6-wide core is 1.50 cycles/nnz, which is close enough to
+    the measured 1.57 to have been adopted as a mechanism. The real figure is 4.625, giving
+    0.77, which rules that mechanism out. A guard whose guarantee is parameterised by the
+    control-flow shape of its input degraded silently on exactly the two variants it had never
+    seen.
+
+    So: enumerate the backward-jump spans, DISCARD any that contains a function epilogue or a
+    call, and among the rest take the SMALLEST that attains the maximum FMA count. Smallest
+    rather than largest is what makes it the innermost loop; the FMA-count tie-break is what
+    stops a peeled or remainder loop with fewer FMAs from being chosen over the main one.
+    """
+    cand = [(t, a) for t, a in spans(ins)
+            if not any(mn.startswith(EPILOGUE) for x, mn, _ in ins if t <= x <= a)]
+    if not cand:
         return []
-    return [(a, mn, ops) for a, mn, ops in ins if best[0] <= a <= best[1]]
+    def body(s):
+        return [x for x in ins if s[0] <= x[0] <= s[1]]
+    nf = {s: sum(1 for _, mn, _ in body(s) if mn.startswith("vfmadd")) for s in cand}
+    best = max(nf.values())
+    if best == 0:
+        return []
+    # `spans` is already sorted by size, so the first match is the smallest.
+    return body(next(s for s in cand if nf[s] == best))
 
 
 def profile(ins):
@@ -82,7 +122,7 @@ def profile(ins):
 
 
 P = {k: profile(v) for k, v in body.items()}
-print("HOT-LOOP PROFILE (instructions between the largest backward jump and its target)")
+print("HOT-LOOP PROFILE (innermost loop containing every FMA; spans with ret/pop/call refused)")
 print("  %-5s %6s %6s %5s %7s %7s %7s %7s %8s" %
       ("arm", "insn", "mem", "fma", "fma_mem", "bcast", "vpor", "vmov_m", "unroll"))
 print("  " + "-" * 70)

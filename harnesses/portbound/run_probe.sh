@@ -28,7 +28,28 @@ AC=$?
   echo "flags -O3 -march=native -funroll-loops -std=c++17"
   echo "asmcheck_exit $AC"
   sed -n '/^PER-NONZERO/,/^$/p' asmcheck.txt
-} > ATTEST.txt
+} > "ATTEST-${BIN:0:16}.txt"
+
+# WHY THE ATTESTATION IS NAMED BY THE BINARY AND NEVER OVERWRITTEN.
+# This script used to write a single ATTEST.txt in place. A re-run then clobbered the previous
+# run's attestation while leaving the previous run's CSVs on disk untouched -- the one combination
+# that makes an ALREADY PUBLISHED number unverifiable after the fact, because the CSV still names
+# a binary whose emitted counts and gate verdict no longer exist anywhere. It happened: the
+# attestation for binary ae683b29, which produced every P-core figure in commits 56b2350 and
+# a058bba, is gone. Found by the peer session reading the directory, not by this script.
+# So: one attestation file per binary digest, an append-only log, and the disassembly and source
+# kept under the same digest -- the disassembly because a later question about symbol PLACEMENT
+# across builds is answerable only if both builds' symbol addresses survive, and the previous
+# build's probe.asm did not.
+cp -f probe.asm "probe-${BIN:0:16}.asm"
+cp -f probe.cpp "probe-${BIN:0:16}.cpp"
+printf '%s  binary %s  source %s  asmcheck_exit %s  argv "%s %s %s %s"\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIN" "$SRC" "$AC" "$N" "$REPS" "$NB" "$SEED" >> ATTEST_LOG.txt
+# ATTEST.txt remains as a convenience pointer to the newest attestation. It is NOT the record:
+# the analyzer resolves each CSV's own digest to ATTEST-<digest>.txt and refuses if that file is
+# absent, so a stale CSV can never be read against a newer binary's attestation.
+cp -f "ATTEST-${BIN:0:16}.txt" ATTEST.txt
+
 if [ "$AC" -ne 0 ]; then
   echo "REFUSE: asmcheck rejected the emitted code; no timing is read."
   cat asmcheck.txt | tail -6

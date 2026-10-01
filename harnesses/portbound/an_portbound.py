@@ -22,7 +22,7 @@ REGISTERED PREDICTIONS. Let s be one load-port slot in ns per nonzero.
 REFUTATION, registered verbatim: "if t(V5) is at t(V1) rather than at t(V0), or if V4 is free, the
 line-reuse kernel cannot pay and the lever is closed." That result gets reported, not worked around.
 """
-import collections, csv, math, statistics, sys
+import re, collections, csv, math, os, statistics, sys
 
 red = lambda v: math.exp(statistics.median([math.log(x) for x in v]))
 dev = lambda x: math.exp(abs(math.log(x))) - 1.0
@@ -47,6 +47,42 @@ def load(path):
         a, r, v = ln.strip().split(",")
         T[a][int(r)] = float(v)
     return hdr, T, binsha
+
+
+def resolve_attest(csv_path, att_arg):
+    """Resolve the attestation for the binary THIS CSV names, not for whatever is newest.
+
+    The failure this exists to make impossible: a re-run overwrites a single-slot attestation
+    while the previous run's CSVs stay on disk, so a published number's gate verdict and emitted
+    counts vanish and the CSV silently reads against a different binary's attestation. Naming the
+    attestation by digest turns that into a missing file, which is loud.
+    """
+    want = None
+    for ln in open(csv_path):
+        t = ln.split()
+        if len(t) == 3 and t[0] == "#" and t[1] == "binary_sha256":
+            want = t[2]
+            break
+        if not ln.startswith("#"):
+            break
+    if want is None:
+        sys.exit("REFUSE: %s carries no '# binary_sha256' line, so it cannot be bound to a "
+                 "binary." % csv_path)
+    d = os.path.dirname(os.path.abspath(att_arg)) or "."
+    cand = os.path.join(d, "ATTEST-%s.txt" % want[:16])
+    if os.path.exists(cand):
+        return cand
+    # Backward compatibility with the single-slot era, but only when it actually matches.
+    if os.path.isfile(att_arg):
+        for ln in open(att_arg):
+            t = ln.split()
+            if len(t) == 2 and t[0] == "binary_sha256" and t[1] == want:
+                return att_arg
+    sys.exit("REFUSE: %s names binary %s but no attestation for it exists.\n"
+             "  looked for %s\n"
+             "  and %s does not record that digest.\n"
+             "  A CSV whose attestation is gone is unverifiable; it is not readable against a "
+             "different binary's attestation." % (csv_path, want[:16], cand, att_arg))
 
 
 def attest(path):
@@ -177,14 +213,53 @@ if __name__ == "__main__":
     for i in range(2, len(sys.argv), 2):
         if i > 2:
             print()
-        report(sys.argv[i], sys.argv[i + 1], bs, cnt)
+        # Each CSV resolves its OWN attestation by the digest it carries.
+        att_i = resolve_attest(sys.argv[i + 1], sys.argv[1])
+        bs_i, cnt_i = attest(att_i)
+        report(sys.argv[i], sys.argv[i + 1], bs_i, cnt_i)
     print()
-    print("  THE FLOOR IS AN ARM FLOOR, NOT A LAYOUT FLOOR, which bounds what the three small")
-    print("  readings can claim. V0b is the SAME variant recompiled under a second symbol, so the")
-    print("  p95 above measures re-running the same code -- not running different code at a")
-    print("  different address. Two objects with identical DECISIONS have measured 1-2.6% apart on")
-    print("  narrow-k SpMM and identical SOURCE at different addresses about 0.3%. So V1, V2 and V3")
-    print("  at 0.57-1.41% are an UPPER BOUND on the per-load gain, not established effects: that")
-    print("  range is the size layout alone can produce. The refutation is untouched either way --")
-    print("  V5 against V1 is 0.007%, inside even a 1% layout-scale floor, and V5 against V0 is")
-    print("  1.08%, 17x the arm floor -- so the test still discriminates its two alternatives.")
+    # ---- is the A/A floor a PLACEMENT floor? Derived from the disassembly, never asserted.
+    # The earlier text here said V0b "measures re-running the same code -- not running different
+    # code at a different address", and imported a 0.3-2.6% layout floor from narrow-k SpMM on a
+    # different harness to demote V1/V2/V3/V5 to upper bounds. That was wrong on the first clause
+    # and the second followed from it. V0b is a SEPARATE FUNCTION compiled from source identical
+    # to V0's, so it occupies a different address in the same binary -- which is exactly what a
+    # placement floor must vary. The addresses below decide it, and if the disassembly is absent
+    # the claim is withheld rather than assumed.
+    asm = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])) or ".", "probe.asm")
+    addr = {}
+    if os.path.exists(asm):
+        for ln in open(asm):
+            m = re.match(r"^([0-9a-f]+) <_Z[23]v(0b?|[1-7][bc]?)RK4Args>:", ln)
+            if m:
+                addr["V" + m.group(2)] = int(m.group(1), 16)
+    print("  IS THE A/A FLOOR A PLACEMENT FLOOR? The addresses say yes.")
+    if "V0" in addr and "V0b" in addr:
+        d = addr["V0b"] - addr["V0"]
+        print("    V0 at 0x%x, V0b at 0x%x -- %d bytes apart, so the linker did not fold them."
+              % (addr["V0"], addr["V0b"], d))
+        print("    Identical source, identical instruction count, DIFFERENT ADDRESS, same binary,")
+        print("    same process, interleaved repetitions. That is a placement floor by construction,")
+        print("    and it is the tightest one available: it varies address while holding the")
+        print("    instruction sequence, the binary, the process and the timing window fixed.")
+        print("    Caveat recorded rather than buried: both loop bodies land at the same offset mod")
+        print("    16, differing mod 32 and mod 64, so this floor varies cache-line and 32-byte")
+        print("    fetch alignment but not the 16-byte instruction-fetch offset. It is a floor over")
+        print("    the placements the linker actually produced, not over all placements.")
+    else:
+        print("    WITHHELD: probe.asm not found beside the attestation, so the addresses cannot")
+        print("    be checked and no placement claim is made. (looked for %s)" % asm)
+    print()
+    print("  SO THE SMALL ARMS ARE EFFECTS, NOT UPPER BOUNDS. Against a floor that already")
+    print("  contains placement, V1, V2, V3 and V5 at 0.19-1.42% clear it by 9x to 19x on both")
+    print("  core types. The 0.3-2.6% band previously quoted here came from narrow-k SpMM on a")
+    print("  different harness measuring whole-kernel objects, and it overstates this probe --")
+    print("  a single pinned loop, one thread, no allocation, no OpenMP -- by one to two orders")
+    print("  of magnitude. Importing a floor measured on a different instrument is the error; the")
+    print("  floor has to come from the instrument in hand.")
+    print()
+    print("  WHAT THAT DOES TO THE REFUTATION: strengthens it, and does not change its verdict.")
+    print("  V5 sits at -0.007 of the way from V1 to V0 with dev(V5/V1) = 0.00008 BELOW the")
+    print("  0.00075 floor, so V5 is AT V1 on a floor that now has placement in it. Restoring the")
+    print("  issue slot without restoring the load is free; the load port was not binding at two")
+    print("  accumulator chains. The registered refutation fired on the right floor.")
