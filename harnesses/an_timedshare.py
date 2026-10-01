@@ -36,8 +36,9 @@ THREE WAYS THE FACTOR IS ESTABLISHED, none of them relying on a carried memory o
 Agreement of (2)'s bound with (3)'s value is the guard: this script refuses if the reps it is told
 to use exceeds what the wall clock allows.
 
-WHAT IS STILL NOT TIMED. calibrate() makes 5 untimed calls and is called twice per cell (once for
-the shared ours/oursb batch, once for mkl), so 10 untimed kernel calls per cell. Priced at the
+WHAT IS STILL NOT TIMED. calibrate() makes 8 untimed calls -- three bare warm-ups then five it times -- and is
+called twice per cell (once for the shared ours/oursb batch, once for mkl), so 16 untimed
+kernel calls per cell. Priced at the
 per-call times in the same row, they are 0.3% of a pass -- the reason "outside the timed calls" and
 "outside the kernel" differ by almost nothing here, which is the opposite of what I expected when I
 opened this question.
@@ -55,7 +56,12 @@ occupancy is bounded on both sides and reported as an interval.
 """
 import collections, csv, glob, os, sys
 
-CAL_CALLS_PER_CALIBRATE = 5      # calibrate(): `for _ in range(5)`
+CAL_CALLS_PER_CALIBRATE = 8      # calibrate(): `fn(); fn(); fn()` THEN `for _ in range(5)`.
+                                 # I and the peer both wrote 5, missing the three warm-up
+                                 # calls on the line above the loop. They are kernel calls
+                                 # like any other. Pricing all 8 at the row's steady-state
+                                 # per-call time UNDERSTATES them, since a cold call at
+                                 # batch 1 is slower -- so this stays a lower bound.
 CALIBRATES_PER_CELL = 2          # batch_ours (shared by ours+oursb) and batch_mkl
 
 
