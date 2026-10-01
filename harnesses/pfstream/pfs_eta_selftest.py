@@ -307,6 +307,36 @@ def t_mt_pattern_must_name_its_groups():
            "PROJECTED FINISH", want_absent=("must name groups",))
 
 
+def t_mt_reports_what_it_skipped_so_an_empty_result_is_not_mistaken_for_no_passes():
+    """Adopted rule: a loop over a filesystem counts what it failed to take and prints it beside
+    the result. An empty list from a non-matching pattern was indistinguishable from an unstarted
+    run -- the vacuous pass looking like the clean one. read_mtimes returns tuples rather than
+    lines, so the report is on stdout and the plant captures it.
+    """
+    d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
+                      ("dl_b_float32_p1.csv", 400, (2, 0)),
+                      ("unrelated.txt", 100, (3, 0))])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        got = pfs_eta.read_mtimes(d, RX)
+    expect("mt/skip-counted", [buf.getvalue()], "2 entries matched")
+    expect("mt/skip-count-nonzero", [buf.getvalue()], "1 skipped")
+    expect("mt/skip-named", [buf.getvalue()], "unrelated.txt")
+    if len(got) != 2:
+        FAIL.append("mt/skip-returned: expected 2 matched entries, got %d" % len(got))
+
+    # The all-skipped case must say so, since the empty list alone reads as "no passes yet" to
+    # every projection downstream. This is the ablation: same directory, pattern that matches
+    # nothing, and the output must differ from the clean empty case.
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        got2 = pfs_eta.read_mtimes(d, r"nomatch_(?P<build>[a-z]+)_(?P<pass>[0-9]+)\.csv$")
+    expect("mt/all-skipped-flagged", [buf2.getvalue()], "NOTHING matched")
+    expect("mt/all-skipped-counted", [buf2.getvalue()], "3 skipped")
+    if got2 != []:
+        FAIL.append("mt/all-skipped-empty: expected [], got %r" % (got2,))
+
+
 def t_mt_pattern_must_compile():
     """An uncompilable pattern is the caller's typo and the tool can say so exactly."""
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),

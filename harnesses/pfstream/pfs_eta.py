@@ -346,14 +346,29 @@ def read_mtimes(d, pattern):
     # became unreachable. A new guard in front of existing validation can silence it; the
     # narrowest failure is diagnosed last.
     LC.require_end_anchored(pattern)
-    out = []
+    # COUNT WHAT THE LOOP DID NOT TAKE, AND PRINT IT BESIDE WHAT IT DID. A scope error in a
+    # PREDICATE produces a number a second party can disagree with; a scope error in an
+    # ITERATION produces a tidy table with no counterparty. That asymmetry is why a silent
+    # `continue` here is the dangerous form: a pattern that matches nothing -- a wrong directory,
+    # a renamed producer, a dtype that is not in these filenames -- returns an empty list and
+    # every projection downstream reads as "no passes yet" rather than "I could not parse any of
+    # the 24 files I saw". Reporting the skipped count makes the vacuous pass visibly different
+    # from the clean one.
+    out, skipped = [], []
     for f in sorted(os.listdir(d)):
         m = rx.match(f)
         if not m:
+            skipped.append(f)
             continue
         st = os.stat(os.path.join(d, f))
         out.append((st.st_mtime, st.st_size, m.group("build"), int(m.group("pass")), f))
     out.sort()
+    print("  read_mtimes: %d entries matched %r, %d skipped%s"
+          % (len(out), pattern, len(skipped),
+             ("; e.g. " + ", ".join(skipped[:3])) if skipped else ""))
+    if not out and skipped:
+        print("  ^ NOTHING matched while %d entries were present, so an empty projection below "
+              "is a pattern or directory error, not an unstarted run" % len(skipped))
     return out
 
 
