@@ -277,6 +277,43 @@ def t_log_day_or_more():
 
 
 # ------------------------------------------------------------- mtime-mode refusals
+def t_mt_pattern_must_name_its_groups():
+    """A pattern without both named groups used to raise a bare IndexError mid-loop.
+
+    Caught by running the tool on real output with a hand-written pattern, not by any
+    plant: the unstructured exception arrived from inside the file loop, where it is
+    indistinguishable from a corrupt or vanished file. Three inputs, because the guard
+    has to separate them -- no groups at all, one of the two, and a valid pattern that
+    must fall THROUGH to the real refusal rather than be swallowed by this one.
+    """
+    d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (10, 29)),
+                      ("dl_b_float32_p1.csv", 400, (10, 31)),
+                      ("dl_a_float32_p2.csv", 400, (10, 33)),
+                      ("dl_b_float32_p2.csv", 10, (10, 34))])
+    bare = r"dl_([a-z_]+)_float32_p([0-9]+)\.csv"
+    expect("mt/pattern-no-groups", call(pfs_eta.project_mtimes, d, bare, 2),
+           "REFUSE: the pattern")
+    expect("mt/pattern-no-groups-names-them", call(pfs_eta.project_mtimes, d, bare, 2),
+           "no groups at all")
+    half = r"dl_(?P<build>[a-z_]+)_float32_p([0-9]+)\.csv"
+    expect("mt/pattern-half-named", call(pfs_eta.project_mtimes, d, half, 2),
+           "it names ['build']")
+    # The input that must NOT refuse here, so the guard is not a blanket refusal.
+    expect("mt/pattern-valid-passes-through", call(pfs_eta.project_mtimes, d, RX, 2),
+           "PROJECTED FINISH", want_absent=("must name groups",))
+
+
+def t_mt_pattern_must_compile():
+    """An uncompilable pattern is the caller's typo and the tool can say so exactly."""
+    d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
+                      ("dl_b_float32_p1.csv", 400, (2, 0))])
+    expect("mt/pattern-uncompilable", call(pfs_eta.project_mtimes, d, r"dl_(?P<build>[a-z", 2),
+           "REFUSE: the pattern")
+    expect("mt/pattern-uncompilable-reason",
+           call(pfs_eta.project_mtimes, d, r"dl_(?P<build>[a-z", 2),
+           "does not compile")
+
+
 def t_mt_too_few():
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
                       ("dl_b_float32_p1.csv", 400, (2, 0))])

@@ -320,7 +320,19 @@ def read_mtimes(d, pattern):
     `pattern` must name groups `build` and `pass`. A per-pass output file's mtime is
     the pass's COMPLETION, never its start -- the caller must not conflate them.
     """
-    rx = re.compile(pattern)
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        _refuse("the pattern %r does not compile: %s", pattern, e)
+    # Checked here rather than at the first match, where a missing group raised a bare
+    # IndexError from inside the loop -- an unstructured exception for a caller error the
+    # tool can name exactly, and one that cannot be distinguished from a corrupt file.
+    want = set(rx.groupindex) & {"build", "pass"}
+    if want != {"build", "pass"}:
+        _refuse("the pattern %r must name groups (?P<build>...) and (?P<pass>...); it "
+                "names %s. Without both, a per-build round count cannot be formed and "
+                "every pass would be attributed to one arm", pattern,
+                sorted(rx.groupindex) or "no groups at all")
     out = []
     for f in sorted(os.listdir(d)):
         m = rx.match(f)
@@ -366,7 +378,6 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
         _refuse("build(s) %s have no pass with a measurable duration. A "
                 "completion-difference needs a predecessor, so the earliest file "
                 "contributes none", ",".join(nolast))
-    n_landed = len(landed) + 1          # the open pass counts against its build's rounds
     out = ["  estimator: finish = open pass's start + SUM_builds mean(landed) * remaining",
            "  input: per-pass COMPLETION mtimes, so each duration is a difference "
            "between consecutive completions and assumes a zero inter-pass gap",
@@ -408,8 +419,9 @@ def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
     if max(counts.values()) - min(counts.values()) > 1:
         _refuse("the rotation is not balanced -- file counts %s differ by %d. "
                 "The schedule is meant to hold them within one, so each build's mean "
-                "would be conditioned on a different stretch of the run", dict(sorted(counts.items())),
-                   max(counts.values()) - min(counts.values()))
+                "would be conditioned on a different stretch of the run",
+                dict(sorted(counts.items())),
+                max(counts.values()) - min(counts.values()))
     base = landed[-1][0]
     fin = base + rem_s
     # Scoped to the BARE-CLOCK route only. With a real clock both endpoints carry a
