@@ -1,0 +1,18 @@
+binary_sha256 ae683b299438d0cfdaed3a54f05e3ad700d7d12924d2cef2dbf622522b3a5091
+source_sha256 f76c801a473b7fb23dcbaad2e166d7374a4b732a6832bfe10b2a691f04d2ba9f
+compiler g++ (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
+flags -O3 -march=native -funroll-loops -std=c++17
+asmcheck_exit 0
+PER-NONZERO COUNTS, and the registered intent of each delta
+  arm      mem/nnz  bcast/nnz   vpor/nnz   verdict
+  ----------------------------------------------------------------------------
+  V0          3.00       1.00       0.00   baseline: index load + A broadcast + folded B load
+  V0b         3.00       1.00       0.00   A/A floor arm: must equal V0 exactly
+  V1          2.00       1.00       0.00   index load removed
+  V2          2.12       0.00       0.00   A broadcast removed (hoisted)
+  V3          2.00       1.00       0.00   B load removed (register-resident)
+  V4          4.00       1.00       1.00   positive control: V0 + one extra load, accumulated
+  V4b         3.12       1.00       1.00   V0 + the accumulate ONLY; V4-V4b isolates the load
+  V4c         4.00       1.00       1.00   clean control: +1 load of an already-loaded address
+  V5          2.12       1.00       1.00   discriminator: V1 + the same accumulate
+
