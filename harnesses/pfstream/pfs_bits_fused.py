@@ -139,7 +139,7 @@ if _bad_L:
 
 
 def _detect(got, ref, tol):
-    """(index of the worst violation or None, count of CHECKABLE elements).
+    """(index of worst violation or None, checkable elements, fully-dark rows, row count).
 
     One function so a planted perturbation exercises the same code a real cell does. The index is
     the largest excess over its OWN tolerance, not the largest absolute difference -- those are
@@ -147,8 +147,50 @@ def _detect(got, ref, tol):
     names an element that passed.
     """
     off = np.abs(got - ref) - tol
-    n_check = int(np.count_nonzero(np.abs(ref) > tol))
-    return (int(np.argmax(off)) if np.any(off > 0) else None), n_check
+    chk = np.abs(ref) > tol
+    n_check = int(np.count_nonzero(chk))
+    # PER ROW, not just per cell, because the failure mode is systematic. A prefetch that altered
+    # arithmetic would move many elements of a row, so ONE checkable element in a row suffices to
+    # catch it -- but a row with NONE is a row whose correctness is unestablished, and that is the
+    # unit to count. A per-cell total cannot express it: a cell can be 40% checkable with every
+    # row partly covered, or with 60% of rows entirely dark.
+    dark_rows = int(np.count_nonzero(~chk.any(axis=1))) if chk.ndim == 2 else 0
+    n_rows = chk.shape[0] if chk.ndim == 2 else 1
+    return (int(np.argmax(off)) if np.any(off > 0) else None), n_check, dark_rows, n_rows
+
+
+def _gate_dark(label, per_act):
+    """Refuse when NO activation gives a strong check for this (problem, width).
+
+    THE UNIT IS THE PROBLEM INSTANCE, NOT THE CELL, and the first version got that wrong in a way
+    that came with wrong advice attached. It gated per (cell, act) at 50% dark rows and told the
+    reader to raise --bias-scale or pick a corpus with fewer empty rows. Measured on nemeth24
+    (9506 rows, mean degree 158.5, ZERO empty rows):
+
+        act=0 identity   99.8% checkable,  0.0% dark rows
+        act=1 relu       43.1% checkable, 37.2% dark rows
+
+    So empty rows are not the cause and --bias-scale barely moves it (49.5% -> 49.2% dark). The
+    cause is that a row's outputs share the sign of A[i,:] @ B, so relu zeroes WHOLE ROWS rather
+    than scattered elements -- at k=8 independent signs would give 0.5^8 = 0.4% dark rows and the
+    measurement is 37%. That is a structural property of the problem, not of the harness, and it
+    is not fixable by a parameter.
+
+    What IS true is that the two claims separate. Bit-identity across the four builds is
+    established by the digest on EVERY activation. Numerical correctness against the float64
+    reference is established wherever the check is strong, and act=0 is strong on exactly the
+    matrices where relu is weak. So the gate asks whether this (problem, width) was verified by
+    SOME activation, which is the claim the run actually needs. 50% is the one non-arbitrary point
+    on the scale: above it, "this output is verified" is false of most of the output.
+    """
+    best = min(per_act.values())
+    if best * 2 > 1.0:
+        sys.exit("REFUSE: %s has no activation with a strong check -- dark-row fractions %s, best "
+                 "%.1f%%. Bit-identity still holds (the digests agree), but numerical correctness "
+                 "is unestablished for most rows of this problem at every activation, so a pass "
+                 "here would be a statement about the digest alone."
+                 % (label, {a: "%.1f%%" % (100 * f) for a, f in sorted(per_act.items())},
+                    100 * best))
 
 
 def _selfcheck_detector():
@@ -164,35 +206,45 @@ def _selfcheck_detector():
     """
     ref = np.array([[1.0, 100.0, 2.0]])
     tol = np.array([[0.01, 10.0, 0.01]])
-    ok, nc = _detect(ref.copy(), ref, tol)
-    if ok is not None or nc != 3:
-        sys.exit("REFUSE: the detector rejects an exact match (%r) or miscounts checkable (%d of 3)"
-                 % (ok, nc))
+    ok, nc, dk, nr = _detect(ref.copy(), ref, tol)
+    if ok is not None or nc != 3 or dk != 0 or nr != 1:
+        sys.exit("REFUSE: on an exact match the detector gave (%r, %d checkable, %d dark of %d "
+                 "rows); expected (None, 3, 0, 1)." % (ok, nc, dk, nr))
     got = ref.copy(); got[0, 0] += 0.02
-    bad, _ = _detect(got, ref, tol)
+    bad, _, _, _ = _detect(got, ref, tol)
     if bad != 0:
         sys.exit("REFUSE: the detector missed a planted violation at element 0 (said %r)" % bad)
     # Element 1 has the larger absolute difference (12 against 0.02) but element 0 the larger
     # excess over its own tolerance (0.01 against 2.0)... so element 1 must win here, and the
     # INVERTED plant below is the one that separates the two rules.
     got = ref.copy(); got[0, 0] += 0.011; got[0, 1] += 12.0
-    bad, _ = _detect(got, ref, tol)
+    bad, _, _, _ = _detect(got, ref, tol)
     if bad != 1:
         sys.exit("REFUSE: with excesses 0.001 and 2.0 the detector named element %r; it must name "
                  "the larger EXCESS (element 1)." % bad)
     got = ref.copy(); got[0, 1] += 10.5; got[0, 2] += 1.0
-    bad, _ = _detect(got, ref, tol)
+    bad, _, _, _ = _detect(got, ref, tol)
     if bad != 2:
         sys.exit("REFUSE: element 1 has the larger absolute difference (10.5 against 1.0) but "
                  "element 2 the larger excess (0.99 against 0.5); the detector named %r." % bad)
     # A vacuous cell: every |reference| below its own tolerance.
-    _, nc = _detect(np.zeros((1, 3)), np.zeros((1, 3)), tol)
-    if nc != 0:
-        sys.exit("REFUSE: an all-zero reference counted %d checkable elements; a cell that cannot "
-                 "fail must report 0." % nc)
+    _, nc, dk, nr = _detect(np.zeros((1, 3)), np.zeros((1, 3)), tol)
+    if nc != 0 or dk != 1 or nr != 1:
+        sys.exit("REFUSE: an all-zero reference gave (%d checkable, %d dark of %d rows); a cell "
+                 "that cannot fail must report (0, 1, 1)." % (nc, dk, nr))
+    # THE DARK-ROW UNIT NEEDS ITS OWN PLANT, because a per-cell count cannot distinguish "every
+    # row partly covered" from "some rows entirely dark" and the gate is on the latter. Three
+    # rows, two of them wholly below their own tolerance: 1 checkable element, 2 dark rows.
+    r3 = np.array([[5.0, 6.0], [0.0, 0.0], [0.0, 0.0]])
+    t3 = np.array([[0.01, 100.0], [1.0, 1.0], [1.0, 1.0]])
+    _, nc, dk, nr = _detect(r3, r3, t3)
+    if (nc, dk, nr) != (1, 2, 3):
+        sys.exit("REFUSE: the dark-row plant gave (%d checkable, %d dark of %d rows); expected "
+                 "(1, 2, 3). A per-cell count alone cannot express this case." % (nc, dk, nr))
     print("  detector self-check: exact match passes, a planted violation is caught, the element "
-          "named is the larger EXCESS not the larger difference, and a dead cell counts 0 "
-          "checkable", flush=True)
+          "named is the larger EXCESS not the larger difference, a dead cell counts 0 checkable, "
+          "and a 3-row plant with 2 dark rows is counted as 2 dark rather than as 1 of 6 "
+          "elements", flush=True)
 
 
 def _ref(M, J, indptr, indices, vals, Bd, bias, act):
@@ -251,7 +303,7 @@ def run_cell(M, J, indptr, indices, vals, k, act, seed, pos_bias=False):
     scale = (_ref(M, J, indptr, np.asarray(indices), np.abs(np.asarray(vals, dtype=np.float64)),
                   np.abs(Bd), np.abs(bias.numpy()), 0))
     tol = 1e-3 + 1e-3 * np.abs(scale)
-    bad, n_check = _detect(got, ref, tol)
+    bad, n_check, dark, nrows = _detect(got, ref, tol)
     if bad is not None:
         off = np.abs(got - ref) - tol
         sys.exit("REFUSE: build %s k=%d act=%d element %d: got %r reference %r tolerance %r "
@@ -268,7 +320,7 @@ def run_cell(M, J, indptr, indices, vals, k, act, seed, pos_bias=False):
                  "means every cell is dead; under sigmoid it means the tolerance exceeds the "
                  "function's whole range, which happens once |A|@|B| reaches about 999."
                  % (A.build, k, act, got.size))
-    return hashlib.sha256(v.tobytes()).hexdigest()[:32], v, n_check, got.size
+    return hashlib.sha256(v.tobytes()).hexdigest()[:32], v, n_check, got.size, dark, nrows
 
 
 _selfcheck_detector()
@@ -309,22 +361,32 @@ if _bad:
 n_degen = n_real = 0
 nz_degen = nz_real = 0
 chk_d = tot_d = chk_r = tot_r = 0
-min_frac = (2.0, None)   # per-cell worst case; an aggregate cannot show one collapsed cell
+# NO OUT-OF-RANGE SENTINEL. The first version initialised the worst-case fraction to 2.0 so the
+# first comparison would win, and with zero cells that printed "WORST CELL: 200.0% checkable
+# (None)" -- a value the quantity cannot take, reported in its own units. None means "no cell was
+# measured" and is reported as that.
+min_frac = None
+worst_dark = (0.0, None)
+dark_d = rows_d = dark_r = rows_r = 0
 print("DEGENERATE CASES FIRST -- the script stops here if any fails, because every digest below "
       "would otherwise be taken on a process that already read out of bounds.", flush=True)
 for name, M, J, ip, ix, vl in DEGEN:
     for k in KS:
+        _pa = {}
         for act in ACTS:
-            sha, v, nc, nt = run_cell(M, J, ip, ix, vl, k, act,
-                                      zlib.crc32(("%s|%d|%d" % (name, k, act)).encode()) % (2**31),
-                                      pos_bias=True)
+            sha, v, nc, nt, dk, nr = run_cell(
+                M, J, ip, ix, vl, k, act,
+                zlib.crc32(("%s|%d|%d" % (name, k, act)).encode()) % (2**31), pos_bias=True)
+            dark_d += dk; rows_d += nr
+            _pa[act] = dk / max(nr, 1)
             chk_d += nc; tot_d += nt
-            if nc / max(nt, 1) < min_frac[0]:
+            if min_frac is None or nc / max(nt, 1) < min_frac[0]:
                 min_frac = (nc / max(nt, 1), "degen %s k=%d act=%d" % (name, k, act))
             w.writerow(dict(build=A.build, case="degen", key=name, k=k, act=act, rows=M,
                             nnz=len(vl), sha=sha))
             n_degen += 1
             nz_degen += int(np.any(v != 0))
+        _gate_dark("degen %s k=%d" % (name, k), _pa)
 # THE COUNT CARRIES ITS FACTORS. "126 degenerate cells" does not determine its own factorisation
 # -- it is 7 cases x 6 widths x 3 acts and equally 6 x 7 x 3 -- so two runs with different case
 # lists and different width sweeps print numbers that read as one set which grew.
@@ -343,16 +405,23 @@ for key in keys:
     ip, ix, vl = z["indptr"], z["indices"], z["data"]
     nnz = int(ip[-1])
     for k in KS:
+        _pa = {}
         for act in ACTS:
-            sha, v, nc, nt = run_cell(M, J, ip, ix, vl, k, act,
-                                      zlib.crc32(("%s|%d|%d" % (key, k, act)).encode()) % (2**31))
+            sha, v, nc, nt, dk, nr = run_cell(
+                M, J, ip, ix, vl, k, act,
+                zlib.crc32(("%s|%d|%d" % (key, k, act)).encode()) % (2**31))
+            _pa[act] = dk / max(nr, 1)
+            dark_r += dk; rows_r += nr
+            if dk / max(nr, 1) > worst_dark[0]:
+                worst_dark = (dk / max(nr, 1), "real %s k=%d act=%d" % (key, k, act))
             chk_r += nc; tot_r += nt
-            if nc / max(nt, 1) < min_frac[0]:
+            if min_frac is None or nc / max(nt, 1) < min_frac[0]:
                 min_frac = (nc / max(nt, 1), "real %s k=%d act=%d" % (key, k, act))
             w.writerow(dict(build=A.build, case="real", key=key, k=k, act=act, rows=M, nnz=nnz,
                             sha=sha))
             n_real += 1
             nz_real += int(np.any(v != 0))
+        _gate_dark("real %s k=%d" % (key, k), _pa)
     out.flush()
 out.close()
 # The sentinel carries the counts, so a comparator can cross-check the cell set it was HANDED
@@ -374,6 +443,14 @@ print("  CHECKABLE ELEMENTS: %d of %d degenerate (%.1f%%), %d of %d real (%.1f%%
          100.0 * chk_r / max(tot_r, 1), A.bias_scale), flush=True)
 # The aggregate cannot show a single collapsed cell: one cell at 1 element of 100000 leaves the
 # pooled fraction near 100%. The per-cell MINIMUM is the number aggregation cannot hide.
-print("  WORST CELL: %.1f%% checkable (%s) -- the aggregate above cannot show one collapsed cell, "
-      "so this is the number that bounds what 'no mismatch' covers"
-      % (100.0 * min_frac[0], min_frac[1]), flush=True)
+if min_frac is None:
+    print("  WORST CELL: no cell was measured, so there is no worst case to report", flush=True)
+else:
+    print("  WORST CELL: %.1f%% checkable (%s) -- the aggregate above cannot show one collapsed "
+          "cell, so this is the number that bounds what 'no mismatch' covers"
+          % (100.0 * min_frac[0], min_frac[1]), flush=True)
+print("  FULLY-DARK ROWS: %d of %d degenerate, %d of %d real; worst cell %.1f%% (%s). A dark row "
+      "has no checkable element at all, and that is the unit the gate uses, because a prefetch "
+      "altering arithmetic would move many elements of a row rather than one."
+      % (dark_d, rows_d, dark_r, rows_r, 100.0 * worst_dark[0],
+         worst_dark[1] or "none"), flush=True)

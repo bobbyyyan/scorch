@@ -53,7 +53,7 @@ declare -A WANT=(
   ["csrresolve.py"]="1872f707045dc14e149fd53e845fee4b60e206b48132b144ee8217c227bfba78"
   ["fmgate.py"]="99e20fee682c205300e4410ea77352cb6a05f6516b1711191146c92296ac60b0"
   ["pfs_bitcmp.py"]="f4b09ad2488b3d1ad7ed71c9a5861edc051d3cc0e75407927dac6e3625a27b41"
-  ["pfs_bits_fused.py"]="fde751c65001b78a6da3b986671dc8340ddc952c00d3a2534e3c6fdcfcbfa4cc"
+  ["pfs_bits_fused.py"]="46066dc66d40a615d542765e9c61dd5f484b93e2aa5dacf75fa4a41de65c3f4b"
 )
 for f in "${!WANT[@]}"; do
   cp "$STAGE/$f" /scr/bobbyy/pfs/$f || { echo "REFUSE: cannot stage $f"; exit 1; }
