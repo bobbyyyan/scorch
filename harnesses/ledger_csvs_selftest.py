@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger_csvs as L                                              # noqa: E402
 
 FAIL, CHECKS, NOTES = [], 0, []
-N_PLANTS = 12
+N_PLANTS = 15
 REAL = os.path.expanduser(
     "~/.cache/scorch-codex/spmm-beat-mkl/chain194-mrhv-redwood")
 
@@ -150,6 +150,44 @@ def t_a_symlink_to_a_CLEAN_target_is_still_refused():
     except SystemExit as e:
         eq("symlink-clean", "raised", "raised")
         eq("symlink-clean-no-marker", "TARGET CARRIES MARKER" not in str(e), True)
+
+
+def t_a_linked_ANCESTOR_is_caught_when_the_caller_names_its_root():
+    """The directory form. Files under a linked directory are not links, so the per-hit check
+    returns them silently -- measured before this guard existed."""
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "real"))
+    open(os.path.join(root, "real", "a_float32_p1.csv"), "w").write("x")
+    os.symlink(os.path.join(root, "real"), os.path.join(root, "link"))
+    d = os.path.join(root, "link")
+    eq("ancestor-found", len(L.linked_ancestors(d, root)), 1)
+    try:
+        L.glob_clean(d, "*_float32_p*.csv", anchor=root)
+        eq("ancestor-refuse", "returned", "raised")
+    except SystemExit as e:
+        eq("ancestor-refuse", "raised", "raised")
+        eq("ancestor-names-target", os.path.realpath(d) in str(e), True)
+
+
+def t_the_PLATFORM_prefix_link_does_not_trip_the_anchored_check():
+    """ABLATION on the rule that was rejected: /var is a symlink to /private/var on macOS, so
+    realpath != abspath refuses every temp directory. Anchoring at the caller's root must not."""
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "plain"))
+    open(os.path.join(root, "plain", "a_float32_p1.csv"), "w").write("x")
+    d = os.path.join(root, "plain")
+    eq("prefix-not-flagged", L.linked_ancestors(d, root), [])
+    eq("prefix-passes", len(L.glob_clean(d, "*_float32_p*.csv", anchor=root)), 1)
+
+
+def t_a_wrong_anchor_is_refused_rather_than_returning_empty():
+    """An empty result from an anchor the directory is not under would read as safety."""
+    root = tempfile.mkdtemp()
+    try:
+        L.linked_ancestors(root, os.path.join(tempfile.mkdtemp(), "elsewhere"))
+        eq("wrong-anchor", "returned", "raised")
+    except ValueError:
+        eq("wrong-anchor", "raised", "raised")
 
 
 def main():

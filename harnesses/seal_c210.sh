@@ -113,6 +113,41 @@ cd "$DEST" || exit 1
 # CONTAINMENT. shasum follows symlinks, so a sealed name whose bytes live outside the directory
 # verifies clean forever while the real file is unsealed and mutable. attest.py has contained()
 # for exactly this; the seal is where it matters most.
+# LINKED ANCESTOR, which the census below cannot see. `find . -type l` finds nothing when a
+# DIRECTORY above $DEST is a symlink, because files under it are not themselves links -- measured
+# at 0 found while a glob through the link returned its files silently. Anchored at the ledger
+# root on purpose: /var is itself a symlink to /private/var on macOS, so an unanchored
+# realpath-versus-path comparison refuses every temporary directory and the check becomes
+# unusable. A directory outside the ledger reports that the check did not run rather than passing.
+LROOT="$HOME/.cache/scorch-codex"
+here=$(pwd)
+case "$here" in
+  "$LROOT"/*)
+    anc=""
+    cur="$here"
+    # The `prev` guard is not decoration. Writing this check's own plant, an empty `cur` (a cd
+    # that failed, because zsh did not word-split the loop variable I passed it) made
+    # `dirname ""` return "." and `dirname "."` return "." forever -- an infinite loop, not a
+    # wrong answer. Any walk that relies on reaching a sentinel needs a does-it-still-shrink test.
+    prev=""
+    while [ -n "$cur" ] && [ "$cur" != "/" ] && [ "$cur" != "$LROOT" ] && [ "$cur" != "$prev" ]; do
+      if [ -L "$cur" ]; then anc="$anc $cur"; fi
+      prev="$cur"
+      cur=$(dirname "$cur")
+    done
+    if [ -n "$anc" ]; then
+      echo "REFUSE: $DEST is reached through symlinked directory(ies):$anc"
+      echo "  Files under it are not symlinks, so the -type l census below reads clean while the"
+      echo "  bytes are not where the manifest's names say they are."
+      exit 1
+    fi
+    echo "OK  no symlinked ancestor between $LROOT and this directory"
+    ;;
+  *)
+    echo "NOTE linked-ancestor check did NOT run: $here is outside $LROOT, and walking to / would"
+    echo "     flag the platform's own prefix links rather than an evidence defect"
+    ;;
+esac
 nl=$(find . -type l | wc -l | tr -d ' ')
 [ "$nl" -eq 0 ] || { echo "REFUSE: $nl symlink(s) in $DEST -- a sealed name must be a sealed file:"; find . -type l | sed 's/^/  /'; exit 1; }
 # DOTFILES. The enumeration below is `ls -1`, which omits them, so the one class of file this

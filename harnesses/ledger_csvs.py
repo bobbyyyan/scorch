@@ -63,7 +63,39 @@ def scan(names):
     return sorted(clean), sorted(flagged)
 
 
-def glob_clean(d, pattern, label="", allow_excluded=False):
+def linked_ancestors(d, anchor):
+    """Components of the path to `d` that are symlinks, strictly below `anchor`.
+
+    THE DIRECTORY FORM OF THE SYMLINK PROBLEM, and why it needs an anchor the file form does not.
+    A file reached THROUGH a symlinked directory is not itself a symlink, so the per-hit
+    os.path.islink check in glob_clean cannot see it: measured, a glob through a linked directory
+    returns its files silently. The obvious rule -- refuse when realpath(d) != abspath(d) -- is
+    unusable, because on macOS /var is itself a symlink to /private/var, so it refuses every
+    temporary directory including the ones this module's own plants build. The platform's prefix
+    links are not evidence defects, and nothing in the path itself distinguishes them from one
+    inside a ledger. So the caller must say where its evidence tree starts, and only links at or
+    below that point count.
+
+    Refuses when `d` is not under `anchor`, because an empty result from a wrong anchor would read
+    as "no linked ancestors".
+    """
+    a = os.path.realpath(anchor)
+    cur = os.path.abspath(d)
+    if not (os.path.realpath(cur) + os.sep).startswith(a + os.sep) and os.path.realpath(cur) != a:
+        raise ValueError("%r is not under anchor %r, so an empty result would be meaningless"
+                         % (d, anchor))
+    out = []
+    while True:
+        if os.path.islink(cur):
+            out.append(cur)
+        nxt = os.path.dirname(cur)
+        if nxt == cur or os.path.abspath(cur) == a or os.path.realpath(cur) == a:
+            break
+        cur = nxt
+    return out
+
+
+def glob_clean(d, pattern, label="", allow_excluded=False, anchor=None):
     """Glob `pattern` under `d` and REFUSE if any match carries a quarantine marker.
 
     Returns the sorted clean matches. Refusing is the point: a recount that silently excluded the
@@ -87,6 +119,19 @@ def glob_clean(d, pattern, label="", allow_excluded=False):
     # mutable. seal_c210.sh refuses links for that reason, and measurement agrees it is not a
     # restriction in practice -- every sealed directory in the ledger is symlink-free today, and
     # the only linked CSVs are four pytest fixtures in an unsealed directory.
+    # The DIRECTORY form, only when the caller named its evidence root -- see linked_ancestors
+    # for why an unanchored version cannot work. Checked before the per-hit test because a linked
+    # ancestor makes every hit's path wrong, not just one file's.
+    if anchor is not None:
+        anc = linked_ancestors(d, anchor)
+        if anc:
+            raise SystemExit(
+                "REFUSE: %s%s is reached through %d symlinked director%s below %s:\n%s\n"
+                "  Files under it are not themselves symlinks, so a per-file check cannot see\n"
+                "  this, and the bytes are not where the path says they are."
+                % (label + ": " if label else "", d, len(anc),
+                   "y" if len(anc) == 1 else "ies", anchor,
+                   "\n".join("    %s -> %s" % (x, os.path.realpath(x)) for x in anc)))
     links = [h for h in hits if os.path.islink(h)]
     if links:
         raise SystemExit(
