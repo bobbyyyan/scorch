@@ -20,6 +20,7 @@
 #define K 4
 #define NSINK 4            // rotating sinks, so a sink's own latency chain cannot bind
 #define NOINLINE __attribute__((noinline))
+#define SCORCH_RESTRICT __restrict__
 
 // Sinks live at file scope and are printed, so nothing in any variant is dead.
 alignas(32) static float g_sink[NSINK][K];
@@ -282,22 +283,26 @@ NOINLINE float v5(const Args& A) {
 
 // ---- V6: four accumulator chains, 4-way unrolled over nonzeros.
 NOINLINE float v6(const Args& A) {
+  const int* SCORCH_RESTRICT SCORCH_IDX = A.idx;
+  const float* SCORCH_RESTRICT SCORCH_AV = A.aval;
+  const float* SCORCH_RESTRICT SCORCH_BV = A.bval;
+  const int SCORCH_N = A.n;
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
          acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
   int p = 0;
-  for (; p + 4 <= A.n; p += 4) {
-    const float* B0 = A.bval + (size_t)A.idx[p] * K;
-    const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
-    const float* B2 = A.bval + (size_t)A.idx[p + 2] * K;
-    const float* B3 = A.bval + (size_t)A.idx[p + 3] * K;
-    acc0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),     _mm_loadu_ps(B0), acc0);
-    acc1 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 1]), _mm_loadu_ps(B1), acc1);
-    acc2 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 2]), _mm_loadu_ps(B2), acc2);
-    acc3 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 3]), _mm_loadu_ps(B3), acc3);
+  for (; p + 4 <= SCORCH_N; p += 4) {
+    const float* B0 = SCORCH_BV + (size_t)SCORCH_IDX[p] * K;
+    const float* B1 = SCORCH_BV + (size_t)SCORCH_IDX[p + 1] * K;
+    const float* B2 = SCORCH_BV + (size_t)SCORCH_IDX[p + 2] * K;
+    const float* B3 = SCORCH_BV + (size_t)SCORCH_IDX[p + 3] * K;
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),     _mm_loadu_ps(B0), acc0);
+    acc1 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 1]), _mm_loadu_ps(B1), acc1);
+    acc2 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 2]), _mm_loadu_ps(B2), acc2);
+    acc3 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 3]), _mm_loadu_ps(B3), acc3);
   }
-  for (; p < A.n; ++p)
-    acc0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),
-                        _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), acc0);
+  for (; p < SCORCH_N; ++p)
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p] * K), acc0);
   const __m128 r = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
   alignas(16) float o[K]; _mm_storeu_ps(o, r);
   return o[0] + o[1] + o[2] + o[3];
@@ -305,22 +310,26 @@ NOINLINE float v6(const Args& A) {
 
 // ---- V7: eight accumulator chains, 8-way unrolled over nonzeros.
 NOINLINE float v7(const Args& A) {
+  const int* SCORCH_RESTRICT SCORCH_IDX = A.idx;
+  const float* SCORCH_RESTRICT SCORCH_AV = A.aval;
+  const float* SCORCH_RESTRICT SCORCH_BV = A.bval;
+  const int SCORCH_N = A.n;
   __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps(), a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
   __m128 a4 = _mm_setzero_ps(), a5 = _mm_setzero_ps(), a6 = _mm_setzero_ps(), a7 = _mm_setzero_ps();
   int p = 0;
-  for (; p + 8 <= A.n; p += 8) {
-    a0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),     _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), a0);
-    a1 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 1]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 1] * K), a1);
-    a2 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 2]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 2] * K), a2);
-    a3 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 3]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 3] * K), a3);
-    a4 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 4]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 4] * K), a4);
-    a5 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 5]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 5] * K), a5);
-    a6 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 6]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 6] * K), a6);
-    a7 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 7]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 7] * K), a7);
+  for (; p + 8 <= SCORCH_N; p += 8) {
+    a0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),     _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p] * K), a0);
+    a1 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 1]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 1] * K), a1);
+    a2 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 2]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 2] * K), a2);
+    a3 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 3]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 3] * K), a3);
+    a4 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 4]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 4] * K), a4);
+    a5 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 5]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 5] * K), a5);
+    a6 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 6]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 6] * K), a6);
+    a7 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 7]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 7] * K), a7);
   }
-  for (; p < A.n; ++p)
-    a0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),
-                      _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), a0);
+  for (; p < SCORCH_N; ++p)
+    a0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),
+                      _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p] * K), a0);
   const __m128 r = _mm_add_ps(_mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3)),
                               _mm_add_ps(_mm_add_ps(a4, a5), _mm_add_ps(a6, a7)));
   alignas(16) float o[K]; _mm_storeu_ps(o, r);

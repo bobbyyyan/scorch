@@ -1,8 +1,8 @@
-binary_sha256 ae683b299438d0cfdaed3a54f05e3ad700d7d12924d2cef2dbf622522b3a5091
-source_sha256 f76c801a473b7fb23dcbaad2e166d7374a4b732a6832bfe10b2a691f04d2ba9f
+binary_sha256 2c8347152100c2871357b4f4bc3f4616a130cee819b922da1c65c5c08627f825
+source_sha256 1f06374d85b1fe4d3a27ea8a43392d52a254bb2a3d9922420d8ce06771b78dcc
 compiler g++ (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
 flags -O3 -march=native -funroll-loops -std=c++17
-asmcheck_exit 0
+asmcheck_exit 1
 PER-NONZERO COUNTS, and the registered intent of each delta
   arm      mem/nnz  bcast/nnz   vpor/nnz   verdict
   ----------------------------------------------------------------------------
@@ -15,4 +15,6 @@ PER-NONZERO COUNTS, and the registered intent of each delta
   V4b         3.12       1.00       1.00   V0 + the accumulate ONLY; V4-V4b isolates the load
   V4c         4.00       1.00       1.00   clean control: +1 load of an already-loaded address
   V5          2.12       1.00       1.00   discriminator: V1 + the same accumulate
+  V6          3.75       1.00       0.00   CANDIDATE: 4 accumulator chains, same 3 load ops/nnz
+  V7          3.75       1.00       0.00   CANDIDATE: 8 accumulator chains, same 3 load ops/nnz
 
