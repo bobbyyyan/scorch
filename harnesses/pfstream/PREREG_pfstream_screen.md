@@ -579,3 +579,72 @@ docstring, so it read as a duplicated write swallowed by an unterminated string 
 runs, plausible. What killed it was digesting on the producing host rather than on the transported
 copy. Pass `-n 1`. No published figure was affected, and that was checked rather than assumed: 418
 sample keys reconciles as `ceil(4594/11)` and 6270 CSV rows as `418 x 5 widths x 3 arms`.
+
+## Amendment 11 — the two unexercised axes are not symmetric, and amendment 10's digests did not name their function
+
+### Correction to amendment 10's digests
+
+Amendment 10 gave `a55e07bf03e1fb34` and `23d42aafa6329b84`. **A 16-hex digest does not name its
+function**, and a verifier had to guess SHA-256-truncated-to-16 and happened to be right. `cksum`
+on the same driver is `2321751174`, which is no more self-describing. The full values, with the
+function named:
+
+```
+sha256 a55e07bf03e1fb34644072da299f4e34645f3d4c1363f45aaa3b4fd382163fc8  mrgate.py            148 lines
+sha256 23d42aafa6329b8401f836d477257159c7b49a15af26a2c61a08e195a1490577  pfs_screen.sbatch     49 lines
+sha256 509c106a88bd0dd77fc58d01feabd4b125231b96d3fe3c4a00142e3983b4d00c  pfs_screen_f64.sbatch 72 lines
+```
+
+And amendment 10's "148 lines each" meant the driver's two host copies, not the two files. The
+sbatch is 49 lines. Stated because the ambiguity was real in the sentence as written.
+
+### The asymmetry between the two axes
+
+Amendment 10 recorded that the float32 screen reaches `nvec ∈ {1,2,4}` with a full tail only. The
+two gaps are **not closable by the same means**, and that changes what the float64 run is for.
+
+**`full_last` has an existing override.** It is declared non-`const` at `spmm.h:3982`, and
+`SCORCH_SPMM_MASKED` at `spmm.h:4296-4297` sets it `false` at any width — its own comment says that
+is the only way to time the masked and unmasked instantiations against each other in one process
+against one binary. But it sits inside `#if defined(__AVX2__) && defined(__FMA__) &&
+defined(SCORCH_TUNE_HOOKS)` (opened at `4287`), so reaching it means a build class `pfs_bits.py`
+refuses by design and `pfs_build.sh` never produces. In that class the per-call `getenv` tax is
+arm-vs-arm safe and **not** MKL-comparable — it is what manufactured a 1.57× MKL deficit on short
+kernels. So the override exists, and using it would cost the MKL comparison that is the whole point.
+
+**`nvec == 3` has no override at all.** `nvec = (B1_size + SL - 1) / SL` is a pure function of the
+width, so only a width reaches it.
+
+The consequence: *"both axes are closed by the float64 width set"* is true, and *"both axes could
+only be closed by a width set"* is false. One of them could have been closed in a hooks build, at a
+price that happens to be the price of this entire screen.
+
+**Both instantiations are emitted at every site, so neither axis is hypothetical.** `FULL_LAST` is
+the third template parameter of all three register-block definitions (`2267`, `2534`, `2744`) and
+both values are instantiated at every call site; `case 3: SCORCH_RB(3)` exists at `5086`, `5116`,
+`5127` and at `6351` inside the fused Linear.
+
+### The float64 control's validity was a derivation, and it holds
+
+`exact_cap_ = exact_f32_ ? 7 : 3` at `spmm.h:4147`, and `narrowk_exact_hi` resolves through
+`SCORCH_NARROWK_EXACT_HI_F64` defaulting to `SCORCH_NARROWK_EXACT_HI = 3`. So at float64
+`exact_hi_` is 3 and k=2 sits inside the exact band with the register-block arm absent. **Had that
+cap been below 2 at float64, k=2 would have been an arm rather than a control** and the design would
+have shipped without one. Separately `SCORCH_SPMM_HALFVEC_F64` is 0, so k=4 at float64 is
+register-block and not the half-vector path.
+
+### What the float64 set buys beyond coverage
+
+`nvec` 2 and 3 each appear in **both** tail states (k=6/8 and k=10/12), so the run contains a
+matched masked-against-full pair at two different vector counts, not one instance of each arm. That
+is a within-run contrast on the tail axis rather than a presence check.
+
+### One sharper form of the srun hazard
+
+The doubling is in `srun`'s **stdout**, so an aggregation performed outside the allocation is
+doubled while the same aggregation inside it is not: `srun wc -l f` prints the right number twice,
+`srun cat f | wc -l` prints twice the number once. That makes the landed-pass count the exposed
+quantity, since it is the only authoritative progress counter. **It was not doubled**, and the check
+is arithmetic rather than reassurance: at the 8-pass checkpoint, `09:25:31 − 06:24:32 = 10859 s`
+against `3(1352.5) + 2(1351.5) + 3(1366.3) = 10859.4 s`. A doubled count would have missed by a
+factor near two, not by 0.4 s.
