@@ -41805,3 +41805,64 @@ moving work off the load ports onto the shuffle port). But it only pays if the k
 load-port bound rather than bound on instruction issue or the accumulator chain, and that has not
 been measured. Establishing it needs either performance counters or a port-level static analysis,
 and neither will run on redwood until chain210 is off the machine.
+
+### Correction: the 3.3x line-reuse contrast is a density contrast, and the case is better without it
+
+Two claims in the entry above are withdrawn. The reframing that replaces them argues *more*
+strongly for building the mechanism, which is why this is worth the space.
+
+**WITHDRAWN 1: "the headroom is 3.3x larger on the residues".** It is not. At a uniform k=4 divisor
+throughout, so the comparison is apples to apples, reuse by density band with residues beside their
+own band's non-residues:
+
+    density       n non-res   non-res reuse   n res   res reuse   res/non-res
+    0.00-0.05       1083         1.073          0        -            -
+    0.05-0.10        549         1.168          0        -            -
+    0.10-0.20        568         1.355          0        -            -
+    0.20-0.35        658         1.580          3      1.566        0.991x
+    0.35-0.60        881         2.131          4      2.209        1.037x
+    0.60-1.01         71         2.712          3      2.574        0.949x
+
+In every band the residues match their band's non-residues to within a few percent, in both
+directions. At the decisive cut, density >= 0.60: non-residues n=71 median 2.712 (ceiling 63.1%),
+residues n=3 median 2.574 (ceiling 61.1%) -- **reuse ratio 0.949x, ceiling ratio 0.969x**. The
+residues have slightly LESS headroom than density-matched controls. Reuse is a function of density
+and essentially nothing else.
+
+**The confound is that I selected the control on the OUTCOME.** I defined it as "low-density DLMC
+where we already run 0.337-0.44 of MKL" -- a selection on S, not on density -- and then compared a
+structural property between two groups that differ in a third variable. **This is the third
+unmatched control I have used tonight**: the DLMC density quintiles against SuiteSparse (unmatched
+on density), the SuiteSparse dense population against DLMC (unmatched on size), and now this one
+(selected on S). Each time the headline effect survived my own checks and died at the match.
+
+**WITHDRAWN 2: "rises monotonically with density".** False at the residues' own widths and false at
+a uniform divisor. Sorted by density the own-k sequence is 1.192, 1.466, 1.578, 2.137, 2.133,
+**4.351**, 2.315, 2.516, 2.574, 2.798 -- two dips and an outlier. **Reuse is not comparable across
+widths**: 16/k B rows share a line, so the 4.351 is the k=2 cell with eight per line and the 1.192
+is the k=8 cell with two. That same k=8 matrix reads 1.566 under a k=4 divisor. The median 2.226 is
+sound because eight of ten cells are k=4, but the range endpoints were the two cells whose values
+are extreme partly *because* of the divisor, and reading a mixed-k sequence as one curve is what
+produced the monotone claim.
+
+**THE REFRAMING, AND IT IS A STRONGER CASE FOR THE KERNEL.** The justification is not that the
+residues have excess headroom -- they have 0.97x. It is that **the headroom and the deficit live in
+the same place.** Band-level estimand-A median S at k=4 runs 0.5220 / 0.9017 / 0.9263 / 0.9986 /
+1.0966 / 1.0374 across those six bands, crossing parity between band 4 and band 5, so the top third
+of the density range is at or behind MKL. Bands 5 and 6 hold **959 keys** with median S 1.04 to
+1.10 and a B-load ceiling of 53-63%.
+
+So the gate's expected footprint is a broad region that is broadly behind parity, not ten scattered
+cells -- which is the difference between a general mechanism and a fix aimed at a residue list. And
+the inertness argument survives intact and is now quantitative: below 0.05 density reuse is 1.073, a
+6.8% ceiling, so a gate keyed on realised reuse **provably cannot fire** across the 1083 keys where
+we already run 0.34-0.52 of MKL.
+
+**One arithmetic note on framing.** A ratio of ceilings is fragile by construction -- it inflates
+without bound as the control approaches reuse 1.0, reaching 11.6x at 1.05 and 28.1x at 1.02 -- so
+the reuse ratio belongs beside any ceiling ratio. (And my "1.200 -> 16.6%" was display rounding of
+1.19904; 1.200 gives 16.67%.)
+
+**A count correction in the other direction.** The checker reported 6472 .smtx files locally. There
+are **3846** -- 2716 transformer and 1130 rn50 -- which is exactly the row count of chain209's
+sealed table, so that table is complete for DLMC and nothing is missing from it.
