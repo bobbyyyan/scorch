@@ -85,6 +85,10 @@ def resolve_attest(csv_path, att_arg):
              "different binary's attestation." % (csv_path, want[:16], cand, att_arg))
 
 
+ORDER = ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7",
+         "V8", "V9")
+
+
 def attest(path):
     """Read ATTEST.txt: the binary digest and the per-variant emitted counts for THAT binary.
 
@@ -102,7 +106,7 @@ def attest(path):
             binsha = t[1]
         elif len(t) >= 2 and t[0] == "asmcheck_exit":
             exit_ok = (t[1] == "0")
-        elif len(t) >= 4 and t[0] in ("V0","V0b","V1","V2","V3","V4","V4b","V4c","V5","V6","V7"):
+        elif len(t) >= 4 and t[0] in ("V0","V0b","V1","V2","V3","V4","V4b","V4c","V5","V6","V7","V8","V9"):
             try:
                 counts[t[0]] = (float(t[1]), float(t[2]), float(t[3]))
             except ValueError:
@@ -122,10 +126,29 @@ def report(label, path, binsha_att, counts):
         sys.exit("REFUSE: %s was produced by binary %s but ATTEST.txt verifies %s. A timing read "
                  "against a different binary than the one disassembled is exactly how a deleted V5 "
                  "would be published as a refutation." % (path, binsha[:16], binsha_att[:16]))
-    arms = ["V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7"]
+    # THE EXPECTED ARM SET COMES FROM THE ATTESTATION, NOT FROM A CONSTANT. A hardcoded list
+    # breaks both ways: adding V8/V9 to the probe made this refuse the already-published 11-arm
+    # CSVs, which is a false alarm, and the symmetric failure -- a list that still names only the
+    # arms an older binary had -- would silently skip a new arm and read as a complete run. The
+    # attestation enumerates the arms the disassembled binary actually contains, so requiring
+    # exactly those makes the check self-adjusting and still complete.
+    arms = [a for a in ORDER if a in counts]
+    if not arms:
+        sys.exit("REFUSE: the attestation for %s names no arms, so the CSV's completeness cannot "
+                 "be checked against it." % binsha[:16])
+    unknown = [a for a in counts if a not in ORDER]
+    if unknown:
+        sys.exit("REFUSE: the attestation names arm(s) %s that this analyzer has no ordering for; "
+                 "add them to ORDER rather than letting them be dropped silently." % unknown)
     missing = [a for a in arms if a not in T]
     if missing:
-        sys.exit("REFUSE: %s lacks arms %s" % (path, missing))
+        sys.exit("REFUSE: %s lacks arms %s, which the attestation for binary %s says the binary "
+                 "emits." % (path, missing, binsha[:16]))
+    extra = [a for a in T if a not in arms]
+    if extra:
+        sys.exit("REFUSE: %s carries arm(s) %s that the attestation for binary %s does not name, "
+                 "so the CSV and the disassembly describe different binaries." % (path, extra,
+                                                                                 binsha[:16]))
     nrep = {a: len(T[a]) for a in arms}
     if len(set(nrep.values())) != 1:
         sys.exit("REFUSE: unequal repetition counts %s -- the A/A floor pairs by repetition index "
@@ -154,7 +177,9 @@ def report(label, path, binsha_att, counts):
             "V4c": "+1 load of an ADDRESS ALREADY LOADED (no new cache stream)",
             "V5": "V1 + accumulate (the discriminator)",
             "V6": "CANDIDATE KERNEL: 4 accumulator chains",
-            "V7": "CANDIDATE KERNEL: 8 accumulator chains"}
+            "V7": "CANDIDATE KERNEL: 8 accumulator chains",
+            "V8": "4 chains, index load removed -- the PORT discriminator",
+            "V9": "4 chains, B register-resident -- dependency vs memory parallelism"}
     for a in arms:
         d = R[a] / R["V0"]
         c = counts.get(a, (float("nan"),) * 3)

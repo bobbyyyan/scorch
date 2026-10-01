@@ -31,6 +31,68 @@ its R^2 and residuals so a curved t_call(n) is visible rather than silently line
 """
 import collections, csv, glob, math, os, re, statistics, sys
 
+# ---- each arm's MACHINE body width, derived from the attested disassembly.
+# WHY THIS IS NOT READ FROM THE SOURCE. probe.cpp's V6 steps `p += 4`, but -funroll-loops doubled
+# it: the hot loop emits EIGHT FMAs, so the machine body consumes eight nonzeros. V0 steps p += 2
+# and also emits eight; V7 steps p += 8 and ALSO emits eight, so the compiler doubled V0 four
+# times, V6 twice and V7 not at all. Taking the width from the source would understate V0 by 4x
+# and V6 by 2x while getting V7 right -- in three different directions.
+#
+# WHY IT MATTERS FOR THE FIT. Below its machine body width an arm runs only the scalar remainder,
+# which has ONE accumulator chain and a different per-nonzero cost. That is a DIFFERENT KERNEL
+# from the one being fitted, and a single line fitted across the boundary absorbs the difference
+# into the intercept -- which is the estimand. The peer simulated it with a +0.20 ns/nnz remainder
+# penalty (57% of b): the full ladder returns n* = 7.23 against a truth of 4.71, a 54% inflation
+# far outside the noise interquartile range, and UPWARD -- so the error manufactures a degree
+# guard that V6 may not need. Restricting to n >= body recovers 4.72 exactly.
+#
+# The excluded degrees are reported as raw ratios instead, which need no model and are the honest
+# answer at a degree where the remainder IS what production would run.
+MEMOP = re.compile(r"-?(0x[0-9a-f]+)?\(%[a-z0-9]+(,%[a-z0-9]+(,[0-9])?)?\)")
+EPILOGUE = ("ret", "pop", "push", "call")
+SYMS = {"_Z2v0RK4Args": "V0", "_Z3v0bRK4Args": "V0b", "_Z2v1RK4Args": "V1", "_Z2v2RK4Args": "V2",
+        "_Z2v3RK4Args": "V3", "_Z2v4RK4Args": "V4", "_Z3v4bRK4Args": "V4b",
+        "_Z3v4cRK4Args": "V4c", "_Z2v5RK4Args": "V5", "_Z2v6RK4Args": "V6", "_Z2v7RK4Args": "V7"}
+
+
+def body_widths(asm_path):
+    """FMA count of each arm's innermost loop = nonzeros consumed per machine body."""
+    fn, cur = collections.defaultdict(list), None
+    for ln in open(asm_path):
+        m = re.match(r"^([0-9a-f]+) <(\S+)>:", ln)
+        if m:
+            cur = SYMS.get(m.group(2))
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^\s+([0-9a-f]+):\s+(\S+)\s*(.*)$", ln.rstrip())
+        if m:
+            fn[cur].append((int(m.group(1), 16), m.group(2), m.group(3).split("#")[0].strip()))
+    out = {}
+    for arm, ins in fn.items():
+        addrs = {a for a, _, _ in ins}
+        sp = set()
+        for a, mn, ops in ins:
+            if not mn.startswith("j"):
+                continue
+            mm = re.match(r"^([0-9a-f]+)", ops)
+            if mm and int(mm.group(1), 16) in addrs and int(mm.group(1), 16) < a:
+                sp.add((int(mm.group(1), 16), a))
+        cand = [(t, a) for t, a in sorted(sp, key=lambda x: x[1] - x[0])
+                if not any(mn.startswith(EPILOGUE) for x, mn, _ in ins if t <= x <= a)]
+        best = 0
+        for t, a in cand:
+            nf = sum(1 for x, mn, _ in ins if t <= x <= a and mn.startswith("vfmadd"))
+            best = max(best, nf)
+        for t, a in cand:
+            nf = sum(1 for x, mn, _ in ins if t <= x <= a and mn.startswith("vfmadd"))
+            if nf == best and best > 0:
+                out[arm] = best
+                break
+    return out
+
+
+
 KEEP = ("V0", "V0b", "V6", "V7", "V1", "V5")
 red = lambda v: math.exp(statistics.median([math.log(x) for x in v]))
 dev = lambda x: math.exp(abs(math.log(x))) - 1.0
@@ -76,6 +138,23 @@ def main():
     if not cores:
         sys.exit("REFUSE: no pbdeg_n*_core*.csv found under %s" % D)
 
+    asms = sorted(glob.glob(os.path.join(D, "probe-*.asm")))
+    if len(asms) != 1:
+        sys.exit("REFUSE: expected exactly one probe-<digest>.asm beside the data so each arm's\n"
+                 "  machine body width is DERIVED rather than assumed; found %d. Without it the\n"
+                 "  fit cannot know which ladder points run only the scalar remainder, and the\n"
+                 "  peer's simulation puts that error at +54%% on n*, upward." % len(asms))
+    BW = body_widths(asms[0])
+    for a in ("V0", "V6", "V7"):
+        if a not in BW or BW[a] < 2:
+            sys.exit("REFUSE: no machine body width for %s in %s." % (a, asms[0]))
+    print("MACHINE BODY WIDTHS from %s (FMAs in the innermost loop = nonzeros per body):"
+          % os.path.basename(asms[0]))
+    print("  " + "   ".join("%s=%d" % (a, BW[a]) for a in sorted(BW)))
+    print("  probe.cpp steps V0 by 2, V6 by 4, V7 by 8, so -funroll-loops doubled V0 four times,")
+    print("  V6 twice and V7 not at all. The source would mis-state all three, in three")
+    print("  different directions.")
+
     for core in sorted(cores):
         S = cores[core]
         ns = sorted(S)
@@ -103,6 +182,20 @@ def main():
                   (n, r.get("V0", float("nan")), r.get("V6", float("nan")),
                    r.get("V7", float("nan")), rat("V6"), rat("V7"), v76, fl))
         print("  '~' marks a ratio whose deviation from 1 is INSIDE that degree's own A/A floor.")
+        bad = [(n, S[n]["__floor__"]) for n in ns
+               if not math.isnan(S[n]["__floor__"]) and S[n]["__floor__"] > 0.005]
+        if bad:
+            print()
+            print("  FLOOR QUALITY: %d degree(s) have an A/A floor above 0.5%%: %s"
+                  % (len(bad), ", ".join("n=%d %.3f%%" % (n, f * 100) for n, f in bad)))
+            print("  The peer simulated n* against noise: at 0.075%% the interquartile range is")
+            print("  [4.45, 4.95] around a truth of 4.71, at 0.5%% it is [2.98, 6.30], and at 2%% it")
+            print("  CROSSES ZERO. So a degree whose own floor is above 0.5%% contributes an")
+            print("  interval wider than the answer, and n* below should be read as a direction")
+            print("  rather than a number.")
+        else:
+            print("  FLOOR QUALITY: every degree's A/A floor is at or below 0.5%, so n* is")
+            print("  resolvable (the peer's simulation gives an IQR of about +/-0.25 at 0.075%).")
 
         # ---- the registered fit
         print()
@@ -111,7 +204,13 @@ def main():
         print("  " + "-" * 60)
         fits = {}
         for a in ("V0", "V6", "V7"):
-            pts = [(n, S[n][a] * n) for n in ns if a in S[n]]
+            w = BW[a]
+            pts = [(n, S[n][a] * n) for n in ns if a in S[n] and n >= w]
+            drop = [n for n in ns if a in S[n] and n < w]
+            if drop:
+                print("  %5s excluding n=%s: below its %d-nonzero machine body, so those degrees"
+                      % (a, ",".join(str(x) for x in drop), w))
+                print("        run the scalar remainder -- a different kernel, with a different b.")
             if len(pts) < 4:
                 print("  %5s  only %d points, a fit is refused" % (a, len(pts)))
                 continue

@@ -12,7 +12,8 @@ ASM = sys.argv[1]
 FUNCS = {"_Z2v0RK4Args": "V0", "_Z3v0bRK4Args": "V0b", "_Z2v1RK4Args": "V1",
          "_Z2v2RK4Args": "V2", "_Z2v3RK4Args": "V3", "_Z2v4RK4Args": "V4",
          "_Z3v4bRK4Args": "V4b", "_Z3v4cRK4Args": "V4c", "_Z2v5RK4Args": "V5",
-         "_Z2v6RK4Args": "V6", "_Z2v7RK4Args": "V7"}
+         "_Z2v6RK4Args": "V6", "_Z2v7RK4Args": "V7",
+         "_Z2v8RK4Args": "V8", "_Z2v9RK4Args": "V9"}
 
 # Parse into functions.
 body, cur = collections.defaultdict(list), None
@@ -126,7 +127,7 @@ print("HOT-LOOP PROFILE (innermost loop containing every FMA; spans with ret/pop
 print("  %-5s %6s %6s %5s %7s %7s %7s %7s %8s" %
       ("arm", "insn", "mem", "fma", "fma_mem", "bcast", "vpor", "vmov_m", "unroll"))
 print("  " + "-" * 70)
-for a in ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7"):
+for a in ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7", "V8", "V9"):
     if a not in P:
         print("  %-5s MISSING FROM THE DISASSEMBLY" % a); continue
     p = P[a]
@@ -162,8 +163,10 @@ EXPECT = {"V0":  (3.0, 1.0, 0.0, "baseline: index load + A broadcast + folded B 
           "V4c": (4.0, 1.0, 1.0, "clean control: +1 load of an already-loaded address"),
           "V5":  (2.0, 1.0, 1.0, "discriminator: V1 + the same accumulate"),
           "V6":  (3.0, 1.0, 0.0, "CANDIDATE: 4 accumulator chains, V0's 3 load ops/nnz"),
-          "V7":  (3.0, 1.0, 0.0, "CANDIDATE: 8 accumulator chains, V0's 3 load ops/nnz")}
-for a in ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7"):
+          "V7":  (3.0, 1.0, 0.0, "CANDIDATE: 8 accumulator chains, V0's 3 load ops/nnz"),
+          "V8":  (2.0, 1.0, 0.0, "4 chains, index load removed -- the port discriminator"),
+          "V9":  (2.0, 1.0, 0.0, "4 chains, B register-resident -- dependency vs MLP")}
+for a in ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7", "V8", "V9"):
     if a not in P:
         fails.append("%s missing" % a); continue
     p = P[a]

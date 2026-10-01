@@ -338,9 +338,98 @@ NOINLINE float v7(const Args& A) {
 
 typedef float (*Fn)(const Args&);
 struct Arm { const char* name; Fn fn; };
+// ---- V8 and V9: THE LEVER THE PROBE LACKED. Both are probes, not candidates -- they compute the
+// wrong answer -- and both exist to discriminate two readings of V6's measured 1.5705 cycles/nnz
+// on the P-core, which is above BOTH named floors (4-chain latency 1.00 and 3-loads/3-ports 1.00)
+// and so is unexplained by the model that predicted it.
+//
+// THE TWO READINGS. The peer's hypothesis: something restricts this loop to two effective load
+// slots on Golden Cove, making the port floor 3 ops / 2 slots = 1.50 cycles/nnz, which V6 sits
+// 4.7% above. The alternative: 1.50 arises from something else entirely and the port count is
+// slack, in which case removing a load buys only what it bought at two chains.
+//
+// Recorded before measuring, and the two predictions differ by an ORDER OF MAGNITUDE rather than
+// by a floor width, which is what makes this worth running:
+//
+//   V8 = V6 with the index load removed, so 2 load ops/nnz at four chains.
+//     PORT READING:  2 ops / 2 slots = 1.00 cycles/nnz, so V8 beats V6 by roughly 30-36%.
+//     SLACK READING: V8 beats V6 by about 1%, which is what V1 bought over V0 at two chains
+//                    (-1.041% on P, -0.243% on E).
+//     There is no reading that puts it between 5% and 25%. If it lands there, both are wrong.
+//
+//   V9 = V6 with the B load removed (register-resident B, index still loaded), so 2 load ops/nnz
+//        at four chains and NO random memory access.
+//     This asks whether V6's 21.259% depends on the random column-indexed load at all. V3 bought
+//     -1.420% over V0 at two chains, so the whole cost of that load -- port slot and latency
+//     together -- was 1.42% when the accumulator chain was the deep one. If V9 over V6 is again
+//     about -1.4%, the random load is equally cheap once the chain is shallower and the gain is
+//     dependency. If V9 over V6 is much larger, the load's latency became exposed when the
+//     dependency was lifted, and the four-chain gain is partly memory-level parallelism.
+//     Note this is at a 128 KB B (nrowsB=8192, K=4), which is L2-resident: the answer is for the
+//     L2 band only and a footprint sweep is the companion measurement.
+
+// ---- V8: four accumulator chains, index load removed (B walked sequentially). Not a kernel.
+NOINLINE float v8(const Args& A) {
+  const float* SCORCH_RESTRICT SCORCH_AV = A.aval;
+  const float* SCORCH_RESTRICT SCORCH_BV = A.bval;
+  const int SCORCH_N = A.n;
+  __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
+         acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
+  int p = 0;
+  for (; p + 4 <= SCORCH_N; p += 4) {
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)p * K), acc0);
+    acc1 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 1]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)(p + 1) * K), acc1);
+    acc2 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 2]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)(p + 2) * K), acc2);
+    acc3 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 3]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)(p + 3) * K), acc3);
+  }
+  for (; p < SCORCH_N; ++p)
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),
+                        _mm_loadu_ps(SCORCH_BV + (size_t)p * K), acc0);
+  const __m128 r = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
+  alignas(16) float o[K]; _mm_storeu_ps(o, r);
+  return o[0] + o[1] + o[2] + o[3];
+}
+
+// ---- V9: four accumulator chains, B register-resident, index still loaded. Not a kernel.
+// `keep` consumes the index exactly as V3 does, so the index load is ISSUED and only the random
+// B access is gone -- otherwise -O3 deletes the load and V9 becomes V8 under another symbol,
+// which is the failure mode the disassembly gate exists for.
+NOINLINE float v9(const Args& A) {
+  const int* SCORCH_RESTRICT SCORCH_IDX = A.idx;
+  const float* SCORCH_RESTRICT SCORCH_AV = A.aval;
+  const int SCORCH_N = A.n;
+  const __m128 b0 = _mm_loadu_ps(A.bval);
+  const __m128 b1 = _mm_loadu_ps(A.bval + K);
+  const __m128 b2 = _mm_loadu_ps(A.bval + 2 * K);
+  const __m128 b3 = _mm_loadu_ps(A.bval + 3 * K);
+  __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
+         acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
+  int32_t keep = 0;
+  int p = 0;
+  for (; p + 4 <= SCORCH_N; p += 4) {
+    keep += SCORCH_IDX[p] + SCORCH_IDX[p + 1] + SCORCH_IDX[p + 2] + SCORCH_IDX[p + 3];
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),     b0, acc0);
+    acc1 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 1]), b1, acc1);
+    acc2 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 2]), b2, acc2);
+    acc3 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 3]), b3, acc3);
+  }
+  for (; p < SCORCH_N; ++p) {
+    keep += SCORCH_IDX[p];
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]), b0, acc0);
+  }
+  const __m128 r = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
+  alignas(16) float o[K]; _mm_storeu_ps(o, r);
+  return o[0] + o[1] + o[2] + o[3] + (float)keep * 1e-30f;
+}
+
 static Arm ARMS[] = {{"V0", v0}, {"V0b", v0b}, {"V1", v1}, {"V2", v2},
                      {"V3", v3}, {"V4", v4},   {"V4b", v4b}, {"V4c", v4c}, {"V5", v5},
-                     {"V6", v6},  {"V7", v7}};
+                     {"V6", v6},  {"V7", v7},
+                     {"V8", v8}, {"V9", v9}};
 static const int NARM = 11;
 
 static double now_ns() {
