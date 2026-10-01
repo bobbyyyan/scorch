@@ -39,6 +39,13 @@ import pfs_eta                                                   # noqa: E402
 
 RX = r"dl_(?P<build>[a-z_]+)_float32_p(?P<pass>[0-9]+)\.csv"
 
+# AN ENUMERATION, DECLARED AS ONE. Matched on a call's final name component, so it covers
+# `exit(...)`, `sys.exit(...)`, `os._exit(...)` and `os.abort()` alike. It is NOT complete
+# over ways to terminate a process -- an alias, a C extension or signal.raise_signal would
+# be outside it -- and that is why the docstring above says which half of the population is
+# complete by node type and which half is this list.
+TERMINATORS = frozenset(("exit", "_exit", "quit", "abort"))
+
 
 def early_exits():
     """Line numbers of every EARLY ERROR EXIT: the CALL SITES of pfs_eta._refuse, plus
@@ -64,11 +71,32 @@ def early_exits():
         no arguments read 15 of 15 / OK while producing an EMPTY message at status 1, and
         `raise SystemExit(...)` -- the same termination `sys.exit(...)` performs, spelled
         as a Raise rather than a Call -- was outside the population too.
-      * THIS ONE -- the sink's call sites UNION every `ast.Raise` node UNION every
-        `sys.exit` call. Complete over abnormal terminations by NODE TYPE rather than by
-        which exception is named or how it is spelled. A raise is a raise; the sink's
+      * THIS ONE -- the sink's call sites UNION every `ast.Raise` UNION every `ast.Assert`
+        UNION every call whose callee's final name is a process terminator. The sink's
         call sites are kept only for RESOLUTION, since one raise inside _refuse would
-        otherwise collapse eleven distinct error conditions into one site. Exact regardless of how the message is
+        otherwise collapse eleven distinct error conditions into one site.
+
+    AND THE SCOPE OF THAT IS STATED EXACTLY, because claiming completeness over the
+    CATEGORY while covering particular ENCODINGS of it is the error this file has now
+    made four times -- the fourth in the very commit that named it. ABNORMAL TERMINATION
+    IS NOT A SYNTACTIC CATEGORY IN PYTHON, so no AST predicate can be complete over it.
+    What is true:
+
+      * `ast.Raise` and `ast.Assert` are NODE TYPES, so those two are complete -- every
+        raise and every assert, whatever it names and however it is spelled.
+      * TERMINATOR CALLS ARE AN ENUMERATION and are stated as one: the final name
+        component in TERMINATORS below. It was previously `Attribute.attr == "exit"`,
+        which missed `exit(...)` (a Call on a Name) and `os._exit(3)` (attr `_exit`).
+        Widening it does not make it complete -- `signal.raise_signal`, a C extension, or
+        any alias would be outside it. The set is a judgement about what is idiomatic
+        here, and it is named rather than hidden in a predicate.
+
+    THE `assert` FORM IS SEPARATELY PROHIBITED, because its defect is not a coverage gap.
+    Under `python -O` asserts are STRIPPED: measured on a planted guard, the branch
+    vanished and the run produced a full projection at EXIT STATUS 0. So an assert-based
+    guard is fail-OPEN under an interpreter flag, where every other form here is
+    fail-closed. t_no_assert_control_flow forbids it outright and the corpus is run under
+    -O as a second arm, which tests that property instead of arguing it. Exact regardless of how the message is
         built or spelled, and it brought the helper refusal into the population. But
         REPLACING the shape predicate with it was a REGRESSION: an exit that neither
         calls the sink nor contains the word "REFUSE" left the population again, and
@@ -96,12 +124,12 @@ def early_exits():
     t = ast.parse(open(TARGET).read())
     out = set()
     for n in ast.walk(t):
-        if isinstance(n, ast.Raise):
+        if isinstance(n, (ast.Raise, ast.Assert)):       # node types: complete
             out.add(n.lineno)
         if isinstance(n, ast.Call):
-            if isinstance(n.func, ast.Name) and n.func.id == "_refuse":
-                out.add(n.lineno)
-            if isinstance(n.func, ast.Attribute) and n.func.attr == "exit":
+            nm = (n.func.id if isinstance(n.func, ast.Name)
+                  else n.func.attr if isinstance(n.func, ast.Attribute) else None)
+            if nm == "_refuse" or nm in TERMINATORS:     # names: an enumeration, declared
                 out.add(n.lineno)
     return out
 
@@ -721,10 +749,75 @@ def t_empty_refusal_is_named_not_relayed():
         FAIL.append("empty-refusal: _surface() altered a refusal that had a message")
 
 
+def t_no_assert_control_flow():
+    """No `assert` anywhere in pfs_eta.py. Not a coverage rule -- a correctness one.
+
+    `python -O` STRIPS asserts. Measured on a guard planted in project(): under -O the
+    branch vanished and the CLI produced a full projection at EXIT STATUS 0. Every other
+    termination form here is fail-closed; an assert-based guard is fail-OPEN under an
+    interpreter flag, so it cannot be used for a refusal and the prohibition is flat
+    rather than a demand for a plant.
+
+    This check is COMPLETE for its form, unlike the terminator-name enumeration: ast.Assert
+    is a node type.
+    """
+    global CHECKS
+    CHECKS += 1
+    t = ast.parse(open(TARGET).read())
+    bad = [n.lineno for n in ast.walk(t) if isinstance(n, ast.Assert)]
+    if bad:
+        FAIL.append("no-assert: pfs_eta.py uses `assert` at %s. Under `python -O` those "
+                    "statements are stripped and the guard silently disappears -- a "
+                    "planted one let the CLI print a full projection at exit status 0. "
+                    "Use _refuse(), which raises." % bad)
+
+
+def t_corpus_arms_agree_under_O():
+    """A/B the corpus against itself with asserts stripped. The two arms must AGREE.
+
+    The first version of this required the -O run to exit 0, and its message said "some
+    guard here is an assert". That was wrong in exactly the way finding 13 described: it
+    fired for EVERY failing perturbation, because a corpus failing for any reason exits
+    non-zero under -O too, and it named a cause that had nothing to do with most of them.
+    A diagnosis that names the wrong cause is worse than none.
+
+    So both arms are subprocesses of the same file differing ONLY in the flag, and the
+    comparison is their failure sets. A difference is then attributable to the flag, which
+    is what the test is about: a guard implemented as `assert` disappears under -O, and
+    measured on a planted one the corpus went from a named crash to OK.
+    """
+    global CHECKS
+    CHECKS += 1
+    if not __debug__:
+        return
+    import subprocess
+
+    def labels(opt):
+        r = subprocess.run([sys.executable] + opt + [os.path.abspath(__file__),
+                                                     "--no-recurse"],
+                           capture_output=True, text=True)
+        return set(ln.split(":")[0].strip() for ln in r.stdout.split("\n")
+                   if ln.strip().startswith("FAIL ")), r.returncode
+
+    plain, rc0 = labels([])
+    opt, rc1 = labels(["-O"])
+    if plain != opt:
+        FAIL.append("under-O: the two arms disagree. Only in the normal arm: %s. Only "
+                    "under -O: %s. A guard that appears in one arm and not the other is "
+                    "an `assert`, which -O strips."
+                    % (sorted(plain - opt) or "none", sorted(opt - plain) or "none"))
+    elif (rc0 == 0) != (rc1 == 0):
+        FAIL.append("under-O: identical failure sets but different verdicts, rc %d vs %d "
+                    "-- something outside the FAIL list differs under the flag" % (rc0, rc1))
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
 def main():
+    # `--no-recurse` keeps the -O A/B arm from spawning its own A/B arm forever.
+    if "--no-recurse" in sys.argv:
+        TESTS[:] = [f for f in TESTS if f is not t_corpus_arms_agree_under_O]
     sys.settrace(_tracer)
     try:
         for fn in TESTS:
@@ -744,7 +837,7 @@ def main():
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
     print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
-          "(sink call sites + every ast.Raise + sys.exit)" % (len(TESTS), CHECKS, len(want)))
+          "(Raise/Assert by node type + declared terminator names + sink calls)" % (len(TESTS), CHECKS, len(want)))
     print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:
