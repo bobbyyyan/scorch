@@ -33,6 +33,17 @@ struct Args {
 NOINLINE float v0(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
   int p = 0;
+  // BODY WIDTH IS PINNED ON EVERY ARM, so it is a CONTROLLED CONSTANT rather than a compiler
+  // choice. It had become a dependent variable: removing the index load lowered register
+  // pressure and gcc unrolled V8 FOURfold to a 16-nonzero body, while ADDING a sink raised
+  // pressure and it unrolled V4/V4c only twofold to 4 -- opposite directions, both caused by
+  // the change under test. Then V8-vs-V6 and V4c-vs-V4b each measured their intended delta
+  // PLUS a halved or doubled per-nonzero loop control, and the gate could not see it: all three
+  // of its metrics are per-nonzero ratios, so doubling a body doubles numerator and denominator
+  // and leaves them invariant. Every arm now gets 8 nonzeros per body. Some arms are slower in
+  // absolute terms than their preferred width would give, which costs nothing: the probe only
+  // ever reads differences, and matched bodies are what make a difference attributable.
+  #pragma GCC unroll 4
   for (; p + 2 <= A.n; p += 2) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -50,6 +61,7 @@ NOINLINE float v0(const Args& A) {
 NOINLINE float v0b(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 4
   for (; p + 2 <= A.n; p += 2) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -67,6 +79,7 @@ NOINLINE float v0b(const Args& A) {
 NOINLINE float v1(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 4
   for (; p + 2 <= A.n; p += 2) {
     const float* B0 = A.bval + (size_t)p * K;
     const float* B1 = A.bval + (size_t)(p + 1) * K;
@@ -86,6 +99,7 @@ NOINLINE float v2(const Args& A) {
   const __m128 a0 = _mm_set1_ps(A.aval[0]);
   const __m128 a1 = _mm_set1_ps(A.aval[1]);
   int p = 0;
+  #pragma GCC unroll 4
   for (; p + 2 <= A.n; p += 2) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -106,6 +120,7 @@ NOINLINE float v3(const Args& A) {
   const __m128 b1 = _mm_loadu_ps(A.bval + K);
   int32_t keep = 0;
   int p = 0;
+  #pragma GCC unroll 4
   for (; p + 2 <= A.n; p += 2) {
     keep += A.idx[p] + A.idx[p + 1];
     const __m128 a0 = _mm_set1_ps(A.aval[p]);
@@ -136,6 +151,7 @@ NOINLINE float v4(const Args& A) {
   __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(),
          s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= A.n; p += 4) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -168,6 +184,7 @@ NOINLINE float v4b(const Args& A) {
   __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(),
          s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= A.n; p += 4) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -209,6 +226,7 @@ NOINLINE float v4c(const Args& A) {
   __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(),
          s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= A.n; p += 4) {
     const float* B0 = A.bval + (size_t)A.idx[p] * K;
     const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
@@ -242,6 +260,7 @@ NOINLINE float v5(const Args& A) {
   __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(),
          s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= A.n; p += 4) {
     const float* B0 = A.bval + (size_t)p * K;
     const float* B1 = A.bval + (size_t)(p + 1) * K;
@@ -290,6 +309,7 @@ NOINLINE float v6(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
          acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= SCORCH_N; p += 4) {
     const float* B0 = SCORCH_BV + (size_t)SCORCH_IDX[p] * K;
     const float* B1 = SCORCH_BV + (size_t)SCORCH_IDX[p + 1] * K;
@@ -317,6 +337,7 @@ NOINLINE float v7(const Args& A) {
   __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps(), a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
   __m128 a4 = _mm_setzero_ps(), a5 = _mm_setzero_ps(), a6 = _mm_setzero_ps(), a7 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 1
   for (; p + 8 <= SCORCH_N; p += 8) {
     a0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),     _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p] * K), a0);
     a1 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p + 1]), _mm_loadu_ps(SCORCH_BV + (size_t)SCORCH_IDX[p + 1] * K), a1);
@@ -376,6 +397,7 @@ NOINLINE float v8(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
          acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= SCORCH_N; p += 4) {
     acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),
                         _mm_loadu_ps(SCORCH_BV + (size_t)p * K), acc0);
@@ -410,6 +432,7 @@ NOINLINE float v9(const Args& A) {
          acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
   int32_t keep = 0;
   int p = 0;
+  #pragma GCC unroll 2
   for (; p + 4 <= SCORCH_N; p += 4) {
     keep += SCORCH_IDX[p] + SCORCH_IDX[p + 1] + SCORCH_IDX[p + 2] + SCORCH_IDX[p + 3];
     acc0 = _mm_fmadd_ps(_mm_set1_ps(SCORCH_AV[p]),     b0, acc0);

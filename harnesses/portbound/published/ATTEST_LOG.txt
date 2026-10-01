@@ -1,0 +1,13 @@
+2026-10-01T12:03:15Z  degree-sweep n=4 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:03:25Z  degree-sweep n=6 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:03:36Z  degree-sweep n=8 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:03:52Z  degree-sweep n=12 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:04:10Z  degree-sweep n=16 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:04:36Z  degree-sweep n=24 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:05:04Z  degree-sweep n=32 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:05:51Z  degree-sweep n=48 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:06:31Z  degree-sweep n=64 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:07:54Z  degree-sweep n=128 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:11:11Z  degree-sweep n=512 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:17:34Z  degree-sweep n=4096 reps=61 binary 526c0e971db0953ea8ed2dc9b6aad92eac7a1dad04bfe67b5e6f9b96506938df
+2026-10-01T12:21:53Z  binary 5a9943904a51008e911bcbc485a045f9df607a9fa87fcdc519a33d719c4af792  source 145c61e7656b7f5aaa178ae6771be4671746ad37f574e2897a68065df4befa6d  asmcheck_exit 0  argv "4096 61 8192 12345"

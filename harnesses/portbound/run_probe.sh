@@ -59,9 +59,17 @@ echo "ATTESTED binary $BIN"
 for core in 0 16; do
   taskset -c "$core" ./probe "$N" "$REPS" "$NB" "$SEED" > "pb_core${core}.raw" || { echo "REFUSE: probe failed on cpu$core"; exit 1; }
   # The digest goes INTO the data file, so a CSV can never be read against a different binary.
-  { echo "# binary_sha256 $BIN"; cat "pb_core${core}.raw"; } > "pb_core${core}.csv"
+  # THE DATA IS DIGEST-NAMED FOR THE SAME REASON THE ATTESTATION IS, and I fixed only half of
+  # this problem the first time: ATTEST.txt was made per-binary while the CSVs kept their fixed
+  # names, so a re-run still destroyed the DATA behind a published number even though its
+  # attestation now survived. It happened within the hour -- the 526c0e97 E-core CSV, the
+  # published half of the latency refutation, was overwritten by the next run and survived only
+  # because a copy had already been fetched. Fixing one half of a two-part custody problem and
+  # calling it done is the error; the generic name stays as a convenience pointer only.
+  { echo "# binary_sha256 $BIN"; cat "pb_core${core}.raw"; } > "pb_core${core}-${BIN:0:16}.csv"
+  cp -f "pb_core${core}-${BIN:0:16}.csv" "pb_core${core}.csv"
   rm -f "pb_core${core}.raw"
-  echo "cpu$core -> pb_core${core}.csv ($(wc -l < pb_core${core}.csv) lines)"
+  echo "cpu$core -> pb_core${core}-${BIN:0:16}.csv ($(wc -l < pb_core${core}.csv) lines)"
 done
 echo "freq during a P-core block, for the cycles conversion:"
 ( taskset -c 0 ./probe "$N" 9 "$NB" "$SEED" > /dev/null & \
