@@ -17,9 +17,26 @@ still owed is known exactly.
 
 It REFUSES rather than extrapolating when a build has no landed pass, because then
 its mean does not exist and a pooled substitute would silently change the estimator.
+
+TWO INPUT SOURCES, because the two live runs record their passes differently and the
+difference is not cosmetic. A pass LOG carries each pass's start and done, so a
+duration is measured directly and an inter-pass gap is visible. Per-pass output file
+MTIMES carry only COMPLETIONS, so a duration is a difference between consecutive
+completions -- which silently assumes the gap is zero, gives the first pass no
+measurable duration at all (it has no predecessor), and makes the open pass's "start"
+the previous pass's completion. Those are different quantities that coincide only
+while the gap is zero, so the mtime mode says which one it used and never labels a
+completion as a start.
+
+The mtime mode's own trap: the open pass's file EXISTS and its mtime is moving, so
+including it would attribute a near-zero duration to a pass that has not finished.
+It is identified by being both newest and smaller than every landed file, and if that
+test does not separate it the mode refuses rather than guessing.
 """
+import os
 import re
 import sys
+import time
 
 LINE = re.compile(r"---\s+p(\d+)\s+(\S+)\s+(start|done)\s+(\d\d):(\d\d):(\d\d)")
 
@@ -107,11 +124,137 @@ def hms(t):
     return "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
 
 
+def read_mtimes(d, pattern):
+    """-> [(mtime, size, build, pass)] from filenames matching `pattern`.
+
+    `pattern` must name groups `build` and `pass`. A per-pass output file's mtime is
+    the pass's COMPLETION, never its start -- the caller must not conflate them.
+    """
+    rx = re.compile(pattern)
+    out = []
+    for f in sorted(os.listdir(d)):
+        m = rx.match(f)
+        if not m:
+            continue
+        st = os.stat(os.path.join(d, f))
+        out.append((st.st_mtime, st.st_size, m.group("build"), int(m.group("pass")), f))
+    out.sort()
+    return out
+
+
+def project_mtimes(d, pattern, rounds, now=None):
+    """Projection from per-pass completion mtimes. Prints the same inputs as the log mode."""
+    fs = read_mtimes(d, pattern)
+    if len(fs) < 3:
+        return ["REFUSE: %d file(s) matched in %s -- a difference-of-completions "
+                "estimator needs at least two landed passes plus an open one" % (len(fs), d)]
+    sizes = [x[1] for x in fs]
+    openf = None
+    if sizes[-1] < min(sizes[:-1]):
+        openf = fs[-1]
+        landed = fs[:-1]
+    else:
+        return ["REFUSE: the newest file %s is %d bytes and not smaller than every "
+                "landed file (min %d), so the open pass cannot be identified by size; "
+                "its mtime is a moving target and including it would attribute a "
+                "near-zero duration to an unfinished pass"
+                % (fs[-1][4], sizes[-1], min(sizes[:-1]))]
+    builds = sorted(set(x[2] for x in fs))
+    per = {}
+    for i in range(1, len(landed)):
+        per.setdefault(landed[i][2], []).append(landed[i][0] - landed[i - 1][0])
+    nolast = [b for b in builds if not per.get(b)]
+    if nolast:
+        return ["REFUSE: build(s) %s have no pass with a measurable duration. A "
+                "completion-difference needs a predecessor, so the earliest file "
+                "contributes none" % ",".join(nolast)]
+    n_landed = len(landed) + 1          # the open pass counts against its build's rounds
+    out = ["  estimator: finish = open pass's start + SUM_builds mean(landed) * remaining",
+           "  input: per-pass COMPLETION mtimes, so each duration is a difference "
+           "between consecutive completions and assumes a zero inter-pass gap",
+           "  landed %d of %d passes over %d builds, %d rounds; %s is open (%d bytes "
+           "against a landed min of %d)"
+           % (len(landed), rounds * len(builds), len(builds), rounds, openf[4],
+              openf[1], min(sizes[:-1])),
+           "  %s has no measurable duration: it is the earliest file and has no "
+           "predecessor" % landed[0][4]]
+    rem_s = 0.0
+    rem_n = 0
+    for b in builds:
+        v = per[b]
+        mean = sum(v) / len(v)
+        # `done` counts this build's FILES; the open pass has a file but is not landed,
+        # so it is still owed -- and only by the build that owns it. Adding 1 for every
+        # build (the first version of this) overstated the remainder by one pass per
+        # build, which the per-build/total cross-check below now catches.
+        done = sum(1 for x in fs if x[2] == b)
+        rem = rounds - done + (1 if b == openf[2] else 0)
+        if rem < 0:
+            return ["REFUSE: build %s already has %d files but only %d rounds were "
+                    "declared" % (b, done, rounds)]
+        rem_s += mean * rem
+        rem_n += rem
+        out.append("    %-5s durations %-34s mean %9.3f  remaining %d"
+                   % (b, ",".join("%.1f" % x for x in v), mean, rem))
+    # NOT a cross-check against the global count. sum_b (rounds - done_b) plus one for
+    # the open build is rounds*B - len(fs) + 1 = rounds*B - len(landed) ALGEBRAICALLY, so
+    # that equality holds whatever the per-build attribution is and would have passed the
+    # off-by-one this file shipped with. It is the partition-identity trap: making the
+    # total an identity lets a misrouted item still sum correctly.
+    #
+    # What IS evidence is a property of the SCHEDULE rather than of the arithmetic: the
+    # rotation is balanced, so at any instant two builds' file counts differ by at most
+    # one. A build running ahead means the rotation broke, and then every per-build mean
+    # is conditioned on a different stretch of the run.
+    counts = {b: sum(1 for x in fs if x[2] == b) for b in builds}
+    if max(counts.values()) - min(counts.values()) > 1:
+        return ["REFUSE: the rotation is not balanced -- file counts %s differ by %d. "
+                "The schedule is meant to hold them within one, so each build's mean "
+                "would be conditioned on a different stretch of the run"
+                % (dict(sorted(counts.items())),
+                   max(counts.values()) - min(counts.values()))]
+    base = landed[-1][0]
+    fin = base + rem_s
+    out.append("  remaining seconds = %.3f over %d passes" % (rem_s, rem_n))
+    # LOCAL time, not `epoch % 86400`. st_mtime is epoch UTC and the log mode reads a
+    # local wall clock out of the log text, so a UTC rendering here put the two modes
+    # 7 hours apart on the same kind of run -- a disagreement no plant of mine covered
+    # because every plant built its own mtimes and compared them to each other.
+    out.append("  the open pass's start is taken as %s's COMPLETION, %s local"
+               % (landed[-1][4], local_hms(base)))
+    out.append("  PROJECTED FINISH %s local  (+%s)" % (local_hms(fin), hms(rem_s)))
+    if now is not None:
+        out.append("  now %s, so %s to go"
+                   % (hms(now), hms(max(0.0, _secs_of_day(fin) - now))))
+    return out
+
+
+def _secs_of_day(epoch):
+    t = time.localtime(epoch)
+    return t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec
+
+
+def local_hms(epoch):
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.exit("usage: pfs_eta.py <pass-log> <rounds> [HH:MM:SS now]")
-    nw = None
-    if len(sys.argv) > 3:
-        hh, mm, ss = sys.argv[3].split(":")
-        nw = _secs(hh, mm, ss)
-    print("\n".join(project(sys.argv[1], int(sys.argv[2]), nw)))
+    a = sys.argv[1:]
+    if a and a[0] == "--mtimes":
+        if len(a) < 4:
+            sys.exit("usage: pfs_eta.py --mtimes <dir> <regex with (?P<build>)(?P<pass>)> "
+                     "<rounds> [HH:MM:SS now]")
+        nw = None
+        if len(a) > 5:
+            hh, mm, ss = a[5].split(":")
+            nw = _secs(hh, mm, ss)
+        print("\n".join(project_mtimes(a[1], a[2], int(a[3]), nw)))
+    else:
+        if len(a) < 2:
+            sys.exit("usage: pfs_eta.py <pass-log> <rounds> [HH:MM:SS now]\n"
+                     "       pfs_eta.py --mtimes <dir> <regex> <rounds> [HH:MM:SS now]")
+        nw = None
+        if len(a) > 2:
+            hh, mm, ss = a[2].split(":")
+            nw = _secs(hh, mm, ss)
+        print("\n".join(project(a[0], int(a[1]), nw)))
