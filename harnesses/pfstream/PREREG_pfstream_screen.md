@@ -648,3 +648,97 @@ quantity, since it is the only authoritative progress counter. **It was not doub
 is arithmetic rather than reassurance: at the 8-pass checkpoint, `09:25:31 − 06:24:32 = 10859 s`
 against `3(1352.5) + 2(1351.5) + 3(1366.3) = 10859.4 s`. A doubled count would have missed by a
 factor near two, not by 0.4 s.
+
+## Amendment 12 — the mechanism's reach is `2/d`, and that is a falsifiable prediction registered before any arm is read
+
+**Registered at 10:40 on 2026-10-01, with the screen at 8 of 16 object-passes and no arm read.**
+
+`SCORCH_SPMM_REGBLOCK_PFD` ships at **2** (`scorch_policy.h:705`), and the two forms of the
+run-ahead differ exactly as follows:
+
+| form | site | fires when | prefetches in a row of length L |
+|---|---|---|---|
+| shipped, row-clipped | `spmm.h:2305` | `pA + 2 < pA_end` | `max(0, L − 2)` |
+| PFSTREAM, array-clamped | `spmm.h:2302` | always (the clamp guarantees a target) | `L` |
+
+So the **newly covered fraction of nonzeros is `Σ_rows min(L_i, 2) / nnz`**, which is `≈ 2/d` at mean
+degree `d`. This is not an estimate; it is the difference of the two expressions, and the measured
+Spearman correlation against `1/d` over the cached SuiteSparse matrices is **1.0000** — as it must
+be, because the quantity *is* `2/d`.
+
+**Measured reach, two corpora.** SuiteSparse first, and the sample limitation stated: 16 matrices
+cached on the local machine, assembled for earlier panels, a convenience sample and not a draw.
+
+| | newly covered |
+|---|---|
+| SuiteSparse (16 cached) | min 0.0%, **median 0.9%**, max 38.0% |
+| — matrices at ≤ 5% | **9 of 16** |
+| — matrices at ≥ 50% | 0 of 16 |
+
+DLMC, read from `~/dlmc` directly rather than from the cache, because the cache stops at pruning
+0.9 and the fused path's shipped result lives at 0.95–0.99. 3846 `.smtx` files, up to 30 sampled
+per (method, level):
+
+| pruning level | mean degree | newly covered |
+|---|---|---|
+| 0.5 | 256–286 | 0.7–0.8% |
+| 0.8 | 102–104 | 1.9–2.0% |
+| 0.9 | 49–63 | 2.8–4.0% |
+| 0.95 | 21–28 | 4.5–9.8% |
+| 0.98 | 8.6–12.2 | 9.6–21.3% |
+
+**THE PREDICTION, pre-registered.** The screen's per-matrix effect must be **monotone increasing in
+that matrix's newly-covered fraction**, and must be **indistinguishable from the floor where the
+fraction is near zero**. The screen CSV already records `deg`, so the test needs no new measurement:
+compute `2/d` per row and regress the per-cell `strm/ship` log-ratio on it.
+
+**Why this matters more than the earlier prediction.** Amendment 0's conjunction was "beats `nopf`
+where B is cache-resident AND beats `ship` on the 115 matrices that need the prefetch". That has no
+degree term at all. But in **both** corpora the mechanism touches a *single-digit percentage* of
+prefetches at the median. So a large pooled effect would be **disproportionate to its own
+mechanism** — and a disproportionate effect is the signature of a layout artefact (two objects with
+identical decisions differ 1–2.6% on narrow-k SpMM, largest at the narrowest width) rather than of
+the change under test.
+
+**The falsification is therefore sharper than "no effect".** If the effect is large but
+*uncorrelated* with `2/d`, the mechanism story is wrong even though the measurement is right — and
+PFSTREAM must not ship on it, because what would be shipping is an unexplained difference between
+two builds. Stating this now, before any arm is read, is the whole point of registering it.
+
+**One corollary for `nopf`.** Deleting the prefetch entirely was measured at 2.9–14.2% faster while
+harming 115 matrices at width 32. Since the prefetch covers `(L−2)/L` of a row, the *cost* side also
+scales with degree but in the opposite direction — a high-degree matrix pays the full guard cost on
+almost every nonzero and PFSTREAM changes almost nothing there. So `ship`-versus-`nopf` should be
+**largest** where `strm`-versus-`ship` is **smallest**. That is a second, independent prediction
+from the same arithmetic, and the two must not both be flat.
+
+## Amendment 13 — the windowing rule named the wrong pair, and the bias halves rather than vanishing
+
+Amendment 4's windowing decision said: at three complete rounds, "report the ship-vs-shpb position
+effect beside every number". **That names the wrong pair at every window size**, and the position
+bias at three rounds is larger than the phrasing implies. From the four landed orders
+(`ship shpb strm nopf` / `shpb strm nopf ship` / `strm nopf ship shpb` / `nopf ship shpb strm`),
+each build's mean position:
+
+| after | ship | shpb | strm | nopf | spread | worst pair | ship–shpb |
+|---|---|---|---|---|---|---|---|
+| 2 rounds | 2.500 | 1.500 | 2.500 | 3.500 | **2.000** | nopf–shpb at 2.000 | 1.000 |
+| 3 rounds | 2.667 | 2.333 | 2.000 | 3.000 | **1.000** | nopf–strm at 1.000 | 0.333 |
+| 4 rounds | 2.500 | 2.500 | 2.500 | 2.500 | **0** | — | 0 |
+
+Three consequences, and the first two are corrections rather than refinements:
+
+1. **The maximally confounded pair is a function of the window.** `nopf–shpb` at two rounds,
+   `nopf–strm` at three. `ship–shpb` is 1.000 and 0.333 — so the standing rule pointed at a pair
+   carrying half, then a sixth, of the actual confound. The correct statement is *the spread, plus
+   which pair carries it*, recomputed for the window actually analysed.
+2. **At three rounds the bias halves; it does not nearly vanish.** A per-position drift of `d`
+   seconds still buys one full position-unit of build contrast, so a three-round read carries the
+   position term with coefficient 1.0 rather than as a caveat.
+3. **At two rounds the estimator carries no progress information**, same property as the board at
+   3/3/3: with balanced counts the total is `4 × (sum of the four build means)`. The landed sum
+   being 6716 s and the remaining estimate also being 6716 s is that identity, not a coincidence,
+   and nothing should be read into the symmetry.
+
+This amends amendment 4 and does not change the gate: four complete rounds, which is the only
+window where the spread is zero.
