@@ -104,6 +104,10 @@ def project(path, rounds, now=None):
         rem_s += mean * rem
         out.append("    %-5s landed %d  durations %-22s mean %8.3f  remaining %d"
                    % (b, len(v), ",".join(str(x) for x in v), mean, rem))
+    if now is not None and rem_s >= 86400:
+        return ["REFUSE: %.0f s remain, which is a day or more. `now` is a bare clock "
+                "with no date, so the elapsed time on the open pass cannot be "
+                "distinguished from itself plus a multiple of 24 h" % rem_s]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, total - landed))
     if running is None:
         base = max(t for _p, _b, _k, t in ev)
@@ -115,13 +119,49 @@ def project(path, rounds, now=None):
     out.append("  PROJECTED FINISH %s  (+%s from the open pass's start)"
                % (hms(fin), hms(rem_s)))
     if now is not None:
-        out.append("  now %s, so %s to go" % (hms(now), hms(max(0.0, fin - now))))
+        out.append(_to_go_line(rem_s, _elapsed_since(base, now), now))
     return out
 
 
 def hms(t):
     t = int(round(t)) % 86400
     return "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
+
+
+def _elapsed_since(base_sod, now_sod):
+    """Seconds from `base` to `now`, both seconds-of-day, assuming under 24 h apart.
+
+    Neither input carries a date: the log's timestamps are bare wall clocks and `now` is
+    given as HH:MM:SS. A negative difference is therefore a midnight crossing, not a
+    `now` in the past -- justified because the quantity measured is the age of the OPEN
+    pass, which is minutes to hours, never days.
+    """
+    d = now_sod - base_sod
+    if d < 0:
+        d += 86400
+    return d
+
+
+def _to_go_line(rem_s, elapsed, now_sod):
+    """The remainder as a SIGNED quantity, because a deficit must not read as zero.
+
+    Both modes previously computed this from wrapped clock values and clamped at zero:
+      * the mtimes mode wrapped `finish` to seconds-of-day BEFORE subtracting `now`, so a
+        projection past midnight produced a large negative that clamped -- a two-hour
+        remainder printed as `00:00:00 to go`;
+      * both modes clamped an OVERDUE run to `00:00:00`, so a run an hour late read as
+        about to land rather than as possibly dead. That is the reading that matters when
+        a watcher is the primary wake signal.
+    The fix is to stop deriving it from clocks at all. `remaining - elapsed` is wrap-free
+    because `elapsed` is, and its sign is the information the clamp was destroying.
+    """
+    left = rem_s - elapsed
+    if left >= 0:
+        return "  now %s, %s elapsed on the open pass, so %s to go" % (
+            hms(now_sod), hms(elapsed), hms(left))
+    return ("  now %s, %s elapsed on the open pass -- OVERDUE by %s against a %s "
+            "projection. The run may have stalled or died; the projection is not a "
+            "deadline" % (hms(now_sod), hms(elapsed), hms(-left), hms(rem_s)))
 
 
 def read_mtimes(d, pattern):
@@ -215,6 +255,10 @@ def project_mtimes(d, pattern, rounds, now=None):
                    max(counts.values()) - min(counts.values()))]
     base = landed[-1][0]
     fin = base + rem_s
+    if now is not None and rem_s >= 86400:
+        return ["REFUSE: %.0f s remain, which is a day or more. `now` is a bare clock "
+                "with no date, so the elapsed time on the open pass cannot be "
+                "distinguished from itself plus a multiple of 24 h" % rem_s]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, rem_n))
     # LOCAL time, not `epoch % 86400`. st_mtime is epoch UTC and the log mode reads a
     # local wall clock out of the log text, so a UTC rendering here put the two modes
@@ -224,8 +268,7 @@ def project_mtimes(d, pattern, rounds, now=None):
                % (landed[-1][4], local_hms(base)))
     out.append("  PROJECTED FINISH %s local  (+%s)" % (local_hms(fin), hms(rem_s)))
     if now is not None:
-        out.append("  now %s, so %s to go"
-                   % (hms(now), hms(max(0.0, _secs_of_day(fin) - now))))
+        out.append(_to_go_line(rem_s, _elapsed_since(_secs_of_day(base), now), now))
     return out
 
 
@@ -244,9 +287,14 @@ if __name__ == "__main__":
         if len(a) < 4:
             sys.exit("usage: pfs_eta.py --mtimes <dir> <regex with (?P<build>)(?P<pass>)> "
                      "<rounds> [HH:MM:SS now]")
+        # `a` is ["--mtimes", dir, regex, rounds, now], so `now` is a[4] and len(a) is 5.
+        # This read a[5] behind a `len(a) > 5` gate -- both off by one in the SAME
+        # direction, so the gate that would have raised the IndexError was itself never
+        # true and the documented 4-argument form silently dropped `now`. Repairing only
+        # one half converts a silent no-op into a crash or leaves it silent.
         nw = None
-        if len(a) > 5:
-            hh, mm, ss = a[5].split(":")
+        if len(a) > 4:
+            hh, mm, ss = a[4].split(":")
             nw = _secs(hh, mm, ss)
         print("\n".join(project_mtimes(a[1], a[2], int(a[3]), nw)))
     else:
