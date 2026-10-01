@@ -47,6 +47,40 @@ KS = (2, 4, 8, 16, 32)
 NBOOT = 2000
 SEED = 20261001
 ARM, FLOOR, DEN = "deep", "bsb_", "base"
+# Everything compared against a displacement is compared at the precision it is PRINTED at.
+# A guard tighter than that lets a value print as zero beside a number derived by dividing
+# by it. `%.2f` of a percentage rounds at 0.005.
+PRINTED_ZERO = 0.005
+
+
+def _sign(pp):
+    """-1 / 0 / +1 at the PRINTED precision. One place, so no caller can treat the zero case
+    on one line and omit it on the next."""
+    if abs(pp) < PRINTED_ZERO:
+        return 0
+    return 1 if pp > 0 else -1
+
+
+def sign_argument(arm_pps, ctl_pp):
+    """The SIGN paragraph as a pure function of (arm displacements, control displacement).
+
+    Extracted because the block was module-level straight-line code with no selftest, and the
+    defect it replaced was a sentence true only on the pass it was written for. An unexercised
+    branch is the same thing with a condition in front of it. -> (token, arm_word, ctl_word).
+    """
+    signs = set(_sign(x) for x in arm_pps)
+    signs.discard(0)
+    arm_word = ("SLOWER" if signs == {1} else "FASTER" if signs == {-1}
+                else "NO EFFECT AT ANY WIDTH" if not signs else "MIXED")
+    cs = _sign(ctl_pp)
+    ctl_word = "FASTER" if cs < 0 else "SLOWER" if cs > 0 else "ZERO"
+    if cs == 0:
+        return "CONTROL_ZERO", arm_word, ctl_word
+    if arm_word in ("MIXED", "NO EFFECT AT ANY WIDTH"):
+        return "ARM_HAS_NO_SINGLE_SIGN", arm_word, ctl_word
+    if (cs == 1) != (signs == {1}):
+        return "OPPOSITE_SIGN_AVAILABLE", arm_word, ctl_word
+    return "SAME_SIGN_NOT_AVAILABLE", arm_word, ctl_word
 
 
 def load(obj):
@@ -73,7 +107,7 @@ print("PAIRED CONTRAST %s/%s per width -- base cancels, so this is the arm again
       % (ARM, FLOOR))
 print("  %-4s %8s %24s %14s %7s  %s"
       % ("k", "n", "deep/bsb_  [95% CI]", "contains 1?", "n<1/boot", "index-matrix sha256"))
-verdicts, ci = {}, {}
+verdicts, ci, MACHINE = {}, {}, []
 for k in KS:
     keys = sorted(key for (key, kk) in A if kk == k)
     keys = [key for key in keys if (key, k) in F and A[(key, k)] > 0 and F[(key, k)] > 0]
@@ -103,6 +137,12 @@ for k in KS:
     nlt = int(np.count_nonzero(meds < 0.0))
     verdicts[k] = (inside, nlt, point)
     ci[k] = (lo, hi)
+    # Emitted so a downstream analysis READS this half-width rather than transcribing it to
+    # two significant figures. A hand-copied 0.20 bounded a published factor's precision by
+    # its own rounding (6.1 at 0.25, 10.1 at 0.15), and a scalar also cannot carry the
+    # per-pass per-width variation that a uniformity claim about it needs.
+    MACHINE.append("HALFWIDTH k=%d pass=%s halfwidth_pp=%.6f point_pp=%.6f n=%d"
+                   % (k, TAG, 100 * (hi - lo) / 2.0, 100 * (point - 1), n))
     print("  %-4d %8d %8.4f [%.4f,%.4f] %14s %9s  %s"
           % (k, n, point, lo, hi, "CONTAINS 1" if inside else "excludes 1",
              "%d/%d" % (nlt, NBOOT), dig))
@@ -151,7 +191,13 @@ if 2 in verdicts:
     # ZeroDivisionError after printing the interval. The ratio is then unbounded above, which
     # is a statement, not a number; the interval bound below is the form that always exists
     # and is the conservative one anyway.
-    if abs(disp) < 1e-9:
+    # PRINTED_ZERO, not 1e-9. The value is printed `%.2f%%`, so anything under 0.005 prints
+    # as 0.00% -- and the old 1e-9 guard let a displacement of 0.001 print "0.00%" beside a
+    # finite ratio with a 1e-3 divisor, inflating it 1000x against a 1.00 displacement. The
+    # crash was fixed; the misleading-number case the comment was reasoning about was still
+    # reachable across six decades. `<=` because exactly 0.005 rounds to 0.01 but exactly
+    # 1e-9 must not take the number branch.
+    if abs(disp) < PRINTED_ZERO:
         print("    vs the point displacement %.2f%%   : the point is zero to the printed "
               "precision, so this ratio is unbounded above and is not a number. The "
               "interval bound below is the form that always exists." % abs(disp),
@@ -169,25 +215,32 @@ if 2 in verdicts:
     # arm, so the argument it claimed was exactly unavailable. The sign now comes from the
     # data, and when it agrees with the arm the report says the argument is NOT available
     # rather than making it anyway.
-    arm_signs = set(1 if verdicts[k][2] > 1 else -1 for k in KS if k != 2)
-    ctl_sign = 0 if abs(disp) < 1e-9 else (1 if disp > 0 else -1)
-    arm_word = "SLOWER" if arm_signs == {1} else ("FASTER" if arm_signs == {-1} else "MIXED")
-    if ctl_sign == 0:
+    # An arm point ratio of exactly 1.0 -- no effect at all -- used to bin as -1, FASTER,
+    # which would flip arm_signs off {1} and route the report to "the arm's direction is
+    # MIXED, only the magnitude argument is available" on the strength of a width where
+    # nothing happened. The control's sign got a zero case on the very next line and the
+    # arm's did not, inside four lines.
+    # ONE implementation, in sign_argument(). The inline version of this block was
+    # module-level straight-line code with no test over its branches, which is the same
+    # defect as the constant sentence it replaced, wearing a condition.
+    tok, arm_word, ctl_word = sign_argument(
+        [100 * (verdicts[k][2] - 1) for k in KS if k != 2], disp)
+    if tok == "CONTROL_ZERO":
         print("  SIGN: the control's point displacement is zero to the printed precision, so "
               "there is no sign to compare. Only the magnitude argument above is available.")
-    elif arm_word == "MIXED":
-        print("  SIGN: the arm's own direction is MIXED across widths, so there is no single "
-              "arm sign for the control to disagree with. Only the magnitude argument above "
-              "is available.")
-    elif (ctl_sign == 1) != (arm_signs == {1}):
+    elif tok == "ARM_HAS_NO_SINGLE_SIGN":
+        print("  SIGN: the arm's own direction is %s, so there is no single arm sign for the "
+              "control to disagree with. Only the magnitude argument above is available."
+              % arm_word)
+    elif tok == "OPPOSITE_SIGN_AVAILABLE":
         print("  SIGN: the arm is %s at every width where it can fire and the control reads "
               "%s, so the displacement has the wrong sign to be the arm. That argument needs "
-              "no artefact range." % (arm_word, "FASTER" if ctl_sign < 0 else "SLOWER"))
+              "no artefact range." % (arm_word, ctl_word))
     else:
         print("  SIGN: NOT AVAILABLE. The arm is %s at every width where it can fire and the "
               "control reads %s too -- the SAME direction. The sign argument is therefore not "
               "available on this pass and only the magnitude argument above stands."
-              % (arm_word, arm_word))
+              % (arm_word, ctl_word))
 
 # A SURVIVING-CONVERSION-SPECIFIER SCAN. Twice in one session a format string reached output
 # unsubstituted -- a literal `%+.0f s`, and a doubled `%%` printed outside a format operation -- and
@@ -264,3 +317,10 @@ else:
     print("  as written or read back as a ratio. %d lines marked `derived` are"
           % sum(1 for _, _d in OUT if _d))
     print("  skipped -- they restate a table value in percent form on purpose.")
+
+# MACHINE-READABLE TAIL, after the duplicate scan so it is outside the prose it would otherwise
+# trip. These lines exist so a downstream analysis reads this estimator's own half-widths rather
+# than transcribing them; `_real_print` because the duplicate scan has already run and these
+# deliberately restate table values.
+for _m in MACHINE:
+    _real_print(_m)

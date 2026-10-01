@@ -19,8 +19,15 @@ Four mechanical steps, no judgement at any of them:
   4. FAIL CLOSED with a structured reason, and report candidates beside matches so a zero
      carries information.
 
-Usage:  attest.py <dir> <glob> [glob ...]
-        attest.py --seal-only <dir>
+Usage:  attest.py [--require-seal] <dir> <glob> [glob ...]
+        attest.py [--require-seal] --seal-only <dir>
+
+        Every run ends with one `VERDICT: <TOKEN>` line from the VERDICTS enumeration below,
+        so a caller branches on that rather than on a sentence. A manifest with no seal of its
+        own gets a DIFFERENT token from one whose seal matched, because rc=0 and the word
+        SEAL-VERIFIED were previously identical for both. `--require-seal` turns the absent
+        case into a refusal; it is off by default because 2 of 28 chain directories in this
+        ledger carry such a seal and 26 do not.
 
         globs are the claim's input files, relative to <dir>. ATTESTED requires at least one,
         because a run that names no file certifies no file. `--seal-only` runs steps 1, 2 and
@@ -34,6 +41,36 @@ import re
 import sys
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# The verdict as a DECLARED ENUMERATION on its own machine-readable line, because the human
+# sentences were not distinguishable by a caller. `SEAL-VERIFIED` was printed both when a
+# seal matched and when no seal existed at all -- the same word and the same rc=0 for "the
+# manifest's bytes are bound" and "nothing binds the manifest's bytes", which is the shape of
+# the no-globs defect reproduced inside the mode added to fix it. One null got its own verdict
+# and exit, the other got an informational line beside a pass.
+#
+# NO TOKEN MAY BE A PREFIX OF ANOTHER. A `grep -c "^  FAIL"` matching a suite's own `FAILED`
+# summary miscounted four assertions as five earlier today, so the property is asserted in
+# attest_selftest.py rather than left to inspection.
+VERDICTS = (
+    "ATTESTED_SEALED_MANIFEST",            # inputs inside, and a seal binds the manifest
+    "ATTESTED_UNSEALED_MANIFEST",          # inputs inside, but nothing binds the manifest
+    "SEAL_AND_MANIFEST_VERIFIED",          # --seal-only, seal present and matching
+    "MANIFEST_VERIFIED_NO_SEAL_PRESENT",   # --seal-only, nothing binds the manifest
+    "NOT_ATTESTED_NO_INPUTS_NAMED",
+    "REFUSED_NO_DATA_MANIFEST",
+    "REFUSED_MANIFEST_UNCLEAN",
+    "REFUSED_SEAL_STALE",
+    "REFUSED_INPUTS_OUTSIDE_SEAL",
+    "REFUSED_SEAL_REQUIRED_BUT_ABSENT",
+    "REFUSED_BAD_USAGE",
+)
+
+
+def verdict(tok, rc):
+    assert tok in VERDICTS, tok
+    print("VERDICT: %s" % tok)
+    return rc
 
 
 def manifest_kind(path):
@@ -324,7 +361,16 @@ def main():
     # seal check is still available, but it has to be ASKED for, and it says a different
     # word. A caller who wants the old exit code now says so in the command line.
     seal_only = "--seal-only" in argv
-    argv = [a for a in argv if a != "--seal-only"]
+    # An ABSENT seal is a weaker attestation than a matching one, but whether it is a FAILURE
+    # is a producer convention, not this tool's call: 2 of 28 chain directories in the ledger
+    # carry a seal-of-manifest and 26 do not, so refusing by default would refuse the 26 and
+    # every pre-chain207 directory. So the verdict always distinguishes them and the exit code
+    # changes only when the caller asks for the stricter convention.
+    require_seal = "--require-seal" in argv
+    argv = [a for a in argv if a not in ("--seal-only", "--require-seal")]
+    if not argv:
+        print("REFUSE: no directory given")
+        return verdict("REFUSED_BAD_USAGE", 1)
     d = os.path.abspath(argv[0])
     pats = argv[1:]
     print("ATTEST %s" % d)
@@ -332,30 +378,43 @@ def main():
         sys.exit("REFUSE: %s is not a directory" % d)
     mf, seals = pick(d)
     if mf is None:
-        sys.exit(2)
+        return verdict("REFUSED_NO_DATA_MANIFEST", 2)
     print("          chose %s BY CONTENT" % mf)
     clean, sealed = verify(d, mf)
     if not clean:
-        sys.exit(3)
+        return verdict("REFUSED_MANIFEST_UNCLEAN", 3)
     if not verify_seals(d, seals):
-        sys.exit(5)
+        return verdict("REFUSED_SEAL_STALE", 5)
+    if require_seal and not seals:
+        print("  REFUSE: --require-seal was given and no seal of the manifest is present, so "
+              "the manifest's own bytes are bound by nothing")
+        return verdict("REFUSED_SEAL_REQUIRED_BUT_ABSENT", 7)
     if seal_only:
         if pats:
-            sys.exit("REFUSE: --seal-only was given together with %d input glob(s). Those "
-                     "globs are the claim's files and asking to skip them while naming "
-                     "them is two different requests" % len(pats))
-        print("  SEAL-VERIFIED (NOT ATTESTED) -- steps 1, 2 and 2B only. No claim inputs "
-              "were named, so no file is attested by this run")
-        return 0
+            print("REFUSE: --seal-only was given together with %d input glob(s). Those globs "
+                  "are the claim's files and asking to skip them while naming them is two "
+                  "different requests" % len(pats))
+            return verdict("REFUSED_BAD_USAGE", 1)
+        if seals:
+            print("  steps 1, 2 and 2B only. A seal binds the manifest's bytes, but no claim "
+                  "inputs were named, so no file is attested by this run")
+            return verdict("SEAL_AND_MANIFEST_VERIFIED", 0)
+        print("  steps 1 and 2 only. The manifest verifies, NOTHING BINDS ITS BYTES, and no "
+              "claim inputs were named, so no file is attested by this run")
+        return verdict("MANIFEST_VERIFIED_NO_SEAL_PRESENT", 0)
     if not pats:
-        print("  NOT ATTESTED: no input globs were given, so step 3 proved nothing and this "
-              "run certifies no file. Pass the claim's inputs, or --seal-only to ask for a "
-              "seal check and get a zero exit for it")
-        sys.exit(6)
+        print("  no input globs were given, so step 3 proved nothing and this run certifies "
+              "no file. Pass the claim's inputs, or --seal-only to ask for a seal check and "
+              "get a zero exit for it")
+        return verdict("NOT_ATTESTED_NO_INPUTS_NAMED", 6)
     if not cover(d, pats, sealed):
-        sys.exit(4)
-    print("  ATTESTED")
-    return 0
+        return verdict("REFUSED_INPUTS_OUTSIDE_SEAL", 4)
+    if seals:
+        return verdict("ATTESTED_SEALED_MANIFEST", 0)
+    print("  NOTE: the claim's inputs are inside a manifest that verifies, but NOTHING BINDS "
+          "THAT MANIFEST'S BYTES -- no seal of it is present. Pass --require-seal to make "
+          "that a refusal.")
+    return verdict("ATTESTED_UNSEALED_MANIFEST", 0)
 
 
 if __name__ == "__main__":

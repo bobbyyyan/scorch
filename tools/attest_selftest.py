@@ -77,7 +77,7 @@ def t_stale_seal_of_manifest_refuses():
     files = {"a.csv": b"tampered\n", "b.csv": b"other\n"}
     with open(os.path.join(d, "SHA256SUMS"), "w") as fh:   # rewritten to agree
         fh.write("".join("%s  %s\n" % (sha(b), n) for n, b in sorted(files.items())))
-    expect("stale-seal", run(d, "*.csv"), 5, "STALE", "seal(s) of the manifest are STALE")
+    expect("stale-seal", run(d, "*.csv"), 5, "VERDICT: REFUSED_SEAL_STALE", "STALE")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -88,14 +88,16 @@ def t_the_same_tamper_without_the_rewrite_still_refuses():
     d = mkdir_ledger({"a.csv": b"original\n", "b.csv": b"other\n"})
     with open(os.path.join(d, "a.csv"), "wb") as fh:
         fh.write(b"tampered\n")
-    expect("tamper-no-rewrite", run(d, "*.csv"), 3, "MISMATCH", "a.csv")
+    expect("tamper-no-rewrite", run(d, "*.csv"), 3, "VERDICT: REFUSED_MANIFEST_UNCLEAN",
+           "MISMATCH", "a.csv")
     shutil.rmtree(d, ignore_errors=True)
 
 
 def t_a_current_seal_attests():
     """And the untampered directory must still pass, or the two refusals above are trivial."""
     d = mkdir_ledger({"a.csv": b"original\n", "b.csv": b"other\n"})
-    expect("clean-attests", run(d, "*.csv"), 0, "ATTESTED", "MATCH", "<- seals SHA256SUMS")
+    expect("clean-attests", run(d, "*.csv"), 0, "VERDICT: ATTESTED_SEALED_MANIFEST",
+           "MATCH", "<- seals SHA256SUMS")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -115,7 +117,8 @@ def t_a_full_manifest_named_SHA256SUMS_sha256_is_still_CHOSEN():
     with open(os.path.join(d, "SHA256SUMS.sha256"), "w") as fh:
         fh.write("".join("%s  %s\n" % (sha(b), n) for n, b in sorted(files.items())))
     expect("full-manifest-dot-sha256", run(d, "*.csv"), 0,
-           "chose SHA256SUMS.sha256 BY CONTENT", "ATTESTED", "verifies nothing with shasum")
+           "chose SHA256SUMS.sha256 BY CONTENT", "VERDICT: ATTESTED_UNSEALED_MANIFEST",
+           "verifies nothing with shasum")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -123,14 +126,12 @@ def t_a_full_manifest_named_SHA256SUMS_sha256_is_still_CHOSEN():
 def t_no_globs_is_not_attested():
     """`attest.py "$d" && publish` used to get ATTESTED rc=0 with zero file-level coverage."""
     d = mkdir_ledger({"a.csv": b"original\n"})
-    expect("no-globs", run(d), 6, "NOT ATTESTED", "certifies no file")
-    rc, out = run(d)
-    global CHECKS
-    CHECKS += 1
-    if "  ATTESTED" in out.replace("NOT ATTESTED", ""):
-        FAIL.append("no-globs: the word ATTESTED still appears on its own")
-    expect("seal-only", run("--seal-only", d), 0, "SEAL-VERIFIED (NOT ATTESTED)")
-    expect("seal-only-with-globs", run("--seal-only", d, "*.csv"), 1, "two different requests")
+    expect("no-globs", run(d), 6, "VERDICT: NOT_ATTESTED_NO_INPUTS_NAMED",
+           "certifies no file")
+    expect("seal-only", run("--seal-only", d), 0,
+           "VERDICT: SEAL_AND_MANIFEST_VERIFIED")
+    expect("seal-only-with-globs", run("--seal-only", d, "*.csv"), 1,
+           "VERDICT: REFUSED_BAD_USAGE", "two different requests")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -140,7 +141,8 @@ def t_dropped_manifest_lines_refuse():
     files = {"a.csv": b"original\n"}
     mf = "%s  a.csv\nthis line is prose and names nothing\n" % sha(b"original\n")
     d = mkdir_ledger(files, manifest=mf)
-    expect("dropped-lines", run(d, "*.csv"), 3, "were DROPPED", "non-blank lines")
+    expect("dropped-lines", run(d, "*.csv"), 3, "VERDICT: REFUSED_MANIFEST_UNCLEAN",
+           "were DROPPED", "non-blank lines")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -176,17 +178,63 @@ def t_cksum_only_still_refuses():
         fh.write(b"x\n")
     with open(os.path.join(d, "SHA256SUMS"), "w") as fh:
         fh.write("1234567890 2 a.csv\n")
-    expect("cksum-only", run(d, "*.csv"), 2, "no candidate is a data manifest")
+    expect("cksum-only", run(d, "*.csv"), 2, "VERDICT: REFUSED_NO_DATA_MANIFEST",
+           "no candidate is a data manifest")
     shutil.rmtree(d, ignore_errors=True)
 
 
-def t_unsealed_manifest_says_so():
-    """No seal present is not an error, but it must be stated: the manifest's own bytes are
-    then unsealed, and a silent step would read as 'checked, fine'."""
-    d = mkdir_ledger({"a.csv": b"original\n"}, seal=False)
-    expect("no-seal", run(d, "*.csv"), 0, "none present, so this step bounds nothing",
-           "ATTESTED")
-    shutil.rmtree(d, ignore_errors=True)
+def t_an_unsealed_manifest_gets_its_own_verdict():
+    """`SEAL-VERIFIED` rc=0 was printed BOTH when a seal matched and when none existed -- the
+    same word and the same exit for "the manifest's bytes are bound" and "nothing binds the
+    manifest's bytes". That is the no-globs defect reproduced inside the mode added to fix it:
+    one null got its own verdict and exit, the other an informational line beside a pass.
+    Two directories differing only in whether the seal exists must not share a token.
+    """
+    sealed = mkdir_ledger({"a.csv": b"original\n"})
+    bare = mkdir_ledger({"a.csv": b"original\n"}, seal=False)
+    expect("unsealed-attest", run(bare, "*.csv"), 0,
+           "VERDICT: ATTESTED_UNSEALED_MANIFEST", "NOTHING BINDS")
+    expect("unsealed-seal-only", run("--seal-only", bare), 0,
+           "VERDICT: MANIFEST_VERIFIED_NO_SEAL_PRESENT")
+    expect("sealed-seal-only", run("--seal-only", sealed), 0,
+           "VERDICT: SEAL_AND_MANIFEST_VERIFIED")
+    global CHECKS
+    CHECKS += 1
+    a_tok = [ln for ln in run("--seal-only", bare)[1].split("\n") if ln.startswith("VERDICT")]
+    b_tok = [ln for ln in run("--seal-only", sealed)[1].split("\n") if ln.startswith("VERDICT")]
+    if a_tok == b_tok:
+        FAIL.append("unsealed-vs-sealed: both report %r, so a caller cannot tell them apart"
+                    % a_tok)
+    # The stricter convention has to be ASKED for: 26 of 28 chain directories in the ledger
+    # carry no seal of the manifest, so refusing by default would refuse all of them.
+    expect("require-seal-refuses", run("--require-seal", "--seal-only", bare), 7,
+           "VERDICT: REFUSED_SEAL_REQUIRED_BUT_ABSENT", "bound by nothing")
+    expect("require-seal-passes-when-present", run("--require-seal", "--seal-only", sealed), 0,
+           "VERDICT: SEAL_AND_MANIFEST_VERIFIED")
+    shutil.rmtree(sealed, ignore_errors=True)
+    shutil.rmtree(bare, ignore_errors=True)
+
+
+def t_no_verdict_token_is_a_prefix_of_another():
+    """A `grep -c "^  FAIL"` matching a suite's own `FAILED` summary miscounted 4 assertions
+    as 5 earlier today. A verdict enumeration a caller greps for has the same hazard, so the
+    property is asserted rather than inspected."""
+    sys.path.insert(0, HERE)
+    import attest                                                    # noqa: E402
+    global CHECKS
+    CHECKS += 1
+    toks = list(attest.VERDICTS)
+    if len(set(toks)) != len(toks):
+        FAIL.append("verdict tokens are not distinct: %s" % toks)
+    CHECKS += 1
+    bad = [(a, b) for a in toks for b in toks if a != b and b.startswith(a)]
+    if bad:
+        FAIL.append("verdict token(s) prefix another, so grepping for the shorter also "
+                    "matches the longer: %s" % bad)
+    CHECKS += 1
+    if len(toks) < 8:
+        FAIL.append("only %d tokens declared, so the prefix check above is near-vacuous"
+                    % len(toks))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
