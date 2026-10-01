@@ -16,9 +16,21 @@ line 2. `harnesses/an_rowdist.py` reads one line per file.
 
 ## The measurement
 
-**3846 files read, 0 malformed, 3402920 rows, 475663122 nonzeros.** The nonzero total matches
-chain210's exactly, which is the check that this is the same collection the board was scored on.
-(3846 files against chain210's 3820 keys: 26 files the board did not score.)
+**3846 files read, 0 malformed, 3402920 rows, 475663122 nonzeros.**
+
+**Provenance, which a result alone can never supply.** The peer re-derived this from an
+independent copy of DLMC on a different machine, reading the same two lines per file, and
+**fourteen integers agree exactly**: both totals and all seven threshold pairs
+(208128/118916, 321734/764157, 591681/3785810, 777243/7414836, 958746/12367173,
+1423602/34199481, 1988992/88386481), plus the three per-matrix counts 886 / 493 / 345. Two copies
+of a collection agreeing on fourteen integers is a check a substituted or truncated dataset cannot
+pass. Their quantiles differ in the third digit (p75 0.3566 against 0.3525) which is nearest-rank
+against interpolated and nothing else.
+
+**And the identity closes against the board on both axes.** 3846 files against chain210's 3820
+keys is exactly the **26 matrices with nnz == 0**, which hold **20992 rows** — and chain210's own
+`rows` column sums to 3381928, so 3402920 − 3381928 = 20992. The collection reconciles on rows and
+on nonzeros, not just on nonzeros.
 
 | threshold | rows below | % of rows | nonzeros in them | **% of nonzeros** |
 |---|---|---|---|---|
@@ -49,8 +61,27 @@ Fraction of a matrix's own nonzeros living in rows shorter than 32:
     >= 90%:                            493 of 3846  (12.8%)
     >= 99%:                            345 of 3846  ( 9.0%)
 
-The median is **exactly zero**: more than half the collection's matrices have no row shorter than
-32 at all, so they take the fast path everywhere. At the other end, **9.0% of matrices are
+**The median is exactly zero, and two different statements follow from that — only one of them
+correctly.** I wrote "more than half the collection's matrices have no row shorter than 32 at all".
+That is a claim about ROWS and it is not what a median *nonzero share* of 0.0000 reports. Both
+happen to be true here and they are 40 matrices apart:
+
+    matrices with NO ROW shorter than 32        1940 of 3846 = 50.4%
+    matrices with NO NONZEROS in rows under 32  1980 of 3846 = 51.5%   <- what the median reports
+
+The gap is **empty rows: 147840 of 3402920 = 4.34% of the collection.** An empty row is shorter
+than any threshold and carries nothing, so it enters the first statement and not the second. At a
+threshold somewhat below 32 the first could stop being true while the second still held, so the
+distinction is not cosmetic. The peer caught this and both counts are verified here independently.
+
+**A consequence for the guard's firing rate.** Of the 28.2% of rows below degree 32, **4.34 points
+are empty** and carry no arithmetic at either threshold — so the rows where the guard actually
+chooses between two kernels are 810906 of 3402920 = **23.8%**, not 28.2%. Whether an empty row
+reaches the row kernel at all depends on the shipped empty-row handling, which zeroes inside the
+arithmetic row loop rather than skipping it; I have not re-verified that path here, so 23.8% is the
+share of rows carrying work and 28.2% is the share the guard's predicate is true for.
+
+At the other end, **9.0% of matrices are
 essentially entirely short rows and would get no speedup whatever** — the most extreme is
 `transformer/variational_dropout/0.98/body_encoder_layer_2_self_attention_multihead_attention_v`
 at 1.0000. Under a per-row guard those matrices do not regress; they simply do not improve.
