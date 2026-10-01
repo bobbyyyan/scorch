@@ -1,0 +1,61 @@
+PRODUCTION DEEP-LOOP MACHINE BODY WIDTH -- measured, not assumed
+
+THE QUESTION. scorch_spmm_row_regblock_deep's main loop carries no #pragma GCC unroll,
+unlike every loop in harnesses/portbound/probe.cpp. So its machine body width -- the
+nonzeros one hardware iteration retires -- is a compiler choice, and the probe's degree
+sweep cannot be placed against it until the width is read off a real object. In the probe
+-funroll-loops quadrupled the two-chain arm (source step 2 -> body 8) and doubled the
+four-chain one (step 4 -> body 8), so assuming the source step here would have been wrong
+in the probe's own binary and could not be assumed to be right in this one.
+
+host            redwood.stanford.edu
+cpu             Intel(R) Core(TM) i9-14900K
+g++             g++ (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
+flags           -c -O3 -std=c++17 -march=native -funroll-loops -DSCORCH_NARROWK_DEEP_UNROLL=4
+spmm.h          0de53d05bdf470f2
+scorch_policy.h 1605be3336b0f348
+deep.o          7a370542938ebdce  1607328 bytes
+deep.asm        d718c32741e90e62  156760 lines
+
+METHOD. Compile ops.cpp with the deep arm enabled, disassemble, and for each out-of-line
+instantiation of the deep kernel take the SMALLEST backward-jump span containing no
+ret/call/push/pop -- the innermost loop -- then count vector FMAs in it. Each nonzero does
+NVEC FMAs, one per output vector, so nonzeros/body = FMA/NVEC. Same rule as asmcheck.py.
+
+SCOPE. nm sees only instantiations that survived as out-of-line functions; inlined ones
+carry no symbol and are not measured here. The nine below are what the object exposes.
+
+  instantiation <T,NVEC,FULL_LAST,UNROLL,PF>      insn   FMA    ld
+  ----------------------------------------------------------------------
+  void <double, 2, false, 4, true>                  56     8     4
+  void <double, 2, false, 8, true>                 122    16    22
+  void <double, 2, true, 4, true>                   52     8     4
+  void <double, 3, false, 4, true>                  72    12    16
+  void <double, 3, true, 4, true>                   68    12    16
+  void <double, 4, false, 4, true>                  87    16    27
+  void <double, 4, true, 4, true>                   86    16    30
+  void <float, 3, false, 4, true>                   72    12    16
+  void <float, 4, false, 4, true>                   87    16    27
+
+FMA count in the innermost loop = vector-FMAs per body.
+nonzeros per body = FMA / NVEC  (each nonzero does NVEC FMAs, one per output vector)
+  void <double, 2, false, 4, true>               FMA   8 / NVEC 2 =   4.0 nonzeros/body   (source steps 4)
+  void <double, 2, false, 8, true>               FMA  16 / NVEC 2 =   8.0 nonzeros/body   (source steps 8)
+  void <double, 2, true, 4, true>                FMA   8 / NVEC 2 =   4.0 nonzeros/body   (source steps 4)
+  void <double, 3, false, 4, true>               FMA  12 / NVEC 3 =   4.0 nonzeros/body   (source steps 4)
+  void <double, 3, true, 4, true>                FMA  12 / NVEC 3 =   4.0 nonzeros/body   (source steps 4)
+  void <double, 4, false, 4, true>               FMA  16 / NVEC 4 =   4.0 nonzeros/body   (source steps 4)
+  void <double, 4, true, 4, true>                FMA  16 / NVEC 4 =   4.0 nonzeros/body   (source steps 4)
+  void <float, 3, false, 4, true>                FMA  12 / NVEC 3 =   4.0 nonzeros/body   (source steps 4)
+  void <float, 4, false, 4, true>                FMA  16 / NVEC 4 =   4.0 nonzeros/body   (source steps 4)
+
+RESULT. The machine body equals the SOURCE step in every instantiation: 4.0 nonzeros per
+body at UNROLL=4, 8.0 at UNROLL=8. -funroll-loops left this loop alone.
+
+WHY IT MATTERS FOR THE ROW-LENGTH GATE. The probe's body is 8 and this kernel's is 4, so
+this kernel crosses a loop boundary twice as often per nonzero. That raises its per-row
+cost relative to the probe's, in the same direction as its deeper fold (3 dependent adds
+against the probe's 2). Both push its crossing degree ABOVE the probe's [24, 32] bracket,
+and neither can pull it down -- which is the only reason a bound measured on the probe
+constrains this kernel at all. A row-length minimum is safe only AT OR ABOVE the crossing,
+so the probe gives a lower bound where the guard needs an upper one.

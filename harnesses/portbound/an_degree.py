@@ -147,6 +147,7 @@ def main():
                  "  fit cannot know which ladder points run only the scalar remainder, and the\n"
                  "  peer's simulation puts that error at +54%% on n*, upward." % len(asms))
     BW = body_widths(asms[0])
+    TAILS = arm_tails(os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.cpp"))
     for a in ("V0", "V6", "V7"):
         if a not in BW or BW[a] < 2:
             sys.exit("REFUSE: no machine body width for %s in %s." % (a, asms[0]))
@@ -173,44 +174,76 @@ def main():
         for n in ns:
             r = S[n]
             fl = r["__floor__"]
+            def contam(a):
+                """Nonzeros of an n-nonzero row that this arm runs outside a full body.
+
+                '!' SINGLE-CHAIN: the arm has a scalar `++p` remainder, so `n mod step`
+                    nonzeros ran in ONE accumulator chain. Production's deep kernel has no such
+                    loop -- its remainder runs two streams and it static_asserts that it does --
+                    so the ratio at this degree measures a loop that does not ship.
+                '?' DROPPED WORK: the arm has NO remainder, so `n mod step` nonzeros are not
+                    computed at all while the harness still divides by n. That is a work
+                    mismatch, not an ILP difference, and it makes the ratio incomparable rather
+                    than merely unrepresentative.
+                """
+                st = TAILS.get(a)
+                if not st:
+                    return ""
+                step, has_scalar = st
+                left = n % step
+                if not left:
+                    return ""
+                return "!" if has_scalar else "?"
+
             def rat(a):
                 if a not in r or "V0" not in r:
                     return "       -"
                 x = r[a] / r["V0"]
-                # '!' means the row is shorter than the machine body of EITHER arm in the ratio,
-                # so at least one side spent part of the row in probe.cpp's scalar remainder --
-                # a SINGLE-chain loop (`for (; p < SCORCH_N; ++p)` into acc0 alone) that the
-                # production kernel does not have: scorch_spmm_row_regblock_deep's remainder runs
-                # two streams and static_asserts that it does. The ratio is therefore not a
-                # measurement of the chain count on this degree, and the fit below already
-                # excludes these degrees for the same reason. Marked here too, because the fit's
-                # exclusion does not stop a reader lifting a number out of this table.
-                bw = max(BW.get(a, 0), BW.get("V0", 0))
-                if bw and n < bw:
-                    return "%8.4f!" % x
+                c = contam(a) or contam("V0")
+                if c:
+                    return "%8.4f%s" % (x, c)
                 mark = "" if dev(x) > fl else "~"
                 return "%8.4f%s" % (x, mark)
             if "V6" in r and "V7" in r:
-                bw76 = max(BW.get("V6", 0), BW.get("V7", 0))
-                v76 = "%8.4f%s" % (r["V7"] / r["V6"], "!" if bw76 and n < bw76 else "")
+                v76 = "%8.4f%s" % (r["V7"] / r["V6"], contam("V7") or contam("V6"))
             else:
                 v76 = "       -"
             print("  %5d %10.5f %10.5f %10.5f %9s %9s %9s %8.5f" %
                   (n, r.get("V0", float("nan")), r.get("V6", float("nan")),
                    r.get("V7", float("nan")), rat("V6"), rat("V7"), v76, fl))
         print("  '~' marks a ratio whose deviation from 1 is INSIDE that degree's own A/A floor.")
-        marked = sorted({n for n in ns for a in ("V6", "V7")
-                         if max(BW.get(a, 0), BW.get("V0", 0))
-                         and n < max(BW.get(a, 0), BW.get("V0", 0))})
-        if marked:
-            print("  '!' marks a degree SHORTER than the arms' machine body, where part of the row")
-            print("      ran probe.cpp's one-chain scalar remainder. Production's deep kernel has a")
-            print("      TWO-stream remainder, so these ratios measure a loop that does not ship and")
-            print("      must not price a row-length guard: n=%s."
-                  % ", ".join(str(n) for n in marked))
-        else:
-            print("  '!' would mark a degree below the machine body width; none here, so every")
-            print("      ratio in this table ran whole bodies on both sides.")
+        for sym, what, why in (
+                ("!", "ran part of the row in probe.cpp's ONE-chain scalar remainder",
+                 "production's deep kernel has a two-stream remainder and static_asserts it, so\n"
+                 "      these ratios measure a loop that does not ship and must not price a guard"),
+                ("?", "DID NOT COMPUTE part of the row (no remainder loop) while the harness\n"
+                      "      still divided by n",
+                 "a work mismatch rather than an ILP difference, so these ratios are\n"
+                 "      incomparable, not merely unrepresentative")):
+            hits = []
+            for n in ns:
+                for a in ("V0", "V6", "V7"):
+                    st = TAILS.get(a)
+                    if not st or n % st[0] == 0:
+                        continue
+                    if ("!" if st[1] else "?") == sym:
+                        hits.append("%s n=%d (%d of %d nonzeros)" % (a, n, n % st[0], n))
+            if hits:
+                print("  '%s' an arm in the ratio %s --" % (sym, what))
+                print("      %s." % why)
+                print("      %s" % "; ".join(hits))
+        print("  per-arm SOURCE steps read from probe.cpp: %s"
+              % ", ".join("%s=%d%s" % (a, TAILS[a][0], "" if TAILS[a][1] else " (no remainder)")
+                          for a in ("V0", "V6", "V7") if a in TAILS))
+        # State the absence, so a silent legend is not read as a check that cannot fire. V0 has
+        # no remainder loop at all, so at an ODD degree it would drop its last nonzero while the
+        # denominator stayed n -- a work mismatch. Every degree on this ladder is even, so the
+        # condition was evaluated and found absent rather than skipped.
+        odd = [n for n in ns if n % 2]
+        print("  '?' (dropped work) evaluated at all %d degrees and fired at %d: V0 has no"
+              % (len(ns), len(odd)))
+        print("      remainder, so it would fire at any ODD degree, and this ladder has %s."
+              % ("none" if not odd else "n=%s" % ", ".join(map(str, odd))))
         bad = [(n, S[n]["__floor__"]) for n in ns
                if not math.isnan(S[n]["__floor__"]) and S[n]["__floor__"] > 0.005]
         if bad:
@@ -380,6 +413,50 @@ def _nnz_share_below(n):
             return pct
     return None
 
+
+
+def arm_tails(probe_path):
+    """Per-arm SOURCE step and remainder shape, read out of probe.cpp.
+
+    The quantity that decides whether a degree is contaminated is `n mod SOURCE step`, not
+    `n < machine body`. The machine body is what -funroll-loops produced; the SOURCE step is what
+    decides how many nonzeros are left over, because gcc's leftover handling falls back to a
+    rolled copy of the source loop and only then to the source's own scalar remainder. The two
+    disagree on this ladder: every arm's body is 8, but V7 steps 8 while V6 steps 4, so V7 runs
+    its single-chain remainder at 4, 6 AND 12 where V6 runs one only at 6. A `n < body` test marks
+    4 and 6 for every arm and misses V7 at n=12, where a third of the row ran in one chain.
+
+    Returns {ARM: (step, has_scalar_remainder)}. Both are read from the file so neither can drift
+    out of agreement with the source the way a hardcoded table would.
+
+    TWO CRITERIA, both legitimate, answering different questions -- do not collapse them:
+      n mod SOURCE step != 0   some nonzeros ran outside a full body: in ONE chain if the arm has
+                               a scalar remainder, or not at all if it has none. This is what
+                               contaminates a ratio as a measurement of the chain count, and it
+                               is what the table's '!' and '?' marks use.
+      n < MACHINE body         the unrolled body never ran, so the whole degree executed a
+                               different code path with different loop overhead per nonzero.
+                               This is what the linear fit excludes on, and correctly: a fit of
+                               a per-nonzero slope must not mix two code paths.
+    They select different sets. On this ladder the first marks V6 at 6 and V7 at 4, 6 and 12;
+    the second marks every arm at 4 and 6.
+    """
+    txt = open(probe_path).read()
+    out = {}
+    for m in re.finditer(r"NOINLINE\s+\w+\s+(v\d+[a-z]?)\s*\(", txt):
+        name = m.group(1)
+        # body of the function: from the opening brace to the first line-start '}'
+        start = txt.index("{", m.end() - 1)
+        end = txt.index("\n}", start)
+        body = txt[start:end]
+        steps = [int(x) for x in re.findall(r"for\s*\(;\s*p\s*\+\s*(\d+)\s*<=", body)]
+        scalar = bool(re.search(r"for\s*\(;\s*p\s*<\s*\w+;\s*\+\+p\s*\)", body))
+        if steps:
+            # Capitalise the first letter only: v0 -> V0, v0b -> V0b, v4c -> V4c. An .upper()
+            # here produced V4B and V4C, which match no row in ARMS[] and would have made the
+            # contamination check silently inert for those arms rather than wrong out loud.
+            out[name[0].upper() + name[1:]] = (max(steps), scalar)
+    return out
 
 def _verdict(nstar):
     """Place the break-even against DLMC's per-ROW length distribution."""

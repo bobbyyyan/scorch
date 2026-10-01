@@ -1014,6 +1014,12 @@
 // a short-row loss from a single-chain tail, and the tail was then fixed. Citing the prediction
 // without the fix is citing a kernel version that no longer exists.
 //
+// The tail is bounded, and that bound is what makes the gate cheap to reason about. Below the
+// two-stream remainder sits a single `if (pA < pA_end)` doing ONE straight-line FMA into acc[0],
+// not a loop -- so at most 3 nonzeros of any row fall outside a full body, and no row ever runs a
+// multi-nonzero single-accumulator chain. The probe's remainder IS a loop and can run up to seven
+// nonzeros that way.
+//
 // So on a row shorter than UNROLL the deep kernel runs the incumbent's exact arithmetic, and the
 // only difference left is the FOLD: the deep kernel reduces UNROLL accumulators with UNROLL-1
 // dependent adds (`r = acc[0]; for u: r = V::add(r, acc[u])`, a left fold, depth 3 at UNROLL=4)
@@ -1023,10 +1029,10 @@
 //
 // WHY THE PROBE'S CROSSING IS A LOWER BOUND AND A GUARD NEEDS AN UPPER ONE. The degree sweep in
 // harnesses/portbound ran the probe's four-chain arm against its two-chain arm over a ladder of
-// row lengths. Its machine body is eight nonzeros, so at the ladder points that are multiples of
-// eight NEITHER arm executed a remainder iteration, and those points isolate the one axis that
-// still differs from production -- the fold. Ratios of four chains over two, with each point's
-// distance from its own A/A floor:
+// row lengths. The probe's arms step 2 (two chains) and 4 (four chains) in source, so at a ladder
+// point that is a multiple of eight -- a multiple of every arm's step -- NO arm has a leftover
+// nonzero and the remainder is out of the comparison entirely. Ratios of four chains over two,
+// with each point's distance from its own A/A floor:
 //
 //      degree      P-core            E-core
 //           8   1.1347 (187x)   0.9817 ( 33x)
@@ -1041,21 +1047,38 @@
 // ahead at every one of these degrees. The crossing on the P-core is bracketed by [24, 32] and
 // the ladder has no point between.
 //
-// The direction the remaining gap points is what matters, and it is unfavourable. The probe folds
-// four accumulators as a TREE, depth 2; this kernel LEFT-folds them, UNROLL-1 = 3 adds, depth 3;
-// the incumbent folds two in one add, depth 1. So the probe pays one extra dependent vector-add
-// level per output vector per row and this kernel pays two -- twice the per-row cost, against the
-// same per-nonzero gain. This kernel's crossing is therefore AT OR ABOVE 32, not below it.
+// TWO axes still differ on those clean points, and both push the same way, which is what makes
+// the comparison usable at all:
+//
+//   fold depth   The probe folds four accumulators as a TREE, depth 2. This kernel LEFT-folds
+//                them, UNROLL-1 = 3 adds, depth 3. The incumbent folds two in one add, depth 1.
+//                So the probe pays one extra dependent vector-add level per output vector per
+//                row and this kernel pays two -- twice the per-row cost, against the same
+//                per-nonzero gain.
+//   body width   MEASURED rather than assumed, because this loop carries no unroll pragma and
+//                the probe's does. On redwood (g++ 11, -O3 -march=native -funroll-loops) this
+//                kernel's machine body equals its SOURCE step in all nine out-of-line
+//                instantiations -- 4.0 nonzeros per body at UNROLL=4, 8.0 at UNROLL=8. So
+//                -funroll-loops left it alone, where in the probe it quadrupled the two-chain
+//                arm and doubled the four-chain one to eight. A body of 4 against 8 means this
+//                kernel crosses a loop boundary twice as often per nonzero.
+//
+// Both raise this kernel's per-row cost relative to the probe's, so its crossing is AT OR ABOVE
+// the probe's bracket, not below it. Neither can pull it down, which is the only reason a bound
+// measured on one kernel says anything about the other.
 //
 // A row-length minimum is safe only when it is AT OR ABOVE the crossing: rows between the
 // threshold and the true crossing take the deep kernel and lose. The probe supplies a lower bound
 // on the crossing where the guard needs an upper one. **32 is therefore the smallest value that
 // could be correct rather than a value known to be safe**, and that is why this ships at 0. The
-// earlier short-row figure of 25.0% at degree 6 is withdrawn: degree 6 is the only ladder point
-// that is not a multiple of the machine body, so it is the only point where the probe ran its
-// scalar remainder -- a SINGLE-chain loop, on two of that row's six nonzeros, that this kernel
-// does not have. It was also the one short-row point whose own A/A floor (5.3%) was large. The
-// clean points above replace it and say the same thing more defensibly.
+// earlier short-row figure of 25.0% at degree 6 is withdrawn. The criterion is the four-chain
+// arm's SOURCE step of 4 and not its machine body of 8: degree 6 is the only ladder point that is
+// not a multiple of 4, so it is the only point where that arm ran its scalar remainder -- a
+// SINGLE-chain loop, on two of the row's six nonzeros, which this kernel does not have. (Against
+// the body instead, the rule would wrongly implicate 4 and 12 as well, and would miss that the
+// EIGHT-chain arm, stepping 8, is contaminated at 4, 6 and 12. Only the clean points above are
+// free of both.) Degree 6 was also the one short-row point whose own A/A floor was large, 5.3%.
+// The clean points replace it and say the same thing more defensibly.
 //
 // The fix is to measure this kernel against the incumbent on real matrices and read the crossing
 // off that, rather than to carry a bound across the gap.
@@ -1063,9 +1086,28 @@
 // WHAT THE THRESHOLD WOULD ACT ON, for when it has a value. Measured over all 3846 DLMC matrices
 // from their CSR row pointers (harnesses/an_rowdist.py, verified against an independent copy of
 // the collection): 28.2% of rows are shorter than 32 and they hold 2.60% of the collection's
-// nonzeros. Read the ROW distribution and not a per-matrix mean degree: DLMC's mean degree
-// happens to agree with its median row length to within 1% (102.40 against 103), which makes the
-// substitution invisible at the median and wrong by a quarter at p25 (25.60 against 32).
+// nonzeros.
+//
+// Read the ROW distribution and not a per-matrix mean degree, and NAME THE ROW POPULATION,
+// because which quantile exposes the substitution depends on it:
+//
+//                            p25   median      per-matrix mean degree
+//   non-empty rows (3255080)  32      103       p25 25.60, median 102.40
+//   all rows       (3402920)  26       97
+//
+// Non-empty is the right population -- empty rows never reach either kernel. On it the mean
+// degree is wrong by a quarter at p25 (25.60 against 32) and invisible at the median (102.40
+// against 103, 0.6%). Over all rows the contrast REVERSES: the median exposes it (97 against
+// 102.40) and p25 hides it (26 against 25.60). So a reader who recomputed on the other
+// population would find the p25 contrast gone and a median contrast nobody claimed. Both
+// statements survive only if the population is stated, which is why it is stated here.
+//
+// AND NEITHER MEDIAN IS THE RIGHT CENTRE for this threshold. A row-length minimum is a question
+// about ARITHMETIC, not about row counts, and the collection's nonzeros sit much further out
+// than its rows: the NONZERO-WEIGHTED median row length is 240, with weighted p25 155 and p75
+// 356. Half of DLMC's arithmetic is in rows of 240 nonzeros or more -- 2.3x the unweighted
+// median and 7.5x the 32 under discussion -- which is why a minimum in the low tens forgoes so
+// little work (2.60% at 32) while the deep kernel still serves the bulk of it.
 // Structurally empty rows never reach either kernel -- the `pA_begin == pA_end` branch above the
 // row-kernel call short-circuits them before the dispatch -- so the gate is never ASKED about
 // 147840 of the 3402920 rows. Of the
