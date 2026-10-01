@@ -144,3 +144,29 @@ is all rows, only cells carrying a complete A/A pair, or one pass. **The conclus
 version** -- all three shortfalls sit far below the `b/(b+1)` flooring bound, which at the group's
 median batch of 37 is 0.974 -- but no reader can reproduce "0.276" from the phrase "batch 11-100".
 Carry the predicate, not the value.
+
+## Amendment 2: the k margin, and a bad endpoint of mine
+
+**The two k margins differ by statistic, not by pass.** The peer read k=2 0.080 / k=4 0.095 /
+k=8 0.233 / k=16 0.368 / k=32 0.612 (a 7.7x gradient); I read 0.169 / 0.375 / 0.429 / 0.444 / 0.537
+(3.2x, nearly flat above k=8). Both are p1 aa, batch 11-100, n=4934, and both reproduce exactly:
+mine is the **mean**, theirs the **median**. The group is skewed enough that the mean compresses the
+gradient at both ends. Monotone either way, so the direction holds, but "how much k carries" differs
+and the statistic is the whole of it. Third instance tonight of the same lesson.
+
+**"Up to 18x" was wrong, and wrong in the easy direction.** I obtained it by inverting the 0.054
+band mean. The reciprocal of a mean of ratios is neither a maximum nor a median of the ratios. On the
+1521 cells at nnz < 1e4 inside batch 11-100 the cold-to-warm ratio is **median 21.5x, p90 28.3x,
+max 39.0x**. So the true endpoint is more than twice what I published, and the correction enlarges
+the pathology rather than shrinking it -- which is the direction that would have flattered my own
+argument had I noticed it first.
+
+## The cost of the pairing, stated because it bit twice tonight
+
+Two sessions independently reconstructed 0.50% for the untimed share and called it confirmed; both
+had priced calibration calls at `ms`. Earlier, two sessions independently computed a 21-22% timed
+share and called it confirmed; both had omitted `reps`. **Agreement between two parties who share a
+derivation is one calculation run twice, not a replication.** What broke both was a check against the
+producing source -- `timeit`'s loop structure, `calibrate`'s own batch formula -- not a check against
+each other. This is the failure mode a checker arrangement actively encourages, so it is worth naming
+as its price rather than discovering twice more.
