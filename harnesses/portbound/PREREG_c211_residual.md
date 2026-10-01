@@ -243,3 +243,66 @@ on a single copy cannot establish. The reference copy's digest is
 
 `an_dlmc_dims.py` REFUSES on any unresolved key rather than fitting on a partial join, since a
 silently dropped subset is invisible in every coefficient it would produce.
+
+---
+
+# Amendment 3: the footprint hypothesis is a THRESHOLD, not a slope. Still before any CSV.
+
+The peer supplied the residency table that makes the footprint family testable in a specific form.
+Reproduced here independently from the dims join, and the cache sizes read off the host rather
+than assumed by either of us.
+
+## redwood's actual cache geometry, from sysfs
+
+    P-core (cpu0)   L1d   48K    L2  2048K     L3 36864K shared
+    E-core (cpu16)  L1d   32K    L2  4096K     L3 36864K shared
+
+## B's footprint over the board, `J * k * 4` bytes
+
+      k   min B / median B / max B    <=48K(P L1d)  <=32K(E L1d)  <=2048K(P L2)
+      2      512 /    4096 /   36864     100.0%        98.4%          100.0%
+      4     1024 /    8192 /   73728      98.4%        95.1%          100.0%
+      8     2048 /   16384 /  147456      84.7%        82.5%          100.0%
+     16     4096 /   32768 /  294912      78.7%        77.0%          100.0%
+     32     8192 /   65536 /  589824      10.9%        10.9%          100.0%
+
+**The only cache boundary this board crosses is L1.** The largest B anywhere is 576 KB against a
+2 MB P-core L2, so every key at every width is L2-resident with room to spare. "A resident B
+offers no stall to hide the prefetch in" is therefore a statement about L1 and nothing else, and
+because the pool spans both core types both the 48 KB and 32 KB boundaries are live.
+
+## Consequence: register the threshold, not the slope
+
+At k=8 the 48 KB boundary falls between J=1152 (36 KB) and J=2048 (64 KB), splitting the board
+**3237 resident / 583 non-resident (15.3%)**, the non-resident side being J=2048 (394), 2304 (126)
+and 4608 (63). So a slope on log J at k=8 spends most of its leverage on variation from 2 KB to
+36 KB -- all inside L1, where the stated mechanism does not vary at all -- while the contrast the
+hypothesis actually predicts is the 15.3% on the far side.
+
+**Registered form:** an indicator at `J*k >= 12288` (48 KB) and, reported alongside because the
+pool is hybrid, at `J*k >= 8192` (32 KB). The 32 KB boundary splits 3153 / 667 and moves 84 keys
+relative to the 48 KB one, all of them the J=1152 level. The monotone log J slope is retained only
+as a secondary reading, and if the two disagree the threshold is the registered one.
+
+## A second, independent reason the k=2 layout correction does not transfer
+
+Already withdrawn on the grounds that the two-objects artefact is largest at the narrowest width.
+The residency table adds a structural reason that does not depend on that: at k=2 every key on the
+board is L1-resident, at k=32 only 10.9% are. The width used as the negative control and the width
+whose rank the retraction turned on sit at opposite ends of the only boundary the board crosses.
+
+## Caution carried with the table, the peer's and correct
+
+"Fits L1" is an upper bound on residency, not residency. A's values and column indices stream
+through the same L1 and C's output row is live there too, so the effective capacity available to B
+is less than 48 KB and the true crossing is at a smaller J than the table says. The direction is
+known, so the resident fractions above are OPTIMISTIC -- they overstate how much of the board sits
+in the regime where the mechanism is silent.
+
+## Two corrections to the figures as sent
+
+- The L2 was given as 1.25 MB; it is 2 MB on a P-core and 4 MB on an E-core. The conclusion is
+  unchanged and in fact stronger: the board clears L2 by a wider margin than stated.
+- The 32 KB split was given as 3151 / 669, moving 86 keys. It is **3153 / 667, moving 84** -- the
+  J=1152 level holds exactly 84 keys, and `J*8*4 <= 32768` is `J <= 1024`, so the moved set is
+  precisely that level.
