@@ -43,7 +43,12 @@ def t_the_read_that_happened():
     the short arm were plausible and on a quarter of the corpus."""
     by = {a: cells(418) for a in ("ship", "shpb", "strm")}
     by["nopf"] = cells(100)
-    expect_refusal("nopf-mid-write", lambda: G.check(by), "nopf=700", "WAIT for those file(s)")
+    # RIGHT-DELIMITED, with the trailing space taken from the live message (") nopf=700 hold
+    # [700] ce"). A substring is LEFT-ambiguous when it starts with a digit and RIGHT-ambiguous
+    # when it ends with one: "nopf=700" is inside "nopf=7000", so the bare form passes on a
+    # ten-fold larger count. What bounded it was this fixture's cells(100), i.e. the plant's
+    # data rather than the assertion -- the same condition that hid the prefix case in pfs_eta.
+    expect_refusal("nopf-mid-write", lambda: G.check(by), "nopf=700 ", "WAIT for those file(s)")
 
 
 def t_a_complete_pass_passes():
@@ -72,8 +77,11 @@ def t_identical_counts_disjoint_keys():
     shared keys. The first version returned {2: 10, 4: 10, 8: 10} and refused nothing."""
     by = {"ship": cells(10, widths=(2, 4, 8), prefix="a"),
           "strm": cells(10, widths=(2, 4, 8), prefix="b")}
+    # The period is the delimiter here, from the live message ("intersection 0 of 10. A
+    # downst..."): without it, a denominator of 100 renders "intersection 0 of 100." which
+    # contains the asserted string.
     expect_refusal("disjoint-keys", lambda: G.check(by),
-                   "same NUMBER of cells", "intersection 0 of 10")
+                   "same NUMBER of cells", "intersection 0 of 10.")
 
 
 def t_partial_swap_is_the_live_gap():
