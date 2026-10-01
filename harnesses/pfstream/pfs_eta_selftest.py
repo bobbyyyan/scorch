@@ -59,7 +59,16 @@ def early_exits():
         projectors and NOT module-wide: all eight helper returns are BinOps. So the
         reasoning was right about the projectors and overstated about the module, and
         the gap is exactly where the newest refusal landed.
-      * SINK -- call sites of one named function. Exact regardless of how the message is
+      * SINK -- call sites of one named function. Complete over refusals ROUTED THROUGH
+        the sink, and blind to a termination spelled any other way: `raise _Refuse` with
+        no arguments read 15 of 15 / OK while producing an EMPTY message at status 1, and
+        `raise SystemExit(...)` -- the same termination `sys.exit(...)` performs, spelled
+        as a Raise rather than a Call -- was outside the population too.
+      * THIS ONE -- the sink's call sites UNION every `ast.Raise` node UNION every
+        `sys.exit` call. Complete over abnormal terminations by NODE TYPE rather than by
+        which exception is named or how it is spelled. A raise is a raise; the sink's
+        call sites are kept only for RESOLUTION, since one raise inside _refuse would
+        otherwise collapse eleven distinct error conditions into one site. Exact regardless of how the message is
         built or spelled, and it brought the helper refusal into the population. But
         REPLACING the shape predicate with it was a REGRESSION: an exit that neither
         calls the sink nor contains the word "REFUSE" left the population again, and
@@ -87,6 +96,8 @@ def early_exits():
     t = ast.parse(open(TARGET).read())
     out = set()
     for n in ast.walk(t):
+        if isinstance(n, ast.Raise):
+            out.add(n.lineno)
         if isinstance(n, ast.Call):
             if isinstance(n.func, ast.Name) and n.func.id == "_refuse":
                 out.add(n.lineno)
@@ -491,20 +502,22 @@ def t_refuse_sink_is_the_only_producer():
     t = ast.parse(src)
     ok = set()
     for n in ast.walk(t):
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_refuse":
-            ok.update(id(c) for c in ast.walk(n))
         if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)):
             d = ast.get_docstring(n, clean=False)
             if d is not None and n.body:
                 ok.update(id(c) for c in ast.walk(n.body[0]))
-        if isinstance(n, ast.FunctionDef) and n.name == "_refuse":
+        # ONE producer of the prefix, so no exclusion list. The CLI handler also has to
+        # RENDER a refusal (the message-less case), and when that carried its own literal
+        # it became a second producer and tripped this check -- correctly. The fix was to
+        # give it `_refuse_text` rather than to add it here as an exception.
+        if isinstance(n, ast.FunctionDef) and n.name == "_refuse_text":
             ok.update(id(c) for c in ast.walk(n))
     stray = [(n.lineno, n.value[:60]) for n in ast.walk(t)
              if isinstance(n, ast.Constant) and isinstance(n.value, str)
              and "REFUSE" in n.value and id(n) not in ok]
     if stray:
-        FAIL.append("refuse-sink: %d REFUSE literal(s) outside a _refuse() call, so the "
-                    "coverage population is not exact: %s" % (len(stray), stray))
+        FAIL.append("refuse-sink: %d REFUSE literal(s) outside _refuse_text, so the "
+                    "prefix has more than one producer: %s" % (len(stray), stray))
 
 
 def t_coverage_population_is_not_vacuous():
@@ -581,11 +594,24 @@ def t_refuse_raises_and_is_the_only_abnormal_exit():
     t = ast.parse(open(TARGET).read())
     raisers = set()
     for f in ast.walk(t):
-        if isinstance(f, ast.FunctionDef):
-            for n in ast.walk(f):
-                if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) \
-                        and isinstance(n.exc.func, ast.Name) and n.exc.func.id == "_Refuse":
-                    raisers.add(f.name)
+        if not isinstance(f, ast.FunctionDef):
+            continue
+        for n in ast.walk(f):
+            if not isinstance(n, ast.Raise) or n.exc is None:
+                continue
+            # BLIND TO SPELLING. The previous version required an ast.Call, so the
+            # argument-less `raise _Refuse` was invisible -- a message-less refusal that
+            # read 15 of 15 / OK and printed an empty line at exit status 1. Matching the
+            # NAME wherever it appears in the raised expression covers the called form,
+            # the bare form, and anything built around them.
+            named = set(c.id for c in ast.walk(n.exc) if isinstance(c, ast.Name))
+            if "_Refuse" in named:
+                raisers.add(f.name)
+                if not isinstance(n.exc, ast.Call):
+                    FAIL.append("refuse-raises: pfs_eta.py:%d raises _Refuse with NO "
+                                "ARGUMENTS, in %s -- fail-closed but message-less, and "
+                                "it bypasses _refuse so the text the user sees is lost"
+                                % (n.lineno, f.name))
     if raisers != {"_refuse"}:
         FAIL.append("refuse-raises: _Refuse is raised from %s -- it must be raised only "
                     "by _refuse, or the call sites are no longer the population"
@@ -662,6 +688,39 @@ def t_report_guard_is_loud():
                         % (why, bad))
 
 
+def t_empty_refusal_is_named_not_relayed():
+    """A message-less refusal must not reach the user as an empty line.
+
+    `raise _Refuse` with no arguments is fail-closed -- status 1 -- so this is a
+    DIAGNOSIS gap rather than a wrong answer, which is how the peer ranked it and how I
+    am treating it. But "a raised refusal reaches the user as text" was guaranteed for
+    `_refuse`, not for `_Refuse`, and the CLI relayed the silence. It now names the
+    defect instead.
+    """
+    global CHECKS
+    CHECKS += 1
+    import contextlib as _c
+    import io as _io
+    out = _io.StringIO()
+    try:
+        with _c.redirect_stdout(out):
+            raise pfs_eta._Refuse()
+    except pfs_eta._Refuse as e:
+        if str(e).strip():
+            FAIL.append("empty-refusal: a no-argument _Refuse carries a message %r, so "
+                        "this plant no longer exercises the empty case" % str(e))
+    CHECKS += 1
+    # _surface is where the silence was relayed. Exercised directly, which is why it was
+    # split out of the handler -- otherwise this branch needed a planted defect in
+    # production code to reach.
+    t = pfs_eta._surface(pfs_eta._Refuse())
+    if "no message" not in t or not t.startswith("REFUSE:"):
+        FAIL.append("empty-refusal: _surface() relayed an empty refusal as %r" % t)
+    CHECKS += 1
+    if pfs_eta._surface(pfs_eta._Refuse("REFUSE: a real one")) != "REFUSE: a real one":
+        FAIL.append("empty-refusal: _surface() altered a refusal that had a message")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
@@ -685,7 +744,7 @@ def main():
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
     print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
-          "(_refuse call sites -- it raises -- plus sys.exit)" % (len(TESTS), CHECKS, len(want)))
+          "(sink call sites + every ast.Raise + sys.exit)" % (len(TESTS), CHECKS, len(want)))
     print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:

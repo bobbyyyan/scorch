@@ -112,7 +112,34 @@ def _refuse(msg, *args):
     which is the check that was missing when the lexical predicate silently dropped a
     live path out of its own denominator.
     """
-    raise _Refuse("REFUSE: " + (msg % args if args else msg))
+    raise _Refuse(_refuse_text(msg, *args))
+
+
+def _refuse_text(msg, *args):
+    """The ONE place the "REFUSE: " prefix is produced.
+
+    Split out from `_refuse` because the CLI's handler also has to RENDER a refusal --
+    specifically a message-less one -- and a second literal carrying the prefix would be
+    a second producer, which is exactly what the enforcement check is for. With one
+    producer the check needs no exclusion list: the prefix may appear only inside this
+    function, and nothing else has to be remembered.
+    """
+    return "REFUSE: " + (msg % args if args else msg)
+
+
+def _surface(exc):
+    """The text a raised refusal should show the user. Separated from the handler so it
+    can be exercised directly -- the handler's own branch was otherwise reachable only by
+    planting a defect in production code."""
+    m = str(exc)
+    if m.strip():
+        return m
+    # `raise _Refuse` with no arguments bypasses _refuse and carries nothing. Fail-closed
+    # either way (status 1), so this is a DIAGNOSIS gap rather than a wrong answer -- but
+    # relaying an empty line tells the user nothing, so name the defect instead.
+    return _refuse_text("a refusal was raised with no message -- some path raised "
+                        "_Refuse directly instead of calling _refuse(). Fail-closed, "
+                        "but the reason is lost.")
 
 
 def _secs(h, m, s):
@@ -464,5 +491,5 @@ if __name__ == "__main__":
     try:
         sys.exit(_main(sys.argv[1:]))
     except _Refuse as _e:
-        print(_e)
+        print(_surface(_e))
         sys.exit(1)
