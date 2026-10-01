@@ -41520,8 +41520,24 @@ chain207's sealed stage log carries start/done lines for all twelve object-passe
     p5 aa 23m34s   p2 aa 23m38s   p3 bb 23m38s   p4 bb 23m40s   p5 bb 23m41s   p3 aa 23m43s
 
 n=12, min 22m50s, median **23m32.5s** (the mean of the 6th and 7th of twelve), max 23m43s,
-standard deviation **14.4 seconds**. Total spread is 3.75% of the median or 3.87% of the minimum --
-the two differ only by the denominator, which has to be named rather than rounded to "about 3.8%".
+standard deviation **14.4 seconds**.
+
+Spread, three ways, and the third is the one to quote:
+
+    (max-min)/median    3.752%    uses 2 of 12 observations
+    (max-min)/min       3.869%    uses 2 of 12
+    stdev/median        1.020%    uses 12 of 12      <- the coefficient of variation
+
+The first two differ only by their denominator and both are defensible, so the denominator has to be
+named rather than rounded to "about 3.8%". But both are functions of two durations out of twelve,
+and the coefficient of variation uses all of them. The operative reason to prefer it: **a
+range-based spread is not comparable between runs with different pass counts**, because the expected
+range grows with n -- for a normal sample of twelve it is about 3.26 sigma, so a range-spread is
+roughly the CV times a sample-size constant. (Here 3.26 x 1.020% = 3.32%, which is BELOW both
+observed figures, so this sample's range is wide relative to its own standard deviation at 3.68
+sigma. The constant is an expectation, not a conversion.) chain207 and chain210 are both twelve
+passes so nothing here is affected, but a spread quoted beside them for a run of different length
+would be broken in a way that looks fine.
 A twelve-pass run whose passes agree to 14 seconds is a useful fact in itself -- it means per-pass
 timing is not a source of variance worth modelling here.
 
@@ -41562,10 +41578,14 @@ separated by 250 s, 459 s and 709 s, i.e. **5.2x, 9.6x and 14.9x** that noise sc
 discriminates all three cleanly. A landing outside all three -- before 04:08 or after 04:21 -- means
 something changed between the runs beyond pace, and that is the interesting outcome.
 
-**AND THE DETECTION LEDGER FOR TONIGHT, WHICH IS THE PART I WANT KEPT.** Five method errors between
-two sessions: a count with no predicate, a correlate with no decomposition, an unpaired estimator, a
-rate extrapolated from a partial file, and a floor quoted at the wrong level. **Self-review found
-none of them.** Four surfaced because two sessions computed overlapping quantities and the numbers
+**AND THE DETECTION LEDGER FOR TONIGHT, WHICH IS THE PART I WANT KEPT.** The method errors between
+two sessions include a count with no predicate, a correlate with no decomposition, an unpaired
+estimator, a rate extrapolated from a partial file, a floor quoted at the wrong level, and a
+denominator difference presented as a rounding. **I am deliberately not giving a total**: depending
+on whether the two wrong explanations for one gap count once or twice, and whether a mislabelling
+counts, it is five, six, seven or eight, all true under different predicates -- and a count without
+a predicate is itself one of the errors on the list. The number that does carry a predicate is the
+one worth keeping: **self-review caught zero of them.** Four surfaced because two sessions computed overlapping quantities and the numbers
 disagreed. The fifth surfaced because `date -d` on a host whose date had just rolled over returned a
 NEGATIVE elapsed time -- a guard firing on an impossible value, not a re-reading of the reasoning.
 So the ranking, four rungs and self-review is not one of them: make wrong answers **impossible**
