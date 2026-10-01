@@ -7,6 +7,12 @@ whose results were all zero (agreement is then trivial).
 """
 import csv, os, sys
 from collections import defaultdict
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# THE INPUT SET IS DECLARED IN ONE PLACE AND THIS FILE DERIVES ITS PATHS FROM IT. A second
+# copy of the naming is what let an auditor measure a population this tool cannot read and
+# conclude the gate had never fired. If the declaration drifts from what is opened here, the
+# open fails loudly rather than an audit succeeding against the wrong set.
+import pfs_inputs as PI
 if len(sys.argv) < 3:
     sys.exit("usage: pfs_bitcmp.py <dir-with-<prefix>_*.csv> <expected-real-matrices> [prefix]")
 D = sys.argv[1]
@@ -47,13 +53,18 @@ REQUIRED_IDENT = ("case", "key", "k")
 # nonzero partway through the corpus and this printed "CORRECT" over 26 of 418 matrices. Covering
 # the same cells and covering the declared cells are two claims.
 EXPECT_MATRICES = int(sys.argv[2])
-BUILDS = ("ship", "shpb", "strm", "nopf")
-BASE = BUILDS[0]                     # the reference build, named once rather than spelled inline
+BUILDS = PI.BUILDS
+BASE = PI.BASE                       # the reference build, named once rather than spelled inline
 PREFIX = sys.argv[3] if len(sys.argv) > 3 else "bits"
 if PREFIX not in SCHEMAS:
     sys.exit("REFUSE: no schema declared for producer prefix %r (known: %s). A comparator that "
              "guesses a cell key from an unknown header cannot say what a cell was."
              % (PREFIX, ", ".join(sorted(SCHEMAS))))
+if set(SCHEMAS) != set(PI.PREFIXES):
+    sys.exit("REFUSE: this file declares schemas for %s and pfs_inputs declares input\n"
+             "sets for %s. Two disagreeing lists of producers means one of them is not\n"
+             "the contract, and an auditor reading the other one measures a set this\n"
+             "comparison never opens." % (sorted(SCHEMAS), sorted(PI.PREFIXES)))
 SCH = SCHEMAS[PREFIX]
 keyflds = list(SCH["ident"])
 missing_req = [c for c in REQUIRED_IDENT if c not in keyflds]
@@ -66,7 +77,7 @@ print("  cell key: %s   (schema %r; attributes %s)"
       % (" + ".join(keyflds), PREFIX, " + ".join(SCH["attrs"]) or "none"))
 rows = {}
 for b in BUILDS:
-    p = os.path.join(D, "%s_%s.csv" % (PREFIX, b))
+    p = os.path.join(D, PI.csv_name(PREFIX, b))
     if not os.path.exists(p):
         sys.exit("REFUSE: %s is missing; 'every build agrees' over %d of the %d builds is not the "
                  "claim" % (p, len(BUILDS) - 1, len(BUILDS)))
@@ -122,7 +133,7 @@ for b in BUILDS:
     # The sentinel path must follow the PREFIX. Parameterising the CSV path and not this one made
     # the fused run read the drop-in run's sentinel -- it refused, correctly, on a declared count
     # that belonged to a different producer, and a planted two-shape test is what surfaced it.
-    dn = os.path.join(D, "%s_%s.csv.done" % (PREFIX, b))
+    dn = os.path.join(D, PI.sentinel_name(PREFIX, b))
     if not os.path.exists(dn):
         sys.exit("REFUSE: %s is absent. The producer writes it only after closing its CSV, so a "
                  "complete-looking CSV with no sentinel is a run that died after the last matrix "

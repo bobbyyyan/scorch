@@ -115,6 +115,18 @@ cd "$DEST" || exit 1
 # for exactly this; the seal is where it matters most.
 nl=$(find . -type l | wc -l | tr -d ' ')
 [ "$nl" -eq 0 ] || { echo "REFUSE: $nl symlink(s) in $DEST -- a sealed name must be a sealed file:"; find . -type l | sed 's/^/  /'; exit 1; }
+# DOTFILES. The enumeration below is `ls -1`, which omits them, so the one class of file this
+# sealer cannot see is an rsync/scp temporary -- `.name.XXXXXX` -- and that is precisely the file
+# whose presence means the transfer did not finish and the directory must NOT be sealed yet. The
+# blindness is in DETECTION, not in what gets sealed: a dotfile should block the seal, not join
+# the manifest, so this refuses rather than widening the enumeration (which would also change
+# every manifest line's format from `name` to `./name`).
+dots=$(find . -maxdepth 1 -type f -name '.*' | sed 's|^\./||' | tr '\n' ' ')
+[ -z "$dots" ] || { echo "REFUSE: dotfile(s) present, which the ls -1 enumeration below cannot see: $dots"; echo "  An rsync temporary means the transfer is incomplete. Resolve it before sealing."; exit 1; }
+# The refusal above can only fire if find sees this directory at all; a wrong CWD would make it
+# vacuous, so assert the non-dot count is the one already verified above.
+nf=$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')
+[ "$nf" -ge "$n" ] || { echo "REFUSE: find sees $nf files but $n object-pass CSVs were counted -- the dotfile check ran somewhere else"; exit 1; }
 rm -f SHA256SUMS.sha256
 # NUL-delimited into xargs: never let the shell word-split a file list, and zsh would not
 # split it at all, so `shasum $(echo "$SET")` is wrong in two different ways depending on shell.
