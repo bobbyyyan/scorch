@@ -99,3 +99,48 @@ No conclusion moves -- kernel calls go from 85.7% to **86.05%** of wall and the 
 from 14.3% to **13.95%**, so the occupancy bracket *tightens* slightly to **6.045-9.773 of 24 cores
 (25.2-40.7%)**, ceiling 2.46-3.97x. But 0.50% was a published figure the peer and I had agreed on,
 and agreement between two sessions is not evidence: we had made the same substitution.
+
+## Amendment: one of the three confirmations is low-power, and the split needs its interval
+
+Both from the peer session, both accepted.
+
+**The group-level contrast is demoted — it is not a third route.** I offered `b=11-100` (window
+2.29 ms, floor 0.2117) against `b=101-1000` (window 5.52 ms, floor 0.2097) as independent weight.
+But `batch` is a monotone function of per-call time, so the two groups differ about 2x in median nnz
+and **both medians sit on the plateau of the inverted U**, where the decile floors are near their
+peak. Near-equal floors are therefore what the nnz axis predicts on its own, window or no window.
+The test is consistent with the conclusion and could not have contradicted it, which makes it
+low-power rather than confirming. (They are not disjoint populations — 767 of 787 distinct nnz values
+in the smaller group also appear in the larger — so the confound is in the distributions, not the
+support.)
+
+**The conditioned split now carries its uncertainty.** 4000 bootstrap resamples over cells, seed
+20261001, same split sizes:
+
+    p95 dev  short 0.2489   long 0.2688   ratio 0.9260
+    95% CI on the ratio      [0.8596, 0.9921]
+
+The interval excludes 1.0, so the 7% is not sampling noise. The better framing is still the bound
+rather than the reversal: **the artefact hypothesis requires a ratio above 1, and the entire interval
+lies below it**, so the window cannot be inflating the floor in this band at all — its contribution
+is bounded above at -0.8%. Against a floor that moves 20x across nnz deciles while the median window
+stays flat at 5.36-5.62 ms, a 1.05x cause bounded to a non-positive contribution is the result. The
+decile argument is the headline because it yields that quantitative bound; the conditioned split with
+its interval is the second informative route; the group contrast is neither.
+
+## One group, three published numbers — each needs its pass and its statistic
+
+The shortfall for "batch 11-100" is circulating as 0.276, 0.433 and 0.196, and all three are right:
+
+| figure | population | statistic |
+|---|---|---|
+| 0.433 | p1 aa rows, n=4934 | mean |
+| 0.196 | p1 aa rows, n=4934 | median |
+| 0.276 | cells with a median over 12 passes, n=6006 | median of per-cell values |
+
+The group is badly right-skewed, so mean and median differ by 2.2x on the same rows. The same
+applies to its median nnz, which reads 131072, 294912 or 104857 depending on whether the population
+is all rows, only cells carrying a complete A/A pair, or one pass. **The conclusion survives every
+version** -- all three shortfalls sit far below the `b/(b+1)` flooring bound, which at the group's
+median batch of 37 is 0.974 -- but no reader can reproduce "0.276" from the phrase "batch 11-100".
+Carry the predicate, not the value.
