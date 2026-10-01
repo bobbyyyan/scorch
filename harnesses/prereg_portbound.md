@@ -650,3 +650,53 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   with `r_P/r_E` to be measured by V0 pinned on each core type and both arms reported unweighted
   until then. The occupancy question is accepted as outranking this one and is pre-registered
   separately, with my own 25%-occupancy claim narrowed to a statement about the harness process.
+
+### Amendment 12 -- V4 must ACCUMULATE, and V4b is added to isolate the load
+
+Forced by the emitted code and made before any timing was read. Three successive versions of V4 and
+V5 were rejected by the disassembly gate this design makes binding, and each rejection is the
+optimiser deleting the thing being measured:
+
+1. **Sinks as an array indexed by `p & 3` cannot be register-allocated**, so they spilled to memory
+   and every spill counted as a load-port operation. V4 read **5.75 mem/nnz against an intended
+   4.00**, and **half of V5's ALU ops were gone**.
+2. With named sink registers, the sinks were **overwritten each iteration**, which is still dead --
+   only the last iteration's value is stored. `-O3` deleted V4's loads entirely (delta **+0.12**)
+   and **all** of V5's ALU ops (**+0.00**). Consuming a value means *accumulating* it, not assigning
+   it.
+3. An accumulate costs an ALU operation, which would confound V4's intended load-only delta.
+
+So V4 carries the accumulate and **V4b carries the accumulate without the load**; `V4 - V4b` is one
+load per nonzero with the ALU operation held fixed. `_mm_or_ps` is the accumulate throughout:
+non-idiom, distinct live sources, and on ports 0/1/5 rather than the FMA's 0/1, so it can retire on
+port 5 without contending with FMA throughput.
+
+Rejection 2 is the failure this design names as dangerous: a deleted V5 reads identical to V1, which
+is the signature the refutation condition tells us to accept. It occurred.
+
+### Amendment 13 -- V4c, because V4 conflates a load-port operation with a cache stream
+
+V4's extra load comes from a separate 64 KB array, so it adds a memory stream as well as a
+load-port operation and cannot isolate port pressure. **V4c** is V0 plus one load from `B0 + K`:
+a different address, so no common-subexpression elimination, and 16 bytes along, so it lands inside
+the same 64-byte line three times in four. One added port operation, no new footprint, so
+`V4c - V4b` is port pressure alone. (The first V4c reloaded `B0` itself and CSE deleted it --
+mem/nnz 3.12 against 4.00, the third deletion of the evening.)
+
+### Amendment 14 -- the timings are bound to an attested binary, and the floor is demoted
+
+**The refutation's accept condition and the vacuity signature are the same reading.** The rule is
+"if t(V5) is at t(V1), the lever is closed", and a V5 whose ALU ops were deleted *is* a V1 under a
+different symbol. A disassembly gate that rejected three earlier attempts attests nothing about the
+binary that produced a published number. So `run_probe.sh` performs one compile, records the
+binary's sha256, disassembles that binary, runs the gate against it, writes `ATTEST.txt` with the
+digest plus the per-variant `mem/nnz` and `alu/nnz` table plus the gate's exit code, and stamps
+`# binary_sha256` into every CSV. The analyzer refuses on a digest mismatch or a nonzero gate exit,
+and prints each variant's emitted counts **in the same table row as its timing**.
+
+**The floor is an arm floor, not a layout floor.** V0b is the same variant under a second symbol, so
+the registered p95 measures re-running identical code, not running different code at a different
+address. Two objects with identical *decisions* have measured 1-2.6% apart on narrow-k SpMM and
+identical *source* at different addresses about 0.3%. V1, V2 and V3 therefore stand as an **upper
+bound** on the per-load gain rather than as established effects, since their range is the size
+layout alone produces. The refutation is unaffected under either floor, and the analyzer says why.
