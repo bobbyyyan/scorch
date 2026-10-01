@@ -55,11 +55,20 @@ instructions per nonzero.** Per-body delta from PF=1 to PF=0:
     prefetcht2  -4      the prefetches themselves
     movslq      -4      load A1_crd[pA + UNROLL + u]
     shl         -4      multiply by B1_size
-    lea / add   -3      form the address
+    lea         -2      form the address
+    add         -1        "
+    mov         -1        "
     cmp         -4      the per-prefetch bounds check
     jle         -4      its branch
+                ---
+                -24      = 6.00 per nonzero, matching 44 - 20 exactly
 
-So each prefetch costs about six instructions, only one of which is the prefetch.
+So each prefetch costs six instructions, only one of which is the prefetch. Note the address
+arithmetic is 4 instructions for 4 prefetches on the movslq and shl rows but only 4 across
+lea+add+mov -- one address computation is shared, so the compiler has already amortised part of
+it. An earlier version of this list omitted `mov -1` and summed to 23 against a measured 24; the
+enumeration has to close against the difference of the two instruction counts, because the
+memorable sentence is the enumeration's and not the total's.
 
 ## The mechanism, from the source
 
@@ -99,9 +108,16 @@ disassembly before anything is timed.
 - **Keep prefetch coverage per nonzero fixed at the measured rate** rather than letting it scale
   with UNROLL: issue `UNROLL/2` prefetches per body, not `UNROLL`. This restores the quantity that
   was actually tuned and is the change with a mechanism behind it.
-- **Hoist the bounds check.** The condition `pA + UNROLL + u < pA_end` is monotone in `u`, so one
-  check on the largest `u` dominates the group. That recovers 8 of the 24 instructions per body
-  without changing coverage at all, and is correct independent of what the timing says.
+- **Remove the per-prefetch bounds check**, in either of two forms, and note which figure goes
+  with which. The condition `pA + UNROLL + u < pA_end` is monotone increasing in `u`, so the
+  `u = UNROLL-1` test dominates the group.
+    *Hoisting* it replaces 4 `cmp` + 4 `jle` with 1 + 1, so it recovers **6** of the 24
+    instructions per body -- a group-level check is still a check inside the body.
+    *Loop splitting* reaches the full **8**: iterate the bulk while `pA < pA_end - 2*UNROLL + 1`,
+    where the guard is statically true, and handle the final group separately, leaving the bulk
+    body with zero checks.
+  Both are correct independent of what the timing says, and the distinction matters because the 8
+  is reachable but hoisting alone does not reach it.
 
 ## Scope
 
