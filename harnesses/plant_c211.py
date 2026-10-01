@@ -347,7 +347,20 @@ if _m is None or "distinct keys" not in _m.group(0):
     fails.append("ablation: guard not locatable by regex (reworded?)")
 else:
     _abl_src = _an_src[:_m.start()] + _an_src[_m.end():]
-    if "distinct keys" in _abl_src:
+    # MINIMALITY, asserted as the quantity and not a correlate. "the message is gone" bounds the
+    # cut from BELOW only, and `(?:[ \t]+.*\n)+` is greedy over indented lines -- it removes the
+    # guard plus every indented line that follows it, which today is the guard alone. Put an
+    # indented block after that guard (a continued print, a nested conditional) and the cut
+    # silently grows, and then the ablated+oversized cell is accepted for a reason this table
+    # does not name while every printed verdict stays the same. That is the shape of the
+    # wrong-schedule ablation from earlier in this milestone: the right verdict, because
+    # something other than the named change moved.
+    _cut_lines = _m.group(0).count("\n")
+    if _cut_lines != 2:
+        print("  FAIL: the ablation removed %d lines, expected exactly 2 (the `if` and its"
+              " sys.exit) -- the cut is no longer minimal:\n%s" % (_cut_lines, _m.group(0)))
+        fails.append("ablation: cut spans %d lines, expected 2" % _cut_lines)
+    elif "distinct keys" in _abl_src:
         # The message survives the cut, so either there are two sites or the cut was partial.
         print("  FAIL: 'distinct keys' still present after the cut -- the ablation is incomplete")
         fails.append("ablation: 'distinct keys' survives the cut")
@@ -428,16 +441,25 @@ else:
             # version duplicated them, and inverting the condition to check that this assert can
             # fail produced "accepted n=[3819] (want [3819])" -- a failure message contradicting
             # the condition that raised it. One binding, two uses.
-            _WANT_ACC, _WANT_CTL = [3819], [3820]
+            # DERIVED, with the predicate named. 3819 is true of today's KEYS and says nothing
+            # about why; these say why. m_keycount drops exactly ONE key (its own assert checks
+            # the 15 rows) from base p1, so that key's base cells hold five of six passes and
+            # ratio() drops them -- hence len(KEYS) - 1. The two synthetic keys hold one of six
+            # and drop too, so they never enter the floor, but they DO enter the printed key
+            # count -- hence len(KEYS) + 2 there. Growing the corpus now moves all three together.
+            _WANT_ACC, _WANT_CTL = [len(KEYS) - 1], [len(KEYS)]
+            _WANT_PRINTED = len(KEYS) + 2
             if _acc[1] != _WANT_ACC or _ctl[1] != _WANT_CTL:
                 fails.append("population check: accepted n=%s (want %s), clean n=%s (want %s)"
                              % (_acc[1], _WANT_ACC, _ctl[1], _WANT_CTL))
                 print("  FAIL: expected n=%s accepted and n=%s clean" % (_WANT_ACC, _WANT_CTL))
-            elif _acc[0] != 3822:
-                fails.append("population check: accepted run printed %s keys, want 3822" % (_acc[0],))
-                print("  FAIL: expected the accepted run to print 3822 keys")
+            elif _acc[0] != _WANT_PRINTED:
+                fails.append("population check: accepted run printed %s keys, want %d"
+                             % (_acc[0], _WANT_PRINTED))
+                print("  FAIL: expected the accepted run to print %d keys" % _WANT_PRINTED)
             else:
-                print("  PASS: 3822 printed, 3819 estimated -- a population drop with no diagnostic.")
+                print("  PASS: %d printed, %d estimated -- a population drop with no diagnostic."
+                      % (_acc[0], _acc[1][0]))
             print()
             print("  AND THE GUARD CLOSES THIS TOO, which makes it the guard's second independent")
             print("  consequence rather than a second hole. With the guard intact n < 3820 is")
