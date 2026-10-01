@@ -41603,3 +41603,35 @@ position-balanced one, since the rotation is balanced only over the full twelve.
 and independent reason the wait-for-all-twelve rule is load-bearing; the first is the
 pre-registration. A valid partial comparison would have to position-match passes rather than pool
 them.
+
+### chain210's analyzer, pre-registered with 1 of 12 object-passes complete
+
+`harnesses/an_c210.py`, sha256 `219e25b39890531e02b19d9d27ec374d8c500b9d705d7abbaffbf120c90a284f`, committed while chain210 had **1 of 12** object-passes on
+disk. The point of fixing the digest now is that every threshold in it -- the verdict partition for
+P1, P2''s union band, P3's 0.40/0.60 cut, P4's 2% gate -- is unselectable after the fact.
+
+It refuses rather than reports on partial data, for two reasons that are independent of the
+pre-registration: chain207's pass 1 is the fastest of its twelve, so a partial run is biased fast;
+and the rotation balances only over all twelve, so a partial run is position-1-heavy in its cell
+composition as well as its clock.
+
+**Five guards, each tested against a planted input that fails it** -- because a guard that can only
+pass is the dominant failure shape in this milestone:
+
+    guard                   planted defect                      result
+    G1 file count           11 of 12 files                      REFUSE
+    G1 row count            one object-pass short by 100 rows    REFUSE, naming (aa, 3) at 57200
+    G1 pass index           bb's p6 relabelled p7                REFUSE, printing both index sets
+    G2 dims digest          a 3-row dlmc_dims.csv                REFUSE, printing both digests
+    G3 object binding       .text replaced with deadbeef...      REFUSE
+
+The intact input clears G1 through G3, so the guards are not vacuously refusing either. G4 is the
+one that matters most and has no planted case: it recomputes **chain207's own headline from the
+sealed ledger and exits if it is not 10**, so a drift in the estimand or the ledger voids the
+comparison instead of silently rebasing it.
+
+One trap worth recording from building this. My first truncation used `head -n -100`, which macOS
+rejects -- so the file was never truncated, the row-count guard printed OK on an intact file, and I
+briefly had a passing test of a guard that had not been exercised. The planted case planted nothing.
+That is the same shape as the guard failures the planting is meant to catch, one level up in the
+test harness, and it was visible only because `head` printed an error I happened to read.
