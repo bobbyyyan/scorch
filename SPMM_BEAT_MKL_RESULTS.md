@@ -41326,3 +41326,66 @@ conditions on run 1 and is capped at n=10. Instead compute run 2's behind-set **
 all 19100 cells** under the identical criterion and report **intersection, union and Jaccard** --
 the symmetric statistic, using the whole grid, and exactly what produced 14/18/7/25 on SuiteSparse.
 P1 is the special case of it that conditions on run 1.
+
+### The density result independently re-derived, and the one anomaly in it withdrawn (2026-09-30)
+
+The checker session re-derived the density work from chain209's sealed dimension table with its own
+reducer, not reading my analyzers. The main result reproduces exactly; the anomaly I had recorded as
+unexplained does not survive, and the reason is an estimand, not a build.
+
+**WHAT REPRODUCES TO THE DIGIT.** The k=4 density quintile row on both builds -- aa
+0.440/0.902/0.925/1.028/1.096, bb 0.441/0.903/0.928/1.030/1.097, cross-build deviation 0.12-0.37%.
+And every cell of the nanoseconds-per-nonzero table to four decimals, with the 6.148x-against-7.705x
+gain comparison at k=4 and 6.527x-against-6.409x at k=16.
+
+**THE WIDTH PROFILE IS THE RESULT, AND IT IS STRONGER THAN THE PAIR I PUBLISHED.** I reported the
+reversal as k=4 against k=16. The right statement is the gradient of S from the SECOND to the FIFTH
+density quintile, at every width, on both builds:
+
+    k=2   aa +5.85%   bb +4.45%
+    k=4   aa +21.43%  bb +21.42%     <- reproducible to 0.01 percentage points
+    k=8   aa +4.88%   bb +5.86%
+    k=16  aa -3.74%   bb -3.21%
+    k=32  aa -3.15%   bb -2.60%
+
+Max cross-build deviation over all 25 width-by-quintile cells is **1.03%** (at k=2 q5), so k=16's
+-3.7% clears its own floor by 3.6x and k=4's +21.4% by 21x. Two corrections to how I stated it. It
+is the **q2-to-q5 segment** that reverses, not q1-to-q5: q1 is the ultra-sparse regime and q1-to-q5
+rises at every width, so quoting k=16 as "0.490 to 0.781" reads as the same direction as k=4 and
+undersells the finding. And the sign flips between k=8 and k=16 while k=4's +21.4% is **3.7x its own
+neighbours** at k=2 and k=8 -- density hurting us is a narrow-k effect and k=4 is an outlier inside
+it, which is the same shape as 8 of the 10 residues sitting at k=4. The profile is a far better
+mechanism constraint than the two-width pair.
+
+**THE 60-101% UPTURN IS WITHDRAWN.** I recorded it as a second effect the sub-cache-line mechanism
+could not explain. It is not a feature. Two things are true and either is sufficient:
+
+    k=4, band 5 -> band 6     estimand A (median per-cell S)   aa -5.39%   bb -5.78%
+                              estimand B (pooled ns/nnz ratio)  aa +5.0%    bb +3.7%
+    band 6 cross-build dev of S  6.57% (n=74) -- the move is 0.82x its own floor
+
+The sign depends on **which estimand** is used, and the move is inside the band's own cross-build
+replication error either way. Estimand A is the project convention (`an_c207.py` reduces per-pass
+ratios, then takes the median); estimand B is a ratio of two pooled medians, which is what the
+ratio column of my nanoseconds table implicitly used. B runs 1.5-4.2% above A in every band and
+**12.3% above it in band 6**, the band with the smallest n -- so the two are not interchangeable and
+the published table mixed conventions between its quintile row (A) and its ratio column (B).
+
+The checker reached the same withdrawal by a different route -- the absolute ns/nonzero curve does
+reverse between builds there (ours aa +4.88%, bb -3.37%) -- and that is also true, of that quantity.
+In S both builds agree within each estimand; it is the estimands that disagree.
+
+**AN ESTIMATOR ERROR OF MINE, CAUGHT IN THE SAME CHECK.** My first verification of this used
+`median(ours) / median(mkl)` instead of `median(ours_p / mkl_p)`. Ours and MKL are timed in the same
+pass, so per-pass noise is common-mode and cancels only in the paired form; the unpaired form
+inflated band 6's cross-build deviation from 6.57% to 7.77% and changed the q2-to-q5 gradient at
+k=4 from +21.43% to +20.11%. It also made my numbers disagree with the checker's until I noticed,
+which is the only reason I found it. Same lesson as [[spot_check_the_largest_effect]]: the
+convention choice is proportional to the effect and shows up first where n is smallest.
+
+**TWO SMALLER FIXES.** The k=16 "flat at 0.82-0.84" has band 6 at 0.8585 on aa, outside the stated
+range, but its own cross-build deviation there is 3.97%, so flat stands and the exception is inside
+the floor -- stated rather than omitted. And "7 residues above the 86th density percentile" is 7
+under `>=` and 6 under `>`, because the fourth-sparsest residue sits exactly AT the 86th: the
+threshold is the datum. The honest form is the rank -- "the fourth-sparsest residue sits at the 86th
+percentile" -- not a threshold, which reads as a test when it restates the list.
