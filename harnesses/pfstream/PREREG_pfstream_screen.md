@@ -505,3 +505,77 @@ Which holds is what the screen is for. A one-sided band is blind to exactly one 
 is the tail where the run finishes **early** and someone looks for output before it exists.
 
 **Henceforth: board 13:11:28 build-balanced; screen 12:18:08 build-pooled with `nopf` imputed.**
+
+## Amendment 10 — the live screen leaves two of the kernel's own branch axes unexercised, and the float64 cell is queued
+
+Writing the float64 width set made me enumerate what the float32 one reaches, and it is less than I
+had assumed. With `SL = scorch_simd<float>::lanes == 8`, `nvec = ceil(k/8)` and
+`full_last = (k % 8 == 0)` (`spmm.h:3979-3982`), the shipped width set 2,4,8,16,32 reaches:
+
+| k | path | nvec | tail |
+|---|---|---|---|
+| 2 | `scorch_spmm_row_narrow_exact` — regblock BYPASSED | — | — |
+| 4 | regblock at `__m128` (`halfvec_exact`, `LH == 4`) | 1 | full |
+| 8 | regblock at `__m256` | 1 | full |
+| 16 | regblock | 2 | full |
+| 32 | regblock | 4 | full |
+
+So the live screen **never reaches `nvec == 3`** (that needs k ∈ 17..24) and **never reaches a
+masked tail** (any k not a multiple of 8). Both are real branches: the call sites instantiate
+`scorch_spmm_row_regblock<float, NV, true>` and `<..., false>` on `full_last`, and the `switch
+(nvec)` has an arm for 3. Two of the kernel's own template axes are therefore outside the screen's
+coverage, and PFSTREAM — which clamps a prefetch run-ahead inside that kernel — is unmeasured on
+both.
+
+This is recorded rather than fixed in place. The float32 screen is mid-flight with four passes of a
+balanced Latin square; adding widths now would change the design under a running job, and a
+balanced rotation does not survive being windowed. The float32 result stands as a result **about
+nvec ∈ {1,2,4} with a full tail**, and that qualification travels with every number it produces.
+
+**The float64 cell closes both axes, and that is why its widths are not the float32 set.** With
+`SL == 4` (`spmm.h:2178`), `narrow_k` is k ≤ 16 and each width names the branch it exists to reach:
+
+| k | nvec | tail | role |
+|---|---|---|---|
+| 2 | — | — | **negative control** — `exact_width` routes k ∈ {1,2,3} to `narrow_exact`; `halfvec_exact` would also be true here (`lanes == 2`) and is held off only by `SCORCH_SPMM_HALFVEC_F64` shipping at 0, so two independent mechanisms keep it inert |
+| 4 | 1 | full | |
+| 6 | 2 | **masked** | |
+| 8 | 2 | full | |
+| 10 | 3 | **masked** | |
+| 12 | 3 | full | |
+| 16 | 4 | full | |
+
+k=32 is absent because at float64 it is not the narrow-k path at all, so PFSTREAM is unreachable
+there — a coverage statement from `narrow_k = B1_size <= 4*SL`, not a choice. Matching the float32
+width *numbers* would have been false comparability: the same k is a different nvec at the two
+dtypes, so the covered triples are disjoint in the middle.
+
+**Submitted as job 17681665, held on `--dependency=afterok:17680942`.** afterok rather than afterany
+so a failed float32 screen cannot hand this one a build set already in question, and dependency-
+gated rather than concurrent because mkt1's memory bandwidth is not cgroup-partitioned: a second
+timing job on the same node is a perturbation of the first, not a neighbour.
+
+**Three facts confirmed in a built arm rather than assumed** (`PYTHONPATH=/scr/bobbyy/pfs/strm/src`):
+`spmm_csr_double_v2` present, `scorch_tune_hooks()` False (so no getenv tax against MKL), and
+`spmm_csr_linear_fused_double` **absent** while `spmm_csr_linear_fused_float` is present. That last
+one is the measurement behind amendment 8's claim that the reachable product is three cells and not
+four.
+
+**All six release call sites pass `SCORCH_SPMM_PFLIM`, including both inside the fused Linear**
+(`spmm.h:6346`, `6347`, inside `spmm_csr_linear_fused_float` defined at 6119). Verified
+per-STATEMENT by brace matching, not per line: two sites wrap their argument list, and an earlier
+per-line test reported NO BOUND for them — a false negative pointing at absence.
+
+**Provenance closed.** `mrgate.py` and `pfs_screen.sbatch` existed only on the hosts and are now in
+the repo, digests matching the producing host: `a55e07bf03e1fb34` for the driver on MKT **and on
+redwood** (148 lines each, so the two-host confirmation compares like with like — previously
+asserted, now measured) and `23d42aafa6329b84` for the sbatch.
+
+One hazard found while doing that, because it nearly produced a false alarm about the instrument
+driving both live runs: **`srun` on `mkt-interactive` defaults to two tasks**, so every observation
+command run through it executes twice. Reading the 148-line driver that way produced a 296-line
+local copy with a second `#!/usr/bin/env python3` at line 73 — and line 72 sits inside a function
+docstring, so it read as a duplicated write swallowed by an unterminated string literal: parses,
+runs, plausible. What killed it was digesting on the producing host rather than on the transported
+copy. Pass `-n 1`. No published figure was affected, and that was checked rather than assumed: 418
+sample keys reconciles as `ceil(4594/11)` and 6270 CSV rows as `418 x 5 widths x 3 arms`.
