@@ -206,24 +206,47 @@ they are opposite claims. So this is measured, on the same three landed p1 CSVs.
 `ms` is a per-call time; the batch only sets how many calls are averaged into it. The per-cell
 ratio is therefore **not** the aggregate a calibrator pins, and the effect is fully present in it:
 
-| k | deep/base | bsb_/base (A/A) | x floor | NVEC / vector |
+Bootstrap percentile CIs, 2000 resamples, seed 20261001, n = 3820 per width:
+
+| k | deep/base [95% CI] | A/A bsb_/base [95% CI] | verdict | NVEC / vector |
 |---|---|---|---|---|
-| 2 | **1.0004** | 1.0017 | **0.2** | *arm unreachable* |
-| 4 | 1.0944 | 1.0017 | 54.9 | 1 / `__m128` |
-| 8 | **1.1963** | 1.0018 | 106.6 | 1 / `__m256` |
-| 16 | 1.0712 | 1.0038 | 19.0 | 2 |
-| 32 | 1.0833 | 0.9997 | 306.3 | 4 |
-| all | 1.0768 | 1.0017 | | n = 19100 |
+| 2 | 1.0004 [0.9987, 1.0024] | 1.0017 [1.0004, 1.0028] | **CIs OVERLAP** | *arm unreachable* |
+| 4 | 1.0944 [1.0891, 1.0989] | 1.0017 [1.0004, 1.0028] | separated | 1 / `__m128` |
+| 8 | **1.1963** [1.1881, 1.2036] | 1.0018 [1.0003, 1.0034] | separated | 1 / `__m256` |
+| 16 | 1.0712 [1.0682, 1.0736] | 1.0038 [1.0022, 1.0053] | separated | 2 |
+| 32 | 1.0833 [1.0786, 1.0868] | 0.9997 [0.9982, 1.0013] | separated | 4 |
 
 So the per-call effect **is** 5-19% -- 9.4% at k=4, 19.6% at k=8 -- and nothing in the wall-time
 withdrawal licenses doubt about the board's per-cell estimator. The withdrawn claim was about a
 sum; this is about a ratio.
 
-**k=2 is a positive control for the board's own instrument, and it passes.** The deep arm is
-bypassed at k=2 for the same reason PFSTREAM is (Amendment 1), and k=2 reads 1.0004 against a
-1.0017 floor -- **0.2x floor, inside it**, the only width of five that is. A width where the arm
-provably cannot fire reads flat. That is the control this board was never given explicitly, and it
-was in the data all along.
+**THE "x FLOOR" COLUMN THIS REPLACES WAS A CATEGORY ERROR, AND SO IS THE OBVIOUS REPAIR.** The
+first version divided `|median(deep/base) - 1|` by `|median(bsb_/base) - 1|` and printed 54.9,
+106.6, 19.0, 306.3. The tell is inside the column: k=16 and k=32 have nearly equal numerators
+(1.0712, 1.0833) and multiples 16-fold apart, so the swing is entirely denominator -- and it is
+worst where a pooled two-sided quantity nearly cancels. 0.9997 is a **centre near zero, not a
+spread**, so 306 measures cancellation. A pooled A/A near one understates per-cell scatter, so
+every multiple was overstated by an unknown width-dependent factor. Not quotable.
+
+The repair is **not** to divide by the p95 of per-cell `dev(bsb_/base)` either. Measured, that p95
+is **0.4987 / 0.6437 / 0.6445 / 0.6514 / 0.6312** by width -- per-cell A/A scatter of +-50-65% --
+and dividing the pooled medians by it gives 0.00 / 0.15 / 0.30 / 0.11 / 0.13, i.e. *nothing
+clears*. That is the wrong comparison in the opposite direction: **the p95 of per-cell deviations
+bounds a SINGLE CELL**, and it is the correct floor for the board's per-cell criterion, which
+counts how many of 19100 cells sit beyond it. A **pooled median** needs its own sampling interval,
+which is what the bootstrap above gives. Two estimators, two criteria; neither denominator
+substitutes for the other.
+
+**k=2 is a NEGATIVE control, and it passes.** Null expected, null observed: that bounds **false
+positives** -- the pipeline does not manufacture an effect at a width where the arm provably cannot
+fire. The deep arm is bypassed there by the same routing as PFSTREAM (Amendment 1), and k=2 is the
+only width of five whose CI overlaps the A/A's. An earlier version of this paragraph called it a
+positive control, which it is not: a positive control **injects a known effect** and confirms the
+pipeline reports it, bounding false **negatives**.
+
+**So chain211 has a negative control it never had, and still has no positive control.** That gap is
+the one that matters for a null result: if a later width or arm reads flat, nothing on this board
+yet separates "no effect" from "the instrument cannot see one".
 
 **The cross-object ratio is not batch-matched, which is why the floor must be cross-object.**
 Inside one process `ours` and `oursb` share a batch by construction. Across objects each
@@ -238,8 +261,9 @@ calibrates its own, so `deep/base` compares two readings taken at different batc
 | 32 | 313 | 0.9025 | 0.506 |
 | A/A pair, same quantity | | | 0.439 |
 
-At k=8, `1/0.8255 = 1.211` against a measured `ms` ratio of 1.1963 -- the batch is `target/ms` to
-within 1%, which confirms the pinning mechanism directly. The A/A pair's divergence (43.9%) is
+At k=8, `1/0.8255 = 1.2114` against a measured `ms` ratio of 1.1963 -- **1.3% apart**, so the batch
+tracks `target/ms` and the pinning mechanism is confirmed directly from data. (An earlier version
+said "to within 1%", which the two numbers do not support.) The A/A pair's divergence (43.9%) is
 comparable to the arms', so **the `bsb_/base` floor contains this term**, which is exactly why it
 and not the within-process `oursb/ours` floor is the one an arm must clear.
 
