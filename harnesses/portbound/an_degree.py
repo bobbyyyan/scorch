@@ -197,6 +197,59 @@ def main():
             print("  FLOOR QUALITY: every degree's A/A floor is at or below 0.5%, so n* is")
             print("  resolvable (the peer's simulation gives an IQR of about +/-0.25 at 0.075%).")
 
+        # ---- THE MODEL-FREE CROSSING. This is now the PRIMARY result and the fit below is
+        # reported only so its failure is visible.
+        #
+        # WHY THE PER-DEGREE RATIO IS CLEAN AND THE CROSS-DEGREE FIT IS NOT. At a fixed n both
+        # arms see the same row length, the same index array, the same B, and interleaved
+        # repetitions -- so V6/V0 at that n holds everything fixed except the accumulator count.
+        # Across n it does not: the number of DISTINCT B rows touched is about min(n, nrowsB), so
+        # the working set grows with the degree. V0's own ns/nnz is non-monotone in n for exactly
+        # that reason -- it falls to a minimum around n=16-48 and then RISES as B leaves L1 -- and
+        # a model of the form a + b*n has no term for it. The fit absorbs the cache curve into the
+        # intercept, which is the estimand, and that is fatal rather than inconvenient.
+        #
+        # So the break-even is read off the ratios directly: the first degree at or above each
+        # arm's machine body width where the ratio crosses 1, bracketed by its neighbours. No
+        # model, no intercept, no extrapolation.
+        print()
+        print("  THE MODEL-FREE BREAK-EVEN: the degree at which the ratio crosses 1")
+        for cand in ("V6", "V7"):
+            w = BW[cand]
+            seq = [(n, S[n][cand] / S[n]["V0"], S[n]["__floor__"])
+                   for n in ns if cand in S[n] and "V0" in S[n] and n >= w]
+            cross = None
+            for i in range(1, len(seq)):
+                if seq[i - 1][1] > 1.0 >= seq[i][1]:
+                    cross = (seq[i - 1], seq[i])
+                    break
+            if cross is None:
+                side = "below 1 at every measured degree >= %d" % w if seq and seq[0][1] <= 1.0 \
+                    else "above 1 at every measured degree >= %d" % w
+                print("    %s: %s, so the crossing is outside the ladder." % (cand, side))
+                continue
+            (na, ra, fa), (nb, rb, fb) = cross
+            print("    %s: crosses between degree %d (ratio %.4f) and degree %d (ratio %.4f)"
+                  % (cand, na, ra, nb, rb))
+            print("        linear interpolation in log(n) puts it at degree %.0f, but the bracket"
+                  % math.exp(math.log(na) + (math.log(nb) - math.log(na)) * (ra - 1.0) / (ra - rb)))
+            print("        [%d, %d] is the honest answer -- the ladder has no point between them."
+                  % (na, nb))
+            qs = [q for q, v in DLMC if v < nb]
+            print("        DLMC quantiles below the upper bracket: %s"
+                  % (", ".join("%s=%.2f" % (q, v) for q, v in DLMC if v < nb) or "none"))
+            if len(qs) >= 3:
+                print("        ABOVE THE MEDIAN: most of the corpus is below the crossing.")
+            elif qs:
+                print("        So %s REGRESSES on the keys below the bracket and ships only behind"
+                      % cand)
+                print("        a degree guard that provably cannot fire above it.")
+            else:
+                print("        Below p10, so %s pays on every decile and needs no guard here."
+                      % cand)
+            best = min(seq, key=lambda x: x[1])
+            print("        best measured ratio %.4f at degree %d" % (best[1], best[0]))
+
         # ---- the registered fit
         print()
         print("  THE REGISTERED FIT  t_call(n) = a + b*n,  overhead cancelling in a difference")
@@ -227,6 +280,21 @@ def main():
                 print("  %s: per-nonzero gain b(V0)-b(%s) = %+.6f ns/nnz" % (cand, cand, db))
                 print("      extra per-row cost a(%s)-a(V0) = %+.4f ns  <- call overhead cancels"
                       % (cand, da))
+                mr_pair = max(fits["V0"][3], fits[cand][3])
+                if abs(da) < mr_pair:
+                    print("      FIT REFUSED FOR THIS PURPOSE: |a(%s)-a(V0)| = %.4f ns is SMALLER"
+                          % (cand, abs(da)))
+                    print("      than the fits' own worst residual, %.4f ns. The intercept"
+                          % mr_pair)
+                    print("      difference IS the estimand, so a residual larger than it means")
+                    print("      the straight line is absorbing structure that belongs to the")
+                    print("      estimand -- here the B working set growing with the degree, which")
+                    print("      makes V0's ns/nnz non-monotone. R^2 near 1 does NOT rescue this:")
+                    print("      t_call is dominated by the b*n term over a 1000x range of n, so")
+                    print("      R^2 measures the slope's fit and says nothing about the intercept.")
+                    print("      Read the model-free crossing above instead.")
+                    print()
+                    continue
                 if db > 0 and da > 0:
                     nstar = da / db
                     print("      BREAK-EVEN DEGREE n* = %.1f" % nstar)

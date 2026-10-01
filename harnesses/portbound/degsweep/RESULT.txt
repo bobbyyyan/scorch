@@ -1,0 +1,165 @@
+MACHINE BODY WIDTHS from probe-526c0e971db0953e.asm (FMAs in the innermost loop = nonzeros per body):
+  V0=8   V0b=8   V1=8   V2=8   V3=8   V4=4   V4b=8   V4c=4   V5=8   V6=8   V7=8
+  probe.cpp steps V0 by 2, V6 by 4, V7 by 8, so -funroll-loops doubled V0 four times,
+  V6 twice and V7 not at all. The source would mis-state all three, in three
+  different directions.
+
+====================================================================================================
+cpu0 -- 12 degrees: 4 6 8 12 16 24 32 48 64 128 512 4096
+  (floor = p95 of per-repetition dev(V0/V0b), computed separately at every degree,
+   because the A/A floor is not degree-invariant: a shorter row is a shorter timed
+   call and noise does not scale with it.)
+
+    deg  V0 ns/nnz  V6 ns/nnz  V7 ns/nnz     V6/V0     V7/V0     V7/V6    floor
+  --------------------------------------------------------------------------------------------
+      4    0.43844    0.48773    0.48232   1.1124~   1.1001~    0.9889  0.16438
+      6    0.35095    0.43881    0.38061    1.2503    1.0845    0.8674  0.05251
+      8    0.29067    0.32981    0.35841    1.1347    1.2331    1.0867  0.00072
+     12    0.27789    0.29248    0.32536   1.0525~    1.1708    1.1124  0.05574
+     16    0.23380    0.25227    0.27731    1.0790    1.1861    1.0992  0.00042
+     24    0.22573    0.22668    0.25147    1.0042    1.1140    1.1093  0.00051
+     32    0.23549    0.21389    0.23733    0.9083    1.0078    1.1096  0.00050
+     48    0.23467    0.20113    0.22494    0.8570    0.9585    1.1184  0.00084
+     64    0.25886    0.19474    0.21739    0.7523    0.8398    1.1163  0.00250
+    128    0.26328    0.18524    0.20742    0.7036    0.7878    1.1197  0.00254
+    512    0.32949    0.17999    0.19990    0.5463    0.6067    1.1107  0.01552
+   4096    0.34991    0.27549    0.27601    0.7873    0.7888    1.0019  0.00065
+  '~' marks a ratio whose deviation from 1 is INSIDE that degree's own A/A floor.
+
+  FLOOR QUALITY: 4 degree(s) have an A/A floor above 0.5%: n=4 16.438%, n=6 5.251%, n=12 5.574%, n=512 1.552%
+  The peer simulated n* against noise: at 0.075%% the interquartile range is
+  [4.45, 4.95] around a truth of 4.71, at 0.5%% it is [2.98, 6.30], and at 2%% it
+  CROSSES ZERO. So a degree whose own floor is above 0.5%% contributes an
+  interval wider than the answer, and n* below should be read as a direction
+  rather than a number.
+
+  THE MODEL-FREE BREAK-EVEN: the degree at which the ratio crosses 1
+    V6: crosses between degree 24 (ratio 1.0042) and degree 32 (ratio 0.9083)
+        linear interpolation in log(n) puts it at degree 24, but the bracket
+        [24, 32] is the honest answer -- the ladder has no point between them.
+        DLMC quantiles below the upper bracket: p10=10.24, p25=25.60
+        So V6 REGRESSES on the keys below the bracket and ships only behind
+        a degree guard that provably cannot fire above it.
+        best measured ratio 0.5463 at degree 512
+    V7: crosses between degree 32 (ratio 1.0078) and degree 48 (ratio 0.9585)
+        linear interpolation in log(n) puts it at degree 34, but the bracket
+        [32, 48] is the honest answer -- the ladder has no point between them.
+        DLMC quantiles below the upper bracket: p10=10.24, p25=25.60
+        So V7 REGRESSES on the keys below the bracket and ships only behind
+        a degree guard that provably cannot fire above it.
+        best measured ratio 0.6067 at degree 512
+
+  THE REGISTERED FIT  t_call(n) = a + b*n,  overhead cancelling in a difference
+    arm    b (ns/nnz)   a (ns/call)       R^2   max resid
+  ------------------------------------------------------------
+     V0 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V0      0.350834       -4.7294   0.99993      6.4772
+     V6 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V6      0.276069       -7.4930   0.99817     41.7013
+     V7 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V7      0.276382       -5.6345   0.99882     33.5231
+
+  V6: per-nonzero gain b(V0)-b(V6) = +0.074765 ns/nnz
+      extra per-row cost a(V6)-a(V0) = -2.7636 ns  <- call overhead cancels
+      FIT REFUSED FOR THIS PURPOSE: |a(V6)-a(V0)| = 2.7636 ns is SMALLER
+      than the fits' own worst residual, 41.7013 ns. The intercept
+      difference IS the estimand, so a residual larger than it means
+      the straight line is absorbing structure that belongs to the
+      estimand -- here the B working set growing with the degree, which
+      makes V0's ns/nnz non-monotone. R^2 near 1 does NOT rescue this:
+      t_call is dominated by the b*n term over a 1000x range of n, so
+      R^2 measures the slope's fit and says nothing about the intercept.
+      Read the model-free crossing above instead.
+
+  V7: per-nonzero gain b(V0)-b(V7) = +0.074452 ns/nnz
+      extra per-row cost a(V7)-a(V0) = -0.9051 ns  <- call overhead cancels
+      FIT REFUSED FOR THIS PURPOSE: |a(V7)-a(V0)| = 0.9051 ns is SMALLER
+      than the fits' own worst residual, 33.5231 ns. The intercept
+      difference IS the estimand, so a residual larger than it means
+      the straight line is absorbing structure that belongs to the
+      estimand -- here the B working set growing with the degree, which
+      makes V0's ns/nnz non-monotone. R^2 near 1 does NOT rescue this:
+      t_call is dominated by the b*n term over a 1000x range of n, so
+      R^2 measures the slope's fit and says nothing about the intercept.
+      Read the model-free crossing above instead.
+
+
+====================================================================================================
+cpu16 -- 12 degrees: 4 6 8 12 16 24 32 48 64 128 512 4096
+  (floor = p95 of per-repetition dev(V0/V0b), computed separately at every degree,
+   because the A/A floor is not degree-invariant: a shorter row is a shorter timed
+   call and noise does not scale with it.)
+
+    deg  V0 ns/nnz  V6 ns/nnz  V7 ns/nnz     V6/V0     V7/V0     V7/V6    floor
+  --------------------------------------------------------------------------------------------
+      4    0.73648    0.86323    0.93093    1.1721    1.2640    1.0784  0.10818
+      6    0.56461    0.74633    0.76536    1.3218    1.3555    1.0255  0.03172
+      8    0.51475    0.50534    0.54478    0.9817    1.0583    1.0781  0.00056
+     12    0.46060    0.43903    0.57381    0.9532    1.2458    1.3070  0.01156
+     16    0.43243    0.41005    0.44922    0.9483    1.0388    1.0955  0.00032
+     24    0.41473    0.38585    0.38187    0.9304    0.9208    0.9897  0.00085
+     32    0.41959    0.37102    0.36695    0.8843    0.8745    0.9890  0.00030
+     48    0.45684    0.36108    0.35817    0.7904    0.7840    0.9919  0.00071
+     64    0.46569    0.35607    0.35391    0.7646    0.7600    0.9940  0.00029
+    128    0.55844    0.34851    0.34752    0.6241    0.6223    0.9971  0.00047
+    512    0.65115    0.43330    0.44846    0.6654    0.6887    1.0350  0.00023
+   4096    0.67974    0.65239    0.64995    0.9598    0.9562    0.9962  0.00010
+  '~' marks a ratio whose deviation from 1 is INSIDE that degree's own A/A floor.
+
+  FLOOR QUALITY: 3 degree(s) have an A/A floor above 0.5%: n=4 10.818%, n=6 3.172%, n=12 1.156%
+  The peer simulated n* against noise: at 0.075%% the interquartile range is
+  [4.45, 4.95] around a truth of 4.71, at 0.5%% it is [2.98, 6.30], and at 2%% it
+  CROSSES ZERO. So a degree whose own floor is above 0.5%% contributes an
+  interval wider than the answer, and n* below should be read as a direction
+  rather than a number.
+
+  THE MODEL-FREE BREAK-EVEN: the degree at which the ratio crosses 1
+    V6: below 1 at every measured degree >= 8, so the crossing is outside the ladder.
+    V7: crosses between degree 16 (ratio 1.0388) and degree 24 (ratio 0.9208)
+        linear interpolation in log(n) puts it at degree 18, but the bracket
+        [16, 24] is the honest answer -- the ladder has no point between them.
+        DLMC quantiles below the upper bracket: p10=10.24
+        So V7 REGRESSES on the keys below the bracket and ships only behind
+        a degree guard that provably cannot fire above it.
+        best measured ratio 0.6223 at degree 128
+
+  THE REGISTERED FIT  t_call(n) = a + b*n,  overhead cancelling in a difference
+    arm    b (ns/nnz)   a (ns/call)       R^2   max resid
+  ------------------------------------------------------------
+     V0 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V0      0.681570       -8.6184   0.99996      7.2839
+     V6 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V6      0.654955      -21.9685   0.99834     91.5208
+     V7 excluding n=4,6: below its 8-nonzero machine body, so those degrees
+        run the scalar remainder -- a different kernel, with a different b.
+     V7      0.652430      -20.7540   0.99857     83.6766
+
+  V6: per-nonzero gain b(V0)-b(V6) = +0.026615 ns/nnz
+      extra per-row cost a(V6)-a(V0) = -13.3501 ns  <- call overhead cancels
+      FIT REFUSED FOR THIS PURPOSE: |a(V6)-a(V0)| = 13.3501 ns is SMALLER
+      than the fits' own worst residual, 91.5208 ns. The intercept
+      difference IS the estimand, so a residual larger than it means
+      the straight line is absorbing structure that belongs to the
+      estimand -- here the B working set growing with the degree, which
+      makes V0's ns/nnz non-monotone. R^2 near 1 does NOT rescue this:
+      t_call is dominated by the b*n term over a 1000x range of n, so
+      R^2 measures the slope's fit and says nothing about the intercept.
+      Read the model-free crossing above instead.
+
+  V7: per-nonzero gain b(V0)-b(V7) = +0.029140 ns/nnz
+      extra per-row cost a(V7)-a(V0) = -12.1356 ns  <- call overhead cancels
+      FIT REFUSED FOR THIS PURPOSE: |a(V7)-a(V0)| = 12.1356 ns is SMALLER
+      than the fits' own worst residual, 83.6766 ns. The intercept
+      difference IS the estimand, so a residual larger than it means
+      the straight line is absorbing structure that belongs to the
+      estimand -- here the B working set growing with the degree, which
+      makes V0's ns/nnz non-monotone. R^2 near 1 does NOT rescue this:
+      t_call is dominated by the b*n term over a 1000x range of n, so
+      R^2 measures the slope's fit and says nothing about the intercept.
+      Read the model-free crossing above instead.
+

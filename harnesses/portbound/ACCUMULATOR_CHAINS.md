@@ -9,13 +9,36 @@ probe and the production kernel, and it includes two objections to my own framin
 nonzero loop two at a time. So the number of independent accumulator chains is **`2 * NVEC`**,
 and `NVEC = ceil(k / V::lanes)` is a function of the output width alone:
 
-| k  | vector trait | lanes | NVEC | accumulator chains | chain210 median `ours/mkl` (aa) |
-|----|--------------|-------|------|--------------------|---------------------------------|
-| 2  | `__m128`     | 4     | 1    | **2**              | 0.8864 |
-| 4  | `__m128`     | 4     | 1    | **2**              | 0.9231 |
-| 8  | `__m256`     | 8     | 1    | **2**              | 0.8849 |
-| 16 | `__m256`     | 8     | 2    | 4                  | 0.7907 |
-| 32 | `__m256`     | 8     | 4    | 8                  | 0.7409 |
+| k  | NVEC | accumulator chains | chain210 median `ours/mkl` (aa) | chain207, for contrast |
+|----|------|--------------------|---------------------------------|------------------------|
+| 2  | 1    | **2**              | 0.8815 | 0.8864 |
+| 4  | 1    | **2**              | 0.9130 | 0.9231 |
+| 8  | 1    | **2**              | 0.8676 | 0.8849 |
+| 16 | 2    | 4                  | 0.7596 | 0.7907 |
+| 32 | 4    | 8                  | 0.7101 | 0.7409 |
+
+**CORRECTION, and it is the kind this project has a memory file about.** The first version of this
+table printed 0.8864 / 0.9231 / 0.8849 / 0.7907 / 0.7409 under the heading "chain210" -- those are
+**chain207's values, exactly, to four decimals**, and chain207 is the run whose P4 assay-validity
+check FAILED at 4.34% and 4.09%. I carried them out of chain207's `PROVENANCE.md`, which was in
+context, and they arrived already believed. The peer caught it; both columns above are recomputed
+from the sealed CSVs of each chain independently (12 CSVs, 19100 aa cells each, per-cell
+`exp(median(log(ours/mkl)))` then the per-width median).
+
+The argument is slightly **stronger** on the clean run: chain210's step from the two-chain group to
+k=16 is 0.8676 -> 0.7596, wider than chain207's 0.8849 -> 0.7907. And a one-value spot check would
+not have caught the substitution -- k=2 reads 0.8864 in chain207 and 0.8815 in chain210, a
+difference smaller than several of the others -- so it is the whole vector that identifies the
+source, not any single entry.
+
+**The trait column has been REMOVED rather than corrected.** It read "k=4 -> `__m128`, 4 lanes" but
+`scorch_spmm_row_regblock`'s `V` parameter defaults to the full 8-lane `scorch_simd<T>`, and the
+kernel is instantiated BOTH ways -- the default at spmm.h:4877/4878 and the half-vector `VH` at
+4939/4943 -- behind the `spmm_halfvec` gate at 4415, which is env-overridable at 4327. So which
+trait a k=4 cell runs is a selector decision I had not checked, and asserting it was the last
+unverified column in this document. The chain count is unaffected either way, since `ceil(4/4)` and
+`ceil(4/8)` are both 1 and k=4 therefore has two chains on both paths -- which is why the argument
+survives the removal untouched.
 
 The chain count was never chosen for the dependency structure. It is `2 * NVEC` because the
 loop is 2-way unrolled and there is one accumulator per vector, and the vector count follows
@@ -43,9 +66,22 @@ k=4, and k=4 carries half of chain206's 14 on SuiteSparse. So the chain count is
 explanation for the **step from the 2-chain group to the multi-chain group** -- 0.88-0.92 against
 0.7907 and 0.7409, with the two multi-chain widths ordered by chain count -- and it is **not** an
 explanation of why k=4 within that group carries the deficits. Something else distinguishes k=4
-from its two neighbours, and the obvious candidate is the vector occupancy: k=4 is `__m128` with
-all four lanes live, k=2 is `__m128` with two of four masked, k=8 is `__m256` with all eight live.
-Anyone quoting the table above as explaining the k=4 concentration is quoting it wrong.
+from its two neighbours, and anyone quoting the table above as explaining the k=4 concentration is
+quoting it wrong.
+
+**The candidate I named for that was vector occupancy, and its SIGN depends on the path, so it is
+withdrawn until the path is known.** I wrote that k=4 is `__m128` with four of four lanes live
+against k=2's two of four masked -- an ordering in which k=4 is the best-off of the three, making
+occupancy a poor candidate. On the full-vector path k=4 is instead `ceil(4/8) = 1` with
+`FULL_LAST` false, i.e. **four of eight lanes masked**, and this file's own kernel comment calls
+that the bad case: the mask lands on the only vector, `vmaskmovps` is two uops on the load side
+and cannot fold into the FMA as a memory operand, and spmm.h:2195 says plainly that "at k=4 it
+runs `_mm256_maskload_ps` for EVERY nonzero over 4 lanes of 8". On that path k=4 is the
+**worst**-off of the three, which is the sign a candidate for 19 of 22 behind-MKL cells needs.
+
+So the same mechanism is a poor candidate or a good one depending on a selector decision, and the
+honest state is that it is undetermined. Settling it is one query against the decision export, not
+a measurement, and it is the next thing to do on this thread.
 
 ## OBJECTION 2: NVEC and k move together, so the table is confounded
 
