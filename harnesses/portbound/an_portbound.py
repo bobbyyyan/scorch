@@ -66,7 +66,7 @@ def attest(path):
             binsha = t[1]
         elif len(t) >= 2 and t[0] == "asmcheck_exit":
             exit_ok = (t[1] == "0")
-        elif len(t) >= 4 and t[0] in ("V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5"):
+        elif len(t) >= 4 and t[0] in ("V0","V0b","V1","V2","V3","V4","V4b","V4c","V5","V6","V7"):
             try:
                 counts[t[0]] = (float(t[1]), float(t[2]), float(t[3]))
             except ValueError:
@@ -86,7 +86,7 @@ def report(label, path, binsha_att, counts):
         sys.exit("REFUSE: %s was produced by binary %s but ATTEST.txt verifies %s. A timing read "
                  "against a different binary than the one disassembled is exactly how a deleted V5 "
                  "would be published as a refutation." % (path, binsha[:16], binsha_att[:16]))
-    arms = ["V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5"]
+    arms = ["V0", "V0b", "V1", "V2", "V3", "V4", "V4b", "V4c", "V5", "V6", "V7"]
     missing = [a for a in arms if a not in T]
     if missing:
         sys.exit("REFUSE: %s lacks arms %s" % (path, missing))
@@ -116,7 +116,9 @@ def report(label, path, binsha_att, counts):
             "V1": "index load removed", "V2": "A broadcast removed", "V3": "B load removed",
             "V4": "+1 load, accumulated (positive control)", "V4b": "accumulate only, no load",
             "V4c": "+1 load of an ADDRESS ALREADY LOADED (no new cache stream)",
-            "V5": "V1 + accumulate (the discriminator)"}
+            "V5": "V1 + accumulate (the discriminator)",
+            "V6": "CANDIDATE KERNEL: 4 accumulator chains",
+            "V7": "CANDIDATE KERNEL: 8 accumulator chains"}
     for a in arms:
         d = R[a] / R["V0"]
         c = counts.get(a, (float("nan"),) * 3)

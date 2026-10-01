@@ -266,11 +266,73 @@ NOINLINE float v5(const Args& A) {
   return o[0] + o[1] + o[2] + o[3];
 }
 
+// ---- V6 and V7 ARE CANDIDATE KERNELS, not throughput probes. Unlike V1/V2/V3/V5 they compute
+// the CORRECT answer: more independent accumulator chains is a reassociation of the same sum.
+//
+// They exist because the registered probe's result identified the bound. V0 measures 1.994
+// cycles/nnz on a P-core at 5.700 GHz and 2.991 on an E-core at 4.400 GHz, against a prediction of
+// 4/2 = 2.00 and 6/2 = 3.00 from TWO accumulator chains, one FMA entering each per two nonzeros,
+// at Golden Cove's 4-cycle and Gracemont's 6-cycle FMA latency. Both match to 0.3%. So the kernel
+// is latency-bound on its accumulator chains and the remedy is more of them.
+//
+// Predicted, before measuring: 4 chains gives 4/4 = 1.00 cycles/nnz on P and 6/4 = 1.50 on E, both
+// 2.0x. 8 chains gives 0.50 and 0.75 -- but the P-core cannot go below 3 load ops / 3 ports =
+// 1.00 cycles/nnz, so V7 should show NO further gain on P while still gaining on E, whose load
+// width is narrower but whose latency is longer. If V7 beats V6 on P, the load-port model is wrong.
+
+// ---- V6: four accumulator chains, 4-way unrolled over nonzeros.
+NOINLINE float v6(const Args& A) {
+  __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps(),
+         acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
+  int p = 0;
+  for (; p + 4 <= A.n; p += 4) {
+    const float* B0 = A.bval + (size_t)A.idx[p] * K;
+    const float* B1 = A.bval + (size_t)A.idx[p + 1] * K;
+    const float* B2 = A.bval + (size_t)A.idx[p + 2] * K;
+    const float* B3 = A.bval + (size_t)A.idx[p + 3] * K;
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),     _mm_loadu_ps(B0), acc0);
+    acc1 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 1]), _mm_loadu_ps(B1), acc1);
+    acc2 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 2]), _mm_loadu_ps(B2), acc2);
+    acc3 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 3]), _mm_loadu_ps(B3), acc3);
+  }
+  for (; p < A.n; ++p)
+    acc0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),
+                        _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), acc0);
+  const __m128 r = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
+  alignas(16) float o[K]; _mm_storeu_ps(o, r);
+  return o[0] + o[1] + o[2] + o[3];
+}
+
+// ---- V7: eight accumulator chains, 8-way unrolled over nonzeros.
+NOINLINE float v7(const Args& A) {
+  __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps(), a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+  __m128 a4 = _mm_setzero_ps(), a5 = _mm_setzero_ps(), a6 = _mm_setzero_ps(), a7 = _mm_setzero_ps();
+  int p = 0;
+  for (; p + 8 <= A.n; p += 8) {
+    a0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),     _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), a0);
+    a1 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 1]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 1] * K), a1);
+    a2 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 2]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 2] * K), a2);
+    a3 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 3]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 3] * K), a3);
+    a4 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 4]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 4] * K), a4);
+    a5 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 5]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 5] * K), a5);
+    a6 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 6]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 6] * K), a6);
+    a7 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p + 7]), _mm_loadu_ps(A.bval + (size_t)A.idx[p + 7] * K), a7);
+  }
+  for (; p < A.n; ++p)
+    a0 = _mm_fmadd_ps(_mm_set1_ps(A.aval[p]),
+                      _mm_loadu_ps(A.bval + (size_t)A.idx[p] * K), a0);
+  const __m128 r = _mm_add_ps(_mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3)),
+                              _mm_add_ps(_mm_add_ps(a4, a5), _mm_add_ps(a6, a7)));
+  alignas(16) float o[K]; _mm_storeu_ps(o, r);
+  return o[0] + o[1] + o[2] + o[3];
+}
+
 typedef float (*Fn)(const Args&);
 struct Arm { const char* name; Fn fn; };
 static Arm ARMS[] = {{"V0", v0}, {"V0b", v0b}, {"V1", v1}, {"V2", v2},
-                     {"V3", v3}, {"V4", v4},   {"V4b", v4b}, {"V4c", v4c}, {"V5", v5}};
-static const int NARM = 9;
+                     {"V3", v3}, {"V4", v4},   {"V4b", v4b}, {"V4c", v4c}, {"V5", v5},
+                     {"V6", v6},  {"V7", v7}};
+static const int NARM = 11;
 
 static double now_ns() {
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
