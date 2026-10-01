@@ -105,8 +105,8 @@ def project(path, rounds, now=None):
         out.append("    %-5s landed %d  durations %-22s mean %8.3f  remaining %d"
                    % (b, len(v), ",".join(str(x) for x in v), mean, rem))
     if now is not None and rem_s >= 86400:
-        return ["REFUSE: %.0f s remain, which is a day or more. `now` is a bare clock "
-                "with no date, so the elapsed time on the open pass cannot be "
+        return ["REFUSE: %.0f s remain, which is a day or more. The log's timestamps "
+                "are bare wall clocks, so the elapsed time on the open pass cannot be "
                 "distinguished from itself plus a multiple of 24 h" % rem_s]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, total - landed))
     if running is None:
@@ -117,24 +117,49 @@ def project(path, rounds, now=None):
         out.append("  open pass p%d %s started %s" % (running[0], running[1], hms(base)))
     fin = base + rem_s
     out.append("  PROJECTED FINISH %s  (+%s from the open pass's start)"
-               % (hms(fin), hms(rem_s)))
+               % (hms(fin), dur(rem_s)))
     if now is not None:
-        out.append(_to_go_line(rem_s, _elapsed_since(base, now), now))
+        # Always a lower bound here, with or without a real clock: the LOG's timestamps
+        # are bare wall clocks, so `base` has no date to anchor against. That is a
+        # property of the input, unlike the mtime mode where the date was discarded.
+        out.append(_to_go_line(rem_s, _elapsed_since(base, now), now, exact=False))
     return out
 
 
 def hms(t):
+    """A TIME OF DAY. Wraps at 24 h, which is correct for a clock and wrong for a span."""
     t = int(round(t)) % 86400
     return "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
 
 
-def _elapsed_since(base_sod, now_sod):
-    """Seconds from `base` to `now`, both seconds-of-day, assuming under 24 h apart.
+def dur(t):
+    """A SPAN. Never wraps, and names the days when there are any.
 
-    Neither input carries a date: the log's timestamps are bare wall clocks and `now` is
-    given as HH:MM:SS. A negative difference is therefore a midnight crossing, not a
-    `now` in the past -- justified because the quantity measured is the age of the OPEN
-    pass, which is minutes to hours, never days.
+    This exists because `hms` took the modulus internally and every duration in the
+    report went through it. The arithmetic for a 25-hour-old stalled pass was already
+    exact once the mtime's date stopped being discarded -- and the formatter still
+    printed "01:00:00 elapsed", because 90000 mod 86400 is 3600. A correct measurement
+    rendered through a wrapping formatter is indistinguishable from the wrong one, so
+    fixing the wrap in `_elapsed_since` alone changed nothing the reader could see.
+    """
+    neg = "-" if t < 0 else ""
+    t = int(round(abs(t)))
+    d, t = divmod(t, 86400)
+    base = "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
+    return "%s%s%s" % (neg, ("%dd " % d) if d else "", base)
+
+
+def _elapsed_since(base_sod, now_sod):
+    """Seconds from `base` to `now`, both seconds-of-day. Known only MODULO 24 h.
+
+    Neither input carries a date, so this cannot tell a 1-hour-old pass from a
+    25-hour-old one. The earlier version of this docstring justified the wrap by saying
+    the open pass is "minutes to hours, never days" -- which is exactly backwards for
+    the branch that needs it: the OVERDUE report exists for the run that has stopped
+    advancing, and a stalled run's age is unbounded while its projected remainder stays
+    at whatever it was when it stopped. So the guard on `rem_s` (a day or more remaining)
+    is on the operand that stays small and is absent from the one that grows. Callers
+    must treat this as a LOWER BOUND; `_elapsed_exact` is the unambiguous route.
     """
     d = now_sod - base_sod
     if d < 0:
@@ -142,7 +167,12 @@ def _elapsed_since(base_sod, now_sod):
     return d
 
 
-def _to_go_line(rem_s, elapsed, now_sod):
+def _elapsed_exact(base_epoch, now_epoch):
+    """Seconds from base to now when BOTH carry a date. No wrap, no assumption."""
+    return now_epoch - base_epoch
+
+
+def _to_go_line(rem_s, elapsed, now_sod, exact=True):
     """The remainder as a SIGNED quantity, because a deficit must not read as zero.
 
     Both modes previously computed this from wrapped clock values and clamped at zero:
@@ -152,16 +182,36 @@ def _to_go_line(rem_s, elapsed, now_sod):
       * both modes clamped an OVERDUE run to `00:00:00`, so a run an hour late read as
         about to land rather than as possibly dead. That is the reading that matters when
         a watcher is the primary wake signal.
-    The fix is to stop deriving it from clocks at all. `remaining - elapsed` is wrap-free
-    because `elapsed` is, and its sign is the information the clamp was destroying.
+    The fix is to stop deriving it from clocks at all: `remaining - elapsed` carries the
+    sign the clamp was destroying.
+
+    A NEGATIVE `elapsed` is refused rather than rendered. It means the open pass's start
+    is in the future relative to `now`, which no live run can produce -- clock skew
+    between hosts, a stale `now`, or a fixture built ahead of the real clock. It was
+    found that last way, printing "-09:47:47 elapsed ... so 14:17:47 to go": a plausible
+    remainder derived from an impossible state, which is worse than an error.
+
+    `exact` says whether `elapsed` is a measurement or a lower bound. When both endpoints
+    carry a date it is exact and a stall of any length reads correctly. When either is a
+    bare wall clock it is known only modulo 24 h, and the line says "at least" -- because
+    a 25-hour stall and a 1-hour stall produced IDENTICAL output here, to the second, and
+    nothing in the figure revealed which one it was.
     """
+    if elapsed < 0:
+        return ("  REFUSE: the open pass's start is %s AFTER the given `now` of %s. No "
+                "live run can be in that state -- check for clock skew between hosts, a "
+                "stale `now`, or a fixture built ahead of the real clock"
+                % (dur(-elapsed), hms(now_sod)))
     left = rem_s - elapsed
+    at = "" if exact else "at least "
+    note = "" if exact else (" (`elapsed` is known only modulo 24 h: both endpoints "
+                             "would need a date to rule out a stall a whole day longer)")
     if left >= 0:
-        return "  now %s, %s elapsed on the open pass, so %s to go" % (
-            hms(now_sod), hms(elapsed), hms(left))
-    return ("  now %s, %s elapsed on the open pass -- OVERDUE by %s against a %s "
+        return "  now %s, %s%s elapsed on the open pass, so %s to go%s" % (
+            hms(now_sod), at, dur(elapsed), dur(left), note)
+    return ("  now %s, %s%s elapsed on the open pass -- OVERDUE by %s%s against a %s "
             "projection. The run may have stalled or died; the projection is not a "
-            "deadline" % (hms(now_sod), hms(elapsed), hms(-left), hms(rem_s)))
+            "deadline%s" % (hms(now_sod), at, dur(elapsed), at, dur(-left), dur(rem_s), note))
 
 
 def read_mtimes(d, pattern):
@@ -182,8 +232,17 @@ def read_mtimes(d, pattern):
     return out
 
 
-def project_mtimes(d, pattern, rounds, now=None):
-    """Projection from per-pass completion mtimes. Prints the same inputs as the log mode."""
+def project_mtimes(d, pattern, rounds, now=None, now_epoch=None):
+    """Projection from per-pass completion mtimes. Prints the same inputs as the log mode.
+
+    `now_epoch` is the unambiguous route and the DEFAULT: an mtime is a real epoch, so
+    when `now` is also one the open pass's age is measured rather than assumed, and a
+    stall of any length reports its true size. `now` as a bare HH:MM:SS is kept because
+    it answers a different question -- what the projection looked like at an arbitrary
+    instant T -- and it is marked as a lower bound rather than refused. Discarding the
+    mtime's date to match the log mode's bare-clock convention was a choice, not a
+    constraint, and it threw away the only field that could resolve the ambiguity.
+    """
     fs = read_mtimes(d, pattern)
     if len(fs) < 3:
         return ["REFUSE: %d file(s) matched in %s -- a difference-of-completions "
@@ -255,20 +314,28 @@ def project_mtimes(d, pattern, rounds, now=None):
                    max(counts.values()) - min(counts.values()))]
     base = landed[-1][0]
     fin = base + rem_s
-    if now is not None and rem_s >= 86400:
-        return ["REFUSE: %.0f s remain, which is a day or more. `now` is a bare clock "
-                "with no date, so the elapsed time on the open pass cannot be "
-                "distinguished from itself plus a multiple of 24 h" % rem_s]
+    # Scoped to the BARE-CLOCK route only. With a real clock both endpoints carry a
+    # date, so a remainder over a day is no longer ambiguous and refusing would be
+    # refusing a question the inputs can answer.
+    if now is not None and now_epoch is None and rem_s >= 86400:
+        return ["REFUSE: %.0f s remain, which is a day or more, and `now` was given "
+                "as a bare clock. Pass a real clock instead -- an mtime carries a "
+                "date, so that route has no ambiguity to refuse" % rem_s]
     out.append("  remaining seconds = %.3f over %d passes" % (rem_s, rem_n))
     # LOCAL time, not `epoch % 86400`. st_mtime is epoch UTC and the log mode reads a
     # local wall clock out of the log text, so a UTC rendering here put the two modes
     # 7 hours apart on the same kind of run -- a disagreement no plant of mine covered
     # because every plant built its own mtimes and compared them to each other.
+    ref = now_epoch if now_epoch is not None else time.time()
     out.append("  the open pass's start is taken as %s's COMPLETION, %s local"
-               % (landed[-1][4], local_hms(base)))
-    out.append("  PROJECTED FINISH %s local  (+%s)" % (local_hms(fin), hms(rem_s)))
-    if now is not None:
-        out.append(_to_go_line(rem_s, _elapsed_since(_secs_of_day(base), now), now))
+               % (landed[-1][4], local_hms(base, ref)))
+    out.append("  PROJECTED FINISH %s local  (+%s)" % (local_hms(fin, ref), dur(rem_s)))
+    if now_epoch is not None:
+        out.append(_to_go_line(rem_s, _elapsed_exact(base, now_epoch),
+                               _secs_of_day(now_epoch), exact=True))
+    elif now is not None:
+        out.append(_to_go_line(rem_s, _elapsed_since(_secs_of_day(base), now), now,
+                               exact=False))
     return out
 
 
@@ -277,8 +344,17 @@ def _secs_of_day(epoch):
     return t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec
 
 
-def local_hms(epoch):
-    return time.strftime("%H:%M:%S", time.localtime(epoch))
+def local_hms(epoch, ref=None):
+    """HH:MM:SS, with the DATE when it falls on a different local day from `ref`.
+
+    A 25-hour-old stalled run printed a finish of "10:27:14 local" for an instant that
+    was YESTERDAY. HH:MM:SS alone cannot say which day, and the projection's whole job
+    is to be compared against a clock.
+    """
+    t = time.localtime(epoch)
+    if ref is not None and time.localtime(ref)[:3] != t[:3]:
+        return time.strftime("%Y-%m-%d %H:%M:%S", t)
+    return time.strftime("%H:%M:%S", t)
 
 
 if __name__ == "__main__":
@@ -292,17 +368,21 @@ if __name__ == "__main__":
         # direction, so the gate that would have raised the IndexError was itself never
         # true and the documented 4-argument form silently dropped `now`. Repairing only
         # one half converts a silent no-op into a crash or leaves it silent.
-        nw = None
+        # Omitting the clock used to print no time-to-go line at all, which made the
+        # OVERDUE report reachable ONLY through the ambiguous bare-clock argument. The
+        # default is now the real clock, which in this mode is fully unambiguous, so the
+        # bare clock is no longer the only route and the capability it exists for
+        # (asking what the projection looked like at an arbitrary T) is unaffected.
+        nw, nwe = None, None
         if len(a) > 4:
-            hh, mm, ss = a[4].split(":")
-            nw = _secs(hh, mm, ss)
-        print("\n".join(project_mtimes(a[1], a[2], int(a[3]), nw)))
+            nw = _secs(*a[4].split(":"))
+        else:
+            nwe = time.time()
+        print("\n".join(project_mtimes(a[1], a[2], int(a[3]), nw, nwe)))
     else:
         if len(a) < 2:
             sys.exit("usage: pfs_eta.py <pass-log> <rounds> [HH:MM:SS now]\n"
                      "       pfs_eta.py --mtimes <dir> <regex> <rounds> [HH:MM:SS now]")
-        nw = None
-        if len(a) > 2:
-            hh, mm, ss = a[2].split(":")
-            nw = _secs(hh, mm, ss)
+        # Same default; here it stays a lower bound because the log carries no date.
+        nw = _secs(*a[2].split(":")) if len(a) > 2 else _secs_of_day(time.time())
         print("\n".join(project(a[0], int(a[1]), nw)))

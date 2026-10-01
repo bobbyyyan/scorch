@@ -23,8 +23,11 @@ anyone remembering to update a list, which a list of expected messages cannot do
 a list can only check what someone thought to write down.
 """
 import ast
+import contextlib
 import datetime
+import io
 import os
+import runpy
 import shutil
 import sys
 import tempfile
@@ -37,12 +40,37 @@ import pfs_eta                                                   # noqa: E402
 RX = r"dl_(?P<build>[a-z_]+)_float32_p(?P<pass>[0-9]+)\.csv"
 
 
-def refusal_lines():
-    """Line numbers of every REFUSE literal in pfs_eta.py, from its AST."""
+def early_exits():
+    """Line numbers of every EARLY ERROR EXIT in pfs_eta.py, found STRUCTURALLY.
+
+    The predicate is `return [<...string literal...>]` plus any `sys.exit(...)` -- a
+    shape, not a spelling. The previous version matched string constants beginning
+    "REFUSE:", which removed the enumeration premise about WHICH refusals to list but
+    kept one about how a refusal is SPELLED. A reachable early exit added without that
+    prefix was absent from the DENOMINATOR rather than reported as uncovered, so the
+    file printed "10 of 10 / OK" with an unplanted path live -- the
+    null-indistinguishable-from-failure shape inside the instrument built to prevent it.
+
+    The shape is the right predicate here because every normal return in this module
+    returns a NAME (`out`), never a list display: the projectors accumulate their report
+    in a variable. So a returned list of literals is an error exit by construction, and
+    the convention being relied on is the module's structure rather than its wording.
+    If a normal path ever returns a list display, this will demand a plant for it and
+    that demand is the correct signal to re-read this docstring.
+    """
     t = ast.parse(open(TARGET).read())
-    return set(n.lineno for n in ast.walk(t)
-               if isinstance(n, ast.Constant) and isinstance(n.value, str)
-               and n.value.startswith("REFUSE:"))
+    out = set()
+    for n in ast.walk(t):
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.List):
+            if any(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                   for e in n.value.elts) or any(
+                       isinstance(e, ast.BinOp) and isinstance(e.left, ast.Constant)
+                       and isinstance(e.left.value, str) for e in n.value.elts):
+                out.add(n.lineno)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr == "exit":
+            out.add(n.lineno)
+    return out
 
 
 HIT = set()
@@ -69,6 +97,40 @@ def mkdir_mtimes(spec):
             fh.write(b"x" * size)
         t = datetime.datetime(2026, 10, 1, hh, mm, 0).timestamp()
         os.utime(p, (t, t))
+    return d
+
+
+def run_cli(argv):
+    """Execute pfs_eta.py's __main__ block IN-PROCESS with a real argv -> (out, err, rc).
+
+    A subprocess would be correct for the argument indices and invisible to the line
+    tracer, so the two usage exits could never be covered and the denominator would
+    permanently read 10 of 12. runpy re-executes the module under __main__ in this
+    process, so argv is genuinely argv AND every line executed is traced.
+    """
+    old, out, err = sys.argv, io.StringIO(), io.StringIO()
+    sys.argv = [TARGET] + argv
+    rc = 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            runpy.run_path(TARGET, run_name="__main__")
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        if not isinstance(e.code, (int, type(None))):
+            err.write(str(e.code))
+    finally:
+        sys.argv = old
+    return out.getvalue(), err.getvalue(), rc
+
+
+def mkdir_relative(spec, now):
+    """spec: [(name, size, seconds_before_now)] -> a tempdir with real-clock mtimes."""
+    d = tempfile.mkdtemp(prefix="pfseta_")
+    for name, size, age in spec:
+        q = os.path.join(d, name)
+        with open(q, "wb") as fh:
+            fh.write(b"x" * size)
+        os.utime(q, (now - age, now - age))
     return d
 
 
@@ -220,7 +282,9 @@ def t_mt_across_midnight():
                       ("dl_b_float32_p2.csv", 120, (22, 30))])
     got = pfs_eta.project_mtimes(d, RX, 3, _clock(23, 30))
     expect("mt/across-midnight", got, "so 02:00:00 to go", want_absent=("so 00:00:00",))
-    expect("mt/across-midnight-finish", got, "PROJECTED FINISH 01:30:00")
+    # The finish now carries a DATE when it is not on the reference day. A bare
+    # HH:MM:SS printed a next-day instant as though it were today's.
+    expect("mt/across-midnight-finish", got, "PROJECTED FINISH 2026-10-02 01:30:00")
 
 
 def t_overdue_both_modes():
@@ -229,8 +293,10 @@ def t_overdue_both_modes():
     is the wake signal."""
     p = mklog(passes([(1, "a", "09:40:00", "09:50:00"), (1, "b", "09:50:00", "10:00:00"),
                       (2, "a", "10:00:00", None)]))
+    # "at least", because a pass log's timestamps carry no date: this route cannot rule
+    # out a stall a whole day longer. The log mode has no unambiguous alternative.
     expect("log/overdue", pfs_eta.project(p, 2, _clock(11, 20)),
-           "OVERDUE by 01:00:00", want_absent=("so 00:00:00",))
+           "OVERDUE by at least 01:00:00", want_absent=("so 00:00:00",))
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (9, 40)),
                       ("dl_b_float32_p1.csv", 400, (9, 50)),
                       ("dl_a_float32_p2.csv", 400, (10, 0)),
@@ -240,25 +306,113 @@ def t_overdue_both_modes():
 
 
 def t_cli_now_is_honoured():
-    """THE ARGUMENT-INDEX DEFECT, tested through the CLI because that is where it lived.
+    """THE ARGUMENT-INDEX DEFECT, tested through argv because that is where it lived.
     `--mtimes dir regex rounds now` read a[5] behind a `len(a) > 5` gate -- both off by
     one in the same direction, so the gate that would have raised the IndexError was
     never true and the documented form silently dropped `now`. A call into
     project_mtimes() cannot see this; only argv can."""
     global CHECKS
-    import subprocess
+    import time as _t
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (18, 0)),
                       ("dl_b_float32_p1.csv", 400, (19, 30)),
                       ("dl_a_float32_p2.csv", 400, (21, 0)),
                       ("dl_b_float32_p2.csv", 120, (22, 30))])
-    for args, want in (([TARGET, "--mtimes", d, RX, "3", "23:30:00"], "to go"),
-                       ([TARGET, "--mtimes", d, RX, "3"], None)):
+    # The default route needs a fixture behind the REAL clock, not a fixed wall time:
+    # the absolute fixture above sits in the future for most of the day, and the
+    # real-clock route then correctly refuses rather than reporting.
+    dr = mkdir_relative([("dl_a_float32_p1.csv", 400, 7200),
+                         ("dl_b_float32_p1.csv", 400, 5400),
+                         ("dl_a_float32_p2.csv", 400, 3600),
+                         ("dl_b_float32_p2.csv", 120, 60)], _t.time())
+    # Both forms must now report a clock line: the bare-clock one marked "at least",
+    # the default one (no argument, real clock) exact. Omitting the argument used to
+    # print nothing, which made OVERDUE reachable only through the ambiguous route.
+    for args, want in ((["--mtimes", d, RX, "3", "23:30:00"], "at least"),
+                       (["--mtimes", dr, RX, "3"], "elapsed on the open pass")):
         CHECKS += 1
-        o = subprocess.run([sys.executable] + args, capture_output=True, text=True).stdout
-        if want and want not in o:
-            FAIL.append("cli/now: %r missing from `%s`:\n%s" % (want, " ".join(args[1:]), o))
-        if want is None and ("to go" in o or "OVERDUE" in o):
-            FAIL.append("cli/no-now: a clock line appeared with no clock argument:\n%s" % o)
+        o, _e, _rc = run_cli(args)
+        if want not in o:
+            FAIL.append("cli/now: %r missing from `%s`:\n%s" % (want, " ".join(args), o))
+    # And the default route must NOT carry the modulo-24h caveat, since an mtime has a date.
+    CHECKS += 1
+    o, _e, _rc = run_cli(["--mtimes", dr, RX, "3"])
+    if "modulo 24 h" in o:
+        FAIL.append("cli/default-exact: the real-clock route claimed modulo-24h "
+                    "ambiguity, but both endpoints carry a date:\n%s" % o)
+    # The log mode's default must also report, and must stay marked as a lower bound.
+    CHECKS += 1
+    lp = mklog(passes([(1, "a", "00:00:00", "00:10:00"), (1, "b", "00:10:00", "00:20:00"),
+                       (2, "a", "00:20:00", None)]))
+    o, _e, _rc = run_cli([lp, "2"])
+    if "elapsed on the open pass" not in o or "modulo 24 h" not in o:
+        FAIL.append("cli/log-default: the log mode's default clock line is missing or "
+                    "is not marked as a lower bound:\n%s" % o)
+
+
+def t_mt_exact_beats_the_wrap():
+    """A 25-HOUR STALL. The bare-clock route cannot tell it from a 1-hour stall -- both
+    printed an identical line to the second -- and the real-clock route must, because an
+    mtime carries a date. The day-or-more refusal cannot catch this: it guards `rem_s`,
+    which for a dead run is whatever the projection was when it stopped, i.e. small."""
+    import time as _t
+    now = _t.time()
+    d = tempfile.mkdtemp(prefix="pfseta_")
+    for name, size, age in (("dl_a_float32_p1.csv", 400, 90000 + 2400),
+                            ("dl_b_float32_p1.csv", 400, 90000 + 1200),
+                            ("dl_a_float32_p2.csv", 400, 90000),
+                            ("dl_b_float32_p2.csv", 10, 0)):
+        q = os.path.join(d, name)
+        with open(q, "wb") as fh:
+            fh.write(b"x" * size)
+        os.utime(q, (now - age, now - age))
+    lt = _t.localtime(now)
+    sod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    expect("mt/25h-exact", pfs_eta.project_mtimes(d, RX, 2, None, now),
+           "1d 01:00:00 elapsed", want_absent=("at least",))
+    expect("mt/25h-bare", pfs_eta.project_mtimes(d, RX, 2, sod),
+           "at least 01:00:00 elapsed")
+
+
+def t_dur_does_not_wrap():
+    """The formatter was the residue. `hms` takes a modulus, so an exactly-measured
+    90000 s printed as 01:00:00 and the arithmetic fix was invisible to the reader."""
+    global CHECKS
+    CHECKS += 1
+    if pfs_eta.dur(90000) != "1d 01:00:00" or pfs_eta.hms(90000) != "01:00:00":
+        FAIL.append("dur/wrap: dur(90000)=%r hms(90000)=%r -- a span must not wrap and a "
+                    "clock must" % (pfs_eta.dur(90000), pfs_eta.hms(90000)))
+
+
+def t_now_before_open_pass():
+    """A `now` EARLIER than the open pass's start rendered a plausible remainder from an
+    impossible state (-09:47:47 elapsed, "so 14:17:47 to go"). Found by a fixture whose
+    mtimes sat ahead of the real clock, which is also what host clock skew looks like."""
+    import time as _t
+    now = _t.time()
+    d = tempfile.mkdtemp(prefix="pfseta_")
+    for name, size, ahead in (("dl_a_float32_p1.csv", 400, 3600),
+                              ("dl_b_float32_p1.csv", 400, 5400),
+                              ("dl_a_float32_p2.csv", 400, 7200),
+                              ("dl_b_float32_p2.csv", 10, 7300)):
+        q = os.path.join(d, name)
+        with open(q, "wb") as fh:
+            fh.write(b"x" * size)
+        os.utime(q, (now + ahead, now + ahead))
+    expect("mt/now-before-open", pfs_eta.project_mtimes(d, RX, 2, None, now),
+           "REFUSE: the open pass's start is", want_absent=("to go",))
+
+
+def t_usage_exits():
+    """The two usage exits. The structural coverage predicate demands these; the
+    prefix-based one could not see them, since `sys.exit("usage: ...")` carries no
+    REFUSE. Run in-process so the tracer records them."""
+    global CHECKS
+    for args, want in ((["--mtimes", "d", "rx"], "usage: pfs_eta.py --mtimes"),
+                       ([], "usage: pfs_eta.py <pass-log>")):
+        CHECKS += 1
+        _o, e, rc = run_cli(args)
+        if want not in e or rc == 0:
+            FAIL.append("cli/usage %r: rc=%d stderr=%r" % (args, rc, e))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
@@ -271,16 +425,16 @@ def main():
             fn()
     finally:
         sys.settrace(None)
-    want = refusal_lines()
+    want = early_exits()
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
-    print("pfs_eta selftest: %d plants, %d assertions, %d refusal sites in the AST"
-          % (len(TESTS), CHECKS, len(want)))
-    print("  refusal sites reached: %d of %d" % (len(want & HIT), len(want)))
+    print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
+          "(found structurally, not by prefix)" % (len(TESTS), CHECKS, len(want)))
+    print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:
         rc = 1
-        print("  UNCOVERED refusal sites -- a plant is missing for each:")
+        print("  UNCOVERED early exits -- a plant is missing for each:")
         for ln in missed:
             print("    pfs_eta.py:%d  %s" % (ln, src[ln - 1].strip()[:80]))
     for f in FAIL:
