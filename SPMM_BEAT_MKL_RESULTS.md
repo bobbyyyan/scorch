@@ -41720,3 +41720,39 @@ instability vectors are 3820 distinct of 3820 at every one of the five widths, z
 assert cannot refuse a valid run. This matters because the guard was suggested rather than authored:
 had there been ties it would refuse the actual measurement, which is worse than the silent
 convention it replaced. **A suggested guard needs its own input tested exactly like an authored one.**
+
+### an_c210.py amendment 3 -- label where the identity control's output must be ignored
+
+2 of 12 object-passes complete. Digest `9c42d96123ce3560d2420ec1ee9cd25408b2aac9ed372aa4e2ede433fdfabef5`, superseding `0d7aa0a7...`. Comment-only, and this
+time proven by **token stream** rather than AST: 3016 tokens identical with comments and whitespace
+stripped. AST identity alone permits a reformatting that is not a comment, so it proves "no
+executable change" rather than the literal claim; the token check rules out both.
+
+**The identity control validates the timing adjudicator, which I had not claimed, and it would have
+caught amendment 1's defect.** On chain207's own timings the corrected 11-pass form selects H1 at
+|delta| 10.5 s = **0.22 noise units** -- correct, because H1 *is* chain207's absolute pace, so
+feeding chain207 in must select it near zero. Under the old `12 * rate` form the same data reads
+32.0 s = **0.64 units**, so the corrected form fits **2.9x better on data that is chain207**. The
+control was already built and passing when that defect shipped. Nobody read its timing output. **A
+positive control is only as good as the sections someone actually reads.**
+
+**Three of the five inferential predicates return wrong-if-believed verdicts on that input, and the
+file now says so.** P1 prints "10 of 10 -> the column is stable" (trivially true, no content); P2'
+prints "union 10 -> FAILS P2'" (the union *must* be 10 at identity); P3 prints Pearson 1.000 and
+the ">=0.60, part of what was attributed to the RUN is object-layout artefact" verdict, **the
+inverse of the truth** on an input where the run and the objects are the same thing. So the control
+certifies the mechanics -- guards, floors, S, the criterion, both P0 branches, P4, the adjudicator --
+and is meaningless-to-inverted for the inference.
+
+The risk is not being fooled by it; it is that the output contains a line reading "FAILS P2'" and a
+line announcing an overturn, and **the natural response to a positive control printing a failure is
+to tune the predicate until it goes green** -- which would corrupt a pre-registration to accommodate
+a degenerate input it was never about. The file now carries an explicit DO NOT ADJUST block naming
+all three.
+
+**And the output digest I offered as evidence does not reproduce across stagings.** Two sessions ran
+the same control and got `0990bb8f...` against `d239c553...`, purely because one symlinked
+chain207's stage log and the other synthesised a three-line one, so the TIMING block differs while
+everything above it is identical. For its actual purpose -- before/after with the staging fixed --
+it works and is a good check. As a handle anyone else can verify it needs its staging named, or it
+emits only false negatives, which is exactly what happened.

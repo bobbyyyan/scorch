@@ -178,7 +178,12 @@ print("  SuiteSparse analogue: 14 and 18, intersection 7, union 25, Jaccard 0.28
 # test ANY symmetric function of two inputs, because every such function coincides there. It is the
 # strongest available control for everything upstream of the two-input combination and definitionally
 # vacuous for the combination itself. The pooled rule was therefore verified by reading these four
-# lines, not by the control. (A 2x scale perturbation separates pooled from max and from
+# lines, not by the control. A digest of this file's OUTPUT is only a before/after handle with the
+# staging held fixed -- it depends on which c210_stage.log is present, since the TIMING block prints
+# whatever that log contains. Quoting such a digest without naming its staging can only produce
+# false negatives, and did: two sessions ran the same control and got 0990bb8f29bef961 against
+# d239c55302e56af4 purely because one symlinked chain207's stage log and the other synthesised a
+# three-line one. (A 2x scale perturbation separates pooled from max and from
 # chain207-alone but sits 0.35% from mean-of-floors, because mean-of-floors is a function of the two
 # marginal p95s while pooled-p95 is a function of the union -- separating them needs a SHAPE
 # perturbation preserving both marginals, which was judged not to earn its cost.)
@@ -202,6 +207,30 @@ for c in sorted(inter, key=lambda c: (c[1], c[0])):
     print("    REPLICATED k=%-3d S207 %.4f S210 %.4f  %s" % (c[1], Sa7[c], Sa0[c], c[0]))
 
 # ---------------------------------------------------------------- P1, conditioned on run 1
+# ---------------------------------------------------------------------------------------------
+# WHAT THE IDENTITY POSITIVE CONTROL CERTIFIES, AND WHERE ITS OUTPUT MUST BE IGNORED.
+#
+# Running this file with chain207's own twelve CSVs as the chain210 input certifies the MECHANICS:
+# all four guards, the floors to the digit at all five widths, S, the behind-set criterion, both P0
+# branches, P4 (worst deviation 0.00%), and the timing adjudicator -- which selects H1 at |delta|
+# 10.5 s = 0.22 noise units, correct because H1 IS chain207's absolute pace. That last one would
+# have caught the restated-hypothesis defect fixed in amendment 1: under the old 12*rate form the
+# same data reads 32.0 s = 0.64 units, so the corrected form fits 2.9x better on data that IS
+# chain207. The control was already built when that defect shipped; nobody read its timing output.
+# A positive control is only as good as the sections someone actually reads.
+#
+# THE INFERENTIAL PREDICATES BELOW ARE MEANINGLESS-TO-INVERTED ON THAT INPUT, AND THAT IS CORRECT:
+#   P1   prints "survivors 10 of 10 -> 9-10, the column is stable"   trivially true, no content
+#   P2'  prints "union 10 -> FAILS P2'"                              the union MUST be 10 at identity
+#   P3   prints Pearson 1.000 -> ">=0.60, part of what was attributed to the RUN is object-layout
+#        artefact"                                                   the INVERSE of the truth, on an
+#        input where the run and the objects are the same thing
+#
+# DO NOT ADJUST THESE PREDICATES TO MAKE THE IDENTITY CONTROL PASS. Identity is not a plausible run,
+# a control that prints a failure on a degenerate input is behaving correctly, and the natural
+# response -- tuning the predicate until the control is green -- would corrupt a pre-registration to
+# accommodate an input it was never about.
+# ---------------------------------------------------------------------------------------------
 print()
 print("P1  survivors among chain207's 10, with the verdict fixed in advance")
 surv = sorted(B7 & B0, key=lambda c: (c[1], c[0]))
