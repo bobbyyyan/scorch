@@ -227,7 +227,13 @@ stripped, 64.4% at the highest single window. **No windowed figure feeds the con
 **The spread is 13x beyond counting noise, which is why it reads as phase and not as scatter.**
 Treating tick counts as Poisson, the per-window relative SE on `T` is `sqrt(1/n_E + 1/n_P)` =
 2.54–3.04%, mean 2.82%. The observed sd across six windows is 0.2022 = **11.6% of the mean, 4.1x
-counting noise**, and the span is **13.3x** it. So "the range is 38%" is not an argument from the
+counting noise** — a variance ratio of 17, and the right statistic to quote. The span is 13.3x the
+per-observation SE, but **that compares an extreme order statistic against a per-observation
+quantity**: the expected range of six draws under the null is 2.534σ, so against the correct null
+the span is **5.3x** its expectation, not 13.3x. Both kill the noise explanation; 13.3x overstates
+by exactly the factor 2.534. This is the project's own rule that coefficient of variation transfers
+while range-based spread does not, violated on the next number after I had quoted it. Peer session's
+correction. So "the range is 38%" is not an argument from the
 spread looking large; it is four to thirteen times what the counters could produce, from numbers
 already in hand. Peer session's point, and the number that makes it was free.
 
@@ -245,11 +251,63 @@ a 38% phase span, and the only error in this design that was avoidable for free.
 catch, flagged as time-critical with fourteen minutes to the next boundary.
 
 Re-anchored on the **done-line count incrementing**, not on a clock, since boundary times are
-estimates: a bounded script (deadline 04:23:15, at most four snapshots, PID recorded so it is killed
-by exact PID and never by a pattern that could match itself) writes a `/proc/stat` snapshot at each
-of the four remaining object-pass completions. That yields a one-pass interval and a three-pass
+estimates: `harnesses/pb_snap.sh` (deadline 04:23:15, at most four snapshots, PID recorded so it is
+killed by exact PID and never by a pattern that could match itself) writes a `/proc/stat` snapshot at
+each of the four remaining object-pass completions. That yields a one-pass interval and a three-pass
 interval, both phase-complete. The 02:45:03 read is kept: against a clean interval it is a positive
 control on whether the head/tail difference matters at all.
+
+**The check I named to prove it armed does not discriminate.** `$O` is opened with `>>`, so a START
+line from the broken attempt — or from any earlier debugging run — satisfies "a START line in the
+output". The discriminating checks, all free: **exactly one** START line, its `last=` reading
+exactly **8**, and its timestamp after the relaunch. Run: 1 START line, `START last=8
+deadline=1790853845 hms=02:49:05`, 46 bytes, 0 SNAP lines, PID alive. `last=8` is the one that
+proves the read path, because it is a value only a correct path can produce — a wrong path gives
+`last=` or `last=0`. Peer session's correction.
+
+**And the failure it guards against is shell-dependent, which my own negative control got wrong.**
+`grep -c` on a missing or unreadable `$S` prints *nothing*, not 0, so `last` becomes the empty
+string — and `set -u` does not catch it, confirmed, because the variable *is* assigned. Under
+**bash**, which is the script's shebang, `[ "$cur" -gt "" ]` errors with "integer expression
+expected" and is false every iteration, so the snapshot branch never fires and the result is a clean
+`EXIT n=0` at the deadline — a correct-looking wait, which is the one failure mode the 426-byte
+incident could not have caught because its symptom was immediate. Under **zsh**, where I first ran
+the control, `[ 9 -gt "" ]` *silently succeeds* and takes the branch. Opposite symptoms, same wrong
+measurement, and a negative control run under a different shell than the code under test answers a
+different question. The live script is **not** restarted to harden this: the discriminating checks
+above already prove the read path for this run, and restarting next to a boundary seven minutes away
+is the perturbation.
+
+**Verify at the first boundary, not at the end.** Until 03:01 an empty `$O` is the expected state,
+so the poller's silence is indistinguishable from a wrong path. Three boundaries remain, so a
+failure at the first is recoverable and one discovered at 04:23 is not: one `grep -c SNAP` converts
+an unguarded 95-minute bet into a 20-minute one. Peer session's point; the existing 03:13 check
+already lands after the 03:01 boundary.
+
+**The poll interval leaves a residual, which is the same defect one order smaller.** `sleep 15` then
+test means each read lands 0–15 s after its done line, so the interval is still bracketed mid-pass —
+by up to 15 s instead of 376. Bias coefficient 0.0055 against 0.1167, about 0.003 in `T`, 0.1 points
+of share. The two offsets are **independent draws from [0,15] and do not cancel**: the interval-length
+error is their difference, sd 6.1 s. What is *exactly* removable is the interval length, since
+`epoch_ns` is in every SNAP line and the stage log timestamps each done line to the second, so
+`busy_cores` gets an exact denominator. What is **not** removable by arithmetic is the 0–15 s of the
+next pass's head whose ticks are included; that stays bounded at 0.003 in `T`. Peer session's point,
+with the removable and irremovable parts separated.
+
+**The busy definition, stated because the comparison depends on it.** Both the six 10-second windows
+and the poller use `/proc/stat` fields `$2+$3+$4+$7+$8+$9` = user + nice + system + irq + softirq +
+steal, omitting idle, iowait, guest and guest_nice. Omitting guest is correct: the kernel already
+counts guest time inside user, so adding it would double-count. Verified identical in both, which is
+what makes the whole-run figure comparable to the 1.532–2.110 phase span rather than a different
+quantity. (The voided per-thread instrument used `utime+stime`, fields 14+15 — a different
+definition on a different instrument, already discarded.)
+
+**The deadline fails gracefully and should not read as a cliff.** 04:23:15 is 868 s past the
+observed-pace projection of the last boundary (03:01:17, 03:23:47, 03:46:17, 04:08:47 at 1350 s per
+pass). Against the registered H1 projection it is thinner than the peer session stated: H1 is
+`p1 aa done 00:01:16 + 11 × 1412.5 s = 04:20:13`, so the margin is **182 s**, not 618 — their
+04:12:57 does not reconstruct from the registered form. Either way, if snapshot(12) is lost the
+9→11 interval is still two phase-complete passes.
 
 Note that this quantity is *not* available from the sealed CSVs — they record per-cell kernel time,
 not per-core-type attribution — so it is the one input that requires a reading taken while the run
@@ -506,6 +564,14 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 10**, digest `e830770d58098802` superseded. The armed-poller check is replaced by
+  three discriminating ones (exactly one START line, `last=8`, timestamp after relaunch), all of
+  which pass; the guarded failure mode is shown to be shell-dependent and my own negative control
+  initially ran under the wrong shell. Verification moved to the first boundary rather than the
+  deadline. The poll interval's residual is separated into an exactly-removable interval length and
+  an irremovable 0.003-in-`T` phase term. The busy column set is stated and confirmed identical
+  across instruments. The span statistic is corrected from 13.3x to 5.3x against the expected range
+  of six draws. The deadline's H1 margin is corrected to 182 s.
 - **Amendment 9**, digest `6449741246a44318` superseded. The whole-run anchor was 27.9% into an
   object-pass rather than on a boundary, reintroducing phase selection worth 0.043–0.068 in `T`;
   re-anchored on done-line increments by a bounded snapshot script, with the misaligned read kept as
