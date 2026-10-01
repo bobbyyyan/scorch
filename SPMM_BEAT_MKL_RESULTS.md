@@ -41153,3 +41153,57 @@ largest at the narrowest vector width, which is k=4.
 So the next mechanism is line reuse across consecutive columns, and it is explicitly NOT the
 multi-row kernel, whose own comment says "NOT line reuse: this kernel loads ROWS *different* B rows
 per iteration". Nothing is implemented and nothing ships on this entry.
+
+### Corrections to the entry above, after the checker session audited it
+
+**The 5-matrix control is at most 3 distinct problems, and that is the real limit on it.**
+`mbeacxc` and `mbeaflw` are both 496x496 with **identical nnz = 49920**; `beacxc` and `beaflw` are
+497x506 and 497x507. Both pairs are BEA economic tables. So the set is `cari` plus two
+near-duplicate pairs -- effective n = 3, not 5. The median 0.9195 stands but carries three
+problems' worth of evidence, not five.
+
+**The predicate has to be written out, because at this n the window is the result.** As coded it is
+`density >= 0.20 AND 256 <= rows <= 4096 AND 2e4 <= nnz <= 1e6`, which gives exactly 5 and contains
+`cari`. Row-only windows do not reproduce it: the checker got 7, 6, 10, 68 and 3 from five readings
+of "DLMC-sized", spanning S = 0.34 to 0.92. The `nnz >= 2e4` bound is doing the work, and it is also
+why the set contains **zero** right-hand-side vectors -- at rows <= 4096, `cols == 1` cannot reach
+2e4 nonzeros. That was luck in the predicate, not foresight.
+
+**67 of the 150 SuiteSparse matrices at >=20% density are cols == 1 vectors.** The 60-101% band is
+64 of 72 vectors and reads 0.3347 with them against 0.2416 without -- 38% apart. The 35-60% band
+quoted above is 2 of 24 and is clean (0.2371 against 0.2362). Any future statement about a dense
+POPULATION has to split them out.
+
+**`cari` at 1.0498 is withdrawn as a load-bearing number.** On chain196 it replicates tightly --
+c0 1.0498, c0b 1.0580, cross-build deviation 0.78% against a 9.49% floor, 0.08x -- and all five
+controls replicate within that floor (worst `mbeaflw` at 0.78x). But the checker's chain206 A/A pair
+puts the same matrix at aa 1.0299 against bb 1.3375, a **29.9% cross-build deviation, 3.1x the
+floor**. Two byte-identical-source A/A pairs disagree about one matrix's stability by a factor of
+38. That is [[aa_floor_is_a_process_boundary]] arriving on membership rather than on an interval:
+the median over the set is robust, and no single matrix in it can carry a claim. The regime finding
+does not depend on `cari`.
+
+**One reading the proposed mechanism does not explain.** Our nanoseconds per nonzero turn UP in the
+densest DLMC band -- 0.1556 at 35-60% to 0.1632 at 60-101%, a 4.9% regression -- while MKL is flat
+at 0.1380 to 0.1379. Cache-line sharing predicts the most available reuse exactly there, so the
+upturn is evidence of a second effect and is recorded as unexplained. (The band is 74 cells and has
+no vectors; DLMC has no cols == 1.)
+
+**The 6.1x/7.7x pair is same-band and stands:** both are the 35-60% endpoints, 0.9563/0.1556 =
+6.146 and 1.0636/0.1380 = 7.707. At the 60-101% endpoints it reads 5.860 against 7.713, which makes
+the gap larger, not smaller.
+
+**Citations, corrected -- third slip in three commits, so the lesson is the pattern and not the
+line.** `scorch_spmm_row_gather_f32` is at `spmm.h:2373`; 2346 is inside a comment about the
+regblock kernel at k=1. `mrbuild.sh` is **not in the worktree** -- it exists only as harness copies
+under six ledger directories carrying five distinct digests, and the quoted paragraph is in the copy
+at `~/.cache/scorch-codex/spmm-beat-mkl/chain196-fullcollection-redwood/mrbuild.sh`, sha256
+`2b990e9c5f03...`, which is byte-identical to the live `/scratch/bobbyy/mrbuild.sh` I read.
+
+**The density tables are now reproducible from a seal.** chain207's schema has no `cols`, so neither
+density table above could be re-derived from the sealed ledger. `chain209-dlmc-dims` fixes that:
+`dlmc_dims.csv` (3846 rows) was generated independently on redwood and on the Mac and the two are
+BYTE-IDENTICAL, sha256 `ff167f71d50abf74...`, which also binds the two corpora to each other.
+Coverage guard: all 3820 chain207 keys present, 0 missing. Seal
+`841a892b742ba9b13f645100f97625f4256c78e24b852763efd27875e0a3ede1`, 9 entries, 9 OK, digest field
+width 64.
