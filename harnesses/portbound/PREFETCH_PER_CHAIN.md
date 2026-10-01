@@ -63,12 +63,21 @@ instructions per nonzero.** Per-body delta from PF=1 to PF=0:
                 ---
                 -24      = 6.00 per nonzero, matching 44 - 20 exactly
 
-So each prefetch costs six instructions, only one of which is the prefetch. Note the address
-arithmetic is 4 instructions for 4 prefetches on the movslq and shl rows but only 4 across
-lea+add+mov -- one address computation is shared, so the compiler has already amortised part of
-it. An earlier version of this list omitted `mov -1` and summed to 23 against a measured 24; the
-enumeration has to close against the difference of the two instruction counts, because the
-memorable sentence is the enumeration's and not the total's.
+So each prefetch costs six instructions, UNIFORMLY, only one of which is the prefetch:
+
+    movslq + shl + one address instruction + prefetcht2 + cmp + jle  =  6,  x4  =  24
+
+The address row is `lea 2 + add 1 + mov 1 = 4` across four prefetches -- exactly one each. The
+three different mnemonics are the compiler picking encodings for different operand shapes, not
+work being shared between prefetches.
+
+Two corrections were made to this list and the second was worse than the first. It originally
+omitted `mov -1` and summed to 23 against a measured 24. The fix for that then asserted that one
+address computation was amortised across prefetches, on the reasoning that the lea/add/mov rows
+"only" totalled 4 -- but 4 across 4 prefetches is one each, and the sentence offered ("three of the
+four need one address instruction and one needs two") sums to 5, contradicting the total it was
+drawn from. There is no sharing. The enumeration has to close against the difference of the two
+measured instruction counts, and when it does, it closes at 6.00 uniformly.
 
 ## The mechanism, from the source
 

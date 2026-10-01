@@ -306,3 +306,29 @@ in the regime where the mechanism is silent.
 - The 32 KB split was given as 3151 / 669, moving 86 keys. It is **3153 / 667, moving 84** -- the
   J=1152 level holds exactly 84 keys, and `J*8*4 <= 32768` is `J <= 1024`, so the moved set is
   precisely that level.
+
+
+---
+
+# Amendment 4: P2 and P3 are scored separately, and the prefetch finding feeds P3 not P2
+
+The +6.00 instructions per nonzero attributable to the guarded per-chain prefetch does NOT rescue
+P2, and saying it did would have mis-scored both predictions.
+
+P2 is about the per-ROW account -- accumulator initialisation plus the deeper fold, paid once per
+row -- and it predicts a `c/degree` term. The prefetch overhead is per-BODY, so it scales with
+NONZEROS and not with rows, and it does not enter the `c/degree` term at all. What it predicts
+instead is a degree-INDEPENDENT component, which is P3's floor at high degree.
+
+So the two are scored separately:
+  P2  the per-row family's magnitude against the fitted c/degree term. Unaffected by the
+      prefetch result.
+  P3  the floor at high degree. The prefetch finding PREDICTS this floor and gives it a size:
+      a per-nonzero overhead does not decay with degree, so y at the 90th-percentile degree of
+      307 should remain well above the A/A floor rather than collapsing to it.
+
+This also sharpens what would refute the prefetch account on the board: if y DOES decay to the
+floor at high degree, a per-nonzero overhead is not what is operating, whatever the disassembly
+says about instruction counts.
+
+(Raised by the peer, who had earlier offered the opposite reading and withdrew it.)

@@ -62,27 +62,86 @@ extra = set(glob.glob(os.path.join(ROOT, "dl_*_float32_p*.csv"))) - set(files.va
 if extra:
     sys.exit("REFUSE: %d CSV(s) present beyond the 18 declared: %s"
              % (len(extra), " ".join(sorted(os.path.basename(x) for x in extra))))
-print("LOADED 18 object-passes, each exactly %d data rows" % EXPECT_ROWS)
+
+# A DUPLICATED PASS PASSES EVERY CHECK ABOVE and biases the floor DOWNWARD, which manufactures
+# findings. A byte-copy of p2 as p3 has the right row count, build label and key set; then
+# ratio()'s six-pass requirement is met by five independent observations plus a repeat, and the
+# p95 of dev(bsb_/base) tightens because the duplicated pass contributes zero variance to the pair
+# it appears in. A tighter floor makes more cells read as beyond-floor. Only provenance separates
+# a run from a duplicate, so digest all 18 and print them rather than asserting the check ran.
+import hashlib
+digs = {}
+for key, f in sorted(files.items()):
+    digs[key] = hashlib.sha256(open(f, "rb").read()).hexdigest()
+by_dig = collections.defaultdict(list)
+for key, d in digs.items():
+    by_dig[d].append(key)
+dupes = {d: v for d, v in by_dig.items() if len(v) > 1}
+if dupes:
+    for d, v in dupes.items():
+        print("  DUPLICATE %s : %s" % (d[:16], " ".join("%s_p%d" % kv for kv in sorted(v))))
+    sys.exit("REFUSE: %d set(s) of byte-identical object-passes. A duplicated pass biases the "
+             "cross-object floor low and manufactures beyond-floor cells." % len(dupes))
+print("LOADED 18 object-passes, each exactly %d data rows; all 18 digests distinct" % EXPECT_ROWS)
+print("  " + "  ".join("%s_p%d=%s" % (o, p, digs[(o, p)][:8])
+                       for o in OBJECTS for p in PASSES))
 
 T = collections.defaultdict(dict)        # (obj,key,k) -> pass -> arm -> ms
 META = {}                                # key -> (rows, nnz)
+ARMS = ("ours", "oursb", "mkl")
+# COUNT, INDEX AND CONTENT ARE INDEPENDENT AXES. The row count alone is satisfied by a file with a
+# k=7 row, or with "ours" twice for one cell and "oursb" absent -- those rows load and are then
+# silently never read back, because every use of KS and ARMS downstream is iteration and not a
+# membership test. So validate the (key, k, arm) multiset per file: exactly EXPECT_ROWS entries,
+# no duplicate, every k in KS, and the arm set EQUAL to the three (bidirectional -- a missing arm
+# and an extra arm are different defects and both must refuse).
 for (ob, p), f in sorted(files.items()):
+    seen = set()
+    nrow = 0
+    ks_here, arms_here = set(), set()
     for r in csv.DictReader(open(f)):
         if r["build"] != ob:
             sys.exit("REFUSE: %s contains build label %r; a mislabelled file would silently "
                      "cross-assign arms" % (os.path.basename(f), r["build"]))
+        key, k, arm = r["key"], int(r["k"]), r["arm"]
+        nrow += 1
+        if (key, k, arm) in seen:
+            sys.exit("REFUSE: %s repeats cell (%s, k=%d, %s); a repeated arm overwrites its own "
+                     "reading and the row count cannot see it"
+                     % (os.path.basename(f), key, k, arm))
+        seen.add((key, k, arm))
+        ks_here.add(k); arms_here.add(arm)
+        rn = (int(r["rows"]), int(r["nnz"]))
+        if key in META:
+            if META[key] != rn:
+                sys.exit("REFUSE: %s gives %s rows/nnz %s against %s seen earlier; a staging "
+                         "error confined to one object would otherwise validate against whichever "
+                         "file was read first" % (os.path.basename(f), key, rn, META[key]))
+        else:
+            META[key] = rn
         try:
             ms = float(r["ms"])
         except (TypeError, ValueError):
             continue
         if not (0 < ms < float("inf")):
             continue
-        key, k = r["key"], int(r["k"])
-        T[(ob, key, k)].setdefault(p, {})[r["arm"]] = ms
-        META.setdefault(key, (int(r["rows"]), int(r["nnz"])))
+        T[(ob, key, k)].setdefault(p, {})[arm] = ms
+    if nrow != EXPECT_ROWS:
+        sys.exit("REFUSE: %s parsed %d rows, expected %d" % (os.path.basename(f), nrow, EXPECT_ROWS))
+    bad_k = ks_here - set(KS)
+    if bad_k:
+        sys.exit("REFUSE: %s contains width(s) %s outside the declared %s; those rows load and "
+                 "are then never read" % (os.path.basename(f), sorted(bad_k), list(KS)))
+    if ks_here != set(KS):
+        sys.exit("REFUSE: %s is missing width(s) %s" % (os.path.basename(f), sorted(set(KS) - ks_here)))
+    if arms_here != set(ARMS):
+        sys.exit("REFUSE: %s arm set is %s, expected exactly %s"
+                 % (os.path.basename(f), sorted(arms_here), sorted(ARMS)))
 keys = sorted(META)
 if len(keys) != EXPECT_KEYS:
     sys.exit("REFUSE: %d distinct keys, expected %d" % (len(keys), EXPECT_KEYS))
+print("VALIDATED per file: %d unique (key,k,arm) cells, widths == %s, arms == %s, rows/nnz "
+      "consistent across all 18" % (EXPECT_ROWS, list(KS), sorted(ARMS)))
 
 # ---------------------------------------------------------------- join J, refusing on any gap
 J = {}
@@ -115,7 +174,7 @@ def ratio(o_num, a_num, o_den, a_den, key, k):
 print()
 print("FLOORS, per width. The cross-object A/A (bsb_/base, byte-identical code in two processes)")
 print("is the floor the effect must clear, because deep-vs-base crosses a process AND an object.")
-print("  %-34s %s" % ("", "   ".join("k=%-6d" % k for k in KS)))
+print("  %-34s %s   (value/n)" % ("", "   ".join("k=%-11d" % k for k in KS)))
 FLOOR, ARMFLOOR = {}, {}
 for lbl, fn, store in (("within-process  oursb/ours (base)",
                         lambda key, k: ratio("base", "oursb", "base", "ours", key, k), ARMFLOOR),
@@ -125,8 +184,11 @@ for lbl, fn, store in (("within-process  oursb/ours (base)",
     for k in KS:
         d = [dev(r) for key in keys if (r := fn(key, k)) is not None]
         store[k] = p95(d)
-        out.append("%.4f" % store[k])
-    print("  %-34s %s" % (lbl, "   ".join("%-8s" % x for x in out)))
+        # Print the floor's OWN n. The effect table carries an n column and this one did not, so
+        # the two halves of every "x floor" figure were documented to different standards: a p95
+        # over a handful of surviving cells looks identical to a p95 over 3820.
+        out.append("%.4f/%d" % (store[k], len(d)))
+    print("  %-34s %s" % (lbl, "   ".join("%-13s" % x for x in out)))
 
 print()
 print("THE EFFECT: deep/base on our own kernel, per width, against the cross-object floor.")
