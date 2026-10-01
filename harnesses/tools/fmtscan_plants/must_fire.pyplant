@@ -1,0 +1,21 @@
+import sys, logging, warnings
+log = logging.getLogger("x")
+fh = open("/dev/null", "w")
+print("D1 print %d")                                  # L4  baseline
+print("D2 doubled %%")                                # L5
+sys.exit("D3 exit %s")                                # L6
+fh.write("D4 write %d")                               # L7
+log.warning("D5 lazy no args %d")                     # L8
+print("D6 ternary %d" if 1 else "x")                  # L9
+print("D7 repr %r")                                   # L10  peer item 2
+print("D8 ascii %a")                                  # L11
+print("D9 char %c")                                   # L12
+print("D10 mapping %(name)s")                         # L13
+print("D11 star %*d")                                 # L14
+print("D12 upperE %E")                                # L15
+log.log(logging.WARNING, "D13 level-first %d")        # L16  peer item 4a
+log.warning("D14 kwarg only %d", exc_info=True)       # L17  peer item 4b
+warnings.warn("D15 eager warn %d", UserWarning)       # L18  mine: receiver, not arity
+print("<%s>" % "D16 right operand %d")                # L19  peer item 5
+print("D17 method receiver %d".upper())               # L20  peer item 6b
+raise RuntimeError("D18 raise %d")                    # L21  peer item 6

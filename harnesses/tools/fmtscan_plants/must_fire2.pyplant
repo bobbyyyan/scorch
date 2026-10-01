@@ -1,0 +1,2 @@
+def f(c):
+    assert c, "D19 assert %d"                         # L2  peer item 6

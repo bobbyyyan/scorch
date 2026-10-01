@@ -1,0 +1,20 @@
+import re, argparse, logging, datetime, sys
+log = logging.getLogger("x")
+print("C1 ok %d" % 7)
+print("C2 ok %s" % ("v",))
+print(f"C3 ok {7}")
+print("C4 ok {}".format(7))
+print("C5 pct literal 3% bare prose")
+print("C6 space flag % i and % o are English")
+print("C7 pct-b %b is not a specifier")
+re.compile(r"^%[sd]$")
+argparse.ArgumentParser().add_argument("--x", help="C8 required %% and %(default)s", default=3)
+datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z")
+"C9 search target".replace("%%", "")
+log.warning("C10 lazy with args %d", 7)
+log.log(logging.WARNING, "C11 level-first with args %d", 7)
+log.warning("C12 template %s", "value %d")
+d = {"%d": 1}
+if "%s" == "x":
+    pass
+print("C13 method then format %d".upper() % 7)
