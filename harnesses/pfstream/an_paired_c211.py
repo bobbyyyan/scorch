@@ -21,6 +21,8 @@ with the digest, because a digest without its serialisation emits only false neg
 C order, shape (NBOOT, n), little-endian, keys sorted lexicographically before indexing.
 """
 import csv, hashlib, math, os, re, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pfs_rowguard as _rowguard
 import numpy as np
 
 OUT = []
@@ -101,6 +103,24 @@ def load(obj):
 
 A, F, B = load(ARM), load(FLOOR), load(DEN)
 print("loaded %s/%s/%s: %d / %d / %d cells at arm=ours" % (ARM, FLOOR, DEN, len(A), len(F), len(B)))
+
+# THE CALL SITE. pfs_rowguard was written for a partial-write that produced plausible medians
+# on a quarter of the corpus, and it shipped with no callers -- the only references to it in
+# the tree were in its own selftest, so the defect it was written for would have been read
+# exactly as before. Called here, before any estimate is formed, because line 113 below
+# intersects the arms silently: a shrunken intersection reaches the bootstrap as a smaller n
+# and printing n does not help a reader who does not already know the expected value, which
+# is the condition that failed the first time.
+try:
+    _cen = _rowguard.check({ARM: A, FLOOR: F, DEN: B})
+except _rowguard.Incomplete as _e:
+    # Structured, not a traceback. The house rule is that an unsupported shape exits with a
+    # structured defect code and never an unstructured exception, and a traceback from inside
+    # an imported guard is exactly that -- it also buries the sentence that names the file to
+    # wait for under a stack.
+    sys.exit("REFUSE: %s" % _e)
+print("row guard: the three arms cover the same cells -- %s"
+      % ", ".join("k=%d n=%d" % (k, _cen[k]) for k in sorted(_cen)))
 
 print()
 print("PAIRED CONTRAST %s/%s per width -- base cancels, so this is the arm against its own floor."

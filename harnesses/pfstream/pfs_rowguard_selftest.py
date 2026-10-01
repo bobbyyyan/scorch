@@ -67,6 +67,40 @@ def t_equal_totals_different_cells():
                    "different per-width censuses")
 
 
+def t_identical_counts_disjoint_keys():
+    """THE DEFECT THE COUNT CHECK COULD NOT SEE. Two arms, identical per-width counts, ZERO
+    shared keys. The first version returned {2: 10, 4: 10, 8: 10} and refused nothing."""
+    by = {"ship": cells(10, widths=(2, 4, 8), prefix="a"),
+          "strm": cells(10, widths=(2, 4, 8), prefix="b")}
+    expect_refusal("disjoint-keys", lambda: G.check(by),
+                   "same NUMBER of cells", "intersection 0 of 10")
+
+
+def t_partial_swap_is_the_live_gap():
+    """The fully disjoint case is caught downstream by a `no paired cells` refusal. The LIVE
+    gap is the partial mismatch: equal counts with a shrunken intersection, where a reader
+    reaches the estimator with a quietly smaller population and printing n does not help
+    unless it already knows the expected value -- the condition that failed the first time.
+    One, five and forty-two of 418 swapped, all of which used to pass.
+    """
+    for nswap, want_n in ((1, 417), (5, 413), (42, 376)):
+        ship = cells(418, prefix="m")
+        strm = dict(ship)
+        for i in range(nswap):
+            for k in (2, 4, 6, 8, 10, 12, 16):
+                strm.pop(("m%d" % i, k))
+                strm[("swapped%d" % i, k)] = 1.0
+        # counts agree exactly, which is why the census check is silent here
+        global CHECKS
+        CHECKS += 1
+        if G.census({"a": ship})["a"] != G.census({"b": strm})["b"]:
+            FAIL.append("partial-swap %d: the censuses differ, so this plant is exercising "
+                        "the COUNT check and not the set check" % nswap)
+        expect_refusal("partial-swap-%d" % nswap, lambda s=ship, t=strm: G.check({"ship": s,
+                                                                                  "strm": t}),
+                       "intersection %d of 418" % want_n)
+
+
 def t_one_arm_cannot_check_itself():
     """A single arm has no sibling to compare against, so the guard must refuse rather than
     pass -- otherwise it passes on an empty file."""
