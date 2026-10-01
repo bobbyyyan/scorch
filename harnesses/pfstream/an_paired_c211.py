@@ -146,14 +146,48 @@ if 2 in verdicts:
     print("  calibration, same passes as every effect above.")
     print("  Against the effects it has to be small relative to (%.2f%% to %.2f%%):"
           % (min(eff), max(eff)), derived=True)
-    print("    vs the point displacement %.2f%%   : %.0fx to %.0fx smaller"
-          % (abs(disp), min(eff) / abs(disp), max(eff) / abs(disp)), derived=True)
+    # A control displacement of exactly zero is the BEST possible outcome and it divided by
+    # itself here -- c211 p4 landed at 1.0000 and crashed the reporter with
+    # ZeroDivisionError after printing the interval. The ratio is then unbounded above, which
+    # is a statement, not a number; the interval bound below is the form that always exists
+    # and is the conservative one anyway.
+    if abs(disp) < 1e-9:
+        print("    vs the point displacement %.2f%%   : the point is zero to the printed "
+              "precision, so this ratio is unbounded above and is not a number. The "
+              "interval bound below is the form that always exists." % abs(disp),
+              derived=True)
+    else:
+        print("    vs the point displacement %.2f%%   : %.0fx to %.0fx smaller"
+              % (abs(disp), min(eff) / abs(disp), max(eff) / abs(disp)), derived=True)
     print("    vs the interval bound    %.2f%%   : %.0fx to %.0fx smaller   <- the conservative form"
           % (bound, min(eff) / bound, max(eff) / bound), derived=True)
     print("  This bounds FALSE POSITIVES. It does NOT bound false negatives; that needs a positive")
     print("  control, which injects a known effect, and this board has none.")
-    print("  SIGN: the arm is SLOWER at every width where it can fire and this reads FASTER, so the")
-    print("  displacement has the wrong sign to be the arm. That argument needs no artefact range.")
+    # THIS WAS A CONSTANT SENTENCE ASSERTING A MEASURED SIGN. It read "this reads FASTER, so
+    # the displacement has the wrong sign to be the arm" on every pass, including c211 p2/p3/p5
+    # where the control's displacement is +1.34% / +0.51% / +0.71% -- the SAME direction as the
+    # arm, so the argument it claimed was exactly unavailable. The sign now comes from the
+    # data, and when it agrees with the arm the report says the argument is NOT available
+    # rather than making it anyway.
+    arm_signs = set(1 if verdicts[k][2] > 1 else -1 for k in KS if k != 2)
+    ctl_sign = 0 if abs(disp) < 1e-9 else (1 if disp > 0 else -1)
+    arm_word = "SLOWER" if arm_signs == {1} else ("FASTER" if arm_signs == {-1} else "MIXED")
+    if ctl_sign == 0:
+        print("  SIGN: the control's point displacement is zero to the printed precision, so "
+              "there is no sign to compare. Only the magnitude argument above is available.")
+    elif arm_word == "MIXED":
+        print("  SIGN: the arm's own direction is MIXED across widths, so there is no single "
+              "arm sign for the control to disagree with. Only the magnitude argument above "
+              "is available.")
+    elif (ctl_sign == 1) != (arm_signs == {1}):
+        print("  SIGN: the arm is %s at every width where it can fire and the control reads "
+              "%s, so the displacement has the wrong sign to be the arm. That argument needs "
+              "no artefact range." % (arm_word, "FASTER" if ctl_sign < 0 else "SLOWER"))
+    else:
+        print("  SIGN: NOT AVAILABLE. The arm is %s at every width where it can fire and the "
+              "control reads %s too -- the SAME direction. The sign argument is therefore not "
+              "available on this pass and only the magnitude argument above stands."
+              % (arm_word, arm_word))
 
 # A SURVIVING-CONVERSION-SPECIFIER SCAN. Twice in one session a format string reached output
 # unsubstituted -- a literal `%+.0f s`, and a doubled `%%` printed outside a format operation -- and
