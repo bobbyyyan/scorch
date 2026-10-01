@@ -849,3 +849,31 @@ instinct is to switch B to a signed distribution. That makes the check pass and 
 and nothing downstream would record that the inputs no longer resemble a layer's input. If a future
 run needs a signed B it must be declared as a separate arm with its own label, never as a repair to
 a refusal. `pfs_bits_fused.py` therefore does not expose a B-distribution flag.
+
+## Amendment 16 — the worst pair must be recomputed for the window being read, not fixed in advance
+
+Registered 2026-10-01 at 11:32, with the screen at three complete rounds (12 of 16) and no arm
+read. This closes a defect in amendment 13 that is amendment 13's own defect one level down.
+
+**Amendment 13 retracted a pair that had been named in advance.** The standing windowing rule
+named `ship–shpb` as the pair carrying the position spread; measurement showed the spread is
+2.000 at two rounds (worst pair `nopf–shpb`), 1.000 at three (worst pair `nopf–strm`), and 0 at
+four, while `ship–shpb` reads 1.000 then 0.333 — **the worst pair at neither window size**. So
+the rule named the wrong pair twice.
+
+**What amendment 13 did not say is that the replacement must be recomputed per window**, and
+without that it repeats the error with a different constant. The worst pair is a property of
+the landed passes in the window being analysed: it changed between two rounds and three, so
+there is no reason to expect the pair at three to be the pair at any other count, and naming
+`nopf–strm` in advance would be the same mistake with a fresher number.
+
+**Registered condition.** Any read of a partial window must (a) compute the mean-position
+spread for **every** build pair from that window's own landed passes, (b) report the maximum
+and name the pair achieving it, and (c) state the position term's coefficient. A pair named
+from a different window is not evidence about this one. At four complete rounds the spread is
+0 for every pair and this condition is satisfied trivially — which is the reason the gate is
+four and not three, stated here as the positive form of the same fact.
+
+**This is not a licence to read at three.** The gate remains four complete rounds. The
+condition exists so that a forced partial read (a preempted job, a co-tenant arriving
+mid-round) carries the right covariate rather than an inherited one.
