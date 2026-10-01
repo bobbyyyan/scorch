@@ -164,10 +164,81 @@ apart, so the figure is **residency** rather than a last-CPU snapshot:
   consistent with this project's earlier finding that the whole-row balance ceiling is occupancy
   rather than time.
 
-So the E-core arm carries roughly two thirds of production weight on this corpus and the P-core arm
-one third. Both are reported; the weighting is stated and never used to average them into one
-number. Scope: one 15-second window inside one object-pass of DLMC float32 with widths 2–32
-interleaved. It is not established for SuiteSparse or for any single width.
+Scope: one 15-second window inside one object-pass of DLMC float32 with widths 2–32 interleaved.
+Not established for SuiteSparse or for any single width.
+
+**The per-thread instrument is unusable and was replaced.** A second attempt at the same sample
+refused its own stability check: 47 threads before and after, but 32 TIDs differed, so `join` would
+have silently dropped most of them. Six further 5-second windows were all void (32, 32, 40, 9, 17
+and 8 TIDs changed). The process churns threads continuously; the one window that passed was the
+exception, and a property measured in the only window that passed its check is selected on the
+instrument.
+
+`/proc/stat`'s per-CPU lines accumulate busy ticks per CPU regardless of which thread ran, so they
+are immune to churn, and they are valid here because this process is essentially the only load on
+the host. Three 10-second windows:
+
+| window | busy cores of 24 | P-logical | E | P-cores with both siblings busy | E-cores busy |
+|---|---|---|---|---|---|
+| 1 | 5.93 | 36.0% | 64.0% | 0 of 8 | 16 of 16 |
+| 2 | 4.65 | 37.6% | 62.4% | 0 of 8 | 16 of 16 |
+| 3 | 4.79 | 39.5% | 60.5% | 0 of 8 | 16 of 16 |
+
+The churn-immune instrument reproduces the fragile one (36.0% against 36.7%, 5.93 busy cores
+against 5.89), so the split was right; it was measured with the wrong instrument.
+
+**Thread placement: one thread per physical core, across all 24 physical cores, with zero SMT
+sharing.** The per-CPU detail is unambiguous — even CPUs 0,2,…,14 carry 136–547 ticks while their
+odd siblings carry 1–22, and all 16 E-cores carry a uniform 155–195. So the team of 24 is 8 threads
+on 8 P-cores plus 16 on 16 E-cores.
+
+**That refutes my own objection to the work-share correction.** I had argued that a P-logical
+CPU-second is a second on half a shared core, which would put `r_P/r_E` near 0.78–0.84 and make the
+direction unknowable from clocks. No SMT sharing is happening, so the objection does not apply and
+the peer session's direction stands: `r_P/r_E` is at least the 1.295x clock ratio and higher once
+vector-FMA width differs between the two microarchitectures.
+
+**Time share is not work share, and the probe supplies its own conversion.** With `T = W/r`, the
+measured `T_E/T_P = 1.72` gives `W_E/W_P = 1.72 · (r_E/r_P)`: at `r_P/r_E = 1.295` the E arm does
+57% of the work, at 2.0 it does 46%, at 2.5 it does 41%. So the slow core type's time share always
+overstates its work share, and the E arm's two-thirds of *time* may be under half the *work*.
+`r_P/r_E` does not need a separate experiment — **V0 pinned to cpu0 and to cpu16 measures it
+directly**, so the probe converts its own time split into a work split. Until it does, **both arms
+are reported unweighted** and the time split is stated as a time split.
+
+### The occupancy question outranks this one, and is settled first
+
+The same measurement puts the 24-thread team at **4.65–5.93 busy cores, 19–25% occupancy**. Three
+quarters of the wall time is not in the arithmetic at all, which is a larger quantity than anything
+this probe can win: if every idle slot were in-kernel imbalance, perfect balance would be a 4.07x
+lever against −18.4%.
+
+**It is not established that any of it is in-kernel.** The figure is occupancy of the *harness
+process*, and it sums at least three components that need different fixes and have different
+production meanings:
+
+1. in-kernel thread idling — real, and a kernel-level lever;
+2. serial time between calls inside the harness — partly real, since production has per-call cost too;
+3. Python and CSR tensor construction between invocations — **an artefact of the measurement
+   harness with no production meaning at all.**
+
+A 15-second window spanning 3820 keys at five widths cannot separate them, so the 4.07x is a
+ceiling on a quantity whose composition is unknown, and the component that is pure harness overhead
+cannot be removed by any kernel change. My reporting 25% occupancy as a finding about SpMM was
+therefore too strong; it is a finding about the harness process that *bounds* an SpMM question.
+
+**The priority inversion is accepted.** This probe answers "is the loop load-port bound"; the
+occupancy decomposition answers "does the loop matter". A yes to the first with a no to the second
+is a kernel change that measures beautifully in isolation and moves nothing in production, so the
+decomposition is pre-registered separately and settled first. It needs no new run for its larger
+half: the per-cell timings in chain210's twelve sealed CSVs, summed against the per-object-pass wall
+times already recorded in `c210_stage.log`, bound component 3 plus 2 directly. That computation
+waits for the seal — summing the per-cell timings of a partial run is reducing partial data, which
+is the thing this project does not do.
+
+This also sharpens the existing project finding that the whole-row balance ceiling is occupancy
+rather than time. That finding closed row-splitting as a lever; it did not establish which of the
+three components above produces the occupancy.
 
 One further limit, stated because it is the weakest point of the design: a pinned single-threaded
 probe is not the shipped configuration. The production kernel runs on a 24-thread pool spanning both
@@ -188,3 +259,10 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 4**, digest `499f35c80f80124b` superseded. The per-thread instrument was replaced
+  after it voided itself in 6 of 7 windows; `/proc/stat` per-CPU accounting reproduces the split and
+  additionally shows one thread per physical core with **zero SMT sharing**, which refutes my own
+  objection to the peer's work-share correction. Time share is restated as not being work share,
+  with `r_P/r_E` to be measured by V0 pinned on each core type and both arms reported unweighted
+  until then. The occupancy question is accepted as outranking this one and is pre-registered
+  separately, with my own 25%-occupancy claim narrowed to a statement about the harness process.
