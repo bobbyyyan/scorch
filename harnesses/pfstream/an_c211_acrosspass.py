@@ -187,9 +187,18 @@ for k in KS:
     x2 = (NP - 1) * (s_obs ** 2) / (se_w ** 2) if se_w > 0 else float("inf")
     pv = chi2_sf(x2, NP - 1)
     s_pass = math.sqrt(max(0.0, s_obs ** 2 - se_w ** 2))
-    res[k] = (s_obs, se_w, ratio, x2, pv, s_pass, min(hws), max(hws))
-    print("  k=%-3d SD %5.3f  SE_within %5.3f  ratio %5.2f (null %.2f)  chi2 %8.1f  p %-9.2g"
-          "  pass-level SD %5.3f" % (k, s_obs, se_w, ratio, nsd, x2, pv, s_pass))
+    # TWO RATIOS, TWO ESTIMANDS, and they must not be quoted interchangeably. s_obs/SE
+    # estimates sqrt(sigma_pass^2 + SE^2)/SE and carries the within-pass term in its
+    # numerator; sigma_pass/SE does not. They differ by sqrt(1 + (SE/sigma_pass)^2), which is
+    # 1.015 here -- small, but a range statistic divided by its own null estimates the SECOND
+    # quantity, so "two routes agreeing" is a cross-check between different estimands unless
+    # both are named. Both are printed for that reason.
+    ratio_p = s_pass / se_w if se_w > 0 else float("inf")
+    res[k] = (s_obs, se_w, ratio, x2, pv, s_pass, min(hws), max(hws), ratio_p)
+    print("  k=%-3d SD %5.3f  SE_within %5.3f  chi2 %8.1f  p %-9.2g  pass-level SD %5.3f"
+          % (k, s_obs, se_w, x2, pv, s_pass))
+    print("        sqrt(sig^2+SE^2)/SE = %5.2f (null %.2f)   sig_pass/SE = %5.2f (null 0.00)"
+          % (ratio, nsd, ratio_p))
     print("        the passes' own half-widths span %.3f to %.3f pp, so the mean above is not "
           "a uniform value" % (min(hws), max(hws)))
 
@@ -197,14 +206,20 @@ print()
 if 2 not in res:
     sys.exit("REFUSE: no complete k=2 row, so the board's own provably-inert width is absent "
              "and nothing here is a floor statement")
-s_obs, se_w, ratio, x2, pv, s_pass, _lo, _hi = res[2]
+s_obs, se_w, ratio, x2, pv, s_pass, _lo, _hi, ratio_p = res[2]
 adequate = pv >= ALPHA
 print("VERDICT %s at k=2, the width where the arm provably cannot fire."
       % ("ADEQUATE" if adequate else "UNDERSTATED"))
-print("  across-pass SD %.3f pp against a within-pass SE of %.3f pp: ratio %.2f, whose value"
-      % (s_obs, se_w, ratio))
-print("  under NO pass-level effect is %.2f. chi2 = %.1f on %d df, p = %.2g."
-      % (nsd, x2, NP - 1, pv))
+print("  across-pass SD %.3f pp against a within-pass SE of %.3f pp." % (s_obs, se_w))
+print("  sqrt(sigma_pass^2 + SE^2)/SE = %.2f, whose value under NO pass-level effect is %.2f."
+      % (ratio, nsd))
+print("  sigma_pass/SE = %.2f, whose value under no pass-level effect is 0. A range statistic"
+      % ratio_p)
+print("  divided by its own null estimates THIS one, not the line above; the two differ by")
+print("  sqrt(1 + (SE/sigma_pass)^2) = %.4f here, so they are a cross-check between different"
+      % (ratio / ratio_p if ratio_p > 0 else float("inf")))
+print("  estimands and neither confirms the other unless both are named.")
+print("  chi2 = %.1f on %d df, p = %.2g." % (x2, NP - 1, pv))
 if not adequate:
     bound = CI_Z * s_pass
     print("  The implied pass-level SD is %.3f pp, a 95%% pass-level band of +-%.2f pp against"

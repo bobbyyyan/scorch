@@ -186,11 +186,22 @@ if 2 in verdicts:
     print("  calibration, same passes as every effect above.")
     print("  Against the effects it has to be small relative to (%.2f%% to %.2f%%):"
           % (min(eff), max(eff)), derived=True)
-    # A control displacement of exactly zero is the BEST possible outcome and it divided by
-    # itself here -- c211 p4 landed at 1.0000 and crashed the reporter with
-    # ZeroDivisionError after printing the interval. The ratio is then unbounded above, which
-    # is a statement, not a number; the interval bound below is the form that always exists
-    # and is the conservative one anyway.
+    # c211 k=2 p4 landed at exactly 1.0000 and divided by itself here, crashing the reporter
+    # with ZeroDivisionError after the interval had printed. An exactly-zero displacement is
+    # NOT "perfect agreement" -- that reading was wrong and the mechanism is order-statistic
+    # tie placement. In that cell the ratios take 3818 distinct values over 3820 cells, so the
+    # data is not coarse; exactly three cells have arm == floor bit-for-bit and they sit at
+    # ranks 1909, 1910 and 1911, while the median at n=3820 is the mean of ranks 1910 and 1911
+    # -- both inside that run. The neighbours are -0.0093 pp at rank 1908 and +0.0067 pp at
+    # 1912, so the honest characterisation is |displacement| < 0.01 pp and the exact zero is
+    # cosmetic. The ratio is then unbounded above, which is a statement and not a number, so
+    # the interval bound below is used: it always exists and is the conservative form anyway.
+    #
+    # THIS BRANCH'S REACHABILITY IS A PROPERTY OF THE MEDIAN. One of thirty (width, pass)
+    # cells on that board reaches it, and under a geometric or trimmed mean nothing would land
+    # on exactly 1.0, so the branch and its plant would go from live to dead with nothing
+    # failing. an_paired_c211_selftest.py asserts the estimand is still an order statistic for
+    # that reason.
     # PRINTED_ZERO, not 1e-9. The value is printed `%.2f%%`, so anything under 0.005 prints
     # as 0.00% -- and the old 1e-9 guard let a displacement of 0.001 print "0.00%" beside a
     # finite ratio with a 1e-3 divisor, inflating it 1000x against a 1.00 displacement. The

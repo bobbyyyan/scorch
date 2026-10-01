@@ -113,6 +113,44 @@ def t_the_control_zero_branch_wins_over_the_arm_branch():
     eq("zero-control-beats-mixed-arm", sign_argument([9.9, -3.0], 0.0)[0], "CONTROL_ZERO")
 
 
+def t_the_estimand_is_still_an_order_statistic():
+    """The CONTROL_ZERO branch is reachable only because the point estimate is a MEDIAN.
+
+    Measured on chain211: 1 of 30 (width, pass) cells has an exactly-1.0 median, and it gets
+    there by tie placement -- three cells agree bit-for-bit at ranks 1909/1910/1911 and the
+    median at n=3820 is the mean of 1910 and 1911. Under a geometric mean, a trimmed mean, or
+    any estimand that averages over the whole sample, nothing lands on exactly 1.0 and that
+    branch becomes dead while its plant still passes. Nothing would fail.
+
+    So the premise is asserted here: a change of estimand must re-establish reachability
+    rather than inherit it. This is the third time today a plant's reachability turned out to
+    rest on a property nothing was checking.
+    """
+    global CHECKS
+    src = open(os.path.join(HERE, "an_paired_c211.py")).read()
+    CHECKS += 1
+    if "point = math.exp(float(np.median(v)))" not in src:
+        FAIL.append("estimand-premise: the point estimate is no longer `np.median(v)`. The "
+                    "CONTROL_ZERO branch and its plant are reachable only under an ORDER "
+                    "STATISTIC, which can land on an exact tie; a mean-based estimand makes "
+                    "them dead code that still passes. Re-establish reachability, or delete "
+                    "the branch and its plant together.")
+    CHECKS += 1
+    # And the reachability itself, at the level this file can check: a tie run straddling the
+    # median positions produces an exact zero under a median and does not under a mean.
+    import statistics as stat
+    ties = [0.999907467] + [1.0, 1.0, 1.0] + [1.000067155]
+    if abs(stat.median(ties) - 1.0) > 1e-12:
+        FAIL.append("estimand-premise: a tie run across the median positions did not give an "
+                    "exact 1.0, so the mechanism described in an_paired_c211.py is not the "
+                    "one this plant rests on")
+    CHECKS += 1
+    if abs(stat.mean(ties) - 1.0) < 1e-12:
+        FAIL.append("estimand-premise: the MEAN of that same tie run is also exactly 1.0, so "
+                    "the median/mean distinction above carries no weight and the premise "
+                    "assertion is vacuous")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
