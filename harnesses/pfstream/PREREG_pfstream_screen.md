@@ -84,9 +84,52 @@ Consequences, stated so they are not rediscovered later:
 * Any later comparison against a board number is across **different populations** and needs the
   intersection taken on exact matrices, not on names.
 
+## AMENDMENT 1: k=2 CANNOT SHOW THE EFFECT, AND IS THEREFORE THE NEGATIVE CONTROL
+
+Found before any pass landed, by reading the dispatch rather than the timings.
+
+`SCORCH_NARROWK_EXACT_HI` ships at **3** (`scorch_policy.h:1518`) and `SCORCH_NARROWK_EXACT_MINDEG`
+at 0, so `exact_width = B1_size` is set for every k in {1, 2, 3} on any matrix
+(`spmm.h:4160`). At `spmm.h:4979` a nonzero `exact_width` routes the row to
+`scorch_spmm_row_narrow_exact`, and `scorch_spmm_row_regblock` is bypassed -- the half-vector
+path at `spmm.h:4903` even requires `!exact_width` explicitly.
+
+**PFSTREAM lives in `scorch_spmm_row_regblock`. So at k=2 it is not merely small, it is
+unreachable.** Of the five widths timed, four can show an effect: 4, 8, 16, 32.
+
+This is worth more than the width it costs. k=2 is a **negative control that the design already
+contains**: a width where the arm under test provably cannot fire, measured in the same passes,
+on the same matrices, through the same calibration. Any `strm/ship` or `nopf/ship` movement at
+k=2 is floor, not effect. Pre-registered predictions, which can fail:
+
+* `strm/ship` and `nopf/ship` at k=2 land inside the `shpb/ship` floor at k=2.
+* If either moves beyond that floor at k=2, the floor is understated at every width and no
+  k=4/8/16/32 result from this screen is readable. That would be a finding about the instrument,
+  not about the prefetch.
+
+## AMENDMENT 2: THE SCOPE LIMIT BELOW WAS WRONG ABOUT NVEC, AND THE REAL HOST DIFFERENCE IS k=1
+
+The original scope limit claimed MKT is AVX-512 with `NVEC = ceil(k/16)`. **There is no AVX-512
+code path in this kernel.** `scorch_simd<float>` is unconditionally `using vec = __m256` with
+`lanes = 8` (`spmm.h:2155`), with no specialization guarded on `__AVX512F__`; `_mm512` and
+`AVX512` appear nowhere under `src/scorch/csrc/` except three gate lines in `scorch_policy.h`,
+and the count is computed as `(B1_size + 7) / 8` at `spmm.h:6243`. So **`NVEC = ceil(k/8)` on both
+hosts** and widths 2/4/8/16/32 map to NVEC 1,1,1,2,4 on MKT exactly as on redwood. The compiler
+may emit zmm for surrounding code; it does not widen this kernel's vector, which is an intrinsic
+type fixed at compile time with one specialization.
+
+The hosts do compile different kernels, but at a different place and a narrower one.
+`SCORCH_NARROWK_EXACT_UNROLL_W1_HI_MINDEG_F32` is gated on
+`defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512F__)` (`scorch_policy.h:1451`), so it is
+16 on redwood and 0 on MKT. It is read at `spmm.h:4214` **only when `exact_width == 1`**, and
+`exact_width` is `B1_size`, not NVEC -- so that rule fires at **k == 1 alone**. No width in this
+screen is 1, so it cannot touch any cell here, and a redwood confirmation measures the same code
+path at the widths measured. (`SCORCH_NARROWK_EXACT_K1_MINDEG` is also ISA-conditional, on
+`__AVX2__ && __FMA__` rather than on the AVX-512 macro, so it is 8 on both hosts -- and it too is
+k=1 only.)
+
 ## Scope limits
 
-Single host. MKT is Zen4 AVX-512 and `NVEC = ceil(k/16)` there, while the prediction's 115-matrix
-figure came from redwood's AVX2 with `NVEC = ceil(k/8)`. This screen can refute the first clause;
-confirming either needs redwood, which is occupied by the c211 board until ~13:11. float32 only.
-MKT is shared and not cgroup-partitioned for bandwidth.
+Single host for now; confirming either clause needs redwood, which is occupied by the c211 board
+until ~13:11. float32 only. MKT is shared and not cgroup-partitioned for bandwidth. Four widths
+carry the effect and k=2 is the negative control, per Amendment 1.
