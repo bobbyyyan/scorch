@@ -123,6 +123,22 @@ effect is a property of the width and not of the matrix.
 All three are conditional on the 60-key screen being representative. If the full board moves the
 headline off 18.59%, these are re-read against the new number.
 
+**Why I expect P2 to be the one that breaks, named before the data so it is a prediction and not
+an excuse.** P2's shortfall rests on "roughly 2 cycles each" for a nonzero, and that figure comes
+from an isolated single-row probe with B resident in cache. That premise is the same one that made
+the probe's whole chain measurement non-transferable: the probe was latency-bound because its
+working set was small, and the board is neither isolated nor resident. If the per-nonzero cost on
+the board is materially higher than 2 cycles, the four extra per-row vector ops are a SMALLER
+fraction of the row and P2 gets stronger; if it is lower, P2 weakens. The direction is therefore
+not obvious from the premise alone, and that is the point -- a denominator imported from a
+measurement whose premise failed once should not be trusted to fix its magnitude the second time.
+
+The same shape explains the pass timing and is worth recording as a calibration: the 60-key screen
+implied 20.5 minutes per object-pass and the measured rate is 22.3. That is the screen's
+extrapolation failing by 9%, not the run misbehaving, and it is the mildest instance of exactly
+the inference P1-P3 depend on. Any number in this file derived by scaling the screen to 3820 keys
+inherits that failure mode.
+
 ## The layout nuisance, corrected
 
 Quoting "~1.8% is object layout" uniformly across widths is wrong in the direction that matters.
