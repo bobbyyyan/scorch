@@ -7,20 +7,42 @@ on its own repository -- a negative control that invalidates the measurement it 
 fixtures therefore carry a non-.py suffix (so the scan's own directory walk cannot see them) and are
 materialised into a temp directory here.
 
-A PLANT SHOWS A GUARD IS REACHED; ONLY A SILENCE CORPUS SHOWS IT IS NOT OVER-BROAD. Both halves are
-required and both are asserted: 19 defect forms must fire, one cause each, and 13 correct forms must
-stay silent. Six of the 19 came from a peer session running the scan on inputs it built, after my own
-test list had passed -- an author's test set is written from the same enumeration as the
-implementation, so it cannot contain the case the implementation forgot.
+AND THE SILENCE CORPUS NEEDS ITS SIZE ASSERTED, which the first version also got wrong. Its
+expectation was (rc=0, UNFORMATTED=0, SYNTAX=0), and an EMPTY FILE satisfies that identically -- a
+peer truncated must_be_silent.pyplant to zero bytes and this self-test still passed. A plant shows a
+guard is reached; an ablation shows it was necessary; and a SILENCE corpus shows nothing at all
+unless its content is pinned. So the count of specifier-bearing literals is derived from the fixture
+and compared against a declared number, and so is the count of near-miss literals that carry a `%`
+the regex must NOT match. Emptying the file now fails twice.
+
+EVERY PRINTED NUMBER HAS ONE BINDING. The first version printed three figures with three different
+predicates -- 19 in the docstring, 20 in the PASS line, 19 in the attribution check -- and claimed
+13 silence cases in a fixture that held 17. A count in a message and the same count in a condition
+must be the same name.
 """
-import os, re, shutil, subprocess, sys, tempfile
+import ast, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "an_fmtscan.py")
 PLANTS = os.path.join(HERE, "fmtscan_plants")
 # (fixture, expected UNFORMATTED, expected SYNTAX, expected rc)
-CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1),
-         ("must_be_silent", 0, 0, 0), ("broken", 0, 1, 1)]
+CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1), ("must_fire3", 9, 0, 1),
+         ("must_be_silent", 0, 0, 0), ("known_miss", 0, 0, 0), ("broken", 0, 1, 1)]
+N_FIRE = sum(c[1] for c in CASES)          # defect forms that must be detected
+N_SYNTAX = sum(c[2] for c in CASES)        # files that must be reported as unreadable
+SILENT_SPEC = 15                           # specifier-bearing literals that must stay silent
+# SILENCE HAS TWO CAUSES AND ONE CORPUS CANNOT ASSERT EITHER. must_be_silent.pyplant claims "this
+# is correct code", and the only way to assert that is to RUN it and require that no specifier
+# survives into its output. known_miss.pyplant claims the opposite -- a specifier DOES reach output
+# and the scan cannot see it -- so it is asserted to emit exactly MISS_SPECS of them. Without the
+# split, three cases sat in the silence corpus emitting %d while labelled correct: translate() with
+# an empty table is a no-op, and a lazy-logging ARGUMENT has its own specifiers substituted through.
+MISS_SPECS = 4
+# Literals carrying a % the regex must NOT match. Enumerated rather than counted, because a bare
+# number here is a value without its predicate: '3% bare prose', '% i and % o', '%b is not a
+# specifier', the regex '^%[sd]$', and the single '%' that is replace()'s replacement argument.
+SILENT_NEARMISS = 5
+FIRE_FIXTURES = [c[0] for c in CASES if c[1]]
 
 
 def run(paths):
@@ -30,6 +52,22 @@ def run(paths):
     if m and m.group(1) != "(none)":
         cls = {k: int(v) for k, v in (p.split("=") for p in m.group(1).split())}
     return r.returncode, cls, r.stdout
+
+
+def spec_census(path):
+    """(matching, near-miss) string literals, using the scan's OWN regex rather than a copy.
+
+    Importing SPEC instead of restating it matters: a harness that recomputes the thing it checks
+    is wrong silently and flatteringly, and a second copy of this regex would drift from the one
+    that does the work.
+    """
+    sys.path.insert(0, HERE)
+    from an_fmtscan import SPEC
+    t = ast.parse(open(path).read())
+    lits = [n.value for n in ast.walk(t)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    return (sum(1 for v in lits if SPEC.search(v)),
+            sum(1 for v in lits if "%" in v and not SPEC.search(v)))
 
 
 fail = []
@@ -49,17 +87,39 @@ try:
         if not ok:
             fail.append(name)
             print(out)
+    # THE SILENCE CORPUS IS PINNED BY CONTENT, NOT BY ITS VERDICT. Without this an empty file
+    # passes, because "produced no finding" is what an empty file does best.
+    got_spec, got_near = spec_census(os.path.join(PLANTS, "must_be_silent.pyplant"))
+    ok = (got_spec, got_near) == (SILENT_SPEC, SILENT_NEARMISS)
+    print("  %-16s %d specifier-bearing + %d near-miss literal(s)   want %d + %d   %s"
+          % ("silence corpus", got_spec, got_near, SILENT_SPEC, SILENT_NEARMISS,
+             "ok" if ok else "FAIL"))
+    if not ok:
+        fail.append("silence-corpus-size")
+    # Execute both corpora. This is the runtime half of the pair turned on the fixtures: a claim
+    # about what reaches OUTPUT can only be settled by looking at output.
+    sys.path.insert(0, HERE)
+    from an_fmtscan import SPEC
+    for name, want_specs in (("must_be_silent", 0), ("known_miss", MISS_SPECS)):
+        r = subprocess.run([sys.executable, staged[name]], capture_output=True, text=True)
+        hits = SPEC.findall(r.stdout + r.stderr)
+        ok = r.returncode == 0 and len(hits) == want_specs
+        print("  %-16s executes rc=%d, %d specifier(s) survive into its output   want rc=0, %d"
+              "   %s" % (name, r.returncode, len(hits), want_specs, "ok" if ok else "FAIL"))
+        if not ok:
+            fail.append(name + "-runtime")
     # Every planted defect must be attributable to its own line, so a single over-broad rule
     # cannot pass by firing twice on one construct and never on another.
-    rc, cls, out = run([staged["must_fire"], staged["must_fire2"]])
-    lines = sorted(int(m.group(1)) for m in re.finditer(r"^FINDING UNFORMATTED\s+\S+:(\d+)", out, re.M))
-    n_want = sum(c[1] for c in CASES)
-    if len(lines) != len(set(lines)) or len(lines) != n_want:
+    rc, cls, out = run([staged[n] for n in FIRE_FIXTURES])
+    lines = sorted((m.group(1), int(m.group(2))) for m in
+                   re.finditer(r"^FINDING UNFORMATTED\s+(\S+):(\d+)", out, re.M))
+    if len(lines) != len(set(lines)) or len(lines) != N_FIRE:
         fail.append("one-cause-per-line")
-        print("  FAIL distinct lines: %d finding(s) on %d distinct line(s), want %d of each"
-              % (len(lines), len(set(lines)), n_want))
+        print("  FAIL attribution: %d finding(s) on %d distinct (file, line) pair(s), want %d"
+              % (len(lines), len(set(lines)), N_FIRE))
     else:
-        print("  %-16s %d finding(s) on %d distinct line(s)" % ("attribution", len(lines), len(set(lines))))
+        print("  %-16s %d finding(s) on %d distinct (file, line) pair(s)"
+              % ("attribution", len(lines), len(set(lines))))
     # The fixtures must be invisible to the scan's own directory walk, or the control would
     # contaminate the population it certifies. This is the defect the .pyplant suffix fixes.
     rc, cls, out = run([PLANTS])
@@ -76,5 +136,6 @@ finally:
 print()
 if fail:
     sys.exit("REFUSE: %d self-test case(s) failed: %s" % (len(fail), ", ".join(fail)))
-print("an_fmtscan self-test PASS: %d defect form(s) fire, %d correct form(s) silent, "
-      "fixtures isolated" % (sum(c[1] + c[2] for c in CASES), 13))
+print("an_fmtscan self-test PASS: %d defect form(s) fire, %d unreadable file(s) reported, "
+      "%d specifier-bearing literal(s) stay silent in code that runs clean, %d documented miss(es) "
+      "confirmed real, fixtures isolated" % (N_FIRE, N_SYNTAX, SILENT_SPEC, MISS_SPECS))

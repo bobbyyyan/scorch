@@ -1,5 +1,9 @@
-import re, argparse, logging, datetime, sys
+# Correct forms that must stay silent. The four UNLABELLED constructs at the end are the historical
+# allow-list false positives that motivated flagging by sink, so they have the strongest claim on
+# silence of anything here.
+import re, argparse, logging, datetime, sys, warnings
 log = logging.getLogger("x")
+dt = datetime.datetime(2026, 10, 1)
 print("C1 ok %d" % 7)
 print("C2 ok %s" % ("v",))
 print(f"C3 ok {7}")
@@ -7,14 +11,16 @@ print("C4 ok {}".format(7))
 print("C5 pct literal 3% bare prose")
 print("C6 space flag % i and % o are English")
 print("C7 pct-b %b is not a specifier")
+print("C8 method then format %d  ".strip() % 7)
+print(f"C9 format spec consumes the text {dt:%Y-%m-%d}")
+print("C10 poor-mans %s".replace("%s", "world"))
+print("C11 doubled 100%% done".replace("%%", "%"))
+log.warning("C14 lazy with args %d", 7)
+log.log(logging.WARNING, "C15 level-first with args %d", 7)
+warnings.warn("C16 eager warn with no specifier", UserWarning)
+argparse.ArgumentParser().add_argument("--x", help="C17 required %% and %(default)s", default=3)
 re.compile(r"^%[sd]$")
-argparse.ArgumentParser().add_argument("--x", help="C8 required %% and %(default)s", default=3)
 datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z")
-"C9 search target".replace("%%", "")
-log.warning("C10 lazy with args %d", 7)
-log.log(logging.WARNING, "C11 level-first with args %d", 7)
-log.warning("C12 template %s", "value %d")
-d = {"%d": 1}
-if "%s" == "x":
+"unlabelled search target".replace("%%", "")
+if {"%d": 1} and "%s" == "x":
     pass
-print("C13 method then format %d".upper() % 7)

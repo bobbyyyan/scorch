@@ -1,0 +1,13 @@
+# KNOWN MISSES: a specifier DOES reach output here and the scan cannot see it. These are the costs
+# the docstring states, kept as a corpus rather than as prose so each one is asserted to be a real
+# miss and not a hypothetical. Silence has TWO causes -- correct code, and an undetectable defect --
+# and a single corpus conflating them cannot assert either. Three of these sat in the silence corpus
+# claiming to be correct code.
+import logging
+log = logging.getLogger("x")
+tbl = {}
+msg = "M1 through a variable %d"
+print(msg)                                          # the half the runtime output scan covers
+print("M2 opaque table %d".translate(tbl))          # translate() could map % to anything
+log.warning("M3 template %s", "argument %d")        # argument position: data, substituted in
+print("M4 argument to format {}".format("inner %d"))  # same, brace flavour

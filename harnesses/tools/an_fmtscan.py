@@ -15,7 +15,21 @@ reaches a text SINK -- `print`, `sys.exit`, `.write`, `raise`, `assert`, or the 
 families -- with no formatter between. See the comment on SINKS for why the rule is inverted from
 the obvious one.
 
-THE TEMPLATE POSITION IS THE WHOLE RULE. A formatter only substitutes the literal that is its
+TWO AXES, NOT ONE. The template POSITION decides whether a formatter was even applied to this
+literal; the substitution LANGUAGE decides whether that formatter touches % at all. Getting the
+first right and ignoring the second silenced the exact defect class this scan was built to find:
+
+    f"doubled {pct:.1f}%%"       -> 'doubled 1.5%%'     brace formatter, % untouched
+    "stray {} %d".format(n)      -> 'stray 3 %d'        same
+    f"{dt:%Y-%m-%d}"             -> '2026-10-01'        the ONE brace position that CONSUMES text
+
+An f-string or .format() substitutes braces and never substitutes a conversion specifier, so a
+literal inside one is still a %-template and the walk passes through it. The sole exception is a
+FORMAT SPEC, where the text is handed to the value's __format__ and never emitted. Converting a
+%-format call to an f-string is the single most likely edit to these harnesses, and it is exactly
+how the first line gets introduced.
+
+THE TEMPLATE POSITION IS THE OTHER HALF. A formatter only substitutes the literal that is its
 TEMPLATE; a literal sitting in an ARGUMENT position is data, and its specifiers reach output
 untouched. Three constructs, one test, all three measured rather than reasoned about:
 
@@ -106,13 +120,30 @@ SINK_ATTRS = {"write", "exit"}                 # sys.exit, fh.write
 # every argument of a print is a template position because print emits all of them.
 LAZY_ATTRS = {"warn", "warning", "info", "error", "debug", "critical", "exception", "fatal", "log"}
 LEVEL_FIRST = {"log"}                          # log(level, msg, *args): the message is args[1]
-EAGER_RECEIVERS = {"warnings"}                 # warnings.warn formats nothing, ever
+# warnings.warn formats nothing, ever -- and it must be separated by BINDING, not by the name
+# `warnings`, because either alias reinstates the defect. Both measured, both emit '%d' literally:
+#   import warnings as w;             w.warn("%d", UserWarning)
+#   from warnings import warn as bw;  bw("%d", UserWarning)
+EAGER_MODULE = "warnings"
+EAGER_FUNC = "warn"
+KW_MSG = {"msg", "message"}                    # logging accepts the message as a keyword
 # String methods the walk passes through when the literal is the RECEIVER. Not an allow-list of safe
 # consumers -- the opposite: these are consumers that PRESERVE the specifier, so stopping at them
-# would be a miss. `format` and `format_map` are absent because they are formatters.
-STR_METHODS = {"upper", "lower", "title", "capitalize", "casefold", "strip", "lstrip", "rstrip",
-               "ljust", "rjust", "center", "zfill", "replace", "expandtabs", "swapcase",
-               "removeprefix", "removesuffix", "join"}
+# would be a miss. `format` and `format_map` ARE here: they substitute braces and leave % alone, so
+# with the literal as receiver the result is still a %-template.
+PRESERVING = {"upper", "lower", "title", "capitalize", "casefold", "strip", "lstrip", "rstrip",
+              "ljust", "rjust", "center", "zfill", "expandtabs", "swapcase", "join",
+              "format", "format_map"}
+# These can REMOVE a specifier when the literal is the receiver, so they cannot sit in PRESERVING:
+#   "poor-mans %s".replace("%s", "world")  -> 'poor-mans world'   correct code
+#   "100%% done".replace("%%", "%")        -> '100% done'         correct code
+# Flagging either is the failure mode this whole design exists to avoid. The test is the same
+# template/argument principle one level down: look at what the ARGUMENT says. An argument that
+# itself carries a specifier is editing specifiers, so the result is out of scope; an argument
+# that carries none cannot touch them, so the walk passes through and "x %d".replace("a","b")
+# stays visible.
+EDITING = {"replace", "removeprefix", "removesuffix"}
+OPAQUE = {"translate"}                         # an arbitrary table; unknowable, so out of scope
 
 
 def _msg_index(attr):
@@ -126,25 +157,58 @@ def _receiver_name(node):
     return node.id if isinstance(node, ast.Name) else None
 
 
-def _is_sink(call, literal_arg_index, parent):
-    """True when this call emits the string without formatting it."""
+def _eager_bindings(tree):
+    """(module aliases, function aliases) for warnings, resolved from this file's own imports.
+
+    A receiver NAME test is wrong because a name is not a binding: `import warnings as w` and
+    `from warnings import warn as bw` both reinstate the eager-warn defect, and the second is a
+    bare ast.Name call that no attribute rule can see at all.
+    """
+    mods, funcs = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name == EAGER_MODULE:
+                    mods.add(a.asname or a.name)
+        elif isinstance(n, ast.ImportFrom) and n.module == EAGER_MODULE:
+            for a in n.names:
+                if a.name == EAGER_FUNC:
+                    funcs.add(a.asname or a.name)
+    return mods, funcs
+
+
+def _is_sink(call, slot, parent, eager):
+    """True when this call emits the string without formatting it.
+
+    `slot` says WHERE the literal sits: ("pos", i), ("kw", name), or ("other", None). A bare
+    index could not tell "a non-template positional slot" from "not positional at all", so a
+    keyword message -- log.warning(msg="%d"), which emits '%d' -- read as a value and was silent.
+    """
     if isinstance(call, ast.Assert):
         return True                                    # reached only when the literal IS .msg
+    eager_mods, eager_funcs = eager
     f = call.func
     if isinstance(f, ast.Name):
         if f.id in SINKS:
             return True
-        # raise SomeError("..."): the constructor call sits directly under the Raise.
+        if f.id in eager_funcs:
+            return True                                # from warnings import warn [as ...]
         return isinstance(parent.get(call), ast.Raise)
     if isinstance(f, ast.Attribute):
         if f.attr in SINK_ATTRS:
             return True
         if f.attr in LAZY_ATTRS:
-            if _receiver_name(f.value) in EAGER_RECEIVERS:
+            if f.attr == EAGER_FUNC and _receiver_name(f.value) in eager_mods:
                 return True                            # warnings.warn: never formats
             mi = _msg_index(f.attr)
-            if literal_arg_index != mi:
+            kw = {k.arg for k in call.keywords if k.arg}
+            if slot[0] == "kw":
+                # The keyword message IS the template; any other keyword is a value.
+                return slot[1] in KW_MSG
+            if slot[0] != "pos" or slot[1] != mi:
                 return False                           # a value, not the template
+            if kw & KW_MSG:
+                return False                           # the template is elsewhere
             return len(call.args) <= mi + 1            # no args after the message -> defect
         return isinstance(parent.get(call), ast.Raise)
     return False
@@ -158,6 +222,7 @@ def scan(path):
         return [("SYNTAX", getattr(e, "lineno", 0) or 0, str(e))]
     parent = {}
     docstrings = set()
+    eager = _eager_bindings(tree)
     for node in ast.walk(tree):
         for ch in ast.iter_child_nodes(node):
             parent[ch] = node
@@ -175,10 +240,17 @@ def scan(path):
         if id(node) in docstrings:
             out.append(("DOCSTRING", node.lineno, node.value.strip().split("\n")[0][:70]))
             continue
-        # Walk up to the nearest enclosing sink, stopping if a formatter intervenes. The literal
-        # must be in the TEMPLATE position of whatever it meets -- see the docstring.
+        # Walk up to the nearest enclosing sink, stopping if a %-formatter intervenes. The
+        # literal must be in the TEMPLATE position of whatever it meets, and the formatter must
+        # be one that substitutes % at all -- see the docstring's two axes.
+        #
+        # THERE IS NO STEP BUDGET. The previous bound of 10 was reachable (measured: 10 `+` terms
+        # give zero findings where 9 give one) and giving up set `sink = None`, which is
+        # indistinguishable from "no sink was found" -- a silent miss on exactly the shape that
+        # reaches it, a long implicit concatenation in a refusal message. Parent chains are finite
+        # and acyclic, so the loop terminates at the Module.
         q, formatted, sink = node, False, None
-        for _ in range(10):
+        while True:
             par = parent.get(q)
             if par is None:
                 break
@@ -189,10 +261,23 @@ def scan(path):
                 q = par                      # right operand: data, its specifiers survive
                 continue
             if isinstance(par, ast.JoinedStr):
-                formatted = True; break
-            if isinstance(par, ast.Attribute) and par.attr in ("format", "format_map"):
-                formatted = True; break
-            if isinstance(par, ast.Attribute) and par.attr in STR_METHODS and par.value is q:
+                gp = parent.get(par)
+                if isinstance(gp, ast.FormattedValue) and gp.format_spec is par:
+                    break                    # a format spec is consumed, not emitted
+                q = par                      # f-strings substitute braces, never %
+                continue
+            if isinstance(par, ast.Attribute) and par.value is q:
+                if par.attr in OPAQUE:
+                    break
+                if par.attr in EDITING:
+                    gp = parent.get(par)
+                    arg0 = gp.args[0] if isinstance(gp, ast.Call) and gp.args else None
+                    if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str) \
+                       and SPEC.search(arg0.value):
+                        break                # the argument edits specifiers: out of scope
+                elif par.attr not in PRESERVING:
+                    q = par
+                    continue
                 gp = parent.get(par)         # skip the literal's own method call, not a sink
                 q = gp if isinstance(gp, ast.Call) else par
                 continue
@@ -205,8 +290,15 @@ def scan(path):
             q = par
         if formatted or sink is None:
             continue
-        ai = sink.args.index(q) if isinstance(sink, ast.Call) and q in sink.args else -1
-        if not _is_sink(sink, ai, parent):
+        if isinstance(q, ast.keyword):
+            # The walk steps onto the keyword NODE, not its value, so testing sink.keywords
+            # against q never matched and log.warning(msg="%d") read as "not an argument at all".
+            slot = ("kw", q.arg) if q.arg else ("other", None)
+        elif isinstance(sink, ast.Call) and q in sink.args:
+            slot = ("pos", sink.args.index(q))
+        else:
+            slot = ("other", None)
+        if not _is_sink(sink, slot, parent, eager):
             continue
         out.append(("UNFORMATTED", node.lineno, node.value.strip().split("\n")[0][:70]))
     return out
@@ -214,44 +306,45 @@ def scan(path):
 
 COUNTED = ("UNFORMATTED", "SYNTAX")            # every class scan() emits except DOCSTRING
 
-if len(sys.argv) < 2:
-    sys.exit("usage: an_fmtscan.py <file-or-dir> [...]")
-files = []
-for a in sys.argv[1:]:
-    if os.path.isdir(a):
-        for r, _d, fs in os.walk(a):
-            files += [os.path.join(r, f) for f in fs if f.endswith(".py")]
-    else:
-        files.append(a)
-files = sorted(set(files))
-# A scope that is a file LIST must not print as 166 paths -- it buries the count the reader came
-# for. Directories echo as given; explicit files collapse to their count and common prefix.
-_dirs = [a for a in sys.argv[1:] if os.path.isdir(a)]
-_fs = [a for a in sys.argv[1:] if not os.path.isdir(a)]
-SCOPE = ", ".join(_dirs)
-if _fs:
-    SCOPE += ("; " if _dirs else "") + "%d file(s) listed under %s" % (
-        len(_fs), os.path.commonpath([os.path.abspath(f) for f in _fs]) if len(_fs) > 1 else _fs[0])
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit("usage: an_fmtscan.py <file-or-dir> [...]")
+    files = []
+    for a in sys.argv[1:]:
+        if os.path.isdir(a):
+            for r, _d, fs in os.walk(a):
+                files += [os.path.join(r, f) for f in fs if f.endswith(".py")]
+        else:
+            files.append(a)
+    files = sorted(set(files))
+    # A scope that is a file LIST must not print as 166 paths -- it buries the count the reader came
+    # for. Directories echo as given; explicit files collapse to their count and common prefix.
+    _dirs = [a for a in sys.argv[1:] if os.path.isdir(a)]
+    _fs = [a for a in sys.argv[1:] if not os.path.isdir(a)]
+    SCOPE = ", ".join(_dirs)
+    if _fs:
+        SCOPE += ("; " if _dirs else "") + "%d file(s) listed under %s" % (
+            len(_fs), os.path.commonpath([os.path.abspath(f) for f in _fs]) if len(_fs) > 1 else _fs[0])
 
-bad, seen = 0, {}
-for f in files:
-    for cls, ln, txt in scan(f):
-        # FINDING lines are prefixed so a consumer's class census cannot pick up the explanatory
-        # footnotes below. An earlier census did exactly that: grepping '^  [A-Z]+' returned
-        # SCOPE and SYNTAX from this file's own prose, the same shape as the defects it was built
-        # to find. The CLASSES line exists so no consumer has to parse the body at all.
-        print("FINDING %-12s %s:%d  %s" % (cls, os.path.relpath(f), ln, txt))
-        seen[cls] = seen.get(cls, 0) + 1
-        if cls in COUNTED:
-            bad += 1
-print()
-print("scanned %d file(s); scope: %s; %d defect(s) in classes %s"
-      % (len(files), SCOPE, bad, "+".join(COUNTED)))
-print("CLASSES " + (" ".join("%s=%d" % kv for kv in sorted(seen.items())) or "(none)"))
-print("  note: SCOPE IS THE ARGV PATHS, not the repository. A zero here is a statement about those")
-print("  note: paths only -- an earlier run of this scan covered harnesses/ and was reported as 'the")
-print("  note: tree is clean', while the one live argparse instance sat in tools/.")
-print("  note: SYNTAX counts as a defect: a file that did not parse was not cleared, and an exit code")
-print("  note: that cannot tell those apart makes a failure to measure read as a pass.")
-if bad:
-    sys.exit(1)
+    bad, seen = 0, {}
+    for f in files:
+        for cls, ln, txt in scan(f):
+            # FINDING lines are prefixed so a consumer's class census cannot pick up the explanatory
+            # footnotes below. An earlier census did exactly that: grepping '^  [A-Z]+' returned
+            # SCOPE and SYNTAX from this file's own prose, the same shape as the defects it was built
+            # to find. The CLASSES line exists so no consumer has to parse the body at all.
+            print("FINDING %-12s %s:%d  %s" % (cls, os.path.relpath(f), ln, txt))
+            seen[cls] = seen.get(cls, 0) + 1
+            if cls in COUNTED:
+                bad += 1
+    print()
+    print("scanned %d file(s); scope: %s; %d defect(s) in classes %s"
+          % (len(files), SCOPE, bad, "+".join(COUNTED)))
+    print("CLASSES " + (" ".join("%s=%d" % kv for kv in sorted(seen.items())) or "(none)"))
+    print("  note: SCOPE IS THE ARGV PATHS, not the repository. A zero here is a statement about those")
+    print("  note: paths only -- an earlier run of this scan covered harnesses/ and was reported as 'the")
+    print("  note: tree is clean', while the one live argparse instance sat in tools/.")
+    print("  note: SYNTAX counts as a defect: a file that did not parse was not cleared, and an exit code")
+    print("  note: that cannot tell those apart makes a failure to measure read as a pass.")
+    if bad:
+        sys.exit(1)

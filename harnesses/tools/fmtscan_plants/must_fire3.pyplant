@@ -1,0 +1,15 @@
+# The substitution-LANGUAGE family, plus binding and depth. One cause per line.
+import logging, warnings, warnings as w
+from warnings import warn as bw
+log = logging.getLogger("x")
+p, n = 1.5, 3
+print(f"E1 brace doubled {p:.1f}%%")                      # f-string never substitutes %
+print(f"E2 brace stray {p:.1f} %d")                       # same, single specifier
+print("E3 format stray {} %d".format(n))                  # .format substitutes braces only
+print("E4 format doubled {} %%".format(n))                # same, the shape of the 4 live defects
+w.warn("E5 aliased module %d", UserWarning)               # EAGER by binding, not by name
+bw("E6 aliased func %d", UserWarning)                     # a bare Name call, no attribute to test
+log.warning(msg="E7 keyword message %d")                  # the kw message IS the template
+print("E8 deep %d" + "b" + "c" + "d" + "e" + "f" + "g"
+      + "h" + "i" + "j" + "k" + "l" + "m")                # past the old 10-step budget
+print("E9 replace preserves %d".replace("a", "b"))        # argument carries no specifier
