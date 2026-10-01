@@ -44,52 +44,73 @@ nulls and the interaction is −45 points.** An effect that is invisible in both
 exactly the shape that makes a sequence of single-factor experiments conclude there is nothing
 there.
 
-## Three independent confirmations of the latency model, one of which needs no clock
+## ONE body of evidence, not three — a correction to how I presented it
 
-**1. Per-core latency floors.** The model is `cycles/nnz = FMA latency / chains`, with Golden Cove
-at 4 and Gracemont at 6:
+I wrote "three independent confirmations, one of which needs no clock". **That count is wrong.**
+There is one dataset — ten cells of measured `cycles/nnz` against `FMA latency / chains` — and what
+I called confirmations (2) and (3) are exact algebraic rearrangements of it. The peer showed the
+identities and they hold to machine precision here:
 
-    cell                      P-core predicted/measured/miss    E-core predicted/measured/miss
-    2 chains, 3 loads         2.00  1.9943   −0.28%             3.00  2.9909   −0.30%
-    2 chains, 2 loads         2.00  1.9737   −1.32%             3.00  2.9835   −0.55%
-    4 chains, 3 loads         1.00  1.5805  +58.05%             1.50  2.8676  +91.17%
-    4 chains, 2 loads         1.00  1.0258   +2.58%             1.50  1.5041   +0.28%
-    4 chains, 2 loads (V9)    1.00  0.9978   −0.22%             1.50  1.5044   +0.30%
+    (3), the cross-core ratio:  (E_cyc/P_cyc)/1.50 - 1  ==  (1+miss_E)/(1+miss_P) - 1
+         because pred_E/pred_P = (6/ch)/(4/ch) = 6/4, so the chain count cancels.
+         V0 -0.01844% both ways, V1 +0.77799%, V6 +20.95719%, V8 -2.24967%, V9 +0.51543%
+         largest difference 2.2e-16.
 
-Eight of ten readings within 1.32%, across two FMA latencies and two chain counts. One cell fails,
-on both cores, and it is the same cell.
+    (2), the chain ratio:  (meas_2ch/meas_4ch)/2.00 - 1  ==  (1+miss_2ch)/(1+miss_4ch) - 1
+         because pred_2ch/pred_4ch = (lat/2)/(lat/4) = 2, so the LATENCY cancels.
+         P V1/V8 -3.80202% both ways, P V0/V6 -36.90904%, E V1/V8 -0.82244%,
+         E V0/V6 -47.84988%; largest difference 1.1e-16.
 
-**2. The chain ratio, which is frequency-free.** Doubling the chains must halve the cycles, so the
-*ratio* is 2.00 whatever the clock is:
+So each projection cancels a nuisance factor — (2) the clock down a column, (3) a common-mode clock
+error across cores — and neither adds a datum. Neither can pass where the table fails or fail where
+it passes. They look tighter because they drop a nuisance factor, **not a degree of freedom**.
 
-    V1/V8  (2→4 chains at 2 loads)   P 1.9240 (−3.80%)   E 1.9836 (−0.82%)
-    V0/V6  (2→4 chains at 3 loads)   P 1.2618 (−36.9%)   E 1.0430 (−47.9%)
+**And my ranking was backwards.** I called (3) "strongest of the three, because the predicted value
+is a ratio of two latencies and cannot be fitted". Unfitted it is, but it is the projection *most*
+exposed to the clock, because its measured value needs the frequency **ratio**: on the ±100 MHz grid
+I adopted, 4.4/5.7 carries ±2.87% in quadrature (±4.03% worst case) against a **3.03% spread** across
+the four cells I cited as agreement. On a half-step ±50 MHz reading it is ±1.44% and the agreement
+resolves — so whether (3) resolves at all is decided by a grid convention, and I adopted the one on
+which it does not. Worse for its use as a test: (3) passes identically whenever both cores miss the
+latency floor by the *same* factor, i.e. when the model is wrong in the same way on both. V0's
+−0.018% is exactly P's −0.28% and E's −0.30% being nearly equal.
 
-This matters because the frequency read is on a 100 MHz grid, so every `cycles/nnz` above carries
-±1.75% / ±2.27%. The ratio carries none of it.
+**What the evidence actually is, stated once:** ten cells, two FMA latencies and two chain counts,
+both taken from the datasheet and the source with nothing fitted, **eight within 1.32%**. That is
+strong parameter-free support and it does not need to be counted three times. The identity remains
+useful as a *consistency constraint* — it is how I caught a scale inversion, since V0 agreeing to
+−0.30% on its own-core floor made a 68% cross-core miss impossible — and that use is legitimate
+precisely because it is an identity.
 
-**3. The cross-core cycle ratio, which tests the model's structure rather than a constant.** If
-latency binds on both cores, the E/P cycle ratio must be 6/4 = 1.50:
+## What is NOT explained — and it is E-core-only, which is narrower than I said
 
-    arm  chains loads   E/P cycles   vs 1.50
-    V0      2     3       1.4997     −0.02%
-    V1      2     2       1.5117     +0.78%
-    V6      4     3       1.8144    +20.96%   <- the same failing cell
-    V8      4     2       1.4663     −2.25%
-    V9      4     2       1.5077     +0.52%
+I put the P-core in this paragraph and should not have. On the P-core, the maximum of the two
+parameter-free bounds describes **every** cell:
 
-Four of five within 2.25%. This is the strongest of the three, because the predicted value is a
-*ratio of two latencies* rather than a number that could be fitted.
+    arm   max(latency/chains, loads/2)   measured   miss
+    V0    max(2.00, 1.50) = 2.00         1.9943    −0.28%
+    V1    max(2.00, 1.00) = 2.00         1.9737    −1.32%
+    V6    max(1.00, 1.50) = 1.50         1.5805    +5.37%
+    V8    max(1.00, 1.00) = 1.00         1.0258    +2.58%
+    V9    max(1.00, 1.00) = 1.00         0.9978    −0.22%
 
-## What is NOT explained, stated rather than papered over
+All five within 5.4%, including the cell I called unexplained. So the P-core needs no residual: it
+is `max(accumulator latency, load supply at two per cycle)` throughout.
 
-Why the (4 chains, 3 loads) cell sits where it does. On the P-core 1.5805 is within 5.4% of
-3 loads / 2 slots = 1.50, which is the hypothesis the peer registered and which V8 confirmed at
-2 loads (1.0258 against 1.00). On the E-core the same cell reads 2.8676, which is 1.046
-loads/cycle, while V8 in the same core achieves 2 / 1.5041 = **1.33** loads/cycle. **A fixed
-effective-slot count therefore does not describe the E-core**, and I am not offering a replacement.
-The defensible statement is narrower than a mechanism: at three load operations per nonzero the
-load supply, whatever limits it, prevents the chains from paying on both cores; at two it does not.
+**The residual is the E-core's, and it is that its load throughput is not constant.** V8 achieves
+2 loads / 1.5041 cycles = **1.330 loads/cycle**; at that rate three loads would cost 2.2562
+cycles/nnz, and V6 measures **2.8676**, a **+27.1%** miss. The same core sustains **1.046**
+loads/cycle at three loads per nonzero. A single effective-slot count therefore cannot describe the
+E-core at both load counts, and I am not offering a mechanism — only narrowing where one is still
+owed. Which is: the E-core, at three load operations per nonzero, and nowhere else in this table.
+
+## The V7-with-two-loads arm is not worth building
+
+I listed it as the testable next prediction. It cannot discriminate. At eight chains the latency
+floor is 4/8 = 0.50 on the P-core and 6/8 = 0.75 on the E-core, while the load bound at two loads
+is 2/2 = 1.00 — and since the binding bound is the larger, `max` gives 1.00 under both readings.
+"Gains nothing over V8" is what either predicts, so the arm would cost a build and settle nothing.
+The peer caught this before I spent it.
 
 ## What this is not
 
