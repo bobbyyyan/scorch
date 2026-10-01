@@ -127,3 +127,34 @@ my narrowing, is a plan-versus-record distinction: **a declaration that precedes
 be preferred to the record; one that postdates it can.** The pairing clause — require them to agree
 — carries the value either way, and it is what catches a script that did not run its own plan.
 chain207's `PROVENANCE.md` already stated the convention at lines 12-13.
+
+## 8. `an_c210.py` cannot detect being pointed at its own reference
+
+`an_c210.py:34` hardcodes the comparison baseline as
+`~/.cache/scorch-codex/spmm-beat-mkl/chain207-dlmc-redwood`, against the repository rule that a
+harness takes its tree root as `$1`. That is defensible here -- the baseline is a *sealed* chain
+bound by digest, and G3 asserts chain207's `.text` and both whole-file digests while G4 refuses
+unless the baseline reproduces its sealed headline of 10 residues -- so a wrong baseline path fails
+closed rather than quietly comparing against something else.
+
+What neither guard covers is the other direction: **nothing refuses `argv[1]` BEING the reference.**
+I found this by accident, smoke-testing the pinned analyzer on a directory of symlinks to chain207's
+own twelve CSVs with its stage log renamed. Every guard passed and the analyzer printed
+Jaccard 1.0000, Pearson 1.000, Spearman 1.000, union 10, survivors 10 of 10, and the P3 verdict
+"part of what was attributed to the RUN is object-layout artefact" -- all of it from comparing a
+file set to itself. G3 and G4 cannot fire on that input because the input genuinely *is* chain207.
+
+The failure is the one that matters, because **perfect replication is the answer this chain is
+looking for**: a path mistake and the strongest possible positive result are the same output. The
+amendments at `351bba1` and `23e9700` record the identity control's blind spot and label where it
+must be ignored, but the label is a comment -- there is no runtime refusal.
+
+The analyzer is pinned and is NOT amended for this. The compensating control is external and sits
+in the run procedure: print both resolved paths before trusting any output, and require
+`realpath(argv[1]) != realpath(C207)` plus a set-disjointness check on the twelve CSV digests.
+`collect_c210.sh` already supplies most of it by refusing a destination that exists, so the
+chain210 ledger can never be chain207's directory.
+
+Size of the defect at the read point: zero on the real run, because the collector creates a fresh
+destination and the digests differ. It is a trap for a later session re-running the analyzer by
+hand, which is exactly how I tripped it.
