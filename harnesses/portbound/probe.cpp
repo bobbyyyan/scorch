@@ -430,7 +430,13 @@ static Arm ARMS[] = {{"V0", v0}, {"V0b", v0b}, {"V1", v1}, {"V2", v2},
                      {"V3", v3}, {"V4", v4},   {"V4b", v4b}, {"V4c", v4c}, {"V5", v5},
                      {"V6", v6},  {"V7", v7},
                      {"V8", v8}, {"V9", v9}};
-static const int NARM = 11;
+// Derived, never restated. This read `= 11` while ARMS[] grew to 13, so V8 and V9 were
+// compiled, disassembled and ATTESTED -- and never timed. A constant beside a table whose
+// length it duplicates is wrong the moment the table changes, and silently: the run produced a
+// self-consistent 11-arm CSV that passed every internal check. What caught it was the analyzer
+// requiring the CSV's arm set to EQUAL the attestation's, which is the bidirectional form added
+// one commit earlier for an unrelated reason.
+static const int NARM = (int)(sizeof(ARMS) / sizeof(ARMS[0]));
 
 static double now_ns() {
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
