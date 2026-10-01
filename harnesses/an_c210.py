@@ -168,6 +168,20 @@ print("  intersection %d   union %d   Jaccard %.4f   only-207 %d   only-210 %d"
       % (len(inter), len(union), len(inter) / float(len(union)) if union else float("nan"),
          len(B7 - B0), len(B0 - B7)))
 print("  SuiteSparse analogue: 14 and 18, intersection 7, union 25, Jaccard 0.2800")
+# WHAT THE IDENTITY POSITIVE CONTROL CANNOT TEST, so that whoever edits COMMON next does not read
+# Jaccard 1.0000 as having covered it. Feeding chain207's own files in as run 2 gives Jaccard
+# 1.0000 and makes this branch agree with the own-floor branch EXACTLY -- but that agreement is
+# arithmetically forced, not evidence. With n=3820 the own p95 index is int(0.95*3819)=3628 and the
+# doubled-list index is int(0.95*7639)=7257=2*3628+1, so both land on the same original value;
+# verified numerically at 0.278335. Pooled p95, mean of the two floors, max of the two floors and
+# chain207's floor alone ALL return 0.278335 there. A positive control at the identity point cannot
+# test ANY symmetric function of two inputs, because every such function coincides there. It is the
+# strongest available control for everything upstream of the two-input combination and definitionally
+# vacuous for the combination itself. The pooled rule was therefore verified by reading these four
+# lines, not by the control. (A 2x scale perturbation separates pooled from max and from
+# chain207-alone but sits 0.35% from mean-of-floors, because mean-of-floors is a function of the two
+# marginal p95s while pooled-p95 is a function of the union -- separating them needs a SHAPE
+# perturbation preserving both marginals, which was judged not to earn its cost.)
 ic, uc = B7c & B0c, B7c | B0c
 j_own = len(inter) / float(len(union)) if union else float("nan")
 j_com = len(ic) / float(len(uc)) if uc else float("nan")
@@ -219,6 +233,11 @@ def pearson(a, b):
 def spearman(a, b):
     # Value->rank through a dict collapses ties and gives every tied entry the LAST occurrence's
     # rank, which is a non-standard convention applied silently. Refuse instead of adopting it.
+    # Checked against real data of this shape before relying on it: chain207's instability vectors
+    # are 3820 distinct of 3820 at every one of the five widths, zero ties, so this cannot refuse a
+    # valid run. A suggested guard needs its own input tested exactly like an authored one -- had
+    # there been ties, this would refuse the actual measurement, which is worse than the silent
+    # convention it replaces.
     assert len(set(a)) == len(a) and len(set(b)) == len(b), \
         "  REFUSE: ties in the instability vectors (%d/%d and %d/%d distinct) -- the rank map " \
         "would collapse them to a non-standard convention" % (len(set(a)), len(a), len(set(b)), len(b))

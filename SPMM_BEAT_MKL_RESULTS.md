@@ -41684,3 +41684,39 @@ failure path exits with a structured refusal.
 **A positive control that came free.** Feeding chain207's own twelve files in as the chain210 input
 gives Jaccard **1.0000**, 10 of 10 survivors, and identical floors -- the correct degenerate answer
 for a self-comparison. An analyzer whose identity case is not exact is broken, and this one is.
+
+### an_c210.py amendment 2 -- comment-only, and the identity control's blind spot
+
+2 of 12 object-passes complete. Digest `0d7aa0a7759d9d75e55d842eaab174320a92deeb1e79c94f38f51b8837009947`, superseding `6d2bb3f3...`.
+
+**Proven comment-only rather than asserted.** The parsed AST is **identical** before and after
+(comments do not appear in an AST, though a docstring change would), and the identity positive
+control produces output whose digest is `0990bb8f29bef961` under both versions. So the behaviour is
+unchanged and only the file digest moved.
+
+**What the identity positive control cannot test, which is exactly what amendment 1 added.** Feeding
+chain207's own twelve files in as run 2 gives Jaccard 1.0000 and makes the common-floor branch agree
+with the own-floor branch exactly -- but **that agreement is arithmetically forced, not evidence**.
+With n=3820 the own p95 index is `int(0.95*3819) = 3628` and the doubled-list index is
+`int(0.95*7639) = 7257 = 2*3628+1`, so both land on the same original value. Verified numerically:
+pooled p95, mean of the two floors, max of the two floors and chain207's floor alone **all** return
+0.278335 there.
+
+So: **a positive control at the identity point cannot test any symmetric function of two inputs,
+because every such function coincides there.** It is the strongest available control for everything
+upstream of the two-input combination -- G4, the floors, the behind-set criterion, the wiring of both
+P0 branches -- and definitionally vacuous for the combination itself. The pooled rule was verified by
+reading the four lines that implement it, not by the control, and that limitation is now recorded
+beside the control in the file.
+
+A 2x scale perturbation separates pooled (1.5052x own) from max (2.0000x) and from chain207-alone
+(1.0000x), but sits 0.35% from mean-of-floors (1.5000x) -- because mean-of-floors is a function of
+the two marginal p95s while pooled-p95 is a function of their union, so separating them needs a
+SHAPE perturbation that preserves both marginals while moving the mass above them. Judged not to
+earn its cost against reading four lines.
+
+**And the tie assertion was checked against real data before being relied on.** chain207's
+instability vectors are 3820 distinct of 3820 at every one of the five widths, zero ties, so the
+assert cannot refuse a valid run. This matters because the guard was suggested rather than authored:
+had there been ties it would refuse the actual measurement, which is worse than the silent
+convention it replaced. **A suggested guard needs its own input tested exactly like an authored one.**
