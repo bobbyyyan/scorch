@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger_csvs as L                                              # noqa: E402
 
 FAIL, CHECKS, NOTES = [], 0, []
-N_PLANTS = 15
+N_PLANTS = 16
 REAL = os.path.expanduser(
     "~/.cache/scorch-codex/spmm-beat-mkl/chain194-mrhv-redwood")
 
@@ -188,6 +188,29 @@ def t_a_wrong_anchor_is_refused_rather_than_returning_empty():
         eq("wrong-anchor", "returned", "raised")
     except ValueError:
         eq("wrong-anchor", "raised", "raised")
+
+
+def t_the_anchor_is_NAMED_in_the_output_on_a_clean_pass():
+    """A conditional correctness claim must print its condition. The in-situ population of
+    symlinked chain directories is zero, so this check's clean pass is the usual case and
+    "0 linked ancestors" with no anchor would be indistinguishable from a misplaced anchor."""
+    import io
+    import contextlib
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "plain"))
+    open(os.path.join(root, "plain", "a_float32_p1.csv"), "w").write("x")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        L.glob_clean(os.path.join(root, "plain"), "*_float32_p*.csv", anchor=root)
+    out = buf.getvalue()
+    eq("anchor-reported", "linked-ancestor check: 0 found below" in out, True)
+    eq("anchor-named", root in out, True)
+    # And no line is printed when no anchor was given, so the absence of the claim is visible
+    # rather than a zero that was never computed.
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        L.glob_clean(os.path.join(root, "plain"), "*_float32_p*.csv")
+    eq("silent-without-anchor", "linked-ancestor" in buf2.getvalue(), False)
 
 
 def main():

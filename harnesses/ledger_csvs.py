@@ -124,6 +124,16 @@ def glob_clean(d, pattern, label="", allow_excluded=False, anchor=None):
     # ancestor makes every hit's path wrong, not just one file's.
     if anchor is not None:
         anc = linked_ancestors(d, anchor)
+        # THE ANCHOR GOES IN THE OUTPUT, NOT JUST IN THE CALL. This check's correctness claim is
+        # conditional on an argument the caller supplies, and the conditional is not small:
+        # anchored at a sealed chain directory there is one component to walk and the measured
+        # population of symlinked milestone and chain directories is ZERO, so the check cannot
+        # fire on sealed evidence as the tree stands; anchored at the ledger root and allowed to
+        # descend there are 4871 symlinked directories. Same code, same tree, three orders apart,
+        # selected entirely by the argument. So "0 linked ancestors" is not a statement and
+        # "0 below <anchor>" is -- a silently misplaced anchor is the vacuous pass, and the
+        # number that shows this one was not is the anchor itself.
+        print("  linked-ancestor check: %d found below %s" % (len(anc), anchor))
         if anc:
             raise SystemExit(
                 "REFUSE: %s%s is reached through %d symlinked director%s below %s:\n%s\n"
