@@ -187,8 +187,13 @@ def main():
                     than merely unrepresentative.
                 """
                 st = TAILS.get(a)
-                if not st:
-                    return ""
+                if st is None:
+                    # FAIL CLOSED, like the machine-body lookup above. An arm absent from TAILS
+                    # would otherwise read as uncontaminated and print unmarked -- the same
+                    # inertness mode as the .upper() defect that produced V4B/V4C. `is None`
+                    # rather than falsiness, so a step of 0 is a refusal and not an absence.
+                    sys.exit("REFUSE: no source step for arm %r -- probe.cpp parse missed it, so "
+                             "the contamination mark would be silently inert for this arm" % a)
                 step, has_scalar = st
                 left = n % step
                 if not left:
@@ -220,11 +225,17 @@ def main():
                       "      still divided by n",
                  "a work mismatch rather than an ILP difference, so these ratios are\n"
                  "      incomparable, not merely unrepresentative")):
+            # EVERY ARM PRESENT IN THE DATA, not the three the table prints. The arms with no
+            # remainder loop at all are V4, V4b, V4c and V5, and a scan over ("V0","V6","V7")
+            # excludes all four -- so the '?' class would have been structurally unable to report
+            # a hit while printing a legend that promised it could. They ARE in this dataset: the
+            # sweep timed eleven arms at every degree.
+            present = sorted({a for nn in ns for a in S[nn] if not a.startswith("__")})
             hits = []
             for n in ns:
-                for a in ("V0", "V6", "V7"):
+                for a in present:
                     st = TAILS.get(a)
-                    if not st or n % st[0] == 0:
+                    if st is None or n % st[0] == 0:
                         continue
                     if ("!" if st[1] else "?") == sym:
                         hits.append("%s n=%d (%d of %d nonzeros)" % (a, n, n % st[0], n))
@@ -235,15 +246,16 @@ def main():
         print("  per-arm SOURCE steps read from probe.cpp: %s"
               % ", ".join("%s=%d%s" % (a, TAILS[a][0], "" if TAILS[a][1] else " (no remainder)")
                           for a in ("V0", "V6", "V7") if a in TAILS))
-        # State the absence, so a silent legend is not read as a check that cannot fire. V0 has
-        # no remainder loop at all, so at an ODD degree it would drop its last nonzero while the
-        # denominator stayed n -- a work mismatch. Every degree on this ladder is even, so the
-        # condition was evaluated and found absent rather than skipped.
-        odd = [n for n in ns if n % 2]
-        print("  '?' (dropped work) evaluated at all %d degrees and fired at %d: V0 has no"
-              % (len(ns), len(odd)))
-        print("      remainder, so it would fire at any ODD degree, and this ladder has %s."
-              % ("none" if not odd else "n=%s" % ", ".join(map(str, odd))))
+        # Name the SCOPE the marks were evaluated over, not just the count. A legend that
+        # reports zero hits is indistinguishable from a legend that cannot produce one, and the
+        # difference here was the arm list: over ("V0","V6","V7") the '?' class is inert by
+        # construction, because every no-remainder arm is outside it.
+        present = sorted({a for nn in ns for a in S[nn] if not a.startswith("__")})
+        noremain = [a for a in present if a in TAILS and not TAILS[a][1]]
+        print("  marks evaluated over %d arms x %d degrees: %s"
+              % (len(present), len(ns), " ".join(present)))
+        print("      arms with NO remainder loop (the '?' class): %s"
+              % (" ".join(noremain) or "none in this dataset"))
         bad = [(n, S[n]["__floor__"]) for n in ns
                if not math.isnan(S[n]["__floor__"]) and S[n]["__floor__"] > 0.005]
         if bad:

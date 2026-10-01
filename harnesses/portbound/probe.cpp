@@ -255,6 +255,17 @@ NOINLINE float v4c(const Args& A) {
 // ---- V5: V1 plus the same ACCUMULATE. THE DISCRIMINATOR. 2 load ops/nnz, issue +1.
 // V5 is exactly V4b with the index load removed. If V5 lands at V0 the binding constraint was the
 // load port; if V5 lands at V1 it was issue width, and that closes the line-reuse lever.
+//
+// THE SOURCE STEP CHANGES AND THE INTENT TEXT DID NOT SAY SO. V1 steps 2; V5 steps 4, like the
+// whole V4 family it was built against. So "V1 plus the same accumulate" crosses the source step,
+// exactly as V4b-over-V0 does, and the contrast is only clean because the step change prices at
+// zero per nonzero here: the accumulate reads +1.250 insn/nnz and +0.000 mem/nnz in BOTH families
+// (V0 4.375 -> V4b 5.625, V1 2.375 -> V5 3.625), and at matched 8-nonzero machine bodies V5-V1
+// measured +0.03%, 0.6x the floor and inside it. Recorded rather than silently relied on, because
+// the same crossing is NOT free at a degree that is not a multiple of 4: V5 has no remainder loop,
+// so at such a degree it does not compute `n mod 4` of the row's nonzeros at all while the
+// harness still divides by n. an_degree.py marks those cells '?' and they exist in the sweep at
+// n=6 for V4, V4b, V4c and V5.
 NOINLINE float v5(const Args& A) {
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
   __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(),
