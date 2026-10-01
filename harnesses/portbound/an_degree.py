@@ -231,11 +231,23 @@ def main():
             # a hit while printing a legend that promised it could. They ARE in this dataset: the
             # sweep timed eleven arms at every degree.
             present = sorted({a for nn in ns for a in S[nn] if not a.startswith("__")})
+            # SELF-CHECK THE SCOPE. contam() refuses on an unknown arm, but it is only called for
+            # the three arms the table prints; these loops cover all of them and used to `continue`
+            # past an arm missing from TAILS. Under a name mismatch -- the .upper() defect produced
+            # V4B/V4C where the CSV says V4b/V4c -- `present` would carry the arm, TAILS would not,
+            # and the scan would skip it while the scope line below printed a SHORTER class list
+            # with nothing saying two arms went unmatched. The statement added to make inertness
+            # visible would itself have under-reported. Refuse instead.
+            missing = [a for a in present if a not in TAILS]
+            if missing:
+                sys.exit("REFUSE: %d arm(s) timed but absent from the probe.cpp parse: %s. The "
+                         "contamination scan would skip them and the scope line would under-report."
+                         % (len(missing), " ".join(missing)))
             hits = []
             for n in ns:
                 for a in present:
-                    st = TAILS.get(a)
-                    if st is None or n % st[0] == 0:
+                    st = TAILS[a]          # refused above if absent, so no shrug here
+                    if n % st[0] == 0:
                         continue
                     if ("!" if st[1] else "?") == sym:
                         hits.append("%s n=%d (%d of %d nonzeros)" % (a, n, n % st[0], n))
@@ -243,19 +255,29 @@ def main():
                 print("  '%s' an arm in the ratio %s --" % (sym, what))
                 print("      %s." % why)
                 print("      %s" % "; ".join(hits))
-        print("  per-arm SOURCE steps read from probe.cpp: %s"
-              % ", ".join("%s=%d%s" % (a, TAILS[a][0], "" if TAILS[a][1] else " (no remainder)")
-                          for a in ("V0", "V6", "V7") if a in TAILS))
+
         # Name the SCOPE the marks were evaluated over, not just the count. A legend that
         # reports zero hits is indistinguishable from a legend that cannot produce one, and the
         # difference here was the arm list: over ("V0","V6","V7") the '?' class is inert by
         # construction, because every no-remainder arm is outside it.
         present = sorted({a for nn in ns for a in S[nn] if not a.startswith("__")})
-        noremain = [a for a in present if a in TAILS and not TAILS[a][1]]
+        missing = [a for a in present if a not in TAILS]
+        if missing:
+            sys.exit("REFUSE: %d timed arm(s) absent from the probe.cpp parse: %s"
+                     % (len(missing), " ".join(missing)))
+        noremain = [a for a in present if not TAILS[a][1]]
         print("  marks evaluated over %d arms x %d degrees: %s"
               % (len(present), len(ns), " ".join(present)))
         print("      arms with NO remainder loop (the '?' class): %s"
               % (" ".join(noremain) or "none in this dataset"))
+        # The FULL extracted table, not three of thirteen. Printing the whole key set is what
+        # caught the .upper() mismatch; a reader cannot apply that check to a list they are not
+        # shown, and the three arms the table happens to print are the three least likely to drift.
+        print("      source steps, all %d arms parsed from probe.cpp: %s"
+              % (len(TAILS), ", ".join("%s=%d%s" % (a, TAILS[a][0], "" if TAILS[a][1] else "*")
+                                       for a in sorted(TAILS))))
+        print("      (* = no remainder loop; those arms drop `n mod step` nonzeros rather than")
+        print("       running them in one chain)")
         bad = [(n, S[n]["__floor__"]) for n in ns
                if not math.isnan(S[n]["__floor__"]) and S[n]["__floor__"] > 0.005]
         if bad:
