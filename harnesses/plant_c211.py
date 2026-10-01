@@ -63,8 +63,8 @@ def build(d, dims_override=None):
                                        1.0 + 0.001 * p + 0.000001 * i))
     return d
 
-def run(d, dims=DIMS):
-    r = subprocess.run([sys.executable, ANALYSER, d, dims], capture_output=True, text=True)
+def run(d, dims=DIMS, an=ANALYSER):
+    r = subprocess.run([sys.executable, an, d, dims], capture_output=True, text=True)
     txt = r.stdout + r.stderr
     ref = next((l for l in txt.split("\n") if l.startswith("REFUSE")), None)
     return r.returncode, ref, txt
@@ -317,11 +317,136 @@ print("               join guard refuses")
 print("  So against a 3820-key dims file the set this guard uniquely rejects is EMPTY. Its")
 print("  independent value is confined to ONE input class: a dims file with MORE than 3820 keys,")
 print("  which this analyser deliberately allows (a larger dims file joins correctly and is")
-print("  harmless, so asserting |J| == 3820 would reject a valid run). Verified by construction:")
-print("  with an oversized J that also contains the two synthetic keys, the ablated analyser")
-print("  accepts 3822 keys with no refusal at all, and the guard is what rejects it. The guard")
-print("  is therefore what makes that allowance safe -- a narrower and checkable claim than")
-print("  'nothing else catches this input'.")
+print("  harmless, so asserting |J| == 3820 would reject a valid run). That allowance is what")
+print("  the ABLATION TABLE below measures, rather than this paragraph asserting it.")
+
+# ------------------------------------------------- the ablation, as a NEGATIVE control that runs
+#
+# Every other claim in this file is reproducible by running it; the necessity claim for the
+# distinct-key guard was a sentence in a comment, asserted by a run no committed artefact
+# reproduces. That is the standard applied to an attested wrong dims file elsewhere in this
+# harness -- a plant's job is to trip (or here, NOT trip) a guard reproducibly from this repo --
+# so it is applied here too.
+#
+# This is a NEGATIVE control: an input that must be ACCEPTED once the guard is removed. A
+# positive control shows a guard is reached; only an acceptance shows it was NECESSARY, because
+# necessity is a counterfactual. The 2x2 is (analyser intact / ablated) x (dims 3820 / 3822), and
+# only the ablated+oversized cell may pass.
+#
+# The ablation is done by REGEX ON THE ANALYSER'S SOURCE and then verified to have removed the
+# message: if the guard is reworded the match fails and this block errors out, rather than
+# silently ablating nothing and reporting a vacuous "still refuses".
+
+print()
+print("ABLATION 2x2 -- the distinct-key guard's necessity, measured rather than asserted.")
+
+_an_src = open(ANALYSER).read()
+_m = re.search(r'^if len\(keys\) != EXPECT_KEYS:\n(?:[ \t]+.*\n)+', _an_src, re.M)
+if _m is None or "distinct keys" not in _m.group(0):
+    print("  FAIL: cannot locate the distinct-key guard in the analyser source to ablate it")
+    fails.append("ablation: guard not locatable by regex (reworded?)")
+else:
+    _abl_src = _an_src[:_m.start()] + _an_src[_m.end():]
+    if "distinct keys" in _abl_src:
+        # The message survives the cut, so either there are two sites or the cut was partial.
+        print("  FAIL: 'distinct keys' still present after the cut -- the ablation is incomplete")
+        fails.append("ablation: 'distinct keys' survives the cut")
+    else:
+        _abl = os.path.join(work, "an_ablated.py")
+        open(_abl, "w").write(_abl_src)
+
+        # An oversized J: the real 3820 plus the two synthetic keys the 3822-key board carries,
+        # with rows and nnz matching what m_keycount writes so the dims-disagreement guard has
+        # nothing to catch. This is the input class the analyser deliberately allows.
+        _over = os.path.join(work, "dims_oversized.csv")
+        with open(_over, "w") as h:
+            h.write("key,rows,cols,nnz\n")
+            for key, nrow, nc, nnz in KEYS:
+                h.write("%s,%d,%d,%d\n" % (key, nrow, nc, nnz))
+            _k7 = KEYS[7]
+            for _sk in ("SYNTH_X", "SYNTH_Y"):
+                h.write("%s,%d,%d,%d\n" % (_sk, _k7[1], _k7[2], _k7[3]))
+
+        _tree = build(os.path.join(work, "ablation_3822"))
+        m_keycount(_tree)
+
+        def _pop(txt):
+            """(#keys the run PRINTS, the set of n's its floor actually estimates over)."""
+            ls = txt.split("\n")
+            j = next((l for l in ls if l.startswith("JOINED J for all")), "")
+            nk = int(re.search(r"all (\d+) keys", j).group(1)) if j else None
+            f = next((l for l in ls if "within-process" in l), "")
+            return nk, sorted(set(int(x) for x in re.findall(r"\d+\.\d+/(\d+)", f)))
+
+        print("  %-10s %-16s %-5s %s" % ("ANALYSER", "DIMS", "RC", "OUTCOME"))
+        _cells = [("intact",  ANALYSER, "real 3820",      DIMS,   "distinct keys"),
+                  ("intact",  ANALYSER, "oversized 3822", _over,  "distinct keys"),
+                  ("ablated", _abl,     "real 3820",      DIMS,   "absent from the dims join"),
+                  ("ablated", _abl,     "oversized 3822", _over,  None)]
+        _acc = None
+        for _lab, _a, _dl, _d, _exp in _cells:
+            _rc, _ref, _txt = run(_tree, _d, _a)
+            if _exp is None:
+                # THE NEGATIVE CONTROL. Must be accepted outright.
+                if _ref is not None or _rc != 0:
+                    print("  %-10s %-16s %-5s FAIL expected acceptance, got %s"
+                          % (_lab, _dl, _rc, (_ref or "exit %d" % _rc)[:40]))
+                    fails.append("negative control: ablated+oversized did not accept the 3822-key board")
+                else:
+                    _acc = _pop(_txt)
+                    print("  %-10s %-16s %-5s NO REFUSAL -- accepted, so the guard IS what rejects it"
+                          % (_lab, _dl, _rc))
+            elif _ref is None:
+                print("  %-10s %-16s %-5s FAIL no refusal, expected %r" % (_lab, _dl, _rc, _exp))
+                fails.append("ablation cell (%s, %s): no refusal" % (_lab, _dl))
+            elif _exp not in _ref:
+                print("  %-10s %-16s %-5s WRONG %s" % (_lab, _dl, _rc, _ref[:52]))
+                fails.append("ablation cell (%s, %s): refused on %r, expected %r"
+                             % (_lab, _dl, _ref, _exp))
+            else:
+                print("  %-10s %-16s %-5s refuses: %s" % (_lab, _dl, _rc, _ref[:52]))
+
+        # WHAT THE ACCEPTED RUN COSTS, which is the peer's finding and is not a wrong printed
+        # number: the key count prints LARGER while the estimation population silently SHRINKS.
+        # The victim key is absent from base p1, so its base cells hold five of six passes and
+        # ratio() drops them; the two synthetic keys hold one of six and drop too. So "JOINED J
+        # for all 3822 keys" prints directly above a floor estimated over 3819.
+        if _acc is not None:
+            _rc_c, _ref_c, _txt_c = run(base, _over, _abl)   # clean tree, same analyser and dims
+            _ctl = _pop(_txt_c) if _ref_c is None else (None, [])
+            print()
+            print("  THE COST OF THE ACCEPTED RUN -- not a wrong number printed, a smaller one")
+            print("  estimated. Key count and estimation population move in OPPOSITE directions:")
+            print("    %-28s prints %s keys, floor estimated over n=%s"
+                  % ("ablated+oversized, 3822 board", _acc[0], _acc[1]))
+            print("    %-28s prints %s keys, floor estimated over n=%s"
+                  % ("same analyser+dims, clean tree", _ctl[0], _ctl[1]))
+            print("  The clean-tree row is why n=3819 is attributable to the PLANT and not to the")
+            print("  oversized dims file or the ablation: analyser and dims are held fixed across")
+            print("  the two rows and only the board changes.")
+            # The wanted populations are NAMED, not repeated as literals in the message. A first
+            # version duplicated them, and inverting the condition to check that this assert can
+            # fail produced "accepted n=[3819] (want [3819])" -- a failure message contradicting
+            # the condition that raised it. One binding, two uses.
+            _WANT_ACC, _WANT_CTL = [3819], [3820]
+            if _acc[1] != _WANT_ACC or _ctl[1] != _WANT_CTL:
+                fails.append("population check: accepted n=%s (want %s), clean n=%s (want %s)"
+                             % (_acc[1], _WANT_ACC, _ctl[1], _WANT_CTL))
+                print("  FAIL: expected n=%s accepted and n=%s clean" % (_WANT_ACC, _WANT_CTL))
+            elif _acc[0] != 3822:
+                fails.append("population check: accepted run printed %s keys, want 3822" % (_acc[0],))
+                print("  FAIL: expected the accepted run to print 3822 keys")
+            else:
+                print("  PASS: 3822 printed, 3819 estimated -- a population drop with no diagnostic.")
+            print()
+            print("  AND THE GUARD CLOSES THIS TOO, which makes it the guard's second independent")
+            print("  consequence rather than a second hole. With the guard intact n < 3820 is")
+            print("  IMPOSSIBLE: a key absent from one file leaves at most 3819 x 15 = 57285 unique")
+            print("  cells there, short of 57300, so an extra key is forced into that file, and an")
+            print("  extra key raises the union above 3820 and trips the guard. So the guard pins")
+            print("  the ESTIMATION POPULATION, not merely the key count, and no separate assertion")
+            print("  on n is needed. In the |J| > 3820 class the analyser allows, it is the only")
+            print("  thing between an oversized dims file and a population that quietly drops.")
 
 print()
 if fails:
