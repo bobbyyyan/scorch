@@ -92,10 +92,6 @@ def early_exits():
                 out.add(n.lineno)
             if isinstance(n.func, ast.Attribute) and n.func.attr == "exit":
                 out.add(n.lineno)
-        # The shape half, kept rather than replaced. Any returned list display at all --
-        # no test on the element kind, which is what finding 8 showed cannot be enumerated.
-        if isinstance(n, ast.Return) and isinstance(n.value, ast.List) and n.value.elts:
-            out.add(n.lineno)
     return out
 
 
@@ -187,6 +183,19 @@ FAIL = []
 CHECKS = 0
 
 
+def call(fn, *a, **kw):
+    """Run a projector and return its report lines, or the refusal's message as one line.
+
+    Refusals RAISE now, so a plant cannot read one out of a return value. Catching it
+    here keeps every assertion in the corpus phrased against text, and keeps the raise
+    from being mistaken for a corpus crash.
+    """
+    try:
+        return fn(*a, **kw)
+    except pfs_eta._Refuse as e:
+        return [str(e)]
+
+
 def expect(label, got, want_sub, want_absent=()):
     """`got` is the projector's line list. Assert a substring present and others absent."""
     global CHECKS
@@ -201,30 +210,30 @@ def expect(label, got, want_sub, want_absent=()):
 
 # ---------------------------------------------------------------- log-mode refusals
 def t_log_no_lines():
-    expect("log/no-lines", pfs_eta.project(mklog(["nothing\n"]), 4),
+    expect("log/no-lines", call(pfs_eta.project, mklog(["nothing\n"]), 4),
            "REFUSE: no pass lines matched")
 
 
 def t_log_no_landed_build():
     p = mklog(passes([(1, "a", "00:00:00", "00:10:00"), (1, "b", "00:10:00", None)]))
-    expect("log/no-landed-build", pfs_eta.project(p, 2),
+    expect("log/no-landed-build", call(pfs_eta.project, p, 2),
            "REFUSE: no landed pass for build(s) b")
 
 
 def t_log_over_rounds():
     p = mklog(passes([(1, "a", "00:00:00", "00:10:00"),
                       (2, "a", "00:10:00", "00:20:00")]))
-    expect("log/over-rounds", pfs_eta.project(p, 1), "REFUSE: build a has 2 landed")
+    expect("log/over-rounds", call(pfs_eta.project, p, 1), "REFUSE: build a has 2 landed")
 
 
 def t_log_day_or_more():
     """A remainder of a day makes `elapsed` undecidable from a bare clock."""
     p = mklog(passes([(1, "a", "00:00:00", "08:00:00"), (1, "b", "08:00:00", "16:00:00"),
                       (2, "a", "16:00:00", None)]))
-    expect("log/day-or-more", pfs_eta.project(p, 4, _clock(17, 0)),
+    expect("log/day-or-more", call(pfs_eta.project, p, 4, _clock(17, 0)),
            "REFUSE: ")
     # and WITHOUT a clock it must still project -- the refusal is about `now`, not the run
-    expect("log/day-or-more-no-clock", pfs_eta.project(p, 4),
+    expect("log/day-or-more-no-clock", call(pfs_eta.project, p, 4),
            "PROJECTED FINISH", want_absent=("REFUSE",))
 
 
@@ -232,14 +241,14 @@ def t_log_day_or_more():
 def t_mt_too_few():
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
                       ("dl_b_float32_p1.csv", 400, (2, 0))])
-    expect("mt/too-few", pfs_eta.project_mtimes(d, RX, 2), "REFUSE: 2 file(s) matched")
+    expect("mt/too-few", call(pfs_eta.project_mtimes, d, RX, 2), "REFUSE: 2 file(s) matched")
 
 
 def t_mt_open_not_smaller():
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
                       ("dl_b_float32_p1.csv", 400, (2, 0)),
                       ("dl_a_float32_p2.csv", 400, (3, 0))])
-    expect("mt/open-not-smaller", pfs_eta.project_mtimes(d, RX, 2),
+    expect("mt/open-not-smaller", call(pfs_eta.project_mtimes, d, RX, 2),
            "REFUSE: the newest file")
 
 
@@ -247,7 +256,7 @@ def t_mt_no_predecessor():
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (1, 0)),
                       ("dl_b_float32_p1.csv", 400, (2, 0)),
                       ("dl_b_float32_p2.csv", 10, (3, 0))])
-    expect("mt/no-predecessor", pfs_eta.project_mtimes(d, RX, 2),
+    expect("mt/no-predecessor", call(pfs_eta.project_mtimes, d, RX, 2),
            "REFUSE: build(s) a have no pass with a measurable duration")
 
 
@@ -257,7 +266,7 @@ def t_mt_over_rounds():
                       ("dl_a_float32_p2.csv", 400, (3, 0)),
                       ("dl_b_float32_p2.csv", 400, (4, 0)),
                       ("dl_a_float32_p3.csv", 10, (5, 0))])
-    expect("mt/over-rounds", pfs_eta.project_mtimes(d, RX, 1),
+    expect("mt/over-rounds", call(pfs_eta.project_mtimes, d, RX, 1),
            "REFUSE: build a already has 3 files but only 1 rounds")
 
 
@@ -268,7 +277,7 @@ def t_mt_unbalanced():
                       ("dl_a_float32_p2.csv", 400, (4, 0)),
                       ("dl_a_float32_p3.csv", 400, (5, 0)),
                       ("dl_c_float32_p2.csv", 10, (6, 0))])
-    expect("mt/unbalanced", pfs_eta.project_mtimes(d, RX, 4),
+    expect("mt/unbalanced", call(pfs_eta.project_mtimes, d, RX, 4),
            "REFUSE: the rotation is not balanced")
 
 
@@ -277,7 +286,7 @@ def t_mt_day_or_more():
                       ("dl_b_float32_p1.csv", 400, (8, 0)),
                       ("dl_a_float32_p2.csv", 400, (16, 0)),
                       ("dl_b_float32_p2.csv", 10, (23, 0))])
-    expect("mt/day-or-more", pfs_eta.project_mtimes(d, RX, 4, _clock(23, 30)), "REFUSE: ")
+    expect("mt/day-or-more", call(pfs_eta.project_mtimes, d, RX, 4, _clock(23, 30)), "REFUSE: ")
 
 
 # ----------------------------------------------------- the arithmetic and the clock
@@ -285,13 +294,13 @@ def t_log_arithmetic():
     """Hand-computable: means 100 and 200, one round owed each, open pass at 00:05:00."""
     p = mklog(passes([(1, "a", "00:00:00", "00:01:40"), (1, "b", "00:01:40", "00:05:00"),
                       (2, "a", "00:05:00", None)]))
-    expect("log/arithmetic", pfs_eta.project(p, 2), "PROJECTED FINISH 00:10:00")
+    expect("log/arithmetic", call(pfs_eta.project, p, 2), "PROJECTED FINISH 00:10:00")
 
 
 def t_log_no_open_pass():
     """Every pass closed: there is no open pass to project from, and it must say so."""
     p = mklog(passes([(1, "a", "00:00:00", "00:10:00"), (1, "b", "00:10:00", "00:20:00")]))
-    expect("log/no-open-pass", pfs_eta.project(p, 2), "NOTE: no pass is open")
+    expect("log/no-open-pass", call(pfs_eta.project, p, 2), "NOTE: no pass is open")
 
 
 def t_mt_local_clock():
@@ -300,7 +309,7 @@ def t_mt_local_clock():
                       ("dl_b_float32_p1.csv", 400, (10, 31)),
                       ("dl_a_float32_p2.csv", 400, (10, 33)),
                       ("dl_b_float32_p2.csv", 10, (10, 34))])
-    expect("mt/local-clock", pfs_eta.project_mtimes(d, RX, 2), "COMPLETION, 10:33:00 local")
+    expect("mt/local-clock", call(pfs_eta.project_mtimes, d, RX, 2), "COMPLETION, 10:33:00 local")
 
 
 def t_mt_across_midnight():
@@ -311,7 +320,7 @@ def t_mt_across_midnight():
                       ("dl_b_float32_p1.csv", 400, (19, 30)),
                       ("dl_a_float32_p2.csv", 400, (21, 0)),
                       ("dl_b_float32_p2.csv", 120, (22, 30))])
-    got = pfs_eta.project_mtimes(d, RX, 3, _clock(23, 30))
+    got = call(pfs_eta.project_mtimes, d, RX, 3, _clock(23, 30))
     expect("mt/across-midnight", got, "so 02:00:00 to go", want_absent=("so 00:00:00",))
     # The finish now carries a DATE when it is not on the reference day. A bare
     # HH:MM:SS printed a next-day instant as though it were today's.
@@ -326,13 +335,13 @@ def t_overdue_both_modes():
                       (2, "a", "10:00:00", None)]))
     # "at least", because a pass log's timestamps carry no date: this route cannot rule
     # out a stall a whole day longer. The log mode has no unambiguous alternative.
-    expect("log/overdue", pfs_eta.project(p, 2, _clock(11, 20)),
+    expect("log/overdue", call(pfs_eta.project, p, 2, _clock(11, 20)),
            "OVERDUE by at least 01:00:00", want_absent=("so 00:00:00",))
     d = mkdir_mtimes([("dl_a_float32_p1.csv", 400, (9, 40)),
                       ("dl_b_float32_p1.csv", 400, (9, 50)),
                       ("dl_a_float32_p2.csv", 400, (10, 0)),
                       ("dl_b_float32_p2.csv", 10, (10, 5))])
-    expect("mt/overdue", pfs_eta.project_mtimes(d, RX, 2, _clock(11, 20)),
+    expect("mt/overdue", call(pfs_eta.project_mtimes, d, RX, 2, _clock(11, 20)),
            "OVERDUE by", want_absent=("so 00:00:00",))
 
 
@@ -398,9 +407,9 @@ def t_mt_exact_beats_the_wrap():
         os.utime(q, (now - age, now - age))
     lt = _t.localtime(now)
     sod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
-    expect("mt/25h-exact", pfs_eta.project_mtimes(d, RX, 2, None, now),
+    expect("mt/25h-exact", call(pfs_eta.project_mtimes, d, RX, 2, None, now),
            "1d 01:00:00 elapsed", want_absent=("at least",))
-    expect("mt/25h-bare", pfs_eta.project_mtimes(d, RX, 2, sod),
+    expect("mt/25h-bare", call(pfs_eta.project_mtimes, d, RX, 2, sod),
            "at least 01:00:00 elapsed")
 
 
@@ -429,8 +438,29 @@ def t_now_before_open_pass():
         with open(q, "wb") as fh:
             fh.write(b"x" * size)
         os.utime(q, (now + ahead, now + ahead))
-    expect("mt/now-before-open", pfs_eta.project_mtimes(d, RX, 2, None, now),
+    expect("mt/now-before-open", call(pfs_eta.project_mtimes, d, RX, 2, None, now),
            "REFUSE: the open pass's start is", want_absent=("to go",))
+
+
+def t_cli_surfaces_a_refusal():
+    """A raised refusal must reach the user as text and a NON-ZERO status.
+
+    Raising moved the refusal off the return path, so the CLI has to catch it -- and a
+    refusal that escaped as a traceback, or one that printed but exited 0, would both be
+    worse than the returned-value design it replaced. The uncovered-site report is what
+    demanded this plant: converting to raises added the handler and nothing exercised it.
+    """
+    global CHECKS
+    CHECKS += 1
+    lp = mklog(["nothing here\n"])
+    o, e, rc = run_cli([lp, "4"])
+    if "REFUSE: no pass lines matched" not in o:
+        FAIL.append("cli/refusal: the refusal did not reach stdout: out=%r err=%r" % (o, e))
+    if rc != 1:
+        FAIL.append("cli/refusal: exit status %r, expected 1 -- a refusal that exits 0 "
+                    "reads as success to every caller" % rc)
+    if "Traceback" in e:
+        FAIL.append("cli/refusal: the refusal escaped as a traceback:\n%s" % e)
 
 
 def t_usage_exits():
@@ -502,13 +532,19 @@ def t_coverage_population_is_not_vacuous():
                     "refusal is outside the coverage population again (finding 7)")
 
 
-def t_union_has_no_false_demand():
-    """The union costs nothing HERE, and that is re-derived rather than assumed.
+def t_projectors_return_only_their_accumulator():
+    """A projector must return the NAME it accumulated into, never a list display.
 
-    The shape half would be a false-demand generator in a module whose normal paths
-    return list displays. In this one they do not: the projectors accumulate into `out`
-    and return the NAME. This fails if that stops being true, which is the honest form --
-    the cost of the union is measured each run instead of priced once.
+    This used to be half of the coverage predicate, and that was wrong for the reason the
+    peer identified: a list display returned from a NORMAL path was reported as an
+    uncovered early exit, so the remedy a reader was pointed to was "add a plant" -- which
+    would certify a normal path as an error exit and make the false positive permanent.
+    Over-matching and a missing plant need different messages because they need opposite
+    fixes, so this is its own check with its own diagnosis, outside the ratio.
+
+    `return ["..."]` from a projector is now EITHER an error exit written as a return
+    (which must call _refuse and raise instead) OR a malformed report; _report's invariant
+    catches the second at runtime and this catches both statically.
     """
     global CHECKS
     CHECKS += 1
@@ -516,18 +552,44 @@ def t_union_has_no_false_demand():
     bad = []
     for f in _projectors(t):
         for n in ast.walk(f):
-            if isinstance(n, ast.Return) and isinstance(n.value, ast.List) and n.value.elts:
-                # An error exit either calls the sink or is a non-sink exit we want flagged.
-                calls = [c for c in ast.walk(n.value) if isinstance(c, ast.Call)]
-                names = set(c.func.id for c in calls if isinstance(c.func, ast.Name))
-                if "_refuse" not in names and not any(
-                        isinstance(e, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call))
-                        for e in n.value.elts):
-                    bad.append(n.lineno)
+            if isinstance(n, ast.Return) and not isinstance(n.value, ast.Name):
+                bad.append((f.name, n.lineno, type(n.value).__name__))
     if bad:
-        FAIL.append("union/false-demand: list displays returned from a projector that are "
-                    "not error exits, at %s -- the shape half now demands plants for "
-                    "normal paths and its justification needs re-reading" % bad)
+        FAIL.append("projector-return: %s -- a projector returns its accumulator; an "
+                    "error exit must call _refuse() (which raises), and a returned list "
+                    "display is either that mistake or a malformed report. This is NOT a "
+                    "missing plant and adding one would make the defect permanent" % bad)
+
+
+def t_refuse_raises_and_is_the_only_abnormal_exit():
+    """The population is complete over abnormal terminations BY CONSTRUCTION, not by a
+    convention: `_refuse` raises, so an abnormal exit is a raise and a returned string is
+    a report line. Checked, because that is the claim the whole predicate now rests on."""
+    global CHECKS
+    CHECKS += 1
+    try:
+        pfs_eta._refuse("probe %d", 1)
+    except pfs_eta._Refuse as e:
+        if not str(e).startswith("REFUSE: probe 1"):
+            FAIL.append("refuse-raises: raised _Refuse with the wrong message: %r" % str(e))
+    except Exception as e:                                  # noqa: BLE001
+        FAIL.append("refuse-raises: raised %s, not _Refuse" % type(e).__name__)
+    else:
+        FAIL.append("refuse-raises: _refuse() RETURNED instead of raising, so a refusal "
+                    "is a value again and the population is back to being a convention")
+    CHECKS += 1
+    t = ast.parse(open(TARGET).read())
+    raisers = set()
+    for f in ast.walk(t):
+        if isinstance(f, ast.FunctionDef):
+            for n in ast.walk(f):
+                if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) \
+                        and isinstance(n.exc.func, ast.Name) and n.exc.func.id == "_Refuse":
+                    raisers.add(f.name)
+    if raisers != {"_refuse"}:
+        FAIL.append("refuse-raises: _Refuse is raised from %s -- it must be raised only "
+                    "by _refuse, or the call sites are no longer the population"
+                    % sorted(raisers))
 
 
 def t_refuse_wrapper_convention():
@@ -580,8 +642,24 @@ def t_report_guard_is_loud():
     else:
         FAIL.append("report-guard: _report() joined a bare string instead of refusing")
     CHECKS += 1
-    if pfs_eta._report(["a", "b"]) != "a\nb":
+    good = ["  estimator: ...", "  PROJECTED FINISH 00:10:00"]
+    if pfs_eta._report(good) != "\n".join(good):
         FAIL.append("report-guard: _report() broke the normal list case")
+    # THE REPORT INVARIANT. A projector could still return a list whose CONTENT is an
+    # error message -- `return ["cannot project against 99 rounds"]` is a structurally
+    # normal return and printed as a one-line report at exit status 0. My own plant above
+    # used ["a", "b"] and the invariant caught it, which is the guard firing on its own
+    # input rather than on a constructed one.
+    for bad, why in ((["  a", "  b"], "no estimator line"),
+                     (["  estimator: x", "  landed 1 of 2"], "neither projects nor says why")):
+        CHECKS += 1
+        try:
+            pfs_eta._report(bad)
+        except TypeError:
+            pass
+        else:
+            FAIL.append("report-invariant: _report() accepted a report with %s: %r"
+                        % (why, bad))
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
@@ -591,14 +669,23 @@ def main():
     sys.settrace(_tracer)
     try:
         for fn in TESTS:
-            fn()
+            # A plant that CRASHES must become a named failure, not kill the run. An
+            # ablation that made _refuse return instead of raise took the corpus down
+            # with "ValueError: max() iterable argument is empty" from a later line in
+            # the projector -- zero FAIL lines, which `grep -c FAIL` reports as 0 and a
+            # reader reports as "the corpus is blind to this". Same false zero both peers
+            # hit this morning, reached from a third direction.
+            try:
+                fn()
+            except Exception as e:                                   # noqa: BLE001
+                FAIL.append("%s CRASHED: %s: %s" % (fn.__name__, type(e).__name__, e))
     finally:
         sys.settrace(None)
     want = early_exits()
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
     print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
-          "(union: sink call sites, returned list displays, sys.exit)" % (len(TESTS), CHECKS, len(want)))
+          "(_refuse call sites -- it raises -- plus sys.exit)" % (len(TESTS), CHECKS, len(want)))
     print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:
