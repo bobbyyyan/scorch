@@ -109,3 +109,21 @@ real partial log, where it reads plan 6, headers 4, landed 4 and refuses as inco
 The planted cases that fire it: all six passes in the same order (aa second 0, bb second 6); a
 landed order that differs from declarations which agree with each other; and five passes instead of
 six. The second of those is the one a declaration-only check cannot see.
+
+## 6. The three rotation regexes are disjoint, checked mechanically
+
+Stated because a parser that applies three patterns to every line without `continue` could have one
+line counted twice, and eyeballing the prefixes is not a check. On chain207's sealed log the three
+patterns match 6, 6 and 12 lines, no line is matched by more than one, and the three line sets are
+pairwise disjoint. The peer session's independent parse returns the same three counts.
+
+## 7. The declared-versus-derived rule, corrected to plan-versus-record
+
+The peer session proposed "prefer a declared field to a derived one" with the closing clause "a
+derivation can only lose information the declaration already has". That clause is false for this
+artefact: both declarations are printed from the schedule variable *before* the pass body runs, so
+they are a plan and carry no evidence about what the script did. The corrected form, theirs after
+my narrowing, is a plan-versus-record distinction: **a declaration that precedes the event cannot
+be preferred to the record; one that postdates it can.** The pairing clause — require them to agree
+— carries the value either way, and it is what catches a script that did not run its own plan.
+chain207's `PROVENANCE.md` already stated the convention at lines 12-13.
