@@ -103,6 +103,73 @@ def t_refuses_a_degenerate_call():
             FAIL.append("%s: did NOT raise" % label)
 
 
+def _mixed_population():
+    """One cell of each kind, so an equivalence check has something to disagree about."""
+    by = {"ship": grid(n=6), "shpb": grid(n=6), "strm": grid(n=6), "nopf": grid(n=6)}
+    # m0: every arm slower -> denominator too fast, binding = min = 1.30
+    for a, r in (("shpb", 1.30), ("strm", 1.44), ("nopf", 1.55)):
+        by[a][("m0", 8)] = r
+    # m1: every arm faster -> denominator too slow, binding = 1/max = 1/0.40 = 2.50
+    for a, r in (("shpb", 0.25), ("strm", 0.40), ("nopf", 0.31)):
+        by[a][("m1", 8)] = r
+    # m2: arms straddle 1 -> shared at no threshold, binding = 1.0 even though an arm reads 1.5
+    for a, r in (("shpb", 0.50), ("strm", 1.50), ("nopf", 1.05)):
+        by[a][("m2", 8)] = r
+    return by
+
+
+def t_binding_is_the_threshold_where_shared_tail_flips():
+    """Tie the new quantity to the existing detector MECHANICALLY, not by restating its rule.
+
+    For thr >= 1, `cell in shared_tail(thr)` must equal `binding(cell) > thr`. Checked over a
+    threshold grid that straddles all three cells' binding values, so each cell crosses.
+    """
+    by = _mixed_population()
+    b = S.binding_thresholds(by, "ship")
+    eq("binding-fast", round(b[("m0", 8)], 6), 1.30)
+    eq("binding-slow", round(b[("m1", 8)], 6), 2.5)
+    eq("binding-straddle", b[("m2", 8)], 1.0)
+    disagree = []
+    for thr in (1.01, 1.2, 1.29, 1.30, 1.31, 1.5, 2.0, 2.49, 2.5, 2.51, 3.0):
+        inset = set(S.shared_tail(by, "ship", thr))
+        predicted = {c for c, v in b.items() if v > thr}
+        if inset != predicted:
+            disagree.append((thr, sorted(inset), sorted(predicted)))
+    eq("binding-flips-where-shared_tail-flips", disagree, [])
+
+
+def t_the_max_arm_ratio_form_is_not_equivalent():
+    """ABLATION: the form I published twice disagrees, so the check above is not vacuous.
+
+    `max(rs) if min(rs) > 1 else 1/min(rs)` ignores whether the cell is SHARED. On the
+    straddling cell it claims reach 2.0 -- a threshold at which the cell is in no tail at all.
+    """
+    by = _mixed_population()
+
+    def wrong(rs):
+        return max(rs) if min(rs) > 1.0 else 1.0 / min(rs)
+
+    rs = (0.50, 1.50, 1.05)
+    eq("ablation-wrong-value", wrong(rs), 2.0)
+    eq("ablation-right-value", S.binding(rs), 1.0)
+    thr = 1.5
+    eq("ablation-cell-not-shared", ("m2", 8) in S.shared_tail(by, "ship", thr), False)
+    eq("ablation-wrong-would-claim-shared", wrong(rs) > thr, True)
+    eq("ablation-right-agrees", S.binding(rs) > thr, False)
+
+
+def t_binding_refuses_an_empty_arm_list():
+    """Own input: no arms is not a binding threshold of 1, it is unanswerable."""
+    global CHECKS
+    CHECKS += 1
+    try:
+        S.binding([])
+    except ValueError:
+        pass
+    else:
+        FAIL.append("binding-empty: did NOT raise")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
@@ -117,7 +184,7 @@ def main():
     for f in FAIL:
         rc = 1
         print("  FAIL " + f)
-    if CHECKS < 14:
+    if CHECKS < 24:
         rc = 1
         print("  REFUSE: only %d assertions ran" % CHECKS)
     print("  " + ("OK" if rc == 0 else "FAILED"))

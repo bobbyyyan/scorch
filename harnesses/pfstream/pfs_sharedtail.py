@@ -57,10 +57,17 @@ def shared_tail(by_arm, denom, thr=1.20):
 def sensitivity(by_arm, denom, thrs=(1.05, 1.10, 1.20, 1.50, 2.0)):
     """Counts across thresholds, two-sided beside one-sided.
 
-    A bare "1 of 2926 cells" is uninformative if the threshold was unreachable elsewhere, and
-    on that screen every width except one had a maximum below thr=2.0 -- so the count was
-    partly a property of the threshold. Reporting the sweep is what makes a small count mean
-    something, and pairing it with the one-sided count keeps the blind tail visible.
+    A bare "1 of 2926 cells" is uninformative if the threshold was unreachable elsewhere, so
+    the count is partly a property of the threshold. Reporting the sweep is what makes a small
+    count mean something, and pairing it with the one-sided count keeps the blind tail visible.
+
+    HOW FAR THE THRESHOLD REACHES IS `binding`, NOT A MAXIMUM ARM RATIO. An earlier version of
+    this docstring said "every width except one had a maximum below thr=2.0". That was computed
+    with the one-sided form, which cannot see a cell whose binding arm is BELOW 1, and it is
+    also the wrong quantity -- a maximum arm ratio says nothing about whether the cell is shared.
+    Re-derived with `binding` on the f64 screen's round 1 (418 SuiteSparse keys, seven widths):
+    TWO widths have a cell binding above 2.0, k=10 at 20.178x and k=16 at 8.960x, and every
+    other width's largest binding is at most 1.122x.
     """
     rows = []
     for thr in thrs:
@@ -68,3 +75,41 @@ def sensitivity(by_arm, denom, thrs=(1.05, 1.10, 1.20, 1.50, 2.0)):
         one = sum(1 for cell, v in two.items() if v[0] == "denominator-too-fast")
         rows.append((thr, len(two), one, sorted({k for _key, k in two})))
     return rows
+
+
+def binding(rs):
+    """The LARGEST thr at which a cell with these arm ratios is still excluded.
+
+    `shared_tail` asks a yes/no question at one threshold; this reports the threshold at which
+    the answer flips, which is what a sweep's shape is made of. The two are tied by a property
+    the selftest checks mechanically rather than restating: for thr > 1 -- the domain
+    `shared_tail` accepts -- a cell is in `shared_tail(thr)` if and only if
+    `binding(rs) > thr`.
+
+    `min(rs) > thr` needs thr < min(rs); `max(rs) < 1/thr` needs thr < 1/max(rs). A cell whose
+    arms straddle 1 is shared at no thr > 1, so its binding threshold is 1 -- NOT its largest
+    arm ratio. Taking a max arm ratio instead is the error this function exists to stop: it
+    ignores whether the cell is shared at all, so it overstates, and it was published twice.
+    """
+    if not rs:
+        raise ValueError("binding() needs at least one arm ratio; got none")
+    if min(rs) > 1.0:
+        return min(rs)
+    if max(rs) < 1.0:
+        return 1.0 / max(rs)
+    return 1.0
+
+
+def binding_thresholds(by_arm, denom):
+    """{cell: binding} over every cell the denominator and all arms share."""
+    cells = set(by_arm[denom])
+    for a in by_arm:
+        cells &= set(by_arm[a])
+    arms = [a for a in by_arm if a != denom]
+    out = {}
+    for cell in cells:
+        d = by_arm[denom][cell]
+        if d <= 0:
+            continue
+        out[cell] = binding([by_arm[a][cell] / d for a in arms])
+    return out
