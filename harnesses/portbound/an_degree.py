@@ -284,9 +284,9 @@ def main():
             print()
             print("  FLOOR QUALITY: %d degree(s) have an A/A floor above 0.5%%: %s"
                   % (len(bad), ", ".join("n=%d %.3f%%" % (n, f * 100) for n, f in bad)))
-            print("  The peer simulated n* against noise: at 0.075%% the interquartile range is")
-            print("  [4.45, 4.95] around a truth of 4.71, at 0.5%% it is [2.98, 6.30], and at 2%% it")
-            print("  CROSSES ZERO. So a degree whose own floor is above 0.5%% contributes an")
+            print("  The peer simulated n* against noise: at 0.075% the interquartile range is")
+            print("  [4.45, 4.95] around a truth of 4.71, at 0.5% it is [2.98, 6.30], and at 2% it")
+            print("  CROSSES ZERO. So a degree whose own floor is above 0.5% contributes an")
             print("  interval wider than the answer, and n* below should be read as a direction")
             print("  rather than a number.")
         else:

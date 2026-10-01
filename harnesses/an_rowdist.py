@@ -85,7 +85,7 @@ def main():
               % (t, rows_below[t], 100.0 * rows_below[t] / tot_rows, nnz_below[t],
                  100.0 * nnz_below[t] / tot_nnz))
     print()
-    print("  THE PER-ROW EXPOSURE is the '%% of nnz' column: the share of the collection's")
+    print("  THE PER-ROW EXPOSURE is the '% of nnz' column: the share of the collection's")
     print("  arithmetic that a per-row guard sends to the fallback and that therefore gets no")
     print("  speedup. It is NOT a regression -- those rows run exactly today's kernel.")
     print()
