@@ -149,7 +149,19 @@ with open(DIMS) as h:
     rdr = csv.reader(l for l in h if not l.startswith("#"))
     ix = {n: i for i, n in enumerate(next(rdr))}
     for row in rdr:
-        J[row[ix["key"]]] = (int(row[ix["rows"]]), int(row[ix["cols"]]), int(row[ix["nnz"]]))
+        kk = row[ix["key"]]
+        v = (int(row[ix["rows"]]), int(row[ix["cols"]]), int(row[ix["nnz"]]))
+        # A REPEATED KEY IN THE DIMS FILE IS THE ONE THING NOT CHECKED ANYWHERE. Assignment into
+        # a dict silently keeps the LAST occurrence, so a file carrying a key twice with different
+        # cols would join a J value that no line of the file announces as authoritative, and every
+        # downstream coefficient would be computed from it. The board's own key count is pinned
+        # separately, so the dims file's SIZE needs no assertion -- a larger dims file covering
+        # more of the collection joins correctly and is harmless -- but a contradictory duplicate
+        # inside it is not harmless and is invisible.
+        if kk in J and J[kk] != v:
+            sys.exit("REFUSE: dims file gives %s two different rows/cols/nnz, %s and %s; a dict "
+                     "assignment would silently keep the last" % (kk, J[kk], v))
+        J[kk] = v
 miss = [k for k in keys if k not in J]
 if miss:
     sys.exit("REFUSE: %d key(s) absent from the dims join; a partial join is invisible in every "

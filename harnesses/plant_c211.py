@@ -114,6 +114,37 @@ def m_arm(d):
     f = os.path.join(d, "dl_deep_float32_p5.csv"); L = open(f).readlines()
     L[3] = L[3].replace(",mkl,", ",mkx,", 1)
     open(f, "w").writelines(L)
+def m_dimsrows(d):
+    # The DIMS-DISAGREEMENT guard: the board against the dims file, as distinct from the
+    # cross-file META guard (one object-pass against another). This is the only check standing
+    # between a wrong dims file and every coefficient downstream of the join, and it was credited
+    # as covered by a plant that cannot reach it. Synthesised rather than taken from an attested
+    # wrong copy on purpose: a plant's job is to trip a guard reproducibly from this repo, and a
+    # generated input makes the test runnable by anyone without fetching an artefact.
+    pass   # the mutation is in the dims override, not the tree
+
+def m_keycount(d):
+    # The peer's construction, and it refutes my dominance claim. Drop one key's 15 rows and add
+    # key X with 10 cells (five widths x {ours, oursb}) plus key Y with 5 cells (five widths x
+    # {mkl}). Row count stays 57300, every (key,k,arm) is unique, every width is present, and the
+    # arm set is exactly the three -- X supplies ours and oursb, Y supplies mkl. So uniqueness +
+    # row count + k-subset + missing-width + arm-set ALL pass at 3822 keys. Row count and
+    # uniqueness bound #keys from BELOW (>= 3820); only the distinct-key guard pins it.
+    f = os.path.join(d, "dl_base_float32_p1.csv")
+    L = open(f).readlines()
+    victim = KEYS[7][0]
+    kept = [l for l in L[1:] if l.split(",")[2] != victim]
+    assert len(L) - 1 - len(kept) == 15, "expected to drop exactly 15 rows"
+    nr, nnz = KEYS[7][1], KEYS[7][3]
+    add = []
+    for k in KS:
+        for a in ("ours", "oursb"):
+            add.append("base,x,SYNTH_X,%d,%d,%d,1.0,%s,1.0,1\n" % (k, nr, nnz, a))
+    for k in KS:
+        add.append("base,x,SYNTH_Y,%d,%d,%d,1.0,mkl,1.0,1\n" % (k, nr, nnz))
+    assert len(add) == 15, len(add)
+    open(f, "w").writelines([L[0]] + kept + add)
+
 def m_blank(d):
     # Reaches the POST-PARSE row check, which the pre-read line count cannot: a blank line keeps
     # the line count at 57301 while csv.DictReader skips it, so parsed rows come out one short.
@@ -135,9 +166,28 @@ PLANTS = [
     ("repeated cell",              m_repeat,  "repeats cell", None),
     ("k outside KS",               m_badk,    "outside the declared", None),
     ("wrong arm name",             m_arm,     "arm set is", None),
-    ("rows disagree across files", m_meta,    "rows/nnz", None),
+    ("rows disagree across files", m_meta,    "seen earlier", None),
     ("blank line (parsed rows)",   m_blank,   "parsed", None),
+    ("key count 3822 (peer's)",    m_keycount, "distinct keys", None),
 ]
+
+# A dims file carrying one key twice with CONTRADICTORY values. Needs its own dims override, so
+# it is appended after PLANTS is built, like the collinearity and partial-join plants.
+_dupdims = os.path.join(work, "dims_dupkey.csv")
+with open(_dupdims, "w") as h:
+    h.write("key,rows,cols,nnz\n")
+    for key, nrow, nc, nnz in KEYS:
+        h.write("%s,%d,%d,%d\n" % (key, nrow, nc, nnz))
+    k3 = KEYS[3]
+    h.write("%s,%d,%d,%d\n" % (k3[0], k3[1], k3[2] + 64, k3[3]))
+PLANTS.append(("dims file repeats a key", lambda d: None, "two different rows/cols/nnz", _dupdims))
+
+_wrongdims = os.path.join(work, "dims_wrongrows.csv")
+with open(_wrongdims, "w") as h:
+    h.write("key,rows,cols,nnz\n")
+    for i, (key, nrow, nc, nnz) in enumerate(KEYS):
+        h.write("%s,%d,%d,%d\n" % (key, nrow + (1 if i == 11 else 0), nc, nnz))
+PLANTS.append(("dims rows disagree w/ board", m_dimsrows, "disagree with the board", _wrongdims))
 
 # A dims file whose J is an EXACT function of rows and nnz, to reach the collinearity refusal.
 coll = os.path.join(work, "dims_collinear.csv")
@@ -186,19 +236,57 @@ if not usage_ok:
     fails.append("no argument: did not refuse")
 
 src = open(ANALYSER).read()
+_sites_pre = re.findall(r'sys\.exit\(\s*"(REFUSE: [^"]*)"', src)
+_sites_pre += re.findall(r'sys\.exit\(\s*"(usage: [^"\\]*)', src)
+# EACH EXPECTATION MUST MATCH EXACTLY ONE SITE. The per-site check below catches a site claimed by
+# two plants; this catches the other two failures it cannot see -- an expectation matching SEVERAL
+# sites (so one plant is credited for a guard it cannot reach, which is what happened with
+# "rows/nnz") and an expectation matching NONE (a stale string left behind when a message is
+# reworded, which would silently drop a plant from the coverage count while it still passes).
+print()
+print("EXPECTATION DISCRIMINATION -- each plant's expected substring must match exactly one of the")
+print("analyser's %d exit messages, so coverage is attributable and survives a rewording:" % len(_sites_pre))
+_bad_exp = []
+for _n, _f, _e, _d in PLANTS:
+    if not _e:
+        continue
+    _hits = [x for x in _sites_pre if _e in x]
+    if len(_hits) != 1:
+        _bad_exp.append((_n, _e, len(_hits)))
+if _bad_exp:
+    for _n, _e, _c in _bad_exp:
+        print("  FAIL  %-30s %r matches %d sites" % (_n, _e, _c))
+        fails.append("expectation %r for %s matches %d sites (need exactly 1)" % (_e, _n, _c))
+else:
+    print("  PASS  all %d expectations match exactly one site each"
+          % sum(1 for _, _, e, _ in PLANTS if e))
+
 sites = re.findall(r'sys\.exit\(\s*"(REFUSE: [^"]*)"', src)
 sites += re.findall(r'sys\.exit\(\s*"(usage: [^"\\]*)', src)
-covered, uncovered = [], []
-for s in sites:
-    if s.startswith("usage:") and usage_ok:
-        covered.append(s); continue
-    if any(expect in s for _, _, expect, _ in PLANTS if expect):
-        covered.append(s)
+covered, uncovered, ambiguous = [], [], []
+for site in sites:
+    if site.startswith("usage:") and usage_ok:
+        covered.append(site); continue
+    hits = [n for n, _, expect, _ in PLANTS if expect and expect in site]
+    if len(hits) == 1:
+        covered.append(site)
+    elif len(hits) > 1:
+        # A substring shared by two refusal messages attributes one plant to both sites and
+        # inflates coverage. This happened: "rows/nnz" appears in the META disagreement message
+        # AND the dims-duplicate message, so adding the second guard made coverage read 15/18
+        # with nothing planted for it. Report rather than count.
+        ambiguous.append((site, hits))
     else:
-        uncovered.append(s)
+        uncovered.append(site)
 print()
 print("COVERAGE, derived from the analyser's own sys.exit sites rather than a list written here:")
-print("  %d refusal sites; %d covered by a plant, %d not" % (len(sites), len(covered), len(uncovered)))
+print("  %d refusal sites; %d covered by exactly one plant, %d ambiguous, %d not"
+      % (len(sites), len(covered), len(ambiguous), len(uncovered)))
+for site, hits in ambiguous:
+    print("    AMBIGUOUS  %s" % site[:70])
+    print("               matched by %d plants (%s) -- substring is not discriminating"
+          % (len(hits), ", ".join(hits)))
+    fails.append("coverage substring for %s matches %d sites" % (hits, len(hits)))
 for s in uncovered:
     print("    UNCOVERED  %s" % s[:92])
 print("  The remainder are UNREACHABLE rather than untested, and the argument is given so the")
@@ -206,11 +294,16 @@ print("  claim can be checked rather than believed:")
 print("    * 'log degree did not read collinear' is a code-integrity check -- degree is computed")
 print("      as log nnz - log rows, so it is collinear by construction and only a broken analyser")
 print("      can trip it. No input reaches it.")
-print("    * the distinct-key count and the missing-width check are both DOMINATED by cell")
-print("      uniqueness. A key can hold at most 5 widths x 3 arms = 15 unique cells, and")
-print("      3820 x 15 = 57300 exactly, so once the row count and uniqueness both hold, every")
-print("      key must carry all five widths and all three arms. Fewer keys, or a key missing a")
-print("      width, forces a duplicate cell and refuses earlier. Unreachable, not untested.")
+print("    * the missing-width check is dominated, but ONLY GIVEN the distinct-key guard, and")
+print("      the premise has to be stated because an earlier version of this argument got it")
+print("      wrong. Row count plus uniqueness bounds the key count from BELOW only: a key holds")
+print("      at most 15 unique cells, so 57300 unique cells force #keys >= 3820, NOT == 3820,")
+print("      because a key may carry fewer than 15. Once #keys == 3820 is separately asserted,")
+print("      15 cells per key is forced and every key must then carry all five widths and all")
+print("      three arms -- so missing-width cannot fire. The distinct-key guard is therefore")
+print("      LOAD-BEARING rather than redundant, and it is planted above (3822 keys) rather")
+print("      than argued away: that plant passes uniqueness, row count, k-subset, missing-width")
+print("      and arm-set, and is caught by nothing else.")
 
 print()
 if fails:
