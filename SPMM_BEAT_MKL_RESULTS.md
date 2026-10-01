@@ -41866,3 +41866,80 @@ the reuse ratio belongs beside any ceiling ratio. (And my "1.200 -> 16.6%" was d
 **A count correction in the other direction.** The checker reported 6472 .smtx files locally. There
 are **3846** -- 2716 transformer and 1130 rn50 -- which is exactly the row count of chain209's
 sealed table, so that table is complete for DLMC and nothing is missing from it.
+
+## 382. chain210 landed: the pre-registered replication test is VOID, and chain207's board is the contaminated one
+
+Sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain210-dlmc-replicate-redwood`, manifest
+`SHA256SUMS.sha256` digest `ea37381b7c3e269866bea7342fcef10cb84147d0b8ab689a2300d3c25e2a73e9`,
+25 entries, 25 OK / 0 FAILED. Producing-host manifest 15 OK / 0 FAILED. Twelve object-passes,
+23:38:48 to 04:08:53 PDT, rotation `aabb bbaa aabb bbaa aabb bbaa` verified from three independent
+sources plus a fourth the peer session found (the CSV mtimes survived the tarball and sort into the
+declared order). Analyzer pinned at `9c42d96123ce3560`, predating **10 of 12** object-passes.
+
+**P4 failed, which voids P0-P3 by the pre-registration's own terms.** P4 is an assay-validity check
+requiring the pooled per-width median `ours/mkl` to reproduce between runs within 2%. Worst
+deviation **4.34%** (k=32), 4.09% at k=16. So no replication verdict is available: the raw P0
+reading was intersection 0, Jaccard 0.0000, chain207's 10 cells against chain210's 22, and P1 would
+have read "0 of 10 survivors -- essentially selection on noise" -- but a global shift produces 0
+survivors just as noise does, which is exactly why P4 gates them.
+
+**The failure decomposes onto our side, not MKL's.** Absolute per-call medians, microseconds:
+
+| k | ours 207 | ours 210 | d% | mkl 207 | mkl 210 | d% |
+|---|---|---|---|---|---|---|
+| 2 | 13.53 | 13.34 | -1.35% | 15.29 | 15.21 | -0.56% |
+| 4 | 13.75 | 13.51 | -1.73% | 14.82 | 14.78 | -0.28% |
+| 8 | 14.58 | 14.53 | -0.38% | 15.74 | 15.81 | +0.45% |
+| 16 | 14.81 | 14.40 | -2.77% | 18.14 | 18.33 | +1.06% |
+| 32 | 16.81 | 16.05 | -4.47% | 22.69 | 22.94 | +1.08% |
+
+Our kernel is faster in chain210 at every width; MKL moves the other way at k >= 8. The machine code
+is byte-identical (bound by digest), and a machine-wide effect would move both arms together.
+
+**A within-chain diagnostic identifies chain207 as contaminated -- EXPLORATORY, not registered.**
+Pearson of each pass's wall time against its own `ours/mkl`, 12 passes per chain, critical |r| =
+0.576:
+
+| k | chain207 r | slope %/100s | chain210 r | slope %/100s |
+|---|---|---|---|---|
+| 2 | **0.790** | +4.01 | -0.001 | -0.04 |
+| 4 | -0.045 | -0.26 | 0.073 | +3.36 |
+| 8 | 0.411 | +1.95 | -0.055 | -1.50 |
+| 16 | **0.958** | +8.30 | -0.349 | -7.46 |
+| 32 | **0.878** | +11.57 | -0.406 | -12.30 |
+
+chain207's pass times span 3.87% (1370-1423 s), chain210's 0.67% (1346-1355 s); CV 1.020% against
+0.250%. Three of five widths clear critical in chain207, none in chain210, and the pattern is
+structured -- the two widest plus k=2, monotone slopes. chain207's k=32 slope extrapolated across
+the 62 s median-wall difference predicts a 7.2% ratio shift against **4.32% observed**: same sign,
+same order, from an independent within-chain quantity. Three limits are recorded in
+`PROVENANCE.md`: not pre-registered; the five widths share the same twelve passes so the nominal
+p ~ 0.0012 is optimistic; and no cause is identified -- "a time-varying perturbation hurting us more
+than MKL at wide k" is consistent with every number and is still a story.
+
+**What chain210 establishes on its own, needing no cross-chain pairing.** Pooled median `ours/mkl`
+below 1 at every width: **0.8815 / 0.9130 / 0.8676 / 0.7596 / 0.7101**. And **22 of 19100 cells
+(0.115%) behind MKL beyond chain210's own per-width floor on both byte-identical builds, by width
+2 / 19 / 1 / 0 / 0** -- so **k=4 carries 19 of 22, 86%**, up from chain207's 8 of 10. chain210's
+floors are 25-34% tighter (0.1955/0.2118/0.2196/0.1974/0.2222 against
+0.2607/0.2783/0.2858/0.3010/0.2960), which is *why* the cleaner run finds more cells: a tighter
+floor makes the test more sensitive, so a larger count here is not a worse result.
+
+**Occupancy, from this chain's own snapshots, and a retraction.** Four boundary-triggered
+`/proc/stat` snapshots give three single object-passes and the three-pass interval at **8.651 /
+8.447 / 8.481 / 8.526 busy cores of 24** (35.2-36.0%), `T_E/T_P` stripped 2.1937-2.2198 -- a 2.4%
+and 1.2% spread where six 10-second windows spanned 2.9x and 38%. Matched to chain210's own CSVs
+with `reps` attested from the live process, **kernel calls are 90.6% of a pass**, remainder 9.4%,
+in-kernel occupancy **6.913-9.310 of 24 (28.8-38.8%)**, ceiling **2.58-3.47x**.
+
+That retires a bound two sessions had published: that at most `0.223 x 24 = 5.35` core-equivalents
+could come from timed calls against 8.651 busy, so >= 3.30 cores lay outside them. The 21-22% was
+`sum(ms x batch)/wall`, which omits `reps` -- `timeit` returns a per-call time, so that product is
+ONE batch and the loop runs four. **The occupancy deficit is inside the kernel calls**, which is
+where the port-boundedness probe was already aimed.
+
+**Also closed this round: OpenMP team startup is not the k=4 lever.** On chain207's ten residues the
+team-width cost (24 x 0.26 us = 6.24 us) is 21.1% of our call, against a k=4 base rate of **45.4%**
+-- a *smaller* fraction on the cells we lose, because the residues are 2-4x the median cell
+(26-58 us against 13.7 us) and sit at the 85th percentile of both degree and nnz. A pool-width gate
+is therefore not the mechanism, and the base rate is what shows it.
