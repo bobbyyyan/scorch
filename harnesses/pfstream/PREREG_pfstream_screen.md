@@ -817,3 +817,35 @@ corpus the **fused** cell will run on and is absent from the one the **screen** 
 is not a defect in the screen; it is a statement about which corpus can test the mechanism, and it
 means a flat screen result is weaker evidence against the mechanism than a flat DLMC result would
 be. The 418-key SuiteSparse sample's own reach distribution is unmeasured and is item 1 above.
+
+## Amendment 15 — the dark-row rate is parametric in B, and the faithful B is the one that darkens the check
+
+Registered 2026-10-01, before any fused timing number exists. Measured by the peer session on the
+512x512 DLMC matrix with signed `A` values, over its 274 non-empty rows: the rate at which a whole
+row goes dark under relu, against `0.5^k`, which is what independent per-output signs would give.
+
+| B | k=2 | k=8 | k=32 |
+|---|-----|-----|------|
+| uniform[0,1) — what `pfs_bits_fused.py` uses | 0.4562 | 0.3358 (86x `0.5^8` = 0.0039) | 0.2920 |
+| standard normal (signed) | 0.2153 | 0.0000 | 0.0000 |
+
+The ELEMENTWISE negative rate is 0.49–0.52 in every case, so the entire excess is within-row
+correlation. **It collapses to zero with a signed B**, which locates the cause in B's
+non-negativity and not in the matrix: with `B >= 0` a row's `k` outputs are all non-negatively
+weighted sums of the same `A[i,:]`, so a row whose values lean negative goes dark across the whole
+width. My earlier claim that the dark-row rate is "structural, not a parameter" is correct about
+`--bias-scale` (it moves nemeth24 from 49.5% to 49.2%) and **wrong as a general statement**: the
+rate is parametric in B, and B is a harness choice that this pre-registration had not declared.
+
+**The declaration, and it is a trade rather than a knob.** A non-negative B is the FAITHFUL choice
+for this kernel, because the fused Linear's input in production is post-activation values from a
+preceding relu. So the modelling decision that makes the benchmark realistic is the same decision
+that makes ~37% of its output unverifiable by a tolerance check. The harness keeps the faithful B
+and closes the verification gap on the other axis — the dark-row gate asks whether a `(problem,
+width)` was verified by SOME activation, and identity is strong exactly where relu is weak.
+
+**The wrong fix is named here so it is not available later.** On seeing a dark-row refusal the
+instinct is to switch B to a signed distribution. That makes the check pass and the workload wrong,
+and nothing downstream would record that the inputs no longer resemble a layer's input. If a future
+run needs a signed B it must be declared as a separate arm with its own label, never as a repair to
+a refusal. `pfs_bits_fused.py` therefore does not expose a B-distribution flag.
