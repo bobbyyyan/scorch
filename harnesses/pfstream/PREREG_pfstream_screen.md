@@ -1097,3 +1097,88 @@ the arm effect — it strengthens the floor interpretation of a quantity that re
 because correction 1 shows there is no offset to subtract. "Diverges" does not establish an arm
 effect either; it identifies a width where object and arm displacement differ in a way the floor
 alone does not explain, which is a reason to build the next design's floor, not a result.
+
+## Amendment 19 — the registered comparison is INVALID, because the floor fails it too
+
+Computed 2026-10-01 at 12:40, criterion and controls fixed at `c19277d` beforehand. The outcome
+is that **the test cannot discriminate what it was registered to discriminate**, and the evidence
+is in the test's own output.
+
+### The verdicts, reported in full including the indeterminate ones
+
+Per-band index matrix digests, required to differ and they do: `927f8b94ef5d5d25`,
+`c629d7ba634f1818`, `03fa42a6f80d81dc`, `6319e2d983008d22`.
+
+| build | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|
+| `strm` | DIVERGES (0/4 in) | DIVERGES (0/4) | DIVERGES (0/4) | DIVERGES (0/4) |
+| `nopf` | DIVERGES (0/4) | DIVERGES (0/4) | DIVERGES (0/4) | DIVERGES (0/4) |
+| **`shpb` — the floor** | **INDETERMINATE (2/4)** | **DIVERGES (2/4)** | **INDETERMINATE (1/4)** | **DIVERGES (1/4)** |
+
+**`shpb` is two objects with byte-identical `.text`. There is no arm in it at any width.** It
+diverges from its own k=2 band profile at k=8 and k=32, and is indeterminate at k=4 and k=16.
+A test its own no-effect case fails is not a test, so `strm` and `nopf` diverging says nothing
+about either arm.
+
+### The positive control passed, which makes the failure diagnostic rather than fatal-and-vague
+
+Injecting +2.0% returned DIVERGES in **12 of 12** cells. So the test is **not underpowered — it
+is measuring the wrong quantity.** That distinction is the useful part: a passing positive
+control beside a failing negative control says *misdirected*, where two failing controls would
+only have said *insensitive*.
+
+### What it actually measures, and the floor number that shows it
+
+Comparing a k≥4 band profile against a k=2 band profile tests whether the band profile is
+**width-stable**. The floor's is not. `shpb/ship` per-band medians, in percent — a property of
+the instrument and not a reading of either arm:
+
+| k | 0–1e4 | 1e4–1e5 | 1e5–1e6 | 1e6–1e7 |
+|---|---|---|---|---|
+| 2 | +0.257 | −0.538 | −0.064 | −0.170 |
+| 4 | +0.312 | −0.763 | −0.482 | −0.445 |
+| 8 | +0.270 | **−1.489** | −0.800 | −0.370 |
+| 16 | +0.211 | −0.744 | −0.434 | +0.329 |
+| 32 | +0.190 | −0.889 | −0.629 | +0.037 |
+
+Largest absolute floor band displacement **1.489% at k=8, band 1e4–1e5**. Width-to-width swing
+*within* a band, on byte-identical code: **0.951 pp** (1e4–1e5), 0.775 pp (1e6–1e7), 0.737 pp
+(1e5–1e6), 0.122 pp (0–1e4). A criterion requiring the k≥4 profile to sit inside the k=2 profile
+demands a stability the floor does not have.
+
+### My error, and it is a registration error rather than an analysis one
+
+**I registered the positive control and not the negative one.** Amendment 18 fixed the criterion,
+the statistic, the intervals and an injected-effect control — and never asked whether the floor
+arm passes the criterion when no effect is present. That check needed no new data and no new run:
+`shpb`'s width profile was already in the same CSVs. The house rule is that a guard must fire on
+its own input and a control must sit inside the population it certifies; the corresponding rule
+for a *criterion* is that **both** controls belong in the registration, because a criterion the
+no-effect case fails produces a confident verdict on every arm.
+
+Registering the criterion first was still right — it is why this is reportable as a method
+failure instead of being quietly reshaped around the numbers.
+
+### Registered for the f64 replication, not applied here
+
+The floor's displacement is bounded in this run: **no floor band at any width exceeds 1.489% in
+absolute value.** That suggests a magnitude criterion rather than a shape one, and it is
+registered for job 17681665 — whose data does not exist yet — rather than applied to data already
+seen:
+
+* **Statistic**: per-band median `|num/ship − 1|`, same bands, same within-band bootstrap form.
+* **Floor bound**: the maximum over all widths and bands of `|shpb/ship − 1|`, computed from the
+  f64 run's own `shpb`. Never imported from this run — a floor from another run is another run's
+  artefact range.
+* **Criterion**: a band-width cell counts as beyond floor only if its 95% CI lies entirely
+  outside ±(that run's floor bound). Containment, not overlap.
+* **Both controls registered this time.** Positive: an injected effect at the floor bound's
+  magnitude must be detected. **Negative: `shpb` itself must produce zero beyond-floor cells.**
+  If `shpb` produces any, the criterion is invalid for that run and no arm verdict from it is
+  readable — stated now so the outcome cannot be re-labelled later.
+* The f64 k=2 control remains the gate, and it is checked before any of the above.
+
+**Not applied to the f32 screen, and the reason is not caution.** Correction 1 of amendment 18
+shows there is no width-invariant object offset to remove, so even a magnitude comparison on
+this run would compare an arm-plus-artefact quantity against a floor measured on objects that
+differ from the arms in code. The f32 screen's k≥4 numbers stay unreadable.
