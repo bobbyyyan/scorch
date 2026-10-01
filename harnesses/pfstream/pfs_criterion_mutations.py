@@ -220,6 +220,29 @@ def main():
                    "{'<suite-aborted>'} with a nonzero rc; got rc=%s %s"
                    % (rc, sorted(labs)))
 
+    # A GUARD WITH NO CALL SITE CANNOT REFUSE ANYTHING. pfs_rowguard shipped with a docstring
+    # saying "imported by readers" and no importers, so the defect it was written for would
+    # have been read exactly as before. Reported here every run so the same gap in THIS file
+    # is visible rather than implicit. It is not a failure: the criterion's intended call site
+    # is the PFSTREAM screen's own analysis, and that analysis cannot be written before the
+    # f64 cell lands. It becomes a failure the moment that analysis exists without using it.
+    import glob as _g
+    callers = []
+    for f in sorted(_g.glob(os.path.join(HERE, "*.py"))):
+        base = os.path.basename(f)
+        if base in ("pfs_criterion.py", "pfs_criterion_selftest.py",
+                    "pfs_criterion_mutations.py"):
+            continue
+        if "import pfs_criterion" in open(f).read():
+            callers.append(base)
+    print("\ncall sites for pfs_criterion outside its own tests: %d%s"
+          % (len(callers), (" (%s)" % ", ".join(callers)) if callers else ""))
+    if not callers:
+        print("  NOT YET WIRED, and stated rather than left implicit. The intended caller is")
+        print("  the PFSTREAM screen's beyond-floor analysis, which needs the f64 cell's data")
+        print("  to exist. Until then this file tests a criterion nothing applies, so a green")
+        print("  run here does NOT mean any published verdict went through it.")
+
     coll, n_lit, n_par = label_collisions()
     print("label scan: %d literal labels resolved, %d parameterised (helper) and skipped"
           % (n_lit, n_par))
