@@ -251,7 +251,7 @@ a 38% phase span, and the only error in this design that was avoidable for free.
 catch, flagged as time-critical with fourteen minutes to the next boundary.
 
 Re-anchored on the **done-line count incrementing**, not on a clock, since boundary times are
-estimates: `harnesses/pb_snap.sh` (deadline 04:23:15, at most four snapshots, PID recorded so it is
+estimates: `harnesses/pb_snap.sh` (deadline 04:24:05, at most four snapshots, PID recorded so it is
 killed by exact PID and never by a pattern that could match itself) writes a `/proc/stat` snapshot at
 each of the four remaining object-pass completions. That yields a one-pass interval and a three-pass
 interval, both phase-complete. The 02:45:03 read is kept: against a clean interval it is a positive
@@ -291,8 +291,16 @@ of share. The two offsets are **independent draws from [0,15] and do not cancel*
 error is their difference, sd 6.1 s. What is *exactly* removable is the interval length, since
 `epoch_ns` is in every SNAP line and the stage log timestamps each done line to the second, so
 `busy_cores` gets an exact denominator. What is **not** removable by arithmetic is the 0–15 s of the
-next pass's head whose ticks are included; that stays bounded at 0.003 in `T`. Peer session's point,
-with the removable and irremovable parts separated.
+next pass's head whose ticks are included.
+
+That term is smaller than 0.003 because **the two head terms are the same corpus region**:
+snapshot(9) drops `δ9` seconds of the following pass's head and snapshot(10) adds `δ10` seconds of
+the next one's, and a head is a head, so the composition error scales with `|δ10 − δ9|` rather than
+with either offset. For independent draws from [0,15], `E|X − Y| = a/3 = 5.0 s`, so the **expected**
+bias is `0.003 × 5/15 = 0.0010` in `T`, with 0.003 remaining the bound at the maximum difference.
+(The peer session's "about 0.002" reconstructs from neither the mean, 0.0010, nor the sd, 0.0012; the
+direction of the refinement is right regardless.) Peer session's point, with the removable and
+irremovable parts separated.
 
 **The busy definition, stated because the comparison depends on it.** Both the six 10-second windows
 and the poller use `/proc/stat` fields `$2+$3+$4+$7+$8+$9` = user + nice + system + irq + softirq +
@@ -302,12 +310,28 @@ what makes the whole-run figure comparable to the 1.532–2.110 phase span rathe
 quantity. (The voided per-thread instrument used `utime+stime`, fields 14+15 — a different
 definition on a different instrument, already discarded.)
 
-**The deadline fails gracefully and should not read as a cliff.** 04:23:15 is 868 s past the
-observed-pace projection of the last boundary (03:01:17, 03:23:47, 03:46:17, 04:08:47 at 1350 s per
-pass). Against the registered H1 projection it is thinner than the peer session stated: H1 is
-`p1 aa done 00:01:16 + 11 × 1412.5 s = 04:20:13`, so the margin is **182 s**, not 618 — their
-04:12:57 does not reconstruct from the registered form. Either way, if snapshot(12) is lost the
-9→11 interval is still two phase-complete passes.
+**The deadline is 04:24:05, and the authoritative figure was two lines above the prose that got it
+wrong.** `deadline=1790853845` is 2026-10-01 04:24:05 PDT, and it reconstructs from the START line
+quoted in this document: 02:49:05 + 5700 s = 04:24:05. The 04:23:15 first published here implies a
+launch at 02:48:15 — **the dead attempt's time** — carried into the live run's description while the
+correct epoch sat two lines up. Same stale-artefact channel as the START-line check being satisfiable
+by that attempt's output, one layer higher: quote the epoch and derive the wall time from it, since
+the epoch is what the script compares against. Peer session's catch, on two occurrences rather than
+the three they named — their third, line 308, is `04:20:13`, H1's projection, which is a different
+and correct number.
+
+**It fails gracefully and should not read as a cliff.** 04:24:05 is **918 s** past the observed-pace
+projection of the last boundary (03:01:17, 03:23:47, 03:46:17, 04:08:47 at 1350 s per pass) and
+**232 s** past the registered H1 realisation, `p1 aa done 00:01:16 + 11 × 1412.5 s = 04:20:13`. The
+peer session's 04:12:57 was `02:38:47 + 4 × 1412.5`, i.e. the remaining four passes each at H1's
+per-pass rate — which is not H1, because H1 is a statement about the **sum** over eleven passes and
+the first seven came in below it. Reading a per-pass rate off a sum hypothesis is the same class of
+error as reading a work share off a time split.
+
+And the scenario the margin protects is already remote: `sum(2–8)` is observed at **9451 s over 7
+passes, 1350.1 s each** (p1 aa done 00:01:16 to p5 aa start 02:38:47), so H1 now requires
+`sum(9–12) = 6086.5 s`, **1521.6 s per pass, +12.7% on the observed pace**. Either way, if
+snapshot(12) is lost the 9→11 interval is still two phase-complete passes.
 
 Note that this quantity is *not* available from the sealed CSVs — they record per-cell kernel time,
 not per-core-type attribution — so it is the one input that requires a reading taken while the run
@@ -564,6 +588,12 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 11**, digest `f48fa54c981928df` superseded. The deadline is corrected from 04:23:15
+  to 04:24:05 at both occurrences — the wrong value came from the dead launch attempt while the
+  authoritative epoch was quoted two lines above it — so the margins become 918 s and 232 s. The
+  peer session's 04:12:57 is explained as a per-pass reading of a sum hypothesis, and H1 is recorded
+  as now requiring +12.7% on the observed pace. The irremovable poll-offset term is refined to scale
+  with the difference of the two offsets, expected 0.0010 in `T` with 0.003 as the bound.
 - **Amendment 10**, digest `e830770d58098802` superseded. The armed-poller check is replaced by
   three discriminating ones (exactly one START line, `last=8`, timestamp after relaunch), all of
   which pass; the guarded failure mode is shown to be shell-dependent and my own negative control
