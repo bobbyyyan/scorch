@@ -27,6 +27,7 @@ import contextlib
 import datetime
 import io
 import os
+import re
 import runpy
 import shutil
 import sys
@@ -239,6 +240,30 @@ def call(fn, *a, **kw):
         return [str(e)]
 
 
+def _counts_from(text):
+    """(matched, skipped) parsed out of read_mtimes' report line, as INTEGERS.
+
+    Exists because expect() is a substring test and a bare count is a prefix of larger counts.
+    Parsing the number and comparing it is immune to that, and unlike asserting the whole line it
+    does not couple the plant to the message's wording -- only to the `N entries matched` and
+    `N skipped` shapes. Raises if either is absent, so a reworded message fails loudly instead of
+    returning a default that would compare equal to nothing.
+    """
+    m = re.search(r"(\d+) entries matched", text)
+    k = re.search(r"(\d+) skipped", text)
+    if not m or not k:
+        raise AssertionError("read_mtimes report line not found in %r" % text[:200])
+    return int(m.group(1)), int(k.group(1))
+
+
+def _eqi(label, got, want):
+    """Integer equality, for counts. expect() cannot do this and the difference is the finding."""
+    global CHECKS
+    CHECKS += 1
+    if got != want:
+        FAIL.append("%s: got %d, expected %d" % (label, got, want))
+
+
 def expect(label, got, want_sub, want_absent=()):
     """`got` is the projector's line list. Assert a substring present and others absent."""
     global CHECKS
@@ -319,8 +344,15 @@ def t_mt_reports_what_it_skipped_so_an_empty_result_is_not_mistaken_for_no_passe
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         got = pfs_eta.read_mtimes(d, RX)
-    expect("mt/skip-counted", [buf.getvalue()], "2 entries matched")
-    expect("mt/skip-count-nonzero", [buf.getvalue()], "1 skipped")
+    # COUNTS ARE COMPARED AS INTEGERS, NOT AS SUBSTRINGS. expect() is a plain `in` test, so
+    # "1 skipped" is satisfied by "11 skipped" -- and the skipped count's only observable is this
+    # line, because read_mtimes returns `out` alone. So the substring was its SOLE catcher and was
+    # prefix-ambiguous, bounded not by the assertion but by this fixture holding three entries;
+    # adding a file to the fixture would have removed the bound silently. The matched count was
+    # covered twice (substring plus the len(got) check below) and so never had the problem.
+    _n_match, _n_skip = _counts_from(buf.getvalue())
+    _eqi("mt/skip-matched-count", _n_match, 2)
+    _eqi("mt/skip-skipped-count", _n_skip, 1)
     expect("mt/skip-named", [buf.getvalue()], "unrelated.txt")
     if len(got) != 2:
         FAIL.append("mt/skip-returned: expected 2 matched entries, got %d" % len(got))
@@ -332,9 +364,28 @@ def t_mt_reports_what_it_skipped_so_an_empty_result_is_not_mistaken_for_no_passe
     with contextlib.redirect_stdout(buf2):
         got2 = pfs_eta.read_mtimes(d, r"nomatch_(?P<build>[a-z]+)_(?P<pass>[0-9]+)\.csv$")
     expect("mt/all-skipped-flagged", [buf2.getvalue()], "NOTHING matched")
-    expect("mt/all-skipped-counted", [buf2.getvalue()], "3 skipped")
+    _n_match2, _n_skip2 = _counts_from(buf2.getvalue())
+    _eqi("mt/all-skipped-matched-count", _n_match2, 0)
+    _eqi("mt/all-skipped-skipped-count", _n_skip2, 3)
     if got2 != []:
         FAIL.append("mt/all-skipped-empty: expected [], got %r" % (got2,))
+
+
+def t_mt_count_parsing_is_not_prefix_ambiguous():
+    """ABLATION on the fix above: assert that the substring form it replaced WOULD have passed.
+
+    Without this the fix is an unexplained style change. The line below reports 12 matched and 11
+    skipped; the retired assertions were the substrings "2 entries matched" and "1 skipped", and
+    both are present in it. So the plant records what the old form could not distinguish, and the
+    integer comparison that replaced it is the sole thing standing between a 1 and an 11.
+    """
+    line = "  read_mtimes: 12 entries matched 'pat', 11 skipped; e.g. a, b, c"
+    m, k = _counts_from(line)
+    _eqi("parse/matched", m, 12)
+    _eqi("parse/skipped", k, 11)
+    if "1 skipped" not in line or "2 entries matched" not in line:
+        FAIL.append("parse/ablation: the prefix ambiguity being guarded against is absent from "
+                    "the probe line, so this plant proves nothing")
 
 
 def t_mt_pattern_must_compile():
@@ -517,8 +568,13 @@ def t_mt_exact_beats_the_wrap():
         os.utime(q, (now - age, now - age))
     lt = _t.localtime(now)
     sod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    # LEFT-DELIMITED. "1d 01:00:00 elapsed" is a substring of "11d 01:00:00 elapsed", so the
+    # bare form passes on any elapsed of 1, 11, 21 ... days. The ", " prefix is taken from the
+    # real line ("  now 16:37:31, 1d 01:00:00 elapsed on the open pass -- ...") rather than
+    # assumed. Found by a mechanical scan for wanted-substrings that start with a digit: 1 of 29
+    # expect() calls in the tree, this one.
     expect("mt/25h-exact", call(pfs_eta.project_mtimes, d, RX, 2, None, now),
-           "1d 01:00:00 elapsed", want_absent=("at least",))
+           ", 1d 01:00:00 elapsed", want_absent=("at least",))
     expect("mt/25h-bare", call(pfs_eta.project_mtimes, d, RX, 2, sod),
            "at least 01:00:00 elapsed")
 
