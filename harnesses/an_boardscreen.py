@@ -23,6 +23,12 @@ THE STATISTIC IS max|r| WITH A PERMUTATION p, NOT A COUNT OF WIDTHS. The first v
 file flagged on "two or more widths above the per-width critical value". Permuting the twelve pass
 labels -- which carries the width-to-width dependence exactly, since all five widths are recomputed
 from the same permuted assignment -- puts that rule's own false-positive rate at 0.0441 to 0.1051
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger_csvs as LC
 across three boards of the SAME design, against the 0.0226 independence would give. P(at least one
 width over critical) is 0.111 to 0.197. So a width count is not evidence at n=12, there is no
 multiplicity constant to hardcode, and the rate has to come from each board's own pass structure.
@@ -164,7 +170,7 @@ def screen(d, draws=200000, seed=20261001):
         sys.exit("REFUSE: only %d completed object-passes; a correlation on fewer than 6 points has "
                  "no critical value worth quoting." % len(W))
 
-    csvs = [f for f in glob.glob(os.path.join(d, "*_float32_p*.csv"))]
+    csvs = list(LC.glob_clean(d, "*_float32_p*.csv", label="an_boardscreen"))
     if not csvs:
         sys.exit("REFUSE: no *_float32_p*.csv under %s -- an empty glob makes every correlation nan, "
                  "which reads as 'no contamination found'." % d)

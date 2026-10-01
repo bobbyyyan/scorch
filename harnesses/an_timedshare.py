@@ -55,6 +55,12 @@ busy core-seconds outside the kernel lie between 1 * remainder and NCPU * remain
 occupancy is bounded on both sides and reported as an interval.
 """
 import collections, csv, glob, os, sys
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger_csvs as LC
 
 CAL_CALLS_PER_CALIBRATE = 8      # calibrate(): `fn(); fn(); fn()` THEN `for _ in range(5)`.
                                  # I and the peer both wrote 5, missing the three warm-up
@@ -117,7 +123,7 @@ def report(d, reps, target_ms, busy=None, ncpu=24, label=""):
         sys.exit("REFUSE: %d files match *_stage.log in %s; the wall-time denominator has no "
                  "unambiguous source." % (len(stages), d))
     walls = pass_walls(stages[0])
-    csvs = sorted(glob.glob(os.path.join(d, "dl_*_float32_p*.csv")))
+    csvs = sorted(LC.glob_clean(d, "dl_*_float32_p*.csv", label="an_timedshare"))
     if not csvs:
         sys.exit("REFUSE: no dl_*_float32_p*.csv under %s -- an empty sweep reads as a 0%% share, "
                  "which is the one answer a broken glob always gives." % d)

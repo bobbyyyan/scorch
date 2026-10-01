@@ -29,6 +29,12 @@ transformer/variational_dropout/0.98, pruned to nothing), so {nnz > 0} equals th
 chain210 drops the same 26 for the same deterministic reason, which is why both runs are 19100.
 """
 import collections, csv, glob, hashlib, math, os, re, statistics, sys
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger_csvs as LC
 
 C210 = sys.argv[1] if len(sys.argv) > 1 else "."
 C207 = os.path.expanduser("~/.cache/scorch-codex/spmm-beat-mkl/chain207-dlmc-redwood")
@@ -45,7 +51,7 @@ p95 = lambda d: sorted(d)[int(0.95 * (len(d) - 1))] if d else float("nan")
 def load(d, pat):
     """-> MS[(build, cell, arm)][pass] = ms, plus the per-(build,pass) row counts."""
     MS, seen, NNZ = collections.defaultdict(dict), collections.Counter(), {}
-    files = sorted(glob.glob(os.path.join(d, pat)))
+    files = sorted(LC.glob_clean(d, pat, label="an_c210"))
     for f in files:
         b = os.path.basename(f).split("_")[1]
         p = int(f.rsplit("_p", 1)[1].split(".")[0])

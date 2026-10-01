@@ -37,6 +37,11 @@ import os
 import re
 import sys
 import time
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ledger_csvs as LC
 
 LINE = re.compile(r"---\s+p(\d+)\s+(\S+)\s+(start|done)\s+(\d\d):(\d\d):(\d\d)")
 
@@ -333,6 +338,14 @@ def read_mtimes(d, pattern):
                 "names %s. Without both, a per-build round count cannot be formed and "
                 "every pass would be attributed to one arm", pattern,
                 sorted(rx.groupindex) or "no groups at all")
+    # ANCHORING IS CHECKED LAST OF THE THREE, and the order is the point. re.match anchors only
+    # at the start, so an unanchored pattern accepts a renamed artefact (x.csv.bad) as a clean
+    # pass file. But placing this check ahead of the compile made a truncated pattern --
+    # `dl_(?P<build>[a-z` -- refuse for missing a `$` when its actual fault is that it does not
+    # compile, and SystemExit does not pass through `except re.error`, so the better diagnosis
+    # became unreachable. A new guard in front of existing validation can silence it; the
+    # narrowest failure is diagnosed last.
+    LC.require_end_anchored(pattern)
     out = []
     for f in sorted(os.listdir(d)):
         m = rx.match(f)

@@ -32,6 +32,12 @@ asmcheck_exit 0; the ladder must have at least 4 points for a fit; and the fit i
 its R^2 and residuals so a curved t_call(n) is visible rather than silently linearised.
 """
 import collections, csv, glob, math, os, re, statistics, sys
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ledger_csvs as LC
 
 # ---- each arm's MACHINE body width, derived from the attested disassembly.
 # WHY THIS IS NOT READ FROM THE SOURCE. probe.cpp's V6 steps `p += 4`, but -funroll-loops doubled
@@ -122,7 +128,7 @@ def main():
         sys.exit("usage: an_degree.py <dir-holding-pbdeg_n*_core*.csv-and-ATTEST-*.txt>")
     D = os.path.abspath(sys.argv[1])
     cores = {}
-    for f in sorted(glob.glob(os.path.join(D, "pbdeg_n*_core*.csv"))):
+    for f in sorted(LC.glob_clean(D, "pbdeg_n*_core*.csv", label="an_degree")):
         m = re.search(r"pbdeg_n(\d+)_core(\d+)\.csv$", f)
         n, core = int(m.group(1)), int(m.group(2))
         binsha, rows = read(f)

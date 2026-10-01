@@ -26,6 +26,12 @@ PREREG_c211_residual.md, amendments 1-3. In particular:
 """
 import collections, csv, glob, math, os, statistics, sys
 import numpy as np
+# A quarantined artefact (chain194's hv_ex4b_float64_p2.contaminated.csv) is sealed
+# evidence that this file's glob admits. LC refuses rather than letting it join a
+# recount silently, or be dropped silently, which are both decisions for a reader.
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger_csvs as LC
 
 if len(sys.argv) < 2:
     sys.exit("usage: an_c211.py <tree-root> [dims.csv]\n"
@@ -58,7 +64,7 @@ for ob in OBJECTS:
             sys.exit("REFUSE: %s has %d data rows, expected %d (3820 keys x 5 widths x 3 arms)"
                      % (os.path.basename(f), n, EXPECT_ROWS))
         files[(ob, p)] = f
-extra = set(glob.glob(os.path.join(ROOT, "dl_*_float32_p*.csv"))) - set(files.values())
+extra = set(LC.glob_clean(ROOT, "dl_*_float32_p*.csv", label="an_c211")) - set(files.values())
 if extra:
     sys.exit("REFUSE: %d CSV(s) present beyond the 18 declared: %s"
              % (len(extra), " ".join(sorted(os.path.basename(x) for x in extra))))

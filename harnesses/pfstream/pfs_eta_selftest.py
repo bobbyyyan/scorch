@@ -37,7 +37,11 @@ TARGET = os.path.join(HERE, "pfs_eta.py")
 sys.path.insert(0, HERE)
 import pfs_eta                                                   # noqa: E402
 
-RX = r"dl_(?P<build>[a-z_]+)_float32_p(?P<pass>[0-9]+)\.csv"
+# END-ANCHORED, and the $ is load-bearing. pfs_eta calls re.match, which anchors only at the
+# start, so without it this pattern accepts dl_base_float32_p2.csv.bad -- a renamed, marked
+# artefact -- as a clean pass file. ledger_csvs.require_end_anchored now refuses the
+# unanchored form, and it caught this exact line.
+RX = r"dl_(?P<build>[a-z_]+)_float32_p(?P<pass>[0-9]+)\.csv$"
 
 # AN ENUMERATION, DECLARED AS ONE. Matched on a call's final name component, so it covers
 # `exit(...)`, `sys.exit(...)`, `os._exit(...)` and `os.abort()` alike. It is NOT complete
