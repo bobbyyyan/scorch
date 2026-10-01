@@ -81,8 +81,17 @@ def null_check():
             rng.append(max(d) - min(d))
             sd.append(st.stdev(d))
             psd.append(st.pstdev(d))
+        # The THIRD statistic: sqrt(max(s^2 - SE^2, 0))/SE, which is what a range divided by
+        # its own null estimates. Its null was printed as "0.00" -- correct as a MEDIAN and
+        # uninformative as a reference, because the statistic sits exactly on zero more than
+        # half the time. Printed beside c4, a MEAN, under one word, it invited a comparison
+        # that does not hold. Both summaries of both statistics are now simulated.
+        sp = sorted(math.sqrt(max(x * x - 1.0, 0.0)) for x in sd)
         out[n] = (st.mean(rng) / CI_Z, sum(1 for r in rng if r > CI_Z) / len(rng),
-                  st.mean(sd), st.mean(psd))
+                  st.mean(sd), st.mean(psd),
+                  sorted(sd)[len(sd) // 2], sorted(sd)[int(0.95 * len(sd))],
+                  st.mean(sp), sp[len(sp) // 2], sp[int(0.95 * len(sp))],
+                  sum(1 for x in sp if x == 0.0) / len(sp))
     return out
 
 
@@ -152,14 +161,22 @@ if NP < 3:
              "across-pass statistic says anything about the floor" % NP)
 
 NULL = null_check()
-nr, np_, nsd, npsd = NULL[NP] if NP in NULL else NULL[6]
+(nr, np_, nsd, npsd, nsd_med, nsd_p95,
+ nsp, nsp_med, nsp_p95, nsp_zero) = NULL[NP] if NP in NULL else NULL[6]
 print()
 print("NULL CALIBRATION at n=%d passes, %d draws, seed %d. No pass-level effect at all:"
       % (NP, NSIM // 4, SEED))
 print("  range / half-width      expected %.4f, and P(range > half-width) = %.4f" % (nr, np_))
 print("    <- the statistic the FIRST version of this file used, with ADEQUATE requiring")
 print("       <= 1.0. A correct floor failed that %.1f%% of the time." % (100 * np_))
-print("  sample SD / within SE   expected %.4f   <- the statistic used below" % nsd)
+print("  s/SE                    mean %.4f (= c4)  median %.4f  p95 %.4f"
+      % (nsd, nsd_med, nsd_p95))
+print("  sqrt(max(s^2-SE^2,0))/SE mean %.4f  median %.4f  p95 %.4f, and EXACTLY ZERO %.1f%%"
+      % (nsp, nsp_med, nsp_p95, 100 * nsp_zero))
+print("    <- these are two different statistics AND two different kinds of summary. The")
+print("       second's null was printed as a bare 0.00, which is its MEDIAN and is")
+print("       uninformative as a reference because the statistic lands exactly on it more")
+print("       than half the time. The p95 is what adjudicates a borderline reading.")
 print("  pstdev understates the SD by %.1f%% at this n, which is why ddof=1 is used"
       % (100 * (1 - npsd / nsd)))
 
@@ -197,8 +214,8 @@ for k in KS:
     res[k] = (s_obs, se_w, ratio, x2, pv, s_pass, min(hws), max(hws), ratio_p)
     print("  k=%-3d SD %5.3f  SE_within %5.3f  chi2 %8.1f  p %-9.2g  pass-level SD %5.3f"
           % (k, s_obs, se_w, x2, pv, s_pass))
-    print("        sqrt(sig^2+SE^2)/SE = %5.2f (null %.2f)   sig_pass/SE = %5.2f (null 0.00)"
-          % (ratio, nsd, ratio_p))
+    print("        s/SE = %5.2f (null mean %.2f, p95 %.2f)   sqrt(max(s^2-SE^2,0))/SE = %5.2f "
+          "(null mean %.2f, p95 %.2f)" % (ratio, nsd, nsd_p95, ratio_p, nsp, nsp_p95))
     print("        the passes' own half-widths span %.3f to %.3f pp, so the mean above is not "
           "a uniform value" % (min(hws), max(hws)))
 
@@ -211,14 +228,16 @@ adequate = pv >= ALPHA
 print("VERDICT %s at k=2, the width where the arm provably cannot fire."
       % ("ADEQUATE" if adequate else "UNDERSTATED"))
 print("  across-pass SD %.3f pp against a within-pass SE of %.3f pp." % (s_obs, se_w))
-print("  sqrt(sigma_pass^2 + SE^2)/SE = %.2f, whose value under NO pass-level effect is %.2f."
-      % (ratio, nsd))
-print("  sigma_pass/SE = %.2f, whose value under no pass-level effect is 0. A range statistic"
-      % ratio_p)
-print("  divided by its own null estimates THIS one, not the line above; the two differ by")
-print("  sqrt(1 + (SE/sigma_pass)^2) = %.4f here, so they are a cross-check between different"
+print("  s/SE = %.2f, against a null mean of %.2f and a null p95 of %.2f."
+      % (ratio, nsd, nsd_p95))
+print("  sqrt(max(s^2-SE^2,0))/SE = %.2f, against a null mean of %.2f and a null p95 of %.2f."
+      % (ratio_p, nsp, nsp_p95))
+print("  Those are the ESTIMATORS, not the parameters: the second is an estimator of")
+print("  sigma_pass/SE whose own null is NOT zero, and naming it by its parameter is how a")
+print("  bare 0.00 got printed as its reference. A range statistic divided by its own null")
+print("  estimates the second; the two differ by sqrt(1 + (SE/sigma_pass)^2) = %.4f here, so"
       % (ratio / ratio_p if ratio_p > 0 else float("inf")))
-print("  estimands and neither confirms the other unless both are named.")
+print("  they cross-check each other and neither confirms the other unless both are named.")
 print("  chi2 = %.1f on %d df, p = %.2g." % (x2, NP - 1, pv))
 if not adequate:
     bound = CI_Z * s_pass
