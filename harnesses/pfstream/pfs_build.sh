@@ -38,6 +38,17 @@ for tag in ship shpb strm nopf; do
   echo "  staged $tag  (path len ${#d})"
 done
 
+# POSITIVE CONTROL for the ambient-environment section below. The section's failure mode is
+# silence, and silence is what it also prints when nothing is set -- so prove the machinery emits
+# a line when a matching variable IS present, before trusting an empty section to mean "empty".
+probe=$(SCORCH_PFS_BUILD_ENV_PROBE=1 env | grep -c '^SCORCH_PFS_BUILD_ENV_PROBE' || true)
+if [ "${probe:-0}" -lt 1 ]; then
+  echo "REFUSE: the ambient-environment probe cannot see a variable that is set, so an empty"
+  echo "        SCORCH_* section in the build logs would carry no information."
+  exit 1
+fi
+echo "ambient-environment probe: sees a set variable (count $probe), so an empty section is a fact"
+
 # Build all four concurrently; each is one translation unit, so they do not contend on make jobs.
 for tag in ship shpb strm nopf; do
   (
@@ -50,9 +61,20 @@ for tag in ship shpb strm nopf; do
     # kernels once -- so it would make the ours/mkl columns unreadable, not merely the split
     # gate unanswerable. The emission check below cannot see this axis: ship == shpb and
     # strm != ship hold identically whether or not the hooks are compiled in.
+    # The count is taken FIRST and branched on, rather than relying on `|| echo` after a
+    # pipeline. A pipeline's exit status is its LAST command's, and `sed` succeeds on empty
+    # input, so `env | grep ... | sed ... || echo "(none)"` never reaches the fallback: the
+    # no-variables case prints NOTHING, which is indistinguishable from a truncated log, a
+    # redirect that landed elsewhere, or this section not running at all -- in the one file
+    # whose whole purpose is to record what the ambient environment was.
+    n_amb=$(env | grep -c '^SCORCH_' || true)
     {
-      echo "AMBIENT SCORCH_* ENVIRONMENT AT BUILD TIME:"
-      env | grep '^SCORCH_' | sed 's/^/  /' || echo "  (no SCORCH_* variables set)"
+      echo "AMBIENT SCORCH_* ENVIRONMENT AT BUILD TIME: $n_amb variable(s)"
+      if [ "${n_amb:-0}" -gt 0 ]; then
+        env | grep '^SCORCH_' | sort | sed 's/^/  /'
+      else
+        echo "  (no SCORCH_* variables were set in the ambient environment)"
+      fi
       echo "SCORCH_BUILD_DEFINES deliberately set for this tag: ${DEFS[$tag]}"
       echo "---- build output follows ----"
     } > build.log
@@ -131,9 +153,21 @@ echo "  ASSERTED: ship == shpb, and strm, nopf each differ from ship and from ea
 echo
 echo "HOOKS CHECK (spmm_tune_hooks must be False on all four; a hooks build taxes every call)"
 for tag in ship shpb strm nopf; do
-  v=$(PYTHONPATH="$ROOT/$tag/src" python -c \
-        'import torch, scorch_ops as S; print(getattr(S, "spmm_tune_hooks", "ABSENT"))' 2>/dev/null)
-  echo "  $tag  spmm_tune_hooks=${v:-IMPORT_FAILED}"
+  # Bind the answer to the object under $ROOT/$tag. The emission check above already refuses on
+  # a missing object and line 36 rm -rf's the directory before staging, so an installed copy
+  # winning is mostly closed by construction -- but "mostly" is not a check, and the sibling
+  # instrument pfs_splitgate.py does bind it. Printing the module path and requiring the prefix
+  # costs one expression.
+  read -r v mod <<<"$(PYTHONPATH="$ROOT/$tag/src" python -c \
+        'import torch, scorch_ops as S; print(getattr(S, "spmm_tune_hooks", "ABSENT"), S.__file__)' \
+        2>/dev/null)"
+  echo "  $tag  spmm_tune_hooks=${v:-IMPORT_FAILED}  from ${mod:-<no module>}"
+  case "$mod" in
+    "$ROOT/$tag"/*) ;;
+    *) echo "REFUSE: $tag reported from '${mod:-<no module>}', not from $ROOT/$tag -- an"
+       echo "        installed copy answered, so the flag is not this object's."
+       fail=1; continue ;;
+  esac
   case "$v" in
     False) ;;
     True)  echo "REFUSE: $tag is a HOOKS build. Its per-call getenv tax makes every ours/mkl"
