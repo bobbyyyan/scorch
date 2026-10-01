@@ -21,13 +21,24 @@ first right and ignoring the second silenced the exact defect class this scan wa
 
     f"doubled {pct:.1f}%%"       -> 'doubled 1.5%%'     brace formatter, % untouched
     "stray {} %d".format(n)      -> 'stray 3 %d'        same
-    f"{dt:%Y-%m-%d}"             -> '2026-10-01'        the ONE brace position that CONSUMES text
+    f"{dt:%Y-%m-%d}"             -> '2026-10-01'        a format spec CONSUMES text
+    "{:%Y-%m-%d}".format(dt)     -> '2026-10-01'        and so does this one
 
 An f-string or .format() substitutes braces and never substitutes a conversion specifier, so a
-literal inside one is still a %-template and the walk passes through it. The sole exception is a
-FORMAT SPEC, where the text is handed to the value's __format__ and never emitted. Converting a
-%-format call to an f-string is the single most likely edit to these harnesses, and it is exactly
-how the first line gets introduced.
+literal inside one is still a %-template and the walk passes through it. The exception is a FORMAT
+SPEC, where the text is handed to the value's __format__ and never emitted -- and there are TWO of
+those, which are not equally visible. An f-string's spec is its own AST node
+(FormattedValue.format_spec) and can simply be skipped; a .format() string's spec lives INSIDE the
+literal's value, so the only way to see it is to parse the literal with string.Formatter().parse()
+and test only the literal_text pieces. Excluding the first and not the second reported correct code.
+
+Converting a %-format call to an f-string is the single most likely edit to these harnesses, and it
+is exactly how the first line gets introduced.
+
+AN ARGUMENT TO A BRACE FORMATTER IS NOT DATA. It is substituted into the result verbatim, exactly as
+the right operand of % is, so "{}".format("a %d") emits 'a %d' and log.warning("%s", "a %d") emits
+'a %d'. Both were silent while the % form was flagged -- the same principle applied inconsistently,
+and the fix was to delete the inconsistency rather than to document two of its instances as costs.
 
 THE TEMPLATE POSITION IS THE OTHER HALF. A formatter only substitutes the literal that is its
 TEMPLATE; a literal sitting in an ARGUMENT position is data, and its specifiers reach output
@@ -69,7 +80,7 @@ and "0 defects over N files" is a claim about N files only if all N were read. L
 unparseable file exit 0 makes a failure to measure indistinguishable from a clean result, which is
 the one reading this scan must never support.
 """
-import ast, re, sys, os
+import ast, re, string, sys, os
 
 # The conversion types Python's % operator accepts, all of them: d i o u x X e E f F g G c r s a %.
 # `b` is deliberately absent -- "%b" % 1 raises, so it is not a specifier and prose containing "%b"
@@ -132,16 +143,27 @@ KW_MSG = {"msg", "message"}                    # logging accepts the message as 
 # would be a miss. `format` and `format_map` ARE here: they substitute braces and leave % alone, so
 # with the literal as receiver the result is still a %-template.
 PRESERVING = {"upper", "lower", "title", "capitalize", "casefold", "strip", "lstrip", "rstrip",
-              "ljust", "rjust", "center", "zfill", "expandtabs", "swapcase", "join",
-              "format", "format_map"}
+              "ljust", "rjust", "center", "zfill", "expandtabs", "swapcase", "join"}
+# Brace formatters cannot sit in PRESERVING, because THERE ARE TWO BRACE POSITIONS THAT CONSUME
+# TEXT and only one of them is visible as an AST node. An f-string's replacement-field format spec
+# is FormattedValue.format_spec and can simply be skipped; a .format() string's spec is INSIDE the
+# literal's own value, so the only way to see it is to parse the literal with the same parser
+# .format() uses. Measured: "{:%Y-%m-%d}".format(dt) renders '2026-10-01', and string.Formatter()
+# .parse() splits it into literal_text='' and format_spec='%Y-%m-%d'. Testing the whole literal
+# reported correct code.
+BRACE = {"format", "format_map"}
 # These can REMOVE a specifier when the literal is the receiver, so they cannot sit in PRESERVING:
 #   "poor-mans %s".replace("%s", "world")  -> 'poor-mans world'   correct code
 #   "100%% done".replace("%%", "%")        -> '100% done'         correct code
-# Flagging either is the failure mode this whole design exists to avoid. The test is the same
-# template/argument principle one level down: look at what the ARGUMENT says. An argument that
-# itself carries a specifier is editing specifiers, so the result is out of scope; an argument
-# that carries none cannot touch them, so the walk passes through and "x %d".replace("a","b")
-# stays visible.
+# Flagging either is the failure mode this whole design exists to avoid. The first version keyed on
+# whether the ARGUMENT matched SPEC, and that is the wrong predicate in two ways, both measured:
+#   "x %d".replace("%", "pct")   -> 'x pctd'   a bare % removes the specifier and does not match
+#   "x %d".replace(old, new)     -> 'x x'      a NAME argument says nothing at all
+# Both were reported as defects. So the branch defaults to OUT OF SCOPE and passes through only
+# when it can be PROVEN that specifiers are untouched -- a literal argument containing no % at
+# all. "carries no literal specifier" and "cannot touch specifiers" are the same test only for
+# literals, which is the variable cost arriving here with its sign flipped: everywhere else a
+# variable causes a miss, on this branch it would cause a false positive.
 EDITING = {"replace", "removeprefix", "removesuffix"}
 OPAQUE = {"translate"}                         # an arbitrary table; unknowable, so out of scope
 
@@ -205,8 +227,10 @@ def _is_sink(call, slot, parent, eager):
             if slot[0] == "kw":
                 # The keyword message IS the template; any other keyword is a value.
                 return slot[1] in KW_MSG
-            if slot[0] != "pos" or slot[1] != mi:
-                return False                           # a value, not the template
+            if slot[0] != "pos":
+                return False
+            if slot[1] != mi:
+                return True                            # a value argument: substituted verbatim
             if kw & KW_MSG:
                 return False                           # the template is elsewhere
             return len(call.args) <= mi + 1            # no args after the message -> defect
@@ -269,12 +293,20 @@ def scan(path):
             if isinstance(par, ast.Attribute) and par.value is q:
                 if par.attr in OPAQUE:
                     break
-                if par.attr in EDITING:
+                if par.attr in BRACE:
+                    if q is node:
+                        try:
+                            fields = list(string.Formatter().parse(node.value))
+                        except ValueError:
+                            break            # malformed: .format() raises, nothing reaches output
+                        if not SPEC.search("".join(f[0] or "" for f in fields)):
+                            break            # every specifier is in a format spec: consumed
+                elif par.attr in EDITING:
                     gp = parent.get(par)
                     arg0 = gp.args[0] if isinstance(gp, ast.Call) and gp.args else None
-                    if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str) \
-                       and SPEC.search(arg0.value):
-                        break                # the argument edits specifiers: out of scope
+                    if not (isinstance(arg0, ast.Constant) and isinstance(arg0.value, str)
+                            and "%" not in arg0.value):
+                        break                # cannot prove specifiers are untouched
                 elif par.attr not in PRESERVING:
                     q = par
                     continue
@@ -286,6 +318,13 @@ def scan(path):
                     sink = par
                 break                        # the test position never reaches output
             if isinstance(par, ast.Call):
+                # An ARGUMENT to a brace formatter is substituted into the result verbatim, so its
+                # specifiers survive exactly as the right operand of % does. Flagging one and not
+                # the other was the same principle applied inconsistently.
+                cf = par.func
+                if isinstance(cf, ast.Attribute) and cf.attr in BRACE and q in par.args:
+                    q = par
+                    continue
                 sink = par; break
             q = par
         if formatted or sink is None:

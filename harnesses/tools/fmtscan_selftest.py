@@ -26,22 +26,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "an_fmtscan.py")
 PLANTS = os.path.join(HERE, "fmtscan_plants")
 # (fixture, expected UNFORMATTED, expected SYNTAX, expected rc)
-CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1), ("must_fire3", 9, 0, 1),
+CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1), ("must_fire3", 11, 0, 1),
          ("must_be_silent", 0, 0, 0), ("known_miss", 0, 0, 0), ("broken", 0, 1, 1)]
 N_FIRE = sum(c[1] for c in CASES)          # defect forms that must be detected
 N_SYNTAX = sum(c[2] for c in CASES)        # files that must be reported as unreadable
-SILENT_SPEC = 15                           # specifier-bearing literals that must stay silent
+SILENT_SPEC = 19                           # specifier-bearing literals that must stay silent
 # SILENCE HAS TWO CAUSES AND ONE CORPUS CANNOT ASSERT EITHER. must_be_silent.pyplant claims "this
 # is correct code", and the only way to assert that is to RUN it and require that no specifier
 # survives into its output. known_miss.pyplant claims the opposite -- a specifier DOES reach output
 # and the scan cannot see it -- so it is asserted to emit exactly MISS_SPECS of them. Without the
 # split, three cases sat in the silence corpus emitting %d while labelled correct: translate() with
 # an empty table is a no-op, and a lazy-logging ARGUMENT has its own specifiers substituted through.
-MISS_SPECS = 4
+#
+# TWO MEMBERS THEN LEFT known_miss BECAUSE THEY WERE INCONSISTENCIES, NOT LIMITS. An argument to
+# .format() and a value argument to lazy logging are both substituted verbatim, exactly as the
+# right operand of % is -- and that one was already flagged. A documented cost has to be a limit of
+# the method, not a gap in it, so both moved to must_fire3 and MISS_SPECS fell from 4 to 3. The
+# replacement is a case that IS a limit: an editing method with a NAME argument, where the scan
+# cannot prove specifiers are untouched and a false positive would be worse than a miss.
+MISS_SPECS = 3
 # Literals carrying a % the regex must NOT match. Enumerated rather than counted, because a bare
 # number here is a value without its predicate: '3% bare prose', '% i and % o', '%b is not a
-# specifier', the regex '^%[sd]$', and the single '%' that is replace()'s replacement argument.
-SILENT_NEARMISS = 5
+# specifier', the regex '^%[sd]$', and the two bare '%' that are replace() arguments.
+SILENT_NEARMISS = 6
 FIRE_FIXTURES = [c[0] for c in CASES if c[1]]
 
 

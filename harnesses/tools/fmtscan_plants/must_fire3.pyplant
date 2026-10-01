@@ -13,3 +13,5 @@ log.warning(msg="E7 keyword message %d")                  # the kw message IS th
 print("E8 deep %d" + "b" + "c" + "d" + "e" + "f" + "g"
       + "h" + "i" + "j" + "k" + "l" + "m")                # past the old 10-step budget
 print("E9 replace preserves %d".replace("a", "b"))        # argument carries no specifier
+print("{}".format("E10 argument to format %d"))      # substituted verbatim, like % right operand
+log.warning("E11 template %s", "argument %d")        # same, lazy-logging value position

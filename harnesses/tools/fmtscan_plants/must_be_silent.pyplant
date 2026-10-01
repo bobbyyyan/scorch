@@ -15,6 +15,10 @@ print("C8 method then format %d  ".strip() % 7)
 print(f"C9 format spec consumes the text {dt:%Y-%m-%d}")
 print("C10 poor-mans %s".replace("%s", "world"))
 print("C11 doubled 100%% done".replace("%%", "%"))
+kills = "%d"                                           # a NAME argument that DOES remove it
+print("C18 editing with a variable %d".replace(kills, "7"))
+print("C19 bare pct argument %d".replace("%", "pct"))  # removes it without matching SPEC
+print("C20 brace format spec {:%Y-%m-%d}".format(dt))  # the spec is INSIDE the literal
 log.warning("C14 lazy with args %d", 7)
 log.log(logging.WARNING, "C15 level-first with args %d", 7)
 warnings.warn("C16 eager warn with no specifier", UserWarning)
