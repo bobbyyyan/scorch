@@ -42,9 +42,23 @@ done
 for tag in ship shpb strm nopf; do
   (
     cd "$ROOT/$tag" || exit 1
+    # Record the AMBIENT SCORCH_* environment before building. scorch_build.py:103 keys
+    # -DSCORCH_TUNE_HOOKS on SCORCH_BUILD_TUNE_HOOKS, a DIFFERENT variable from the
+    # SCORCH_BUILD_DEFINES this script sets, and there is no `env -i` here. So whether these are
+    # hooks builds depended on the ambient shell and nothing recorded it. A hooks build adds
+    # ~54 getenv per call, 17-26us under Slurm, which manufactured a 1.57x MKL deficit on short
+    # kernels once -- so it would make the ours/mkl columns unreadable, not merely the split
+    # gate unanswerable. The emission check below cannot see this axis: ship == shpb and
+    # strm != ship hold identically whether or not the hooks are compiled in.
+    {
+      echo "AMBIENT SCORCH_* ENVIRONMENT AT BUILD TIME:"
+      env | grep '^SCORCH_' | sed 's/^/  /' || echo "  (no SCORCH_* variables set)"
+      echo "SCORCH_BUILD_DEFINES deliberately set for this tag: ${DEFS[$tag]}"
+      echo "---- build output follows ----"
+    } > build.log
     SCORCH_BUILD_DEFINES="${DEFS[$tag]}" \
       python -c "import setuptools; setuptools.setup()" build_ext --inplace \
-      > build.log 2>&1
+      >> build.log 2>&1
     echo "$? $tag" > rc.txt
   ) &
 done
@@ -108,3 +122,27 @@ if [ "${TSHA[strm]}" = "${TSHA[nopf]}" ]; then
 fi
 [ "$fail" = "0" ] || exit 1
 echo "  ASSERTED: ship == shpb, and strm, nopf each differ from ship and from each other."
+
+# THE HOOKS AXIS, WHICH THE DIGESTS ABOVE CANNOT SEE. Every .text assertion above passes whether
+# or not SCORCH_TUNE_HOOKS was compiled in, because it is orthogonal to the PFSTREAM/PFD defines
+# these arms differ by. The built object publishes the flag precisely so a harness can fail closed
+# instead of reporting a null it manufactured (ops.cpp:595-600) -- and until now no screen in this
+# directory had ever queried it. Asked of each object, not of the headers or the environment.
+echo
+echo "HOOKS CHECK (spmm_tune_hooks must be False on all four; a hooks build taxes every call)"
+for tag in ship shpb strm nopf; do
+  v=$(PYTHONPATH="$ROOT/$tag/src" python -c \
+        'import torch, scorch_ops as S; print(getattr(S, "spmm_tune_hooks", "ABSENT"))' 2>/dev/null)
+  echo "  $tag  spmm_tune_hooks=${v:-IMPORT_FAILED}"
+  case "$v" in
+    False) ;;
+    True)  echo "REFUSE: $tag is a HOOKS build. Its per-call getenv tax makes every ours/mkl"
+           echo "        number in this screen unreadable, not just the row-split question."
+           fail=1 ;;
+    *)     echo "REFUSE: $tag did not report the flag (got '${v:-IMPORT_FAILED}'), so the check"
+           echo "        is vacuous rather than passing."
+           fail=1 ;;
+  esac
+done
+[ "$fail" = "0" ] || exit 1
+echo "  ASSERTED: all four objects report spmm_tune_hooks=False."
