@@ -96,9 +96,19 @@ def null_check():
 
 
 def chi2_sf(x, df):
-    """Upper tail of chi-square. df is small and even/odd both occur, so the series is exact
-    for integer df via the regularised upper incomplete gamma at half-integer a."""
+    """Upper tail of chi-square: P(X > x) = Q(df/2, x/2) for the regularised upper incomplete
+    gamma Q. Integer df, even and odd both occur.
+
+    THE HALVING WAS MISSING. This computed Q(df/2, x) and the chi-square tail is Q(df/2, x/2),
+    so every p-value it produced was the tail at twice the correct argument -- far too small.
+    Checked against table values below rather than trusted: at df=5 it returned 0.000492 for
+    x = 11.0705 where the table says 0.05, and 0.1215 for the median 4.3515 where the table
+    says 0.50. Found by computing the ANALYTIC value of a quantity the simulator also
+    estimates, which is the only check that could have found it: the simulated null was
+    correct throughout and agreed with an independent session's, so nothing in the Monte Carlo
+    comparison was wrong. test_chi2_sf_against_table() now runs every invocation."""
     a = df / 2.0
+    x = x / 2.0
     if x <= 0:
         return 1.0
     # Lentz continued fraction for Q(a, x), adequate and stable for the df and x here.
@@ -136,6 +146,48 @@ def chi2_sf(x, df):
     return h * math.exp(-x + a * math.log(x) - math.lgamma(a))
 
 
+def test_chi2_sf_against_table():
+    """Four published chi-square table values, at the df this file uses. A tail function is
+    exactly the kind of code whose output is plausible when wrong -- 0.000492 and 0.05 both
+    read as "significant" -- so the check is not optional and not a comment."""
+    cases = ((11.0705, 5, 0.05), (9.2364, 5, 0.10), (4.3515, 5, 0.50), (1.1455, 5, 0.95),
+             (7.8147, 3, 0.05), (0.3518, 3, 0.95), (12.5916, 6, 0.05))
+    bad = []
+    for x, df, want in cases:
+        got = chi2_sf(x, df)
+        if abs(got - want) > 2e-3:
+            bad.append("sf(%.4f, %d) = %.6f, table %.2f" % (x, df, got, want))
+    if bad:
+        sys.exit("REFUSE: chi2_sf disagrees with the published table, so every p-value below "
+                 "would be wrong in a way that still reads as significant:\n  "
+                 + "\n  ".join(bad))
+    return len(cases)
+
+
+def c4(n):
+    """E[s]/sigma for a normal sample, exactly. The simulated mean of s/SE must match this, so
+    the s/SE row is a free analytic POSITIVE CONTROL on the null simulator -- the one thing a
+    simulated null otherwise lacks, since nothing else tells you the simulator is right. It
+    would catch a wrong n, a wrong ddof, or a reused RNG stream."""
+    return math.sqrt(2.0 / (n - 1)) * math.exp(math.lgamma(n / 2.0)
+                                               - math.lgamma((n - 1) / 2.0))
+
+
+def s_over_sigma_p95(n):
+    """The 95th percentile of s/sigma = sqrt(chi2_{n-1,0.95}/(n-1)). Also closed form, so the
+    row has TWO analytic anchors rather than one."""
+    lo, hi = 1e-9, 1e4
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if chi2_sf(mid, n - 1) > 0.05:
+            lo = mid
+        else:
+            hi = mid
+    return math.sqrt(0.5 * (lo + hi) / (n - 1))
+
+
+_NCASES = test_chi2_sf_against_table()
+
 rows = {}
 for f in FILES:
     if not os.path.exists(f):
@@ -169,8 +221,21 @@ print("NULL CALIBRATION at n=%d passes, %d draws, seed %d. No pass-level effect 
 print("  range / half-width      expected %.4f, and P(range > half-width) = %.4f" % (nr, np_))
 print("    <- the statistic the FIRST version of this file used, with ADEQUATE requiring")
 print("       <= 1.0. A correct floor failed that %.1f%% of the time." % (100 * np_))
-print("  s/SE                    mean %.4f (= c4)  median %.4f  p95 %.4f"
-      % (nsd, nsd_med, nsd_p95))
+# THE s/SE ROW HAS CLOSED FORMS, so it is an analytic POSITIVE CONTROL on the simulator that
+# produced the row beneath it. Nothing else tells you a simulated null is right. The previous
+# version printed `mean 0.9500 (= c4)`, labelling a SIMULATED number with an analytic identity
+# whose exact value is 0.951533 -- a reader who knows c4 sees a third-decimal mismatch and
+# cannot separate Monte Carlo error from a defect. Both anchors are now printed with the gap in
+# SE units, which is the quantity that distinguishes them.
+_c4, _p95a = c4(NP), s_over_sigma_p95(NP)
+_se_mean = 0.3 / math.sqrt(max(1, NSIM // 4))          # sd(s/sigma) ~ 0.3 at these n
+print("  s/SE          simulated mean %.4f  median %.4f  p95 %.4f" % (nsd, nsd_med, nsd_p95))
+print("                ANALYTIC  mean %.6f (c4)            p95 %.6f" % (_c4, _p95a))
+print("                gap %+.4f = %.1f SE of the simulated mean, and %+.4f on the p95. This"
+      % (nsd - _c4, (nsd - _c4) / _se_mean if _se_mean else 0.0, nsd_p95 - _p95a))
+print("                row is the control: a wrong n, a wrong ddof or a reused RNG stream would")
+print("                move it off these two closed forms. %d chi2 table values also checked."
+      % _NCASES)
 print("  sqrt(max(s^2-SE^2,0))/SE mean %.4f  median %.4f  p95 %.4f, and EXACTLY ZERO %.1f%%"
       % (nsp, nsp_med, nsp_p95, 100 * nsp_zero))
 print("    <- these are two different statistics AND two different kinds of summary. The")
