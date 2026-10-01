@@ -41519,7 +41519,9 @@ chain207's sealed stage log carries start/done lines for all twelve object-passe
     p1 aa 22m50s   p1 bb 23m19s   p2 bb 23m25s   p6 bb 23m29s   p4 aa 23m30s   p6 aa 23m31s
     p5 aa 23m34s   p2 aa 23m38s   p3 bb 23m38s   p4 bb 23m40s   p5 bb 23m41s   p3 aa 23m43s
 
-n=12, min 22m50s, median 23m32s, max 23m43s, standard deviation **14.4 seconds**, total spread 3.8%.
+n=12, min 22m50s, median **23m32.5s** (the mean of the 6th and 7th of twelve), max 23m43s,
+standard deviation **14.4 seconds**. Total spread is 3.75% of the median or 3.87% of the minimum --
+the two differ only by the denominator, which has to be named rather than rounded to "about 3.8%".
 A twelve-pass run whose passes agree to 14 seconds is a useful fact in itself -- it means per-pass
 timing is not a source of variance worth modelling here.
 
@@ -41539,14 +41541,26 @@ all eleven remaining passes -- the extrapolation error one level up from the lin
 retracted above, same uniformity assumption with a bigger unit. Built from chain207's observed
 per-pass distribution instead, from p1/aa done at 00:01:16 with 11 passes left:
 
-    every remaining pass at chain207's min (22m50s)      04:12:26
-    at chain207's median (23m32s)                        04:20:13      <- the prediction
-    at chain207's max (23m43s)                           04:22:09
-    at chain210's own pass-1 rate (22m28s)               04:08:24      <- my retracted estimate
+    H1  chain210 runs at chain207's absolute per-pass pace        11 x 1412.5 s  ->  04:20:13
+    H2  chain207's shape scaled by the observed p1 ratio, -1.61%  11 x 1389.8 s  ->  04:16:03
+    H3  no pass-1 effect: p1's rate holds for every pass          11 x 1348.0 s  ->  04:08:24
 
-Predicted completion is **[04:12, 04:22], centre 04:20**. If it lands near 04:08 then chain210 is
-uniformly about 5% faster than chain207 and the pass-1 effect does not exist there, which would
-itself be a finding rather than a nuisance. The run adjudicates it without anyone arguing.
+**An interval was registered here first and is withdrawn, because it was not a bound.** It put every
+remaining pass between chain207's min and max, giving [04:12, 04:22] -- but that lower endpoint
+treats chain207's fastest pass (1370 s) as a floor, and chain210's p1 aa is **1348 s, already 22
+seconds below it**. An interval whose lower bound is violated by the only observation available is
+the baseline's observed range dressed as a prediction, and it would have excluded H3 outright.
+
+H3 is the estimate retracted above, kept on the board in its correct form: not as an error but as
+the hypothesis that pass 1 is representative. H2 is the reading neither of us had first -- chain210
+uniformly slightly faster -- which is what a single observation outside chain207's range actually
+suggests.
+
+**And the power check the interval was missing.** chain207's pass-to-pass standard deviation is
+14.4 s, so eleven passes accumulate 14.4 x sqrt(11) = **47.8 s** of noise. The three predictions are
+separated by 250 s, 459 s and 709 s, i.e. **5.2x, 9.6x and 14.9x** that noise scale, so the run
+discriminates all three cleanly. A landing outside all three -- before 04:08 or after 04:21 -- means
+something changed between the runs beyond pace, and that is the interesting outcome.
 
 **AND THE DETECTION LEDGER FOR TONIGHT, WHICH IS THE PART I WANT KEPT.** Five method errors between
 two sessions: a count with no predicate, a correlate with no decomposition, an unpaired estimator, a
@@ -41554,8 +41568,18 @@ rate extrapolated from a partial file, and a floor quoted at the wrong level. **
 none of them.** Four surfaced because two sessions computed overlapping quantities and the numbers
 disagreed. The fifth surfaced because `date -d` on a host whose date had just rolled over returned a
 NEGATIVE elapsed time -- a guard firing on an impossible value, not a re-reading of the reasoning.
-So there are three detection mechanisms and the useful ranking is: make wrong answers **impossible**
+So the ranking, four rungs and self-review is not one of them: make wrong answers **impossible**
 rather than merely wrong (a start/done log does on purpose what the negative elapsed did by
-accident), then cross-check against an independent computation, and do not rely on re-reading your
-own reasoning at all. 29 minutes against 23 is entirely plausible, which is exactly why it survived
-two of my reports and a peer's endorsement.
+accident); failing that **read the quantity instead of a correlate of it** -- the start/done lines
+were available at the first check, so the impossible value did not merely catch the error, it stood
+in for a measurement that was there to be taken; failing that, cross-check against an independent
+computation; and do not rely on re-reading your own reasoning at all. 29 minutes against 23 is
+entirely plausible, which is exactly why it survived two of my reports and a peer's endorsement.
+
+**The partial-run bias applies to the DATA, not only the clock.** Because pass 1 is systematically
+the fastest, any statistic from a partial run is biased fast -- and a partial chain210 reduced
+against a complete chain207 would also compare a position-1-heavy set of readings against a
+position-balanced one, since the rotation is balanced only over the full twelve. That is a second
+and independent reason the wait-for-all-twelve rule is load-bearing; the first is the
+pre-registration. A valid partial comparison would have to position-match passes rather than pool
+them.
