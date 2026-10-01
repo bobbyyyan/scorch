@@ -110,7 +110,19 @@ def main():
     both = sorted(set(A) & set(B))
     print()
     print("symbols: %d in a, %d in b, %d in both" % (len(A), len(B), len(both)))
-    kern = [s for s in both if re.search(pattern, s)]
+    # PLT stubs match any symbol pattern and are 16-byte trampolines, not code under test. They
+    # also sit in .plt rather than .text, so a .text pad does not move them -- including them
+    # diluted condition 3 from 12 of 12 to 12 of 18 on the first run. They appear only when the
+    # link omits -Wl,-Bsymbolic-functions, which production's setuptools link passes, so a
+    # hand-built floor object that keeps them differs from the screen's objects in LINKAGE and
+    # not only in placement. Counted and reported rather than silently dropped.
+    allmatch = [s for s in both if re.search(pattern, s)]
+    kern = [s for s in allmatch if "@plt" not in s]
+    nplt = len(allmatch) - len(kern)
+    if nplt:
+        print("  NOTE: %d of %d matches are @plt stubs, excluded; their presence means this link"
+              % (nplt, len(allmatch)))
+        print("        omitted -Wl,-Bsymbolic-functions, which production's link passes")
     if not kern:
         sys.exit("REFUSE: no symbol matches %r, so conditions 2 and 3 are unevaluated and the"
                  " zero above would be vacuous" % pattern)
