@@ -86,6 +86,7 @@ sha256sum $SEAL > SHA256SUMS.producing || { echo "RFAIL sha256sum failed over th
 ne=$(grep -c . SHA256SUMS.producing)
 [ "$ne" -eq 15 ] || { echo "RFAIL manifest has $ne entries, expected 15 (12 object-passes + 3 logs)"; exit 1; }
 tar czf "$ARCH" $SEAL SHA256SUMS.producing || { echo "RFAIL tar failed"; exit 1; }
+echo "ROK manifest_sha=$(sha256sum SHA256SUMS.producing | awk '{print $1}')"
 echo "ROK entries=$ne"
 echo "ROK tgz_bytes=$(stat -c %s "$ARCH")"
 echo "ROK tgz_path=$ARCH"
@@ -96,7 +97,8 @@ grep -q '^RFAIL' "$DEST/COLLECTION.log" && { echo "REFUSE: producing host refuse
 RB=$(sed -n 's/^ROK tgz_bytes=//p' "$DEST/COLLECTION.log")
 RS=$(sed -n 's/^ROK tgz_sha=//p' "$DEST/COLLECTION.log")
 RP=$(sed -n 's/^ROK tgz_path=//p' "$DEST/COLLECTION.log")
-[ -n "$RB" ] && [ -n "$RS" ] && [ -n "$RP" ] || { echo "REFUSE: producing host did not report the archive path, size and digest"; exit 1; }
+RM=$(sed -n 's/^ROK manifest_sha=//p' "$DEST/COLLECTION.log")
+[ -n "$RB" ] && [ -n "$RS" ] && [ -n "$RP" ] && [ -n "$RM" ] || { echo "REFUSE: producing host did not report the archive path, size, digest and manifest digest"; exit 1; }
 
 echo "=== 2. transfer, verified by archive size AND digest, both values kept in COLLECTION.log"
 scp -q "redwood:$RP" "$DEST/c210_final.tgz" || { echo "REFUSE: scp failed"; exit 1; }
@@ -116,6 +118,17 @@ cd "$DEST" || exit 1
 awk '{ if (length($1) != 64) { print "  line " NR " has a " length($1) "-char digest field"; bad=1 } }
      END { exit bad }' SHA256SUMS.producing \
   || { echo "REFUSE: manifest is not SHA-256 on every line -- a CRC-32 manifest verifies vacuously"; exit 1; }
+# BIND THE ARCHIVE TO THE DIRECTORY ITS MANIFEST CAME FROM. Checking tar's exit status closes the
+# instance where a stale archive gets digested; it does not close the class, because an archive can
+# fail to be the archive of this directory for reasons other than tar returning non-zero. Without
+# this, a stale archive at the expected path would be digested on redwood, compared against itself
+# across the transfer, extracted, and verified 15 OK 0 FAILED against its OWN manifest -- a clean
+# verification of planted data, with the completeness guards having already passed on the live
+# directory. Nothing bound the two. Peer's catch; the one-line form is theirs.
+EM=$(shasum -a 256 SHA256SUMS.producing | awk '{print $1}')
+echo "MANIFEST extracted=$EM redwood=$RM" >> "$DEST/COLLECTION.log"
+[ "$EM" = "$RM" ] || { echo "REFUSE: the extracted manifest is not the one computed on redwood"; echo "  redwood   $RM"; echo "  extracted $EM"; exit 1; }
+echo "  manifest bound: $EM computed on redwood over the live directory, same bytes here"
 shasum -a 256 -c SHA256SUMS.producing > "$DEST/VERIFY.log" 2>&1
 NE=$(grep -c . SHA256SUMS.producing)
 OK=$(grep -c ': OK$' "$DEST/VERIFY.log"); FA=$(grep -c ': FAILED' "$DEST/VERIFY.log")
