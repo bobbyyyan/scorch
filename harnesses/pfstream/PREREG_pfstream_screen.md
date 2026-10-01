@@ -89,10 +89,34 @@ Consequences, stated so they are not rediscovered later:
 Found before any pass landed, by reading the dispatch rather than the timings.
 
 `SCORCH_NARROWK_EXACT_HI` ships at **3** (`scorch_policy.h:1518`) and `SCORCH_NARROWK_EXACT_MINDEG`
-at 0, so `exact_width = B1_size` is set for every k in {1, 2, 3} on any matrix
-(`spmm.h:4160`). At `spmm.h:4979` a nonzero `exact_width` routes the row to
-`scorch_spmm_row_narrow_exact`, and `scorch_spmm_row_regblock` is bypassed -- the half-vector
-path at `spmm.h:4903` even requires `!exact_width` explicitly.
+at **0L** (`scorch_policy.h:562`), so `exact_width = B1_size` is set for every k in {1, 2, 3} on
+**every** matrix (`spmm.h:4160`) -- the degree floor at `spmm.h:4183` is guarded by
+`narrowk_exact_mindeg > 0` and so never clears it. That the floor is 0 is what makes k=2 a control
+on the whole corpus rather than on a subset. At `spmm.h:4979` a nonzero `exact_width` routes the
+row to `scorch_spmm_row_narrow_exact` and `continue`s, before the first `SCORCH_RB` invocation.
+
+**The half-vector block is what actually has to be ruled out, and `exact_width` is not what rules
+it out.** It sits at `spmm.h:4896`, *before* the `exact_width` branch, and
+`halfvec_exact = (B1_size == LH)` at `spmm.h:4899` carries **no `exact_width` test at all**; only
+`halfvec_under` at 4903 does. If `halfvec_exact` were true it would preempt the exact branch and
+the row would reach `regblock`. What protects float32 k=2 is that `scorch_simd_half<float>` is
+`__m128` with `lanes = 4` (`spmm.h:2202`), so `2 == 4` is false. Nothing about `exact_width`
+enters it.
+
+This matters for the dtype this screen is not running. `scorch_simd_half<double>` has `lanes = 2`
+(`spmm.h:2220`), so at **float64 k=2** `halfvec_exact` is `2 == 2` and the earlier block wins
+despite `exact_width == 2` -- the row reaches `regblock` and PFSTREAM applies. It does not fire
+today only because `SCORCH_SPMM_HALFVEC_F64` ships at 0 (`scorch_policy.h:1515`), and
+`spmm_halfvec` is env-overridable at `spmm.h:4128`. So "k=2 cannot fire" holds for **float32 at
+release defaults**, and the two dtypes are protected by two different mechanisms, neither of them
+`exact_width`.
+
+**And the same block changes what k=4 measures.** `SCORCH_SPMM_HALFVEC_F32` ships at 1
+(`scorch_policy.h:1512`) and `LH = 4`, so at float32 k=4 `halfvec_exact` is true and the row takes
+`scorch_spmm_row_regblock<scalar_t, 1, true, VH>` with `VH = __m128` -- the **half-vector**
+instantiation, which does receive `SCORCH_SPMM_PFLIM`. So the arm applies at k=4, through a
+different vector type than at k=8. Both are NVEC 1, so the prediction's NVEC=1 clause spans two
+widths with *different vector widths*, and they must be reported separately rather than pooled.
 
 **PFSTREAM lives in `scorch_spmm_row_regblock`. So at k=2 it is not merely small, it is
 unreachable.** Of the five widths timed, four can show an effect: 4, 8, 16, 32.
@@ -133,3 +157,40 @@ k=1 only.)
 Single host for now; confirming either clause needs redwood, which is occupied by the c211 board
 until ~13:11. float32 only. MKT is shared and not cgroup-partitioned for bandwidth. Four widths
 carry the effect and k=2 is the negative control, per Amendment 1.
+
+
+## AMENDMENT 3: THE WALL-TIME SIGNATURE CLAIM IS WITHDRAWN
+
+Not about this screen, but about the c211 board beside it, and it belongs here because it is the
+same instrument. I claimed the deep arm's +14 s per-pass wall-time excess was "the calibration
+damping a 5-19% per-call effect down to 1%", and called it an independent signature of the deep
+regression. A peer named an identity that makes it falsifiable: the gap should equal the summed
+kernel gap in the arms that run the object's own kernel. **It does not.**
+
+Measured on the three landed p1 CSVs, against the +14.0 s matched-position wall gap:
+
+| term | deep − base | A/A (bsb_ − base) |
+|---|---|---|
+| timed loops, ours+oursb | **+1.9 s** | +0.4 s |
+| timed loops, mkl (must be 0) | **+1.2 s** | +0.0 s |
+| calibration of ours, 8 unbatched calls/cell | +0.4 s | +0.0 s |
+| calibration of mkl | +0.1 s | −0.0 s |
+| **accounted** | **+3.6 s of +14.0** | +0.4 s |
+
+So **74% of the gap is in pass overhead the CSVs do not record at all** (per-key `np.load`, tensor
+construction, CSV writing: 1352 s of pass against 1220 s of accounted time), and the timed-loop
+portion is 0.16%, not a damped 5-19%.
+
+**Why the summed timed loops cannot see a kernel gap, which is the part I had backwards.** The
+batch is calibrated per cell to a target, so `batch x ms ~ target_ms` and
+`reps x batch x ms ~ reps x target` **independent of how fast the kernel is**. Median `batch x ms`
+is 5.665 / 5.666 / 5.641 ms for base / bsb_ / deep against `--target-ms 6`. The quantity is
+insensitive to the effect by construction, so it was never going to carry a damped version of it.
+
+**The +14 s is still real** -- matched on position and round, 0 for the byte-identical pair -- but
+nothing here attributes it to the kernel, and I withdraw the attribution rather than the
+observation.
+
+**One term in that table is a finding on its own.** MKL's timed loops differ by +1.2 s between two
+objects that share MKL's code exactly, against a +0.0 s A/A on the same quantity. That is a
+cross-object effect on code that did not change, and it is the largest single accounted term.
