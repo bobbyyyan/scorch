@@ -168,14 +168,18 @@ if 2 in verdicts:
 print()
 # NORMALISED ACROSS REPRESENTATIONS, because the historical bug printed 8.13% where the table held
 # 1.0813 -- the SAME value in ratio and percent form, and two different decimal STRINGS. A literal
-# string scan reports "all distinct" on it, so the scan is keyed on the ratio form and every number
-# is also offered under the percent-of-excess transform x -> 1 + x/100.
-# SIX decimals, not four, and matches must come from DIFFERENT lines. At four the percent
-# transform collided 1.0772 with 1.0813 -- both map to 1.0108 -- which are the interval endpoint
-# and the point estimate on the SAME row, so the scan invented a duplicate out of its own rounding.
-# Six separates them (1.010772 vs 1.010813), and the different-line requirement is the real
-# predicate anyway: a leaked loop variable duplicates a value ACROSS rows, so a same-line repeat is
-# never the signal.
+# string scan reports "all distinct" on it, so every number is also offered under
+# `x -> 1 + x / 100`, which READS A CANDIDATE PERCENTAGE BACK AS A RATIO. The direction matters and
+# naming it badly cost a peer a wrong inference: the transform DIVIDES, so its slope is 1/100 and
+# it compresses by a hundred. Applying it to a number that is already a ratio is the spurious case,
+# and that is exactly what produced the four-decimal collision described below.
+# SIX decimals, not four, and matches must come from DIFFERENT lines. At four decimals the
+# read-a-percentage-back-as-a-ratio form collided 1.0772 with 1.0813, the interval endpoint and the
+# point estimate on the SAME row: 1 + 1.0772/100 = 1.010772 and 1 + 1.0813/100 = 1.010813 both
+# round to 1.0108, because an input gap of 0.0041 compresses to 0.000041, under the 0.00005 that
+# four decimals can resolve. So the scan invented a duplicate out of its own rounding. Six decimals
+# separates them, and the different-line requirement is the real predicate anyway: a leaked loop
+# variable duplicates a value ACROSS rows, and a rounding collision does not.
 def _canon(x):
     return round(x, 6)
 
@@ -198,11 +202,12 @@ if _dups:
         print("    ratio form %.4f appears %d times:" % (v, len(w)))
         for _l in w:
             print("        %s" % _l)
-    print("  Exact repetition of a continuous statistic across rows is the signature of a leaked")
-    print("  loop variable or a copied cell. Inspect each before quoting it. Some repeats are")
-    print("  legitimate (two widths sharing a floor), so this REPORTS rather than refuses.")
+    print("  (Values are compared as written AND as `1 + x/100`, so a percentage matches the ratio")
+    print("   it restates.) Exact repetition of a continuous statistic across rows is the signature")
+    print("  of a leaked loop variable or a copied cell. Inspect each before quoting. Some repeats")
+    print("  are legitimate (two widths sharing a floor), so this REPORTS rather than refuses.")
 else:
-    print("INTERNAL-DUPLICATE SCAN over the printed report: no value repeats across lines under")
-    print("  either the ratio form or the percent-of-excess form. %d lines marked `derived` are"
+    print("INTERNAL-DUPLICATE SCAN over the printed report: no value repeats across lines, either")
+    print("  as written or read back as a ratio. %d lines marked `derived` are"
           % sum(1 for _, _d in OUT if _d))
     print("  skipped -- they restate a table value in percent form on purpose.")
