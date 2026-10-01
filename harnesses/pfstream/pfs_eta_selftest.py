@@ -59,13 +59,30 @@ def early_exits():
         projectors and NOT module-wide: all eight helper returns are BinOps. So the
         reasoning was right about the projectors and overstated about the module, and
         the gap is exactly where the newest refusal landed.
-      * THIS ONE -- call sites of a single named function. Exact regardless of how the
-        message is built, how the literal is spelled, or what the caller returns.
+      * SINK -- call sites of one named function. Exact regardless of how the message is
+        built or spelled, and it brought the helper refusal into the population. But
+        REPLACING the shape predicate with it was a REGRESSION: an exit that neither
+        calls the sink nor contains the word "REFUSE" left the population again, and
+        that is the very exit the lexical predicate was first caught on. Measured with
+        one plant at both tips:
+            shape predicate   13 sites, 12 of 13, names the line, FAILED
+            sink predicate    13 sites, 13 of 13, OK
 
-    Enumerating expression kinds cannot be completed; naming the sink removes the need
-    to. The remaining assumption -- that every refusal goes through the sink -- is
-    CHECKED by t_refuse_sink_is_the_only_producer rather than assumed, which is the step
-    missing from both earlier predicates.
+    SO THE PREDICATE IS THE UNION, because the two blind spots are COMPLEMENTARY rather
+    than nested: shape catches any list-display exit whatever its wording and misses a
+    helper's string refusal; the sink catches any sink call whatever its spelling and
+    misses an exit that neither calls it nor says REFUSE.
+
+    Keeping both has ZERO false-demand cost in this module, which is a measurement and
+    not an assumption: of 26 returns, all 10 list displays are error exits, and the 11
+    helper BinOp/Tuple/Call returns are not list displays so the shape half can never
+    flag them. t_union_has_no_false_demand re-derives that from the AST each run, so if
+    a normal path ever returns a list display the corpus says so instead of silently
+    demanding a plant for it.
+
+    The remaining assumption -- that every refusal goes through the sink -- is CHECKED by
+    t_refuse_sink_is_the_only_producer, and the two CALL CONVENTIONS are checked by
+    t_refuse_wrapper_convention. Both steps were missing from the earlier predicates.
     """
     t = ast.parse(open(TARGET).read())
     out = set()
@@ -75,7 +92,16 @@ def early_exits():
                 out.add(n.lineno)
             if isinstance(n.func, ast.Attribute) and n.func.attr == "exit":
                 out.add(n.lineno)
+        # The shape half, kept rather than replaced. Any returned list display at all --
+        # no test on the element kind, which is what finding 8 showed cannot be enumerated.
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.List) and n.value.elts:
+            out.add(n.lineno)
     return out
+
+
+def _projectors(t):
+    return [f for f in ast.walk(t) if isinstance(f, ast.FunctionDef)
+            and f.name in ("project", "project_mtimes")]
 
 
 HIT = set()
@@ -476,6 +502,88 @@ def t_coverage_population_is_not_vacuous():
                     "refusal is outside the coverage population again (finding 7)")
 
 
+def t_union_has_no_false_demand():
+    """The union costs nothing HERE, and that is re-derived rather than assumed.
+
+    The shape half would be a false-demand generator in a module whose normal paths
+    return list displays. In this one they do not: the projectors accumulate into `out`
+    and return the NAME. This fails if that stops being true, which is the honest form --
+    the cost of the union is measured each run instead of priced once.
+    """
+    global CHECKS
+    CHECKS += 1
+    t = ast.parse(open(TARGET).read())
+    bad = []
+    for f in _projectors(t):
+        for n in ast.walk(f):
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.List) and n.value.elts:
+                # An error exit either calls the sink or is a non-sink exit we want flagged.
+                calls = [c for c in ast.walk(n.value) if isinstance(c, ast.Call)]
+                names = set(c.func.id for c in calls if isinstance(c.func, ast.Name))
+                if "_refuse" not in names and not any(
+                        isinstance(e, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call))
+                        for e in n.value.elts):
+                    bad.append(n.lineno)
+    if bad:
+        FAIL.append("union/false-demand: list displays returned from a projector that are "
+                    "not error exits, at %s -- the shape half now demands plants for "
+                    "normal paths and its justification needs re-reading" % bad)
+
+
+def t_refuse_wrapper_convention():
+    """`_refuse` has TWO call conventions by context and only one half was enforced.
+
+    Projectors must `return [_refuse(...)]`; helpers must `return _refuse(...)`. Using
+    the helper form inside a projector emitted 43 lines of ONE CHARACTER EACH at exit
+    status 0, because `"\n".join(a_string)` iterates characters -- and every static check
+    passed it, since the site IS a sink call site and the literal IS inside a call.
+    Nothing looked at the wrapper. Checked from the AST, by scope.
+    """
+    global CHECKS
+    CHECKS += 1
+    t = ast.parse(open(TARGET).read())
+    pnames = ("project", "project_mtimes")
+    bad = []
+    for f in ast.walk(t):
+        if not isinstance(f, ast.FunctionDef):
+            continue
+        for n in ast.walk(f):
+            if not (isinstance(n, ast.Return) and n.value is not None):
+                continue
+            direct = (isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+                      and n.value.func.id == "_refuse")
+            wrapped = (isinstance(n.value, ast.List) and any(
+                isinstance(e, ast.Call) and isinstance(e.func, ast.Name)
+                and e.func.id == "_refuse" for e in n.value.elts))
+            if f.name in pnames and direct:
+                bad.append((f.name, n.lineno, "unwrapped `_refuse` in a projector"))
+            if f.name not in pnames and wrapped:
+                bad.append((f.name, n.lineno, "list-wrapped `_refuse` in a helper"))
+    if bad:
+        FAIL.append("refuse-wrapper: %s" % bad)
+
+
+def t_report_guard_is_loud():
+    """And the runtime half, because a static check only covers what it can parse.
+
+    `_report` refuses to join a bare string. Without it the CLI printed one line per
+    character at exit status 0 -- a catastrophic-looking output that no status code or
+    grep would flag as an error.
+    """
+    global CHECKS
+    CHECKS += 1
+    try:
+        pfs_eta._report("REFUSE: a bare string")
+    except TypeError as e:
+        if "one line per character" not in str(e):
+            FAIL.append("report-guard: raised TypeError but without the diagnosis: %s" % e)
+    else:
+        FAIL.append("report-guard: _report() joined a bare string instead of refusing")
+    CHECKS += 1
+    if pfs_eta._report(["a", "b"]) != "a\nb":
+        FAIL.append("report-guard: _report() broke the normal list case")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
 
 
@@ -490,7 +598,7 @@ def main():
     missed = sorted(want - HIT)
     src = open(TARGET).read().split("\n")
     print("pfs_eta selftest: %d plants, %d assertions, %d early exits in the AST "
-          "(call sites of the _refuse sink, plus sys.exit)" % (len(TESTS), CHECKS, len(want)))
+          "(union: sink call sites, returned list displays, sys.exit)" % (len(TESTS), CHECKS, len(want)))
     print("  early exits reached: %d of %d" % (len(want & HIT), len(want)))
     rc = 0
     if missed:

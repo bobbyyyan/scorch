@@ -41,6 +41,25 @@ import time
 LINE = re.compile(r"---\s+p(\d+)\s+(\S+)\s+(start|done)\s+(\d\d):(\d\d):(\d\d)")
 
 
+def _report(lines):
+    """Guard the projectors' return type at the boundary where confusing it is silent.
+
+    `_refuse` has two call conventions by context -- the projectors return
+    `[_refuse(...)]` and the helpers return `_refuse(...)` -- and using the helper form
+    inside a projector produced 43 lines of ONE CHARACTER EACH at exit status 0, because
+    `"\n".join(a_string)` iterates its characters. Every static check passed it: the site
+    is a genuine `_refuse` call, the literal is inside a call, and nothing looked at the
+    wrapper. So the convention is checked here too, at the one place the two types meet.
+    """
+    if isinstance(lines, str):
+        raise TypeError(
+            "a projector returned a bare string, not a list of lines: %r. A refusal in a "
+            "projector must be wrapped -- `return [_refuse(...)]`, not "
+            "`return _refuse(...)` -- or joining it emits one line per character."
+            % (lines[:60],))
+    return "\n".join(lines)
+
+
 def _refuse(msg, *args):
     """The ONE producer of a refusal string. Every error exit in this module calls it.
 
@@ -398,11 +417,11 @@ if __name__ == "__main__":
             nw = _secs(*a[4].split(":"))
         else:
             nwe = time.time()
-        print("\n".join(project_mtimes(a[1], a[2], int(a[3]), nw, nwe)))
+        print(_report(project_mtimes(a[1], a[2], int(a[3]), nw, nwe)))
     else:
         if len(a) < 2:
             sys.exit("usage: pfs_eta.py <pass-log> <rounds> [HH:MM:SS now]\n"
                      "       pfs_eta.py --mtimes <dir> <regex> <rounds> [HH:MM:SS now]")
         # Same default; here it stays a lower bound because the log carries no date.
         nw = _secs(*a[2].split(":")) if len(a) > 2 else _secs_of_day(time.time())
-        print("\n".join(project(a[0], int(a[1]), nw)))
+        print(_report(project(a[0], int(a[1]), nw)))
