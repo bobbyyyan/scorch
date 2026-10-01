@@ -66,6 +66,24 @@ def _check_closed_forms(hi=200):
     return bad
 
 
+def _q(v, q):
+    """A quantile, printed so a value NEAR a boundary cannot read as the boundary.
+
+    A factor of `1 - n_odd/nnz` is exactly 1 only when a matrix has no odd-length row at all, and
+    that is a real atom worth distinguishing from a value a rounding away from it. Printed at four
+    decimals, SuiteSparse's p95 read 1.0000 and looked like the atom; it is 0.9999968283, and the
+    atom (4.86% of that population) does not begin until quantile 0.9521. So a value within 5e-5
+    of 0 or 1 is printed with enough digits to show it is not there, and an exact hit is marked.
+    """
+    import numpy as _np
+    x = float(_np.quantile(v, q))
+    if x == 1.0 or x == 0.0:
+        return "%.4f(exact)" % x
+    if abs(x - 1.0) < 5e-5 or abs(x) < 5e-5:
+        return "%.10f" % x
+    return "%.4f" % x
+
+
 def reach_of(indptr):
     """(G, S, added, reach, n_rows_reaching_loop, n_odd) from CSR row pointers.
 
@@ -160,14 +178,63 @@ def main():
     print("EXACT FORM: reach = 2*added/(nnz - n_odd), since G = (nnz - n_odd)/2. The familiar")
     print("2*P/d = 2*added/nnz is that with n_odd dropped, so it UNDERSTATES reach by exactly")
     print("the factor 1 - n_odd/nnz, per matrix -- no comparison of aggregates required. Chasing")
-    print("that error by dividing a per-matrix median reach by a mean degree mixes three")
-    print("estimator kinds and gave three different answers (0.81, 0.87); the per-matrix ratio")
-    print("below is the only form comparable to a per-matrix measured reach.")
-    ef = np.array([1.0 - x[8] / x[2] for x in rows if x[2]])
-    print("  error factor 1 - n_odd/nnz:  p5 %.4f  median %.4f  p95 %.4f  (n=%d)"
-          % (np.quantile(ef, 0.05), np.median(ef), np.quantile(ef, 0.95), ef.size))
-    print("  so 2*P/d understates the median reach here by %.2f%%" % (100.0 * (1 - np.median(ef))))
-    print("  where reach == 0 both sides are 0, so the approximation is EXACT, not undefined")
+    print("that error by dividing a per-matrix median reach by a mean degree mixes estimator")
+    print("kinds and gave three different answers (0.81, 0.81, 0.87); the per-matrix ratio is")
+    print("the only form comparable to a per-matrix measured reach.")
+    print()
+    print("THREE DEGENERACY CLASSES, which the exact form separates and the ratio does not:")
+    cls0 = [x for x in allrows if x[3] == 0]
+    cls1 = [x for x in allrows if x[3] > 0 and x[5] == 0]
+    cls2 = [x for x in allrows if x[3] > 0 and x[5] > 0]
+    print("  G == 0            %5d   reach is 0/0, UNDEFINED; the factor is still defined"
+          % len(cls0))
+    print("  G > 0, added == 0 %5d   reach is EXACTLY 0 and so is the prediction, so the"
+          % len(cls1))
+    print("                            approximation is EXACT here; the RATIO is 0/0 = NaN")
+    print("  G > 0, added > 0  %5d   ratio defined, and equal to the factor by the identity"
+          % len(cls2))
+    if len(cls0) + len(cls1) + len(cls2) != len(allrows):
+        raise AssertionError("the three classes do not partition %d matrices" % len(allrows))
+
+    # The factor and the ratio are the SAME random variable wherever added > 0, so their medians
+    # cannot differ on a common population. Asserting that is free and it fails the instant one
+    # side is computed over a different set -- which is exactly what happened when the factor was
+    # taken over G > 0 (4271 matrices) and the ratio over reach > 0 (4117), printing 0.9016 and
+    # 0.9063 as one answer. No amount of care in the prose catches that; this does.
+    ef = np.array([1.0 - x[8] / x[2] for x in cls2])
+    ratio = np.array([(2.0 * (x[5] / x[1]) / (x[2] / x[1])) / x[6] for x in cls2])
+    if abs(float(np.median(ef)) - float(np.median(ratio))) > 1e-12:
+        raise AssertionError(
+            "factor median %.12f != ratio median %.12f on the added>0 population, so one of "
+            "them is over a different set" % (np.median(ef), np.median(ratio)))
+    print()
+    print("ON THE %d MATRICES WHERE THE RATIO IS DEFINED (G > 0 and added > 0):" % len(cls2))
+    print("  error factor 1 - n_odd/nnz   p5 %s  median %s  p95 %s"
+          % tuple(_q(ef, q) for q in (0.05, 0.50, 0.95)))
+    print("  predicted/measured           p5 %s  median %s  p95 %s"
+          % tuple(_q(ratio, q) for q in (0.05, 0.50, 0.95)))
+    print("  ASSERTED equal medians (they are one random variable where added > 0)")
+    print("  so 2*P/d understates the median reach by %.2f%% ON THIS POPULATION"
+          % (100.0 * (1 - np.median(ef))))
+    efg = np.array([1.0 - x[8] / x[2] for x in allrows if x[3] > 0 and x[2]])
+    same = len(cls2) == efg.size
+    print("  the factor median over ALL %d with G > 0 is %.4f" % (efg.size, np.median(efg)))
+    if same:
+        print("    (the same population here, so necessarily identical)")
+    else:
+        print("    which differs because the added == 0 matrices are, by construction, those")
+        print("    whose long rows are all ODD, so they sit at the low end of the factor")
+    atom = sum(1 for x in cls2 if x[8] == 0)
+    n2 = max(len(cls2), 1)
+    # The quantile at which the atom STARTS, under this file's index convention (n-1)q: the atom
+    # occupies 0-indexed ranks n-atom .. n-1, so it starts at q = (n-atom)/(n-1). The tempting
+    # 1 - atom/n is NOT that -- it gives 0.9514 here where the true threshold is 0.9517, and a
+    # bisection on the real data confirms q=0.9514 still returns 0.9999995 rather than 1.
+    qstart = (n2 - atom) / (n2 - 1) if n2 > 1 and atom else float("nan")
+    print("  matrices with n_odd == 0 exactly, where the factor is 1 and not merely near it:")
+    print("    %d of %d = %.2f%%; the atom at 1.0 begins at quantile %s"
+          % (atom, len(cls2), 100.0 * atom / n2,
+             ("%.6f" % qstart) if atom else "none (no such matrix)"))
     print("Spearman-free check -- reach by mean-degree band:")
     for lo, hi in ((0, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 1 << 30)):
         m = (d >= lo) & (d < hi)

@@ -41,7 +41,12 @@ done
 # POSITIVE CONTROL for the ambient-environment section below. The section's failure mode is
 # silence, and silence is what it also prints when nothing is set -- so prove the machinery emits
 # a line when a matching variable IS present, before trusting an empty section to mean "empty".
-probe=$(SCORCH_PFS_BUILD_ENV_PROBE=1 env | grep -c '^SCORCH_PFS_BUILD_ENV_PROBE' || true)
+# Greps the PRODUCTION pattern, not a probe-specific one. A probe matching
+# '^SCORCH_PFS_BUILD_ENV_PROBE' would certify the env-to-grep-to-count plumbing while leaving a
+# mistyped '^SCORCH_' in the section below undetected; since the probe variable starts with
+# SCORCH_ anyway, using the real pattern is strictly tighter at the same cost and couples the
+# guard to the thing it certifies.
+probe=$(SCORCH_PFS_BUILD_ENV_PROBE=1 env | grep -c '^SCORCH_' || true)
 if [ "${probe:-0}" -lt 1 ]; then
   echo "REFUSE: the ambient-environment probe cannot see a variable that is set, so an empty"
   echo "        SCORCH_* section in the build logs would carry no information."
