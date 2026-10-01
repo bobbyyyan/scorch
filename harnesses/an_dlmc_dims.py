@@ -103,15 +103,57 @@ print("  the footprint signal would arrive through the log(nnz) partial if J wer
 
 print()
 X2 = np.column_stack([ln, lr, np.ones_like(ln)])
-_, res, _, _ = np.linalg.lstsq(X2, lc, rcond=None)
-r3 = np.linalg.matrix_rank(np.column_stack([ln, lr, lc, np.ones_like(ln)]))
-r_bad = np.linalg.matrix_rank(np.column_stack([ln, lr, ld, np.ones_like(ln)]))
-print("RANK CHECKS, so the added regressor is demonstrated and not assumed:")
-print("  residual SS of log J on {log nnz, log rows, 1} = %.1f  (0 would mean collinear)"
-      % (float(res[0]) if len(res) else 0.0))
-print("  rank{log nnz, log rows, log J,      1} = %d  <- usable, J adds a dimension" % r3)
-print("  rank{log nnz, log rows, log degree, 1} = %d  <- DEFICIENT, degree is nnz/rows exactly"
-      % r_bad)
+n = len(lr)
+
+
+def collinearity(y):
+    """Variance inflation of `y` against {log nnz, log rows, 1}, with its scale-free reading.
+
+    Residual SS alone is NOT scale-free: it is in squared units of y, so it would read the same
+    whether y had a wide or a narrow spread, and "0 means collinear" never says how far from 0 is
+    far enough. The ratio total/residual is the variance inflation factor, which does say: it is
+    the factor by which this regressor's own standard error is inflated, squared.
+    """
+    b, _, _, _ = np.linalg.lstsq(X2, y, rcond=None)
+    r = y - X2 @ b
+    rss = float(r @ r)
+    tss = float(((y - y.mean()) ** 2).sum())
+    vif = tss / rss if rss > 0 else float("inf")
+    return rss, tss, vif
+
+
+print("COLLINEARITY, so the added regressor is demonstrated and not assumed. Reported as VIF")
+print("because residual SS carries no scale; VIF is the squared inflation of that coefficient's")
+print("own standard error, and it leaves the other coefficients' identifiability untouched.")
+print("  %-11s %21s %10s %7s %7s %8s" % ("regressor", "residual SS", "total SS", "VIF", "R^2", "SE infl"))
+for nm, y in (("log J", lc), ("log degree", ld)):
+    rss, tss, vif = collinearity(y)
+    # The degree row is the POSITIVE CONTROL for this check. A collinearity test that cannot
+    # return zero on a genuinely collinear regressor proves nothing about the one that returns
+    # 1674. Report it against a threshold rather than as a value: the residual is numerical noise,
+    # so its exact magnitude is not reproducible across BLAS paths (two machines read 7e-25 and
+    # 3e-24 for the same data) and quoting it as a figure would imply precision it lacks.
+    zero = rss < 1e-18 * max(tss, 1.0)
+    print("  %-11s %21s %10.1f %7s %7.4f %8s%s"
+          % (nm,
+             "~0 (< 1e-18 x total SS)" if zero else "%.1f" % rss,
+             tss,
+             "inf" if zero else "%.3f" % vif,
+             1.0 if zero else 1 - rss / tss,
+             "inf" if zero else "%.3f" % np.sqrt(vif),
+             "   <- POSITIVE CONTROL: degree IS nnz/rows, so this MUST read collinear" if zero
+             else "   <- usable"))
+    if nm == "log J" and zero:
+        sys.exit("REFUSE: log J reads collinear with {log nnz, log rows}; the repair that "
+                 "separates the per-row and footprint families is not available on this data")
+    if nm == "log degree" and not zero:
+        sys.exit("REFUSE: log degree did NOT read collinear, but it is nnz/rows by construction. "
+                 "The collinearity check is broken and its verdict on log J means nothing")
+print("  residual SD of log J %.4f against a total SD of %.4f -- the same statement in log units"
+      % (np.sqrt(collinearity(lc)[0] / (n - 3)), np.sqrt(collinearity(lc)[1] / (n - 1))))
+print("  rank{log nnz, log rows, log J, 1} = %d   rank{log nnz, log rows, log degree, 1} = %d"
+      % (np.linalg.matrix_rank(np.column_stack([ln, lr, lc, np.ones_like(ln)])),
+         np.linalg.matrix_rank(np.column_stack([ln, lr, ld, np.ones_like(ln)]))))
 
 st = [k for k in dims if dims[k][0] == 512]
 sj = collections.Counter(dims[k][1] for k in st)

@@ -166,9 +166,28 @@ not re-run here, and it is a sample rather than a census.)
 Fit `y ~ log(nnz) + log(rows) + log(J)`. Demonstrated to be legitimate rather than assumed, by
 `harnesses/an_dlmc_dims.py`:
 
-    residual SS of log J on {log nnz, log rows, 1} = 1674.0     0 would mean collinear
-    rank{log nnz, log rows, log J,      1} = 4                  usable
-    rank{log nnz, log rows, log degree, 1} = 3                  deficient, degree IS nnz/rows
+    regressor             residual SS   total SS     VIF     R^2  SE infl
+    log J                      1674.0     2136.8   1.276  0.2166    1.130   usable
+    log degree  ~0 (< 1e-18 x total SS)     7877.2     inf  1.0000      inf   POSITIVE CONTROL
+
+    rank{log nnz, log rows, log J, 1} = 4      rank{..., log degree, 1} = 3
+
+Reported as VIF and not as residual SS, because residual SS is not scale-free: 1674.0 is in
+squared log-J units and would read the same whether log J had a wide spread or a narrow one, and
+"0 means collinear" never says how far from 0 is far enough. VIF = total/residual = 1.276 does
+say. It is the squared inflation of that coefficient's OWN standard error -- 13% -- and it leaves
+the other coefficients' identifiability untouched. Residual SD of log J is 0.6622 against a total
+SD of 0.7480, the same statement in log units. A VIF of 1.276 is not a design under strain.
+
+The degree row is the POSITIVE CONTROL for the check rather than a second finding: a collinearity
+test that cannot return zero on a genuinely collinear regressor says nothing about the one that
+returns 1674. It is reported against a threshold and not as a value, because the residual there is
+numerical noise whose magnitude is not reproducible across BLAS paths -- two machines read 7e-25
+and 3e-24 on identical data -- so quoting it as a figure would imply precision it does not have.
+
+Both directions of the check are planted and fire: log J made an exact function of nnz and rows
+reads collinear and refuses; log degree replaced by noise reads non-collinear and refuses; and the
+real log degree = log nnz - log rows reads collinear as it must.
 
 Then the hypotheses separate on a coefficient neither shares:
 
