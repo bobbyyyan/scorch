@@ -42,6 +42,32 @@ cp -p "$H/ERRATA_c210.md" "$DEST/ERRATA.md"
 cp -p "$H/REPS_WITNESS_c210.txt" "$DEST/REPS_WITNESS.txt"
 cp -p "$SNAP" "$DEST/portbound_boundaries.txt"
 
+# COMMIT BINDING. ERRATA.md and REPS_WITNESS.txt are copies from a live worktree, renamed, so the
+# sealed digest pins the copy and not a revision -- the worktree file can move afterwards with
+# nothing recording what was sealed. Record the revision and whether it was clean.
+{
+  echo "=== SOURCE BINDING for the artefacts copied in from the worktree"
+  echo "worktree: /Users/bobby/scorch-beat-mkl"
+  echo "HEAD:     $(git -C /Users/bobby/scorch-beat-mkl rev-parse HEAD)"
+  echo "branch:   $(git -C /Users/bobby/scorch-beat-mkl rev-parse --abbrev-ref HEAD)"
+  echo "ERRATA.md           <- harnesses/ERRATA_c210.md      sha256 $(shasum -a 256 "$H/ERRATA_c210.md" | cut -d' ' -f1)"
+  echo "REPS_WITNESS.txt    <- harnesses/REPS_WITNESS_c210.txt sha256 $(shasum -a 256 "$H/REPS_WITNESS_c210.txt" | cut -d' ' -f1)"
+  echo "an_c210.py          sha256 $(shasum -a 256 "$DEST/an_c210.py" | cut -d' ' -f1)"
+  d=$(git -C /Users/bobby/scorch-beat-mkl status --porcelain -- harnesses/ERRATA_c210.md harnesses/REPS_WITNESS_c210.txt harnesses/an_c210.py)
+  if [ -z "$d" ]; then echo "worktree state: all three tracked files CLEAN at the HEAD above"
+  else echo "worktree state: UNCOMMITTED changes present, so HEAD does not reproduce these bytes:"; echo "$d" | sed 's/^/  /'; fi
+} > "$DEST/SOURCE_BINDING.txt"
+echo "OK  source binding recorded: HEAD $(git -C /Users/bobby/scorch-beat-mkl rev-parse --short HEAD)"
+
+# ---- FIX: the baseline must EXIST and be POPULATED before any comparison. Without this,
+# `cd "$C207"` fails, `b` is the empty string, `comm -12` finds nothing and the verdict reads
+# DISJOINT -- so a moved, renamed, pruned or not-yet-populated baseline prints the registered
+# headline. My own note says a copy check can be vacuous and to size-filter first; I planted a
+# duplicate (which the check catches) and left the empty operand open one level up.
+[ -d "$C207" ] || { echo "REFUSE: baseline $C207 is not a directory -- a comparison against nothing reads as DISJOINT"; exit 1; }
+NB=$( (cd "$C207" && ls -1 dl_*_float32_p*.csv 2>/dev/null) | wc -l | tr -d ' ')
+[ "$NB" -eq 12 ] || { echo "REFUSE: baseline holds $NB object-pass CSVs, not 12 -- an undersized baseline weakens the disjointness claim silently"; exit 1; }
+
 # ---- errata 8d: attest disjointness in the artefact, not at read time.
 {
   echo "=== DISJOINTNESS ATTESTATION (errata item 8d)"
@@ -71,16 +97,32 @@ cp -p "$SNAP" "$DEST/portbound_boundaries.txt"
   fi
 } > "$DEST/DISJOINTNESS.txt"
 grep -q "^VERDICT: DISJOINT" "$DEST/DISJOINTNESS.txt" || { echo "REFUSE: digest sets are not disjoint (see $DEST/DISJOINTNESS.txt)"; exit 1; }
-echo "OK  disjointness attested: 0 of 12 digests shared with chain207"
+# The guard reads its OWN artefact, because the tell for a vacuous pass is already written there:
+# an empty baseline realpath and zero digest lines under the baseline heading.
+grep -qE '^chain207 realpath: /' "$DEST/DISJOINTNESS.txt" || { echo "REFUSE: DISJOINTNESS.txt records no baseline realpath -- the comparison had an empty operand"; exit 1; }
+for side in chain210 chain207; do
+  nd=$(awk "/^--- $side's twelve object-pass digests\$/{f=1;next} /^--- /{f=0} f && /^[0-9a-f]{64} /{n++} END{print n+0}" "$DEST/DISJOINTNESS.txt")
+  [ "$nd" -eq 12 ] || { echo "REFUSE: DISJOINTNESS.txt lists $nd digests for $side, not 12"; exit 1; }
+done
+echo "OK  disjointness attested: 12 vs 12 digests listed, 0 shared with chain207"
 
 # ---- the manifest. Identify a real manifest by its digest FIELD WIDTH, not its name: 9 of 25
 # ledger manifests in this project are CRC-32, against which `shasum -c` prints zero OK and zero
 # FAILED -- a vacuous pass. 64 hex chars is the check.
 cd "$DEST" || exit 1
-rm -f SHA256SUMS SHA256SUMS.sha256
+# CONTAINMENT. shasum follows symlinks, so a sealed name whose bytes live outside the directory
+# verifies clean forever while the real file is unsealed and mutable. attest.py has contained()
+# for exactly this; the seal is where it matters most.
+nl=$(find . -type l | wc -l | tr -d ' ')
+[ "$nl" -eq 0 ] || { echo "REFUSE: $nl symlink(s) in $DEST -- a sealed name must be a sealed file:"; find . -type l | sed 's/^/  /'; exit 1; }
+rm -f SHA256SUMS.sha256
 # NUL-delimited into xargs: never let the shell word-split a file list, and zsh would not
 # split it at all, so `shasum $(echo "$SET")` is wrong in two different ways depending on shell.
-ls -1 | grep -v '^SHA256SUMS' | sort | tr '\n' '\0' | xargs -0 shasum -a 256 > SHA256SUMS.sha256 \
+# EXACT name, not a prefix. `grep -v '^SHA256SUMS'` also excluded SHA256SUMS.producing --
+# the producing-host manifest, which cannot attest itself and whose ONLY binding is this seal.
+# Left unsealed it could be edited afterwards undetected, breaking the chain of custody from
+# redwood through the tarball to here, which is the single thing it exists for.
+ls -1 | grep -vx 'SHA256SUMS.sha256' | sort | tr '\n' '\0' | xargs -0 shasum -a 256 > SHA256SUMS.sha256 \
   || { echo "REFUSE: could not write the manifest"; exit 1; }
 awk '{ if (length($1) != 64) { print "  line " NR " digest field is " length($1) " chars, not 64"; bad=1 } } END { exit bad+0 }' SHA256SUMS.sha256 \
   || { echo "REFUSE: manifest is not SHA-256 on every line"; exit 1; }
