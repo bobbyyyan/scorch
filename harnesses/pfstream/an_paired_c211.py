@@ -155,6 +155,25 @@ if 2 in verdicts:
     print("  SIGN: the arm is SLOWER at every width where it can fire and this reads FASTER, so the")
     print("  displacement has the wrong sign to be the arm. That argument needs no artefact range.")
 
+# A SURVIVING-CONVERSION-SPECIFIER SCAN. Twice in one session a format string reached output
+# unsubstituted -- a literal `%+.0f s`, and a doubled `%%` printed outside a format operation -- and
+# both times in a line added to EXPLAIN a number rather than to compute one. Explanatory prints are
+# written last, are exercised by no check, and fail in a way that looks cosmetic, so they are a
+# population a scan covers and review does not.
+#
+# THE SPACE FLAG IS DELIBERATELY EXCLUDED. `%[-+ #0]*...` -- the textbook form -- false-positives on
+# ordinary prose here: "against 0.3% identical-source" reads as `% i` and "95.9% of resampled" as
+# `% o`, both legitimate percent signs followed by a word. Dropping the space flag costs the ability
+# to catch a real `% d`, which is rare, and buys zero false positives on this harness's own output.
+# `%%` is added as a separate alternative because it matches no conversion class.
+_SPEC = re.compile(r"%[-+#0]*[0-9]*\.?[0-9]*[sdfgeiouxX]|%%")
+_bad_fmt = [(i, l) for i, (l, _d) in enumerate(OUT) if _SPEC.search(l)]
+if _bad_fmt:
+    for _i, _l in _bad_fmt:
+        _real_print("  line %d: %s" % (_i, _l.strip()[:96]))
+    sys.exit("REFUSE: %d printed line(s) carry an unsubstituted conversion specifier, so a number "
+             "this report claims to state was never formatted into it." % len(_bad_fmt))
+
 # AN INTERNAL-DUPLICATE SCAN OVER THE PRINTED OUTPUT, which is the only version that catches the
 # bug it is named for. A leaked loop variable produces a number that is plausible in isolation and
 # DUPLICATED IN CONTEXT: this report printed k=32's 8.13% as k=2's displacement, and the tell was

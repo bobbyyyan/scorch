@@ -496,7 +496,12 @@ landed (0.429) against a true share of 6 of 18 (0.333), and `deep` is the slow b
 mean **overstates** and its ETA is late by 25 s. Build-balanced is the correct estimator whenever the
 landed composition is unbalanced, which it is at every intermediate point of a rotation.
 
-Screen sensitivity to the imputation, since it cannot be removed yet: `nopf` running +2% moves the
-ETA +67 s, +5% moves it +168 s.
+Screen sensitivity to the imputation, **two-sided because the sign is unknown**: `nopf` at +-2%
+moves the ETA +-67 s, at +-5% +-168 s. A first version quoted this one-sided (`+2%`, `+5%`), which
+is wrong on a quantity whose direction is the thing being tested: `nopf` has the **fewest**
+instructions in the inner loop -- no prefetch at all, `.text` 1488 bytes below `strm` -- so it is
+the fastest of the four if instruction count dominates and the slowest if prefetch coverage does.
+Which holds is what the screen is for. A one-sided band is blind to exactly one tail, and here that
+is the tail where the run finishes **early** and someone looks for output before it exists.
 
 **Henceforth: board 13:11:28 build-balanced; screen 12:18:08 build-pooled with `nopf` imputed.**
