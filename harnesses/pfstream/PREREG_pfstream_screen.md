@@ -344,3 +344,67 @@ requirement:
 The routing map therefore differs by ISA, and the x86 one is the only one that matters here:
 k=2 narrow-k exact (arm unreachable), k=4 half-vector regblock (`__m128`), k=8/16/32 full-width
 regblock at NVEC 1/2/4.
+
+## AMENDMENT 7: THREE variants, not two -- and "name every kernel this width can dispatch to"
+
+Amendment 6 split the 12 substring matches as 8 + 4. **It is 6 + 4 + 2.** There is a THIRD suffix
+variant, `scorch_spmm_row_regblock_pf` (definition `spmm.h:2744`, calls 5096/5097). I published
+"match on a word boundary when a `_suffix` variant exists" in the same commit as a count that broke
+that rule, because I looked for *the* variant I had just been burned by and there were two.
+
+Enumerated mechanically this time -- the variant set is **discovered** by
+`\bscorch_spmm_row_regblock(_[a-z0-9_]+)?\b` rather than assumed:
+
+| variant | calls | definition | comments |
+|---|---|---|---|
+| `scorch_spmm_row_regblock` | 6 — 4884, 4885, 4968, 4972, 6346, 6347 | 2267 | 2642, 2814, 4923 |
+| `..._deep` | 4 — 4948, 4951, 5065, 5066 | 2534 | 4928 |
+| `..._pf` | 2 — 5096, 5097 | 2744 | — |
+| | **12** | **3** | **4** = 19 total |
+
+**And the release-reachable 6 was right for the wrong reason.** 5096/5097 dropped out of my "8"
+because they are hooks-only; they should drop out because they are **a different function**. Two
+reasons, one of them wrong, the same answer — which is why the number survived and the derivation
+should not have.
+
+### Does the arm exist in every kernel the screen can dispatch to?
+
+The right question is not "is the arm enabled" but **"name every kernel this width can dispatch to,
+and does the arm exist in each"**. Tested by reconstructing each **full call expression** (balancing
+parentheses forward), because a per-LINE test reported `NO BOUND` for 4968/4972 — whose
+`SCORCH_SPMM_PFLIM` sits on continuation lines 4970/4974. That false negative would have read as
+"k=4 does not receive the arm", the opposite of the truth.
+
+| call | variant | receives `SCORCH_SPMM_PFLIM` |
+|---|---|---|
+| 4884, 4885, 4968, 4972, 6346, 6347 | `scorch_spmm_row_regblock` | **yes, all 6** |
+| 4948, 4951, 5065, 5066 | `..._deep` | no — separate kernel, default-off |
+| 5096, 5097 | `..._pf` | **no, and its signature has no such parameter** |
+
+`..._pf` takes `pA_begin, pA_end, mask_last` and nothing else; `PFLIM`/`pA_limit` appear nowhere in
+its body, and its prefetch is row-clipped (`if (pA + PFD < pA_end)`, twice). So **in a hooks build
+with `narrowk_pf` set, the arm under test is silently absent**: the clamp is not in the kernel that
+runs, the build still compiles, `strm` and `ship` emit the same code on that path, and the result
+reads as a plausible null.
+
+That makes `pfs_bits.py`'s `so.scorch_tune_hooks()` refusal load-bearing in a **second and stronger
+way** than the per-call getenv tax. The tax distorts a comparison; this removes the arm. Same shape
+as the near-miss M5 check — a configuration in which the thing being measured is not in the
+reachable code — reached by a different route.
+
+### Screen coverage, and one gap it does not cover
+
+`mrgate` calls `spmm_csr_float_v2` → `spmm_csr_v2_core`. In a release object (no hooks,
+`DEEP_UNROLL=0`):
+
+| k | kernel reached | arm present |
+|---|---|---|
+| 2 | `scorch_spmm_row_narrow_exact` | no — **declared negative control** |
+| 4 | `scorch_spmm_row_regblock<…, VH>` via 4968/4972 | yes |
+| 8, 16, 32 | `scorch_spmm_row_regblock` via `SCORCH_RB` (4884/4885) | yes |
+
+**THE GAP:** calls 6346/6347 are in `spmm_csr_linear_fused_float` (`spmm.h:6119`), a different entry
+point. PFSTREAM changes the **fused Linear-SpMM path too**, and this screen never calls it — so the
+screen is silent about a path the change affects. That path carries real workloads (the sparse
+autoencoder family). It needs its own measurement before PFSTREAM ships, and "neutral-or-better
+everywhere" is not established by this screen alone.
