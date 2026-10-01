@@ -280,3 +280,31 @@ did not support it. And the MKL term is sharper than Amendment 3 put it: it is a
 quantity the calibration *pins*, so unlike the wall-time gap it cannot be absorbed by unrecorded
 overhead. Of the two numbers in that table, the one flagged as a finding is the one whose
 instrument is tightest.
+
+## AMENDMENT 6: PFSTREAM IS PROVABLY INERT ON ARM, so "no regressions" is satisfied there by
+## construction rather than by measurement
+
+Checked mechanically rather than by eye: for each of the 12 `scorch_spmm_row_regblock` **call**
+sites, the enclosing preprocessor stack was accumulated by walking upward and matching `#endif`
+against `#if`. **All 12 are inside `#if defined(__AVX2__) && defined(__FMA__)`; none is reachable
+on ARM.** `scorch_simd<float>` does have a NEON specialization (`float32x4_t`, `lanes = 4`), but
+the register-block *dispatch* is x86-only, so the NEON path uses its own row kernel and PFSTREAM is
+dead code there.
+
+Three consequences for the standing "neutral-or-better across the whole space, no regressions"
+requirement:
+
+1. **ARM cannot regress.** Not "measured neutral on the M5" -- unreachable. That is the stronger
+   form of the gate this project's convention asks for (a condition that *provably cannot fire* on
+   the shapes it would hurt), and here it comes free from the existing ISA guard.
+2. **Two-host confirmation IS available for this change**, unlike every ARM claim in this
+   milestone. redwood is AVX2 and MKT compiles the same AVX2 path (Amendment 2: there is no
+   AVX-512 specialization), so both confirmation hosts run the *same* register-block code. The
+   usual asymmetry -- one ARM host, so ARM claims never get two hosts -- does not apply.
+3. **The M5 is not a third host for this, and no correctness run there would mean anything.** The
+   bit-identity check would pass trivially because the arm is absent from the binary's reachable
+   code, which is the vacuous-pass shape: a check that cannot fail is not evidence.
+
+The routing map therefore differs by ISA, and the x86 one is the only one that matters here:
+k=2 narrow-k exact (arm unreachable), k=4 half-vector regblock (`__m128`), k=8/16/32 full-width
+regblock at NVEC 1/2/4.
