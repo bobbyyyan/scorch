@@ -238,6 +238,10 @@ def main():
     print("\ncall sites for pfs_criterion outside its own tests: %d%s"
           % (len(callers), (" (%s)" % ", ".join(callers)) if callers else ""))
     if not callers:
+        print("  The f32 screen that first posed this question is UNREADABLE, not a null: its")
+        print("  k=2 negative control FAILED, so the instrument did not work there. A null is a")
+        print("  result with power behind it; unreadable is the absence of a result. The f64")
+        print("  screen is the independent reading of the same question and is still running.")
         print("  NOT YET WIRED, and stated rather than left implicit. The intended caller is")
         print("  the PFSTREAM screen's beyond-floor analysis, which needs the f64 cell's data")
         print("  to exist. Until then this file tests a criterion nothing applies, so a green")
