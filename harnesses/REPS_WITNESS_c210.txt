@@ -68,3 +68,19 @@ its DEFAULTS, recorded so it is clear they were overridden and not relied on:
       cals.sort()
       return max(1, int((A.target_ms * 1e-3) / max(cals[len(cals) // 2], 1e-9)))
   
+
+=== ADDENDUM, two corrections to how this file should be read (peer session, accepted)
+
+1. "EXACTLY ONE LINE MATCHING --reps" DOES NOT BY ITSELF EXCLUDE A PASS LAUNCHED WITHOUT THE FLAG.
+   Such a pass would take mrgate.py's default of 13. What excludes it is the ARITHMETIC CEILING, not
+   the grep: 13 batches need 3963 s of timed calls inside a 1370 s object-pass. So the attestation is
+   two-sided and both sides are needed --
+     RECORD + PLAN  pin the value that was passed
+     CEILING        excludes the unrecorded fallback
+   and it is two-sided only because this default happens to be absurd. With a default of 3 the
+   ceiling would not have excluded it, and the grep would have had to be over invocation PATHS
+   through the script rather than over occurrences of the flag.
+
+2. AN mtime PREDATING THE RUN ORDERS, IT DOES NOT IDENTIFY. It excludes ordinary editing during the
+   run but not a `cp -p`, which preserves mtime. The sha256 above is the binding without that
+   weakness. Correct phrasing: sha256 for identity, mtime only for ordering.

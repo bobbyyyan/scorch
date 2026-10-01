@@ -63,3 +63,39 @@ narrated, since three mechanisms proposed tonight had three wrong signs.
 The measurement consequence is worth stating anyway: for 10.5% of rows the timed window is a third of
 the intended length, so a `min` over four reps there rests on fewer calls than the design assumed.
 That is a precision cost in a known band, not a bias, and the A/A floor already prices it.
+
+## Correction: "batch carries it" was wrong, in the same output that printed it
+
+The one-way batch grouping dips at 11-100 and the one-way nnz grouping rises monotonically, so the
+two disagree about where the shortfall lives while agreeing in aggregate (both weight back to 0.887).
+I printed the reading "the 11-100 column is low in EVERY nnz band it occupies, so batch carries it".
+The two-way table in that same output refutes it -- the column runs
+
+    nnz <1e3   1e3-1e4   1e4-1e5   1e5-1e6   1e6+
+    0.054      0.055     0.144     0.730     0.938
+
+a 17x span. The column is not uniform, so batch does not carry it alone; it is an **interaction**,
+visible in the table and invisible in either margin. The peer's reading that this is a grouping
+artefact to leave alone is also not right -- an interaction is a real structure, not an artefact of
+how the rows were cut.
+
+Where it actually lives: **small nnz AND narrow k, together.** Inside the 11-100 column the shortfall
+rises monotonically with width (k=2 0.169, k=4 0.375, k=8 0.429, k=16 0.444, k=32 0.537), and the
+extreme cells are matrices under 1e4 nonzeros whose calibration median was 60-550 us -- absurdly slow
+for that size. Those 1521 cells are a cold-start population, not a point on a size trend: calibration
+ran up to 18x slower than the batched steady state. Neither of us had grouped by width.
+
+## The untimed-call share was understated 1.75x, by both of us, for the reason the table shows
+
+`calibrate()` sets `batch = max(1, int(target/m_cal))`, so `m_cal = target/batch` up to the floor.
+The 8 untimed calls therefore cost `8 x target/batch` each cell, **not** `8 x ms`. Pricing them at
+`ms` assumes a calibration call costs what a batched call costs -- which is precisely what the
+shortfall disproves. Repriced at the interval midpoint of `target/batch`, over all twelve passes:
+
+    at ms            86.44 s   0.511% of wall
+    at target/batch  151.22 s  0.894% of wall      ratio 1.75x, stable at 1.72-1.82x per pass
+
+No conclusion moves -- kernel calls go from 85.7% to **86.05%** of wall and the non-kernel remainder
+from 14.3% to **13.95%**, so the occupancy bracket *tightens* slightly to **6.045-9.773 of 24 cores
+(25.2-40.7%)**, ceiling 2.46-3.97x. But 0.50% was a published figure the peer and I had agreed on,
+and agreement between two sessions is not evidence: we had made the same substitution.
