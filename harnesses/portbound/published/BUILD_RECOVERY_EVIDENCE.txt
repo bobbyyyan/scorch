@@ -1,0 +1,74 @@
+# RECOVERED BUILD CONFIGURATION, chain206 / chain210 objects
+# captured 2026-10-01T12:32:25Z on redwood from /scratch/bobbyy/det1
+#
+# THE TEST. Every getenv("SCORCH_NARROWK_*"), getenv("SCORCH_SPMM_HALFVEC") and
+# getenv("SCORCH_SPMM_ALLOC") call sits inside #ifdef SCORCH_TUNE_HOOKS, so the string
+# literal is in .rodata if and only if that macro was defined. The non-hook names below are
+# the positive control: they are present, which is what makes the hook-name zeros
+# informative rather than the output of a broken search.
+
+object aa   (aa/src/scorch_ops.cpython-311-x86_64-linux-gnu.so)
+  sha256       7f8f78d58a8784b13b48ff508adcf7fa8d4f3bad0ba0fc42227c9c5124549fd3
+  .text sha256 a79b5d20b322c5ac0cba6aec5699d07f47205b9d22abc5fd0840a2ef0ae5657e
+  all SCORCH_ string literals:
+    SCORCH_ABI_VALIDATE_MEMO
+    SCORCH_LLC_BYTES
+    SCORCH_NEON_REGTILE
+    SCORCH_PCORES
+    SCORCH_PHYS_CORES
+    SCORCH_SPMM_ATPARALLEL
+  hook-only literals (present iff SCORCH_TUNE_HOOKS defined):
+    SCORCH_SPMM_HALFVEC          0
+    SCORCH_NARROWK_UNROLL        0
+    SCORCH_NARROWK_EXACT_HI      0
+    SCORCH_SPMM_ALLOC            0
+    SCORCH_REGTILE_BASE          0
+    SCORCH_MULTIROW              0
+    SCORCH_DUMMY_TESTS           0
+  getenv imported (nm -D): 1
+
+object bb   (bb/src/scorch_ops.cpython-311-x86_64-linux-gnu.so)
+  sha256       70c9f5473e498f50b88251392b87c5fde4a19f6aa31c4c1f2670f9a8c0fdd350
+  .text sha256 a79b5d20b322c5ac0cba6aec5699d07f47205b9d22abc5fd0840a2ef0ae5657e
+  all SCORCH_ string literals:
+    SCORCH_ABI_VALIDATE_MEMO
+    SCORCH_LLC_BYTES
+    SCORCH_NEON_REGTILE
+    SCORCH_PCORES
+    SCORCH_PHYS_CORES
+    SCORCH_SPMM_ATPARALLEL
+  hook-only literals (present iff SCORCH_TUNE_HOOKS defined):
+    SCORCH_SPMM_HALFVEC          0
+    SCORCH_NARROWK_UNROLL        0
+    SCORCH_NARROWK_EXACT_HI      0
+    SCORCH_SPMM_ALLOC            0
+    SCORCH_REGTILE_BASE          0
+    SCORCH_MULTIROW              0
+    SCORCH_DUMMY_TESTS           0
+  getenv imported (nm -D): 1
+
+object aax   (aax/src/scorch_ops.cpython-311-x86_64-linux-gnu.so)
+  sha256       cb0450e8d0a67c7b8668c318454770b6195623a6c9c88c60ecc0036ecfd2508a
+  .text sha256 9b74325277bd2fb9529de77794206eabad0109d7d69c0282d4fb58f1ad7d036b
+  all SCORCH_ string literals:
+    SCORCH_ABI_VALIDATE_MEMO
+    SCORCH_LLC_BYTES
+    SCORCH_NEON_REGTILE
+    SCORCH_PCORES
+    SCORCH_PHYS_CORES
+    SCORCH_SPMM_ATPARALLEL
+  hook-only literals (present iff SCORCH_TUNE_HOOKS defined):
+    SCORCH_SPMM_HALFVEC          0
+    SCORCH_NARROWK_UNROLL        0
+    SCORCH_NARROWK_EXACT_HI      0
+    SCORCH_SPMM_ALLOC            0
+    SCORCH_REGTILE_BASE          0
+    SCORCH_MULTIROW              0
+    SCORCH_DUMMY_TESTS           0
+  getenv imported (nm -D): 1
+
+# CONCLUSION: no hook-only literal is present in any object and getenv IS imported, so the
+# builds were made WITHOUT SCORCH_TUNE_HOOKS. spmm_halfvec is therefore the compiled-in
+# SCORCH_SPMM_HALFVEC_F32, which scorch_policy.h:1332 defines as 1 under an #ifndef, and no
+# environment variable could have altered it because the override is not in the object.
+# So k=4 float32 ran the half-vector __m128 path with four of four lanes live.

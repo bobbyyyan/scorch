@@ -1,0 +1,22 @@
+binary_sha256 5b0c0afba493d9a4dfe8c1b39cf6f341f8053717e05ef56ef94f6d9f00d82d30
+source_sha256 d8a30d8c3386a5d5dc7f91fdabab98c02a1635478c671be120af593058cfb8dd
+compiler g++ (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
+flags -O3 -march=native -funroll-loops -std=c++17
+asmcheck_exit 0
+PER-NONZERO COUNTS, and the registered intent of each delta
+  arm   nnz/body   insn/nnz    mem/nnz  bcast/nnz  vpor/nnz   verdict
+  ----------------------------------------------------------------------------
+  V0           8      4.375       3.00       1.00      0.00   baseline: index load + A broadcast + folded B load
+  V0b          8      4.375       3.00       1.00      0.00   A/A floor arm: must equal V0 exactly
+  V1           8      2.375       2.00       1.00      0.00   index load removed
+  V2           8      3.500       2.00       0.00      0.00   A broadcast removed (hoisted)
+  V3           8      3.875       2.00       1.00      0.00   B load removed (register-resident)
+  V4           8      5.750       4.00       1.00      1.00   positive control: V0 + one extra load, accumulated
+  V4b          8      5.625       3.00       1.00      1.00   V0 + the accumulate ONLY; V4-V4b isolates the load
+  V4c          8      6.625       4.00       1.00      1.00   clean control: +1 load of an already-loaded address
+  V5           8      3.625       2.00       1.00      1.00   discriminator: V1 + the same accumulate
+  V6           8      4.625       3.00       1.00      0.00   CANDIDATE: 4 accumulator chains, V0's 3 load ops/nnz
+  V7           8      4.500       3.00       1.00      0.00   CANDIDATE: 8 accumulator chains, V0's 3 load ops/nnz
+  V8           8      2.625       2.00       1.00      0.00   4 chains, index load removed -- the port discriminator
+  V9           8      3.750       2.00       1.00      0.00   4 chains, B register-resident -- dependency vs MLP
+
