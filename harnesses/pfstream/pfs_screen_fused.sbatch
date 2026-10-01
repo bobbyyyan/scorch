@@ -48,6 +48,19 @@ echo "host $(hostname)  pool $(python -c 'import torch;print(torch.get_num_threa
 # allocation would mean running a command on mkt1 beside a live timing job. Staging here
 # removes that entirely: the files arrive from /matx when this job starts, and each digest
 # is checked, so a stale or partial copy refuses instead of producing numbers.
+# THE SCRIPT ITSELF HAS NO VERIFIER, which is the gap the staging block below cannot close:
+# it digests four inputs and refuses on mismatch, but nothing digests the verifier. A stale
+# script with a stale pin fails loudly (it did -- the deployed copy carried a d1567d6-era pin
+# beside a stage refreshed past it, and the job would have exited at startup). A stale script
+# whose pin happens to match a stale stage, or one whose pin was relaxed, passes silently.
+# So the script records its OWN digest, which a reader compares against the tracked file. That
+# is a self-description and not a gate -- a script cannot refuse itself on its own digest
+# without pinning that digest inside itself -- but it makes "which script ran" answerable from
+# the log instead of from a deployment nobody recorded.
+echo "script $(basename "$0") sha256 $(shasum -a 256 "$0" | cut -d" " -f1)"
+echo "  compare against harnesses/pfstream/pfs_screen_fused.sbatch in the tree; a difference"
+echo "  means this was deployed by hand rather than from a commit."
+
 STAGE=/matx/u/bobbyy/pfsstage
 declare -A WANT=(
   ["csrresolve.py"]="1872f707045dc14e149fd53e845fee4b60e206b48132b144ee8217c227bfba78"
