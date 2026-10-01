@@ -1142,9 +1142,13 @@ the instrument and not a reading of either arm:
 | 32 | +0.190 | −0.889 | −0.629 | +0.037 |
 
 Largest absolute floor band displacement **1.489% at k=8, band 1e4–1e5**. Width-to-width swing
-*within* a band, on byte-identical code: **0.951 pp** (1e4–1e5), 0.775 pp (1e6–1e7), 0.737 pp
-(1e5–1e6), 0.122 pp (0–1e4). A criterion requiring the k≥4 profile to sit inside the k=2 profile
-demands a stability the floor does not have.
+*within* a band, on byte-identical code, **in band order to match the table above**: 0.122 pp
+(0–1e4), **0.951 pp** (1e4–1e5), 0.737 pp (1e5–1e6), 0.775 pp (1e6–1e7). A criterion requiring
+the k≥4 profile to sit inside the k=2 profile demands a stability the floor does not have.
+
+*(Corrected by amendment 21: this list was first published sorted descending directly beneath a
+band-ordered table, so it read as band-aligned and was not — a reader mapped 0.951 pp to the
+0–1e4 band. The values were right and their order was a presentation defect.)*
 
 ### My error, and it is a registration error rather than an analysis one
 
@@ -1283,3 +1287,103 @@ the intervals share at least that point, so "disjoint" cannot also hold and no c
 both labels. The burden is also correctly directed: "shares" is a conjunction over four bands and
 is the outcome supporting the floor reading, so the harder test guards the dismissal of an arm
 effect.
+
+## Amendment 21 — the f64 positive control as registered was SELF-VOIDING, and three smaller fixes
+
+Raised by the peer session at 12:40. Point 1 is the one that matters: amendment 19's f64
+positive control, inherited by amendment 20, would have thrown away a correct and adequately
+powered analysis.
+
+### The control was incoherent, not conservative
+
+Amendment 19 registered "positive control an injected effect at the bound's magnitude" together
+with "beyond-floor only if the 95% CI lies entirely outside ±(floor bound)". Detection then
+requires `estimate − h > b` with `h` the CI half-width; injecting the true effect **at** `b`
+centres the estimate on `b`, so detection needs it to exceed `b` by a full half-width. Simulated
+at 200000 draws rather than taken on the algebra:
+
+| injected effect | detection |
+|---|---|
+| `b` — **as registered** | **2.45%** |
+| `b` + 1h | 49.89% |
+| `b` + 2h | 97.56% |
+| `b` + 3h | 100.00% |
+
+The 2.45% is assumption-free in `b` and in the standard error — only the CI's 95% level enters.
+So the registered control fails roughly 39 times in 40 on a correctly built test, and amendment
+20's consequence ("a band failing to detect at the floor bound's magnitude cannot contribute a
+pass to a beyond-floor verdict in that band") would then void the verdict in essentially every
+band.
+
+**The error is conceptual and worth naming as such.** The criterion defines an effect at `b` as
+*not* beyond floor — it is floor-sized by construction. I asked the control to detect something
+the criterion is built to call floor. That is not a cautious threshold; it is a contradiction
+between two clauses I registered in the same paragraph.
+
+### The opposite failure, which rules out the obvious repair
+
+Setting the injection to `b + 2h` using **each band's own** half-width would give 97.56%
+detection everywhere — and would make the control pass by construction whenever the interval is
+well-formed, which is unfalsifiable. A control scaled to the instrument's own resolution reports
+nothing about whether that resolution is adequate. So the injection must be a **fixed absolute
+magnitude chosen for relevance**, not a multiple of the band's own interval.
+
+### Re-registered: a fixed magnitude, and failure LABELS rather than VOIDS
+
+* **Injection: +3.0%, absolute and fixed**, applied per band. The anchor is prior measurement
+  rather than the instrument: chain197 measured deleting the register-block prefetch at
+  2.9–14.2%, and the f32 screen's floor bound was 1.489%. So 3.0% is above any floor displacement
+  this project has measured and at the low end of an effect worth acting on.
+* **Reported per band**, as amendment 20 requires, beside each band's `b + 2h` so a reader can
+  see the chosen magnitude against that band's own detectability threshold.
+* **Consequence replaced.** A band that fails the control is labelled **UNDERPOWERED AT 3.0%**
+  and its beyond-floor verdict in that band is reported carrying that label. It does **not** void
+  other bands and does not void the run. "Underpowered" joins shares / diverges / indeterminate
+  as a reportable fourth outcome — the same move as making "indeterminate" reportable, for the
+  same reason: a label that voids its own analysis will be argued away instead of reported.
+
+### The floor bound must be measured per band, and 13.2× is why
+
+Amendment 19 said the f64 floor bound is "the maximum over all widths and bands of
+`|shpb/ship − 1|`, computed from the f64 run's own `shpb`". Point 4 supplies the quantitative
+reason that it cannot instead be a scaled pooled figure. On the f32 screen at k=2, the same floor
+arm gives:
+
+* pooled `shpb/ship` = 0.999359 [0.998729, 0.999935] — half-width **0.0603 pp**;
+* per-band medians +0.257, −0.538, −0.064, −0.170 — spread **0.795 pp**.
+
+**13.2×.** The pooled statement in amendment 17 remains valid as a pooled statement — both arms
+pooled over the same 418 cells — but no per-band claim can be judged against a scaled pooled
+floor, and the f64 analysis is explicitly per band.
+
+### Correction 1 is now established twice, the second time on byte-identical code
+
+The peer found this in amendment 19's own table and I had not drawn it. The 1e6–1e7 floor band's
+displacement across widths is **−0.170, −0.445, −0.370, +0.329, +0.037** — it **changes sign**,
+on two objects with byte-identical `.text`. So "there is no width-invariant object offset to
+subtract" holds independently of `nopf`: once on an arm, once where there is no arm at all. The
+repair is closed for the floor as well as for the arms.
+
+### Amendment 20's gap-2b replacement was one-factor in the other direction
+
+I wrote "band power is driven by σ, not n". That overcorrects. Backing the implied spread out of
+each band's half-width as `h·√n` (the 1.2533 cancels in any between-band ratio):
+
+| band | n | half-width % | implied spread | +2% misses |
+|---|---|---|---|---|
+| 0–1e4 | 129 | 0.2191 | 1.986 | 2 of 12 |
+| 1e4–1e5 | 181 | 0.2989 | 3.209 | 1 of 12 |
+| 1e5–1e6 | 67 | 0.2621 | 1.712 | 0 of 12 |
+| 1e6–1e7 | 36 | 0.4129 | 1.977 | 3 of 12 |
+
+Implied spread ranges 1.87× and peaks at 1e4–1e5, which is the σ effect and is real. But √n
+ranges 2.24×, and the **widest** interval — 1e6–1e7 at 0.4129 — is the smallest-n band at an
+entirely ordinary spread (1.977 against 0–1e4's 1.986), so n explains that band by itself.
+**Neither factor orders the bands alone and they are comparable in magnitude**, so the honest
+form is the table, not either single driver. This is the same shape as the rule this project
+already holds about decomposing a gap before naming its cause: two non-orthogonal factors have no
+unique per-factor share.
+
+And **detection is ordered by neither** — 0.2191 misses twice while 0.2621 misses none — which is
+consistent with the build term being dominant for detection and makes three factors, not one.
+So σ is reported beside n per amendment 20, and neither is presented as the driver.
