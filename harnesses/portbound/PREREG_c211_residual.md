@@ -133,3 +133,78 @@ the form that works, it is already in the board, and the ordering must be read a
 than against a single number carried across widths. Adjacent-width gaps are 3.1, 1.9 and 3.1
 points against a nuisance of unknown size in a 1-2.6% band, so the ordering is not safe until
 that floor is in hand.
+
+---
+
+# Amendment 2, still before any chain211 CSV is read
+
+The design in Amendment 1 cannot separate two of its own candidates. Caught by the peer session;
+every figure below independently reproduced here from this machine's DLMC copy before adoption.
+
+## The confound
+
+The board has no `cols` column -- its header is `build,slice,key,k,rows,nnz,deg,arm,ms,batch` --
+so B's footprint, `4 * k * J` for a dense B, is not computable from the board at all. Joining J in
+from the collection then exposes the problem: at a FIXED width, footprint is J up to a constant,
+and `log J` correlates +0.4104 with `log nnz` while being near-orthogonal to `log rows` (+0.0077).
+So in the registered fit of `y` on `{log nnz, log rows}` the footprint signal arrives almost
+entirely through the `log(nnz)` partial -- which is the same coefficient P1 predicts to be
+NEGATIVE, and the prefetch/footprint story predicts to be negative too.
+
+Two hypotheses, one coefficient, the same sign. As registered, the fit cannot tell them apart and
+whichever one I held while reading the number would have looked confirmed. This is P0 again,
+inside the amendment that adopted P0.
+
+Nor is it rescued by redefining footprint as the columns actually touched. In a 300-key sample
+stratified by `nnz/cols` decile the median `distinct/J` is 1.0000 in deciles 2 through 10, so the
+two definitions coincide on roughly 90% of the board; they differ only in the bottom decile, where
+25 of 30 sampled keys touch fewer columns than J at a median ratio of 0.9688. (The peer's sample;
+not re-run here, and it is a sample rather than a census.)
+
+## The repair, adopted
+
+Fit `y ~ log(nnz) + log(rows) + log(J)`. Demonstrated to be legitimate rather than assumed, by
+`harnesses/an_dlmc_dims.py`:
+
+    residual SS of log J on {log nnz, log rows, 1} = 1674.0     0 would mean collinear
+    rank{log nnz, log rows, log J,      1} = 4                  usable
+    rank{log nnz, log rows, log degree, 1} = 3                  deficient, degree IS nnz/rows
+
+Then the hypotheses separate on a coefficient neither shares:
+
+    per-ROW family      slope(log J) = 0 within the floor's CI
+    footprint family    slope(log J) < 0
+    flat penalty        all three slopes at zero
+
+**Primary analysis is the stratified version**, which needs no partialling: fit inside `rows==512`
+alone -- 2562 keys, 67.1% of the board, rows constant by construction -- and read the J slope
+directly. The unstratified three-regressor fit becomes the robustness check rather than the
+headline.
+
+## The shape that must be reported beside any J slope
+
+J takes 11 distinct values and 66.2% of keys sit at J=512:
+
+    64:105  128:84  147:17  256:210  512:2527  576:63  1024:147  1152:84  2048:394  2304:126  4608:63
+
+Six levels carry 100 keys or more. So a footprint slope has nothing like n=3820 of leverage behind
+it: it is a six-point contrast with two thirds of the mass at one point, and the levels track
+DLMC's layer shapes, so the slope is partly a contrast across layer families rather than a
+response to footprint. 52.9% of the board is square.
+
+Inside the `rows==512` stratum the J levels are `128:84 256:21 512:2000 1024:21 2048:373 4608:63`
+-- effectively a 512-versus-2048 contrast with two small wings. A slope estimated there is a real
+slope with a small number of levels, and that sentence goes next to the number.
+
+## Two-copy provenance, which came free
+
+The join was derived independently on this machine from line 1 of each `.smtx` and compared
+against the peer's independently obtained copy: **3820 keys x 3 integers = 11460 compared, zero
+disagreements, no key present in only one copy.** All 3820 chain210 keys resolve to a local file,
+zero unresolved, and rows and nnz agree with the board on every one. Two copies agreeing on 11460
+integers is something a substituted or regenerated collection cannot do, which a consistency check
+on a single copy cannot establish. The reference copy's digest is
+`3f0887e553b61e71627246d676035b3577382f314103df11fb36527dd011b028`.
+
+`an_dlmc_dims.py` REFUSES on any unresolved key rather than fitting on a partial join, since a
+silently dropped subset is invisible in every coefficient it would produce.
