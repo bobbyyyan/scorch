@@ -43,6 +43,34 @@ relu (L=1, and it truncates toward zero) and sigmoid (L=1/4). So a bound valid o
 pre-activation value is valid on the post-activation value, and the scale is |A| @ |B| + |bias|.
 L is CHECKED NUMERICALLY below rather than taken from calculus, because the claim that matters is
 about the implementation's activation and not about the mathematical function.
+
+THE BIAS TERM IS IN THE SCALE, AND HERE IS WHAT ITS ABSENCE WOULD COST. The rounding of (Z + bias)
+carries eps*|Z + bias|, so a scale of |A| @ |B| alone is too TIGHT once the bias is comparable to
+the product -- measured on a 512x512 DLMC matrix at mean degree 1.45: median tolerance 0.001084 at
+zero bias, 0.001197 at bias sd 0.1, 0.002189 at bias sd 1.0, a factor of 2.02. Too tight is the
+dangerous direction for a gate, because it refuses a correct build. The scale below is therefore
+|A| @ |B| + |bias|.
+
+AND THE REAL HAZARD IS VACUITY, NOT A WRONG TOLERANCE. Neither activation can make the bound too
+tight by itself -- that is what L <= 1 buys. What relu does instead is remove the signal from under
+the bound: on that same matrix 72.8% of output cells are exactly 0, so the comparison is 0 against
+0 and cannot fail however wrong the kernel is. Decomposed before being attributed, because "the
+sign of Z" is the tempting single cause and it is the smaller half: 46.5% is EMPTY ROWS (238 of 512
+rows have no nonzeros, so Z is exactly 0 across them) and 26.3% is negative Z. Of cells in
+non-empty rows, 49.1% are negative, which is the ordinary half.
+
+The dead fraction moves with the BIAS DISTRIBUTION -- 72.8% at sd 0, 52.0% at sd 0.1, 48.8% at sd
+1.0 -- so the fraction of the output that is effectively unchecked is set by a harness parameter
+and not by the kernel. That parameter is registered as --bias-scale and recorded in every row.
+
+Sigmoid has the mirror-image version of the same hazard and it is NOT the one that was predicted:
+it tightens the relative comparison (centring |Y| at 0.5 against identity's spread), but
+tol = 1e-3 + 1e-3*scale exceeds sigmoid's entire range once scale >= 999, and then no pair of
+values can fail. Both the relu and the sigmoid case are caught by ONE mechanism rather than two
+special cases: an element whose own |reference| does not exceed its own tolerance cannot
+distinguish a correct result from a zero, so it is NOT CHECKABLE. The checkable count is reported
+per cell and asserted nonzero, which fires on a dead relu cell and on a sigmoid cell at high
+degree alike.
 """
 import argparse, csv, hashlib, os, sys, zlib
 ap = argparse.ArgumentParser()
@@ -53,6 +81,10 @@ ap.add_argument("--build", required=True)
 ap.add_argument("--ks", default="1,2,3,4,8,12,16,20,32,33")
 ap.add_argument("--acts", default="0,1,2")
 ap.add_argument("--limit", type=int, default=0, help="0 = every key")
+# REGISTERED, because it sets the fraction of the output that is effectively unchecked under relu
+# (72.8% dead at sd 0, 52.0% at 0.1, 48.8% at 1.0 on a measured matrix) and is therefore a
+# parameter of the CHECK and not a nuisance constant. bias ~ bias_scale * U(-1, 1) for real cells.
+ap.add_argument("--bias-scale", type=float, default=1.0)
 A = ap.parse_args()
 import numpy as np, torch, scorch_ops as so
 if so.scorch_tune_hooks():
@@ -106,6 +138,63 @@ if _bad_L:
              "below is unjustified." % _bad_L)
 
 
+def _detect(got, ref, tol):
+    """(index of the worst violation or None, count of CHECKABLE elements).
+
+    One function so a planted perturbation exercises the same code a real cell does. The index is
+    the largest excess over its OWN tolerance, not the largest absolute difference -- those are
+    different elements whenever the tolerance varies across the array, and reporting the latter
+    names an element that passed.
+    """
+    off = np.abs(got - ref) - tol
+    n_check = int(np.count_nonzero(np.abs(ref) > tol))
+    return (int(np.argmax(off)) if np.any(off > 0) else None), n_check
+
+
+def _selfcheck_detector():
+    """Plant a violation and require _detect to find it, and the right one.
+
+    A tolerance check that has never rejected anything is a check whose refusal path is untested,
+    and every cell below is expected to pass -- so without this the one branch that matters never
+    runs. Three plants, because three different things can be wrong:
+      * an exact match must pass and must report the checkable count
+      * a perturbation just over tolerance must be caught
+      * when two elements both violate, the one named must be the larger EXCESS over its own
+        tolerance, not the larger absolute difference -- different elements whenever tol varies
+    """
+    ref = np.array([[1.0, 100.0, 2.0]])
+    tol = np.array([[0.01, 10.0, 0.01]])
+    ok, nc = _detect(ref.copy(), ref, tol)
+    if ok is not None or nc != 3:
+        sys.exit("REFUSE: the detector rejects an exact match (%r) or miscounts checkable (%d of 3)"
+                 % (ok, nc))
+    got = ref.copy(); got[0, 0] += 0.02
+    bad, _ = _detect(got, ref, tol)
+    if bad != 0:
+        sys.exit("REFUSE: the detector missed a planted violation at element 0 (said %r)" % bad)
+    # Element 1 has the larger absolute difference (12 against 0.02) but element 0 the larger
+    # excess over its own tolerance (0.01 against 2.0)... so element 1 must win here, and the
+    # INVERTED plant below is the one that separates the two rules.
+    got = ref.copy(); got[0, 0] += 0.011; got[0, 1] += 12.0
+    bad, _ = _detect(got, ref, tol)
+    if bad != 1:
+        sys.exit("REFUSE: with excesses 0.001 and 2.0 the detector named element %r; it must name "
+                 "the larger EXCESS (element 1)." % bad)
+    got = ref.copy(); got[0, 1] += 10.5; got[0, 2] += 1.0
+    bad, _ = _detect(got, ref, tol)
+    if bad != 2:
+        sys.exit("REFUSE: element 1 has the larger absolute difference (10.5 against 1.0) but "
+                 "element 2 the larger excess (0.99 against 0.5); the detector named %r." % bad)
+    # A vacuous cell: every |reference| below its own tolerance.
+    _, nc = _detect(np.zeros((1, 3)), np.zeros((1, 3)), tol)
+    if nc != 0:
+        sys.exit("REFUSE: an all-zero reference counted %d checkable elements; a cell that cannot "
+                 "fail must report 0." % nc)
+    print("  detector self-check: exact match passes, a planted violation is caught, the element "
+          "named is the larger EXCESS not the larger difference, and a dead cell counts 0 "
+          "checkable", flush=True)
+
+
 def _ref(M, J, indptr, indices, vals, Bd, bias, act):
     """act(A @ B + bias[:, None]) in float64."""
     Acsr = sp.csr_matrix((np.asarray(vals, dtype=np.float64),
@@ -118,16 +207,25 @@ def run_cell(M, J, indptr, indices, vals, k, act, seed, pos_bias=False):
     """pos_bias forces a strictly positive bias, and the degenerate cases need it.
 
     An empty row's output IS act(bias), so with relu and a negative bias the whole cell is zeros --
-    and a digest over an all-zero result agrees across four builds for the wrong reason. One of 126
-    degenerate cells hit exactly that (`empty`, k=33, act=1, both biases negative), which is a
-    property of the seed rather than of the code, so leaving it to the seed means the epilogue
-    branch is proven to RUN only by luck. Real matrices keep the signed bias, so relu's truncation
-    branch is still exercised where the rows are not empty.
+    and a digest over an all-zero result agrees across four builds for the wrong reason. Found by
+    printing the nonzero count rather than trusting it.
+
+    THE VACUITY IS INDEPENDENT OF THE WIDTH, and the first version of this note named one, which
+    would let a reader conclude it needed a k the default sweep no longer contains. It is a
+    function of (the case has zero nonzeros) x (act == 1) x (every bias in the case negative).
+    bias ~ U(-1,1) seeded per (case, k, act), so over W widths the expected dead count is
+    W x sum(2^-M) over the zero-nonzero cases = W x (1/4 + 1/8) for `empty` (M=2) and `all_empty`
+    (M=3). At the committed eight-width default that is 3.0 exactly, which is what the pos_bias
+    ablation reproduces -- so the ablation's number and the width sweep are consistent with each
+    other, which a count without its factors could not show.
+
+    Real matrices keep the signed bias, so relu's truncation branch is still exercised where the
+    rows are not empty.
     """
     g = torch.Generator().manual_seed(seed)
     B = torch.rand((J, k), generator=g).to(torch.float32)
     bias = torch.rand((M,), generator=g).to(torch.float32)
-    bias = bias + 0.5 if pos_bias else bias * 2.0 - 1.0
+    bias = bias + 0.5 if pos_bias else (bias * 2.0 - 1.0) * A.bias_scale
     ipt = torch.from_numpy(np.asarray(indptr, dtype=np.int32))
     ixt = torch.from_numpy(np.asarray(indices, dtype=np.int32))
     vt = torch.from_numpy(np.asarray(vals, dtype=np.float32))
@@ -153,17 +251,27 @@ def run_cell(M, J, indptr, indices, vals, k, act, seed, pos_bias=False):
     scale = (_ref(M, J, indptr, np.asarray(indices), np.abs(np.asarray(vals, dtype=np.float64)),
                   np.abs(Bd), np.abs(bias.numpy()), 0))
     tol = 1e-3 + 1e-3 * np.abs(scale)
-    off = np.abs(got - ref) - tol
-    if np.any(off > 0):
-        # The element that actually FAILED -- the largest excess over its OWN tolerance -- not the
-        # largest absolute difference. Those are different elements whenever the tolerance varies.
-        bad = int(np.argmax(off))
+    bad, n_check = _detect(got, ref, tol)
+    if bad is not None:
+        off = np.abs(got - ref) - tol
         sys.exit("REFUSE: build %s k=%d act=%d element %d: got %r reference %r tolerance %r "
                  "(excess %r). A prefetch changes no arithmetic."
                  % (A.build, k, act, bad, got.reshape(-1)[bad], ref.reshape(-1)[bad],
                     tol.reshape(-1)[bad], off.reshape(-1)[bad]))
-    return hashlib.sha256(v.tobytes()).hexdigest()[:32], v
+    # BESIDE THE VERDICT, THE NUMBER THAT SHOWS IT WAS NOT VACUOUS. An element whose own reference
+    # does not exceed its own tolerance passes with got == 0 just as it passes with got == ref, so
+    # it distinguishes nothing. Asserted rather than reported: a cell with no checkable element
+    # contributes a digest and no correctness information at all.
+    if n_check == 0:
+        sys.exit("REFUSE: build %s k=%d act=%d: 0 of %d elements are CHECKABLE (|reference| > its "
+                 "own tolerance), so 'no mismatch' is a statement about nothing. Under relu this "
+                 "means every cell is dead; under sigmoid it means the tolerance exceeds the "
+                 "function's whole range, which happens once |A|@|B| reaches about 999."
+                 % (A.build, k, act, got.size))
+    return hashlib.sha256(v.tobytes()).hexdigest()[:32], v, n_check, got.size
 
+
+_selfcheck_detector()
 
 # PREMISE cases make the clamp's bound take the value that would index backwards; CLAMP cases make
 # the run-ahead actually clip. The fused path adds a third kind: EPILOGUE, where the row never
@@ -200,19 +308,28 @@ if _bad:
 
 n_degen = n_real = 0
 nz_degen = nz_real = 0
+chk_d = tot_d = chk_r = tot_r = 0
+min_frac = (2.0, None)   # per-cell worst case; an aggregate cannot show one collapsed cell
 print("DEGENERATE CASES FIRST -- the script stops here if any fails, because every digest below "
       "would otherwise be taken on a process that already read out of bounds.", flush=True)
 for name, M, J, ip, ix, vl in DEGEN:
     for k in KS:
         for act in ACTS:
-            sha, v = run_cell(M, J, ip, ix, vl, k, act,
-                              zlib.crc32(("%s|%d|%d" % (name, k, act)).encode()) % (2**31),
-                              pos_bias=True)
+            sha, v, nc, nt = run_cell(M, J, ip, ix, vl, k, act,
+                                      zlib.crc32(("%s|%d|%d" % (name, k, act)).encode()) % (2**31),
+                                      pos_bias=True)
+            chk_d += nc; tot_d += nt
+            if nc / max(nt, 1) < min_frac[0]:
+                min_frac = (nc / max(nt, 1), "degen %s k=%d act=%d" % (name, k, act))
             w.writerow(dict(build=A.build, case="degen", key=name, k=k, act=act, rows=M,
                             nnz=len(vl), sha=sha))
             n_degen += 1
             nz_degen += int(np.any(v != 0))
-print("  %d degenerate cell(s) passed, %d with a nonzero result" % (n_degen, nz_degen), flush=True)
+# THE COUNT CARRIES ITS FACTORS. "126 degenerate cells" does not determine its own factorisation
+# -- it is 7 cases x 6 widths x 3 acts and equally 6 x 7 x 3 -- so two runs with different case
+# lists and different width sweeps print numbers that read as one set which grew.
+print("  %d degenerate cell(s) passed = %d case(s) x %d width(s) x %d act(s); %d with a nonzero "
+      "result" % (n_degen, len(DEGEN), len(KS), len(ACTS), nz_degen), flush=True)
 # ASSERTED, not reported. With a strictly positive bias every degenerate cell is nonzero by
 # construction, so any shortfall means a cell went vacuous and its digest proves nothing -- and a
 # count that is only printed is a count nobody checks.
@@ -227,8 +344,11 @@ for key in keys:
     nnz = int(ip[-1])
     for k in KS:
         for act in ACTS:
-            sha, v = run_cell(M, J, ip, ix, vl, k, act,
-                              zlib.crc32(("%s|%d|%d" % (key, k, act)).encode()) % (2**31))
+            sha, v, nc, nt = run_cell(M, J, ip, ix, vl, k, act,
+                                      zlib.crc32(("%s|%d|%d" % (key, k, act)).encode()) % (2**31))
+            chk_r += nc; tot_r += nt
+            if nc / max(nt, 1) < min_frac[0]:
+                min_frac = (nc / max(nt, 1), "real %s k=%d act=%d" % (key, k, act))
             w.writerow(dict(build=A.build, case="real", key=key, k=k, act=act, rows=M, nnz=nnz,
                             sha=sha))
             n_real += 1
@@ -247,3 +367,13 @@ print("wrote %s (%d degenerate + %d real = %d cells)"
 # is not on the drop-in path.
 print("  NONZERO RESULTS: %d of %d degenerate, %d of %d real -- a digest over an all-zero result "
       "agrees across builds for the wrong reason" % (nz_degen, n_degen, nz_real, n_real), flush=True)
+print("  CHECKABLE ELEMENTS: %d of %d degenerate (%.1f%%), %d of %d real (%.1f%%) -- the "
+      "denominator of 'no mismatch'. The rest have |reference| below their own tolerance and pass "
+      "whatever the kernel wrote. bias_scale %g sets this."
+      % (chk_d, tot_d, 100.0 * chk_d / max(tot_d, 1), chk_r, tot_r,
+         100.0 * chk_r / max(tot_r, 1), A.bias_scale), flush=True)
+# The aggregate cannot show a single collapsed cell: one cell at 1 element of 100000 leaves the
+# pooled fraction near 100%. The per-cell MINIMUM is the number aggregation cannot hide.
+print("  WORST CELL: %.1f%% checkable (%s) -- the aggregate above cannot show one collapsed cell, "
+      "so this is the number that bounds what 'no mismatch' covers"
+      % (100.0 * min_frac[0], min_frac[1]), flush=True)
