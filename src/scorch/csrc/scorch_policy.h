@@ -1080,34 +1080,51 @@
 // free of both.) Degree 6 was also the one short-row point whose own A/A floor was large, 5.3%.
 // The clean points replace it and say the same thing more defensibly.
 //
-// MEASURED, AND THE AXIS IS WRONG. The production pair has now been run against MKL on a 60-key
-// screen of the DLMC board, three objects on redwood, and the deep arm is SLOWER at every width:
-// deep/base on our own kernel reads 1.018 at k=2, 1.100 at k=4, 1.186 at k=8, 1.049 at k=16 and
-// 1.081 at k=32, turning k=4 and k=8 from leading MKL into trailing it. k=2 is a negative control
-// inside the effect arm -- the deep kernel provably does not fire there, the two builds' outputs
-// being bit-identical at k=1, 2, 3 and 33 and differing at 4, 8, 16 and 32 -- so about 1.8% is
-// object layout and the rest is the kernel.
+// MEASURED, AND THE DEEP ARM LOSES. The production pair has now been run against MKL on a 60-key
+// screen of the DLMC board, three objects on redwood, float32, pool 24. deep/base on our own
+// kernel, with NVEC = ceil(k/8) as defined above this file's register-block kernel:
 //
-// The dominant cost is a REGISTER SPILL, not a row-length trade. The register block holds NVEC
-// output vectors and UNROLL chains multiply that, so the kernel needs UNROLL*NVEC vector
-// accumulators live, plus the B loads, the A splats and the tail mask, against AVX2's 16 ymm
-// registers. Read off the innermost loop of one object at matched bodies: the shipped kernel
-// spills ZERO times at every NVEC and runs 9.75-11.50 instructions per nonzero, while this one
-// spills 12 times at NVEC=3 and 23 times at NVEC=4 -- where `vmovaps` to the stack is its most
-// frequent instruction, outnumbering its own FMAs -- and runs 18.00 and 21.75.
+//     k   NVEC   deep/base   spilled vmovs in the innermost loop
+//     2     1      1.0177    -- does not fire (negative control)
+//     4     1      1.1002    not measured
+//     8     1      1.1859    not measured
+//    16     2      1.0494    not measured
+//    32     4      1.0808    23
 //
-// That is why a row-length minimum cannot rescue this. A spill is paid per BODY, so it is paid on
-// long rows too, which is precisely where the chain lever was supposed to pay best. The probe
-// could not have seen it: the probe accumulates into one output vector, so four chains cost it
-// four registers of sixteen, and it measured the lever at the one NVEC where the lever is free.
+// It is slower at every width that fires and it turns k=4 and k=8 from leading MKL (0.9420,
+// 0.8835) into trailing it (1.0293, 1.0362). k=2 is a negative control carried inside the effect
+// arm rather than asserted: the deep kernel provably does not fire there, the two builds' outputs
+// being bit-identical at k=1, 2, 3 and 33 and differing at 4, 8, 16 and 32.
 //
-// So the number this define wants is not a row length. It is a register budget, UNROLL*NVEC <= R
-// with headroom, which makes UNROLL a function of NVEC rather than a threshold on the data:
-// 4 at NVEC=1, 2 at NVEC=2, and the shipped kernel at NVEC=4 on a 16-register file, with
-// AVX-512's 32 moving every entry one notch. That rule is checkable in the disassembly before it
-// is timed. One thing it does NOT explain is k=8, which is NVEC=1, spills nothing, and regressed
-// 18.6% on the screen -- so register pressure is a mechanism here and not the only one. The full
-// 3820-key board separates them. See harnesses/portbound/WHY_THE_CHAINS_DID_NOT_TRANSFER.md.
+// NO MECHANISM IS ESTABLISHED FOR THIS, and an earlier version of this comment claimed one. What
+// is measured is that the deep kernel at NVEC=4 spills 23 times in its innermost loop where the
+// shipped kernel spills zero at every NVEC, running 21.75 instructions per nonzero against
+// 10.50. That is true and it is not the board's story: NVEC=4 is k=32 alone, which is the THIRD
+// worst of the four widths that fire, behind two widths at NVEC=1 that spill nothing. The largest
+// regression, k=8 at +18.6%, is at NVEC=1 with four accumulators in a sixteen-register file. A
+// mechanism that predicts the worst outcome at the widest register block predicts the opposite of
+// what the board shows.
+//
+// The reading was also taken where it could not see the effect. Only the NVEC=3 and NVEC=4 deep
+// instantiations survive as out-of-line symbols; NVEC=1 and NVEC=2 are inlined and carry no
+// symbol, so there is no disassembly for them. NVEC=3 is k=17..24 and is not a board width at
+// all. So both the spill count and the doubled prefetch volume (1.00 per nonzero against the
+// shipped kernel's 0.50) are measured only at the two vector counts the board either never runs
+// or runs at one width, and extrapolating them to NVEC=1 is exactly the move that fails when a
+// mechanism is characterised where its effect is smallest.
+//
+// What the register budget is worth stating for: it is ALREADY enforced, weakly, by the switch
+// that instantiates these kernels -- UNROLL=8 exists only at NVEC 1 and 2, while NVEC 3 and 4 are
+// instantiated at UNROLL=4 only, under a comment saying NVEC*UNROLL accumulators must stay
+// resident. The 16-accumulator case at NVEC=4, UNROLL=4 is the one that rule lets through, and
+// the 23 spills are what that costs. Tightening it is defensible on the disassembly alone. It is
+// not an explanation of the board.
+//
+// A row-length minimum does not address any of this. Every candidate still standing is paid per
+// nonzero or per row, not per row-length band, and the one cost that is measured -- the spill --
+// is paid per body and so is paid on long rows too, which is where the chain lever was supposed
+// to pay best. See harnesses/portbound/WHY_THE_CHAINS_DID_NOT_TRANSFER.md and the registered
+// predictions in PREREG_c211_residual.md; the full 3820-key board is what settles it.
 //
 // WHAT THE THRESHOLD WOULD ACT ON, for when it has a value. Measured over all 3846 DLMC matrices
 // from their CSR row pointers (harnesses/an_rowdist.py, verified against an independent copy of

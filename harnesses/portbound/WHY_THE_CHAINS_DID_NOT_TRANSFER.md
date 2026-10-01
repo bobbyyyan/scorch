@@ -1,4 +1,4 @@
-# Four accumulator chains cost 4xNVEC registers, and the probe only ever paid for one NVEC
+# The four-chain kernel loses on real matrices, and the mechanism I published for it was wrong
 
 ## The claim this replaces
 
@@ -29,44 +29,63 @@ there, verified by the two builds' outputs being BIT-IDENTICAL at k=1, 2, 3 and 
 at 4, 8, 16 and 32 -- so roughly 1.8% of each figure is object-layout difference and the rest is
 the kernel. This is a screen, not a result; the full 3820-key run is chain211.
 
-## The mechanism, read off the object
+## The mechanism I published, and why it is not the board's story
 
-Both kernels in one object, `-O3 -march=native -funroll-loops`, g++ 11, innermost loop of each
-out-of-line float32 instantiation, matched to nonzeros per body:
+Retracted as an explanation on 2026-10-01, within hours of writing it, after a peer session
+pointed out that its dose-response runs backwards. Keeping the measurement and the retraction
+together, because the measurement is sound and only the inference was wrong.
 
-    kernel   NVEC  UNROLL  nnz/body  insn  insn/nnz  stack vmov
-    SHIP        1       -       4.0    39      9.75           0
-    SHIP        2       -       4.0    46     11.50           0
-    SHIP        3       -       4.0    46     11.50           0
-    SHIP        4       -       4.0    42     10.50           0
-    deep        3       4       4.0    72     18.00          12
-    deep        4       4       4.0    87     21.75          23
+What is measured, both kernels in one object, `-O3 -march=native -funroll-loops`, g++ 11,
+innermost loop of each out-of-line float32 instantiation, matched to nonzeros per body:
 
-The deep kernel's single most frequent instruction at NVEC=4 is `vmovaps`, 23 of them, every one
-stack-referencing -- more than the 14 FMAs in the same loop. The shipped kernel spills zero times
-at every NVEC. Instructions per nonzero roughly double.
+    kernel   NVEC  UNROLL  nnz/body  insn  insn/nnz  stack vmov  prefetch/nnz
+    SHIP        1       -       4.0    39      9.75           0          0.50
+    SHIP        2       -       4.0    46     11.50           0          0.50
+    SHIP        3       -       4.0    46     11.50           0          0.50
+    SHIP        4       -       4.0    42     10.50           0          0.50
+    deep        3       4       4.0    72     18.00          12          1.00
+    deep        4       4       4.0    87     21.75          23          1.00
 
-The reason is a register count and nothing softer. The register block holds NVEC output vectors;
-UNROLL accumulator chains multiply that, so the kernel needs `UNROLL * NVEC` vector accumulators
-live across the loop, plus registers for the B loads, the A splats and the tail mask. AVX2 has 16
-ymm registers. At UNROLL=4 that is:
+At NVEC=4 the deep kernel's most frequent instruction is a stack `vmovaps`, 23 of them,
+outnumbering its own 14 FMAs. The shipped kernel spills nowhere at any NVEC. All of that stands.
 
-    NVEC=1   4 accumulators    fits
-    NVEC=2   8 accumulators    fits
-    NVEC=3  12 accumulators    tight -- 12 stack moves appear
-    NVEC=4  16 accumulators    the entire register file, nothing left -- 23 stack moves
+**It explains none of the board, for two reasons I should have checked before publishing it.**
 
-## Why the probe could not have seen it, structurally
+First, the dose-response is backwards. `NVEC = ceil(k/8)`, so the board's five widths map to NVEC
+1, 1, 1, 2, 4 for k = 2, 4, 8, 16, 32. The spill therefore exists at exactly ONE board width:
 
-The probe accumulates into `__m128`/`__m256` scalars -- ONE output vector. So four chains cost it
-four registers of sixteen and it has twelve to spare. The production kernel multiplies the chain
-count by the register-block width, and the register-block width is the whole point of the kernel.
-The probe measured the chain lever at the one value of NVEC where the lever is free.
+    k     NVEC  deep/base   spilled vmovs
+    2      1     1.0177     -- does not fire
+    4      1     1.1002     not measured
+    8      1     1.1859     not measured
+    16     2     1.0494     not measured
+    32     4     1.0808     23
 
-That is not a defect in the probe's execution. It is a defect in the mapping from the probe to the
-kernel, and it is invisible in every quantity the probe reports: the per-nonzero gain, the latency
-model, the 2x2 interaction, the crossing degree. All of those are correct about the loop the probe
-ran. None of them is a statement about a loop that also has to hold NVEC output vectors live.
+The only spilling width is third of the four that fire, behind two that spill nothing. The LARGEST
+regression, k=8 at +18.6%, sits at NVEC=1 with four accumulators in a sixteen-register file. A
+mechanism predicting the worst outcome at the widest register block predicts the reverse of the
+observed ordering.
+
+Second, and this is the worse error: I characterised the mechanism where it could not be seen.
+Only the NVEC=3 and NVEC=4 deep instantiations survive as out-of-line symbols -- NVEC=1 and NVEC=2
+are inlined and carry no symbol, so there is NO disassembly for them. NVEC=3 is k=17..24 and is
+not a board width at all. So every number in the `deep` rows above describes configurations the
+board either never runs or runs at a single width, and both the spill count and the doubled
+prefetch volume were extrapolated to NVEC=1 on no evidence. That is the failure mode of verifying
+the smallest-effect cell: the error is definitionally invisible where I looked.
+
+I also framed k=8 as "the residual". At +18.6% it is the largest effect on the board. What is owed
+a mechanism is the main effect, not a remainder of one.
+
+## The register budget was already in the source
+
+The rule I offered as the lesson -- `UNROLL * NVEC <= R` with headroom -- is partly implemented
+already. The switch that instantiates these kernels carries the comment "NVEC * UNROLL
+accumulators must stay resident, so the deeper streams are only instantiated where the vector
+count is small", and it admits UNROLL=8 only at NVEC 1 and 2 while NVEC 3 and 4 get UNROLL=4 only.
+The 16-accumulator case at NVEC=4, UNROLL=4 is precisely what that rule lets through, and the 23
+spills are its price. Tightening it is defensible on the disassembly alone, without any timing.
+It is still not an explanation of the board.
 
 ## What survives
 
@@ -79,22 +98,26 @@ ran. None of them is a statement about a loop that also has to hold NVEC output 
 
 ## What does not survive
 
-- `SCORCH_NARROWK_DEEP_MINDEG`'s framing as a ROW-LENGTH question. A row-length minimum cannot fix
-  a register spill: the spill is per body, not per row, so it is paid on long rows too -- which is
-  exactly where the probe said the lever pays best. The threshold was looking for the crossing on
-  the wrong axis.
+- The claim that a register spill is why the chain lever does not transfer. The spill is real,
+  confined to NVEC=4, and cannot produce the observed ordering.
+- `SCORCH_NARROWK_DEEP_MINDEG`'s framing as a ROW-LENGTH question, but for a reason that no longer
+  depends on the spill: every candidate still standing is paid per nonzero or per row, and a
+  row-length band addresses neither.
 - The claim that the probe's bracket bounds production's crossing from below. It bounds the
-  crossing of a loop with one output vector. For NVEC >= 3 there may be no crossing at all.
+  crossing of a loop with one output vector.
+- My "third reason" that production's machine body is narrower than the probe's. It is -- but the
+  SHIPPED kernel's body is also 4.0 nonzeros, so body width is no difference at all between the
+  two production kernels, which is the comparison the board measures.
 
-## The experiment this makes, and why it is not a tuned threshold
+## What is still unexplained, stated plainly
 
-The budget is an architectural constant: `UNROLL * NVEC <= R` for a vector file of R registers,
-with headroom for operands. That predicts the chain lever is available only at narrow register
-blocks, and that UNROLL must fall as NVEC rises -- UNROLL=4 at NVEC=1, 2 at NVEC=2, 1 (i.e. the
-shipped kernel) at NVEC=4 on AVX2, with AVX-512's 32 registers moving every entry one notch.
+Why the deep kernel loses 10-19% at NVEC=1, where it spills nothing and its per-nonzero loop
+control is identical to the shipped kernel's (both bodies 4.0 nonzeros). The structural
+differences left at NVEC=1 are per-ROW: four accumulator zeroes against two, and a depth-3 left
+fold against a depth-1 add. The peer's arithmetic puts that family at roughly 6% at DLMC's median
+degree of 103 and falling as a nonzero gets more expensive under real traffic -- at least
+threefold short of 18.6%. So either the per-row cost is far larger than its op count suggests, or
+a degree-independent component survives.
 
-That is a rule derived from the register file, checkable against the disassembly before it is
-timed, and it predicts the sign of its own failures. It is the opposite of a per-shape threshold.
-The open question it does NOT answer is k=8, which is NVEC=1, spills nothing, and still regressed
-18.6% on the screen -- so register pressure is a mechanism here, not the only one, and the
-chain211 board is what separates them.
+Registered predictions that discriminate these, including the collinearity trap that would void
+the analysis, are in PREREG_c211_residual.md. The 3820-key board settles it.

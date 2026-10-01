@@ -63,3 +63,73 @@ of `dev(bsb_/base)` on the same cells at the same width -- the cross-object A/A,
 within-process arm floor, because deep-vs-base crosses a process and an object. Correlations are
 Spearman on log footprint, reported with the floor beside them, and no cell inside the floor
 counts toward a sign.
+
+---
+
+# Amendment, same day, before the board is read
+
+Two of this file's premises are withdrawn and the analysis plan is replaced. Written after a peer
+session checked the dose-response, and before any chain211 CSV has been opened.
+
+## Withdrawn
+
+1. **"The k=8 residual."** At +18.59% k=8 is the LARGEST effect on the board, not a remainder.
+   Framing it as a residual presumed the spill accounted for the rest, which it does not.
+
+2. **"Twice the prefetches per nonzero, at every NVEC."** Measured at NVEC=3 and NVEC=4 only.
+   NVEC=1 and NVEC=2 deep instantiations are INLINED and carry no symbol, so no disassembly for
+   them exists. `NVEC = ceil(k/8)` puts k=4 and k=8 -- where the effect is largest -- at NVEC=1,
+   and NVEC=3 at k=17..24, which is not a board width. The prefetch prediction below therefore has
+   no disassembly behind it at the widths it is about, and must be read as a hypothesis rather
+   than as an extrapolation from a measurement. Getting the NVEC=1 body requires forcing those
+   instantiations out of line, which needs a compile, which must wait until the board is off the
+   host.
+
+## P0, the collinearity trap, adopted from the peer
+
+`degree == nnz/rows` exactly, so `{log nnz, log rows, log degree}` has rank two. Never fit all
+three. Fit `y` on `log(nnz)` and `log(rows)`; `log(degree)`'s slope is the difference of those two
+partials and needs no term of its own. An analysis that reports three independent slopes here is
+reporting an artefact of a singular design matrix.
+
+## The candidates and the sign each predicts
+
+Estimand per width k: `y_i = log(deep_i / base_i)` over the 3820 keys, paired within pass.
+
+    (A) per-BODY cost (loop control, fold, spill -- once per UNROLL nonzeros)
+        both partials zero inside the floor's CI; y near-constant across keys at fixed k
+    (B) per-ROW cost (accumulator init + deeper fold -- once per row)
+        slope(log rows) > 0, slope(log nnz) < 0, near-equal magnitude; this IS y ~ c/degree,
+        so test directly: R^2 of y on 1/degree exceeds R^2 on log(degree)
+    (C) footprint or traffic driven
+        slope(log rows) > 0, slope(log nnz) ~ 0, and a THRESHOLD in rows*k*4 against a cache
+        level rather than a monotone slope
+
+The null -- both partials inside the floor's CI at every width -- is itself a result: it says the
+effect is a property of the width and not of the matrix.
+
+## Registered magnitudes (the peer's, adopted verbatim as predictions)
+
+    P1  at k=8, slope(log rows) > 0 and slope(log nnz) < 0: the per-row family is present.
+    P2  it is NOT sufficient. Four extra vector ops per row, over DLMC's median 103 nonzeros at
+        roughly 2 cycles each, is about 6%, and under real traffic a nonzero costs more so the
+        fraction shrinks. Against +18.59% the per-row account falls at least threefold short. So
+        either the fitted c exceeds the structural op count by more than 3x, or a
+        degree-independent component of 10 points or more survives at median degree.
+    P3  therefore both a negative degree slope AND a floor at high degree: y at the 90th-percentile
+        degree (307) stays at or above 5%. If it decays to the floor there, P2 is wrong and the
+        effect is purely per-row with a mis-sized c.
+
+All three are conditional on the 60-key screen being representative. If the full board moves the
+headline off 18.59%, these are re-read against the new number.
+
+## The layout nuisance, corrected
+
+Quoting "~1.8% is object layout" uniformly across widths is wrong in the direction that matters.
+The two-objects-same-decisions artefact is 1-2.6% on narrow-k SpMM and LARGEST AT THE NARROWEST
+WIDTH, so k=2 estimates it where it is biggest and over-corrects at k=32 -- the width whose rank
+the retraction above turns on. The per-width floor from the byte-identical `base`/`bsb_` pair is
+the form that works, it is already in the board, and the ordering must be read against it rather
+than against a single number carried across widths. Adjacent-width gaps are 3.1, 1.9 and 3.1
+points against a nuisance of unknown size in a 1-2.6% band, so the ordering is not safe until
+that floor is in hand.
