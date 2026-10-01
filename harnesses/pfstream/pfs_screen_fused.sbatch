@@ -43,6 +43,26 @@ BITS_LIMIT=40
 mkdir -p /scr/bobbyy/pfs/csvfused
 echo "host $(hostname)  pool $(python -c 'import torch;print(torch.get_num_threads())')  $(date +%H:%M:%S)"
 
+# THE JOB STAGES ITS OWN INPUTS FROM DURABLE STORAGE AND VERIFIES THEM.
+# /scr is node-local, so a login node cannot write it and copying from an interactive
+# allocation would mean running a command on mkt1 beside a live timing job. Staging here
+# removes that entirely: the files arrive from /matx when this job starts, and each digest
+# is checked, so a stale or partial copy refuses instead of producing numbers.
+STAGE=/matx/u/bobbyy/pfsstage
+declare -A WANT=(
+  ["csrresolve.py"]="1872f707045dc14e149fd53e845fee4b60e206b48132b144ee8217c227bfba78"
+  ["fmgate.py"]="99e20fee682c205300e4410ea77352cb6a05f6516b1711191146c92296ac60b0"
+  ["pfs_bitcmp.py"]="f4b09ad2488b3d1ad7ed71c9a5861edc051d3cc0e75407927dac6e3625a27b41"
+  ["pfs_bits_fused.py"]="fde751c65001b78a6da3b986671dc8340ddc952c00d3a2534e3c6fdcfcbfa4cc"
+)
+for f in "${!WANT[@]}"; do
+  cp "$STAGE/$f" /scr/bobbyy/pfs/$f || { echo "REFUSE: cannot stage $f"; exit 1; }
+  got=$(shasum -a 256 /scr/bobbyy/pfs/$f | cut -d" " -f1)
+  [ "$got" = "${WANT[$f]}" ] || { echo "REFUSE: $f sha256 $got, expected ${WANT[$f]}"; exit 1; }
+  echo "  staged $f sha256 ${got:0:16}"
+done
+
+
 echo "== STAGE 1: bit-identity across the four builds on the fused symbol"
 for tag in ship shpb strm nopf; do
   echo "  --- bits $tag start $(date +%H:%M:%S)"
