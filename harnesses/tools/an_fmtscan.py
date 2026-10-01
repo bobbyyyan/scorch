@@ -152,6 +152,15 @@ PRESERVING = {"upper", "lower", "title", "capitalize", "casefold", "strip", "lst
 # .parse() splits it into literal_text='' and format_spec='%Y-%m-%d'. Testing the whole literal
 # reported correct code.
 BRACE = {"format", "format_map"}
+# Methods that EMIT THEIR ARGUMENTS' TEXT, so an argument literal's specifiers survive into output
+# exactly as the right operand of % does. This set is not a guess: it is the ENUMERATION over
+# PRESERVING, and only three members qualify. Every other member's argument is a fill character
+# (ljust/rjust/center), a character SET that is removed rather than emitted (strip/lstrip/rstrip),
+# or an integer (expandtabs) -- checked one by one: 'x %d'.ljust(8,'.') is 'x %d....',
+# ' x %d '.strip(' ') is 'x %d', 'x'.center(5,'%') is '%%x%%'. Measured for join:
+#   "\n".join(["hdr %d", "tail"])  -> 'hdr %d\ntail'
+#   "".join("g %d" for _ in r)      -> 'g %dg %d'
+EMITS_ARGS = BRACE | {"join"}
 # These can REMOVE a specifier when the literal is the receiver, so they cannot sit in PRESERVING:
 #   "poor-mans %s".replace("%s", "world")  -> 'poor-mans world'   correct code
 #   "100%% done".replace("%%", "%")        -> '100% done'         correct code
@@ -243,7 +252,8 @@ def scan(path):
     try:
         tree = ast.parse(src)
     except SyntaxError as e:
-        return [("SYNTAX", getattr(e, "lineno", 0) or 0, str(e))]
+        return [("SYNTAX", getattr(e, "lineno", 0) or 0, getattr(e, "offset", 0) or 0,
+                 str(e))]
     parent = {}
     docstrings = set()
     eager = _eager_bindings(tree)
@@ -262,7 +272,8 @@ def scan(path):
         if not SPEC.search(node.value):
             continue
         if id(node) in docstrings:
-            out.append(("DOCSTRING", node.lineno, node.value.strip().split("\n")[0][:70]))
+            out.append(("DOCSTRING", node.lineno, node.col_offset,
+                        node.value.strip().split("\n")[0][:70]))
             continue
         # Walk up to the nearest enclosing sink, stopping if a %-formatter intervenes. The
         # literal must be in the TEMPLATE position of whatever it meets, and the formatter must
@@ -322,7 +333,7 @@ def scan(path):
                 # specifiers survive exactly as the right operand of % does. Flagging one and not
                 # the other was the same principle applied inconsistently.
                 cf = par.func
-                if isinstance(cf, ast.Attribute) and cf.attr in BRACE and q in par.args:
+                if isinstance(cf, ast.Attribute) and cf.attr in EMITS_ARGS and q in par.args:
                     q = par
                     continue
                 sink = par; break
@@ -339,7 +350,8 @@ def scan(path):
             slot = ("other", None)
         if not _is_sink(sink, slot, parent, eager):
             continue
-        out.append(("UNFORMATTED", node.lineno, node.value.strip().split("\n")[0][:70]))
+        out.append(("UNFORMATTED", node.lineno, node.col_offset,
+                    node.value.strip().split("\n")[0][:70]))
     return out
 
 
@@ -367,12 +379,12 @@ if __name__ == "__main__":
 
     bad, seen = 0, {}
     for f in files:
-        for cls, ln, txt in scan(f):
+        for cls, ln, col, txt in scan(f):
             # FINDING lines are prefixed so a consumer's class census cannot pick up the explanatory
             # footnotes below. An earlier census did exactly that: grepping '^  [A-Z]+' returned
             # SCOPE and SYNTAX from this file's own prose, the same shape as the defects it was built
             # to find. The CLASSES line exists so no consumer has to parse the body at all.
-            print("FINDING %-12s %s:%d  %s" % (cls, os.path.relpath(f), ln, txt))
+            print("FINDING %-12s %s:%d:%d  %s" % (cls, os.path.relpath(f), ln, col, txt))
             seen[cls] = seen.get(cls, 0) + 1
             if cls in COUNTED:
                 bad += 1

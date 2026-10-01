@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN = os.path.join(HERE, "an_fmtscan.py")
 PLANTS = os.path.join(HERE, "fmtscan_plants")
 # (fixture, expected UNFORMATTED, expected SYNTAX, expected rc)
-CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1), ("must_fire3", 11, 0, 1),
+CASES = [("must_fire", 18, 0, 1), ("must_fire2", 1, 0, 1), ("must_fire3", 15, 0, 1),
          ("must_be_silent", 0, 0, 0), ("known_miss", 0, 0, 0), ("broken", 0, 1, 1)]
 N_FIRE = sum(c[1] for c in CASES)          # defect forms that must be detected
 N_SYNTAX = sum(c[2] for c in CASES)        # files that must be reported as unreadable
@@ -118,14 +118,18 @@ try:
     # Every planted defect must be attributable to its own line, so a single over-broad rule
     # cannot pass by firing twice on one construct and never on another.
     rc, cls, out = run([staged[n] for n in FIRE_FIXTURES])
-    lines = sorted((m.group(1), int(m.group(2))) for m in
-                   re.finditer(r"^FINDING UNFORMATTED\s+(\S+):(\d+)", out, re.M))
+    # (file, line, COLUMN) -- a site, not a line. Two specifier literals on one line are
+    # legitimate (both branches of a ternary) and with (file, line) alone such a fixture would make
+    # this check FAIL: fail-closed, but a constraint on the fixture rather than a defect in the
+    # scan. The column removes it, so a two-literals-on-one-line case can now be planted.
+    lines = sorted(m.group(1) for m in
+                   re.finditer(r"^FINDING UNFORMATTED\s+(\S+:\d+:\d+)", out, re.M))
     if len(lines) != len(set(lines)) or len(lines) != N_FIRE:
         fail.append("one-cause-per-line")
-        print("  FAIL attribution: %d finding(s) on %d distinct (file, line) pair(s), want %d"
+        print("  FAIL attribution: %d finding(s) on %d distinct site(s), want %d of each"
               % (len(lines), len(set(lines)), N_FIRE))
     else:
-        print("  %-16s %d finding(s) on %d distinct (file, line) pair(s)"
+        print("  %-16s %d finding(s) on %d distinct site(s), incl. two on one line"
               % ("attribution", len(lines), len(set(lines))))
     # The fixtures must be invisible to the scan's own directory walk, or the control would
     # contaminate the population it certifies. This is the defect the .pyplant suffix fixes.

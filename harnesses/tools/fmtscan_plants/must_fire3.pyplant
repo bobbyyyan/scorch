@@ -15,3 +15,6 @@ print("E8 deep %d" + "b" + "c" + "d" + "e" + "f" + "g"
 print("E9 replace preserves %d".replace("a", "b"))        # argument carries no specifier
 print("{}".format("E10 argument to format %d"))      # substituted verbatim, like % right operand
 log.warning("E11 template %s", "argument %d")        # same, lazy-logging value position
+print("\n".join(["E12 join argument %d", "tail"]))   # join emits its arguments' text
+print("".join("E13 join genexp %d" for _ in range(2)))  # same, generator form
+print("E14 ternary a %d" if p else "E15 ternary b %d")  # TWO sites on ONE line
