@@ -141,7 +141,11 @@ def main():
     for q, lab in ((0.50, "median"), (0.90, "p90"), (1.0, "max")):
         print("  %-7s %8.4f per 100 nonzeros" % (lab, 100.0 * np.quantile(addpn, q)))
     print()
-    print("reach is ~ P(row length even) / mean_degree, so it is largest on the sparsest rows.")
+    print("reach ~ 2*P(row length even)/mean_degree, because G = sum floor(L/2) ~ nnz/2 and")
+    print("added = rows*P(even), so added/G ~ 2*P(even)*rows/nnz. The FACTOR OF 2 is easy to")
+    print("drop: P(even)/d reads 0.44 of the measured median on SuiteSparse and 0.49 on DLMC,")
+    print("while 2*P(even)/d reads 0.87 and 0.97. The 1/d simplification needs P(even)=0.5,")
+    print("which holds on DLMC (0.496) but NOT on SuiteSparse (0.367, so 1/d overshoots 19%).")
     print("Spearman-free check -- reach by mean-degree band:")
     for lo, hi in ((0, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 1 << 30)):
         m = (d >= lo) & (d < hi)
