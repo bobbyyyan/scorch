@@ -877,3 +877,121 @@ four and not three, stated here as the positive form of the same fact.
 **This is not a licence to read at three.** The gate remains four complete rounds. The
 condition exists so that a forced partial read (a preempted job, a co-tenant arriving
 mid-round) carries the right covariate rather than an inherited one.
+
+## Amendment 17 — the registered negative control FAILED, and the screen's floor is the wrong floor
+
+Read 2026-10-01 at 12:20, after all sixteen passes landed (job 17680942 COMPLETED, 03:44:00,
+exit 0:0, last pass closing 12:18:07). Written before any k≥4 number was interpreted.
+
+### The window qualifies, checked first per amendment 16
+
+The pass order read out of `screen.log` is the left-cyclic rotation of (ship, shpb, strm, nopf),
+each build occupying each position exactly once. Mean position 2.5000 for all four, and the
+spread for **every** one of the six pairs is **0.0000** — so the position term's coefficient is
+0 and no pair carries it. That is the four-pass branch of the windowing decision, satisfied by
+measurement rather than by assumption.
+
+### Bit-identity holds, and the check is not vacuous
+
+All four builds agree on all **2120** cells (424 keys × 5 widths; 2090 real, 30 degenerate), and
+**2120 of 2120 digests are distinct within one build** — so the agreement is not the artefact of
+every cell sharing one hash. `pfs_bitcmp.py` **refused**: the producer wrote no `.done` sentinel,
+so this is a hand comparison carrying no guarantee that each run closed its file. The row count
+being exactly 2120 everywhere bounds that risk to "died after writing every row", which changes
+nothing in the comparison, but it does not remove it. **A sentinel is owed by the f64 and fused
+producers.**
+
+### The control, and it failed
+
+Amendment 1 registered: `strm/ship` and `nopf/ship` at k=2 must land inside the `shpb/ship`
+floor at k=2, and if either moves beyond it, *"the floor is understated at every width and no
+k=4/8/16/32 result from this screen is readable"*. Pooled medians over 418 matrices, bootstrap
+percentile CIs, 2000 resamples, index matrix sha256 `fe90d5e14bc94d99a833a1464ee98603`:
+
+| ratio at k=2 | pooled median | 95% CI | vs the floor's CI |
+|---|---|---|---|
+| `strm/ship` | **1.006837** | [1.004488, 1.008271] | **separated** |
+| `nopf/ship` | **1.017599** | [1.015588, 1.019778] | **separated** |
+| `shpb/ship` (floor) | 0.999359 | [0.998729, 0.999935] | — |
+
+Both arms are slower than `ship` by 0.68% and 1.76% at a width where their differing code
+**cannot execute**. The declared floor sits at −0.064%. So the registered consequence applies:
+**no k≥4 result from this screen is readable as the arm effect.**
+
+### The control's premise was re-verified, and it holds
+
+Before accepting the failure the premise was re-checked against the source with brace-matched
+function spans rather than nearest-preceding-definition (the first attempt mis-attributed a
+file-scope macro block to `scorch_spmm_row_narrow_exact` and would have invalidated the control
+for the wrong reason). Both macros are confined to `scorch_spmm_row_regblock` — its signature
+(`spmm.h:2270`), its body (`2291`–`2295`) and its call sites (`4884`, `4885`, `4970`, `4974`,
+`6346`, `6347`). **Nothing in `scorch_spmm_row_narrow_exact`**, which owns float32 k ∈ {1,2,3}.
+The control is valid; the failure is real.
+
+### The mechanism, measured
+
+`.text`, read from the four objects:
+
+| build | `.text` bytes | vs ship | `.text` sha |
+|---|---|---|---|
+| `ship` | 1073586 | — | `d726054c522aaca2` |
+| `shpb` | 1073586 | 0 | `d726054c522aaca2` — **identical, as designed** |
+| `strm` | 1071954 | −1632 (−0.152%) | `fec561b30165be9e` |
+| `nopf` | 1070466 | −3120 (−0.291%) | `238988e56786106e` |
+
+**The floor bounds the wrong thing.** `shpb` differs from `ship` only in build path, with
+byte-identical `.text`, so `shpb/ship` measures build-*path* variation. `strm` and `nopf` are
+different code. PFSTREAM adds a parameter to a kernel this file's own comment calls "register-starved
+enough that one more live value moves code" (`spmm.h:2256-2258`, where the unconditional form cost
+67 instructions and 480 bytes). A design whose arms are compile-time macros that change emitted
+code needs a floor that **also** differs in emitted code, and this one does not have it.
+
+The displacement is **4–6× the relative code-size change**, which is what a layout effect looks
+like: alignment, instruction-cache set conflicts and branch-predictor aliasing are not
+proportional to size.
+
+### Two properties that distinguish this from noise
+
+**It is one-signed.** At k=2, `nopf` is slower than `ship` on **359 of 418** cells (85.9%) and
+`strm` on **280 of 418** (67.0%), against the floor's **187 of 418** (44.7%). A two-sided
+placement wobble would sit near 50%.
+
+**Its size profile matches the known A/A inverted U.** The k=2 displacement peaks in the
+1e4–1e5 nonzero band — `strm` +1.766%, `nopf` +2.524% — and falls away at both ends
+(0–1e4: −0.113% / +0.691%; 1e6–1e7: −0.327% / +0.663%). That is the shape full-collection A/A
+noise already has, which is evidence for a placement mechanism and against a kernel effect.
+
+### What is NOT reported
+
+The k=4/8/16/32 ratios exist and are not the arm result. The largest of them is `strm/ship` =
+1.04717 at k=16, and **"PFSTREAM is 4.7% slower at k=16" is not a claim this screen supports**:
+the same object carries a +0.68% displacement at a width where its difference cannot run, and
+the displacement is not constant in width (`nopf` swings from +1.760% at k=2 to −1.700% at k=8).
+Object identity and arm identity are confounded at every width, and nothing in this design
+separates them.
+
+### What the next design needs
+
+The floor must be an estimate of **inter-object** variance, not of build-path variance. Two
+routes, neither chosen here:
+
+* **≥2 objects per arm**, so the variance between objects of the same configuration is measured
+  rather than assumed. This is the honest form and it doubles the build count, not the run time.
+* **A floor arm that differs in emitted code by a comparable amount while being semantically
+  inert at every width.** Cheaper, and weaker: "comparable" is a judgement, and an inert change
+  that happens to land in a different cache set proves nothing about one that does not.
+
+**The f64 cell now carries an independent replication of this question** rather than only a
+coverage role. Job 17681665 started 12:19:07 with the same four-build design, and at float64
+k=2 the row still takes `narrow_exact` (`exact_hi_` is 3 at f64, and `SCORCH_SPMM_HALFVEC_F64`
+ships at 0, so `halfvec_exact` is false). If its k=2 control fails too, the defect is a property
+of the build-arm design; if it passes, something specific to these three f32 objects. Either
+outcome is informative and neither is the prefetch question.
+
+### The amendment-12 regression stays blocked
+
+Unchanged and for the registered reason: the true reach `Σ min(L_i,2)/nnz` must be measured for
+the screen's own 418 keys before the mechanism regression is read, and that read is 418 `.npz`
+decompressions on a host now running job 17681665. One bounded 7.3 MB copy of the results was
+taken off the live node and is stated here rather than treated as free; a 418-matrix read is not
+in the same class and waits.
