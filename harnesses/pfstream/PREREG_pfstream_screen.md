@@ -408,3 +408,58 @@ point. PFSTREAM changes the **fused Linear-SpMM path too**, and this screen neve
 screen is silent about a path the change affects. That path carries real workloads (the sparse
 autoencoder family). It needs its own measurement before PFSTREAM ships, and "neutral-or-better
 everywhere" is not established by this screen alone.
+
+## AMENDMENT 8: COVERAGE IS A QUESTION ABOUT A PRODUCT OF AXES, and the screen covers one cell of three
+
+Amendment 7 enumerated kernels **along width**, holding entry point and dtype at the screen's
+values. That finds the fused-path gap only because the fused calls happen to be in a different
+function; it cannot see a gap on an axis it never varies. The version that finds all of them:
+**name every (entry point, dtype, width) the arm is reachable from, then mark which the screen
+visits.**
+
+### The dtype axis, verified from the tree
+
+`scorch_spmm_row_regblock` is templated on `T` and 4884/4885 instantiate it as
+`<scalar_t, NV, ...>`. `spmm_csr_double_v2` is an exposed release symbol (`ops.cpp:309`) and its
+own comment at `ops.cpp:303` says it goes through "the float32 v2" core -- the same one. The
+width bound and the vector count are both **dtype-dependent**, from `spmm.h:3977-3980`:
+
+```
+using SV = scorch_simd<scalar_t>;  constexpr int SL = SV::lanes;
+const bool narrow_k = (B1_size >= 1 && B1_size <= 4 * SL);
+const int nvec = (B1_size + SL - 1) / SL;
+```
+
+`scorch_simd<double>` is `__m256d` with `lanes = 4` (`spmm.h:2177`), so:
+
+| dtype | SL | narrow_k holds for | NVEC | k=2 | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|---|---|---|---|
+| float32 | 8 | k ≤ 32 | ceil(k/8) | 1 | 1 | 1 | 2 | 4 |
+| float64 | 4 | k ≤ **16** | ceil(k/4) | 1 | 1 | **2** | **4** | *not regblock* |
+
+So PFSTREAM changes the shipped **float64** register kernel at every width up to 16, and this screen
+is float32-only by construction. **The f32 grid does not stand in for f64 even where the width
+coincides**: f64 k=8 is NVEC 2 where f32 k=8 is NVEC 1, so the (dtype, width, NVEC) triples covered
+and uncovered are disjoint in the *middle* of the range, not only at the ends.
+
+The stake is at least as large as the fused one: the f64 register kernel is the one reading
+**2.273x geomean against MKL with 0 of 129 cells below parity**. A regression there is not
+hypothetical.
+
+### The product, and its actual size
+
+| entry point | dtype | exists? | arm reachable | screen visits |
+|---|---|---|---|---|
+| `spmm_csr_v2_core` | float32 | yes | yes | **YES** |
+| `spmm_csr_v2_core` | float64 | yes (`spmm_csr_double_v2`) | yes, k ≤ 16 | no |
+| `spmm_csr_linear_fused_float` | float32 | yes | yes | no |
+| fused | float64 | **no such symbol** | — | — |
+
+`grep -c spmm_csr_linear_fused_double` is **0** in both `spmm.h` and `ops.cpp`, so the fourth cell
+does not exist and the product is **three reachable cells, of which the screen visits one**. (A peer
+put it at a quarter assuming 2x2; it is a third. Checked precisely because that is the direction
+that flatters my own coverage.)
+
+**Neither uncovered cell is optional before shipping**, and both carry a live result: the fused path
+closed the 0.99-sparsity autoencoder gap against MKL, and f64 is at 2.273x with nothing below
+parity.
