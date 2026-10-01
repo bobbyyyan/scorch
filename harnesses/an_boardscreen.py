@@ -170,7 +170,12 @@ def screen(d, draws=200000, seed=20261001):
         sys.exit("REFUSE: only %d completed object-passes; a correlation on fewer than 6 points has "
                  "no critical value worth quoting." % len(W))
 
-    csvs = list(LC.glob_clean(d, "*_float32_p*.csv", label="an_boardscreen"))
+    # allow_excluded=True, and this is the one caller entitled to it: this file IS the
+        # contamination screen, so refusing to read a run already marked contaminated would make it
+        # unable to do the thing the mark came from. Every other reader fails closed. The filename
+        # marker check still applies -- a bad FILE is excluded even inside a run we mean to read.
+        csvs = list(LC.glob_clean(d, "*_float32_p*.csv", label="an_boardscreen",
+                                  allow_excluded=True))
     if not csvs:
         sys.exit("REFUSE: no *_float32_p*.csv under %s -- an empty glob makes every correlation nan, "
                  "which reads as 'no contamination found'." % d)

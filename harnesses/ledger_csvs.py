@@ -63,13 +63,19 @@ def scan(names):
     return sorted(clean), sorted(flagged)
 
 
-def glob_clean(d, pattern, label=""):
+def glob_clean(d, pattern, label="", allow_excluded=False):
     """Glob `pattern` under `d` and REFUSE if any match carries a quarantine marker.
 
     Returns the sorted clean matches. Refusing is the point: a recount that silently excluded the
     file would report a denominator nobody could check, and one that included it would average a
     file someone marked bad.
     """
+    # RUN-LEVEL EXCLUSION FIRST. A bad file is marked in its name; a bad RUN has no filename to
+    # mark, because every file in it is individually well-formed. Checking the directory before
+    # the filenames means a reader pointed at a set-aside run stops on the larger fact rather
+    # than reporting a clean filename scan over data nobody should be averaging.
+    import ledger_excluded_runs as LX
+    LX.check_run(d, allow_excluded=allow_excluded, label=label)
     hits = _glob.glob(os.path.join(d, pattern))
     clean, flagged = scan(hits)
     if flagged:
