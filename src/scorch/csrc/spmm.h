@@ -4272,6 +4272,7 @@ torch::Tensor spmm_csr_v2_core(
   int narrowk_unroll_pf = SCORCH_NARROWK_DEEP_PF;
   long narrowk_deep_lo = SCORCH_NARROWK_DEEP_NVEC_LO;
   long narrowk_deep_hi = SCORCH_NARROWK_DEEP_NVEC_HI;
+  long narrowk_deep_mindeg = SCORCH_NARROWK_DEEP_MINDEG;
 #else
   // const in the shipped build, the same way full_last is, so `if (narrowk_unroll && ...)` folds
   // away and none of the deep instantiations are emitted. Left non-const it does NOT fold: the
@@ -4280,6 +4281,7 @@ torch::Tensor spmm_csr_v2_core(
   const int narrowk_unroll_pf = SCORCH_NARROWK_DEEP_PF;
   const long narrowk_deep_lo = SCORCH_NARROWK_DEEP_NVEC_LO;
   const long narrowk_deep_hi = SCORCH_NARROWK_DEEP_NVEC_HI;
+  const long narrowk_deep_mindeg = SCORCH_NARROWK_DEEP_MINDEG;
 #endif
 #endif
 #if defined(__AVX2__) && defined(__FMA__) && defined(SCORCH_TUNE_HOOKS)
@@ -4308,6 +4310,11 @@ torch::Tensor spmm_csr_v2_core(
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 8) narrowk_deep_lo = v; } }
   { const char* e = std::getenv("SCORCH_NARROWK_DEEP_NVEC_HI");
     if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 8) narrowk_deep_hi = v; } }
+  // A/B hook: the minimum row length, in nonzeros, that the deep kernel takes. 0 restores "take
+  // every row", so an arm setting only the depth reproduces the pre-gate behaviour and the gate's
+  // own effect is measurable as a separate arm instead of being bundled with turning depth on.
+  { const char* e = std::getenv("SCORCH_NARROWK_DEEP_MINDEG");
+    if (e && *e) { long v = std::atol(e); if (v >= 0 && v <= 4096) narrowk_deep_mindeg = v; } }
   // A/B hook: whether the deep register kernel prefetches the next group of B rows.
   // Defaults to 1, because the arm that has never been run is the one WITH a prefetch: the
   // measurement that rejected stream depth ran the deep kernel with no prefetch at all,
@@ -4912,7 +4919,17 @@ torch::Tensor spmm_csr_v2_core(
                 // to argue about. SCORCH_TUNE_HOOKS keeps it reachable where the constant is a
                 // runtime value.
 #if SCORCH_NARROWK_DEEP_UNROLL || defined(SCORCH_TUNE_HOOKS)
+                // The row-length minimum. A row below it takes no branch of its own: `took_d`
+                // stays false and control falls through to the `scorch_spmm_row_regblock` call
+                // below, which is the kernel that ships. So a short row runs today's two-chain
+                // form rather than the deep kernel's one-chain remainder, and no row can be
+                // slower than it is today for a reason this gate introduced. Measured crossing
+                // is row length 24 to 32 on redwood's P-cores; the sweep and the row-length
+                // distribution it acts on are recorded at SCORCH_NARROWK_DEEP_MINDEG in
+                // scorch_policy.h.
                 if (narrowk_unroll &&
+                    (narrowk_deep_mindeg <= 0 ||
+                     (long)(pA_end - pA_begin) >= narrowk_deep_mindeg) &&
                     (narrowk_deep_hi <= 0 || (1 >= narrowk_deep_lo && 1 <= narrowk_deep_hi))) {
                   #define SCORCH_RBDH(UN, PFV) \
                     (halfvec_exact \

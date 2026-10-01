@@ -990,6 +990,36 @@
 #ifndef SCORCH_NARROWK_DEEP_NVEC_HI
 #  define SCORCH_NARROWK_DEEP_NVEC_HI 0
 #endif
+// Minimum row length, in nonzeros, for the deep kernel to take a row. 0 means no minimum, which
+// is how the deep arm behaved before this existed, so an arm written against the older build
+// fires exactly where it used to.
+//
+// WHY A ROW-LENGTH MINIMUM IS THE RIGHT GATE HERE. The deep kernel's gain comes from running
+// UNROLL independent accumulator chains instead of two, and a measured sweep of the probe in
+// harnesses/portbound puts four chains at -20.7% on redwood's P-cores and -4.1% on its E-cores
+// at a 4096-nonzero row, rising to -29.6% and -37.6% at a 128-nonzero row. But the gain is paid
+// for per row: four chains fold down in two dependent vector adds where two chains fold in one,
+// and a row shorter than the machine body runs the remainder loop, which carries ONE chain and
+// so has less instruction-level parallelism than the two-stream form it replaced. The sweep puts
+// the crossing between row length 24 and 32 on the P-cores; below it the deep kernel is slower.
+//
+// With a minimum set, a row below it falls through to `scorch_spmm_row_regblock` -- the kernel
+// that ships today -- rather than to the deep kernel's own remainder. So every row runs either
+// today's kernel or a kernel measured faster at that row's length, which is what makes this a
+// gate rather than a tuned threshold: the quantity gated on is the same quantity the measurement
+// varied, and the fallback is the incumbent.
+//
+// Row-length distribution it acts on, measured over all 3846 DLMC matrices from their CSR row
+// pointers (harnesses/an_rowdist.py): 28.2% of rows are shorter than 32 and they hold 2.60% of
+// the collection's nonzeros, so a minimum of 32 forgoes the gain on about a fortieth of the
+// arithmetic. Structurally empty rows never reach either kernel -- spmm.h:4824 short-circuits
+// them before the dispatch -- so the gate is never ASKED about 147840 of the 3402920 rows. Of
+// the 3255080 that do reach it, those below 32 number 810906, so the gate's FIRING RATE is
+// 24.91%. Neither 28.2% (the predicate's truth rate over all rows) nor 23.83% (short rows over
+// all rows) is that rate: both divide by a population that includes rows the gate never sees.
+#ifndef SCORCH_NARROWK_DEEP_MINDEG
+#  define SCORCH_NARROWK_DEEP_MINDEG 0
+#endif
 
 // Serve width 1 from the exact-width kernel instead of whatever owns it by default. On x86 float32
 // that displaces the nonzero-axis gather (one vgatherdps covering eight nonzeros); everywhere else it
