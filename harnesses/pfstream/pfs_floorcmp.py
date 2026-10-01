@@ -90,6 +90,15 @@ def disasm(path):
     return syms
 
 
+def nplt_of(path, pattern):
+    """@plt stubs whose name matches the pattern. A property of the LINK, not of the code."""
+    out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", path],
+                         capture_output=True, text=True).stdout
+    return len([ln for ln in out.split("\n")
+                if re.match(r"^[0-9a-f]+ <.+>:$", ln) and "@plt" in ln
+                and re.search(pattern, ln)])
+
+
 def text_digest(path):
     subprocess.run(["objcopy", "-O", "binary", "--only-section=.text", path, path + ".text.bin"],
                    check=True)
@@ -178,9 +187,29 @@ def main():
     print()
     print("NORMALISER CONTROL: a one-instruction mutation of %s is still detected" % probe[:48])
 
+    # CONDITION 4 -- the two objects must share their LINKAGE. A floor that bounds placement
+    # variation in an object shaped differently from the arm is bounding the wrong object. The two
+    # hosts here do not agree on the link: MKT's system Python passes -Wl,-Bsymbolic-functions and
+    # redwood's conda Python does not, and without it the kernel's own calls go through @plt
+    # trampolines. So the stub count and the torch DT_NEEDED count are compared, not assumed.
     print()
-    ok = (da != db) and diff_insn == 0 and shifted > 0
-    print("VERDICT: %s" % ("all three conditions hold -- this pair is a candidate floor"
+    print("CONDITION 4 -- the pair must share its linkage, or the floor is shaped wrong")
+    lk = {}
+    for tag, path in (("a", pa), ("b", pb)):
+        rd = subprocess.run(["readelf", "-d", path], capture_output=True, text=True).stdout
+        need = len([ln for ln in rd.split("\n") if "NEEDED" in ln and "torch" in ln])
+        lk[tag] = (need, nplt_of(path, pattern))
+        print("  %s  DT_NEEDED torch %d   @plt stubs matching the pattern %d" % (tag, *lk[tag]))
+    linked_same = lk["a"] == lk["b"]
+    print("  %s" % ("same linkage" if linked_same else
+                    "DIFFERENT linkage -- this pair cannot be a floor for each other"))
+    if lk["a"][1]:
+        print("  note: @plt stubs present, so this link omitted -Wl,-Bsymbolic-functions. That is")
+        print("        correct for a floor only if the ARM was linked the same way.")
+
+    print()
+    ok = (da != db) and diff_insn == 0 and shifted > 0 and linked_same
+    print("VERDICT: %s" % ("all four conditions hold -- this pair is a candidate floor"
                            if ok else "NOT a usable floor pair as constructed"))
     return 0 if ok else 3
 
