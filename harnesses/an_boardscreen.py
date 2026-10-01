@@ -19,9 +19,23 @@ Three of five widths clear the two-sided 5% critical value in chain207 and none 
 board. So chain207's board is the contaminated one and chain206's SuiteSparse board stands -- which
 matters because chain206 is where the 14-cell SuiteSparse count comes from.
 
-THE CHEAP PART. The wall-time spread alone separates the three boards 3.87% against 0.66-0.67%, and
-it is computable from the stage log before any CSV is read. Report it beside every board. The
-regression is the confirmation; the spread is the screen.
+THE STATISTIC IS max|r| WITH A PERMUTATION p, NOT A COUNT OF WIDTHS. The first version of this
+file flagged on "two or more widths above the per-width critical value". Permuting the twelve pass
+labels -- which carries the width-to-width dependence exactly, since all five widths are recomputed
+from the same permuted assignment -- puts that rule's own false-positive rate at 0.0441 to 0.1051
+across three boards of the SAME design, against the 0.0226 independence would give. P(at least one
+width over critical) is 0.111 to 0.197. So a width count is not evidence at n=12, there is no
+multiplicity constant to hardcode, and the rate has to come from each board's own pass structure.
+max|r| with its permutation p is both correct and much stronger: chain207 reads p = 0.00011 at
+|r| = 0.963, chain210 p = 0.667 at 0.263, chain206 p = 0.894 at 0.204.
+
+A CLEAN SCREEN IS A BOUND, NOT A CLEARANCE. "chain206 stands" is a detection claim. The defensible
+form multiplies each board's wall-time spread in SECONDS by a reference sensitivity -- chain207's
+measured worst slope, 11.57% per 100 s at k=32 -- to get how much pass-varying contamination the
+spread admits: chain207 6.32%, chain210 1.04%, chain206 1.40%. chain206's bound sits BELOW the 2%
+P4 gate, which is the useful statement. Note that chain206's percentage spread equals chain210's at
+0.66% while its bound is 35% wider, because its passes are longer: seconds times slope is the
+comparable quantity across boards and a percentage spread is not.
 
 WHAT IT CANNOT DO. It detects a perturbation that VARIES across passes. A perturbation constant for
 a whole run shifts every pass equally, leaves no within-run slope, and is invisible here -- the
@@ -30,7 +44,7 @@ catches a constant perturbation is a second run, which is what P4 is for.
 
 Takes the ledger root as argv[1]; the CSV prefix is derived from what is there, not assumed.
 """
-import csv, glob, math, os, statistics, sys, collections
+import collections, csv, glob, math, os, random, statistics, sys
 
 med = statistics.median
 # Two-sided 5% critical values for Pearson r, by n.
@@ -55,10 +69,48 @@ def pearson(x, y):
         return float("nan"), float("nan")
     r = sum((a - mx) * (b - my) for a, b in zip(x, y)) / (sx * sy)
     slope = sum((a - mx) * (b - my) for a, b in zip(x, y)) / sum((a - mx) ** 2 for a in x)
-    return r, 100.0 * slope * 100.0 / my          # percent of the mean ratio per 100 s
+    # The slope is reported as a percentage of the mean ratio, which is undefined on a CENTRED
+    # series (mean 0). The within-object check needs only r, so return nan rather than dividing.
+    pct = 100.0 * slope * 100.0 / my if abs(my) > 1e-12 else float("nan")
+    return r, pct                                  # percent of the mean ratio per 100 s
 
 
-def screen(d):
+def perm_max_r(W, per, ks, draws, seed):
+    """P(max|r| over widths >= observed) under permutation of the PASS LABELS.
+
+    Permuting pass labels rather than resampling widths is what carries the dependence: all five
+    widths are recomputed from the same permuted assignment, exactly as in the observed statistic.
+    """
+    keys = [k for k in per if k in W]
+    walls = [W[k] for k in keys]
+    series = {}
+    for k in ks:
+        ys = []
+        ok = True
+        for key in keys:
+            o = per[key].get(k, {}).get("ours")
+            m = per[key].get(k, {}).get("mkl")
+            if not o or not m:
+                ok = False; break
+            ys.append(med(o) / med(m))
+        if ok:
+            series[k] = ys
+    if not series:
+        return float("nan"), float("nan"), {}
+    obs = {k: abs(pearson(walls, series[k])[0]) for k in series}
+    mobs = max(obs.values())
+    rng = random.Random(seed)
+    hits = 0
+    idx = list(range(len(walls)))
+    for _ in range(draws):
+        rng.shuffle(idx)
+        pw = [walls[i] for i in idx]
+        if max(abs(pearson(pw, series[k])[0]) for k in series) >= mobs:
+            hits += 1
+    return mobs, (hits + 1.0) / (draws + 1.0), obs
+
+
+def screen(d, draws=20000, seed=20261001, ref_slope=11.57):
     stages = glob.glob(os.path.join(d, "*_stage.log"))
     if len(stages) != 1:
         sys.exit("REFUSE: %d files match *_stage.log in %s -- no unambiguous source of per-pass "
@@ -92,6 +144,10 @@ def screen(d):
         base = os.path.basename(f)
         parts = base.split("_")
         b, p = parts[1], "p" + base.rsplit("_p", 1)[1].split(".")[0]
+        if (p, b) in per:
+            sys.exit("REFUSE: %s and an earlier file both map to key (%s, %s). The key comes from "
+                     "the filename's second field, so a board with two files per pass per object "
+                     "would silently overwrite one and halve the sample." % (base, p, b))
         acc = collections.defaultdict(lambda: collections.defaultdict(list))
         for r in csv.DictReader(open(f)):
             try:
@@ -130,17 +186,58 @@ def screen(d):
         flagged += 1 if hit else 0
         print("  k=%-3d %11.3f %7d %15.4f %9s" % (k, r, len(xs), sl, "OVER" if hit else "-"))
     print()
-    print("  %d of %d widths clear |r| >= %.3f (two-sided 5%%, n=%d)" % (flagged, len(ks), crit(len(W)), len(W)))
-    if flagged >= 2:
-        print("  SCREEN: FLAGGED -- a pass's own wall time predicts its ratio at %d widths. Treat this" % flagged)
+    mx, pp, obs = perm_max_r(W, per, ks, draws, seed)
+    bound = (ws[-1] - ws[0]) * ref_slope / 100.0
+    print("  max|r| = %.3f at k=%s ; permutation p = %.5f (%d draws, pass labels permuted so the"
+          % (mx, [k for k in obs if abs(obs[k]) == mx][0] if obs else "?", pp, draws))
+    print("    width-to-width dependence and the five-width maximum are both in the null)")
+    print("  P(>=1 width over the per-width critical value) under the same null: see the docstring --")
+    print("    it runs 0.111 to 0.197 on boards of this design, so a WIDTH COUNT is not evidence here.")
+    print()
+    print("  ADMISSIBLE CONTAMINATION, which is what a clean screen actually licenses:")
+    print("    wall spread %.1f s x %.2f%%/100s (chain207's measured worst slope) = %.2f%% in the ratio"
+          % (ws[-1] - ws[0], ref_slope, bound))
+    print("    Compare against the 2% P4 reproducibility gate. Seconds x slope is the comparable")
+    print("    quantity across boards; a PERCENTAGE spread is not, since longer passes admit more.")
+    print()
+    if pp <= 0.01:
+        print("  SCREEN: FLAGGED at p = %.5f. A pass's own wall time predicts its ratio. Treat this" % pp)
         print("  board's behind-set as contaminated by a pass-varying perturbation until replicated.")
-    elif flagged == 1:
-        print("  SCREEN: one width over critical. At 5%% per test that is within multiplicity on %d" % len(ks))
-        print("  widths (expected %.2f), so this is not a flag on its own." % (0.05 * len(ks)))
+    elif pp <= 0.05:
+        print("  SCREEN: BORDERLINE at p = %.5f. Not a clearance and not a flag; replicate." % pp)
     else:
-        print("  SCREEN: clean on this axis. NECESSARY, NOT SUFFICIENT -- a perturbation constant")
-        print("  across a whole run shifts every pass equally, leaves no within-run slope, and is")
-        print("  invisible here. Only a second run catches that.")
+        print("  SCREEN: no pass-varying signal (p = %.5f). The claim is the BOUND above, %.2f%%," % (pp, bound))
+        print("  not that the board is clean. And it is bounded only against a perturbation that")
+        print("  VARIES across passes: one constant for a whole run shifts every pass equally, leaves")
+        print("  no within-run slope, and is invisible here. Only a second run catches that.")
+
+    # Between-object confound: on a multi-object board the pooled slope could be picking up a
+    # systematic difference BETWEEN objects rather than a within-run perturbation. Measured, not
+    # assumed -- it moved nothing by more than 0.06 on either board checked.
+    objs = {b for (_, b) in per}
+    if len(objs) > 1:
+        print()
+        print("  WITHIN-OBJECT CHECK (%d objects): x and y centred inside each object first, so a" % len(objs))
+        print("  between-object difference in wall time and ratio cannot produce the slope.")
+        print("    %-5s %10s %10s" % ("k", "pooled r", "within r"))
+        for k in ks:
+            xs, ys, gs = [], [], []
+            for key in per:
+                if key not in W or k not in per[key]: continue
+                o, m = per[key][k].get("ours"), per[key][k].get("mkl")
+                if not o or not m: continue
+                xs.append(W[key]); ys.append(med(o) / med(m)); gs.append(key[1])
+            if len(xs) < 6: continue
+            r0, _ = pearson(xs, ys)
+            cx, cy = [], []
+            for g in set(gs):
+                ix = [i for i in range(len(xs)) if gs[i] == g]
+                if len(ix) < 2: continue
+                mxg = sum(xs[i] for i in ix) / len(ix); myg = sum(ys[i] for i in ix) / len(ix)
+                for i in ix:
+                    cx.append(xs[i] - mxg); cy.append(ys[i] - myg)
+            r1, _ = pearson(cx, cy) if len(cx) >= 6 else (float("nan"), 0)
+            print("    k=%-3d %10.3f %10.3f" % (k, r0, r1))
 
 
 if __name__ == "__main__":
