@@ -41252,3 +41252,77 @@ driver, same corpus, same balanced rotation, 6 passes, 57301 rows per object-pas
 
 **What it cannot settle.** Same objects means a positive result does not clear the object-layout
 artefact, and same host means none of this is two-host. It settles replication across runs only.
+
+### chain210 pre-registration, AMENDMENT 1 -- committed with zero object-passes complete
+
+The checker session audited the registration above and found two predictions that cannot fail, one
+that is near-vacuous, three unpinned thresholds, a mislabelled control, a better-powered primary
+statistic, and three factual slips. All nine accepted. Amending a registration after data exists is
+not legitimate, so the state at the time of writing is recorded: **0 of 12 object-passes complete**,
+`dl_aa_float32_p1.csv` at 4456 of 57301 lines, nothing read, nothing reduced. The run keeps going.
+
+**THREE FACTUAL CORRECTIONS.**
+
+1. *chain207 DOES bind the binary.* I had carried "chain207 seals the data and does not bind the
+   binary" as a standing gap. It is wrong, and it is wrong in a sealed file: `c207_stage.log` lines
+   1-2 record `aa .text a79b5d20b322c5ac whole 7f8f78d58a8784b1` and `bb .text a79b5d20b322c5ac
+   whole 70c9f5473e498f50`, plus the premise line, `exact 3820`, `pool: torch reports 24` and the
+   balanced rotation. One grep settles it. What is actually missing is narrower: chain207 binds the
+   **object** and not the **tree** -- no source digest or PYTHONPATH is recorded. The checker raised
+   this against itself first, having repeated the same error further than I did.
+2. *Not "full SHA-256".* chain207 records 16 hex characters, **64 bits**. The guard compares
+   `${TA:0:16}`, so equality is asserted on the 64 bits that exist and the design is unchanged --
+   only the sentence was wrong. Same defect class as a digest that does not name its width.
+3. *57300 data rows, 57301 lines.* 3820 keys x 5 widths x 3 arms = 57300 exactly. `EXPECT=57301` in
+   the stage script is a LINE count via `grep -c .` and is correct; my prose was not.
+
+**P5 WITHDRAWN -- IT CANNOT FAIL.** Candidates are 1 at k=2, 8 at k=4, 1 at k=8. With only two
+non-k=4 candidates, four survivors force k=4 to contribute at least two and five force at least
+three, so k=4 is the largest group in every reachable outcome. The hypergeometric probability of
+failure is exactly 0. P5 was a property of run 1's composition, not a test of run 2.
+
+**P2 REPLACED.** "Union exceeds 10" fails only if run 2's behind-set is a subset of run 1's, which
+at the measured run-specificity is effectively impossible. The falsifiable form predicts the union's
+SIZE: the SuiteSparse analogue gives union/run1 of 25/14 = 1.79 and 25/18 = 1.39, so **P2' predicts
+a union of 14 to 18 cells**, and a union outside [12, 21] fails it.
+
+**P1 REPARTITIONED, AND ITS REAL POWER STATED.** The old band left {3, 6, 7, 8} with no meaning, and
+under the very transfer rate it was derived from that gap is the single most likely outcome -- at
+p=0.50, binomial on 10 puts 0.483 on the unadjudicated region against 0.451 on the predicted band.
+The full partition, fixed now:
+
+    survivors   verdict
+    0-2         the DLMC column is essentially selection on noise; the headline of 10 does not
+                survive and must be restated as the intersection, as SuiteSparse now is
+    3           consistent with the SuiteSparse rate at its low end; column is mostly churn
+    4-5         the SuiteSparse transfer rate reproduces on DLMC
+    6-8         DLMC is MORE reproducible than SuiteSparse; the 10 is weakened but not dissolved,
+                and the difference between collections needs its own explanation
+    9-10        the DLMC column is stable and the SuiteSparse extrapolation does not transfer
+
+And the honest limit: **n=10 cannot discriminate a transfer rate of 0.389 from 0.500.** P1 is not a
+test of the rate. It is a test of whether the DLMC set is nearly all noise or nearly all signal,
+which is what the two failure zones encode, and that is worth testing on its own terms.
+
+**P3 PINNED AND PROMOTED TO PRIMARY.** It is the most informative prediction here and was listed
+third. The checker's Pearson 0.282 compared two chains differing in objects AND run; this run
+compares two runs with the SAME objects, isolating the run cleanly. Pinned: per-matrix instability
+correlation at k=4 **at or below 0.40 confirms** the run-specific reading on a better design;
+**at or above 0.60 means part of what was attributed to the run is object-layout artefact**, and the
+7-of-25 SuiteSparse intersection then needs re-reading. Between 0.40 and 0.60 is indeterminate and
+will be reported as such. Pooled per-width floors: predicted to agree within **1%** (the two
+SuiteSparse pairs agreed to 0.26% at k=4).
+
+**P4 PINNED AND RELABELLED.** It is an **assay-validity check**, not a negative control -- a negative
+control is a condition where the effect must be ABSENT, and P4 requires a quantity to be present and
+stable. (The k=16 gradient reversal in the density work was a proper negative control.) Pinned: the
+pooled per-width median S must reproduce within **2%** at every width. chain207's own per-quintile
+statistic reproduced across its aa/bb pair to within 1.29% on all 15 cells, and a pooled median over
+3820 keys should hold tighter than a quintile statistic, so 2% is a real gate. Failure invalidates
+the comparison rather than the hypothesis.
+
+**NEW PRIMARY STATISTIC, P0, replacing P1 as the headline.** Asking how many of the 10 survive
+conditions on run 1 and is capped at n=10. Instead compute run 2's behind-set **independently over
+all 19100 cells** under the identical criterion and report **intersection, union and Jaccard** --
+the symmetric statistic, using the whole grid, and exactly what produced 14/18/7/25 on SuiteSparse.
+P1 is the special case of it that conditions on run 1.
