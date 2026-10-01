@@ -41756,3 +41756,52 @@ chain207's stage log and the other synthesised a three-line one, so the TIMING b
 everything above it is identical. For its actual purpose -- before/after with the staging fixed --
 it works and is a good check. As a handle anyone else can verify it needs its staging named, or it
 emits only false negatives, which is exactly what happened.
+
+### The line-reuse mechanism has measurable headroom, concentrated where the deficit is (2026-10-01)
+
+Computed from matrix structure only -- no timing, no load on the host running chain210. At k=4
+float32 a B row is 16 bytes, so four consecutive B rows share one 64-byte line; CSR stores a row's
+columns sorted, so consecutive nonzeros falling in one line-group could be served by one load. The
+ceiling on B-load reduction is nonzeros-per-row over distinct-lines-per-row.
+
+    k   lines/B-row  density   reuse   same-line pairs   ceiling   matrix
+    8       2          22.8%   1.192       16.2%          -16.1%   body_decoder_l0_..._q
+    4       4          23.8%   1.466       32.1%          -31.8%   body_decoder_l3_ffn_conv1
+    4       4          30.0%   1.578       36.7%          -36.6%   body_decoder_l0_ffn_conv2_fc
+    4       4          48.9%   2.137       53.4%          -53.2%   body_encoder_l1_ffn_conv1
+    4       4          50.0%   2.133       53.3%          -53.1%   body_decoder_l4_..._v_fc
+    4       4          55.6%   2.315       57.0%          -56.8%   body_decoder_l5_..._v
+    4       4          61.5%   2.516       60.5%          -60.3%   body_decoder_l3_..._v
+    4       4          63.1%   2.574       61.3%          -61.1%   body_decoder_l3_..._output
+    4       4          64.5%   2.798       64.7%          -64.3%   bottleneck_3_block_group3_5_1
+    2       8          54.2%   4.351       77.3%          -77.0%   body_encoder_l1_..._output
+
+Median reuse **2.226**, a **-55.1%** ceiling on B loads, and it rises monotonically with density
+exactly as the mechanism predicts.
+
+**THE CONTROL IS WHAT MAKES THIS MORE THAN A RESTATEMENT.** The same statistic on low-density DLMC
+matrices -- the ones where we already run 0.337-0.44 of MKL -- gives a median reuse of **1.200**, a
+-16.6% ceiling, with individual matrices as low as 1.044. So the headroom is **3.3x larger on the
+residues than where there is no deficit to close**. The opportunity is concentrated where the
+problem is, and a kernel gated on it would be close to inert on the matrices we already win, because
+there the structure offers nothing to reuse.
+
+This is a physical predicate computed from structure, not a threshold fitted to timings: the
+condition is `k * sizeof(T) < 64` for the mechanism to exist at all, and the realised benefit is
+whatever the column pattern supports.
+
+**WHAT THIS DOES NOT SHOW, AND IT IS THE NEXT THING TO ESTABLISH.** A -55% cut in B *loads* is not a
+-55% speedup, and the translation is unfavourable in a way worth stating before anyone builds it. At
+k=4 the shipped kernel's B load is already **folded into the FMA as a memory operand**, so a load
+costs no separate instruction -- it costs a load-port slot. Per nonzero the kernel issues roughly
+three load-port operations: the `A1_crd` index load, the folded B load, and the `vbroadcastss` of
+the A value. With two load ports that is a floor near 1.5 cycles per nonzero. Cutting the B load to
+one per 2.23 nonzeros takes three load-port ops to about 2.45, i.e. a load-port bound of ~1.23
+cycles -- roughly **-18%**, not -55%.
+
+That is still the right order of magnitude for a 13-23% deficit, and the A broadcast is a second
+unclaimed target (A_val is contiguous, so eight values could be loaded once and shuffle-broadcast,
+moving work off the load ports onto the shuffle port). But it only pays if the kernel is actually
+load-port bound rather than bound on instruction issue or the accumulator chain, and that has not
+been measured. Establishing it needs either performance counters or a port-level static analysis,
+and neither will run on redwood until chain210 is off the machine.
