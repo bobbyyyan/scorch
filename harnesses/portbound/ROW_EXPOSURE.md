@@ -74,12 +74,23 @@ than any threshold and carries nothing, so it enters the first statement and not
 threshold somewhat below 32 the first could stop being true while the second still held, so the
 distinction is not cosmetic. The peer caught this and both counts are verified here independently.
 
-**A consequence for the guard's firing rate.** Of the 28.2% of rows below degree 32, **4.34 points
-are empty** and carry no arithmetic at either threshold — so the rows where the guard actually
-chooses between two kernels are 810906 of 3402920 = **23.8%**, not 28.2%. Whether an empty row
-reaches the row kernel at all depends on the shipped empty-row handling, which zeroes inside the
-arithmetic row loop rather than skipping it; I have not re-verified that path here, so 23.8% is the
-share of rows carrying work and 28.2% is the share the guard's predicate is true for.
+**A consequence for the guard's firing rate, now settled from the source.** Of the 28.2% of rows
+below degree 32, **4.34 points are empty**. `spmm.h:4824-4857` short-circuits those:
+`if (pA_begin == pA_end) { ...zero the row (or a merged run of empty rows)... continue; }`, and that
+block sits **before** the row-kernel call at 4859. So an empty row never reaches either row kernel,
+and consecutive empty rows become a single `memset` rather than one per row.
+
+Two things follow.
+
+- **The guard's firing rate is 23.8%, not 28.2%** — 810906 of 3402920 rows. The 28.2% counts rows
+  the row kernel never sees, so it is the share the predicate is true for and not the share where a
+  choice is made. The 2.60% nonzero exposure is unaffected either way, since empty rows contribute
+  zero to both its numerator and denominator.
+- **A four-chain kernel's longer fold-down is not paid on empty rows.** I had raised this as a cost
+  on the regression side of the ledger — 4.34% of rows paying three dependent `vaddps` levels to
+  compute nothing, which the degree sweep could not see because the probe's `n` is the row length
+  and `n = 0` was never on the ladder. The short-circuit removes it. The concern was real and the
+  answer goes the proposal's way.
 
 At the other end, **9.0% of matrices are
 essentially entirely short rows and would get no speedup whatever** — the most extreme is
