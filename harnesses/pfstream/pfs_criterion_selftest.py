@@ -133,14 +133,14 @@ def t_underpowered_labels_and_does_not_void():
     CHECKS += 1
     lab = c.label("1e6-1e7", 0.0, -0.5, 0.5)
     if "UNDERPOWERED" not in lab or "WITHIN_FLOOR" not in lab:
-        FAIL.append("underpowered: expected a labelled WITHIN verdict, got %r" % lab)
+        FAIL.append("underpowered-label-missing: expected a labelled WITHIN verdict, got %r" % lab)
     CHECKS += 1
     if c.label("0-1e4", 5.0, 4.0, 6.0) != C.BEYOND:
-        FAIL.append("underpowered: a wide band voided another band's verdict")
+        FAIL.append("underpowered-voids-another-band: a wide band voided another band's verdict")
     CHECKS += 1
     # and a BEYOND verdict is never suffixed -- power only qualifies a non-detection
     if "UNDERPOWERED" in c.label("1e6-1e7", 9.0, 8.0, 10.0):
-        FAIL.append("underpowered: suffixed a BEYOND_FLOOR verdict, where low power is "
+        FAIL.append("underpowered-suffixed-beyond: suffixed a BEYOND_FLOOR verdict, where low power is "
                     "not a caveat")
     CHECKS += 1
     margins = {r[0]: r[4] for r in rows}
@@ -163,13 +163,13 @@ def t_the_bound_is_inclusive():
     CHECKS += 1
     v = c.label("0-1e4", 0.0, -B, B)
     if v != C.WITHIN:
-        FAIL.append("inclusive-bound: [-b, +b] exactly gave %r, not WITHIN" % (v,))
+        FAIL.append("inclusive-bound-at: [-b, +b] exactly gave %r, not WITHIN" % (v,))
     CHECKS += 1
     # The input that FAILS the check above, so its passing is not vacuous: one ulp past
     # the bound must leave WITHIN.
     v = c.label("0-1e4", 0.0, -B, B + 1e-9)
     if v != C.INDETERMINATE:
-        FAIL.append("inclusive-bound: a hair past +b gave %r, not INDETERMINATE" % (v,))
+        FAIL.append("inclusive-bound-past: a hair past +b gave %r, not INDETERMINATE" % (v,))
 
 
 def t_structural_refusals():
