@@ -41389,3 +41389,60 @@ the floor -- stated rather than omitted. And "7 residues above the 86th density 
 under `>=` and 6 under `>`, because the fourth-sparsest residue sits exactly AT the 86th: the
 threshold is the datum. The honest form is the rank -- "the fourth-sparsest residue sits at the 86th
 percentile" -- not a threshold, which reads as a test when it restates the list.
+
+### Correction to 570d913: the upturn's floor was quoted at the wrong LEVEL
+
+570d913 says the band-6 move is "0.82x its own cross-build floor". **That claim does not hold**, and
+the withdrawal it supports gets stronger rather than weaker. Two different quantities were both
+being called "band 6's cross-build dev of S":
+
+    (i)  dev of the BAND STATISTIC    A_aa 1.0374 against A_bb 1.0365     0.09%
+    (ii) MEDIAN over the 74 CELLS of each cell's own dev                  6.57%
+
+I used (ii) as the denominator for an effect computed from all 74 cells at once. (ii) is the typical
+single cell's reproducibility; averaging 74 cells is what buys the difference. The band-level column
+at k=4 runs 0.24 / 0.57 / 0.40 / 0.18 / 0.02 / 0.32 / 0.09 %, so band 6 is not even its loose end.
+Against 0.09% the -5.39% / -5.78% dip is **59x** its floor; against the worst band-level floor in the
+column (0.57%) it is still **10x**.
+
+**So the correct verdict is not "inside the floor" -- it is worse than that.** Both estimands clear
+their own floors and they disagree in SIGN:
+
+    estimand A (median per-cell S)      -5.39% / -5.78%   against 0.09%   a DIP,  59x
+    estimand B (pooled ns/nnz ratio)    +4.98% / +3.69%   against 1.62%   a RISE, 2.5x
+
+Neither reading is noise. They point opposite ways. The quantity is **estimand-defined rather than
+ill-measured**, which is a stronger reason to withdraw: "inside the floor" invites rescue by more
+passes, and so does "0.82x its floor". Nothing rescues two solid effects of opposite sign.
+
+**The divergence between A and B tracks within-band SPREAD, not n.** 570d913 said they diverge in
+"the band with the smallest n". Wrong. B/A-1 at k=4 on aa, against the p10-to-p90 spread of S inside
+each band:
+
+    0-5%      n=1083   spread 3.0x   +22.94%     <- largest n AND largest divergence
+    5-10%     n=549    spread 2.4x   +1.54%
+    10-20%    n=568    spread 1.4x   +4.13%
+    20-35%    n=661    spread 1.5x   +4.33%
+    35-60%    n=885    spread 1.4x   +2.77%
+    60-101%   n=74     spread 2.3x   +14.04%
+
+A median of ratios and a ratio of pooled medians separate most where the band is internally
+heterogeneous. Also: the "12.3%" in 570d913 is A relative to B on build **aa** quoted as though it
+were B relative to A. B is +14.04% above A on aa and +12.32% on bb; the earlier figure named neither
+the direction nor the build.
+
+**AND THE CANCELLATION IS LEVEL-DEPENDENT, so do not carry it as a property of S.** Band 6, k=4:
+
+    band-aggregate   ours 7.07%   mkl 5.37%   ratio    1.62%    cancels ~4x
+    cell median      ours 6.10%   mkl 6.65%   paired S 6.57%    does NOT cancel
+    cell p95         ours 54.16%  mkl 61.42%  paired S 39.65%   cancels
+
+There are two noise components: a run-wide shift that survives aggregation and cancels in an
+aggregate ratio, and idiosyncratic per-cell noise that does not cancel within a cell but averages
+away under aggregation instead. "State density conclusions as S" still holds -- A is 0.02-0.57% and
+B is 0.08-1.62% at the band level against 5.37-7.07% for the absolute aggregate -- but the
+supporting number must be the **band-level** dev, and per-cell S is no tighter than its parts at the
+median.
+
+None of this touches the width profile, which is band-level estimand A on both builds with a 1.03%
+worst-case floor.
