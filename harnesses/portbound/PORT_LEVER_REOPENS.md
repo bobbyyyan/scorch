@@ -89,6 +89,10 @@ Frequency resolution is unchanged and still one-sided: 5.700 GHz is read on a 10
 every `cyc/nnz` above is an upper bound and a lower true clock shrinks all of them — improving
 V9's fit and worsening V6's. Single row of 4096 nonzeros, so the long-row limit; the degree sweep
 governs production row lengths. B is 128 KB and L2-resident, so the load-slot reading is for that
-band. E-core arm still running at the time of writing; the E-core's V6 sat at 2.8702 cyc/nnz
-against a 1.50 port floor, so it is **not** load-slot bound at four chains and the model above is
-P-core only until that arm lands.
+band. **The E-core scope restriction written here was wrong and is superseded by `THE_2X2.md`.** I
+wrote that the model is "P-core only" from V6's absolute level alone, before the E-core's V8 had
+landed — and V6's level cannot tell you what V8 will do. The condition replicates on the E-core
+*larger*: V8 − V6 is **−47.55%** there against the P-core's −35.10%. What is P-core-only is the
+`loads/2` arithmetic, which overshoots the E-core by +50% at two loads and +91% at three; no
+integer slot count fits both E-core points. Reading a scope restriction off one cell's level was
+the error.
