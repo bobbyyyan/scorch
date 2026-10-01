@@ -41000,3 +41000,76 @@ through a convention and can be re-litigated by choosing differently -- we demon
 twice, reaching 0.93x and 0.42x on the same quantity -- whereas `intercept(ours)` running
 4.37 to 31.99 us with no plateau cannot be reinterpreted by any choice of floor. **Prefer the
 refutation that does not depend on a threshold.**
+
+## Going at the k=4 kernel: every existing lever is blocked, and the recorded evidence names my own residues
+
+Directed to work the k=4 kernel rather than diagnose further. Three findings, and the third
+stops the obvious change.
+
+**1. None of the three production decisions is anomalous at k=4.** Asked of the shipped rules
+on the chain207 object (`scorch_spmm_nthreads`, `scorch_spmm_chunk`,
+`scorch_spmm_partition_mode`), across degree quintiles of the nnz [1e5,1e6) band:
+
+| quintile | med deg | k=2 nt/chunk/mode | k=4 | k=8 | S at k=2 / 4 / 8 |
+|---|---|---|---|---|---|
+| q1 | 122 | 20 / 64 / 3 | 20 / 48 / 3 | 20 / 24 / 3 | 0.831 / **1.024** / 0.901 |
+| q3 | 256 | 13 / 64 / 3 | 13 / 24 / 3 | 13 / 12 / 3 | 0.967 / **1.136** / 0.961 |
+| q5 | 772 | 24 / 14 / 3 | 24 / 7 / 3 | 24 / 4 / 3 | 0.882 / **0.981** / 0.877 |
+
+The **thread count is identical at k=2, 4 and 8** within each quintile -- forced, since
+`work = nnz*max(k,16)` clamps all three to the same value -- partition mode is 3 everywhere,
+and chunk varies smoothly as designed. So with the same team, the same hand-out mode and a
+chunk between its neighbours', k=4 is 23% worse than k=2 and 14% worse than k=8. **The gap is
+in the kernel's per-nonzero efficiency, not in any policy decision.**
+
+**2. The mechanism that fits is vector utilisation, and it is the only width that loses.** At
+float32 on AVX2: k=2 takes the exact-width kernel, whose accumulators are a compile-time
+scalar array the compiler decomposes with no masked operations and no waste; k=8 fills one
+256-bit vector exactly; k=16/32 fill several. **k=4 is the only width using a 128-bit half
+vector -- four lanes of eight, 50% of the unit.** That predicts the observed ordering exactly:
+k=4 worst, k=2 and k=8 both ahead.
+
+**3. The fix for that already exists, is defaulted off, and is measured to HARM these cells.**
+`SCORCH_SPMM_MULTIROW_ROWS` is 0. The multi-row kernel pairs two rows per iteration, which at
+k=4 would fill the 256-bit vector and give two independent FMA chains -- its own comment
+describes the win as "ROWS independent B loads in flight where the per-row kernel has one
+row's worth". But `scorch_policy.h:757-790` records the measurement, and it names the losers:
+
+| recorded loser | ratio | appears in my residues as |
+|---|---|---|
+| `connectus` | **0.602** (redwood) | k=4 and k=8 residue |
+| `lp_osa_14` | 0.852 | k=4 residue |
+| `body_decoder` | 0.858 | **six** DLMC residues (5 at k=4) |
+| `bottleneck` | 0.895 | k=4 residue |
+| `cari`, `lhr`, `com-Amazon`, `as-caida`, `relat8` | 0.82-0.93 | -- |
+
+**11 of my 28 residues, and 9 of the 17 at k=4, appear by name in that loser list.** The
+recorded mechanism is the serial tail: past a group's common prefix each row runs through one
+stream, so a group of unequal or long rows pays ROWS accumulators of register pressure and
+collects the parallelism of one. The loss is flat **per nonzero** (0.01-0.04 ns), which is why
+`connectus` with 512 rows loses 49 us. My residues are degree 117-2202 -- precisely the MAXDEG
+loser population the comment identifies.
+
+**Caveat, stated because the overlap is by name and not by direct measurement:** those ratios
+were measured for `EXACT_HI_F32=1` **paired with** `MULTIROW_ROWS_F32=2`, at widths 2 and 8,
+not for multirow alone at k=4. The mechanism is degree-driven rather than width-driven, so the
+transfer is plausible, but it is an inference. Enabling multirow at k=4 would still be a
+change whose own evidence predicts it harms the majority of the cells it is meant to fix.
+
+### What this means for the target, and the fork it creates
+
+The 24 residues are **blocked against every existing lever**: `HALFVEC_F32` already ships and
+is the k=4 half-vector path; `EXACT_HI` is measured harmful above 1e6 nnz, which is where the
+residues sit, and its queued arm lowers rather than raises it; `MULTIROW` is measured harmful
+on 9 of the 17 k=4 residues by name. Closing these cells needs a **new** mechanism -- filling
+the k=4 vector without the multi-row kernel's serial-tail penalty -- not a constant.
+
+**And a separate, genuinely shippable win is sitting here unclaimed.** MULTIROW wins **11-20%
+at float32 width 2 and 10-35% at width 8 on uniform-degree matrices, on both x86 hosts**, and
+loses only on the high-degree population, which `SCORCH_SPMM_MULTIROW_MAXDEG` exists to
+exclude and which currently defaults to 0 (disabled). That is exactly the pattern CLAUDE.md
+prescribes -- gate it behind a condition that provably cannot fire on the shapes it would
+hurt -- and the loser population is already characterised by name and by mechanism. It is a
+real improvement at k=2 and k=8. **It is not a fix for the k=4 residues**, and conflating the
+two would be the overfitting error in reverse: shipping a win and claiming it closed a
+deficit it cannot touch.
