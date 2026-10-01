@@ -41635,3 +41635,52 @@ rejects -- so the file was never truncated, the row-count guard printed OK on an
 briefly had a passing test of a guard that had not been exercised. The planted case planted nothing.
 That is the same shape as the guard failures the planting is meant to catch, one level up in the
 test harness, and it was visible only because `head` printed an error I happened to read.
+
+### an_c210.py, amendment 1 -- still pre-data, 1 of 12 object-passes complete
+
+Two real defects found by audit, both fixed before chain210 produced the data they would have
+corrupted. New digest `6d2bb3f3c4fc32ff8f502d7eb98306362861f79f8a7876a7983df04a04c514fd`, superseding `219e25b3...`.
+
+**1. The timing section restated the registered hypotheses.** H1/H2/H3 were registered *conditional
+on p1 aa having already completed at 1348 s*, so each predicts the **eleven** remaining passes. The
+file scored `12 * rate`. That is not a rounding -- it inflates H1 by 64.5 s and H2 by 41.8 s while
+leaving H3 **exactly** unchanged, because H3 alone assumes pass 1 is representative. So the error
+was non-uniform and leaned the board toward H3, by 1.29 and 0.84 units of the 49.9 s twelve-pass
+noise scale. Fixed by holding p1 out as the conditioning observation and scoring passes 2-12 against
+`11 * rate`. A pre-registered prediction silently restated after registration is the exact thing
+the registration exists to prevent.
+
+**2. P0's Jaccard was confounded with the floor ratio.** Each run's behind-set is defined against
+that run's OWN p95 floor, so a purely global difference in noise level moves the membership with
+zero per-matrix churn -- and this behind-set is steeper in the floor than in anything else:
+
+    floor scale   residues   by width       symmetric difference vs baseline
+    x0.80         33         1/25/7/0/0     23
+    x0.90         19         1/13/5/0/0      9
+    x0.95         12         1/9/2/0/0       2
+    x1.00         10         1/8/1/0/0       0
+    x1.05          7         1/6/0/0/0       3
+    x1.20          5         0/5/0/0/0       5
+
+**Twelve cells sit within +/-10% of their width's floor against a behind-set of ten** -- more cells
+beside the threshold than inside it -- so a 5% floor difference between runs would move 2-3 of the
+10, which is 20-30% of the headline, for a reason that is not replication failure. The empirical
+range is reassuring (the two SuiteSparse pairs agreed on the pooled k=4 floor to 1.0026, and at
++/-1-2% the set moves by 0 or 1 cell) but "probably benign" is a thing to show, not assume. P0 now
+reports **twice**: once with each run's own floor and once with a **common floor fixed here before
+the data** -- p95 by nearest rank, per width, over both runs' per-cell devs **pooled**, chosen
+pooled rather than chain207's alone because P0 is a symmetric statistic and must not privilege
+either run. If the two Jaccards agree within 0.05 the churn reading is demonstrated; if they
+diverge, a material part of the apparent churn is a floor-level effect and the headline is restated
+under the common floor.
+
+**Three smaller fixes.** `min()` always named a nearest hypothesis, so a total far from all three
+would still have printed "nearest: H1", which reads as support -- there is now an explicit ALL THREE
+REJECTED branch above 3 noise units, the registered meaning of a landing outside the three. The
+Spearman rank map collapsed ties to the last occurrence's rank, a non-standard convention applied
+silently; it now refuses. And a missing stage log raised `FileNotFoundError` where every other
+failure path exits with a structured refusal.
+
+**A positive control that came free.** Feeding chain207's own twelve files in as the chain210 input
+gives Jaccard **1.0000**, 10 of 10 survivors, and identical floors -- the correct degenerate answer
+for a self-comparison. An analyzer whose identity case is not exact is broken, and this one is.

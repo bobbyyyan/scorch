@@ -58,7 +58,22 @@ def load(d, pat):
             seen[(b, p)] += 1
     return files, MS, seen, NNZ
 
-def board(MS):
+def board(MS, floors=None):
+    """floors=None computes the run's OWN p95 floor; passing floors applies a common one.
+
+    WHY BOTH ARE NEEDED, and this is pre-data. Each run's behind-set is defined against that run's
+    own p95 floor, so a purely GLOBAL difference in noise level moves the membership with no
+    per-matrix churn whatsoever -- and on chain207 the behind-set is steeper in the floor than in
+    anything else: scaling its floors by 0.95 gives 12 residues and by 1.05 gives 7, against a
+    baseline of 10, and TWELVE cells sit within +/-10% of their width's floor, i.e. more cells
+    beside the threshold than inside it. So a 5% floor difference between runs would move 2-3 of
+    the 10 for a reason that is not replication failure. At the +/-1-2% the two SuiteSparse pairs
+    actually showed (pooled k=4 floor ratio 1.0026) the set moves by 0 or 1 cell, so this is
+    probably benign -- but probably benign is a thing to show, not assume.
+    THE COMMON FLOOR IS FIXED HERE, BEFORE THE DATA: p95 by nearest rank, per width, over the two
+    runs' per-cell devs POOLED. Pooled rather than chain207's alone because P0 is a symmetric
+    statistic and must not privilege either run.
+    """
     cells = sorted({c for (b, c, a) in MS if b == BUILDS[0]})
     def S(b, c):
         o, m = MS.get((b, c, "ours"), {}), MS.get((b, c, "mkl"), {})
@@ -67,11 +82,12 @@ def board(MS):
     Sa = {c: S("aa", c) for c in cells}
     Sb = {c: S("bb", c) for c in cells}
     ok = [c for c in cells if Sa[c] and Sb[c]]
-    FR = {k: p95([dev(Sa[c] / Sb[c]) for c in ok if c[1] == k]) for k in KS}
+    own = {k: p95([dev(Sa[c] / Sb[c]) for c in ok if c[1] == k]) for k in KS}
+    use = own if floors is None else floors
     behind = {c for c in ok if Sa[c] > 1 and Sb[c] > 1
-              and dev(Sa[c]) > FR[c[1]] and dev(Sb[c]) > FR[c[1]]}
+              and dev(Sa[c]) > use[c[1]] and dev(Sb[c]) > use[c[1]]}
     inst = {c: dev(Sa[c] / Sb[c]) for c in ok}
-    return Sa, Sb, ok, FR, behind, inst
+    return Sa, Sb, ok, own, behind, inst
 
 # ---------------------------------------------------------------- GUARDS
 # Each asserts on the quantity it is about, and each has an input that fails it. A guard that can
@@ -106,7 +122,11 @@ print("  G2  dims table binds by digest; {nnz>0} == timed set exactly (%d keys);
 
 # G3: bind the OBJECTS. chain207's premise check accepts ANY replication pair; this asserts it was
 # chain207's pair. 64-bit fields, which is what the stage log records -- not a full SHA-256.
-log = open(os.path.join(C210, "c210_stage.log")).read()
+_sl = os.path.join(C210, "c210_stage.log")
+if not os.path.isfile(_sl):
+    sys.exit("  REFUSE: no c210_stage.log at %s -- the object binding and the per-pass timings both "
+             "come from it, so there is nothing to bind against." % _sl)
+log = open(_sl).read()
 tx = re.findall(r"^\s+(aa|bb)\s+\.text\s+([0-9a-f]{16})\s+whole\s+([0-9a-f]{16})", log, re.M)
 assert len(tx) == 2, "  REFUSE: stage log does not record two object digests: %r" % (tx,)
 dd = {b: (t, w) for b, t, w in tx}
@@ -126,6 +146,11 @@ if len(B7) != 10:
 print("  G4  chain207 side reproduces its sealed headline: %d residues over %d cells" % (len(B7), len(ok7)))
 
 Sa0, Sb0, ok0, FR0, B0, I0 = board(MS)
+# the pooled common floor, fixed in the docstring above, computed from both runs' devs
+COMMON = {k: p95([dev(Sa7[c] / Sb7[c]) for c in ok7 if c[1] == k]
+                 + [dev(Sa0[c] / Sb0[c]) for c in ok0 if c[1] == k]) for k in KS}
+_, _, _, _, B7c, _ = board(MS7, COMMON)
+_, _, _, _, B0c, _ = board(MS, COMMON)
 print()
 print("FLOORS, p95 dev by nearest rank, per width")
 print("  %-10s %s" % ("", "  ".join("k=%-7d" % k for k in KS)))
@@ -143,6 +168,22 @@ print("  intersection %d   union %d   Jaccard %.4f   only-207 %d   only-210 %d"
       % (len(inter), len(union), len(inter) / float(len(union)) if union else float("nan"),
          len(B7 - B0), len(B0 - B7)))
 print("  SuiteSparse analogue: 14 and 18, intersection 7, union 25, Jaccard 0.2800")
+ic, uc = B7c & B0c, B7c | B0c
+j_own = len(inter) / float(len(union)) if union else float("nan")
+j_com = len(ic) / float(len(uc)) if uc else float("nan")
+print()
+print("  THE SAME STATISTIC UNDER A COMMON FLOOR (pooled p95 per width, fixed pre-data), which")
+print("  separates replication churn from a global difference in noise level:")
+print("  %-10s %s" % ("", "  ".join("k=%-7d" % k for k in KS)))
+print("  %-10s %s" % ("common", "  ".join("%-9.4f" % COMMON[k] for k in KS)))
+print("  chain207 %d   chain210 %d   intersection %d   union %d   Jaccard %.4f"
+      % (len(B7c), len(B0c), len(ic), len(uc), j_com))
+print("  own-floor Jaccard %.4f vs common-floor %.4f -> %s"
+      % (j_own, j_com,
+         "AGREE; the churn reading is clean and shown rather than assumed"
+         if abs(j_own - j_com) <= 0.05 else
+         "DISAGREE by more than 0.05; a material part of the apparent churn is a FLOOR-LEVEL "
+         "effect and P0's headline must be restated under the common floor"))
 for c in sorted(inter, key=lambda c: (c[1], c[0])):
     print("    REPLICATED k=%-3d S207 %.4f S210 %.4f  %s" % (c[1], Sa7[c], Sa0[c], c[0]))
 
@@ -176,6 +217,11 @@ def pearson(a, b):
     return (sum((x - ma) * (y - mb) for x, y in zip(a, b))
             / math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b)))
 def spearman(a, b):
+    # Value->rank through a dict collapses ties and gives every tied entry the LAST occurrence's
+    # rank, which is a non-standard convention applied silently. Refuse instead of adopting it.
+    assert len(set(a)) == len(a) and len(set(b)) == len(b), \
+        "  REFUSE: ties in the instability vectors (%d/%d and %d/%d distinct) -- the rank map " \
+        "would collapse them to a non-standard convention" % (len(set(a)), len(a), len(set(b)), len(b))
     ra = {v: i for i, v in enumerate(sorted(a))}; rb = {v: i for i, v in enumerate(sorted(b))}
     return pearson([ra[x] for x in a], [rb[y] for y in b])
 pe, sp = pearson(xs, ys), spearman(xs, ys)
@@ -226,15 +272,28 @@ if durs:
           % (len(v), statistics.median(v), statistics.stdev(v) if len(v) > 1 else 0,
              100 * statistics.stdev(v) / statistics.median(v) if len(v) > 1 else 0))
     if len(v) == 12:
-        tot = sum(v)
-        print("  H1 chain207 absolute pace 1412.5 s/pass -> predicted total %d s" % (12 * 1412.5))
-        print("  H2 chain207 shape x -1.61%%  1389.8 s/pass -> predicted total %d s" % (12 * 1389.8))
-        print("  H3 no pass-1 effect       1348.0 s/pass -> predicted total %d s" % (12 * 1348))
-        print("  OBSERVED total %d s. 12-pass noise scale 14.4*sqrt(12) = %.1f s" % (tot, 14.4 * 12 ** 0.5))
-        best = min(("H1", 12 * 1412.5), ("H2", 12 * 1389.8), ("H3", 12 * 1348.0),
-                   key=lambda z: abs(z[1] - tot))
-        print("  nearest hypothesis: %s (|delta| %.0f s = %.1f noise units)"
-              % (best[0], abs(best[1] - tot), abs(best[1] - tot) / (14.4 * 12 ** 0.5)))
+        # H1/H2/H3 were registered CONDITIONAL on p1 aa having completed at 1348 s, so each
+        # predicts the ELEVEN remaining passes. Scoring 12*rate would restate the registered
+        # hypotheses -- non-uniformly, since it inflates H1 by 64.5 s and H2 by 41.8 s while
+        # leaving H3 exact, shifting both toward H3's side of the board. p1 is the conditioning
+        # observation and is held out of the comparison.
+        rest = sum(t for (pp, bb), t in durs if not (pp == 1 and bb == "aa"))
+        noise11 = 14.4 * 11 ** 0.5
+        print("  passes 2-12 observed: %d s over %d passes. 11-pass noise scale %.1f s"
+              % (rest, len(v) - 1, noise11))
+        cand = [("H1", 11 * 1412.5), ("H2", 11 * 1389.8), ("H3", 11 * 1348.0)]
+        for lab, pred in cand:
+            print("    %s predicts %8.1f s   |delta| %6.1f s = %5.2f noise units"
+                  % (lab, pred, abs(pred - rest), abs(pred - rest) / noise11))
+        best = min(cand, key=lambda z: abs(z[1] - rest))
+        units = abs(best[1] - rest) / noise11
+        # A rejection region, because min() always names a nearest hypothesis and a nearest
+        # hypothesis reads as support. Registered: outside all three means something changed
+        # beyond pace.
+        print("  VERDICT: %s" % ("ALL THREE REJECTED at %.2f noise units from the nearest (%s) -- "
+              "something changed between the runs beyond pace, which is the interesting outcome"
+              % (units, best[0]) if units > 3.0 else
+              "%s, |delta| %.1f s = %.2f noise units" % (best[0], abs(best[1] - rest), units)))
 print()
 print("Floors, counts and verdicts above are the pre-registered ones. Nothing in this file selects "
       "a threshold after seeing a number.")
