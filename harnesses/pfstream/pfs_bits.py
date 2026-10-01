@@ -113,17 +113,30 @@ w.writeheader()
 # ---------------------------------------------------------------- degenerate cases, asserted first
 #
 # `nnz` here is the matrix's total, which is exactly the pA_limit the clamp reads.
+# TWO DIFFERENT CLAIMS, and the table says which cell carries which, because an earlier version of
+# this header called all six "the clamp's edge values" and that is true of four.
+#
+#   PREMISE cells reach the clamp's edge BOUNDS without reaching the clamp. They are the witnesses
+#   for the reachability premise -- the thing that keeps pA_limit == 0 from indexing A1_crd[-1] --
+#   and `empty` is that premise's only witness. `empty` never calls the register-block kernel at
+#   all: no row has nonzeros and the empty-row short-circuit continues first. `one_nz` calls it but
+#   `pA + 1 < pA_end` is false at one nonzero, so only the single-nonzero tail runs and the tail
+#   issues no prefetch.
+#
+#   CLAMP cells actually index through it. The smallest bound the clamp ever READS is pA_limit == 2
+#   in two_nz, where `0 + 2 < 2` is false and pf_ = pA_limit - 1 = 1 names the last element of a
+#   two-element array -- the in-bounds boundary, one past which is the bug.
 DEGEN = [
-    ("empty",      2, 4, [0, 0, 0],       [],              []),              # pA_limit == 0
-    ("one_nz",     2, 4, [0, 1, 1],       [2],             [1.5]),           # pA_limit == 1
-    ("two_nz",     1, 4, [0, 2],          [0, 3],          [1.0, 2.0]),      # the shortest body
+    ("empty",      2, 4, [0, 0, 0],       [],              []),              # PREMISE: limit 0
+    ("one_nz",     2, 4, [0, 1, 1],       [2],             [1.5]),           # PREMISE: limit 1
+    ("two_nz",     1, 4, [0, 2],          [0, 3],          [1.0, 2.0]),      # CLAMP: limit 2, pf_=1
     ("row_of_2",   3, 4, [0, 2, 4, 6],    [0, 1, 1, 2, 2, 3],
-     [1., 2., 3., 4., 5., 6.]),                                              # row-clip: 0 prefetch
+     [1., 2., 3., 4., 5., 6.]),                                        # CLAMP: row-clip 0 prefetch
     ("row_of_3",   2, 4, [0, 3, 6],       [0, 1, 2, 1, 2, 3],
-     [1., 2., 3., 4., 5., 6.]),                                              # row-clip: 1 prefetch
-    ("empty_rows", 4, 4, [0, 0, 2, 2, 2], [1, 3], [7.0, 8.0]),               # interior empty rows
+     [1., 2., 3., 4., 5., 6.]),                                        # CLAMP: row-clip 1 prefetch
+    ("empty_rows", 4, 4, [0, 0, 2, 2, 2], [1, 3], [7.0, 8.0]),         # CLAMP: interior empty rows
 ]
-print("DEGENERATE CASES (build %s) -- these reach the clamp's edge values" % A.build, flush=True)
+print("DEGENERATE CASES (build %s): PREMISE cells reach the clamp's edge BOUNDS without\n  reaching the clamp; CLAMP cells index through it." % A.build, flush=True)
 nz = 0
 for name, M, J, ip, ix, vl in DEGEN:
     for k in KS:
@@ -163,6 +176,13 @@ for key in keys:
         n += 1
     out.flush()
 out.close()
+# A COMPLETION SENTINEL, written only after the CSV is closed and carrying the row count it closed
+# with. The comparator REQUIRES it, which is why it is written here and not by a shell wrapper: an
+# exit code recorded by whatever shell happened to launch the producer does not exist in a clean
+# checkout, and a check that skips when its input is missing reports an unrecorded exit as correct
+# -- the same shape, one level down, as the comparator defect this sentinel was added to close.
+with open(A.csv + ".done", "w") as _h:
+    _h.write("%d %d %d\n" % (n + len(DEGEN) * len(KS), n, len(DEGEN) * len(KS)))
 print("wrote %s (%d real rows + %d degenerate)" % (A.csv, n, len(DEGEN) * len(KS)), flush=True)
 # Beside the digest count, the count that shows the digests are not over zeros.
 print("  NONZERO RESULTS: %d of %d degenerate, %d of %d real -- a digest over an all-zero result "

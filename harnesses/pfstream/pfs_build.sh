@@ -66,11 +66,45 @@ done
 # THE A/A PAIR MUST BE BYTE-IDENTICAL IN .text, and strm/nopf must NOT be. A floor built from a
 # pair that silently differs is not a floor, and an arm that silently matches ship is not an arm --
 # the define could have been dropped and every number would still look plausible.
+#
+# ASSERTED, NOT PRINTED. A first version emitted four digests and a byte count and left the script's
+# exit status independent of every one of them, so "the floor pair is sound" was a human reading a
+# printout. Its own comment named the failure it did not check for. Four digests, four assertions,
+# and a missing object is a REFUSAL rather than a `continue`.
 echo
-echo "EMISSION CHECK (.text digests; the floor pair must agree, the arms must differ)"
+echo "EMISSION CHECK (.text digests; the floor pair must AGREE, the arms must DIFFER)"
+fail=0
+declare -A TSHA
 for tag in ship shpb strm nopf; do
   so=$(ls "$ROOT/$tag"/src/scorch_ops*.so 2>/dev/null | head -1)
-  [ -n "$so" ] || { echo "  $tag  (no object)"; continue; }
+  if [ -z "$so" ]; then
+    echo "  $tag  REFUSE: no object, so its digest cannot be compared"; fail=1; continue
+  fi
   objcopy -O binary --only-section=.text "$so" "$ROOT/$tag/text.bin" 2>/dev/null
-  echo "  $tag  text_sha $(sha256sum "$ROOT/$tag/text.bin" | cut -c1-24)  $(stat -c %s "$ROOT/$tag/text.bin") bytes"
+  TSHA[$tag]=$(sha256sum "$ROOT/$tag/text.bin" | cut -d' ' -f1)
+  echo "  $tag  text_sha $(echo "${TSHA[$tag]}" | cut -c1-24)  $(stat -c %s "$ROOT/$tag/text.bin") bytes"
 done
+[ "$fail" = "0" ] || { echo "REFUSE: an object is missing; no comparison below is meaningful"; exit 1; }
+
+# The floor pair: same configuration, equal-length paths, so .text must be identical.
+if [ "${TSHA[ship]}" != "${TSHA[shpb]}" ]; then
+  echo "REFUSE: ship and shpb differ in .text. They are the same configuration at equal-length"
+  echo "        paths, so a difference means the floor pair is not an A/A and the floor it"
+  echo "        produces is not the floor an arm must clear."
+  fail=1
+fi
+# The arms: each must differ from the floor pair AND from each other. An arm matching ship is a
+# dropped define, which no timing can distinguish from a true null result.
+for tag in strm nopf; do
+  if [ "${TSHA[$tag]}" = "${TSHA[ship]}" ]; then
+    echo "REFUSE: $tag has ship's .text, so its define did not take. Every number it produces"
+    echo "        would look like a plausible null result."
+    fail=1
+  fi
+done
+if [ "${TSHA[strm]}" = "${TSHA[nopf]}" ]; then
+  echo "REFUSE: strm and nopf have identical .text; they are different configurations"
+  fail=1
+fi
+[ "$fail" = "0" ] || exit 1
+echo "  ASSERTED: ship == shpb, and strm, nopf each differ from ship and from each other."

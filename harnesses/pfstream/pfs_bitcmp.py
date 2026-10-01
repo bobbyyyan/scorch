@@ -48,13 +48,27 @@ if len(_real) != EXPECT_MATRICES:
     sys.exit("REFUSE: %d real matrices in the digests, expected %d. Four runs truncated at the "
              "same point agree with each other and say nothing about the corpus." 
              % (len(_real), EXPECT_MATRICES))
+# THE PRODUCER'S COMPLETION SENTINEL, REQUIRED rather than read-if-present. A first version read a
+# `bits_<b>.rc` written by whatever shell launched the producer: nothing in this tree wrote that
+# file, and the read was wrapped in os.path.exists, so from a clean checkout the check could not
+# fire and a missing file passed. That is the same shape one level down from the defect it was
+# added to close -- a check that reported a truncated run as correct, repaired by a check that
+# reports an unrecorded exit as correct.
+#
+# The count check above is the load-bearing catch for truncation and would have caught the
+# 26-of-418 run on its own. This sentinel's independent job is the case the count cannot see: a
+# producer that dies AFTER writing every matrix, in cleanup or on the final flush. pfs_bits.py
+# writes it only after closing the CSV, so that death leaves it absent and this refuses.
 for b in BUILDS:
-    rcp = os.path.join(D, "bits_%s.rc" % b)
-    if os.path.exists(rcp):
-        rc = open(rcp).read().strip()
-        if rc != "0":
-            sys.exit("REFUSE: the %s producer exited %s. A nonzero producer with a complete-looking "
-                     "CSV is the failure this check exists to not report as a pass." % (b, rc))
+    dn = os.path.join(D, "bits_%s.csv.done" % b)
+    if not os.path.exists(dn):
+        sys.exit("REFUSE: %s is absent. The producer writes it only after closing its CSV, so a "
+                 "complete-looking CSV with no sentinel is a run that died after the last matrix "
+                 "-- which the row count cannot see." % dn)
+    tot = int(open(dn).read().split()[0])
+    if tot != len(rows[b]):
+        sys.exit("REFUSE: %s declares %d rows, the CSV holds %d cells. The sentinel and the file "
+                 "disagree, so one of them is not describing this run." % (dn, tot, len(rows[b])))
 dis = defaultdict(list)
 for c in cells:
     ref = rows["ship"][c]
