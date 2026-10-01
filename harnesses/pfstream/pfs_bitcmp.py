@@ -155,5 +155,15 @@ print("  %d DISTINCT digests over %d cells -- so the agreement is not four objec
 if u < len(cells) // 2:
     sys.exit("REFUSE: only %d distinct digests over %d cells; agreement is suspiciously cheap" % (u, len(cells)))
 print()
-print("CORRECT: all four objects byte-identical. ship/shpb is the A/A pair, strm and nopf are the "
-      "arms, and their .text digests differ, so the identity is not three copies of one object.")
+# WHAT THIS FILE IS ENTITLED TO SAY, and the clause that used to be here and was not earned.
+# The retired sentence ended "...and their .text digests differ, so the identity is not three
+# copies of one object." This program never opens an object: it compares the digests of numerical
+# OUTPUTS. Whether the four `.text` sections differ is a real and necessary question -- it is the
+# difference between an A/A floor and three copies of one build -- but it is answered by
+# pfs_floorcmp.py's condition 1, on the objects themselves. Asserting it here put the reassuring
+# half of the sentence on a quantity absent from the file, where no input could contradict it.
+print("OUTPUTS AGREE: %d cells, all %d objects bit-identical to %s, over %d distinct digests."
+      % (len(cells), len(BUILDS), BASE, u))
+print("  That is a statement about arithmetic only. It does NOT establish that the four objects")
+print("  differ in emitted code -- this file reads no object. Run pfs_floorcmp.py for that, and")
+print("  treat the A/A floor as unestablished until its condition 1 reports .text DIFFERING.")
