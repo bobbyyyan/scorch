@@ -9,13 +9,16 @@ probe and the production kernel, and it includes two objections to my own framin
 nonzero loop two at a time. So the number of independent accumulator chains is **`2 * NVEC`**,
 and `NVEC = ceil(k / V::lanes)` is a function of the output width alone:
 
-| k  | NVEC | accumulator chains | chain210 median `ours/mkl` (aa) | chain207, for contrast |
-|----|------|--------------------|---------------------------------|------------------------|
-| 2  | 1    | **2**              | 0.8815 | 0.8864 |
-| 4  | 1    | **2**              | 0.9130 | 0.9231 |
-| 8  | 1    | **2**              | 0.8676 | 0.8849 |
-| 16 | 2    | 4                  | 0.7596 | 0.7907 |
-| 32 | 4    | 8                  | 0.7101 | 0.7409 |
+| k  | trait at the shipped default | lanes live | NVEC | chains | chain210 `ours/mkl` (aa) | chain207 |
+|----|------------------------------|-----------|------|--------|--------------------------|----------|
+| 2  | `__m256` (full)              | 2 of 8    | 1    | **2**  | 0.8815 | 0.8864 |
+| 4  | `__m128` (half)              | 4 of 4    | 1    | **2**  | 0.9130 | 0.9231 |
+| 8  | `__m256` (full)              | 8 of 8    | 1    | **2**  | 0.8676 | 0.8849 |
+| 16 | `__m256` (full)              | 8 of 8    | 2    | 4      | 0.7596 | 0.7907 |
+| 32 | `__m256` (full)              | 8 of 8    | 4    | 8      | 0.7101 | 0.7409 |
+
+The trait and lane columns are derived below from `SCORCH_SPMM_HALFVEC_F32 = 1`
+(`scorch_policy.h:1332`) and the dispatch at `spmm.h:4889-4897`, not asserted.
 
 **CORRECTION, and it is the kind this project has a memory file about.** The first version of this
 table printed 0.8864 / 0.9231 / 0.8849 / 0.7907 / 0.7409 under the heading "chain210" -- those are
@@ -31,7 +34,50 @@ not have caught the substitution -- k=2 reads 0.8864 in chain207 and 0.8815 in c
 difference smaller than several of the others -- so it is the whole vector that identifies the
 source, not any single entry.
 
-**The trait column has been REMOVED rather than corrected.** It read "k=4 -> `__m128`, 4 lanes" but
+## Which path a k=4 cell runs: settled from the source, and it resolves the OTHER way
+
+`scorch_policy.h:1332` compiles in `SCORCH_SPMM_HALFVEC_F32 = 1`. At that value the dispatch at
+spmm.h:4889-4897 takes `halfvec_exact = (B1_size == LH)` with `LH = scorch_simd_half<float>::lanes
+= 4`, so **k=4 float32 takes the half-vector `__m128` path with four of four lanes live.** The
+`halfvec_under` branch, which would also claim the widths below 4, requires `spmm_halfvec >= 2` --
+so **k=2 does NOT take it** and runs the full-vector `__m256` path with two of eight lanes masked.
+k=8 is `NVEC = 1` with `FULL_LAST` true: eight of eight live.
+
+And the environment cannot change this in a shipped build. The override
+`getenv("SCORCH_SPMM_HALFVEC")` at spmm.h:4127 sits inside `#ifdef SCORCH_TUNE_HOOKS`, opened at
+4070 and closed at 4129, so in a non-hooks build **the override does not exist** and the gate is a
+build-time constant.
+
+**So the original ordering was right, and that makes occupancy an ANTI-candidate rather than a
+candidate.** Lane occupancy at the default is k=2 at 2 of 8 = 25%, k=4 at 4 of 4 = 100%, k=8 at 8
+of 8 = 100%. The width with the WORST occupancy is k=2, and k=2 is not where the behind-MKL cells
+concentrate -- 19 of chain210's 22 are k=4. An explanation whose worst case is the width that does
+NOT carry the deficits is refuted by that pattern, not merely unsupported by it. The peer's
+inversion -- k=4 as `ceil(4/8) = 1` with four of eight lanes masked, which spmm.h:2195 does call
+out as running `_mm256_maskload_ps` for every nonzero -- is the behaviour of a build with
+`SCORCH_SPMM_HALFVEC_F32 = 0`, not of the shipped one.
+
+**What is NOT settled, and it is a provenance gap in the board itself.** Whether chain210 ran a
+hooks build is not recorded anywhere in the sealed ledger: `SOURCE_BINDING.txt` binds the three
+analysis sources to HEAD `3d9edd5` and says nothing about build defines, and the three logs
+(`c210_run.log`, `c210_stage.log`, `COLLECTION.log`) contain **zero** occurrences of any `SCORCH_`
+name. So grepping the ledger for `HALFVEC` and finding nothing is vacuous -- the logs record no
+environment at all, so that check could only ever have returned "not found", and reporting it as
+reassurance would be the failure mode this project keeps a file about.
+
+That matters beyond this question: two different kernel families serve k=4 depending on a
+build-time constant, and the board's headline is a per-width comparison against MKL. **A board that
+does not record its build defines does not determine which kernel it measured.** Future boards
+should capture the defines and the resolved gate values per width; this one did not, and the
+statement above therefore rests on the shipped default rather than on the run's own record.
+
+One piece of indirect evidence, offered for its direction only: a hooks build costs 54 `getenv`
+calls per invocation, 17-26 microseconds under Slurm, which manufactures an MKL deficit on short
+kernels. chain210 reads 0.71-0.91 -- faster than MKL at every width -- so if it WAS a hooks build
+the true advantage is larger than reported, not smaller. That bounds the direction of one error
+without identifying the kernel.
+
+**The trait column has been RESTORED above, derived rather than asserted.** It read "k=4 -> `__m128`, 4 lanes" but
 `scorch_spmm_row_regblock`'s `V` parameter defaults to the full 8-lane `scorch_simd<T>`, and the
 kernel is instantiated BOTH ways -- the default at spmm.h:4877/4878 and the half-vector `VH` at
 4939/4943 -- behind the `spmm_halfvec` gate at 4415, which is env-overridable at 4327. So which
