@@ -995,3 +995,105 @@ the screen's own 418 keys before the mechanism regression is read, and that read
 decompressions on a host now running job 17681665. One bounded 7.3 MB copy of the results was
 taken off the live node and is stated here rather than treated as free; a 418-matrix read is not
 in the same class and waits.
+
+## Amendment 18 — four corrections to amendment 17, and a criterion registered before the data is touched
+
+Written 2026-10-01 at 12:35. The band-profile comparison in the last section of this amendment
+is **registered and not yet computed**; the criterion and its positive control are fixed here
+first, because the peer session left the threshold to me and choosing it after seeing the numbers
+is the exact failure this file exists to prevent.
+
+### Correction 1 — the repair is RULED OUT, not merely confounded
+
+Amendment 17 said object identity and arm identity are confounded at every width. That is true
+and too weak, and it leaves the obvious repair available: treat the k=2 displacement as a
+per-object offset and subtract it from the k=16 ratio. **That repair is refuted by data already
+in amendment 17.** It assumes the object displacement is constant in width, and `nopf` goes
+**+1.760% at k=2 to −1.700% at k=8 — a sign change**. There is no width-invariant object offset
+to subtract, so `strm/ship` = 1.04717 at k=16 **cannot be decomposed**, by measurement rather
+than by caution.
+
+### Correction 2 — the control's per-cell inertness rests on a default nothing here pinned
+
+`spmm.h:4183-4185` disables the exact kernel per matrix:
+
+```
+if (exact_width && narrowk_exact_mindeg > 0 &&
+    nnz_total < narrowk_exact_mindeg * (long)A0_size) exact_width = 0;
+```
+
+Had `SCORCH_NARROWK_EXACT_MINDEG` shipped nonzero, every matrix below that mean degree would
+have escaped `narrow_exact` at k=2 and fallen through to a branch that **does** reach
+`regblock` — so the arm would have been live on a low-degree subset of the control population.
+It ships at `0L` (`scorch_policy.h:562`) so the branch cannot fire.
+
+**This matters for the one-signed statistic specifically.** "The control is inert" and "the
+control is inert on every matrix in it" are different claims, and a per-cell sign test over 418
+matrices needs the second. It holds — but because of a default, not because of the kernel's
+structure, and amendment 1 did not pin it. Pinned now, with the defaults read at this tip:
+`NARROWK_EXACT_HI` 3, `NARROWK_EXACT_MINDEG` 0L, `SPMM_HALFVEC_F32` 1, `SPMM_HALFVEC_F64` 0,
+`REGBLOCK_PFSTREAM` 0, `REGBLOCK_PFD` 2. The source comment at 4178-4182 says the constant is
+host-conditional and "stays 0", so this is a deliberate default rather than an accident — but a
+future run that changes it invalidates the per-cell test and not just the pooled one.
+
+### Correction 3 — k=4 is an ARM, and the plausible reason it is not a second control
+
+`NARROWK_EXACT_HI` is 3, so at f32 k=4 the row leaves `narrow_exact` and takes the half-vector
+branch. That branch is **not a different kernel**: `spmm.h:4967-4970` calls
+`scorch_spmm_row_regblock<scalar_t, 1, true, VH>` — the same kernel at the half-vector type —
+**and passes `SCORCH_SPMM_PFLIM(nnz_total)`**. `halfvec_exact` is `(B1_size == LH)` = (4 == 4)
+with `SPMM_HALFVEC_F32` at 1. So PFSTREAM reaches k=4 through the half-vector path.
+
+Registered so nobody later reasons the other way: **"k=4 takes the half-vector path" is true and
+"so the register-block arm is inert there" does not follow.** There is no second negative control
+in this design.
+
+### Correction 4 — the row-count guarantee is narrower than amendment 17 stated
+
+Amendment 17 said the row count being exactly 2120 bounds the missing-sentinel risk to "died
+after writing every row". That holds **only because the comparison is over digests of complete
+rows**, so a truncated final row would have changed the count. It does **not** extend to any
+statistic computed from partial rows, and it is a strictly narrower guarantee than a sentinel.
+The f64 and fused producers owe the sentinel.
+
+### Correction 5 — the band profile does no work where amendment 17 used it
+
+At k=2 the arm provably cannot execute, so the whole k=2 displacement is floor **by
+construction**. Inertness already settles that, and no band profile is needed to establish it.
+Amendment 17 offered the size profile as evidence for "placement rather than a kernel effect" at
+k=2, which is a question the k=2 data neither answers nor needs to.
+
+### THE REGISTERED COMPARISON, fixed before the data is touched
+
+The informative question is the one amendment 17 did not ask: **does the k≥4 displacement share
+the k=2 band profile?** Matching shape and magnitude is evidence the k≥4 displacement is floor
+too; divergence would be the first thing in this design pointing at an arm effect.
+
+**Statistic.** Per-band median of `num/ship − 1` for `num` in {`strm`, `nopf`, `shpb`} over the
+nonzero bands [0,1e4), [1e4,1e5), [1e5,1e6), [1e6,1e7) with n = 129, 181, 67, 36. The
+≥1e7 band is **excluded**: n = 5, below the eight-cell minimum already used in this file.
+
+**Interval.** Each band's median gets its own bootstrap percentile CI, 2000 resamples drawn
+*within* the band, from a per-band index matrix whose sha256 is reported. Per-width digests must
+differ from each other — a one-line control on the seal that this file has failed before.
+
+**Criterion, as a containment test rather than an overlap test.**
+
+* **"Shares the k=2 profile"** = for all four bands, the k≥4 point estimate lies inside the
+  k=2 band's 95% CI.
+* **"Diverges"** = at least one band where the k≥4 CI and the k=2 CI are **disjoint**.
+* Anything else is **"indeterminate"**, and indeterminate is a reportable outcome, not a
+  licence to pick the nearer label.
+
+**Positive control, because a "matches" verdict is unfalsifiable without one.** Inject a
+multiplicative +2.0% into one build's k≥4 per-cell ratios — comparable to the largest observed
+k=2 displacement — and require the test to return **"diverges"**. If it cannot, the test is
+underpowered at the magnitude in question and **no "shares the profile" verdict from it is
+readable**. The injected effect is applied to a copy and the uninjected run is reported beside
+it, so the control reports a magnitude rather than a verdict.
+
+**What neither outcome licenses.** "Shares the profile" does not make the k≥4 ratios readable as
+the arm effect — it strengthens the floor interpretation of a quantity that remains confounded,
+because correction 1 shows there is no offset to subtract. "Diverges" does not establish an arm
+effect either; it identifies a width where object and arm displacement differ in a way the floor
+alone does not explain, which is a reason to build the next design's floor, not a result.
