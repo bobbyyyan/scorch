@@ -158,3 +158,42 @@ chain210 ledger can never be chain207's directory.
 Size of the defect at the read point: zero on the real run, because the collector creates a fresh
 destination and the digests differ. It is a trap for a later session re-running the analyzer by
 hand, which is exactly how I tripped it.
+
+### 8a. The identity output lands on the registered number, not somewhere implausible
+
+The peer session's refinement, and it sharpens the item. `Jaccard 1.0000` invites suspicion.
+`union 10, survivors 10 of 10` does not -- because 10 is chain207's own sealed headline, the exact
+figure this chain's pre-registration names as the thing to reproduce. So the failure mode does not
+produce an answer a reader would query; it produces the one value nobody would.
+
+### 8b. Why no amount of care in G3 and G4 could have caught it
+
+**Guards that validate each input separately cannot catch a defect in the RELATION between
+inputs.** Both inputs here were individually valid: `argv[1]` was a real directory of real CSVs with
+a real stage log, and the baseline was genuinely chain207 with the right `.text` and both whole-file
+digests. The defect was that they were the same thing. A relational defect needs a relational check,
+and per-input validation does not reach it however thorough it is -- the same way count, index and
+content are three independent axes rather than one.
+
+The relational check that covers it is **digest set-disjointness over the twelve CSVs**, not
+`realpath` inequality: realpath catches only the literally-same directory, and misses symlinks (what
+I actually did) and a copy.
+
+### 8c. A runtime signature exists in the pinned output, with its weakness
+
+Also the peer's. H1 is chain207's own pace by construction, so an identity input scores it at a
+fraction of a noise unit while a genuine chain210 rejects it: identity accepts H1 at 0.22 units and
+rejects H2/H3; a real chain210 at ~1350.3 s/pass rejects H1 at 14.33 and accepts H3 at 0.53. The two
+cases accept *different* hypotheses, which is a stronger tell than any magnitude. So "H1 accepted
+below one noise unit" reads as "you are reducing the baseline against itself" with no amendment to
+the pinned reduction -- it is a reading of its existing output.
+
+**The weakness is the whole of it:** this works only because the two runs differ in pace by 4.5%.
+Had chain210 matched chain207's pace, the adjudicator would accept H1 in both cases and say nothing.
+It supplements digest disjointness; it does not replace it.
+
+### 8d. What the seal does about it
+
+Per the peer's procedural suggestion: the ledger records `realpath` of both trees and the two
+twelve-CSV digest sets side by side, so disjointness is **attested in the artefact** rather than
+asserted at read time. A later hand re-run is then safe without having read this item.
