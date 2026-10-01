@@ -4921,12 +4921,24 @@ torch::Tensor spmm_csr_v2_core(
 #if SCORCH_NARROWK_DEEP_UNROLL || defined(SCORCH_TUNE_HOOKS)
                 // The row-length minimum. A row below it takes no branch of its own: `took_d`
                 // stays false and control falls through to the `scorch_spmm_row_regblock` call
-                // below, which is the kernel that ships. So a short row runs today's two-chain
-                // form rather than the deep kernel's one-chain remainder, and no row can be
-                // slower than it is today for a reason this gate introduced. Measured crossing
-                // is row length 24 to 32 on redwood's P-cores; the sweep and the row-length
-                // distribution it acts on are recorded at SCORCH_NARROWK_DEEP_MINDEG in
-                // scorch_policy.h.
+                // below, which is the kernel that ships.
+                //
+                // What it saves is the FOLD, not a remainder. This kernel's remainder runs TWO
+                // streams -- see the static_assert at the top of
+                // scorch_spmm_row_regblock_deep and the comment above its remainder loop -- so a
+                // row shorter than UNROLL already runs the incumbent's exact arithmetic. The
+                // difference left is that the deep kernel reduces UNROLL accumulators with
+                // UNROLL-1 dependent adds where the incumbent reduces two with one.
+                //
+                // SCORCH_NARROWK_DEEP_MINDEG defaults to 0. The probe's degree sweep brackets
+                // ITS crossing at [24, 32] on the P-core, but this kernel folds four
+                // accumulators in three dependent adds where the probe folded them in two, so
+                // its per-row cost is larger and its crossing is at or above that bracket. A
+                // row-length minimum is safe only at or above the crossing, so the sweep gives a
+                // lower bound where the guard needs an upper one -- 32 is the smallest value
+                // that could be right, not one known to be safe. The clean ladder points, the
+                // withdrawn degree-6 figure, and the SCORCH_SPMM_SEG_MIN interaction under row
+                // redirection are recorded with the define in scorch_policy.h.
                 if (narrowk_unroll &&
                     (narrowk_deep_mindeg <= 0 ||
                      (long)(pA_end - pA_begin) >= narrowk_deep_mindeg) &&

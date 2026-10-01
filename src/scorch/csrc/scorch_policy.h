@@ -994,29 +994,94 @@
 // is how the deep arm behaved before this existed, so an arm written against the older build
 // fires exactly where it used to.
 //
-// WHY A ROW-LENGTH MINIMUM IS THE RIGHT GATE HERE. The deep kernel's gain comes from running
-// UNROLL independent accumulator chains instead of two, and a measured sweep of the probe in
-// harnesses/portbound puts four chains at -20.7% on redwood's P-cores and -4.1% on its E-cores
-// at a 4096-nonzero row, rising to -29.6% and -37.6% at a 128-nonzero row. But the gain is paid
-// for per row: four chains fold down in two dependent vector adds where two chains fold in one,
-// and a row shorter than the machine body runs the remainder loop, which carries ONE chain and
-// so has less instruction-level parallelism than the two-stream form it replaced. The sweep puts
-// the crossing between row length 24 and 32 on the P-cores; below it the deep kernel is slower.
+// 0 IS THE ONLY VALUE THE EVIDENCE CURRENTLY SUPPORTS. The mechanism below is sound and verified;
+// the THRESHOLD has no measured value yet, because the sweep that produced "24 to 32" measured a
+// different kernel pair. See "WHY THE PROBE'S CROSSING DOES NOT TRANSFER" below. Setting this to
+// a nonzero value is an experiment, not a policy.
 //
-// With a minimum set, a row below it falls through to `scorch_spmm_row_regblock` -- the kernel
-// that ships today -- rather than to the deep kernel's own remainder. So every row runs either
-// today's kernel or a kernel measured faster at that row's length, which is what makes this a
-// gate rather than a tuned threshold: the quantity gated on is the same quantity the measurement
-// varied, and the fallback is the incumbent.
+// WHAT THE GATE DOES. A row shorter than the minimum takes no branch of its own: `took_d` stays
+// false and control falls through to the `scorch_spmm_row_regblock` call already below the deep
+// dispatch, which is the kernel that ships. So every row runs either the incumbent or the deep
+// kernel, never a third thing, and the quantity gated on is a row length.
 //
-// Row-length distribution it acts on, measured over all 3846 DLMC matrices from their CSR row
-// pointers (harnesses/an_rowdist.py): 28.2% of rows are shorter than 32 and they hold 2.60% of
-// the collection's nonzeros, so a minimum of 32 forgoes the gain on about a fortieth of the
-// arithmetic. Structurally empty rows never reach either kernel -- spmm.h:4824 short-circuits
-// them before the dispatch -- so the gate is never ASKED about 147840 of the 3402920 rows. Of
-// the 3255080 that do reach it, those below 32 number 810906, so the gate's FIRING RATE is
-// 24.91%. Neither 28.2% (the predicate's truth rate over all rows) nor 23.83% (short rows over
-// all rows) is that rate: both divide by a population that includes rows the gate never sees.
+// WHAT THE DEEP KERNEL ACTUALLY COSTS ON A SHORT ROW, corrected. An earlier version of this
+// comment said a short row would otherwise run "the deep kernel's one-chain remainder". That is
+// false and `scorch_spmm_row_regblock_deep` says so twice: `static_assert(UNROLL >= 2, "the
+// remainder below runs two streams, so UNROLL cannot be 1")`, and the remainder itself steps
+// `pA += 2` over `acc[0]` and `acc[1]`, which is structurally the incumbent's own main loop.
+// The comment above that remainder loop is the record of that CORRECTION, not a prediction of
+// the defect -- an older comment predicted
+// a short-row loss from a single-chain tail, and the tail was then fixed. Citing the prediction
+// without the fix is citing a kernel version that no longer exists.
+//
+// So on a row shorter than UNROLL the deep kernel runs the incumbent's exact arithmetic, and the
+// only difference left is the FOLD: the deep kernel reduces UNROLL accumulators with UNROLL-1
+// dependent adds (`r = acc[0]; for u: r = V::add(r, acc[u])`, a left fold, depth 3 at UNROLL=4)
+// where the incumbent reduces two with one add at depth 1. Two extra dependent vector-add
+// latencies per output vector, per row. That is the real cost this gate avoids. It is smaller
+// than the one the earlier comment claimed, and it is still a cost.
+//
+// WHY THE PROBE'S CROSSING IS A LOWER BOUND AND A GUARD NEEDS AN UPPER ONE. The degree sweep in
+// harnesses/portbound ran the probe's four-chain arm against its two-chain arm over a ladder of
+// row lengths. Its machine body is eight nonzeros, so at the ladder points that are multiples of
+// eight NEITHER arm executed a remainder iteration, and those points isolate the one axis that
+// still differs from production -- the fold. Ratios of four chains over two, with each point's
+// distance from its own A/A floor:
+//
+//      degree      P-core            E-core
+//           8   1.1347 (187x)   0.9817 ( 33x)
+//          16   1.0790 (188x)   0.9482 (162x)
+//          24   1.0042 (  8x)   0.9304 ( 82x)
+//          32   0.9083 (183x)   0.8842 (386x)
+//          64   0.7523 ( 99x)   0.7646 (812x)
+//         128   0.7036 (117x)   0.6241 (800x)
+//
+// So the short-row penalty is real, resolvable, and P-CORE ONLY: the P-core pays 13.5% at eight
+// nonzeros and 7.9% at sixteen, each nearly 190 times its floor, while the E-core is already
+// ahead at every one of these degrees. The crossing on the P-core is bracketed by [24, 32] and
+// the ladder has no point between.
+//
+// The direction the remaining gap points is what matters, and it is unfavourable. The probe folds
+// four accumulators as a TREE, depth 2; this kernel LEFT-folds them, UNROLL-1 = 3 adds, depth 3;
+// the incumbent folds two in one add, depth 1. So the probe pays one extra dependent vector-add
+// level per output vector per row and this kernel pays two -- twice the per-row cost, against the
+// same per-nonzero gain. This kernel's crossing is therefore AT OR ABOVE 32, not below it.
+//
+// A row-length minimum is safe only when it is AT OR ABOVE the crossing: rows between the
+// threshold and the true crossing take the deep kernel and lose. The probe supplies a lower bound
+// on the crossing where the guard needs an upper one. **32 is therefore the smallest value that
+// could be correct rather than a value known to be safe**, and that is why this ships at 0. The
+// earlier short-row figure of 25.0% at degree 6 is withdrawn: degree 6 is the only ladder point
+// that is not a multiple of the machine body, so it is the only point where the probe ran its
+// scalar remainder -- a SINGLE-chain loop, on two of that row's six nonzeros, that this kernel
+// does not have. It was also the one short-row point whose own A/A floor (5.3%) was large. The
+// clean points above replace it and say the same thing more defensibly.
+//
+// The fix is to measure this kernel against the incumbent on real matrices and read the crossing
+// off that, rather than to carry a bound across the gap.
+//
+// WHAT THE THRESHOLD WOULD ACT ON, for when it has a value. Measured over all 3846 DLMC matrices
+// from their CSR row pointers (harnesses/an_rowdist.py, verified against an independent copy of
+// the collection): 28.2% of rows are shorter than 32 and they hold 2.60% of the collection's
+// nonzeros. Read the ROW distribution and not a per-matrix mean degree: DLMC's mean degree
+// happens to agree with its median row length to within 1% (102.40 against 103), which makes the
+// substitution invisible at the median and wrong by a quarter at p25 (25.60 against 32).
+// Structurally empty rows never reach either kernel -- the `pA_begin == pA_end` branch above the
+// row-kernel call short-circuits them before the dispatch -- so the gate is never ASKED about
+// 147840 of the 3402920 rows. Of the
+// 3255080 that do reach it, 810906 are below 32, so the gate's FIRING RATE at 32 is 24.91%.
+// Neither 28.2% (the predicate's truth rate over all rows) nor 23.83% (short rows over all rows)
+// is that rate; both divide by a population including rows the gate never sees.
+//
+// A SAFETY THAT IS PARAMETERISED BY ANOTHER DEFINE. Under row redirection, the `REDIRECT &&`
+// clamp above the row-kernel call sets `pA_end` to `pA_begin + sp_seg` for any row longer than
+// `sp_wide_deg`, so for wide rows this
+// gate reads a SEGMENT length rather than a row length. That is harmless only because
+// `scorch_spmm_seg_width` floors at SCORCH_SPMM_SEG_MIN = 256, which clears any threshold anyone
+// would plausibly set here. Both are overridable in the same hooks build, and an arm that lowers
+// SEG_MIN below this minimum would send every wide-row segment to the incumbent -- the inverse of
+// the intent, on exactly the rows where the deep kernel measured best. Any arm that moves SEG_MIN
+// must check it against this value.
 #ifndef SCORCH_NARROWK_DEEP_MINDEG
 #  define SCORCH_NARROWK_DEEP_MINDEG 0
 #endif

@@ -2,9 +2,11 @@
 """Where does V6's asymptotic win stop paying as the row degree falls?
 
 THE QUESTION. The 11-arm probe put V6 (4 accumulator chains) at -21.259% on the P-core and
--4.032% on the E-core over a single row of 4096 nonzeros. chain210's own `deg` column over the
-3820 DLMC keys reads p10 10.24, p25 25.60, median 102.40, p75 204.80, p90 307.20 -- so that row
-is 40x the median production row. V6 buys a per-NONZERO gain with a per-ROW cost: four chains
+-4.032% on the E-core over a single row of 4096 nonzeros. DLMC's per-ROW length distribution, measured from the
+CSR row pointers over all 3846 files, reads p10 11, p25 32, median 103, p75 208, p90 278 over the
+3255080 rows that reach the dispatch -- so that row is 40x the median production ROW. (Place the
+bracket against THIS and not against chain210's `deg`, which is a per-matrix mean; the two agree
+within 1% at the median on DLMC and differ by a quarter at p25.) V6 buys a per-NONZERO gain with a per-ROW cost: four chains
 fold in two dependent vaddps levels where two chains fold in one. Below some degree the trade
 inverts and V6 is a regression, and the project's performance convention makes a regression a
 blocker however large the asymptotic win is.
@@ -175,13 +177,40 @@ def main():
                 if a not in r or "V0" not in r:
                     return "       -"
                 x = r[a] / r["V0"]
+                # '!' means the row is shorter than the machine body of EITHER arm in the ratio,
+                # so at least one side spent part of the row in probe.cpp's scalar remainder --
+                # a SINGLE-chain loop (`for (; p < SCORCH_N; ++p)` into acc0 alone) that the
+                # production kernel does not have: scorch_spmm_row_regblock_deep's remainder runs
+                # two streams and static_asserts that it does. The ratio is therefore not a
+                # measurement of the chain count on this degree, and the fit below already
+                # excludes these degrees for the same reason. Marked here too, because the fit's
+                # exclusion does not stop a reader lifting a number out of this table.
+                bw = max(BW.get(a, 0), BW.get("V0", 0))
+                if bw and n < bw:
+                    return "%8.4f!" % x
                 mark = "" if dev(x) > fl else "~"
                 return "%8.4f%s" % (x, mark)
-            v76 = "%8.4f" % (r["V7"] / r["V6"]) if ("V6" in r and "V7" in r) else "       -"
+            if "V6" in r and "V7" in r:
+                bw76 = max(BW.get("V6", 0), BW.get("V7", 0))
+                v76 = "%8.4f%s" % (r["V7"] / r["V6"], "!" if bw76 and n < bw76 else "")
+            else:
+                v76 = "       -"
             print("  %5d %10.5f %10.5f %10.5f %9s %9s %9s %8.5f" %
                   (n, r.get("V0", float("nan")), r.get("V6", float("nan")),
                    r.get("V7", float("nan")), rat("V6"), rat("V7"), v76, fl))
         print("  '~' marks a ratio whose deviation from 1 is INSIDE that degree's own A/A floor.")
+        marked = sorted({n for n in ns for a in ("V6", "V7")
+                         if max(BW.get(a, 0), BW.get("V0", 0))
+                         and n < max(BW.get(a, 0), BW.get("V0", 0))})
+        if marked:
+            print("  '!' marks a degree SHORTER than the arms' machine body, where part of the row")
+            print("      ran probe.cpp's one-chain scalar remainder. Production's deep kernel has a")
+            print("      TWO-stream remainder, so these ratios measure a loop that does not ship and")
+            print("      must not price a row-length guard: n=%s."
+                  % ", ".join(str(n) for n in marked))
+        else:
+            print("  '!' would mark a degree below the machine body width; none here, so every")
+            print("      ratio in this table ran whole bodies on both sides.")
         bad = [(n, S[n]["__floor__"]) for n in ns
                if not math.isnan(S[n]["__floor__"]) and S[n]["__floor__"] > 0.005]
         if bad:
@@ -235,18 +264,28 @@ def main():
                   % math.exp(math.log(na) + (math.log(nb) - math.log(na)) * (ra - 1.0) / (ra - rb)))
             print("        [%d, %d] is the honest answer -- the ladder has no point between them."
                   % (na, nb))
-            qs = [q for q, v in DLMC if v < nb]
-            print("        DLMC quantiles below the upper bracket: %s"
-                  % (", ".join("%s=%.2f" % (q, v) for q, v in DLMC if v < nb) or "none"))
-            if len(qs) >= 3:
-                print("        ABOVE THE MEDIAN: most of the corpus is below the crossing.")
-            elif qs:
-                print("        So %s REGRESSES on the keys below the bracket and ships only behind"
-                      % cand)
-                print("        a degree guard that provably cannot fire above it.")
+            qs = [q for q, v in DLMC_ROWLEN if v < nb]
+            print("        DLMC per-ROW quantiles below the upper bracket: %s"
+                  % (", ".join("%s=%.0f" % (q, v) for q, v in DLMC_ROWLEN if v < nb) or "none"))
+            share = _nnz_share_below(nb)
+            if share is None:
+                print("        nonzero share below %d: NOT MEASURED (off the an_rowdist ladder),"
+                      " so the guard's cost is not priced here." % nb)
             else:
-                print("        Below p10, so %s pays on every decile and needs no guard here."
+                print("        nonzero share in rows below %d: %.2f%% of the collection -- what a"
+                      % (nb, share))
+                print("        guard at the bracket's top forgoes. Those rows are not regressions;")
+                print("        they run today's kernel.")
+            if len(qs) >= 3:
+                print("        ABOVE THE MEDIAN ROW: most of the collection's rows are below the"
+                      " crossing.")
+            elif qs:
+                print("        So %s REGRESSES on the rows below the bracket and ships only behind"
                       % cand)
+                print("        a row-length guard that provably cannot fire above it.")
+            else:
+                print("        Below the per-row p10, so %s pays on every decile and needs no"
+                      " guard here." % cand)
             best = min(seq, key=lambda x: x[1])
             print("        best measured ratio %.4f at degree %d" % (best[1], best[0]))
 
@@ -308,20 +347,51 @@ def main():
                 print()
 
 
-DLMC = [("p10", 10.24), ("p25", 25.60), ("median", 102.40), ("p75", 204.80), ("p90", 307.20)]
+# TWO DIFFERENT POPULATIONS, and only one of them bounds a per-row guard.
+#
+# The probe times a kernel on a single row of n nonzeros, and the production gate reads a row
+# length, so the crossing bracket is a PER-ROW quantity. It must be placed against the per-row
+# length distribution. chain210's `deg` column is nnz/rows, a PER-MATRIX mean, and this file used
+# to place the bracket against that -- the wrong population, invisible at the median because on
+# DLMC the two happen to agree there to within 1% (102.40 against 103) and wrong by a quarter at
+# p25 (25.60 against 32). Both are kept, each under its own name, so the substitution cannot
+# recur silently.
+#
+# Measured by harnesses/an_rowdist.py over all 3846 .smtx files, 3402920 rows, 475663122
+# nonzeros, 0 refused. Quantiles are over the 3255080 NONEMPTY rows, because the empty ones never
+# reach either kernel (the `pA_begin == pA_end` branch short-circuits them above the dispatch) and
+# including them shifts every quantile toward a population the gate is never asked about.
+DLMC_ROWLEN = [("p10", 11.0), ("p25", 32.0), ("median", 103.0), ("p75", 208.0), ("p90", 278.0)]
+DLMC_MEANDEG = [("p10", 10.24), ("p25", 25.60), ("median", 102.40), ("p75", 204.80),
+                ("p90", 307.20)]
+
+# Share of the collection's ARITHMETIC in rows shorter than the threshold -- what a per-row guard
+# sends to the fallback and that therefore gets no speedup. Not a regression: those rows run
+# exactly today's kernel. This is the number that prices a guard, and it is far smaller than the
+# row count because short rows are short.
+DLMC_NNZ_BELOW = [(4, 0.03), (8, 0.16), (12, 0.46), (16, 0.80), (24, 1.56),
+                  (32, 2.60), (48, 4.57), (64, 7.19), (128, 18.58)]
+
+
+def _nnz_share_below(n):
+    """Measured nonzero share below n, or None when n is off the measured ladder."""
+    for t, pct in DLMC_NNZ_BELOW:
+        if t == n:
+            return pct
+    return None
 
 
 def _verdict(nstar):
-    """Place the break-even against chain210's own DLMC degree distribution."""
-    below = [q for q, v in DLMC if v < nstar]
+    """Place the break-even against DLMC's per-ROW length distribution."""
+    below = [q for q, v in DLMC_ROWLEN if v < nstar]
     if not below:
-        return ("below p10 (10.24), so V6 pays on every decile of the DLMC corpus and ships "
-                "without a degree guard -- on this core type.")
+        return ("below p10 (11 nonzeros), so the arm pays on every decile of DLMC's rows and "
+                "ships without a row-length guard -- on this core type.")
     if len(below) >= 3:
-        return ("above the DLMC median (102.40), so the asymptotic win is unreachable for most "
-                "of the corpus and the lever is effectively closed here.")
-    return ("between %s and the next DLMC quantile, so V6 REGRESSES on the keys below it and "
-            "ships only behind a degree guard constructed to be inert there." % below[-1])
+        return ("above the median ROW (103 nonzeros), so the asymptotic win is unreachable for "
+                "most of the collection's rows and the lever is effectively closed here.")
+    return ("between %s and the next per-row quantile, so the arm REGRESSES on the rows below it "
+            "and ships only behind a row-length guard constructed to be inert there." % below[-1])
 
 
 def _floor(rows):
