@@ -218,10 +218,16 @@ range was then used as though it characterised all three.
 
 The *finding* is not window-limited: the both-siblings-busy count is computed inside each window's
 reduction and is 0 of 8 in all three. But it is a **threshold** (>50 ticks of 1000), not an
-observation of zero — siblings run at 0.1–2.2% busy in w3, which is 4.1% of P-logical ticks, so
-excluding them moves the P share from 39.5% to 37.8%. In a later 20-second window siblings reached
-1.5–7.7%. The conclusion is robust at any sane threshold; the column should not read as an exact
-zero. Peer session's correction.
+observation of zero — siblings run at 0.1–2.2% busy in w3, and in a later 20-second window they
+reached 1.5–7.7%. The conclusion is robust at any sane threshold; the column should not read as an
+exact zero.
+
+**And the exclusion belongs in the denominator too.** Stripping sibling ticks from the numerator
+alone gives P 1812/4786 = 37.9%, which answers "what share of all busy ticks landed on P even
+cores". The conversion needs "what share of the work was done by P physical cores", so the sibling
+time comes out of both sides: P 1812/4709 = **38.5%**, E **61.5%**, which raises w3's `T_E/T_P` from
+1.532 to **1.599** and E's bounded share at `r = 1.322` from 53.7% to **54.7%**. Small, and in the
+direction that raises E. Peer session's correction, both parts.
 
 **That refutes my own objection to the work-share correction.** I had argued that a P-logical
 CPU-second is a second on half a shared core, which would put `r_P/r_E` near 0.78–0.84 and make the
@@ -251,14 +257,52 @@ time split.
    run's own occupancy — 8 threads on P against 16 on E, same total work — or label the converted
    share a bound and name its direction. Peer session's point, and theirs to raise since they
    proposed the conversion.
-2. *The clock input was the wrong clock, and measurement rescues it.* 1.295 is 5.7/4.4, the
-   **single-core boost** ratio, which is the least appropriate figure for an all-core run where both
-   types clock down. Measured in situ — ten frequency sweeps over all 32 CPUs across one window,
-   weighted by the per-CPU busy ticks of that same window, `intel_pstate` on `powersave`:
-   **P-logical 3.902 GHz, E 2.952 GHz, ratio 1.322.** Both types are far below their maxima (P
-   3.90 against 5.7, E 2.95 against 4.4) and the ratio lands within 2% of the boost ratio. So the
-   criticism was right and the number survives it — for a different reason than the one originally
-   given, which is worth saying rather than quietly keeping 1.295.
+2. *The clock ratio is not `r`.* `r = (IPC_P/IPC_E) · (f_P/f_E)`, and only the second factor is
+   measurable this way. The first is unmeasured and is `≥ 1` for Raptor Cove against Gracemont on a
+   kernel of this shape. Demoting the vector-FMA-width argument removed the *justification* for
+   `r > f_P/f_E`; it did not turn the clock ratio into an estimate of `r`. So the clock-only input
+   yields an **upper bound** on E's work share, because the share falls monotonically in `r`:
+
+   | `r_P/r_E` | 1.322 | 1.5 | 2.0 | 2.5 |
+   |---|---|---|---|---|
+   | E work share at `T_E/T_P = 1.656` | **55.6%** (bound) | 52.5% | 45.3% | 39.8% |
+
+   And the pinned V0 pair measures `r` **directly, as a rate**, so the clock ratio is not needed as
+   a conversion input at all — it is a cross-check on the pin, which is a better use for it. Peer
+   session's correction.
+
+3. *The clock figure itself, and the test its instrument needed.* 1.295 is 5.7/4.4, the
+   **single-core boost** ratio, which is the wrong clock for an all-core run. Measured in situ —
+   ten sweeps of all 32 CPUs across one window, weighted by the per-CPU busy ticks of that same
+   window, `intel_pstate` on `powersave`: **P-logical 3.902 GHz, E 2.952 GHz, ratio 1.3218**.
+
+   Offering "within 2% of the boost ratio" as reassurance was the wrong move, and the peer session's
+   objection is the right shape: agreement with a spec number is also what a **duty-contaminated**
+   reading produces, since a TSC-normalised `scaling_cur_freq` would report `f_max · duty` and the
+   ratio would collapse to `1.2955 · (d_P/d_E)`, needing only `d_P/d_E = 1.020` to land on 1.3218.
+   Agreement therefore discriminates nothing; the thing to show is that the reading is busy-only.
+
+   **Tested, and the contamination model is refuted.** An almost-idle sibling, cpu13 at 1.8% busy,
+   reads **5.24–5.47 GHz**; duty-inclusive would predict `5.7 × 0.018 = 0.103 GHz`. So the figure is
+   C0-only, not TSC-normalised. The test also explains why two of my own sweeps disagreed: five
+   back-to-back reads return one cached value (4198243 five times) while reads 2 s apart vary
+   (4.198 → 3.890 → 5.289 GHz on the same CPU), so it is an interval-averaged quantity with real
+   variance under a bursty workload — the ten-sweep mean averages that, the single sweep caught one
+   interval. `cpuinfo_cur_freq` is absent on this kernel, so there is no second hardware route.
+
+   A better anchor than the boost ratio also appeared: `base_frequency` is **3.2 GHz for P and
+   2.4 for E**, a ratio of **1.3333**, which the measurement sits 0.8% from. Three independent
+   routes — base 1.3333, boost 1.2955, measured 1.3218 — bracket the clock ratio at 1.30–1.33, and
+   the operating point (P 3.90, E 2.95) lies above base and below boost for both types, which is
+   internally coherent. The clock factor is therefore solid; it is `r` that is not.
+
+4. *The two inputs came from different windows.* The frequencies are weighted by window 4's busy
+   ticks (11.9–13.7 busy cores) and applied to a time split from windows 1–3 (4.65–5.93). That is
+   the window-mixing this document had just finished arguing against, committed one paragraph later.
+   P-cores throttle more steeply with active-core count than E-cores do, so a ratio taken at ~13
+   busy cores is if anything a floor for a 5-core phase — the same direction as the `r` bound above,
+   which is why this is bookkeeping rather than a reversal. Every input is now labelled with its
+   window. Peer session's catch.
 
 Finally, "higher once vector-FMA width differs between the microarchitectures" presupposes the
 kernel is compute-bound, which is the hypothesis this probe exists to test. It stands as a
@@ -272,6 +316,14 @@ arithmetic at all, which is a larger quantity than anything this probe can win: 
 were in-kernel imbalance, perfect balance would be a 4.05–5.16x lever against −18.4%. **But the
 quantity is phase-dependent by a factor of 2.5–2.9 across windows, so no windowed figure is a
 property of the run** and the ceiling is quoted only as a range.
+
+**The ceiling is phase-dependent too, and in the high-occupancy phase it is close to this probe's
+own effect.** w1–w3 give 4.05x / 5.16x / 5.01x; w4 gives **1.75–2.01x**. So "occupancy outranks
+ports" is true of the low-occupancy phases and much weaker in the high one. A whole-run ceiling is
+`24 / (time-weighted mean occupancy)`, so the mean is exactly the quantity the whole-run
+decomposition produces — which makes it the right estimand rather than a compromise. The per-phase
+values are kept alongside it, because a lever that only pays in the low-occupancy phase is
+misvalued by the mean. Peer session's framing.
 
 **It is not established that any of it is in-kernel.** The figure is occupancy of the *harness
 process*, and it sums at least three components that need different fixes and have different
@@ -319,6 +371,15 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 6**, digest `ea0fd535e9d99ead` superseded. The clock ratio is not `r`: the IPC factor
+  is unmeasured and `≥ 1`, so the converted E work share is an upper bound of 55.6% rather than a
+  point estimate, and the pinned V0 pair measures `r` directly as a rate. The "within 2% of the
+  boost ratio" reassurance is withdrawn as non-discriminating; the instrument was instead tested and
+  the duty-contamination model refuted (an idle sibling reads 5.24 GHz where duty-inclusive predicts
+  0.103), with `base_frequency` 3.2/2.4 = 1.3333 supplying a third bracketing route. Clock ratio and
+  time split labelled with their windows after being mixed. Sibling exclusion moved to both sides of
+  the ratio. The occupancy ceiling recorded as phase-dependent, 1.75–2.01x in the high-occupancy
+  window against 4.05–5.16x in the low ones.
 - **Amendment 5**, digest `17c4d77e22268b83` superseded. The sentence certifying the new instrument
   quoted window 1 twice; the split reproduces and the occupancy level does not, and a fourth window
   widens occupancy to a factor of 2.5–2.9, so the windowed figure is dropped as a headline.
