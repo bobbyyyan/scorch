@@ -271,6 +271,13 @@ time split.
    a conversion input at all — it is a cross-check on the pin, which is a better use for it. Peer
    session's correction.
 
+   **Read this before quoting anything from the clock subsection below.** Everything there —
+   the refuted contamination model, the base-frequency anchor, the coherent operating point, the
+   error bar — concerns `f_P/f_E` **only**. `f_P/f_E` was never the factor in doubt. `r` is still
+   unmeasured, floored by the clock ratio and with **no upper bound**, and nothing in this document
+   pins it to 1.30–1.33. The risk the peer session named is that the strongest-sounding sentence in
+   the section is about the factor that was never at issue.
+
 3. *The clock figure itself, and the test its instrument needed.* 1.295 is 5.7/4.4, the
    **single-core boost** ratio, which is the wrong clock for an all-core run. Measured in situ —
    ten sweeps of all 32 CPUs across one window, weighted by the per-CPU busy ticks of that same
@@ -290,11 +297,56 @@ time split.
    variance under a bursty workload — the ten-sweep mean averages that, the single sweep caught one
    interval. `cpuinfo_cur_freq` is absent on this kernel, so there is no second hardware route.
 
-   A better anchor than the boost ratio also appeared: `base_frequency` is **3.2 GHz for P and
-   2.4 for E**, a ratio of **1.3333**, which the measurement sits 0.8% from. Three independent
-   routes — base 1.3333, boost 1.2955, measured 1.3218 — bracket the clock ratio at 1.30–1.33, and
-   the operating point (P 3.90, E 2.95) lies above base and below boost for both types, which is
-   internally coherent. The clock factor is therefore solid; it is `r` that is not.
+   **The replacement reassurance was the same error in a new costume, and the numbers say so.**
+   I offered `base_frequency` 3.2/2.4 = 1.3333 as a third route and wrote that "three routes bracket
+   the clock ratio at 1.30–1.33". But base and boost are **2.92% apart**: Intel holds the P:E ratio
+   nearly constant across the frequency range, so that window was fixed by the product before
+   anything was measured, and two of the three "routes" are one source. Computed from my own data —
+   per-CPU ten-sweep means, busy-weighted, CPUs as the sampling unit:
+
+   | | value | SE | 95% interval |
+   |---|---|---|---|
+   | `f_P` | 3.9036 GHz | ±0.1242 (n_eff 8.7) | |
+   | `f_E` | 2.9535 GHz | ±0.0629 (n_eff 16.0) | |
+   | `f_P/f_E` | **1.3217** | ±0.0506 (**3.8%**) | **[1.223, 1.421]** |
+
+   The ratio's own 95% interval is **15.0% wide and contains the entire 2.92% spec bracket**, so the
+   measurement discriminates none of it. The honest statement is `f_P/f_E = 1.32 ± 0.05`, consistent
+   with every operating point between base and boost and distinguishing none. "Internally coherent"
+   was true and is also exactly what a measurement carrying no information would look like — which
+   is the objection to the boost-ratio agreement, arriving one paragraph later in new clothes.
+
+   **And the floor is not independent of the measurement either, which is a third instance.** The
+   natural rescue is "you only need a floor on `r`, and 1.29 is one whether the truth is 1.2955 or
+   1.3333". But `cpuinfo_min_freq` is **800 MHz for both core types**, so at the bottom of the range
+   `f_P/f_E = 1.000`. Intel holds the ratio near 1.30 only *between base and boost*, and what
+   establishes that this run sits in that region is the measurement (P 3.90 ∈ [3.2, 5.7], E 2.95 ∈
+   [2.4, 4.4]). So the spec cannot supply a floor without the measurement, and the measurement's
+   interval reaches down to 1.223.
+
+   Carried through, the defensible bound moves: with `r ≥ f_P/f_E ≥ 1.223` at 95%, E's work share is
+   **≤ 57.5%**, not the 55.6% published from the point estimate.
+
+   **One boundary on what the cpu13 test establishes.** It excludes TSC-normalisation; it does not
+   by itself exclude a cached *requested* P-state. If the sysfs value were per-physical-core policy
+   rather than per-logical `aperf/mperf`, 16 P-logical reads would carry only 8 distinct values and
+   busy-tick weighting across 16 would double-count them. Checked from the same data: **all 8
+   sibling pairs disagree** (by 0.04 to 0.73 GHz), so the value is per-logical and there is no
+   double-counting. Peer session's boundary, answered from data already in hand.
+
+   **The caching observation has a resolution and it belongs with it.** Five back-to-back reads
+   returning one value threatens the independence of the ten sweeps the mean rests on. The loop is
+   10 × (32 fast reads, then `sleep 2`), so reads *within* a sweep are 1–5 ms apart — that is where
+   the cache returns one value — while consecutive reads of the *same* CPU are separated by at least
+   2.00 s, exactly the spacing at which the value was shown to move (4.198 → 3.890 → 5.289 GHz). So
+   there are about ten independent samples per CPU and the mean stands: caching bounds the usable
+   cadence, not the mean. Peer session's rescue.
+
+   **C0 time is not kernel time.** An `aperf/mperf` average covers all C0 time on that CPU — the
+   kernel, the Python driver, CSR construction, anything else scheduled there — and weighting by
+   busy ticks weights *CPUs*, not *code*. So this figure is the average frequency of everything that
+   ran, not of the SpMM. Same fix as for `r`: the frequency taken during the pinned V0 runs is
+   kernel-only, because nothing else is on the core.
 
 4. *The two inputs came from different windows.* The frequencies are weighted by window 4's busy
    ticks (11.9–13.7 busy cores) and applied to a time split from windows 1–3 (4.65–5.93). That is
@@ -371,6 +423,15 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 7**, digest `e929ea9d753438bc` superseded. The "three routes bracket 1.30–1.33"
+  reassurance is withdrawn: base and boost are 2.92% apart because the product holds the ratio
+  constant, and the measurement's own 95% interval is [1.223, 1.421], 15.0% wide, containing the
+  whole bracket. `f_P/f_E = 1.32 ± 0.05` discriminates nothing, the spec cannot supply a floor
+  independently of the measurement (`cpuinfo_min_freq` is 800 MHz for both types), and the E
+  work-share bound moves to ≤ 57.5%. The cpu13 test's boundary is closed by showing all 8 sibling
+  pairs disagree, so the reading is per-logical. The caching observation gains its resolution. C0
+  time is restated as not kernel time. A warning added that the whole clock subsection concerns
+  `f_P/f_E` and not `r`.
 - **Amendment 6**, digest `ea0fd535e9d99ead` superseded. The clock ratio is not `r`: the IPC factor
   is unmeasured and `≥ 1`, so the converted E work share is an upper bound of 55.6% rather than a
   point estimate, and the pinned V0 pair measures `r` directly as a rate. The "within 2% of the
