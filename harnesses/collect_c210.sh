@@ -51,6 +51,46 @@ sd=$(grep -cE '^    --- p[1-6] (aa|bb) done ' "$STAGE")
 ss=$(grep -cE '^    --- p[1-6] (aa|bb) start' "$STAGE")
 [ "$sd" -eq 12 ] && [ "$ss" -eq 12 ] || { echo "RFAIL stage log has $ss start / $sd done lines, not 12 each -- the H1/H2/H3 block would skip silently"; exit 1; }
 
+# THE ROTATION BALANCE IS THE PREMISE P0 RESTS ON, so it is checked here from THREE sources that
+# must agree, not derived once. The stage log carries two DECLARATIONS -- the up-front rotation
+# print and each pass header's `order [x y]` -- and one LANDED record, the sequence of start lines
+# in file order. The project's own convention (chain207's PROVENANCE) is that the landed order is
+# authoritative and the schedule is never substituted for it; the declarations are the cheap
+# independent route. Requiring agreement catches both a lossy derivation and a script that did not
+# run its own plan. I nearly published "the rotation is unbalanced, aa 4 bb 2" from a
+# seconds-of-day sort across midnight, with the declaration three lines above the data I sorted.
+# Verified on chain207's sealed log: all three agree, aa second 3, bb second 3.
+python3 - "$STAGE" <<'PY' || exit 1
+import re, sys
+L = open(sys.argv[1]).read().splitlines()
+plan, hdr, land = {}, {}, {}
+for l in L:
+    m = re.match(r"\s+p([1-6]): (aa|bb) (aa|bb)\s*$", l)
+    if m: plan[int(m.group(1))] = [m.group(2), m.group(3)]
+    m = re.match(r"\s+=== pass p([1-6]) of \d+\s+order \[(aa|bb) (aa|bb)\]", l)
+    if m: hdr[int(m.group(1))] = [m.group(2), m.group(3)]
+    m = re.match(r"\s+--- p([1-6]) (aa|bb) start", l)
+    if m: land.setdefault(int(m.group(1)), []).append(m.group(2))
+def seq(d): return [ "".join(d[k]) for k in sorted(d) ]
+def second(d):
+    c = {"aa": 0, "bb": 0}
+    for v in d.values():
+        if len(v) == 2: c[v[1]] += 1
+    return c
+if not (len(plan) == len(hdr) == len(land) == 6):
+    sys.exit("RFAIL rotation sources incomplete: plan %d, headers %d, landed %d of 6"
+             % (len(plan), len(hdr), len(land)))
+if not (plan == hdr == land):
+    sys.exit("RFAIL rotation sources disagree: plan %s header %s landed %s"
+             % (seq(plan), seq(hdr), seq(land)))
+c = second(land)
+if c["aa"] != 3 or c["bb"] != 3:
+    sys.exit("RFAIL rotation NOT balanced: ran second aa %d, bb %d (must be 3 and 3, or a linear "
+             "drift in pass position does not cancel in the cross-build ratio)" % (c["aa"], c["bb"]))
+print("  rotation: %s -- plan, pass headers and landed order all agree; ran second aa 3, bb 3"
+      % " ".join(seq(land)))
+PY
+
 # ENUMERATE FROM THE DECLARING FACTORS, {aa,bb} x {p1..p6}, and resolve each to a file. The first
 # version globbed dl_*_float32_p*.csv in five places and relied on a count of 12 to backstop it,
 # which fails closed but refuses with "11 CSVs" instead of naming the absent object-pass -- and the

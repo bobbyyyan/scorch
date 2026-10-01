@@ -85,3 +85,27 @@ pace points at H3 (1348.0 s) rather than H1 (1412.5) or H2 (1389.8). What preser
 that pre-registration here is **by digest** rather than by blinding: the output is a deterministic
 function of sealed inputs and code pinned at `9c42d96123ce3560`, so neither session's expectation
 can move it. Recorded so that no reader mistakes the eventual H1/H2/H3 line for a blind adjudication.
+
+## 5. The rotation balance is checked from three sources, and two of them are declarations
+
+The stage log carries the rotation **three** ways: the up-front `rotation (balanced, ...)` print,
+each pass header's `order [x y]` field, and the landed sequence of `--- pN t start` lines in file
+order. The first two are the **schedule** — both are printed from `$ORDER` before the pass body
+runs — and only the third is what happened. chain207's `PROVENANCE.md` already states the
+convention: GUARD 4 reads the landed order, never the schedule.
+
+So "prefer a declared field to a derived one" needs its pairing clause to be usable here: the
+landed sequence is authoritative for the premise, the declarations are the cheap independent route,
+and **requiring all three to agree** is what catches both a lossy derivation and a script that did
+not run its own plan. `collect_c210.sh` refuses unless all three agree and each object ran second
+in exactly three of the six passes — which is the condition under which a drift linear in pass
+position cancels to first order in every cross-build ratio.
+
+Verified on chain207's sealed log: plan, headers and landed order all read
+`aabb bbaa aabb bbaa aabb bbaa`, aa second 3, bb second 3. Confirmed independently by the peer
+session. For chain210 the same check runs at collection time; the parser was verified against the
+real partial log, where it reads plan 6, headers 4, landed 4 and refuses as incomplete.
+
+The planted cases that fire it: all six passes in the same order (aa second 0, bb second 6); a
+landed order that differs from declarations which agree with each other; and five passes instead of
+six. The second of those is the one a declaration-only check cannot see.
