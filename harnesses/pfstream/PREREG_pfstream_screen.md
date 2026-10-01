@@ -284,12 +284,48 @@ instrument is tightest.
 ## AMENDMENT 6: PFSTREAM IS PROVABLY INERT ON ARM, so "no regressions" is satisfied there by
 ## construction rather than by measurement
 
-Checked mechanically rather than by eye: for each of the 12 `scorch_spmm_row_regblock` **call**
-sites, the enclosing preprocessor stack was accumulated by walking upward and matching `#endif`
-against `#if`. **All 12 are inside `#if defined(__AVX2__) && defined(__FMA__)`; none is reachable
-on ARM.** `scorch_simd<float>` does have a NEON specialization (`float32x4_t`, `lanes = 4`), but
-the register-block *dispatch* is x86-only, so the NEON path uses its own row kernel and PFSTREAM is
-dead code there.
+Checked mechanically: one forward pass over `spmm.h` accumulating each line's enclosing
+preprocessor stack, with the walk's **own** check that the stack closes at depth 0 at EOF -- without
+that, a mismatched `#endif` silently shortens every later stack and the result is spurious in
+either direction.
+
+**Counts, each with its predicate, because "12" alone reconstructs to nothing.** The substring
+`scorch_spmm_row_regblock` is a **prefix of `scorch_spmm_row_regblock_deep`**, so a substring match
+counts calls to two different functions:
+
+| predicate | n | lines |
+|---|---|---|
+| call expressions matching the substring | **12** | both functions below |
+| → calls to `scorch_spmm_row_regblock` | **8** | 4884, 4885, 4968, 4972, 5096, 5097, 6346, 6347 |
+| → calls to `scorch_spmm_row_regblock_deep` | **4** | 4948, 4951, 5065, 5066 |
+| of the 8, outside `#ifdef SCORCH_TUNE_HOOKS` (release-reachable) | **6** | 4884, 4885, 4968, 4972, 6346, 6347 |
+| definitions | 3 | 2267, 2534, 2744 |
+| other textual references (comments, macro bodies) | 4 | 2642, 2814, 4923, 4928 |
+
+**Every one of those 23 references is inside `#if defined(__AVX2__) && defined(__FMA__)`, and none
+is NEON-guarded.** The 6 is the number that matters for a release object.
+
+**AND THE VECTOR TYPE DOES NOT EXIST ON ARM EITHER, which an earlier version of this paragraph got
+backwards.** I wrote that `scorch_simd<float>` has a NEON specialization. It does not:
+
+| template | line | AVX2-guarded | NEON-guarded |
+|---|---|---|---|
+| `scorch_simd<float>` / `<double>` | 2155 / 2175 | yes | no |
+| `scorch_simd_half<float>` / `<double>` | 2202 / 2220 | yes | no |
+| `scorch_neon<float>` / `<double>` | 3002 / 3014 | no | yes |
+
+The NEON vectors are a **separate template**. So the register-block kernel's vector type is absent
+on ARM and the template could not instantiate even if a call site were reachable.
+
+**That makes the unreachability doubly and independently enforced** -- once by the guard around
+every call, once by the guard around the type the kernel is written in. It is a better basis for
+"ARM cannot regress" than the call-site walk alone, because a future edit that moved a dispatch out
+of the AVX2 block would **fail to compile** rather than silently become reachable.
+
+The belief being corrected is the one that nearly produced the vacuous M5 check: *the kernel is
+shared and only the routing differs*. That was never true, and it was not true at the type level
+either -- so getting the reason right is what stops the same assumption generating a different
+vacuous check later.
 
 Three consequences for the standing "neutral-or-better across the whole space, no regressions"
 requirement:
