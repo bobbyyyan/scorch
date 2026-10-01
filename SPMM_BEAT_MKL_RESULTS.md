@@ -41207,3 +41207,48 @@ BYTE-IDENTICAL, sha256 `ff167f71d50abf74...`, which also binds the two corpora t
 Coverage guard: all 3820 chain207 keys present, 0 missing. Seal
 `841a892b742ba9b13f645100f97625f4256c78e24b852763efd27875e0a3ede1`, 9 entries, 9 OK, digest field
 width 64.
+
+## chain210 pre-registration: does the DLMC board's behind-set replicate across RUNS? (2026-09-30)
+
+Written and committed BEFORE the run starts. Nothing below is measured yet.
+
+**Why.** chain207's own design note fixed the ONE-OBJECT churn: over SuiteSparse the same three
+objects gave behind counts of 79/62/74, union 139 cells, only 22 in all three and 85 in exactly
+one, so it used a pure replication PAIR (identical `.text`, distinct object files) and required a
+cell to be behind on both. The checker session has now shown the PAIR does not replicate across
+runs either, and I reproduced every figure independently from the two sealed ledgers:
+
+    chain206 aa/bb   14 residues  6/7/1/0/0   floors 0.0896 0.0951 0.1493 0.1349 0.1689
+    chain196 c0/c0b  18 residues  8/9/1/0/0   floors 0.0916 0.0949 0.1533 0.1367 0.1629
+    union 25   intersection 7   only-206 7   only-196 11
+
+The two pairs agree on the POOLED floor to a ratio of 1.0026 at k=4 while agreeing on WHICH MATRIX
+is unstable at Pearson 0.282 / Spearman 0.206; each puts 230 of 4584 matrices above its own floor
+(definitional at p95) and they share 61 against 11.5 expected by chance -- 5.3x enrichment, so the
+matrix-intrinsic component is real but most of "this cell does not replicate" is run-specific.
+The replicated SuiteSparse intersection is **7 cells, 3 of them at k=4**, not 14 or 18.
+
+**So the DLMC headline of 10 is a single-run number and has never been replication-tested**, because
+only one DLMC run exists. This is the measurement that tests it.
+
+**Design.** A second run of chain207's grid with the SAME two objects, which isolates the RUN with
+machine code held fixed -- a cleaner contrast than chain206-against-chain196, where objects and run
+both varied. Objects asserted by full SHA-256 to equal chain207's recorded digests: aa `.text`
+a79b5d20b322c5ac whole 7f8f78d58a8784b1, bb `.text` a79b5d20b322c5ac whole 70c9f5473e498f50. Same
+driver, same corpus, same balanced rotation, 6 passes, 57301 rows per object-pass.
+
+**PREDICTIONS, from the SuiteSparse transfer rate, each able to fail:**
+ P1  of chain207's 10 residues, **4 to 5 survive** (7/18 = 38.9% and 7/14 = 50.0% bracket the
+     SuiteSparse rate). FAILS if >=9 survive -- DLMC would then be far more stable than
+     SuiteSparse and the extrapolation is wrong. FAILS the other way if <=2 survive, which would
+     make the DLMC headline essentially noise.
+ P2  the union over the two runs EXCEEDS 10, since only-196 was 11 against an intersection of 7.
+ P3  the per-width pooled floors agree between runs to within a few percent (SuiteSparse analogue
+     1.0026 at k=4), while per-matrix instability correlates weakly, Pearson well below 0.5.
+ P4  NEGATIVE CONTROL, and the one that can embarrass this design: the pooled per-width median S
+     must reproduce tightly. If the MEDIAN moves materially the two runs are not measuring the same
+     thing and P1 is uninterpretable rather than informative.
+ P5  k=4 stays the largest width group in the surviving set.
+
+**What it cannot settle.** Same objects means a positive result does not clear the object-layout
+artefact, and same host means none of this is two-host. It settles replication across runs only.
