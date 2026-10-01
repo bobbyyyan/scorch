@@ -1387,3 +1387,86 @@ unique per-factor share.
 And **detection is ordered by neither** — 0.2191 misses twice while 0.2621 misses none — which is
 consistent with the build term being dominant for detection and makes three factors, not one.
 So σ is reported beside n per amendment 20, and neither is presented as the driver.
+
+## Amendment 22 — the criterion is now code that refuses an incoherent registration
+
+The f64 criterion registered across amendments 19–21 is implemented as
+`harnesses/pfstream/pfs_criterion.py`, and the f64 analysis will instantiate it rather than
+re-describe it. Three of the four registration failures logged today mechanise, and the peer
+session's classification of them is the reason this exists rather than a resolution to be more
+careful:
+
+* **"both controls belong in a registration"** is a presence check. `BeyondFloorCriterion.label()`
+  raises until `run_negative()` has been **called** — declaring a negative control is not running
+  one, and a criterion whose no-effect case was never exercised answers confidently on every arm.
+  That is amendment 18's failure, as an exception.
+* **"the injected magnitude against a whole-CI criterion"** is arithmetic. Construction refuses
+  `injection <= floor_bound` and reports the detection probability, because the criterion defines
+  an effect at the bound as floor-sized — so the control would be demanding detection of
+  something the criterion is built to call floor. That is amendment 19's failure, at construction
+  time.
+* **The floor bound must be measured on this run's own floor arm**, and a non-positive bound is
+  refused with that sentence attached.
+
+**What does not mechanise, and is therefore written as prose.** The self-voiding diagnosis itself
+— "the criterion defines an effect at `b` as floor, so asking the control to detect it is
+incoherent" — required reading two clauses of one paragraph against each other. No arithmetic
+finds that; the arithmetic only *implements* it once found. The peer priced the threshold instead
+of noticing the contradiction, and I wrote both clauses, so the finding belongs to neither of our
+checklists and stays in amendment 21's text.
+
+**The pair the implementation names, because only one half was found by either of us.** A control
+whose magnitude is a function of the instrument's own noise reports nothing about that noise:
+
+* **self-voiding** — `delta <= b`, detection 2.5% at equality, fails on a correct instrument;
+* **self-passing** — `delta = b + 2h` using the band's *own* half-width, detection 97.5%
+  whenever the interval is well formed, so it passes without measuring adequacy.
+
+`delta` is therefore an absolute magnitude anchored outside the instrument: **3.0%**, from
+chain197's measurement of this same lever at 2.9–14.2% against the f32 screen's measured floor
+bound of 1.489%.
+
+**Adequacy is reported, never assumed.** `MIN_DETECT` is declared at 0.80 in the source rather
+than implied. A band below it has its non-detection verdict suffixed
+`UNDERPOWERED AT 3.00% (power …)`; other bands keep their verdicts and the run is not voided. A
+`BEYOND_FLOOR` verdict is never suffixed, because low power is not a caveat on a detection.
+
+**Plants and ablations.** `pfs_criterion_selftest.py`: 7 plants, 20 assertions, and the refusal
+population extracted from the target's own AST — every `raise` site, 9 of 9 reached. Six
+ablations, each asserting its anchor, its edit and its kept line:
+
+| perturbation | sites | failures |
+|---|---|---|
+| the self-voiding guard removed | 8 of 9 | 3 |
+| the negative-control-was-run guard removed | 8 of 9 | 2 |
+| the negative-control-failed guard removed | 8 of 9 | 2 |
+| `MIN_DETECT` set to 0 | 8 of 9 | 2 |
+| underpowered VOIDS instead of labelling | 10 of 10 | 2 |
+| the `−1.0` dropped from the detection formula | 9 of 9 | **5** |
+
+The last is the arithmetic the entire self-voiding diagnosis turns on — detection needs the
+estimate to exceed the bound by a full half-width, not merely to exceed the bound — and it is the
+one an implementation could get wrong while reading as correct.
+
+### The f32 margin table, as a regression rather than a prediction
+
+Computed from the f32 screen's measured half-widths with `b` = 1.489%, and asserted by the
+corpus so the arithmetic cannot drift:
+
+| band | h | b + 2h | margin at 3.0% |
+|---|---|---|---|
+| 0–1e4 | 0.2191 | 1.927% | +1.073 pp = 4.9 h |
+| 1e4–1e5 | 0.2989 | 2.087% | +0.913 pp = 3.1 h |
+| 1e5–1e6 | 0.2621 | 2.013% | +0.987 pp = 3.8 h |
+| 1e6–1e7 | 0.4129 | 2.315% | +0.685 pp = 1.7 h |
+
+**These are f32 numbers and they are not an f64 prediction.** The f64 band half-widths are
+unmeasured and that run's band populations may differ, since corpus composition is a property of
+the run. The one expectation they license: if the `UNDERPOWERED` label appears at all, 1e6–1e7 is
+where to expect it first, at 1.7 half-widths of margin against 3.1–4.9 elsewhere.
+
+### f64 progress, with the estimator's inputs
+
+Job 17681665: p1 `ship` landed 12:38:49 in 1181 s over 8778 rows (418 keys × 7 widths × 3 arms).
+One pass of sixteen. A single landed pass is one observation of one build, so no completion
+figure is quoted from it — the four-build means the projector needs do not exist yet.
