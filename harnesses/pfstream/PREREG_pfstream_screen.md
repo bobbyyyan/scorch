@@ -996,7 +996,7 @@ decompressions on a host now running job 17681665. One bounded 7.3 MB copy of th
 taken off the live node and is stated here rather than treated as free; a 418-matrix read is not
 in the same class and waits.
 
-## Amendment 18 — four corrections to amendment 17, and a criterion registered before the data is touched
+## Amendment 18 — five corrections to amendment 17, and a criterion registered before the data is touched
 
 Written 2026-10-01 at 12:35. The band-profile comparison in the last section of this amendment
 is **registered and not yet computed**; the criterion and its positive control are fixed here
@@ -1182,3 +1182,104 @@ seen:
 shows there is no width-invariant object offset to remove, so even a magnitude comparison on
 this run would compare an arm-plus-artefact quantity against a floor measured on objects that
 differ from the arms in code. The f32 screen's k≥4 numbers stay unreadable.
+
+## Amendment 20 — three gaps in amendment 18's registration, one of which overstated amendment 19
+
+Raised by the peer session at 12:36, before they had seen amendment 19. Two of the three apply to
+what was actually run, and one of those weakens a claim amendment 19 made.
+
+### Gap 1 — the criterion did not say POOLED or PER WIDTH, and the implementation chose silently
+
+Amendment 18 says "the k≥4 point estimate", singular, throughout, and never states whether the
+four widths are pooled or tested separately. **The implementation tested per width** (a loop over
+k ∈ {4,8,16,32}), so every verdict in amendment 19 is a per-width verdict — but that was an
+implementation choice resolving a registration ambiguity, and it went unrecorded until now. A
+registration that leaves the analysis unit to the code has not fixed the analysis.
+
+**Registered: per width.** The reason is the peer's and it is directional, not about power.
+Correction 1 of amendment 18 established that `nopf` changes sign between k=2 (+1.760%) and k=8
+(−1.700%), so the four widths are not estimating a common quantity. A pooled k≥4 estimate
+averages opposite-signed displacements toward zero, and "shares the k=2 profile" is the
+containment outcome — **so pooling is biased toward "shares" by exactly the mechanism correction 1
+established.** Per-width testing carries no such bias and multiplies the comparisons by four,
+which is a cost in multiplicity rather than a bias.
+
+### Gap 2 — the positive control was a GLOBAL verdict where the criterion's weakest link is PER BAND
+
+Amendment 18 required an injected +2.0% to return "diverges", and "diverges" is satisfied by any
+single disjoint band. So detection in the n=181 band established nothing about the n=36 band —
+while "shares" requires **all four** bands to contain, so a band too wide to see a 2% effect
+contributes a free pass toward the floor reading. The asymmetry runs against the conclusion
+amendment 19 drew.
+
+**Measured per band rather than argued.** Of 48 band-cells (3 builds × 4 widths × 4 bands),
+**42 detect an injected +2.0% and 6 do not**:
+
+| band | n | failed to detect +2% |
+|---|---|---|
+| 0–1e4 | 129 | 2 of 12 |
+| 1e4–1e5 | 181 | 1 of 12 |
+| 1e5–1e6 | 67 | 0 of 12 |
+| 1e6–1e7 | 36 | 3 of 12 |
+
+**So amendment 19's "the test is NOT underpowered — it is measuring the wrong quantity" was
+overstated.** The honest form is that it is **both**: misdirected, and partly underpowered at
+2.0% in 6 of 48 band-cells. "12 of 12" was a global verdict and is withdrawn as a power claim.
+
+**Amendment 19's conclusion survives the correction, and here is why it is not special pleading.**
+The floor arm `shpb` detects the injected effect in **4 of 4 bands at every width**. Its
+divergences — bands 1 and 2 at k=8, band 1 at k=32 — therefore sit in bands with *confirmed*
+power at this magnitude, so "the no-effect case fails the criterion" is not an artefact of a wide
+interval. The invalidation stands; its stated justification is replaced.
+
+### Gap 2b — the peer's n-based scaling prediction is wrong in its ORDERING
+
+They predicted CI half-widths scaling as `1.253·σ/√n` relative to the tightest band: n=181 at
+1.00×, 129 at 1.18×, 67 at 1.64×, 36 at 2.24×. Measured half-widths at k=2 (`strm`):
+
+| band | n | half-width % | vs tightest |
+|---|---|---|---|
+| 0–1e4 | 129 | 0.2191 | 1.00× |
+| 1e4–1e5 | 181 | 0.2989 | 1.36× |
+| 1e5–1e6 | 67 | 0.2621 | 1.20× |
+| 1e6–1e7 | 36 | 0.4129 | 1.88× |
+
+**The largest band has the second-widest interval.** The prediction assumed σ constant across
+bands and it is not — the 1e4–1e5 band is the noisiest, which is the full-collection A/A inverted
+U this project has already measured. So band power is driven by σ, not by n, and the failure
+counts follow: n=129 fails twice while n=67 fails none. Their direction was right and their
+ordering was not, and the ordering is what a reader would use to decide which band to distrust.
+
+Detection also depends on the **build**, which neither of us anticipated: `shpb` detects 4/4
+everywhere while `nopf` manages only 3/4 at every width, because disjointness is measured against
+each build's *own* k=2 interval and `nopf`'s are both wider and shifted.
+
+### Gap 3 — the digest control's subscript was imported from another run
+
+Amendment 18 says "per-width digests must differ from each other". The index matrices in this
+design are **per band**, four of them. The control is right and its subscript came from a
+different run's phrasing. The implementation asserted the four **per-band** digests are distinct
+and they are (`927f8b94ef5d5d25`, `c629d7ba634f1818`, `03fa42a6f80d81dc`, `6319e2d983008d22`), so
+the executed check was correct while the registered sentence named the wrong objects. Corrected
+here: **the four per-band index digests must differ.**
+
+### What the f64 criterion inherits
+
+Amendment 19's f64 registration is amended by all three before any f64 data exists:
+
+* **per width**, never pooled, for gap 1's reason;
+* the positive control is **per band** and its result reported as a per-band table, with the
+  consequence that a band failing to detect an effect at the floor bound's magnitude **cannot
+  contribute a pass** to any beyond-floor verdict in that band;
+* the digest control names the **per-band** matrices;
+* and σ is to be reported per band beside n, since gap 2b shows n alone does not order the bands
+  by power.
+
+### Two of the peer's checks that found nothing, recorded so they are not re-run
+
+The band partition is complete: 129 + 181 + 67 + 36 = 413, plus the excluded n=5 band = 418,
+matching the corpus. And the trichotomy is well-formed — a point estimate inside the k=2 CI means
+the intervals share at least that point, so "disjoint" cannot also hold and no cell can satisfy
+both labels. The burden is also correctly directed: "shares" is a conjunction over four bands and
+is the outcome supporting the floor reading, so the harder test guards the dismissal of an arm
+effect.
