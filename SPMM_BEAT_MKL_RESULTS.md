@@ -41511,3 +41511,51 @@ about half the band is under 1e4. By nnz quintile the median kernel runs 4.43 / 
 swing inside one density band, from a fixed per-call cost amortised over very different nnz. Any
 per-nonzero figure for that band is reporting overhead, not a rate. This does not reopen the
 withdrawn per-call deficit; it is a statement about what the units mean at a few microseconds.
+
+### A harness property worth knowing before anyone compares a partial run: pass 1 is the FASTEST
+
+chain207's sealed stage log carries start/done lines for all twelve object-passes. Durations:
+
+    p1 aa 22m50s   p1 bb 23m19s   p2 bb 23m25s   p6 bb 23m29s   p4 aa 23m30s   p6 aa 23m31s
+    p5 aa 23m34s   p2 aa 23m38s   p3 bb 23m38s   p4 bb 23m40s   p5 bb 23m41s   p3 aa 23m43s
+
+n=12, min 22m50s, median 23m32s, max 23m43s, standard deviation **14.4 seconds**, total spread 3.8%.
+A twelve-pass run whose passes agree to 14 seconds is a useful fact in itself -- it means per-pass
+timing is not a source of variance worth modelling here.
+
+**The first object-pass is the fastest of the twelve**, rank 1, 42 seconds below the median and the
+only one under 23 minutes. So a reading taken from pass 1 is biased FAST, and anyone comparing a
+partial run against a completed one will overestimate the partial run's speed. I had read 29 min/pass
+on chain210 as "first-pass cost", i.e. the opposite sign, against evidence already sealed in a log
+whose tail I had read earlier the same night. Same shape as the chain207 object-digest claim: the
+refuting line was in a sealed file already read.
+
+**Position-matched, chain210's first pass is 22m28s against chain207's 22m50s, -1.61%**, and faster
+than all twelve of chain207's passes (-4.57% against the median). My earlier comparison used
+chain207's p6, which is a different position in the rotation.
+
+**Completion prediction, registered before the data exists.** My own ~04:09 applied pass 1's rate to
+all eleven remaining passes -- the extrapolation error one level up from the line-count version
+retracted above, same uniformity assumption with a bigger unit. Built from chain207's observed
+per-pass distribution instead, from p1/aa done at 00:01:16 with 11 passes left:
+
+    every remaining pass at chain207's min (22m50s)      04:12:26
+    at chain207's median (23m32s)                        04:20:13      <- the prediction
+    at chain207's max (23m43s)                           04:22:09
+    at chain210's own pass-1 rate (22m28s)               04:08:24      <- my retracted estimate
+
+Predicted completion is **[04:12, 04:22], centre 04:20**. If it lands near 04:08 then chain210 is
+uniformly about 5% faster than chain207 and the pass-1 effect does not exist there, which would
+itself be a finding rather than a nuisance. The run adjudicates it without anyone arguing.
+
+**AND THE DETECTION LEDGER FOR TONIGHT, WHICH IS THE PART I WANT KEPT.** Five method errors between
+two sessions: a count with no predicate, a correlate with no decomposition, an unpaired estimator, a
+rate extrapolated from a partial file, and a floor quoted at the wrong level. **Self-review found
+none of them.** Four surfaced because two sessions computed overlapping quantities and the numbers
+disagreed. The fifth surfaced because `date -d` on a host whose date had just rolled over returned a
+NEGATIVE elapsed time -- a guard firing on an impossible value, not a re-reading of the reasoning.
+So there are three detection mechanisms and the useful ranking is: make wrong answers **impossible**
+rather than merely wrong (a start/done log does on purpose what the negative elapsed did by
+accident), then cross-check against an independent computation, and do not rely on re-reading your
+own reasoning at all. 29 minutes against 23 is entirely plausible, which is exactly why it survived
+two of my reports and a peer's endorsement.
