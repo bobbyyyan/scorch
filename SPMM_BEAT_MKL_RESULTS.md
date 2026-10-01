@@ -41493,6 +41493,12 @@ the within-band nnz distribution enters numerator and denominator differently. *
 better estimand on construction rather than by preference, and it means the ratio column of the
 nanoseconds-per-nonzero table is not a speedup in the strict sense.**
 
+SCOPE OF THAT SENTENCE, because it is the kind that gets quoted one level too broadly. It is about
+the AGGREGATE ratio of per-nonzero medians -- estimand B, the ratio column of that one table, and
+the 6.1x-against-7.7x gain comparison built from it. It does not touch per-cell speedups, the width
+profile, the board, the residue counts, or any other figure in this document, because all of those
+are estimand A or are per-cell ratios, and both cancel nnz exactly per key before any reduction.
+
 **I have now been wrong twice about the explanation for the same gap** -- "smallest n", then
 "within-band spread" -- while the S-spread figures I quoted were themselves correct and reproduced
 (2.97/2.37/1.40/1.51/1.38/2.30). Both times I reached for the first plausible mechanical cause and
