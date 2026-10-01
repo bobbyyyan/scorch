@@ -184,13 +184,44 @@ the host. Three 10-second windows:
 | 2 | 4.65 | 37.6% | 62.4% | 0 of 8 | 16 of 16 |
 | 3 | 4.79 | 39.5% | 60.5% | 0 of 8 | 16 of 16 |
 
-The churn-immune instrument reproduces the fragile one (36.0% against 36.7%, 5.93 busy cores
-against 5.89), so the split was right; it was measured with the wrong instrument.
+**Two verdicts, and they must not be stated as one.** The sentence that first appeared here —
+"reproduces the fragile one (36.0% against 36.7%, 5.93 busy cores against 5.89)" — quoted window 1
+for both figures, which is the row nearest the instrument being validated. Separated:
 
-**Thread placement: one thread per physical core, across all 24 physical cores, with zero SMT
-sharing.** The per-CPU detail is unambiguous — even CPUs 0,2,…,14 carry 136–547 ticks while their
-odd siblings carry 1–22, and all 16 E-cores carry a uniform 155–195. So the team of 24 is 8 threads
-on 8 P-cores plus 16 on 16 E-cores.
+- **The core-type split reproduces.** E share 64.0 / 62.4 / 60.5%, mean **62.3%**, range 3.5 points,
+  against the voided instrument's 63.3%. That conclusion holds.
+- **The occupancy level does not.** Busy cores 5.93 / 4.65 / 4.79, mean **5.123**, range 1.28 =
+  27.5% of the minimum; occupancy 24.7 / 19.4 / 20.0%, mean **21.3%**; the all-idle-is-in-kernel
+  ceiling is 4.05x / 5.16x / 5.01x, mean **4.68x** — not the single 4.07x figure published first.
+  That spread is five to seven times the −18.4% this probe exists to measure.
+
+A fourth window, taken later while sampling frequencies, puts it at **11.9–13.7 busy cores** (the
+denominator is a range because the sweep overhead inside the window was not timed). So across four
+windows occupancy spans a factor of **2.5–2.9**, and sampling overhead cannot explain it: 320 `cat`
+forks at about 1 ms of CPU each is 32 ticks of 27445, 0.12%.
+
+**No 10-second window is a property of the run.** The run sweeps 3820 keys at five widths, so a
+window samples whichever matrix sizes happen to be in flight; three windows are three different
+workloads, not three draws from one occupancy. The windowed occupancy figure is therefore dropped as
+a headline. The whole-run computation — per-cell timings summed across the sealed CSVs against the
+per-object-pass wall times — is the only phase-free version of the quantity, which is an argument
+for the method already chosen rather than a new one. Peer session's correction, in both halves.
+
+**Thread placement: one thread per physical core, across all 24 physical cores, with no meaningful
+SMT sharing.** The per-CPU tick counts printed as illustration (even CPUs 0,2,…,14 at 136–547, odd
+siblings at 1–22, all 16 E-cores at a uniform 155–193) are **window 3 only**, which is recoverable
+from the numbers themselves: w3's 4790 total ticks at a 60.5% E share predicts 2898 E ticks and
+181.1 per core against 2897 and 181.1 observed, while w1 predicts 237.2 per core and is excluded.
+The peer session found the inconsistency from the published figures alone and could not resolve it
+without the raw counters; the resolution is that the detail is one window's and the illustrative
+range was then used as though it characterised all three.
+
+The *finding* is not window-limited: the both-siblings-busy count is computed inside each window's
+reduction and is 0 of 8 in all three. But it is a **threshold** (>50 ticks of 1000), not an
+observation of zero — siblings run at 0.1–2.2% busy in w3, which is 4.1% of P-logical ticks, so
+excluding them moves the P share from 39.5% to 37.8%. In a later 20-second window siblings reached
+1.5–7.7%. The conclusion is robust at any sane threshold; the column should not read as an exact
+zero. Peer session's correction.
 
 **That refutes my own objection to the work-share correction.** I had argued that a P-logical
 CPU-second is a second on half a shared core, which would put `r_P/r_E` near 0.78–0.84 and make the
@@ -198,20 +229,49 @@ direction unknowable from clocks. No SMT sharing is happening, so the objection 
 the peer session's direction stands: `r_P/r_E` is at least the 1.295x clock ratio and higher once
 vector-FMA width differs between the two microarchitectures.
 
-**Time share is not work share, and the probe supplies its own conversion.** With `T = W/r`, the
-measured `T_E/T_P = 1.72` gives `W_E/W_P = 1.72 · (r_E/r_P)`: at `r_P/r_E = 1.295` the E arm does
-57% of the work, at 2.0 it does 46%, at 2.5 it does 41%. So the slow core type's time share always
-overstates its work share, and the E arm's two-thirds of *time* may be under half the *work*.
-`r_P/r_E` does not need a separate experiment — **V0 pinned to cpu0 and to cpu16 measures it
-directly**, so the probe converts its own time split into a work split. Until it does, **both arms
-are reported unweighted** and the time split is stated as a time split.
+**Time share is not work share, and the probe supplies its own conversion.** With `T = W/r`:
+`W_E/W_P = (T_E/T_P)·(r_E/r_P)`. The figure first published here, `T_E/T_P = 1.72`, was **the voided
+instrument's number** (63.3/36.7 = 1.7248) carried across an instrument replacement. From the
+surviving instrument: 1.778 / 1.660 / 1.532, mean **1.656**. E work share at `r_P/r_E` = 1.295 /
+2.0 / 2.5 is then **56.1% / 45.3% / 39.9%**, against the 57 / 46 / 41% published from the voided
+number. Direction unchanged and magnitudes barely moved, so this is bookkeeping rather than a
+retraction — but a figure should come from the instrument that survived its own check.
+
+`r_P/r_E` does not need a separate experiment: **V0 pinned to cpu0 and to cpu16 measures it
+directly**. Until it does, **both arms are reported unweighted** and the time split is stated as a
+time split.
+
+**Two preconditions on that conversion, both of which make the converted share a bound.**
+
+1. *Occupancy mismatch.* A solo pin measures `r_P/r_E` at occupancy 1 while the time split it
+   converts was measured at occupancy 24. If the kernel is bandwidth- or latency-limited with all
+   cores live, per-core rates converge toward the shared limit, so the solo ratio is an **upper**
+   bound on the in-situ one. The direction is knowable because E's share falls monotonically in `r`
+   (56.1 → 45.3 → 39.9%), so too high an `r` understates E's work share. Either pin the pair at the
+   run's own occupancy — 8 threads on P against 16 on E, same total work — or label the converted
+   share a bound and name its direction. Peer session's point, and theirs to raise since they
+   proposed the conversion.
+2. *The clock input was the wrong clock, and measurement rescues it.* 1.295 is 5.7/4.4, the
+   **single-core boost** ratio, which is the least appropriate figure for an all-core run where both
+   types clock down. Measured in situ — ten frequency sweeps over all 32 CPUs across one window,
+   weighted by the per-CPU busy ticks of that same window, `intel_pstate` on `powersave`:
+   **P-logical 3.902 GHz, E 2.952 GHz, ratio 1.322.** Both types are far below their maxima (P
+   3.90 against 5.7, E 2.95 against 4.4) and the ratio lands within 2% of the boost ratio. So the
+   criticism was right and the number survives it — for a different reason than the one originally
+   given, which is worth saying rather than quietly keeping 1.295.
+
+Finally, "higher once vector-FMA width differs between the microarchitectures" presupposes the
+kernel is compute-bound, which is the hypothesis this probe exists to test. It stands as a
+prediction, not as an input to any weighting.
 
 ### The occupancy question outranks this one, and is settled first
 
-The same measurement puts the 24-thread team at **4.65–5.93 busy cores, 19–25% occupancy**. Three
-quarters of the wall time is not in the arithmetic at all, which is a larger quantity than anything
-this probe can win: if every idle slot were in-kernel imbalance, perfect balance would be a 4.07x
-lever against −18.4%.
+The same measurement puts the 24-thread team at **4.65–13.7 busy cores across four windows, 19–57% occupancy**, mean 21.3%
+over the three comparable ones. On the low windows three quarters of the wall time is not in the
+arithmetic at all, which is a larger quantity than anything this probe can win: if every idle slot
+were in-kernel imbalance, perfect balance would be a 4.05–5.16x lever against −18.4%. **But the
+quantity is phase-dependent by a factor of 2.5–2.9 across windows, so no windowed figure is a
+property of the run** and the ceiling is quoted only as a range.
 
 **It is not established that any of it is in-kernel.** The figure is occupancy of the *harness
 process*, and it sums at least three components that need different fixes and have different
@@ -259,6 +319,13 @@ Pre-data throughout: nothing in this document has been measured, and chain210 is
   verification with asserted counts and refusal on mismatch.
 - **Amendment 3**, same commit. Added the measured core-type weighting of production, 63.3% E-core
   and 36.7% P-logical by residency, replacing an unstated assumption that the pool is P-core work.
+- **Amendment 5**, digest `17c4d77e22268b83` superseded. The sentence certifying the new instrument
+  quoted window 1 twice; the split reproduces and the occupancy level does not, and a fourth window
+  widens occupancy to a factor of 2.5–2.9, so the windowed figure is dropped as a headline.
+  `T_E/T_P` recomputed from the surviving instrument (1.656, not 1.724). Two preconditions added to
+  the conversion, with the in-situ busy-weighted clock ratio measured at 1.322 against the 1.295
+  boost ratio. The per-CPU illustration identified as window 3, and "zero SMT sharing" restated as a
+  threshold. All five points from the peer session.
 - **Amendment 4**, digest `499f35c80f80124b` superseded. The per-thread instrument was replaced
   after it voided itself in 6 of 7 windows; `/proc/stat` per-CPU accounting reproduces the split and
   additionally shows one thread per physical core with **zero SMT sharing**, which refutes my own
