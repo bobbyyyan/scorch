@@ -742,3 +742,78 @@ Three consequences, and the first two are corrections rather than refinements:
 
 This amends amendment 4 and does not change the gate: four complete rounds, which is the only
 window where the spread is zero.
+
+## Amendment 14 — amendment 12's validation was a tautology, and its covariate is a proxy that always overstates
+
+**Two hours after registering amendment 12 and still with no arm read.** The derivation in it is
+exact and unchanged. Two things around it are not.
+
+### The retraction
+
+Amendment 12 wrote: *"the measured Spearman correlation against `1/d` over the cached SuiteSparse
+matrices is 1.0000 — as it must be, because the quantity *is* `2/d`."* That reads as a sanity check
+and **it is a tautology that measures nothing**: `2/d` is a monotone function of `1/d`, so their
+rank correlation can only be 1. I had computed the correlation of the **approximation** with
+`1/d`, not of the **statistic** with anything. This is the same family as a table that can only
+print 0 — a check whose output is fixed by construction.
+
+The real statistic, measured over all 3820 nonzero DLMC matrices (and 26 excluded for `nnz == 0`,
+which have **zero in this statistic's denominator** — a guard, not a discovery):
+
+```
+Spearman( TRUE reach = Σ min(L,2)/nnz , 1/d )  = 0.992354    the real check
+Spearman( 2/d                         , 1/d )  = 1.000000    1 by construction
+Pearson ( TRUE , 2/d )                         = 0.304235
+```
+
+### `2/d` is a proxy, it always overstates, and it leaves the unit interval
+
+`Σ min(L_i, 2) = 2·rows` only when **every** row has degree ≥ 2, so `Σ min(L,2)/nnz ≤ 2/d` always:
+
+| | |
+|---|---|
+| max TRUE/PROXY ratio | **1.000000** — the bound, so the proxy never understates |
+| p5 of TRUE/PROXY | 0.6884 — on 5% of matrices the proxy overstates by ≥ 45% |
+| differ by > 1% | 653 of 3820 |
+| rows of degree 0 or 1 present | 956 of 3820 |
+| `2/d > 1` | **55 of 3820**, max **17067%** |
+
+Most misleading case, ranked by `proxy/true` because that is the shape that manufactures a
+violation: `body_encoder_layer_2_ffn_conv1.smtx`, 2048 rows, 159 nonzeros — **true reach 3.77%,
+proxy 2576%, overstated 683×**. A covariate an effect is about to be regressed against must not be
+able to take the value 2576% when the thing it stands for is a fraction of prefetches.
+
+### What this does to the registered test
+
+Amendment 12 said *"the screen CSV already records `deg`, so the test needs no new measurement."*
+**That is false.** From `deg` alone only `2/d` is constructible, and the registered prediction is
+monotonicity in the newly-covered **fraction**, which needs `Σ min(L_i, 2)` — a property of the
+row-length distribution, not recoverable from the mean. So:
+
+1. **The true reach must be measured per matrix for the screen's own 418 keys before the
+   regression is read.** It needs only each matrix's `indptr`, so it is a cheap read — deferred
+   until the node is free rather than run beside a live timing job.
+2. **If `2/d` is used at all it is a DECLARED PROXY** with the error above stated beside it, not a
+   stand-in presented as the statistic.
+
+### The direction of the bias, registered now because it decides how to read the outcome
+
+The proxy **always overstates**. So a low-true-reach matrix can be assigned a high proxy reach, and
+its genuinely small effect then reads as a monotonicity **violation**. **The bias works against the
+hypothesis**: a confirmation under the proxy is stronger than it looks, and a rejection under the
+proxy may be the proxy rather than the mechanism. Amendment 12 exists precisely to separate "the
+mechanism story is wrong" from "the measurement is right but unexplained", and without this
+asymmetry on the record a proxy-driven rejection would be read as the former.
+
+### The screen's corpus cannot provide the strongest test, and the fused cell's can
+
+On DLMC the true reach is ≥ 5% on 1080 of 3820, ≥ 25% on 156, ≥ 50% on 55, ≥ 90% on 6, with a
+maximum of **exactly 100.0000%** — a matrix where every row has degree ≤ 2, so the row clamp issues
+**no useful prefetch at all** and PFSTREAM covers every one. Over the 16 cached SuiteSparse
+matrices, **none reaches 50%** (median 0.9%).
+
+So the high-reach end of the covariate, where the prediction is most sharply testable, lives in the
+corpus the **fused** cell will run on and is absent from the one the **screen** is running on. That
+is not a defect in the screen; it is a statement about which corpus can test the mechanism, and it
+means a flat screen result is weaker evidence against the mechanism than a flat DLMC result would
+be. The 418-key SuiteSparse sample's own reach distribution is unmeasured and is item 1 above.
