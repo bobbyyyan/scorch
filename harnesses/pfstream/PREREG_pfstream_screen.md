@@ -1816,16 +1816,43 @@ earlier, reappearing in prose — a fix to an estimator reaches one analyser, an
 nothing from it, so after correcting a statistic's form in code the amendments and commit bodies
 have to be swept for the same form by hand.
 
-**The sweep's scope was wrong before it was right.** I first swept the amendments only and
-reported one instance. Swept over the whole file, the five spellings (`% apart`,
-`% difference`, `differ by N`, `understat`, `overstat`) return 16 lines, of which 15 are
-directional claims about an estimator or a proxy — "the proxy always overstates", "the floor
-is understated" — where there is no second object and no base to name. One is a genuine
-two-object ratio: `:264`, "1.3% apart" on 1.2114 against 1.1963, now carrying the symmetric
-figure and both asymmetric readings. Its spread is 0.016 percentage points, so nothing it
-supports moves. The scoping error matters more than the hit: a hand sweep fails at the
-spelling list *and* at per-hit classification, and `% apart` was on my list and present at
-:264, so this was the classification half, not a missed spelling.
+**The sweep's scope was wrong before it was right, and then its predicate was wrong too.** I
+first swept the amendments only and reported one instance; swept over the whole file I reported
+16 lines. Neither number travels, because **a sweep count is meaningless without the pattern and
+the commit beside it** — this file grows by lines that contain these very words, so every edit
+moves the count, including the edit you are reading. At commit `efb3e33`, before this paragraph
+was rewritten, `grep -cE '% apart|% difference|differ by|understat|overstat'` returned 28 lines,
+and per alternative: `% apart` 4, `% difference` 1, `differ by` 6, `understat` 9, `overstat` 11.
+
+Three things that count cannot show, all of which matter more than it does.
+
+**One alternative on my list matched nothing at all.** `differ by [0-9]` returns **zero** on this
+file, because the house formatting puts markdown bold between the word and the number. My own
+corrected sentence above reads ``differ by **27.8%**`` and is invisible to the pattern written to
+catch exactly that form. The one genuine ratio, `:264`, was caught by `% apart`; `differ by N`
+contributed nothing and was carried in the list as if it were working. A spelling list is an
+enumeration premise, and an alternative that matches nothing is indistinguishable from an
+alternative that found nothing.
+
+**A line count is not a hit count.** The five alternatives produce 31 hits over 28 distinct lines,
+so some lines match more than once, and "16 lines, of which 15 are directional" reads as 16 hits.
+
+**The sweep's own description is inside the swept population.** This paragraph names the five
+spellings and therefore matches them; the sweep counts its own report. Harmless here, and the same
+shape as a self-exclusion written as a basename.
+
+The substantive result is unchanged: of the matching lines, all but one are directional claims
+about an estimator or a proxy — "the proxy always overstates", "the floor is understated" — where
+there is no second object and no base to name. The one genuine two-object ratio is `:264`,
+"1.3% apart" on 1.2114 against 1.1963, now carrying the symmetric figure and both asymmetric
+readings, with a spread of 0.016 percentage points, so nothing it supports moves. The transferable
+failure is per-hit classification rather than the spelling list: `% apart` was on my list and
+present at `:264`, so the hit was seen and misfiled. A hand sweep can fail at both ends.
+
+**Withdrawn:** that the earlier 16-vs-21 discrepancy was caused by "the two commits I landed
+between the two greps". That was a guess offered as a cause. The attributable causes are two
+different patterns, two different file versions, and one alternative that cannot match — and only
+the first and third are findings.
 
 **2. The 0.3347 / 0.2416 pair is the 60-101% band, not the ≥20% band.** Fixed in place above with
 the measured three-band partition. The direction matters: attributing it to ≥20% moves the
