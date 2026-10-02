@@ -45,7 +45,7 @@ for r in csv.DictReader(open(A.csv)):
     # Accept either column name. A CSV written before the rename carries `policy`, which is the
     # resolved count at override 0 -- the policy count CAPPED BY THE POOL, not the policy count.
     pol[(key, k)] = int(r.get("res_ovr0") or r["policy"])
-    sat[(key, k)] = int(r["saturating"]) if r.get("saturating") else None
+    sat[(key, k)] = int(r.get("res_ovr_max") or r.get("saturating") or 0) or None
     caprows[(key, k)] = int(r["cap_rows"])
     pool = int(r["pool"])
     if int(r["nthreads"]) == pool:

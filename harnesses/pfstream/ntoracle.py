@@ -60,6 +60,8 @@ TS = [int(x) for x in A.threads.split(",")] if A.threads else [0] + list(range(1
 # 18 cells -- 3.1% of cells -- and 56.8% of cells supply none at all. Override 0 is included in
 # the sweep because it is a real configuration: the standalone and panel paths pass no override.
 REPEAT = 2
+# The override used for the res_ovr_max column. Recorded per row rather than implied.
+PROBE_OVR = 1 << 20
 
 
 def read_smtx(path):
@@ -108,12 +110,24 @@ out = open(A.csv, "w", newline="")
 # strictly above it, gaps up to 17. Recording it is right -- the standalone and panel paths pass
 # no override, so it is a configuration to TIME -- but calling it `policy` and reasoning from it
 # as a lower bound is not, and a bound taken from it is one-signed too small.
-# `saturating` is the count at an override far above anything, recorded so the gap is visible in
-# the data rather than having to be rederived. Both carry `pool`, because a number derived from a
-# policy query is not a number until its pool is attached.
+# `res_ovr_max` IS NOT THE POLICY COUNT EITHER, and is named for the query rather than for a
+# mechanism. With a large override the chain computes cand = min(override, rows/16, procs) and
+# then nthreads = max(policy, cand), so the reading is max(policy, min(rows/16, procs)) -- it
+# includes the ADOPTION'S RAISE. On rows=512 nnz=6200 k=32 it reads 16 at override 16 and 18 at
+# override 32, and a value that tracks the requested count is no property of the policy. Calling
+# it "saturating" invited exactly the reading that it contrasts with the policy count, which is
+# why it is named after what produced it: the resolved count at override PROBE_OVR.
+# The probe argument is recorded per row, because the GAP against res_ovr0 is invariant in the
+# total (342 of 576 cells at pool 6 for every probe from 16 to 2^20) and NOT in its shape: at
+# probe 16 the mass sits at gap 10 with a maximum of 15, and at probe >= 32 it moves to gap 12
+# with a maximum of 17. A total being insensitive to a probe parameter says nothing about its
+# decomposition. Both carry `pool`, because a number derived from a policy query is not a number
+# until its pool, its probe argument AND the object's compiled policy are attached -- the last of
+# those cost two sessions an hour on a histogram that differed only because one of the objects
+# had SCORCH_SPMM_BASE_WORK_TRUE=1 compiled in.
 w = csv.DictWriter(out, fieldnames=["key", "k", "rows", "cols", "nnz", "deg", "nthreads",
-                                    "resolved", "res_ovr0", "saturating", "cap_rows", "pool",
-                                    "ms", "batch"])
+                                    "resolved", "res_ovr0", "res_ovr_max", "probe_ovr",
+                                    "cap_rows", "pool", "ms", "batch"])
 w.writeheader()
 nrow = 0
 CELLN = collections.Counter()
@@ -161,7 +175,7 @@ for key in keys:
             fn = at(nt)
             res = so.scorch_spmm_nthreads(nnz * max(k, 16), M, nt, nnz * k, nnz)
             pol = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 0, nnz * k, nnz)
-            sat = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 1 << 20, nnz * k, nnz)
+            sat = so.scorch_spmm_nthreads(nnz * max(k, 16), M, PROBE_OVR, nnz * k, nnz)
             best = float("inf")
             try:
                 for _ in range(A.reps):
@@ -175,8 +189,8 @@ for key in keys:
                 continue
             w.writerow(dict(key=key, k=k, rows=M, cols=J, nnz=nnz,
                             deg=round(nnz / max(M, 1), 2), nthreads=nt, resolved=res,
-                            res_ovr0=pol, saturating=sat, cap_rows=max(1, M // 16),
-                            pool=POOL,
+                            res_ovr0=pol, res_ovr_max=sat, probe_ovr=PROBE_OVR,
+                            cap_rows=max(1, M // 16), pool=POOL,
                             ms="%.6f" % (best * 1e3), batch=batch))
             nrow += 1
         out.flush()
