@@ -1470,3 +1470,94 @@ where to expect it first, at 1.7 half-widths of margin against 3.1–4.9 elsewhe
 Job 17681665: p1 `ship` landed 12:38:49 in 1181 s over 8778 rows (418 keys × 7 widths × 3 arms).
 One pass of sixteen. A single landed pass is one observation of one build, so no completion
 figure is quoted from it — the four-build means the projector needs do not exist yet.
+
+
+## Amendment 23 — the floor instrument CHANGED for the f64 population, and the registered one was the wrong functional
+
+Written 2026-10-01 at 18:4x, after the f64 screen completed and the 16-member family finished.
+
+### The change, stated as a change
+
+The registration says the **within-class agreement number of the 16-member padded family** is
+read before any arm timing and is what decides whether a contrast is reported as a matched
+headline or only as a bound. I honoured the ordering — the family ran to completion (64 CSVs, all
+rc=0, 14400 rows) and its number was computed before any arm CSV was opened — **but the number
+that ended up bounding the f64 arm contrast is not that one.** It is the `shpb` versus `ship`
+spread inside the f64 screen itself. That is a different instrument and it is recorded here as a
+substitution rather than absorbed, so the original ordering is not later read as having been
+honoured in substance when it was honoured only in sequence.
+
+Two independent reasons, either of which is sufficient:
+
+**1. Host.** The family was built and timed on redwood because MKT was occupied. The f64 screen
+ran on MKT. The two hosts compile different code under `-march=native` and differ by roughly 7x in
+achieved bandwidth, so placement-induced spread measured on one is not a bound for the other. A
+floor is named by what it holds fixed, and this one does not hold the host fixed.
+
+**2. Functional form, which is the deeper reason.** The same full-collection comparison on this
+branch gave pooled p95 of 0.0569, 0.0851, 0.1970 and 0.4023 for four different cell statistics —
+a **7.1x spread driven by the choice of statistic, not by the data**. The registered number is a
+coefficient of variation over **four** objects per cell. An arm contrast is a ratio between
+**two** objects. Those are different functionals, so the registered statistic could not have
+bounded the registered contrast even on the right host. `shpb` is a second object at the identical
+configuration, measured on the same cells, widths, host, run and pass structure, so it is the
+matched functional by construction rather than by argument.
+
+The family's own output has been corrected to report the matched form alongside the registered
+one — every unordered same-class pair's `|ratio − 1|`, 7200 pairs — so the registered number and
+the usable number are both on the page and distinguishable.
+
+### What the family's number actually is, now that it exists
+
+Redwood, 16 members, c4-corrected coefficient of variation per (key, width, class) at n = 4:
+
+| band | cells | median | p95 | max |
+|---|---|---|---|---|
+| 1e3–1e4 | 240 | 1.279% | 5.707% | 33.247% |
+| 1e4–1e5 | 240 | 2.026% | 12.962% | 70.734% |
+| 1e5–1e6 | 240 | 2.075% | 32.835% | 93.198% |
+| 1e6–1e7 | 240 | 3.991% | 50.659% | 74.596% |
+| ≥1e7 | 240 | 5.228% | 14.762% | 22.551% |
+
+The matched two-object form on the same data: median 0.980 / 1.877 / 2.057 / 3.481 / 4.979% and
+p95 8.741 / 13.716 / 37.844 / 52.263 / 19.106% over the same bands.
+
+**The within-class column is not positionally confounded** even though this run used the cyclic
+step-4 schedule, because that schedule's within-class position range is exactly 0. Its defect was
+purely between-class, which is the term reported as an upper bound rather than an estimate.
+
+**Band `<1e3` has zero cells**, and that is not a sampling choice: redwood's cache holds no matrix
+below 1e3 nonzeros (pools 477/587/431/250/41 = 1786 over five labels). The f64 arm corpus splits
+47/82/181/67/36/5, so **47 of 418 keys (11.24%)** have no family coverage. The direction is
+favourable — `<1e3` is the quiet end of the inverted U — so borrowing the 1e3–1e4 floor there is
+conservative, and the gap costs sensitivity on 47 cells rather than validity.
+
+### A registered fact about the f64 width grid that changes what the screen can conclude
+
+`scorch_simd<double>::lanes` is 4 and the register-block kernel is specialized NVEC 1..4, so
+**float64's register-block range is exactly k = 1..16**. Below it, `scorch_spmm_row_narrow_exact`
+owns double k = 1..3 (`exact_cap_ = exact_f32_ ? 7 : 3`), and the `narrowk_exact_mindeg` gate that
+could withdraw it ships at 0.
+
+Two consequences, both registered before the arm read was reported:
+
+- **k=2 is a negative control, not a data point.** `SCORCH_SPMM_REGBLOCK_PFD` provably cannot
+  change executed code at double k=2, so whatever that width reads is the object pair's layout
+  offset rather than an effect.
+- **The recorded harm at width 32 is unreachable in float64.** k=32 needs NVEC 8 for doubles, so
+  the 115-matrix regression recorded against removing the prefetch is a float32 phenomenon. The
+  f64 screen's grid therefore covers the macro's **entire** reachable float64 range, which the
+  registration did not previously state and which is the difference between "a width is missing"
+  and "there is no missing width".
+
+### Cross-host corpus provenance, registered before the confirmation run
+
+The 418-key list resolves 418 of 418 on both hosts, but 304 of redwood's resolutions are by
+**basename** rather than exact path, and a basename match can name a different matrix. Comparing
+(rows, nnz) per key across hosts: **417 of 418 agree; `Pothen/barth4/barth4` does not** — MKT has
+(6019, 40965), redwood has (6019, 23492), and (40965 + 6019) / 2 = 23492 exactly, so one host
+holds the full symmetric expansion and the other the lower triangle including the diagonal. Same
+name, different matrix, different work, different time. **It is excluded from the confirmation
+corpus (417 keys) and the reason is measured rather than assumed.** A result is invisible to
+dataset substitution, so this check is registered as a precondition of any two-host claim here,
+not as a diagnostic run afterwards.
