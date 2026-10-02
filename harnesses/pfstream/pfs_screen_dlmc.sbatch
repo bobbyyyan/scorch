@@ -32,23 +32,53 @@
 # cell has the most layers. 392 keys, 8 from each of the 49 populated strata.
 set -u
 
-# DIGEST PIN. sbatch copies this script at submit time, so an edit after submission does not
-# reach a queued job. Pinning the producer digests means a stale stage is caught at startup
-# rather than discovered in the output, and the comparison is against what is on disk NOW.
-echo "script $(basename "$0") spooled; producer digests at startup:"
-# The KEY LIST is pinned too, not only its generator. Pinning dlmc_corpus.py does not pin
+# DIGEST GATE. sbatch copies this script at submit time, so an edit after submission does not
+# reach a queued job. A stale stage must therefore be caught at startup rather than discovered
+# in the output.
+#
+# THIS BLOCK USED TO ONLY PRINT. It recorded each producer's digest and refused on ABSENCE
+# only, with no expected value anywhere in the file -- so a stale-but-present file passed and
+# had its digest written into the log, which is discovery in the output: exactly what the
+# comment above claimed it prevented. `pfs_screen_fused.sbatch` had the real gate the whole
+# time, a `declare -A WANT` of full digests compared with an explicit refusal, so this was an
+# inconsistency between two files rather than a missing idea. A printed digest binds nothing;
+# only a comparison does.
+#
+# The KEY LIST is gated too, not only its generator. Gating dlmc_corpus.py does not gate
 # dlmc_keys.txt: a stale list from an earlier parameterisation, or a hand-edited one, reads
 # identically with every generator digest unchanged. The generator is deterministic -- evenly
 # spaced indices over an nnz-sorted pool, no seed -- so the list is reproducible from it, which
-# is exactly why its digest is worth recording rather than inferring. One corpus-identity
-# failure on the other host already served one key another key's matrix.
+# is exactly why its digest must be compared rather than inferred. One corpus-identity failure
+# on the other host already served one key another key's matrix.
+#
+# THESE VALUES ARE THE CURRENT WORKTREE'S, NOT WHAT JOB 17693884 RAN. That job staged
+# arm_screen.sh at 266ca5fc and dlmc_corpus.py at 61f54f46, both since superseded. A future run
+# must restage /scr/bobbyy/pfs from the worktree or this gate will refuse -- which is the gate
+# working, not a fault. Update a value here only together with the file it names.
+declare -A WANT=(
+  ["mrgate.py"]="a55e07bf03e1fb34644072da299f4e34645f3d4c1363f45aaa3b4fd382163fc8"
+  ["csrresolve.py"]="1872f707045dc14e149fd53e845fee4b60e206b48132b144ee8217c227bfba78"
+  ["arm_screen.sh"]="78f73444e60c62c33316e2bb172289f874f81c430f0e1d4c8c13064b98dd9d1e"
+  ["dlmc_corpus.py"]="22afdbe4c3b5b3f3e7a96f1b10254389dbdad2c61ba855bf681b7587721406d5"
+  ["dlmc_keys.txt"]="24e386cee4371ce9fddf02d0bb11378596f4345ec8923ef099b89cd129bbde6b"
+)
+echo "script $(basename "$0") spooled; producer digest gate:"
 for f in mrgate.py csrresolve.py arm_screen.sh dlmc_corpus.py dlmc_keys.txt; do
-  if [ -f "/scr/bobbyy/pfs/$f" ]; then
-    printf "  %-18s %s\n" "$f" "$(shasum -a 256 "/scr/bobbyy/pfs/$f" | cut -c1-16)"
-  else
-    echo "REFUSE: /scr/bobbyy/pfs/$f absent at startup"; exit 1
+  [ -f "/scr/bobbyy/pfs/$f" ] || { echo "REFUSE: /scr/bobbyy/pfs/$f absent at startup"; exit 1; }
+  got=$(shasum -a 256 "/scr/bobbyy/pfs/$f" | cut -d" " -f1)
+  if [ "$got" != "${WANT[$f]}" ]; then
+    echo "REFUSE: $f sha256 $got, expected ${WANT[$f]}"
+    echo "        A digest mismatch here means /scr holds a different producer than this"
+    echo "        script was written against. Restage, or update WANT with the file."
+    exit 1
   fi
+  printf "  %-18s %s  OK\n" "$f" "${got:0:16}"
 done
+# Print the count that shows the loop was not empty. An unset or misspelled WANT key would make
+# every iteration compare against "" and refuse, so a silent pass is not reachable -- but a
+# shortened FILE LIST would skip a producer without any refusal, and the count catches that.
+echo "  gated ${#WANT[@]} producers against stored digests"
+[ "${#WANT[@]}" -eq 5 ] || { echo "REFUSE: WANT holds ${#WANT[@]} entries, expected 5"; exit 1; }
 
 export F64_HARNESS=/scr/bobbyy/pfs
 export F64_ACTIVATE=/scr/bobbyy/venv/bin/activate

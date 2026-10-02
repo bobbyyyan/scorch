@@ -2309,8 +2309,9 @@ denominator change is not pure removal, and any arithmetic treating it as such i
 
 **The gate change is not tail-neutral, and it cannot be.** The denominator falls 11.7% while the
 count of cells more than 5% slower falls **41.0%**, 39 to 23, against 34.4 expected if removal
-were independent of the tail. The removed set is **3.1x** enriched in the tail (that figure is
-3.5x if the 45 above is used, which is how the two propagate). The cause is arithmetic rather
+were independent of the tail. The removed set is **3.28x** enriched in the tail — see the
+correction below; 3.1x and 3.5x were both wrong, each by a different mis-paired numerator and
+denominator. The cause is arithmetic rather
 than a hypothesis about timing: the gate statistic is `|ship/shpb − 1|` and the contrast is
 `nopf/ship`, and **both contain `ship`**. A cell where `ship` reads low inflates the gate
 statistic and the contrast together, so the gate discards it. **No timing-based A/A gate can be
@@ -2388,3 +2389,54 @@ mean degree is a known confounder that moves the same way — amendment 26 exist
 a predictor that only reproduces the degree split has added nothing. Stated here so that when the
 registered contrast runs, it is clear the expectation existed beforehand and was not fitted to
 the answer.
+
+### Amendment 27, correction 9 — the enrichment figure, and a digest "pin" that only printed
+
+**The tail enrichment is 3.28x. Both earlier figures were wrong, in different places.** 3.09x
+paired the *net* tail change with the *removed* count; 3.50x paired net with net. Decomposing the
+>5% tail across the two gate sets at k=32: of the 51 removed cells **17** are in the tail, of the
+6 added cells **1** is, and 39 − 17 + 1 = 23 closes against the inter-object gate's own count.
+
+| pairing | computation | value |
+|---|---|---|
+| removed / removed | (17/51) ÷ (39/384) | **3.28x — correct** |
+| net / removed | (16/51) ÷ (39/384) | 3.09x |
+| net / net | (16/45) ÷ (39/384) | 3.50x |
+
+The correct value sits between the two published ones. The added cells' tail rate is 1 of 6,
+which at n=6 says nothing. The structural claim is untouched: the gate statistic and the contrast
+share `ship`, so no timing-based A/A gate can be independent of a contrast it shares an object
+with.
+
+**`pfs_screen_dlmc.sbatch`'s digest block only printed. It is now a gate.** The block looped over
+five producers, recorded each digest, and refused on **absence only** — there was no expected
+value anywhere in the file. A stale-but-present file passed and had its digest written into the
+log, which is discovery in the output: precisely what that block's own comment claimed it
+prevented ("a stale stage is caught at startup rather than discovered in the output"). The
+comment reasoned correctly and at length about why the key list needs pinning separately from its
+generator, and the code beneath did not act on it. `pfs_screen_fused.sbatch:64-77` has had the
+real construction the whole time — a `declare -A WANT` of full digests with an explicit
+comparison and refusal — so this was an inconsistency between two files, not a missing idea.
+**A printed digest binds nothing; only a comparison does.**
+
+Replaced with a `WANT` array of all five full digests plus a refusal that prints both values.
+Tested on the target host rather than assumed, and both paths fired on real input: under bash
+5.2 on mkt1 against the live `/scr/bobbyy/pfs`, it passed `mrgate.py` at `a55e07bf03e1fb34` and
+`csrresolve.py` at `1872f707045dc14e` — matching the running job's own startup log — and refused
+`arm_screen.sh` at `266ca5fc42bf190d` against the expected `78f73444e60c62c3`, exit 1. Those two
+producers differ because the worktree has advanced since job 17693884 staged them, which the
+comment now says, so a future refusal reads as the gate working rather than as a fault.
+
+**Two shell facts that made this worth testing rather than reading.** `bash -n` reported "syntax
+ok" on the new block without evaluating it, so it was vacuous for exactly the construct in
+question. And `declare -A` needs bash 4+, while macOS ships 3.2 — under which the array is
+simply empty and every comparison would be against `""`. The count assertion added beside the
+loop (`[ "${#WANT[@]}" -eq 5 ]`) caught that locally: it printed `REFUSE: WANT holds 0 entries,
+expected 5` rather than passing. A fail-closed gate on a shell that cannot express it.
+
+**Correction to amendment 28's wording.** It said the fetched key list digest matched "the digest
+`pfs_screen_dlmc.sbatch` pinned at startup". Given the above, that was a comparison against a
+value the sbatch *printed into the job log* — a line only I can read — and not against anything
+stored. Grepping the worktree for `24e386cee4371ce9` before this commit returned exactly one hit:
+amendment 28's own sentence. The binding was real but it was mine and unverifiable by the
+reviewing session. It is now stored, in the `WANT` array, where a comparison can reach it.
