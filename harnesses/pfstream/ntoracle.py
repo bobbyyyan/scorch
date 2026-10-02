@@ -101,8 +101,19 @@ out = open(A.csv, "w", newline="")
 # all, and a harness that recomputes a production policy is wrong silently and flatteringly --
 # an earlier draft of the analyser reimplemented it and disagreed with the object on 16% of cells,
 # always in the same direction.
+# `res_ovr0` IS NOT THE POLICY COUNT and is named for what it is. With override <= 0 the final
+# cap is `nt_cap = omp_get_max_threads()` (scorch_policy.h:2203), so the reading is the policy
+# count CAPPED BY THE PROCESS POOL, with the >= 2*pool decline punching through for large values.
+# Measured at pool 6 over the tracked corpus, 342 of 576 cells (59.4%) have a saturating count
+# strictly above it, gaps up to 17. Recording it is right -- the standalone and panel paths pass
+# no override, so it is a configuration to TIME -- but calling it `policy` and reasoning from it
+# as a lower bound is not, and a bound taken from it is one-signed too small.
+# `saturating` is the count at an override far above anything, recorded so the gap is visible in
+# the data rather than having to be rederived. Both carry `pool`, because a number derived from a
+# policy query is not a number until its pool is attached.
 w = csv.DictWriter(out, fieldnames=["key", "k", "rows", "cols", "nnz", "deg", "nthreads",
-                                    "resolved", "policy", "cap_rows", "pool", "ms", "batch"])
+                                    "resolved", "res_ovr0", "saturating", "cap_rows", "pool",
+                                    "ms", "batch"])
 w.writeheader()
 nrow = 0
 CELLN = collections.Counter()
@@ -150,6 +161,7 @@ for key in keys:
             fn = at(nt)
             res = so.scorch_spmm_nthreads(nnz * max(k, 16), M, nt, nnz * k, nnz)
             pol = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 0, nnz * k, nnz)
+            sat = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 1 << 20, nnz * k, nnz)
             best = float("inf")
             try:
                 for _ in range(A.reps):
@@ -163,7 +175,8 @@ for key in keys:
                 continue
             w.writerow(dict(key=key, k=k, rows=M, cols=J, nnz=nnz,
                             deg=round(nnz / max(M, 1), 2), nthreads=nt, resolved=res,
-                            policy=pol, cap_rows=max(1, M // 16), pool=POOL,
+                            res_ovr0=pol, saturating=sat, cap_rows=max(1, M // 16),
+                            pool=POOL,
                             ms="%.6f" % (best * 1e3), batch=batch))
             nrow += 1
         out.flush()

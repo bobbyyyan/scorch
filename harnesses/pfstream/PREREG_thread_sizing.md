@@ -217,3 +217,35 @@ threshold now, after the instrument exists and with the data about to land, the 
 printed at all three thresholds and the threshold-sensitivity is part of the result.** If the
 three disagree, that is reported as the finding; picking one retroactively would be choosing the
 answer. Prediction 3's own 80% stands, because it was registered with the prediction.
+
+## Amendment 4: every policy-derived figure in this project needs its pool attached
+
+A number produced by querying `scorch_spmm_nthreads` is not a number until the calling process's
+pool is recorded with it. Two sessions read the same function on the same corpus and got
+incompatible distributions -- one spanning worker counts 7 to 18, the other stopping at 6 -- and
+both were right: `torch.set_num_threads` differed. On the cell (rows 128, nnz 44236, k 24) the
+same call returns 2, 4, 6, 7, 7, 7, 7 at pools 2, 4, 6, 8, 12, 16, 32. Neither reading was an
+arithmetic error and no amount of re-deriving either one would have found it.
+
+**So, retroactively, with the pool named:** the reach figures (36.4% of 3820 DLMC matrices at
+k<=16, 31.4% at k=32), the reachable-configuration histogram ({1: 231, 4: 18, 6: 327} over
+576 cells), the single-configuration share (231 of 576 = 40.1%, of which 141 pin at 1 and 90 at
+18), and the accidental same-count pair supply (54 pairs on 18 cells) were **all measured at
+pool 6 on the M5**. They are not comparable to a reading on a host with a different pool, nor to
+a rerun on the same host under a different `-c`. The per-host drivers already record the pool;
+the prose did not, and that is the gap.
+
+**AND `override = 0` IS NOT THE POLICY COUNT.** With a non-positive override the final cap is
+`nt_cap = omp_get_max_threads()` (`scorch_policy.h:2203`), so the reading is the policy count
+capped by the process pool, with the `>= 2*pool` recruit decline punching through for large
+values. At pool 6 over the tracked corpus, 342 of 576 cells (59.4%) have a saturating count --
+the value at an override far above anything -- strictly above the override-0 reading, with gaps
+up to 17 (rows 512, nnz 6200, k 32: the override-0 reading is 1 and the saturating count is 18).
+Recording the override-0 reading is correct, because the standalone and panel paths pass no
+override and it is therefore a configuration worth timing. Calling it `policy` and using it as a
+lower bound was not: the bound came out one-signed too small.
+
+That landed on the very null added to make prediction 1 honest, and it biased it toward reporting
+that a pass was informative. The null no longer uses any policy bound. It is now the count of
+cells where **no tested G** lands within one worker of the measured argmin, computed directly
+over the ladder -- exact for the family actually tested, and free of the pool entirely.

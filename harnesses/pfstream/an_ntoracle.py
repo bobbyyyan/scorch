@@ -36,12 +36,16 @@ A = ap.parse_args()
 
 ms = collections.defaultdict(lambda: collections.defaultdict(list))   # (key,k) -> {resolved:[ms]}
 meta, pol, caprows, pool = {}, {}, {}, None
+sat = {}
 shipped_res = {}
 for r in csv.DictReader(open(A.csv)):
     key, k = r["key"], int(r["k"])
     ms[(key, k)][int(r["resolved"])].append(float(r["ms"]))
     meta[key] = (int(r["rows"]), int(r["nnz"]))
-    pol[(key, k)] = int(r["policy"])
+    # Accept either column name. A CSV written before the rename carries `policy`, which is the
+    # resolved count at override 0 -- the policy count CAPPED BY THE POOL, not the policy count.
+    pol[(key, k)] = int(r.get("res_ovr0") or r["policy"])
+    sat[(key, k)] = int(r["saturating"]) if r.get("saturating") else None
     caprows[(key, k)] = int(r["cap_rows"])
     pool = int(r["pool"])
     if int(r["nthreads"]) == pool:
@@ -244,15 +248,23 @@ print("THE SHARE THRESHOLD IS NOT REGISTERED, so the verdict is printed at three
 print("than at one of my choosing. The registration names a per-width quantity -- within +/-1 of")
 print("the measured optimum -- and gives no aggregation rule; an earlier draft borrowed the 80%")
 print("that belongs to prediction 3, which is a decision rule supplied by the instrument.")
-print("ITS NULL IS PRINTED BESIDE IT: the chain only RAISES, so a grain rule's output is bounded")
-print("below by the policy count. On a cell with policy - argmin >= 2 no G can come within 1, so")
-print("prediction 1 would pass there for a reason that has nothing to do with the functional form.")
-print("%4s %6s %12s %12s   %s" % ("k", "n", "pol-argmin>=2", "argmin>cap", "share within 1 by G"))
+print("ITS NULL IS PRINTED BESIDE IT, as the count of cells where NO tested G lands within 1 of")
+print("the measured argmin. Prediction 1 passes on those for a reason that has nothing to do with")
+print("linear-versus-sqrt -- the family simply cannot reach the optimum there -- so a width whose")
+print("no-G-can count is a large share of n cannot inform the comparison either way.")
+print("%4s %6s %12s %12s   %s" % ("k", "n", "no-G-can", "argmin>cap", "share within 1 by G"))
 for k in ks:
     cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
     if not cells:
         continue
-    nullc = sum(1 for c in cells if pol[c] - best(c)[0] >= 2)
+    # THE NULL IS COMPUTED DIRECTLY OVER THE LADDER, not from a policy lower bound. The earlier
+    # form subtracted the override-0 reading, which is pool-capped and smaller than the count
+    # that actually bounds the rule from below on 59.4% of cells -- so the subtraction was
+    # smaller and the null UNDER-counted, one-signed toward reporting that prediction 1's pass
+    # is informative. Asking the ladder whether ANY tested G lands within 1 needs no bound at
+    # all and is exact for the family actually tested.
+    nullc = sum(1 for c in cells
+                if min(abs(r_adopt(c, G) - best(c)[0]) for G in cands) > 1)
     overc = sum(1 for c in cells if best(c)[0] > cap(c))
     shares = []
     for G in cands:
