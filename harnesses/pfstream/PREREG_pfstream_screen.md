@@ -1619,3 +1619,76 @@ invariant that can see absent files; a Cartesian-product comparison; and a measu
 quantity the claim was actually about. **The generalisable rule: when a description would explain
 a set, state the check that could refute it in the same breath, and prefer a check whose inputs
 are not the numbers that suggested the description.**
+
+
+## Amendment 25 — amendment 24 cited the weaker of two available supports, and barth4 is now confirmed by sealed evidence
+
+Written 2026-10-02 at 10:5x. Both corrections come from a sealed ledger artefact that was readable
+all along and that both sessions had been treating as out of reach.
+
+### The artefact, and its seal
+
+`~/.cache/scorch-codex/spmm-beat-mkl/chain209-dlmc-dims/`, verified here:
+`shasum -a 256 -c SHA256SUMS` reports OK for all 8 files, and the manifest's digest field is 64
+characters wide, so it is a real SHA-256 and not one of the CRC-32 manifests in this ledger that
+`shasum -c` passes vacuously. The two files used below:
+
+| file | sha256 (first 16) | content |
+|---|---|---|
+| `ss_dims.csv` | `195e940572acfd80` | key,rows,cols,nnz for 4584 SuiteSparse keys, from redwood's npz cache |
+| `dlmc_dims.csv` | `ff167f71d50abf74` | the same for 3846 DLMC keys |
+
+Its `PROVENANCE.md:29` warns against using `ss_dims.csv` **for density** — 67 of the 150
+SuiteSparse matrices at ≥20% have a defect it describes. Nothing below uses density; the uses are
+a nonzero count and a key-layout census, so the caveat does not reach them. Anyone citing these
+files for a density claim needs that line first.
+
+**A naming hazard beside it, recorded because the filename is what travels.** A second file named
+`dlmc_dims.csv` exists at `~/.cache/scorch-codex/verifier-dlmc-dims/`, digest `3f0887e553b61e71`.
+It is not a copy and not a contradiction: it holds column counts read from the local `.smtx`
+files for chain210's keys, 3822 lines including comments, sharing 3820 keys with the sealed file
+and omitting the 26 zero-nonzero ones. Two different measurements under one filename in one
+ledger is the configuration in which a citation by name is ambiguous, so both of these must be
+cited by digest.
+
+### Correction to amendment 24
+
+Amendment 24 supports "these 26 layers prune to nothing" with the achieved-sparsity distribution:
+median per-layer nonzero ratio 0.2075 against the uniform-rate 0.4000, max 1.4069, and 16 of 71
+survivors under 5% of their 0.95 nonzeros. **That argument establishes that zero is REACHABLE by
+this pruner. It does not establish that these 26 reached it.**
+
+`dlmc_dims.csv` establishes exactly that, by name: 26 of its 3846 rows have `nnz == 0`, every one
+under `dlmc/transformer/variational_dropout/0.98`, and `3846 − 26 = 3820` is the DLMC count cached
+on both hosts. So the absent-from-cache set IS the zero-nonzero set, by enumeration and by
+subtraction — not by two counts of 26 agreeing across runs, which is the form that would have
+deserved the suspicion the earlier reconciliation got. The structure also reproduces from the
+sealed file independently of my walk over the cache: 2 sides, indices {0,1,3,4,5}, 8 suffixes,
+product 80 against 26, split `{decoder: 4, encoder: 22}`.
+
+**Amendment 24's sparsity measurement keeps its own value and stays.** It refutes the uniform-rate
+model outright, which is what the objection to it actually required, and the maximum ratio of
+1.4069 — a layer carrying MORE nonzeros at a nominal 0.98 than at 0.95 — is a fact about
+variational dropout that nothing else on the page carries.
+
+### barth4, confirmed rather than argued
+
+`grep -i barth4` over `ss_dims.csv` returns exactly one line: `ss/barth4/barth4,6019,6019,23492`.
+One barth4 in redwood's cache, stored **flat** with no group level, holding 23492 nonzeros —
+Nasa's value. Both requested keys therefore resolve to a single file that is Nasa's matrix. The
+symmetric-expansion account is dead on direct evidence, not on argument, and the exclusion of
+`Pothen/barth4` from the 417-key confirmation corpus is confirmed correct for the stated reason.
+
+**The exposure is bounded by the flat subset, which sharpens the predicate.** Only 1772 of 4584
+cache entries have the flat `ss/<X>/<X>` form — 38.66%. The rest are group-qualified
+(`ss/AG-Monien/3elt/3elt`) or multi-matrix (`ss/ABACUS_shell_ud/ABACUS_shell_ud_K`), and a
+group-qualified entry resolves exactly and cannot collide. So duplicate basenames among requested
+keys remains the right predicate, and its exposure is confined to keys whose cache entry is
+stored flat. Reporting which member of a colliding pair is stored flat says whether the collision
+is reachable at all.
+
+**One sharpening tested and withdrawn, by the measurement rather than by argument.** The
+within-cache ambiguity count of 0 of 4584 looked vacuous by construction — a cache keyed
+`ss/<X>/<X>` cannot hold two directories of one name. The mixed layout refutes that: the count was
+capable of returning nonzero, so it was a measured zero over the wrong population rather than a
+vacuous one.
