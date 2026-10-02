@@ -111,18 +111,28 @@ def main(argv):
         print()
         print("%s  (n=%d)" % (label, len(pop)))
         fl = rel("shpb", "ship", pop)
-        print("  %-18s %6s %9s %9s %9s %9s" % ("contrast", "n", "median", "p05", "p95", "better")
-              )
-        print("  %-18s %6d %8.3f%% %8.3f%% %8.3f%% %8s   <- FLOOR, same config, 2 objects"
-              % ("shpb vs ship", len(fl), 100 * pct(fl, 0.5), 100 * pct(fl, 0.05),
-                 100 * pct(fl, 0.95), "%d/%d" % (sum(1 for x in fl if x < 0), len(fl))))
+        # A MEAN BESIDE THE MEDIAN, because a median over cells has a 50% breakdown point and
+        # an arm that treats a minority of cells is invisible to it however large the effect
+        # where it fires. That is not hypothetical here: on a different lever in this directory
+        # the pooled median read 0.02-1.01% and the mean read 10-19% on the same readings,
+        # because the treated share was 26%. The two together say which case this is -- they
+        # agree when the treatment is broad and diverge when it is not.
+        print("  %-18s %6s %9s %9s %9s %9s %9s" % ("contrast", "n", "median", "MEAN", "p05",
+                                                    "p95", "better"))
+        amean = lambda v: (sum(v) / len(v)) if v else float("nan")
+        print("  %-18s %6d %8.3f%% %8.3f%% %8.3f%% %8.3f%% %8s   <- FLOOR, same config, 2 objects"
+              % ("shpb vs ship", len(fl), 100 * pct(fl, 0.5), 100 * amean(fl),
+                 100 * pct(fl, 0.05), 100 * pct(fl, 0.95),
+                 "%d/%d" % (sum(1 for x in fl if x < 0), len(fl))))
         for a in arms:
             v = rel(a, "ship", pop)
             if not v:
                 continue
-            print("  %-18s %6d %8.3f%% %8.3f%% %8.3f%% %8s"
-                  % ("%s vs ship" % a, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.05),
-                     100 * pct(v, 0.95), "%d/%d" % (sum(1 for x in v if x < 0), len(v))))
+            md, mn = 100 * pct(v, 0.5), 100 * amean(v)
+            print("  %-18s %6d %8.3f%% %8.3f%% %8.3f%% %8.3f%% %8s%s"
+                  % ("%s vs ship" % a, len(v), md, mn, 100 * pct(v, 0.05),
+                     100 * pct(v, 0.95), "%d/%d" % (sum(1 for x in v if x < 0), len(v)),
+                     "   <- median and mean DISAGREE in sign" if md * mn < 0 else ""))
         print("  (negative = faster than ship. 'better' counts cells where the arm is faster;")
         print("   the floor row's own count is the null -- a coin-flip there is ~half.)")
 
