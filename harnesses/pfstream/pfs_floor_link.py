@@ -83,6 +83,7 @@ def main():
     print()
 
     fail = []
+    addrs = []
     print("%-7s %-6s %-20s %-6s %-8s %-6s %s" % ("pad", "link", "hot lambda", "mod64",
                                                  "NEEDED", "@plt", "loads"))
     for n in pads:
@@ -135,6 +136,8 @@ def main():
         print("%-7d %-6s 0x%-18s %-6s %-8d %-6d %s"
               % (n, "rc=0", addr or "none", (int(addr, 16) % 64) if addr else "?",
                  need, nplt, "yes" if loads else "NO"))
+        if addr:
+            addrs.append((n, int(addr, 16)))
 
     print()
     if fail:
@@ -144,6 +147,34 @@ def main():
         for f in fail[:6]:
             print("    %s" % f)
         return 1
+    # THE ASSUMPTION THE WHOLE FAMILY RESTS ON, ASSERTED RATHER THAN ASSUMED: a pad of N bytes
+    # must shift the hot symbol by exactly N. If it does not, the members' alignment classes are
+    # not the ones their pads name and every within-class and between-class grouping built from
+    # them is mislabelled -- a `.space` that landed in .data once left every kernel address
+    # byte-identical across five pad sizes while rc stayed 0 and the file grew, which is the
+    # failure this catches. Checked against the SMALLEST pad as the reference, so the reference
+    # is a member of the family rather than the unpadded arm (the arm differs by the pad object's
+    # own presence, which is why its class need not equal the pad-0 member's).
+    if len(addrs) < 2:
+        print("REFUSE: %d member address(es) resolved; the pad-to-shift identity needs at least 2"
+              % len(addrs))
+        return 1
+    addrs.sort()
+    p0, a0 = addrs[0]
+    bad = [(n, a, (a - a0), (n - p0)) for n, a in addrs if (a - a0) != (n - p0)]
+    print("PAD-TO-SHIFT IDENTITY, against the smallest pad (%d at 0x%x):" % (p0, a0))
+    print("  %d of %d members shift by exactly their nominal pad difference"
+          % (len(addrs) - len(bad), len(addrs)))
+    if bad:
+        print("REFUSE: the pad is not controlling placement, so the class labels are wrong:")
+        for n, a, got, want in bad[:6]:
+            print("    pad %-5d addr 0x%-12x shifted %-6d expected %d" % (n, a, got, want))
+        return 1
+    cls = {}
+    for n, a in addrs:
+        cls.setdefault(a % 64, []).append(n)
+    print("  classes mod 64 and their member pads: %s"
+          % {k: cls[k] for k in sorted(cls)})
     print("all %d members link through the ARM'S OWN link line, carry torch, and load." % len(pads))
     return 0
 

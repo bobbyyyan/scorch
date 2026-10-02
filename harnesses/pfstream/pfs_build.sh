@@ -44,11 +44,19 @@ ACTIVATE=${PFS_ACTIVATE:-/scr/bobbyy/venv/bin/activate}
 # followed by a silent exit 1. This note exists because a reader who checks only "does the cp
 # exit on failure?" gets yes, concludes this is ceremony, and removes the pre-rm-rf failure point.
 [ -f "$ACTIVATE" ] || { echo "REFUSE: PFS_ACTIVATE=$ACTIVATE is not a file"; exit 1; }
-# A bare `exit 1` here was the one asymmetry in this block: `[ -f ]` passing and the activation
-# then FAILING is exactly what a conda shim hits in a non-interactive shell, and that case
-# printed nothing while its three neighbours printed REFUSE with the value.
-source "$ACTIVATE" || { echo "REFUSE: sourcing PFS_ACTIVATE=$ACTIVATE failed -- the file exists"
-                        echo "        but the environment it should activate did not come up"; exit 1; }
+# PROBED IN A SUBSHELL FIRST, then sourced for real. A status check alone covers only one of the
+# two ways a shim fails: `source` runs in the CURRENT shell, so a shim spelled
+# `conda activate scorch || exit 1` terminates this script at that line and the `||` branch never
+# executes -- no REFUSE, no output at all, just rc=1. Measured over four shim spellings: `return 1`
+# and `false` reach the branch; `exit 1` produces NO OUTPUT; success proceeds. The `exit` spelling
+# is arguably the likelier one to write, so the uncovered case was the common one.
+# A subshell CONTAINS the exit, so its status reaches the `||` for both spellings. Sourcing twice
+# is harmless for both conda and venv activation, and the probe is what makes the failure speak.
+( source "$ACTIVATE" >/dev/null 2>&1 ) || {
+    echo "REFUSE: PFS_ACTIVATE=$ACTIVATE exists but does not bring up an environment"
+    echo "        (probed in a subshell, which catches both a nonzero return and an exit)"
+    exit 1; }
+source "$ACTIVATE" || { echo "REFUSE: PFS_ACTIVATE=$ACTIVATE failed on the real source"; exit 1; }
 for f in src pyproject.toml scorch_build.py; do
   [ -e "$STAGE/$f" ] || { echo "REFUSE: PFS_STAGE=$STAGE has no $f -- wrong stage tree"; exit 1; }
 done
