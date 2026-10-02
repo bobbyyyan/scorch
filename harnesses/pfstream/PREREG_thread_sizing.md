@@ -360,3 +360,51 @@ the outcome and then characterising its top rows. A property found that way is c
 outcome and cannot be evidence about it. The fix that worked both times was the same: state the
 property, then recompute it on the whole population WITH the opposite class as a contrast, before
 writing anything down.
+
+---
+
+## Amendment 7 (2026-10-02): amendment 6 reached the right conclusion from the wrong configuration
+
+**Amendment 6's table asked the policy at `override = 0`. No measurement on this project uses
+that.** `mrgate.py:123` is `SYM(nthreads_override=POOL, atparallel=False, **native)`, so every
+reading in both screens was taken with a positive override, which engages the composition
+adoption at `scorch_policy.h:2139` -- `nthreads_override > 0 && gate_work >= grain`, with
+`gate_work = nnz*max(k,16)` and `grain = 150000`. The conclusion survives; the table that
+supported it named a configuration that never ran.
+
+Recomputed at `override = POOL`, same 392 keys, same classification:
+
+| class  |   n | resolved count, override=POOL  | median | at 1 worker | adoption gate fires |
+|--------|-----|--------------------------------|--------|-------------|---------------------|
+| behind | 328 | {1:30, 4:1, 8:20, 16:23, 18:254} |   18.0 |  30 (9.1%)  |      298 (90.9%)    |
+| ahead  |  53 | {1:49, 18:4}                   |    1.0 |  49 (92.5%) |        4 (7.5%)     |
+| mixed  |  11 | {1:9, 18:2}                    |    1.0 |   9 (81.8%) |        2 (18.2%)    |
+
+**The kill condition is met, and more sharply than at override 0.** 92.5% of the cells we BEAT
+MKL on run on a single worker, against 9.1% of the cells we lose on. The gate keys on `nnz`
+alone at a fixed width, and the behind set is the high-nnz set, so the behind cells pass the gate,
+are raised to the host team, **and are still 1.16-1.90x behind**. Amendment 5 required the deficit
+cells to be the ones held to few workers. They are the ones given the most.
+
+**One column in that table does not transfer and is marked rather than quietly carried.** The
+adoption gate is pool-independent -- at k=2 it is just `nnz >= 9375` -- so the 90.9% / 7.5% split
+holds on MKT. The resolved counts do not: the 18 is `min(override=32, rows/16=32,
+hardware_concurrency=18)` and 18 is THIS host's core count. On MKT, where that term is 128, the
+same behind cells resolve to 32. So the correct transferable statement is the gate split plus the
+raise it implies, and the per-count histogram needs re-asking on MKT before it is quoted.
+
+**What this does to amendment 5.** Its provocation is withdrawn: the table said the worst cells
+run on one worker out of 32, and under the configuration that produced the 1.960x they run on the
+whole team. The `c`-spans-79x argument is untouched by this -- it is about where the break-even
+for adding a worker lies, not about which cells are currently starved -- and the four registered
+predictions remain scoreable on the x86 sweeps. Prediction 2, "the headroom concentrates where
+the resolved count is small", now has its direction contradicted twice: once by amendment 6's
+population check and once by this one at the right override.
+
+**The method failure, stated once because it is now three instances in one afternoon.** A
+resolved count is a property of four things -- shape, override, pool, and object -- and amendment
+5's table named only the first. The 169x cell named no reading index, amendment 5 named no
+override, and this correction's own histogram would have named no `hardware_concurrency` if the
+value had been 32 instead of 18 and so had looked plausible. The operational form: before
+quoting a policy figure, write down all four coordinates; if any is absent the figure is about an
+unspecified configuration, and the ones that read plausibly are the dangerous ones.
