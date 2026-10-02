@@ -52,7 +52,14 @@ TDT = torch.float32 if A.dtype == "float32" else torch.float64
 SYM = so.spmm_csr_float_v2 if A.dtype == "float32" else so.spmm_csr_double_v2
 KS = [int(x) for x in A.ks.split(",")]
 POOL = torch.get_num_threads()
-TS = [int(x) for x in A.threads.split(",")] if A.threads else list(range(1, POOL + 1))
+TS = [int(x) for x in A.threads.split(",")] if A.threads else [0] + list(range(1, POOL + 1))
+# EACH OVERRIDE IS TIMED TWICE, so every reachable count carries a same-object repeat and the
+# cell-level A/A floor exists on every live cell. Relying on two overrides happening to resolve
+# to the same count does not work: over the tracked corpus at pool 6, overrides 1..6 give a
+# distinct-count histogram of {1: 231, 4: 18, 6: 327}, so the accidental supply is 54 pairs on
+# 18 cells -- 3.1% of cells -- and 56.8% of cells supply none at all. Override 0 is included in
+# the sweep because it is a real configuration: the standalone and panel paths pass no override.
+REPEAT = 2
 
 
 def read_smtx(path):
@@ -133,7 +140,7 @@ for key in keys:
         # each count lead within one of an equal share inside every width's own window.
         off = CELLN[k] % len(TS)
         CELLN[k] += 1
-        for nt in TS[off:] + TS[:off]:
+        for nt in (TS[off:] + TS[:off]) * REPEAT:
             fn = at(nt)
             res = so.scorch_spmm_nthreads(nnz * max(k, 16), M, nt, nnz * k, nnz)
             pol = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 0, nnz * k, nnz)

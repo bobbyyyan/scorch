@@ -52,6 +52,14 @@ FIT, TEST = set(keys[0::2]), set(keys[1::2])
 gm = lambda v: math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
 
 live = {c for c in ms if len(ms[c]) >= 2}
+# THE REGISTERED 33288-ROW NEGATIVE CONTROL IS WITHDRAWN. It was registered on the ground that
+# sqrt(T1/c) exceeds min(pool, rows/16) there so the clamp binds and the rule is provably inert.
+# Measured, 57 of that stratum's 72 cells are flat at resolved 18 -- inert through the final
+# cap's recruit DECLINE, not through the clamp -- so the control cannot distinguish its
+# registered reason from a harness fault, which is the one thing it existed to do. Excluding
+# flat cells empties it rather than cleaning it. What replaces it is printed below with its own
+# n, so an empty control reads as empty instead of as a pass.
+clampbound = {c for c in live if max(ms[c]) >= max(1, min(pool, caprows[c]))}
 print("%d keys (%d fit / %d test)  widths %s  pool %d  per-worker cost %.2f us"
       % (len(keys), len(FIT), len(TEST), ks, pool, A.percore_us))
 print("cells: %d total, %d with >=2 reachable counts (LIVE), %d excluded as single-configuration"
@@ -60,8 +68,9 @@ print("  reachable-count histogram: %s"
       % dict(sorted(collections.Counter(len(ms[c]) for c in ms).items())))
 
 print()
-print("THE FREE A/A FLOOR: counts reached by more than one override, so the same configuration")
-print("timed twice with a different argument. max/min - 1, over LIVE cells.")
+print("THE CELL-LEVEL A/A FLOOR: the same resolved count timed more than once on the same object.")
+print("With REPEAT=2 in the sweep this exists on every live cell by design. Before REPEAT it came")
+print("only from two overrides happening to resolve alike, which supplied 3.1% of cells.")
 print("%4s %8s %10s %10s" % ("k", "n pairs", "median", "p95"))
 floor95 = {}
 for k in ks:
@@ -72,6 +81,17 @@ for k in ks:
     sp.sort()
     floor95[k] = sp[min(len(sp) - 1, int(0.95 * len(sp)))] * 100
     print("%4d %8d %9.3f%% %9.3f%%" % (k, len(sp), st.median(sp) * 100, floor95[k]))
+
+
+print()
+print("REPLACEMENT CONTROL, with its n so an empty one cannot read as a pass: LIVE cells whose")
+print("largest reachable count already equals the clamp min(pool, rows/16). A rule cannot ask for")
+print("more there, so every rule naming a count at or above the clamp must read the floor.")
+print("  live cells: %d   of those, clamp-bound: %d (%.1f%%)   flat cells excluded: %d"
+      % (len(live), len(clampbound), 100.0 * len(clampbound) / max(len(live), 1), len(ms) - len(live)))
+if len(clampbound) < 20:
+    print("  WARNING: fewer than 20 clamp-bound live cells, so this control is underpowered and")
+    print("           a quiet reading from it means little.")
 
 
 def best(c):
@@ -220,7 +240,10 @@ for k in ks:
 
 print()
 print("REGISTERED PREDICTION 1, scored as registered: PER CELL, within +/-1, not modal.")
-print("A G matches a width if it is within 1 of the measured argmin on at least 80% of cells.")
+print("THE SHARE THRESHOLD IS NOT REGISTERED, so the verdict is printed at three of them rather")
+print("than at one of my choosing. The registration names a per-width quantity -- within +/-1 of")
+print("the measured optimum -- and gives no aggregation rule; an earlier draft borrowed the 80%")
+print("that belongs to prediction 3, which is a decision rule supplied by the instrument.")
 print("ITS NULL IS PRINTED BESIDE IT: the chain only RAISES, so a grain rule's output is bounded")
 print("below by the policy count. On a cell with policy - argmin >= 2 no G can come within 1, so")
 print("prediction 1 would pass there for a reason that has nothing to do with the functional form.")
@@ -239,6 +262,16 @@ for k in ks:
           " ".join("%.0f%%" % x for x in shares)))
 print("  G columns, in order: %s" % cands)
 print()
-print("Prediction 1 FAILS (and the sqrt form is unnecessary) if one G column is >=80% at EVERY")
-print("width. Read the null columns first: a width whose pol-argmin>=2 count is a large share of")
-print("n cannot inform the comparison either way.")
+print("VERDICT AT THREE THRESHOLDS. Prediction 1 fails -- and the sqrt form is then unnecessary --")
+print("if some single G clears the threshold at EVERY width. Read the null columns first: a width")
+print("whose pol-argmin>=2 count is a large share of n cannot inform the comparison either way.")
+for thr in (50.0, 80.0, 100.0):
+    winners = []
+    for G in cands:
+        if all(100.0 * sum(1 for c in [(key, k) for key in sorted(TEST) if (key, k) in live]
+                           if abs(r_adopt(c, G) - best(c)[0]) <= 1)
+               / max(len([(key, k) for key in sorted(TEST) if (key, k) in live]), 1) >= thr
+               for k in ks if [(key, k) for key in sorted(TEST) if (key, k) in live]):
+            winners.append(G)
+    print("  threshold %5.0f%%: %s" % (thr, ("prediction 1 FAILS, G in %s clears every width" % winners)
+                                       if winners else "prediction 1 HOLDS, no single G clears every width"))

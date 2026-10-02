@@ -179,3 +179,41 @@ over matrices within a decade band of `a_i / t_i(k=2)`. A band-level OLS with on
 band is a different estimator and gives different numbers (0.87-1.03 on the same data); neither
 is wrong, and the two are not comparable. The per-matrix form is what was reported and it is what
 the quoted range refers to.
+
+## Amendment 3: a registered control withdrawn, and a decision rule the registration omitted
+
+**(a) THE 33288-ROW NEGATIVE CONTROL IS WITHDRAWN.** It was registered on the ground that where
+`sqrt(T1/c)` exceeds `min(pool, rows/16)` the clamp binds and the rule is provably inert, so a
+reading that differs from the floor there is an instrument fault. Measured against the object,
+57 of that stratum's 72 cells resolve to a single count (18) for every override, because their
+policy count reaches twice the caller's pool and `scorch_policy.h` then declines the final cap
+outright -- `if ((long)nthreads >= 2 * pool) nt_cap = 0;`. So the override has no effect in
+either direction there, and the cells are inert through the cap decline rather than through the
+clamp the control names. A control that cannot distinguish its registered reason from a harness
+fault cannot detect the thing it exists to detect, and excluding single-configuration cells
+empties it rather than cleaning it. Withdrawn rather than reinterpreted.
+
+Two controls replace it, both printed with their own n so an empty one reads as empty:
+- **A cell-level A/A by design.** The sweep now times every override TWICE, so each reachable
+  count carries a same-object repeat on every live cell. The accidental supply it replaces was
+  54 pairs on 18 of 576 cells (3.1%), with 56.8% of cells supplying none -- so the earlier claim
+  that duplicate resolutions "turn the defect into an instrument" was true of 3.1% of cells and
+  was stated as though it were general.
+- **Clamp-bound live cells**, meaning live cells whose largest reachable count already equals
+  `min(pool, rows/16)`. A rule cannot ask for more there, so any rule naming a count at or above
+  the clamp must read the floor. The analyser warns when there are fewer than twenty.
+
+Override 0 is also added to the sweep, because it is a real configuration and not a probe: the
+standalone and panel paths pass no override, so pure policy is something the library actually
+runs.
+
+**(b) PREDICTION 1 WAS REGISTERED WITHOUT AN AGGREGATION RULE, and the instrument supplied one.**
+The registered text names a per-width quantity -- within +/-1 of the measured optimum -- and says
+nothing about what share of cells must satisfy it. The analyser printed "at least 80% of cells",
+a constant borrowed from prediction 3, which is a different prediction over matrix classes.
+80%, 50% and 100% can disagree about the verdict, so the choice decided the outcome and was
+disclosed in a print statement rather than in the registration. **Rather than register a
+threshold now, after the instrument exists and with the data about to land, the verdict is
+printed at all three thresholds and the threshold-sensitivity is part of the result.** If the
+three disagree, that is reported as the finding; picking one retroactively would be choosing the
+answer. Prediction 3's own 80% stands, because it was registered with the prediction.
