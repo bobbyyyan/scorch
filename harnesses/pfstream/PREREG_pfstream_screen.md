@@ -2767,3 +2767,93 @@ The paired test has **not yet been computed on the DLMC data**: MKT job 17696556
 mkt1's CPUs, `/scr` is reachable only from an allocation, and taking one beside a live 32-worker
 measurement is the perturbation this project refuses. The numbers above are the self-test's, on
 synthetic data with a known answer. The DLMC paired CIs run when the job clears.
+
+---
+
+## Amendment 32 — four defects in amendment 31's own instrument, one of which made its headline guarantee false
+
+### (a) The resample digest was a pure function of `(seed, nboot, n)` and ignored the data
+
+`h.update(idx)` never touched the values. Measured, not reasoned: a dataset with a −0.50% effect
+and one with a +9.00% effect, both n=392 at the default seed, returned the **same sixteen
+characters**. Three consequences, all of which amendment 31 published:
+
+- **"Quote both or neither" overstated what the digest certifies.** It pinned the *resample*, not
+  the bound. A substituted dataset reproduces it exactly — which is the one thing a provenance
+  digest exists to prevent.
+- A seven-width table at one `n` would print the **same string on every row**, reading as a
+  constant or a placeholder.
+- **Check 7 could not catch it.** It compared `boot_median_ci(d)` against
+  `boot_median_ci(d, seed=20261002)` — same data, same seed — so it asserted *determinism*, which
+  data-independence also satisfies.
+
+Now `boot_median_ci` returns `(lo, hi, vdig, idig, n)`: `vdig` digests the data the bound is *of*,
+`idig` the resample, printed as `v:… i:…`. The missing assertion is added and it is the one that
+would have failed before — **same `n`, different data, different data digest** (`7b08537cad4e` vs
+`62c3d6b8223e`) — plus its complement, that the index digest is *correctly* unchanged by the data,
+so the two columns are separable rather than redundant.
+
+This corrects a rule this project had already published. "An index matrix pins it" was incomplete:
+reproducing a bound needs the indices **and** the values.
+
+### (b) Production's pairing line had no assertion coverage at all
+
+The self-test imported only `boot_median_ci` and `pct`, so `(a−b)/b − (f−b)/b` was never called,
+and the test's own `d` was a plain difference — not even production's functional form. The
+material mutation is not an arithmetic typo: swapping `arm` and `floor` **flips the sign of every
+verdict** with nothing firing.
+
+Extracted as `paired_d(med, pop, arm, floor, base)` and covered on a deliberately **asymmetric**
+synthetic (`ship` 100.0, floor ≈ +1%, arm ≈ −3%), so the known value is −0.0400 and a role swap
+reads +0.0400. A third check confirms a cell missing any one of the three tags is **dropped, not
+defaulted** (39 of 40). Nothing was wrong today — the tags do agree with the band's contrast —
+but nothing was checking.
+
+### (c) The 13.7× pairing gain is a property of the control's construction
+
+In the control, `floor` and `arm` share `shared[i]` **exactly**, so the shared term cancels
+exactly and roughly 7.4× of the gain is built in by construction. The real object-swap artefact is
+not identically shared between the arm pair and the floor pair, so the realized gain on DLMC will
+be smaller by however much it fails to be shared. **That is not a defect and 13.7× is not a
+property of the method.** The `gain > 2.0` threshold is deliberately loose for exactly this
+reason; only the headline number needed the caveat, and it now carries it in the output.
+
+Same caution applies to the CI width: the control's 0.0461 pp is **one draw**, near the bottom of
+a realization range measured at [0.0439, 0.0985] with median 0.0671. It is not "the paired CI
+width".
+
+### (d) `"SELFTEST PASSED: 9 checks"` was a typed literal beside nine `check()` calls
+
+Add a tenth and the line still says nine. Now counted: **14 checks**, and the failure path reports
+`%d of %d` from the same counter.
+
+### Two things withdrawn or softened from amendment 31
+
+**The RNG-stream premise is weaker than stated.** Amendment 31 justified the digest by "the RNG
+stream is a library property". Run independently under 3.11.15 against this worktree's 3.13, the
+digests were byte-identical and every figure matched — so `randrange`'s stream was stable across
+those versions. The digest is cheap insurance, not demonstrated necessity, and the demonstrated
+need is (a)'s: pinning the data.
+
+**The floor-shape characterisation now rests on all seven widths**, not three. An extremum claim
+has a denominator too, and the earlier reading of k=32 as the maximum and k=8 as the minimum was
+drawn from the three values then in hand. With all seven, the smallest is k=12 and the largest is
+**k=24** — both extremes elsewhere. What survives is unchanged: the magnitude range 0.237–1.735%
+overlaps the low end of the recorded 1–2.6% artefact while the width-shape does not transfer, with
+k=2 mid-range at 0.672%.
+
+### Also confirmed clean, listed so the absence of a change is not read as an absence of looking
+
+The band table's denominators are visible as `len(vn)` and `len(fl)` inside the `b/n` columns, so
+a population divergence between the band table and the paired table — the paired one needs all
+three tags on one cell where the band needs two — would be readable. `pct` indexes without
+sorting and both call sites sort first. The `n < 8` path returns a tuple the caller unpacks
+correctly and the nan-guarded print is safe. Percentile indices 99 and 3899 of 4000 give 2.475%
+and 2.500% tails.
+
+### Run provenance, so the chain does not carry two numbers for one run
+
+**17696496 FAILED** at 00:00:00, exit 1: `adg_host_run.sh`'s guard refused because the pattern
+`arm_screen` named no producer script in the staged harness directory, so its silence would have
+carried no information. That is the guard working. `arm_screen.sh` staged at `78f73444e60c62c3`,
+matching the digest already pinned in this document. **17696556** is the live run.

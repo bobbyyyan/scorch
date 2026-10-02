@@ -35,29 +35,54 @@ def band(nnz):
 
 
 def boot_median_ci(vals, nboot=4000, seed=20261002, alpha=0.05):
-    """Percentile bootstrap CI for the MEDIAN of `vals`, plus a digest pinning the resample.
+    """Percentile bootstrap CI for the MEDIAN of `vals`, with digests of BOTH data and resample.
 
-    A bootstrap bound is not reproducible from seed and nboot alone -- the RNG's stream depends
-    on the library version -- so the index matrix is digested and returned. Quoting the bound
-    without the digest is quoting an unreproducible number.
+    REPRODUCING A BOUND NEEDS THE VALUES AND THE INDICES, and an earlier version digested only
+    the indices. That digest is a pure function of (seed, nboot, n): a -0.50% dataset and a
+    +9.00% dataset, both n=392 at the default seed, returned the same sixteen characters. So it
+    pinned the resample and not the bound, a substituted dataset reproduced it exactly, and a
+    seven-width table at one n printed the same string on every row -- which reads as a constant.
+
+    Returns (lo, hi, vdig, idig, n). `vdig` digests the data the bound is OF; `idig` digests the
+    resample. Quote the bound with both: vdig alone cannot show the resample was the registered
+    one, and idig alone cannot show the data was.
     """
     import hashlib
     import random
     n = len(vals)
     if n < 8:
-        return None, None, None, n
+        return None, None, None, None, n
+    vh = hashlib.sha256(("|".join("%.17g" % v for v in vals)).encode())
     rng = random.Random(seed)
-    h = hashlib.sha256()
+    ih = hashlib.sha256()
     meds = []
     for _ in range(nboot):
         idx = [rng.randrange(n) for _ in range(n)]
-        h.update((",".join(map(str, idx))).encode())
+        ih.update((",".join(map(str, idx))).encode())
         r = sorted(vals[i] for i in idx)
         meds.append(r[n // 2] if n % 2 else 0.5 * (r[n // 2 - 1] + r[n // 2]))
     meds.sort()
     lo = meds[int(alpha / 2 * (nboot - 1))]
     hi = meds[int((1 - alpha / 2) * (nboot - 1))]
-    return lo, hi, h.hexdigest()[:16], n
+    return lo, hi, vh.hexdigest()[:12], ih.hexdigest()[:12], n
+
+
+def paired_d(med, pop, arm, floor, base):
+    """Per-cell paired difference: (arm vs base) - (floor vs base), on cells carrying all three.
+
+    EXTRACTED SO IT CAN BE TESTED. Inline, the production construction had no assertion
+    coverage, and the material mutation is not an arithmetic typo -- swapping `arm` and `floor`
+    flips the sign of every verdict and no check would fire. The self-test calls this with an
+    ASYMMETRIC synthetic `med`, so a swapped role changes the sign and an assertion notices.
+    """
+    out = []
+    for (key, w) in pop:
+        a = med.get((key, w, arm))
+        f = med.get((key, w, floor))
+        b = med.get((key, w, base))
+        if a and f and b and b > 0:
+            out.append((a - b) / b - (f - b) / b)
+    return sorted(out)
 
 
 def pct(v, q):
@@ -249,24 +274,18 @@ def main(argv):
     print("  same cell -- which removes the object-change artefact cell by cell instead of")
     print("  subtracting two pooled locations, and carries a bootstrap CI on its own median.")
     print("  %-5s %6s %10s %10s %10s %-22s %s"
-          % ("k", "n", "median d", "CI95 lo", "CI95 hi", "paired verdict", "resample"))
+          % ("k", "n", "median d", "CI95 lo", "CI95 hi", "paired verdict",
+             "v:data i:resample"))
     for (w, _fl, _vn, _vs) in signrows:
         pop = [c for c in cells if c[1] == w]
-        d = []
-        for (key, ww) in pop:
-            a = med.get((key, ww, "nopf"))
-            f = med.get((key, ww, "shpb"))
-            b = med.get((key, ww, "ship"))
-            if a and f and b and b > 0:
-                d.append((a - b) / b - (f - b) / b)
+        d = paired_d(med, pop, "nopf", "shpb", "ship")
         if not d:
             print("  k=%-5d %6s   NO PAIRED CELL: needs nopf, shpb and ship on one cell" % (w, "-"))
             continue
-        d.sort()
-        lo, hi, dig, n = boot_median_ci(d)
+        lo, hi, vdig, idig, n = boot_median_ci(d)
         m = pct(d, 0.5)
         if lo is None:
-            vd, dig = "n < 8, no CI", "-"
+            vd, vdig, idig = "n < 8, no CI", "-", "-"
         elif hi < 0:
             vd = "FASTER than floor"
         elif lo > 0:
@@ -275,10 +294,13 @@ def main(argv):
             vd = "CI spans 0, no diff"
         print("  k=%-5d %6d %9.3f%% %9.3f%% %9.3f%% %-22s %s"
               % (w, n, 100 * m, 100 * lo if lo is not None else float("nan"),
-                 100 * hi if hi is not None else float("nan"), vd, dig))
+                 100 * hi if hi is not None else float("nan"), vd,
+                 "v:%s i:%s" % (vdig, idig)))
     print("  The CI is a percentile bootstrap on the median, 4000 resamples, seed 20261002. The")
-    print("  resample column digests the INDEX MATRIX, because a bound is not reproducible from")
-    print("  seed and nboot alone -- the RNG stream is a library property. Quote both or neither.")
+    print("  last column digests the DATA (v) and the RESAMPLE (i) separately. Digesting only the")
+    print("  indices, as an earlier version did, pins a pure function of (seed, nboot, n): two")
+    print("  datasets with different effects gave the same string, so a substituted dataset")
+    print("  reproduced it exactly. Reproducing a bound needs the values AND the indices.")
     print()
     print("  AND THE TWO COLUMNS ANSWER DIFFERENT QUESTIONS, which one verdict string had merged.")
     print("  The paired CI is a TEST OF EXISTENCE: does this arm differ from a mere object swap.")
