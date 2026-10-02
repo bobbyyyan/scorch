@@ -249,3 +249,66 @@ That landed on the very null added to make prediction 1 honest, and it biased it
 that a pass was informative. The null no longer uses any policy bound. It is now the count of
 cells where **no tested G** lands within one worker of the measured argmin, computed directly
 over the ladder -- exact for the family actually tested, and free of the pool entirely.
+
+---
+
+## Amendment 5 (2026-10-02, before any x86 sweep exists): the grain is one constant and the break-even is not
+
+**The prediction registered in the pending work -- "near-inert on MKT (c=0.06 us)" -- is hereby
+replaced, and the replacement predicts the opposite sign.** It was written from the M5's
+arithmetic, where widening a team costs 4.75 us per worker and the measured excess headroom is
+1.0032 at k=2 (i.e. none). That reasoning does not transfer, and the reason it does not is the
+one quantity the two hosts differ in most.
+
+**What provoked it.** Asked at pool 32 what the shipped policy resolves for the shapes that
+dominate the MKT DLMC float32 k=2 deficit set:
+
+| rows | nnz | mean deg | resolved at k=2 | measured ours/mkl |
+|------|-----|----------|-----------------|-------------------|
+| 512  | 9630    | 18.8  | **1** | 1.960x |
+| 512  | 13107   | 25.6  | **1** | 1.940x |
+| 512  | 26214   | 51.2  | **2** | 1.938x |
+| 512  | 58982   | 115.2 | 6     | ~1.47x |
+| 512  | 472165  | 922.2 | 18    | 1.481x |
+
+`rows/16` is 32 on every one of them, so the clamp is not binding. The binding term is
+`work/grain` with `work = nnz*max(k,16)` and `SCORCH_GRAIN_SPMM 150000`: at nnz 9630 that is
+154080, one grain, one worker. **The cells furthest behind MKL are the ones running on a single
+thread out of a pool of 32**, and the ordering is monotone in the table above.
+
+**The mechanism, which is not host-specific special-casing.** A worker is worth adding while the
+time it removes exceeds what it costs: `T1/(n(n+1)) > c`, where `c` is the per-worker team cost.
+`c` is a measured host property and it spans **79x** across our three hosts -- 0.06 us on MKT,
+0.26 us on redwood, 4.75 us on the M5. A single work grain encodes one break-even point, so a
+grain calibrated where teams are expensive is far too conservative where they are nearly free. On
+a 20 us kernel, eight workers cost 0.5 us on MKT (2.4%) and 38 us on the M5 (190%). The same
+constant cannot be right for both, and nothing in the shipped rule reads `c`.
+
+### Registered predictions, scored on the x86 sweeps when the screens clear
+
+1. **MKT is NOT inert.** The excess over the winner's-curse null -- median(cur/best) divided by
+   its within-cell permutation null, the statistic defined in `nt_k2curve.py` -- will exceed
+   **1.05** at k=2 on MKT. The M5 reads 1.0032. Scored on live cells only.
+2. **The headroom concentrates where the resolved count is small.** Among MKT k=2 live cells,
+   the excess for cells resolving to <= 2 workers will exceed that for cells resolving to >= 8
+   workers. Registered as a comparison, not a threshold, because the split sizes are unknown.
+3. **redwood sits between the two hosts** on prediction 1's statistic, c being 0.26 us against
+   MKT's 0.06 and the M5's 4.75. This is the prediction most likely to fail, because c enters
+   the criterion under a square root and a 4.3x difference in c is 2.1x in n*, which the pool
+   clamp may absorb entirely on redwood's pool of 24.
+4. **The negative control.** At k=32 the work measure `nnz*max(k,16)` is `nnz*32`, so the same
+   matrices resolve to roughly twice the count and the criterion is nearer satisfied. Prediction
+   1's statistic at k=32 will be below its k=2 value on MKT. If k=32 shows equal or greater
+   excess, the account above is wrong and the deficit is not a thread-count story at all.
+
+### What would refute the mechanism rather than the predictions
+
+If MKT's excess at k=2 is at the null (<= 1.01) while single-worker cells remain 1.9x behind MKL,
+then the thread count is not the deficit's cause on MKT either, and the single-thread resolution
+above is a coincidence of the shapes rather than an explanation. That outcome is to be reported
+as the result, exactly as the M5's 1.0032 was.
+
+**No rule is to be written before these are scored.** The marginal criterion gives the form
+`n* ~ sqrt(T1/c)`, which no linear grain reproduces, and a host-measured `c` is a defensible
+constant rather than a tuned one -- but a defensible form fitted to a noise-selected optimum is
+still fitted to noise, which is what the winner's-curse null exists to prevent.
