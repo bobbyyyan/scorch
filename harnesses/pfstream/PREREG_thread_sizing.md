@@ -317,6 +317,14 @@ still fitted to noise, which is what the winner's-curse null exists to prevent.
 
 ## Amendment 6 (2026-10-02, minutes after amendment 5, before any x86 sweep): amendment 5's mechanism is refuted by data already in hand
 
+> **FORWARD MARKER, inserted later the same day, after amendment 7.** The resolved-count table
+> in THIS amendment is asked at `override = 0`, which no measurement on this project uses:
+> `mrgate.py:123` passes `nthreads_override=POOL`. Its one-worker total of 133 keys is correct
+> FOR override 0 and is 45 higher than the 88 the measured configuration gives, because the
+> adoption gate at `scorch_policy.h:2139` is conditioned on `override > 0` and raises 45 of
+> those keys. Read amendment 7's table instead. The conclusion below is unchanged and is
+> sharper at the right override.
+
 **Amendment 5's table was selection on the outcome and the full population reverses it.** I
 probed five shapes chosen from the worst-cells table, found the worst ones resolving to one
 worker, and proposed that the work grain is too conservative where teams are cheap. The check
@@ -434,6 +442,17 @@ change cannot explain one that changes 4.4x. The count does rise by about 9% by 
 the direction that would help, and the deficit there is 2 cells; so the two move together only in
 the sense that both improve, and 9% of worker count is not 160x of deficit count.
 
+> **SCOPE MARKER, inserted later the same day, in the form amendment 7 used for the 18.** The
+> 392/392 identity is a property of `(override, hardware_concurrency)`, not of the keys. At
+> `override = 6` on this host the same object gives 382/392 at k=8, 376/392 at k=12 and
+> 373/392 at k=16, and the k=2-to-k=32 mean rises 33.9% rather than 9.5% -- because the raise
+> gate reads `work_true = nnz*k`, which is NOT k-invariant, and whether that shows depends on
+> where the cap lands. At override 32 here the cap is `hardware_concurrency = 18`; on MKT that
+> term is 128, so cells reach 32 and the k-dependence has more room. **Re-ask on MKT before
+> quoting 392/392 there.** The argument survives either reading: even at override 6, 95-97% of
+> keys are unchanged across k=2..16, and a few percent of keys changing count cannot explain a
+> 4.4x change in deficit count.
+
 **Three independent arguments now close it, in both directions and on the choice itself:**
 
 1. **Too few workers** -- refuted by amendments 6 and 7: the cells we BEAT MKL on are the
@@ -457,3 +476,70 @@ sweeps run, because a registered prediction is not withdrawn for being expected 
 the expectation is now recorded: predictions 1 and 2 should fail, and if prediction 1 PASSES on
 MKT while this table holds, something is wrong with the excess statistic rather than right with
 the thread rule.
+
+---
+
+## Amendment 9 (2026-10-02): "the narrow-k deficit" is at least two populations, and one candidate died proving it
+
+**A candidate registered and refuted inside ten minutes, on data already in hand.** The two
+constraints from amendments 7 and 8 -- that the class is shape-determined, and that the deficit
+is monotone in k while the thread count is not -- point at one quantity: A-bytes streamed per
+output element, `8*nnz/(rows*k)` for float32 CSR. It is a function of shape alone and falls as
+`1/k`. Registered form: ONE threshold, chosen once on all widths pooled, scored per width against
+the majority-class baseline, because a quantity needing a different threshold at each width is a
+restatement of k and explains nothing.
+
+| k  | behind |  ahead | threshold accuracy | majority baseline | verdict |
+|----|--------|--------|--------------------|-------------------|---------|
+| 2  |    328 |     53 |              64.6% |         **86.1%** | worse   |
+| 8  |    158 |     96 |              31.5% |         **62.2%** | worse   |
+| 12 |    116 |    144 |              48.1% |         **55.4%** | worse   |
+| 16 |     74 |    252 |              72.1% |         **77.3%** | worse   |
+| 20 |      6 |    362 |              95.1% |         **98.4%** | worse   |
+| 24 |      4 |    383 |              97.4% |         **99.0%** | worse   |
+| 32 |      2 |    384 |              99.0% |         **99.5%** | worse   |
+
+**It beats the baseline at no width.** Pooled accuracy was 76.0%, which looked respectable and is
+the number that would have been quoted without the per-width baseline beside it.
+
+### Why it failed, which is the finding
+
+The association does not keep its sign. Median mean-degree by class:
+
+| k  | behind | ahead | ratio  | we lose on        |
+|----|--------|-------|--------|-------------------|
+| 2  | 115.00 |  7.12 | 16.14x | **HIGH** degree   |
+| 8  |  92.97 | 32.04 |  2.90x | **HIGH** degree   |
+| 12 |  51.20 |104.79 |  0.49x | **LOW** degree    |
+| 16 |  39.68 |157.95 |  0.25x | **LOW** degree    |
+| 20 |  25.61 |102.40 |  0.25x | **LOW** degree    |
+| 24 |  15.80 | 93.78 |  0.17x | **LOW** degree    |
+| 32 | 216.36 | 92.97 |  2.33x | HIGH, but n=2     |
+
+**The sign reverses between k=8 and k=12.** At k=2 the cells we lose on have 16x the degree of
+the cells we win on; at k=16 they have a quarter of it. So the phrase "the narrow-k deficit" has
+been naming a set whose composition changes as k rises, and every mechanism search this session
+-- team width, thread count, the adoption gate, the work grain, the prefetch, the gather kernel,
+A-streaming -- has been looking for a single explanation of two different things. That is why a
+candidate satisfying both registered constraints could still fail at every width: the constraints
+were derived from the pooled set.
+
+### The split, and which part is the task
+
+- **The high-degree narrow-k population: k=2 and k=8, 486 of the 688 behind cells.** At k=2:
+  median 58 982 nonzeros, median degree 115, median 512 rows, and the 53 cells we beat have
+  median 1 311 nonzeros. This is the dominant part and the only part worth a mechanism now.
+- **The low-degree mid-k population: k=12 through k=24, 200 cells.** Median degree 15-51 against
+  an ahead set at 94-158. Its deficit is also falling fast with k (116 to 4), so it may be the
+  tail of a different effect entirely and is explicitly NOT in scope until the first is closed.
+- **k=32's 2 cells are not a population** and the 216.36 in that row is two matrices. It is in
+  the table only so that its sign is not read as corroborating k=2.
+
+### Registered before the next measurement
+
+No mechanism will be proposed for the pooled 688 again. The next measurement addresses the k=2
+high-degree set alone, holds the worker count fixed across both libraries, and will be scored
+against the stated refutation condition rather than characterised after the fact. A finding on
+k=2 that does not also predict the k=8 behaviour of the SAME matrices is not to be reported as
+explaining the narrow-k deficit, because those two widths are the part of the set that shares a
+composition.
