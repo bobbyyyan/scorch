@@ -1060,3 +1060,62 @@ ratio against a baseline. The headroom statistic -- built separately for exactly
 has needed no correction and has carried every verdict that survived: predictions 2 and 3 remain
 FAILED on it, and amendment 8's construction argument closes the thread-count account
 independently of any curve.
+
+---
+
+## Amendment 17 (2026-10-02): three defects in the instrument that produced amendment 15's wording
+
+Amendment 16 adopted a peer's point that the flat test's null is `live/2` by construction.
+Re-running the tool to confirm the fix surfaced three further defects in the same output, two
+of which plausibly *caused* the original misreading.
+
+### 1. A column named `flat` that counted cells with no shape at all
+
+The statistics table's third column was `len(cells) - len(live)`: cells reaching exactly **one**
+worker count, whose curve shape is **undefined**, not flat. At k=2 on the M5 it reads **23**,
+sitting beside a flat-cell null of `live/2` = **24.5**. Two numerically adjacent quantities,
+one named `flat` and one actually about flatness, in one output. Amendment 15's "observed 0
+against a null of 24-29" is what reading across them produces.
+
+Renamed to `1cnt`, with a line under the header stating what it is and what it is not.
+
+### 2. Two measured numbers hardcoded into explanatory prose
+
+The paragraph introducing the two candidate statistics said "the endpoint ratio reads 0.9615
+(FLAT) and max/min reads 1.2362 (RISING)". Both were literals. Neither was computed anywhere in
+the file. On redwood that paragraph asserted the M5's numbers as if they were the run's.
+
+Now computed per run and printed as `THIS run at k=%d`, with the agree/disagree conclusion
+derived rather than asserted. On the M5 the computed values are **0.9615** and **1.2363** --
+the literals were right *for this CSV*, which is exactly why the defect was invisible: it was
+checked only against the file it was transcribed from.
+
+### 3. The single-object guard could not fire on the input it was written for
+
+`shas = sorted({r.get("so_sha", "") for r in rows})` followed by `if len(shas) > 1: REFUSE`.
+A sweep predating the `so_sha` column yields the one-element set `{''}`, passes, and prints
+`object(s): ['']` -- which reads as single-object provenance. The guard existed because an
+in-place build in the tree this environment imports from silently becomes every process's
+import default, so two objects can produce one indistinguishable CSV. That is precisely the
+case it accepted.
+
+**The M5 oracle sweep behind every number in amendments 14-16 is provenance-absent**: 0 of 8064
+rows carry an `so_sha`. The within-cell exchangeability result does not depend on which object
+answered, but it does require that no single *cell* straddles an object boundary, and this file
+cannot establish that. The −6.2 to −7.0 sd figures are therefore **provisional on the M5** and
+confirmed on redwood, whose sweep carries one named object, `8192715070225fd3`.
+
+Now: distinct named objects still refuse; a **mix** of named and blank rows refuses
+unconditionally, being strictly worse than two named objects; an all-blank file refuses unless
+`--allow-unknown-object` is passed, which stamps every pooled-curve line `[PROVENANCE UNKNOWN]`.
+Stamping rather than withholding, because a stamp travels with a line that gets copied and a
+suppressed number teaches nothing. Row counts per class print beside the verdict, so a vacuous
+check cannot read as a passing one.
+
+### What the three have in common
+
+Each is a check or a label that was verified against the single artefact it was written beside.
+The guard was written while looking at a CSV that had the column; the literals were transcribed
+from the run that produced them; the column name was accurate to an earlier version of the
+table. None of the three could be caught by re-reading the code, and all three fell out of
+running the tool on a *second* input -- which in two cases was the same host, one sweep older.

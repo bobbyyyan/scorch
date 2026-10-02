@@ -54,6 +54,9 @@ RISING, FLAT = 1.20, 1.10
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--csv", required=True, help="an ntoracle.py sweep")
+ap.add_argument("--allow-unknown-object", action="store_true",
+                help="accept a sweep with no so_sha column; pooled-curve numbers are "
+                     "then withheld and the rest is labelled provisional")
 ap.add_argument("--ks", default="", help="widths to report; default every width present")
 A = ap.parse_args()
 
@@ -64,14 +67,45 @@ if not rows:
 # so_sha names the object that answered. It is read rather than assumed because the whole
 # reason the column exists is that an in-place build in the tree this environment imports from
 # silently becomes every process's default.
-shas = sorted({r.get("so_sha", "") for r in rows})
+# A blank so_sha is NOT one object -- it is no answer, and the first version of this guard
+# accepted it. `len(shas) > 1` passed on a sweep predating the column, printing object(s):
+# [''] and reading as single-object provenance. The guard could not fire on the one input it
+# was written for. So classify the column and count the rows behind each class, because a
+# count is the thing that shows the check was not vacuous.
+named = collections.Counter(r.get("so_sha", "").strip() for r in rows)
+blank = named.pop("", 0)
 pools = sorted({r.get("pool", "") for r in rows})
-print("object(s): %s     pool(s): %s" % (shas, pools))
-if len(shas) > 1:
+print("object(s): %s     pool(s): %s" % (
+    ", ".join("%s x%d" % (k, v) for k, v in sorted(named.items())) or "NONE NAMED", pools))
+print("  rows carrying an so_sha: %d of %d; rows with the column blank or absent: %d"
+      % (sum(named.values()), len(rows), blank))
+if len(named) > 1:
     print("REFUSE: %d distinct objects in one sweep. A curve pooled over two objects is not a"
-          % len(shas))
+          % len(named))
     print("        curve; the layout artefact between objects is 1-2.6% at narrow k.")
     raise SystemExit(1)
+if blank and named:
+    print("REFUSE: %d rows name an object and %d do not, so the sweep spans two provenances and"
+          % (sum(named.values()), blank))
+    print("        one of them is unknown. That is strictly worse than two named objects.")
+    raise SystemExit(1)
+if blank and not A.allow_unknown_object:
+    print("REFUSE: no row carries an so_sha, so the object that answered is UNKNOWN. This sweep")
+    print("        predates the column. It is not a single-object sweep -- it is a sweep whose")
+    print("        provenance was never recorded, and an in-place build in the tree this env")
+    print("        imports from silently becomes every process's default, so two objects can")
+    print("        produce one indistinguishable CSV. Re-run with an so_sha-bearing ntoracle.py,")
+    print("        or pass --allow-unknown-object to get the within-cell tests ONLY.")
+    raise SystemExit(1)
+PROVENANCE = ("UNKNOWN" if blank else sorted(named)[0])
+PMARK = "   [PROVENANCE UNKNOWN]" if blank else ""
+if blank:
+    print("  PROVENANCE UNKNOWN, accepted under --allow-unknown-object. Every POOLED-CURVE line")
+    print("  below is STAMPED rather than withheld, because a stamp travels with the line if it is")
+    print("  copied and a suppressed number teaches nothing. A pooled curve compares counts ACROSS")
+    print("  cells, so an object boundary inside the file would move it; the within-cell tests ask")
+    print("  exchangeability of one cell's own readings and are sound unless a CELL straddles the")
+    print("  boundary, which this file cannot rule out either. Provisional, not a measurement.")
 
 # (key, k) -> resolved count -> [ms]
 cell = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -99,11 +133,36 @@ ks = ([int(x) for x in A.ks.split(",")] if A.ks
 
 print()
 print("TWO CANDIDATE STATISTICS, BOTH REPORTED, BECAUSE THEY DISAGREE AND THE CHOICE DECIDES")
-print("THE VERDICT. On the pooled M5 curve the endpoint ratio reads 0.9615 (FLAT) and max/min")
-print("reads 1.2362 (RISING). An endpoint ratio cannot see a non-monotone shape at all: a curve")
-print("that falls 19% and rises 19% returns to its start and reads flat, which is exactly the")
-print("shallow U this sweep measures. max/min sees any spread but cannot say whether the spread")
-print("is a trend or one bad count. Reporting one of them alone would be choosing the answer.")
+print("THE VERDICT. An endpoint ratio cannot see a non-monotone shape at all: a curve that falls")
+print("19% and rises 19% returns to its start and reads flat, which is exactly the shallow U this")
+print("sweep measures. max/min sees any spread but cannot say whether the spread is a trend or")
+print("one bad count. Reporting one of them alone would be choosing the answer.")
+# THIS RUN'S OWN TWO NUMBERS, COMPUTED HERE. The paragraph above used to quote 0.9615 and
+# 1.2362 as literals -- one M5 sweep's values, computed nowhere in this file and reprinted on
+# every host, so on redwood it asserted the M5's numbers as if they were the run's.
+_k0 = ks[0]
+_bc = collections.defaultdict(list)
+for _ck, _co in cell.items():
+    if _ck[1] != _k0 or len(_co) < 2:
+        continue
+    _b = st.median(_co[min(_co)])
+    if _b > 0:
+        for _c, _v in _co.items():
+            _bc[_c].append(st.median(_v) / _b)
+if len(_bc) >= 2:
+    _g = {c: math.exp(sum(math.log(x) for x in v) / len(v)) for c, v in _bc.items()}
+    _ep = _g[max(_g)] / _g[min(_g)]
+    _mm = max(_g.values()) / min(_g.values())
+    print("  THIS run at k=%d, %d counts: endpoint %.4f (%s), max/min %.4f (%s).%s"
+          % (_k0, len(_g), _ep, "FLAT" if _ep < RISING else "RISING",
+             _mm, "FLAT" if _mm < RISING else "RISING", PMARK))
+    print("  They %s here, so the choice of statistic %s the verdict on this file."
+          % (("DISAGREE", "decides") if (_ep < RISING) != (_mm < RISING)
+             else ("AGREE", "does not change")))
+else:
+    print("  THIS run reaches %d distinct count(s) at k=%d, so neither statistic is defined and"
+          % (len(_bc), _k0))
+    print("  an empty curve cannot read as flat." + PMARK)
 print()
 print("EACH STATISTIC CARRIES ITS OWN NULL, COMPUTED THE WAY THE STATISTIC IS COMPUTED. The")
 print("cell-level A/A floor (1.02-1.61%) is a TWO-reading same-count comparison, so it bounds a")
@@ -184,16 +243,22 @@ def shape(counts):
 
 STATS = (("endpoint hi/lo", stat_endpoint), ("max/min", stat_maxmin))
 print()
+# "flat" was the wrong name for this column and a dangerous one. It is len(cells) - len(live):
+# cells reaching exactly ONE worker count, whose shape is UNDEFINED rather than flat. At k=2 on
+# the M5 it reads 23 beside a flat-cell null of live/2 = 24.5, so the two are numerically
+# adjacent -- and confusing them is how "observed 0 against a null of 24-29" got written.
 print("%4s %6s %6s  %-15s %9s %9s %9s %9s %9s %s"
-      % ("k", "live", "flat", "statistic", "median", "null", "excess", "p25", "p75", "verdict"))
+      % ("k", "live", "1cnt", "statistic", "median", "null", "excess", "p25", "p75", "verdict"))
+print("     (1cnt = cells reaching ONE count, shape UNDEFINED; NOT the flat-cell count, which")
+print("      is reported separately below against Binomial(live, 0.5).)")
 verdicts = {}
 for k in ks:
     cells = [(ck, c) for ck, c in cell.items() if ck[1] == k]
     live = [(ck, c) for ck, c in cells if len(c) >= 2]
-    n_flat = len(cells) - len(live)
+    n_one = len(cells) - len(live)
     if not live:
         print("%4d %6d %6d   NO CELL AT THIS WIDTH CAN VARY ITS WORKER COUNT, so no verdict"
-              % (k, 0, n_flat))
+              % (k, 0, n_one))
         verdicts[k] = {name: "unable" for name, _ in STATS}
         continue
     verdicts[k] = {}
@@ -209,7 +274,7 @@ for k in ks:
         verdicts[k][name] = v
         nv = st.median(nul) if nul else float("nan")
         print("%4d %6d %6d  %-15s %9.4f %9.4f %8.1f%% %9.4f %9.4f %s"
-              % (k, len(obs), n_flat, name, med, nv,
+              % (k, len(obs), n_one, name, med, nv,
                  100.0 * (med / nv - 1.0) if nv == nv and nv > 0 else float("nan"),
                  obs[int(0.25 * (len(obs) - 1))], obs[int(0.75 * (len(obs) - 1))], v))
 
@@ -419,7 +484,8 @@ for ck, counts in cell.items():
         continue
     for c, v in counts.items():
         bycount[c].append(st.median(v) / base)
-print("k=%d, each count's time relative to that cell's own smallest reachable count:" % k0)
+print("k=%d, each count's time relative to that cell's own smallest reachable count:%s"
+      % (k0, PMARK))
 print("  %6s %7s %10s" % ("count", "cells", "geomean"))
 prev, mono = None, True
 for c in sorted(bycount):
@@ -429,7 +495,7 @@ for c in sorted(bycount):
     if prev is not None and g < prev - 1e-9:
         mono = False
     prev = g
-print("  monotone non-decreasing in worker count: %s" % mono)
+print("  monotone non-decreasing in worker count: %s%s" % (mono, PMARK))
 
 # THE LAST POINT OF THIS CURVE IS NOT THE "endpoint hi/lo" STATISTIC ABOVE, AND THE TWO SIT
 # CLOSE ENOUGH TOGETHER TO BE READ AS ONE. A reader who divides this table's last row by its
