@@ -178,9 +178,25 @@ def main(argv):
               % omitted)
         print("  the grid, and this line is the only record of that.")
     print("  The floor column is the null for the two beside it. The recorded float32 result is")
-    print("  that removing the prefetch wins 14.6%% at k=4 and fades to 0.56%% by k=16, and that it")
-    print("  HARMS 115 matrices at k=32 -- a width absent from this grid, so this table cannot")
-    print("  see the side of the trade that blocks shipping.")
+    print("  that removing the prefetch wins 14.6% at k=4 and fades to 0.56% by k=16, and that it")
+    print("  HARMS 115 matrices at k=32. That harm was measured on SUITESPARSE; whether this")
+    print("  grid can see it depends on the grid, so the condition is tested rather than asserted:")
+    if 32 in widths:
+        pop32 = [c for c in cells if c[1] == 32]
+        fl32 = rel("shpb", "ship", pop32)
+        vn32 = rel("nopf", "ship", pop32) if "nopf" in builds else []
+        if vn32 and fl32:
+            print("    k=32 IS in this grid (%d cells): nopf reads %+.3f%% against a floor of %+.3f%%."
+                  % (len(vn32), 100 * pct(vn32, 0.5), 100 * pct(fl32, 0.5)))
+            print("    A sign agreeing with the SuiteSparse harm would corroborate it on a second")
+            print("    corpus; a sign against it means the harm is corpus-specific. Either way this")
+            print("    table DOES see the side of the trade that blocks shipping, so the sentence")
+            print("    above must not be read as an excuse for not looking.")
+        else:
+            print("    k=32 is in the grid but lacks a nopf or shpb reading, so it is still unseen.")
+    else:
+        print("    k=32 is ABSENT from this grid, so this table cannot see the side of the trade")
+        print("    that blocks shipping, and no conclusion about it may be drawn from these rows.")
 
     # ---- the decisive question, stated as a comparison and not a verdict.
     print()

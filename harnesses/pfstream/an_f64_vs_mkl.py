@@ -264,18 +264,49 @@ def main(argv):
 
     # ---- how far behind, for the cells that are.
     print()
-    print("MARGIN on the behind set (max over readings of ours/mkl, so the worst object)")
+    # MARGIN FROM THE CELL'S MEDIAN READING, NOT ITS MAXIMUM.
+    #
+    # This block used to summarise each cell by max(ratios), described as "the worst object".
+    # It is not: it is the worst READING, and a maximum over 12 readings is maximally sensitive
+    # to a single perturbed timing. On the DLMC float32 screen it made one cell read 169.181x
+    # when eleven of its twelve readings were 1.0-1.6x and its median was 1.481x -- a 114-fold
+    # inflation of the headline deficit from one reading, on a host documented as shared and
+    # not bandwidth-partitioned. The per-cell summary is therefore the MEDIAN over readings,
+    # which needs seven of twelve readings to move before it does.
+    #
+    # The maximum is still printed, because a cell that is genuinely worse in one object is a
+    # real finding, and so is a cell with one wild reading -- they are just different findings.
+    # max/median separates them, so it is reported with its own count rather than left for a
+    # reader to notice: a ratio of 114 is an interference reading, a ratio of 1.3 is an object.
+    print("MARGIN on the behind set, per cell. The summary statistic is the cell's MEDIAN")
+    print("reading; the max column is the single worst reading and is NOT a per-cell deficit.")
     marg = collections.defaultdict(list)
     for ck, v in verdict.items():
         if v == BEHIND:
-            marg[band(nnz[ck[0]])].append(max(ratios[ck]))
-    print("  %-9s %6s %9s %9s %9s" % ("band", "cells", "median", "p95", "max"))
+            rr = sorted(ratios[ck])
+            marg[band(nnz[ck[0]])].append((pct(rr, 0.5), rr[-1], ck))
+    print("  %-9s %6s %9s %9s %9s %9s %s"
+          % ("band", "cells", "med-med", "p95-med", "max-med", "worst-rdg", "max/med>5"))
+    susp_all = []
     for lab in BAND_ORDER:
-        vv = sorted(marg.get(lab, []))
+        vv = marg.get(lab, [])
         if not vv:
             continue
-        print("  %-9s %6d %8.3fx %8.3fx %8.3fx"
-              % (lab, len(vv), pct(vv, 0.5), pct(vv, 0.95), vv[-1]))
+        meds = sorted(x[0] for x in vv)
+        susp = [x for x in vv if x[0] > 0 and x[1] / x[0] > 5.0]
+        susp_all.extend(susp)
+        print("  %-9s %6d %8.3fx %8.3fx %8.3fx %8.3fx %9d"
+              % (lab, len(vv), pct(meds, 0.5), pct(meds, 0.95), meds[-1],
+                 max(x[1] for x in vv), len(susp)))
+    if susp_all:
+        print("  CELLS WHOSE WORST READING EXCEEDS 5x THEIR OWN MEDIAN -- read as interference,")
+        print("  not as deficit, and named so the judgement is auditable rather than implied:")
+        for md, mx, ck in sorted(susp_all, key=lambda x: -x[1])[:6]:
+            print("    %7.3fx median vs %9.3fx worst  (x%.0f)  k=%-3d %s"
+                  % (md, mx, mx / md, ck[1], ck[0][-58:]))
+    else:
+        print("  no cell's worst reading exceeds 5x its own median, so no reading is flagged")
+        print("  as interference -- printed because an empty list must not read as unchecked.")
 
     # ---- STRUCTURE of the deficit set against the rest, because a fix has to key on
     # something the matrices share. Printed as a comparison, never as the behind set alone:
