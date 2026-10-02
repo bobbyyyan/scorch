@@ -31,6 +31,13 @@ is what makes this an upper bound on traffic rather than a prediction of it; `b_
 reported so a reader can see where B is small enough that the bound is loose, instead of this
 script picking a cache size on their behalf.
 
+COST AND COVERAGE, both stated because neither is derivable from the output. Row-blocked at
+2,000,000 nonzeros, so peak working memory is about 24 * span * CHUNK_NNZ bytes regardless of
+matrix size, roughly 144 MB at span 3. `span` is `(S-1)//64 + 2`, which is 2 for S <= 64 and 3
+for 64 < S <= 128; `span >= 4` needs S >= 193, and no registered width reaches it (float64
+tops out at S=128 for k=16, and the float32 DLMC width set at S=128 for k=32). So the blocked
+union path is exercised at exactly the spans the registered runs use.
+
 WHAT IT REPORTS, per (key, k):
   deg            nnz / rows, the known separator. Reported so the new columns can be shown to
                  add information OVER it rather than restate it.
@@ -64,31 +71,68 @@ ITEMSIZE = {"float32": 4, "float64": 8}
 LINE = 64
 
 
-def lines_per_row(indptr, indices, S):
-    """Total distinct 64-byte B lines summed over rows, vectorized across the whole matrix.
+def fits_int64(nrows, stride):
+    """Can (row, line) pairs be packed as `row * stride + line` without wrapping int64?
 
-    A row's gathered B rows span lines `lo = (j*S)//64` through `hi = (j*S+S-1)//64`. The
-    widest a single gathered row can be is `(S-1)//64 + 2` lines, so unioning `span` shifted
-    copies clipped at `hi` enumerates every line touched with no per-row Python loop.
+    Pulled out as a pure predicate so it has a plant. An earlier version inlined this as a
+    bare `raise OverflowError` whose message named a "pairwise unique path" that does not
+    exist in this file, in a module where every other failure returns a "REFUSE: ..." string
+    from main(); and no self-test input reached it. A guard with no reachable input is not a
+    guard, which is the comment three lines below the one it sat above.
+
+    A wrap here would alias two different rows onto one key and UNDER-count lines, reading as
+    better locality -- the direction that flatters the hypothesis this script exists to test.
     """
+    if nrows <= 0 or stride <= 0:
+        return True
+    return nrows <= (np.iinfo(np.int64).max // stride)
+
+
+# Nonzeros per row-block. The total is a SUM over independent rows, so blocking changes no
+# answer and bounds peak memory: the unblocked version allocated `span` int64 copies of the
+# whole index array plus numpy's sort buffer, about 24*span*nnz bytes, which is 2.09 GB at the
+# collection's largest matrix (28,967,291 nonzeros) at span 3 -- and 75 of 4584 keys exceed
+# 1e7 nonzeros, so that cost lands late in a sweep and on the slowest keys.
+CHUNK_NNZ = 2_000_000
+
+
+def lines_per_row(indptr, indices, S):
+    """Total distinct 64-byte B lines summed over rows, blocked over rows.
+
+    A row's gathered B rows span lines `lo = (j*S)//64` through `hi = (j*S+S-1)//64`. A
+    length-S byte range spans at most `ceil(S/64) + 1 = (S-1)//64 + 2` lines, so unioning that
+    many shifted copies clipped at `hi` enumerates every line touched, with the surplus copies
+    collapsing under `unique`. Row ids are made block-local and the stride is taken from the
+    block, so the packed key stays small.
+    """
+    indptr = indptr.astype(np.int64)
     nnz = int(indptr[-1])
     if nnz == 0:
         return 0
     nrows = len(indptr) - 1
-    counts = np.diff(indptr.astype(np.int64))
-    row_id = np.repeat(np.arange(nrows, dtype=np.int64), counts)
-    off = indices.astype(np.int64) * S
-    lo, hi = off // LINE, (off + S - 1) // LINE
     span = (S - 1) // LINE + 2
-    # Pack (row, line) into one int64 key. Guard the multiply rather than trust the shapes:
-    # a silent wrap here would alias two different rows onto one key and UNDER-count lines,
-    # which reads as better locality -- the direction that would flatter the hypothesis.
-    stride = int(hi.max()) + 1
-    if nrows > 0 and stride > 0 and nrows > (np.iinfo(np.int64).max // stride):
-        raise OverflowError("row count %d times line stride %d exceeds int64; this matrix "
-                            "needs the pairwise unique path" % (nrows, stride))
-    keys = [row_id * stride + np.minimum(lo + t, hi) for t in range(span)]
-    return int(np.unique(np.concatenate(keys)).size)
+    total = 0
+    r0 = 0
+    while r0 < nrows:
+        # Advance to the first row whose cumulative nonzero count passes the budget, always
+        # taking at least one row so a single row wider than the budget still progresses.
+        r1 = int(np.searchsorted(indptr, indptr[r0] + CHUNK_NNZ, side="right")) - 1
+        r1 = max(r1, r0 + 1)
+        r1 = min(r1, nrows)
+        a, b = int(indptr[r0]), int(indptr[r1])
+        if b > a:
+            off = indices[a:b].astype(np.int64) * S
+            lo, hi = off // LINE, (off + S - 1) // LINE
+            local = np.repeat(np.arange(r1 - r0, dtype=np.int64),
+                              np.diff(indptr[r0:r1 + 1]))
+            stride = int(hi.max()) + 1
+            if not fits_int64(r1 - r0, stride):
+                raise OverflowError("block of %d rows times line stride %d exceeds int64"
+                                    % (r1 - r0, stride))
+            keys = [local * stride + np.minimum(lo + t, hi) for t in range(span)]
+            total += int(np.unique(np.concatenate(keys)).size)
+        r0 = r1
+    return total
 
 
 def stats_for(indptr, indices, k, itemsize):
@@ -146,7 +190,12 @@ def main(argv):
             # nnz == 0 is handled in ONE place, inside stats_for, so this guard has reachable
             # input. An earlier version skipped such keys before the call AND kept this branch,
             # which made the branch dead -- a guard with no reachable input is not a guard.
-            st = stats_for(indptr, indices, k, itemsize)
+            try:
+                st = stats_for(indptr, indices, k, itemsize)
+            except OverflowError as e:
+                return ("REFUSE: key %s at k=%d could not be keyed safely: %s. Every other "
+                        "failure in this module returns a REFUSE line; this one did too."
+                        % (key, k, e))
             if st is None:
                 zero += 1
                 continue

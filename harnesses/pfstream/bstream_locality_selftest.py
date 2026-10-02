@@ -31,7 +31,12 @@ def ref_lines(indptr, indices, S):
     return total
 
 
+NASSERT = 0
+
+
 def chk(label, got, want, tol=1e-9):
+    global NASSERT
+    NASSERT += 1
     ok = abs(got - want) <= tol
     print("  %-58s %-11.6f %s" % (label, got, "ok" if ok else "FAIL want %.6f" % want))
     if not ok:
@@ -39,6 +44,8 @@ def chk(label, got, want, tol=1e-9):
 
 
 def chki(label, got, want):
+    global NASSERT
+    NASSERT += 1
     ok = got == want
     print("  %-58s %-11s %s" % (label, got, "ok" if ok else "FAIL want %s" % want))
     if not ok:
@@ -94,7 +101,8 @@ chk("pack = 128 useful / 320 fetched", pack, 0.4)
 
 print("GROUP 7 -- the vectorized path against the brute-force reference")
 rng = np.random.default_rng(20261002)
-mism = 0
+mism = ncmp = ntrial = ndup = 0
+spans = set()
 for trial in range(60):
     nrows = int(rng.integers(1, 12))
     cnt = rng.integers(0, 7, size=nrows)
@@ -109,13 +117,82 @@ for trial in range(60):
             ix[a:b] = np.sort(ix[a:b])
     if int(ip[-1]) == 0:
         continue
+    ntrial += 1
+    ndup += 1 if any(len(set(ix[int(ip[r]):int(ip[r + 1])].tolist()))
+                     < int(ip[r + 1]) - int(ip[r]) for r in range(nrows)) else 0
     for k in (2, 4, 6, 8, 10, 12, 16):
         S, got = k * 8, lines_per_row(ip, ix, k * 8)
         want = ref_lines(ip, ix, S)
+        ncmp += 1
+        spans.add((S - 1) // LINE + 2)
         if got != want:
             mism += 1
             print("    MISMATCH trial %d k=%d: %d vs %d" % (trial, k, got, want))
-chki("vectorized == brute force over 60 random matrices x 7 widths", mism, 0)
+chki("vectorized == brute force, mismatches", mism, 0)
+# A printed 0 cannot distinguish "413 comparisons all agreed" from "0 comparisons ran". One of
+# the 60 trials draws all-zero row counts and hits the `continue`, so the label "60 matrices x
+# 7 widths" overstates by 7. Assert the comparison COUNT, not only the mismatch count.
+chki("comparisons actually run (59 non-empty trials x 7 widths)", ncmp, 413)
+chki("trials skipped for being entirely empty", 60 - ntrial, 1)
+print("    non-vacuity: %d of %d non-empty trials contain a repeated column index in some row,"
+      % (ndup, ntrial))
+print("    so the duplicate path is exercised by this comparison and not only by GROUP 8")
+chki("trials exercising duplicate columns is nonzero", ndup > 0, True)
+chki("spans exercised by GROUP 7", sorted(spans), [2, 3])
+
+print("GROUP 7b -- the reference has discriminating power: it REJECTS the superseded model")
+# GROUP 7 passing shows the two implementations agree. It does not show the comparison could
+# fail. Running the same reference against the model this file replaced -- whole B rows per
+# line -- must DISAGREE, otherwise GROUP 7 is a check that cannot go red.
+def old_model_lines(ip, ix, S):
+    bpl = max(1, LINE // S)
+    tot = 0
+    for r in range(len(ip) - 1):
+        a_, b_ = int(ip[r]), int(ip[r + 1])
+        if b_ > a_:
+            tot += int(np.unique(ix[a_:b_] // bpl).size)
+    return tot
+ip_d = np.array([0, 2]); ix_d = np.array([1, 5])
+chki("at k=6 the reference and the OLD model disagree (4 vs 2 lines)",
+     (ref_lines(ip_d, ix_d, 48), old_model_lines(ip_d, ix_d, 48)), (4, 2))
+caught = sum(1 for k in (2, 4, 6, 8, 10, 12, 16)
+             if ref_lines(ip_d, ix_d, 8 * k) != old_model_lines(ip_d, ix_d, 8 * k))
+chki("widths at which the reference catches the old model", caught, 4)
+
+print("GROUP 7c -- the answer is invariant to the row-blocking size")
+# Row blocking is a memory bound, not a model change: the total is a sum over independent
+# rows. Shrinking the block to 3 nonzeros must not move any answer.
+import bstream_locality as _bl
+keep = _bl.CHUNK_NNZ
+moved = 0
+try:
+    for trial in range(12):
+        nrows = int(rng.integers(2, 9))
+        cnt = rng.integers(0, 6, size=nrows)
+        ip = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int64)
+        if int(ip[-1]) == 0:
+            continue
+        ix = np.sort(rng.integers(0, 50, size=int(ip[-1]))).astype(np.int64)
+        for k in (2, 6, 16):
+            _bl.CHUNK_NNZ = 10 ** 9
+            unblocked = _bl.lines_per_row(ip, ix, 8 * k)
+            _bl.CHUNK_NNZ = 3
+            blocked = _bl.lines_per_row(ip, ix, 8 * k)
+            if unblocked != blocked:
+                moved += 1
+finally:
+    _bl.CHUNK_NNZ = keep
+chki("blocked == unblocked over 12 matrices x 3 widths", moved, 0)
+
+print("GROUP 7d -- the int64 packing predicate, planted at values no corpus can reach")
+from bstream_locality import fits_int64
+MAXI = np.iinfo(np.int64).max
+chki("fits_int64 accepts the collection's extremes (9888048 rows, stride 9380004)",
+     fits_int64(9888048, 9380004), True)
+chki("fits_int64 REFUSES a product past int64", fits_int64(MAXI // 2, 4), False)
+chki("fits_int64 at exactly the boundary", fits_int64(MAXI // 1000, 1000), True)
+chki("fits_int64 one step past it", fits_int64(MAXI // 1000 + 2, 1000), False)
+chki("degenerate stride is accepted rather than dividing by zero", fits_int64(10, 0), True)
 
 print("GROUP 8 -- the pack assertion fires on its own failing input")
 # A repeated column index inflates the numerator without touching the denominator. Eight
@@ -125,8 +202,9 @@ chk("8 duplicate columns -> pack 2.0, above the asserted bound", pack, 2.0)
 chki("that value would be REFUSED by the bound in main()", pack > 1.0, True)
 chki("nnz 0 returns None", stats_for(np.array([0, 0]), np.array([], dtype=np.int64), 2, 8), None)
 
+NGROUPS = 11
 print()
 if FAIL:
     print("FAILED %d: %s" % (len(FAIL), FAIL))
     sys.exit(1)
-print("all planted cases pass (8 groups)")
+print("all planted cases pass (%d groups, %d assertions)" % (NGROUPS, NASSERT))
