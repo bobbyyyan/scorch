@@ -59,6 +59,8 @@ def main(argv):
     # (key, k) -> list of (build, pass, ours_ms, mkl_ms)
     cell = collections.defaultdict(list)
     nnz = {}
+    rows_of = {}
+    degree_of = {}
     skipped = collections.Counter()
     passes, builds = set(), set()
     for n in names:
@@ -69,6 +71,8 @@ def main(argv):
             try:
                 by[(r["key"], int(r["k"]), r["arm"])] = float(r["ms"])
                 nnz[r["key"]] = int(r["nnz"])
+                rows_of[r["key"]] = int(r["rows"])
+                degree_of[r["key"]] = float(r["deg"])
             except (KeyError, TypeError, ValueError):
                 skipped["unparseable"] += 1
         bset = {r["build"] for r in rows}
@@ -158,6 +162,38 @@ def main(argv):
             continue
         print("  %-9s %6d %8.3fx %8.3fx %8.3fx"
               % (lab, len(vv), pct(vv, 0.5), pct(vv, 0.95), vv[-1]))
+
+    # ---- STRUCTURE of the deficit set against the rest, because a fix has to key on
+    # something the matrices share. Printed as a comparison, never as the behind set alone:
+    # a property is only a candidate if it SEPARATES behind from ahead.
+    print()
+    print("STRUCTURE: the behind set against the ahead set, same widths")
+    deg = {}
+    for ck in cell:
+        key = ck[0]
+        deg[key] = rows_of.get(key), nnz[key]
+    print("  %-6s %-7s %7s %9s %9s %9s %9s" % ("k", "set", "cells", "med deg", "p10 deg", "p90 deg", "med nnz"))
+    for w in widths:
+        for lab, want in (("behind", BEHIND), ("ahead", AHEAD), ("mixed", MIXED)):
+            sel = [ck for ck, v in verdict.items() if ck[1] == w and v == want]
+            if not sel:
+                continue
+            ds = sorted(degree_of[ck[0]] for ck in sel if ck[0] in degree_of)
+            ns = sorted(nnz[ck[0]] for ck in sel)
+            if not ds:
+                continue
+            print("  k=%-4d %-7s %7d %9.2f %9.2f %9.2f %9d"
+                  % (w, lab, len(sel), pct(ds, 0.5), pct(ds, 0.10), pct(ds, 0.90), pct(ns, 0.5)))
+        print()
+
+    print("THE 20 WORST CELLS (largest max-over-readings ours/mkl), with structure")
+    worst = sorted(((max(ratios[ck]), ck) for ck, v in verdict.items() if v == BEHIND),
+                   reverse=True)[:20]
+    print("  %-26s %4s %10s %9s %8s %8s" % ("key", "k", "nnz", "rows", "deg", "worst"))
+    for r, ck in worst:
+        key, w = ck
+        print("  %-26s %4d %10d %9s %8.2f %7.3fx"
+              % (key[-26:], w, nnz[key], rows_of.get(key, "?"), degree_of.get(key, 0), r))
 
     # ---- pooled position, reported last and labelled as pooled.
     print()
