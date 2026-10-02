@@ -3,7 +3,12 @@
 #SBATCH -p mkt
 #SBATCH -J pfs-dlmc-f32
 #SBATCH -t 12:00:00
-#SBATCH -N 1
+# -c 32 IS LOAD-BEARING. Without a cpus-per-task request Slurm gives the default allocation and
+# torch.get_num_threads() reads 2 on this node, so OMP_NUM_THREADS=32 cannot help -- the cgroup
+# caps it. A first submission of this script ran at pool 2 and would have completed normally,
+# producing timings on a 2-CPU allocation that look like the 32-CPU screen's and are comparable
+# to nothing. The working float64 screen requests -c 32; this matches it.
+#SBATCH -c 32
 #SBATCH -o /scr/bobbyy/pfs/screen_dlmc.log
 #
 # The four-arm prefetch screen over DLMC, float32.
@@ -29,7 +34,13 @@ set -u
 # reach a queued job. Pinning the producer digests means a stale stage is caught at startup
 # rather than discovered in the output, and the comparison is against what is on disk NOW.
 echo "script $(basename "$0") spooled; producer digests at startup:"
-for f in mrgate.py csrresolve.py arm_screen.sh dlmc_corpus.py; do
+# The KEY LIST is pinned too, not only its generator. Pinning dlmc_corpus.py does not pin
+# dlmc_keys.txt: a stale list from an earlier parameterisation, or a hand-edited one, reads
+# identically with every generator digest unchanged. The generator is deterministic -- evenly
+# spaced indices over an nnz-sorted pool, no seed -- so the list is reproducible from it, which
+# is exactly why its digest is worth recording rather than inferring. One corpus-identity
+# failure on the other host already served one key another key's matrix.
+for f in mrgate.py csrresolve.py arm_screen.sh dlmc_corpus.py dlmc_keys.txt; do
   if [ -f "/scr/bobbyy/pfs/$f" ]; then
     printf "  %-18s %s\n" "$f" "$(shasum -a 256 "/scr/bobbyy/pfs/$f" | cut -c1-16)"
   else

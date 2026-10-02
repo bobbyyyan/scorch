@@ -77,26 +77,44 @@ def main(argv):
           % (len(models), len(methods), len(sparsities),
              len(models) * len(methods) * len(sparsities), len(st)))
 
-    picked, short, empty = [], [], []
+    picked, short, empty, degen = [], [], [], []
     print()
-    print("  %-12s %-22s %-6s %6s %5s" % ("model", "method", "sparse", "pool", "took"))
+    print("  %-12s %-22s %-6s %6s %5s %6s %8s" % ("model", "method", "sparse", "pool", "took",
+                                                   "zero", "min nnz"))
     for key in sorted(st, key=lambda k: (k[0], k[1], float(k[2]))):
         pool = st[key]
         # order by nonzero count so the spacing below spans the stratum's size range
         sized = [(nnz_of(p), k, p) for k, p in pool]
-        usable = sorted([x for x in sized if x[0] is not None])
-        if len(usable) < len(sized):
-            short.append((key, len(sized) - len(usable)))
+        unreadable = [x for x in sized if x[0] is None]
+        # DEGENERATE MATRICES ARE DROPPED AND COUNTED. nnz_of returns None only on an exception,
+        # so a matrix with zero nonzeros returns 0 and passes an `is not None` filter. That
+        # interacts badly with the selection below: the spacing's i=0 term is round(0) = 0 for
+        # every pool size, so the MINIMUM-nnz member of every stratum is picked unconditionally
+        # and ties at the minimum sort to the front. A stratum containing zero-nonzero files
+        # would therefore contribute them first, every time. This cache has none -- they were
+        # excluded upstream, which is why one stratum's pool is 71 where its siblings are 97 --
+        # but the filter must not depend on that.
+        degenerate = [x for x in sized if x[0] is not None and x[0] <= 0]
+        usable = sorted([x for x in sized if x[0] is not None and x[0] > 0])
+        if unreadable:
+            short.append((key, len(unreadable)))
+        if degenerate:
+            degen.append((key, len(degenerate)))
         if not usable:
             empty.append(key)
-            print("  %-12s %-22s %-6s %6d %5s" % (key[0], key[1], key[2], len(pool), "0 !"))
+            print("  %-12s %-22s %-6s %6d %5s %6d %8s"
+                  % (key[0], key[1], key[2], len(pool), "0 !", len(degenerate), "-"))
             continue
         take = min(per, len(usable))
         idx = ([round(i * (len(usable) - 1) / max(1, take - 1)) for i in range(take)]
                if take > 1 else [0])
         sel = [usable[i] for i in sorted(set(idx))]
         picked += [k for _n, k, _p in sel]
-        print("  %-12s %-22s %-6s %6d %5d" % (key[0], key[1], key[2], len(usable), len(sel)))
+        # The dropped count sits beside the pool size on purpose: a stratum that loses 26 of 97
+        # members has a different effective n from its neighbours, and a summary that reports
+        # only "took 8" conceals that.
+        print("  %-12s %-22s %-6s %6d %5d %6d %8d"
+              % (key[0], key[1], key[2], len(usable), len(sel), len(degenerate), sel[0][0]))
 
     print()
     if short:
@@ -104,8 +122,13 @@ def main(argv):
     if empty:
         print("  EMPTY strata: %d -- no claim about those design cells is supported: %s"
               % (len(empty), empty[:6]))
-    if not short and not empty:
-        print("  every stratum contributed; no shortfalls")
+    if degen:
+        print("  strata containing ZERO-NONZERO files, dropped: %d (%s)" % (len(degen), degen[:5]))
+    if not short and not empty and not degen:
+        print("  every stratum contributed; no unreadable and no zero-nonzero files")
+    print("  ^ 'every stratum contributed' is about STRATA. The zero column above is about")
+    print("    MATRICES, and an earlier version could only report the former -- so it printed")
+    print("    'no shortfalls' in exactly the case where a degenerate matrix had been selected.")
     # Duplicate basenames among the selected keys would collide in a flat cache. This cache is
     # NOT flat, but the check is cheap and the failure it guards against was real on the other
     # host, where exactly one such collision silently served one key another key's matrix.

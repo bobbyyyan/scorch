@@ -58,9 +58,35 @@ def main(argv):
     # declared width that produced no rows -- and the defect this guards against was exactly
     # that: a prose summary named five widths while the run measured seven, and 19 of 192 cells
     # went missing. Only a declaration outside the data can catch it.
-    declared = None
-    if len(argv) > 2 and argv[2] and not argv[2].startswith("--"):
+    # The producer writes its own ks, keys, builds and passes into a sentinel beside the CSVs,
+    # so the declaration is read rather than handed over. An analysis whose validation depends on
+    # a caller remembering an argument has only its plants: there was no committed caller passing
+    # it at all, and a forgotten argument completed and exited 0 with the width check silently
+    # unavailable.
+    declared, decl_src, decl = None, None, {}
+    sentinel = os.path.join(d, "f64screen.done")
+    if os.path.exists(sentinel):
+        for ln in open(sentinel):
+            parts = ln.split()
+            if len(parts) >= 2:
+                decl[parts[0]] = parts[1]
+        if "ks" in decl:
+            declared = sorted(int(x) for x in decl["ks"].split(",") if x)
+            decl_src = "the producer's sentinel %s" % sentinel
+    if declared is None and len(argv) > 2 and argv[2] and not argv[2].startswith("--"):
         declared = sorted(int(x) for x in argv[2].split(",") if x)
+        decl_src = "argument 2"
+    if declared is None:
+        return ("REFUSE: no declared width set. Either %s must exist carrying a `ks` line, or the "
+                "producer's ks must be passed as argument 2. Without a declaration the width "
+                "validation is unavailable and the cell counts below cannot be checked against "
+                "anything outside the data they are computed from -- which is how 19 of 192 "
+                "cells went unreported once already." % sentinel)
+    print("declaration read from %s: ks %s%s"
+          % (decl_src, declared,
+             (", keys %s, builds %s, passes %s"
+              % (decl.get("keys", "?"), decl.get("builds", "?"), decl.get("passes", "?")))
+             if decl else ""))
     names = sorted(f for f in os.listdir(d) if f.endswith(".csv"))
     if not names:
         return "REFUSE: no CSVs in %s" % d
@@ -71,7 +97,6 @@ def main(argv):
     degree_of = {}
     skipped = collections.Counter()
     passes, builds = set(), set()
-    n_ours_paired = 0
     for n in names:
         with open(os.path.join(d, n)) as fh:
             rows = list(csv.DictReader(fh))
@@ -97,7 +122,6 @@ def main(argv):
             m = by.get((key, k, "mkl"))
             if m and t > 0 and m > 0:
                 cell[(key, k)].append((b, tag, t, m))
-                n_ours_paired += 1
             else:
                 skipped["no mkl partner or non-positive"] += 1
     print("files %d   builds %s   pass-files %d" % (len(names), sorted(builds), len(passes)))
@@ -109,16 +133,32 @@ def main(argv):
     print("readings per cell: %s" % dict(nread))
     full = max(nread)
     print("cells with the full %d readings: %d of %d" % (full, nread[full], len(cell)))
-    # Independent accounting: every (cell, reading) pair came from one parsed `ours` row that
-    # found an mkl partner. Summing the readings per cell must reproduce that count.
-    pairs_from_cells = sum(len(v) for v in cell.values())
-    if pairs_from_cells != n_ours_paired:
-        return ("REFUSE: %d ours-rows were paired with an mkl partner during parsing but the "
-                "cell table holds %d readings, so %d reading(s) were dropped between parse and "
-                "classify" % (n_ours_paired, pairs_from_cells,
-                              n_ours_paired - pairs_from_cells))
-    print("paired ours-rows at parse time %d == readings held in the cell table, ASSERTED"
-          % n_ours_paired)
+    # INDEPENDENT ACCOUNTING, derived entirely from the declaration. An earlier version compared
+    # a counter incremented in the same branch as the append it was counting -- the two moved in
+    # lockstep, so it was an identity, and it was evaluated before the classifier it claimed to
+    # watch even ran. None of the four factors below come from the cell table: the key count and
+    # width count are the producer's, and builds x passes is the pass-file structure.
+    observed = sum(len(v) for v in cell.values())
+    n_keys = int(decl["keys"]) if decl.get("keys", "").isdigit() else None
+    n_bp = (int(decl["builds"]) * int(decl["passes"])
+            if decl.get("builds", "").isdigit() and decl.get("passes", "").isdigit() else None)
+    if n_keys is None or n_bp is None:
+        n_bp = n_bp or len(names)
+        n_keys = n_keys or len({k for (k, _w) in cell})
+        print("  (keys/builds/passes not all declared; falling back to %d keys and %d pass-files,"
+              % (n_keys, n_bp))
+        print("   which weakens this check toward the data it is checking -- say so rather than")
+        print("   present it as independent.)")
+    expected = n_keys * len(declared) * n_bp
+    print("expected readings = %d keys x %d declared widths x %d pass-files = %d; observed %d"
+          % (n_keys, len(declared), n_bp, expected, observed))
+    if expected != observed:
+        return ("REFUSE: %d readings expected from the declaration but %d present (%+d). This "
+                "catches a key the cache never resolved, a declared width that produced no rows, "
+                "a pass-file that never arrived, and a row dropped before the mkl-partner test -- "
+                "none of which a counter incremented beside its own append can see."
+                % (expected, observed, observed - expected))
+    print("  ASSERTED equal, so no key, width or pass-file is silently missing")
 
     # ---- classify every cell once.
     AHEAD, BEHIND, MIXED = "ahead", "behind", "mixed"

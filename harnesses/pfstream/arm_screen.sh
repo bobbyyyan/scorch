@@ -79,7 +79,22 @@ python - "$KS" "$LANES" "$DTYPE" <<'PY' || exit 1
 import sys
 ks = [int(x) for x in sys.argv[1].split(",") if x]
 lanes, dtype = int(sys.argv[2]), sys.argv[3]
-exact_hi = 7 if lanes == 8 else 3
+# THE SHIPPED BOUND, NOT THE INSTANTIATION CAP. spmm.h reads
+#   int exact_hi_ = narrowk_exact_hi;
+#   const int exact_cap_ = exact_f32_ ? 7 : 3;
+#   if (exact_hi_ > exact_cap_) exact_hi_ = exact_cap_;
+# so 7 only CLAMPS; it is the number of instantiated float widths. The value that decides what
+# the exact kernel owns is SCORCH_NARROWK_EXACT_HI, which ships at 3, and both
+# SCORCH_NARROWK_EXACT_HI_F32 and _F64 are defined to it. So the exact kernel owns k=1..3 for
+# BOTH dtypes. Using 7 here would let k=5, 6 or 7 be accepted as a float32 "negative control"
+# when they are live register-block widths (nvec 1, masked tail), and would drop them from the
+# nvec and tail census -- a latent hole in a fail-closed guard. It is invisible on the float64
+# side because min(3, 3) makes the two bounds agree.
+exact_hi = 3
+# float32 additionally routes k == lanes/2 to the half-vector kernel (halfvec_exact is
+# B1_size == LH, LH = 4 for float, and SCORCH_SPMM_HALFVEC_F32 ships at 1), so that one width is
+# neither the exact kernel nor a plain register block. SCORCH_SPMM_HALFVEC_F64 ships at 0.
+halfvec = lanes // 2 if lanes == 8 else None
 hi = 4 * lanes
 print("  GRID CHECK for %s (%d lanes): regblock reaches k=1..%d, exact kernel owns k=1..%d"
       % (dtype, lanes, hi, exact_hi))
@@ -87,11 +102,15 @@ over = [k for k in ks if k > hi]
 if over:
     sys.exit("REFUSE: widths %s exceed k=%d, which needs NVEC>4 and is not instantiated" % (over, hi))
 ctrl = [k for k in ks if k <= exact_hi]
-arm = [k for k in ks if k > exact_hi]
+arm = [k for k in ks if k > exact_hi and k != halfvec]
 nvec = sorted({-(-k // lanes) for k in arm})
 full = sorted({k for k in arm if k % lanes == 0})
 mask = sorted({k for k in arm if k % lanes != 0})
-print("    negative-control widths (macro inert): %s" % ctrl)
+print("    negative-control widths (macro inert, exact kernel owns k=1..%d): %s" % (exact_hi, ctrl))
+if halfvec is not None and halfvec in ks:
+    print("    NOTE k=%d routes to the half-vector kernel on this dtype, so it is neither the"
+          % halfvec)
+    print("         exact kernel nor a plain register block; it is excluded from the tail census")
 print("    arm widths %s -> nvec %s" % (arm, nvec))
 print("    full tail %s   masked tail %s" % (full, mask))
 missing = []
@@ -114,7 +133,22 @@ done
 
 mkdir -p "$OUT" || exit 1
 NK=$(wc -l < "$KEYS" | tr -d ' ')
-echo "host $(hostname)  pool $(python -c 'import torch;print(torch.get_num_threads())')  threads $THREADS  $(date +%H:%M:%S)"
+# THE POOL MUST MATCH WHAT WAS ASKED FOR. A batch submission without a cpus-per-task request
+# gets the scheduler's default and torch reads a pool of 2, while OMP_NUM_THREADS still says 32 --
+# the cgroup caps it and nothing in the output looks wrong. That run completes and its timings are
+# comparable to nothing. Refusing here costs one second and catches it before the first cell.
+POOL=$(python -c 'import torch;print(torch.get_num_threads())')
+echo "host $(hostname)  pool $POOL  threads $THREADS  $(date +%H:%M:%S)"
+case "$POOL" in ''|*[!0-9]*) echo "REFUSE: could not read the torch thread pool (got '$POOL')"; exit 1 ;; esac
+MINPOOL=${F64_MINPOOL:-$(( THREADS / 2 ))}
+if [ "$POOL" -lt "$MINPOOL" ]; then
+  echo "REFUSE: torch reports a thread pool of $POOL but this screen asked for $THREADS threads"
+  echo "        (floor $MINPOOL). A pool far below the request means the allocation is smaller"
+  echo "        than intended -- a batch job without a cpus-per-task request reads 2 here -- and"
+  echo "        the timings would not be comparable to any other run of this screen."
+  echo "        Set F64_MINPOOL to override if a small pool is deliberate."
+  exit 1
+fi
 echo "corpus $NK matrices, dtype $DTYPE, widths $KS, reps $REPS"
 echo "cache $CACHE"
 echo "builds $BUILDS"
