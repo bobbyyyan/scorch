@@ -30,6 +30,25 @@
 # WHY A STRATIFIED CORPUS. DLMC is a factorial design (model x pruning method x sparsity x layer)
 # with unequal layer counts per cell (53-97), so a flat sample would load the corpus onto whichever
 # cell has the most layers. 392 keys, 8 from each of the 49 populated strata.
+#
+# THE SELECTION RULE, STATED COMPLETELY, BECAUSE THE LIST IS CALLED REPRODUCIBLE FROM IT BELOW.
+# Within each stratum: drop every matrix with nnz <= 0, sort the remainder by nnz ascending, and
+# take the 8 keys at indices round(i*(n-1)/7) for i = 0..7 over THAT filtered pool. No seed.
+#
+# THE FILTER IS LOAD-BEARING AND IS INVISIBLE ON 48 OF THE 49 STRATA. "Populated" above counts
+# STRATA, not matrices: DLMC ships 26 matrices whose .smtx header declares nnz == 0, all of them
+# inside transformer/variational_dropout/0.98, whose pool is 97. Reconstructing that stratum from
+# the unfiltered pool predicts indices [0, 14, 27, 41, 55, 69, 82, 96] and gets 7 of the 8 keys
+# wrong, two of them with zero nonzeros; applying the rule to the 71 usable matrices gives
+# absolute [26, 36, 46, 56, 66, 76, 86, 96], which is the committed list exactly. The other 48
+# strata contain no empty matrices, so the filter changes nothing there and its omission from
+# this comment was undetectable from 48/49 of the data.
+#
+# The filter lives at dlmc_corpus.py:170-171 as `x[0] > 0`, with the dropped count reported per
+# stratum. An earlier version used `is not None`, which a zero-nonzero matrix passes, and even
+# spacing always selects index 0 -- the minimum -- so the empties would have been selected first.
+# Incidentally the pool's smallest nonzero nnz is 6, so `nnz > 0` and `nnz >= 6` pick the same
+# 71 matrices here; that is a property of this corpus and not a safe substitution.
 set -u
 
 # DIGEST GATE. sbatch copies this script at submit time, so an edit after submission does not
