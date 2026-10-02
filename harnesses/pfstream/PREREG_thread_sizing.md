@@ -408,3 +408,52 @@ override, and this correction's own histogram would have named no `hardware_conc
 value had been 32 instead of 18 and so had looked plausible. The operational form: before
 quoting a policy figure, write down all four coordinates; if any is absent the figure is about an
 unspecified configuration, and the ones that read plausibly are the dangerous ones.
+
+---
+
+## Amendment 8 (2026-10-02): the thread count is constant where the deficit varies 4.4x
+
+**This closes the thread-count account with an argument that needs no measurement at all, only
+the two tables already in hand.** The work measure is `nnz*max(k,16)`, so it is numerically
+identical at k=2, 8, 12 and 16. Asked of the default object at `override = POOL` over all 392
+MKT DLMC float32 keys:
+
+| k  | resolved count identical to the k=2 count | mean count | cells behind MKL in all 12 readings |
+|----|-------------------------------------------|------------|-------------------------------------|
+| 2  | **392 of 392 (100.0%)**                   |      13.52 | 328 (83.7%)                         |
+| 8  | **392 of 392 (100.0%)**                   |      13.52 | 158 (40.3%)                         |
+| 12 | **392 of 392 (100.0%)**                   |      13.52 | 116 (29.6%)                         |
+| 16 | **392 of 392 (100.0%)**                   |      13.52 |  74 (18.9%)                         |
+| 20 | 386 of 392 (98.5%)                        |      13.68 |   6 (1.5%)                          |
+| 24 | 377 of 392 (96.2%)                        |      13.94 |   4 (1.0%)                          |
+| 32 | 354 of 392 (90.3%)                        |      14.80 |   2 (0.5%)                          |
+
+Every key runs on exactly the same number of workers at k=2 as at k=16, and the deficit falls
+from 83.7% of keys to 18.9% -- a factor of **4.4** -- across that range. A quantity that does not
+change cannot explain one that changes 4.4x. The count does rise by about 9% by k=32, which is
+the direction that would help, and the deficit there is 2 cells; so the two move together only in
+the sense that both improve, and 9% of worker count is not 160x of deficit count.
+
+**Three independent arguments now close it, in both directions and on the choice itself:**
+
+1. **Too few workers** -- refuted by amendments 6 and 7: the cells we BEAT MKL on are the
+   single-worker cells (92.5% at one worker against 9.1% of the behind cells), and the behind
+   cells pass the adoption gate, are raised to the host team, and lose anyway. Mean 13.52 workers.
+2. **Too many workers** -- refuted by the M5 curve relabelled by resolved count: time falls to
+   0.8089 at five workers before rising to 0.9615 at six, so six workers are still 3.85% faster
+   than one, and the 3.06x figure that said otherwise was labelling arms by the override argument.
+3. **The wrong count was chosen** -- refuted by the winner's-curse null: production's count
+   against the best reachable count reads 1.1856 at k=2 against a permutation null of 1.1818
+   (excess 1.0032), and at k=4..32 the excess is below 1, meaning production BEATS an arbitrary
+   count by 4.7-11.4% of the null.
+
+**So the remaining deficit is not a threading question and the prereg's subject is closed.** What
+is left is a kernel running on a full host team, at narrow k, on matrices of median 58 982
+nonzeros, losing to MKL by 1.16-1.90x, with the deficit monotone in k. The width dependence is
+now the primary signature and it is the one thing none of the eliminated mechanisms predicts.
+
+The four predictions of amendment 5 remain registered and will still be scored when the x86
+sweeps run, because a registered prediction is not withdrawn for being expected to fail -- but
+the expectation is now recorded: predictions 1 and 2 should fail, and if prediction 1 PASSES on
+MKT while this table holds, something is wrong with the excess statistic rather than right with
+the thread rule.
