@@ -2034,7 +2034,16 @@ pre-registration, and the verifying session, which holds the same cells, has not
 
 ### Four corrections
 
-**1. There is a tighter floor in the same files and the first version did not use it.** The `arm`
+**1. A second, tighter floor instrument was available in the same files and went unreported.**
+**It does not replace the floor used above, and must not be substituted for it.** `oursb/ours`
+holds the object fixed and varies only the reading, so it bounds *timing*. `shpb/ship` varies the
+object and so bounds placement and layout as well. The arm under test — `nopf` against `ship` —
+*is* an object difference, a separate compile and a separate link, so `shpb/ship` is the correct
+floor for it and the table above uses the right one. What the repeat adds is the separation: it
+says the +0.61% to +2.40% inter-object offset is not timing, because timing on this corpus is
+0.074-0.094% at the median. A strengthening of the signed-floor reading, not a tighter bar to
+judge the arms against — swapping it in would make almost every arm column above look
+significant. The `arm`
 column holds `ours`, `oursb`, `mkl`, and `oursb` is not a second code path: `mrgate.py:124` binds
 `{"ours": ours, "oursb": ours, ...}` — the same callable twice — documented at `mrgate.py:19` as
 the noise floor. So `oursb/ours` is a repeat reading of an identical configuration in one
