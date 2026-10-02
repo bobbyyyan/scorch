@@ -2934,3 +2934,67 @@ in `pfs_screen_dlmc.sbatch:101`. The earlier refusal recorded at `:2450` is a **
 against `266ca5fc42bf190d`; job 17696496's refusal is a **missing producer script** for the
 `arm_screen` guard pattern. Different causes, both recorded, and the chain should keep them
 separate.
+
+---
+
+## Amendment 34 — the retained identity check was not an identity, and its label contradicted its behaviour
+
+Amendment 33 kept the antisymmetry check and relabelled it *"an IDENTITY, not coverage"*. The
+label was wrong, and the proof is that the check **failed** under the planted swap — which an
+identity cannot do.
+
+```python
+dd = arm_paired_d(synth, pop)                            # the WRAPPER under test
+sw = paired_d(synth, pop, "shpb", "nopf", "ship")         # explicit literals
+check("... (an IDENTITY, not coverage)", abs(pct(sw, 0.5) + pct(dd, 0.5)) < 1e-12, ...)
+```
+
+One operand came from the wrapper, so the assertion was not `f(x,y) = −f(y,x)` but
+`paired_d(explicit swapped) + arm_paired_d(…) == 0`, which **depends on the wrapper**. It was the
+second of amendment 33's two reported failures. So the stated nature was wrong in both directions
+at once: *"holds unconditionally"* printed beside a FAIL line, and *"covers nothing"* when it had
+demonstrably covered something. A reader hitting that output would reasonably conclude
+antisymmetry had broken, which cannot happen.
+
+Both operands are now explicit. **A label about an assertion's nature is itself a claim and has to
+match the assertion's form** — which is amendment 33's lesson applied to the annotation rather
+than the code.
+
+| | before | after |
+|---|---|---|
+| planted swap in the wrapper | FAILED **2** of 14, exit 1 | FAILED **1** of 14, exit 1 |
+| the identity check, under the plant | FAIL (so: not an identity) | **PASS** (unconditional, as labelled) |
+| worktree | PASSED 14, exit 0 | PASSED 14, exit 0, digest `cc5dc235462da821` |
+
+The fix *narrows* what fails under the plant, from two checks to one. That is the correct
+direction: exactly one assertion covers the call site, it is the signed one, and the identity
+check is now visibly inert under the mutation — which is what its label says.
+
+### The signed assertion covers the whole permutation group, not just the named swap
+
+Computed over all six orderings of the three tags on the asymmetric synthetic:
+
+| arm | floor | base | median | |
+|-----|-------|------|--------|---|
+| nopf | shpb | ship | **−0.04000** | the only one that passes |
+| nopf | ship | shpb | −0.02767 | caught |
+| shpb | nopf | ship | +0.04000 | caught |
+| shpb | ship | nopf | +0.01235 | caught |
+| ship | nopf | shpb | +0.02777 | caught |
+| ship | shpb | nopf | −0.01224 | caught |
+
+**The asymmetry of the fixture was the load-bearing choice**, and it is worth naming as a reusable
+technique: when a function takes several same-typed arguments, a fixture in which every argument
+has a distinguishable effect turns **one** assertion into exhaustive coverage of their orderings.
+A symmetric fixture — floor and arm equidistant from ship — would have left half the group
+undetectable while passing.
+
+### And the exit-code rule has a sharper form than the one already recorded
+
+The existing note says *never read an exit status through a pipe*, which treats it as a
+measurement hazard. In this placement it is worse than that. **A test suite communicates its
+verdict in exactly one channel a gate consumes — its exit status — and stdout is for humans.** So a
+pipe there does not degrade a number; it **discards the entire verdict** and substitutes the status
+of a formatter that always succeeds. `tail`, `head`, `cat` and `grep -c` all return 0 on healthy
+input, so the substitution is always toward a false PASS. Every other instance of this trap
+degrades a measurement; this one inverts a verdict.

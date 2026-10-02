@@ -123,10 +123,21 @@ def main():
     # AND THIS ONE DOES NOT COVER IT, which is now stated rather than implied. paired_d returns
     # (a-f)/b, so swapping its two tag arguments is an exact negation for every dataset: the
     # property is real and cheap, but it shows a swap would be VISIBLE, not that none occurs.
+    #
+    # BOTH OPERANDS ARE EXPLICIT, AND THAT IS THE WHOLE POINT. An earlier version compared the
+    # explicit swap against `dd` -- the WRAPPER's output -- so the assertion was
+    # `paired_d(swapped) + arm_paired_d(...) == 0`, which depends on the wrapper and duly FAILED
+    # under a planted swap. An identity cannot fail, so the label contradicted the behaviour in
+    # both directions at once: "holds unconditionally" printed beside a FAIL, and "covers
+    # nothing" when it had demonstrably covered something. A reader would have concluded that
+    # antisymmetry broke, which cannot happen. A label about an assertion's NATURE is itself a
+    # claim and has to match the assertion's FORM.
+    fwd = paired_d(synth, pop, "nopf", "shpb", "ship")
     sw = paired_d(synth, pop, "shpb", "nopf", "ship")
     check("paired_d is antisymmetric in its two tags (an IDENTITY, not coverage)",
-          abs(pct(sw, 0.5) + pct(dd, 0.5)) < 1e-12,
-          "swapped median %+.4f -- holds unconditionally, covers nothing" % pct(sw, 0.5))
+          abs(pct(sw, 0.5) + pct(fwd, 0.5)) < 1e-12,
+          "%+.4f vs %+.4f -- holds unconditionally, covers nothing"
+          % (pct(fwd, 0.5), pct(sw, 0.5)))
     miss = dict(synth)
     del miss[(pop[0][0], 2, "shpb")]
     check("a cell missing one of the three tags is dropped, not defaulted",
