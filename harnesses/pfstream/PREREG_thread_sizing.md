@@ -596,3 +596,67 @@ a claim that one set skews higher than another on some quantity must print the m
 and a share above a single global cut. The share is tail-insensitive, so a split it joins is a
 location effect and one it breaks is a tail effect, and the three together say which. A direction
 feels non-parametric and so invites picking one functional without noticing a choice was made.
+
+---
+
+## Amendment 11 (2026-10-02): the k=2 structure is a one-sided degree ceiling, and it exists at no other width
+
+**The sharpest statement of the k=2 deficit is a ceiling on the set we WIN, not a floor on the
+set we lose.** On the 12-reading classification (328 behind / 53 ahead):
+
+> At k=2, the highest mean degree of any matrix we beat MKL on is **59.92**. **218 of 392 keys
+> lie above that ceiling and 217 of them are behind in all twelve readings** -- the remaining one
+> is mixed, and none is ahead.
+
+The association is **one-sided**. High degree predicts the deficit almost perfectly; low degree
+predicts nothing, because the behind set reaches down to degree **5.12** and overlaps the ahead
+set across its whole range. Every earlier framing -- "we lose on long rows", "59.5% of behind
+cells exceed the corpus median", "zero of the 53 ahead cells exceed it" -- is the weaker half of
+this, and the share-above-a-cut version is also cut-sensitive in a way the ceiling is not.
+
+**It needs a cut-free statistic with its own null, because a maximum is an order statistic of the
+data** and 100% precision at exactly that threshold is true by construction -- the same
+winner's-curse shape as the regret denominator. Statistic: the percentile rank, in that width's
+all-key degree distribution, of the ahead set's maximum. Null: labels shuffled with the ahead-set
+SIZE held fixed, 2000 permutations, seed 20261002.
+
+| k  | n ahead | max deg(ahead) | percentile | null median | null p05 | p(null <= obs) |
+|----|---------|----------------|------------|-------------|----------|----------------|
+| 2  |      53 |      **59.92** |  **43.04** |       98.95 |    95.01 |     **0.0000** |
+| 8  |      96 |        1382.40 |     100.00 |      100.00 |    97.64 |     1.0000     |
+| 12 |     144 |        2304.00 |     100.00 |      100.00 |    99.23 |     1.0000     |
+| 16 |     252 |        2304.00 |     100.00 |      100.00 |    99.39 |     1.0000     |
+| 20 |     362 |        2304.00 |     100.00 |      100.00 |   100.00 |     1.0000     |
+| 24 |     383 |        2304.00 |     100.00 |      100.00 |   100.00 |     1.0000     |
+| 32 |     384 |        2304.00 |     100.00 |      100.00 |   100.00 |     1.0000     |
+
+At k=2 the ceiling sits at the 43rd percentile of a distribution where random labelling puts it
+at the 99th. **At every other width the ahead set reaches the corpus maximum degree (2304.00) and
+the statistic is exactly null, p = 1.0000.** So the structure does not weaken with width -- it is
+absent. This is a third independent reason for amendment 10's k=2-only scope, and the only one of
+the three that is cut-free.
+
+### What this constrains about any mechanism
+
+A mechanism for these 328 cells must be something that is **essentially always decisive above
+mean degree 60 at k=2 and never decisive at k=8**, where matrices of degree 1382 and 2304 are
+ahead. It must also be compatible with the behind set extending down to degree 5.12, so it cannot
+be a property that only high-degree matrices have -- it has to be one whose COST at k=2 grows
+with degree without bound while its cost at k=8 does not.
+
+Every mechanism eliminated so far fails that test in an instructive way: the thread count, the
+adoption gate and the work grain are all identical at k=2 and k=8 by construction (amendment 8,
+`nnz*max(k,16)`), so none of them can be decisive at one width and null at the other.
+
+### Cross-criterion status, recorded because the ceiling's VALUE is criterion-dependent
+
+A peer's independent read of sealed pass 1, under the weaker "median behind" split (333/59),
+places the ceiling at **88.25** rather than 59.92 -- the difference being a single key,
+`rn50/variational_dropout/0.95/initial_conv`, which that criterion admits as ahead and this one
+does not. Confirmed here: my ahead set's maximum is 59.92, so that key is not in it. The
+CEILING EXISTS under both criteria and the null is p = 0.0000 under both; its numeric value moves
+with the classification and must be quoted with it. The shape counts underlying amendment 9 --
+266 distinct shapes, 52 repeated, 178 keys covered, max multiplicity 14, and 52 of 52 unanimous
+split 42 behind / 10 ahead -- reproduce EXACTLY across the two criteria, and the permutation nulls
+differ (35/39/44 against 34/38/42) in the direction the label imbalance predicts (86.1% against
+85.0% behind), which is the agreement worth having.
