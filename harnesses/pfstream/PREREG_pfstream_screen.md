@@ -2678,3 +2678,92 @@ floor's p05 is negative at **all seven widths** (−0.549% to −1.888%), so the
 reads either object faster depending on the cell. The floor is genuinely two-sided in spread with
 a positive median, and the band is the object to compare against. That is now printed rather than
 inferred.
+
+---
+
+## Amendment 31 — amendment 30's band compared a pooled median against a per-cell spread, so it was ~√n too wide; the paired test it needed is now computed
+
+Amendment 30 replaced a wrong magnitude comparison with a band comparison, and the band was
+wrong in a second way that the first error hid.
+
+`pct(fl, 0.05)` is the 5th percentile over **individual cells**. `pct(vn, 0.5)` is a **median
+over 392 cells**. A median's sampling spread narrows as `1/√n`, so the boundary is roughly
+`0.67·√n ≈ 13×` wider than the sampling spread of the quantity it bounds. Nothing in those eight
+lines is wrong on its own terms — both calls are exactly what they say. The defect is only that
+the two are not in the same units, and the only way to see it is to ask what each is the spread
+*of*.
+
+**The conservatism is one-directional, which separates the verdicts:**
+
+- The three **OUTSIDE** verdicts are safe and *understated*. k=8 at 5.9× the lower edge was never
+  near the scale question; k=12 and k=16 cleared a boundary ~13× too wide, which is a stronger
+  result than amendment 30 reported, not a weaker one.
+- **"inside, no verdict" is not evidence of absence.** It says only that the pooled effect is
+  smaller than a typical single-cell fluctuation, which nearly any real sub-percent effect would
+  be. The four inside rows carry much less information than the phrase implies.
+- **k=32's 0.009 pp miss is meaningless.** It is a near-miss on a boundary of the wrong width,
+  and nothing may be read from which side the arm landed on.
+
+### The estimator that answers the question, paired per cell
+
+Subtracting two pooled locations was the wrong shape. The arm and the floor pair share a
+per-cell term — the object swap — so the estimator is the **paired difference on each cell**,
+`d = (arm vs ship) − (floor vs ship)`, which cancels that term cell by cell. Its median carries
+a percentile bootstrap CI, 4000 resamples, seed 20261002, and the output **digests the index
+matrix**: a bootstrap bound is not reproducible from seed and nboot alone, because the RNG stream
+is a library property. Quote both or neither.
+
+### Two questions had been merged into one verdict string, and the answer to which is registered
+
+- The **paired CI** is a test of **existence**: does this arm differ from a mere object swap.
+- The **band** is a decision rule about **actionability**: an effect smaller than the per-cell
+  artefact between two same-config objects is not worth shipping even if it is real.
+
+This project's standing rule — *nothing inside the noise floor counts* — is the **second**.
+So the band is registered and stays; labelling it "no verdict" was the error, because it *is* a
+verdict, about actionability, and it is silent about existence. Both columns now print with that
+distinction stated, and neither is to be read alone.
+
+### The self-test is the case the defect hides, not the case the two agree on
+
+`an_f64_arms_selftest.py`, 9 checks, all passing. The control injects an effect that is real,
+consistent, and **smaller than one cell's fluctuation** — −0.50% against a per-cell sd of 2.00%
+at n=392:
+
+| check | result |
+|---|---|
+| the per-cell band calls this real effect "inside" | arm median +0.730% in band [−2.703%, +4.100%] |
+| the paired CI excludes zero | median −0.517%, CI **[−0.541%, −0.495%]** |
+| the paired CI covers the injected effect | −0.500% inside it |
+| band is ~0.67√n wider than that same median's CI | ratio 10.8 vs predicted 13.3 |
+| pairing narrows further by removing the shared term | 13.7× beyond the √n factor |
+| no-effect control: paired CI spans zero | [−0.051%, +0.037%] |
+| index digest stable under one seed, changes with another | yes / yes |
+| n < 8 returns no CI rather than a bound | None |
+
+**My first version of the scale check was itself wrong and is recorded rather than silently
+fixed.** It divided the floor's per-cell band by the *paired* CI and expected `√n ≈ 19.8`; it read
+147.5. Pairing removes the shared term, so that ratio carries `√n` **times** the variance pairing
+removes — two narrowings, not one. The `√n` factor holds only between a quantity's per-cell
+spread and the sampling spread of *its own* median, so the check now bootstraps the floor's own
+median. Same defect as finding 114 itself: two spreads of different things, divided.
+
+### An open question about the floor, which now carries every verdict
+
+Floor medians by width: **+0.672 / +0.474 / +0.237 / +1.110 / +0.562 / +1.735 / +1.381 %** at
+k = 2 / 8 / 12 / 16 / 20 / 24 / 32. Non-monotone — smallest at k=12, **largest at k=24**, not at
+either end. The recorded layout artefact between two identically-deciding objects is 1–2.6% and
+**largest at the narrowest width**; here the magnitude range transfers and the width-shape does
+not, with k=2 sitting mid-range at 0.672%.
+
+So either this is a different artefact or that characterisation does not transfer to this grid.
+**Not settled here, and it should be**, because a floor whose structure is not understood is the
+bar every arm is being read against. Registered as the next question about the instrument rather
+than about the kernel.
+
+### Status of the run
+
+The paired test has **not yet been computed on the DLMC data**: MKT job 17696556 holds all 32 of
+mkt1's CPUs, `/scr` is reachable only from an allocation, and taking one beside a live 32-worker
+measurement is the perturbation this project refuses. The numbers above are the self-test's, on
+synthetic data with a known answer. The DLMC paired CIs run when the job clears.

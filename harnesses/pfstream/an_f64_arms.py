@@ -34,6 +34,32 @@ def band(nnz):
     return "<1e3"
 
 
+def boot_median_ci(vals, nboot=4000, seed=20261002, alpha=0.05):
+    """Percentile bootstrap CI for the MEDIAN of `vals`, plus a digest pinning the resample.
+
+    A bootstrap bound is not reproducible from seed and nboot alone -- the RNG's stream depends
+    on the library version -- so the index matrix is digested and returned. Quoting the bound
+    without the digest is quoting an unreproducible number.
+    """
+    import hashlib
+    import random
+    n = len(vals)
+    if n < 8:
+        return None, None, None, n
+    rng = random.Random(seed)
+    h = hashlib.sha256()
+    meds = []
+    for _ in range(nboot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        h.update((",".join(map(str, idx))).encode())
+        r = sorted(vals[i] for i in idx)
+        meds.append(r[n // 2] if n % 2 else 0.5 * (r[n // 2 - 1] + r[n // 2]))
+    meds.sort()
+    lo = meds[int(alpha / 2 * (nboot - 1))]
+    hi = meds[int((1 - alpha / 2) * (nboot - 1))]
+    return lo, hi, h.hexdigest()[:16], n
+
+
 def pct(v, q):
     if not v:
         return None
@@ -209,6 +235,58 @@ def main(argv):
         print("  WIDTHS OMITTED FOR WANT OF A FLOOR: %s -- the table above is not complete over"
               % omitted)
         print("  the grid, and this line is the only record of that.")
+    print()
+    print("  THE PAIRED TEST, WHICH IS THE ONE THAT ANSWERS WHETHER THE ARM DIFFERS AT ALL.")
+    print("  The band column beside it compares a POOLED MEDIAN against a PER-CELL dispersion:")
+    print("  pct(fl, 0.05) is the spread over cells, pct(vn, 0.5) is a median over n of them, and")
+    print("  a median's sampling spread narrows as 1/sqrt(n) -- so that boundary is about")
+    print("  sqrt(n) ~ 20x too wide for the quantity it bounds. Its OUTSIDE verdicts are therefore")
+    print("  conservative (safe, and understated), and its 'inside' is NOT evidence of absence:")
+    print("  it says only that the pooled effect is smaller than a typical single-cell")
+    print("  fluctuation, which nearly any real sub-percent effect would be.")
+    print()
+    print("  So the test below is PAIRED PER CELL -- d = (arm vs ship) - (floor vs ship) on the")
+    print("  same cell -- which removes the object-change artefact cell by cell instead of")
+    print("  subtracting two pooled locations, and carries a bootstrap CI on its own median.")
+    print("  %-5s %6s %10s %10s %10s %-22s %s"
+          % ("k", "n", "median d", "CI95 lo", "CI95 hi", "paired verdict", "resample"))
+    for (w, _fl, _vn, _vs) in signrows:
+        pop = [c for c in cells if c[1] == w]
+        d = []
+        for (key, ww) in pop:
+            a = med.get((key, ww, "nopf"))
+            f = med.get((key, ww, "shpb"))
+            b = med.get((key, ww, "ship"))
+            if a and f and b and b > 0:
+                d.append((a - b) / b - (f - b) / b)
+        if not d:
+            print("  k=%-5d %6s   NO PAIRED CELL: needs nopf, shpb and ship on one cell" % (w, "-"))
+            continue
+        d.sort()
+        lo, hi, dig, n = boot_median_ci(d)
+        m = pct(d, 0.5)
+        if lo is None:
+            vd, dig = "n < 8, no CI", "-"
+        elif hi < 0:
+            vd = "FASTER than floor"
+        elif lo > 0:
+            vd = "SLOWER than floor"
+        else:
+            vd = "CI spans 0, no diff"
+        print("  k=%-5d %6d %9.3f%% %9.3f%% %9.3f%% %-22s %s"
+              % (w, n, 100 * m, 100 * lo if lo is not None else float("nan"),
+                 100 * hi if hi is not None else float("nan"), vd, dig))
+    print("  The CI is a percentile bootstrap on the median, 4000 resamples, seed 20261002. The")
+    print("  resample column digests the INDEX MATRIX, because a bound is not reproducible from")
+    print("  seed and nboot alone -- the RNG stream is a library property. Quote both or neither.")
+    print()
+    print("  AND THE TWO COLUMNS ANSWER DIFFERENT QUESTIONS, which one verdict string had merged.")
+    print("  The paired CI is a TEST OF EXISTENCE: does this arm differ from a mere object swap.")
+    print("  The band is a DECISION RULE ABOUT ACTIONABILITY: an effect smaller than the per-cell")
+    print("  artefact between two same-config objects is not worth shipping even if it is real.")
+    print("  This project's standing rule -- nothing inside the noise floor counts -- is the")
+    print("  second. Labelling it 'no verdict' was wrong: it is a verdict, about actionability,")
+    print("  and it is silent about existence. Read the two columns together, never one alone.")
     print()
     print("  THE SIGN TEST, read against the FLOOR PAIR and not against 0.5. cells-better as a")
     print("  z against Binomial(n, 0.5) is only valid if the same-config pair sits near half; the")
