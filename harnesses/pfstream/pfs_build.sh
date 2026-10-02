@@ -28,11 +28,27 @@ STAGE=${PFS_STAGE:-/matx/u/bobbyy/pfsstage}
 ROOT=${PFS_ROOT:-/scr/bobbyy/pfs}
 ACTIVATE=${PFS_ACTIVATE:-/scr/bobbyy/venv/bin/activate}
 
-# FAIL CLOSED ON EACH, with the value printed. A missing stage tree made `cp -r` fail per-tag and
-# the build then ran against whatever was already in $ROOT/$tag from a previous run -- stale
-# objects that pass every digest check in this file because they are internally consistent.
+# FAIL CLOSED ON EACH, with the value printed.
+#
+# WHAT THE STAGE CHECK BUYS, stated correctly after a reviewer refuted my first justification. I
+# claimed a missing stage tree let the build run against stale objects left in $ROOT/$tag. It
+# could not: the staging loop below already does `rm -rf "$d"; mkdir -p "$d"` and then
+# `cp -r ... || exit 1`, so the cp's status IS checked and the directory is emptied first. The
+# reviewer simulated that loop with a nonexistent STAGE and a stale object planted in root/ship:
+# rc=1, the build phase never reached, and root/ship empty afterwards -- the rm -rf had destroyed
+# the stale object before the cp failed, so even the material for a stale build was gone.
+#
+# The two things it does buy, neither of which was in my reasoning: it fails BEFORE the first
+# `rm -rf`, so a previous run's artefacts survive for inspection rather than being destroyed by
+# an attempt that cannot succeed; and it names the reason once instead of three bare `cp:` lines
+# followed by a silent exit 1. This note exists because a reader who checks only "does the cp
+# exit on failure?" gets yes, concludes this is ceremony, and removes the pre-rm-rf failure point.
 [ -f "$ACTIVATE" ] || { echo "REFUSE: PFS_ACTIVATE=$ACTIVATE is not a file"; exit 1; }
-source "$ACTIVATE" || exit 1
+# A bare `exit 1` here was the one asymmetry in this block: `[ -f ]` passing and the activation
+# then FAILING is exactly what a conda shim hits in a non-interactive shell, and that case
+# printed nothing while its three neighbours printed REFUSE with the value.
+source "$ACTIVATE" || { echo "REFUSE: sourcing PFS_ACTIVATE=$ACTIVATE failed -- the file exists"
+                        echo "        but the environment it should activate did not come up"; exit 1; }
 for f in src pyproject.toml scorch_build.py; do
   [ -e "$STAGE/$f" ] || { echo "REFUSE: PFS_STAGE=$STAGE has no $f -- wrong stage tree"; exit 1; }
 done
