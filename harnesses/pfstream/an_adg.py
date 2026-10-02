@@ -96,8 +96,20 @@ for k in ks:
             continue
         (ch if nt.get(("adgG", key, k)) != nt.get(("adg0", key, k)) else sa).append(
             c1["ours"] / c0["ours"])
-    print("%4d %9d %10.4f %9d %10.4f" % (k, len(ch), gm(ch) if ch else float("nan"),
-                                          len(sa), gm(sa) if sa else float("nan")))
+    # The partition must TOTAL, asserted rather than eyeballed. A previous reading reported
+    # 19 changed and 44 unchanged out of 72 and the 9 missing cells were a truncated CSV that
+    # nothing in the output named -- `ahead = n - behind - band` style arithmetic makes a
+    # total an identity and hides exactly that.
+    nmiss = len(keys) - len(ch) - len(sa)
+    print("%4d %9d %10.4f %9d %10.4f   missing %d of %d"
+          % (k, len(ch), gm(ch) if ch else float("nan"),
+             len(sa), gm(sa) if sa else float("nan"), nmiss, len(keys)))
+    if nmiss:
+        absent = [key for key in keys
+                  if "ours" not in cells.get(("adgG", key, k), {})
+                  or "ours" not in cells.get(("adg0", key, k), {})]
+        print("         NOT COUNTED (%d): %s" % (len(absent), ", ".join(absent[:4])
+                                                  + (" ..." if len(absent) > 4 else "")))
 
 print()
 # The reference arm is labelled by the backend the CSV records, not by the column's old name. A

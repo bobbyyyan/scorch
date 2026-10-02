@@ -1,176 +1,244 @@
 #!/usr/bin/env python3
 """Score thread rules against the measured per-cell optimum.
 
-THE SPLIT IS FIXED HERE AND NOT CHOSEN AFTER LOOKING. Keys are sorted; EVEN indices are the FIT
-half and ODD indices the TEST half. Every constant any rule needs is estimated on the FIT half
-only, and every number reported as a result comes from the TEST half. A rule whose constants were
-fitted on the cells it is scored on is not a rule, it is a lookup table.
+A RULE NAMES A RESOLVED COUNT, NOT AN OVERRIDE. The sweep varies the override; the object decides
+what that resolves to, and two different overrides frequently resolve to the same count. So
+everything here is grouped by the RESOLVED count the object reported.
 
-THE REGRET of a rule on a cell is time(the count the rule names) / time(the best count measured
-on that cell). It is >= 1 by construction, and 1.0 means the rule picked an optimal count. The
-geometric median of regret over cells is the figure of merit; the share of cells where regret
-exceeds 1.10 is the harm figure, because a pooled central tendency cannot see a tail and this
-lever's whole problem is a tail.
+WHAT IS EXCLUDED AND WHY. A cell with one reachable count is excluded. The sweep timed one
+configuration several times there, so an argmin over those readings is an argmin over noise and
+any rule compared to it is compared to a coin flip. 40.1% of cells on the M5 at pool 6 are like
+this -- the policy floor pins 141 of them at 1 below the adoption gate, and the final cap's
+recruit decline pins 90 at 18 because their policy count reaches twice the caller's pool.
 
-FOUR RULES, three of which already exist in the library:
-  shipped      what the default object resolves to with override = pool
-  adopt_grain  the same with SCORCH_SPMM_ADOPT_GRAIN = G, best single G chosen ON THE FIT HALF
-  sqrt         n* = clamp(round(sqrt(T1/c)), 1, min(pool, rows/16)), T1 = a*nnz + b*nnz*k
-  oracle       the measured argmin, which is regret 1.0 by definition and is the ceiling
+AND WHAT THAT BUYS. Where two overrides resolve to the SAME count, those readings time the same
+configuration with a different argument: a free same-object A/A floor at the cell level. It is
+printed beside the effect, so a regret is read against the noise measured on its own cell rather
+than against an assumption.
+
+THE SPLIT IS FIXED HERE AND NOT CHOSEN AFTER LOOKING: keys sorted, EVEN indices FIT, ODD TEST.
+Every constant any rule needs is estimated on FIT; every reported number is from TEST.
+
+ONE RESTATEMENT OF PRODUCTION, FLAGGED. `policy` and `cap_rows` come from the object, recorded by
+the sweep. The adoption candidate for an arbitrary grain G cannot -- G is compiled in -- so
+rule_adopt restates `min(pool, cap_rows, max(1, nnz*k//G))` and is validated at G=150000 against
+the adgG object by a separate call. An earlier draft reimplemented the POLICY count too and
+disagreed with the object on 16% of cells, always in one direction.
 """
-import argparse, csv, collections, math, os, statistics as st
+import argparse, csv, collections, math, statistics as st
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--csv", required=True)
-ap.add_argument("--pool", type=int, default=6)
-ap.add_argument("--percore-us", type=float, default=4.75,
-                help="independently measured per-worker team cost for this host")
-ap.add_argument("--rpt", type=int, default=16, help="SCORCH_ROWS_PER_THREAD")
-ap.add_argument("--grain", type=int, default=150000)
+ap.add_argument("--percore-us", type=float, required=True,
+                help="independently measured per-worker team cost for THIS host, microseconds")
+ap.add_argument("--grain", type=int, default=150000, help="base grain, for the adopt family only")
 A = ap.parse_args()
 
-t = collections.defaultdict(dict)        # (key,k) -> {nt: ms}
-meta = {}
-resolved = collections.defaultdict(dict)
+ms = collections.defaultdict(lambda: collections.defaultdict(list))   # (key,k) -> {resolved:[ms]}
+meta, pol, caprows, pool = {}, {}, {}, None
+shipped_res = {}
 for r in csv.DictReader(open(A.csv)):
-    key, k, nt = r["key"], int(r["k"]), int(r["nthreads"])
-    t[(key, k)][nt] = float(r["ms"])
-    resolved[(key, k)][nt] = int(r["resolved"])
+    key, k = r["key"], int(r["k"])
+    ms[(key, k)][int(r["resolved"])].append(float(r["ms"]))
     meta[key] = (int(r["rows"]), int(r["nnz"]))
-keys = sorted({key for (key, _) in t})
-ks = sorted({k for (_, k) in t})
-FIT = set(keys[0::2])
-TEST = set(keys[1::2])
-print("%d keys (%d fit / %d test)  widths %s  pool %d  per-worker cost %.2f us"
-      % (len(keys), len(FIT), len(TEST), ks, A.pool, A.percore_us))
-
+    pol[(key, k)] = int(r["policy"])
+    caprows[(key, k)] = int(r["cap_rows"])
+    pool = int(r["pool"])
+    if int(r["nthreads"]) == pool:
+        shipped_res[(key, k)] = int(r["resolved"])
+keys = sorted({key for (key, _) in ms})
+ks = sorted({k for (_, k) in ms})
+FIT, TEST = set(keys[0::2]), set(keys[1::2])
 gm = lambda v: math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
-cap = lambda M: max(1, min(A.pool, M // A.rpt))
+
+live = {c for c in ms if len(ms[c]) >= 2}
+print("%d keys (%d fit / %d test)  widths %s  pool %d  per-worker cost %.2f us"
+      % (len(keys), len(FIT), len(TEST), ks, pool, A.percore_us))
+print("cells: %d total, %d with >=2 reachable counts (LIVE), %d excluded as single-configuration"
+      % (len(ms), len(live), len(ms) - len(live)))
+print("  reachable-count histogram: %s"
+      % dict(sorted(collections.Counter(len(ms[c]) for c in ms).items())))
+
+print()
+print("THE FREE A/A FLOOR: counts reached by more than one override, so the same configuration")
+print("timed twice with a different argument. max/min - 1, over LIVE cells.")
+print("%4s %8s %10s %10s" % ("k", "n pairs", "median", "p95"))
+floor95 = {}
+for k in ks:
+    sp = [max(v) / min(v) - 1.0 for (key, kk), d in ms.items() if kk == k and (key, kk) in live
+          for v in d.values() if len(v) >= 2]
+    if not sp:
+        floor95[k] = float("nan"); print("%4d %8d %10s %10s" % (k, 0, "-", "-")); continue
+    sp.sort()
+    floor95[k] = sp[min(len(sp) - 1, int(0.95 * len(sp)))] * 100
+    print("%4d %8d %9.3f%% %9.3f%%" % (k, len(sp), st.median(sp) * 100, floor95[k]))
 
 
-def best(key, k):
-    d = t[(key, k)]
-    n = min(d, key=lambda n: d[n])
-    return n, d[n]
+def best(c):
+    d = ms[c]
+    n = min(d, key=lambda n: min(d[n]))
+    return n, min(d[n])
 
 
-# ---- did the override deliver? A cell where it did not is not evidence about a count.
-undeliv = sum(1 for (key, k) in t for nt in t[(key, k)]
-              if resolved[(key, k)][nt] != min(nt, cap(meta[key][0])) )
-print("cells where the resolved count != min(requested, rows/%d): %d of %d  (a nonzero count here"
-      % (A.rpt, undeliv, sum(len(v) for v in t.values())))
-print("  means some readings are not at the count they are labelled with)")
+def at(c, n):
+    """Time at the nearest REACHABLE count to n, plus whether a snap was needed."""
+    d = ms[c]
+    if n in d:
+        return min(d[n]), False
+    nn = min(d, key=lambda x: (abs(x - n), x))
+    return min(d[nn]), True
 
-# ---- FIT: the T1 model, on the fit half only
-xs, ys = [], []
+
+# ---------- FIT: the T1 model. Its own refutation check comes first.
+print()
+print("THE T1 MODEL AND ITS OWN REFUTATION CHECK (prereg amendment: 'three host constants').")
+print("T1 = a*nnz + b*nnz*k treats a as a CONSTANT. Fit per nnz decade on the FIT half, at the")
+print("resolved count 1 only. If a varies by orders of magnitude the model has no constant a,")
+print("and since n* = sqrt(T1/c) a factor f in T1 is sqrt(f) in the count.")
+bands = collections.defaultdict(list)
 for key in sorted(FIT):
     M, nnz = meta[key]
     for k in ks:
-        if 1 in t[(key, k)]:
-            xs.append((nnz, nnz * k)); ys.append(t[(key, k)][1] * 1000.0)
-n = len(xs)
-s1 = sum(x[0] for x in xs); s2 = sum(x[1] for x in xs)
-s11 = sum(x[0] * x[0] for x in xs); s22 = sum(x[1] * x[1] for x in xs)
-s12 = sum(x[0] * x[1] for x in xs)
-sy1 = sum(x[0] * y for x, y in zip(xs, ys)); sy2 = sum(x[1] * y for x, y in zip(xs, ys))
-det = s11 * s22 - s12 * s12
-a_ = (sy1 * s22 - sy2 * s12) / det
-b_ = (sy2 * s11 - sy1 * s12) / det
-print()
-print("FIT half, single-thread model T1 = a*nnz + b*nnz*k   (microseconds, n=%d)" % n)
-print("  a = %.4e us per nonzero (k-independent)   b = %.4e us per nonzero-unit" % (a_, b_))
-print("  implied: at k=2 the k-independent term is %.0f%% of T1 for the median fit matrix"
-      % (100.0 * a_ / (a_ + 2 * b_)))
-
-T1 = lambda nnz, k: max(a_ * nnz + b_ * nnz * k, 1e-6)
+        c = (key, k)
+        if c in ms and 1 in ms[c]:
+            bands[int(math.log10(max(nnz, 1)))].append((nnz, k, min(ms[c][1]) * 1000.0))
 
 
-def rule_sqrt(key, k):
+def fit(pts):
+    s11 = sum(p[0] * p[0] for p in pts); s22 = sum((p[0] * p[1]) ** 2 for p in pts)
+    s12 = sum(p[0] * p[0] * p[1] for p in pts)
+    sy1 = sum(p[0] * p[2] for p in pts); sy2 = sum(p[0] * p[1] * p[2] for p in pts)
+    det = s11 * s22 - s12 * s12
+    if abs(det) < 1e-30:
+        return float("nan"), float("nan")
+    return (sy1 * s22 - sy2 * s12) / det, (sy2 * s11 - sy1 * s12) / det
+
+
+print("%10s %6s %14s %14s" % ("nnz decade", "n", "a (us/nnz)", "b (us/unit)"))
+avals = []
+for d in sorted(bands):
+    a_, b_ = fit(bands[d])
+    if a_ == a_:
+        avals.append(a_)
+    print("%10s %6d %14.3e %14.3e" % ("1e%d" % d, len(bands[d]), a_, b_))
+allpts = [p for v in bands.values() for p in v]
+A_, B_ = fit(allpts)
+print("  pooled over all bands: a = %.3e  b = %.3e" % (A_, B_))
+if len(avals) >= 2:
+    sp = max(avals) / min(avals)
+    print("  SPREAD IN a ACROSS BANDS: %.0fx  ->  up to %.1fx in n* via sqrt. %s"
+          % (sp, math.sqrt(sp), "a is NOT a constant; the model's premise fails as written."
+             if sp > 4 else "within a factor of four, so a single a is defensible."))
+
+T1m = lambda nnz, k: max(A_ * nnz + B_ * nnz * k, 1e-6)
+cap = lambda c: max(1, min(pool, caprows[c]))
+
+
+def r_shipped(c):
+    return shipped_res.get(c, pol[c])
+
+
+def r_policy(c):
+    return pol[c]
+
+
+def r_adopt(c, G):
+    key, k = c
     M, nnz = meta[key]
-    return max(1, min(cap(M), int(round(math.sqrt(T1(nnz, k) / A.percore_us)))))
+    cand = min(pool, caprows[c], max(1, (nnz * k) // G))
+    return max(1, min(max(pol[c], cand), pool))
 
 
-def rule_shipped(key, k):
-    return min(resolved[(key, k)].get(A.pool, A.pool), A.pool)
+def r_sqrt_meas(c):
+    """The FORM, given T1 measured. Upper bound on what the form can do; cannot ship."""
+    if 1 not in ms[c]:
+        return None
+    t1 = min(ms[c][1]) * 1000.0
+    return max(1, min(cap(c), int(round(math.sqrt(t1 / A.percore_us)))))
 
 
-def rule_adopt(key, k, G):
+def r_sqrt_model(c):
+    key, k = c
     M, nnz = meta[key]
-    pol = min(cap(M), max(1, (nnz * max(k, 16)) // A.grain))
-    cand = min(A.pool, M // A.rpt, max(1, (nnz * k) // G))
-    return max(1, min(max(pol, cand), A.pool))
+    return max(1, min(cap(c), int(round(math.sqrt(T1m(nnz, k) / A.percore_us)))))
 
 
-# ---- FIT: choose G on the fit half
-cands = [600, 2000, 5000, 10000, 20000, 50000, 150000, 400000]
+# ---------- FIT: best single G
+cands = [600, 2000, 5000, 20000, 50000, 150000, 400000]
 bestG, bestr = None, None
 for G in cands:
-    rg = []
-    for key in sorted(FIT):
-        for k in ks:
-            if not t[(key, k)]:
-                continue
-            nt = rule_adopt(key, k, G)
-            if nt in t[(key, k)]:
-                rg.append(t[(key, k)][nt] / best(key, k)[1])
+    rg = [at((key, k), r_adopt((key, k), G))[0] / best((key, k))[1]
+          for key in sorted(FIT) for k in ks if (key, k) in live]
     r = gm(rg)
     if bestr is None or r < bestr:
         bestG, bestr = G, r
-print("  best single ADOPT_GRAIN on the fit half: G = %d (fit regret %.4f)" % (bestG, bestr))
-print("  fitted c that would make sqrt match the fit half is reported below for convergence")
-
 print()
-print("TEST HALF -- every number below is held out. Regret = time(rule) / time(best measured).")
-print("%4s %6s | %-22s %-22s %-22s" % ("k", "n", "shipped", "adopt_grain G=%d" % bestG, "sqrt"))
-print("%4s %6s | %9s %11s %9s %11s %9s %11s" % ("", "", "regret", ">1.10", "regret", ">1.10",
-                                                 "regret", ">1.10"))
-agree = collections.Counter()
+print("FIT half: best single ADOPT_GRAIN is G = %d (fit regret %.4f)" % (bestG, bestr))
+
+RULES = [("shipped", r_shipped), ("policy", r_policy),
+         ("adopt G=%d" % bestG, lambda c: r_adopt(c, bestG)),
+         ("sqrt/measT1", r_sqrt_meas), ("sqrt/modelT1", r_sqrt_model)]
+print()
+print("TEST HALF, LIVE CELLS ONLY. Regret = time(rule's count) / time(best measured count).")
+print("Paired with the share above 1.10, because a central tendency cannot see a tail.")
+hdr = "%4s %5s" % ("k", "n")
+for nm, _ in RULES:
+    hdr += " | %-13s" % nm
+print(hdr)
+print("%4s %5s" % ("", "") + "".join(" | %6s %6s" % ("regret", ">1.10") for _ in RULES))
+snaps = collections.Counter()
 for k in ks:
-    cols = []
-    for name in ("shipped", "adopt", "sqrt"):
+    cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
+    row = "%4d %5d" % (k, len(cells))
+    for nm, f in RULES:
         rg = []
-        for key in sorted(TEST):
-            if not t[(key, k)]:
+        for c in cells:
+            n = f(c)
+            if n is None:
                 continue
-            nt = (rule_shipped(key, k) if name == "shipped" else
-                  rule_adopt(key, k, bestG) if name == "adopt" else rule_sqrt(key, k))
-            if nt in t[(key, k)]:
-                rg.append(t[(key, k)][nt] / best(key, k)[1])
-        cols.append((gm(rg), 100.0 * sum(1 for x in rg if x > 1.10) / max(len(rg), 1), len(rg)))
-    print("%4d %6d | %9.4f %10.1f%% %9.4f %10.1f%% %9.4f %10.1f%%"
-          % (k, cols[0][2], cols[0][0], cols[0][1], cols[1][0], cols[1][1],
-             cols[2][0], cols[2][1]))
+            t, sn = at(c, n)
+            if sn:
+                snaps[nm] += 1
+            rg.append(t / best(c)[1])
+        row += " | %6.4f %5.1f%%" % (gm(rg), 100.0 * sum(1 for x in rg if x > 1.10) / max(len(rg), 1))
+    print(row)
+print("  counts snapped to the nearest reachable value: %s" % dict(snaps))
 
 print()
-print("REGISTERED PREDICTION 2: the sqrt rule's count agrees with the measured argmin within +/-1.")
-print("%4s %8s %10s %10s %10s" % ("k", "n", "within 0", "within 1", "off by >2"))
+print("REGISTERED PREDICTION 2, scored as registered: |rule count - measured argmin| <= 1.")
+print("The four columns are exhaustive and are asserted to sum to 100%.")
+print("%4s %6s %9s %9s %9s %9s" % ("k", "n", "exact", "off by 1", "off by 2", "off by >2"))
 for k in ks:
-    d = []
-    for key in sorted(TEST):
-        if not t[(key, k)]:
-            continue
-        d.append(abs(rule_sqrt(key, k) - best(key, k)[0]))
+    cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
+    d = [abs(r_sqrt_meas(c) - best(c)[0]) for c in cells if r_sqrt_meas(c) is not None]
     if not d:
         continue
-    print("%4d %8d %9.1f%% %9.1f%% %9.1f%%" % (k, len(d),
-          100.0 * sum(1 for x in d if x == 0) / len(d),
-          100.0 * sum(1 for x in d if x <= 1) / len(d),
-          100.0 * sum(1 for x in d if x > 2) / len(d)))
+    f = [100.0 * sum(1 for x in d if x == j) / len(d) for j in (0, 1, 2)]
+    f.append(100.0 * sum(1 for x in d if x > 2) / len(d))
+    assert abs(sum(f) - 100.0) < 1e-6, "the four columns must partition the cells"
+    print("%4d %6d %8.1f%% %8.1f%% %8.1f%% %8.1f%%" % (k, len(d), f[0], f[1], f[2], f[3]))
 
 print()
-print("REGISTERED PREDICTION 1: no single linear G matches the per-width optimum within +/-1.")
-print("The measured modal argmin by width, against what each G names for the median cell:")
-print("%4s %12s   %s" % ("k", "modal argmin", "  ".join("G=%d" % G for G in cands)))
+print("REGISTERED PREDICTION 1, scored as registered: PER CELL, within +/-1, not modal.")
+print("A G matches a width if it is within 1 of the measured argmin on at least 80% of cells.")
+print("ITS NULL IS PRINTED BESIDE IT: the chain only RAISES, so a grain rule's output is bounded")
+print("below by the policy count. On a cell with policy - argmin >= 2 no G can come within 1, so")
+print("prediction 1 would pass there for a reason that has nothing to do with the functional form.")
+print("%4s %6s %12s %12s   %s" % ("k", "n", "pol-argmin>=2", "argmin>cap", "share within 1 by G"))
 for k in ks:
-    arg = collections.Counter(best(key, k)[0] for key in sorted(TEST) if t[(key, k)])
-    if not arg:
+    cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
+    if not cells:
         continue
-    modal = arg.most_common(1)[0][0]
-    row = []
+    nullc = sum(1 for c in cells if pol[c] - best(c)[0] >= 2)
+    overc = sum(1 for c in cells if best(c)[0] > cap(c))
+    shares = []
     for G in cands:
-        v = collections.Counter(rule_adopt(key, k, G) for key in sorted(TEST) if t[(key, k)])
-        row.append(v.most_common(1)[0][0])
-    print("%4d %12d   %s" % (k, modal, "  ".join("%5d" % x for x in row)))
+        ok = sum(1 for c in cells if abs(r_adopt(c, G) - best(c)[0]) <= 1)
+        shares.append(100.0 * ok / len(cells))
+    print("%4d %6d %11d %12d   %s" % (k, len(cells), nullc, overc,
+          " ".join("%.0f%%" % x for x in shares)))
+print("  G columns, in order: %s" % cands)
 print()
-print("A G 'matches' a width if its modal count equals the measured modal argmin. Prediction 1")
-print("fails if any single column matches at EVERY width.")
+print("Prediction 1 FAILS (and the sqrt form is unnecessary) if one G column is >=80% at EVERY")
+print("width. Read the null columns first: a width whose pol-argmin>=2 count is a large share of")
+print("n cannot inform the comparison either way.")

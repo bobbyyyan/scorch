@@ -126,3 +126,56 @@ problem and this whole line does not address it. Registered: if MKT's k=2 curve 
 than rising, the thread rule is NOT the fix for MKT's narrow-k deficit, and saying so is the
 result. The two hosts may simply be bound by different things at k=2, and one rule in worker
 count would then be the wrong shape for both.
+
+## Amendment 2: four corrections, one of which weakens the registered prediction
+
+All four were raised by a reviewing session and all four reproduce. Registered before any
+held-out cell was measured; the oracle sweep had not run when this was written.
+
+**(a) The ADOPT_GRAIN family DOES span width-aware rules, and 150000 is the one value that does
+not.** Amendment 1 and the commit body for e374854 said the knob "cannot make the decision
+width-aware, because all it can do is remove the adoption's raise". That holds only for large G.
+The chain is `cand = min(override, rows/16)`, then `cand = min(cand, max(1, work_true/G))`, then
+`nthreads = max(nthreads, cand)`, so wherever `policy < by_real <= min(override, rows/16)` the
+resolved count IS `by_real = nnz*k/G`, which is proportional to k. At the probe cell (nnz 32530,
+rows 512, policy 3 from the object, pool 6) the resolved counts over k = 2,4,8,12,16 are
+
+    G = 400000   3 3 3 3 3     G = 100000   3 3 3 3 5
+    G = 150000   3 3 3 3 3     G =  50000   3 3 5 6 6
+                               G =  20000   3 6 6 6 6
+
+The flat claim needs `G >= nnz*k_max/policy`, which is 173493 on that cell. **This weakens
+registered prediction 1**, which is correct: a family that spans width-aware rules might contain
+one that matches everywhere, and that is exactly the refutation the prediction is there to admit.
+The oracle sweep scores the whole G ladder, so the comparison is a reading.
+
+**(b) `a` IS NOT A CONSTANT, so "three host constants total" is false as written.** Fitting
+`T1 = a*nnz + b*nnz*k` per nonzero decade gives an intercept-per-nonzero that falls by about
+three orders of magnitude from the smallest band to the largest -- cache residency, which no
+linear term in nnz can carry. Since `n* = sqrt(T1/c)`, a factor f in T1 is sqrt(f) in the count,
+so a 850x spread in `a` is up to 29x in the worker count. **Added to the refutation list.** The
+repair is to separate two questions the first draft conflated: the FORM `n* = sqrt(T1/c)` is
+scored with T1 MEASURED (the sweep's resolved-count-1 reading), which is an upper bound on what
+the form can achieve and cannot ship; and the SHIPPABLE rule is scored with T1 modelled. If the
+measured-T1 version wins and the modelled one does not, the limit is the T1 model and not the
+form, and saying which is the result. `an_ntoracle.py` prints the per-band spread in `a` and
+states the premise fails when it exceeds a factor of four.
+
+**(c) 32530 and 22.7 are BAND MEDIANS, not a cell, and median(T) is not T(median(nnz)).**
+Amendment 1 said "MKT's measured k=2 time is 22.7us at 32 workers on 32530 nonzeros". 32530 is
+the median nnz of the 1e4-1e5 band and 22.7us is the median k=2 time in that band, taken
+independently; no row in any sealed CSV has nnz = 32530. So the "roughly six times what the model
+allows" factor compares a median time against the model evaluated at a median nnz, which for a
+nonlinear T is not a valid composition. The competing-mechanism paragraph stands as a HYPOTHESIS
+-- it was always going to be settled by the shape of time against worker count, not by that
+factor -- but the factor itself is withdrawn and must not be quoted. The synthetic probe point
+(nnz 32530, rows 512) used to interrogate the objects is a constructed input, not a matrix, and
+is fine for asking a policy what it resolves to and not fine as evidence about any matrix.
+
+**(d) The intercept-share figure's predicate, stated so it can be checked.** "99.6-100.8% of our
+k=2 time" is: `chain212-dlmc-f32-p1/ss64_ship_p1.csv`, build `ship`, arm `ours`, PER MATRIX
+ordinary least squares of `ms ~ a + b*(nnz*k)` over that matrix's seven widths, then the MEDIAN
+over matrices within a decade band of `a_i / t_i(k=2)`. A band-level OLS with one intercept per
+band is a different estimator and gives different numbers (0.87-1.03 on the same data); neither
+is wrong, and the two are not comparable. The per-matrix form is what was reported and it is what
+the quoted range refers to.

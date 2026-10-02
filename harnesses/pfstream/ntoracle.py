@@ -9,17 +9,30 @@ registered prediction 1 -- that no single linear grain matches the per-width opt
 from one run, and it makes the comparison of the shipped rule, the ADOPT_GRAIN rule and the sqrt
 rule a reading rather than three builds.
 
-nthreads_override DOES deliver the count. With SCORCH_SPMM_NT_CAP = -2 a positive override is a
-hard cap below the base count as well as a floor the adoption raises to, so the resolved count is
-the override wherever rows/16 allows it. Every row records what the object said it resolved to,
-asked of the object, so a cell where the override did NOT deliver is visible rather than assumed.
+THE OVERRIDE OFTEN DOES NOT DELIVER THE COUNT, and this is written the way it is because the
+first version of this file asserted that it does. Two clauses stop it. The adoption branch is
+gated -- `if (nthreads_override > 0 && gate_work >= grain)` with gate_work = nnz*max(k,16) -- so
+below the gate the override is purely a cap and the resolved count is the base policy count. And
+the final cap DECLINES when the resolved count reaches twice the caller's pool, to preserve the
+recruit that makes the kernel launch its own team, so a large-policy cell cannot be lowered at
+all. Asked of the object over the tracked 72-key corpus at pool 6 and eight widths, 231 of 576
+cells (40.1%) resolve to ONE count for every override in 1..6 -- 141 of them pinned at 1 by the
+policy floor and 90 pinned at 18 by the recruit decline.
+
+So this sweeps the OVERRIDE and reports the RESOLVED count, and the analysis groups by resolved.
+Two consequences, one of which is a gain. Cells with a single reachable count are excluded: the
+sweep would otherwise time one configuration six times and a "regret" there would be noise, and a
+rule compared to that argmin would be compared to a coin flip. And where two overrides resolve to
+the SAME count, those readings time the same configuration with a different argument, which is a
+free same-object A/A floor at the cell level -- so the noise the first version would have reported
+as effect becomes the thing the effect is scored against.
 
 The reported time per (cell, count) is the minimum over `reps` batched means at a batch fixed by
 one calibration at the pool -- the SAME batch for every count on that cell, because the batch is
 the one parameter that biases a reading and a per-count batch would make the count and the batch
 vary together.
 """
-import argparse, csv, math, os, sys, time, zlib
+import argparse, collections, csv, math, os, sys, time, zlib
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
 ap.add_argument("--keys", required=True)
@@ -76,10 +89,16 @@ if bad:
 print("corpus %d keys  pool %d  threads %s  widths %s" % (len(keys), POOL, TS, KS), flush=True)
 
 out = open(A.csv, "w", newline="")
+# `policy` and `cap_rows` are recorded from the OBJECT, not recomputed downstream. The analyser
+# needs the base policy count to say whether a rule could have reached the measured optimum at
+# all, and a harness that recomputes a production policy is wrong silently and flatteringly --
+# an earlier draft of the analyser reimplemented it and disagreed with the object on 16% of cells,
+# always in the same direction.
 w = csv.DictWriter(out, fieldnames=["key", "k", "rows", "cols", "nnz", "deg", "nthreads",
-                                    "resolved", "ms", "batch"])
+                                    "resolved", "policy", "cap_rows", "pool", "ms", "batch"])
 w.writeheader()
 nrow = 0
+CELLN = collections.Counter()
 for key in keys:
     indptr, indices, M, J = loaded[key]
     nnz = int(indptr[-1])
@@ -107,12 +126,17 @@ for key in keys:
         except Exception as exc:
             print("  SKIP %s k=%d calibration: %s" % (key, k, type(exc).__name__), flush=True)
             continue
-        # Counts visited in a rotated order per cell, so a count does not always sit at the
-        # warm or cold end of the cell's own sequence.
-        off = zlib.crc32(("%s|%d" % (key, k)).encode()) % len(TS)
+        # Counts visited in a rotated order, with the offset taken from a COUNTER over cells
+        # rather than from a hash of the key. A hash balances position only in expectation, and
+        # in the 36-cell per-width window the analysis actually reports that is not balanced at
+        # all -- one count led 11 times and another once against an ideal of 6. A counter makes
+        # each count lead within one of an equal share inside every width's own window.
+        off = CELLN[k] % len(TS)
+        CELLN[k] += 1
         for nt in TS[off:] + TS[:off]:
             fn = at(nt)
             res = so.scorch_spmm_nthreads(nnz * max(k, 16), M, nt, nnz * k, nnz)
+            pol = so.scorch_spmm_nthreads(nnz * max(k, 16), M, 0, nnz * k, nnz)
             best = float("inf")
             try:
                 for _ in range(A.reps):
