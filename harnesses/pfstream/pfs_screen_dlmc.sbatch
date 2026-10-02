@@ -20,7 +20,9 @@
 # covers the side of that trade the float64 screen is structurally blind to.
 #
 # The width set 2,8,12,16,20,24,32 is checked by the driver against the lane count: k=2 sits
-# inside the exact kernel's float range (k=1..7) and is therefore a NEGATIVE CONTROL where the
+# inside the exact kernel's range, which is k=1..3 for BOTH dtypes (the shipped
+# SCORCH_NARROWK_EXACT_HI; the `exact_f32_ ? 7 : 3` in the source only clamps), and is a
+# NEGATIVE CONTROL where the
 # macro cannot change executed code; 8/16/24/32 are full tails at NVEC 1/2/3/4; 12 and 20 are
 # masked tails at NVEC 2 and 3. The historical float32 set 2,4,8,16,32 reached neither NVEC 3 nor
 # any masked tail, and the driver refuses it by name.

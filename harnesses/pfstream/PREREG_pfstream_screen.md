@@ -1993,9 +1993,13 @@ premise. Correcting the arithmetic was not the same as correcting the question.
 
 ## Amendment 27 — PRELIMINARY one-pass DLMC float32 read, and four corrections to it
 
-**Status: superseded on arrival of the 16-pass run.** One reading per cell per build, so
-per-cell noise is not separable from effect; what makes it readable is n = 392 matrices per
-width. Filed because it answers the question that was blocking a float32 `PFD=0` decision, and
+**Status: superseded on completion of the run, which is 4 passes x 4 builds = 16 CSVs, not
+16 passes** (`arm_screen.sh:189` is `for p in 1 2 3 4`; the sentinel writes the literal
+`passes 4`, `builds 4`; `REPS` defaults to 9 at `:35`). Three integers describe this run's
+replication — 4, 9 and 16 — and none substitutes for another. Each reported value is the
+**minimum over 9 batched means** at a caller-fixed batch (`mrgate.py:79-83`), one value per cell
+per build per pass; what a single pass lacks is *across-pass* replication, not replication. What
+makes it readable is n = 392 matrices per width. Filed because it answers the question that was blocking a float32 `PFD=0` decision, and
 corrected here because the first version of this table carried four defects, all found by the
 verifying session, which recomputed every number from the raw rows and reproduced all of them.
 
@@ -2052,10 +2056,19 @@ deviation is 0.074-0.094%, which is **7x to 29x tighter** than the inter-object 
 offset of +0.61% to +2.40%. That is a second independent instrument agreeing that the offset is
 object-level and not timing, and it prices the k=2 control violation exactly: `nopf` reads +2.35%
 raw where no code can differ, the inter-object floor is +1.22%, and the repeat is +0.09%, so
-essentially all of the excess is object-level. **Caveat that limits it:** the repeat's p95 reaches
-3.90% at k=12, comparable to the offset itself, so the tightness holds for the median statistic
-and not for individual cells — a floor must be formed by the same cell statistic as the contrast
-it bounds, which is the defect corrected in amendment 23.
+essentially all of the excess is object-level. **Caveat that limits it, with its functional named.** The median
+range above is invariant to four decimals under all four two-object functionals, so quoting it
+does not pin which functional produced any tail figure. The tail is *not* invariant. Under the
+project's registered `dev = exp(|log t|) - 1` (`an_verify5.py:3`), which equals
+`max(t, 1/t) - 1`, the repeat's p95 on `ship` is k=2 1.8552%, k=8 0.4527%, k=12 **4.0150%**,
+k=16 2.1664%, k=20 2.3185%, k=24 2.1742%, k=32 3.3406% — comparable to the inter-object offset
+itself at k=12 and k=32. So the 7x-to-29x tightness holds for the **median** statistic and not
+for individual cells. The first version of this amendment published 3.90% at k=12 without naming
+a functional; that is `|oursb/ours - 1|`, the *lower* of the two asymmetric forms, so it
+understated the floor — the direction that lets an arm clear too easily. The four functionals at
+k=12 read 4.0150 registered, 3.8988, 4.0150, and 3.9359 symmetric. A floor must be formed by the
+same cell statistic as the contrast it bounds, which is the defect corrected in amendment 23 and
+recommitted here on the next tail figure published.
 
 **2. "Grows monotonically with k" was false.** `shpb/ship` by width is 1.0122, 1.0091, 1.0061,
 1.0198, 1.0156, 1.0215, 1.0240 — three of six consecutive steps go the wrong way. The shape is a

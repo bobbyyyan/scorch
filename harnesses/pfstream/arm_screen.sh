@@ -7,10 +7,17 @@
 # and k=1..16 for float64, and "width 32" is a float32-only question -- in float64 it would need
 # NVEC 8 and the kernel cannot reach it.
 #
-# Below the range, scorch_spmm_row_narrow_exact owns float k=1..7 and double k=1..3
-# (exact_cap_ = exact_f32_ ? 7 : 3), so a width inside that span is one at which
+# Below the range, scorch_spmm_row_narrow_exact owns k=1..3 for BOTH dtypes, so a width inside
+# that span is one at which
 # SCORCH_SPMM_REGBLOCK_PFD provably cannot change executed code -- a NEGATIVE CONTROL rather than
 # a data point, and the only thing that bounds a single-object arm's layout offset for free.
+#
+# NOT k=1..7 for float32, which these lines said until this correction. `exact_cap_ =
+# exact_f32_ ? 7 : 3` only CLAMPS; the value deciding what the exact kernel owns is
+# SCORCH_NARROWK_EXACT_HI, which ships at 3 with both the _F32 and _F64 aliases pointing at it.
+# The executable grid check below uses exact_hi = 3 and explains why at line ~99. Reading 7 off
+# this header and passing it as the $3 width override would offer k=5, 6 or 7 as float32
+# "negative controls" when they are live register-block widths.
 #
 # A GRID MUST COVER BOTH TAIL STATES. The tail vector is full when k % lanes == 0 and masked
 # otherwise, and that is a distinct branch in the kernel. A width set of 2,4,8,16,32 reaches
