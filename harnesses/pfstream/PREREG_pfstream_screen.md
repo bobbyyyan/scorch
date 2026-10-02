@@ -1751,9 +1751,22 @@ and so does their vector count:
 
 So the contrast those two numbers describe sits in a population that is 88.9% right-hand-side
 vectors, not one that is 44.7%. The vectors concentrate almost entirely in the top band, which is
-the actionable half of the caveat: the 35-60% band is 2 of 24 and is clean, so a dense-population
-claim restricted below 60% needs no split. `PROVENANCE.md:33-35` also records that the 5-matrix
-control in the results doc has zero vectors because its `nnz >= 2e4` bound makes `cols == 1`
+the actionable half of the caveat: the 35-60% band is 2 of 24 and is clean. Below 60% is 78 matrices
+holding 3 vectors (3.85%), which cannot move the statistic those two numbers report — and that
+statistic is now named rather than assumed. `0.3347` and `0.2416` are `S all` and
+`S non-vector` from `an_verify5.py` POINT 5: the **geometric median** (`red` = `exp` of the
+median of logs) of `ours/mkl` at **k=4**, where S below 1 means Scorch is faster. Being a
+median, it is insensitive to 3 contaminated members in 78, so the below-60% exemption holds for
+*this* statistic and is not established for a maximum or a p95 of the same ratio. Two further
+things follow from the producer. The direction favours us: removing the vectors moves S from
+0.3347 to 0.2416, so the right-hand-side vectors are where our margin is *smallest* and the
+split the sealed file asks for strengthens the result rather than weakening it. And the two
+halves of that sentence have different denominators — `64 of 72` counts rows of `ss_dims.csv`,
+while S is computed over chain196's k=4 cells that survive six passes in both builds, so `72`
+is not the population S was measured on and the membership fraction should not be read as S's n.
+
+`PROVENANCE.md:33-35` also records that the 5-matrix control in the results doc has zero
+vectors because its `nnz >= 2e4` bound makes `cols == 1`
 unreachable at `rows <= 4096` — that was luck in the predicate, not foresight, and it does not
 transfer to a control chosen on any other bound.
 
@@ -1768,7 +1781,13 @@ non-blank-line count wearing the label `lines`. This is not the truncated-view e
 other corrections in this section — the view was complete and the predicate was wrong, which is
 why auditing the number against the file it describes could not find it and only recomputing with
 the named predicate could. A count in a durable record must name the predicate that produced it;
-`line` and `non-blank line` differ by 24% on this file.
+`line` and `non-blank line` differ by **27.8%** on this file, the symmetric
+`2(a-b)/(a+b)`; the asymmetric pair is 24.4% with 41 as the base and 32.3% with 31, and I had
+published the 24.4% without naming its base. That is the same order-dependent two-object
+relative difference I replaced with a symmetric form in `an_floor_within.py:220` about an hour
+earlier, reappearing in prose — a fix to an estimator reaches one analyser, and prose inherits
+nothing from it, so after correcting a statistic's form in code the amendments and commit bodies
+have to be swept for the same form by hand. Swept: this was the only instance.
 
 **2. The 0.3347 / 0.2416 pair is the 60-101% band, not the ≥20% band.** Fixed in place above with
 the measured three-band partition. The direction matters: attributing it to ≥20% moves the
