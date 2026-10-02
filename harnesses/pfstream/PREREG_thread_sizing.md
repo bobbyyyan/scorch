@@ -543,3 +543,56 @@ against the stated refutation condition rather than characterised after the fact
 k=2 that does not also predict the k=8 behaviour of the SAME matrices is not to be reported as
 explaining the narrow-k deficit, because those two widths are the part of the set that shares a
 composition.
+
+---
+
+## Amendment 10 (2026-10-02): amendment 9's scope included a width whose sign no statistic settles
+
+**k=8 does not belong in the high-degree population, and amendment 9 put it there on a per-set
+statistic nothing registered.** Recomputed with three statistics side by side -- the median, the
+mean, and the share above a single global degree cut (the corpus median `deg`, 86.22, which makes
+that column tail-insensitive by construction):
+
+| k  | behind | ahead | med beh / ahd  | mean beh / ahd | >cut beh / ahd | sign        |
+|----|--------|-------|----------------|----------------|----------------|-------------|
+| 2  |    328 |    53 | 115.00 /  7.12 | 200.9 /  13.8  | 59.5% /  0.0%  | **all three HIGH** |
+| 8  |    158 |    96 |  92.97 / 32.04 | 106.8 / 170.2  | 50.6% / 35.4%  | **SPLIT 2-1**      |
+| 12 |    116 |   144 |  51.20 /104.79 |  69.1 / 263.7  | 26.7% / 54.2%  | all three LOW      |
+| 16 |     74 |   252 |  39.68 /157.95 |  45.7 / 235.0  |  2.7% / 65.5%  | all three LOW      |
+| 20 |      6 |   362 |  25.61 /102.40 |  28.7 / 181.2  |  0.0% / 53.6%  | all three LOW      |
+| 24 |      4 |   383 |  15.80 / 93.78 | 114.6 / 173.1  | 25.0% / 50.7%  | all three LOW      |
+| 32 |      2 |   384 | 216.36 / 92.97 | 216.4 / 172.7  | 50.0% / 50.5%  | SPLIT 2-1, n=2     |
+
+At k=8 the median and the share say the behind set is the high-degree one and **the mean says the
+opposite** -- the ahead set has 1.6x the mean degree. Since the share is tail-insensitive and
+agrees with the median, the disagreement is a tail effect: the ahead set at k=8 contains a few
+very high-degree matrices. Either reading is defensible and nothing was registered, so k=8 is
+**not assignable** and is removed from scope.
+
+### The scope, corrected
+
+- **k=2 alone: 328 cells. This is the task.** All three statistics agree and the separation is
+  the cleanest in the table -- **zero of the 53 ahead cells have a degree above the corpus
+  median**, against 59.5% of the behind cells. Median 115.00 against 7.12, median 58 982
+  nonzeros against 1 311.
+- **k=8: 158 cells, sign indeterminate.** A transition width. Admitting it needs a criterion
+  registered in advance with its reason, not chosen after seeing which answer it gives. I am not
+  registering one now, because the only reason I would is that it enlarges the population I want
+  to explain.
+- **k=12 through k=24: 200 cells, all three statistics LOW.** A coherent second population,
+  out of scope.
+- **k=32: 2 cells, no sign.** Under a weaker classification on the sealed pass-1 ledger the same
+  width reads 4 keys and the OPPOSITE sign (0.18x against this table's 2.33x) -- same data,
+  different split, opposite direction, n in {2,4}. It stays tabulated only with its n attached.
+
+**Amendment 9's "486 of 688" is withdrawn and replaced by 328.** The k=2-plus-k=8 grouping was
+the larger number and the one I wanted; it was not the one the data supports. The rule registered
+in amendment 9 -- that a k=2 finding must also predict k=8 on the same matrices -- is likewise
+withdrawn, since it was premised on those two widths sharing a composition and k=8's composition
+is undetermined.
+
+**Carried forward as a rule, since the direction here was decided by a choice I made silently:**
+a claim that one set skews higher than another on some quantity must print the median, the mean,
+and a share above a single global cut. The share is tail-insensitive, so a split it joins is a
+location effect and one it breaks is a tail effect, and the three together say which. A direction
+feels non-parametric and so invites picking one functional without noticing a choice was made.

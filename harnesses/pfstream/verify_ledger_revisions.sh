@@ -11,7 +11,8 @@
 #
 # Harness convention: the ledger directory is "$1". Never hardcoded.
 #
-# THREE DEFECTS THIS VERSION FIXES, ALL FOUND BY PLANTING AGAINST THE PREVIOUS ONE.
+# FOUR DEFECTS THIS VERSION FIXES, ALL FOUND BY PLANTING AGAINST THE PREVIOUS ONE.
+# (The header said THREE while enumerating four, in the file whose job is counting.)
 #
 # 1. It skipped SHA256SUMS.sha256 and therefore reported VERIFY OK, exit 0, on a directory whose
 #    live prose AND live manifest had both been rewritten -- which is what a tamper does and what
@@ -77,9 +78,31 @@ for t in $man_tags; do
 done
 
 checked=0
+n_recon=0
+n_evid=0
+n_unknown=0
 for m in SHA256SUMS.*; do
   case "$m" in *.sha256) continue ;; esac
-  t=$(echo "$m" | sed 's/^SHA256SUMS\.//; s/\..*$//')
+  # THE SUFFIX IS KEPT, NOT STRIPPED. `s/\..*$//` discarded `.RECONSTRUCTED` before any check
+  # saw it, so a reconstruction's OK lines were printed in the same format as an attestation's.
+  # They are not the same thing: a reconstruction's digests were recomputed from the surviving
+  # files, so they agree with whatever is present and CANNOT report loss. On chain212 that is 9
+  # of the OK lines guaranteed by construction, reported indistinguishably from 13 that are
+  # evidence.
+  full=$(echo "$m" | sed 's/^SHA256SUMS\.//')
+  t=$(echo "$full" | sed 's/\..*$//')
+  sfx=$(echo "$full" | sed 's/^[^.]*//; s/^\.//')
+  case "$sfx" in
+    RECONSTRUCTED) cls="RECONSTRUCTED -- its OK lines are guaranteed, NOT evidence"
+                   n_recon=$((n_recon+1)) ;;
+    TRANSCRIBED)   cls="TRANSCRIBED -- can report loss, so its OK lines are evidence"
+                   n_evid=$((n_evid+1)) ;;
+    "")            cls="NO SUFFIX -- class UNDETERMINED by this tool, see below"
+                   n_unknown=$((n_unknown+1)) ;;
+    *)             cls="SUFFIX '$sfx' UNKNOWN to this tool -- treated as undetermined"
+                   n_unknown=$((n_unknown+1)) ;;
+  esac
+  echo "  provenance class of $m: $cls"
   checked=$((checked+1))
   p="PROVENANCE.$t.md"
   if [ ! -f "$p" ]; then
@@ -154,3 +177,19 @@ echo "VERIFY OK -- seal-of-seal, coverage, every retained manifest and the live 
 echo "  This is INTERNAL consistency. A simultaneous rewrite of prose + manifest + seal is"
 echo "  self-consistent and undetectable from inside the directory; only a digest recorded"
 echo "  elsewhere beforehand can rule that out. No sealed bytes were modified by this script."
+echo
+echo "  WHAT 'ALL CHECK' DOES AND DOES NOT MEAN, by provenance class:"
+echo "    RECONSTRUCTED manifests: $n_recon. Their digests were recomputed from surviving files,"
+echo "      so they agree with what is present BY CONSTRUCTION and cannot report loss. Their OK"
+echo "      lines are not evidence of integrity and are excluded from any such claim."
+echo "    TRANSCRIBED manifests:   $n_evid. These can report loss, so their OK lines are evidence."
+echo "    UNDETERMINED (no suffix): $n_unknown. THIS TOOL CANNOT CLASSIFY THESE and does not"
+echo "      guess. A missing suffix does NOT mean original: chain212's SHA256SUMS.v2 is itself"
+echo "      reconstructed (PROVENANCE.md:125) and carries no suffix, but was digest-tested"
+echo "      against a value read BEFORE the replacement, so it is reconstructed-AND-ANCHORED."
+echo "      The real taxonomy is three-way -- original / reconstructed-and-anchored /"
+echo "      reconstructed-and-unanchored -- and two of those three are spelled identically on"
+echo "      disk, so no filename rule can separate them. The authoritative source is the"
+echo "      directory's own prose table, which this script deliberately does not parse: a"
+echo "      verifier that inferred provenance from prose would be trusting the artefact it is"
+echo "      checking. Read it yourself before quoting any OK count as attestation."
