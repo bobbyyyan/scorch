@@ -216,6 +216,63 @@ chk("8 duplicate columns -> pack 2.0, above the asserted bound", pack, 2.0)
 chki("that value would be REFUSED by the bound in main()", pack > 1.0, True)
 chki("nnz 0 returns None", stats_for(np.array([0, 0]), np.array([], dtype=np.int64), 2, 8), None)
 
+group("GROUP 12 -- the .smtx reader, including the failure its format allows")
+import os
+import tempfile
+from bstream_locality import read_smtx, load_csr
+
+TD = tempfile.mkdtemp()
+
+
+def write_smtx(name, header, ipt, idx):
+    p = os.path.join(TD, name + ".smtx")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as fh:
+        fh.write(header + "\n" + ipt + "\n" + idx + "\n")
+    return p
+
+
+# A well-formed 2x8 matrix with 6 nonzeros: row 0 has columns 0,1,2 and row 1 has 4,5,6.
+good = write_smtx("ok/m", "2, 8, 6", "0 3 6", "0 1 2 4 5 6")
+ip, ix, r, c = read_smtx(good)
+chki("smtx rows", r, 2)
+chki("smtx cols", c, 8)
+chki("smtx indptr", list(ip), [0, 3, 6])
+chki("smtx indices", list(ix), [0, 1, 2, 4, 5, 6])
+chki("load_csr dispatches to .smtx when the file exists",
+     load_csr(TD, "ok/m", None)[2:], (2, 8))
+
+# The failure this format allows: a truncated indices line. The file parses, every array is
+# well-formed, and the result reads as a legitimately sparser matrix. Only the header
+# cross-check sees it, which is why the reader does not trust the header.
+trunc = write_smtx("bad/trunc", "2, 8, 6", "0 3 6", "0 1 2 4")
+try:
+    read_smtx(trunc)
+    chki("truncated indices REFUSED", False, True)
+except ValueError as e:
+    chki("truncated indices REFUSED", "len(indices) 4" in str(e), True)
+
+# An indptr of the wrong length is the other half, and a different check.
+shortp = write_smtx("bad/shortp", "3, 8, 6", "0 3 6", "0 1 2 4 5 6")
+try:
+    read_smtx(shortp)
+    chki("indptr length mismatch REFUSED", False, True)
+except ValueError as e:
+    chki("indptr length mismatch REFUSED", "should hold 4 entries, holds 3" in str(e), True)
+
+# And the predictor runs end to end on a parsed .smtx. At k=2 float64 (S=16): row 0 is columns
+# 0,1,2 at bytes 0..47, inside line 0; row 1 is columns 4,5,6 at bytes 64..111, ALL inside
+# line 1 -- not two lines, which is what I first wrote here. 2 lines over 6 nonzeros.
+lpn, pack, S, sh = stats_for(ip, ix, 2, 8)
+chki("smtx -> stats_for S", S, 16)
+chk("smtx -> lines_per_nnz (1 line per row, 2 over 6 nnz)", lpn, 2.0 / 6.0)
+chk("smtx -> pack (6*16 useful / 2*64 fetched)", pack, (6 * 16.0) / (2 * 64.0))
+# A column that straddles: column 3 is bytes 48..63 (line 0) and column 4 is 64..79 (line 1),
+# so adding column 3 to row 0 keeps it at one line while row 1 stays at one. Column 7 would
+# reach bytes 112..127, still line 1. The first column to add a line to row 1 is 8.
+ip2 = np.array([0, 3, 7]); ix2 = np.array([0, 1, 2, 4, 5, 6, 8])
+chk("adding column 8 to row 1 adds a line (3 over 7 nnz)", stats_for(ip2, ix2, 2, 8)[0], 3.0 / 7.0)
+
 print()
 if FAIL:
     print("FAILED %d: %s" % (len(FAIL), FAIL))

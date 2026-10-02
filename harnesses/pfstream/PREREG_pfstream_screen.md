@@ -2249,3 +2249,43 @@ floor sits above the median inter-object offset nearly everywhere, which strengt
 rather than qualifying it. The single width where it does not is k=8 — the one contrast that is
 readable in correction 5's table and the one where the mirror criterion fires 108 times. Those
 agree, and the agreement is the reason k=8 is the only arm result this run supports.
+
+### Amendment 27, correction 7 — the criterion's gate and base, and the margin a zero owes
+
+**I reproduced the registered criterion with the wrong A/A gate.** The recorded four-build design
+is `c0` / `c0b` / `pfd0` / `stream` (`spmm_regblock_prefetch_costs_15pct.md:156`), which maps to
+`ship` / `shpb` / `nopf` / `strm`. So "A/A inside 5%" in that record is `c0` against `c0b` — an
+**inter-object** A/A. Correction 6 gated on `dev(oursb/ours) < 5%`, the *within-object* repeat,
+which is a different and much tighter A/A, and the denominators differ accordingly: 384 gated
+cells at k=32 under the repeat gate, **339** under the inter-object gate.
+
+**The base, likewise, is `ship`.** The recorded test is that the shipped prefetch *earns* >10% at
+width 32, i.e. `pfd0 / c0 > 1.10` — the arm against the shipped build, not against a twin.
+`shpb` is the base that controls for the object offset, which is a different and later question.
+
+**The verdict survives both choices, which is the useful part.** At k=32, more than 10% slower is
+**0** under the repeat gate and **0** under the inter-object gate, against both bases. The zero is
+robust to the gate and to the base; only its denominator and its margin are not.
+
+| at k=32 | gate = repeat, base = ship | gate = inter-object, base = ship | gate = inter-object, base = shpb |
+|---|---|---|---|
+| gated n | 384 | 339 | 339 |
+| >10% slower | 0 | **0** | **0** |
+| >5% slower | 39 (10.2%) | 23 (6.8%) | 3 (0.9%) |
+| >3% slower | 144 (37.5%) | 100 (29.5%) | 11 (3.2%) |
+| max | 1.0756 | **1.0743** | 1.0549 |
+| distance to threshold | 2.44 pp | **2.57 pp** | 4.51 pp |
+
+**A zero count at a threshold owes its maximum, and this one had not reported it.** Under the
+original gate and base the worst cell reads 1.0743, which is **2.57 percentage points** below the
+1.10 threshold — and 100 of 339 cells are more than 3% slower. A count of zero with the nearest
+cell at 1.074 is a different result from a count of zero with nothing above 1.01, and the count
+alone cannot tell them apart. The sub-threshold tail also depends on the base by roughly tenfold,
+and **the base that matches the original criterion is the one carrying the larger tail** — so the
+reassurance in "0 of 339" is thinner on the base the blocker was actually written in. That does
+not change the verdict; it sets how much weight the verdict carries.
+
+**One cell fires at k=2 under the inter-object gate, at a width where the arm is inert.** That is
+instrument, not effect — `narrow_exact` owns k ∈ {1,2,3} — and it is worth stating because it is
+a live demonstration that this criterion can fire on object-level displacement alone at this n.
+A null from it is therefore a statement about a threshold, not about a mechanism.

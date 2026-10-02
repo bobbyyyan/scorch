@@ -78,6 +78,47 @@ ITEMSIZE = {"float32": 4, "float64": 8}
 LINE = 64
 
 
+def read_smtx(path):
+    """Parse a DLMC .smtx: a `rows, cols, nnz` header, then indptr, then indices.
+
+    Three lines, CSR without values, which is exactly what this script needs -- it never reads
+    values. The header's nnz is CROSS-CHECKED against both arrays rather than trusted: a
+    truncated file still parses, and the shape it would produce (fewer nonzeros, same declared
+    count) reads as a legitimately sparser matrix. That is the one failure this format has that
+    a shape check cannot see.
+    """
+    with open(path) as fh:
+        head = fh.readline()
+        ipt = fh.readline()
+        idx = fh.readline()
+    rows, cols, nnz = (int(x) for x in head.replace(",", " ").split())
+    indptr = np.array(ipt.split(), dtype=np.int64)
+    indices = np.array(idx.split(), dtype=np.int64)
+    if len(indptr) != rows + 1:
+        raise ValueError("%s: header says %d rows so indptr should hold %d entries, holds %d"
+                         % (path, rows, rows + 1, len(indptr)))
+    if int(indptr[-1]) != nnz or len(indices) != nnz:
+        raise ValueError("%s: header nnz %d, indptr[-1] %d, len(indices) %d -- a truncated file "
+                         "parses cleanly and reads as a sparser matrix"
+                         % (path, nnz, int(indptr[-1]), len(indices)))
+    return indptr, indices, rows, cols
+
+
+def load_csr(cache, key, resolved):
+    """Return (indptr, indices, rows, cols) for a key, from .smtx or .npz.
+
+    SuiteSparse lives in an npz cache resolved by csrresolve; DLMC ships as .smtx under a tree
+    rooted at the same `cache` argument. Dispatch is on what exists, not on a flag, so a caller
+    cannot pair a DLMC key list with an npz root and silently get nothing.
+    """
+    sm = os.path.join(cache, key + ".smtx")
+    if os.path.exists(sm):
+        return read_smtx(sm)
+    z = np.load(resolved)
+    shape = z["shape"]
+    return z["indptr"], z["indices"], int(shape[0]), int(shape[1])
+
+
 def fits_int64(nrows, stride):
     """Can (row, line) pairs be packed as `row * stride + line` without wrapping int64?
 
@@ -174,9 +215,21 @@ def main(argv):
                 "here with a second os.path.exists is the defect that module exists to prevent.")
 
     keys = [ln.strip() for ln in open(keysfile) if ln.strip() and not ln.startswith("#")]
-    paths, how = resolve_all(cache, keys)
-    print(describe(how))
-    missing = [k for k in keys if paths.get(k) is None]
+    smtx = [k for k in keys if os.path.exists(os.path.join(cache, k + ".smtx"))]
+    if len(smtx) == len(keys):
+        # A pure .smtx tree. csrresolve is for the npz cache and would report every key missing
+        # here, so skipping it is correct -- but say so, because "resolved 392 of 392" with no
+        # resolver named is the kind of line that hides which path ran.
+        print("all %d keys resolved as .smtx under %s; csrresolve not used (it is the npz path)"
+              % (len(keys), cache))
+        paths = {k: None for k in keys}
+    else:
+        paths, how = resolve_all(cache, keys)
+        print(describe(how))
+        if smtx:
+            print("MIXED: %d of %d keys exist as .smtx under the same root; dispatch is per key"
+                  % (len(smtx), len(keys)))
+    missing = [k for k in keys if paths.get(k) is None and k not in smtx]
     if missing:
         return ("REFUSE: %d of %d keys did not resolve, first %s. A structural predictor "
                 "computed on a subset is not comparable to a verdict table computed on the "
@@ -189,9 +242,7 @@ def main(argv):
 
     rows_out, zero, widest = [], 0, (0, None)
     for n, key in enumerate(keys, 1):
-        z = np.load(paths[key])
-        indptr, indices, shape = z["indptr"], z["indices"], z["shape"]
-        rows, cols = int(shape[0]), int(shape[1])
+        indptr, indices, rows, cols = load_csr(cache, key, paths[key])
         nnz = int(indptr[-1])
         if nnz:
             row_nnz = int(np.diff(indptr.astype(np.int64)).max())
