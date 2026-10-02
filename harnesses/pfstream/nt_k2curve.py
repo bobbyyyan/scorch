@@ -158,8 +158,8 @@ def shape(counts):
 
 STATS = (("endpoint hi/lo", stat_endpoint), ("max/min", stat_maxmin))
 print()
-print("%4s %6s %6s  %-15s %9s %9s %9s %9s %s"
-      % ("k", "live", "flat", "statistic", "median", "null", "p25", "p75", "verdict"))
+print("%4s %6s %6s  %-15s %9s %9s %9s %9s %9s %s"
+      % ("k", "live", "flat", "statistic", "median", "null", "excess", "p25", "p75", "verdict"))
 verdicts = {}
 for k in ks:
     cells = [(ck, c) for ck, c in cell.items() if ck[1] == k]
@@ -181,9 +181,10 @@ for k in ks:
         med = st.median(obs)
         v = "RISING" if med >= RISING else ("FLAT" if med <= FLAT else "NEITHER")
         verdicts[k][name] = v
-        print("%4d %6d %6d  %-15s %9.4f %9.4f %9.4f %9.4f %s"
-              % (k, len(obs), n_flat, name, med,
-                 st.median(nul) if nul else float("nan"),
+        nv = st.median(nul) if nul else float("nan")
+        print("%4d %6d %6d  %-15s %9.4f %9.4f %8.1f%% %9.4f %9.4f %s"
+              % (k, len(obs), n_flat, name, med, nv,
+                 100.0 * (med / nv - 1.0) if nv == nv and nv > 0 else float("nan"),
                  obs[int(0.25 * (len(obs) - 1))], obs[int(0.75 * (len(obs) - 1))], v))
 
 print()
@@ -213,6 +214,7 @@ print("on pure noise, by construction, and the raw value is not the headroom. Th
 print("null is the winner's curse itself, measured on this cell's own noise, and the EXCESS")
 print("over it is the part a thread rule could actually recover.")
 print("  %4s %7s %9s %9s %9s %9s %9s" % ("k", "cells", "median", "null", "excess", "p75", "p95"))
+excess_by_k = {}
 for k in ks:
     gains, nulls = [], []
     for ck, c in cell.items():
@@ -239,11 +241,28 @@ for k in ks:
         continue
     gs, ns = sorted(gains), sorted(x for x in nulls if x == x)
     med, nul = st.median(gs), (st.median(ns) if ns else float("nan"))
+    exc = med / nul if nul == nul and nul > 0 else float("nan")
+    excess_by_k[k] = exc
     print("  %4d %7d %9.4f %9.4f %9.4f %9.4f %9.4f"
-          % (k, len(gs), med, nul, med / nul if nul == nul and nul > 0 else float("nan"),
+          % (k, len(gs), med, nul, exc,
              gs[int(0.75 * (len(gs) - 1))], gs[int(0.95 * (len(gs) - 1))]))
 print("  'excess' is median/null. At 1.00 the apparent headroom is entirely the winner's curse")
 print("  and a thread rule has nothing to recover; above 1.00 it is the recoverable part.")
+print()
+print("  AN EXCESS BELOW 1.00 IS NOT AN ABSENCE OF RESULT, IT IS THE SHIPPED PATH WINNING. It")
+print("  says production's count beats an ARBITRARY count by (1 - excess) of the null, so the")
+print("  rule is measurably better than chance rather than merely not leaving anything behind.")
+print("  Printed with its sign, because reporting it as 'no headroom' inverts a positive result:")
+for k in ks:
+    e = excess_by_k.get(k)
+    if e is None or e != e:
+        continue
+    if e < 1.0:
+        print("    k=%-3d production beats an arbitrary count by %5.1f%% of the null (excess %.4f)"
+              % (k, 100.0 * (1.0 - e), e))
+    else:
+        print("    k=%-3d an arbitrary count beats production by %5.1f%% -- recoverable (excess %.4f)"
+              % (k, 100.0 * (e - 1.0), e))
 
 print()
 print("THE THRESHOLDS ARE FIXED IN THIS FILE, NOT CHOSEN HERE: >=%.2f RISING, <=%.2f FLAT,"

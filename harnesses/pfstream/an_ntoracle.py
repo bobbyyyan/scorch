@@ -277,7 +277,8 @@ import random as _random
 print()
 print("THE NULL, same cells and same denominator: regret of an arbitrary count on SHUFFLED")
 print("readings. A rule is evidence only to the extent it beats this.")
-print("%4s %5s %10s %10s   %s" % ("k", "n", "null", "best rule", "beats null by"))
+print("%4s %5s %10s %10s   %-13s  %13s   %11s"
+      % ("k", "n", "null", "best rule", "which rule", "arb->oracle", "arb->rule"))
 for k in ks:
     cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
     rng = _random.Random(20261002 + k)
@@ -306,8 +307,13 @@ for k in ks:
             rules_r.append((gm(rg), nm))
     nz = gm(nullv)
     br, bn = min(rules_r) if rules_r else (float("nan"), "-")
-    print("%4d %5d %10.4f %10.4f   %s is %.4f below the null"
-          % (k, len(cells), nz, br, bn, nz - br))
+    # TWO SPANS, BOTH PRINTED, BECAUSE A SENTENCE NAMING ONE NUMBER SWITCHES BETWEEN THEM.
+    # arbitrary-to-ORACLE bounds what any rule could ever recover here. arbitrary-to-BEST-RULE
+    # bounds what the best rule actually did recover. At k=32 these are 4.01% and 0.38% -- a
+    # factor of ten apart -- and a claim that quotes "0.4%" as the available span understates
+    # the ceiling tenfold while a claim that quotes "8%" at k=32 overstates what was achieved.
+    print("%4d %5d %10.4f %10.4f   %-13s  oracle %6.2f%%   rule %6.2f%%"
+          % (k, len(cells), nz, br, bn, 100.0 * (nz - 1.0), 100.0 * (nz / br - 1.0)))
 
 print()
 print("=" * 78)
