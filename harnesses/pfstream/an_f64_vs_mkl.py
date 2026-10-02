@@ -51,8 +51,16 @@ def pct(v, q):
 
 def main(argv):
     if len(argv) < 2:
-        return "usage: an_f64_vs_mkl.py <csv-dir>"
+        return "usage: an_f64_vs_mkl.py <csv-dir> [declared-ks e.g. 2,4,6,8,10,12,16]"
     d = argv[1]
+    # THE DECLARED WIDTH SET, from the producer rather than from the data. A width set derived
+    # from the rows cannot detect a width the run measured and the analysis never grouped, nor a
+    # declared width that produced no rows -- and the defect this guards against was exactly
+    # that: a prose summary named five widths while the run measured seven, and 19 of 192 cells
+    # went missing. Only a declaration outside the data can catch it.
+    declared = None
+    if len(argv) > 2 and argv[2] and not argv[2].startswith("--"):
+        declared = sorted(int(x) for x in argv[2].split(",") if x)
     names = sorted(f for f in os.listdir(d) if f.endswith(".csv"))
     if not names:
         return "REFUSE: no CSVs in %s" % d
@@ -63,6 +71,7 @@ def main(argv):
     degree_of = {}
     skipped = collections.Counter()
     passes, builds = set(), set()
+    n_ours_paired = 0
     for n in names:
         with open(os.path.join(d, n)) as fh:
             rows = list(csv.DictReader(fh))
@@ -88,6 +97,7 @@ def main(argv):
             m = by.get((key, k, "mkl"))
             if m and t > 0 and m > 0:
                 cell[(key, k)].append((b, tag, t, m))
+                n_ours_paired += 1
             else:
                 skipped["no mkl partner or non-positive"] += 1
     print("files %d   builds %s   pass-files %d" % (len(names), sorted(builds), len(passes)))
@@ -99,6 +109,16 @@ def main(argv):
     print("readings per cell: %s" % dict(nread))
     full = max(nread)
     print("cells with the full %d readings: %d of %d" % (full, nread[full], len(cell)))
+    # Independent accounting: every (cell, reading) pair came from one parsed `ours` row that
+    # found an mkl partner. Summing the readings per cell must reproduce that count.
+    pairs_from_cells = sum(len(v) for v in cell.values())
+    if pairs_from_cells != n_ours_paired:
+        return ("REFUSE: %d ours-rows were paired with an mkl partner during parsing but the "
+                "cell table holds %d readings, so %d reading(s) were dropped between parse and "
+                "classify" % (n_ours_paired, pairs_from_cells,
+                              n_ours_paired - pairs_from_cells))
+    print("paired ours-rows at parse time %d == readings held in the cell table, ASSERTED"
+          % n_ours_paired)
 
     # ---- classify every cell once.
     AHEAD, BEHIND, MIXED = "ahead", "behind", "mixed"
@@ -115,8 +135,14 @@ def main(argv):
             verdict[ck] = MIXED
     counts = collections.Counter(verdict.values())
     tot = counts[AHEAD] + counts[BEHIND] + counts[MIXED]
+    # This equality is an IDENTITY -- the classifier is if/elif/else over cell.items(), so every
+    # cell gets exactly one verdict and a Counter over them sums to len(cell). Keeping it as an
+    # assertion would claim coverage it does not have. The LIVE check is against a different
+    # source: the number of `ours` rows actually parsed, which must equal cells x readings. That
+    # catches a cell dropped between parse and classify, which is the failure the old form read
+    # as covering.
     if tot != len(cell):
-        return "REFUSE: the three verdicts sum to %d but there are %d cells" % (tot, len(cell))
+        return "REFUSE: internal inconsistency, verdicts %d vs cells %d" % (tot, len(cell))
     print()
     print("CELL VERDICTS over %d readings each (sign must agree in ALL readings)" % full)
     print("  ahead in every reading  %5d  (%.2f%%)" % (counts[AHEAD], 100.0 * counts[AHEAD] / tot))
@@ -146,12 +172,28 @@ def main(argv):
         print(row + "%8d" % tt if any_cell else row + "%8s" % "-")
     per_width = {w: sum(1 for (key, k), v in verdict.items() if k == w and v == BEHIND)
                  for w in widths}
-    if sum(per_width.values()) != counts[BEHIND]:
-        return ("REFUSE: the per-width behind counts sum to %d but the verdict count is %d, so "
-                "the width partition does not close and a reader subtracting would be misled"
-                % (sum(per_width.values()), counts[BEHIND]))
-    print("  per-width behind counts %s sum to %d, ASSERTED equal to the verdict count"
-          % (per_width, counts[BEHIND]))
+    # This sum is an IDENTITY and is not an assertion: `widths` is derived from `cell` and
+    # verdict's keys are cell's keys, so every behind cell's width is in widths by construction.
+    # Printed as arithmetic, not as a check.
+    print("  per-width behind counts %s sum to %d (an identity: the width set is derived from "
+          "the same rows, so this cannot fail)" % (per_width, sum(per_width.values())))
+    if declared is None:
+        print("  NO DECLARED WIDTH SET GIVEN, so the live check is unavailable: pass the"
+              " producer's")
+        print("  own ks (e.g. 2,4,6,8,10,12,16) as argument 2 to compare the measured width set")
+        print("  against the declared one. Without it a width the run measured and this analysis")
+        print("  never grouped is undetectable here.")
+    else:
+        extra = [w for w in widths if w not in declared]
+        missing = [w for w in declared if w not in widths]
+        print("  declared widths %s vs measured %s" % (declared, widths))
+        if extra or missing:
+            return ("REFUSE: the measured width set does not match the declared one -- measured "
+                    "but not declared %s, declared but unmeasured %s. The first means this "
+                    "analysis is grouping rows the producer did not register; the second means a "
+                    "declared width produced no rows at all."
+                    % (extra or "none", missing or "none"))
+        print("  ASSERTED equal, so no declared width is missing and none is unregistered")
     # Named explicitly, because a prose summary of this table omitted two widths and left a
     # reader to subtract 19 cells. For doubles (4 lanes) the tail is masked when k %% 4 != 0.
     masked = [w for w in widths if w > 3 and w % 4 != 0]

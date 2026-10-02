@@ -34,38 +34,6 @@ esac
 KS=${3:-$DEFAULT_KS}
 REPS=${4:-9}
 
-# The grid is checked against the dtype rather than trusted: every width must be reachable, and
-# NVEC 1..4 and both tail states must each appear, or the screen cannot support a claim about the
-# macro's whole range.
-case "$DTYPE" in float32) LANES=8 ;; float64) LANES=4 ;; esac
-python - "$KS" "$LANES" "$DTYPE" <<'PY' || exit 1
-import sys
-ks = [int(x) for x in sys.argv[1].split(",") if x]
-lanes, dtype = int(sys.argv[2]), sys.argv[3]
-exact_hi = 7 if lanes == 8 else 3
-hi = 4 * lanes
-print("  GRID CHECK for %s (%d lanes): regblock reaches k=1..%d, exact kernel owns k=1..%d"
-      % (dtype, lanes, hi, exact_hi))
-over = [k for k in ks if k > hi]
-if over:
-    sys.exit("REFUSE: widths %s exceed k=%d, which needs NVEC>4 and is not instantiated" % (over, hi))
-ctrl = [k for k in ks if k <= exact_hi]
-arm = [k for k in ks if k > exact_hi]
-nvec = sorted({-(-k // lanes) for k in arm})
-full = sorted({k for k in arm if k % lanes == 0})
-mask = sorted({k for k in arm if k % lanes != 0})
-print("    negative-control widths (macro inert): %s" % ctrl)
-print("    arm widths %s -> nvec %s" % (arm, nvec))
-print("    full tail %s   masked tail %s" % (full, mask))
-missing = []
-if not ctrl: missing.append("no negative control (no width at or below k=%d)" % exact_hi)
-if nvec != [1, 2, 3, 4]: missing.append("nvec coverage is %s, not 1..4" % nvec)
-if not full: missing.append("no full-tail width")
-if not mask: missing.append("no masked-tail width")
-if missing:
-    sys.exit("REFUSE: the grid does not cover the kernel's branch axes: " + "; ".join(missing))
-print("    COVERS nvec 1..4, both tail states, and a negative control")
-PY
 
 # The harness directory is overridable on its own, because the two hosts lay it out differently:
 # one has a checked-out tree, the other keeps the producer files flat beside the builds. Deriving
@@ -98,6 +66,43 @@ done
 source "$ACTIVATE" || { echo "REFUSE: $ACTIVATE failed on the real source"; exit 1; }
 python -c "import torch,sys; sys.stderr.write('torch %s at %s\n'%(torch.__version__,sys.executable))" \
   || { echo "REFUSE: the activated environment cannot import torch"; exit 1; }
+
+# THE GRID CHECK RUNS HERE, NOT EARLIER. It needs a python interpreter, and on one of the two
+# hosts there is no `python` on PATH until the environment is activated -- placed above the
+# activation it failed with "python: command not found", which is a refusal for the wrong reason
+# and says nothing about the grid. A check has to be able to reach its own subject.
+# The grid is checked against the dtype rather than trusted: every width must be reachable, and
+# NVEC 1..4 and both tail states must each appear, or the screen cannot support a claim about the
+# macro's whole range.
+case "$DTYPE" in float32) LANES=8 ;; float64) LANES=4 ;; esac
+python - "$KS" "$LANES" "$DTYPE" <<'PY' || exit 1
+import sys
+ks = [int(x) for x in sys.argv[1].split(",") if x]
+lanes, dtype = int(sys.argv[2]), sys.argv[3]
+exact_hi = 7 if lanes == 8 else 3
+hi = 4 * lanes
+print("  GRID CHECK for %s (%d lanes): regblock reaches k=1..%d, exact kernel owns k=1..%d"
+      % (dtype, lanes, hi, exact_hi))
+over = [k for k in ks if k > hi]
+if over:
+    sys.exit("REFUSE: widths %s exceed k=%d, which needs NVEC>4 and is not instantiated" % (over, hi))
+ctrl = [k for k in ks if k <= exact_hi]
+arm = [k for k in ks if k > exact_hi]
+nvec = sorted({-(-k // lanes) for k in arm})
+full = sorted({k for k in arm if k % lanes == 0})
+mask = sorted({k for k in arm if k % lanes != 0})
+print("    negative-control widths (macro inert): %s" % ctrl)
+print("    arm widths %s -> nvec %s" % (arm, nvec))
+print("    full tail %s   masked tail %s" % (full, mask))
+missing = []
+if not ctrl: missing.append("no negative control (no width at or below k=%d)" % exact_hi)
+if nvec != [1, 2, 3, 4]: missing.append("nvec coverage is %s, not 1..4" % nvec)
+if not full: missing.append("no full-tail width")
+if not mask: missing.append("no masked-tail width")
+if missing:
+    sys.exit("REFUSE: the grid does not cover the kernel's branch axes: " + "; ".join(missing))
+print("    COVERS nvec 1..4, both tail states, and a negative control")
+PY
 
 # Every arm must exist before the first measurement, so a missing build fails now rather than
 # three hours in with a partial Latin square on disk.

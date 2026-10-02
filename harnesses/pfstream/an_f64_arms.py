@@ -131,6 +131,7 @@ def main(argv):
     # and the shape is the whole question for whether the macro can ship.
     print()
     print("PER WIDTH over all cells (negative = faster than ship)")
+    omitted = []
     widths = sorted({w for (_k, w) in cells})
     print("  %-6s %10s %10s %10s %12s %12s" % ("k", "floor", "nopf", "strm", "nopf better", "strm better"))
     for w in widths:
@@ -144,11 +145,17 @@ def main(argv):
         # partway -- which is how a long run ends -- leaves a width with ship cells and no shpb
         # cells. Unguarded that is a TypeError mid-table, not a structured refusal.
         if not fl:
-            print("  k=%-4d %9s   REFUSE: no shpb/ship pair at this width, so the floor the two"
+            # NOT "REFUSE". In this project REFUSE marks a fail-closed exit, and every other
+            # occurrence in these files is returned from main into sys.exit and leaves status 1.
+            # This path prints a row and continues, so the process still exits 0 -- wearing the
+            # same token would make a skipped width indistinguishable from an aborted run to
+            # anyone grepping logs for it.
+            print("  k=%-4d %9s   OMITTED: no shpb/ship pair at this width, so the floor the two"
                   % (w, "-"))
-            print("            arm columns are read against does not exist here; %d cells have"
+            print("            arm columns are read against does not exist here; %d cell(s) have"
                   % len(pop))
-            print("            a ship reading. Nothing is reported for k=%d." % w)
+            print("            a ship reading. No arm figure is reported for k=%d." % w)
+            omitted.append(w)
             continue
         print("  k=%-4d %9.3f%% %9.3f%% %9.3f%% %11s %11s"
               % (w, 100 * pct(fl, 0.5),
@@ -156,6 +163,10 @@ def main(argv):
                  100 * pct(vs, 0.5) if vs else float("nan"),
                  "%d/%d" % (sum(1 for x in vn if x < 0), len(vn)) if vn else "-",
                  "%d/%d" % (sum(1 for x in vs if x < 0), len(vs)) if vs else "-"))
+    if omitted:
+        print("  WIDTHS OMITTED FOR WANT OF A FLOOR: %s -- the table above is not complete over"
+              % omitted)
+        print("  the grid, and this line is the only record of that.")
     print("  The floor column is the null for the two beside it. The recorded float32 result is")
     print("  that removing the prefetch wins 14.6%% at k=4 and fades to 0.56%% by k=16, and that it")
     print("  HARMS 115 matrices at k=32 -- a width absent from this grid, so this table cannot")

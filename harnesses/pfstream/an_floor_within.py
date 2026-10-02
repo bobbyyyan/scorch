@@ -163,7 +163,6 @@ def main(argv):
     print("(c4-corrected sd / mean, per (key, width, class); n = members in the class)")
     rows_by_band = collections.defaultdict(list)
     per_class = collections.defaultdict(list)
-    within_med = {}
     n_cells = 0
     short = collections.Counter()
     for key in sorted(nnz):
@@ -189,7 +188,6 @@ def main(argv):
             continue
         print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%"
               % (lab, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95), 100 * v[-1]))
-        within_med[lab] = pct(v, 0.5)
     allv = sorted(x for v in rows_by_band.values() for x in v)
     print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%   <- pooled, which bounds NEITHER end"
           % ("POOLED", len(allv), 100 * pct(allv, 0.5), 100 * pct(allv, 0.95), 100 * allv[-1]))
