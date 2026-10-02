@@ -2592,3 +2592,89 @@ scored on the key set redwood was.
 MKT job **17696496** (`adg-dlmc-f32`, 32 CPUs, 8h) builds the three ADOPT_GRAIN objects, runs the
 three-pass screen, then sweeps overrides 0..32. Pool 32 is the value prediction 4's arithmetic
 was registered against.
+
+---
+
+## Amendment 30 — amendment 29's k=32 verdict is WITHDRAWN: the effect is inside the floor, and the sign test that might have rescued it is contaminated
+
+Amendment 29 reads: "`nopf` reads **−0.973% against a floor of +1.381%** — a win, outside the
+floor, sign **opposed** to the SuiteSparse harm."
+
+**0.973 < 1.381.** That is inside. And the same comparison is applied *correctly* four paragraphs
+earlier in the same amendment: at k=2, "+0.604% against a floor of +0.672% ... Inside the floor
+both ways." One amendment, two instances of one comparison, opposite verdicts. The k=32 one was
+the one carrying a conclusion.
+
+### The floor is a location, not a width, which is how the error got written
+
+The floor column is `pct(fl, 0.5)` — the **median** of a same-config two-object contrast. Two
+objects with identical configuration differ by a systematic offset (the layout artefact), so the
+floor's median is where that offset sits, not how wide the noise is. Comparing `|arm|` against
+`|floor median|` treats an offset as a band, and at k=32 the offset is the largest of any width,
+which is exactly where that mistake flips a verdict.
+
+The tool now prints the floor's **p05/p95** beside its median. Those are the relevant numbers and
+they were never on the page:
+
+| k | floor med | floor p05 | floor p95 | nopf | verdict against the band |
+|---|-----------|-----------|-----------|------|--------------------------|
+| 2 | +0.672% | −1.107% | +2.999% | +0.604% | inside, no verdict |
+| 8 | +0.474% | −1.053% | +2.245% | **−6.222%** | **FASTER, outside** |
+| 12 | +0.237% | −1.888% | +2.487% | −2.353% | FASTER, outside |
+| 16 | +1.110% | −0.780% | +3.793% | −1.905% | FASTER, outside |
+| 20 | +0.562% | −1.349% | +2.570% | −0.782% | inside, no verdict |
+| 24 | +1.735% | −0.549% | +4.340% | −0.436% | inside, no verdict |
+| 32 | +1.381% | −0.982% | +3.301% | −0.973% | **inside, no verdict** |
+
+k=32 misses the band's lower edge by **0.009 pp**. That is not a near-miss worth arguing about;
+it is a measurement that landed on the boundary, and the boundary is where a verdict must not be
+read. The criterion is labelled post-hoc in the tool's own output, because it was chosen after
+the median comparison was found wrong — it is the reading of the standing rule that nothing
+inside the noise floor counts.
+
+### The sign test could have rescued it, and the column that decides is now computed: it does not
+
+A pooled magnitude inside a floor can still carry a direction, and `cells-better` is the statistic
+that would see it: 294 of 392 at k=32 is +9.9 sd against Binomial(392, 0.5). That test is valid
+only if the **same-config pair** sits near half. It does not:
+
+| k | FLOOR cells-better | FLOOR z | nopf z |
+|---|--------------------|---------|--------|
+| 2 | 98/392 | −9.9 sd | −8.6 sd |
+| 8 | 104/392 | −9.3 sd | +17.8 sd |
+| 12 | 159/392 | −3.7 sd | +17.0 sd |
+| 16 | 58/392 | −13.9 sd | +11.2 sd |
+| 20 | 101/392 | −9.6 sd | +6.2 sd |
+| 24 | 62/392 | −13.5 sd | +5.6 sd |
+| 32 | **72/392** | **−12.5 sd** | +9.9 sd |
+
+The floor pair is **3.7 to 13.9 sd off half at every one of seven widths**. Two objects differing
+in nothing but which `.so` answered disagree in sign on three quarters of cells, consistently.
+So `cells-better` against 0.5 measures the object asymmetry and the arm together, and at k=32 the
+floor's own z is larger in magnitude than the arm's. **The sign test is unusable on this grid at
+every width**, and the 9.9 sd must not be quoted. The tool now prints the floor's z first and
+flags every row where it exceeds 2 sd, which here is all of them.
+
+### What survives, stated at the strength the data supports
+
+**k=8 is the one unambiguous result**: −6.222% against a floor band of −1.053% to +2.245%, 5.9×
+the band's lower edge. k=12 and k=16 also clear the band, k=12 by 0.465 pp, so amendment 29's
+"continuing" survives — but it survives marginally and was asserted without the floors that
+decide it, which was the right thing to challenge.
+
+**The corpus-specificity conclusion stands on a weaker and sufficient footing.** "The harm is a
+property of SuiteSparse-like structure at wide k, not of wide k" needs only the *absence* on DLMC
+of a harm of the recorded size. The SuiteSparse result is a harm large enough to be recorded over
+115 matrices; at k=32 here nothing of that size appears in either direction. So the claim is
+**does not reproduce**, not **a win**. Every sentence resting on "a win, outside the floor, sign
+opposed" is withdrawn. The next measurement is unchanged: both corpora in one grid at k=32 with
+the floor computed inside it, and the floor's band and its cells-better both reported.
+
+### The convention question, answered rather than left to the reader
+
+The floors were all quoted positive while the effects span both signs, which left it to the reader
+to decide whether a negative effect is "inside" a positive floor. It is not a one-signed p95: the
+floor's p05 is negative at **all seven widths** (−0.549% to −1.888%), so the same-config pair
+reads either object faster depending on the cell. The floor is genuinely two-sided in spread with
+a positive median, and the band is the object to compare against. That is now printed rather than
+inferred.

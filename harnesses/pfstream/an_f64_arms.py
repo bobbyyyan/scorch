@@ -18,6 +18,7 @@ beside it on the same population is the error this file exists to avoid.
 """
 import collections
 import csv
+import math
 import os
 import statistics
 import sys
@@ -142,8 +143,25 @@ def main(argv):
     print()
     print("PER WIDTH over all cells (negative = faster than ship)")
     omitted = []
+    signrows = []
     widths = sorted({w for (_k, w) in cells})
-    print("  %-6s %10s %10s %10s %12s %12s" % ("k", "floor", "nopf", "strm", "nopf better", "strm better"))
+    # THE FLOOR COLUMN IS A MEDIAN, SO IT IS A LOCATION AND NOT A WIDTH. Two objects with the
+    # SAME configuration differ by a systematic offset here (the layout artefact), so comparing
+    # |arm| against |floor median| treats an offset as a noise band -- which is how a committed
+    # amendment came to call an arm of -0.973% "outside" a floor of +1.381%. The floor's p05/p95
+    # print beside its median so a magnitude claim has a width to be read against.
+    #
+    # AND THE SIGN TEST NEEDS THE FLOOR PAIR'S OWN cells-better, not 0.5. A pooled effect inside
+    # the floor's band can still be directionally real, and cells-better is the statistic that
+    # sees it -- but only if the same-config pair sits near half. If the pair that differs by
+    # nothing but its object ALSO reads 75% better, that share is the artefact, not an effect.
+    print("  %-5s %8s %8s %8s %8s %8s | %10s %10s %10s | %s"
+          % ("k", "floor", "fl p05", "fl p95", "nopf", "strm",
+             "nopf b/n", "strm b/n", "FLOOR b/n", "nopf vs band"))
+    print("  'nopf vs band' is the only magnitude verdict this table supports: the arm's median")
+    print("  against the floor pair's p05-p95 BAND. Chosen after the median-magnitude comparison")
+    print("  was found wrong in a committed amendment, and labelled as post-hoc for that reason;")
+    print("  it is the reading of the standing rule that nothing inside the noise floor counts.")
     for w in widths:
         pop = [c for c in cells if c[1] == w]
         fl = rel("shpb", "ship", pop)
@@ -167,16 +185,50 @@ def main(argv):
             print("            a ship reading. No arm figure is reported for k=%d." % w)
             omitted.append(w)
             continue
-        print("  k=%-4d %9.3f%% %9.3f%% %9.3f%% %11s %11s"
-              % (w, 100 * pct(fl, 0.5),
+        lo, hi = pct(fl, 0.05), pct(fl, 0.95)
+        if vn:
+            mn = pct(vn, 0.5)
+            if mn < lo:
+                vd = "FASTER, outside"
+            elif mn > hi:
+                vd = "SLOWER, outside"
+            else:
+                vd = "inside, no verdict"
+            vd += " (%+.3f vs %+.3f)" % (100 * mn, 100 * (lo if mn < lo else hi))
+        else:
+            vd = "-"
+        print("  k=%-4d %7.3f%% %7.3f%% %7.3f%% %7.3f%% %7.3f%% | %10s %10s %10s | %s"
+              % (w, 100 * pct(fl, 0.5), 100 * lo, 100 * hi,
                  100 * pct(vn, 0.5) if vn else float("nan"),
                  100 * pct(vs, 0.5) if vs else float("nan"),
                  "%d/%d" % (sum(1 for x in vn if x < 0), len(vn)) if vn else "-",
-                 "%d/%d" % (sum(1 for x in vs if x < 0), len(vs)) if vs else "-"))
+                 "%d/%d" % (sum(1 for x in vs if x < 0), len(vs)) if vs else "-",
+                 "%d/%d" % (sum(1 for x in fl if x < 0), len(fl)), vd))
+        signrows.append((w, fl, vn, vs))
     if omitted:
         print("  WIDTHS OMITTED FOR WANT OF A FLOOR: %s -- the table above is not complete over"
               % omitted)
         print("  the grid, and this line is the only record of that.")
+    print()
+    print("  THE SIGN TEST, read against the FLOOR PAIR and not against 0.5. cells-better as a")
+    print("  z against Binomial(n, 0.5) is only valid if the same-config pair sits near half; the")
+    print("  floor column's own z is printed first for exactly that reason, and where it is large")
+    print("  the arm's z beside it is measuring the object asymmetry, not the arm.")
+    print("  %-5s %22s %22s %22s" % ("k", "FLOOR z (the null)", "nopf z", "strm z"))
+    for (w, fl, vn, vs) in signrows:
+        def _z(v):
+            if not v:
+                return None
+            n = len(v)
+            return ((sum(1 for x in v if x < 0) - n / 2.0) / math.sqrt(n / 4.0)) if n else None
+        zf, zn, zs = _z(fl), _z(vn), _z(vs)
+        def _f(z):
+            return ("%+.1f sd" % z) if z is not None else "-"
+        flag = ""
+        if zf is not None and abs(zf) >= 2.0:
+            flag = "  <- FLOOR ITSELF OFF HALF, arm z unreadable"
+        print("  k=%-5d %22s %22s %22s%s" % (w, _f(zf), _f(zn), _f(zs), flag))
+    print()
     print("  The floor column is the null for the two beside it. The recorded float32 result is")
     print("  that removing the prefetch wins 14.6% at k=4 and fades to 0.56% by k=16, and that it")
     print("  HARMS 115 matrices at k=32. That harm was measured on SUITESPARSE; whether this")
@@ -186,10 +238,22 @@ def main(argv):
         fl32 = rel("shpb", "ship", pop32)
         vn32 = rel("nopf", "ship", pop32) if "nopf" in builds else []
         if vn32 and fl32:
-            print("    k=32 IS in this grid (%d cells): nopf reads %+.3f%% against a floor of %+.3f%%."
-                  % (len(vn32), 100 * pct(vn32, 0.5), 100 * pct(fl32, 0.5)))
-            print("    A sign agreeing with the SuiteSparse harm would corroborate it on a second")
-            print("    corpus; a sign against it means the harm is corpus-specific. Either way this")
+            fb = sum(1 for x in fl32 if x < 0)
+            nb = sum(1 for x in vn32 if x < 0)
+            print("    k=32 IS in this grid (%d cells): nopf reads %+.3f%% against a floor whose"
+                  % (len(vn32), 100 * pct(vn32, 0.5)))
+            print("    median is %+.3f%% and whose p05/p95 band is %+.3f%% to %+.3f%%. The MAGNITUDE"
+                  % (100 * pct(fl32, 0.5), 100 * pct(fl32, 0.05), 100 * pct(fl32, 0.95)))
+            print("    comparison is |%.3f| vs |%.3f|, so the pooled effect is INSIDE the floor and"
+                  % (100 * pct(vn32, 0.5), 100 * pct(fl32, 0.5)))
+            print("    carries NO sign from its magnitude. Cells-better: nopf %d/%d against the"
+                  % (nb, len(vn32)))
+            print("    floor pair's own %d/%d -- compare those two, never nopf against 0.5."
+                  % (fb, len(fl32)))
+            print("    The recorded harm is large enough to have been recorded over 115 matrices,")
+            print("    so an effect inside this floor establishes that it DOES NOT REPRODUCE here;")
+            print("    that is what a corpus-specificity claim needs, and it is all it may use.")
+            print("    Either way this")
             print("    table DOES see the side of the trade that blocks shipping, so the sentence")
             print("    above must not be read as an excuse for not looking.")
         else:
