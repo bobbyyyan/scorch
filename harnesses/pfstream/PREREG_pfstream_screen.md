@@ -3124,3 +3124,74 @@ readings, behind on none, with 81 cells inside the object/pass spread.** Pooled 
 4.127 / 2.652 / 2.347 / 2.386 / 1.857 / 1.344. That is the goal met for float64 on this host and
 this corpus, and it is one host — MKT float64 remains unmeasured by me, which is exactly the gap
 the paragraph above turns on.
+
+---
+
+## Amendment 37 — reading count is EXCLUDED as the explanation for the 192: at matched N=1 redwood reads 9–20 cells, not 192
+
+Amendment 36 offered two outcomes — host difference, or superseded run — and they were not
+exhaustive. Both held the **reading count fixed** without saying so.
+
+`behind in every reading` is an **intersection** over readings, so it shrinks monotonically as
+readings are added: an intersection over more readings is a subset. An estimator defined by a
+quantifier over repetitions silently encodes the repetition count in its own value, and the drift
+is always toward the null. `ahead in all`, `behind in all`, `wins every reading`, `never regresses`
+are all of this kind. **Two such counts are comparable only at equal N.** Amendment 36's own two
+datasets show the sensitivity: four extra readings moved 7 cells out of ahead-in-all into mixed.
+
+So a 192 recorded at low N and a 0 at N=16 could be the same host, the same corpus, and no error
+in either number. That is a third explanation needing neither a host difference nor a mistake, and
+it is separable on passes already on disk.
+
+### Measured, on redwood's complete set, with `an_nslope.py`
+
+Ratios parsed the way `an_f64_vs_mkl.py` parses them — `arm` is `"ours"`/`"mkl"`, paired **within**
+one file so a ratio never crosses a pass boundary. 46704 ratios built, **0 rows with no mkl
+partner**. All 2919 cells carry all 16 readings, so N is exact rather than nominal.
+
+| N | pass-subsets | min | median | max | mean |
+|---|---|-----|--------|-----|------|
+| 1 | 16 (all) | **9** | **11.5** | **20** | 12.00 |
+| 2 | 40 | 0 | 3.0 | 6 | 2.70 |
+| 4 | 40 | 0 | 0.0 | 2 | 0.35 |
+| 8 | 40 | 0 | 0.0 | 0 | 0.00 |
+| 12 | 40 | 0 | 0.0 | 0 | 0.00 |
+| 16 | 1 | 0 | 0.0 | 0 | 0.00 |
+
+**At the weakest bar this data admits — one pass, where "behind in all" degenerates to "behind in
+that reading" — the count is 9 to 20 cells, 0.31% to 0.69% of 2919.** The 192 is 6.58%, a factor
+of ten to twenty away. The slope is real and steep (12 → 2.7 → 0.35 → 0), which is exactly why N
+had to be checked, and it does not come close to spanning the gap.
+
+**So reading count is excluded.** Amendment 36's two outcomes stand as the live ones, with the
+host difference now the leading candidate rather than one of three.
+
+### The ceiling, with the scope the bound actually has
+
+Separately and independently: 2838 cells are ahead in all 16 readings, and **cells behind in at
+least one reading is exactly 81** — equal to the mixed count, as it must be when none are behind
+in all. So even `behind in ANY reading`, the weakest criterion of this family, yields 81 < 192.
+
+Amendment 36 said "no criterion computed from those readings can label any of them behind." That
+is literally too strong — a pathological rule, say *behind if the ratio exceeds 0.5*, could. The
+bound holds under the restriction that **a criterion cannot call a cell behind when ours is faster
+in all 16 readings**, which is the intended reading. Worth stating because this is a bound, and a
+bound's scope is what makes it one. 81 < 192 either way, and 88 < 192 even allowing the
+seven-cell denominator gap.
+
+### A static read that closes the width question outright
+
+The open item's premise was that k=6 and k=10 might never have been registered widths. They were,
+deliberately: `arm_screen.sh:37` reads `float64) DEFAULT_KS=2,4,6,8,10,12,16`, commented *"control
+2; nvec 1,2,3,4; masked tails at 6 and 10"*. There is no `f64_screen.sh` in the worktree to
+override it, and the screen log's third line reads `widths 2,4,6,8,10,12,16`. The masked tails were
+chosen, not inherited.
+
+### And the predictor's negative control vanishes with its target, which is worse than being unscored
+
+Amendment 26's 9 cells at k=8 were the region where the mechanism predicts **no** signal —
+`S % 64 == 0`, the B row owning its lines outright — and a deficit was recorded there anyway. If
+the 192 dissolves, the positive set of 183 and the silent set of 9 vanish **together**. So the
+predictor is not merely unscored: **its negative control is gone**, and a mechanism without the
+population that gave it a negative control stays unfalsifiable even if some other deficit set turns
+up later. Re-registering it would need a new control, not just a new target.
