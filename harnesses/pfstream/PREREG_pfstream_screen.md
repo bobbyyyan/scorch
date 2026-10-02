@@ -2857,3 +2857,80 @@ and 2.500% tails.
 `arm_screen` named no producer script in the staged harness directory, so its silence would have
 carried no information. That is the guard working. `arm_screen.sh` staged at `78f73444e60c62c3`,
 matching the digest already pinned in this document. **17696556** is the live run.
+
+---
+
+## Amendment 33 — the role-swap check was an algebraic identity, so it survived the mutation it was written for
+
+`paired_d` returns `(a − b)/b − (f − b)/b`, which is `(a − f)/b`. Swapping its two tag arguments
+therefore yields `(f − a)/b`: an **exact negation, for every dataset and every tag assignment**.
+The check asserting that a swap flips the sign was asserting antisymmetry, which holds
+unconditionally and cannot fail unless the arithmetic itself changes.
+
+What it established was that a swap **would be visible in the output**. It did not establish that
+production performs none, because the self-test passed its own three literals and **never consumed
+the production call site**. Planting the swap there — a one-line change — left the suite reporting
+`SELFTEST PASSED: 14 checks`, exit 0, with the role-swap line printing PASS unchanged, while every
+verdict in the real table would have had its sign reversed: the arm reading as the floor and the
+floor as the arm.
+
+This is the pattern already recorded as *a harness that restates production is wrong silently and
+flatteringly*, in its hardest-to-see form — three string literals read as test fixture rather than
+as a second copy of the policy.
+
+### The fix is that the tags exist once, somewhere the test consumes
+
+```python
+def arm_paired_d(med, pop):
+    """THE SCREEN'S CONTRAST, and the only place its three tags appear."""
+    return paired_d(med, pop, "nopf", "shpb", "ship")
+```
+
+Production calls it; the self-test calls it and asserts a **signed** known value on the asymmetric
+synthetic — `−0.0400`, negative meaning the arm is faster than the floor. A swapped literal in the
+wrapper flips that and fails.
+
+The antisymmetry check is **kept and relabelled** rather than deleted: it is a true, cheap property
+of `paired_d`, and its name now says what it is — *an IDENTITY, not coverage* — so the next reader
+cannot mistake it for call-site coverage.
+
+### The control, demonstrated rather than argued
+
+Planted in a scratchpad copy taken from the committed blob, never in the worktree:
+
+| | result |
+|---|---|
+| planted swap, before this amendment | `SELFTEST PASSED: 14 checks`, exit 0 |
+| planted swap, after | `SELFTEST FAILED 2 of 14`, exit **1** |
+| worktree unchanged | exit **0**, digest `cc5dc235462da821` |
+
+The planted copy was removed and the worktree digest re-verified afterwards. A guard whose
+positive control is the mutation that motivated it is the only kind worth having, and that is now
+true of this one where it was not before.
+
+**One reading note on the exit code.** The first run of the plant appeared to report `rc=0`. That
+was `$?` reading the exit status of `tail` at the end of a pipeline, not of python — the same trap
+already recorded for `PIPESTATUS`. Measured directly, the plant exits 1 and the worktree exits 0.
+A self-test's exit code is the only part of it a gate reads, so checking it through a pipe is
+checking the pipe.
+
+### Confirmed clean on the other three fixes
+
+The `boot_median_ci` arity change is complete across all five call sites including the three
+`_, _, _, x, _` sites and the `r[0] is None` refusal path. `paired_d` returns sorted, so
+production's `pct(d, 0.5)` receives sorted input and the earlier explicit `d.sort()` is correctly
+gone. The missing-tag check at 39 of 40 exercises the single conjunction `a and f and b and b > 0`,
+so deleting any one of the three tags is the same branch.
+
+On the data digest: `%.17g` over every value is sensitive to a **one-ULP change in a single cell
+out of 392** (`d00fece38580` → `3b4d82183fe0`), which is the realistic substitution — a few cells
+changing, not a uniform shift — and is the stronger case than the uniform `+0.095` the self-test
+uses.
+
+### Provenance: two distinct refusals, not one described twice
+
+`arm_screen.sh` digests to `78f73444e60c62c3`, matching both this document and the full 64-hex pin
+in `pfs_screen_dlmc.sbatch:101`. The earlier refusal recorded at `:2450` is a **digest mismatch**
+against `266ca5fc42bf190d`; job 17696496's refusal is a **missing producer script** for the
+`arm_screen` guard pattern. Different causes, both recorded, and the chain should keep them
+separate.

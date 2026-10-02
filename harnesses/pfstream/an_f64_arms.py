@@ -85,6 +85,23 @@ def paired_d(med, pop, arm, floor, base):
     return sorted(out)
 
 
+def arm_paired_d(med, pop):
+    """THE SCREEN'S CONTRAST, and the only place its three tags appear.
+
+    The tags live here because a test that re-derives them cannot cover them. The previous
+    self-test passed its own literals and asserted that swapping the two tag arguments flips the
+    sign -- but `paired_d` returns `(a - f) / b`, so that antisymmetry is an ALGEBRAIC IDENTITY
+    holding for every dataset and every assignment. It proved a swap would be VISIBLE; it could
+    not prove production performs none, because the call site's literals were never consumed by
+    the test. Planting the swap at the call site left the suite reporting 14 checks PASSED while
+    every verdict's sign was reversed.
+
+    So the contrast is named once and both production and the self-test call THIS. The test
+    asserts a SIGNED known value on it, which a swapped literal here flips and fails.
+    """
+    return paired_d(med, pop, "nopf", "shpb", "ship")
+
+
 def pct(v, q):
     if not v:
         return None
@@ -278,7 +295,7 @@ def main(argv):
              "v:data i:resample"))
     for (w, _fl, _vn, _vs) in signrows:
         pop = [c for c in cells if c[1] == w]
-        d = paired_d(med, pop, "nopf", "shpb", "ship")
+        d = arm_paired_d(med, pop)
         if not d:
             print("  k=%-5d %6s   NO PAIRED CELL: needs nopf, shpb and ship on one cell" % (w, "-"))
             continue

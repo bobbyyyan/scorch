@@ -15,7 +15,7 @@ import random
 import sys
 
 sys.path.insert(0, ".")
-from an_f64_arms import boot_median_ci, paired_d, pct  # noqa: E402
+from an_f64_arms import arm_paired_d, boot_median_ci, paired_d, pct  # noqa: E402
 
 FAIL = []
 RAN = []
@@ -114,17 +114,24 @@ def main():
         synth[(key, w, "ship")] = 100.0
         synth[(key, w, "shpb")] = 101.0 + 0.01 * i      # floor: ~+1% slower than ship
         synth[(key, w, "nopf")] = 97.0 + 0.01 * i       # arm:   ~-3% faster than ship
-    dd = paired_d(synth, pop, "nopf", "shpb", "ship")
-    check("paired_d on an asymmetric synthetic reads the known value", dd and abs(pct(dd, 0.5) - (-0.04)) < 1e-9,
-          "median %+.4f, expected -0.0400 (= -3%% - +1%%)" % pct(dd, 0.5))
+    # THE CHECK THAT COVERS THE CALL SITE: it consumes arm_paired_d, where the three tags live
+    # exactly once, and asserts a SIGNED value. Swap the literals in that wrapper and this fails.
+    dd = arm_paired_d(synth, pop)
+    check("arm_paired_d reads the SIGNED known value (negative = arm faster)",
+          bool(dd) and abs(pct(dd, 0.5) - (-0.04)) < 1e-9,
+          "median %+.4f, expected -0.0400 (= arm -3%% minus floor +1%%)" % pct(dd, 0.5))
+    # AND THIS ONE DOES NOT COVER IT, which is now stated rather than implied. paired_d returns
+    # (a-f)/b, so swapping its two tag arguments is an exact negation for every dataset: the
+    # property is real and cheap, but it shows a swap would be VISIBLE, not that none occurs.
     sw = paired_d(synth, pop, "shpb", "nopf", "ship")
-    check("swapping the arm and floor ROLES flips the sign", abs(pct(sw, 0.5) + pct(dd, 0.5)) < 1e-12,
-          "swapped median %+.4f, so a role swap is detectable" % pct(sw, 0.5))
+    check("paired_d is antisymmetric in its two tags (an IDENTITY, not coverage)",
+          abs(pct(sw, 0.5) + pct(dd, 0.5)) < 1e-12,
+          "swapped median %+.4f -- holds unconditionally, covers nothing" % pct(sw, 0.5))
     miss = dict(synth)
     del miss[(pop[0][0], 2, "shpb")]
     check("a cell missing one of the three tags is dropped, not defaulted",
-          len(paired_d(miss, pop, "nopf", "shpb", "ship")) == len(dd) - 1,
-          "%d cells vs %d" % (len(paired_d(miss, pop, "nopf", "shpb", "ship")), len(dd)))
+          len(arm_paired_d(miss, pop)) == len(dd) - 1,
+          "%d cells vs %d" % (len(arm_paired_d(miss, pop)), len(dd)))
 
     print()
     if FAIL:
