@@ -2091,3 +2091,85 @@ stated.
 **4. The width list was incomplete.** Under the paired functional `nopf` sits below the floor at
 k = 8, 12, 16, 20, 24 and 32 — **six of seven**, everything but k=2. The first version named
 12, 16, 24 and 32, treating k=8 separately as an outright win and omitting k=20 entirely.
+
+### Amendment 27, correction 5 — the control width bounds the arm columns, and four of six claims do not survive it
+
+Raised by the verifying session, which reproduced all 21 ratios and both k=32 counts to four
+decimals before disagreeing, so this is a disagreement about a conclusion and not about
+arithmetic. The decision below is a pre-registration decision and it is mine; it is recorded
+before the completed run is analysed.
+
+**The measurement.** At k=2 the register-block kernel is bypassed — `narrow_exact` owns k in
+{1,2,3} for both dtypes — so no arm's differing code can execute and every displacement there is
+instrument. Four pairs, same cells, same pass, paired geometric median, n=392:
+
+| pair | ratio | slower on |
+|---|---|---|
+| nopf/ship | 1.023452 | 341 of 392 = 87.0% |
+| shpb/ship (declared floor) | 1.012171 | 263 of 392 = 67.1% |
+| strm/ship | 0.999110 | 186 of 392 = 47.4% |
+| oursb/ours (repeat, one object, one process) | 1.000118 | 205 of 392 = 52.3% |
+
+`nopf` deviates 2.35 pp from 1.0 where it is provably inert. The inter-object floor covers
+1.22 pp, or **51.9%** of it; the repeat covers 0.01 pp. That leaves an **unattributed residual of
+1.13 pp** — larger than the floor's own value, and the largest `nopf` deviation at any of the
+seven widths. Amendment 27 said "essentially all of the excess is object-level". That was wrong:
+about half of it is, and the rest is accounted for by neither instrument. I have no mechanism for
+the residual and am not proposing one; the three-part table is the honest form.
+
+**The decision: the residual bounds the arm-vs-floor contrasts, and I adopt it.** The earlier
+float32 run that failed this same control registered the consequence "no k≥4 result from that run
+is readable as the arm effect." I adopt that consequence here in **calibrated** rather than
+blanket form, because a blanket exclusion would discard a contrast four times the instrument's
+own demonstrated displacement, and because a bound with a measured null is what this branch
+requires. Criterion: an arm-vs-floor contrast is readable only if it exceeds 1.13 pp.
+
+| k | nopf/ship | floor | contrast | readable at 1.13 pp? |
+|---|---|---|---|---|
+| 8 | 0.9615 | 1.0091 | −4.76 pp | **yes, 4.2x** |
+| 16 | 1.0030 | 1.0198 | −1.67 pp | yes, 1.5x — marginal |
+| 12 | 0.9984 | 1.0061 | −0.76 pp | **no** |
+| 20 | 1.0106 | 1.0156 | −0.50 pp | **no** |
+| 24 | 1.0123 | 1.0215 | −0.92 pp | **no** |
+| 32 | 1.0150 | 1.0240 | −0.90 pp | **no** |
+
+**So "nopf beats the inter-object floor at six of seven widths" is withdrawn.** Only k=8 is
+readable; k=16 is marginal at 1.5x the residual; k=12, 20, 24 and 32 are inside it. Correction 3
+had already reduced the robust set to {8, 16, 24, 32} by functional-invariance; this reduces it
+further to {8} with {16} marginal, and the two reductions have different causes.
+
+**The k=32 headline weakens and does not vanish.** The question was whether removing the
+register-block prefetch *harms* at k=32, where the recorded SuiteSparse result was harm on 115
+matrices. The contrast there is negative — `nopf` faster than the floor pair — and inside the
+residual. So the correct statement is **no demonstrated harm at k=32, and no demonstrated
+benefit either**: the arm is indistinguishable from two objects at identical configuration. That
+still answers the question that was blocking a float32 `PFD=0` decision, because the recorded
+harm would have had to appear as a positive contrast and does not. It does not support the
+stronger claim that `nopf` is better there, which amendment 27 made.
+
+**A new finding about the floor itself, which is why the residual cannot be assigned.** The
+one-signedness test now fires on the *floor* rather than on `strm`. In the prior float32 run
+(job 17680942, 418 SuiteSparse × 5 widths) the recorded figures were nopf 85.9% one-signed, strm
+67.0%, floor 44.7% — a clean two-sided floor. Here `nopf` holds almost exactly at 87.0%, `strm`
+has gone clean at 47.4%, and the **floor has become the one-signed pair at 67.1%**, against a
+measured null of 52.3% from the repeat in the same files. The instrument that is supposed to
+bound object-level displacement is itself displaced in this run.
+
+**Two limits on this registration, stated now.** The residual is measured at a single width, and
+it is a width where the *executed kernel differs* — `narrow_exact` rather than the register-block
+path — so its width-dependence is unknown and 1.13 pp is a one-point calibration, not a
+profile. And the inter-object floor itself ranges 0.61 to 2.40 pp across widths, so a scalar
+bound taken from the narrowest width may be the wrong scale at the widest.
+
+**What this does NOT touch: the MKL deficit.** `ours/mkl` reads 1.4489 at k=2, a displacement of
+44.89 pp, which is **40x** the residual and 37x the floor. Every conclusion about being behind
+MKL at narrow k on DLMC survives this correction untouched, and that remains the finding that
+matters for the goal.
+
+**Also corrected, from the same recomputation.** Amendment 27 cited "`batch` counts are identical
+on all 2744 cells, 0 differing" as support for the `oursb`-is-`ours` identity. Over all four
+builds and seven widths the figure is 0 of 10976, and it cannot be otherwise, because
+`mrgate.py:125-130` hands one batch to every arm running our code. The number that shows the
+column is live sits in the same place: `ours` versus `mkl`, separately calibrated, differs on
+**10940 of 10976 = 99.7%**. With that printed beside it the zero is a pipeline check; without it,
+it reads as evidence for a conclusion it cannot support.
