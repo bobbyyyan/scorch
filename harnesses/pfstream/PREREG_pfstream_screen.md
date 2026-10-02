@@ -1834,3 +1834,63 @@ runs *against* the caveat's own point. The sealed `PROVENANCE.md` had the band r
 entered when I transcribed it, which makes the derived record less reliable than the artefact it
 cites — the failure mode that makes transcription worth checking against the source each time
 rather than once.
+
+
+## Amendment 26 — a structural predictor for the 192-cell float64 deficit, registered before it runs
+
+The float64 screen leaves **192 of 2926 cells behind MKL**, and neither prefetch arm touches
+them: `PFD=0` wins 1.3-2.9% at k=4..16 but reads **+0.139%** on that selected set at k=2, inside
+the floor's own 61% better-count there. So the deficit is not the register-block prefetch, and a
+third arm on the same axis would be a guess. This amendment registers a *mechanism* and the
+measurement that can refute it, before the measurement is run, because the corpus verdicts are
+already known to me and any threshold chosen after looking at them would be fitted.
+
+**The mechanism.** Every nonzero gathers one row of B. At k=2 float64 that row is 16 bytes, inside
+a 64-byte cache line, so **four B rows share a line** and whether they are used together is a
+property of A's column index pattern, not of the kernel. `harnesses/pfstream/bstream_locality.py`
+measures exactly that and nothing else: per row, the number of distinct 64-byte B lines its
+columns touch; amortized per nonzero; reported as `lines_per_nnz` and as
+`pack = 1 / (lines_per_nnz * brows_per_line)`, the mean fraction of each fetched line the row
+consumes. It reads only `indptr` and `indices`, so no arm and no timing can influence it.
+
+**The reach is arithmetic, and it is narrower than I first reasoned.** `brows_per_line` is
+`max(1, 64 // (k * itemsize))`. I wrote down the boundary as "`k * 8 < 64`, so k = 2, 4, 6" and the
+computation returned k = 2, 4 only: at k=6 a B row is 48 bytes and `64 // 48 == 1`, because two
+48-byte rows do not fit in a line. Integer division, not a judgment call, and the self-test pins
+it. So for float64:
+
+| k | B row bytes | brows_per_line | structural signal | cells behind MKL |
+|---|---|---|---|---|
+| 2 | 16 | 4 | yes | 129 |
+| 4 | 32 | 2 | yes | 35 |
+| 6 | 48 | 1 | **none, constant** | 18 |
+| 8 | 64 | 1 | none, constant | 9 |
+| 10 | 80 | 1 | none, constant | 1 |
+| 12, 16 | 96, 128 | 1 | none, constant | 0 |
+
+The predictor can speak for **164 of 192 cells (85.42%)** and is provably silent on the other 28.
+That limit is stated here rather than discovered afterwards. For float32 the same arithmetic gives
+a signal at k = 2 and k = 8 and silence from k = 12 up, which is a second, independently reachable
+test on the DLMC screen's own width set.
+
+**What would establish it, and what would refute it.** Within k=2 and k=4, the behind-MKL cells
+should show **lower `pack`** than the ahead cells — worse line utilization, so more bytes fetched
+per useful B row. Two conditions on that, both registered now:
+
+1. **It must survive conditioning on degree.** Mean degree already separates these sets (behind
+   6.86 vs ahead 3.98 at k=2). A predictor that only reproduces the degree split has added
+   nothing, so the contrast is to be read *within* degree strata, and the registered criterion is
+   that the separation persists inside strata, not merely in the pooled comparison.
+2. **It must be silent where it is constant.** At k=6 and above, `pack` is pinned at 1.0 for every
+   matrix by the table above. An analysis that reports a `pack` contrast at those widths has a bug,
+   not a finding. This is a negative control the construction supplies for free.
+
+Refutation: if the behind and ahead `pack` distributions overlap at k=2 and k=4 as much as they do
+at k=6, the mechanism is wrong and this amendment closes with a null.
+
+**What it does not license.** No threshold, no cache-size constant, and no per-matrix rule. The
+script's output is a continuous structural column and it classifies nothing. If the mechanism
+survives, the kernel change it would motivate is a B-side access-order change, and under the
+project's performance convention that change ships only gated on a condition that *provably cannot
+fire* where it would hurt — which, given the table above, means a gate that is inert for
+`k * itemsize >= 32` by construction rather than by measurement.
