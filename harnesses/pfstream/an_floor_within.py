@@ -211,6 +211,7 @@ def main(argv):
     print("MATCHED FUNCTIONAL: the ratio between TWO same-class objects, which is the form an")
     print("arm contrast takes. Every unordered same-class pair contributes one |ratio - 1|.")
     pair_by_band = collections.defaultdict(list)
+    pair_med = {}
     npairs = 0
     for key in sorted(nnz):
         for w in widths:
@@ -220,9 +221,22 @@ def main(argv):
                     for j in range(i + 1, len(have)):
                         a_, b_ = ms[(key, w, have[i], arm)], ms[(key, w, have[j], arm)]
                         if a_ > 0 and b_ > 0:
-                            pair_by_band[band(nnz[key])].append(abs(a_ / b_ - 1.0))
+                            # SYMMETRIC, because |a/b - 1| is order-dependent: the same physical
+                            # pair reads |t-1| one way and |t-1|/t the other, so the number would
+                            # depend on which member happened to hold the lower index and the
+                            # output could not say which way it fell. The same-process reference
+                            # below already divides by the mean, so this also makes the two
+                            # two-object statistics the SAME functional -- which is the whole
+                            # point of this block.
+                            pair_by_band[band(nnz[key])].append(
+                                abs(a_ - b_) / ((a_ + b_) / 2.0))
                             npairs += 1
-    print("  pairs contributing %d (%d same-class pairs per (key,width,class) at n=4)" % (npairs, 6))
+    # Non-vacuity, and a check that no cell was short: at n=4 a full cell gives 6 pairs, so
+    # npairs must equal 6 * n_cells. A literal 6 in a caption cannot show that.
+    want_pairs = 6 * n_cells
+    print("  pairs contributing %d; 6 per full cell x %d cells = %d  (%s)"
+          % (npairs, n_cells, want_pairs,
+             "complete" if npairs == want_pairs else "SHORT by %d" % (want_pairs - npairs)))
     print("  %-9s %6s %9s %9s %9s" % ("band", "pairs", "median", "p95", "max"))
     for lab in BAND_ORDER:
         v = sorted(pair_by_band.get(lab, []))
@@ -230,6 +244,7 @@ def main(argv):
             continue
         print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%"
               % (lab, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95), 100 * v[-1]))
+        pair_med[lab] = pct(v, 0.5)
     allp = sorted(x for v in pair_by_band.values() for x in v)
     print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%   <- pooled" % ("POOLED", len(allp),
           100 * pct(allp, 0.5), 100 * pct(allp, 0.95), 100 * allp[-1]))
@@ -283,12 +298,15 @@ def main(argv):
     else:
         rep_med = {}
     print()
-    print("THE GAP, PER BAND, because the ratio between the two IS the finding and two separate")
-    print("ranges cannot produce it (a published '3-10x' was not derivable from them):")
-    print("  %-9s %12s %12s %9s" % ("band", "within-class", "same-process", "ratio"))
+    print("THE GAP, PER BAND. Both columns are the SAME two-object functional -- a symmetric")
+    print("relative difference between two objects -- so the ratio is single-functional. An")
+    print("earlier version divided the FOUR-object CV by this same-process column, which is the")
+    print("cross-functional pairing that the statistic-choice spread (7.1x over four choices of")
+    print("cell statistic on this branch) rules out; the number it produced is withdrawn.")
+    print("  %-9s %14s %14s %9s" % ("band", "2-obj same-class", "2-obj same-proc", "ratio"))
     ratios = []
     for lab in BAND_ORDER:
-        w_ = within_med.get(lab)
+        w_ = pair_med.get(lab)
         r_ = rep_med.get(lab)
         if w_ is None or r_ is None or r_ <= 0:
             continue
@@ -298,6 +316,8 @@ def main(argv):
     # read as a result: the assignment that fills this dict had been placed one indent level
     # outside its loop, so it ran once with the loop variable left at its last value.
     print("  bands contributing %d of %d" % (len(ratios), len(BAND_ORDER)))
+    print("  (the four-object CV is still reported above; it answers how far four objects of one")
+    print("   class spread, which is not the form an arm contrast takes.)")
     if len(ratios) < 2:
         print("  REFUSING to state a range over %d band(s); the per-band pairing is the finding"
               % len(ratios))

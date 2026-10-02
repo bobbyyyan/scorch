@@ -126,6 +126,41 @@ def main(argv):
         print("  (negative = faster than ship. 'better' counts cells where the arm is faster;")
         print("   the floor row's own count is the null -- a coin-flip there is ~half.)")
 
+    # ---- PER WIDTH, because the recorded float32 result is that this effect FADES with width
+    # and reverses somewhere above the widths measured here. A pooled number hides that shape,
+    # and the shape is the whole question for whether the macro can ship.
+    print()
+    print("PER WIDTH over all cells (negative = faster than ship)")
+    widths = sorted({w for (_k, w) in cells})
+    print("  %-6s %10s %10s %10s %12s %12s" % ("k", "floor", "nopf", "strm", "nopf better", "strm better"))
+    for w in widths:
+        pop = [c for c in cells if c[1] == w]
+        fl = rel("shpb", "ship", pop)
+        vn = rel("nopf", "ship", pop) if "nopf" in builds else []
+        vs = rel("strm", "ship", pop) if "strm" in builds else []
+        # The FLOOR column is the one the other two are read against, and it was the only one
+        # without a guard. The up-front requirement that shpb exists is satisfied by one row
+        # anywhere in the corpus; this table needs it present PER WIDTH, and a pass that dies
+        # partway -- which is how a long run ends -- leaves a width with ship cells and no shpb
+        # cells. Unguarded that is a TypeError mid-table, not a structured refusal.
+        if not fl:
+            print("  k=%-4d %9s   REFUSE: no shpb/ship pair at this width, so the floor the two"
+                  % (w, "-"))
+            print("            arm columns are read against does not exist here; %d cells have"
+                  % len(pop))
+            print("            a ship reading. Nothing is reported for k=%d." % w)
+            continue
+        print("  k=%-4d %9.3f%% %9.3f%% %9.3f%% %11s %11s"
+              % (w, 100 * pct(fl, 0.5),
+                 100 * pct(vn, 0.5) if vn else float("nan"),
+                 100 * pct(vs, 0.5) if vs else float("nan"),
+                 "%d/%d" % (sum(1 for x in vn if x < 0), len(vn)) if vn else "-",
+                 "%d/%d" % (sum(1 for x in vs if x < 0), len(vs)) if vs else "-"))
+    print("  The floor column is the null for the two beside it. The recorded float32 result is")
+    print("  that removing the prefetch wins 14.6%% at k=4 and fades to 0.56%% by k=16, and that it")
+    print("  HARMS 115 matrices at k=32 -- a width absent from this grid, so this table cannot")
+    print("  see the side of the trade that blocks shipping.")
+
     # ---- the decisive question, stated as a comparison and not a verdict.
     print()
     print("DOES ANY ARM CLEAR ITS OWN FLOOR ON THE DEFICIT SET?")

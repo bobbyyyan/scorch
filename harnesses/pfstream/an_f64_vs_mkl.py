@@ -144,9 +144,19 @@ def main(argv):
             row += "%7s" % (n if d_ else "-")
             tt += n
         print(row + "%8d" % tt if any_cell else row + "%8s" % "-")
-    print("  (every width in the grid is a column above, so the row totals close on %d with no"
-          % counts[BEHIND])
-    print("   width omitted -- read the per-width totals rather than subtracting.)")
+    per_width = {w: sum(1 for (key, k), v in verdict.items() if k == w and v == BEHIND)
+                 for w in widths}
+    if sum(per_width.values()) != counts[BEHIND]:
+        return ("REFUSE: the per-width behind counts sum to %d but the verdict count is %d, so "
+                "the width partition does not close and a reader subtracting would be misled"
+                % (sum(per_width.values()), counts[BEHIND]))
+    print("  per-width behind counts %s sum to %d, ASSERTED equal to the verdict count"
+          % (per_width, counts[BEHIND]))
+    # Named explicitly, because a prose summary of this table omitted two widths and left a
+    # reader to subtract 19 cells. For doubles (4 lanes) the tail is masked when k %% 4 != 0.
+    masked = [w for w in widths if w > 3 and w % 4 != 0]
+    print("  masked-tail widths above the exact kernel's range (k %% 4 != 0): %s holding %d cell(s)"
+          % (masked, sum(per_width[w] for w in masked)))
     print("  %-9s" % "TOTAL" + "".join(
         "%7d" % sum(1 for (key, k), v in verdict.items() if k == w and v == BEHIND)
         for w in widths) + "%8d" % counts[BEHIND])
@@ -240,8 +250,13 @@ def main(argv):
     print("  %-26s %4s %10s %9s %8s %8s" % ("key", "k", "nnz", "rows", "deg", "worst"))
     for r, ck in worst:
         key, w = ck
-        print("  %-26s %4d %10d %9s %8.2f %7.3fx"
-              % (key[-26:], w, nnz[key], rows_of.get(key, "?"), degree_of.get(key, 0), r))
+        # A key absent from degree_of is one whose row count was unusable, and printing 0 for it
+        # would be indistinguishable from a measured value -- the real small-degree tail reaches
+        # 0.0001, so 0 is plausible here. Printed as "n/a" instead, and the count of such keys is
+        # the `unchecked` figure above.
+        dg = ("%8.2f" % degree_of[key]) if key in degree_of else "%8s" % "n/a"
+        print("  %-26s %4d %10d %9s %s %7.3fx"
+              % (key[-26:], w, nnz[key], rows_of.get(key, "?"), dg, r))
 
     # ---- pooled position, reported last and labelled as pooled.
     print()

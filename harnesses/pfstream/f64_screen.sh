@@ -15,7 +15,13 @@ set -u
 ROOT=${1:-}
 [ -n "$ROOT" ] || { echo "usage: f64_screen.sh <root> [ks] [reps]"; exit 1; }
 [ -d "$ROOT" ] || { echo "REFUSE: root $ROOT is not a directory"; exit 1; }
-KS=${2:-2,4,8,16}
+# THE REGISTERED SEVEN, not a subset. This file's own header justifies the grid by completeness
+# over float64's reachable register-block range, and 2,4,8,16 is not complete over it: with 4
+# lanes it reaches nvec 1, 2 and 4 with a FULL tail only, missing nvec 3 (k=10,12) and every
+# masked tail (k=6,10). That is the exact coverage pattern of the float32 set that the first
+# host's screen header calls out as reaching neither. A default that contradicts the header's
+# justification is worse than no default.
+KS=${2:-2,4,6,8,10,12,16}
 REPS=${3:-9}
 
 TREE=${F64_TREE:-$ROOT/scorch-beat-mkl}
