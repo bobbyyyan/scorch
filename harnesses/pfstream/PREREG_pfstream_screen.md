@@ -2498,3 +2498,97 @@ value the sbatch *printed into the job log* — a line only I can read — and n
 stored. Grepping the worktree for `24e386cee4371ce9` before this commit returned exactly one hit:
 amendment 28's own sentence. The binding was real but it was mine and unverifiable by the
 reviewing session. It is now stored, in the `WANT` array, where a comparison can reach it.
+
+---
+
+## Amendment 29 — the MKT DLMC float32 screen is COMPLETE, and the registered k=32 prefetch conditional has fired
+
+`F64_SCREEN_ALL_PASSES_DONE 15:13:56`, 4 passes x 4 builds = 16 CSVs of 8232 rows each,
+`nonzero_rc 0`, 392 keys, widths 2,8,12,16,20,24,32, dtype float32. The producer's sentinel
+declares the width set, so the analysis validates against a declaration outside the data:
+**expected 392 x 7 x 16 = 43904 readings, observed 43904**, and 2744 of 2744 cells carry the
+full 16. Both analysis tools were digest-matched to the worktree before their output was read
+(see the divergence note below), `an_f64_vs_mkl.py` at `82e10428eec95cdf`.
+
+### The verdict, over 16 readings with the sign required to agree in all of them
+
+| | cells | share |
+|---|---|---|
+| ahead in every reading | 1670 | 60.86% |
+| behind in every reading | **662** | 24.13% |
+| mixed sign | 412 | 15.01% |
+
+Pooled geomean 0.8731 = **1.145x ours faster**. By band: 1.474 / 1.142 / 1.035 / 1.228 / 1.419.
+
+Behind by width `{2: 328, 8: 149, 12: 102, 16: 71, 20: 6, 24: 4, 32: 2}`. The 12-pass interim
+read 688 at `328/158/116/74/6/4/2`, so the count **fell** as readings were added — the right
+direction, since agreement across 16 readings is strictly stricter than across 12, and a count
+that had risen would have meant the interim was reading noise as agreement. **k=2 is unchanged
+at 328**, which is the set every open question is about.
+
+The degree structure holds on the complete set, including the reversal:
+
+| k | behind cells | median degree | ahead cells | median degree |
+|---|---|---|---|---|
+| 2 | 328 | **115.20** | 53 | 7.12 |
+| 8 | 149 | **76.80** | 96 | 32.07 |
+| 12 | 102 | 51.20 | 141 | **102.47** |
+| 16 | 71 | 39.68 | 251 | **159.38** |
+
+All 20 worst cells are `rows = 512, k = 2`. That is not a second carrier: it is why the earlier
+one-sided test on **rows** returned an exact null (p = 1.0000, ceiling = the corpus maximum).
+This corpus has almost no row-count variance, so rows cannot discriminate, and mean degree
+remains the only carrier that survives its own null.
+
+### The prefetch, and the conditional this screen was built to answer
+
+**It is still not the k=2 mechanism.** At k=2 `nopf` reads **+0.604%** — slower — against a
+same-config two-object floor of **+0.672%**; on the 328-cell k=2 deficit subset, **+0.695%**
+against **+0.820%**. Inside the floor both ways. Neither arm clears its floor on the 662-cell
+deficit set (`nopf` −0.073%, `strm` −0.301%, floor median +0.692%), which is a statement about
+this screen's resolution on that population and not evidence of no effect.
+
+**Its win is at k >= 8, and it is large and clean:**
+
+| k | floor | nopf | cells better |
+|---|-------|------|--------------|
+| 2 | +0.672% | +0.604% | 111/392 |
+| 8 | +0.474% | **−6.222%** | **372/392** |
+| 12 | +0.237% | −2.353% | 364/392 |
+| 16 | +1.110% | −1.905% | 307/392 |
+| 32 | +1.381% | **−0.973%** | 294/392 |
+
+**The k=32 row is the registered conditional, and it answers against the recorded result.** The
+float32 record is that deleting the prefetch wins 14.6% at k=4, fades to 0.56% by k=16, and
+**harms 115 matrices at k=32** — measured on SuiteSparse. The tool was written to test whether
+this grid can see that side of the trade rather than assert it cannot: k=32 **is** in the grid,
+over 392 cells, and `nopf` reads **−0.973% against a floor of +1.381%** — a win, outside the
+floor, sign **opposed** to the SuiteSparse harm.
+
+So the harm is a property of SuiteSparse-like structure at wide k, **not of wide k**. This does
+not clear the deletion to ship: the SuiteSparse harm is real on SuiteSparse and a kernel that
+regresses 115 matrices there is a regression. What changed is the shape of the blocker — from a
+width condition, which a runtime gate cannot distinguish from overfitting, to a corpus-structure
+condition, which is a measurable property of the input. The next measurement is both corpora in
+one grid at k=32 with the floor computed inside it. **No gate is proposed until that runs**, and
+if the separating property turns out to be unnameable in terms a kernel can test at runtime, the
+deletion stays unshipped — a per-corpus rule is the overfitting this project measures against.
+
+### A staging divergence that would have invalidated the sweep launched after it
+
+`an_f64_arms.py` on MKT was `f275312f223ed7fde4` against the worktree's `92c73dce0987c45d`.
+Caught only because its output printed `14.6%%` where the worktree has one `%`. Restaged and
+re-run rather than assumed cosmetic; every number was identical, so it was — but that is now
+checked rather than believed.
+
+Digesting the whole set before submitting the oracle sweep, **6 of 14 files differed**, including
+both measurement tools: MKT's `adggate.py` and `ntoracle.py` carried **no `so_sha` column at
+all**, and `adg_build.sh` predated the 96-point decision-grid floor check. Submitting first would
+have produced precisely the provenance-absent CSV that `nt_k2curve.py` now refuses — generated by
+a tool that refuses it, one host over. Staged and verified byte-for-byte before submission;
+`adg_keys.txt` is `751c7f60d1604cc7`, byte-identical to redwood's, so predictions 1 and 4 are
+scored on the key set redwood was.
+
+MKT job **17696496** (`adg-dlmc-f32`, 32 CPUs, 8h) builds the three ADOPT_GRAIN objects, runs the
+three-pass screen, then sweeps overrides 0..32. Pool 32 is the value prediction 4's arithmetic
+was registered against.
