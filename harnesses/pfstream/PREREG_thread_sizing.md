@@ -902,3 +902,84 @@ The operational form, and it is not "read your own output more carefully": **dif
 against the tool's own print string, not against its logic.** The logic was right all three
 times. What differed was the English, and the print string is the only artefact that holds the
 qualifier in the same words the tool uses.
+
+---
+
+## Amendment 15 (2026-10-02): amendment 14's census could not return one of the two registered answers, and its headline is withdrawn
+
+### 1. `flatish` was unreachable by construction
+
+`shape()` read `if i == 0: return "rising" if meds[-1] > meds[0] else "flatish"`. But `i == 0`
+means `meds[0]` IS the minimum, so `meds[-1] > meds[0]` is false only when two medians of timing
+samples are **bit-identical floats**. There was no tolerance anywhere in the function. The column
+duly read 0 at all eight widths on both hosts, and I reported it as a measurement.
+
+That is not cosmetic. **The registration's dichotomy is "flat rather than rising", so FLAT is one
+of its two answers, and the artefact built to adjudicate it could only ever return the other.** A
+genuinely flat curve came out `rising` when noise put its minimum at the first count, and
+`interior-min` otherwise.
+
+The file had the right construction in its *other* notion of flat -- the verdict threshold is
+justified against the measured A/A spread so that "FLAT cannot be returned by noise alone" -- and
+the census was added without it. Two notions of flat in one file, one with a measured tolerance
+and one with exact float equality, and only the second was in the census.
+
+**Fixed with the cell's own permutation null rather than a constant**, because the null of an
+extreme widens with the number of draws and cells differ in how many counts they reach: a cell
+whose observed max/min does not exceed what shuffling its own readings produces is FLAT, whatever
+the position of its minimum. `flatish` is now reachable and non-zero (2 cells at k=2 on redwood).
+
+### 2. The census had no null, and `interior-min` is the null's dominant category
+
+If the worker count did nothing, a cell's minimum lands uniformly among its `n` reachable counts,
+so `P(interior) = (n-2)/n` -- 66.7% at n=6, 91.7% at n=24. So a raw interior share is not
+evidence, and **amendment 14's "81% on redwood against 47% on the M5" was largely comparing pool
+sizes (24 against 6), not curve shapes.**
+
+The null is now measured per cell by the same `perm_null` the other statistics use, because cells
+cap at `min(override, rows/16)` and many reach far fewer counts than the pool.
+
+**Unconditionally, per-cell structure is REAL:** observed `flatish` is 0-2 cells against a null of
+24-29 on redwood and 0 against 19-25 on the M5. The counts are not exchangeable within a cell.
+That much survives and is a genuine finding.
+
+**Conditionally on being non-flat, the interior share is BELOW its null at every width on both
+hosts:**
+
+| k | redwood obs / null | M5 obs / null |
+|---|--------------------|---------------|
+| 2 | 80.4% / **90.4%**  | 46.9% / **66.6%** |
+| 8 | 75.5% / **88.9%**  | 54.3% / **67.0%** |
+| 16| 74.5% / **88.1%**  | 73.2% / 65.6%     |
+| 32| 70.7% / **87.8%**  | 68.4% / 64.1%     |
+
+The conditional comparison is the right one because the null puts most of its own non-flat mass
+in `interior-min` by construction, so an unconditional comparison credits the data for a shape
+the null prefers.
+
+### 3. What is withdrawn and what stands
+
+**WITHDRAWN: "43 of 53 redwood k=2 cells have an interior minimum" as evidence of anything.** It
+is below its own null. Amendment 14 led with it and called it "the primary result for the curve
+question on this host". It is not a result.
+
+**STANDS, and is the actual evidence for an interior optimum:** the POOLED curve, which falls to
+0.3147 at nine workers and rises 23% to 0.3883 at twenty-four. That is far outside any A/A spread
+this corpus has produced and is a different claim with a different null from the per-cell census.
+Amendment 14's conclusion -- that the registered dichotomy has no good answer on redwood -- also
+stands, but for a different reason than I gave: not because interior minima dominate, but because
+the per-cell shape classification cannot distinguish an interior minimum from noise at all. The
+curve question is answered by the pooled curve, not by the census.
+
+**UNAFFECTED: predictions 2 and 3 remain FAILED.** They are headroom predictions and the headroom
+statistic does not read the curve's shape, which is why it was built separately.
+
+### 4. The pattern, now four instances and a different one
+
+The three in amendment 14 were all the same failure -- the tool printed a qualifier and my
+restatement dropped it. This one is not that: the tool printed a column that could only ever hold
+zero, and I reported the zero. The general form is the one already on file as "beside a
+possibly-vacuous number, report the number that shows it was not" -- a category that cannot be
+returned is the vacuous case of a partition, and the check is to ask of every category in a
+classification *what input would land here*. For `flatish` the answer was "two bit-identical
+timing medians", which is none.

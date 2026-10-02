@@ -145,12 +145,38 @@ def stat_maxmin(counts):
 
 
 def shape(counts):
-    """Where the minimum sits: the registration's dichotomy presupposes monotonicity."""
+    """Where the minimum sits, with FLAT decided against the cell's own permutation null.
+
+    THE PREVIOUS VERSION COULD NOT RETURN "flatish" AT ALL. It read
+
+        if i == 0: return "rising" if meds[-1] > meds[0] else "flatish"
+
+    and `i == 0` means meds[0] IS the minimum, so `meds[-1] > meds[0]` is false only when two
+    medians of timing samples are bit-identical floats. The column duly read 0 at all eight
+    widths on both hosts. That is not a cosmetic defect: the registration's dichotomy is "flat
+    rather than rising", so FLAT is one of its two answers, and the artefact built to adjudicate
+    it could only ever return the other one. A genuinely flat curve came out "rising" when noise
+    put its minimum at the first count, and "interior-min" otherwise.
+
+    The file already had the right construction in its other notion of flat -- the verdict
+    threshold is justified against the measured A/A spread so that "FLAT cannot be returned by
+    noise alone" -- and the census was added without it. The tolerance here is not a constant:
+    it is the cell's OWN permutation null for max/min, which is the only defensible bound because
+    the null of an extreme widens with the number of draws and cells differ in how many counts
+    they reach. A cell whose observed spread across counts does not exceed what shuffling its own
+    readings produces is FLAT, whatever the position of its minimum.
+    """
     cs = sorted(counts)
     meds = [st.median(counts[c]) for c in cs]
-    i = meds.index(min(meds))
+    lo, hi = min(meds), max(meds)
+    if lo > 0:
+        obs = hi / lo
+        nul = perm_null(counts, stat_maxmin)
+        if nul == nul and obs <= nul:
+            return "flatish"
+    i = meds.index(lo)
     if i == 0:
-        return "rising" if meds[-1] > meds[0] else "flatish"
+        return "rising"
     if i == len(meds) - 1:
         return "falling"
     return "interior-min"
@@ -193,14 +219,78 @@ print("than rising\", a dichotomy that presupposes a monotone curve. A cell whos
 print("INTERIOR is neither, and forcing it to one side is the error both statistics above make in")
 print("opposite directions. The census decides whether the registered question is even well posed")
 print("on this host, so it is printed before any verdict is read.")
-print("  %4s %7s %9s %9s %9s %9s" % ("k", "live", "rising", "falling", "interior", "flatish"))
+print()
+print("  THE CENSUS CARRIES ITS OWN NULL TOO, because `interior-min` is also the category that")
+print("  pure noise produces most often: if the worker count did nothing, a cell's minimum")
+print("  lands uniformly among its n reachable counts, so P(interior) = (n-2)/n -- 66.7% at")
+print("  n=6, 91.7% at n=24. A raw interior share is therefore not evidence, and comparing the")
+print("  share across hosts compares their POOL SIZES unless the null is carried with it. The")
+print("  null below is measured per cell rather than taken from (n-2)/n, because cells cap at")
+print("  min(override, rows/16) and many reach far fewer counts than the pool.")
+print("  %4s %7s %19s %19s %19s %19s" % ("k", "live", "rising", "falling", "interior", "flatish"))
+print("  %4s %7s %19s %19s %19s %19s" % ("", "", "obs / null", "obs / null", "obs / null", "obs / null"))
+NPERM_CENSUS = 40
 for k in ks:
     live = [c for ck, c in cell.items() if ck[1] == k and len(c) >= 2]
     if not live:
         continue
     cnt = collections.Counter(shape(c) for c in live)
-    print("  %4d %7d %9d %9d %9d %9d"
-          % (k, len(live), cnt["rising"], cnt["falling"], cnt["interior-min"], cnt["flatish"]))
+    nul = collections.Counter()
+    rngc = __import__("random").Random(20261002 + k)
+    for c in live:
+        flat = [x for v in c.values() for x in v]
+        sizes = [(cc, len(v)) for cc, v in sorted(c.items())]
+        for _ in range(NPERM_CENSUS):
+            rngc.shuffle(flat)
+            i_, sh = 0, {}
+            for cc, n_ in sizes:
+                sh[cc] = flat[i_:i_ + n_]
+                i_ += n_
+            nul[shape(sh)] += 1.0 / NPERM_CENSUS
+    print("  %4d %7d %9d /%8.1f %9d /%8.1f %9d /%8.1f %9d /%8.1f"
+          % (k, len(live),
+             cnt["rising"], nul["rising"], cnt["falling"], nul["falling"],
+             cnt["interior-min"], nul["interior-min"], cnt["flatish"], nul["flatish"]))
+print("  obs = observed cells, null = cells that shuffling the SAME readings among counts puts")
+print("  in that category. A category whose obs is at or below its null is not a finding.")
+print()
+print("  TWO SEPARATE QUESTIONS, AND THE UNCONDITIONAL TABLE ABOVE CONFLATES THEM. Whether any")
+print("  per-cell structure exists is the flatish column: observed 0 against a null of ~20-25")
+print("  says the counts are NOT exchangeable within a cell, which is a real finding. Whether")
+print("  the structure is specifically an interior optimum is a different question, and it must")
+print("  be asked CONDITIONAL on being non-flat -- because the null puts most of its own")
+print("  non-flat mass in interior-min by construction, so an unconditional comparison credits")
+print("  the real data for a shape the null prefers.")
+print("  %4s %12s %12s   %s" % ("k", "obs interior", "null interior", "verdict"))
+for k in ks:
+    live = [c for ck, c in cell.items() if ck[1] == k and len(c) >= 2]
+    if not live:
+        continue
+    cnt = collections.Counter(shape(c) for c in live)
+    nul = collections.Counter()
+    rngc = __import__("random").Random(20261002 + k)
+    for c in live:
+        flat = [x for v in c.values() for x in v]
+        sizes = [(cc, len(v)) for cc, v in sorted(c.items())]
+        for _ in range(NPERM_CENSUS):
+            rngc.shuffle(flat)
+            i_, sh = 0, {}
+            for cc, n_ in sizes:
+                sh[cc] = flat[i_:i_ + n_]
+                i_ += n_
+            nul[shape(sh)] += 1.0 / NPERM_CENSUS
+    on = cnt["rising"] + cnt["falling"] + cnt["interior-min"]
+    nn = nul["rising"] + nul["falling"] + nul["interior-min"]
+    if on <= 0 or nn <= 0:
+        print("  %4d   no non-flat cells on one side, so the conditional share is undefined" % k)
+        continue
+    o, n_ = 100.0 * cnt["interior-min"] / on, 100.0 * nul["interior-min"] / nn
+    print("  %4d %11.1f%% %11.1f%%   %s"
+          % (k, o, n_,
+             "ABOVE the null" if o > n_ else "AT OR BELOW the null -- interior-min is NOT a finding here"))
+print("  So the defensible claim is that worker count matters per cell, NOT that the optimum is")
+print("  characteristically interior. The pooled curve is a separate and stronger piece of")
+print("  evidence for an interior optimum and is not affected by this table.")
 
 print()
 print("THE QUANTITY THE DECISION ACTUALLY NEEDS, which is neither of the two above: how much")
