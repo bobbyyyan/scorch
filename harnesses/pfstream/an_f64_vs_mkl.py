@@ -64,7 +64,15 @@ def main(argv):
     # it at all, and a forgotten argument completed and exited 0 with the width check silently
     # unavailable.
     declared, decl_src, decl = None, None, {}
-    sentinel = os.path.join(d, "f64screen.done")
+    # Both names are accepted: the sentinel was renamed to screen.done when the driver stopped
+    # calling every run "f64", and a run already in flight wrote the old name.
+    sentinel = None
+    for cand in ("screen.done", "f64screen.done"):
+        if os.path.exists(os.path.join(d, cand)):
+            sentinel = os.path.join(d, cand)
+            break
+    if sentinel is None:
+        sentinel = os.path.join(d, "screen.done")
     if os.path.exists(sentinel):
         for ln in open(sentinel):
             parts = ln.split()

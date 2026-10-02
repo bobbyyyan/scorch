@@ -110,9 +110,41 @@ def main(argv):
                 have = {leaf(k) for k, _p in st[(mm[0], mm[1], sp)]}
                 miss = sorted(allleaves - have)
                 absent_total += len(miss)
-                print("    %-6s short by %d; absent layer(s): %s%s"
-                      % (sp, mx - sizes[sp], ", ".join(miss[:3]),
-                         " ... (%d more)" % (len(miss) - 3) if len(miss) > 3 else ""))
+                print("    %-6s short by %d, absent files %d" % (sp, mx - sizes[sp], len(miss)))
+                # CHARACTERISE, DO NOT SAMPLE. Printing the first few of a SORTED list is how a
+                # heterogeneous set reads as a regular pattern: sorting puts similar names
+                # adjacent, so the head of any sorted listing looks like a rule. That produced a
+                # published description of this very set as "two suffixes across all decoder
+                # layers" when it is 22 encoder and 4 decoder files over 8 weight types. The
+                # product check below is what refutes such a description: if the absent set were
+                # a Cartesian product of the axes, the product would equal the count.
+                axes = collections.defaultdict(set)
+                parsed = 0
+                for nm in miss:
+                    bits = nm.split("_")
+                    if len(bits) > 3 and bits[0] == "body" and bits[2] == "layer":
+                        axes["side"].add(bits[1])
+                        axes["index"].add(bits[3])
+                        axes["suffix"].add("_".join(bits[4:]))
+                        parsed += 1
+                if parsed == len(miss) and axes:
+                    prod = 1
+                    for k in ("side", "index", "suffix"):
+                        prod *= max(1, len(axes[k]))
+                    print("      axes: %d side(s) %s, %d index(es) %s, %d suffix(es)"
+                          % (len(axes["side"]), sorted(axes["side"]),
+                             len(axes["index"]), sorted(axes["index"], key=lambda x: int(x)),
+                             len(axes["suffix"])))
+                    print("      product %d vs absent %d -> %s"
+                          % (prod, len(miss),
+                             "a full Cartesian product" if prod == len(miss) else
+                             "NOT a product, so no single name-based rule describes this set"))
+                    per_side = collections.Counter(nm.split("_")[1] for nm in miss)
+                    print("      by side %s" % dict(per_side))
+                else:
+                    print("      %d of %d names did not parse into axes, so no structure is"
+                          % (len(miss) - parsed, len(miss)))
+                    print("      claimed for this set")
     print("  absent files implied by the invariant: %d" % absent_total)
     if absent_total == 0:
         print("  ^ zero, so no stratum is quietly missing members and any explanation that")

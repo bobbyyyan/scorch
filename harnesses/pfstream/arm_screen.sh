@@ -45,6 +45,14 @@ KEYS=${F64_KEYS:-$ROOT/f64_keys_screen.txt}
 OUT=${F64_OUT:-$ROOT/csv_$DTYPE}
 ACTIVATE=${F64_ACTIVATE:-$ROOT/pfs-activate.sh}
 THREADS=${F64_THREADS:-32}
+# OUTPUT NAMES CARRY THE CORPUS AND DTYPE. They used to be ss64_<build>_p<n>.csv and
+# f64screen.done regardless of what ran, so a float32 DLMC screen wrote files named for a float64
+# SuiteSparse one. The sentinel carries a dtype line, so the DATA was self-describing while the
+# FILENAMES were not -- and a filename is what survives into a manifest, where only provenance
+# separates one run from another. Two screens writing byte-identically-named outputs for
+# different dtypes over different corpora is the setup in which a mix-up is invisible.
+CORPUS=${F64_CORPUS:-$(basename "$CACHE")}
+PREFIX=${F64_PREFIX:-${CORPUS}_${DTYPE}}
 
 HARNESS=${F64_HARNESS:-$TREE/harnesses/pfstream}
 for spec in "HARNESS=$HARNESS" "PFS=$PFS" "CACHE=$CACHE"; do
@@ -77,7 +85,14 @@ python -c "import torch,sys; sys.stderr.write('torch %s at %s\n'%(torch.__versio
 case "$DTYPE" in float32) LANES=8 ;; float64) LANES=4 ;; esac
 python - "$KS" "$LANES" "$DTYPE" <<'PY' || exit 1
 import sys
-ks = [int(x) for x in sys.argv[1].split(",") if x]
+raw = [int(x) for x in sys.argv[1].split(",") if x]
+dupes = sorted({k for k in raw if raw.count(k) > 1})
+if dupes:
+    sys.exit("REFUSE: width(s) %s appear more than once in the grid %s. A repeated width is "
+             "counted twice by the category lists below while the partition compares against "
+             "the distinct count, so the partition would refuse with an empty unplaced list and "
+             "point a reader at the partition instead of at the duplicate." % (dupes, raw))
+ks = sorted(set(raw))
 lanes, dtype = int(sys.argv[2]), sys.argv[3]
 # THE SHIPPED BOUND, NOT THE INSTANTIATION CAP. spmm.h reads
 #   int exact_hi_ = narrowk_exact_hi;
@@ -165,6 +180,7 @@ if [ "$POOL" -lt "$MINPOOL" ]; then
   exit 1
 fi
 echo "corpus $NK matrices, dtype $DTYPE, widths $KS, reps $REPS"
+echo "output prefix $PREFIX, sentinel $OUT/screen.done"
 echo "cache $CACHE"
 echo "builds $BUILDS"
 
@@ -174,19 +190,19 @@ for p in 1 2 3 4; do
   order=${ORDERS[$((p-1))]}
   echo "== pass p$p order: $order"
   for tag in $order; do
-    out=$OUT/ss64_${tag}_p${p}.csv
+    out=$OUT/${PREFIX}_${tag}_p${p}.csv
     echo "  --- p$p $tag start $(date +%H:%M:%S)"
     OMP_NUM_THREADS=$THREADS PYTHONPATH="$PFS/$tag/src" \
       python "$H/mrgate.py" --cache "$CACHE" --keys "$KEYS" --csv "$out" \
         --dtype "$DTYPE" --ks "$KS" --reps "$REPS" --target-ms 15 \
-        --pass-tag "p$p" --build "$tag" --slice all > "$OUT/ss64_${tag}_p${p}.log" 2>&1
+        --pass-tag "p$p" --build "$tag" --slice all > "$OUT/${PREFIX}_${tag}_p${p}.log" 2>&1
     rc=$?
     rows=$(( $(wc -l < "$out" 2>/dev/null || echo 1) - 1 ))
     echo "  --- p$p $tag done  $(date +%H:%M:%S)  rc=$rc  ($rows rows)"
     if [ "$rc" != "0" ]; then
       failed=$(( failed + 1 ))
       echo "REFUSE: p$p $tag exited $rc"
-      tail -4 "$OUT/ss64_${tag}_p${p}.log"
+      tail -4 "$OUT/${PREFIX}_${tag}_p${p}.log"
       exit 1
     fi
   done
@@ -198,6 +214,6 @@ echo "F64_SCREEN_ALL_PASSES_DONE $(date +%H:%M:%S)  nonzero rc $failed"
 # so an undersized allocation that passes the floor moves the ratio by an unknown amount.
 # Recording it turns a threshold judgement into an exact cross-run comparison a reader can make.
 printf "passes 4\nbuilds 4\nnonzero_rc %s\ncsvs %s\nks %s\nkeys %s\ndtype %s\npool %s\nthreads %s\n" \
-  "$failed" "$(ls "$OUT"/ss64_*.csv 2>/dev/null | wc -l | tr -d ' ')" "$KS" "$NK" "$DTYPE" \
-  "$POOL" "$THREADS" > "$OUT/f64screen.done"
-cat "$OUT/f64screen.done"
+  "$failed" "$(ls "$OUT"/${PREFIX}_*.csv 2>/dev/null | wc -l | tr -d ' ')" "$KS" "$NK" "$DTYPE" \
+  "$POOL" "$THREADS" > "$OUT/screen.done"
+cat "$OUT/screen.done"
