@@ -254,9 +254,50 @@ for k in ks:
 print("  obs = observed cells, null = cells that shuffling the SAME readings among counts puts")
 print("  in that category. A category whose obs is at or below its null is not a finding.")
 print()
+print("  THE flatish NULL IS live/2 BY CONSTRUCTION AND IS NOT A MEASUREMENT. `perm_null`")
+print("  returns the MEDIAN of a cell's permutation distribution, and FLAT is declared when the")
+print("  observed statistic is at or below it -- but under exchangeability the observed value is")
+print("  itself a draw from that distribution, so P(FLAT | exchangeable) = 0.5 exactly, for every")
+print("  cell, independent of n, host and width. Reading that column as 'noise would have")
+print("  produced about 27 flat curves' is wrong: it is a threshold defined to put half the null")
+print("  mass on each side. The realized value is printed against the prediction so a DEVIATION")
+print("  is visible, which is the only informative part of it.")
+print("  %4s %7s %10s %10s %8s | %s" % ("k", "live", "live/2", "realized", "dev", "aggregate test on observed flat"))
+for k in ks:
+    live = [c for ck, c in cell.items() if ck[1] == k and len(c) >= 2]
+    if not live:
+        continue
+    cnt = collections.Counter(shape(c) for c in live)
+    nul = collections.Counter()
+    rngc = __import__("random").Random(20261002 + k)
+    for c in live:
+        flat = [x for v in c.values() for x in v]
+        sizes = [(cc, len(v)) for cc, v in sorted(c.items())]
+        for _ in range(NPERM_CENSUS):
+            rngc.shuffle(flat)
+            i_, sh = 0, {}
+            for cc, n_ in sizes:
+                sh[cc] = flat[i_:i_ + n_]
+                i_ += n_
+            nul[shape(sh)] += 1.0 / NPERM_CENSUS
+    n = len(live)
+    # Both sides share the threshold, so observed-flat against Binomial(n, 0.5) IS a valid
+    # test of exchangeability -- and a far stronger statement than the realized-null column.
+    mu, sd = n / 2.0, math.sqrt(n / 4.0)
+    z = (cnt["flatish"] - mu) / sd if sd > 0 else float("nan")
+    print("  %4d %7d %10.1f %10.1f %+8.1f | observed %d flat, Binomial(%d, 0.5) mean %.1f sd %.2f -> %+.1f sd"
+          % (k, n, mu, nul["flatish"], nul["flatish"] - mu, cnt["flatish"], n, mu, sd, z))
+print("  A large negative z is the finding: the counts are NOT exchangeable within a cell.")
+print()
+print("  AND THE PER-CELL LABELS ARE ASSERTED AT THE 50% LEVEL, so they must not be read as each")
+print("  cell being individually certified to have real shape. Raising the threshold to the")
+print("  null's p95 makes FLAT easier and the non-flat set shrinks; the aggregate test above is")
+print("  immune because the same threshold is applied to both sides, but a per-cell count is not.")
+print()
 print("  TWO SEPARATE QUESTIONS, AND THE UNCONDITIONAL TABLE ABOVE CONFLATES THEM. Whether any")
-print("  per-cell structure exists is the flatish column: observed 0 against a null of ~20-25")
-print("  says the counts are NOT exchangeable within a cell, which is a real finding. Whether")
+print("  per-cell structure exists is the flatish column, read against Binomial(live, 0.5) as")
+print("  above -- NOT against the realized null column, which the threshold pins at live/2.")
+print("  Whether")
 print("  the structure is specifically an interior optimum is a different question, and it must")
 print("  be asked CONDITIONAL on being non-flat -- because the null puts most of its own")
 print("  non-flat mass in interior-min by construction, so an unconditional comparison credits")
@@ -434,10 +475,15 @@ else:
         print("     against its own permutation null.")
     else:
         print("     They AGREE, so the verdict does not depend on which was chosen.")
-    print("  2. THE SHAPE: see the census above. The registration's words -- flat rather than")
-    print("     rising -- presuppose a monotone curve, and a cell with an INTERIOR minimum is")
-    print("     neither. Where interior minima dominate, the registered question is not well")
-    print("     posed on this host and reporting that is the honest result.")
+    print("  2. THE SHAPE: see the census above, and read its two halves SEPARATELY. That the")
+    print("     worker count MATTERS per cell is established -- observed flat cells sit 6+ sd")
+    print("     below Binomial(live, 0.5). That the optimum is characteristically INTERIOR is")
+    print("     NOT: conditional on being non-flat, the interior share is at or below its own")
+    print("     null at most widths on both hosts. So the registration's dichotomy -- flat")
+    print("     rather than rising -- has no good answer here, but because the per-cell")
+    print("     classification cannot separate an interior minimum from noise, NOT because")
+    print("     interior minima dominate. The POOLED curve is the evidence for an interior")
+    print("     optimum, and it is a different claim with its own null.")
     print("  3. WHAT IT MEANS FOR THE THREAD RULE, which is what the registration was for: read")
     print("     the headroom table. A thread rule can only recover the gap between production's")
     print("     count and the best reachable one. If that median is at the floor, the rule has")

@@ -983,3 +983,80 @@ possibly-vacuous number, report the number that shows it was not" -- a category 
 returned is the vacuous case of a partition, and the check is to ask of every category in a
 classification *what input would land here*. For `flatish` the answer was "two bit-identical
 timing medians", which is none.
+
+---
+
+## Amendment 16 (2026-10-02): the flat test's null is `live/2` by construction, so the aggregate claim needed a different test
+
+### The defect, and it is in amendment 15's own fix
+
+`perm_null` returns the **median** of a cell's permutation distribution, and amendment 15's new
+FLAT test declares flat when the observed statistic is at or below it. But under exchangeability
+the observed value is itself a draw from that distribution, so
+
+> **P(FLAT | exchangeable) = 0.5 exactly, for every cell, independent of n, host and width.**
+
+So the `flatish` null column is `live/2` by construction and is not a measurement of anything.
+Amendment 15 wrote "observed 0-2 against a null of 24-29", which reads as *noise would have
+produced about 27 flat curves*. It is a threshold defined to put half the null mass on each side.
+
+Confirmed empirically -- the realized value tracks `live/2` with no systematic sign, redwood:
+
+| k | live | live/2 | realized | dev |
+|---|------|--------|----------|-----|
+| 2 | 53 | 26.5 | 26.9 | +0.4 |
+| 4 | 53 | 26.5 | 26.2 | −0.3 |
+| 8 | 53 | 26.5 | 26.7 | +0.2 |
+| 20 | 54 | 27.0 | 26.6 | −0.4 |
+| 24 | 57 | 28.5 | 29.3 | +0.8 |
+| 32 | 59 | 29.5 | 29.4 | −0.1 |
+
+A proposed diagnostic -- that a strict `<` with ties would under-call FLAT and leave a systematic
+shortfall -- does not hold here: the comparison at `:175` is `obs <= nul`, ties count as flat, and
+the deviations above alternate in sign within ±0.8. The threshold also uses `perm_null`'s default
+**200** permutations, not the 40 that feeds the census tally, so its sampling error is the smaller
+one.
+
+### The aggregate claim survives and is much stronger than the number it was quoted against
+
+Both sides share the threshold, so observed-flat against `Binomial(live, 0.5)` is a valid test of
+exchangeability, and it is the right one:
+
+| host | k | live | observed flat | Binomial mean / sd | z |
+|------|---|------|---------------|--------------------|---|
+| M5 | 2 | 49 | 0 | 24.5 / 3.50 | **−7.0** |
+| M5 | 8 | 46 | 0 | 23.0 / 3.39 | −6.8 |
+| M5 | 32 | 38 | 0 | 19.0 / 3.08 | −6.2 |
+| redwood | 2 | 53 | 2 | 26.5 / 3.64 | **−6.7** |
+
+**Worker count matters per cell, at 6+ standard deviations on both hosts.** That part of amendment
+15 stands on a far better footing than its own wording implied.
+
+### Two things now stated in the output rather than left implicit
+
+- **The realized null prints against its prediction**, so only a *deviation* can be read from it.
+  When a test's threshold is an order statistic of its own null, the null's value becomes a
+  property of the threshold; predicting it and checking the realized value is the only way the
+  column carries information.
+- **The per-cell labels are asserted at the 50% level** and must not be read as each cell being
+  individually certified to have real shape. Raising the threshold to the null's p95 makes FLAT
+  *easier* and shrinks the non-flat set. The aggregate test is immune because the same threshold
+  is applied to both sides; a per-cell count is not.
+
+### And the registered conclusion is restated in the code, not just in an amendment
+
+The script's own conclusion block still said "where interior minima dominate, the registered
+question is not well posed". Amendment 15 withdrew that reasoning and the code had not caught up.
+It now reads the census as two separate halves: that worker count matters is established at 6+
+sd; that the optimum is characteristically interior is **not**, being at or below its null at most
+widths on both hosts. The dichotomy has no good answer because the per-cell classification cannot
+separate an interior minimum from noise -- and the pooled curve, a different claim with its own
+null, is the evidence for an interior optimum.
+
+**A note on where these corrections are landing.** Four of the last six amendments have corrected
+an instrument rather than the kernel, and three of those corrected a correction. That is the cost
+of the registration being about a curve's *shape*, which is a weaker thing to measure than a
+ratio against a baseline. The headroom statistic -- built separately for exactly this reason --
+has needed no correction and has carried every verdict that survived: predictions 2 and 3 remain
+FAILED on it, and amendment 8's construction argument closes the thread-count account
+independently of any curve.
