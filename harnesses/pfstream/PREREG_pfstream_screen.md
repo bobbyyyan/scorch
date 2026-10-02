@@ -1561,3 +1561,61 @@ name, different matrix, different work, different time. **It is excluded from th
 corpus (417 keys) and the reason is measured rather than assumed.** A result is invisible to
 dataset substitution, so this check is registered as a precondition of any two-host claim here,
 not as a diagnostic run afterwards.
+
+
+## Amendment 24 — the DLMC corpus's absent stratum, measured rather than described
+
+Written 2026-10-02 at 10:4x, while the float32 DLMC screen (job 17693884) runs.
+
+### The claim I made, and what it was missing
+
+I wrote that the 26 files absent from `transformer/variational_dropout/0.98` are "the layers
+already thin at 0.95 — median nnz 6602 against 16466 for those that survive — which at 0.98 prune
+to nothing", and labelled it as stated without a mechanism. **"Prune to nothing" is the
+mechanism**, and the two medians do not support it. Under a uniform per-layer rate, nonzeros scale
+by (1 − 0.98) / (1 − 0.95) = 0.4000, so the absent set would read about 2641 nonzeros at 0.98 —
+present, not zero. The distance between 2641 and 0 was the whole claim and was unmeasured.
+
+### The quantity that settles it, measured on the files that DO exist
+
+Achieved per-layer sparsity at a nominal 0.98, over the 71 surviving layers:
+
+| min | p05 | median | p95 | max | spread |
+|---|---|---|---|---|---|
+| 0.8840 | 0.9030 | 0.9895 | 0.9999 | 0.9999 | 0.1160 |
+
+Per-layer nonzero ratio 0.98 / 0.95, against the uniform-rate prediction of 0.4000:
+
+| min | p05 | median | p95 | max |
+|---|---|---|---|---|
+| 0.0005 | 0.0041 | 0.2075 | 0.8163 | 1.4069 |
+
+**Variational dropout does not allocate sparsity uniformly at a nominal level, and the nominal
+level is not a per-layer constraint at all** — the ratio exceeds 1 for some layers (max 1.4069),
+meaning a layer can carry MORE nonzeros at 0.98 than at 0.95. And **16 of 71 surviving layers
+retain under 5% of their 0.95 nonzeros**, the smallest at 0.0005. A layer reaching exactly zero is
+the continuation of that distribution rather than a step outside it, so the claim is supported —
+by this measurement, not by the two medians it was originally attached to.
+
+### A coincidence recorded and then closed
+
+6602 / 16466 = 0.4009 and (1 − 0.98) / (1 − 0.95) = 0.4000 agree to 0.24%, and the two quantities
+are unrelated: one is a density ratio between two sets of layers at one sparsity, the other a
+sparsity ratio between two levels. It was flagged before either session built on it. The
+measurement above closes it: the actual median per-layer ratio is 0.2075, so the uniform rate does
+not describe this pruner and the agreement is arithmetic only.
+
+### Why this is registered rather than left in a commit message
+
+Four times in two days a tidy structure was asserted over a set that had only been sampled or
+reconciled: the symmetric-expansion account of `Pothen/barth4` (an exact identity carrying the
+wrong cause), the 97 − 26 pool reconciliation (a difference equal to a remembered count), "two
+suffixes across all decoder layers" (a rule read off the first three entries of a sorted list of
+26), and "which at 0.98 prune to nothing" (a mechanism attached to a correlation). Each fit its
+visible numbers exactly, which is why none looked like a guess.
+
+The refutations were, in order: a predicate enumerable in advance from the key list; a design
+invariant that can see absent files; a Cartesian-product comparison; and a measurement of the
+quantity the claim was actually about. **The generalisable rule: when a description would explain
+a set, state the check that could refute it in the same breath, and prefer a check whose inputs
+are not the numbers that suggested the description.**
