@@ -2289,3 +2289,54 @@ not change the verdict; it sets how much weight the verdict carries.
 instrument, not effect — `narrow_exact` owns k ∈ {1,2,3} — and it is worth stating because it is
 a live demonstration that this criterion can fire on object-level displacement alone at this n.
 A null from it is therefore a statement about a threshold, not about a mechanism.
+
+### Amendment 27, correction 8 — the registered criterion's gate is not independent of its own contrast
+
+This is a limitation of the criterion as recorded, not of the reproduction, and it has to travel
+into the completed run's analysis.
+
+**The gate's own drop rate independently confirms which A/A the record meant.** A drop rate is a
+property of the gate, so it compares across corpora even where counts cannot. The record at
+`spmm_regblock_prefetch_costs_15pct.md:151-154` reports 978 of 4584 dropped, **21.34%**. Pooled
+over seven widths here, the within-object repeat gate drops 37 of 2744 = **1.35%** — 15.8x off —
+while the inter-object gate drops 341 of 2744 = **12.43%**, within 1.7x, which two corpora and
+two width sets easily cover. The gate's signature selects the same reading the source text did.
+
+**The two gates are not nested.** At k=32 the repeat gate passes 384 and the inter-object gate
+339, with an intersection of 333: **51 cells removed and 6 added**, not 45 removed as first
+proposed — 384 − 45 + 6 = 345, which does not close, whereas 384 − 51 + 6 = 339 does. So the
+denominator change is not pure removal, and any arithmetic treating it as such is wrong.
+
+**The gate change is not tail-neutral, and it cannot be.** The denominator falls 11.7% while the
+count of cells more than 5% slower falls **41.0%**, 39 to 23, against 34.4 expected if removal
+were independent of the tail. The removed set is **3.1x** enriched in the tail (that figure is
+3.5x if the 45 above is used, which is how the two propagate). The cause is arithmetic rather
+than a hypothesis about timing: the gate statistic is `|ship/shpb − 1|` and the contrast is
+`nopf/ship`, and **both contain `ship`**. A cell where `ship` reads low inflates the gate
+statistic and the contrast together, so the gate discards it. **No timing-based A/A gate can be
+independent of a contrast it shares an object with**, and here the induced selection runs toward
+understating the tail — on `ship`, the base the blocker was written in.
+
+**The criterion's effective n is strongly width-dependent**, so no cross-width count comparison is
+valid without its own denominator. Inter-object drop rate by width: k=8 3.32%, k=12 7.14%, k=20
+8.42%, k=2 9.44%, k=32 13.52%, k=24 18.11%, **k=16 27.04%**.
+
+**Count and margin order the four gate/base combinations differently, which is a stronger reason
+to print both than the one correction 7 gave.**
+
+| gate / base | n | >10% | >5% | >3% | max | distance to 1.10 |
+|---|---|---|---|---|---|---|
+| repeat / ship | 384 | 0 | 39 | 144 | 1.0756 | 2.44 pp |
+| repeat / shpb | 384 | 0 | **4** | 12 | **1.0835** | **1.65 pp** |
+| inter-obj / ship | 339 | 0 | 23 | 100 | 1.0743 | 2.57 pp |
+| inter-obj / shpb | 339 | 0 | **3** | 11 | 1.0549 | **4.51 pp** |
+
+The smallest tail count (3) has the *farthest* maximum; the nearest maximum (1.65 pp) belongs to
+the combination with almost the smallest count (4). Neither statistic orders the four, so a
+reading that quotes one of them has chosen an ordering without saying so.
+
+**The k=2 firing is base-specific and points the same way.** One cell exceeds 1.10 against `ship`
+at 1.1051 and none against `shpb`, whose maximum is 1.0979. So the demonstration that this
+criterion fires on object-level displacement alone holds specifically on the base that matches
+the original — the same base carrying the larger sub-threshold tail. Two independent facts, one
+direction.
